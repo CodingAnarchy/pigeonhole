@@ -3,8 +3,8 @@
 //! offsets come from `pigeonhole_format::shm`.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_format::shm::{
     DIRECTORY_MAGIC, HEADER_LEN, READER_SLOT_LEN, ShmHeader, ViewRecord, WATERMARK_STRIDE,
@@ -31,8 +31,9 @@ const SLOT_ACTIVE: u32 = 2;
 /// Directory `format` field.
 const DIRECTORY_FORMAT: u32 = 1;
 
-/// Longest region name the smallest platform limit (macOS `shm_open`) accepts.
-const MAX_REGION_NAME: usize = 31;
+/// Longest region name the smallest platform limit accepts: macOS `shm_open` allows 31 bytes
+/// including the leading `/` it needs.
+const MAX_REGION_NAME: usize = 30;
 
 /// How long a reader waits for a region still marked `initializing`. The builder holds the
 /// shm-init lock until the region is ready and records its generation in the directory only
@@ -45,9 +46,6 @@ const VIEW_READ_ATTEMPTS: u32 = 8;
 
 /// Size of the fixed part of a view record (`FORMAT.md` §11.4).
 const VIEW_HEADER_LEN: usize = 32;
-
-/// First seqno a fresh region hands out: 0 means "none" in reader slots.
-const FIRST_SEQNO: Seqno = 1;
 
 /// The mapped region for one database.
 ///
@@ -69,6 +67,9 @@ pub(crate) struct Inner {
     db_id: [u8; 16],
     identity: FileIdentity,
     config: ShmConfig,
+    /// Serializes in-process publishers (`publish_view` writes the inactive buffer, then
+    /// swaps). Across processes the writer lock already allows one publisher.
+    publish_lock: Mutex<()>,
 }
 
 impl Inner {
@@ -106,17 +107,49 @@ impl Inner {
         self.h64(header::VIEW_POINTER).load(order)
     }
 
-    /// Clears a slot's pins and frees it. Pins go first so a concurrent
-    /// [`ShmRegion::oldest_reader_pin`] never sees a free slot still pinning.
-    fn release_slot(&self, index: u32) {
+    fn visible_seqno(&self) -> Seqno {
+        let next = self.h64(header::NEXT_SEQNO).load(Ordering::Acquire);
+        let mut lowest = next;
+        for shard in 0..self.header.shard_count {
+            lowest = lowest.min(self.pending(shard).load(Ordering::Acquire));
+        }
+        lowest.saturating_sub(1)
+    }
+
+    fn clear_pins(&self, index: u32) {
         self.slot64(index, reader_slot::PINNED_SEQNO)
             .store(0, Ordering::SeqCst);
         self.slot64(index, reader_slot::PINNED_VIEW)
             .store(0, Ordering::SeqCst);
-        self.slot32(index, reader_slot::STATE)
-            .store(SLOT_FREE, Ordering::Release);
+    }
+
+    /// The owner frees its slot: pins first, so a concurrent
+    /// [`ShmRegion::oldest_reader_pin`] never sees a free slot still pinning, then `active`
+    /// to `free`. The CAS fails only while the writer has the slot in `claiming` to check
+    /// its owner's liveness ([`ShmRegion::reclaim_dead_slots`]); the writer puts it back to
+    /// `active` at once because the owner is alive, so retry. If the writer died in that
+    /// window the slot stays `claiming`; give up and leave it to the next generation.
+    fn release_slot(&self, index: u32) {
+        self.clear_pins(index);
+        let state = self.slot32(index, reader_slot::STATE);
+        for attempt in 0..RELEASE_ATTEMPTS {
+            if state
+                .compare_exchange(SLOT_ACTIVE, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+            if attempt < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 }
+
+/// Retries of the owner's `active -> free` transition while the writer probes the slot.
+const RELEASE_ATTEMPTS: u32 = 64 + 200;
 
 /// `Unavailable` for an allocation failure, `Io` for anything else.
 fn unavailable(e: pigeonhole_io::Error) -> Error {
@@ -132,14 +165,21 @@ fn io_error(kind: ErrorKind, context: &'static str) -> Error {
 
 /// Writes the header, including the fields `ShmHeader` leaves to this crate, and idles every
 /// watermark. `state` stays `initializing`; the caller stores `ready` once everything is in.
-fn init_region(region: &SharedRegion, h: &ShmHeader, generation: Generation, writer: ProcessId) {
+fn init_region(
+    region: &SharedRegion,
+    h: &ShmHeader,
+    generation: Generation,
+    writer: ProcessId,
+    first_seqno: Seqno,
+) {
     let mut page = [0u8; HEADER_LEN];
     h.encode(&mut page);
     page[header::GENERATION..header::GENERATION + 8].copy_from_slice(&generation.0.to_le_bytes());
     page[header::WRITER_PID..header::WRITER_PID + 4].copy_from_slice(&writer.pid.to_le_bytes());
     page[header::WRITER_START_TIME..header::WRITER_START_TIME + 8]
         .copy_from_slice(&writer.start_time.to_le_bytes());
-    page[header::NEXT_SEQNO..header::NEXT_SEQNO + 8].copy_from_slice(&FIRST_SEQNO.to_le_bytes());
+    page[header::NEXT_SEQNO..header::NEXT_SEQNO + 8]
+        .copy_from_slice(&first_seqno.max(1).to_le_bytes());
     region.write(0, &page);
     for shard in 0..h.shard_count {
         let off = h.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
@@ -271,6 +311,7 @@ fn attach(
         db_id,
         identity,
         config: config.clone(),
+        publish_lock: Mutex::new(()),
     })
 }
 
@@ -297,7 +338,7 @@ fn build(
                 let found = old
                     .atomic_u32(header::LAYOUT_VERSION)
                     .load(Ordering::Acquire);
-                if found != ShmLayoutVersion::CURRENT.0 && !alone(file) {
+                if found != ShmLayoutVersion::CURRENT.0 && !alone(file)? {
                     return Err(Error::VersionMismatch {
                         found,
                         expected: ShmLayoutVersion::CURRENT.0,
@@ -342,7 +383,13 @@ fn build(
         }
         Err(e) => return Err(unavailable(e)),
     };
-    init_region(&region, &h, generation, vfs.current_process());
+    init_region(
+        &region,
+        &h,
+        generation,
+        vfs.current_process(),
+        config.first_seqno,
+    );
     region
         .atomic_u32(header::STATE)
         .store(STATE_READY, Ordering::Release);
@@ -368,6 +415,7 @@ fn build(
         db_id,
         identity,
         config: config.clone(),
+        publish_lock: Mutex::new(()),
     })
 }
 
@@ -381,7 +429,9 @@ impl ShmRegion {
     ///
     /// `file` must be opened for writing in both roles (the shm-init byte is an exclusive
     /// lock). A reader with no region to attach to (no writer has built one yet) gets
-    /// [`Error::Io`] with `ErrorKind::NotFound`.
+    /// [`Error::Io`] with `ErrorKind::NotFound`. A writer's new generation starts its seqno
+    /// counter at `config.first_seqno` (ICR 0002). `config` must pass
+    /// [`ShmConfig::validate`].
     pub fn open(
         vfs: &VfsRef,
         file: &FileRef,
@@ -390,6 +440,7 @@ impl ShmRegion {
         role: Role,
         config: &ShmConfig,
     ) -> Result<ShmRegion> {
+        config.validate()?;
         let _init = ShmInit::acquire(file)?;
         let directory = open_directory(vfs, identity, config.dir.as_deref())?;
         let current = directory
@@ -406,8 +457,12 @@ impl ShmRegion {
 
     /// A private heap-backed region with the same layout (the mock for engine tests).
     ///
-    /// Generation 1, never stale; [`ShmRegion::reattach`] returns a clone.
+    /// Generation 1, never stale; [`ShmRegion::reattach`] returns a clone. Panics if
+    /// `config` fails [`ShmConfig::validate`].
     pub fn in_memory(db_id: [u8; 16], config: &ShmConfig) -> ShmRegion {
+        if let Err(e) = config.validate() {
+            panic!("{e}");
+        }
         let identity = FileIdentity {
             device: 0,
             inode: 0,
@@ -432,6 +487,7 @@ impl ShmRegion {
                 pid: 0,
                 start_time: 0,
             },
+            config.first_seqno,
         );
         region
             .atomic_u32(header::STATE)
@@ -445,6 +501,7 @@ impl ShmRegion {
                 db_id,
                 identity,
                 config: config.clone(),
+                publish_lock: Mutex::new(()),
             }),
         }
     }
@@ -563,13 +620,13 @@ impl ShmRegion {
     /// The highest seqno a new snapshot may include: every commit at or below it is applied
     /// on every shard.
     pub fn visible_seqno(&self) -> Seqno {
-        let next = self.inner.h64(header::NEXT_SEQNO).load(Ordering::Acquire);
-        let mut lowest = next;
-        for shard in 0..self.inner.header.shard_count {
-            let pending = self.inner.pending(shard).load(Ordering::Acquire);
-            lowest = lowest.min(pending);
-        }
-        lowest.saturating_sub(1)
+        self.inner.visible_seqno()
+    }
+
+    /// The next seqno [`ShmRegion::reserve_seqnos`] will hand out (acquire load). Step 1 of
+    /// the protocol publishes this as the lower bound before reserving.
+    pub fn next_seqno(&self) -> Seqno {
+        self.inner.h64(header::NEXT_SEQNO).load(Ordering::Acquire)
     }
 
     // ---- views and manifest ----
@@ -578,11 +635,24 @@ impl ShmRegion {
     /// pointer with release ordering. Fails with [`Error::ViewTooLarge`] (publishing nothing)
     /// if the encoded view exceeds the buffer.
     ///
-    /// `view.view_version` becomes the published version; it must be at least 1 and the
-    /// writer publishes strictly increasing versions (readers pin by version).
+    /// `view.view_version` becomes the published version and must be greater than the
+    /// published one ([`Error::ViewVersionNotNewer`] otherwise; readers pin by version, and 0
+    /// means "no view"). There is one publisher: the writer process (its lock excludes
+    /// others), and within it a mutex serializes callers, so a second thread publishing
+    /// concurrently waits rather than racing on the inactive buffer.
     pub fn publish_view(&self, view: &ViewRecord) -> Result<()> {
-        if view.view_version == 0 {
-            return Err(Error::Corrupt("view version 0 means \"no view\""));
+        let _publishing = self
+            .inner
+            .publish_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let current = self.inner.view_pointer(Ordering::Relaxed);
+        let published = current >> 1;
+        if view.view_version <= published {
+            return Err(Error::ViewVersionNotNewer {
+                published,
+                offered: view.view_version,
+            });
         }
         let capacity = self.inner.header.view_buffer_len as usize;
         let needed = view.encoded_len();
@@ -591,7 +661,6 @@ impl ShmRegion {
         }
         let mut bytes = Vec::with_capacity(needed);
         view.encode(&mut bytes);
-        let current = self.inner.view_pointer(Ordering::Relaxed);
         let index = if current == 0 { 0 } else { (current & 1) ^ 1 };
         self.inner.region.write(
             self.inner.header.views_off as usize + index as usize * capacity,
@@ -754,19 +823,29 @@ impl ShmRegion {
     /// Frees slots whose process is gone (pid missing or start time changed). Returns how
     /// many were reclaimed. Run by the writer before computing reclamation bounds.
     ///
-    /// Only `active` slots are examined: a slot in the transient `claiming` state has not
-    /// recorded its owner yet, so its pid field cannot be trusted.
+    /// Each `active` slot is first moved to `claiming` by CAS, which keeps its owner from
+    /// freeing it and a new reader from claiming it while the owner recorded in the slot is
+    /// checked; a live owner gets the slot back as `active`. Slots found in `claiming` are
+    /// skipped: their owner has not recorded itself yet, so the pid there is not trustworthy
+    /// (a process that dies between its CAS and its `active` store leaks its slot until the
+    /// next generation).
     pub fn reclaim_dead_slots(&self, vfs: &VfsRef) -> usize {
         let inner = &self.inner;
         let mut reclaimed = 0;
         for index in 0..inner.header.reader_slot_count {
-            if inner
-                .slot32(index, reader_slot::STATE)
-                .load(Ordering::Acquire)
-                != SLOT_ACTIVE
+            let state = inner.slot32(index, reader_slot::STATE);
+            if state
+                .compare_exchange(
+                    SLOT_ACTIVE,
+                    SLOT_CLAIMING,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
             {
                 continue;
             }
+            // Only this writer can change the slot now; the owner's release waits for it.
             let owner = ProcessId {
                 pid: inner
                     .slot32(index, reader_slot::PID)
@@ -776,9 +855,11 @@ impl ShmRegion {
                     .load(Ordering::Relaxed),
             };
             if vfs.process_alive(owner) {
+                state.store(SLOT_ACTIVE, Ordering::Release);
                 continue;
             }
-            inner.release_slot(index);
+            inner.clear_pins(index);
+            state.store(SLOT_FREE, Ordering::Release);
             reclaimed += 1;
         }
         reclaimed
@@ -792,29 +873,31 @@ impl ReaderSlot {
     }
 
     /// Pins a snapshot: record the view version and seqno before reading through them.
-    /// Protocol: store view, store seqno, re-read the view pointer; if it moved past a
-    /// reclaimed version, retry (`FORMAT.md` §11.5).
+    /// Protocol: store view, store seqno, re-read the view pointer; if it moved past the
+    /// pinned version, take a fresh snapshot seqno and pin again with the new version
+    /// (`FORMAT.md` §11.5). Returns the `(seqno, view_version)` pair actually pinned.
     ///
     /// Call this with the version from [`ShmRegion::view_version`] *before*
     /// [`ShmRegion::read_view`]: if the writer published a newer view meanwhile (and may
-    /// already have freed what the older one named), the pin moves up to the newer version,
-    /// and the view read afterwards is at least that version. A pin protects its version and
-    /// every newer one.
-    pub fn pin(&self, seqno: Seqno, view_version: u64) {
+    /// already have freed what the older one named), the pin moves up to the newer version
+    /// together with a seqno taken after it, and the view read afterwards is at least that
+    /// version. A pin protects its version and every newer one. The caller uses the returned
+    /// pair, not the one it passed.
+    pub fn pin(&self, seqno: Seqno, view_version: u64) -> (Seqno, u64) {
         let inner = &self.region;
-        let mut version = view_version;
+        let mut pair = (seqno, view_version);
         loop {
             inner
                 .slot64(self.index, reader_slot::PINNED_VIEW)
-                .store(version, Ordering::SeqCst);
+                .store(pair.1, Ordering::SeqCst);
             inner
                 .slot64(self.index, reader_slot::PINNED_SEQNO)
-                .store(seqno, Ordering::SeqCst);
+                .store(pair.0, Ordering::SeqCst);
             let current = inner.view_pointer(Ordering::SeqCst) >> 1;
-            if current <= version {
-                return;
+            if current <= pair.1 {
+                return pair;
             }
-            version = current;
+            pair = (inner.visible_seqno().max(pair.0), current);
         }
     }
 
@@ -878,7 +961,10 @@ mod tests {
         let shm = ShmRegion::in_memory([3; 16], &small());
         assert!(matches!(
             shm.publish_view(&ViewRecord::default()),
-            Err(Error::Corrupt(_))
+            Err(Error::ViewVersionNotNewer {
+                published: 0,
+                offered: 0
+            })
         ));
         assert_eq!(shm.view_version(), 0);
     }

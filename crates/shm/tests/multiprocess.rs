@@ -15,7 +15,7 @@ use common::*;
 use pigeonhole_format::shm::{directory, directory_name, header, region_name};
 use pigeonhole_io::pread::PreadVfs;
 use pigeonhole_io::{ErrorKind, FileIdentity, FileRef, OpenOptions, SharedOpen, VfsRef};
-use pigeonhole_shm::{Error, Generation, Presence, Role, ShmRegion, WriterLock};
+use pigeonhole_shm::{Error, Generation, Presence, Role, ShmConfig, ShmRegion, WriterLock};
 
 const CHILD_ENV: &str = "PIGEONHOLE_SHM_CHILD";
 /// Every line a child prints for the parent starts with this.
@@ -97,17 +97,19 @@ fn reader_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
     let me = vfs.current_process();
     let mut slot = shm.claim_reader_slot(me).unwrap();
     say(format!(
-        "READY slot={} gen={}",
+        "READY slot={} gen={} pid={} start={}",
         slot.index(),
-        shm.generation().0
+        shm.generation().0,
+        me.pid,
+        me.start_time
     ));
     let mut last = 0;
     for cmd in commands() {
         let mut words = cmd.split_whitespace();
         match (words.next(), words.next()) {
             (Some("pin"), Some(seqno)) => {
-                slot.pin(seqno.parse().unwrap(), shm.view_version());
-                say(format!("PINNED view={}", shm.view_version()));
+                let (seqno, view) = slot.pin(seqno.parse().unwrap(), shm.view_version());
+                say(format!("PINNED seqno={seqno} view={view}"));
             }
             (Some("check"), Some(n)) => {
                 let n: u64 = n.parse().unwrap();
@@ -283,17 +285,18 @@ impl Db {
     }
 
     fn open_writer(&self, file: &FileRef) -> (WriterLock, Presence, ShmRegion) {
+        self.open_writer_with(file, &small_config())
+    }
+
+    fn open_writer_with(
+        &self,
+        file: &FileRef,
+        config: &ShmConfig,
+    ) -> (WriterLock, Presence, ShmRegion) {
         let lock = WriterLock::acquire(file).unwrap();
         let presence = Presence::acquire(file).unwrap();
-        let shm = ShmRegion::open(
-            &self.vfs,
-            file,
-            self.identity,
-            DB_ID,
-            Role::Writer,
-            &small_config(),
-        )
-        .unwrap();
+        let shm =
+            ShmRegion::open(&self.vfs, file, self.identity, DB_ID, Role::Writer, config).unwrap();
         (lock, presence, shm)
     }
 
@@ -311,6 +314,21 @@ impl Drop for Db {
     fn drop(&mut self) {
         let _ = ShmRegion::remove(&self.vfs, self.identity, None);
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The `ProcessId` a reader child reports in its READY line.
+fn ready_process(ready: &str) -> pigeonhole_io::ProcessId {
+    let field = |key: &str| -> u64 {
+        ready
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(key))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no {key} in {ready:?}"))
+    };
+    pigeonhole_io::ProcessId {
+        pid: field("pid=") as u32,
+        start_time: field("start="),
     }
 }
 
@@ -373,8 +391,11 @@ fn killed_reader_process_slot_is_reclaimed() {
     shm.publish_view(&view(1, 1, 4)).unwrap();
 
     let mut reader = Peer::spawn("reader", &db.path);
-    assert!(reader.recv().starts_with("READY"));
-    assert_eq!(reader.ask("pin 5"), "PINNED view=1");
+    let ready = reader.recv();
+    let owner = ready_process(&ready);
+    assert_eq!(owner.pid, reader.pid());
+    assert!(db.vfs.process_alive(owner));
+    assert_eq!(reader.ask("pin 5"), "PINNED seqno=5 view=1");
     assert_eq!(shm.oldest_reader_pin(), Some((5, 1)));
     assert_eq!(
         shm.reclaim_dead_slots(&db.vfs),
@@ -382,15 +403,10 @@ fn killed_reader_process_slot_is_reclaimed() {
         "alive: nothing to reclaim"
     );
 
-    let pid = reader.pid();
     reader.kill();
     assert!(
-        !db.vfs
-            .process_alive(pigeonhole_io::ProcessId { pid, start_time: 0 })
-            || {
-                eprintln!("pid {pid} recycled already; the start time must tell them apart");
-                true
-            }
+        !db.vfs.process_alive(owner),
+        "the recorded pid plus start time names a process that is gone"
     );
     assert_eq!(shm.reclaim_dead_slots(&db.vfs), 1);
     assert_eq!(shm.oldest_reader_pin(), None);
@@ -405,8 +421,8 @@ fn writer_process_kill_and_restart_remaps_readers() {
     assert!(!probe_writer(&db.path));
 
     let mut reader = Peer::spawn("reader", &db.path);
-    assert_eq!(reader.recv(), "READY slot=0 gen=1");
-    assert_eq!(reader.ask("pin 9"), "PINNED view=1");
+    assert!(reader.recv().starts_with("READY slot=0 gen=1 "));
+    assert_eq!(reader.ask("pin 9"), "PINNED seqno=9 view=1");
     assert_eq!(reader.ask("view"), "VIEW version=1 tablets=3 manifest=10");
 
     writer.kill();
@@ -417,10 +433,14 @@ fn writer_process_kill_and_restart_remaps_readers() {
     );
     assert_eq!(reader.ask("view"), "VIEW version=1 tablets=3 manifest=10");
 
-    // The next writer rebuilds under generation 2.
+    // The next writer rebuilds under generation 2, seeding seqnos past the ceiling it
+    // recovered (9), so readers never see the visible seqno go backwards.
     let file = db.open();
-    let (_lock, _presence, shm) = db.open_writer(&file);
+    let mut config = small_config();
+    config.first_seqno = 10;
+    let (_lock, _presence, shm) = db.open_writer_with(&file, &config);
     assert_eq!(shm.generation(), Generation(2));
+    assert_eq!(shm.visible_seqno(), 9);
     shm.publish_view(&view(7, 1, 4)).unwrap();
     assert!(db.region_exists(2));
     #[cfg(unix)]
@@ -442,12 +462,13 @@ fn writer_process_kill_and_restart_remaps_readers() {
     );
     assert_eq!(reader.ask("reattach"), "REATTACHED gen=2 slot=0");
     assert_eq!(reader.ask("view"), "VIEW version=7 tablets=1 manifest=70");
-    assert_eq!(reader.ask("pin 0"), "PINNED view=7");
-    assert_eq!(shm.oldest_reader_pin(), Some((0, 7)));
     assert_eq!(
         reader.ask("status"),
-        "STATUS stale=false gen=2 view=7 visible=0"
+        "STATUS stale=false gen=2 view=7 visible=9",
+        "visible seqno is monotone across the writer restart"
     );
+    assert_eq!(reader.ask("pin 9"), "PINNED seqno=9 view=7");
+    assert_eq!(shm.oldest_reader_pin(), Some((9, 7)));
     reader.quit();
     assert_eq!(
         shm.reclaim_dead_slots(&db.vfs),
@@ -501,7 +522,7 @@ fn mismatched_layout_version_is_refused() {
     assert_eq!(rebuilt.generation(), Generation(2));
     // A reader can still take the presence byte shared: the probe left it shared.
     let mut reader = Peer::spawn("reader", &db.path);
-    assert_eq!(reader.recv(), "READY slot=0 gen=2");
+    assert!(reader.recv().starts_with("READY slot=0 gen=2 "));
     assert!(!presence.try_become_last().unwrap());
     reader.quit();
     assert!(presence.try_become_last().unwrap());
@@ -514,7 +535,10 @@ fn concurrent_reader_processes_claim_distinct_slots_until_exhausted() {
     let (_lock, _presence, shm) = db.open_writer(&file);
     let mut readers: Vec<Peer> = (0..4).map(|_| Peer::spawn("reader", &db.path)).collect();
     let ready: Vec<String> = readers.iter_mut().map(Peer::recv).collect();
-    let mut slots = ready.clone();
+    let mut slots: Vec<String> = ready
+        .iter()
+        .map(|r| r.split(" pid=").next().unwrap().to_owned())
+        .collect();
     slots.sort();
     assert_eq!(
         slots,

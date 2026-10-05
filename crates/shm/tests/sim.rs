@@ -14,7 +14,9 @@ use pigeonhole_io::sim::SimVfs;
 use pigeonhole_io::{
     ErrorKind, FileIdentity, FileRef, LockMode, OpenOptions, ProcessId, SharedOpen, VfsRef,
 };
-use pigeonhole_shm::{Error, Generation, Presence, ReaderSlot, Role, ShmRegion, WriterLock};
+use pigeonhole_shm::{
+    Error, Generation, Presence, ReaderSlot, Role, ShmConfig, ShmRegion, WriterLock,
+};
 
 const DB: &str = "/db/data.phdb";
 
@@ -57,15 +59,12 @@ impl Proc {
     }
 
     fn open(&self, role: Role) -> pigeonhole_shm::Result<ShmRegion> {
+        self.open_with(role, &small_config())
+    }
+
+    fn open_with(&self, role: Role, config: &ShmConfig) -> pigeonhole_shm::Result<ShmRegion> {
         self.enter();
-        ShmRegion::open(
-            &self.vfs,
-            &self.file,
-            self.identity,
-            DB_ID,
-            role,
-            &small_config(),
-        )
+        ShmRegion::open(&self.vfs, &self.file, self.identity, DB_ID, role, config)
     }
 
     fn open_writer(&self) -> (WriterLock, Presence, ShmRegion) {
@@ -167,7 +166,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
     };
 
     // Group of two on shard 0.
-    publish(0, shm.visible_seqno() + 1, held);
+    publish(0, shm.next_seqno(), held);
     let first = shm.reserve_seqnos(2);
     publish(0, first, held);
     let visible = check(&shm1, &shm2);
@@ -183,7 +182,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
     assert_eq!(shm1.visible_seqno(), 2);
 
     // Cross-shard commit q coordinated by shard 0 with shard 1.
-    publish(0, shm.visible_seqno() + 1, held);
+    publish(0, shm.next_seqno(), held);
     let q = shm.reserve_seqnos(1);
     held = Some(q);
     publish(0, u64::MAX, held);
@@ -193,7 +192,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
     assert_eq!(shm1.visible_seqno(), 2, "q is held");
 
     // Shard 1 runs its own group meanwhile: visible stays below q.
-    publish(1, shm.visible_seqno() + 1, None);
+    publish(1, shm.next_seqno(), None);
     let g = shm.reserve_seqnos(1);
     publish(1, g, None);
     set_mask(&shm, g, 0b10);
@@ -203,7 +202,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
     assert_eq!(shm1.visible_seqno(), 2);
 
     // Shard 0 runs another group while still holding q.
-    publish(0, shm.visible_seqno() + 1, held);
+    publish(0, shm.next_seqno(), held);
     let h = shm.reserve_seqnos(1);
     publish(0, h, held);
     set_mask(&shm, h, 0b01);
@@ -280,19 +279,21 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
     assert_eq!(shm_r.visible_seqno(), 9);
     assert_eq!(shm_r.manifest_version(), 10);
 
-    // A new writer: new generation, old one abandoned and unnamed.
+    // A new writer: new generation, old one abandoned and unnamed. It recovered a seqno
+    // ceiling of 9 and seeds the counter past it (ICR 0002).
     let w2 = Proc::start(&sim, pid(2));
-    let (_lock2, _wp2, shm2) = w2.open_writer();
+    let _lock2 = WriterLock::acquire(&w2.file).unwrap();
+    let _wp2 = Presence::acquire(&w2.file).unwrap();
+    let mut config = small_config();
+    config.first_seqno = 10;
+    let shm2 = w2.open_with(Role::Writer, &config).unwrap();
     assert_eq!(shm2.generation(), Generation(2));
     assert_eq!(w2.directory_generation(), 2);
     assert!(!w2.region_exists(1), "old region's name is removed");
     assert!(w2.region_exists(2));
     shm2.publish_view(&view(7, 1, 4)).unwrap();
-    assert_eq!(
-        shm2.visible_seqno(),
-        0,
-        "fresh counters; the engine re-seeds them"
-    );
+    assert_eq!(shm2.next_seqno(), 10);
+    assert_eq!(shm2.visible_seqno(), 9, "never below what readers saw");
     assert_eq!(
         shm2.oldest_reader_pin(),
         None,
@@ -311,9 +312,13 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
     assert!(!shm_r2.is_stale());
     drop(slot);
     let slot2 = shm_r2.claim_reader_slot(r.id).unwrap();
-    slot2.pin(shm_r2.visible_seqno(), shm_r2.view_version());
+    assert!(shm_r2.visible_seqno() >= 9, "monotone across the restart");
+    assert_eq!(
+        slot2.pin(shm_r2.visible_seqno(), shm_r2.view_version()),
+        (9, 7)
+    );
     assert_eq!(shm_r2.read_view().unwrap(), view(7, 1, 4));
-    assert_eq!(shm2.oldest_reader_pin(), Some((0, 7)));
+    assert_eq!(shm2.oldest_reader_pin(), Some((9, 7)));
 
     // Attaching to the old generation directly is refused as stale.
     let old = r.vfs.open_shared(

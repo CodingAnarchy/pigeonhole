@@ -63,7 +63,7 @@ mod region;
 use std::fmt;
 use std::sync::Arc;
 
-use pigeonhole_format::ShmLayoutVersion;
+use pigeonhole_format::{Seqno, ShmLayoutVersion};
 use pigeonhole_io::FileRef;
 
 pub use region::ShmRegion;
@@ -102,6 +102,16 @@ pub enum Error {
     },
     /// This mapping was replaced by a newer generation; call [`ShmRegion::reattach`].
     Stale,
+    /// [`ShmRegion::publish_view`] was given a view version at or below the published one.
+    /// Versions are strictly increasing (readers pin by version) and 0 means "no view".
+    ViewVersionNotNewer {
+        /// The version currently published.
+        published: u64,
+        /// The version offered.
+        offered: u64,
+    },
+    /// An [`ShmConfig`] field is out of range (see [`ShmConfig::validate`]).
+    InvalidConfig(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -125,6 +135,11 @@ impl fmt::Display for Error {
             Error::Stale => {
                 f.write_str("this mapping was replaced by a newer generation; re-attach")
             }
+            Error::ViewVersionNotNewer { published, offered } => write!(
+                f,
+                "view version {offered} is not newer than the published version {published}"
+            ),
+            Error::InvalidConfig(what) => write!(f, "invalid shared-memory configuration: {what}"),
         }
     }
 }
@@ -184,7 +199,10 @@ pub struct Generation(pub u64);
 /// assert_eq!(config.arena_bytes, 64 << 20);
 /// assert_eq!(config.reader_slots, 126);
 /// assert_eq!(config.view_buffer_bytes, 4 << 20);
+/// assert_eq!(config.first_seqno, 1);
 /// assert!(config.dir.is_none());
+/// assert!(config.validate().is_ok());
+/// assert!(ShmConfig::new(0).validate().is_err());
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -200,6 +218,11 @@ pub struct ShmConfig {
     pub view_buffer_bytes: u32,
     /// Directory for a file-backed region instead of the default memory-backed one.
     pub dir: Option<std::path::PathBuf>,
+    /// The first seqno a region built with this config hands out (default 1). A writer
+    /// passes the seqno ceiling it recovered, so visible seqnos never go backwards across a
+    /// writer restart (ICR 0002). Values below 1 are raised to 1: 0 means "none" in reader
+    /// slots.
+    pub first_seqno: Seqno,
 }
 
 impl ShmConfig {
@@ -211,7 +234,25 @@ impl ShmConfig {
             reader_slots: 126,
             view_buffer_bytes: 4 << 20,
             dir: None,
+            first_seqno: 1,
         }
+    }
+
+    /// Checks the ranges a region can be built from: at least one shard, at least one
+    /// reader slot, and a view buffer that holds at least a view header (32 bytes).
+    pub fn validate(&self) -> Result<()> {
+        if self.shards == 0 {
+            return Err(Error::InvalidConfig("shards must be at least 1"));
+        }
+        if self.reader_slots == 0 {
+            return Err(Error::InvalidConfig("reader_slots must be at least 1"));
+        }
+        if self.view_buffer_bytes < 32 {
+            return Err(Error::InvalidConfig(
+                "view_buffer_bytes must be at least 32 (one view header)",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -286,7 +327,7 @@ pub enum Role {
 /// let slot = shm.claim_reader_slot(me).unwrap();
 /// assert_eq!(slot.index(), 0);
 /// assert!(shm.claim_reader_slot(me).is_err(), "one slot, already taken");
-/// slot.pin(10, 0);
+/// assert_eq!(slot.pin(10, 0), (10, 0));
 /// assert_eq!(shm.oldest_reader_pin(), Some((10, 0)));
 /// slot.unpin();
 /// assert_eq!(shm.oldest_reader_pin(), None);

@@ -238,7 +238,7 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
                     }
                     if shards > 1 && rng.below(8) == 0 {
                         // Cross-shard commit: reserve one seqno, hold it, hand shares out.
-                        me.group = Some(shm.visible_seqno() + 1);
+                        me.group = Some(shm.next_seqno());
                         me.publish(shm);
                         let seqno = shm.reserve_seqnos(1);
                         reserved.fetch_add(1, Ordering::Relaxed);
@@ -273,7 +273,7 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
                     } else {
                         // Single-shard group of 1..=4 commits.
                         let n = 1 + rng.below(4);
-                        me.group = Some(shm.visible_seqno() + 1);
+                        me.group = Some(shm.next_seqno());
                         me.publish(shm);
                         let first = shm.reserve_seqnos(n);
                         reserved.fetch_add(n as u32, Ordering::Relaxed);

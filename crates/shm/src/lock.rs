@@ -93,14 +93,16 @@ impl Drop for ShmInit {
 /// Whether no other process has the database open: tries to take the presence byte
 /// exclusively through `file`. On success the byte is left **shared**, so a presence lock the
 /// caller already holds on this handle is kept (converted back) and a process that held none
-/// is now simply present, which it is while `file` stays open. A read-only handle cannot
-/// try, and counts as not alone.
-pub(crate) fn alone(file: &FileRef) -> bool {
+/// is now simply present, which it is while `file` stays open. `Locked` means another process
+/// is present; any other failure (for example a read-only handle, which cannot try) is
+/// returned.
+pub(crate) fn alone(file: &FileRef) -> Result<bool> {
     match file.lock(PRESENCE_BYTE, LockMode::Exclusive) {
         Ok(()) => {
-            let _ = file.lock(PRESENCE_BYTE, LockMode::Shared);
-            true
+            file.lock(PRESENCE_BYTE, LockMode::Shared)?;
+            Ok(true)
         }
-        Err(_) => false,
+        Err(e) if e.kind == ErrorKind::Locked => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
