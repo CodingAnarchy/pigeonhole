@@ -12,8 +12,20 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+[features]
+# Phase 3: the async front door (`get_async`, `commit_async`, scan streams). Becomes
+# default-on when it is implemented, per the spec's "Sync and async" section.
+async = []
+# Phase 3: optional Tokio conveniences, never requirements.
+tokio = ["async"]
+
 [dependencies]
 pigeonhole-engine = { workspace = true }
+pigeonhole-format = { workspace = true }
+pigeonhole-io = { workspace = true }
+
+[dev-dependencies]
+pigeonhole-sim = { workspace = true }
 
 [lints]
 workspace = true

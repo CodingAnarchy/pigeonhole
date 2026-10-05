@@ -16,6 +16,8 @@ readme = "README.md"
 pigeonhole-sst = { workspace = true }
 pigeonhole-pager = { workspace = true }
 pigeonhole-format = { workspace = true }
+pigeonhole-cache = { workspace = true }
+pigeonhole-io = { workspace = true }
 
 [lints]
 workspace = true
