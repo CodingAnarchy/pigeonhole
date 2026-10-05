@@ -15,6 +15,7 @@ readme = "README.md"
 pigeonhole-io = { workspace = true }
 
 [dev-dependencies]
+pigeonhole-sim = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 

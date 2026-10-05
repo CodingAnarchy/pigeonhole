@@ -132,7 +132,8 @@ pub struct RuntimeConfig {
     pub pin_threads: bool,
     /// Extra pinned threads dedicated to background tasks; 0 runs them on the shards.
     /// Engine-owned mode only: application-owned mode starts no threads and runs tasks on
-    /// the shards.
+    /// the shards. As with tasks on shards, tasks still queued or running on these threads
+    /// at shutdown are dropped unfinished.
     pub compaction_threads: usize,
     /// Longest a background task runs before yielding.
     pub time_slice: Duration,
@@ -629,7 +630,13 @@ impl<H: ShardHandler> Runtime<H> {
         handlers: Vec<H>,
     ) -> Result<Vec<ShardDriver<H>>> {
         let (_, cores) = build(&config, handlers, Arc::from(Vec::new()));
-        Ok(cores.into_iter().map(|core| ShardDriver { core }).collect())
+        Ok(cores
+            .into_iter()
+            .map(|core| ShardDriver {
+                _close: CloseOnDrop(core.submitters[usize::from(core.id.0)].clone()),
+                core,
+            })
+            .collect())
     }
 
     /// Submitter for `shard`.
@@ -712,8 +719,13 @@ impl<H: ShardHandler> Drop for Runtime<H> {
 ///
 /// Call [`run_once`](ShardDriver::run_once) until it returns `false`, then wait for the
 /// wakeup registered with [`set_wakeup`](ShardDriver::set_wakeup) (which fires once per
-/// idle period, when work arrives) before calling it again. Dropping the driver closes the
-/// shard: later submits fail with [`Error::Closed`].
+/// idle period, when work arrives) before calling it again.
+///
+/// [`ShardDriver::shutdown`] closes the shard, handles every queued message and returns the
+/// handler, like [`Runtime::shutdown`]. Dropping the driver instead closes the shard and
+/// **discards** what is queued: queued messages are dropped unhandled (their [`Notifier`]s
+/// resolve waiters with `None`) and background tasks are dropped. Either way, later submits
+/// fail with [`Error::Closed`].
 ///
 /// ```
 /// use pigeonhole_io::sim::SimVfs;
@@ -743,6 +755,16 @@ impl<H: ShardHandler> Drop for Runtime<H> {
 /// ```
 pub struct ShardDriver<H: ShardHandler> {
     core: ShardCore<H>,
+    _close: CloseOnDrop<H::Msg>,
+}
+
+/// Refuses further submits once the driver is gone (shut down or dropped).
+struct CloseOnDrop<M>(Submitter<M>);
+
+impl<M> Drop for CloseOnDrop<M> {
+    fn drop(&mut self) {
+        self.0.inbox.closed.store(true, Ordering::SeqCst);
+    }
 }
 
 impl<H: ShardHandler> fmt::Debug for ShardDriver<H> {
@@ -793,17 +815,26 @@ impl<H: ShardHandler> ShardDriver<H> {
     ///
     /// It is called from the submitting thread, at most once per idle period (after
     /// [`run_once`](ShardDriver::run_once) returned `false`), so it should be cheap: set a
-    /// flag, unpark a thread, or write an eventfd.
+    /// flag, unpark a thread, or write an eventfd. It is also called once right away, since
+    /// work may have arrived before it was registered.
     pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
         self.core
             .signal()
-            .set_target(WakeTarget::Callback(Arc::from(wake)));
+            .set_target(WakeTarget::Callback(Arc::clone(&wake)));
+        // A submit that found the shard idle before the target existed woke nobody; a
+        // spurious wake is harmless, a lost one is not.
+        wake();
     }
-}
 
-impl<H: ShardHandler> Drop for ShardDriver<H> {
-    fn drop(&mut self) {
-        // Refuse further submits; the receiver drops with the core.
-        self.core.inbox().closed.store(true, Ordering::SeqCst);
+    /// Closes the shard, waits for in-flight submits, handles every queued message (calling
+    /// `end_batch` per batch) and returns the handler. Unfinished background tasks are
+    /// dropped. Later submits fail with [`Error::Closed`].
+    pub fn shutdown(self) -> H {
+        let ShardDriver { mut core, _close } = self;
+        let _shard = EnterShard::new(core.id);
+        core.inbox().closed.store(true, Ordering::SeqCst);
+        core.finish();
+        core.handler
     }
 }

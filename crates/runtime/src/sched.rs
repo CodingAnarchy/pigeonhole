@@ -177,6 +177,9 @@ impl Scheduler {
         if !self.signal.take_task_woken() || self.blocked == 0 {
             return;
         }
+        // O(slots) per wake batch. A shard has a handful of live tasks (flush, compaction
+        // jobs, the manifest task), so a scan beats a shared woken-list; revisit if that
+        // changes.
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(e) = slot
                 && e.state == State::Blocked

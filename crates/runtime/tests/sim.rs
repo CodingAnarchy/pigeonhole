@@ -1,6 +1,11 @@
 //! Determinism under the simulator: application-owned shards driven from one thread by a
 //! seeded scheduler over `SimVfs` time produce identical traces for the same seed.
+//!
+//! Each shard driver and a message injector run as `pigeonhole_sim::Sim` tasks, so the
+//! interleaving of `run_once` calls, injections and clock jumps is chosen by the seed.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,23 +15,8 @@ use pigeonhole_runtime::{
     Runtime, RuntimeConfig, ShardContext, ShardDriver, ShardHandler, ShardId, Task, TaskPoll,
     TaskWaker,
 };
+use pigeonhole_sim::{Rng, Sim, Step};
 use proptest::prelude::*;
-
-/// SplitMix64: tiny, seedable, good enough for scheduling choices.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
 
 type Trace = Arc<Mutex<Vec<String>>>;
 type Parked = Arc<Mutex<Vec<TaskWaker>>>;
@@ -139,58 +129,85 @@ impl Task for Chunky {
 const SHARDS: usize = 3;
 
 /// One seeded run; returns the full trace.
-fn run(seed: u64, steps: u32) -> Vec<String> {
-    let sim = SimVfs::new(seed);
+fn run(seed: u64, injections: u32) -> Vec<String> {
+    let mut sim = Sim::new(seed);
+    let vfs = sim.vfs();
     let trace: Trace = Arc::default();
-    let mut config = RuntimeConfig::new(sim.clone());
+    let mut config = RuntimeConfig::new(vfs.clone());
     config.shards = SHARDS;
     config.time_slice = Duration::from_micros(300);
     let handlers = (0..SHARDS)
         .map(|i| Handler {
-            sim: Arc::clone(&sim),
-            rng: Rng(seed ^ (i as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407)),
+            sim: Arc::clone(&vfs),
+            rng: Rng::new(seed ^ (i as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407)),
             trace: Arc::clone(&trace),
             parked: Arc::default(),
             batch: 0,
         })
         .collect();
-    let mut drivers: Vec<ShardDriver<Handler>> =
-        Runtime::application_owned(config, handlers).unwrap();
-    let mut rng = Rng(seed);
-    let mut next_id = 0;
-    for _ in 0..steps {
-        let shard = rng.below(SHARDS as u64) as usize;
-        match rng.below(10) {
-            0..=3 => {
-                let hops = rng.below(5) as u32;
-                drivers[0]
-                    .submitter(ShardId(shard as u16))
-                    .submit(Msg::Work { id: next_id, hops })
-                    .unwrap();
-                next_id += 1;
-            }
-            4 => drivers[0]
-                .submitter(ShardId(shard as u16))
-                .submit(Msg::WakeAll)
-                .unwrap(),
-            5 => sim.advance(rng.below(500_000)),
-            _ => {
-                let deadline = sim.monotonic_nanos() + rng.below(2_000_000);
-                let more = drivers[shard].run_once(deadline);
-                trace
-                    .lock()
-                    .unwrap()
-                    .push(format!("run s{shard} more={more}"));
-            }
-        }
+    let drivers: Vec<ShardDriver<Handler>> = Runtime::application_owned(config, handlers).unwrap();
+    let submitters: Vec<_> = (0..SHARDS)
+        .map(|i| drivers[0].submitter(ShardId(i as u16)))
+        .collect();
+    let drivers = Rc::new(RefCell::new(drivers));
+
+    // One sim task per shard: run_once with a random deadline, then poll again later.
+    for i in 0..SHARDS {
+        let drivers = Rc::clone(&drivers);
+        let vfs = Arc::clone(&vfs);
+        let trace = Arc::clone(&trace);
+        sim.spawn(
+            "shard",
+            Box::new(move |rng| {
+                let now = vfs.monotonic_nanos();
+                let more = drivers.borrow_mut()[i].run_once(now + rng.below(2_000_000));
+                trace.lock().unwrap().push(format!("run s{i} more={more}"));
+                if more {
+                    Step::Ready
+                } else {
+                    Step::SleepUntil(vfs.monotonic_nanos() + 1 + rng.below(700_000))
+                }
+            }),
+        );
     }
+
+    // The injector: new work and wakeups at random times.
+    let injected = Rc::new(Cell::new(0));
+    {
+        let injected = Rc::clone(&injected);
+        let vfs = Arc::clone(&vfs);
+        sim.spawn(
+            "inject",
+            Box::new(move |rng| {
+                let n = injected.get();
+                if n == injections {
+                    return Step::Done;
+                }
+                injected.set(n + 1);
+                let to = &submitters[rng.below(SHARDS as u64) as usize];
+                if rng.below(5) == 0 {
+                    to.submit(Msg::WakeAll).unwrap();
+                } else {
+                    let hops = rng.below(5) as u32;
+                    to.submit(Msg::Work { id: n, hops }).unwrap();
+                }
+                Step::SleepUntil(vfs.monotonic_nanos() + rng.below(300_000))
+            }),
+        );
+    }
+    assert!(
+        sim.run_until(u64::MAX, &mut || injected.get() == injections),
+        "seed {seed}: injector never finished"
+    );
+
     // Quiesce: wake everything and run until no shard has work.
+    let mut drivers = drivers.borrow_mut();
     loop {
-        for d in &drivers {
+        for d in drivers.iter() {
             d.submitter(d.shard()).submit(Msg::WakeAll).unwrap();
         }
         let mut more = false;
-        for d in &mut drivers {
+        for d in drivers.iter_mut() {
             while d.run_once(u64::MAX) {
                 more = true;
             }
@@ -202,7 +219,9 @@ fn run(seed: u64, steps: u32) -> Vec<String> {
             break;
         }
     }
+    drivers.clear();
     drop(drivers);
+    drop(sim);
     Arc::try_unwrap(trace).unwrap().into_inner().unwrap()
 }
 
@@ -232,8 +251,8 @@ fn check_complete(trace: &[String]) {
 #[test]
 fn same_seed_same_trace() {
     for seed in [1, 2, 0xDEAD_BEEF, 42] {
-        let a = run(seed, 3000);
-        let b = run(seed, 3000);
+        let a = run(seed, 1200);
+        let b = run(seed, 1200);
         assert!(a == b, "seed {seed}: traces differ");
         check_complete(&a);
     }
@@ -248,8 +267,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
     #[test]
     fn deterministic_for_any_seed(seed in any::<u64>()) {
-        let a = run(seed, 800);
-        let b = run(seed, 800);
+        let a = run(seed, 300);
+        let b = run(seed, 300);
         prop_assert!(a == b, "seed {seed}: traces differ");
         check_complete(&a);
     }

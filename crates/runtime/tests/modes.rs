@@ -93,7 +93,7 @@ impl<H: ShardHandler> Harness<H> {
                 threads.iter().for_each(|t| t.thread().unpark());
                 threads
                     .into_iter()
-                    .map(|t| t.join().unwrap().with_handler(|h, _| f(h)))
+                    .map(|t| f(&mut t.join().unwrap().shutdown()))
                     .collect()
             }
         }
@@ -131,6 +131,8 @@ enum Msg {
     Stamp {
         sent: u64,
     },
+    /// Drops its notifier on the shard without resolving it.
+    Discard(Notifier<u64>),
 }
 
 #[derive(Default)]
@@ -173,6 +175,7 @@ impl ShardHandler for Handler {
             Msg::WhoAmI(n) => n.notify((Runtime::<Handler>::current_shard(), ctx.shard())),
             Msg::Spawn(task) => ctx.spawn(task),
             Msg::Stamp { sent } => self.latencies.push(ctx.now_nanos() - sent),
+            Msg::Discard(n) => drop(n),
         }
     }
 
@@ -525,10 +528,14 @@ fn shutdown_handles_queued_then_refuses(mode: Mode) {
 fn dropped_notifier_resolves_none(mode: Mode) {
     let (cfg, _) = sim_config(1);
     let h = Harness::start(mode, cfg, handlers(1));
-    let (n, w) = completion::<Vec<u16>>();
-    // Forward with hops = 0 notifies; send a message that drops its notifier instead.
-    drop(n);
+    // The shard drops the notifier unresolved: sync and async waiters see `None`.
+    let (n, w) = completion::<u64>();
+    h.submitter(0).submit(Msg::Discard(n)).unwrap();
     assert_eq!(w.wait(), None);
+    let (n, w) = completion::<u64>();
+    h.submitter(0).submit(Msg::Discard(n)).unwrap();
+    assert_eq!(block_on(w), None);
+    // The shard is still healthy.
     let (n, w) = completion::<u64>();
     h.submitter(0).submit(Msg::Echo(1, n)).unwrap();
     assert_eq!(block_on(w), Some(1));
@@ -668,4 +675,136 @@ fn notifier_outlives_shutdown_waiter() {
     let (n, w) = completion::<Mutex<u8>>();
     drop(w);
     n.notify(Mutex::new(1));
+}
+
+// ---------------------------------------------------------------------------------------
+// Application-owned specifics.
+
+fn app_drivers(shards: usize) -> (Vec<ShardDriver<Handler>>, Arc<SimVfs>) {
+    let (cfg, sim) = sim_config(shards);
+    (
+        Runtime::application_owned(cfg, handlers(shards)).unwrap(),
+        sim,
+    )
+}
+
+#[test]
+fn set_wakeup_after_first_run_once_is_not_lost() {
+    let (mut drivers, _) = app_drivers(1);
+    let mut d = drivers.remove(0);
+    // Idle before any wakeup is registered: the submit below finds the shard asleep and has
+    // nobody to wake.
+    assert!(!d.run_once(u64::MAX));
+    let (n, w) = completion();
+    d.submitter(ShardId(0)).submit(Msg::Echo(9, n)).unwrap();
+    let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let f = Arc::clone(&fired);
+    d.set_wakeup(Box::new(move || {
+        f.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert!(
+        fired.load(Ordering::SeqCst) >= 1,
+        "registration must wake once"
+    );
+    d.run_once(u64::MAX);
+    assert_eq!(w.wait(), Some(9));
+
+    // From here on the wakeup fires once per idle period.
+    assert!(!d.run_once(u64::MAX));
+    let before = fired.load(Ordering::SeqCst);
+    let (n1, _w1) = completion();
+    let (n2, _w2) = completion();
+    d.submitter(ShardId(0)).submit(Msg::Echo(1, n1)).unwrap();
+    d.submitter(ShardId(0)).submit(Msg::Echo(2, n2)).unwrap();
+    assert_eq!(fired.load(Ordering::SeqCst), before + 1);
+}
+
+#[test]
+fn dropped_driver_discards_queued_messages() {
+    let (mut drivers, _) = app_drivers(2);
+    let (n, w) = completion();
+    let sub = drivers[0].submitter(ShardId(1));
+    sub.submit(Msg::Echo(5, n)).unwrap();
+    drop(drivers.remove(1)); // queued Echo dropped on the floor, notifier with it
+    assert_eq!(w.wait(), None);
+    assert!(matches!(
+        sub.submit(Msg::Record {
+            producer: 0,
+            seq: 0
+        }),
+        Err(Error::Closed)
+    ));
+    // Other shards are unaffected.
+    let (n, w) = completion();
+    drivers[0]
+        .submitter(ShardId(0))
+        .submit(Msg::Echo(6, n))
+        .unwrap();
+    drivers[0].run_once(u64::MAX);
+    assert_eq!(w.wait(), Some(6));
+}
+
+#[test]
+fn driver_shutdown_handles_queued_messages() {
+    let (mut drivers, _) = app_drivers(1);
+    let d = drivers.remove(0);
+    let sub = d.submitter(ShardId(0));
+    let (n, w) = completion();
+    for seq in 0..3000 {
+        sub.submit(Msg::Record { producer: 0, seq }).unwrap();
+    }
+    sub.submit(Msg::Echo(4, n)).unwrap();
+    let h = d.shutdown();
+    assert_eq!(h.records.len(), 3000);
+    assert!(
+        h.batches >= 3,
+        "a 3001-message backlog spans several capped batches"
+    );
+    assert_eq!(w.wait(), Some(4));
+    assert!(matches!(
+        sub.submit(Msg::Record {
+            producer: 0,
+            seq: 0
+        }),
+        Err(Error::Closed)
+    ));
+}
+
+/// `run_once(u64::MAX)` with a long-running task: one call runs the task across many slices
+/// and still handles each mid-slice message within one slice.
+#[test]
+fn run_once_unbounded_deadline_keeps_latency_bounded() {
+    use pigeonhole_io::Vfs;
+    let (mut drivers, sim) = app_drivers(1);
+    let mut d = drivers.remove(0);
+    let unit = 20_000;
+    let (en, ew) = completion();
+    let task = SimBusy {
+        sim: Arc::clone(&sim),
+        me: d.submitter(ShardId(0)),
+        unit,
+        every: 5,
+        units: 0,
+        total: 5 * 2000, // 200 ms of simulated work: 400 slices of 500 µs
+        done: Some(en),
+    };
+    d.submitter(ShardId(0))
+        .submit(Msg::Spawn(Box::new(task)))
+        .unwrap();
+    let start = sim.monotonic_nanos();
+    assert!(
+        !d.run_once(u64::MAX),
+        "one call runs the task to completion"
+    );
+    assert!(ew.wait().is_some());
+    assert!(sim.monotonic_nanos() - start >= 200_000_000);
+    let h = d.shutdown();
+    let max = h.latencies.iter().copied().max().unwrap();
+    assert_eq!(h.latencies.len(), 2000);
+    assert!(max <= 500_000 + unit, "max latency {max} ns over one slice");
+    assert!(
+        h.batches >= 300,
+        "only {} batches: foreground did not interleave",
+        h.batches
+    );
 }
