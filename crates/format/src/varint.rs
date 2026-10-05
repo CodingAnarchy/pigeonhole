@@ -24,6 +24,7 @@ pub fn put_u64(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// Decodes a varint from the front of `input`; returns the value and the bytes consumed.
+/// Only the canonical (shortest) encoding is accepted, so every value has one encoding.
 pub fn get_u64(input: &[u8]) -> crate::Result<(u64, usize)> {
     let mut v = 0u64;
     for (i, &b) in input.iter().take(MAX_VARINT_LEN).enumerate() {
@@ -33,6 +34,10 @@ pub fn get_u64(input: &[u8]) -> crate::Result<(u64, usize)> {
         }
         v |= u64::from(b & 0x7F) << (7 * i);
         if b < 0x80 {
+            // A zero final byte after the first means an overlong (non-canonical) encoding.
+            if b == 0 && i > 0 {
+                return Err(Error::Corrupt { what: "varint" });
+            }
             return Ok((v, i + 1));
         }
     }

@@ -149,6 +149,10 @@ pub struct FrameEncoder {
 /// Size of the meaningful part of a segment header (the rest of frame 0 is zero).
 const SEGMENT_HEADER_LEN: usize = 60;
 
+/// A fragment is only started where more than a header's worth of bytes remains, so every
+/// fragment except an empty record's carries payload. Shorter frame tails are skipped.
+const MIN_FRAGMENT_ROOM: usize = FRAGMENT_HEADER_LEN + 1;
+
 /// Bytes left in the frame at segment offset `pos`.
 fn frame_room(pos: u64) -> usize {
     FRAME_SIZE - (pos % FRAME_SIZE as u64) as usize
@@ -173,8 +177,8 @@ impl FrameEncoder {
         }
     }
 
-    /// Appends the fragments of `record` to `out`, zero-padding a frame tail too short for a
-    /// header. Returns the segment offset just past the record.
+    /// Appends the fragments of `record` to `out`, zero-padding a frame tail of 12 bytes or
+    /// fewer (too short for a header and any payload). Returns the segment offset just past the record.
     ///
     /// The tail of a frame left too short for a header is padded lazily, at the start of the
     /// next record, so the returned offset is exactly where the record's data ends: the
@@ -184,7 +188,7 @@ impl FrameEncoder {
         let mut first = true;
         loop {
             let room = frame_room(self.pos);
-            if room < FRAGMENT_HEADER_LEN {
+            if room < MIN_FRAGMENT_ROOM {
                 out.resize(out.len() + room, 0);
                 self.pos += room as u64;
                 continue;
@@ -215,7 +219,7 @@ impl FrameEncoder {
         let mut rest = len;
         loop {
             let room = frame_room(pos);
-            if room < FRAGMENT_HEADER_LEN {
+            if room < MIN_FRAGMENT_ROOM {
                 pos += room as u64;
                 continue;
             }
@@ -268,6 +272,8 @@ pub struct FrameDecoder {
 impl FrameDecoder {
     /// A decoder for a segment with `epoch`, starting at `offset`.
     pub fn new(epoch: u32, offset: u64) -> Self {
+        // Frame 0 holds the segment header, never fragments (as in `FrameEncoder::new`).
+        let offset = offset.max(FRAME_SIZE as u64);
         Self {
             epoch,
             frame_start: offset - offset % FRAME_SIZE as u64,
@@ -282,7 +288,7 @@ impl FrameDecoder {
 
     /// Feeds the next frame (exactly [`FRAME_SIZE`] bytes, frame-aligned) and decodes until
     /// a record completes, the frame is exhausted (`Ok(None)`), or the segment's data stops.
-    /// A frame tail shorter than a fragment header is skipped whatever its bytes.
+    /// A frame tail of 12 bytes or fewer is skipped whatever its bytes.
     ///
     /// After a `Record`, call again with the same frame; after `Ok(None)`, feed the next
     /// frame. Once it has returned `Stop`, it keeps returning the same `Stop`. If the segment
@@ -301,7 +307,7 @@ impl FrameDecoder {
         }
         loop {
             let at = (self.pos - self.frame_start) as usize;
-            if at + FRAGMENT_HEADER_LEN > FRAME_SIZE {
+            if at + MIN_FRAGMENT_ROOM > FRAME_SIZE {
                 self.frame_start += FRAME_SIZE as u64;
                 self.pos = self.frame_start;
                 return Ok(None);
@@ -493,6 +499,26 @@ impl Default for BatchBuilder {
 /// Bit of `kind_flags` set when the mutation carries its own timestamp.
 const EXPLICIT_TS: u8 = 0x80;
 
+/// The rules every mutation obeys, checked when it is pushed and again when a batch is
+/// decoded: row and qualifier at most [`MAX_KEY_PART`], value at most [`MAX_VALUE_LEN`],
+/// deletes carry no value, and a family delete carries no qualifier.
+fn check_mutation(kind: Kind, row: &[u8], qualifier: &[u8], value: &[u8]) -> crate::Result<()> {
+    if row.len() > MAX_KEY_PART || qualifier.len() > MAX_KEY_PART {
+        return Err(Error::KeyTooLarge);
+    }
+    if value.len() as u64 > MAX_VALUE_LEN {
+        return Err(Error::ValueTooLarge);
+    }
+    if (kind.is_delete() && !value.is_empty())
+        || (kind == Kind::FamilyDelete && !qualifier.is_empty())
+    {
+        return Err(Error::Corrupt {
+            what: "mutation: delete with value or qualifier",
+        });
+    }
+    Ok(())
+}
+
 impl BatchBuilder {
     /// An empty batch.
     pub fn new() -> Self {
@@ -512,22 +538,8 @@ impl BatchBuilder {
         ts: Option<Timestamp>,
         value: &[u8],
     ) -> crate::Result<()> {
-        if row.len() > MAX_KEY_PART || qualifier.len() > MAX_KEY_PART {
-            return Err(Error::KeyTooLarge);
-        }
-        if value.len() as u64 > MAX_VALUE_LEN {
-            return Err(Error::ValueTooLarge);
-        }
-        if (kind.is_delete() && !value.is_empty())
-            || (kind == Kind::FamilyDelete && !qualifier.is_empty())
-        {
-            return Err(Error::Corrupt {
-                what: "mutation: delete with value or qualifier",
-            });
-        }
-        let count = self.count.checked_add(1).ok_or(Error::Corrupt {
-            what: "batch count",
-        })?;
+        check_mutation(kind, row, qualifier, value)?;
+        let count = self.count.checked_add(1).ok_or(Error::ValueTooLarge)?;
         let b = &mut self.buf;
         b.extend_from_slice(&table.0.to_le_bytes());
         b.extend_from_slice(&family.0.to_le_bytes());
@@ -673,6 +685,7 @@ impl<'a> BatchIter<'a> {
             qualifier: r.bytes()?,
             value: r.bytes()?,
         };
+        check_mutation(m.kind, m.row, m.qualifier, m.value)?;
         self.rest = r.rest();
         Ok(m)
     }
@@ -718,9 +731,18 @@ impl<'a> StreamList<'a> {
         Ok(Self { bytes })
     }
 
-    /// Appends `streams` in the same encoding. At most `u16::MAX` streams are written.
+    /// Appends `streams` in the same encoding.
+    ///
+    /// # Panics
+    ///
+    /// If there are more than `u16::MAX` streams. Participants are WAL streams, which number
+    /// at most the shard count, so this is a caller bug; returning an error instead would
+    /// change the frozen signature (see ICR 0001).
     pub fn encode(streams: &[StreamId], out: &mut Vec<u8>) {
-        let streams = &streams[..streams.len().min(usize::from(u16::MAX))];
+        assert!(
+            streams.len() <= usize::from(u16::MAX),
+            "a COMMIT record lists at most 65535 participant streams"
+        );
         out.extend_from_slice(&(streams.len() as u16).to_le_bytes());
         for s in streams {
             out.extend_from_slice(&s.0.to_le_bytes());

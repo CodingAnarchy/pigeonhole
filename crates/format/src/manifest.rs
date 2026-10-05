@@ -132,13 +132,14 @@ pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>, u
         edit_count,
         body_len,
     };
-    // Every edit takes at least two bytes, which bounds the allocation.
-    if edit_count as usize > body.len() / 2 {
+    // Every edit takes at least two bytes.
+    if edit_count as usize > body.len() / MIN_EDIT_BYTES {
         return Err(Error::Corrupt {
             what: "manifest edit count",
         });
     }
-    let mut edits = Vec::with_capacity(edit_count as usize);
+    // Reserve modestly: a corrupt-but-checksummed count must not reserve gigabytes.
+    let mut edits = Vec::with_capacity((edit_count as usize).min(4096));
     let mut pos = 0;
     for _ in 0..edit_count {
         let rest = &body[pos..];
@@ -157,6 +158,9 @@ pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>, u
     }
     Ok((header, edits, end))
 }
+
+/// Smallest encoded edit: a tag and an empty body's length byte.
+const MIN_EDIT_BYTES: usize = 2;
 
 /// Tags this build decodes (FORMAT §9.3).
 const KNOWN_TAGS: std::ops::RangeInclusive<u8> = 1..=12;

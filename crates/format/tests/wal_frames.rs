@@ -39,7 +39,7 @@ fn write(epoch: u32, start: u64, records: &[Vec<u8>], fill: u8) -> (Vec<u8>, Vec
         assert_eq!(end, pos + need as u64);
         seg[pos as usize..end as usize].copy_from_slice(&out);
         // The record's first fragment starts after any skipped frame tail.
-        let first = if FRAME_SIZE - (pos as usize % FRAME_SIZE) < FRAGMENT_HEADER_LEN {
+        let first = if FRAME_SIZE - (pos as usize % FRAME_SIZE) <= FRAGMENT_HEADER_LEN {
             pos.next_multiple_of(FRAME_SIZE as u64)
         } else {
             pos
@@ -167,6 +167,27 @@ fn frame_tail_too_short_for_a_header_is_skipped() {
     let (got, stop) = read(&seg, 1, start);
     assert_eq!(got, [(2 * FRAME_SIZE as u64, b"abc".to_vec())]);
     assert_eq!(stop, Some(end));
+    // Exactly 12 bytes left is also skipped: no zero-payload First fragment is written.
+    let start12 = 2 * FRAME_SIZE as u64 - 12;
+    let mut out = Vec::new();
+    let end12 = FrameEncoder::new(1, start12).encode(b"abc", &mut out);
+    assert_eq!(end12, end);
+    assert!(out[..12].iter().all(|&b| b == 0));
+    let mut seg = vec![0u8; 3 * FRAME_SIZE];
+    seg[start12 as usize..end12 as usize].copy_from_slice(&out);
+    assert_eq!(
+        read(&seg, 1, start12).0,
+        [(2 * FRAME_SIZE as u64, b"abc".to_vec())]
+    );
+    // With 13 bytes left a record starts there, carrying one payload byte.
+    let start13 = 2 * FRAME_SIZE as u64 - 13;
+    let mut out = Vec::new();
+    FrameEncoder::new(1, start13).encode(b"abc", &mut out);
+    assert_eq!(
+        (out[8], out[10]),
+        (1, 2),
+        "First fragment with a 1-byte payload"
+    );
     // A frame of the wrong size is an error, not a panic.
     assert!(FrameDecoder::new(1, start).decode(&[0; 10]).is_err());
 }

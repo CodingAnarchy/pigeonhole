@@ -166,7 +166,8 @@ proptest! {
     fn superblock(n in any::<[u64; 5]>(), db_id in any::<[u8; 16]>(), lens in any::<(u32, u32)>(), snap in proptest::option::of(extent()), log in proptest::option::of(extent())) {
         let sb = Superblock {
             version: FormatVersion::CURRENT, page_size: 4096, sequence: n[0], db_id,
-            snapshot: snap, snapshot_len: lens.0, log, log_len: lens.1,
+            snapshot: snap, snapshot_len: snap.map_or(0, |e| lens.0 % (e.len() as u32 + 1)),
+            log, log_len: log.map_or(0, |e| lens.1 % (e.len() as u32 + 1)),
             manifest_version: n[1], file_pages: n[2], flags: n[3],
         };
         let mut page = [0xEEu8; 4096];

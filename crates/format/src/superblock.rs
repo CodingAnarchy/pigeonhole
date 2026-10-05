@@ -144,18 +144,30 @@ impl Superblock {
             0 => Ok(None),
             _ => ExtentRef { page, size_class }.validate(what).map(Some),
         };
+        let snapshot = extent(le_u64(b, 40), b[48], "superblock snapshot extent")?;
+        let snapshot_len = le_u32(b, 52);
+        let log = extent(le_u64(b, 80), b[88], "superblock log extent")?;
+        let log_len = le_u32(b, 92);
+        // A length must fit its extent; an absent extent has length zero.
+        let fits =
+            |e: Option<ExtentRef>, len: u32| e.map_or(len == 0, |e| u64::from(len) <= e.len());
+        if !fits(snapshot, snapshot_len) || !fits(log, log_len) {
+            return Err(Error::Corrupt {
+                what: "superblock manifest length",
+            });
+        }
         Ok(Self {
             version,
             page_size,
             sequence: le_u64(b, 16),
             db_id: b[24..40].try_into().expect("16 bytes"),
-            snapshot: extent(le_u64(b, 40), b[48], "superblock snapshot extent")?,
-            snapshot_len: le_u32(b, 52),
+            snapshot,
+            snapshot_len,
             manifest_version: le_u64(b, 56),
             file_pages: le_u64(b, 64),
             flags: le_u64(b, 72),
-            log: extent(le_u64(b, 80), b[88], "superblock log extent")?,
-            log_len: le_u32(b, 92),
+            log,
+            log_len,
         })
     }
 

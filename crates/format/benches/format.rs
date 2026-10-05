@@ -59,8 +59,10 @@ fn bench_keys(c: &mut Criterion) {
 }
 
 fn bench_blocks(c: &mut Criterion) {
-    // About one 16 KiB data block: 64-byte keys, 32-byte values.
+    // About one 16 KiB data block: 170 entries of 50-byte keys and 32-byte values.
     let keys = keys(170);
+    let avg = keys.iter().map(Vec::len).sum::<usize>() / keys.len();
+    eprintln!("block bench: {} entries, {avg}-byte keys", keys.len());
     let value = [7u8; 32];
     let mut g = c.benchmark_group("block");
     let mut builder = BlockBuilder::data(16);
@@ -132,6 +134,10 @@ fn bench_wal(c: &mut Criterion) {
         batch: batch.batch(),
     }
     .encode(&mut record);
+    eprintln!(
+        "wal bench record: {} bytes (16 mutations, 100-byte values)",
+        record.len()
+    );
     let mut g = c.benchmark_group("wal");
     g.throughput(Throughput::Bytes(record.len() as u64));
     let mut out = Vec::with_capacity(4 * FRAME_SIZE);
@@ -142,16 +148,35 @@ fn bench_wal(c: &mut Criterion) {
             black_box(enc.encode(black_box(&record), &mut out));
         })
     });
-    let mut frame = vec![0u8; FRAME_SIZE];
-    frame[..out.len()].copy_from_slice(&out);
-    g.bench_function("frame_decode", |b| {
-        let mut dec = FrameDecoder::new(1, FRAME_SIZE as u64);
+
+    // A 64-frame segment packed with records (some spanning frames). One decoder per pass,
+    // so its buffers are reused across ~900 records; the time is per pass.
+    let mut segment = Vec::new();
+    let mut enc = FrameEncoder::new(1, FRAME_SIZE as u64);
+    let mut records = 0u64;
+    while enc.encoded_len(record.len()) + segment.len() <= 64 * FRAME_SIZE {
+        enc.encode(&record, &mut segment);
+        records += 1;
+    }
+    segment.resize(64 * FRAME_SIZE, 0);
+    g.throughput(Throughput::Bytes(records * record.len() as u64));
+    g.bench_function("frame_decode_segment", |b| {
         b.iter(|| {
-            dec = FrameDecoder::new(1, FRAME_SIZE as u64);
-            match dec.decode(black_box(&frame)).unwrap() {
-                Some(Decoded::Record { .. }) => black_box(WalRecord::decode(dec.record()).unwrap()),
-                other => panic!("{other:?}"),
-            };
+            let mut dec = FrameDecoder::new(1, FRAME_SIZE as u64);
+            let mut n = 0u64;
+            'frames: for frame in segment.chunks(FRAME_SIZE) {
+                loop {
+                    match dec.decode(frame).unwrap() {
+                        Some(Decoded::Record { .. }) => {
+                            black_box(WalRecord::decode(dec.record()).unwrap());
+                            n += 1;
+                        }
+                        Some(Decoded::Stop { .. }) => break 'frames,
+                        None => break,
+                    }
+                }
+            }
+            assert_eq!(n, records);
         })
     });
     g.finish();

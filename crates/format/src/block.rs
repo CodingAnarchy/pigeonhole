@@ -50,6 +50,14 @@ pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024;
 /// Size of the physical block trailer.
 pub const TRAILER_LEN: usize = 16;
 
+/// Largest logical block accepted (FORMAT §4.1): twice the largest extent, so a block holding
+/// one maximal cell always fits, while a crafted trailer can never force a huge allocation.
+const MAX_BLOCK_LEN: usize = 128 << 20;
+
+/// LZ4 cannot expand input by more than this factor, which bounds a believable
+/// `uncompressed_len` by the payload length.
+const MAX_LZ4_RATIO: usize = 255;
+
 /// What a block holds. Numbers are frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -141,9 +149,10 @@ pub fn seal(
     logical: &[u8],
     out: &mut Vec<u8>,
 ) -> crate::Result<BlockTrailer> {
-    let uncompressed_len = u32::try_from(logical.len()).map_err(|_| Error::Corrupt {
-        what: "block too large",
-    })?;
+    if logical.len() > MAX_BLOCK_LEN {
+        return Err(Error::ValueTooLarge);
+    }
+    let uncompressed_len = logical.len() as u32;
     let start = out.len();
     let compression = crate::compress::compress(codec, logical, out)?;
     out.extend_from_slice(&[kind as u8, compression as u8, 0, 0]);
@@ -176,8 +185,12 @@ pub fn verify(physical: &[u8]) -> crate::Result<(BlockTrailer, &[u8])> {
         checksum,
     };
     let payload = &physical[..payload_len];
-    if trailer.compression == Compression::None && trailer.uncompressed_len as usize != payload_len
-    {
+    let len = trailer.uncompressed_len as usize;
+    let plausible = match trailer.compression {
+        Compression::None => len == payload_len,
+        _ => len <= payload_len.saturating_mul(MAX_LZ4_RATIO),
+    };
+    if !plausible || len > MAX_BLOCK_LEN {
         return Err(Error::Corrupt {
             what: "uncompressed block length",
         });
@@ -241,9 +254,10 @@ impl BlockBuilder {
                 what: "block builder: keys out of order",
             });
         }
-        let offset = u32::try_from(self.buf.len()).map_err(|_| Error::Corrupt {
-            what: "block too large",
-        })?;
+        if self.buf.len() > MAX_BLOCK_LEN {
+            return Err(Error::ValueTooLarge);
+        }
+        let offset = self.buf.len() as u32;
         let row_len = if self.data {
             Some(crate::key::row_prefix_len(key)?)
         } else {
