@@ -191,20 +191,24 @@ fn segments_are_preallocated_and_recycled_after_checkpoint() {
     let vfs = sim(5);
     let opts = opts(4, 2);
     let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
-    // Current slot plus two spares, preallocated.
+    // The first slot, zero-filled, plus two prepared spares.
+    assert_eq!(file_len(&vfs), opts.segment_size);
+    assert_eq!(wal.spares().prepare(2).unwrap(), 2);
     assert_eq!(file_len(&vfs), 3 * opts.segment_size);
 
     // Checkpoints keep up (each one inside the current segment): the file settles at the
-    // segment being checkpointed, the current one and two spares, and slots are reused.
+    // segment just checkpointed past, the current one and one spare, and slots are reused.
     for i in 1..=60u64 {
         let t = wal
             .append(&batch(i, 20_000).record(), Durability::GroupSync)
             .unwrap();
         wal.sync().unwrap();
         wal.checkpoint(t.end).unwrap();
-        assert!(file_len(&vfs) <= 4 * opts.segment_size, "after record {i}");
+        wal.spares().prepare(2).unwrap();
+        assert!(file_len(&vfs) <= 3 * opts.segment_size, "after record {i}");
     }
-    assert_eq!(file_len(&vfs), 4 * opts.segment_size);
+    assert_eq!(file_len(&vfs), 3 * opts.segment_size);
+    assert_eq!(wal.inline_grows(), 0, "spares were always ready");
     let epoch = wal.written().epoch();
     assert!(epoch > 10, "many segments were started: {epoch}");
     let hs = headers(&vfs, opts.segment_size);
@@ -218,17 +222,17 @@ fn segments_are_preallocated_and_recycled_after_checkpoint() {
         wal.sync().unwrap();
     }
     let grown = file_len(&vfs);
-    assert!(grown > 4 * opts.segment_size);
+    assert!(grown > 3 * opts.segment_size);
     assert_eq!(grown % opts.segment_size, 0);
     // Everything since `cp` replays.
     drop(wal);
     let (got, r) = replay(&vfs, cp).unwrap();
     assert_eq!(got.seqnos(), (61..=80).collect::<Vec<_>>());
-    // Recovery recycles the slots below the checkpoint (growing by at most the spares it
-    // tops up), and appending into recycled slots never grows the file.
+    // Nothing is below the checkpoint, so the reopened stream needs one new slot for its
+    // segment; once checkpoints resume, slots are recycled and the file never grows again.
     let mut wal = r.into_stream(opts).unwrap();
     let after_open = file_len(&vfs);
-    assert!(after_open <= grown + u64::from(opts.spare_segments) * opts.segment_size);
+    assert_eq!(after_open, grown + opts.segment_size);
     for i in 81..=100u64 {
         let t = wal
             .append(&batch(i, 20_000).record(), Durability::GroupSync)
@@ -273,6 +277,109 @@ fn stale_records_in_a_recycled_slot_are_not_replayed() {
 }
 
 #[test]
+fn durability_none_is_never_logged() {
+    let vfs = sim(12);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts(2, 1)).unwrap();
+    assert!(matches!(
+        wal.append(&batch(1, 10).record(), Durability::None),
+        Err(Error::InvalidArgument { .. })
+    ));
+    // The refusal leaves the stream usable and nothing was framed.
+    let t = wal
+        .append(&batch(2, 10).record(), Durability::GroupSync)
+        .unwrap();
+    wal.sync().unwrap();
+    assert!(wal.satisfies(&t));
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), [2]);
+}
+
+#[test]
+fn spares_are_prepared_off_the_shard_thread_and_taken_before_growing() {
+    let vfs = sim(13);
+    let opts = opts(4, 2);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    // Create zero-fills and uses the first slot only.
+    assert_eq!(file_len(&vfs), opts.segment_size);
+    assert_eq!(wal.inline_grows(), 0);
+    let spares = wal.spares();
+    assert_eq!(spares.target(), 2);
+    assert_eq!(spares.ready(), 0);
+
+    // Prepared on another thread while the shard appends.
+    let worker = {
+        let spares = spares.clone();
+        std::thread::spawn(move || spares.prepare(spares.target()))
+    };
+    let mut seqno = 0;
+    let mut appended = Vec::new();
+    for _ in 0..3 {
+        seqno += 1;
+        appended.push(
+            wal.append(&batch(seqno, 100).record(), Durability::GroupSync)
+                .unwrap(),
+        );
+        wal.sync().unwrap();
+    }
+    assert_eq!(worker.join().unwrap().unwrap(), 2);
+    assert_eq!(spares.ready(), 2);
+    assert_eq!(file_len(&vfs), 3 * opts.segment_size);
+    // Enough is enough: preparing again fills nothing.
+    assert_eq!(spares.prepare(2).unwrap(), 0);
+    let f = vfs
+        .open(&path(), pigeonhole_io::OpenOptions::read())
+        .unwrap();
+    let mut tail = vec![1u8; 2 * opts.segment_size as usize];
+    f.read_at(&mut tail, opts.segment_size).unwrap();
+    assert!(tail.iter().all(|&b| b == 0), "spares are zero-filled");
+
+    // Two rollovers take the two prepared slots; the file does not grow.
+    while wal.written().epoch() < 3 {
+        seqno += 1;
+        wal.append(&batch(seqno, 20_000).record(), Durability::GroupSync)
+            .unwrap();
+        wal.sync().unwrap();
+    }
+    assert_eq!(spares.ready(), 0);
+    assert_eq!(file_len(&vfs), 3 * opts.segment_size);
+    assert_eq!(wal.inline_grows(), 0);
+    // No spare and nothing recyclable: the next rollover grows inline and says so.
+    while wal.written().epoch() < 4 {
+        seqno += 1;
+        wal.append(&batch(seqno, 20_000).record(), Durability::GroupSync)
+            .unwrap();
+        wal.sync().unwrap();
+    }
+    assert_eq!(wal.inline_grows(), 1);
+    assert_eq!(file_len(&vfs), 4 * opts.segment_size);
+    // Recyclable slots count as free: after a checkpoint no spare needs preparing, and the
+    // next rollover recycles instead of taking a spare.
+    let cp = wal.written();
+    wal.checkpoint(cp).unwrap();
+    assert_eq!(spares.prepare(2).unwrap(), 0);
+    while wal.written().epoch() < 5 {
+        seqno += 1;
+        wal.append(&batch(seqno, 20_000).record(), Durability::GroupSync)
+            .unwrap();
+        wal.sync().unwrap();
+    }
+    assert_eq!(file_len(&vfs), 4 * opts.segment_size);
+    assert_eq!(wal.inline_grows(), 1);
+    // The trait exposes the same handle; the mock has none.
+    let boxed: Box<dyn Wal> = Box::new(wal);
+    assert!(boxed.spares().is_some());
+    assert!(pigeonhole_wal::MemWal::new(STREAM).spares().is_none());
+    drop(boxed);
+    let (got, r) = replay(&vfs, cp).unwrap();
+    assert!(got.seqnos().last().copied() == Some(seqno));
+    // A blank slot found at recovery is zero-filled by prepare before the file grows.
+    let wal = r.into_stream(opts).unwrap();
+    let before = file_len(&vfs);
+    assert!(wal.spares().prepare(4).unwrap() >= 1);
+    assert!(file_len(&vfs) >= before);
+}
+
+#[test]
 fn records_too_large_for_a_segment_are_refused() {
     let vfs = sim(7);
     let opts = opts(2, 1); // one data frame: at most FRAME_SIZE - 12 bytes of payload
@@ -305,21 +412,13 @@ fn foreign_segments_and_bad_options_are_refused() {
         Err(Error::Io(e)) => assert_eq!(e.kind, pigeonhole_io::ErrorKind::NotFound),
         other => panic!("{other:?}"),
     }
-    good.segment_size = FRAME + 1;
-    assert!(matches!(
-        WalStream::create(&vfs, db(), StreamId(1), DB_ID, good),
-        Err(Error::Format(_))
-    ));
-    good.segment_size = FRAME;
-    assert!(matches!(
-        WalStream::create(&vfs, db(), StreamId(1), DB_ID, good),
-        Err(Error::Format(_))
-    ));
-    good.segment_size = 1 << 32;
-    assert!(matches!(
-        WalStream::create(&vfs, db(), StreamId(1), DB_ID, good),
-        Err(Error::Format(_))
-    ));
+    for size in [FRAME + 1, FRAME, 1 << 32] {
+        good.segment_size = size;
+        assert!(matches!(
+            WalStream::create(&vfs, db(), StreamId(1), DB_ID, good),
+            Err(Error::InvalidArgument { .. })
+        ));
+    }
     // A checkpoint naming an epoch that never existed, with later segments present, is corruption.
     assert!(Recovery::open(&vfs, db(), STREAM, DB_ID, Lsn::new(5, 0)).is_ok());
     assert!(Recovery::open(&vfs, db(), STREAM, DB_ID, Lsn::new(0, 0)).is_ok());

@@ -70,7 +70,7 @@ use pigeonhole_io::{Completion, VfsRef};
 
 pub use mem::MemWal;
 pub use recovery::Recovery;
-pub use stream::WalStream;
+pub use stream::{SpareSegments, WalStream};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -95,6 +95,14 @@ pub enum Error {
     ForeignSegment,
     /// The record is larger than a segment can hold.
     RecordTooLarge,
+    /// A write or sync failed earlier; the stream refuses further appends, writes and syncs
+    /// until it is reopened through [`Recovery`] (see [`Wal`]).
+    Poisoned,
+    /// A caller error: an option out of range, or a record at [`Durability::None`].
+    InvalidArgument {
+        /// What was wrong.
+        what: &'static str,
+    },
 }
 
 impl fmt::Display for Error {
@@ -104,6 +112,10 @@ impl fmt::Display for Error {
             Error::Format(e) => write!(f, "wal: {e}"),
             Error::ForeignSegment => f.write_str("wal segment belongs to another database"),
             Error::RecordTooLarge => f.write_str("wal record larger than a segment can hold"),
+            Error::Poisoned => {
+                f.write_str("wal stream poisoned by an earlier write or sync failure")
+            }
+            Error::InvalidArgument { what } => write!(f, "wal: invalid argument: {what}"),
         }
     }
 }
@@ -113,7 +125,10 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Format(e) => Some(e),
-            Error::ForeignSegment | Error::RecordTooLarge => None,
+            Error::ForeignSegment
+            | Error::RecordTooLarge
+            | Error::Poisoned
+            | Error::InvalidArgument { .. } => None,
         }
     }
 }
@@ -134,7 +149,10 @@ impl From<pigeonhole_format::Error> for Error {
 ///
 /// `segment_size` applies when a stream file is created; an existing file keeps the slot size
 /// its headers record. Invalid sizes (not a multiple of 32 KiB, under two frames, or above
-/// 4 GiB minus one frame so `prev_end` always fits) are refused with [`Error::Format`].
+/// 4 GiB minus one frame so `prev_end` always fits) are refused with
+/// [`Error::InvalidArgument`]. `spare_segments` is the number of free slots
+/// [`SpareSegments::prepare`] keeps ready ahead of the writer (its
+/// [`target`](SpareSegments::target)).
 ///
 /// ```
 /// use pigeonhole_wal::WalOptions;
@@ -205,12 +223,23 @@ impl CommitTicket {
 }
 
 /// One shard's log stream. Single-threaded: owned by the shard thread.
+///
+/// **Failure rule.** Once any write or sync of a stream has failed (a `write`, `sync`,
+/// `submit_sync` completion, or the write and sync a full segment triggers inside `append`),
+/// the stream is poisoned: every later `append`, `write`, `sync` and `submit_sync` fails with
+/// [`Error::Poisoned`]. The kernel's view of the file is unknown after such a failure, so a
+/// later successful sync must never acknowledge commits behind a hole that replay would drop.
+/// The engine reopens the stream through [`Recovery`] to continue. Argument errors
+/// ([`Error::RecordTooLarge`], [`Error::InvalidArgument`]) do not poison.
 pub trait Wal: Send + fmt::Debug {
     /// This stream's id.
     fn stream(&self) -> StreamId;
 
     /// Encodes and frames `record` into the stream's buffer (no syscall). Returns the ticket
     /// for `durability`. Opens a new segment when the current one is full.
+    ///
+    /// `Durability::None` commits write no WAL record (FORMAT §10.3): the engine must not
+    /// call this for them, and an implementation refuses with [`Error::InvalidArgument`].
     fn append(&mut self, record: &WalRecord<'_>, durability: Durability) -> Result<CommitTicket>;
 
     /// Hands every appended byte to the kernel with one `write()`. After this, every ticket
@@ -223,8 +252,11 @@ pub trait Wal: Send + fmt::Debug {
     fn sync(&mut self) -> Result<Lsn>;
 
     /// Writes (if needed) and submits an fdatasync covering everything appended so far.
-    /// Returns at once; the completion resolves with the newly durable position, after which
-    /// [`Wal::durable`] reflects it. Syncs complete in submission order.
+    /// Returns at once; the completion resolves with the position that sync made durable,
+    /// after which [`Wal::durable`] is at least that. Completions may finish in any order (the
+    /// I/O backend has several workers); `durable` only ever moves forward, and a later sync's
+    /// position covers every earlier one's, so waiting on any completion is enough for the
+    /// tickets at or below its position.
     fn submit_sync(&mut self) -> Result<Completion<Lsn>>;
 
     /// Position past the last byte handed to the kernel.
@@ -238,7 +270,19 @@ pub trait Wal: Send + fmt::Debug {
 
     /// Everything before `upto` is no longer needed (the manifest records the checkpoint);
     /// whole segments below it are recycled under a new epoch.
+    ///
+    /// Preconditions, enforced by the engine: the manifest edit recording `upto` as this
+    /// stream's checkpoint is durable before this is called (a recycled segment is gone for
+    /// good, so a manifest that still named an older checkpoint could not be replayed from),
+    /// and `upto` never passes a COMMIT record while a participant's PREPARE for it may
+    /// still need replay (decision D24). This crate checks neither.
     fn checkpoint(&mut self, upto: Lsn) -> Result<()>;
+
+    /// A handle for preparing spare segments on a background task, if the implementation
+    /// has segments to prepare (`None` for mocks).
+    fn spares(&self) -> Option<SpareSegments> {
+        None
+    }
 
     /// Removes this stream's files (clean close by the last process, after checkpoint).
     fn remove(self: Box<Self>) -> Result<()>;

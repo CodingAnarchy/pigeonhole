@@ -9,7 +9,7 @@ use pigeonhole_format::{Lsn, Seqno, StreamId};
 use pigeonhole_io::{FileRef, VfsRef};
 
 use crate::stream::{FRAME, Grid, check_options, corrupt, open_existing};
-use crate::{Result, Wal, WalOptions, WalStream, stream_path};
+use crate::{Result, WalOptions, WalStream, stream_path};
 
 /// Frames read from the file at a time.
 const CHUNK_FRAMES: u64 = 32;
@@ -293,8 +293,11 @@ impl Recovery {
     /// ended. The torn segment is never appended to; its slot is recycled after checkpoint.
     ///
     /// The new segment's header is written and synced before this returns, so a checkpoint
-    /// taken at the new position names a segment that exists. `opts.segment_size` is used
-    /// only if the file holds no segment at all; otherwise the file's slot size is kept.
+    /// taken at the new position names a segment that exists; its slot is zero-filled first
+    /// unless it is a recycled one. `opts.segment_size` is used only if the file holds no
+    /// segment at all; otherwise the file's slot size is kept. Spare slots are not prepared
+    /// here: the engine runs [`SpareSegments::prepare`](crate::SpareSegments::prepare) on a
+    /// background task.
     pub fn into_stream(self, opts: WalOptions) -> Result<WalStream> {
         check_options(&opts)?;
         let Recovery {
@@ -308,9 +311,9 @@ impl Recovery {
             end,
             ..
         } = self;
-        let mut s = match grid {
+        let s = match grid {
             Some(grid) => {
-                let slots = grid
+                let epochs: Vec<u32> = grid
                     .headers
                     .iter()
                     .map(|h| h.map_or(0, |h| h.epoch))
@@ -328,8 +331,8 @@ impl Recovery {
                     grid.segment_size,
                     opts.spare_segments,
                 );
-                s.adopt(slots, max_epoch, checkpoint.epoch());
-                s.start_segment(end.epoch(), end.offset())?;
+                s.adopt(&epochs, max_epoch, checkpoint.epoch());
+                s.open_segment(end.epoch(), end.offset())?;
                 s
             }
             None => {
@@ -343,11 +346,10 @@ impl Recovery {
                     opts.segment_size,
                     opts.spare_segments,
                 );
-                s.start_segment(0, 0)?;
+                s.open_segment(0, 0)?;
                 s
             }
         };
-        s.sync()?;
         Ok(s)
     }
 }

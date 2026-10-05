@@ -30,10 +30,14 @@ fn crash_keeps_written_or_synced_records() {
     assert_eq!(wal.write().unwrap(), t3.end);
     assert!(wal.satisfies(&t2));
     assert!(!wal.satisfies(&t3));
+    assert!(matches!(
+        wal.append(&batch(4, 10).record(), Durability::None),
+        Err(pigeonhole_wal::Error::InvalidArgument { .. })
+    ));
     let t4 = wal
-        .append(&batch(4, 10).record(), Durability::None)
+        .append(&batch(4, 10).record(), Durability::Buffered)
         .unwrap();
-    assert!(wal.satisfies(&t4), "None is always met");
+    assert!(!wal.satisfies(&t4));
     let foreign = pigeonhole_wal::CommitTicket {
         stream: StreamId(5),
         ..t1

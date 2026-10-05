@@ -222,6 +222,79 @@ fn check(vfs: &VfsRef, trace: &Trace, must_survive: impl Fn(&CommitTicket) -> bo
     assert_eq!(again.end, t.end, "{ctx}");
 }
 
+/// Reopens after a crash and crashes again at every operation of `into_stream` and the first
+/// group after it (torn header in a recycled or fresh slot included), then recovers once more.
+#[test]
+fn crash_during_reopen_at_every_operation() {
+    let opts = opts(4, 1);
+    for seed in 300..306u64 {
+        // A workload, a power loss, and a reopen crashed after `crash_at` of its operations.
+        let run = |crash_at: Option<u64>| {
+            let mut plan = FaultPlan::none();
+            plan.torn_writes = true;
+            let sim = SimVfs::with_faults(seed, plan.clone());
+            let vfs: VfsRef = sim.clone();
+            let trace = workload(&vfs, opts, seed);
+            sim.crash(CrashKind::Power);
+            let (before, r) = replay(&vfs, trace.checkpoint).unwrap();
+            let ops_before = sim.mutating_ops();
+            plan.crash_after_ops = crash_at.map(|n| ops_before + n);
+            sim.set_faults(plan);
+            let reopened = r.into_stream(opts).and_then(|mut wal| {
+                let extra = batch(2_000_000, 100);
+                let t = wal.append(&extra.record(), Durability::GroupSync)?;
+                wal.sync()?;
+                Ok((t, extra.bytes()))
+            });
+            (sim, vfs, trace, before, reopened, ops_before)
+        };
+        let (sim, _, _, _, reopened, ops_before) = run(None);
+        assert!(reopened.is_ok(), "seed {seed}: clean reopen");
+        let reopen_ops = sim.mutating_ops() - ops_before;
+        assert!(reopen_ops >= 4, "seed {seed}: {reopen_ops} ops");
+        for n in 1..=reopen_ops {
+            let (sim, vfs, trace, before, reopened, ops_before) = run(Some(n));
+            let ctx = format!("seed {seed} reopen crash after op {n}");
+            assert!(sim.mutating_ops() >= ops_before + n, "{ctx}: never crashed");
+            match &reopened {
+                Ok(_) => {}
+                Err(Error::Io(e)) => assert_eq!(e.kind, ErrorKind::Crashed, "{ctx}"),
+                Err(e) => panic!("{ctx}: {e}"),
+            }
+            // Whatever the crash tore, the records replayed before it are still there, in
+            // order, followed at most by the one record the reopened stream acknowledged.
+            let (after, r) =
+                replay(&vfs, trace.checkpoint).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+            assert!(
+                after.records.len() >= before.records.len(),
+                "{ctx}: records lost"
+            );
+            assert_eq!(
+                after.records[..before.records.len()],
+                before.records[..],
+                "{ctx}"
+            );
+            match &reopened {
+                Ok((t, bytes)) => {
+                    assert_eq!(after.records.len(), before.records.len() + 1, "{ctx}");
+                    assert_eq!(
+                        after.records.last().unwrap(),
+                        &(t.end, bytes.clone()),
+                        "{ctx}"
+                    );
+                }
+                Err(_) => assert!(after.records.len() <= before.records.len() + 1, "{ctx}"),
+            }
+            // And the stream can be reopened once more.
+            let mut wal = r.into_stream(opts).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+            assert!(wal.written().epoch() > after.end.epoch(), "{ctx}");
+            wal.append(&batch(3_000_000, 10).record(), Durability::GroupSync)
+                .unwrap_or_else(|e| panic!("{ctx}: {e}"));
+            wal.sync().unwrap_or_else(|e| panic!("{ctx}: {e}"));
+        }
+    }
+}
+
 fn durable_levels(t: &CommitTicket) -> bool {
     t.durability >= Durability::GroupSync
 }
