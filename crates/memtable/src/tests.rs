@@ -493,3 +493,146 @@ fn reader_and_slices_are_send_and_sync() {
     assert_send::<ShardArena>();
     assert_send::<Retired>();
 }
+
+#[test]
+fn reclaim_waits_for_in_process_readers() {
+    let mut arena = small();
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    let value = vec![0x5a; 100];
+    mt.insert(&mut arena, &key(b"k", 1), &value).unwrap();
+    let root = mt.root();
+    let reader = mt.reader();
+    let mut it = reader.iter();
+    it.seek_to_first().unwrap();
+    let slice = it.value_slice();
+
+    arena.reclaim(mt.retire());
+    assert_eq!(
+        arena.free_bytes(),
+        63 * 1024,
+        "still borrowed by the cursor"
+    );
+    // A new memtable does not reuse the borrowed chunk; the borrowed bytes stay intact.
+    let mut other = Memtable::create(&mut arena).unwrap();
+    assert_ne!(other.root(), root);
+    other.insert(&mut arena, &key(b"x", 2), &[1; 100]).unwrap();
+    assert_eq!(it.value(), &value[..]);
+    assert_eq!(&*slice, &value[..]);
+    assert_eq!(reader.len(), 1);
+
+    // The last handle to go releases the chunk, at the next reclaim or allocation.
+    drop(it);
+    drop(reader);
+    assert_eq!(arena.free_bytes(), 62 * 1024, "the slice still pins");
+    drop(slice);
+    assert_eq!(
+        arena.free_bytes(),
+        62 * 1024,
+        "nothing has run the release yet"
+    );
+    let third = Memtable::create(&mut arena).unwrap();
+    assert_eq!(third.root(), root, "the released chunk is reused first");
+    assert_eq!(arena.free_bytes(), 62 * 1024);
+    arena.reclaim(third.retire());
+    arena.reclaim(other.retire());
+    assert_eq!(arena.free_bytes(), 64 * 1024);
+}
+
+#[test]
+fn reader_opened_by_root_pins_in_the_writer_process() {
+    let mut arena = small();
+    let mt = Memtable::create(&mut arena).unwrap();
+    let root = mt.root();
+    let opened = MemtableReader::open(arena.region().clone(), root).unwrap();
+    arena.reclaim(mt.retire());
+    assert_eq!(arena.free_bytes(), 63 * 1024);
+    assert_ne!(Memtable::create(&mut arena).unwrap().root(), root);
+    drop(opened);
+    let probe = Memtable::create(&mut arena).unwrap();
+    assert_eq!(
+        arena.free_bytes(),
+        62 * 1024,
+        "the old chunk was released on allocation, then one was taken"
+    );
+    arena.reclaim(probe.retire());
+    assert_eq!(arena.free_bytes(), 63 * 1024);
+    assert_eq!(Memtable::create(&mut arena).unwrap().root(), root);
+
+    // A reader opened on a different `ArenaRegion` value (another process's mapping, or
+    // raw bytes copied elsewhere) pins nothing here, as it cannot.
+    let copy = ArenaRegion::heap(64 * 1024);
+    copy.mem.write(0, &arena.region().mem.copy(0, 64 * 1024));
+    let _foreign = MemtableReader::open(copy, root).unwrap();
+}
+
+#[test]
+fn pinned_retired_chunks_count_as_allocated() {
+    let mut arena = ShardArena::new(ArenaRegion::heap(2048), 1024);
+    let a = Memtable::create(&mut arena).unwrap();
+    let reader = a.reader();
+    arena.reclaim(a.retire());
+    let _b = Memtable::create(&mut arena).unwrap();
+    assert_eq!(Memtable::create(&mut arena).unwrap_err(), Error::ArenaFull);
+    drop(reader);
+    assert_eq!(Memtable::create(&mut arena).unwrap().root(), 64);
+}
+
+#[test]
+#[should_panic(expected = "different shard arena")]
+fn insert_through_another_arena_panics() {
+    let mut arena = small();
+    let mut other = small();
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    let _ = mt.insert(&mut other, &key(b"k", 1), b"");
+}
+
+#[test]
+fn reader_rejects_a_node_linked_above_its_height() {
+    let mut arena = ShardArena::new(ArenaRegion::heap(256 * 1024), 4096);
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    for i in 1..=200u64 {
+        mt.insert(&mut arena, &key(&i.to_be_bytes(), i), b"")
+            .unwrap();
+    }
+    let region = arena.region().clone();
+    let mem = &region.mem;
+    let tall = mem.load_u32(tower(mt.head, 1), Ordering::Acquire);
+    assert_ne!(tall, 0, "some node reaches level 1");
+    assert!(mem.read_u8(tall as usize + layout::N_HEIGHT) >= 2);
+    mem.write(tall as usize + layout::N_HEIGHT, &[1]);
+    let mut it = mt.reader().iter();
+    assert_eq!(
+        it.seek(b""),
+        Err(Error::Corrupt("node linked above its height"))
+    );
+    // Level 0 never follows a link above a height of 1, so a scan still works.
+    it.seek_to_first().unwrap();
+    assert!(it.valid());
+}
+
+#[test]
+fn reader_reports_link_cycles() {
+    let mut arena = small();
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    for i in 1..=3u8 {
+        mt.insert(&mut arena, &key(&[i], i as u64), b"").unwrap();
+    }
+    let region = arena.region().clone();
+    let mem = &region.mem;
+    let first = mem.load_u32(tower(mt.head, 0), Ordering::Acquire);
+    let second = mem.load_u32(tower(first, 0), Ordering::Acquire);
+    // second -> first: a level-0 cycle.
+    mem.store_u32(tower(second, 0), first, Ordering::Release);
+
+    let reader = mt.reader();
+    let mut it = reader.iter();
+    it.seek_to_first().unwrap();
+    let result = loop {
+        match it.next() {
+            Ok(()) if it.valid() => {}
+            other => break other,
+        }
+    };
+    assert_eq!(result, Err(Error::Corrupt("link cycle")));
+    assert_eq!(it.seek(&key(&[9], 9)), Err(Error::Corrupt("link cycle")));
+}

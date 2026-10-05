@@ -19,10 +19,16 @@ use std::cmp::Ordering as Cmp;
 use std::fmt;
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::Ordering;
+pub(crate) use std::sync::atomic::{Ordering, fence};
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::Ordering;
+pub(crate) use loom::sync::atomic::{Ordering, fence};
+
+/// An acquire fence: pairs a relaxed load that observed a release store (such as an `Arc`
+/// count decrement) with the accesses that preceded that store.
+pub(crate) fn acquire_fence() {
+    fence(Ordering::Acquire);
+}
 
 #[cfg(not(loom))]
 mod imp {
@@ -94,9 +100,14 @@ mod imp {
         fn atomic_u32(&self, off: usize) -> &AtomicU32 {
             let p = self.ptr(off, 4).cast::<u32>();
             debug_assert!(p.is_aligned(), "misaligned u32 at {off}");
-            // SAFETY: in bounds and 4-byte aligned (node offsets and header fields are
-            // 4-byte aligned by construction); lives as long as `self`; only ever accessed
-            // atomically while shared.
+            // SAFETY: in bounds (`ptr` checked) and 4-byte aligned: the arena base is
+            // 64-byte aligned (heap regions are allocated 64-aligned, mappings are
+            // page-aligned, and `ArenaRegion::new` requires a 64-aligned offset), node
+            // offsets are multiples of 4 (nodes start 4-aligned and sizes round up to 4),
+            // header roots are multiples of 64 (chunk starts and the 64-byte reserved
+            // prefix), and the fields read here sit at 4-aligned offsets inside them;
+            // readers reject any other offset before reaching here. Lives as long as
+            // `self`; only ever accessed atomically while shared.
             unsafe { AtomicU32::from_ptr(p) }
         }
 
@@ -104,7 +115,10 @@ mod imp {
         fn atomic_u64(&self, off: usize) -> &AtomicU64 {
             let p = self.ptr(off, 8).cast::<u64>();
             debug_assert!(p.is_aligned(), "misaligned u64 at {off}");
-            // SAFETY: as in `atomic_u32`, with 8-byte alignment (header fields).
+            // SAFETY: as in `atomic_u32`; the only `u64` fields are in the header, whose
+            // root is a multiple of 64 and whose `u64` fields sit at 8-aligned offsets
+            // (`H_BYTES` 16, `H_MAX_SEQNO` 24, `H_MIN_SEQNO` 32); `MemtableReader::open`
+            // rejects a root that is not a multiple of 8.
             unsafe { AtomicU64::from_ptr(p) }
         }
 
@@ -245,6 +259,7 @@ mod imp {
             self.word(off).store(v, ord);
         }
 
+        #[allow(dead_code)]
         pub(crate) fn load_u64(&self, off: usize, ord: Ordering) -> u64 {
             let lo = self.word(off).load(ord);
             let hi = self.word(off + 4).load(ord);

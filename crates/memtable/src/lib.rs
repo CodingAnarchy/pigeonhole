@@ -42,12 +42,27 @@
 //! pinned anywhere. The same discipline holds across processes, since a mapping of the
 //! region is ordinary memory.
 //!
+//! # Reclamation
+//!
+//! A retired memtable's chunks go back to the arena through [`ShardArena::reclaim`], which
+//! is safe to call at any time: reuse is deferred while any handle of that memtable created
+//! in this process (a [`MemtableReader`], [`MemIter`] or [`ArenaSlice`], from
+//! [`Memtable::reader`] or [`MemtableReader::open`]) is alive, so a `&[u8]` borrowed from
+//! the arena can never be overwritten. Reader *processes* are protected by the shared-memory
+//! protocol instead: the engine calls `reclaim` only after no reader slot pins a view that
+//! lists the memtable. A reader process that nevertheless reads reused memory sees garbage
+//! but never faults: every node a cursor reaches is bounds-checked, a link above a node's
+//! height is rejected, and a traversal longer than the entry count is reported as a cycle,
+//! all as [`Error::Corrupt`].
+//!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 // `unsafe` is permitted in this crate; every block carries a `// SAFETY:` argument.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cmp::Ordering as Cmp;
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex, Weak};
 
 use pigeonhole_format::key::split_suffix;
 use pigeonhole_format::shm::memtable as layout;
@@ -116,6 +131,51 @@ const HEADER_VERSION: u16 = 1;
 const FLAG_FROZEN: u8 = 1;
 /// The null offset.
 const NULL: u32 = 0;
+/// Extra traversal steps allowed beyond the entry count before a walk is called a cycle
+/// (one level stop per level, plus nodes linked but not yet counted).
+const STEP_SLACK: usize = MAX_HEIGHT + 16;
+
+/// One strong reference per live in-process handle of a memtable (the writer, each reader,
+/// cursor and slice, and the `Retired` token). `ShardArena::reclaim` reuses the chunks only
+/// once the token holds the last reference.
+#[derive(Debug)]
+struct Pin;
+
+/// Shared by every clone of an [`ArenaRegion`]: the pins of the memtables this process
+/// created, by root, so a reader opened by root in the writer process pins the same memtable.
+#[derive(Debug, Default)]
+struct Registry {
+    pins: Mutex<HashMap<u32, Weak<Pin>>>,
+}
+
+impl Registry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Weak<Pin>>> {
+        self.pins.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn register(&self, root: u32, pin: &Arc<Pin>) {
+        self.lock().insert(root, Arc::downgrade(pin));
+    }
+
+    /// The pin of the memtable at `root` if it was created in this process, else a fresh one
+    /// (a reader process: nothing reclaims there).
+    fn pin_for(&self, root: u32) -> Arc<Pin> {
+        self.lock()
+            .get(&root)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(Pin))
+    }
+
+    fn forget(&self, root: u32, pin: &Arc<Pin>) {
+        let mut pins = self.lock();
+        if pins
+            .get(&root)
+            .is_some_and(|w| Weak::ptr_eq(w, &Arc::downgrade(pin)))
+        {
+            pins.remove(&root);
+        }
+    }
+}
 
 /// Offset of link `level` in the tower of the node at `node`.
 #[inline]
@@ -142,6 +202,7 @@ fn tower(node: u32, level: usize) -> usize {
 #[derive(Debug, Clone)]
 pub struct ArenaRegion {
     mem: Mem,
+    registry: Arc<Registry>,
 }
 
 impl ArenaRegion {
@@ -150,6 +211,7 @@ impl ArenaRegion {
         assert!(len <= MAX_ARENA_LEN, "arena longer than 4 GiB");
         Self {
             mem: Mem::heap(len),
+            registry: Arc::default(),
         }
     }
 
@@ -174,6 +236,7 @@ impl ArenaRegion {
         }
         Ok(Self {
             mem: Mem::new(region, offset, len),
+            registry: Arc::default(),
         })
     }
 
@@ -192,6 +255,11 @@ impl ArenaRegion {
     /// Whether the arena is empty.
     pub fn is_empty(&self) -> bool {
         self.mem.len() == 0
+    }
+
+    /// Whether `other` is a clone of this arena (the same mapping and pin registry).
+    fn is_same(&self, other: &ArenaRegion) -> bool {
+        Arc::ptr_eq(&self.registry, &other.registry)
     }
 }
 
@@ -217,6 +285,15 @@ struct Run {
 /// // After its flush is in the manifest and no view pins it, its chunks come back.
 /// arena.reclaim(memtable.retire());
 /// assert_eq!(arena.free_bytes(), 1 << 20);
+///
+/// // Reuse waits for in-process readers: a cursor keeps the chunks it borrows from.
+/// let mut memtable = Memtable::create(&mut arena)?;
+/// let reader = memtable.reader();
+/// arena.reclaim(memtable.retire());
+/// assert_eq!(arena.free_bytes(), (1 << 20) - ShardArena::DEFAULT_CHUNK);
+/// drop(reader);
+/// let next = Memtable::create(&mut arena)?; // the deferred chunk is free again
+/// assert_eq!(next.root(), 64);
 /// # Ok::<(), pigeonhole_memtable::Error>(())
 /// ```
 #[derive(Debug)]
@@ -226,6 +303,8 @@ pub struct ShardArena {
     /// `true` for each free chunk.
     free: Vec<bool>,
     free_count: usize,
+    /// Retired memtables whose chunks some in-process handle still borrows.
+    deferred: Vec<Retired>,
 }
 
 impl ShardArena {
@@ -251,6 +330,7 @@ impl ShardArena {
             chunk_size,
             free: vec![true; chunks],
             free_count: chunks,
+            deferred: Vec::new(),
         }
     }
 
@@ -259,18 +339,43 @@ impl ShardArena {
         &self.region
     }
 
-    /// Bytes not allocated to any memtable.
+    /// Bytes not allocated to any memtable. Chunks of a retired memtable count once no
+    /// in-process handle of it is left (see [`ShardArena::reclaim`]).
     pub fn free_bytes(&self) -> usize {
         self.free_count * self.chunk_size
     }
 
-    /// Returns a retired memtable's chunks to the free list. Call only once no view that
-    /// lists it is pinned, in this process or in any reader slot.
+    /// Returns a retired memtable's chunks to the free list. Call only once no reader slot
+    /// pins a view that lists it (reader processes have no other protection). Handles in
+    /// this process need no care: while any [`MemtableReader`], [`MemIter`] or
+    /// [`ArenaSlice`] of the memtable is alive, its chunks stay out of use and become free
+    /// on a later `reclaim` or allocation, after the last handle is dropped.
     ///
     /// # Panics
     /// If a chunk is already free (a double reclaim, or a token from another arena).
     pub fn reclaim(&mut self, retired: Retired) {
-        for run in retired.runs {
+        self.deferred.push(retired);
+        self.release_unreferenced();
+    }
+
+    /// Frees every deferred memtable whose token holds the last in-process reference.
+    fn release_unreferenced(&mut self) {
+        let mut i = 0;
+        while i < self.deferred.len() {
+            if Arc::strong_count(&self.deferred[i].pin) == 1 {
+                // Pairs with the release decrement of the last handle's drop, so its reads
+                // of the chunks happen before the writer reuses them.
+                mem::acquire_fence();
+                let retired = self.deferred.swap_remove(i);
+                self.free_runs(&retired);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn free_runs(&mut self, retired: &Retired) {
+        for run in &retired.runs {
             for c in run.first..run.first + run.count {
                 let slot = &mut self.free[c as usize];
                 assert!(!*slot, "chunk {c} reclaimed twice");
@@ -278,6 +383,7 @@ impl ShardArena {
                 self.free_count += 1;
             }
         }
+        self.region.registry.forget(retired.root, &retired.pin);
     }
 
     /// Usable bytes of a run of `count` chunks starting at chunk `first` (the arena's first
@@ -289,6 +395,7 @@ impl ShardArena {
 
     /// Allocates the lowest run of chunks with at least `bytes` usable bytes.
     fn allocate(&mut self, bytes: usize) -> Result<Run> {
+        self.release_unreferenced();
         let n = self.free.len();
         if n == 0 || bytes > self.usable(0, n) {
             return Err(Error::EntryTooLarge);
@@ -375,6 +482,7 @@ pub struct Memtable {
     max_seqno: Seqno,
     frozen: bool,
     rng: u64,
+    pin: Arc<Pin>,
 }
 
 impl Memtable {
@@ -414,6 +522,8 @@ impl Memtable {
             mem.write_u32(tower(head as u32, level), NULL);
         }
 
+        let pin = Arc::new(Pin);
+        region.registry.register(root as u32, &pin);
         Ok(Memtable {
             region,
             root: root as u32,
@@ -428,6 +538,7 @@ impl Memtable {
             max_seqno: 0,
             frozen: false,
             rng: 0x9E37_79B9_7F4A_7C15 ^ (root as u64),
+            pin,
         })
     }
 
@@ -442,9 +553,13 @@ impl Memtable {
     /// than an internal key suffix.
     ///
     /// # Panics
-    /// If the memtable is frozen.
+    /// If the memtable is frozen, or `arena` is not the arena it was created in.
     pub fn insert(&mut self, arena: &mut ShardArena, key: &[u8], value: &[u8]) -> Result<()> {
         assert!(!self.frozen, "insert into a frozen memtable");
+        assert!(
+            self.region.is_same(&arena.region),
+            "memtable inserted through a different shard arena"
+        );
         let (_, _, seqno, _) =
             split_suffix(key).map_err(|_| Error::Corrupt("insert key is not an internal key"))?;
         let key_len = u32::try_from(key.len()).map_err(|_| Error::EntryTooLarge)?;
@@ -604,19 +719,25 @@ impl Memtable {
         self.root
     }
 
-    /// A reader for other threads.
+    /// A reader for other threads. While it (or a cursor or slice taken from it) is alive,
+    /// the memtable's chunks are not reused.
     pub fn reader(&self) -> MemtableReader {
         MemtableReader {
             region: self.region.clone(),
             root: self.root,
             head: self.head,
+            pin: Arc::clone(&self.pin),
         }
     }
 
     /// Stops using the memtable after its flush is in the manifest. The returned token goes
-    /// to [`ShardArena::reclaim`] when no pinned view lists it.
+    /// to [`ShardArena::reclaim`] when no reader slot pins a view that lists it.
     pub fn retire(self) -> Retired {
-        Retired { runs: self.runs }
+        Retired {
+            runs: self.runs,
+            root: self.root,
+            pin: self.pin,
+        }
     }
 }
 
@@ -625,6 +746,8 @@ impl Memtable {
 #[must_use = "retired chunks leak unless passed to ShardArena::reclaim"]
 pub struct Retired {
     runs: Vec<Run>,
+    root: u32,
+    pin: Arc<Pin>,
 }
 
 /// A validated node: where its parts are.
@@ -663,11 +786,16 @@ pub struct MemtableReader {
     region: ArenaRegion,
     root: u32,
     head: u32,
+    /// Keeps the memtable's chunks from being reused while this handle lives (writer
+    /// process only; in a reader process it pins nothing).
+    pin: Arc<Pin>,
 }
 
 impl MemtableReader {
     /// Opens the memtable whose header is at `root` in `region` (reader processes use the
-    /// root from the published view). Validates the header.
+    /// root from the published view). Validates the header. In the writer process the
+    /// reader pins the memtable like [`Memtable::reader`] does, provided `region` is a clone
+    /// of the arena the memtable was created in.
     ///
     /// # Errors
     /// [`Error::Corrupt`] if the header is misplaced, has the wrong magic or version, or
@@ -692,7 +820,13 @@ impl MemtableReader {
             return Err(Error::Corrupt("memtable header version"));
         }
         let head = mem.read_u32(off + layout::H_HEAD);
-        let reader = MemtableReader { region, root, head };
+        let pin = region.registry.pin_for(root);
+        let reader = MemtableReader {
+            region,
+            root,
+            head,
+            pin,
+        };
         let node = reader.node(head)?;
         if node.height != MAX_HEIGHT || node.key_len != 0 || node.value_len != 0 {
             return Err(Error::Corrupt("memtable head node"));
@@ -718,6 +852,8 @@ impl MemtableReader {
         MemIter {
             reader: self.clone(),
             node: None,
+            steps: 0,
+            budget: 0,
             #[cfg(loom)]
             key_buf: Vec::new(),
             #[cfg(loom)]
@@ -773,6 +909,8 @@ impl MemtableReader {
         let mem = &self.region.mem;
         let mut cur = self.head;
         let mut found = None;
+        let mut steps = 0;
+        let mut budget = self.len() + STEP_SLACK;
         for level in (0..MAX_HEIGHT).rev() {
             found = None;
             loop {
@@ -781,6 +919,17 @@ impl MemtableReader {
                     break;
                 }
                 let n = self.node(next)?;
+                if level >= n.height {
+                    return Err(Error::Corrupt("node linked above its height"));
+                }
+                steps += 1;
+                if steps > budget {
+                    // Entries may have been published meanwhile; re-read before deciding.
+                    budget = self.len() + STEP_SLACK;
+                    if steps > budget {
+                        return Err(Error::Corrupt("link cycle"));
+                    }
+                }
                 if mem.cmp(n.key_off, n.key_len, target) == Cmp::Less {
                     cur = next;
                 } else {
@@ -841,6 +990,10 @@ pub struct MemIter {
     reader: MemtableReader,
     /// The current node, or `None` when unpositioned or past the end.
     node: Option<Node>,
+    /// Nodes stepped to since the last seek, and how many are plausible before the walk is
+    /// declared a cycle.
+    steps: usize,
+    budget: usize,
     #[cfg(loom)]
     key_buf: Vec<u8>,
     #[cfg(loom)]
@@ -860,6 +1013,7 @@ impl MemIter {
             region: self.reader.region.clone(),
             offset: node.value_off,
             len: node.value_len,
+            pin: Arc::clone(&self.reader.pin),
             #[cfg(loom)]
             bytes: self.value_buf.clone(),
         }
@@ -905,6 +1059,10 @@ pub struct ArenaSlice {
     region: ArenaRegion,
     offset: usize,
     len: usize,
+    /// Keeps the memtable's chunks from being reused while the slice lives (held for its
+    /// drop).
+    #[allow(dead_code)]
+    pin: Arc<Pin>,
     #[cfg(loom)]
     bytes: Vec<u8>,
 }
@@ -960,12 +1118,14 @@ impl Cursor for MemIter {
 
     fn seek_to_first(&mut self) -> Result<()> {
         let first = self.reader.successor(self.reader.head)?;
+        self.steps = 0;
         self.set(first);
         Ok(())
     }
 
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         let found = self.reader.lower_bound(target)?;
+        self.steps = 0;
         self.set(found);
         Ok(())
     }
@@ -974,6 +1134,14 @@ impl Cursor for MemIter {
         let Some(node) = self.node else {
             return Ok(());
         };
+        self.steps += 1;
+        if self.steps > self.budget {
+            // Entries may have been published since the last check; re-read the count.
+            self.budget = self.reader.len() + STEP_SLACK;
+            if self.steps > self.budget {
+                return Err(Error::Corrupt("link cycle"));
+            }
+        }
         let next = self.reader.successor(node.off)?;
         self.set(next);
         Ok(())
