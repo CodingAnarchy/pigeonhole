@@ -13,19 +13,69 @@
 //! Messages are a type the engine defines (`H::Msg`), so the hot path has no boxing and no
 //! virtual calls. Background tasks are boxed (`Box<dyn Task>`): they are few and long-lived.
 //!
+//! # Shared state
+//! Shards share nothing mutable except their documented queues: each shard's message queue
+//! (a lock-free `std::sync::mpsc` channel plus a closed flag and in-flight counter), its
+//! idle/wake flag, and the task queues of the optional compaction threads. A
+//! [`Notifier`]/[`Waiter`] pair shares one completion slot between two parties.
+//!
+//! # Example
+//! ```
+//! use std::sync::Arc;
+//! use pigeonhole_io::pread::PreadVfs;
+//! use pigeonhole_runtime::{
+//!     Notifier, Runtime, RuntimeConfig, ShardContext, ShardHandler, ShardId, completion,
+//! };
+//!
+//! /// Each shard keeps a running sum and replies with it.
+//! struct Adder(u64);
+//!
+//! impl ShardHandler for Adder {
+//!     type Msg = (u64, Notifier<u64>);
+//!     fn handle(&mut self, _ctx: &mut ShardContext<'_, Self::Msg>, (n, reply): Self::Msg) {
+//!         self.0 += n;
+//!         reply.notify(self.0);
+//!     }
+//!     fn end_batch(&mut self, _ctx: &mut ShardContext<'_, Self::Msg>) {}
+//! }
+//!
+//! let mut config = RuntimeConfig::new(PreadVfs::new(1));
+//! config.shards = 2;
+//! config.pin_threads = false;
+//! let rt = Runtime::start(config, vec![Adder(0), Adder(100)])?;
+//! let (tx, rx) = completion();
+//! rt.submitter(ShardId(1)).submit((5, tx))?;
+//! assert_eq!(rx.wait(), Some(105));
+//! let handlers = rt.shutdown()?;
+//! assert_eq!(handlers[1].0, 105);
+//! # Ok::<(), pigeonhole_runtime::Error>(())
+//! ```
+//!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
 
+mod completion;
+mod sched;
+mod signal;
+
+use std::cell::Cell;
 use std::fmt;
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pigeonhole_io::VfsRef;
+use pigeonhole_io::{ErrorKind, Vfs, VfsRef};
+
+pub use completion::{Notifier, Waiter, completion};
+pub use sched::{Task, TaskPoll, TaskWaker};
+
+use sched::{PoolShared, Scheduler, Spawner};
+use signal::{Signal, WakeTarget};
+
+/// Most messages handled before `end_batch` runs, so a flooded queue still commits groups.
+const MAX_BATCH: usize = 1024;
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -42,17 +92,37 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        match self {
+            Error::Closed => f.write_str("shard queue is closed"),
+            Error::Spawn(e) => write!(f, "could not start runtime thread: {e}"),
+        }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Closed => None,
+            Error::Spawn(e) => Some(e),
+        }
+    }
+}
 
 /// A shard's index, `0..shard_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShardId(pub u16);
 
 /// Runtime configuration.
+///
+/// ```
+/// use std::time::Duration;
+/// use pigeonhole_io::pread::PreadVfs;
+/// use pigeonhole_runtime::RuntimeConfig;
+///
+/// let mut config = RuntimeConfig::new(PreadVfs::new(1));
+/// assert!(config.shards >= 1);
+/// config.time_slice = Duration::from_micros(200);
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RuntimeConfig {
@@ -61,6 +131,8 @@ pub struct RuntimeConfig {
     /// Pin shard threads to CPUs (engine-owned mode).
     pub pin_threads: bool,
     /// Extra pinned threads dedicated to background tasks; 0 runs them on the shards.
+    /// Engine-owned mode only: application-owned mode starts no threads and runs tasks on
+    /// the shards.
     pub compaction_threads: usize,
     /// Longest a background task runs before yielding.
     pub time_slice: Duration,
@@ -71,11 +143,25 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     /// Defaults: one shard per available CPU, pinned, no compaction threads, 500 µs slices.
     pub fn new(vfs: VfsRef) -> Self {
-        todo!()
+        Self {
+            shards: pigeonhole_io::sys::available_cpus().max(1),
+            pin_threads: true,
+            compaction_threads: 0,
+            time_slice: Duration::from_micros(500),
+            vfs,
+        }
+    }
+
+    fn slice_nanos(&self) -> u64 {
+        u64::try_from(self.time_slice.as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1)
     }
 }
 
 /// The engine's per-shard state. One instance per shard, moved onto its thread.
+///
+/// See the [crate example](crate#example).
 pub trait ShardHandler: Send + 'static {
     /// The message type submitted to this shard.
     type Msg: Send + 'static;
@@ -89,158 +175,606 @@ pub trait ShardHandler: Send + 'static {
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>);
 }
 
-/// What a background task reports after a time slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskPoll {
-    /// More work remains; run me again when foreground work allows.
-    Pending,
-    /// Waiting for I/O or another event; the task is woken by its [`TaskWaker`].
-    Blocked,
-    /// Finished.
-    Done,
-}
-
-/// A cooperative background task (flush, compaction, manifest write, rebalancing).
-pub trait Task: Send + 'static {
-    /// Runs until `deadline_nanos` (monotonic) or until it would block, then returns.
-    fn run(&mut self, deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll;
-
-    /// A short label for metrics.
-    fn name(&self) -> &'static str;
-}
-
-/// Wakes a blocked background task.
-#[derive(Debug, Clone)]
-pub struct TaskWaker {
-    _priv: (),
-}
-
-impl TaskWaker {
-    /// Marks the task runnable.
-    pub fn wake(&self) {
-        todo!()
-    }
-}
-
 /// The handler's view of the runtime while it runs on its shard.
-#[derive(Debug)]
+///
+/// ```
+/// use pigeonhole_runtime::{ShardContext, ShardHandler, ShardId};
+///
+/// /// Forwards every message to the next shard until its hop count runs out.
+/// struct Relay;
+///
+/// impl ShardHandler for Relay {
+///     type Msg = u32;
+///     fn handle(&mut self, ctx: &mut ShardContext<'_, u32>, hops: u32) {
+///         if hops > 0 {
+///             let next = ShardId(((ctx.shard().0 as usize + 1) % ctx.shard_count()) as u16);
+///             let _ = ctx.submitter(next).submit(hops - 1);
+///         }
+///     }
+///     fn end_batch(&mut self, _ctx: &mut ShardContext<'_, u32>) {}
+/// }
+/// ```
 pub struct ShardContext<'a, M> {
-    _priv: PhantomData<&'a M>,
+    shard: ShardId,
+    submitters: &'a [Submitter<M>],
+    spawner: &'a mut Spawner,
+    vfs: &'a dyn Vfs,
+}
+
+impl<M> fmt::Debug for ShardContext<'_, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardContext")
+            .field("shard", &self.shard)
+            .field("shard_count", &self.submitters.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<M: Send + 'static> ShardContext<'_, M> {
     /// This shard.
     pub fn shard(&self) -> ShardId {
-        todo!()
+        self.shard
     }
 
     /// Number of shards.
     pub fn shard_count(&self) -> usize {
-        todo!()
+        self.submitters.len()
     }
 
     /// Submitter for another shard.
+    ///
+    /// # Panics
+    /// If `shard` is out of range.
     pub fn submitter(&self, shard: ShardId) -> &Submitter<M> {
-        todo!()
+        &self.submitters[usize::from(shard.0)]
     }
 
     /// Schedules a background task on this shard (or the compaction pool, if configured).
     pub fn spawn(&mut self, task: Box<dyn Task>) {
-        todo!()
+        self.spawner.spawn(task);
     }
 
     /// Monotonic time in nanoseconds.
     pub fn now_nanos(&self) -> u64 {
-        todo!()
+        self.vfs.monotonic_nanos()
+    }
+}
+
+/// One shard's queue. Producers share it through [`Submitter`]s.
+struct Inbox<M> {
+    shard: ShardId,
+    tx: Sender<M>,
+    closed: AtomicBool,
+    /// Submits between their closed check and their send; shutdown waits for zero.
+    inflight: AtomicUsize,
+    signal: Arc<Signal>,
+}
+
+impl<M> Inbox<M> {
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.signal.force_wake();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
 /// Sends messages to one shard's lock-free MPSC queue and wakes it. Cheap to clone.
-#[derive(Debug)]
+///
+/// Messages from one submitter (or one thread) arrive in the order they were submitted.
+/// See the [crate example](crate#example).
 pub struct Submitter<M> {
-    _priv: PhantomData<fn(M)>,
+    inbox: Arc<Inbox<M>>,
+}
+
+impl<M> fmt::Debug for Submitter<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Submitter")
+            .field("shard", &self.inbox.shard)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<M> Clone for Submitter<M> {
     fn clone(&self) -> Self {
-        todo!()
+        Self {
+            inbox: Arc::clone(&self.inbox),
+        }
     }
 }
 
 impl<M: Send + 'static> Submitter<M> {
     /// The target shard.
     pub fn shard(&self) -> ShardId {
-        todo!()
+        self.inbox.shard
     }
 
     /// Enqueues `msg`. Fails only after shutdown.
     pub fn submit(&self, msg: M) -> Result<()> {
-        todo!()
+        let inbox = &*self.inbox;
+        // `SeqCst` on both sides: either shutdown sees our increment and waits for the send,
+        // or we see `closed` and refuse.
+        inbox.inflight.fetch_add(1, Ordering::SeqCst);
+        if inbox.closed.load(Ordering::SeqCst) {
+            inbox.inflight.fetch_sub(1, Ordering::Release);
+            return Err(Error::Closed);
+        }
+        let sent = inbox.tx.send(msg);
+        inbox.inflight.fetch_sub(1, Ordering::Release);
+        sent.map_err(|_| Error::Closed)?;
+        inbox.signal.notify();
+        Ok(())
     }
 }
 
+thread_local! {
+    static CURRENT_SHARD: Cell<Option<ShardId>> = const { Cell::new(None) };
+}
+
+/// Marks the calling thread as running `shard` until dropped.
+struct EnterShard(Option<ShardId>);
+
+impl EnterShard {
+    fn new(shard: ShardId) -> Self {
+        Self(CURRENT_SHARD.with(|c| c.replace(Some(shard))))
+    }
+}
+
+impl Drop for EnterShard {
+    fn drop(&mut self) {
+        CURRENT_SHARD.with(|c| c.set(self.0));
+    }
+}
+
+/// The shard loop, shared by both embedding modes.
+struct ShardCore<H: ShardHandler> {
+    id: ShardId,
+    handler: H,
+    rx: Receiver<H::Msg>,
+    /// A message taken while checking for work before sleeping; handled first.
+    stash: Option<H::Msg>,
+    submitters: Arc<[Submitter<H::Msg>]>,
+    spawner: Spawner,
+    vfs: VfsRef,
+    time_slice: u64,
+}
+
+impl<H: ShardHandler> ShardCore<H> {
+    fn inbox(&self) -> &Inbox<H::Msg> {
+        &self.submitters[usize::from(self.id.0)].inbox
+    }
+
+    fn signal(&self) -> &Signal {
+        &self.inbox().signal
+    }
+
+    /// Splits `self` into the handler and its context.
+    fn parts(&mut self) -> (&mut H, ShardContext<'_, H::Msg>) {
+        let ctx = ShardContext {
+            shard: self.id,
+            submitters: &self.submitters,
+            spawner: &mut self.spawner,
+            vfs: &*self.vfs,
+        };
+        (&mut self.handler, ctx)
+    }
+
+    /// Handles up to [`MAX_BATCH`] queued messages, then calls `end_batch` if any ran.
+    fn drain(&mut self) -> usize {
+        let stash = self.stash.take();
+        let ShardCore {
+            id,
+            handler,
+            rx,
+            submitters,
+            spawner,
+            vfs,
+            ..
+        } = self;
+        let mut ctx = ShardContext {
+            shard: *id,
+            submitters,
+            spawner,
+            vfs: &**vfs,
+        };
+        let mut n = 0;
+        if let Some(msg) = stash {
+            handler.handle(&mut ctx, msg);
+            n += 1;
+        }
+        while n < MAX_BATCH {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    handler.handle(&mut ctx, msg);
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        if n > 0 {
+            handler.end_batch(&mut ctx);
+        }
+        n
+    }
+
+    fn run_once(&mut self, deadline: u64) -> bool {
+        let _shard = EnterShard::new(self.id);
+        self.signal().awake();
+        self.drain();
+        self.spawner.local.collect_woken();
+        while self.spawner.local.has_runnable() {
+            let now = self.vfs.monotonic_nanos();
+            if now >= deadline {
+                break;
+            }
+            self.spawner
+                .local
+                .run_one(now.saturating_add(self.time_slice).min(deadline));
+            // Foreground first: whatever queued during the slice runs before the next one.
+            self.drain();
+            self.spawner.local.collect_woken();
+        }
+        if self.spawner.local.has_runnable() {
+            return true;
+        }
+        self.check_before_sleep()
+    }
+
+    /// Announces sleep, then re-checks for work. Returns whether work remains.
+    fn check_before_sleep(&mut self) -> bool {
+        self.signal().prepare_sleep();
+        if self.stash.is_none() {
+            self.stash = self.rx.try_recv().ok();
+        }
+        if self.stash.is_some() || self.signal().task_woken() {
+            self.signal().awake();
+            return true;
+        }
+        false
+    }
+
+    /// Shutdown: wait out in-flight submits, then handle everything queued.
+    fn finish(&mut self) {
+        while self.inbox().inflight.load(Ordering::SeqCst) != 0 {
+            thread::yield_now();
+        }
+        while self.drain() > 0 {}
+    }
+}
+
+/// Body of an engine-owned shard thread.
+fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
+    let _shard = EnterShard::new(core.id);
+    core.signal()
+        .set_target(WakeTarget::Thread(thread::current()));
+    loop {
+        let deadline = core.vfs.monotonic_nanos().saturating_add(core.time_slice);
+        let more = core.run_once(deadline);
+        if core.inbox().is_closed() {
+            core.finish();
+            return core.handler;
+        }
+        if !more {
+            thread::park();
+        }
+    }
+}
+
+/// Every shard's submitter, indexed by shard.
+type Submitters<M> = Arc<[Submitter<M>]>;
+
+/// Builds every shard's queue and loop state.
+fn build<H: ShardHandler>(
+    config: &RuntimeConfig,
+    handlers: Vec<H>,
+    pool: Arc<[Arc<PoolShared>]>,
+) -> (Submitters<H::Msg>, Vec<ShardCore<H>>) {
+    let n = handlers.len();
+    assert_eq!(n, config.shards, "handlers.len() must equal config.shards");
+    assert!(
+        (1..=1 << 16).contains(&n),
+        "shard count must be in 1..=65536"
+    );
+    let mut rxs = Vec::with_capacity(n);
+    let submitters: Arc<[Submitter<H::Msg>]> = (0..n)
+        .map(|i| {
+            let (tx, rx) = mpsc::channel();
+            rxs.push(rx);
+            Submitter {
+                inbox: Arc::new(Inbox {
+                    shard: ShardId(i as u16),
+                    tx,
+                    closed: AtomicBool::new(false),
+                    inflight: AtomicUsize::new(0),
+                    signal: Arc::new(Signal::new()),
+                }),
+            }
+        })
+        .collect();
+    let cores = handlers
+        .into_iter()
+        .zip(rxs)
+        .enumerate()
+        .map(|(i, (handler, rx))| ShardCore {
+            id: ShardId(i as u16),
+            handler,
+            rx,
+            stash: None,
+            spawner: Spawner::new(
+                Scheduler::new(Arc::clone(&submitters[i].inbox.signal)),
+                Arc::clone(&pool),
+            ),
+            submitters: Arc::clone(&submitters),
+            vfs: Arc::clone(&config.vfs),
+            time_slice: config.slice_nanos(),
+        })
+        .collect();
+    (submitters, cores)
+}
+
+/// Pins the calling thread to `cpu` (modulo the available CPUs). Platforms without affinity
+/// control (macOS) are best-effort: `Unsupported` is not an error.
+fn pin(cpu: usize) -> std::io::Result<()> {
+    let cpus = pigeonhole_io::sys::available_cpus().max(1);
+    match pigeonhole_io::sys::pin_current_thread(cpu % cpus) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind == ErrorKind::Unsupported => Ok(()),
+        Err(e) => Err(std::io::Error::other(e)),
+    }
+}
+
+/// Spawns a named thread that optionally pins itself, reports the pin result, then runs `f`.
+fn spawn_pinned<T: Send + 'static>(
+    name: String,
+    cpu: Option<usize>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<(JoinHandle<T>, Receiver<std::io::Result<()>>)> {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    let handle = thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            let _ = ack_tx.send(cpu.map_or(Ok(()), pin));
+            f()
+        })
+        .map_err(Error::Spawn)?;
+    Ok((handle, ack_rx))
+}
+
 /// Engine-owned mode: the runtime's own pinned shard threads.
-#[derive(Debug)]
+///
+/// See the [crate example](crate#example). Dropping a `Runtime` shuts it down like
+/// [`Runtime::shutdown`], discarding the handlers.
 pub struct Runtime<H: ShardHandler> {
-    _priv: PhantomData<H>,
+    submitters: Arc<[Submitter<H::Msg>]>,
+    shards: Vec<JoinHandle<H>>,
+    pool: Vec<(Arc<PoolShared>, JoinHandle<()>)>,
+}
+
+impl<H: ShardHandler> fmt::Debug for Runtime<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Runtime")
+            .field("shards", &self.submitters.len())
+            .field("compaction_threads", &self.pool.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<H: ShardHandler> Runtime<H> {
     /// Spawns one thread per handler (`handlers.len()` must equal `config.shards`).
+    ///
+    /// Shard `i` is pinned to CPU `i` and compaction thread `j` to CPU `shards + j` (modulo
+    /// the available CPUs) when `config.pin_threads` is set; pinning is best-effort where the
+    /// OS has no affinity control (macOS).
+    ///
+    /// # Panics
+    /// If `handlers.len() != config.shards` or the count is not in `1..=65536`.
     pub fn start(config: RuntimeConfig, handlers: Vec<H>) -> Result<Self> {
-        todo!()
+        let slice = config.slice_nanos();
+        let mut acks = Vec::new();
+        let mut pool = Vec::with_capacity(config.compaction_threads);
+        let mut pool_threads = Vec::with_capacity(config.compaction_threads);
+        let mut pool_rxs = Vec::with_capacity(config.compaction_threads);
+        for _ in 0..config.compaction_threads {
+            let (shared, rx) = PoolShared::new();
+            pool.push(shared);
+            pool_rxs.push(rx);
+        }
+        let pool: Arc<[Arc<PoolShared>]> = pool.into();
+        let (submitters, cores) = build(&config, handlers, Arc::clone(&pool));
+        let mut rt = Runtime {
+            submitters,
+            shards: Vec::with_capacity(cores.len()),
+            pool: Vec::new(),
+        };
+        for (j, rx) in pool_rxs.into_iter().enumerate() {
+            let shared = Arc::clone(&pool[j]);
+            let vfs = Arc::clone(&config.vfs);
+            let cpu = config.pin_threads.then_some(config.shards + j);
+            let (handle, ack) = spawn_pinned(format!("pigeonhole-compaction-{j}"), cpu, {
+                let shared = Arc::clone(&shared);
+                move || sched::pool_main(shared, rx, vfs, slice)
+            })?;
+            pool_threads.push((shared, handle));
+            acks.push(ack);
+        }
+        rt.pool = pool_threads;
+        for (i, core) in cores.into_iter().enumerate() {
+            let cpu = config.pin_threads.then_some(i);
+            let (handle, ack) = spawn_pinned(format!("pigeonhole-shard-{i}"), cpu, move || {
+                shard_main(core)
+            })?;
+            rt.shards.push(handle);
+            acks.push(ack);
+        }
+        for ack in acks {
+            // A thread that died before reporting will surface its panic at shutdown.
+            if let Ok(Err(e)) = ack.recv() {
+                return Err(Error::Spawn(e));
+            }
+        }
+        Ok(rt)
     }
 
     /// Application-owned mode: no threads; one driver per shard.
+    ///
+    /// `config.pin_threads` and `config.compaction_threads` are ignored: the application owns
+    /// every thread, and background tasks run on the shards.
+    ///
+    /// # Panics
+    /// If `handlers.len() != config.shards` or the count is not in `1..=65536`.
     pub fn application_owned(
         config: RuntimeConfig,
         handlers: Vec<H>,
     ) -> Result<Vec<ShardDriver<H>>> {
-        todo!()
+        let (_, cores) = build(&config, handlers, Arc::from(Vec::new()));
+        Ok(cores.into_iter().map(|core| ShardDriver { core }).collect())
     }
 
     /// Submitter for `shard`.
+    ///
+    /// # Panics
+    /// If `shard` is out of range.
     pub fn submitter(&self, shard: ShardId) -> Submitter<H::Msg> {
-        todo!()
+        self.submitters[usize::from(shard.0)].clone()
     }
 
     /// Number of shards.
     pub fn shard_count(&self) -> usize {
-        todo!()
+        self.submitters.len()
     }
 
     /// Whether the calling thread is a shard thread, and which (inline-write fast path).
+    ///
+    /// True on engine-owned shard threads, and on an application thread while it is inside
+    /// [`ShardDriver::run_once`] or [`ShardDriver::with_handler`].
     pub fn current_shard() -> Option<ShardId> {
-        todo!()
+        CURRENT_SHARD.with(Cell::get)
     }
 
     /// Closes every queue, lets each loop finish its queued messages, and joins the threads.
-    pub fn shutdown(self) -> Result<Vec<H>> {
-        todo!()
+    ///
+    /// Returns the handlers in shard order. Unfinished background tasks are dropped. A
+    /// message a shard sends to an already-closed shard during shutdown fails with
+    /// [`Error::Closed`]. If a shard thread panicked, the panic resumes here.
+    pub fn shutdown(mut self) -> Result<Vec<H>> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Result<Vec<H>> {
+        for s in self.submitters.iter() {
+            s.inbox.close();
+        }
+        let mut handlers = Vec::with_capacity(self.shards.len());
+        let mut panic = None;
+        for t in self.shards.drain(..) {
+            match t.join() {
+                Ok(h) => handlers.push(h),
+                Err(p) => panic = panic.or(Some(p)),
+            }
+        }
+        // Shards are gone, so nothing spawns onto the pool any more.
+        for (shared, _) in &self.pool {
+            shared.close();
+        }
+        for (_, t) in self.pool.drain(..) {
+            if let Err(p) = t.join() {
+                panic = panic.or(Some(p));
+            }
+        }
+        if let Some(p) = panic {
+            std::panic::resume_unwind(p);
+        }
+        Ok(handlers)
+    }
+}
+
+impl<H: ShardHandler> Drop for Runtime<H> {
+    fn drop(&mut self) {
+        if !self.shards.is_empty() || !self.pool.is_empty() {
+            if thread::panicking() {
+                // Close without joining: never double-panic.
+                for s in self.submitters.iter() {
+                    s.inbox.close();
+                }
+                for (shared, _) in &self.pool {
+                    shared.close();
+                }
+            } else {
+                let _ = self.stop();
+            }
+        }
     }
 }
 
 /// Application-owned mode: drives one shard from a thread the application owns.
-#[derive(Debug)]
+///
+/// Call [`run_once`](ShardDriver::run_once) until it returns `false`, then wait for the
+/// wakeup registered with [`set_wakeup`](ShardDriver::set_wakeup) (which fires once per
+/// idle period, when work arrives) before calling it again. Dropping the driver closes the
+/// shard: later submits fail with [`Error::Closed`].
+///
+/// ```
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_runtime::{Runtime, RuntimeConfig, ShardContext, ShardHandler, ShardId};
+///
+/// struct Log(Vec<u32>);
+///
+/// impl ShardHandler for Log {
+///     type Msg = u32;
+///     fn handle(&mut self, _ctx: &mut ShardContext<'_, u32>, msg: u32) {
+///         self.0.push(msg);
+///     }
+///     fn end_batch(&mut self, _ctx: &mut ShardContext<'_, u32>) {}
+/// }
+///
+/// let mut config = RuntimeConfig::new(SimVfs::new(7));
+/// config.shards = 1;
+/// let mut drivers = Runtime::application_owned(config, vec![Log(Vec::new())])?;
+/// let shard = &mut drivers[0];
+/// shard.submitter(ShardId(0)).submit(1)?;
+/// shard.submitter(ShardId(0)).submit(2)?;
+/// assert!(!shard.run_once(u64::MAX)); // drained; no work remains
+/// // The application's own write, inline on its own core:
+/// shard.with_handler(|log, _ctx| log.0.push(3));
+/// assert_eq!(shard.with_handler(|log, _| log.0.clone()), [1, 2, 3]);
+/// # Ok::<(), pigeonhole_runtime::Error>(())
+/// ```
 pub struct ShardDriver<H: ShardHandler> {
-    _priv: PhantomData<H>,
+    core: ShardCore<H>,
+}
+
+impl<H: ShardHandler> fmt::Debug for ShardDriver<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardDriver")
+            .field("shard", &self.core.id)
+            .field("tasks", &self.core.spawner.local)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<H: ShardHandler> ShardDriver<H> {
     /// This shard.
     pub fn shard(&self) -> ShardId {
-        todo!()
+        self.core.id
     }
 
     /// Submitter for any shard.
+    ///
+    /// # Panics
+    /// If `shard` is out of range.
     pub fn submitter(&self, shard: ShardId) -> Submitter<H::Msg> {
-        todo!()
+        self.core.submitters[usize::from(shard.0)].clone()
     }
 
     /// Drains queued messages, calls `end_batch`, then runs background tasks until
     /// `deadline_nanos`. Returns whether work remains.
+    ///
+    /// Between task slices (each at most `time_slice` long) it drains the queue again, so
+    /// foreground messages never wait behind more than one slice.
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
-        todo!()
+        self.core.run_once(deadline_nanos)
     }
 
     /// Runs `f` on this shard's handler inline (the application's own writes on its own
@@ -249,53 +783,27 @@ impl<H: ShardHandler> ShardDriver<H> {
         &mut self,
         f: impl FnOnce(&mut H, &mut ShardContext<'_, H::Msg>) -> R,
     ) -> R {
-        todo!()
+        let _shard = EnterShard::new(self.core.id);
+        let (handler, mut ctx) = self.core.parts();
+        f(handler, &mut ctx)
     }
 
     /// Registers a waker the runtime calls when work arrives (for the application's event
     /// loop).
+    ///
+    /// It is called from the submitting thread, at most once per idle period (after
+    /// [`run_once`](ShardDriver::run_once) returned `false`), so it should be cheap: set a
+    /// flag, unpark a thread, or write an eventfd.
     pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
-        todo!()
+        self.core
+            .signal()
+            .set_target(WakeTarget::Callback(Arc::from(wake)));
     }
 }
 
-/// Creates a one-shot completion: the shard resolves the [`Notifier`]; the caller blocks on,
-/// or awaits, the [`Waiter`].
-pub fn completion<T: Send>() -> (Notifier<T>, Waiter<T>) {
-    todo!()
-}
-
-/// The resolving half of a completion.
-#[derive(Debug)]
-pub struct Notifier<T> {
-    _priv: PhantomData<T>,
-}
-
-impl<T: Send> Notifier<T> {
-    /// Resolves the completion and wakes the waiter (thread unpark or task waker).
-    pub fn notify(self, value: T) {
-        todo!()
-    }
-}
-
-/// The waiting half of a completion. Sync callers call [`Waiter::wait`]; async callers await
-/// it. Dropping it is always safe.
-#[derive(Debug)]
-pub struct Waiter<T> {
-    _priv: PhantomData<T>,
-}
-
-impl<T: Send> Waiter<T> {
-    /// Blocks until notified. Returns `None` if the notifier was dropped unresolved.
-    pub fn wait(self) -> Option<T> {
-        todo!()
-    }
-}
-
-impl<T: Send> Future for Waiter<T> {
-    type Output = Option<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+impl<H: ShardHandler> Drop for ShardDriver<H> {
+    fn drop(&mut self) {
+        // Refuse further submits; the receiver drops with the core.
+        self.core.inbox().closed.store(true, Ordering::SeqCst);
     }
 }

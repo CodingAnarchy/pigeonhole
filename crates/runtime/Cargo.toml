@@ -14,5 +14,13 @@ readme = "README.md"
 [dependencies]
 pigeonhole-io = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "round_trip"
+harness = false
+
 [lints]
 workspace = true
