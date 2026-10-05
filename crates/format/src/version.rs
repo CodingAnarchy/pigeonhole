@@ -2,6 +2,13 @@
 
 /// Version of the main-file and WAL byte formats. Stored in the superblock, the SST footer,
 /// manifest blocks and WAL segment headers.
+///
+/// ```
+/// use pigeonhole_format::FormatVersion;
+///
+/// assert!(FormatVersion::CURRENT.is_readable());
+/// assert!(!FormatVersion(99).is_readable());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct FormatVersion(pub u32);
@@ -14,7 +21,20 @@ impl FormatVersion {
 
     /// Whether this build can read files written with `self`.
     pub fn is_readable(self) -> bool {
-        todo!()
+        Self::MIN_READABLE <= self && self <= Self::CURRENT
+    }
+
+    /// Fails with [`Error::UnsupportedVersion`](crate::Error::UnsupportedVersion) unless
+    /// [`is_readable`](Self::is_readable).
+    pub(crate) fn check(self, what: &'static str) -> crate::Result<()> {
+        if self.is_readable() {
+            Ok(())
+        } else {
+            Err(crate::Error::UnsupportedVersion {
+                what,
+                found: self.0,
+            })
+        }
     }
 }
 

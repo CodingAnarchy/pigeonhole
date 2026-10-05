@@ -6,8 +6,20 @@
 //!
 //! Fields that change while the region is live are accessed as atomics at the offsets given
 //! here; `pigeonhole-shm` does the atomic access, this module only fixes the numbers.
+//!
+//! ```
+//! use pigeonhole_format::shm::{ARENA_ALIGN, HEADER_LEN, ShmHeader};
+//!
+//! let h = ShmHeader::layout([1; 16], 4, 128, 4 << 20, 64 << 20, 66, 1234);
+//! assert_eq!(h.arenas_off % ARENA_ALIGN as u64, 0);
+//! let mut page = [0u8; HEADER_LEN];
+//! h.encode(&mut page);
+//! assert_eq!(ShmHeader::decode(&page).unwrap(), h);
+//! ```
 
-use crate::{FamilyId, ManifestVersion, ShmLayoutVersion, TableId, TabletId};
+use crate::bytes::{Reader, le_u32, le_u64, put_at};
+use crate::version::SHM_MAGIC;
+use crate::{Error, FamilyId, ManifestVersion, ShmLayoutVersion, TableId, TabletId};
 
 /// Magic of the directory region.
 pub const DIRECTORY_MAGIC: [u8; 8] = *b"PHDBSHMD";
@@ -137,17 +149,148 @@ impl ShmHeader {
         file_device: u64,
         file_inode: u64,
     ) -> Self {
-        todo!()
+        // Saturating arithmetic: an absurd request yields a layout `decode` rejects rather
+        // than a panic.
+        let align = |v: u64, a: u64| v.div_ceil(a).saturating_mul(a);
+        let arena_len = align(arena_len, ARENA_ALIGN as u64);
+        let watermarks_off = HEADER_LEN as u64;
+        let views_off = watermarks_off + WATERMARK_STRIDE as u64 * u64::from(shard_count);
+        let reader_slots_off = align(views_off + 2 * u64::from(view_buffer_len), 64);
+        let arenas_off = align(
+            reader_slots_off + READER_SLOT_LEN as u64 * u64::from(reader_slot_count),
+            ARENA_ALIGN as u64,
+        );
+        let region_len =
+            arenas_off.saturating_add(arena_len.saturating_mul(u64::from(shard_count)));
+        Self {
+            layout_version: ShmLayoutVersion::CURRENT,
+            region_len,
+            db_id,
+            shard_count,
+            reader_slot_count,
+            view_buffer_len,
+            watermarks_off,
+            views_off,
+            reader_slots_off,
+            arenas_off,
+            arena_len,
+            file_device,
+            file_inode,
+        }
     }
 
-    /// Encodes the immutable fields (atomic fields are left zero).
+    /// Encodes the immutable fields (atomic fields are left zero). `generation`, `writer_pid`
+    /// and `writer_start_time` are not part of this struct; `pigeonhole-shm` writes them at
+    /// their [`header`] offsets.
     pub fn encode(&self, out: &mut [u8; HEADER_LEN]) {
-        todo!()
+        out.fill(0);
+        let o = &mut out[..];
+        put_at(o, header::MAGIC, &SHM_MAGIC);
+        put_at(
+            o,
+            header::LAYOUT_VERSION,
+            &self.layout_version.0.to_le_bytes(),
+        );
+        put_at(o, header::HEADER_LEN, &(HEADER_LEN as u32).to_le_bytes());
+        put_at(o, header::REGION_LEN, &self.region_len.to_le_bytes());
+        put_at(o, header::DB_ID, &self.db_id);
+        put_at(o, header::SHARD_COUNT, &self.shard_count.to_le_bytes());
+        put_at(
+            o,
+            header::READER_SLOT_COUNT,
+            &self.reader_slot_count.to_le_bytes(),
+        );
+        put_at(
+            o,
+            header::VIEW_BUFFER_LEN,
+            &self.view_buffer_len.to_le_bytes(),
+        );
+        put_at(
+            o,
+            header::WATERMARKS_OFF,
+            &self.watermarks_off.to_le_bytes(),
+        );
+        put_at(o, header::VIEWS_OFF, &self.views_off.to_le_bytes());
+        put_at(
+            o,
+            header::READER_SLOTS_OFF,
+            &self.reader_slots_off.to_le_bytes(),
+        );
+        put_at(o, header::ARENAS_OFF, &self.arenas_off.to_le_bytes());
+        put_at(o, header::ARENA_LEN, &self.arena_len.to_le_bytes());
+        put_at(o, header::FILE_DEVICE, &self.file_device.to_le_bytes());
+        put_at(o, header::FILE_INODE, &self.file_inode.to_le_bytes());
     }
 
     /// Decodes and validates magic, layout version and offsets against `region_len`.
+    ///
+    /// The layout version must equal [`ShmLayoutVersion::CURRENT`] exactly. The areas must
+    /// appear in order without overlapping, arenas must be [`ARENA_ALIGN`]-aligned and sized,
+    /// and everything must lie within `region_len`.
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
-        todo!()
+        const WHAT: &str = "shm header";
+        let Some(b) = bytes.get(..HEADER_LEN) else {
+            return Err(Error::Truncated { what: WHAT });
+        };
+        if b[..8] != SHM_MAGIC {
+            return Err(Error::BadMagic { what: WHAT });
+        }
+        let layout_version = ShmLayoutVersion(le_u32(b, header::LAYOUT_VERSION));
+        if layout_version != ShmLayoutVersion::CURRENT {
+            return Err(Error::UnsupportedVersion {
+                what: WHAT,
+                found: layout_version.0,
+            });
+        }
+        let h = Self {
+            layout_version,
+            region_len: le_u64(b, header::REGION_LEN),
+            db_id: b[header::DB_ID..header::DB_ID + 16]
+                .try_into()
+                .expect("16 bytes"),
+            shard_count: le_u32(b, header::SHARD_COUNT),
+            reader_slot_count: le_u32(b, header::READER_SLOT_COUNT),
+            view_buffer_len: le_u32(b, header::VIEW_BUFFER_LEN),
+            watermarks_off: le_u64(b, header::WATERMARKS_OFF),
+            views_off: le_u64(b, header::VIEWS_OFF),
+            reader_slots_off: le_u64(b, header::READER_SLOTS_OFF),
+            arenas_off: le_u64(b, header::ARENAS_OFF),
+            arena_len: le_u64(b, header::ARENA_LEN),
+            file_device: le_u64(b, header::FILE_DEVICE),
+            file_inode: le_u64(b, header::FILE_INODE),
+        };
+        let fits = |off: u64, n: u64, stride: u64, next: u64| {
+            n.checked_mul(stride)
+                .and_then(|len| off.checked_add(len))
+                .is_some_and(|end| end <= next)
+        };
+        let ok = le_u32(b, header::HEADER_LEN) as usize == HEADER_LEN
+            && h.watermarks_off >= HEADER_LEN as u64
+            && fits(
+                h.watermarks_off,
+                h.shard_count.into(),
+                WATERMARK_STRIDE as u64,
+                h.views_off,
+            )
+            && fits(h.views_off, 2, h.view_buffer_len.into(), h.reader_slots_off)
+            && fits(
+                h.reader_slots_off,
+                h.reader_slot_count.into(),
+                READER_SLOT_LEN as u64,
+                h.arenas_off,
+            )
+            && h.arenas_off.is_multiple_of(ARENA_ALIGN as u64)
+            && h.arena_len.is_multiple_of(ARENA_ALIGN as u64)
+            && fits(
+                h.arenas_off,
+                h.shard_count.into(),
+                h.arena_len,
+                h.region_len,
+            );
+        if !ok {
+            return Err(Error::Corrupt { what: WHAT });
+        }
+        Ok(h)
     }
 }
 
@@ -156,15 +299,28 @@ impl ShmHeader {
 /// spells the path. The directory is one page that records the current generation; its layout
 /// never changes, so it is never rebuilt (decision D27).
 pub fn directory_name(device: u64, inode: u64) -> String {
-    todo!()
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&device.to_le_bytes());
+    id[8..].copy_from_slice(&inode.to_le_bytes());
+    format!("phdb-{:016x}", crate::checksum::xxh3_64(&id))
 }
 
 /// Name of the region for `generation`: the directory name, `-`, and the generation in
 /// lowercase hex (at most 31 bytes, macOS's `shm_open` limit). A rebuilt region always has a
 /// new name, so an old mapping that some process still holds (Windows keeps named mappings
 /// alive while any handle is open) is never mistaken for the new one.
+///
+/// The 31-byte bound holds for generations below `2^36` (nine hex digits).
+///
+/// ```
+/// use pigeonhole_format::shm::{directory_name, region_name};
+///
+/// let dir = directory_name(66, 1234);
+/// assert_eq!(dir.len(), 21);
+/// assert_eq!(region_name(66, 1234, 0x2a), format!("{dir}-2a"));
+/// ```
 pub fn region_name(device: u64, inode: u64, generation: u64) -> String {
-    todo!()
+    format!("{}-{generation:x}", directory_name(device, inode))
 }
 
 /// Byte offsets within the directory region (4096 bytes, layout fixed forever).
@@ -228,17 +384,145 @@ pub struct ViewRecord {
 impl ViewRecord {
     /// Encoded length, so the writer can check it against the view buffer before publishing.
     pub fn encoded_len(&self) -> usize {
-        todo!()
+        VIEW_HEADER_LEN
+            + self
+                .tablets
+                .iter()
+                .map(ViewTablet::encoded_len)
+                .sum::<usize>()
+            + VIEW_MEMTABLE_LEN * self.memtables.len()
     }
 
     /// Encodes with a CRC32C so a reader can detect a torn copy.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        todo!()
+        let start = out.len();
+        out.extend_from_slice(&self.view_version.to_le_bytes());
+        out.extend_from_slice(&self.manifest_version.to_le_bytes());
+        out.extend_from_slice(&(self.encoded_len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.tablets.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.memtables.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0; 4]); // crc, filled below
+        for t in &self.tablets {
+            let end = t.end.as_deref().unwrap_or_default();
+            out.extend_from_slice(&t.tablet.0.to_le_bytes());
+            out.extend_from_slice(&t.table.0.to_le_bytes());
+            out.extend_from_slice(&t.shard.to_le_bytes());
+            out.extend_from_slice(&u16::from(t.end.is_some()).to_le_bytes());
+            out.extend_from_slice(&(t.start.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(end.len() as u32).to_le_bytes());
+            out.extend_from_slice(&t.start);
+            out.extend_from_slice(end);
+            out.resize(start + (out.len() - start).next_multiple_of(8), 0);
+        }
+        for m in &self.memtables {
+            out.extend_from_slice(&m.tablet.0.to_le_bytes());
+            out.extend_from_slice(&m.family.0.to_le_bytes());
+            out.extend_from_slice(&m.shard.to_le_bytes());
+            out.push(m.age);
+            out.push(0);
+            out.extend_from_slice(&m.root.to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+        }
+        let crc = crate::checksum::crc32c(&out[start..]);
+        out[start + 28..start + 32].copy_from_slice(&crc.to_le_bytes());
     }
 
-    /// Decodes and verifies a copied view buffer.
+    /// Decodes and verifies a copied view buffer. `bytes` may extend past the record (a whole
+    /// view buffer); `byte_len` says where it ends.
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
-        todo!()
+        const WHAT: &str = "shm view record";
+        let Some(h) = bytes.get(..VIEW_HEADER_LEN) else {
+            return Err(Error::Truncated { what: WHAT });
+        };
+        let byte_len = le_u32(h, 16) as usize;
+        let tablet_count = le_u32(h, 20) as usize;
+        let memtable_count = le_u32(h, 24) as usize;
+        if byte_len < VIEW_HEADER_LEN {
+            return Err(Error::Corrupt { what: WHAT });
+        }
+        let Some(rec) = bytes.get(..byte_len) else {
+            return Err(Error::Truncated { what: WHAT });
+        };
+        let crc = crate::checksum::crc32c_append(
+            crate::checksum::crc32c_append(crate::checksum::crc32c(&rec[..28]), &[0; 4]),
+            &rec[32..],
+        );
+        if crc != le_u32(h, 28) {
+            return Err(Error::Checksum { what: WHAT });
+        }
+        let body = byte_len - VIEW_HEADER_LEN;
+        // Bound the allocations by what the record can hold.
+        if tablet_count > body / VIEW_TABLET_FIXED_LEN || memtable_count > body / VIEW_MEMTABLE_LEN
+        {
+            return Err(Error::Corrupt { what: WHAT });
+        }
+        let mut r = Reader::new(&rec[VIEW_HEADER_LEN..], WHAT);
+        let mut tablets = Vec::with_capacity(tablet_count);
+        for _ in 0..tablet_count {
+            let tablet = TabletId(r.u64()?);
+            let table = TableId(r.u32()?);
+            let shard = r.u16()?;
+            let flags = r.u16()?;
+            let start_len = r.u32()? as usize;
+            let end_len = r.u32()? as usize;
+            let start = r.take(start_len)?.to_vec();
+            let end_bytes = r.take(end_len)?;
+            let end = if flags & 1 != 0 {
+                Some(end_bytes.to_vec())
+            } else if end_len == 0 {
+                None
+            } else {
+                return Err(Error::Corrupt { what: WHAT });
+            };
+            r.take(r.pos().next_multiple_of(8) - r.pos())?;
+            tablets.push(ViewTablet {
+                tablet,
+                table,
+                shard,
+                start,
+                end,
+            });
+        }
+        let mut memtables = Vec::with_capacity(memtable_count);
+        for _ in 0..memtable_count {
+            let tablet = TabletId(r.u64()?);
+            let family = FamilyId(r.u32()?);
+            let shard = r.u16()?;
+            let age = r.u8()?;
+            r.u8()?;
+            let root = r.u32()?;
+            r.u32()?;
+            memtables.push(ViewMemtable {
+                tablet,
+                family,
+                shard,
+                age,
+                root,
+            });
+        }
+        if r.remaining() != 0 {
+            return Err(Error::Corrupt { what: WHAT });
+        }
+        Ok(Self {
+            view_version: le_u64(h, 0),
+            manifest_version: le_u64(h, 8),
+            tablets,
+            memtables,
+        })
+    }
+}
+
+/// Size of the fixed part of a view record.
+const VIEW_HEADER_LEN: usize = 32;
+/// Size of the fixed part of a view tablet entry (before its row bytes and padding).
+const VIEW_TABLET_FIXED_LEN: usize = 24;
+/// Size of a view memtable entry.
+const VIEW_MEMTABLE_LEN: usize = 24;
+
+impl ViewTablet {
+    fn encoded_len(&self) -> usize {
+        let rows = self.start.len() + self.end.as_ref().map_or(0, Vec::len);
+        (VIEW_TABLET_FIXED_LEN + rows).next_multiple_of(8)
     }
 }
 

@@ -11,8 +11,36 @@
 //! segment and this offset as its predecessor, and the **end of the log** otherwise. A writer
 //! never appends to a segment after recovery; it starts a new one whose header records where
 //! the old one ended (decision D25).
+//!
+//! ```
+//! use pigeonhole_format::wal::{Decoded, FRAME_SIZE, FrameDecoder, FrameEncoder};
+//!
+//! // Encode two records starting at frame 1 of a segment with epoch 3.
+//! let mut enc = FrameEncoder::new(3, FRAME_SIZE as u64);
+//! let mut bytes = Vec::new();
+//! enc.encode(b"first", &mut bytes);
+//! enc.encode(&[9u8; 40_000], &mut bytes); // spans two frames
+//! bytes.resize(3 * FRAME_SIZE, 0); // frames 1 and 2, zero-padded
+//!
+//! let mut dec = FrameDecoder::new(3, FRAME_SIZE as u64);
+//! let mut records = Vec::new();
+//! 'frames: for frame in bytes.chunks(FRAME_SIZE) {
+//!     loop {
+//!         match dec.decode(frame).unwrap() {
+//!             Some(Decoded::Record { .. }) => records.push(dec.record().to_vec()),
+//!             Some(Decoded::Stop { .. }) => break 'frames,
+//!             None => break,
+//!         }
+//!     }
+//! }
+//! assert_eq!(records, [b"first".to_vec(), vec![9u8; 40_000]]);
+//! ```
 
-use crate::{FamilyId, FormatVersion, Seqno, StreamId, TableId, Timestamp};
+use crate::bytes::{Reader, le_u32, le_u64};
+use crate::key::{Kind, MAX_KEY_PART};
+use crate::value::MAX_VALUE_LEN;
+use crate::version::WAL_SEGMENT_MAGIC;
+use crate::{Error, FamilyId, FormatVersion, Seqno, StreamId, TableId, Timestamp};
 
 /// Size of a WAL frame.
 pub const FRAME_SIZE: usize = 32 * 1024;
@@ -59,12 +87,53 @@ pub struct SegmentHeader {
 impl SegmentHeader {
     /// Encodes into a frame-0 buffer (unused bytes zero).
     pub fn encode(&self, frame: &mut [u8; FRAME_SIZE]) {
-        todo!()
+        frame.fill(0);
+        frame[0..8].copy_from_slice(&WAL_SEGMENT_MAGIC);
+        frame[8..12].copy_from_slice(&self.version.0.to_le_bytes());
+        frame[12..16].copy_from_slice(&self.stream.0.to_le_bytes());
+        frame[16..20].copy_from_slice(&self.epoch.to_le_bytes());
+        frame[20..24].copy_from_slice(&self.prev_epoch.to_le_bytes());
+        frame[24..40].copy_from_slice(&self.db_id);
+        frame[40..48].copy_from_slice(&self.segment_size.to_le_bytes());
+        frame[48..52].copy_from_slice(&(FRAME_SIZE as u32).to_le_bytes());
+        frame[52..56].copy_from_slice(&self.prev_end.to_le_bytes());
+        let crc = crate::checksum::crc32c(&frame[..56]);
+        frame[56..60].copy_from_slice(&crc.to_le_bytes());
     }
 
-    /// Decodes and verifies magic, CRC32C and version.
+    /// Decodes and verifies magic, CRC32C and version. Also checks the frame size and that
+    /// the segment size is a whole number (at least two) of frames and at most 4 GiB.
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
-        todo!()
+        const WHAT: &str = "wal segment header";
+        let Some(b) = bytes.get(..SEGMENT_HEADER_LEN) else {
+            return Err(Error::Truncated { what: WHAT });
+        };
+        if b[..8] != WAL_SEGMENT_MAGIC {
+            return Err(Error::BadMagic { what: WHAT });
+        }
+        if crate::checksum::crc32c(&b[..56]) != le_u32(b, 56) {
+            return Err(Error::Checksum { what: WHAT });
+        }
+        let version = FormatVersion(le_u32(b, 8));
+        version.check(WHAT)?;
+        let segment_size = le_u64(b, 40);
+        let frames = segment_size / FRAME_SIZE as u64;
+        if le_u32(b, 48) as usize != FRAME_SIZE
+            || !segment_size.is_multiple_of(FRAME_SIZE as u64)
+            || frames < 2
+            || segment_size > 1 << 32
+        {
+            return Err(Error::Corrupt { what: WHAT });
+        }
+        Ok(Self {
+            version,
+            stream: StreamId(le_u32(b, 12)),
+            epoch: le_u32(b, 16),
+            prev_epoch: le_u32(b, 20),
+            prev_end: le_u32(b, 52),
+            db_id: b[24..40].try_into().expect("16 bytes"),
+            segment_size,
+        })
     }
 }
 
@@ -72,25 +141,91 @@ impl SegmentHeader {
 /// calls so consecutive group commits pack frames densely.
 #[derive(Debug)]
 pub struct FrameEncoder {
-    _priv: (),
+    epoch: u32,
+    /// Segment offset of the next byte to write.
+    pos: u64,
+}
+
+/// Size of the meaningful part of a segment header (the rest of frame 0 is zero).
+const SEGMENT_HEADER_LEN: usize = 60;
+
+/// Bytes left in the frame at segment offset `pos`.
+fn frame_room(pos: u64) -> usize {
+    FRAME_SIZE - (pos % FRAME_SIZE as u64) as usize
+}
+
+fn fragment_type(first: bool, last: bool) -> FragmentType {
+    match (first, last) {
+        (true, true) => FragmentType::Full,
+        (true, false) => FragmentType::First,
+        (false, false) => FragmentType::Middle,
+        (false, true) => FragmentType::Last,
+    }
 }
 
 impl FrameEncoder {
     /// An encoder for a segment with `epoch`, starting at byte `offset` of the segment
     /// (which must be past frame 0).
     pub fn new(epoch: u32, offset: u64) -> Self {
-        todo!()
+        Self {
+            epoch,
+            pos: offset.max(FRAME_SIZE as u64),
+        }
     }
 
     /// Appends the fragments of `record` to `out`, zero-padding a frame tail too short for a
     /// header. Returns the segment offset just past the record.
+    ///
+    /// The tail of a frame left too short for a header is padded lazily, at the start of the
+    /// next record, so the returned offset is exactly where the record's data ends: the
+    /// `prev_end` a successor segment records when this segment fills up.
     pub fn encode(&mut self, record: &[u8], out: &mut Vec<u8>) -> u64 {
-        todo!()
+        let mut rest = record;
+        let mut first = true;
+        loop {
+            let room = frame_room(self.pos);
+            if room < FRAGMENT_HEADER_LEN {
+                out.resize(out.len() + room, 0);
+                self.pos += room as u64;
+                continue;
+            }
+            let n = rest.len().min(room - FRAGMENT_HEADER_LEN);
+            let last = n == rest.len();
+            let mut header = [0u8; FRAGMENT_HEADER_LEN];
+            header[4..8].copy_from_slice(&self.epoch.to_le_bytes());
+            header[8..10].copy_from_slice(&(n as u16).to_le_bytes());
+            header[10] = fragment_type(first, last) as u8;
+            let crc =
+                crate::checksum::crc32c_append(crate::checksum::crc32c(&header[4..]), &rest[..n]);
+            header[..4].copy_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&rest[..n]);
+            self.pos += (FRAGMENT_HEADER_LEN + n) as u64;
+            rest = &rest[n..];
+            first = false;
+            if last {
+                return self.pos;
+            }
+        }
     }
 
     /// Bytes that encoding a record of `len` bytes would append (for segment-full checks).
     pub fn encoded_len(&self, len: usize) -> usize {
-        todo!()
+        let mut pos = self.pos;
+        let mut rest = len;
+        loop {
+            let room = frame_room(pos);
+            if room < FRAGMENT_HEADER_LEN {
+                pos += room as u64;
+                continue;
+            }
+            let n = rest.min(room - FRAGMENT_HEADER_LEN);
+            pos += (FRAGMENT_HEADER_LEN + n) as u64;
+            rest -= n;
+            if rest == 0 {
+                return (pos - self.pos) as usize;
+            }
+        }
     }
 }
 
@@ -106,7 +241,9 @@ pub enum Decoded {
     /// incomplete record. Whether this is also the end of the log depends on whether a
     /// successor segment names this offset as its `prev_end`.
     Stop {
-        /// Segment offset where valid data ends.
+        /// Segment offset where valid data ends: just past the last complete record (or the
+        /// starting offset if none), never past a skipped frame tail. A writer that fills a
+        /// segment records the same offset as its successor's `prev_end`.
         offset: u64,
     },
 }
@@ -114,25 +251,104 @@ pub enum Decoded {
 /// Reassembles records from a segment's frames.
 #[derive(Debug)]
 pub struct FrameDecoder {
-    _priv: (),
+    epoch: u32,
+    /// Segment offset of the frame the caller feeds next (or is feeding).
+    frame_start: u64,
+    /// Segment offset of the next fragment header to read.
+    pos: u64,
+    /// Just past the last complete record.
+    record_end: u64,
+    /// Offset of the first fragment of the record being assembled, if any.
+    partial_start: Option<u64>,
+    partial: Vec<u8>,
+    record: Vec<u8>,
+    stopped: bool,
 }
 
 impl FrameDecoder {
     /// A decoder for a segment with `epoch`, starting at `offset`.
     pub fn new(epoch: u32, offset: u64) -> Self {
-        todo!()
+        Self {
+            epoch,
+            frame_start: offset - offset % FRAME_SIZE as u64,
+            pos: offset,
+            record_end: offset,
+            partial_start: None,
+            partial: Vec::new(),
+            record: Vec::new(),
+            stopped: false,
+        }
     }
 
     /// Feeds the next frame (exactly [`FRAME_SIZE`] bytes, frame-aligned) and decodes until
     /// a record completes, the frame is exhausted (`Ok(None)`), or the segment's data stops.
     /// A frame tail shorter than a fragment header is skipped whatever its bytes.
+    ///
+    /// After a `Record`, call again with the same frame; after `Ok(None)`, feed the next
+    /// frame. Once it has returned `Stop`, it keeps returning the same `Stop`. If the segment
+    /// ends without a `Stop`, its data stops at the end of the last record (a record still
+    /// being assembled is incomplete).
     pub fn decode(&mut self, frame: &[u8]) -> crate::Result<Option<Decoded>> {
-        todo!()
+        if frame.len() != FRAME_SIZE {
+            return Err(Error::Corrupt {
+                what: "wal frame length",
+            });
+        }
+        if self.stopped {
+            return Ok(Some(Decoded::Stop {
+                offset: self.record_end,
+            }));
+        }
+        loop {
+            let at = (self.pos - self.frame_start) as usize;
+            if at + FRAGMENT_HEADER_LEN > FRAME_SIZE {
+                self.frame_start += FRAME_SIZE as u64;
+                self.pos = self.frame_start;
+                return Ok(None);
+            }
+            let h = &frame[at..at + FRAGMENT_HEADER_LEN];
+            let len = usize::from(u16::from_le_bytes([h[8], h[9]]));
+            let end = at + FRAGMENT_HEADER_LEN + len;
+            let ty = h[10];
+            let sequenced = match ty {
+                1 | 2 => self.partial_start.is_none(),
+                3 | 4 => self.partial_start.is_some(),
+                _ => false,
+            };
+            if !sequenced
+                || le_u32(h, 4) != self.epoch
+                || end > FRAME_SIZE
+                || crate::checksum::crc32c_append(
+                    crate::checksum::crc32c(&h[4..]),
+                    &frame[at + FRAGMENT_HEADER_LEN..end],
+                ) != le_u32(h, 0)
+            {
+                self.stopped = true;
+                return Ok(Some(Decoded::Stop {
+                    offset: self.record_end,
+                }));
+            }
+            let start = self.pos;
+            let payload = &frame[at + FRAGMENT_HEADER_LEN..end];
+            self.pos += (FRAGMENT_HEADER_LEN + len) as u64;
+            if ty == FragmentType::First as u8 || ty == FragmentType::Full as u8 {
+                self.partial.clear();
+                self.partial_start = Some(start);
+            }
+            self.partial.extend_from_slice(payload);
+            if ty == FragmentType::Full as u8 || ty == FragmentType::Last as u8 {
+                std::mem::swap(&mut self.partial, &mut self.record);
+                self.partial.clear();
+                self.record_end = self.pos;
+                let offset = self.partial_start.take().unwrap_or(start);
+                return Ok(Some(Decoded::Record { offset }));
+            }
+        }
     }
 
     /// The last complete record.
     pub fn record(&self) -> &[u8] {
-        todo!()
+        &self.record
     }
 }
 
@@ -184,26 +400,103 @@ pub enum WalRecord<'a> {
 impl WalRecord<'_> {
     /// Appends the record encoding.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        todo!()
+        match self {
+            WalRecord::Batch {
+                seqno,
+                commit_ts,
+                batch,
+            } => {
+                out.push(RecordType::Batch as u8);
+                out.extend_from_slice(&seqno.to_le_bytes());
+                out.extend_from_slice(&commit_ts.to_le_bytes());
+                out.extend_from_slice(batch.as_bytes());
+            }
+            WalRecord::Prepare {
+                seqno,
+                commit_ts,
+                coordinator,
+                batch,
+            } => {
+                out.push(RecordType::Prepare as u8);
+                out.extend_from_slice(&seqno.to_le_bytes());
+                out.extend_from_slice(&commit_ts.to_le_bytes());
+                out.extend_from_slice(&coordinator.0.to_le_bytes());
+                out.extend_from_slice(batch.as_bytes());
+            }
+            WalRecord::Commit {
+                seqno,
+                participants,
+            } => {
+                out.push(RecordType::Commit as u8);
+                out.extend_from_slice(&seqno.to_le_bytes());
+                out.extend_from_slice(participants.bytes);
+            }
+        }
     }
 
     /// Decodes a record. Never panics.
+    ///
+    /// ```
+    /// use pigeonhole_format::wal::{BatchBuilder, WalRecord};
+    /// use pigeonhole_format::{FamilyId, Kind, TableId};
+    ///
+    /// let mut b = BatchBuilder::new();
+    /// b.push(TableId(1), FamilyId(2), Kind::Put, b"row", b"q", None, b"\x00v").unwrap();
+    /// let rec = WalRecord::Batch { seqno: 9, commit_ts: 100, batch: b.batch() };
+    /// let mut bytes = Vec::new();
+    /// rec.encode(&mut bytes);
+    /// assert_eq!(WalRecord::decode(&bytes).unwrap(), rec);
+    /// ```
     pub fn decode(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
-        todo!()
+        let mut r = Reader::new(bytes, "wal record");
+        match r.u8()? {
+            1 => Ok(WalRecord::Batch {
+                seqno: r.u64()?,
+                commit_ts: r.u64()?,
+                batch: BatchRef::new(r.rest())?,
+            }),
+            2 => Ok(WalRecord::Prepare {
+                seqno: r.u64()?,
+                commit_ts: r.u64()?,
+                coordinator: StreamId(r.u32()?),
+                batch: BatchRef::new(r.rest())?,
+            }),
+            3 => Ok(WalRecord::Commit {
+                seqno: r.u64()?,
+                participants: StreamList::new(r.rest())?,
+            }),
+            _ => Err(Error::Corrupt {
+                what: "wal record type",
+            }),
+        }
     }
 }
 
 /// Builds the mutation list of a batch in its final encoding, so a write batch becomes a WAL
 /// record without re-encoding. Used by the engine's `WriteBatch`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct BatchBuilder {
-    _priv: (),
+    /// `count u32 LE` followed by the encoded mutations.
+    buf: Vec<u8>,
+    count: u32,
 }
+
+impl Default for BatchBuilder {
+    fn default() -> Self {
+        Self {
+            buf: vec![0; 4],
+            count: 0,
+        }
+    }
+}
+
+/// Bit of `kind_flags` set when the mutation carries its own timestamp.
+const EXPLICIT_TS: u8 = 0x80;
 
 impl BatchBuilder {
     /// An empty batch.
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     /// Appends one mutation. `ts == None` means "use the commit timestamp". `value` is an
@@ -219,60 +512,117 @@ impl BatchBuilder {
         ts: Option<Timestamp>,
         value: &[u8],
     ) -> crate::Result<()> {
-        todo!()
+        if row.len() > MAX_KEY_PART || qualifier.len() > MAX_KEY_PART {
+            return Err(Error::KeyTooLarge);
+        }
+        if value.len() as u64 > MAX_VALUE_LEN {
+            return Err(Error::ValueTooLarge);
+        }
+        if (kind.is_delete() && !value.is_empty())
+            || (kind == Kind::FamilyDelete && !qualifier.is_empty())
+        {
+            return Err(Error::Corrupt {
+                what: "mutation: delete with value or qualifier",
+            });
+        }
+        let count = self.count.checked_add(1).ok_or(Error::Corrupt {
+            what: "batch count",
+        })?;
+        let b = &mut self.buf;
+        b.extend_from_slice(&table.0.to_le_bytes());
+        b.extend_from_slice(&family.0.to_le_bytes());
+        match ts {
+            Some(ts) => {
+                b.push(kind as u8 | EXPLICIT_TS);
+                b.extend_from_slice(&ts.to_le_bytes());
+            }
+            None => b.push(kind as u8),
+        }
+        crate::varint::put_bytes(b, row);
+        crate::varint::put_bytes(b, qualifier);
+        crate::varint::put_bytes(b, value);
+        self.count = count;
+        b[..4].copy_from_slice(&count.to_le_bytes());
+        Ok(())
     }
 
     /// Number of mutations.
     pub fn len(&self) -> usize {
-        todo!()
+        self.count as usize
     }
 
     /// Whether the batch has no mutations.
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.count == 0
     }
 
     /// The encoded batch.
     pub fn batch(&self) -> BatchRef<'_> {
-        todo!()
+        BatchRef {
+            bytes: &self.buf,
+            count: self.count,
+        }
     }
 
     /// Clears the batch, keeping its allocation.
     pub fn clear(&mut self) {
-        todo!()
+        self.buf.truncate(4);
+        self.buf.fill(0);
+        self.count = 0;
     }
 }
 
 /// An encoded batch (`count u32` then mutations), borrowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchRef<'a> {
-    _bytes: &'a [u8],
+    bytes: &'a [u8],
+    count: u32,
 }
 
 impl<'a> BatchRef<'a> {
     /// Wraps encoded batch bytes, validating the count. Never panics.
+    ///
+    /// Every mutation is parsed once here, and trailing bytes are rejected, so iterating a
+    /// `BatchRef` built by this function never yields an error.
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
-        todo!()
+        let mut r = Reader::new(bytes, "wal batch");
+        let count = r.u32()?;
+        let mut it = BatchIter {
+            rest: r.rest(),
+            remaining: count,
+        };
+        for m in &mut it {
+            m?;
+        }
+        if !it.rest.is_empty() {
+            return Err(Error::Corrupt {
+                what: "wal batch: trailing bytes",
+            });
+        }
+        Ok(Self { bytes, count })
     }
 
     /// The encoded bytes.
     pub fn as_bytes(&self) -> &'a [u8] {
-        todo!()
+        self.bytes
     }
 
     /// Number of mutations.
     pub fn len(&self) -> usize {
-        todo!()
+        self.count as usize
     }
 
     /// Whether the batch has no mutations.
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.count == 0
     }
 
     /// Iterates the mutations in insertion order.
     pub fn iter(&self) -> BatchIter<'a> {
-        todo!()
+        BatchIter {
+            rest: self.bytes.get(4..).unwrap_or_default(),
+            remaining: self.count,
+        }
     }
 }
 
@@ -298,14 +648,49 @@ pub struct Mutation<'a> {
 /// Iterator over a batch's mutations.
 #[derive(Debug, Clone)]
 pub struct BatchIter<'a> {
-    _rest: &'a [u8],
+    rest: &'a [u8],
+    remaining: u32,
+}
+
+impl<'a> BatchIter<'a> {
+    fn parse(&mut self) -> crate::Result<Mutation<'a>> {
+        let mut r = Reader::new(self.rest, "wal mutation");
+        let table = TableId(r.u32()?);
+        let family = FamilyId(r.u32()?);
+        let flags = r.u8()?;
+        let kind = Kind::from_u8(flags & !EXPLICIT_TS)?;
+        let ts = if flags & EXPLICIT_TS != 0 {
+            Some(r.u64()?)
+        } else {
+            None
+        };
+        let m = Mutation {
+            table,
+            family,
+            kind,
+            ts,
+            row: r.bytes()?,
+            qualifier: r.bytes()?,
+            value: r.bytes()?,
+        };
+        self.rest = r.rest();
+        Ok(m)
+    }
 }
 
 impl<'a> Iterator for BatchIter<'a> {
     type Item = crate::Result<Mutation<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let m = self.parse();
+        if m.is_err() {
+            self.remaining = 0;
+        }
+        Some(m)
     }
 }
 
@@ -313,22 +698,38 @@ impl<'a> Iterator for BatchIter<'a> {
 /// as `u32 LE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamList<'a> {
-    _bytes: &'a [u8],
+    bytes: &'a [u8],
 }
 
 impl<'a> StreamList<'a> {
     /// Wraps the encoded list; fails unless `bytes.len() == 2 + 4 * count`.
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
-        todo!()
+        let Some(count) = bytes.get(..2) else {
+            return Err(Error::Truncated {
+                what: "wal stream list",
+            });
+        };
+        let count = usize::from(u16::from_le_bytes([count[0], count[1]]));
+        if bytes.len() != 2 + 4 * count {
+            return Err(Error::Corrupt {
+                what: "wal stream list length",
+            });
+        }
+        Ok(Self { bytes })
     }
 
-    /// Appends `streams` in the same encoding.
+    /// Appends `streams` in the same encoding. At most `u16::MAX` streams are written.
     pub fn encode(streams: &[StreamId], out: &mut Vec<u8>) {
-        todo!()
+        let streams = &streams[..streams.len().min(usize::from(u16::MAX))];
+        out.extend_from_slice(&(streams.len() as u16).to_le_bytes());
+        for s in streams {
+            out.extend_from_slice(&s.0.to_le_bytes());
+        }
     }
 
     /// Iterates the stream ids.
     pub fn iter(&self) -> impl Iterator<Item = StreamId> + 'a {
-        std::iter::empty()
+        let (ids, _) = self.bytes[2..].as_chunks::<4>();
+        ids.iter().map(|c| StreamId(u32::from_le_bytes(*c)))
     }
 }

@@ -9,11 +9,10 @@
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
 
 pub mod blob;
 pub mod block;
+mod bytes;
 pub mod checksum;
 pub mod compress;
 pub mod cursor;

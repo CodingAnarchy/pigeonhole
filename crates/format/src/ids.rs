@@ -48,6 +48,14 @@ pub type ManifestVersion = u64;
 
 /// A position in one WAL stream: `(segment epoch << 32) | byte offset within the segment`.
 /// Ordered: a larger `Lsn` was written later. Segments are therefore at most 4 GiB.
+///
+/// ```
+/// use pigeonhole_format::Lsn;
+///
+/// let lsn = Lsn::new(7, 32768);
+/// assert_eq!((lsn.epoch(), lsn.offset()), (7, 32768));
+/// assert!(Lsn::new(8, 0) > lsn);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct Lsn(pub u64);
@@ -55,17 +63,17 @@ pub struct Lsn(pub u64);
 impl Lsn {
     /// Builds an `Lsn` from a segment epoch and an offset within that segment.
     pub fn new(epoch: u32, offset: u32) -> Self {
-        todo!()
+        Self((u64::from(epoch) << 32) | u64::from(offset))
     }
 
     /// The segment epoch this position falls in.
     pub fn epoch(self) -> u32 {
-        todo!()
+        (self.0 >> 32) as u32
     }
 
     /// The byte offset within the segment.
     pub fn offset(self) -> u32 {
-        todo!()
+        self.0 as u32
     }
 }
 

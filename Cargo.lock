@@ -534,7 +534,9 @@ name = "pigeonhole-format"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "criterion",
  "lz4_flex",
+ "proptest",
  "twox-hash",
 ]
 

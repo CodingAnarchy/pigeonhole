@@ -6,6 +6,12 @@ use std::fmt;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// An encoding or decoding failure. Decoders return these instead of panicking on any input.
+///
+/// ```
+/// use pigeonhole_format::{Error, decode_key};
+///
+/// assert!(matches!(decode_key(b"short"), Err(Error::Truncated { .. })));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -46,7 +52,18 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        match self {
+            Error::Truncated { what } => write!(f, "{what}: input truncated"),
+            Error::BadMagic { what } => write!(f, "{what}: bad magic number"),
+            Error::Checksum { what } => write!(f, "{what}: checksum mismatch"),
+            Error::UnsupportedVersion { what, found } => {
+                write!(f, "{what}: unsupported version {found}")
+            }
+            Error::Corrupt { what } => write!(f, "{what}: corrupt"),
+            Error::KeyTooLarge => write!(f, "row key or qualifier longer than 65536 bytes"),
+            Error::ValueTooLarge => write!(f, "value longer than 2^32 - 1 bytes"),
+            Error::UnsupportedCompression(c) => write!(f, "unsupported compression codec {c}"),
+        }
     }
 }
 
