@@ -11,16 +11,71 @@
 //! The in-memory mock for the layers above is simply a `Pager` over
 //! [`SimVfs`](pigeonhole_io::sim::SimVfs) ([`Pager::create`] with any path).
 //!
+//! # Threading
+//!
+//! `Pager` is shared by every shard (`&self` methods, internally synchronized). The calls
+//! differ in what they may block on:
+//!
+//! - [`Pager::allocate`], [`Pager::abandon`], [`Pager::retire`], [`Pager::reclaim`],
+//!   [`Pager::stats`] and [`Pager::shrink_plan`] only touch memory, except that `allocate`
+//!   preallocates more file (one `fallocate`) when no free extent fits. They run per flush or
+//!   compaction output, never per write.
+//! - [`Pager::read`] and [`Pager::write`] are positional I/O on the caller's thread.
+//! - [`Pager::commit_root`] and [`Pager::mark_clean`] block on two fsyncs. They must not run
+//!   on a shard's foreground loop (decision D30): the manifest task uses
+//!   [`Pager::submit_commit_root`], whose fsyncs run on the I/O backend. Root commits must
+//!   not overlap; an overlapping commit fails instead of racing.
+//! - [`Pager::relocate`] and [`Pager::truncate_tail`] copy or truncate on the caller's thread
+//!   (online shrink is a background job).
+//!
+//! # Example
+//!
+//! ```
+//! use std::path::Path;
+//! use pigeonhole_io::VfsRef;
+//! use pigeonhole_io::sim::SimVfs;
+//! use pigeonhole_pager::{Pager, Root};
+//!
+//! # fn main() -> pigeonhole_pager::Result<()> {
+//! let vfs: VfsRef = SimVfs::new(7);
+//! let path = Path::new("/db/data.phdb");
+//! let pager = Pager::create(&vfs, path)?;
+//!
+//! // Write a "manifest snapshot" into a fresh extent and publish it.
+//! let snapshot = pager.allocate(100)?;
+//! pager.write(snapshot, 0, b"manifest bytes")?;
+//! let root = Root { snapshot: Some(snapshot), snapshot_len: 14, manifest_version: 1, ..Root::default() };
+//! pager.commit_root(root)?;
+//! drop(pager);
+//!
+//! // Reopen: read the root, read the manifest, then name every live extent.
+//! let opened = Pager::open(&vfs, path, true)?;
+//! assert_eq!(opened.root(), root);
+//! let pager = opened.finish([snapshot])?;
+//! let mut buf = [0u8; 14];
+//! pager.read(snapshot, 0, &mut buf)?;
+//! assert_eq!(&buf, b"manifest bytes");
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
 
+mod alloc;
+
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use pigeonhole_format::ManifestVersion;
-use pigeonhole_io::{Completion, FileRef, VfsRef};
+use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
+use pigeonhole_format::{FormatVersion, ManifestVersion, PAGE_SIZE};
+use pigeonhole_io::{Completion, ErrorKind, FileRef, OpenOptions, VfsRef};
+
+use crate::alloc::{Alloc, LoadError, UNIT_BYTES, UNIT_PAGES};
 
 /// An allocated extent: `64 KiB << size_class` bytes at `page`. The persisted form.
 pub use pigeonhole_format::superblock::ExtentRef as Extent;
@@ -29,6 +84,16 @@ pub use pigeonhole_format::superblock::ExtentRef as Extent;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Pager errors.
+///
+/// ```
+/// use pigeonhole_io::VfsRef;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_pager::{Error, Pager};
+///
+/// let vfs: VfsRef = SimVfs::new(1);
+/// let pager = Pager::create(&vfs, "/db/data.phdb".as_ref()).unwrap();
+/// assert!(matches!(pager.allocate(65 << 20), Err(Error::TooLarge)));
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -46,11 +111,25 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        match self {
+            Error::Io(e) => write!(f, "page file I/O: {e}"),
+            Error::Format(e) => write!(f, "page file format: {e}"),
+            Error::NoSpace => f.write_str("no free extent and the file cannot grow"),
+            Error::TooLarge => f.write_str("extent request larger than 64 MiB"),
+            Error::UnsupportedVersion(v) => write!(f, "unsupported page file format version {v}"),
+        }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Format(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<pigeonhole_io::Error> for Error {
     fn from(e: pigeonhole_io::Error) -> Self {
@@ -60,12 +139,35 @@ impl From<pigeonhole_io::Error> for Error {
 
 impl From<pigeonhole_format::Error> for Error {
     fn from(e: pigeonhole_format::Error) -> Self {
-        Self::Format(e)
+        match e {
+            pigeonhole_format::Error::UnsupportedVersion { found, .. } => {
+                Self::UnsupportedVersion(found)
+            }
+            e => Self::Format(e),
+        }
     }
+}
+
+fn io_err(kind: ErrorKind, context: &'static str) -> Error {
+    Error::Io(pigeonhole_io::Error::new(kind, context))
 }
 
 /// What the superblock points at: the manifest snapshot block and the live part of the
 /// delta log (decision D7).
+///
+/// ```
+/// use pigeonhole_pager::{Extent, Root};
+///
+/// let empty = Root::default();
+/// assert_eq!(empty.snapshot, None);
+/// let root = Root {
+///     snapshot: Some(Extent { page: 16, size_class: 0 }),
+///     snapshot_len: 512,
+///     manifest_version: 3,
+///     ..Root::default()
+/// };
+/// assert_ne!(root, empty);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Root {
     /// Extent holding the snapshot block; `None` for an empty database.
@@ -80,165 +182,641 @@ pub struct Root {
     pub manifest_version: ManifestVersion,
 }
 
+impl Root {
+    fn from_superblock(sb: &Superblock) -> Self {
+        Self {
+            snapshot: sb.snapshot,
+            snapshot_len: sb.snapshot_len,
+            log: sb.log,
+            log_len: sb.log_len,
+            manifest_version: sb.manifest_version,
+        }
+    }
+}
+
+/// Flag bit 0 of the superblock: the last writer closed cleanly.
+const FLAG_CLEAN: u64 = 1;
+
 /// A pager that has read its superblock but does not yet know which extents are live.
+///
+/// ```
+/// use pigeonhole_io::VfsRef;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_pager::{Pager, Root};
+///
+/// # fn main() -> pigeonhole_pager::Result<()> {
+/// let vfs: VfsRef = SimVfs::new(3);
+/// let path = "/db/data.phdb".as_ref();
+/// let id = Pager::create(&vfs, path)?.db_id();
+///
+/// let opened = Pager::open(&vfs, path, false)?;
+/// assert_eq!(opened.db_id(), id);
+/// assert_eq!(opened.root(), Root::default());
+/// // The engine reads the manifest through `opened.file()` here, then names live extents.
+/// let pager = opened.finish([])?;
+/// assert_eq!(pager.stats().allocated_bytes, 0);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct OpenedPager {
-    _priv: (),
+    file: FileRef,
+    writable: bool,
+    superblock: Superblock,
+    slot: u64,
 }
 
 impl OpenedPager {
     /// The current root, from the newest valid superblock.
     pub fn root(&self) -> Root {
-        todo!()
+        Root::from_superblock(&self.superblock)
     }
 
     /// The database id.
     pub fn db_id(&self) -> [u8; 16] {
-        todo!()
+        self.superblock.db_id
     }
 
-    /// Whether the last writer closed cleanly.
+    /// Whether the last writer closed cleanly. The flag stays set until the next root
+    /// commit, which clears it.
     pub fn clean_shutdown(&self) -> bool {
-        todo!()
+        self.superblock.flags & FLAG_CLEAN != 0
     }
 
     /// The file, for reading the manifest before `finish`.
     pub fn file(&self) -> &FileRef {
-        todo!()
+        &self.file
     }
 
     /// Marks `live` extents allocated (everything else is free) and returns a usable pager.
     /// `live` must include the manifest snapshot and log extents, every SST and every blob
-    /// extent.
+    /// extent. Exact duplicates are accepted (tablets may share an SST after a split);
+    /// overlapping, misaligned or out-of-file extents fail with [`Error::Format`].
     pub fn finish(self, live: impl IntoIterator<Item = Extent>) -> Result<Pager> {
-        todo!()
+        let frontier = self.file.len()?.div_ceil(UNIT_BYTES);
+        let alloc = Alloc::load(frontier, live).map_err(|e| {
+            let what = match e {
+                LoadError::Invalid => "live extent is not a valid extent",
+                LoadError::Overlap => "live extents overlap",
+                LoadError::PastEnd => "live extent past the end of the file",
+            };
+            Error::Format(pigeonhole_format::Error::Corrupt { what })
+        })?;
+        Ok(Pager {
+            inner: Arc::new(Inner {
+                file: self.file,
+                writable: self.writable,
+                db_id: self.superblock.db_id,
+                alloc: Mutex::new(alloc),
+                state: Mutex::new(CommitState {
+                    root: Root::from_superblock(&self.superblock),
+                    sequence: self.superblock.sequence,
+                    slot: self.slot,
+                    poisoned: false,
+                }),
+                committing: AtomicBool::new(false),
+            }),
+        })
     }
 }
 
 /// The main page file. Shared by every shard (`&self` methods, internally synchronized;
-/// allocation is per flush or compaction output, never per write).
+/// allocation is per flush or compaction output, never per write). See the crate docs'
+/// *Threading* section for what each call may block on.
+///
+/// Space is handed out as power-of-two [`Extent`]s from an in-memory buddy allocator
+/// (lowest address first within the smallest fitting size). An extent is freed either at
+/// once ([`abandon`](Pager::abandon), for output never published) or after epoch-deferred
+/// reclamation ([`retire`](Pager::retire) then [`reclaim`](Pager::reclaim)), so a view that
+/// can still reach an extent never sees it reused.
+///
+/// ```
+/// use pigeonhole_io::VfsRef;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_pager::{Pager, Root};
+///
+/// # fn main() -> pigeonhole_pager::Result<()> {
+/// let vfs: VfsRef = SimVfs::new(9);
+/// let pager = Pager::create(&vfs, "/db/data.phdb".as_ref())?;
+/// let old = pager.allocate(64 << 10)?;
+/// pager.commit_root(Root { snapshot: Some(old), manifest_version: 1, ..Root::default() })?;
+///
+/// // Version 2 no longer references `old`; a snapshot of version 1 may still read it.
+/// let new = pager.allocate(64 << 10)?;
+/// pager.commit_root(Root { snapshot: Some(new), manifest_version: 2, ..Root::default() })?;
+/// pager.retire(old, 2);
+/// assert_eq!(pager.reclaim(1), 0); // a view at version 1 is still live
+/// assert_eq!(pager.reclaim(2), 1); // every live view is at version 2 or later
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Pager {
-    _priv: (),
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    file: FileRef,
+    writable: bool,
+    db_id: [u8; 16],
+    alloc: Mutex<Alloc>,
+    state: Mutex<CommitState>,
+    /// Set while a root commit runs; overlapping commits are refused.
+    committing: AtomicBool,
+}
+
+#[derive(Debug)]
+struct CommitState {
+    /// The root most recently committed (or reloaded).
+    root: Root,
+    /// Sequence of the current superblock.
+    sequence: u64,
+    /// Page of the current superblock; the next commit writes the other one.
+    slot: u64,
+    /// A commit failed after its first sync started: the on-disk root is uncertain and an
+    /// fsync error may have dropped data, so no further commit is attempted.
+    poisoned: bool,
+}
+
+/// A root commit in flight: the encoded superblock and where it goes.
+struct PendingCommit {
+    page: Box<[u8; PAGE_SIZE]>,
+    slot: u64,
+    sequence: u64,
+    root: Root,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The smallest size class holding `bytes`.
+fn class_for(bytes: u64) -> Result<u8> {
+    let class = (0..=Extent::MAX_CLASS).find(|&c| UNIT_BYTES << c >= bytes);
+    class.ok_or(Error::TooLarge)
+}
+
+fn grow_error(e: pigeonhole_io::Error) -> Error {
+    match e.kind {
+        ErrorKind::NoSpace => Error::NoSpace,
+        _ => Error::Io(e),
+    }
+}
+
+/// A fresh database id. There is no randomness source in the `Vfs`, so this mixes the
+/// standard library's per-process random hash keys with the clocks and the path.
+fn random_db_id(vfs: &VfsRef, path: &Path) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let (halves, _) = id.as_chunks_mut::<8>();
+    for (i, half) in halves.iter_mut().enumerate() {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(vfs.now_micros());
+        h.write_u64(vfs.monotonic_nanos());
+        h.write_u32(vfs.current_process().pid);
+        h.write(path.as_os_str().as_encoded_bytes());
+        h.write_usize(i);
+        *half = h.finish().to_le_bytes();
+    }
+    id
+}
+
+/// Reads one superblock slot. A short file reads as a truncated (invalid) superblock.
+fn read_slot(file: &FileRef, slot: u64) -> Result<pigeonhole_format::Result<Superblock>> {
+    let mut page = [0u8; PAGE_SIZE];
+    match file.read_at(&mut page, slot * PAGE_SIZE as u64) {
+        Ok(()) => Ok(Superblock::decode(&page)),
+        Err(e) if e.kind == ErrorKind::UnexpectedEof => {
+            Ok(Err(pigeonhole_format::Error::Truncated {
+                what: "superblock",
+            }))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The current superblock and its page.
+fn read_superblocks(file: &FileRef) -> Result<(Superblock, u64)> {
+    let a = read_slot(file, SUPERBLOCK_PAGE_A)?;
+    let b = read_slot(file, SUPERBLOCK_PAGE_B)?;
+    Ok(Superblock::choose(a, b)?)
+}
+
+impl Inner {
+    /// Validates and encodes a commit of `root` and claims the commit slot.
+    fn begin(&self, root: Root, clean: bool) -> pigeonhole_io::Result<PendingCommit> {
+        use pigeonhole_io::Error as IoError;
+        if !self.writable {
+            return Err(IoError::new(
+                ErrorKind::Unsupported,
+                "root commit on a read-only pager",
+            ));
+        }
+        if self.committing.swap(true, Ordering::AcqRel) {
+            return Err(IoError::new(ErrorKind::Other, "root commits overlap"));
+        }
+        let st = lock(&self.state);
+        if st.poisoned {
+            drop(st);
+            self.committing.store(false, Ordering::Release);
+            return Err(IoError::new(
+                ErrorKind::Other,
+                "an earlier root commit failed; reopen the database",
+            ));
+        }
+        let sequence = st.sequence + 1;
+        let slot = st.slot ^ 1;
+        drop(st);
+        let file_pages = lock(&self.alloc).frontier() * UNIT_PAGES;
+        let sb = Superblock {
+            version: FormatVersion::CURRENT,
+            page_size: PAGE_SIZE as u32,
+            sequence,
+            db_id: self.db_id,
+            snapshot: root.snapshot,
+            snapshot_len: root.snapshot_len,
+            log: root.log,
+            log_len: root.log_len,
+            manifest_version: root.manifest_version,
+            file_pages,
+            flags: if clean { FLAG_CLEAN } else { 0 },
+        };
+        let mut page = Box::new([0u8; PAGE_SIZE]);
+        sb.encode(&mut page);
+        Ok(PendingCommit {
+            page,
+            slot,
+            sequence,
+            root,
+        })
+    }
+
+    fn write_superblock(&self, p: &PendingCommit) -> pigeonhole_io::Result<()> {
+        self.file.write_at(&p.page[..], p.slot * PAGE_SIZE as u64)
+    }
+
+    /// Ends a commit: on success the new root is current; on failure the pager is poisoned.
+    fn end(
+        &self,
+        p: PendingCommit,
+        result: pigeonhole_io::Result<()>,
+    ) -> pigeonhole_io::Result<()> {
+        let mut st = lock(&self.state);
+        match &result {
+            Ok(()) => {
+                st.root = p.root;
+                st.sequence = p.sequence;
+                st.slot = p.slot;
+            }
+            Err(_) => st.poisoned = true,
+        }
+        drop(st);
+        self.committing.store(false, Ordering::Release);
+        result
+    }
+
+    /// Sync, write the non-current superblock, sync; blocking.
+    fn commit(&self, root: Root, clean: bool) -> pigeonhole_io::Result<()> {
+        let p = self.begin(root, clean)?;
+        let result = self
+            .file
+            .sync_data()
+            .and_then(|()| self.write_superblock(&p))
+            .and_then(|()| self.file.sync_data());
+        self.end(p, result)
+    }
+
+    /// The same steps with both syncs submitted to the I/O backend. The superblock write (one
+    /// 4 KiB page into the page cache) runs on the thread that resolves the first sync.
+    fn submit_commit(self: Arc<Self>, root: Root) -> Completion<()> {
+        let p = match self.begin(root, false) {
+            Ok(p) => p,
+            Err(e) => return Completion::ready(Err(e)),
+        };
+        let (done, resolver) = Completion::pair();
+        let first = self.file.submit_sync_data();
+        // The continuation's own completion is not needed: `resolver` reports the outcome.
+        let _chained = first.map(move |synced| {
+            match synced.and_then(|()| self.write_superblock(&p)) {
+                Err(e) => resolver.resolve(self.end(p, Err(e))),
+                Ok(()) => {
+                    let second = self.file.submit_sync_data();
+                    let _chained = second.map(move |synced| {
+                        resolver.resolve(self.end(p, synced));
+                        Ok(())
+                    });
+                }
+            }
+            Ok(())
+        });
+        done
+    }
 }
 
 impl Pager {
     /// Creates a new database file at `path` with an empty root (`Root::default()`) and a
     /// fresh random db id. Fails if the file exists.
+    ///
+    /// The file is usable once this returns (superblock A written and synced, directory
+    /// entry synced). A crash during `create` can leave a file without a valid superblock;
+    /// [`Pager::open`] then fails with [`Error::Format`], and the caller may remove it and
+    /// create again since nothing was ever committed to it.
     pub fn create(vfs: &VfsRef, path: &Path) -> Result<Pager> {
-        todo!()
+        let mut opts = OpenOptions::read_write_create();
+        opts.create_new = true;
+        let file = vfs.open(path, opts)?;
+        file.set_len(UNIT_BYTES).map_err(grow_error)?;
+        let superblock = Superblock {
+            version: FormatVersion::CURRENT,
+            page_size: PAGE_SIZE as u32,
+            sequence: 1,
+            db_id: random_db_id(vfs, path),
+            snapshot: None,
+            snapshot_len: 0,
+            log: None,
+            log_len: 0,
+            manifest_version: 0,
+            file_pages: UNIT_PAGES,
+            flags: 0,
+        };
+        let mut page = [0u8; PAGE_SIZE];
+        superblock.encode(&mut page);
+        file.write_at(&page, SUPERBLOCK_PAGE_A * PAGE_SIZE as u64)?;
+        file.sync_all()?;
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        vfs.sync_dir(dir)?;
+        OpenedPager {
+            file,
+            writable: true,
+            superblock,
+            slot: SUPERBLOCK_PAGE_A,
+        }
+        .finish([])
     }
 
     /// Opens an existing file and reads both superblocks. No recovery scan. A read-only pager
     /// (reader processes) never allocates, retires or commits; it only reads and reloads.
     pub fn open(vfs: &VfsRef, path: &Path, writable: bool) -> Result<OpenedPager> {
-        todo!()
+        let mut opts = OpenOptions::read();
+        opts.write = writable;
+        let file = vfs.open(path, opts)?;
+        let (superblock, slot) = read_superblocks(&file)?;
+        Ok(OpenedPager {
+            file,
+            writable,
+            superblock,
+            slot,
+        })
     }
 
     /// The file handle (SST and blob readers read extents through it directly).
     pub fn file(&self) -> &FileRef {
-        todo!()
+        &self.inner.file
     }
 
     /// The database id.
     pub fn db_id(&self) -> [u8; 16] {
-        todo!()
+        self.inner.db_id
     }
 
     /// The root most recently committed.
     pub fn root(&self) -> Root {
-        todo!()
+        lock(&self.inner.state).root
     }
 
     /// Allocates the smallest extent of at least `bytes` (64 KiB minimum), growing the file
     /// if needed. Never returns an extent that is allocated or awaiting reclamation.
     pub fn allocate(&self, bytes: u64) -> Result<Extent> {
-        todo!()
+        let class = class_for(bytes)?;
+        if !self.inner.writable {
+            return Err(io_err(
+                ErrorKind::Unsupported,
+                "allocate on a read-only pager",
+            ));
+        }
+        let mut alloc = lock(&self.inner.alloc);
+        if let Some(e) = alloc.alloc_free(class) {
+            return Ok(e);
+        }
+        // Preallocate rather than extend sparsely: a full disk fails here, as `NoSpace`, and
+        // later writes into the extent need no metadata update before the commit's fsync.
+        let (_, end) = alloc.grow_target(class);
+        let from = alloc.frontier() * UNIT_BYTES;
+        self.inner
+            .file
+            .allocate(from, end * UNIT_BYTES - from)
+            .map_err(grow_error)?;
+        Ok(alloc.alloc_grown(class))
     }
 
     /// Returns an extent that was allocated but never published in a root (an abandoned
     /// flush or compaction output). Freed immediately.
     pub fn abandon(&self, extent: Extent) {
-        todo!()
+        let freed = lock(&self.inner.alloc).release_live(extent);
+        debug_assert!(freed, "abandon of an extent that is not live: {extent:?}");
+    }
+
+    fn check_range(extent: Extent, offset: u64, len: usize) -> Result<u64> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= extent.len() => Ok(extent.offset() + offset),
+            _ => Err(io_err(ErrorKind::Other, "access past the end of an extent")),
+        }
     }
 
     /// Writes `data` at `offset` within `extent`.
     pub fn write(&self, extent: Extent, offset: u64, data: &[u8]) -> Result<()> {
-        todo!()
+        let at = Self::check_range(extent, offset, data.len())?;
+        debug_assert!(
+            lock(&self.inner.alloc).is_used(extent),
+            "write to an unallocated extent: {extent:?}"
+        );
+        Ok(self.inner.file.write_at(data, at)?)
     }
 
     /// Reads `buf.len()` bytes at `offset` within `extent`.
     pub fn read(&self, extent: Extent, offset: u64, buf: &mut [u8]) -> Result<()> {
-        todo!()
+        let at = Self::check_range(extent, offset, buf.len())?;
+        Ok(self.inner.file.read_at(buf, at)?)
     }
 
     /// Publishes `root`: syncs data written so far, writes the non-current superblock slot
     /// with a higher sequence, and syncs again. The only in-place write of live data in the
     /// main file. When this returns, a crash recovers to `root`; before it returns, to the
     /// previous root or `root`. Blocks; use [`Pager::submit_commit_root`] on a shard thread.
+    ///
+    /// If a commit fails, the pager refuses every later commit (an fsync error may have
+    /// dropped written data, so retrying could publish a root over lost bytes); reopen.
     pub fn commit_root(&self, root: Root) -> Result<()> {
-        todo!()
+        Ok(self.inner.commit(root, false)?)
     }
 
     /// [`Pager::commit_root`] run by the I/O backend: returns at once, so the manifest task
     /// never blocks a shard's foreground loop on the two fsyncs. Root commits must not
     /// overlap; submit the next only after this one resolves.
     pub fn submit_commit_root(&self, root: Root) -> Completion<()> {
-        todo!()
+        Arc::clone(&self.inner).submit_commit(root)
     }
 
     /// Re-reads both superblocks and returns the current root if it changed since the last
     /// call (read-only handles in reader processes, when the shared-memory header names a
-    /// newer manifest version). Never writes.
+    /// newer manifest version). Never writes. A writable pager already knows its root and
+    /// returns `None`.
     pub fn reload_root(&self) -> Result<Option<Root>> {
-        todo!()
+        if self.inner.writable {
+            return Ok(None);
+        }
+        let (sb, slot) = read_superblocks(&self.inner.file)?;
+        let mut st = lock(&self.inner.state);
+        if sb.sequence == st.sequence {
+            return Ok(None);
+        }
+        st.sequence = sb.sequence;
+        st.slot = slot;
+        st.root = Root::from_superblock(&sb);
+        Ok(Some(st.root))
     }
 
     /// Marks `extent` unreachable from the root committed at `superseded_at` and every later
     /// one. It is freed by [`Pager::reclaim`] once no view older than `superseded_at` lives.
     pub fn retire(&self, extent: Extent, superseded_at: ManifestVersion) {
-        todo!()
+        let retired = lock(&self.inner.alloc).retire(extent, superseded_at);
+        debug_assert!(retired, "retire of an extent that is not live: {extent:?}");
     }
 
     /// Frees every retired extent whose `superseded_at <= oldest_live`, where `oldest_live`
     /// is the oldest manifest version any view (in-process or in a reader slot) still uses.
     pub fn reclaim(&self, oldest_live: ManifestVersion) -> usize {
-        todo!()
+        lock(&self.inner.alloc).reclaim(oldest_live)
     }
 
     /// Extents past the shrink point that must move before the file can shrink.
+    ///
+    /// The shrink point is where the live (not retired) extents would end if packed toward
+    /// the start of the file, largest first. The plan is best effort: relocating every
+    /// extent it names, publishing the moves, retiring and reclaiming the old extents and
+    /// then calling [`Pager::truncate_tail`] shrinks the file; if free space below the point
+    /// is still held by retired extents, calling it again after they are reclaimed shrinks
+    /// it further.
     pub fn shrink_plan(&self) -> Vec<Extent> {
-        todo!()
+        lock(&self.inner.alloc).shrink_plan()
     }
 
     /// Copies `extent` into a newly allocated extent nearer the start of the file and returns
     /// it. The caller publishes the move in the manifest, then retires the old extent.
+    ///
+    /// Fails with [`Error::NoSpace`] if no free extent of that size lies below `extent`.
     pub fn relocate(&self, extent: Extent) -> Result<Extent> {
-        todo!()
+        if !self.inner.writable {
+            return Err(io_err(
+                ErrorKind::Unsupported,
+                "relocate on a read-only pager",
+            ));
+        }
+        let target = {
+            let mut alloc = lock(&self.inner.alloc);
+            if !alloc.is_used(extent) {
+                return Err(io_err(
+                    ErrorKind::Other,
+                    "relocate of an unallocated extent",
+                ));
+            }
+            match alloc.alloc_lowest(extent.size_class) {
+                Some(t) if t.page < extent.page => t,
+                Some(t) => {
+                    alloc.release_live(t);
+                    return Err(Error::NoSpace);
+                }
+                None => return Err(Error::NoSpace),
+            }
+        };
+        if let Err(e) = self.copy_extent(extent, target) {
+            self.abandon(target);
+            return Err(e);
+        }
+        Ok(target)
+    }
+
+    fn copy_extent(&self, from: Extent, to: Extent) -> Result<()> {
+        const CHUNK: u64 = 1 << 20;
+        let mut buf = vec![0u8; CHUNK.min(from.len()) as usize];
+        let mut at = 0;
+        while at < from.len() {
+            self.read(from, at, &mut buf)?;
+            self.write(to, at, &buf)?;
+            at += buf.len() as u64;
+        }
+        Ok(())
     }
 
     /// Truncates the file after its last allocated extent. Returns bytes released.
+    ///
+    /// Retired extents still count as allocated (an old view may read them). The truncation
+    /// is synced before this returns.
     pub fn truncate_tail(&self) -> Result<u64> {
-        todo!()
+        if !self.inner.writable {
+            return Err(io_err(
+                ErrorKind::Unsupported,
+                "truncate on a read-only pager",
+            ));
+        }
+        let released = {
+            let mut alloc = lock(&self.inner.alloc);
+            let (end, frontier) = (alloc.used_end(), alloc.frontier());
+            if end >= frontier {
+                return Ok(0);
+            }
+            self.inner.file.set_len(end * UNIT_BYTES)?;
+            alloc.truncate(end);
+            (frontier - end) * UNIT_BYTES
+        };
+        self.inner.file.sync_all()?;
+        Ok(released)
     }
 
     /// Records a clean close in the superblock (bit 0 of flags) via one more root commit.
+    /// Blocks like [`Pager::commit_root`]. The next root commit clears the flag.
     pub fn mark_clean(&self) -> Result<()> {
-        todo!()
+        let root = self.root();
+        Ok(self.inner.commit(root, true)?)
     }
 
     /// Allocation statistics.
     pub fn stats(&self) -> PagerStats {
-        todo!()
+        let alloc = lock(&self.inner.alloc);
+        PagerStats {
+            file_bytes: alloc.frontier() * UNIT_BYTES,
+            allocated_bytes: (alloc.used_units() - alloc.retired_units()) * UNIT_BYTES,
+            retired_bytes: alloc.retired_units() * UNIT_BYTES,
+        }
     }
 }
 
-/// Space accounting.
+/// Space accounting. `allocated_bytes + retired_bytes` never exceeds `file_bytes`; the rest
+/// of the file (less the 64 KiB of superblocks and reserved pages) is free.
+///
+/// ```
+/// use pigeonhole_io::VfsRef;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_pager::Pager;
+///
+/// # fn main() -> pigeonhole_pager::Result<()> {
+/// let vfs: VfsRef = SimVfs::new(5);
+/// let pager = Pager::create(&vfs, "/db/data.phdb".as_ref())?;
+/// let e = pager.allocate(100 << 10)?; // rounds up to 128 KiB
+/// assert_eq!(pager.stats().allocated_bytes, 128 << 10);
+/// pager.retire(e, 1);
+/// assert_eq!(pager.stats().retired_bytes, 128 << 10);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PagerStats {
     /// File length in bytes.
     pub file_bytes: u64,
-    /// Bytes in allocated extents.
+    /// Bytes in allocated extents that are not retired.
     pub allocated_bytes: u64,
     /// Bytes retired but not yet reclaimed.
     pub retired_bytes: u64,

@@ -568,8 +568,10 @@ dependencies = [
 name = "pigeonhole-pager"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pigeonhole-format",
  "pigeonhole-io",
+ "proptest",
 ]
 
 [[package]]
