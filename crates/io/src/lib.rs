@@ -17,13 +17,12 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 // `unsafe` is permitted in this crate; every block carries a `// SAFETY:` argument.
 #![deny(unsafe_op_in_unsafe_fn)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
 
 mod buf;
 mod completion;
 mod error;
 mod file;
+mod os;
 pub mod pread;
 mod shared;
 pub mod sim;

@@ -86,7 +86,8 @@ pub trait File: Send + Sync + Debug {
 
     /// Takes a byte-range lock on the single byte at `byte`. Never blocks: fails with
     /// `ErrorKind::Locked` if a conflicting lock is held. Taking `Exclusive` while holding
-    /// `Shared` is an upgrade attempt.
+    /// `Shared` is an upgrade attempt. `Exclusive` needs a handle opened for writing (POSIX
+    /// refuses write locks on read-only descriptors); otherwise it fails with `Unsupported`.
     fn lock(&self, byte: u64, mode: LockMode) -> Result<()>;
 
     /// Releases this handle's lock on `byte` (a no-op if none is held).
