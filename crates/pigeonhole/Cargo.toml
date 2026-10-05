@@ -1,0 +1,19 @@
+[package]
+name = "pigeonhole"
+description = "Embedded, single-file, wide-column store: BigTable's data model with SQLite's deployment model."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+pigeonhole-engine = { workspace = true }
+
+[lints]
+workspace = true

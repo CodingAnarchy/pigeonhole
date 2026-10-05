@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.phdb
+*.phdb-wal-*
+/.claude/worktrees
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+proptest-regressions/

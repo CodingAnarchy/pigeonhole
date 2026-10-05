@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+  PROPTEST_CASES: 256
+
+jobs:
+  lint:
+    name: fmt + clippy + docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo doc --workspace --no-deps --all-features
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  msrv:
+    name: MSRV (1.96)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features
+        env:
+          RUSTFLAGS: ""
+
+  miri:
+    name: Miri (unsafe crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri test -p pigeonhole-io -p pigeonhole-cache -p pigeonhole-memtable -p pigeonhole-format
+        env:
+          RUSTFLAGS: ""
+          PROPTEST_CASES: 8
+          MIRIFLAGS: -Zmiri-disable-isolation
+
+  loom:
+    name: loom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -p pigeonhole-memtable -p pigeonhole-cache --lib loom
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: 3
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  semver:
+    name: semver checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: Check published crates only
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pkg in $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name'); do
+            if curl -fsS -A "pigeonhole-ci (github.com/CodingAnarchy/pigeonhole)" "https://crates.io/api/v1/crates/$pkg" >/dev/null 2>&1; then
+              cargo semver-checks -p "$pkg"
+            else
+              echo "skip $pkg: not yet published"
+            fi
+          done

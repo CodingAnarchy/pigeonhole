@@ -1,0 +1,21 @@
+[package]
+name = "pigeonhole-sst"
+description = "Sorted string tables for Pigeonhole: blocks, filters, partitioned index, filtered iteration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+pigeonhole-format = { workspace = true }
+pigeonhole-io = { workspace = true }
+pigeonhole-cache = { workspace = true }
+
+[lints]
+workspace = true

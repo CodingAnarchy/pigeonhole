@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/format",
+    "crates/io",
+    "crates/sim",
+    "crates/pager",
+    "crates/wal",
+    "crates/memtable",
+    "crates/cache",
+    "crates/runtime",
+    "crates/shm",
+    "crates/sst",
+    "crates/compaction",
+    "crates/engine",
+    "crates/pigeonhole",
+    "crates/bench",
+    "crates/arrow",
+    "crates/cli",
+    "crates/capi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/CodingAnarchy/pigeonhole"
+homepage = "https://github.com/CodingAnarchy/pigeonhole"
+authors = ["Matt Tanous <matt.tanous@hey.com>"]
+keywords = ["database", "wide-column", "embedded", "lsm", "bigtable"]
+categories = ["database-implementations", "data-structures"]
+
+[workspace.dependencies]
+pigeonhole-format = { path = "crates/format", version = "0.1.0" }
+pigeonhole-io = { path = "crates/io", version = "0.1.0" }
+pigeonhole-sim = { path = "crates/sim", version = "0.1.0" }
+pigeonhole-pager = { path = "crates/pager", version = "0.1.0" }
+pigeonhole-wal = { path = "crates/wal", version = "0.1.0" }
+pigeonhole-memtable = { path = "crates/memtable", version = "0.1.0" }
+pigeonhole-cache = { path = "crates/cache", version = "0.1.0" }
+pigeonhole-runtime = { path = "crates/runtime", version = "0.1.0" }
+pigeonhole-shm = { path = "crates/shm", version = "0.1.0" }
+pigeonhole-sst = { path = "crates/sst", version = "0.1.0" }
+pigeonhole-compaction = { path = "crates/compaction", version = "0.1.0" }
+pigeonhole-engine = { path = "crates/engine", version = "0.1.0" }
+pigeonhole = { path = "crates/pigeonhole", version = "0.1.0" }
+pigeonhole-bench = { path = "crates/bench", version = "0.1.0" }
+pigeonhole-arrow = { path = "crates/arrow", version = "0.1.0" }
+pigeonhole-cli = { path = "crates/cli", version = "0.1.0" }
+pigeonhole-capi = { path = "crates/capi", version = "0.1.0" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(pigeonhole_sim)"] }
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
