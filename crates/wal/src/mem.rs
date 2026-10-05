@@ -5,7 +5,7 @@ use pigeonhole_format::wal::{FRAGMENT_HEADER_LEN, FRAME_SIZE};
 use pigeonhole_format::{Durability, Lsn, StreamId};
 use pigeonhole_io::Completion;
 
-use crate::{CommitTicket, Result, Wal};
+use crate::{CommitTicket, Error, Result, Wal};
 
 /// In-memory mock of a stream for engine tests: keeps appended, written and synced records
 /// separately so a test can drop what a crash would lose.
@@ -100,6 +100,11 @@ impl Wal for MemWal {
     }
 
     fn append(&mut self, record: &WalRecord<'_>, durability: Durability) -> Result<CommitTicket> {
+        if durability == Durability::None {
+            return Err(Error::InvalidArgument {
+                what: "Durability::None commits write no WAL record",
+            });
+        }
         let mut bytes = Vec::new();
         record.encode(&mut bytes);
         let len = (bytes.len() + FRAGMENT_HEADER_LEN) as u64;

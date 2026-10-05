@@ -16,7 +16,9 @@ fn record_size() -> impl Strategy<Value = usize> {
     prop_oneof![
         4 => 0usize..200,
         1 => (FRAME_SIZE - 80)..(FRAME_SIZE + 80),
-        1 => 1usize..(3 * FRAME_SIZE),
+        // Up to three data frames less the fragment headers and the record's own overhead,
+        // so it fits the smallest segment used (4 frames).
+        1 => 1usize..(3 * FRAME_SIZE - 3 * 12 - 128),
     ]
 }
 
