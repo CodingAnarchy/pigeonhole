@@ -164,8 +164,34 @@ impl BlockCache {
     /// Pinned blocks of `file` stay indexed until a later eviction; file ids are never reused,
     /// so they can only be found by holders of the old file's keys.
     pub fn erase_file(&self, file: u64) {
-        self.shards
-            .for_each(|s| s.remove_unpinned_where(|k| k.file == file));
+        self.erase_files(&[file]);
+    }
+
+    /// [`erase_file`](Self::erase_file) for a batch of files (one pass over each shard, so a
+    /// compaction that removes many SSTs pays one scan, not one per file).
+    ///
+    /// ```
+    /// use pigeonhole_cache::{BlockCache, BlockKey, Priority};
+    ///
+    /// let cache = BlockCache::new(1 << 20, 0);
+    /// for file in 1..=3 {
+    ///     drop(cache.insert(BlockKey { file, offset: 0 }, vec![0; 8].into(), Priority::Normal));
+    /// }
+    /// cache.erase_files(&[1, 3]);
+    /// assert!(cache.get(BlockKey { file: 1, offset: 0 }).is_none());
+    /// assert!(cache.get(BlockKey { file: 2, offset: 0 }).is_some());
+    /// assert!(cache.get(BlockKey { file: 3, offset: 0 }).is_none());
+    /// ```
+    pub fn erase_files(&self, files: &[u64]) {
+        if files.len() <= 8 {
+            self.shards
+                .for_each(|s| s.remove_unpinned_where(|k| files.contains(&k.file)));
+        } else {
+            let mut sorted = files.to_vec();
+            sorted.sort_unstable();
+            self.shards
+                .for_each(|s| s.remove_unpinned_where(|k| sorted.binary_search(&k.file).is_ok()));
+        }
     }
 
     /// Bytes currently cached.
@@ -376,12 +402,9 @@ impl RowCache {
     #[inline]
     pub fn get(&self, family: u64, row: &[u8], epoch: u64) -> Option<RowHandle> {
         let h = Self::hash(family, row);
-        let mut shard = lock(self.shards.shard(h)?);
-        match shard.peek(&h) {
-            Some(e) if e.is(family, row) && e.epoch == epoch => {}
-            _ => return None,
-        }
-        shard.get(&h).map(|entry| RowHandle { entry })
+        lock(self.shards.shard(h)?)
+            .get_if(&h, |e| e.is(family, row) && e.epoch == epoch)
+            .map(|entry| RowHandle { entry })
     }
 
     /// Caches the encoded row (an engine-defined encoding of its visible cells).

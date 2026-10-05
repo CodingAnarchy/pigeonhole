@@ -1,6 +1,12 @@
 //! Loom models: a pinned `BlockHandle` or `Cell` outlives eviction, replacement and
 //! `erase_file` racing on other threads, and its bytes never change underneath it.
 //!
+//! Memory safety itself (no use-after-free of evicted bytes) comes from `Arc` ownership:
+//! eviction only drops the shard's reference. What these models check is the protocol on
+//! top: a handle is never handed out for an entry that eviction or `erase_file` has already
+//! removed from the shard's index and accounting, pinned entries stay indexed and charged,
+//! and the bytes a handle sees are the ones that were inserted.
+//!
 //! Run with `RUSTFLAGS="--cfg loom" cargo test --release -p pigeonhole-cache --lib loom`.
 
 use loom::thread;
@@ -113,5 +119,44 @@ fn loom_row_handle_survives_invalidate() {
         reader.join().unwrap();
         writer.join().unwrap();
         assert!(rows.get(1, b"r", 1).is_none());
+    });
+}
+
+#[test]
+fn loom_get_races_erase_file_and_eviction() {
+    loom::model(|| {
+        // Room for two blocks: the evicting insert must pick a victim among key(0) and
+        // key(1), which `get` may be pinning at the same moment.
+        let cache = Arc::new(BlockCache::new(128, 1));
+        drop(cache.insert(key(0), block(1), Priority::Normal));
+        drop(cache.insert(BlockKey { file: 2, offset: 0 }, block(2), Priority::Normal));
+
+        let c = Arc::clone(&cache);
+        let reader = thread::spawn(move || {
+            if let Some(h) = c.get(key(0)) {
+                // Pinned: neither the eraser nor the evictor may unindex or uncharge it.
+                thread::yield_now();
+                assert_eq!(h.bytes(), &[1; 64]);
+                let again = c.get(key(0)).expect("pinned block left the index");
+                assert!(
+                    Arc::ptr_eq(&again.block, &h.block),
+                    "handle for an evicted entry"
+                );
+                assert!(c.usage() >= 64, "pinned block uncharged");
+            }
+        });
+        let c = Arc::clone(&cache);
+        let eraser = thread::spawn(move || c.erase_file(1));
+        let c = Arc::clone(&cache);
+        let evictor = thread::spawn(move || {
+            drop(c.insert(BlockKey { file: 3, offset: 0 }, block(3), Priority::High));
+        });
+        reader.join().unwrap();
+        eraser.join().unwrap();
+        evictor.join().unwrap();
+        assert!(cache.usage() <= 128 + 64);
+        if let Some(h) = cache.get(key(0)) {
+            assert_eq!(h.bytes(), &[1; 64]);
+        }
     });
 }

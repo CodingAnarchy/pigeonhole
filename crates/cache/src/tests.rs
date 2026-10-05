@@ -113,3 +113,82 @@ fn row_cache_new_epoch_replaces() {
     drop(rows.insert(1, b"r", 3, b"newer".to_vec()));
     assert_eq!(rows.usage(), one + 2);
 }
+
+/// Whether `k` is cached, without counting a hit.
+fn cached(c: &BlockCache, k: BlockKey) -> bool {
+    let shard = c.shards.shard(hash::hash_of(&k)).expect("shard");
+    lock(shard).peek(&k).is_some()
+}
+
+/// Whether `k` is cached in the main queue.
+fn in_main(c: &BlockCache, k: BlockKey) -> bool {
+    let shard = c.shards.shard(hash::hash_of(&k)).expect("shard");
+    lock(shard).in_main(&k)
+}
+
+#[test]
+fn high_outlives_equally_hot_normal_in_main() {
+    // Twenty 100-byte blocks. Five High and five Normal blocks are hit equally until both
+    // sets sit in main with saturated hit counts; then newcomers that are hit once (so they
+    // are promoted to main too) push main to evict, with no further hits on either set.
+    let c = BlockCache::new(2000, 1);
+    let high: Vec<BlockKey> = (0..5).map(key).collect();
+    let normal: Vec<BlockKey> = (100..105).map(key).collect();
+    for k in &high {
+        drop(c.insert(*k, block(100), Priority::High));
+    }
+    for k in &normal {
+        drop(c.insert(*k, block(100), Priority::Normal));
+    }
+    let mut next = 1000;
+    let mut newcomer = |c: &BlockCache| {
+        drop(c.insert(key(next), block(100), Priority::Normal));
+        drop(c.get(key(next)));
+        next += 1;
+    };
+    let hot = |c: &BlockCache| {
+        for k in high.iter().chain(&normal) {
+            for _ in 0..8 {
+                drop(c.get(*k));
+            }
+        }
+    };
+    for round in 0.. {
+        if normal.iter().all(|k| in_main(&c, *k)) {
+            break;
+        }
+        assert!(round < 100, "Normal blocks never promoted");
+        hot(&c);
+        newcomer(&c);
+    }
+    // Both sets are in main now; saturate them equally once more (promotion cost the Normal
+    // blocks a life). High sits ahead of Normal in main, so at equal lives it would go first.
+    assert!(high.iter().chain(&normal).all(|k| in_main(&c, *k)));
+    hot(&c);
+    while normal.iter().any(|k| cached(&c, *k)) {
+        newcomer(&c);
+    }
+    let left = high.iter().filter(|k| cached(&c, **k)).count();
+    assert_eq!(
+        left, 5,
+        "only {left} of 5 High blocks outlived the equally hot Normal ones"
+    );
+}
+
+#[test]
+fn erase_files_batches() {
+    let c = BlockCache::new(1 << 20, 4);
+    for file in 0..20 {
+        for off in 0..4 {
+            drop(c.insert(BlockKey { file, offset: off }, block(10), Priority::Normal));
+        }
+    }
+    let odd: Vec<u64> = (0..20).filter(|f| f % 2 == 1).collect();
+    c.erase_files(&odd);
+    c.erase_files(&[0, 2]);
+    for file in 0..20 {
+        let hit = c.get(BlockKey { file, offset: 3 }).is_some();
+        assert_eq!(hit, file % 2 == 0 && file > 2, "file {file}");
+    }
+    assert_eq!(c.usage(), 8 * 4 * 10);
+}

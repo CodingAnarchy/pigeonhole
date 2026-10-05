@@ -18,9 +18,15 @@
 //! entry dropped from the index while pinned (replacement, invalidation) stays valid: its
 //! bytes are owned by the `Arc` and freed by the last handle.
 //!
-//! Priorities ([`Priority`]): `High` enters main directly with two extra lives; `Normal` is
-//! plain S3-FIFO; `Low` (scans, compaction) enters small, never leaves a ghost, and keeps at
-//! most one life in main. So a scan of `Low` blocks churns only the small queue.
+//! Priorities ([`Priority`]): `High` enters main directly with two lives and can bank up to
+//! seven (`Normal` three); `Normal` is plain S3-FIFO; `Low` (scans, compaction) enters small,
+//! never leaves a ghost, and keeps at most one life in main. So a scan of `Low` blocks churns
+//! only the small queue, and a `High` block outlives an equally hot `Normal` one.
+//!
+//! Memory safety (no use-after-evict) comes from `Arc` ownership, not from any locking
+//! protocol: eviction only drops the shard's own reference. The loom models check the
+//! accounting protocol around it (a handle `get` returns is never an entry already evicted
+//! or erased from the shard's books).
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -29,8 +35,15 @@ use crate::Priority;
 use crate::hash::BuildKeyHasher;
 use crate::sync::{Arc, Mutex, lock};
 
-/// Maximum hit count (S3-FIFO uses 2 bits).
-const MAX_FREQ: u8 = 3;
+/// Maximum hit count per priority: S3-FIFO's 2 bits for `Normal`, one life for `Low`, and
+/// more lives for `High`, so a hot `High` block outlasts an equally hot `Normal` one in main.
+const fn max_freq(priority: Priority) -> u8 {
+    match priority {
+        Priority::Low => 1,
+        Priority::Normal => 3,
+        Priority::High => 7,
+    }
+}
 
 /// The small queue's share of a shard's bytes, in percent.
 const SMALL_PERCENT: usize = 10;
@@ -58,13 +71,6 @@ struct Slot<V> {
 impl<V> Slot<V> {
     fn pinned(&self) -> bool {
         Arc::strong_count(&self.value) > 1
-    }
-
-    fn max_freq(&self) -> u8 {
-        match self.priority {
-            Priority::Low => 1,
-            _ => MAX_FREQ,
-        }
     }
 }
 
@@ -110,8 +116,18 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
     /// `Arc` increment.
     #[inline]
     pub(crate) fn get(&mut self, key: &K) -> Option<Arc<V>> {
+        self.get_if(key, |_| true)
+    }
+
+    /// Like [`get`](Self::get), but only when `pred` accepts the value (one hash probe; a
+    /// rejected entry's hit count is untouched).
+    #[inline]
+    pub(crate) fn get_if(&mut self, key: &K, pred: impl FnOnce(&V) -> bool) -> Option<Arc<V>> {
         let slot = self.map.get_mut(key)?;
-        slot.freq = (slot.freq + 1).min(slot.max_freq());
+        if !pred(&slot.value) {
+            return None;
+        }
+        slot.freq = (slot.freq + 1).min(max_freq(slot.priority));
         Some(Arc::clone(&slot.value))
     }
 
@@ -184,6 +200,12 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         self.usage -= freed.0;
         self.small_usage -= freed.1;
         self.maybe_compact();
+    }
+
+    /// Whether `key` is cached in the main queue.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn in_main(&self, key: &K) -> bool {
+        self.map.get(key).is_some_and(|s| s.queue == Queue::Main)
     }
 
     pub(crate) fn usage(&self) -> usize {
@@ -317,6 +339,8 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         self.next_id += 1;
         self.ghost_set.insert(key, id);
         self.ghost.push_back((key, id));
+        // Remember about as many evicted keys as the shard holds live entries (small and main
+        // together, the paper's "as many as main" rounded up), at least `MIN_GHOSTS`.
         let cap = self.map.len().max(MIN_GHOSTS);
         while self.ghost_set.len() > cap {
             let Some((k, id)) = self.ghost.pop_front() else {
@@ -371,11 +395,12 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
     #[inline]
     pub(crate) fn shard(&self, hash: u64) -> Option<&Mutex<Shard<K, V>>> {
         let n = self.shards.len() as u64;
-        // Lemire's multiply-shift range reduction over the high half of the hash (the shard's
-        // HashMap uses the low bits).
-        self.shards
-            .get((((hash >> 32) * n) >> 32) as usize)
-            .map(|s| &s.0)
+        // Lemire's multiply-shift range reduction over hash bits 16..48. The shard's HashMap
+        // hashes the same key to the same value and uses the low bits for the bucket and the
+        // top 7 bits as its probe tag; taking the shard from the top bits would give every
+        // key in a shard the same tag prefix and defeat probe filtering.
+        let mid = u64::from((hash >> 16) as u32);
+        self.shards.get(((mid * n) >> 32) as usize).map(|s| &s.0)
     }
 
     pub(crate) fn for_each(&self, mut f: impl FnMut(&mut Shard<K, V>)) {
