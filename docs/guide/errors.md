@@ -33,7 +33,7 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | 8 | `TableNotFound` | No such table. | `TableBuilder::open` or `drop_table` on a missing name; typo. | Use `create_if_missing`, or check `db.tables()`. |
 | 9 | `TableExists` | The table already exists. | `TableBuilder::create` on an existing name. | Use `create_if_missing` or `open`. |
 | 10 | `FamilyNotFound` | No such family. | Misspelled family in `put`, `get`, `row` or `scan`; family never declared. | Declare it on the `TableBuilder` (adding a family is cheap), or fix the name. Check `table.families()`. |
-| 11 | `FamilyExists` | The family already exists. | Adding a family that is already present. | Skip it; existing families keep their stored options. |
+| 11 | `FamilyExists` | The family already exists. | Reserved and rare: `TableBuilder::family` on an existing table does not fail (an existing family keeps its stored options). | If you see it, treat the family as present and continue. |
 | 12 | `UnknownMergeOperator` | A family names a merge operator this process has not registered. *(custom operators: Phase 2)* | Opening a database whose family uses a custom operator. | Register it with `Options::merge_operator`. For read-only inspection, `Options::allow_unregistered_merge_operators(true)` (compaction off; reads of affected cells fail with this code). |
 | 13 | `MergeFailed` | A merge operator failed. | Bad operand encoding, for example `put` of arbitrary bytes into an `incr` counter column. | Write counter columns only with `incr` and `put_i64`. |
 | 14 | `Conflict` | A transaction conflicted and was aborted. *(Phase 4)* | A concurrent commit touched what the transaction read. | Retry the whole transaction. |
@@ -51,8 +51,8 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 ## Handling guide
 | Situation | Action |
 |---|---|
-| Retryable | `Busy`; `Conflict` (retry the whole transaction); `WriterLocked` (after the other writer exits); `NoSpace` and `Io` once the cause is fixed. |
-| Programmer error | `FamilyNotFound`, `TableNotFound`, `TableExists`, `FamilyExists`, `KeyTooLarge`, `ValueTooLarge`, `InvalidArgument`, `Unsupported`, `Closed`, `ReadOnly`. Fix the code or the data model. |
+| Retryable | `Busy`; `Conflict` (retry the whole transaction); `WriterLocked` (after the other writer exits); `NoSpace` and `Io` once the cause is fixed; `NoReaderSlot` (after a reader process closes). |
+| Programmer error | `FamilyNotFound`, `TableNotFound`, `TableExists`, `FamilyExists`, `KeyTooLarge`, `ValueTooLarge`, `RecordTooLarge` (split the batch), `MergeFailed` (bad operand or mixed counter data), `InvalidArgument`, `Unsupported`, `Closed`, `ReadOnly`. Fix the code or the data model. |
 | Configuration | `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
 | Data integrity | `Corruption`. Do not retry; restore from backup. |
 

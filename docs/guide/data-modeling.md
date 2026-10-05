@@ -63,7 +63,7 @@ readings.mutate(b"sensor:7").put_at("temp", &q, ts_micros, &value_bytes).commit(
 // A time window for one sensor: contiguous qualifier range.
 let lo = t0_secs.to_be_bytes();
 let hi = t1_secs.to_be_bytes();
-let it = readings
+let row = readings
     .row(b"sensor:7")
     .family("temp")
     .qualifier_range(&lo[..]..&hi[..])
@@ -98,7 +98,7 @@ let row = g.row(b"node:a").family("out").read()?;
 // Is there an edge a -> b? A point get; the bloom filter makes misses cheap.
 let exists = g.get(b"node:a", "out", b"node:b")?.is_some();
 
-// Neighbors in a range of ids, or the first 100 only:
+// The first 100 neighbors only:
 let page = g.row(b"node:a").family("out").column_limit(100).read()?;
 ```
 - Edge properties go in the value, or as extra families keyed the same way.

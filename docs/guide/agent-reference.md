@@ -10,7 +10,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Row key, qualifier | Arbitrary bytes, each ≤ 64 KiB, else `KeyTooLarge`. Sorted byte-wise. |
 | Value | P1: ≤ `min(WAL segment payload, 64 MiB, ½ memtable arena)`, else `ValueTooLarge` (D16). P2 blobs lift it; ceiling 2³²−1 bytes. |
 | Timestamp | `u64` **microseconds** since the Unix epoch (D11). Default = `max(now, tablet floor + 1)`, never goes backwards. User timestamps are microseconds for TTL. |
-| Version order | Newest timestamp first; ties broken by later commit. |
+| Version order | Newest timestamp first; the same timestamp is ordered by inverted seqno (later commit first). Multiple mutations to the same (row, family, qualifier, timestamp) **within one commit** collapse to the last one written (D34, pending). |
 | Atomicity | One `RowMutation` = one row, all families, all-or-nothing. `WriteBatch` = any rows/tables, atomic, one durability point. |
 | Builder errors | Surface at `commit`/`read`/`iter`, not at the builder call. |
 | Delete rule (D9) | `delete_column`/`delete_family` at ts `T` hides every version in scope with ts ≤ `T`, regardless of commit order. `delete_cell(ts)` hides exactly that version. |
