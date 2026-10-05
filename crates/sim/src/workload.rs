@@ -244,6 +244,77 @@ impl Workload {
         }
     }
 
+    /// A mutation to the same column as `prev` that collides with it: same timestamp (the
+    /// tick, which a harness maps to the commit timestamp), a column delete, or a family or
+    /// row marker.
+    fn companion(&mut self, prev: &ModelOp) -> ModelOp {
+        let (table, row, family) = match prev {
+            ModelOp::Put {
+                table, row, family, ..
+            }
+            | ModelOp::Incr {
+                table, row, family, ..
+            }
+            | ModelOp::DeleteCell {
+                table, row, family, ..
+            }
+            | ModelOp::DeleteColumn {
+                table, row, family, ..
+            }
+            | ModelOp::DeleteFamily { table, row, family } => (table, row, family),
+            ModelOp::DeleteRow { table, row } => (table, row, &self.spec.families[0]),
+        };
+        let (table, row, family) = (table.clone(), row.clone(), family.clone());
+        let qualifier = match prev {
+            ModelOp::Put { qualifier, .. }
+            | ModelOp::Incr { qualifier, .. }
+            | ModelOp::DeleteCell { qualifier, .. }
+            | ModelOp::DeleteColumn { qualifier, .. } => qualifier.clone(),
+            _ => self.qualifier(),
+        };
+        let counter = family.starts_with("counter");
+        match self.rng.below(6) {
+            0 if counter => ModelOp::Incr {
+                table,
+                row,
+                family,
+                qualifier,
+                delta: self.rng.below(100) as i64,
+            },
+            0 | 1 => {
+                let ts = self.rng.chance(500_000).then_some(self.tick);
+                let value = if counter {
+                    7i64.to_le_bytes().to_vec()
+                } else {
+                    self.value()
+                };
+                ModelOp::Put {
+                    table,
+                    row,
+                    family,
+                    qualifier,
+                    ts,
+                    value,
+                }
+            }
+            2 => ModelOp::DeleteCell {
+                table,
+                row,
+                family,
+                qualifier,
+                ts: self.tick,
+            },
+            3 => ModelOp::DeleteColumn {
+                table,
+                row,
+                family,
+                qualifier,
+            },
+            4 => ModelOp::DeleteFamily { table, row, family },
+            _ => ModelOp::DeleteRow { table, row },
+        }
+    }
+
     fn durability(&mut self) -> Durability {
         match self.rng.below(100) {
             0..=9 => Durability::None,
@@ -277,7 +348,16 @@ impl Iterator for Workload {
             });
         }
         let n = 1 + self.rng.below(u64::from(self.spec.max_batch));
-        let ops = (0..n).map(|_| self.mutation()).collect();
+        let mut ops = Vec::new();
+        while (ops.len() as u64) < n {
+            let m = self.mutation();
+            // Sometimes follow with a second mutation to the same column, at the commit
+            // timestamp or covering it, to exercise same-commit collapse (D34) and markers.
+            let companion =
+                (ops.len() as u64 + 1 < n && self.rng.chance(200_000)).then(|| self.companion(&m));
+            ops.push(m);
+            ops.extend(companion);
+        }
         Some(Op::Commit(ops, self.durability()))
     }
 }
@@ -367,5 +447,57 @@ mod tests {
             ..WorkloadSpec::default()
         };
         assert_eq!(Workload::new(1, "t", spec).take(100).count(), 100);
+    }
+
+    #[test]
+    fn generates_same_column_collisions_within_a_commit() {
+        let spec = WorkloadSpec {
+            families: vec!["f".into(), "counter".into()],
+            read_fraction: 0.0,
+            max_batch: 4,
+            ..WorkloadSpec::default()
+        };
+        let col = |m: &ModelOp| match m {
+            ModelOp::Put {
+                row,
+                family,
+                qualifier,
+                ..
+            }
+            | ModelOp::Incr {
+                row,
+                family,
+                qualifier,
+                ..
+            }
+            | ModelOp::DeleteCell {
+                row,
+                family,
+                qualifier,
+                ..
+            }
+            | ModelOp::DeleteColumn {
+                row,
+                family,
+                qualifier,
+                ..
+            } => Some((row.clone(), family.clone(), qualifier.clone())),
+            _ => None,
+        };
+        let (mut same_column, mut markers) = (0, 0);
+        for op in Workload::new(5, "t", spec).take(2_000) {
+            let Op::Commit(ops, _) = op else { continue };
+            assert!(ops.len() <= 4);
+            for (i, a) in ops.iter().enumerate() {
+                markers += usize::from(matches!(
+                    a,
+                    ModelOp::DeleteFamily { .. } | ModelOp::DeleteRow { .. }
+                ));
+                for b in &ops[i + 1..] {
+                    same_column += usize::from(col(a).is_some() && col(a) == col(b));
+                }
+            }
+        }
+        assert!(same_column > 50 && markers > 50, "{same_column} {markers}");
     }
 }

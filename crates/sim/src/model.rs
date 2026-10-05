@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::ops::Bound;
 
 use pigeonhole_format::{Durability, Seqno, Timestamp};
@@ -90,6 +91,29 @@ pub enum ModelOp {
     },
 }
 
+/// Why a commit was rejected. Nothing is applied when a commit fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelError {
+    /// The table does not exist.
+    NoSuchTable(String),
+    /// The family does not exist in the table.
+    NoSuchFamily(String),
+    /// `Incr` on a family without the `i64` add merge operator.
+    NoMergeOperator(String),
+}
+
+impl fmt::Display for ModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSuchTable(t) => write!(f, "no such table {t:?}"),
+            Self::NoSuchFamily(x) => write!(f, "no such family {x:?}"),
+            Self::NoMergeOperator(x) => write!(f, "family {x:?} has no merge operator"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
 /// A visible cell as the model returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCell {
@@ -152,19 +176,28 @@ struct Table {
 ///
 /// - Every commit gets the next seqno (from 1) and applies atomically. A snapshot is a seqno;
 ///   a read at snapshot `s` sees only entries with seqno `<= s`.
-/// - A column's versions are ordered newest first by timestamp. Two puts at one timestamp
-///   are one version: the higher seqno wins.
+/// - A column's versions are ordered newest first by timestamp, one version per timestamp.
+/// - **Same-commit collapse (D34).** Within one commit, mutations to the same
+///   `(row, family, qualifier, ts)` collapse to the last one written (a `Put`'s `ts` is its
+///   explicit or the commit timestamp; `Incr` and `DeleteColumn` use the commit timestamp;
+///   `DeleteCell` its own). So after a commit no column holds two entries at one `(ts, seqno)`.
+///   Family and row markers are separate keys and never collapse with column entries.
+/// - **Same timestamp across commits.** At one timestamp the newest-seqno put is the
+///   version's base; merge operands with a newer seqno fold onto it; every older entry at
+///   that timestamp is shadowed. A timestamp with operands only folds them into the run
+///   described under `Incr` below.
 /// - `DeleteColumn` and `DeleteFamily` (and `DeleteRow`, one family marker per family) take
 ///   the commit timestamp `T` and hide every version in scope with timestamp `<= T`,
-///   whatever its seqno; a later put with an older timestamp stays hidden. `DeleteCell`
-///   hides the versions at exactly its timestamp written before it.
+///   whatever its seqno, including a put in the same commit with timestamp `<= T` and a later
+///   put with an older timestamp. `DeleteCell` hides the versions at exactly its timestamp
+///   with an older seqno.
 /// - TTL: a version is expired when `ts + ttl_micros <= now` (timestamps are microseconds).
 ///   Expired versions are dropped before merge operands are folded and versions counted.
-/// - `Incr` is a merge operand at the commit timestamp. Going newest to oldest, a run of
-///   operands folds into one cell at the newest operand's timestamp: its value is the
-///   wrapping sum of the operands plus the `i64` in the next older put, which the fold
-///   consumes (a put value that is not 8 bytes counts as 0). Without a base the sum is the
-///   value.
+/// - `Incr` (only on `i64_add` families, else [`ModelError::NoMergeOperator`]) is a merge
+///   operand at the commit timestamp. Going newest to oldest, a run of operands folds into
+///   one cell at the newest operand's timestamp: its value is the wrapping sum of the
+///   operands plus the `i64` in the next older put, which the fold consumes (a put value
+///   that is not 8 bytes counts as 0). Without a base the sum is the value.
 /// - `max_versions` keeps the newest N resolved versions (after deletes, TTL and folding).
 /// - Reads order cells by family name, then qualifier, then timestamp descending.
 ///
@@ -212,21 +245,78 @@ impl Model {
     /// [`Durability::None`]: nothing is promised, but it may still have survived.
     ///
     /// # Panics
-    /// If an op names a table or family that does not exist.
+    /// If the commit is invalid; use [`Model::try_commit`] to get the error instead.
     pub fn commit(
         &mut self,
         ops: &[ModelOp],
         commit_ts: Timestamp,
         durability: Durability,
     ) -> Seqno {
-        self.commits.push(durability);
-        let seqno = self.commits.len() as Seqno;
-        for op in ops {
-            self.apply(op, commit_ts, seqno);
+        match self.try_commit(ops, commit_ts, durability) {
+            Ok(seqno) => seqno,
+            Err(e) => panic!("invalid model commit: {e}"),
         }
-        seqno
     }
 
+    /// Like [`Model::commit`], but an invalid commit is a typed error and changes nothing:
+    /// no seqno is consumed and no mutation is applied.
+    ///
+    /// Within one commit, mutations to the same column at the same timestamp collapse to the
+    /// last one written (decision D34); see the type docs.
+    pub fn try_commit(
+        &mut self,
+        ops: &[ModelOp],
+        commit_ts: Timestamp,
+        durability: Durability,
+    ) -> Result<Seqno, ModelError> {
+        for op in ops {
+            self.validate(op)?;
+        }
+        self.commits.push(durability);
+        let seqno = self.commits.len() as Seqno;
+        // Keep only the last column-level mutation per (row, family, qualifier, ts).
+        let mut last: BTreeMap<CollapseKey<'_>, usize> = BTreeMap::new();
+        for (i, op) in ops.iter().enumerate() {
+            if let Some(key) = column_key(op, commit_ts) {
+                last.insert(key, i);
+            }
+        }
+        for (i, op) in ops.iter().enumerate() {
+            let collapsed = column_key(op, commit_ts).is_some_and(|k| last[&k] != i);
+            if !collapsed {
+                self.apply(op, commit_ts, seqno);
+            }
+        }
+        Ok(seqno)
+    }
+
+    fn validate(&self, op: &ModelOp) -> Result<(), ModelError> {
+        let (table, family) = match op {
+            ModelOp::Put { table, family, .. }
+            | ModelOp::Incr { table, family, .. }
+            | ModelOp::DeleteCell { table, family, .. }
+            | ModelOp::DeleteColumn { table, family, .. }
+            | ModelOp::DeleteFamily { table, family, .. } => (table, Some(family)),
+            ModelOp::DeleteRow { table, .. } => (table, None),
+        };
+        let t = self
+            .tables
+            .get(table)
+            .ok_or_else(|| ModelError::NoSuchTable(table.clone()))?;
+        let Some(family) = family else {
+            return Ok(());
+        };
+        let f = t
+            .families
+            .get(family)
+            .ok_or_else(|| ModelError::NoSuchFamily(family.clone()))?;
+        if matches!(op, ModelOp::Incr { .. }) && !f.i64_add {
+            return Err(ModelError::NoMergeOperator(family.clone()));
+        }
+        Ok(())
+    }
+
+    /// Applies one validated mutation.
     fn apply(&mut self, op: &ModelOp, commit_ts: Timestamp, seqno: Seqno) {
         let (table, row) = match op {
             ModelOp::Put { table, row, .. }
@@ -236,18 +326,14 @@ impl Model {
             | ModelOp::DeleteFamily { table, row, .. }
             | ModelOp::DeleteRow { table, row } => (table, row),
         };
-        let t = self
-            .tables
-            .get_mut(table)
-            .unwrap_or_else(|| panic!("no table {table:?}"));
-        let column = |t: &mut Table, family: &String, qualifier: &Vec<u8>, entry: Entry| {
-            assert!(t.families.contains_key(family), "no family {family:?}");
+        let t = self.tables.get_mut(table).expect("validated");
+        let mut column = |family: &String, qualifier: &Vec<u8>, ts: Timestamp, kind: Kind| {
             t.columns
                 .entry(row.clone())
                 .or_default()
                 .entry((family.clone(), qualifier.clone()))
                 .or_default()
-                .push(entry);
+                .push(Entry { ts, seqno, kind });
         };
         match op {
             ModelOp::Put {
@@ -257,59 +343,33 @@ impl Model {
                 value,
                 ..
             } => column(
-                t,
                 family,
                 qualifier,
-                Entry {
-                    ts: ts.unwrap_or(commit_ts),
-                    seqno,
-                    kind: Kind::Put(value.clone()),
-                },
+                ts.unwrap_or(commit_ts),
+                Kind::Put(value.clone()),
             ),
             ModelOp::Incr {
                 family,
                 qualifier,
                 delta,
                 ..
-            } => column(
-                t,
-                family,
-                qualifier,
-                Entry {
-                    ts: commit_ts,
-                    seqno,
-                    kind: Kind::Merge(*delta),
-                },
-            ),
+            } => {
+                column(family, qualifier, commit_ts, Kind::Merge(*delta));
+            }
             ModelOp::DeleteCell {
                 family,
                 qualifier,
                 ts,
                 ..
-            } => column(
-                t,
-                family,
-                qualifier,
-                Entry {
-                    ts: *ts,
-                    seqno,
-                    kind: Kind::CellDelete,
-                },
-            ),
+            } => {
+                column(family, qualifier, *ts, Kind::CellDelete);
+            }
             ModelOp::DeleteColumn {
                 family, qualifier, ..
-            } => column(
-                t,
-                family,
-                qualifier,
-                Entry {
-                    ts: commit_ts,
-                    seqno,
-                    kind: Kind::ColumnDelete,
-                },
-            ),
+            } => {
+                column(family, qualifier, commit_ts, Kind::ColumnDelete);
+            }
             ModelOp::DeleteFamily { family, .. } => {
-                assert!(t.families.contains_key(family), "no family {family:?}");
                 t.family_deletes
                     .entry((row.clone(), family.clone()))
                     .or_default()
@@ -508,60 +568,70 @@ fn resolve(
                 .map(|m| m.0),
         )
         .max();
-    // Entries are in write order, so a position also orders entries inside one commit.
-    let cell_deletes: Vec<(usize, &Entry)> = entries
+    // Deletes and the survivors are found with linear scans, so resolving a column costs
+    // O(entries x cell deletes); columns in model runs are tiny, so clarity wins.
+    let cell_deletes: Vec<&Entry> = entries
         .iter()
-        .enumerate()
-        .filter(|(_, e)| visible(e.seqno) && matches!(e.kind, Kind::CellDelete))
+        .filter(|e| visible(e.seqno) && matches!(e.kind, Kind::CellDelete))
         .collect();
-
-    let mut live: Vec<(usize, &Entry)> = entries
+    let mut live: Vec<&Entry> = entries
         .iter()
-        .enumerate()
-        .filter(|(i, e)| {
+        .filter(|e| {
             visible(e.seqno)
                 && matches!(e.kind, Kind::Put(_) | Kind::Merge(_))
                 && covered.is_none_or(|c| e.ts > c)
-                && !cell_deletes.iter().any(|(d, de)| de.ts == e.ts && d > i)
+                && !cell_deletes
+                    .iter()
+                    .any(|d| d.ts == e.ts && d.seqno > e.seqno)
                 && (family.ttl_micros == 0 || e.ts.saturating_add(family.ttl_micros) > now)
         })
         .collect();
-    live.sort_by(|(ia, a), (ib, b)| (b.ts, b.seqno, ib).cmp(&(a.ts, a.seqno, ia)));
-    let live: Vec<&Entry> = live.into_iter().map(|(_, e)| e).collect();
-    // One version per timestamp: the highest seqno wins, except that merge operands at one
-    // timestamp all stay (they fold together).
+    // Within one commit a (column, ts) holds one entry (D34), so this order is total.
+    live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.seqno)));
+
+    // One version per timestamp. At a timestamp, entries are taken newest seqno first: the
+    // newest put is the base, merge operands newer than it fold onto it, and everything
+    // older at that timestamp is shadowed. A timestamp with operands but no put adds them to
+    // a pending run; the run folds onto the first older timestamp that has a put (whose
+    // newer-than-base operands join the sum), and the version carries the timestamp of the
+    // run's newest operand.
     let mut out: Vec<(Timestamp, Vec<u8>)> = Vec::new();
+    let mut run: Option<(Timestamp, i64)> = None;
     let mut i = 0;
     while i < live.len() {
-        match &live[i].kind {
-            Kind::Put(value) => {
-                let ts = live[i].ts;
+        let ts = live[i].ts;
+        let end = live[i..]
+            .iter()
+            .position(|e| e.ts != ts)
+            .map_or(live.len(), |n| i + n);
+        let group = &live[i..end];
+        i = end;
+        let base = group.iter().position(|e| matches!(e.kind, Kind::Put(_)));
+        let operands = group[..base.unwrap_or(group.len())]
+            .iter()
+            .fold(0i64, |sum, e| match e.kind {
+                Kind::Merge(d) => sum.wrapping_add(d),
+                _ => sum,
+            });
+        match base.map(|b| &group[b].kind) {
+            Some(Kind::Put(value)) if run.is_none() && base == Some(0) => {
                 out.push((ts, value.clone()));
-                while i < live.len() && live[i].ts == ts && matches!(live[i].kind, Kind::Put(_)) {
-                    i += 1;
-                }
             }
-            Kind::Merge(_) => {
-                let ts = live[i].ts;
-                let mut sum = 0i64;
-                while let Some(Kind::Merge(d)) = live.get(i).map(|e| &e.kind) {
-                    sum = sum.wrapping_add(*d);
-                    i += 1;
-                }
-                if let Some(Kind::Put(base)) = live.get(i).map(|e| &e.kind) {
-                    sum = sum.wrapping_add(as_i64(base));
-                    let base_ts = live[i].ts;
-                    while i < live.len()
-                        && live[i].ts == base_ts
-                        && matches!(live[i].kind, Kind::Put(_))
-                    {
-                        i += 1;
-                    }
-                }
-                out.push((ts, sum.to_le_bytes().to_vec()));
+            Some(Kind::Put(value)) => {
+                let (run_ts, run_sum) = run.take().unwrap_or((ts, 0));
+                let total = run_sum.wrapping_add(operands).wrapping_add(as_i64(value));
+                out.push((run_ts, total.to_le_bytes().to_vec()));
             }
-            _ => unreachable!("deletes were filtered out"),
+            _ => {
+                run = Some(match run {
+                    Some((run_ts, sum)) => (run_ts, sum.wrapping_add(operands)),
+                    None => (ts, operands),
+                });
+            }
         }
+    }
+    if let Some((run_ts, sum)) = run {
+        out.push((run_ts, sum.to_le_bytes().to_vec()));
     }
     let mut cap = if family.max_versions == 0 {
         usize::MAX
@@ -573,6 +643,46 @@ fn resolve(
     }
     out.truncate(cap);
     out
+}
+
+/// `(row, family, qualifier, ts)` of a column-level mutation, borrowed.
+type CollapseKey<'a> = (&'a str, &'a [u8], &'a str, &'a [u8], Timestamp);
+
+/// The collapse key of a column-level mutation: `(row, family, qualifier, ts)`. Family and row
+/// markers live in their own key space and never collapse with column entries.
+fn column_key(op: &ModelOp, commit_ts: Timestamp) -> Option<CollapseKey<'_>> {
+    Some(match op {
+        ModelOp::Put {
+            table,
+            row,
+            family,
+            qualifier,
+            ts,
+            ..
+        } => (table, row, family, qualifier, ts.unwrap_or(commit_ts)),
+        ModelOp::Incr {
+            table,
+            row,
+            family,
+            qualifier,
+            ..
+        }
+        | ModelOp::DeleteColumn {
+            table,
+            row,
+            family,
+            qualifier,
+        } => (table, row, family, qualifier, commit_ts),
+        ModelOp::DeleteCell {
+            table,
+            row,
+            family,
+            qualifier,
+            ts,
+        } => (table, row, family, qualifier, *ts),
+        ModelOp::DeleteFamily { .. } | ModelOp::DeleteRow { .. } => return None,
+    })
+    .map(|(t, r, f, q, ts)| (t.as_str(), r.as_slice(), f.as_str(), q.as_slice(), ts))
 }
 
 fn as_i64(bytes: &[u8]) -> i64 {
@@ -775,17 +885,20 @@ mod tests {
         };
         m.commit(&[incr("r", 1)], 5, Durability::Sync);
         m.commit(&[base], 10, Durability::Sync);
-        m.commit(&[incr("r", 1), incr("r", 1)], 20, Durability::Sync);
+        m.commit(&[incr("r", 1)], 20, Durability::Sync);
+        m.commit(&[incr("r", 1)], 20, Durability::Sync);
         let n = |snap| {
             m.get("t", b"r", "c", b"n", snap, 100)
                 .map(|c| (c.ts, i64::from_le_bytes(c.value.try_into().unwrap())))
         };
         assert_eq!(n(1), Some((5, 1)));
         assert_eq!(n(2), Some((10, 40)));
-        assert_eq!(n(3), Some((20, 42)));
+        assert_eq!(n(3), Some((20, 41)));
+        assert_eq!(n(4), Some((20, 42)));
         let mut w = model();
-        w.commit(&[incr("r", i64::MAX), incr("r", 1)], 1, Durability::Sync);
-        let v = w.get("t", b"r", "c", b"n", 1, 1).unwrap().value;
+        w.commit(&[incr("r", i64::MAX)], 1, Durability::Sync);
+        w.commit(&[incr("r", 1)], 2, Durability::Sync);
+        let v = w.get("t", b"r", "c", b"n", 2, 2).unwrap().value;
         assert_eq!(i64::from_le_bytes(v.try_into().unwrap()), i64::MIN);
     }
 
@@ -885,5 +998,252 @@ mod tests {
             m.commit(&[put("s", "q", None, "4")], 4, Durability::None),
             3
         );
+    }
+
+    fn counter_put(row: &str, ts: Option<u64>, v: i64) -> ModelOp {
+        ModelOp::Put {
+            table: "t".into(),
+            row: row.into(),
+            family: "c".into(),
+            qualifier: b"n".to_vec(),
+            ts,
+            value: v.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn counter(m: &Model, row: &str, snap: Seqno) -> Vec<(u64, i64)> {
+        m.read_row("t", row.as_bytes(), &["c"], 0, snap, 1_000)
+            .into_iter()
+            .map(|c| (c.ts, i64::from_le_bytes(c.value.try_into().unwrap())))
+            .collect()
+    }
+
+    #[test]
+    fn merge_and_put_at_one_timestamp_are_one_version() {
+        // Operand older than the put: shadowed by it.
+        let mut m = model();
+        m.commit(&[incr("r", 1)], 10, Durability::Sync);
+        m.commit(&[counter_put("r", Some(10), 5)], 11, Durability::Sync);
+        assert_eq!(counter(&m, "r", 2), [(10, 5)]);
+        // Operand newer than the put: folds onto it.
+        let mut m = model();
+        m.commit(&[counter_put("r", Some(10), 5)], 9, Durability::Sync);
+        m.commit(&[incr("r", 1)], 10, Durability::Sync);
+        assert_eq!(counter(&m, "r", 2), [(10, 6)]);
+        assert_eq!(counter(&m, "r", 1), [(10, 5)]);
+    }
+
+    #[test]
+    fn same_timestamp_newest_put_is_the_base() {
+        let mut m = model();
+        m.commit(&[counter_put("r", Some(10), 100)], 1, Durability::Sync); // 1: shadowed
+        m.commit(&[incr("r", 1000)], 10, Durability::Sync); // 2: shadowed (older than put 3)
+        m.commit(&[counter_put("r", Some(10), 5)], 10, Durability::Sync); // 3: base
+        m.commit(&[incr("r", 7)], 10, Durability::Sync); // 4: folds
+        assert_eq!(counter(&m, "r", 4), [(10, 12)]);
+        assert_eq!(counter(&m, "r", 3), [(10, 5)]);
+        assert_eq!(counter(&m, "r", 2), [(10, 1100)]);
+    }
+
+    #[test]
+    fn operand_run_folds_onto_older_timestamp_base_and_same_ts_operands() {
+        let mut m = model();
+        m.commit(&[counter_put("r", Some(5), 40)], 5, Durability::Sync);
+        m.commit(&[incr("r", 1)], 8, Durability::Sync);
+        m.commit(&[incr("r", 2)], 10, Durability::Sync);
+        // Operands at 10 and 8 fold onto the base at 5: one version at the newest operand's ts.
+        assert_eq!(counter(&m, "r", 3), [(10, 43)]);
+        // A put at 12 starts a new version above the run.
+        m.commit(&[counter_put("r", Some(12), 1)], 12, Durability::Sync);
+        assert_eq!(counter(&m, "r", 4), [(12, 1), (10, 43)]);
+    }
+
+    #[test]
+    fn same_commit_mutations_collapse_to_the_last_write() {
+        let mut m = model();
+        // Two puts at one column and timestamp: the last one is the cell.
+        m.commit(
+            &[put("r", "q", Some(7), "a"), put("r", "q", Some(7), "b")],
+            10,
+            Durability::Sync,
+        );
+        assert_eq!(values(&m, "r", 0, 1, 100), [(7, "b".into())]);
+        // Put (default ts) then incr at the commit ts: only the incr survives, no base.
+        let mut m = model();
+        m.commit(
+            &[counter_put("r", None, 50), incr("r", 3)],
+            10,
+            Durability::Sync,
+        );
+        assert_eq!(counter(&m, "r", 1), [(10, 3)]);
+        // Incr then put: only the put survives.
+        let mut m = model();
+        m.commit(
+            &[incr("r", 3), counter_put("r", None, 50)],
+            10,
+            Durability::Sync,
+        );
+        assert_eq!(counter(&m, "r", 1), [(10, 50)]);
+        // Different timestamps in one commit do not collapse.
+        let mut m = model();
+        m.commit(
+            &[put("r", "q", Some(1), "a"), put("r", "q", Some(2), "b")],
+            10,
+            Durability::Sync,
+        );
+        assert_eq!(values(&m, "r", 0, 1, 100).len(), 2);
+        // A column delete and a put at the commit timestamp are the same key: last wins.
+        let del = ModelOp::DeleteColumn {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "f".into(),
+            qualifier: b"q".to_vec(),
+        };
+        let mut m = model();
+        m.commit(&[put("r", "q", Some(3), "old")], 5, Durability::Sync);
+        m.commit(
+            &[del.clone(), put("r", "q", None, "new")],
+            10,
+            Durability::Sync,
+        );
+        assert_eq!(
+            values(&m, "r", 0, 2, 100),
+            [(10, "new".into()), (3, "old".into())]
+        );
+        let mut m = model();
+        m.commit(&[put("r", "q", Some(3), "old")], 5, Durability::Sync);
+        m.commit(&[put("r", "q", None, "new"), del], 10, Durability::Sync);
+        assert_eq!(values(&m, "r", 0, 2, 100), []);
+    }
+
+    #[test]
+    fn family_marker_hides_same_commit_puts_at_or_below_its_timestamp() {
+        let fd = ModelOp::DeleteFamily {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "f".into(),
+        };
+        for ops in [
+            vec![put("r", "q", Some(5), "x"), fd.clone()],
+            vec![fd.clone(), put("r", "q", Some(5), "x")],
+            vec![fd.clone(), put("r", "q", None, "x")],
+            vec![put("r", "q", None, "x"), fd.clone()],
+        ] {
+            let mut m = model();
+            m.commit(&ops, 10, Durability::Sync);
+            assert_eq!(values(&m, "r", 0, 1, 100), [], "{ops:?}");
+        }
+        // A put newer than the marker survives.
+        let mut m = model();
+        m.commit(&[fd, put("r", "q", Some(11), "x")], 10, Durability::Sync);
+        assert_eq!(values(&m, "r", 0, 1, 100), [(11, "x".into())]);
+    }
+
+    #[test]
+    fn invalid_commits_are_typed_errors_and_change_nothing() {
+        let mut m = model();
+        let bad_incr = ModelOp::Incr {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "f".into(),
+            qualifier: b"q".to_vec(),
+            delta: 1,
+        };
+        let ok = put("r", "q", None, "x");
+        assert_eq!(
+            m.try_commit(&[ok.clone(), bad_incr], 1, Durability::Sync),
+            Err(ModelError::NoMergeOperator("f".into()))
+        );
+        let mut nofam = put("r", "q", None, "x");
+        if let ModelOp::Put { family, .. } = &mut nofam {
+            *family = "zzz".into();
+        }
+        assert_eq!(
+            m.try_commit(&[nofam], 1, Durability::Sync),
+            Err(ModelError::NoSuchFamily("zzz".into()))
+        );
+        let mut notable = put("r", "q", None, "x");
+        if let ModelOp::Put { table, .. } = &mut notable {
+            *table = "nope".into();
+        }
+        assert_eq!(
+            m.try_commit(&[notable], 1, Durability::Sync),
+            Err(ModelError::NoSuchTable("nope".into()))
+        );
+        assert_eq!(m.snapshot(), 0);
+        assert_eq!(values(&m, "r", 0, 0, 100), []);
+        assert_eq!(m.try_commit(&[ok], 1, Durability::Sync), Ok(1));
+    }
+
+    #[test]
+    fn ttl_boundary_with_explicit_timestamps_and_versions() {
+        let mut m = Model::new();
+        m.create_table("t", vec![fam("f", 2, 100, false)]);
+        // Explicit timestamps: 1000 expires at now=1100, 1050 at 1150.
+        m.commit(
+            &[
+                put("r", "q", Some(1000), "a"),
+                put("r", "q", Some(1050), "b"),
+                put("r", "q", Some(1060), "c"),
+            ],
+            1060,
+            Durability::Sync,
+        );
+        let at = |now| m.read_row("t", b"r", &[], 0, 1, now).len();
+        // max_versions=2 keeps the newest two; expiry then shrinks it.
+        assert_eq!(at(1099), 2);
+        assert_eq!(at(1149), 2);
+        assert_eq!(at(1150), 1);
+        assert_eq!(at(1160), 0);
+    }
+
+    #[test]
+    fn delete_by_timestamp_boundaries_and_max_versions_after_deletes() {
+        let mut m = model();
+        let col = ModelOp::DeleteColumn {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "f".into(),
+            qualifier: b"q".to_vec(),
+        };
+        m.commit(
+            &[
+                put("r", "q", Some(19), "a"),
+                put("r", "q", Some(20), "b"),
+                put("r", "q", Some(21), "c"),
+            ],
+            5,
+            Durability::Sync,
+        );
+        m.commit(&[col], 20, Durability::Sync);
+        // The marker at 20 hides 19 and 20 but not 21.
+        assert_eq!(values(&m, "r", 0, 2, 100), [(21, "c".into())]);
+        // max_versions counts versions that survive deletes: family g keeps 2 of the rest.
+        let mut m = model();
+        for ts in 1..=4u64 {
+            let op = ModelOp::Put {
+                table: "t".into(),
+                row: b"r".to_vec(),
+                family: "g".into(),
+                qualifier: b"q".to_vec(),
+                ts: Some(ts),
+                value: vec![ts as u8],
+            };
+            m.commit(&[op], ts, Durability::Sync);
+        }
+        let del = ModelOp::DeleteCell {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "g".into(),
+            qualifier: b"q".to_vec(),
+            ts: 4,
+        };
+        m.commit(&[del], 5, Durability::Sync);
+        let ts: Vec<_> = m
+            .read_row("t", b"r", &[], 0, 5, 100)
+            .iter()
+            .map(|c| c.ts)
+            .collect();
+        assert_eq!(ts, [3, 2]);
     }
 }

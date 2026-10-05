@@ -460,6 +460,10 @@ fn decode(payload: &[u8], families: &[ModelFamily]) -> Option<Record> {
             }
             2 => {
                 let family = r.family(families)?;
+                // The model rejects `Incr` on a family without the merge operator.
+                if !families.iter().any(|f| f.name == family && f.i64_add) {
+                    return None;
+                }
                 let qualifier = r.bytes()?;
                 ModelOp::Incr {
                     table,
