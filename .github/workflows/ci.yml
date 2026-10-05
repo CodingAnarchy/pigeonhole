@@ -1,5 +1,8 @@
 name: CI
 
+# Kept to four jobs: this account schedules about four concurrent runners and
+# cancels jobs left queued for 15 minutes.
+
 on:
   push:
     branches: [main]
@@ -12,92 +15,30 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
   PROPTEST_CASES: 256
 
 jobs:
-  lint:
-    name: fmt + clippy + docs
+  linux:
+    name: linux (fmt, clippy, docs, test, deny, semver)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-semver-checks
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
       - run: cargo doc --workspace --no-deps --all-features
-
-  test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
-
-  msrv:
-    name: MSRV (1.96)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.96
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-features
-        env:
-          RUSTFLAGS: ""
-
-  miri:
-    name: Miri (unsafe crates)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo miri test -p pigeonhole-io -p pigeonhole-cache -p pigeonhole-memtable -p pigeonhole-format
-        env:
-          RUSTFLAGS: ""
-          PROPTEST_CASES: 8
-          MIRIFLAGS: -Zmiri-disable-isolation
-
-  loom:
-    name: loom
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release -p pigeonhole-memtable -p pigeonhole-cache --lib loom
-        env:
-          RUSTFLAGS: --cfg loom
-          LOOM_MAX_PREEMPTIONS: 3
-
-  deny:
-    name: cargo-deny
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
-  semver:
-    name: semver checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-semver-checks
-      - name: Check published crates only
+      - run: cargo deny check
+      - name: semver checks (published crates only)
         shell: bash
         run: |
           set -euo pipefail
@@ -108,3 +49,43 @@ jobs:
               echo "skip $pkg: not yet published"
             fi
           done
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  analysis:
+    name: analysis (MSRV, Miri, loom)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: MSRV 1.96
+        run: cargo +1.96 check --workspace --all-features
+      - name: Miri (unsafe crates + format)
+        run: cargo +nightly miri test -p pigeonhole-io -p pigeonhole-cache -p pigeonhole-memtable -p pigeonhole-format
+        env:
+          PROPTEST_CASES: 8
+          MIRIFLAGS: -Zmiri-disable-isolation
+      - name: loom
+        run: cargo test --release -p pigeonhole-memtable -p pigeonhole-cache --lib loom
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: 3
+          CARGO_TARGET_DIR: target/loom
