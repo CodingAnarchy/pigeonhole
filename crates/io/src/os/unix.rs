@@ -81,6 +81,11 @@ pub(crate) fn is_local(_file: &fs::File) -> Result<bool> {
 pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     let start = off(offset, "allocate: offset too large")?;
     let count = off(len, "allocate: length too large")?;
+    if count == 0 {
+        // fallocate rejects a zero length with EINVAL; keep the cross-backend semantics
+        // (extend to `offset` if the file is shorter) without the syscall.
+        return extend(file, offset, len);
+    }
     // SAFETY: plain syscall on an fd owned by `file`.
     if unsafe { libc::fallocate(file.as_raw_fd(), 0, start, count) } == 0 {
         return Ok(());

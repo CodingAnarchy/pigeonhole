@@ -113,6 +113,8 @@ fn lengths_and_allocation(b: &Backend) {
     assert_eq!(head, [7; 10], "allocate keeps existing data");
     f.allocate(0, 100).unwrap();
     assert_eq!(f.len().unwrap(), 4096, "allocate never shrinks");
+    f.allocate(0, 0).unwrap();
+    assert_eq!(f.len().unwrap(), 4096, "zero-length allocate is a no-op");
     f.allocate(8192, 100).unwrap();
     assert_eq!(f.len().unwrap(), 8292);
 }
