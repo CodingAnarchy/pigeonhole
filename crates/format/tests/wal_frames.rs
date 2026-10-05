@@ -121,7 +121,13 @@ proptest! {
             torn[i] = if stale { old[i] } else { 0 };
         }
         let (got, stop) = read(&torn, epoch, start);
-        let complete = spans.iter().take_while(|s| s.1 as usize <= cut).count();
+        // A record is complete if its bytes survived: usually it ended before the cut, but the
+        // bytes written past the cut may happen to equal the originals (a zero or stale byte
+        // matching a reserved byte), in which case the record is genuinely intact.
+        let complete = spans
+            .iter()
+            .take_while(|s| torn[start as usize..s.1 as usize] == seg[start as usize..s.1 as usize])
+            .count();
         prop_assert_eq!(got.len(), complete);
         for ((_, rec), want) in got.iter().zip(&records) {
             prop_assert_eq!(rec, want);
