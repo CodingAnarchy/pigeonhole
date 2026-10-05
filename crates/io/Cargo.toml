@@ -19,7 +19,16 @@ pigeonhole-format = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
+# `Win32_Security` gates `CreateFileMappingW` (its signature names SECURITY_ATTRIBUTES).
+windows-sys = { workspace = true, features = ["Win32_Security"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "io"
+harness = false
