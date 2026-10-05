@@ -15,5 +15,13 @@ readme = "README.md"
 pigeonhole-io = { workspace = true }
 pigeonhole-format = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "shm"
+harness = false
+
 [lints]
 workspace = true
