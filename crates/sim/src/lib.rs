@@ -12,8 +12,6 @@
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
 
 mod model;
 mod sim;
