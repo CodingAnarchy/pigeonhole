@@ -26,7 +26,6 @@ edition = "2024"
 rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/pigeonhole"
-homepage = "https://github.com/CodingAnarchy/pigeonhole"
 authors = ["Matt Tanous <matt.tanous@hey.com>"]
 keywords = ["database", "wide-column", "embedded", "lsm", "bigtable"]
 categories = ["database-implementations", "data-structures"]
