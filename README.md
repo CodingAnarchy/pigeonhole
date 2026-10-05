@@ -44,7 +44,7 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 | **Family** | Declared up front; its own physical LSM tree with its own policy (compression, bloom bits, versions, TTL, blob threshold, cache priority). |
 | **Qualifier** | Arbitrary bytes created on write, sorted within the family. Absent cells cost nothing. |
 | **Timestamp** | `u64`, newest first. Hybrid logical clock by default; user-supplied for event time. |
-| **Value** | Bytes (≤ 4 GiB, large values stored as blobs), with optional typed merge operators. |
+| **Value** | Bytes. Phase 1 caps a value at the smaller of 64 MiB and half a shard's memtable arena; Phase 2 blob separation raises the cap to 4 GiB − 1. Optional typed merge operators. |
 
 ## Targets
 | Goal | Target (NVMe, hot cache) |
