@@ -35,10 +35,6 @@ id_type!(
     /// A WAL stream (`data.phdb-wal-N` has stream id `N`). Independent of shard numbers.
     StreamId(u32)
 );
-id_type!(
-    /// The id of one cross-shard commit, carried by its PREPARE and COMMIT records.
-    CommitId(u64)
-);
 
 /// A global MVCC sequence number. Every commit gets one; `0` is never assigned.
 pub type Seqno = u64;
@@ -51,7 +47,7 @@ pub type Timestamp = u64;
 pub type ManifestVersion = u64;
 
 /// A position in one WAL stream: `(segment epoch << 32) | byte offset within the segment`.
-/// Ordered: a larger `Lsn` was written later.
+/// Ordered: a larger `Lsn` was written later. Segments are therefore at most 4 GiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct Lsn(pub u64);

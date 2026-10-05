@@ -81,6 +81,7 @@ impl Options {
 
     /// Run on a custom filesystem implementation. Used by the deterministic simulation
     /// suites; applications never need it.
+    #[doc(hidden)]
     pub fn vfs(self, vfs: pigeonhole_io::VfsRef) -> Self {
         todo!()
     }
@@ -115,6 +116,7 @@ impl ReaderOptions {
     }
 
     /// Custom filesystem (simulation).
+    #[doc(hidden)]
     pub fn vfs(self, vfs: pigeonhole_io::VfsRef) -> Self {
         todo!()
     }

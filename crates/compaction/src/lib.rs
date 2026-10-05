@@ -5,7 +5,7 @@
 //!   version/TTL/tombstone GC that preserves every live snapshot, resolves merge operands,
 //!   separates large values into blob files, and returns a [`CompactionOutput`] the engine
 //!   turns into manifest edits.
-//! - [`MergingCursor`] and [`CellResolver`] are the shared read machinery: the engine's read
+//! - [`MergingCursor`], [`FilteredCursor`] and [`CellResolver`] are the shared read machinery: the engine's read
 //!   path runs the same resolver over memtables and SSTs, so reads and compaction can never
 //!   disagree about visibility.
 //! - [`MergeOperator`]s are identified by name in the file.
@@ -20,13 +20,15 @@
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use pigeonhole_cache::BlockCache;
 use pigeonhole_format::manifest::{CompactionStyle, FamilyOptions, SstMeta};
+use pigeonhole_format::scan::ScanFilter;
+use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{BlobFileId, Cursor, FamilyId, Seqno, SstId, TableId, TabletId, Timestamp};
 use pigeonhole_pager::Pager;
-use pigeonhole_sst::SstReader;
+use pigeonhole_sst::{BlobReader, SstReader};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -95,24 +97,24 @@ impl std::error::Error for MergeError {}
 /// Identified by [`MergeOperator::name`], which is stored in the family's options in the
 /// file, so a binary that registers a different operator under that name is the only way to
 /// misinterpret the data. Values and operands are stored values (tag byte included).
+///
+/// Operators are **associative folds** (decision D31) so the resolver streams operands in
+/// the order the cursor yields them (newest first) without buffering copies: the accumulator
+/// starts as a copy of the newest operand, each older operand is folded in with
+/// [`MergeOperator::merge`], and [`MergeOperator::finish`] applies the result to the base
+/// value (the newest put below the operands) if one was found. Compaction that finds no base
+/// keeps the accumulator as a single combined operand.
 pub trait MergeOperator: Send + Sync + fmt::Debug {
     /// Stable name, stored in the file. Built-ins use the `pigeonhole.` prefix.
     fn name(&self) -> &str;
 
-    /// Combines `base` (the newest put below the operands, or none) with `operands` (oldest
-    /// first) into a stored value appended to `out`.
-    fn full_merge(
-        &self,
-        base: Option<&[u8]>,
-        operands: &[&[u8]],
-        out: &mut Vec<u8>,
-    ) -> Result<(), MergeError>;
+    /// Folds `older` into `acc`, where `acc` holds the combination of every newer operand:
+    /// afterwards `acc` is the combination of `older` followed by them.
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError>;
 
-    /// Combines adjacent operands (oldest first) into one operand appended to `out`, if the
-    /// operator is associative. Returns `false` if it cannot (compaction then keeps them).
-    fn partial_merge(&self, operands: &[&[u8]], out: &mut Vec<u8>) -> Result<bool, MergeError> {
-        Ok(false)
-    }
+    /// Applies the combined operands in `acc` to `base` (`None`: no value below them),
+    /// leaving the resulting stored value in `acc`.
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError>;
 }
 
 /// Built-in `i64` add (the `incr` operator): operands and values are `ValueTag::I64`; a
@@ -125,16 +127,11 @@ impl MergeOperator for I64Add {
         "pigeonhole.i64_add"
     }
 
-    fn full_merge(
-        &self,
-        base: Option<&[u8]>,
-        operands: &[&[u8]],
-        out: &mut Vec<u8>,
-    ) -> Result<(), MergeError> {
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
         todo!()
     }
 
-    fn partial_merge(&self, operands: &[&[u8]], out: &mut Vec<u8>) -> Result<bool, MergeError> {
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
         todo!()
     }
 }
@@ -212,6 +209,52 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
     }
 }
 
+/// Applies a [`ScanFilter`] to any cursor with [`ScanFilter::admits`], so sources without
+/// built-in pushdown (memtables) filter exactly like `SstIter` does.
+#[derive(Debug)]
+pub struct FilteredCursor<C> {
+    _inner: C,
+}
+
+impl<C: Cursor> FilteredCursor<C> {
+    /// Wraps `inner`.
+    pub fn new(inner: C, filter: ScanFilter) -> Self {
+        todo!()
+    }
+}
+
+impl<C: Cursor> Cursor for FilteredCursor<C> {
+    type Error = C::Error;
+
+    fn valid(&self) -> bool {
+        todo!()
+    }
+
+    fn key(&self) -> &[u8] {
+        todo!()
+    }
+
+    fn value(&self) -> &[u8] {
+        todo!()
+    }
+
+    fn seek_to_first(&mut self) -> Result<(), C::Error> {
+        todo!()
+    }
+
+    fn seek(&mut self, target: &[u8]) -> Result<(), C::Error> {
+        todo!()
+    }
+
+    fn next(&mut self) -> Result<(), C::Error> {
+        todo!()
+    }
+
+    fn skip_row(&mut self) -> Result<(), C::Error> {
+        todo!()
+    }
+}
+
 /// A predicate on a resolved value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValuePredicate {
@@ -227,6 +270,7 @@ pub enum ValuePredicate {
 
 /// What the read path asks of the resolver.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResolveOptions {
     /// Ignore entries with a newer seqno.
     pub snapshot: Seqno,
@@ -242,6 +286,13 @@ pub struct ResolveOptions {
     pub value: Option<ValuePredicate>,
     /// The family's merge operator, if any.
     pub merge: Option<Arc<dyn MergeOperator>>,
+}
+
+impl ResolveOptions {
+    /// Latest version only, no TTL, no limits, no predicate, no merge operator.
+    pub fn new(snapshot: Seqno, now: Timestamp) -> Self {
+        todo!()
+    }
 }
 
 /// A cell as resolved: visible at the snapshot, not deleted, not expired, merges applied.
@@ -277,8 +328,17 @@ where
         todo!()
     }
 
-    /// Positions at the first entry `>= key` (an encoded seek or row prefix).
+    /// Positions at the first entry `>= key` (an encoded row prefix, for scans). Markers of
+    /// a row are met before its cells, so a row-ordered walk sees every delete it needs.
     pub fn seek(&mut self, key: &[u8]) -> Result<(), C::Error> {
+        todo!()
+    }
+
+    /// Positions for a point read of one column: first seeks the merged cursor to the row's
+    /// marker prefix and records any family markers visible at the snapshot, then seeks to
+    /// the column. Costs a second seek per source (usually inside the block the first seek
+    /// already loaded); the row filter has already excluded SSTs without the row.
+    pub fn seek_column(&mut self, row: &[u8], qualifier: &[u8]) -> Result<(), C::Error> {
         todo!()
     }
 
@@ -312,6 +372,7 @@ pub struct Levels {
 
 /// Tuning for the pickers.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PickerOptions {
     /// L0 file count that triggers an L0 compaction.
     pub l0_trigger: u32,
@@ -331,6 +392,16 @@ impl Default for PickerOptions {
     }
 }
 
+/// A range of internal keys, `[start, end)` in byte order. Built from row bounds with
+/// `pigeonhole_format::key::encode_row_prefix`, so it never splits a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRange {
+    /// Inclusive start; `None` is unbounded.
+    pub start: Option<Vec<u8>>,
+    /// Exclusive end; `None` is unbounded.
+    pub end: Option<Vec<u8>>,
+}
+
 /// One unit of compaction work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionTask {
@@ -338,6 +409,12 @@ pub struct CompactionTask {
     pub tablet: TabletId,
     /// Family.
     pub family: FamilyId,
+    /// Keys the task may read and write: the tablet's row range. Inputs shared with a sibling
+    /// tablet after a split (D13) are read only within it, and outputs never leave it.
+    pub range: KeyRange,
+    /// Disjoint pieces of `range`, in order, that run as independent subcompactions; one
+    /// piece equal to `range` means no split.
+    pub subranges: Vec<KeyRange>,
     /// Input SSTs by level.
     pub inputs: Vec<(u8, Vec<SstId>)>,
     /// Level the outputs go to.
@@ -347,14 +424,21 @@ pub struct CompactionTask {
 }
 
 /// How a task changes the tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskKind {
     /// Merge inputs into new SSTs.
     Rewrite,
-    /// Move one SST down a level without rewriting it.
+    /// Move one SST down a level without rewriting it (only when its key range lies inside
+    /// `range` and no sibling shares it).
     TrivialMove,
     /// Drop whole SSTs (FIFO-by-time expiry): no I/O.
     Drop,
+    /// Blob GC (Phase 2): rewrite the inputs, copying values still live in these blob files
+    /// into new blob files, so the old ones can be dropped.
+    BlobGc {
+        /// Blob files to empty.
+        blob_files: Vec<BlobFileId>,
+    },
 }
 
 /// Picks compaction work for one `(tablet, family)`.
@@ -393,6 +477,7 @@ impl CompactionPicker {
 
 /// Which versions compaction must keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GcPolicy {
     /// Every live snapshot seqno (in-process and reader slots), ascending. A version visible
     /// at any of them, or newer than all of them, is kept.
@@ -403,8 +488,20 @@ pub struct GcPolicy {
     pub bottommost: bool,
 }
 
+impl GcPolicy {
+    /// A policy keeping everything visible at `snapshots`.
+    pub fn new(snapshots: Vec<Seqno>, now: Timestamp, bottommost: bool) -> Self {
+        Self {
+            snapshots,
+            now,
+            bottommost,
+        }
+    }
+}
+
 /// Everything a job needs from the engine.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JobContext {
     /// Table.
     pub table: TableId,
@@ -418,8 +515,28 @@ pub struct JobContext {
     pub merge: Option<Arc<dyn MergeOperator>>,
     /// Allocator for new SST ids (shared with the engine, persisted via manifest counters).
     pub sst_ids: Arc<AtomicU64>,
+    /// Allocator for new blob file ids (likewise).
+    pub blob_ids: Arc<AtomicU32>,
+    /// Open readers for the family's blob files (to copy live values during blob GC).
+    pub blob_files: Vec<(BlobFileId, Arc<BlobReader>)>,
     /// GC rules.
     pub gc: GcPolicy,
+}
+
+impl JobContext {
+    /// A context with no merge operator and no blob files.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        table: TableId,
+        family: FamilyOptions,
+        pager: Arc<Pager>,
+        cache: Arc<BlockCache>,
+        sst_ids: Arc<AtomicU64>,
+        blob_ids: Arc<AtomicU32>,
+        gc: GcPolicy,
+    ) -> Self {
+        todo!()
+    }
 }
 
 /// Progress of a job.
@@ -431,6 +548,17 @@ pub enum JobPoll {
     Done,
 }
 
+/// A blob file a job created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBlobFile {
+    /// Id (from `JobContext::blob_ids`).
+    pub id: BlobFileId,
+    /// Its extents in logical order.
+    pub extents: Vec<ExtentRef>,
+    /// Bytes written (all live at creation).
+    pub total_bytes: u64,
+}
+
 /// The result of a job, for the engine to turn into manifest edits.
 #[derive(Debug, Clone, Default)]
 pub struct CompactionOutput {
@@ -438,8 +566,12 @@ pub struct CompactionOutput {
     pub added: Vec<(u8, SstMeta)>,
     /// Removed SSTs (their extents are retired after the manifest commit).
     pub removed: Vec<SstId>,
-    /// Change in live bytes per blob file (negative: values dropped).
+    /// Blob files created (value separation at the output level, or blob GC copies).
+    pub new_blob_files: Vec<NewBlobFile>,
+    /// Change in live bytes per existing blob file (negative: values dropped).
     pub blob_live_delta: Vec<(BlobFileId, i64)>,
+    /// Blob files with no live bytes left, to drop (`DropBlobFile`) and retire.
+    pub dropped_blob_files: Vec<BlobFileId>,
 }
 
 /// A running compaction. Cooperative: each [`CompactionJob::run`] call does a bounded slice

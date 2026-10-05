@@ -10,6 +10,11 @@
 //! before any continuation, so a shorter row sorts first. A family-in-row marker uses
 //! `0x00 0x00` in place of the qualifier, which sorts before every qualifier (including the
 //! empty one), so a reader meets a row's markers before its cells. See `FORMAT.md` §2.
+//!
+//! **Delete rule** (BigTable semantics, decision D9): a `ColumnDelete` or `FamilyDelete` with
+//! timestamp `T` hides every version with timestamp `<= T` in its scope, regardless of seqno,
+//! so a later put with an older timestamp stays hidden. A `CellDelete` hides exactly the
+//! versions with its timestamp. Seqnos decide only snapshot visibility.
 
 use crate::{Seqno, Timestamp};
 
@@ -77,6 +82,12 @@ pub fn encode_marker_key(
     ts: Timestamp,
     seqno: Seqno,
 ) -> crate::Result<()> {
+    todo!()
+}
+
+/// Appends the marker prefix of `row` (escaped row, terminator, `00 00`): every family marker
+/// of the row starts with it. A point get seeks here before seeking to the column.
+pub fn encode_marker_prefix(out: &mut Vec<u8>, row: &[u8]) -> crate::Result<()> {
     todo!()
 }
 

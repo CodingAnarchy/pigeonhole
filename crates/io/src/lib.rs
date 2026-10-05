@@ -31,7 +31,7 @@ pub mod sys;
 mod vfs;
 
 pub use buf::IoBuf;
-pub use completion::Completion;
+pub use completion::{Completion, Resolver};
 pub use error::{Error, ErrorKind, Result};
 pub use file::{File, FileRef, LockMode, OpenOptions};
 pub use shared::{SharedOpen, SharedRegion};

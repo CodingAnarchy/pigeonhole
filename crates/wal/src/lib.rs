@@ -4,7 +4,13 @@
 //! One [`Wal`] per shard. The shard thread is the only user of its stream, so the trait takes
 //! `&mut self` and needs no locks. Group commit is the shard loop calling
 //! [`Wal::append`] for every commit it drained, then [`Wal::write`] once and, if any member
-//! asked for `GroupSync`, [`Wal::sync`] once.
+//! asked for `GroupSync`, [`Wal::submit_sync`] once. The sync runs on the I/O backend while
+//! the shard builds the next group; its committers resolve when the completion does.
+//!
+//! Segment rules (FORMAT §10, decision D25): when a segment fills, the writer syncs it before
+//! writing the next segment's header, whose `prev_end` records where it ended. After
+//! recovery the writer never appends to the last replayed segment: it starts a new one with
+//! an epoch above every epoch in any header, chained to the recovered end.
 //!
 //! Implementations: [`WalStream`] (sidecar files `data.phdb-wal-N`, preallocated recycled
 //! segments) and [`MemWal`] (the in-memory mock for engine tests). An in-file ring can be
@@ -20,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
-use pigeonhole_io::VfsRef;
+use pigeonhole_io::{Completion, VfsRef};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -61,8 +67,9 @@ impl From<pigeonhole_format::Error> for Error {
 
 /// Stream configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WalOptions {
-    /// Segment size in bytes; a multiple of 32 KiB. Default 64 MiB.
+    /// Segment size in bytes; a multiple of 32 KiB, at most 4 GiB. Default 64 MiB.
     pub segment_size: u64,
     /// Segments kept preallocated ahead of the writer. Default 2.
     pub spare_segments: u32,
@@ -102,9 +109,15 @@ pub trait Wal: Send + fmt::Debug {
     /// appended so far satisfies `Buffered`.
     fn write(&mut self) -> Result<Lsn>;
 
-    /// Writes (if needed) and fdatasyncs. After this, every ticket appended so far satisfies
-    /// `GroupSync` and `Sync`.
+    /// Writes (if needed) and fdatasyncs, blocking. After this, every ticket appended so far
+    /// satisfies `GroupSync` and `Sync`. For tests and shutdown; shards use
+    /// [`Wal::submit_sync`].
     fn sync(&mut self) -> Result<Lsn>;
+
+    /// Writes (if needed) and submits an fdatasync covering everything appended so far.
+    /// Returns at once; the completion resolves with the newly durable position, after which
+    /// [`Wal::durable`] reflects it. Syncs complete in submission order.
+    fn submit_sync(&mut self) -> Result<Completion<Lsn>>;
 
     /// Position past the last byte handed to the kernel.
     fn written(&self) -> Lsn;
@@ -171,6 +184,10 @@ impl Wal for WalStream {
         todo!()
     }
 
+    fn submit_sync(&mut self) -> Result<Completion<Lsn>> {
+        todo!()
+    }
+
     fn written(&self) -> Lsn {
         todo!()
     }
@@ -195,9 +212,11 @@ impl Wal for WalStream {
 /// Replays one stream from its checkpoint. A lending reader: each record borrows the reader's
 /// buffer until the next call.
 ///
-/// Stops at the first fragment that is zeroed, carries a stale epoch, fails its CRC, or ends
-/// a segment mid-record; that point is the torn tail and is truncated by
-/// [`Recovery::into_stream`].
+/// Within a segment, replay stops at the first fragment that is unused, stale, bad or
+/// incomplete. If another segment's header names this segment and exactly this offset as its
+/// predecessor, replay continues there (end of segment); otherwise the log ends (torn tail).
+/// A successor naming this segment with a different offset means synced data was lost and
+/// fails with [`Error::Format`] rather than silently dropping it.
 #[derive(Debug)]
 pub struct Recovery {
     _priv: (),
@@ -225,7 +244,15 @@ impl Recovery {
         todo!()
     }
 
-    /// Truncates the torn tail and reopens the stream for appending after `end`.
+    /// Every seqno seen in any record, including PREPAREs later discarded, is at most this;
+    /// the engine starts `next_seqno` above it so a seqno is never reused.
+    pub fn max_seqno(&self) -> pigeonhole_format::Seqno {
+        todo!()
+    }
+
+    /// Reopens the stream for appending: starts a fresh segment with epoch one above the
+    /// largest epoch in any segment header, chained (`prev_epoch`, `prev_end`) to where replay
+    /// ended. The torn segment is never appended to; its slot is recycled after checkpoint.
     pub fn into_stream(self, opts: WalOptions) -> Result<WalStream> {
         todo!()
     }
@@ -270,6 +297,10 @@ impl Wal for MemWal {
     }
 
     fn sync(&mut self) -> Result<Lsn> {
+        todo!()
+    }
+
+    fn submit_sync(&mut self) -> Result<Completion<Lsn>> {
         todo!()
     }
 

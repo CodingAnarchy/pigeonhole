@@ -206,20 +206,52 @@ impl MemtableReader {
         todo!()
     }
 
-    /// A cursor, initially unpositioned.
-    pub fn iter(&self) -> MemIter<'_> {
+    /// A cursor, initially unpositioned. Holds its own clone of the reader, so it can be
+    /// stored beside the view that keeps the arena memory alive.
+    pub fn iter(&self) -> MemIter {
+        todo!()
+    }
+
+    /// The arena this memtable lives in.
+    pub fn region(&self) -> &ArenaRegion {
         todo!()
     }
 }
 
 /// A zero-copy cursor over a memtable: keys and values borrow arena memory, which the view
-/// pin keeps alive. Sees every entry published before each move.
+/// pin keeps alive. Owns a [`MemtableReader`] clone. Sees every entry published before each
+/// move.
 #[derive(Debug)]
-pub struct MemIter<'a> {
-    _reader: &'a MemtableReader,
+pub struct MemIter {
+    _reader: MemtableReader,
 }
 
-impl Cursor for MemIter<'_> {
+impl MemIter {
+    /// The current value as an [`ArenaSlice`] that outlives the cursor, so a caller can hand
+    /// out a large value without copying it (it must also hold the view pin that keeps the
+    /// memtable from being reclaimed).
+    pub fn value_slice(&self) -> ArenaSlice {
+        todo!()
+    }
+}
+
+/// A byte range of an arena, readable as `&[u8]`. Holds an [`ArenaRegion`] clone (keeping the
+/// mapping alive); the memory stays meaningful only while a view listing its memtable is
+/// pinned, which the holder guarantees.
+#[derive(Debug, Clone)]
+pub struct ArenaSlice {
+    _priv: (),
+}
+
+impl std::ops::Deref for ArenaSlice {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        todo!()
+    }
+}
+
+impl Cursor for MemIter {
     type Error = Error;
 
     fn valid(&self) -> bool {

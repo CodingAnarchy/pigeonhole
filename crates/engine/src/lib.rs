@@ -23,7 +23,7 @@ mod write;
 
 pub use engine::{CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, TableInfo};
 pub use error::{Error, Result};
-pub use options::{Embedding, EngineOptions};
+pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, ScanCell, ScanCursor, ScanSpec};
 pub use snapshot::{Snapshot, TabletMap, View};
 pub use write::{PendingCommit, Predicate, Txn, WriteBatch};
@@ -31,6 +31,6 @@ pub use write::{PendingCommit, Predicate, Txn, WriteBatch};
 pub use pigeonhole_compaction::{I64Add, MergeError, MergeOperator, MergeRegistry, ValuePredicate};
 pub use pigeonhole_format::compress::Compression;
 pub use pigeonhole_format::manifest::{CachePriority, CompactionStyle, FamilyOptions};
+pub use pigeonhole_format::scan::QualifierFilter;
 pub use pigeonhole_format::value::ValueRef;
 pub use pigeonhole_format::{Durability, FamilyId, Seqno, TableId, Timestamp};
-pub use pigeonhole_sst::QualifierFilter;

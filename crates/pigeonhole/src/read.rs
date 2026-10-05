@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::ops::{Range, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 
 use crate::{Result, Row, RowRef, Snapshot};
 
@@ -73,6 +73,11 @@ impl<'t> RowRead<'t> {
         todo!()
     }
 
+    /// Only qualifiers within explicit bounds (the non-generic form a C ABI exports).
+    pub fn qualifier_bounds(self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Self {
+        todo!()
+    }
+
     /// Only the newest version of each column (the default).
     pub fn latest(self) -> Self {
         todo!()
@@ -137,6 +142,11 @@ impl<'t> Scan<'t> {
         self,
         range: impl RangeBounds<&'k K>,
     ) -> Self {
+        todo!()
+    }
+
+    /// Only qualifiers within explicit bounds (the non-generic form a C ABI exports).
+    pub fn qualifier_bounds(self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Self {
         todo!()
     }
 

@@ -45,6 +45,16 @@ pub enum Error {
     NoReaderSlot,
     /// The region could not be allocated at the requested size.
     Unavailable,
+    /// The encoded view does not fit in a view buffer. The writer refuses the change that
+    /// would grow it (for example a tablet split) instead of publishing a truncated view.
+    ViewTooLarge {
+        /// Encoded view length.
+        needed: usize,
+        /// View buffer length.
+        capacity: usize,
+    },
+    /// This mapping was replaced by a newer generation; call [`ShmRegion::reattach`].
+    Stale,
 }
 
 impl fmt::Display for Error {
@@ -61,13 +71,15 @@ impl From<pigeonhole_io::Error> for Error {
     }
 }
 
-/// Writer generation: bumped each time a writer (re)builds the region. Readers remap when it
+/// Region generation: bumped each time a writer (re)builds the region, and part of the
+/// region's name. The directory region records the current one; readers re-attach when it
 /// changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(pub u64);
 
 /// Region sizing and placement.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ShmConfig {
     /// Shards (arenas and watermark lines).
     pub shards: u32,
@@ -75,10 +87,18 @@ pub struct ShmConfig {
     pub arena_bytes: u64,
     /// Reader slots (default 126).
     pub reader_slots: u32,
-    /// Bytes per view buffer (default 1 MiB).
+    /// Bytes per view buffer (default 4 MiB). Must hold the encoded view: about
+    /// `40 + 2 * key bytes` per tablet plus 24 per memtable.
     pub view_buffer_bytes: u32,
     /// Directory for a file-backed region instead of the default memory-backed one.
     pub dir: Option<std::path::PathBuf>,
+}
+
+impl ShmConfig {
+    /// Defaults for `shards` shards.
+    pub fn new(shards: u32) -> Self {
+        todo!()
+    }
 }
 
 /// The writer lock: the exclusive lock on the writer byte of the lock page. Held for the life
@@ -132,8 +152,11 @@ pub struct ShmRegion {
 
 impl ShmRegion {
     /// Creates or attaches to the region for the database file `identity`, holding the
-    /// shm-init lock byte on `file` while creating or validating. Refuses a live region with
-    /// another layout version ([`Error::VersionMismatch`]).
+    /// shm-init lock byte on `file` while creating or validating. Finds the current
+    /// generation through the directory region (FORMAT §11). A writer always builds a new
+    /// generation: it creates the new region, marks the old one abandoned, then records the
+    /// new generation in the directory. Refuses a live region with another layout version
+    /// ([`Error::VersionMismatch`]) unless no other process is attached.
     pub fn open(
         vfs: &VfsRef,
         file: &FileRef,
@@ -150,8 +173,21 @@ impl ShmRegion {
         todo!()
     }
 
-    /// Removes the region's name (by the last process, after [`Presence::try_become_last`]).
+    /// Removes the region's and the directory's names (by the last process, after
+    /// [`Presence::try_become_last`]).
     pub fn remove(vfs: &VfsRef, identity: FileIdentity, dir: Option<&Path>) -> Result<()> {
+        todo!()
+    }
+
+    /// Whether a newer generation replaced this mapping (its state is abandoned or the
+    /// directory names another generation). Cheap: two atomic loads.
+    pub fn is_stale(&self) -> bool {
+        todo!()
+    }
+
+    /// Attaches to the current generation (reader processes, after [`ShmRegion::is_stale`]).
+    /// The caller re-claims its reader slot and re-pins in the new region.
+    pub fn reattach(&self, vfs: &VfsRef, file: &FileRef) -> Result<ShmRegion> {
         todo!()
     }
 
@@ -180,13 +216,14 @@ impl ShmRegion {
 
     /// Reserves `count` consecutive seqnos (one atomic `fetch_add` per commit group) and
     /// returns the first. The caller must already have published a pending watermark no
-    /// higher than the result (see `FORMAT.md` §11.3).
+    /// higher than the result (see `FORMAT.md` §11.3). A cross-shard commit reserves one.
     pub fn reserve_seqnos(&self, count: u64) -> Seqno {
         todo!()
     }
 
-    /// Publishes `shard`'s lowest reserved-but-unapplied seqno (`u64::MAX` if none), with
-    /// release ordering.
+    /// Publishes `shard`'s pending watermark with release ordering: the minimum of its current
+    /// group's lower bound and every cross-shard seqno it coordinates and has not released;
+    /// `u64::MAX` when it holds nothing, so an idle shard never holds back snapshots.
     pub fn publish_pending(&self, shard: u32, pending: Seqno) {
         todo!()
     }
@@ -200,7 +237,8 @@ impl ShmRegion {
     // ---- views and manifest ----
 
     /// Publishes a view (writer only): writes the inactive buffer, then swaps the view
-    /// pointer with release ordering.
+    /// pointer with release ordering. Fails with [`Error::ViewTooLarge`] (publishing nothing)
+    /// if the encoded view exceeds the buffer.
     pub fn publish_view(&self, view: &ViewRecord) -> Result<()> {
         todo!()
     }

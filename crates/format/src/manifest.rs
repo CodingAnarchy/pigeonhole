@@ -1,11 +1,12 @@
 //! Manifest blocks and edit records.
 //!
-//! The manifest is a chain of immutable blocks, each in its own extent: one *snapshot* block
-//! (every edit needed to rebuild the state from empty) followed by zero or more *delta* blocks
-//! (the edits of one manifest commit). Each block points to its predecessor; the superblock
-//! points to the newest. Nothing is ever overwritten. When the chain grows past a bound the
-//! manifest writer emits a fresh snapshot block and the old chain is retired. See `FORMAT.md`
-//! §9 and decision D7.
+//! The manifest is one *snapshot* block (every edit needed to rebuild the state from empty)
+//! in its own extent, plus a *delta log*: one extent (256 KiB) holding consecutive *delta*
+//! blocks, one per manifest commit. The superblock names both and how many log bytes are
+//! live. A commit appends a delta past the live end of the log (never touching live bytes) and
+//! flips the superblock. When the log is full or outgrows the snapshot, the writer emits a new
+//! snapshot and starts a new log. Open reads the superblocks, the snapshot and the log: three
+//! reads. See `FORMAT.md` §9 and decision D7.
 
 use crate::compress::Compression;
 use crate::superblock::ExtentRef;
@@ -17,13 +18,16 @@ use crate::{
 /// Size of the fixed header in front of a manifest block's edits.
 pub const MANIFEST_HEADER_LEN: usize = 64;
 
-/// Whether a block restarts the chain.
+/// Size of a delta-log extent (size class 2).
+pub const LOG_EXTENT_LEN: usize = 256 * 1024;
+
+/// Whether a block is a full snapshot or one commit's delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ManifestBlockKind {
-    /// Full state; recovery stops walking back here.
+    /// Full state.
     Snapshot = 1,
-    /// Edits relative to the previous block.
+    /// One commit's edits, relative to the block before it.
     Delta = 2,
 }
 
@@ -36,10 +40,6 @@ pub struct ManifestHeader {
     pub kind: ManifestBlockKind,
     /// Version this block produces.
     pub manifest_version: ManifestVersion,
-    /// The previous block; `None` for the first snapshot.
-    pub prev: Option<ExtentRef>,
-    /// Length of the previous block in bytes (0 if none).
-    pub prev_len: u32,
     /// Number of edits.
     pub edit_count: u32,
     /// Length of the edit bytes following the header.
@@ -51,8 +51,10 @@ pub fn encode_block(header: &ManifestHeader, edits: &[Edit], out: &mut Vec<u8>) 
     todo!()
 }
 
-/// Decodes and verifies one manifest block, returning its header and edits.
-pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>)> {
+/// Decodes and verifies one manifest block from the front of `bytes`, returning its header,
+/// edits and length. A delta log is decoded by calling this until the live length is used up;
+/// deltas must carry consecutive versions following the snapshot's.
+pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>, usize)> {
     todo!()
 }
 
@@ -250,6 +252,9 @@ pub enum Edit {
         next_blob_file: u32,
         /// Every assigned seqno is below this.
         seqno_ceiling: Seqno,
+        /// Every timestamp assigned by default is at most this; default timestamps after
+        /// open are greater (decision D11).
+        ts_floor: Timestamp,
     },
 }
 

@@ -20,7 +20,7 @@ use std::fmt;
 use std::path::Path;
 
 use pigeonhole_format::ManifestVersion;
-use pigeonhole_io::{FileRef, VfsRef};
+use pigeonhole_io::{Completion, FileRef, VfsRef};
 
 /// An allocated extent: `64 KiB << size_class` bytes at `page`. The persisted form.
 pub use pigeonhole_format::superblock::ExtentRef as Extent;
@@ -64,14 +64,19 @@ impl From<pigeonhole_format::Error> for Error {
     }
 }
 
-/// What the superblock points at: the newest manifest block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the superblock points at: the manifest snapshot block and the live part of the
+/// delta log (decision D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Root {
-    /// Extent holding the newest manifest block.
-    pub manifest: Extent,
-    /// Its length in bytes.
-    pub manifest_len: u32,
-    /// Its version.
+    /// Extent holding the snapshot block; `None` for an empty database.
+    pub snapshot: Option<Extent>,
+    /// Length of the snapshot block.
+    pub snapshot_len: u32,
+    /// Extent holding the delta log, if any delta follows the snapshot.
+    pub log: Option<Extent>,
+    /// Live bytes of the delta log.
+    pub log_len: u32,
+    /// Manifest version of this root.
     pub manifest_version: ManifestVersion,
 }
 
@@ -97,13 +102,14 @@ impl OpenedPager {
         todo!()
     }
 
-    /// The file, for reading the manifest chain before `finish`.
+    /// The file, for reading the manifest before `finish`.
     pub fn file(&self) -> &FileRef {
         todo!()
     }
 
     /// Marks `live` extents allocated (everything else is free) and returns a usable pager.
-    /// `live` must include the manifest chain, every SST and every blob extent.
+    /// `live` must include the manifest snapshot and log extents, every SST and every blob
+    /// extent.
     pub fn finish(self, live: impl IntoIterator<Item = Extent>) -> Result<Pager> {
         todo!()
     }
@@ -117,13 +123,14 @@ pub struct Pager {
 }
 
 impl Pager {
-    /// Creates a new database file at `path` with an empty root (`manifest_version` 0) and a
+    /// Creates a new database file at `path` with an empty root (`Root::default()`) and a
     /// fresh random db id. Fails if the file exists.
     pub fn create(vfs: &VfsRef, path: &Path) -> Result<Pager> {
         todo!()
     }
 
-    /// Opens an existing file and reads both superblocks. No recovery scan.
+    /// Opens an existing file and reads both superblocks. No recovery scan. A read-only pager
+    /// (reader processes) never allocates, retires or commits; it only reads and reloads.
     pub fn open(vfs: &VfsRef, path: &Path, writable: bool) -> Result<OpenedPager> {
         todo!()
     }
@@ -165,10 +172,25 @@ impl Pager {
         todo!()
     }
 
-    /// Publishes `root`: syncs data written so far, writes the older superblock slot with a
-    /// higher sequence, and syncs again. The only in-place write to the main file. When this
-    /// returns, a crash recovers to `root`; before it returns, to the previous root or `root`.
+    /// Publishes `root`: syncs data written so far, writes the non-current superblock slot
+    /// with a higher sequence, and syncs again. The only in-place write of live data in the
+    /// main file. When this returns, a crash recovers to `root`; before it returns, to the
+    /// previous root or `root`. Blocks; use [`Pager::submit_commit_root`] on a shard thread.
     pub fn commit_root(&self, root: Root) -> Result<()> {
+        todo!()
+    }
+
+    /// [`Pager::commit_root`] run by the I/O backend: returns at once, so the manifest task
+    /// never blocks a shard's foreground loop on the two fsyncs. Root commits must not
+    /// overlap; submit the next only after this one resolves.
+    pub fn submit_commit_root(&self, root: Root) -> Completion<()> {
+        todo!()
+    }
+
+    /// Re-reads both superblocks and returns the current root if it changed since the last
+    /// call (read-only handles in reader processes, when the shared-memory header names a
+    /// newer manifest version). Never writes.
+    pub fn reload_root(&self) -> Result<Option<Root>> {
         todo!()
     }
 

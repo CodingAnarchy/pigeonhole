@@ -51,6 +51,12 @@ pub enum ErrorCode {
     Unsupported = 20,
     /// The database is closed.
     Closed = 21,
+    /// Every reader slot in the shared-memory region is taken.
+    NoReaderSlot = 22,
+    /// A commit is too large for one WAL record.
+    RecordTooLarge = 23,
+    /// Writes are stalled and the call asked not to wait.
+    Busy = 24,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.

@@ -1,13 +1,18 @@
 //! WAL segments, 32 KiB frames and log records. See `FORMAT.md` §10.
 //!
 //! A segment is a preallocated file region made of 32 KiB frames. Frame 0 holds the segment
-//! header (magic, stream, epoch, db id). Every later frame holds fragments: a 12-byte header
-//! (CRC32C, low 32 bits of the segment epoch, length, fragment type) and payload. A record
-//! larger than the space left in a frame is split into First/Middle/Last fragments. A
-//! fragment whose epoch differs from the segment's is stale data from a previous use of a
-//! recycled segment and ends the log.
+//! header (magic, stream, epoch, db id, and the predecessor's epoch and end offset). Every
+//! later frame holds fragments: a 12-byte header (CRC32C, the segment epoch, length, fragment
+//! type) and payload. A record larger than the space left in a frame is split into
+//! First/Middle/Last fragments.
+//!
+//! Replay of a segment stops at the first fragment that is unused, stale (another epoch), bad
+//! or incomplete. That stop is the **end of the segment** if some segment's header names this
+//! segment and this offset as its predecessor, and the **end of the log** otherwise. A writer
+//! never appends to a segment after recovery; it starts a new one whose header records where
+//! the old one ended (decision D25).
 
-use crate::{CommitId, FamilyId, FormatVersion, Seqno, StreamId, TableId, Timestamp};
+use crate::{FamilyId, FormatVersion, Seqno, StreamId, TableId, Timestamp};
 
 /// Size of a WAL frame.
 pub const FRAME_SIZE: usize = 32 * 1024;
@@ -36,11 +41,18 @@ pub struct SegmentHeader {
     pub version: FormatVersion,
     /// Stream this segment belongs to.
     pub stream: StreamId,
-    /// Epoch of this use of the segment; strictly increasing per stream.
+    /// Epoch of this use of the segment: one more than the largest epoch in any segment
+    /// header of the stream when it was started, so it never repeats.
     pub epoch: u32,
+    /// Epoch of the segment this one continues, or 0 for the first segment of a new stream.
+    pub prev_epoch: u32,
+    /// Offset in the predecessor where its valid log ends. Replay of the predecessor must stop
+    /// exactly here for this segment to continue it.
+    pub prev_end: u32,
     /// Database id from the superblock; a segment from another database is rejected.
     pub db_id: [u8; 16],
-    /// Segment size in bytes (a multiple of [`FRAME_SIZE`]).
+    /// Segment size in bytes: a multiple of [`FRAME_SIZE`], at most 4 GiB (LSN offsets are
+    /// `u32`).
     pub segment_size: u64,
 }
 
@@ -90,9 +102,10 @@ pub enum Decoded {
         /// Segment offset of the record's first fragment.
         offset: u64,
     },
-    /// The log ends here: zeroed space, a stale epoch, a bad CRC or an incomplete record.
-    /// Everything from `offset` on is discarded (torn-tail truncation).
-    End {
+    /// The segment's valid data ends here: an unused fragment, a stale epoch, a bad CRC or an
+    /// incomplete record. Whether this is also the end of the log depends on whether a
+    /// successor segment names this offset as its `prev_end`.
+    Stop {
         /// Segment offset where valid data ends.
         offset: u64,
     },
@@ -111,7 +124,8 @@ impl FrameDecoder {
     }
 
     /// Feeds the next frame (exactly [`FRAME_SIZE`] bytes, frame-aligned) and decodes until
-    /// a record completes, the frame is exhausted (`Ok(None)`), or the log ends.
+    /// a record completes, the frame is exhausted (`Ok(None)`), or the segment's data stops.
+    /// A frame tail shorter than a fragment header is skipped whatever its bytes.
     pub fn decode(&mut self, frame: &[u8]) -> crate::Result<Option<Decoded>> {
         todo!()
     }
@@ -147,11 +161,9 @@ pub enum WalRecord<'a> {
         batch: BatchRef<'a>,
     },
     /// Cross-shard participant record: apply at `seqno` only if the coordinator's stream holds
-    /// a matching [`WalRecord::Commit`].
+    /// a [`WalRecord::Commit`] with the same seqno. The reserved seqno is the commit's id.
     Prepare {
-        /// Commit id.
-        commit: CommitId,
-        /// Commit seqno (reserved by the coordinator).
+        /// Commit seqno, reserved by the coordinator; identifies the commit.
         seqno: Seqno,
         /// Commit timestamp.
         commit_ts: Timestamp,
@@ -160,10 +172,8 @@ pub enum WalRecord<'a> {
         /// This participant's mutations.
         batch: BatchRef<'a>,
     },
-    /// Cross-shard decision: every PREPARE with this id is committed.
+    /// Cross-shard decision: every PREPARE with this seqno is committed.
     Commit {
-        /// Commit id.
-        commit: CommitId,
         /// Commit seqno.
         seqno: Seqno,
         /// Participant streams (diagnostics and recovery cross-checks).
@@ -299,19 +309,20 @@ impl<'a> Iterator for BatchIter<'a> {
     }
 }
 
-/// A packed list of `u32 LE` stream ids, borrowed from a COMMIT record.
+/// A stream list borrowed from a COMMIT record: `count u16 LE`, then `count` stream ids
+/// as `u32 LE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamList<'a> {
     _bytes: &'a [u8],
 }
 
 impl<'a> StreamList<'a> {
-    /// Wraps packed bytes; the length must be a multiple of 4.
+    /// Wraps the encoded list; fails unless `bytes.len() == 2 + 4 * count`.
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
         todo!()
     }
 
-    /// Appends `streams` in packed form (count `u16 LE`, then ids).
+    /// Appends `streams` in the same encoding.
     pub fn encode(streams: &[StreamId], out: &mut Vec<u8>) {
         todo!()
     }

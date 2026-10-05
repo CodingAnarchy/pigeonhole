@@ -62,11 +62,15 @@ pub struct Superblock {
     pub sequence: u64,
     /// Random id chosen at creation; WAL segments and the shared-memory region carry it.
     pub db_id: [u8; 16],
-    /// Extent holding the newest manifest block.
-    pub manifest: ExtentRef,
-    /// Length of that manifest block in bytes.
-    pub manifest_len: u32,
-    /// Version of that manifest block.
+    /// Extent holding the manifest snapshot block; `None` for an empty database.
+    pub snapshot: Option<ExtentRef>,
+    /// Length of the snapshot block in bytes.
+    pub snapshot_len: u32,
+    /// Extent holding the manifest delta log; `None` if no delta follows the snapshot.
+    pub log: Option<ExtentRef>,
+    /// Bytes of the delta log that belong to this root (later bytes are not live).
+    pub log_len: u32,
+    /// Manifest version this root represents (the last delta's, or the snapshot's).
     pub manifest_version: ManifestVersion,
     /// High-water mark of the file, in pages.
     pub file_pages: u64,

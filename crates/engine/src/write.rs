@@ -148,7 +148,7 @@ pub struct PendingCommit {
 }
 
 impl PendingCommit {
-    /// Blocks until the commit meets its durability level.
+    /// Blocks until the commit meets its durability level and is visible.
     pub fn wait(self) -> crate::Result<CommitInfo> {
         todo!()
     }

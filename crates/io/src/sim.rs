@@ -13,6 +13,7 @@ use crate::{FileRef, OpenOptions, ProcessId, Result, SharedOpen, SharedRegion, V
 
 /// Which faults to inject. All decisions draw from the seeded RNG, so a seed replays exactly.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct FaultPlan {
     /// On crash, unsynced writes may survive partially, torn at sector boundaries.
     pub torn_writes: bool,

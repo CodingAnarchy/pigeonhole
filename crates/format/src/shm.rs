@@ -9,6 +9,9 @@
 
 use crate::{FamilyId, ManifestVersion, ShmLayoutVersion, TableId, TabletId};
 
+/// Magic of the directory region.
+pub const DIRECTORY_MAGIC: [u8; 8] = *b"PHDBSHMD";
+
 /// Size of the region header.
 pub const HEADER_LEN: usize = 4096;
 /// Size of one shard's watermark line.
@@ -30,9 +33,10 @@ pub mod header {
     pub const REGION_LEN: usize = 16;
     /// `[u8; 16]` database id from the superblock.
     pub const DB_ID: usize = 24;
-    /// `u64` atomic: writer generation; bumped every time a writer (re)builds the region.
+    /// `u64` this region's generation (also in its name).
     pub const GENERATION: usize = 40;
-    /// `u32` atomic: 0 initializing, 1 ready, 2 abandoned (writer gone, rebuild pending).
+    /// `u32` atomic: 0 initializing, 1 ready, 2 abandoned (a newer generation replaced it;
+    /// attached processes must re-attach through the directory).
     pub const STATE: usize = 48;
     /// `u32` shard count.
     pub const SHARD_COUNT: usize = 52;
@@ -42,7 +46,8 @@ pub mod header {
     pub const VIEW_BUFFER_LEN: usize = 60;
     /// `u64` atomic: current manifest version.
     pub const MANIFEST_VERSION: usize = 64;
-    /// `u64` atomic: `(view_version << 1) | buffer_index` of the current view.
+    /// `u64` atomic: `(view_version << 1) | buffer_index` of the current view. View versions
+    /// start at 1; 0 means none published yet.
     pub const VIEW_POINTER: usize = 72;
     /// `u32` writer process id.
     pub const WRITER_PID: usize = 80;
@@ -68,8 +73,9 @@ pub mod header {
 
 /// Byte offsets within a watermark line.
 pub mod watermark {
-    /// `u64` atomic: lowest seqno this shard has reserved but not applied, or `u64::MAX`
-    /// when it has none pending.
+    /// `u64` atomic: the lowest seqno this shard holds unapplied: the minimum of its current
+    /// group's lower bound and every cross-shard commit seqno it coordinates and has not yet
+    /// released; `u64::MAX` when idle.
     pub const PENDING: usize = 0;
 }
 
@@ -145,11 +151,34 @@ impl ShmHeader {
     }
 }
 
-/// Region name derived from the main file's identity, identical on every process however it
-/// spells the path: `phdb-` followed by 16 lowercase hex digits of
-/// `xxh3_64(device LE ++ inode LE)`. Short enough for macOS's 31-byte `shm_open` limit.
-pub fn region_name(device: u64, inode: u64) -> String {
+/// Name of the directory region: `phdb-` followed by 16 lowercase hex digits of
+/// `xxh3_64(device LE ++ inode LE)` of the main file, identical on every process however it
+/// spells the path. The directory is one page that records the current generation; its layout
+/// never changes, so it is never rebuilt (decision D27).
+pub fn directory_name(device: u64, inode: u64) -> String {
     todo!()
+}
+
+/// Name of the region for `generation`: the directory name, `-`, and the generation in
+/// lowercase hex (at most 31 bytes, macOS's `shm_open` limit). A rebuilt region always has a
+/// new name, so an old mapping that some process still holds (Windows keeps named mappings
+/// alive while any handle is open) is never mistaken for the new one.
+pub fn region_name(device: u64, inode: u64, generation: u64) -> String {
+    todo!()
+}
+
+/// Byte offsets within the directory region (4096 bytes, layout fixed forever).
+pub mod directory {
+    /// `[u8; 8]` magic `PHDBSHMD`.
+    pub const MAGIC: usize = 0;
+    /// `u32` directory format (always 1).
+    pub const FORMAT: usize = 8;
+    /// `u64` atomic: generation of the current region (0 = none yet).
+    pub const GENERATION: usize = 16;
+    /// `u32` atomic: layout version of the current region.
+    pub const LAYOUT_VERSION: usize = 24;
+    /// Size of the directory region.
+    pub const LEN: usize = 4096;
 }
 
 /// One tablet in a published view.
@@ -186,7 +215,7 @@ pub struct ViewMemtable {
 /// memtables and know which manifest version goes with them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ViewRecord {
-    /// View version (strictly increasing).
+    /// View version (strictly increasing, starting at 1).
     pub view_version: u64,
     /// Manifest version this view's SST set comes from.
     pub manifest_version: ManifestVersion,
@@ -197,6 +226,11 @@ pub struct ViewRecord {
 }
 
 impl ViewRecord {
+    /// Encoded length, so the writer can check it against the view buffer before publishing.
+    pub fn encoded_len(&self) -> usize {
+        todo!()
+    }
+
     /// Encodes with a CRC32C so a reader can detect a torn copy.
     pub fn encode(&self, out: &mut Vec<u8>) {
         todo!()

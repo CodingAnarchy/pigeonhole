@@ -32,7 +32,7 @@
 //! let row = pages.row(b"com.example/a").families(["meta"]).latest().read()?;
 //!
 //! // Ordered scan with filters pushed into the block decoder.
-//! let snap = db.snapshot();
+//! let snap = db.snapshot()?;
 //! for row in pages
 //!     .scan(b"com.example/"..b"com.example0")
 //!     .family("links")

@@ -166,7 +166,10 @@ impl Engine {
         todo!()
     }
 
-    /// Submits and waits.
+    /// Submits and waits. Returns once the commit meets its durability level **and** is
+    /// visible (`visible_seqno >= seqno`), so the caller reads its own write (D19). A
+    /// cross-shard commit becomes visible only when every participant has applied, so its
+    /// latency includes the slowest participant's group.
     pub fn commit(&self, batch: WriteBatch, durability: Option<Durability>) -> Result<CommitInfo> {
         todo!()
     }
@@ -191,8 +194,10 @@ impl Engine {
 
     // ---- reads ----
 
-    /// A snapshot of everything committed and applied so far.
-    pub fn snapshot(&self) -> Snapshot {
+    /// A snapshot of everything committed and applied so far. In a reader process this may
+    /// do I/O: re-attach after a writer restart (`ShmRegion::is_stale`) and reload the
+    /// manifest when its version changed (`Pager::reload_root`).
+    pub fn snapshot(&self) -> Result<Snapshot> {
         todo!()
     }
 
@@ -200,6 +205,19 @@ impl Engine {
     pub fn get(
         &self,
         snapshot: &Snapshot,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+    ) -> Result<Option<CellData>> {
+        todo!()
+    }
+
+    /// The newest visible version of one cell as of now, without creating a snapshot: loads
+    /// the view through an `arc-swap` guard (no reference-count traffic) and pins only what
+    /// the returned value needs.
+    pub fn get_latest(
+        &self,
         table: TableId,
         family: FamilyId,
         row: &[u8],

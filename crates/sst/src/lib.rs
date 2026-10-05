@@ -5,8 +5,10 @@
 //! file (layout in `FORMAT.md` §4). [`SstWriter`] builds one from entries in key order;
 //! [`SstReader`] opens one with its top-level index and filters pinned in memory, so a point
 //! lookup is at most one cached index-partition lookup plus one data-block read.
-//! [`SstIter`] is a zero-copy [`Cursor`] that applies the entry-level part of a
-//! [`ScanFilter`] inside the block decoder and skips rows using the row-start table.
+//! [`SstIter`] is a zero-copy [`Cursor`] that applies a [`ScanFilter`] inside the block
+//! decoder (the same `ScanFilter::admits` rule every source uses) and skips rows using the
+//! row-start table. It owns an `Arc<SstReader>` and a pinned block, so it can be stored
+//! anywhere (scan cursors, compaction jobs) without borrowing.
 //!
 //! Blob extents (separated values) are read and written here too ([`BlobWriter`],
 //! [`BlobReader`]); deciding what to separate is compaction's job.
@@ -20,7 +22,6 @@
 #![allow(unused_variables, clippy::ptr_arg)]
 
 use std::fmt;
-use std::ops::Bound;
 use std::sync::Arc;
 
 use pigeonhole_cache::{BlockCache, Cell, Priority};
@@ -29,7 +30,9 @@ use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
 use pigeonhole_format::sst::Properties;
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::value::BlobPointer;
-use pigeonhole_format::{BlobFileId, Cursor, FamilyId, SstId, TableId, TabletId, Timestamp};
+use pigeonhole_format::{BlobFileId, Cursor, FamilyId, SstId, TableId, TabletId};
+
+pub use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use pigeonhole_io::FileRef;
 
 /// Result alias for this crate.
@@ -71,6 +74,7 @@ impl From<pigeonhole_format::Error> for Error {
 
 /// How to build an SST.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SstWriterOptions {
     /// Target uncompressed data-block size.
     pub block_size: usize,
@@ -143,34 +147,6 @@ impl SstWriter {
     }
 }
 
-/// Entry-level part of a scan filter, applied inside the block decoder.
-///
-/// Only conditions that are safe per entry are applied here: qualifier selection and the
-/// time range on puts and merge operands. Delete entries and family markers always pass,
-/// because hiding them could resurrect older versions. Per-column and per-row conditions
-/// (version count, columns per row, value predicates) need snapshot visibility and are
-/// applied by the resolver above (`pigeonhole_compaction::CellResolver`), still before any
-/// cell is materialized.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ScanFilter {
-    /// Which qualifiers to keep.
-    pub qualifiers: QualifierFilter,
-    /// Keep puts and merges with `min <= ts < max`.
-    pub time_range: Option<(Timestamp, Timestamp)>,
-}
-
-/// Qualifier selection.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum QualifierFilter {
-    /// Every qualifier.
-    #[default]
-    All,
-    /// Qualifiers starting with these bytes.
-    Prefix(Vec<u8>),
-    /// Qualifiers within the range.
-    Range(Bound<Vec<u8>>, Bound<Vec<u8>>),
-}
-
 /// An open SST. Shared by every reader (`Send + Sync`); the engine keeps one per live SST.
 #[derive(Debug)]
 pub struct SstReader {
@@ -210,14 +186,15 @@ impl SstReader {
         todo!()
     }
 
-    /// A cursor applying `filter`; unpositioned until a seek.
-    pub fn iter(&self, filter: ScanFilter, options: ReadOptions) -> SstIter<'_> {
+    /// A cursor applying `filter`; unpositioned until a seek. Owns a clone of the `Arc`.
+    pub fn iter(self: &Arc<Self>, filter: ScanFilter, options: ReadOptions) -> SstIter {
         todo!()
     }
 }
 
 /// Per-read I/O policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReadOptions {
     /// Insert blocks read from disk into the cache (false for compaction inputs).
     pub fill_cache: bool,
@@ -237,21 +214,21 @@ impl Default for ReadOptions {
     }
 }
 
-/// A zero-copy cursor over one SST. Holds a pinned [`pigeonhole_cache::BlockHandle`] for the
-/// current data block; keys and values borrow it.
+/// A zero-copy cursor over one SST. Owns an `Arc<SstReader>` and a
+/// `BlockIter<BlockHandle>` over the current (pinned) data block; keys and values borrow it.
 #[derive(Debug)]
-pub struct SstIter<'a> {
-    _reader: &'a SstReader,
+pub struct SstIter {
+    _reader: Arc<SstReader>,
 }
 
-impl SstIter<'_> {
+impl SstIter {
     /// The current value as a pinned [`Cell`] that outlives the cursor (no copy).
     pub fn value_cell(&self) -> Cell {
         todo!()
     }
 }
 
-impl Cursor for SstIter<'_> {
+impl Cursor for SstIter {
     type Error = Error;
 
     fn valid(&self) -> bool {

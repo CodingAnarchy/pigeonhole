@@ -22,6 +22,7 @@ Format version **1**, shared-memory layout version **1**. Nothing here is promis
 | Blob extent | `PHDBBLOB` | offset 0 of each blob extent |
 | WAL segment | `PHDBWALS` | offset 0 of each segment |
 | Shared-memory region | `PHDBSHM\0` | offset 0 of the region |
+| Shared-memory directory | `PHDBSHMD` | offset 0 of the directory region |
 | Memtable header | `MEMT` (u32 `0x544D454D`) | offset 0 of each memtable header |
 
 - **Versions.** `FormatVersion` (u32, currently 1) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 1) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
@@ -48,6 +49,8 @@ marker: [row, escaped][00 01][00 00]                    [!ts: u64 BE][!seqno: u6
 | `CellDelete` | `0x03` | Deletes exactly the version with this timestamp |
 | `ColumnDelete` | `0x04` | Deletes every version of the column with timestamp `<=` this one |
 | `FamilyDelete` | `0x05` | Marker key only: deletes every cell of the row in this family with timestamp `<=` this one |
+
+**Delete rule** (BigTable semantics, decision D9). A `ColumnDelete` or `FamilyDelete` with timestamp `T` hides every version in its scope with timestamp `<= T`, **regardless of seqno**: a put committed later with an older timestamp stays hidden. A `CellDelete` hides the versions with exactly its timestamp. Seqnos decide only which entries a snapshot can see.
 
 Timestamps are microseconds since the Unix epoch by convention (decision D11). Seqnos are global, start at 1, and are unique per commit; every cell of one commit carries the commit's seqno.
 
@@ -100,7 +103,7 @@ entry = shared: varint | unshared: varint | value_len: varint | key[shared..]: u
 
 - `shared` is the length of the prefix shared with the previous entry's key; it is 0 at restart points.
 - `restarts` holds the offset of every restart entry, ascending; the first entry is always a restart. Data blocks restart every 16 entries by default; index blocks restart at every entry (interval 1).
-- `row_starts` (data blocks only; `S = 0` in index blocks) holds the offset of every entry whose row differs from the previous entry's row (the first entry of the block included if it starts a row). A row-start entry need not be a restart: its shared prefix lies within the previous key's escaped row, which a scanner skipping the current row already knows, so the entry decodes without the skipped cells.
+- `row_starts` (data blocks only; `S = 0` in index blocks) holds the offset of every entry whose row differs from the previous entry's row (the first entry of the block included if it starts a row). A row-start entry need not be a restart: its shared prefix lies within the previous key's row prefix (escaped row including its terminator), which a scanner skipping the current row already knows, so the entry decodes without the skipped cells.
 - Offsets in both tables are from the start of the logical block.
 - Default target size of a data block is 16 KiB uncompressed (per family). A block holds at least one entry, so one huge cell may exceed the target.
 
@@ -171,7 +174,7 @@ Blob extent header (64 bytes):
 | 20 | 36 | reserved |
 | 56 | 8 | `checksum` u64: xxh3-64 of bytes 0..56 |
 
-Blob record at a logical offset: `len` u64, `checksum` u64 (xxh3-64 of the value), then `len` bytes of value. The pointer's `len` must equal the record's `len`.
+Blob record at a logical offset: `len` u64, `checksum` u64 (xxh3-64 of the value), then `len` bytes of value. The pointer's `len` must equal the record's `len`. Because offsets are logical, a value may span several extents; this is how Phase 2 stores values larger than one 64 MiB extent. Until blob separation lands (Phase 2), a value larger than `min(WAL segment payload, 64 MiB, half the shard's memtable arena)` is rejected at write time with `ValueTooLarge` (decision D16).
 
 ## 8. Main file
 
@@ -198,17 +201,21 @@ The first 128 bytes of the page; the rest is zero.
 | 12 | 4 | `page_size` u32 (4096) |
 | 16 | 8 | `sequence` u64: incremented by every root commit |
 | 24 | 16 | `db_id`: random at creation |
-| 40 | 8 | `manifest_page` u64: newest manifest block (0 = empty database) |
-| 48 | 1 | `manifest_size_class` u8 |
+| 40 | 8 | `snapshot_page` u64: manifest snapshot block (0 = empty database) |
+| 48 | 1 | `snapshot_size_class` u8 |
 | 49 | 3 | reserved |
-| 52 | 4 | `manifest_len` u32 |
+| 52 | 4 | `snapshot_len` u32 |
 | 56 | 8 | `manifest_version` u64 |
 | 64 | 8 | `file_pages` u64: file high-water mark, in pages |
 | 72 | 8 | `flags` u64: bit 0 = last writer closed cleanly |
-| 80 | 40 | reserved |
+| 80 | 8 | `log_page` u64: manifest delta log (0 = none) |
+| 88 | 1 | `log_size_class` u8 |
+| 89 | 3 | reserved |
+| 92 | 4 | `log_len` u32: live bytes of the delta log |
+| 96 | 24 | reserved |
 | 120 | 8 | `checksum` u64: xxh3-64 of bytes 0..120 |
 
-A superblock is valid if magic, checksum and version check out. The valid one with the higher `sequence` is current. **Root commit:** sync all data written since the last commit, write the new superblock (sequence + 1) over the *non-current* slot, sync. This is the only in-place write to the main file.
+A superblock is valid if magic, checksum and version check out. The valid one with the higher `sequence` is current. **Root commit:** sync all data written since the last commit, write the new superblock (sequence + 1) over the *non-current* slot, sync. This is the only in-place write of live data in the main file. Reader processes re-read both superblocks to pick up a new root; they never write.
 
 ### 8.3 Lock page (page 2)
 
@@ -222,9 +229,16 @@ Byte-range locks on single bytes at absolute file offsets (decision D3; refined 
 
 ## 9. Manifest
 
-The manifest is a chain of immutable **manifest blocks** (decision D7). The superblock points to the newest block; each block points to its predecessor. A *snapshot* block contains every edit needed to rebuild the state from empty; a *delta* block contains the edits of one manifest commit. Recovery walks back from the head to the nearest snapshot and applies blocks forward. The manifest writer emits a new snapshot block when the deltas since the last snapshot number more than 64 or exceed the snapshot in bytes; the old chain's extents are then retired.
+The manifest is a **snapshot block** plus a **delta log** (decision D7). The snapshot block, in its own extent, holds every edit needed to rebuild the state from empty. The delta log is one 256 KiB extent (size class 2) holding consecutive **delta blocks**, one per manifest commit, with versions `snapshot version + 1, + 2, ...`. The superblock names the snapshot, the log and the log's live length.
+
+- **Commit:** append the new delta block at `log_len` (bytes past `log_len` are not live, so nothing live is overwritten), then commit a root with the larger `log_len` and the new version. The root commit's first sync covers the delta.
+- **Compaction of the manifest:** when the delta would not fit in the log extent, or the live log exceeds the snapshot's length, the writer writes a new snapshot block and a fresh, empty log (new extents) and commits that root. The old snapshot and log extents are retired at that version.
+- **Open:** read the superblocks, the snapshot block and the live log: three reads, independent of history.
+- **Reader catch-up:** a reader at version `v` re-reads the superblock and, if the snapshot is unchanged, only the log bytes after its last position.
 
 ### 9.1 Block header (64 bytes)
+
+Snapshot and delta blocks share this header.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -233,16 +247,13 @@ The manifest is a chain of immutable **manifest blocks** (decision D7). The supe
 | 12 | 1 | `kind`: 1 Snapshot, 2 Delta |
 | 13 | 3 | reserved |
 | 16 | 8 | `manifest_version` u64 (this block's) |
-| 24 | 8 | `prev_page` u64 (0 = none) |
-| 32 | 1 | `prev_size_class` u8 |
-| 33 | 3 | reserved |
-| 36 | 4 | `prev_len` u32 |
+| 24 | 16 | reserved |
 | 40 | 4 | `edit_count` u32 |
 | 44 | 4 | `body_len` u32 |
 | 48 | 8 | `checksum` u64: xxh3-64 of header bytes 0..48 followed by the body |
 | 56 | 8 | reserved |
 
-The body (`body_len` bytes) follows at offset 64: `edit_count` edits.
+The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log, the next delta starts right after the previous body.
 
 ### 9.2 Edit encoding
 
@@ -267,17 +278,26 @@ Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader 
 | 9 | `WalCheckpoint` | `stream` u32, `lsn` u64 |
 | 10 | `PutBlobFile` | `blob_file` u32, `family` u32, `count` u32, `count` x extent, `total_bytes` u64, `live_bytes` u64 |
 | 11 | `DropBlobFile` | `blob_file` u32 |
-| 12 | `Counters` | `next_table` u32, `next_family` u32, `next_tablet` u64, `next_sst` u64, `next_blob_file` u32, `seqno_ceiling` u64 |
+| 12 | `Counters` | `next_table` u32, `next_family` u32, `next_tablet` u64, `next_sst` u64, `next_blob_file` u32, `seqno_ceiling` u64, `ts_floor` u64 |
 
-Rules: family ids are unique across the database, so `(tablet, family)` names one tree. After a split both child tablets may reference the same SST; an SST's extent is retired when no tablet references it. A snapshot block contains `Counters`, every live table, family, tablet, SST, flushed seqno, blob file and stream checkpoint. The live extents at open are: every block of the chain back to the snapshot, every referenced SST extent, and every blob-file extent.
+Rules: family ids are unique across the database, so `(tablet, family)` names one tree. After a split both child tablets may reference the same SST; an SST's extent is retired when no tablet references it. A snapshot block contains `Counters`, every live table, family, tablet, SST, flushed seqno, blob file and stream checkpoint. The live extents at open are: the snapshot and log extents, every referenced SST extent, and every blob-file extent. `ts_floor` is at least every default timestamp assigned before the commit (decision D11).
 
 ## 10. WAL
 
 ### 10.1 Files and segments
 
-Stream `N` of database `data.phdb` is the file `data.phdb-wal-N` (decimal `N`). Stream numbers are independent of shard numbers. A stream file is a sequence of equal-size **segments** (default 64 MiB, a multiple of 32 KiB) at offsets `k x segment_size`. Segments are preallocated and recycled after checkpoint, never deleted while the database is open; each use of a segment gets a new **epoch** (u32, strictly increasing per stream).
+Stream `N` of database `data.phdb` is the file `data.phdb-wal-N` (decimal `N`). Stream numbers are independent of shard numbers. A stream file is a sequence of equal-size **slots** (default 64 MiB, a multiple of 32 KiB, at most 4 GiB) at offsets `k x segment_size`. Slots are preallocated and recycled after checkpoint, never deleted while the database is open. Each use of a slot is a **segment** with its own **epoch** (u32): one more than the largest epoch in any segment header of the stream, so epochs never repeat.
 
-An **LSN** is `(epoch << 32) | offset_within_segment`. LSNs increase monotonically within a stream. The manifest records each stream's checkpoint LSN; replay starts at the segment with the checkpoint's epoch and continues through epochs `+1, +2, ...` until a segment with the next epoch is missing or the log ends.
+An **LSN** is `(epoch << 32) | offset_within_segment`. LSNs increase monotonically within a stream. The manifest records each stream's checkpoint LSN.
+
+**Chaining** (decision D25). Each segment header names its predecessor: `prev_epoch` and `prev_end`, the offset where the predecessor's valid data ends. Rules for the writer:
+1. When a segment fills, write nothing more to it, **sync it**, and only then write the next segment's header with `prev_end` = the full segment's end offset.
+2. After recovery, **never append to the last replayed segment**: start a new segment (epoch = max seen + 1) with `prev_epoch`/`prev_end` = where replay ended.
+
+Replay starts at the segment whose epoch is the checkpoint's, at the checkpoint's offset, and reads until the segment's data stops (§10.2). It then looks for the segment whose header has `prev_epoch` = this epoch:
+- none: **end of log**; the stop point is the torn tail.
+- one, with `prev_end` = the stop offset: **end of segment**; continue there.
+- one, with a different `prev_end`: synced data is missing; recovery fails with a corruption error instead of dropping it.
 
 ### 10.2 Frames
 
@@ -291,11 +311,12 @@ Segment header (offset 0 of frame 0):
 | 8 | 4 | `format_version` u32 |
 | 12 | 4 | `stream` u32 |
 | 16 | 4 | `epoch` u32 |
-| 20 | 4 | reserved |
+| 20 | 4 | `prev_epoch` u32 (0 = first segment of a new stream) |
 | 24 | 16 | `db_id` (must match the superblock) |
 | 40 | 8 | `segment_size` u64 |
 | 48 | 4 | `frame_size` u32 (32768) |
-| 52 | 4 | `crc` u32: CRC32C of bytes 0..52 |
+| 52 | 4 | `prev_end` u32: offset where the predecessor's data ends |
+| 56 | 4 | `crc` u32: CRC32C of bytes 0..56 |
 
 Frames 1.. hold **fragments**. Fragment header (12 bytes):
 
@@ -307,9 +328,9 @@ Frames 1.. hold **fragments**. Fragment header (12 bytes):
 | 10 | 1 | `type`: 1 Full, 2 First, 3 Middle, 4 Last (0 = unused space) |
 | 11 | 1 | reserved |
 
-A record that fits in the rest of the current frame is one Full fragment; otherwise it is split into First, Middle..., Last fragments across frames. Fragments never span frames. If fewer than 12 bytes remain in a frame, they are zero and the next fragment starts at the next frame. A record never spans segments: if it does not fit, the writer moves to a new segment.
+A record that fits in the rest of the current frame is one Full fragment; otherwise it is split into First, Middle..., Last fragments across frames. Fragments never span frames. If fewer than 12 bytes remain in a frame, the reader skips them whatever they contain and the next fragment starts at the next frame. A record never spans segments: if it does not fit, the writer moves to a new segment. A record larger than a segment's payload fails with `RecordTooLarge`.
 
-**End of log.** Replay stops at the first fragment that has type 0, an epoch different from the segment's (stale data from a previous use of a recycled segment), a bad CRC, or a First/Middle without its Last before the segment ends. That point is the torn tail; everything from it on is discarded and overwritten.
+**Where a segment's data stops.** Replay of a segment stops at the first fragment header (read only where at least 12 bytes remain in the frame) that has type 0, an epoch different from the segment's (stale data from a previous use of the slot), a bad CRC, or a First/Middle whose Last never arrives before the segment ends. Whether that stop is the end of the segment or the end of the log is decided by chaining (§10.1), never by the stop condition itself. Data after the end of the log is never read again: the next segment starts fresh.
 
 ### 10.3 Records
 
@@ -318,8 +339,8 @@ The payload of a reassembled record:
 | Type | Byte 0 | Fields after the type byte |
 |---|---|---|
 | Batch | `1` | `seqno` u64, `commit_ts` u64, batch |
-| Prepare | `2` | `commit_id` u64, `seqno` u64, `commit_ts` u64, `coordinator_stream` u32, batch |
-| Commit | `3` | `commit_id` u64, `seqno` u64, `count` u16, `count` x `participant_stream` u32 |
+| Prepare | `2` | `seqno` u64, `commit_ts` u64, `coordinator_stream` u32, batch |
+| Commit | `3` | `seqno` u64, `count` u16, `count` x `participant_stream` u32 |
 
 **Batch** encoding (shared with the engine's `WriteBatch`, so commit never re-encodes): `count` u32, then `count` mutations:
 
@@ -333,13 +354,18 @@ The payload of a reassembled record:
 | `qualifier` | bytes (unescaped; empty for FamilyDelete) |
 | `value` | bytes: a stored value (§3); empty for deletes |
 
-**Cross-shard commits.** Each participant writes a Prepare with its share of the mutations. The coordinator writes a Commit to its own stream once every Prepare meets the requested durability. At recovery, a Prepare is applied if and only if its coordinator's stream holds a Commit with the same `commit_id`. A stream's checkpoint never advances past a Commit record while any of its participants' Prepares may still need replay (decision D24).
+**Cross-shard commits.** The commit's id is its seqno, reserved once by the coordinator, so it is unique for the life of the database (decision D26). Each participant writes a Prepare with its share of the mutations. The coordinator writes a Commit to its own stream once every Prepare meets the requested durability. At recovery, a Prepare is applied if and only if its coordinator's stream holds a Commit with the same seqno. Recovery sets `next_seqno` above every seqno in every replayed record, **including discarded Prepares**, so no seqno is ever reused. A stream's checkpoint never advances past a Commit record while any of its participants' Prepares may still need replay (decision D24).
 
 `Durability::None` commits write no WAL record.
 
 ## 11. Shared-memory region
 
-Named `phdb-` followed by 16 lowercase hex digits of `xxh3_64(device LE ++ inode LE)` of the main file: `/dev/shm/<name>` on Linux, POSIX `shm_open("/<name>")` on macOS and BSD (within the 31-byte limit), `Local\<name>` pagefile-backed mapping on Windows, or `<shm_dir>/<name>.phdb-shm` when `shm_dir` is set. The header also stores the device, inode and `db_id`, which an attaching process verifies.
+Two objects (decision D27), placed at `/dev/shm/<name>` on Linux, POSIX `shm_open("/<name>")` on macOS and BSD, a `Local\<name>` pagefile-backed mapping on Windows, or `<shm_dir>/<name>.phdb-shm` when `shm_dir` is set:
+
+- **Directory** `phdb-<h>`, where `<h>` is 16 lowercase hex digits of `xxh3_64(device LE ++ inode LE)` of the main file. One page whose layout never changes: magic `PHDBSHMD` @0, `format` u32 @8 (=1), `generation` u64 atomic @16 (current region, 0 = none), `layout_version` u32 atomic @24.
+- **Region** `phdb-<h>-<generation in hex>` (at most 31 bytes, macOS's limit), laid out below.
+
+A writer always builds a new generation: create the new region, store `state = abandoned` in the old one, then store the new generation in the directory. Because the name changes with the generation, a mapping some process still holds (Windows keeps named mappings alive while any handle is open) is never reused. Readers that see `state = abandoned` or a different directory generation re-attach. The header also stores the device, inode and `db_id`, which an attaching process verifies.
 
 ```text
 [header 4096][watermarks 64 x shards][view buffer 0][view buffer 1][reader slots 64 x n][pad to 2 MiB][arena 0]...[arena shards-1]
@@ -356,13 +382,13 @@ Named `phdb-` followed by 16 lowercase hex digits of `xxh3_64(device LE ++ inode
 | 12 | 4 | `header_len` u32 (4096) |
 | 16 | 8 | `region_len` u64 |
 | 24 | 16 | `db_id` |
-| 40 | 8 | `generation` u64, atomic: bumped each time a writer (re)builds the region |
-| 48 | 4 | `state` u32, atomic: 0 initializing, 1 ready, 2 abandoned |
+| 40 | 8 | `generation` u64: this region's generation (also in its name) |
+| 48 | 4 | `state` u32, atomic: 0 initializing, 1 ready, 2 abandoned (replaced by a newer generation) |
 | 52 | 4 | `shard_count` u32 |
 | 56 | 4 | `reader_slot_count` u32 |
 | 60 | 4 | `view_buffer_len` u32 |
 | 64 | 8 | `manifest_version` u64, atomic |
-| 72 | 8 | `view_pointer` u64, atomic: `(view_version << 1) \| buffer_index` |
+| 72 | 8 | `view_pointer` u64, atomic: `(view_version << 1) \| buffer_index`; view versions start at 1, 0 = none yet |
 | 80 | 4 | `writer_pid` u32 |
 | 84 | 4 | reserved |
 | 88 | 8 | `writer_start_time` u64 |
@@ -378,22 +404,24 @@ Named `phdb-` followed by 16 lowercase hex digits of `xxh3_64(device LE ++ inode
 
 ### 11.2 Watermarks
 
-One 64-byte line per shard at `watermarks_off + 64 x shard`. Offset 0: `pending` u64, atomic: the lowest seqno this shard has reserved but not yet applied, or `u64::MAX` if none. The rest of the line is padding (no false sharing).
+One 64-byte line per shard at `watermarks_off + 64 x shard`. Offset 0: `pending` u64, atomic: the lowest seqno this shard holds unapplied, or `u64::MAX` when idle (an idle shard never holds back snapshots). The rest of the line is padding (no false sharing).
 
 ### 11.3 Seqno reservation and snapshot protocol
 
-Writer shard reserving `n` seqnos for a commit group:
-1. `pending[shard].store(next_seqno.load())` (Release): a lower bound, published before reserving.
-2. `first = next_seqno.fetch_add(n)` (AcqRel).
-3. `pending[shard].store(first)`; apply the group; then store the next unapplied seqno, or `u64::MAX`.
+Each shard tracks `held`: the seqnos of cross-shard commits it coordinates that are not yet applied everywhere. Every store to `pending` publishes `min(held, x)`:
 
-A cross-shard commit's seqno stays pending on the coordinator until every participant has applied.
+1. `pending[shard].store(min(held, next_seqno.load()))` (Release): a lower bound, published before reserving.
+2. `first = next_seqno.fetch_add(n)` (AcqRel). A cross-shard commit reserves `n = 1` and adds its seqno to `held`.
+3. `pending[shard].store(min(held, first))`; apply the group; then store `min(held, next unapplied seqno)`, which is `u64::MAX` when nothing is held or pending.
+4. When every participant has applied a cross-shard commit, remove it from `held` and store `pending` again.
+
+Without the `min(held, ..)` in steps 1 and 3, a coordinator's next group would overwrite `pending` and expose half of a cross-shard commit.
 
 Snapshot (writer threads and reader processes alike): `n = next_seqno.load()` (Acquire), then `m = min over shards of pending.load()` (Acquire); the snapshot seqno is `min(n, m) - 1`. Every seqno below `n` was reserved by a `fetch_add` that published a lower bound first, so it is either applied or holds `m` at or below it.
 
 ### 11.4 View buffers
 
-Two buffers of `view_buffer_len` bytes at `views_off` and `views_off + view_buffer_len`. The writer encodes a new view into the buffer not named by `view_pointer`, then stores `view_pointer` (Release). A reader loads `view_pointer` (Acquire), copies the named buffer, re-loads `view_pointer`, and retries if it changed or the CRC fails.
+Two buffers of `view_buffer_len` bytes (default 4 MiB) at `views_off` and `views_off + view_buffer_len`. A view that does not fit is never published: the writer gets `ViewTooLarge` and refuses the change that grew it (for example a tablet split) (decision D28). The writer encodes a new view into the buffer not named by `view_pointer`, then stores `view_pointer` (Release). A reader loads `view_pointer` (Acquire), copies the named buffer, re-loads `view_pointer`, and retries if it changed or the CRC fails.
 
 View record:
 

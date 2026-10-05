@@ -3,7 +3,8 @@ use pigeonhole_format::Durability;
 use crate::ModelOp;
 
 /// Shape of a generated workload.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct WorkloadSpec {
     /// Distinct rows.
     pub rows: u64,

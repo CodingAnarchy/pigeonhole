@@ -61,7 +61,7 @@ impl Pigeonhole {
     }
 
     /// A consistent snapshot of everything committed so far.
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> Result<Snapshot> {
         todo!()
     }
 
@@ -116,8 +116,9 @@ impl PigeonholeReader {
         todo!()
     }
 
-    /// A consistent snapshot of what the writer has published.
-    pub fn snapshot(&self) -> Snapshot {
+    /// A consistent snapshot of what the writer has published. May do I/O: re-attach after
+    /// a writer restart and reload the manifest if it changed.
+    pub fn snapshot(&self) -> Result<Snapshot> {
         todo!()
     }
 }

@@ -13,6 +13,8 @@
 //! table lists the offset of the first entry of every row that begins in the block, so a scan
 //! can skip the rest of a row with a binary search instead of decoding cells. See `FORMAT.md` §3.
 
+use std::ops::Deref;
+
 use crate::compress::Compression;
 use crate::cursor::Cursor;
 
@@ -140,15 +142,17 @@ impl BlockBuilder {
     }
 }
 
-/// A parsed logical block borrowing its bytes (a cache buffer or a decompression buffer).
-#[derive(Debug, Clone, Copy)]
-pub struct Block<'a> {
-    _bytes: &'a [u8],
+/// A parsed logical block over any byte owner: `&[u8]`, a cache `BlockHandle`, a
+/// decompression buffer. Owning the bytes lets a cursor live beside whatever keeps them alive
+/// (an `Arc<SstReader>`, a pinned cache entry) without borrowing from it.
+#[derive(Debug, Clone)]
+pub struct Block<B> {
+    _bytes: B,
 }
 
-impl<'a> Block<'a> {
+impl<B: Deref<Target = [u8]>> Block<B> {
     /// Parses the restart and row-start tables. Never panics.
-    pub fn new(logical: &'a [u8]) -> crate::Result<Self> {
+    pub fn new(logical: B) -> crate::Result<Self> {
         todo!()
     }
 
@@ -162,27 +166,38 @@ impl<'a> Block<'a> {
         todo!()
     }
 
-    /// A cursor over the block, positioned before the first entry.
-    pub fn iter(&self) -> BlockIter<'a> {
+    /// A cursor over the block, positioned before the first entry. Takes the block (and so
+    /// its byte owner) by value; clone a cheap owner such as a `BlockHandle` to keep both.
+    pub fn into_cursor(self) -> BlockIter<B> {
         todo!()
     }
 }
 
-/// A zero-copy cursor over one logical block. Keys at restart points are borrowed; other keys
-/// are rebuilt in a small reused buffer.
+/// A zero-copy cursor over one logical block that owns its byte owner `B`. Keys at restart
+/// points are borrowed from the block; other keys are rebuilt in a small reused buffer.
 #[derive(Debug)]
-pub struct BlockIter<'a> {
-    _block: Block<'a>,
+pub struct BlockIter<B> {
+    _block: Block<B>,
 }
 
-impl BlockIter<'_> {
+impl<B: Deref<Target = [u8]>> BlockIter<B> {
     /// Byte offset of the current entry within the block (for row-start lookups).
     pub fn entry_offset(&self) -> usize {
         todo!()
     }
+
+    /// The byte owner (to hand out pinned value ranges).
+    pub fn bytes(&self) -> &B {
+        todo!()
+    }
+
+    /// The current value's byte range within the block.
+    pub fn value_range(&self) -> std::ops::Range<u32> {
+        todo!()
+    }
 }
 
-impl Cursor for BlockIter<'_> {
+impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
     type Error = crate::Error;
 
     fn valid(&self) -> bool {

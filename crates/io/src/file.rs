@@ -5,6 +5,7 @@ use crate::{Completion, FileIdentity, IoBuf, Result};
 
 /// How to open a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct OpenOptions {
     /// Open for writing as well as reading.
     pub write: bool,
@@ -61,6 +62,10 @@ pub trait File: Send + Sync + Debug {
 
     /// Makes written data durable (fdatasync / F_FULLFSYNC / FlushFileBuffers).
     fn sync_data(&self) -> Result<()>;
+
+    /// Submits [`File::sync_data`] and returns at once; the backend runs it off the caller's
+    /// thread (pread pool, io_uring in Phase 3) so a shard keeps working while it runs.
+    fn submit_sync_data(&self) -> Completion<()>;
 
     /// Makes data and metadata (size) durable.
     fn sync_all(&self) -> Result<()>;

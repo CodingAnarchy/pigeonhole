@@ -22,6 +22,7 @@ pub mod filter;
 pub mod ids;
 pub mod key;
 pub mod manifest;
+pub mod scan;
 pub mod shm;
 pub mod sst;
 pub mod superblock;
@@ -33,8 +34,8 @@ pub mod wal;
 pub use cursor::Cursor;
 pub use error::{Error, Result};
 pub use ids::{
-    BlobFileId, CommitId, Durability, FamilyId, Lsn, ManifestVersion, Seqno, SstId, StreamId,
-    TableId, TabletId, Timestamp,
+    BlobFileId, Durability, FamilyId, Lsn, ManifestVersion, Seqno, SstId, StreamId, TableId,
+    TabletId, Timestamp,
 };
 pub use key::{Kind, decode_key, encode_key};
 pub use version::{FormatVersion, ShmLayoutVersion};

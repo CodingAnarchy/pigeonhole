@@ -54,6 +54,7 @@ pub struct ShardId(pub u16);
 
 /// Runtime configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RuntimeConfig {
     /// Number of shards (default: available CPUs).
     pub shards: usize,
@@ -65,6 +66,13 @@ pub struct RuntimeConfig {
     pub time_slice: Duration,
     /// Clock source (simulated under test).
     pub vfs: VfsRef,
+}
+
+impl RuntimeConfig {
+    /// Defaults: one shard per available CPU, pinned, no compaction threads, 500 µs slices.
+    pub fn new(vfs: VfsRef) -> Self {
+        todo!()
+    }
 }
 
 /// The engine's per-shard state. One instance per shard, moved onto its thread.

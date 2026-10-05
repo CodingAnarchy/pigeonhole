@@ -5,19 +5,10 @@ use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
 use pigeonhole_wal::WalOptions;
 
-/// Who runs the shard loops.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Embedding {
-    /// The engine spawns and pins one thread per shard.
-    #[default]
-    EngineOwned,
-    /// The application drives each shard from its own threads via [`crate::EngineShard`].
-    ApplicationOwned,
-}
-
 /// Engine configuration. Process-local; nothing here is stored in the file except through
 /// table and family creation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EngineOptions {
     /// Filesystem and clocks (`PreadVfs` normally, `SimVfs` under test).
     pub vfs: VfsRef,
@@ -25,9 +16,8 @@ pub struct EngineOptions {
     pub create_if_missing: bool,
     /// Shard count; 0 means available CPUs.
     pub shards: usize,
-    /// Who runs the shard loops.
-    pub embedding: Embedding,
-    /// Pin shard threads (engine-owned mode).
+    /// Pin shard threads (engine-owned mode; see `Engine::open_application_owned` for the
+    /// other mode).
     pub pin_threads: bool,
     /// Extra threads dedicated to flush and compaction; 0 runs them on the shards.
     pub compaction_threads: usize,

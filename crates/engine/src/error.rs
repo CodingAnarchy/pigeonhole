@@ -54,6 +54,13 @@ pub enum Error {
     Unsupported(&'static str),
     /// The database is closed.
     Closed,
+    /// Every reader slot in the shared-memory region is taken.
+    NoReaderSlot,
+    /// A commit's WAL record is larger than a WAL segment can hold.
+    RecordTooLarge,
+    /// Writes are stalled (L0 too deep, or the memtable arena full) and the caller asked not
+    /// to wait.
+    Busy,
 }
 
 impl fmt::Display for Error {
