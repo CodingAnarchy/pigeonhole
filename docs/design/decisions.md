@@ -14,6 +14,8 @@ Per the io brief, `SimVfs` (fault injection, deterministic from a seed) is an `i
 ## D4 — interface-freeze gate
 The spec gates the interface freeze on owner review. The owner directed autonomous progress, so the coordinator reviews and approves interfaces, records the approval here, and the owner may revisit at any time through an interface-change request.
 
+**Approved 2026-10-05:** the interface freeze (PR #1), including D7–D24 as revised after review.
+
 ## D5 — reference hardware
 No enterprise-NVMe Linux box with power-loss protection is attached to this project yet. Benchmarks run on available hardware (developer macOS arm64 and GitHub Linux runners), are reported in every run, and are labeled as non-reference. Performance gates are evaluated against those numbers until reference hardware is available.
 

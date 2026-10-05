@@ -7,3 +7,4 @@
 /fuzz/corpus
 /fuzz/artifacts
 proptest-regressions/
+/.claude/settings.local.json

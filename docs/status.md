@@ -4,9 +4,9 @@ Live progress against the [build plan](design/spec.md#build-plan). Updated by th
 
 | Step | State |
 |---|---|
-| 1. Bootstrap — workspace, CI, contributor docs | in progress |
-| 2. Interface freeze — public traits/types for every crate, `FORMAT.md` | not started |
-| 3. Foundations — `format`, `io`, `sim` | not started |
+| 1. Bootstrap — workspace, CI, contributor docs | done |
+| 2. Interface freeze — public traits/types for every crate, `FORMAT.md` | done ([#1](https://github.com/CodingAnarchy/pigeonhole/pull/1); see [interfaces.md](design/interfaces.md)) |
+| 3. Foundations — `format`, `io`, `sim` | in progress (`format`, `io` building in parallel) |
 | 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | not started |
 | 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | not started |
 

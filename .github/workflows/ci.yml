@@ -1,8 +1,7 @@
 name: CI
 
-# Kept to a few jobs: runners (macOS especially) are scarce on this account and
-# jobs left queued for 15 minutes are cancelled. macOS runs only on main because
-# development happens on macOS, so PRs are already exercised there locally.
+# Kept to four jobs to limit runner usage. During GitHub Actions outages jobs can
+# fail with "not acquired by Runner"; re-run them once the outage clears.
 
 on:
   push:
@@ -57,8 +56,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
-        exclude:
-          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: -D warnings
