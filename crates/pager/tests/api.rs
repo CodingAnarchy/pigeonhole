@@ -326,13 +326,20 @@ fn relocate_moves_bytes_toward_the_start() {
     assert_eq!(&buf, b"payload");
     pager.read(moved, (128 << 10) - 3, &mut buf[..3]).unwrap();
     assert_eq!(&buf[..3], b"end");
+    // Publish the move (version 1 names `moved`), then retire the old copy.
+    pager
+        .commit_root(Root {
+            snapshot: Some(moved),
+            ..root(1)
+        })
+        .unwrap();
     pager.retire(high, 1);
     assert_eq!(
         pager.truncate_tail().unwrap(),
         0,
         "retired extents are kept"
     );
-    pager.reclaim(1);
+    assert_eq!(pager.reclaim(1), 1);
     assert_eq!(pager.truncate_tail().unwrap(), 128 << 10);
     assert_eq!(pager.file().len().unwrap(), pager.stats().file_bytes);
 }
@@ -348,4 +355,19 @@ fn errors_display() {
     ];
     assert!(msgs.iter().all(|m| !m.is_empty()));
     assert!(msgs[2].contains('2'));
+}
+
+#[test]
+fn relocate_refuses_retired_and_unallocated_extents() {
+    let pager = Pager::create(&sim(), path()).unwrap();
+    let low = pager.allocate(1).unwrap();
+    let high = pager.allocate(1).unwrap();
+    pager.abandon(low); // a free extent below `high`
+    pager.retire(high, 1);
+    assert!(matches!(pager.relocate(high), Err(Error::Io(_))), "retired");
+    assert!(
+        matches!(pager.relocate(low), Err(Error::Io(_))),
+        "unallocated"
+    );
+    assert_eq!(pager.stats().allocated_bytes, 0, "nothing was allocated");
 }

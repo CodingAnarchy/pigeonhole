@@ -267,6 +267,13 @@ impl Alloc {
         done.len()
     }
 
+    /// Whether `e` is exactly a live (used, not retired) extent.
+    pub(crate) fn is_live(&self, e: Extent) -> bool {
+        unit_of(e)
+            .and_then(|u| self.used.get(&u))
+            .is_some_and(|u| u.class == e.size_class && u.retired.is_none())
+    }
+
     /// Whether `e` is exactly a used extent (live or retired).
     pub(crate) fn is_used(&self, e: Extent) -> bool {
         unit_of(e)

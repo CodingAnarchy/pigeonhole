@@ -18,8 +18,8 @@
 //!
 //! - [`Pager::allocate`], [`Pager::abandon`], [`Pager::retire`], [`Pager::reclaim`],
 //!   [`Pager::stats`] and [`Pager::shrink_plan`] only touch memory, except that `allocate`
-//!   preallocates more file (one `fallocate`) when no free extent fits. They run per flush or
-//!   compaction output, never per write.
+//!   preallocates more file (one `fallocate` of at most 64 MiB, under the allocator lock)
+//!   when no free extent fits. They run per flush or compaction output, never per write.
 //! - [`Pager::read`] and [`Pager::write`] are positional I/O on the caller's thread.
 //! - [`Pager::commit_root`] and [`Pager::mark_clean`] block on two fsyncs. They must not run
 //!   on a shard's foreground loop (decision D30): the manifest task uses
@@ -601,6 +601,8 @@ impl Pager {
         if let Some(e) = alloc.alloc_free(class) {
             return Ok(e);
         }
+        // The allocator lock is held across this one `fallocate` (at most 64 MiB, once per
+        // file growth) so two growths cannot claim the same tail; other allocations wait.
         // Preallocate rather than extend sparsely: a full disk fails here, as `NoSpace`, and
         // later writes into the extent need no metadata update before the commit's fsync.
         let (_, end) = alloc.grow_target(class);
@@ -688,8 +690,14 @@ impl Pager {
 
     /// Frees every retired extent whose `superseded_at <= oldest_live`, where `oldest_live`
     /// is the oldest manifest version any view (in-process or in a reader slot) still uses.
+    ///
+    /// `oldest_live` is clamped to the manifest version of the last *completed* root commit:
+    /// until the root that drops an extent is durable, a crash recovers to a root that still
+    /// references it, so it is not freed even if no view uses it (a retire and reclaim may
+    /// run while [`Pager::submit_commit_root`] is still in flight).
     pub fn reclaim(&self, oldest_live: ManifestVersion) -> usize {
-        lock(&self.inner.alloc).reclaim(oldest_live)
+        let durable = lock(&self.inner.state).root.manifest_version;
+        lock(&self.inner.alloc).reclaim(oldest_live.min(durable))
     }
 
     /// Extents past the shrink point that must move before the file can shrink.
@@ -717,10 +725,10 @@ impl Pager {
         }
         let target = {
             let mut alloc = lock(&self.inner.alloc);
-            if !alloc.is_used(extent) {
+            if !alloc.is_live(extent) {
                 return Err(io_err(
                     ErrorKind::Other,
-                    "relocate of an unallocated extent",
+                    "relocate of an extent that is not live (unallocated or retired)",
                 ));
             }
             match alloc.alloc_lowest(extent.size_class) {
@@ -753,8 +761,12 @@ impl Pager {
 
     /// Truncates the file after its last allocated extent. Returns bytes released.
     ///
-    /// Retired extents still count as allocated (an old view may read them). The truncation
-    /// is synced before this returns.
+    /// Retired extents still count as allocated (an old view may read them), and free space
+    /// only exists where the durable root references nothing (see [`Pager::reclaim`]). While
+    /// a root commit is in flight this releases nothing and returns 0, so a truncation never
+    /// races the commit's syncs; call it again afterwards. The truncation is synced before
+    /// this returns. The superblock's `file_pages` is refreshed by the next root commit; open
+    /// sizes the allocator from the file length, never from `file_pages`.
     pub fn truncate_tail(&self) -> Result<u64> {
         if !self.inner.writable {
             return Err(io_err(
@@ -764,6 +776,9 @@ impl Pager {
         }
         let released = {
             let mut alloc = lock(&self.inner.alloc);
+            if self.inner.committing.load(Ordering::Acquire) {
+                return Ok(0);
+            }
             let (end, frontier) = (alloc.used_end(), alloc.frontier());
             if end >= frontier {
                 return Ok(0);
