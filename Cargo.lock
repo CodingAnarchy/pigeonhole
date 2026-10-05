@@ -608,8 +608,10 @@ dependencies = [
 name = "pigeonhole-wal"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pigeonhole-format",
  "pigeonhole-io",
+ "proptest",
 ]
 
 [[package]]
