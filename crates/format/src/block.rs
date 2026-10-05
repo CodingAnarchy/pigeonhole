@@ -245,12 +245,12 @@ impl BlockBuilder {
     /// Appends an entry. Keys must be strictly increasing.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> crate::Result<()> {
         if self.finished {
-            return Err(Error::Corrupt {
+            return Err(Error::InvalidArgument {
                 what: "block builder: add after finish",
             });
         }
         if self.entries > 0 && key <= self.last_key.as_slice() {
-            return Err(Error::Corrupt {
+            return Err(Error::InvalidArgument {
                 what: "block builder: keys out of order",
             });
         }

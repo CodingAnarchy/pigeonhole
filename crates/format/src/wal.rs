@@ -501,8 +501,15 @@ const EXPLICIT_TS: u8 = 0x80;
 
 /// The rules every mutation obeys, checked when it is pushed and again when a batch is
 /// decoded: row and qualifier at most [`MAX_KEY_PART`], value at most [`MAX_VALUE_LEN`],
-/// deletes carry no value, and a family delete carries no qualifier.
-fn check_mutation(kind: Kind, row: &[u8], qualifier: &[u8], value: &[u8]) -> crate::Result<()> {
+/// deletes carry no value, and a family delete carries no qualifier. A shape violation is
+/// reported with `shape`: `InvalidArgument` when pushing, `Corrupt` when decoding.
+fn check_mutation(
+    kind: Kind,
+    row: &[u8],
+    qualifier: &[u8],
+    value: &[u8],
+    shape: fn(&'static str) -> Error,
+) -> crate::Result<()> {
     if row.len() > MAX_KEY_PART || qualifier.len() > MAX_KEY_PART {
         return Err(Error::KeyTooLarge);
     }
@@ -512,9 +519,7 @@ fn check_mutation(kind: Kind, row: &[u8], qualifier: &[u8], value: &[u8]) -> cra
     if (kind.is_delete() && !value.is_empty())
         || (kind == Kind::FamilyDelete && !qualifier.is_empty())
     {
-        return Err(Error::Corrupt {
-            what: "mutation: delete with value or qualifier",
-        });
+        return Err(shape("mutation: delete with value or qualifier"));
     }
     Ok(())
 }
@@ -538,7 +543,9 @@ impl BatchBuilder {
         ts: Option<Timestamp>,
         value: &[u8],
     ) -> crate::Result<()> {
-        check_mutation(kind, row, qualifier, value)?;
+        check_mutation(kind, row, qualifier, value, |what| Error::InvalidArgument {
+            what,
+        })?;
         let count = self.count.checked_add(1).ok_or(Error::ValueTooLarge)?;
         let b = &mut self.buf;
         b.extend_from_slice(&table.0.to_le_bytes());
@@ -685,7 +692,9 @@ impl<'a> BatchIter<'a> {
             qualifier: r.bytes()?,
             value: r.bytes()?,
         };
-        check_mutation(m.kind, m.row, m.qualifier, m.value)?;
+        check_mutation(m.kind, m.row, m.qualifier, m.value, |what| Error::Corrupt {
+            what,
+        })?;
         self.rest = r.rest();
         Ok(m)
     }
@@ -731,22 +740,19 @@ impl<'a> StreamList<'a> {
         Ok(Self { bytes })
     }
 
-    /// Appends `streams` in the same encoding.
-    ///
-    /// # Panics
-    ///
-    /// If there are more than `u16::MAX` streams. Participants are WAL streams, which number
-    /// at most the shard count, so this is a caller bug; returning an error instead would
-    /// change the frozen signature (see ICR 0001).
-    pub fn encode(streams: &[StreamId], out: &mut Vec<u8>) {
-        assert!(
-            streams.len() <= usize::from(u16::MAX),
-            "a COMMIT record lists at most 65535 participant streams"
-        );
+    /// Appends `streams` in the same encoding. Fails with
+    /// [`Error::InvalidArgument`] (writing nothing) if there are more than `u16::MAX`.
+    pub fn encode(streams: &[StreamId], out: &mut Vec<u8>) -> crate::Result<()> {
+        if streams.len() > usize::from(u16::MAX) {
+            return Err(Error::InvalidArgument {
+                what: "a COMMIT record lists at most 65535 participant streams",
+            });
+        }
         out.extend_from_slice(&(streams.len() as u16).to_le_bytes());
         for s in streams {
             out.extend_from_slice(&s.0.to_le_bytes());
         }
+        Ok(())
     }
 
     /// Iterates the stream ids.

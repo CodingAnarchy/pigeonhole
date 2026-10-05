@@ -224,7 +224,7 @@ proptest! {
 
         let streams: Vec<_> = streams.into_iter().map(StreamId).collect();
         let mut list = Vec::new();
-        StreamList::encode(&streams, &mut list);
+        StreamList::encode(&streams, &mut list).unwrap();
         let list = StreamList::new(&list).unwrap();
         prop_assert_eq!(list.iter().collect::<Vec<_>>(), streams);
 

@@ -1,6 +1,6 @@
 # 0001: `pigeonhole_format::Error::InvalidArgument` and a fallible `StreamList::encode`
 
-**Status:** proposed (format agent, from the PR #4 review). Code is unchanged until this is approved.
+**Status:** Approved (coordinator, 2026-10-05). Implemented in PR #4.
 
 ## Change
 
@@ -10,7 +10,7 @@
    - `block::BlockBuilder::add` after `finish`, or with keys out of order.
 
    Decoding the same conditions from bytes stays `Corrupt`.
-2. Change `wal::StreamList::encode(streams, out)` to return `Result<()>`, failing with `InvalidArgument` on more than `u16::MAX` streams. Today it asserts, and documents the panic.
+2. Change `wal::StreamList::encode(streams, out)` to return `Result<()>`, failing with `InvalidArgument` on more than `u16::MAX` streams. It used to assert, documenting the panic.
 
 ## Why
 

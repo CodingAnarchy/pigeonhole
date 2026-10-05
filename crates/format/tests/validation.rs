@@ -159,8 +159,57 @@ fn decoder_clamps_to_frame_one() {
 }
 
 #[test]
-#[should_panic(expected = "65535")]
 fn stream_list_refuses_too_many_streams() {
-    let streams = vec![StreamId(0); 65536];
-    StreamList::encode(&streams, &mut Vec::new());
+    let mut out = Vec::new();
+    let err = StreamList::encode(&vec![StreamId(0); 65536], &mut out).unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument { .. }));
+    assert!(out.is_empty(), "nothing written on failure");
+    StreamList::encode(&vec![StreamId(0); 65535], &mut out).unwrap();
+    assert_eq!(out.len(), 2 + 4 * 65535);
+}
+
+#[test]
+fn caller_misuse_is_invalid_argument() {
+    use pigeonhole_format::block::BlockBuilder;
+    use pigeonhole_format::key::encode_key;
+    use pigeonhole_format::wal::BatchBuilder;
+    use pigeonhole_format::{FamilyId, Kind, TableId};
+    let invalid = |r: Result<(), Error>| matches!(r, Err(Error::InvalidArgument { .. }));
+    assert!(invalid(encode_key(
+        &mut Vec::new(),
+        b"r",
+        b"",
+        1,
+        1,
+        Kind::FamilyDelete
+    )));
+    let mut b = BatchBuilder::new();
+    assert!(invalid(b.push(
+        TableId(1),
+        FamilyId(1),
+        Kind::ColumnDelete,
+        b"r",
+        b"q",
+        None,
+        b"\0v"
+    )));
+    assert!(invalid(b.push(
+        TableId(1),
+        FamilyId(1),
+        Kind::FamilyDelete,
+        b"r",
+        b"q",
+        None,
+        b""
+    )));
+    let mut blk = BlockBuilder::index();
+    blk.add(b"b", b"").unwrap();
+    assert!(invalid(blk.add(b"a", b"")), "out of order");
+    blk.finish();
+    assert!(invalid(blk.add(b"c", b"")), "after finish");
+    // The same shape violations read from bytes are corruption, not caller error.
+    assert!(matches!(
+        BatchRef::new(&batch(3, 1, b"q", b"\0v")),
+        Err(Error::Corrupt { .. })
+    ));
 }

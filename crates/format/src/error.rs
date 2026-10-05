@@ -48,6 +48,13 @@ pub enum Error {
     ValueTooLarge,
     /// A compression codec this build does not support.
     UnsupportedCompression(u8),
+    /// The caller passed arguments an encoder cannot accept (for example a
+    /// [`FamilyDelete`](crate::Kind::FamilyDelete) cell key, or keys out of order). Never
+    /// produced by a decoder: bad bytes are [`Error::Corrupt`].
+    InvalidArgument {
+        /// What was wrong.
+        what: &'static str,
+    },
 }
 
 impl fmt::Display for Error {
@@ -63,6 +70,7 @@ impl fmt::Display for Error {
             Error::KeyTooLarge => write!(f, "row key or qualifier longer than 65536 bytes"),
             Error::ValueTooLarge => write!(f, "value longer than 2^32 - 1 bytes"),
             Error::UnsupportedCompression(c) => write!(f, "unsupported compression codec {c}"),
+            Error::InvalidArgument { what } => write!(f, "invalid argument: {what}"),
         }
     }
 }

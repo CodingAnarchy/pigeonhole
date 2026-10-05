@@ -114,8 +114,8 @@ pub fn encode_key(
     kind: Kind,
 ) -> crate::Result<()> {
     if kind == Kind::FamilyDelete {
-        return Err(Error::Corrupt {
-            what: "FamilyDelete cell key",
+        return Err(Error::InvalidArgument {
+            what: "FamilyDelete needs encode_marker_key",
         });
     }
     encode_column_prefix(out, row, qualifier)?;

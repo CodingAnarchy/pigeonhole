@@ -482,7 +482,7 @@ fn wal() {
 
     let b = batch();
     let mut participants = Vec::new();
-    StreamList::encode(&[StreamId(0), StreamId(5)], &mut participants);
+    StreamList::encode(&[StreamId(0), StreamId(5)], &mut participants).unwrap();
     let records = [
         (
             "wal_record_batch.bin",
