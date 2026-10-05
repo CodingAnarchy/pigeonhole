@@ -13,7 +13,11 @@ categories.workspace = true
 readme = "README.md"
 
 [dependencies]
+pigeonhole-io = { workspace = true }
 pigeonhole-format = { workspace = true }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
 
 [lints]
 workspace = true

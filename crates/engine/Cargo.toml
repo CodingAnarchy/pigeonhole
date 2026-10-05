@@ -23,6 +23,10 @@ pigeonhole-runtime = { workspace = true }
 pigeonhole-shm = { workspace = true }
 pigeonhole-sst = { workspace = true }
 pigeonhole-compaction = { workspace = true }
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+pigeonhole-sim = { workspace = true }
 
 [lints]
 workspace = true

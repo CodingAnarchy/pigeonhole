@@ -50,6 +50,18 @@ pigeonhole-arrow = { path = "crates/arrow", version = "0.1.0" }
 pigeonhole-cli = { path = "crates/cli", version = "0.1.0" }
 pigeonhole-capi = { path = "crates/capi", version = "0.1.0" }
 
+# External dependencies. Each one is justified in docs/design/interfaces.md.
+crc32c = "0.6"
+twox-hash = { version = "2", default-features = false, features = ["std", "xxhash3_64"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+arc-swap = "1"
+libc = "0.2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading"] }
+# Dev-only.
+proptest = "1"
+loom = "0.7"
+criterion = "0.8"
+
 [workspace.lints.rust]
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "deny"
@@ -58,7 +70,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(pigeonhole_si
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 dbg_macro = "warn"
-todo = "warn"
 
 [profile.release]
 debug = 1
