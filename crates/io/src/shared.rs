@@ -2,7 +2,7 @@ use std::alloc::{self, Layout};
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::Result;
 
@@ -52,10 +52,12 @@ enum Backing {
     Mapped(#[allow(dead_code)] crate::os::Mapping),
 }
 
-// SAFETY: the region is plain memory that every accessor touches only through atomics or
-// volatile copies; the pointer stays valid while the `Arc` lives, on any thread.
+// SAFETY: the memory stays valid while the `Arc` lives, whichever thread holds it, and safe
+// code reaches it only through atomics: the `&AtomicU32`/`&AtomicU64` references that
+// `atomic_u32`/`atomic_u64` hand out, and the relaxed atomic copies in `read`/`write`.
+// `base_ptr` users (memtable) take on the same discipline in their own `unsafe`.
 unsafe impl Send for RegionInner {}
-// SAFETY: as above; `&RegionInner` exposes no non-atomic shared references into the memory.
+// SAFETY: as above; every shared access is atomic, so concurrent use is race-free.
 unsafe impl Sync for RegionInner {}
 
 /// Alignment of heap regions.
@@ -119,7 +121,7 @@ impl SharedRegion {
             "misaligned AtomicU32 at {offset}"
         );
         // SAFETY: in bounds and aligned (checked above); the memory lives as long as `self`
-        // and is only ever accessed atomically or through volatile copies.
+        // and is only ever accessed atomically.
         unsafe { AtomicU32::from_ptr(p.cast()) }
     }
 
@@ -134,21 +136,23 @@ impl SharedRegion {
         unsafe { AtomicU64::from_ptr(p.cast()) }
     }
 
-    /// Copies `dst.len()` bytes out of the region (volatile; may observe concurrent writes,
-    /// which callers detect with checksums or version re-checks). Panics if out of bounds.
+    /// Copies `dst.len()` bytes out of the region (relaxed atomic loads, a word at a time; may
+    /// observe concurrent writes, which callers detect with checksums or version re-checks).
+    /// Panics if out of bounds.
     pub fn read(&self, offset: usize, dst: &mut [u8]) {
         let src = self.at(offset, dst.len());
-        // SAFETY: `src` is valid for `dst.len()` bytes (bounds checked) and cannot overlap
-        // `dst`, which is an exclusive Rust borrow.
+        // SAFETY: `src` is valid for `dst.len()` bytes (bounds checked), is only ever accessed
+        // atomically, and cannot overlap `dst`, an exclusive Rust borrow.
         unsafe { copy_from_region(src, dst) };
     }
 
-    /// Copies `src` into the region (volatile). Callers ensure no one reads the range as
-    /// stable data until they publish it with a release store. Panics if out of bounds.
+    /// Copies `src` into the region (relaxed atomic stores, a word at a time). Callers ensure
+    /// no one reads the range as stable data until they publish it with a release store.
+    /// Panics if out of bounds.
     pub fn write(&self, offset: usize, src: &[u8]) {
         let dst = self.at(offset, src.len());
-        // SAFETY: `dst` is valid for `src.len()` bytes (bounds checked); `src` is a Rust
-        // borrow and the region never hands out references, so they cannot overlap.
+        // SAFETY: `dst` is valid for `src.len()` bytes (bounds checked) and is only ever
+        // accessed atomically; `src` is a plain Rust borrow, so it is not region memory.
         unsafe { copy_to_region(src, dst) };
     }
 
@@ -171,62 +175,57 @@ impl SharedRegion {
 
 const WORD: usize = std::mem::size_of::<u64>();
 
-/// Volatile copy out of the region, a word at a time once the region side is aligned.
+/// Copies out of the region with relaxed atomic loads: bytes until the region side is word
+/// aligned, then words, then the tail. Atomics (not volatile) because another thread or
+/// process may be writing the same bytes; a torn mix of old and new words is possible and is
+/// the caller's to detect.
 ///
 /// # Safety
-/// `src` must be valid for reads of `dst.len()` bytes and must not overlap `dst`.
-unsafe fn copy_from_region(src: *const u8, dst: &mut [u8]) {
+/// `src` must be valid for `dst.len()` bytes, accessed only atomically, and not overlap `dst`.
+unsafe fn copy_from_region(src: *mut u8, dst: &mut [u8]) {
     let len = dst.len();
-    let d = dst.as_mut_ptr();
     let head = src.align_offset(WORD).min(len);
     let mut i = 0;
     while i < head {
-        // SAFETY: `i < len`; both pointers are valid for `len` bytes (caller contract).
-        unsafe { d.add(i).write(src.add(i).read_volatile()) };
+        // SAFETY: `i < len`, so `src + i` is in bounds (caller contract).
+        dst[i] = unsafe { AtomicU8::from_ptr(src.add(i)) }.load(Ordering::Relaxed);
         i += 1;
     }
     while i + WORD <= len {
-        // SAFETY: `src + i` is word aligned and `[i, i + WORD)` is in bounds on both sides;
-        // the destination write is unaligned-tolerant.
-        unsafe {
-            let w = src.add(i).cast::<u64>().read_volatile();
-            d.add(i).cast::<u64>().write_unaligned(w);
-        }
+        // SAFETY: `src + i` is word aligned and `[i, i + WORD)` is in bounds.
+        let w = unsafe { AtomicU64::from_ptr(src.add(i).cast()) }.load(Ordering::Relaxed);
+        dst[i..i + WORD].copy_from_slice(&w.to_ne_bytes());
         i += WORD;
     }
     while i < len {
         // SAFETY: `i < len`.
-        unsafe { d.add(i).write(src.add(i).read_volatile()) };
+        dst[i] = unsafe { AtomicU8::from_ptr(src.add(i)) }.load(Ordering::Relaxed);
         i += 1;
     }
 }
 
-/// Volatile copy into the region, a word at a time once the region side is aligned.
+/// Copies into the region with relaxed atomic stores (see `copy_from_region`).
 ///
 /// # Safety
-/// `dst` must be valid for writes of `src.len()` bytes and must not overlap `src`.
+/// `dst` must be valid for `src.len()` bytes, accessed only atomically, and not overlap `src`.
 unsafe fn copy_to_region(src: &[u8], dst: *mut u8) {
     let len = src.len();
-    let s = src.as_ptr();
     let head = dst.align_offset(WORD).min(len);
     let mut i = 0;
     while i < head {
-        // SAFETY: `i < len`; both pointers are valid for `len` bytes (caller contract).
-        unsafe { dst.add(i).write_volatile(s.add(i).read()) };
+        // SAFETY: `i < len`, so `dst + i` is in bounds (caller contract).
+        unsafe { AtomicU8::from_ptr(dst.add(i)) }.store(src[i], Ordering::Relaxed);
         i += 1;
     }
     while i + WORD <= len {
-        // SAFETY: `dst + i` is word aligned and `[i, i + WORD)` is in bounds on both sides;
-        // the source read is unaligned-tolerant.
-        unsafe {
-            let w = s.add(i).cast::<u64>().read_unaligned();
-            dst.add(i).cast::<u64>().write_volatile(w);
-        }
+        let w = u64::from_ne_bytes(src[i..i + WORD].try_into().expect("one word"));
+        // SAFETY: `dst + i` is word aligned and `[i, i + WORD)` is in bounds.
+        unsafe { AtomicU64::from_ptr(dst.add(i).cast()) }.store(w, Ordering::Relaxed);
         i += WORD;
     }
     while i < len {
         // SAFETY: `i < len`.
-        unsafe { dst.add(i).write_volatile(s.add(i).read()) };
+        unsafe { AtomicU8::from_ptr(dst.add(i)) }.store(src[i], Ordering::Relaxed);
         i += 1;
     }
 }
@@ -298,6 +297,24 @@ mod tests {
         t.join().unwrap();
         assert_eq!(r.atomic_u64(8).load(Ordering::Acquire), 1);
         r.bind_numa(0, 64, 0).unwrap();
+    }
+
+    #[test]
+    fn concurrent_copies_are_race_free() {
+        let r = SharedRegion::heap(64);
+        let w = r.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..50u8 {
+                w.write(3, &[i; 40]);
+            }
+        });
+        let mut buf = [0u8; 40];
+        for _ in 0..50 {
+            r.read(3, &mut buf); // may tear across words; must not be UB (Miri checks)
+        }
+        writer.join().unwrap();
+        r.read(3, &mut buf);
+        assert_eq!(buf, [49; 40]);
     }
 
     #[test]

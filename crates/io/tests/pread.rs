@@ -19,8 +19,9 @@ const CHILD_ENV: &str = "PIGEONHOLE_IO_LOCK_PROBE";
 const PROBE_OK: i32 = 0;
 const PROBE_LOCKED: i32 = 10;
 
-/// Runs in a child process (see `probe`): opens the file, tries one lock, reports by exit
-/// code. Without the environment variable it is an ordinary, empty test.
+/// Runs in a child process (see `probe` and `hold`): opens the file and tries one lock.
+/// A probe reports by exit code; a holder (`hs`/`hx`) prints a marker line and keeps the
+/// lock until its stdin closes. Without the environment variable it is an empty test.
 #[test]
 fn lock_probe_child() {
     let Ok(spec) = std::env::var(CHILD_ENV) else {
@@ -32,6 +33,7 @@ fn lock_probe_child() {
         parts.next().unwrap().parse::<u64>().unwrap(),
         parts.next().unwrap(),
     );
+    let (holding, mode) = mode.strip_prefix('h').map_or((false, mode), |m| (true, m));
     let mode = if mode == "x" {
         LockMode::Exclusive
     } else {
@@ -41,6 +43,17 @@ fn lock_probe_child() {
     let mut opts = OpenOptions::read();
     opts.write = true;
     let file = vfs.open(Path::new(path), opts).unwrap();
+    if holding {
+        use std::io::{Read, Write};
+        let marker = match file.lock(byte, mode) {
+            Ok(()) => HELD,
+            Err(_) => REFUSED,
+        };
+        println!("{marker}");
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read_to_end(&mut Vec::new());
+        std::process::exit(PROBE_OK);
+    }
     let code = match file.lock(byte, mode) {
         Ok(()) => PROBE_OK,
         Err(e) if e.kind == ErrorKind::Locked => PROBE_LOCKED,
@@ -73,6 +86,57 @@ fn probe(path: &Path, byte: u64, mode: LockMode) -> bool {
         Some(PROBE_OK) => true,
         Some(PROBE_LOCKED) => false,
         other => panic!("lock probe child failed: {other:?}"),
+    }
+}
+
+const HELD: &str = "PIGEONHOLE-LOCK-HELD";
+const REFUSED: &str = "PIGEONHOLE-LOCK-REFUSED";
+
+/// Another process holding a lock until dropped.
+struct Holder(std::process::Child);
+
+/// Starts a child process that takes `mode` on `byte` of `path` and keeps it.
+fn hold(path: &Path, byte: u64, mode: LockMode) -> Holder {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    let m = if mode == LockMode::Exclusive {
+        "hx"
+    } else {
+        "hs"
+    };
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lock_probe_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ENV, format!("{m}|{byte}|{}", path.display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Waited on by `Holder::drop` on every path, including the panics below.
+    let mut holder = Holder(child);
+    // The test harness prints its own lines (without newlines) around ours: scan for the marker.
+    let mut out = std::io::BufReader::new(holder.0.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "holder exited early");
+        if line.contains(REFUSED) {
+            panic!("holder could not take its lock");
+        }
+        if line.contains(HELD) {
+            return holder;
+        }
+    }
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take()); // EOF: the holder releases and exits
+        self.0.wait().unwrap();
     }
 }
 
@@ -151,10 +215,35 @@ fn upgrade_fails_while_another_process_shares() {
     let (_dir, vfs, path) = setup("upgrade");
     let f = vfs.open(&path, OpenOptions::read_write_create()).unwrap();
     f.lock(8193, LockMode::Shared).unwrap();
+    let other = hold(&path, 8193, LockMode::Shared);
+    assert_eq!(
+        f.lock(8193, LockMode::Exclusive).unwrap_err().kind,
+        ErrorKind::Locked,
+        "upgrade must fail while another process shares the byte"
+    );
+    drop(other);
+    // The failed upgrade kept our shared lock (on Windows: re-taken after the attempt).
+    assert!(
+        !probe(&path, 8193, LockMode::Exclusive),
+        "the failed upgrade lost the shared lock"
+    );
+    assert!(probe(&path, 8193, LockMode::Shared));
+
+    // With the other holder gone the upgrade succeeds, then downgrades again.
     f.lock(8193, LockMode::Exclusive).unwrap();
     assert!(!probe(&path, 8193, LockMode::Shared));
     f.lock(8193, LockMode::Shared).unwrap();
     assert!(probe(&path, 8193, LockMode::Shared));
+
+    // An exclusive holder elsewhere blocks even a shared lock here.
+    f.unlock(8193).unwrap();
+    let writer = hold(&path, 8193, LockMode::Exclusive);
+    assert_eq!(
+        f.lock(8193, LockMode::Shared).unwrap_err().kind,
+        ErrorKind::Locked
+    );
+    drop(writer);
+    f.lock(8193, LockMode::Exclusive).unwrap();
 }
 
 #[test]

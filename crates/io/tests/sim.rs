@@ -395,3 +395,80 @@ fn simulated_processes() {
     assert!(vfs.process_alive(main));
     assert_eq!(vfs.seed(), 12);
 }
+
+#[test]
+fn crashing_one_process_spares_the_others() {
+    let vfs = SimVfs::new(13);
+    drop(create_durable(&vfs, "f"));
+    let writer = ProcessId {
+        pid: 10,
+        start_time: 1,
+    };
+    let reader = ProcessId {
+        pid: 20,
+        start_time: 1,
+    };
+    let region = vfs
+        .open_shared("phdb-x", None, 4096, SharedOpen::CreateNew)
+        .unwrap();
+    let open_as = |p: ProcessId| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                vfs.enter_process(p);
+                vfs.open(&path("f"), OpenOptions::read_write_create())
+                    .unwrap()
+            })
+            .join()
+            .unwrap()
+        })
+    };
+    let w = open_as(writer);
+    let r = open_as(reader);
+    w.lock(8192, LockMode::Exclusive).unwrap();
+    w.write_at(b"unsynced", 0).unwrap();
+    r.lock(8193, LockMode::Shared).unwrap();
+
+    vfs.crash_process(writer);
+    assert_eq!(w.write_at(b"x", 0).unwrap_err().kind, ErrorKind::Crashed);
+    assert!(!vfs.process_alive(writer));
+    assert!(vfs.process_alive(reader));
+    // The reader keeps working and sees the dead writer's data (still in the kernel).
+    let mut buf = [0u8; 8];
+    r.read_at(&mut buf, 0).unwrap();
+    assert_eq!(&buf, b"unsynced");
+    // The writer's lock is gone; the reader's remains.
+    let next = open_as(ProcessId {
+        pid: 30,
+        start_time: 1,
+    });
+    next.lock(8192, LockMode::Exclusive).unwrap();
+    assert_eq!(
+        next.lock(8193, LockMode::Exclusive).unwrap_err().kind,
+        ErrorKind::Locked
+    );
+    // Shared memory is untouched.
+    vfs.open_shared("phdb-x", None, 4096, SharedOpen::Attach)
+        .unwrap();
+    drop(region);
+}
+
+#[test]
+fn files_are_limited_to_four_gib() {
+    let vfs = SimVfs::new(14);
+    let f = create_durable(&vfs, "f");
+    assert_eq!(
+        f.write_at(b"x", u64::MAX).unwrap_err().kind,
+        ErrorKind::Other
+    );
+    assert_eq!(
+        f.write_at(b"x", 1 << 32).unwrap_err().kind,
+        ErrorKind::Other
+    );
+    assert_eq!(f.set_len(u64::MAX).unwrap_err().kind, ErrorKind::Other);
+    assert_eq!(f.allocate(u64::MAX, 2).unwrap_err().kind, ErrorKind::Other);
+    assert_eq!(
+        f.read_at(&mut [0], u64::MAX).unwrap_err().kind,
+        ErrorKind::UnexpectedEof
+    );
+    assert_eq!(f.len().unwrap(), 0, "failed calls change nothing");
+}

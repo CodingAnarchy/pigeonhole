@@ -99,7 +99,8 @@ fn layout(cap: usize) -> Layout {
 
 fn allocate(cap: usize) -> NonNull<u8> {
     if cap == 0 {
-        return NonNull::dangling();
+        // Dangling but `ALIGN`-aligned, so even an empty buffer honors the alignment promise.
+        return NonNull::new(std::ptr::without_provenance_mut(IoBuf::ALIGN)).expect("non-zero");
     }
     let layout = layout(cap);
     // SAFETY: `layout` has a non-zero size.
@@ -150,6 +151,7 @@ mod tests {
         let mut b = IoBuf::zeroed(0);
         assert!(b.is_empty());
         assert_eq!(b.capacity(), 0);
+        assert_eq!(b.as_ptr() as usize % IoBuf::ALIGN, 0);
         assert_eq!(&b[..], b"");
         b.resize(10);
         assert_eq!(&b[..], &[0; 10]);

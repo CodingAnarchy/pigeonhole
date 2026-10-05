@@ -152,7 +152,9 @@ fn worker(shared: &PoolShared) {
                 q = shared.cond.wait(q).unwrap_or_else(PoisonError::into_inner);
             }
         };
-        job();
+        // A panicking job drops its `Resolver` while unwinding, which resolves the
+        // completion with an error; the worker itself keeps serving.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
     }
 }
 
@@ -283,8 +285,18 @@ mod registry {
     use super::lock;
     use crate::{Error, ErrorKind, FileIdentity, LockMode, Result, os};
 
-    static REGISTRY: LazyLock<Mutex<HashMap<FileIdentity, Inode>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    /// Every descriptor this registry owns is closed only while its lock is held, so no
+    /// other thread can take a lock in the window between deciding a close is safe and the
+    /// `close(2)` that would drop the process's locks.
+    static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
+
+    #[derive(Default)]
+    struct Registry {
+        inodes: HashMap<FileIdentity, Inode>,
+        /// Descriptors whose identity could not be read: closing one might drop another
+        /// handle's locks, so they stay open for the life of the process (never expected).
+        orphans: Vec<fs::File>,
+    }
 
     #[derive(Default)]
     struct Inode {
@@ -325,6 +337,8 @@ mod registry {
     }
 
     impl Inode {
+        /// Records `state` for `byte`; called with the registry lock held, so deferred
+        /// descriptors close under it.
         fn set(&mut self, byte: u64, state: ByteState) {
             if state == ByteState::default() {
                 self.bytes.remove(&byte);
@@ -336,10 +350,33 @@ mod registry {
                 self.bytes.insert(byte, state);
             }
         }
+
+        /// Releases one handle's lock on `byte`, telling the OS first.
+        fn release(&mut self, file: &fs::File, byte: u64, prev: LockMode) -> Result<()> {
+            let before = self.bytes.get(&byte).copied().unwrap_or_default();
+            let after = before.without(Some(prev));
+            if after.level() != before.level() {
+                os::set_lock(file, byte, after.level())?;
+            }
+            self.set(byte, after);
+            Ok(())
+        }
     }
 
-    pub(super) fn register(key: FileIdentity) {
-        lock(&REGISTRY).entry(key).or_default().handles += 1;
+    /// Registers a newly opened descriptor, returning its key. On failure the descriptor is
+    /// parked, never closed (see `Registry::orphans`).
+    pub(super) fn register(file: fs::File) -> Result<(fs::File, FileIdentity)> {
+        let mut reg = lock(&REGISTRY);
+        match os::identity(&file) {
+            Ok(key) => {
+                reg.inodes.entry(key).or_default().handles += 1;
+                Ok((file, key))
+            }
+            Err(e) => {
+                reg.orphans.push(file);
+                Err(e)
+            }
+        }
     }
 
     pub(super) fn lock_byte(
@@ -350,7 +387,7 @@ mod registry {
         mode: LockMode,
     ) -> Result<()> {
         let mut reg = lock(&REGISTRY);
-        let inode = reg.get_mut(&key).expect("handle is registered");
+        let inode = reg.inodes.get_mut(&key).expect("handle is registered");
         let before = inode.bytes.get(&byte).copied().unwrap_or_default();
         let mut after = before.without(held.get(&byte).copied());
         let conflict = match mode {
@@ -378,33 +415,35 @@ mod registry {
         held: &mut HashMap<u64, LockMode>,
         byte: u64,
     ) -> Result<()> {
-        let Some(prev) = held.remove(&byte) else {
+        let Some(&prev) = held.get(&byte) else {
             return Ok(());
         };
         let mut reg = lock(&REGISTRY);
-        let inode = reg.get_mut(&key).expect("handle is registered");
-        let before = inode.bytes.get(&byte).copied().unwrap_or_default();
-        let after = before.without(Some(prev));
-        inode.set(byte, after);
-        if after.level() != before.level() {
-            os::set_lock(file, byte, after.level())?;
-        }
+        let inode = reg.inodes.get_mut(&key).expect("handle is registered");
+        inode.release(file, byte, prev)?;
+        held.remove(&byte);
         Ok(())
     }
 
-    pub(super) fn close(key: FileIdentity, file: fs::File, mut held: HashMap<u64, LockMode>) {
-        let bytes: Vec<u64> = held.keys().copied().collect();
-        for byte in bytes {
-            let _ = unlock_byte(key, &file, &mut held, byte);
-        }
+    pub(super) fn close(key: FileIdentity, file: fs::File, held: HashMap<u64, LockMode>) {
         let mut reg = lock(&REGISTRY);
-        let inode = reg.get_mut(&key).expect("handle is registered");
+        let inode = reg.inodes.get_mut(&key).expect("handle is registered");
+        for (byte, prev) in held {
+            // Best effort: on failure the byte stays recorded as held, so the descriptor is
+            // deferred below rather than closed under someone else's lock.
+            let _ = inode.release(&file, byte, prev);
+        }
         inode.handles -= 1;
         if inode.handles == 0 {
-            reg.remove(&key);
-        } else if !inode.bytes.is_empty() {
+            reg.inodes.remove(&key);
+            drop(file);
+        } else if inode.bytes.is_empty() {
+            drop(file);
+        } else {
             inode.deferred.push(file);
         }
+        // `reg` (the registry lock) is released only after the close above.
+        drop(reg);
     }
 }
 
@@ -531,11 +570,7 @@ impl Vfs for PreadVfs {
             .create_new(opts.create_new);
         let file = o.open(path).map_err(|e| Error::os("open", e))?;
         #[cfg(all(unix, not(target_os = "linux")))]
-        let key = {
-            let key = os::identity(&file)?;
-            registry::register(key);
-            key
-        };
+        let (file, key) = registry::register(file)?;
         Ok(Arc::new(PreadFile {
             inner: Arc::new(FileInner {
                 file: Some(file),
@@ -621,5 +656,25 @@ impl Vfs for PreadVfs {
 
     fn process_alive(&self, process: ProcessId) -> bool {
         process == self.process || os::process_alive(process.pid, process.start_time)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_job_fails_its_completion_and_spares_the_worker() {
+        let pool = Pool::start(1);
+        let (done, resolver) = Completion::<u8>::pair();
+        pool.submit(Box::new(move || {
+            let _owned = resolver;
+            panic!("injected job panic");
+        }));
+        assert_eq!(done.wait().unwrap_err().kind, ErrorKind::Other);
+
+        let (done, resolver) = Completion::<u8>::pair();
+        pool.submit(Box::new(move || resolver.resolve(Ok(5))));
+        assert_eq!(done.wait().unwrap(), 5, "the only worker survived");
     }
 }

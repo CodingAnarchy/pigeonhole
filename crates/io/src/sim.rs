@@ -3,8 +3,9 @@
 //!
 //! The simulator tracks, per file, the bytes the "disk" holds durably and the bytes written
 //! since the last sync. A [`SimVfs::crash`] keeps the durable image and, depending on the
-//! [`FaultPlan`], a seeded subset of unsynced writes (possibly torn at 512-byte sector
-//! granularity, possibly reordered across fsyncs).
+//! [`FaultPlan`], a seeded subset of the writes made since each file's last sync (possibly
+//! torn at 512-byte sector granularity, possibly surviving out of order). Synced data is
+//! never lost or reordered: a sync is a barrier.
 //!
 //! The model, precisely:
 //!
@@ -19,10 +20,18 @@
 //!   the plan: nothing (no faults); an in-order prefix of its unsynced writes whose last
 //!   write may be torn (`torn_writes`); or an arbitrary subset of them, each possibly torn
 //!   (`reorder_unsynced`). Shared memory is lost.
-//! - **Process crash** ([`CrashKind::Process`]). Nothing is lost: written data stays in the
-//!   (simulated) kernel, unsynced, and shared memory survives. Handles still die.
-//! - **Handles** opened before any crash fail with `Crashed`, and their locks are released.
+//! - **Process crash** ([`CrashKind::Process`]): every simulated process dies at once.
+//!   Nothing is lost: written data stays in the (simulated) kernel, unsynced, and
+//!   shared-memory regions survive, as `/dev/shm` and `shm_open` objects do. (A Windows named
+//!   mapping would vanish once no process holds it; the simulator does not model that.)
+//! - **One process crashing** ([`SimVfs::crash_process`]): only the handles opened by that
+//!   process (see [`SimVfs::enter_process`]) die and release their locks; the process is
+//!   marked dead for [`Vfs::process_alive`]. Data, other processes and shared memory are
+//!   untouched.
+//! - **Handles** killed by a crash fail with `Crashed`, and their locks are released.
 //!   Reopening through the same `SimVfs` is the restart.
+//! - **Size.** Files are limited to 4 GiB; a write or length past that fails with `Other`
+//!   (like `EFBIG`).
 //! - **Submitted I/O** completes before `submit_*` returns, so runs are deterministic.
 //!
 //! Every random decision draws from one seeded generator in a fixed order, so a seed and
@@ -55,8 +64,9 @@ use crate::{
 pub struct FaultPlan {
     /// On crash, unsynced writes may survive partially, torn at sector boundaries.
     pub torn_writes: bool,
-    /// On crash, writes from after an fsync may survive while earlier unsynced ones do not
-    /// (models a disk that reorders without barriers).
+    /// On crash, any subset of a file's unsynced writes may survive: a later one can survive
+    /// while an earlier one is lost (a disk reordering its write cache). Writes before the
+    /// file's last sync are always kept.
     pub reorder_unsynced: bool,
     /// Fail writes with `NoSpace` once this many bytes have been written in total.
     pub enospc_after_bytes: Option<u64>,
@@ -90,8 +100,9 @@ impl FaultPlan {
 /// What a crash loses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashKind {
-    /// The process dies: data handed to the kernel (`write_at` returned) survives, shared
-    /// memory survives if another process holds it.
+    /// Every simulated process dies: data handed to the kernel (`write_at` returned)
+    /// survives, and shared-memory regions survive (as `/dev/shm` objects outlive their
+    /// processes). To kill one process, use [`SimVfs::crash_process`].
     Process,
     /// Power loss: only synced data survives (subject to the fault plan), shared memory is
     /// lost.
@@ -132,7 +143,9 @@ pub struct SimVfs {
 /// Wall clock at simulated time zero: 2026-01-01T00:00:00Z, in microseconds.
 const WALL_BASE_MICROS: u64 = 1_767_225_600_000_000;
 /// Sector size for torn writes.
-const SECTOR: u64 = 512;
+const SECTOR: usize = 512;
+/// Largest simulated file.
+const MAX_FILE_LEN: u64 = 1 << 32;
 /// Device number every simulated file reports.
 const SIM_DEVICE: u64 = 0x5137;
 /// The process a thread is in until it calls [`SimVfs::enter_process`].
@@ -151,8 +164,6 @@ thread_local! {
 struct SimState {
     rng: Rng,
     plan: FaultPlan,
-    /// Bumped by every crash; handles from an older epoch fail with `Crashed`.
-    epoch: u64,
     names: BTreeMap<PathBuf, u64>,
     durable_names: BTreeMap<PathBuf, u64>,
     nodes: BTreeMap<u64, Node>,
@@ -173,15 +184,16 @@ struct Node {
     durable: Vec<u8>,
     /// Changes since the last sync, in order.
     pending: Vec<Pending>,
-    /// Open handles from the current epoch.
-    handles: usize,
+    /// Live handles and the process that opened each.
+    open: BTreeMap<u64, ProcessId>,
     /// Lock holders per byte: (handle, mode).
     locks: BTreeMap<u64, Vec<(u64, LockMode)>>,
 }
 
+/// An unsynced change; offsets and lengths were checked against `MAX_FILE_LEN`.
 enum Pending {
-    Write { offset: u64, data: Vec<u8> },
-    SetLen(u64),
+    Write { offset: usize, data: Vec<u8> },
+    SetLen(usize),
 }
 
 /// SplitMix64: tiny, fast and good enough for fault decisions.
@@ -210,8 +222,17 @@ fn crashed() -> Error {
     Error::new(ErrorKind::Crashed, "simulated crash")
 }
 
-fn write_into(image: &mut Vec<u8>, offset: u64, bytes: &[u8]) {
-    let start = offset as usize;
+/// `offset + len` as a file length, or an error past `MAX_FILE_LEN`.
+fn file_end(offset: u64, len: usize, context: &'static str) -> Result<usize> {
+    offset
+        .checked_add(len as u64)
+        .filter(|&end| end <= MAX_FILE_LEN)
+        .and_then(|end| usize::try_from(end).ok())
+        .ok_or(Error::new(ErrorKind::Other, context))
+}
+
+/// Writes `bytes` at `start` (a range already checked by `file_end`).
+fn write_into(image: &mut Vec<u8>, start: usize, bytes: &[u8]) {
     let end = start + bytes.len();
     if image.len() < end {
         image.resize(end, 0);
@@ -222,7 +243,7 @@ fn write_into(image: &mut Vec<u8>, offset: u64, bytes: &[u8]) {
 fn apply(image: &mut Vec<u8>, op: &Pending) {
     match op {
         Pending::Write { offset, data } => write_into(image, *offset, data),
-        Pending::SetLen(len) => image.resize(*len as usize, 0),
+        Pending::SetLen(len) => image.resize(*len, 0),
     }
 }
 
@@ -230,13 +251,12 @@ fn apply(image: &mut Vec<u8>, op: &Pending) {
 fn apply_torn(image: &mut Vec<u8>, op: &Pending, rng: &mut Rng) {
     match op {
         Pending::Write { offset, data } => {
-            let end = offset + data.len() as u64;
+            let end = offset + data.len();
             let mut pos = *offset;
             while pos < end {
                 let next = ((pos / SECTOR + 1) * SECTOR).min(end);
                 if rng.coin() {
-                    let range = (pos - offset) as usize..(next - offset) as usize;
-                    write_into(image, pos, &data[range]);
+                    write_into(image, pos, &data[pos - offset..next - offset]);
                 }
                 pos = next;
             }
@@ -271,10 +291,15 @@ impl SimState {
         }
     }
 
+    fn is_open(&self, node: u64, handle: u64) -> bool {
+        self.nodes
+            .get(&node)
+            .is_some_and(|n| n.open.contains_key(&handle))
+    }
+
     fn crash(&mut self, kind: CrashKind) {
-        self.epoch += 1;
         for node in self.nodes.values_mut() {
-            node.handles = 0;
+            node.open.clear();
             node.locks.clear();
         }
         if kind == CrashKind::Power {
@@ -319,7 +344,7 @@ impl SimState {
             .copied()
             .collect();
         self.nodes
-            .retain(|id, node| node.handles > 0 || named.contains(id));
+            .retain(|id, node| !node.open.is_empty() || named.contains(id));
     }
 }
 
@@ -338,7 +363,6 @@ impl SimVfs {
             state: Mutex::new(SimState {
                 rng: Rng(seed),
                 plan,
-                epoch: 0,
                 names: BTreeMap::new(),
                 durable_names: BTreeMap::new(),
                 nodes: BTreeMap::new(),
@@ -372,6 +396,31 @@ impl SimVfs {
     /// `SimVfs` to recover.
     pub fn crash(&self, kind: CrashKind) {
         self.state().crash(kind);
+    }
+
+    /// Simulates one process crashing (as by `SIGKILL`): the handles it opened fail with
+    /// `Crashed` and lose their locks, and [`Vfs::process_alive`] reports it dead. Written
+    /// data, shared memory and every other process's handles are untouched.
+    pub fn crash_process(&self, process: ProcessId) {
+        let mut st = self.state();
+        for node in st.nodes.values_mut() {
+            let dead: Vec<u64> = node
+                .open
+                .iter()
+                .filter(|&(_, &p)| p == process)
+                .map(|(&h, _)| h)
+                .collect();
+            if dead.is_empty() {
+                continue;
+            }
+            node.open.retain(|h, _| !dead.contains(h));
+            for holders in node.locks.values_mut() {
+                holders.retain(|(h, _)| !dead.contains(h));
+            }
+            node.locks.retain(|_, holders| !holders.is_empty());
+        }
+        st.killed.insert(process);
+        st.gc();
     }
 
     /// Advances both clocks.
@@ -411,7 +460,6 @@ struct SimFile {
     vfs: Arc<SimVfs>,
     node: u64,
     handle: u64,
-    epoch: u64,
     writable: bool,
 }
 
@@ -428,7 +476,7 @@ impl SimFile {
     /// Runs `f` on the shared state if this handle has not been crashed.
     fn with<R>(&self, f: impl FnOnce(&mut SimState) -> Result<R>) -> Result<R> {
         let mut st = self.vfs.state();
-        if st.epoch != self.epoch {
+        if !st.is_open(self.node, self.handle) {
             return Err(crashed());
         }
         f(&mut st)
@@ -444,9 +492,10 @@ impl SimFile {
 
     fn change_len(&self, len: u64) -> Result<()> {
         self.check_writable("set_len: file not opened for writing")?;
+        let len = file_end(len, 0, "set_len: beyond the simulated file size limit")?;
         self.with(|st| {
             let node = st.node(self.node);
-            node.data.resize(len as usize, 0);
+            node.data.resize(len, 0);
             node.pending.push(Pending::SetLen(len));
             st.mutated();
             Ok(())
@@ -457,11 +506,11 @@ impl SimFile {
 impl Drop for SimFile {
     fn drop(&mut self) {
         let mut st = self.vfs.state();
-        if st.epoch != self.epoch {
+        if !st.is_open(self.node, self.handle) {
             return;
         }
         let node = st.node(self.node);
-        node.handles -= 1;
+        node.open.remove(&self.handle);
         for holders in node.locks.values_mut() {
             holders.retain(|&(h, _)| h != self.handle);
         }
@@ -496,6 +545,12 @@ impl File for SimFile {
                 return Ok(());
             }
             st.inject("write: injected I/O error")?;
+            file_end(
+                offset,
+                buf.len(),
+                "write: beyond the simulated file size limit",
+            )?;
+            let start = offset as usize; // in range: checked just above
             let len = buf.len() as u64;
             if let Some(limit) = st.plan.enospc_after_bytes
                 && st.bytes_written + len > limit
@@ -504,9 +559,9 @@ impl File for SimFile {
             }
             st.bytes_written += len;
             let node = st.node(self.node);
-            write_into(&mut node.data, offset, buf);
+            write_into(&mut node.data, start, buf);
             node.pending.push(Pending::Write {
-                offset,
+                offset: start,
                 data: buf.to_vec(),
             });
             st.mutated();
@@ -571,9 +626,6 @@ impl File for SimFile {
                 h != self.handle && (mode == LockMode::Exclusive || m == LockMode::Exclusive)
             });
             if conflict {
-                if holders.is_empty() {
-                    st.node(self.node).locks.remove(&byte);
-                }
                 return Err(Error::new(ErrorKind::Locked, "lock"));
             }
             holders.retain(|&(h, _)| h != self.handle);
@@ -611,6 +663,7 @@ impl File for SimFile {
 
 impl Vfs for SimVfs {
     fn open(&self, path: &Path, opts: OpenOptions) -> Result<FileRef> {
+        let process = self.current_process();
         let mut st = self.state();
         let id = match st.names.get(path) {
             Some(_) if opts.create_new => {
@@ -626,14 +679,13 @@ impl Vfs for SimVfs {
             }
             None => return Err(Error::new(ErrorKind::NotFound, "open")),
         };
-        st.node(id).handles += 1;
         let handle = st.next_handle;
         st.next_handle += 1;
+        st.node(id).open.insert(handle, process);
         Ok(Arc::new(SimFile {
             vfs: self.me.upgrade().expect("SimVfs is alive while borrowed"),
             node: id,
             handle,
-            epoch: st.epoch,
             writable: opts.write || opts.create || opts.create_new,
         }))
     }

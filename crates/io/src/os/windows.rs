@@ -7,13 +7,13 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_LOCK_VIOLATION, FILETIME,
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_FUNCTION,
+    ERROR_LOCK_VIOLATION, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_NAME_NORMALIZED, GetDriveTypeW, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    UnlockFileEx, VOLUME_NAME_DOS,
+    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, GetDriveTypeW,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Memory::{
@@ -136,12 +136,25 @@ pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     Ok(())
 }
 
-/// Windows cannot flush a directory handle; NTFS journals directory entries itself.
+/// Flushes a directory's metadata: `FlushFileBuffers` on a directory handle opened for
+/// writing with backup semantics (required to open a directory at all).
+fn flush_dir(dir: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .sync_all()
+}
+
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    if dir.is_dir() {
-        Ok(())
-    } else {
-        Err(Error::new(ErrorKind::NotFound, "sync directory"))
+    match flush_dir(dir) {
+        Ok(()) => Ok(()),
+        // Filesystems that cannot flush a directory (FAT, some network redirectors) journal
+        // nothing for it either; there is nothing more to make durable.
+        Err(e) if e.raw_os_error() == Some(ERROR_INVALID_FUNCTION as i32) => Ok(()),
+        Err(e) => Err(Error::os("sync directory", e)),
     }
 }
 
@@ -410,4 +423,19 @@ pub(crate) fn pin_current_thread(cpu: usize) -> Result<()> {
 
 pub(crate) fn numa_node_of(_cpu: usize) -> Option<u32> {
     None
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+
+    /// Directory flushes must really work on NTFS, not just fall back to a no-op.
+    #[test]
+    fn directory_flush_works_on_ntfs() {
+        let dir = std::env::temp_dir().join(format!("pigeonhole-io-flush-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let result = flush_dir(&dir);
+        let _ = fs::remove_dir(&dir);
+        result.unwrap();
+    }
 }
