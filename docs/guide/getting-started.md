@@ -112,7 +112,7 @@ if let Some(row) = row {
     let status = row.get("meta", b"status");
 }
 ```
-`read()` returns `None` if the row has no matching cell. Cells are ordered by family, qualifier, then newest version first. `row.to_owned()` gives an owned `Row`.
+`read()` returns `None` if the row has no matching cell. Cells are ordered by family (in the order the families were created, or the order you listed them with `family(..)`), then qualifier, then newest version first. `row.to_owned()` gives an owned `Row`.
 
 ### A range of rows
 ```rust,ignore

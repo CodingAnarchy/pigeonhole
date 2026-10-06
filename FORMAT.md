@@ -6,7 +6,7 @@ Format version **1**, shared-memory layout version **1**. Nothing here is promis
 
 ## 1. Conventions
 
-- **Byte order.** Every integer is little-endian, except the ordering fields inside internal keys (§2), which are big-endian.
+- **Byte order.** Every integer is little-endian, except the ordering fields inside internal keys (§2), which are big-endian. The shared-memory structures (§11) are accessed as native-endian atomics, so only little-endian targets are supported; `pigeonhole-shm` and `pigeonhole-memtable` refuse to build elsewhere (decision D56).
 - **Varint.** Unsigned LEB128, at most 10 bytes for a `u64`. A *bytes* field is a varint length followed by that many bytes.
 - **Checksums.** The main file uses **xxh3-64** (seed 0). The WAL uses **CRC32C** (Castagnoli), unmasked.
 - **Offsets** are byte offsets from the start of the structure being described unless stated otherwise.
@@ -46,11 +46,11 @@ marker: [row, escaped][00 01][00 00]                    [!ts: u64 BE][!seqno: u6
 |---|---|---|
 | `Put` | `0x01` | A value (inline or blob pointer) for this version |
 | `Merge` | `0x02` | A merge operand; resolved at read and compaction time |
-| `CellDelete` | `0x03` | Deletes exactly the version with this timestamp |
+| `CellDelete` | `0x03` | Deletes every version with exactly this timestamp, whatever its seqno |
 | `ColumnDelete` | `0x04` | Deletes every version of the column with timestamp `<=` this one |
 | `FamilyDelete` | `0x05` | Marker key only: deletes every cell of the row in this family with timestamp `<=` this one |
 
-**Delete rule** (BigTable semantics, decision D9). A `ColumnDelete` or `FamilyDelete` with timestamp `T` hides every version in its scope with timestamp `<= T`, **regardless of seqno**: a put committed later with an older timestamp stays hidden. A `CellDelete` hides the versions with exactly its timestamp. Seqnos decide only which entries a snapshot can see.
+**Delete rule** (BigTable semantics, decisions D9 and D38). A `ColumnDelete` or `FamilyDelete` with timestamp `T` hides every version in its scope with timestamp `<= T`, **regardless of seqno**: a put committed later with an older timestamp stays hidden. A `CellDelete` with timestamp `T` hides every version with exactly timestamp `T`, also **regardless of seqno**: a put or merge operand at `T` committed after the delete stays hidden. Seqnos decide only which entries a snapshot can see (a snapshot taken before the delete still sees the versions it hides).
 
 Timestamps are microseconds since the Unix epoch by convention (decision D11). Seqnos are global, start at 1, and are unique per commit; every cell of one commit carries the commit's seqno.
 
@@ -286,12 +286,12 @@ Rules: family ids are unique across the database, so `(tablet, family)` names on
 
 ### 10.1 Files and segments
 
-Stream `N` of database `data.phdb` is the file `data.phdb-wal-N` (decimal `N`). Stream numbers are independent of shard numbers. A stream file is a sequence of equal-size **slots** (default 64 MiB, a multiple of 32 KiB, at most 4 GiB) at offsets `k x segment_size`. Slots are preallocated and recycled after checkpoint, never deleted while the database is open. Each use of a slot is a **segment** with its own **epoch** (u32): one more than the largest epoch in any segment header of the stream, so epochs never repeat.
+Stream `N` of database `data.phdb` is the file `data.phdb-wal-N` (decimal `N`). Stream numbers are independent of shard numbers. A stream file is a sequence of equal-size **slots** (default 64 MiB, a multiple of 32 KiB, at most 4 GiB − 32 KiB so that `prev_end` always fits a `u32`; decision D43) at offsets `k x segment_size`. Slots are preallocated and recycled after checkpoint, never deleted while the database is open. Each use of a slot is a **segment** with its own **epoch** (u32): one more than the largest epoch in any segment header of the stream, so epochs never repeat.
 
 An **LSN** is `(epoch << 32) | offset_within_segment`. LSNs increase monotonically within a stream. The manifest records each stream's checkpoint LSN.
 
 **Chaining** (decision D25). Each segment header names its predecessor: `prev_epoch` and `prev_end`, the offset where the predecessor's valid data ends. Rules for the writer:
-1. When a segment fills, write nothing more to it, **sync it**, and only then write the next segment's header with `prev_end` = the offset where the full segment's last record ends (its stop offset, §10.2; the zero tail after it is not part of `prev_end`).
+1. When a segment fills, write nothing more to it, **sync it**, and only then write the next segment's header with `prev_end` = the offset where the full segment's last record ends (its stop offset, §10.2; the zero tail after it is not part of `prev_end`). The sync may be submitted to the I/O backend; the header write waits for it to complete (decision D30).
 2. After recovery, **never append to the last replayed segment**: start a new segment (epoch = max seen + 1) with `prev_epoch`/`prev_end` = where replay ended.
 
 Replay starts at the segment whose epoch is the checkpoint's, at the checkpoint's offset, and reads until the segment's data stops (§10.2). It then looks for the segment whose header has `prev_epoch` = this epoch:
@@ -363,7 +363,7 @@ The payload of a reassembled record:
 Two objects (decision D27), placed at `/dev/shm/<name>` on Linux, POSIX `shm_open("/<name>")` on macOS and BSD, a `Local\<name>` pagefile-backed mapping on Windows, or `<shm_dir>/<name>.phdb-shm` when `shm_dir` is set:
 
 - **Directory** `phdb-<h>`, where `<h>` is 16 lowercase hex digits of `xxh3_64(device LE ++ inode LE)` of the main file. One page whose layout never changes: magic `PHDBSHMD` @0, `format` u32 @8 (=1), `generation` u64 atomic @16 (current region, 0 = none), `layout_version` u32 atomic @24.
-- **Region** `phdb-<h>-<generation in hex>` (at most 31 bytes, macOS's limit), laid out below.
+- **Region** `phdb-<h>-<generation in hex>` (at most 30 bytes: macOS's `shm_open` limit is 31 including the leading `/`; decision D44), laid out below.
 
 A writer always builds a new generation: create the new region, store `state = abandoned` in the old one, then store the new generation in the directory. Because the name changes with the generation, a mapping some process still holds (Windows keeps named mappings alive while any handle is open) is never reused. Readers that see `state = abandoned` or a different directory generation re-attach. The header also stores the device, inode and `db_id`, which an attaching process verifies.
 
@@ -473,7 +473,7 @@ Memtable header (64 bytes, at the `root` offset named in the view):
 | 12 | 4 | `count` u32, atomic |
 | 16 | 8 | `bytes` u64, atomic: arena bytes used |
 | 24 | 8 | `max_seqno` u64, atomic |
-| 32 | 8 | `min_seqno` u64 |
+| 32 | 8 | `min_seqno` u64, atomic |
 | 40 | 24 | reserved |
 
 Skiplist node (4-byte aligned; maximum height 16):
