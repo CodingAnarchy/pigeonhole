@@ -50,7 +50,7 @@ Pure encode/decode; never panics on input.
 `ArenaRegion` (`heap(len)` mock, or `new(SharedRegion, offset, len)`), `ShardArena` (writer-private chunk allocator; `reclaim(Retired)` defers chunk reuse while any in-process `MemtableReader`/`MemIter`/`ArenaSlice` of that memtable is alive, so it is safe to call whenever no reader slot pins the memtable), `Memtable` (writer: `create`, `insert(&mut ShardArena, key, value)`, `freeze`, `allocated_bytes`, `seqno_range`, `root`, `reader`, `retire`), `MemtableReader` (any thread or process: `open(region, root)`, `iter`), `MemIter: Cursor` (owns a reader clone; `value_slice -> ArenaSlice` for zero-copy large values). Keys are full internal keys; values are stored values. Depends on io for `SharedRegion` (D14).
 
 ### `pigeonhole-cache` (uses io)
-`BlockCache` (`new(capacity, shards)`, `disabled()`, `get(BlockKey) -> Option<BlockHandle>` allocation-free, `insert(key, BlockData, Priority)`, `erase_file`), `BlockHandle` (pinned, `Deref<[u8]>`), `Cell` (pinned sub-range or small owned buffer; the unit of zero-copy value return), `RowCache`/`RowHandle`. Mock: the real cache, small or disabled.
+`BlockCache` (`new(capacity, shards)`, `disabled()`, `get(BlockKey) -> Option<BlockHandle>` allocation-free, `insert(key, BlockData, Priority)`, `erase_file`, `erase_files(&[u64])` (one scan per batch; added after the freeze, additive)), `BlockHandle` (pinned, `Deref<[u8]>`), `Cell` (pinned sub-range or small owned buffer; the unit of zero-copy value return), `RowCache`/`RowHandle`. Mock: the real cache, small or disabled.
 
 ### `pigeonhole-runtime` (uses io)
 `trait ShardHandler { type Msg; handle(ctx, msg); end_batch(ctx) }` (the engine's per-shard state; `end_batch` is the group-commit point). `Runtime::start` (engine-owned: pinned threads) or `Runtime::application_owned -> Vec<ShardDriver>` (`run_once(deadline)`, `with_handler`, `set_wakeup`). `Submitter<M>` (MPSC enqueue + wake), `ShardContext` (shard id, submitters, `spawn(Box<dyn Task>)`, clock), `trait Task { run(deadline, &TaskWaker) -> TaskPoll }`, `completion() -> (Notifier<T>, Waiter<T>)` (`wait()` or `.await`).
@@ -103,7 +103,7 @@ Pure encode/decode; never panics on input.
 1. After each manifest commit (and periodically), each shard scores its `(tablet, family)` `Levels` with `CompactionPicker::score` and runs `pick` for the highest. The task's `range` is the tablet's row range, so SSTs shared with a sibling after a split are read only within it; `subranges` split large tasks.
 2. `CompactionJob::new(task, input readers, JobContext { gc: GcPolicy { snapshots: live snapshot seqnos incl. reader slots, now, bottommost }, sst_ids, blob_ids, .. })` runs as a cooperative `Task` (or on `compaction_threads`), calling `run(deadline)` per time slice.
 3. `finish -> CompactionOutput` becomes `AddSst`/`RemoveSst`/`PutBlobFile`/`DropBlobFile` edits through the manifest task.
-4. After the commit at version `v`, each removed SST's extent is `pager.retire(extent, v)` (only when no tablet references it); `pager.reclaim(oldest_live)` frees extents whose views have all been released; `cache.erase_file`.
+4. After the commit at version `v`, each removed SST's extent is `pager.retire(extent, v)` (only when no tablet references it); `pager.reclaim(oldest_live)` frees extents whose views have all been released; `cache.erase_files` for the removed SSTs and dropped blob files.
 
 ### Recovery (open as writer)
 1. `vfs.open(path)`, `Presence::acquire`, `WriterLock::acquire` (else `WriterLocked`), `file.is_local()` (else `NetworkFilesystem`).

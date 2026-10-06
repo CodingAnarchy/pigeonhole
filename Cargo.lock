@@ -482,8 +482,10 @@ dependencies = [
 name = "pigeonhole-cache"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "loom",
  "pigeonhole-io",
+ "proptest",
 ]
 
 [[package]]
