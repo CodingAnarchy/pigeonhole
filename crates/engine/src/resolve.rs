@@ -705,11 +705,11 @@ impl<S: Source> Resolver<S> {
     }
 }
 
-/// A stored value as an `i64`: a tagged `I64`, or raw bytes of length 8 (the model's rule).
+/// A stored value as an `i64`: it must carry `ValueTag::I64`, the rule
+/// `pigeonhole_compaction::I64Add` applies, so reads and compaction agree (D41).
 fn as_i64(stored: &[u8]) -> Option<i64> {
     match decode_value(stored).ok()? {
         ValueRef::I64(v) => Some(v),
-        ValueRef::Bytes(b) => <[u8; 8]>::try_from(b).ok().map(i64::from_le_bytes),
         _ => None,
     }
 }
@@ -822,7 +822,11 @@ pub(crate) mod tests {
         let mut k = Vec::new();
         encode_key(&mut k, row.as_bytes(), q.as_bytes(), ts, seqno, Kind::Put).unwrap();
         let mut val = Vec::new();
-        encode_value(&mut val, ValueRef::Bytes(v));
+        // Eight raw bytes are written as a tagged `i64` (what `put_i64` does).
+        match <[u8; 8]>::try_from(v) {
+            Ok(b) => encode_value(&mut val, ValueRef::I64(i64::from_le_bytes(b))),
+            Err(_) => encode_value(&mut val, ValueRef::Bytes(v)),
+        }
         (k, val)
     }
 

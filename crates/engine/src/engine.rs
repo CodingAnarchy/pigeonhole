@@ -185,7 +185,7 @@ fn first_seqno(ceiling: Seqno, max_replayed: Seqno) -> Seqno {
 }
 
 fn chunk_size(budget: u64) -> usize {
-    let chunk = (budget / 16).clamp(1024, ShardArena::DEFAULT_CHUNK as u64) as usize;
+    let chunk = (budget / 64).clamp(1024, ShardArena::DEFAULT_CHUNK as u64) as usize;
     chunk & !63
 }
 
@@ -355,7 +355,8 @@ impl Engine {
         let mut max_seqno = 0;
         let mut recoveries: Vec<(StreamId, Recovery)> = Vec::new();
         let mut stashed: Vec<(StreamId, Seqno, u64, StreamId, Vec<u8>)> = Vec::new();
-        let mut commits: HashSet<(StreamId, Seqno)> = HashSet::new();
+        // `(coordinator stream, seqno) -> participant streams` of every COMMIT decision.
+        let mut commits: HashMap<(StreamId, Seqno), Vec<StreamId>> = HashMap::new();
         for stream in discover_streams(&vfs, path)? {
             let checkpoint = catalog
                 .checkpoints
@@ -387,19 +388,37 @@ impl Engine {
                         coordinator,
                         batch.as_bytes().to_vec(),
                     )),
-                    WalRecord::Commit { seqno, .. } => {
-                        commits.insert((stream, seqno));
+                    WalRecord::Commit {
+                        seqno,
+                        participants,
+                    } => {
+                        commits.insert((stream, seqno), participants.iter().collect());
                     }
                 }
             }
             max_seqno = max_seqno.max(rec.max_seqno());
             recoveries.push((stream, rec));
         }
+        // A decided commit is applied only if every participant its COMMIT names still
+        // holds its PREPARE: all or nothing. A `GroupSync`/`Sync` commit's prepares were
+        // durable before the COMMIT was written, so this never discards one; a `Buffered`
+        // commit whose prepare a power loss took is dropped whole rather than in part.
+        let prepared: HashSet<(StreamId, Seqno)> = stashed
+            .iter()
+            .map(|(stream, seqno, ..)| (*stream, *seqno))
+            .collect();
         for (_, seqno, commit_ts, coordinator, bytes) in &stashed {
-            if commits.contains(&(*coordinator, *seqno)) {
-                for s in &mut states {
-                    s.replay(bytes, *seqno, *commit_ts).map_err(replay_error)?;
-                }
+            let Some(participants) = commits.get(&(*coordinator, *seqno)) else {
+                continue;
+            };
+            if !participants
+                .iter()
+                .all(|p| prepared.contains(&(*p, *seqno)))
+            {
+                continue;
+            }
+            for s in &mut states {
+                s.replay(bytes, *seqno, *commit_ts).map_err(replay_error)?;
             }
         }
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
@@ -850,6 +869,11 @@ impl Engine {
     /// and the last one records the clean close and removes the shared-memory region when no
     /// reader is attached. WAL files stay until SST flushes exist (Milestone B): the data
     /// in them has nowhere else to go yet.
+    ///
+    /// In engine-owned mode this waits for the shards and returns the final result. In
+    /// application-owned mode it returns at once after telling every shard to close: the
+    /// application keeps driving each [`EngineShard::run_once`] until it returns `false`
+    /// (the last shard to finish records the clean close), then drops the shards.
     pub fn close(&self) -> Result<()> {
         self.inner.close(true)
     }
@@ -1336,10 +1360,12 @@ impl Inner {
                 let _ = s.submit(ShardMsg::Close);
             }
         }
-        let on_shard = Runtime::<ShardState>::current_shard().is_some();
-        let result = if wait && !(self.application_owned && on_shard) {
+        // Application-owned shards are driven by the application's threads, possibly the
+        // caller's own, so the close never blocks there: the shards finish as they are run.
+        let result = if wait && !self.application_owned {
             rx.wait().unwrap_or(Err(Error::Closed))
         } else {
+            drop(rx);
             Ok(())
         };
         if !self.application_owned {
