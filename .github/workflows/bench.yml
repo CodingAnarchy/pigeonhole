@@ -2,15 +2,18 @@ name: Bench
 
 # Pigeonhole-only benchmark suite at small scale. Not on pull requests: numbers from
 # shared runners are noisy and non-reference (D5), so they are tracked, never gated.
-# Comparison engines (RocksDB, SQLite, fjall) are not built here; run them locally with
-# `--features rocksdb,sqlite,fjall` (see docs/bench.md).
+# Comparison engines (RocksDB, SQLite, fjall) are not run here; run them locally with
+# `--features rocksdb,sqlite,fjall` (see docs/bench.md). scaling.json is uploaded so
+# each run leaves a baseline for the single-shard p99 half of the scaling gate
+# (`phdb-bench compare old/scaling.json new/scaling.json`).
 
 on:
   workflow_dispatch:
     inputs:
       scale:
-        description: "Preset size (smoke or small)"
-        required: false
+        description: "Preset size"
+        type: choice
+        options: [small, smoke]
         default: small
   schedule:
     - cron: "17 5 * * 1" # Mondays 05:17 UTC

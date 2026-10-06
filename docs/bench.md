@@ -28,7 +28,9 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--engine LIST` | `pigeonhole` (default), `rocksdb`, `sqlite`, `fjall`, or `all` |
 | `--scale smoke\|small` | Preset size; `small` is the default, `smoke` is what `cargo test` runs |
 | `--records N`, `--ops N`, `--value-len N`, `--threads N`, `--seed N` | Override the preset |
-| `--shards N`, `--memtable-budget B` | Pigeonhole settings |
+| `--warmup F` | Unrecorded warmup, as a fraction of `--ops` (default 0.05) |
+| `--write-buffer B`, `--cache B` | Every engine's memory budget (default 256 MiB each; see below) |
+| `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |
 | `--json PATH`, `--markdown PATH` | Write results |
 | `--tolerance T` | `compare`: ±T on throughput and p50, ±2T on p99 (default 0.15) |
@@ -44,15 +46,15 @@ export LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib
 export DYLD_FALLBACK_LIBRARY_PATH=$LIBCLANG_PATH
 ```
 
-CI builds and tests the bench crate with `sqlite,fjall` only, so it never needs a C++ toolchain. Run the RocksDB runner's tests locally with `cargo test -p pigeonhole-bench --all-features`.
+PR-gating CI builds and tests the bench crate with `sqlite,fjall` only, so it never needs a C++ toolchain. A separate workflow, `bench-rocksdb.yml`, builds and tests every comparison runner, RocksDB included. It runs weekly, on pushes to `main` that touch `crates/bench/**`, and on demand, so the `rocksdb` feature cannot rot. Locally: `cargo test -p pigeonhole-bench --all-features`.
 
 ### Size limits today
 
-Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), all Pigeonhole data stays in memory. A table also lives on one shard until tablets split, so one run's data must fit in one shard's memtable budget. The runner raises that budget to 256 MiB (`--memtable-budget`). The `small` preset (50,000 records, 200,000 operations, 100-byte values) fits with room to spare. A run that outgrows the budget fails with `Busy` during load, so it never reports a bogus number. Once #37 lands, grow `--records` and `--ops`. The spec's sizes, such as 1M sparse-wide rows, are flags, not code changes ([#52](https://github.com/CodingAnarchy/pigeonhole/issues/52)).
+Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), all Pigeonhole data stays in memory. A table also lives on one shard until tablets split, so one run's data must fit in one shard's memtable budget. The runner raises that budget to 256 MiB (`--write-buffer`). The `small` preset (50,000 records, 200,000 operations, 100-byte values) fits with room to spare. A run that outgrows the budget fails with `Busy` during load, so it never reports a bogus number. Once #37 lands, grow `--records` and `--ops`. The spec's sizes, such as 1M sparse-wide rows, are flags, not code changes ([#52](https://github.com/CodingAnarchy/pigeonhole/issues/52)).
 
 ## Workloads
 
-Every workload is deterministic for a seed (default `0x5EED`, recorded in every result). All operations are generated before the clock starts, so generation cost is never measured.
+Every workload is deterministic for a seed (default `0x5EED`, recorded in every result). After the load, a warmup of 5% of `--ops` runs unrecorded on one thread: these are the first operations of the same seeded stream, and the measured operations follow them. All measured operations are generated before the clock starts, so generation cost is never measured.
 
 | Workload | Data | Operation mix |
 |---|---|---|
@@ -69,21 +71,30 @@ Every workload is deterministic for a seed (default `0x5EED`, recorded in every 
 
 Interpretation notes (details and rationale in [`design/questions/bench.md`](design/questions/bench.md)):
 - A YCSB read fetches one field, not all ten, because a bench op reads one cell.
-- Read-modify-write is a get and then a put in every engine, not an atomic operation.
+- Read-modify-write is a get and then a put in every engine, not an atomic operation. For that reason `ycsb-f` refuses `--threads` > 1: concurrent clients would race and lose updates. Every other workload accepts several threads. With more than one thread, operations are dealt round-robin, so a `ycsb-d` read can reach a key whose insert is still queued on another thread. That read is a miss, in every engine alike.
 - TTL never expires during a run (puts carry no timestamp), so reads pay the TTL check and nothing more.
 
 ### How each store is driven
 
-| Store | Model | Commit (default / `--sync`) |
-|---|---|---|
-| `pigeonhole` | Table `bench`, families `ycsb`, `attr`, `metric` (TTL), `edge`, each `max_versions(1)`; public API only | `Buffered` / `Sync` |
-| `rocksdb` | Hand-written wide-column key: `escape(row) 00 01 <family> <qualifier>` (order-preserving), one key per cell, default options, no compression codecs compiled in | WAL, no fsync / `sync=true` |
-| `sqlite-eav` | `cells(row, family, qualifier, value)` `WITHOUT ROWID`, primary key `(row, family, qualifier)`, WAL journal | `synchronous=NORMAL` / `FULL` |
-| `fjall` | Same key encoding as RocksDB, one keyspace, default options | `PersistMode::Buffer` / `SyncAll` |
+| Store | Model | Memory (default budget) | Filter | Commit (default / `--sync`) |
+|---|---|---|---|---|
+| `pigeonhole` | Table `bench`, families `ycsb`, `attr`, `metric` (TTL), `edge`, each `max_versions(1)`; public API only | memtable 256 MiB per shard, block cache 256 MiB | bloom, 10 bits/key | `Buffered` / `Sync` |
+| `rocksdb` | Hand-written wide-column key: `escape(row) 00 01 <family> <qualifier>` (order-preserving), one key per cell; no compression codecs compiled in | `write_buffer_size` 256 MiB, LRU block cache 256 MiB | bloom, 10 bits/key | WAL, no fsync / `sync=true` |
+| `sqlite-eav` | `cells(row, family, qualifier, value)` `WITHOUT ROWID`, primary key `(row, family, qualifier)`, WAL journal | page cache 512 MiB (write buffer + cache) | none (B-tree) | `synchronous=NORMAL` / `FULL` |
+| `fjall` | Same key encoding as RocksDB, one keyspace | `max_memtable_size` 256 MiB, block cache 256 MiB | fjall's default bloom filters | `PersistMode::Buffer` / `SyncAll` |
 
-The default level, written to the OS but not fsynced, survives a process crash in every engine, so the engines compare like with like. Tests check that every comparison runner reads exactly the same cells and bytes as Pigeonhole, operation by operation, for every workload (`runners::agreement`).
+**Memory budget.** Every engine gets the same `MemoryBudget`: a write buffer (`--write-buffer`) and a read cache (`--cache`), 256 MiB each by default. The read cache matches Pigeonhole's default block cache. The write buffer is raised from Pigeonhole's 64 MiB default, because all data stays in memtables until #37. SQLite has no separate write buffer, so its page cache gets the sum. A one-shard table uses one shard's memtable, so the comparison holds whatever `--shards` is. Every engine's other options are its defaults: no tuning on any side. Each result's `Settings` column prints the budget, filter and durability it ran with.
+
+**Durability.** The default level, written to the OS but not fsynced, survives a process crash in every engine, so the engines compare like with like. Tests check that every comparison runner reads exactly the same cells and bytes as Pigeonhole, operation by operation, for every workload (`runners::agreement`).
 
 Latency is the wall time of one `execute` call, recorded in an HDR-style log-linear histogram (< 0.8% relative error). Throughput is measured operations divided by the wall time of the measured phase, across all client threads.
+
+### Latency caveats
+
+- **Closed loop, no coordinated-omission correction.** Each client issues its next operation only when the previous one returns. A stall delays every operation behind it, but only the stalled one is recorded as slow. Tail percentiles therefore understate what an open-loop client with a fixed arrival rate would see. Read p99.9 as a lower bound.
+- **Timer overhead.** Each operation is bracketed by two `Instant::now()` calls, roughly 20–40 ns on current hardware, and that time is included in its latency. It matters only for sub-microsecond operations (point gets on hot data).
+- **Sample counts.** At 200,000 measured operations, p99 rests on 2,000 samples and p99.9 on 200, of which the slowest 200 decide the value. With one thread per workload, a handful of OS scheduling events moves p99.9 a lot; see the calibration below. Raise `--ops` before reading anything into p99.9.
+- **Warmup.** 5% of `--ops` run unrecorded first (`--warmup`). Warmup does not remove effects that grow with time, such as memtable size growing during the run.
 
 ## Reading results
 
@@ -98,8 +109,10 @@ Each result row gives the workload, store, store settings, size, client threads,
 | RocksDB gap | 1 (reported) | `all --engine pigeonhole,rocksdb` | Reported, not gated |
 | Model value | 2 | `sparse-wide --engine pigeonhole,sqlite,rocksdb` | Pigeonhole beats SQLite EAV and RocksDB on throughput and p99 |
 | Latency | 3 | `ycsb-c` (point get), `ycsb-a`/`skewed-multi-shard` (writes), `adjacency`/`ycsb-e` (scans) | Goals table: get p50 < 2 µs, p99 < 10 µs; within 1.5× of RocksDB |
-| Scaling | 1 onward | `scaling --shards N` | N-shard write throughput ≥ 0.8 × N × single-shard (`efficiency` ≥ 0.8), and single-shard p99 does not regress against the previous run (`compare`) |
+| Scaling | 1 onward | `scaling --shards N`, then `compare` against a stored `scaling.json` | N-shard write throughput ≥ 0.8 × N × single-shard (`efficiency` ≥ 0.8), and single-shard p99 does not regress |
 | Reproducibility | all | Two runs, then `compare a.json b.json` | Every result within tolerance |
+
+**The scaling gate has two halves, checked differently.** Each `scaling` run evaluates only the efficiency half and prints pass or fail. The other half, "no regression in single-shard p99", needs a baseline: compare this run's `scaling.json` against a stored one with `phdb-bench compare old/scaling.json new/scaling.json`, which checks the single-shard p99 within the p99 tolerance. The weekly `bench.yml` uploads `scaling.json` with every run, so each run leaves the baseline for the next.
 
 **Scaling today:** a table is one tablet and tablets do not split yet, so the skewed workload's writes all land on one shard whatever N is. `scaling` reports that faithfully, and it fails. Tracked in [#51](https://github.com/CodingAnarchy/pigeonhole/issues/51).
 
@@ -116,7 +129,7 @@ Two runs of the same suite on the same machine agree when, for every result:
 
 How the tolerance was chosen: two back-to-back runs of `all --engine all` (`small` preset, 40 results) on the machine below, with nothing else running. Worst drift between the runs: throughput 8.3% (median 1.1%), p50 8.6% (median 1.1%), p99 12.1% (median 1.3%). p99.9 drifted up to 144% (median 1.9%), which is why it is not checked. The tolerance leaves about 2× headroom over the worst observed drift. Runs made while other heavy work shared the machine (another agent's test suite at 300% CPU) disagreed by 20–90% on every engine at once, and `compare` failed them, as it should. `compare` also warns when a run started with a one-minute load average of 2 or more; the load is recorded in every result's environment.
 
-`compare` warns when the two runs come from different machines or build profiles, because the tolerance only means something on one machine. Close other heavy work while measuring. Laptops also throttle and switch between performance and efficiency cores.
+`compare` is symmetric: it flags any change beyond tolerance, faster or slower. An unexplained improvement is as suspect as a regression, and an intended one means it is time for a new baseline. It warns when the two runs come from different machines or build profiles, because the tolerance only means something on one machine. Close other heavy work while measuring. Laptops also throttle and switch between performance and efficiency cores.
 
 ## First results (this Mac, non-reference)
 

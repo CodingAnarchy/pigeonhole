@@ -14,6 +14,63 @@ use crate::BenchOp;
 #[cfg(any(feature = "rocksdb", feature = "fjall"))]
 use crate::workload::FAMILIES;
 
+/// Bloom filter bits per key: Pigeonhole's default (`Family::bloom_bits`), which the
+/// RocksDB runner matches. fjall builds filters by default; SQLite has none.
+pub const BLOOM_BITS: u8 = 10;
+
+/// Memory every store may use, so no engine wins by caching more than another.
+///
+/// | Store | Write buffer | Read cache |
+/// |---|---|---|
+/// | Pigeonhole | `memtable_budget` (per shard; one table is on one shard) | `block_cache` |
+/// | RocksDB | `write_buffer_size` | LRU block cache |
+/// | fjall | `max_memtable_size` | `cache_size` |
+/// | SQLite | — | page cache (`cache_size`) of `write_buffer + cache` |
+///
+/// The default is 256 MiB of each: Pigeonhole's default block cache, and a write
+/// buffer raised from its 64 MiB default because all data stays in memtables until the
+/// engine flushes to SSTs (#37).
+///
+/// ```
+/// use pigeonhole_bench::MemoryBudget;
+///
+/// let m = MemoryBudget::default();
+/// assert_eq!(m.write_buffer, 256 << 20);
+/// assert_eq!(m.to_string(), "write_buffer=256MiB cache=256MiB");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    /// Bytes of in-memory write buffer (memtables).
+    pub write_buffer: u64,
+    /// Bytes of read cache (block or page cache).
+    pub cache: u64,
+}
+
+impl Default for MemoryBudget {
+    fn default() -> Self {
+        Self {
+            write_buffer: 256 << 20,
+            cache: 256 << 20,
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "write_buffer={}MiB cache={}MiB",
+            self.write_buffer >> 20,
+            self.cache >> 20
+        )
+    }
+}
+
+/// `buffered` or `sync`, for `describe()`.
+pub(crate) fn durability(sync: bool) -> &'static str {
+    if sync { "sync" } else { "buffered" }
+}
+
 /// What one operation read: cells and value bytes. Runners return it so tests can check
 /// that every store answers the same workload with the same data.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

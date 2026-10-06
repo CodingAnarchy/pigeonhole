@@ -96,3 +96,62 @@ fn every_workload_on_fjall() {
         Box::new(pigeonhole_bench::FjallRunner::default())
     });
 }
+
+#[test]
+fn warmup_is_run_but_not_recorded() {
+    use pigeonhole_bench::{RunOptions, run_detailed};
+    let root = temp_dir("warmup");
+    let config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+    let mut r = PigeonholeRunner::default()
+        .shards(1)
+        .memtable_budget(16 << 20);
+    let rec = run_detailed(&mut r, &config, &root, &RunOptions { warmup: 0.25 }).unwrap();
+    assert_eq!(rec.operations, config.operations);
+    assert_eq!(rec.warmup_ops, config.operations / 4);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn ycsb_f_refuses_concurrent_clients() {
+    let root = temp_dir("ycsb-f-threads");
+    let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbF);
+    config.threads = 2;
+    let mut r = PigeonholeRunner::default()
+        .shards(1)
+        .memtable_budget(16 << 20);
+    let err = run(&mut r, &config, &root).unwrap_err();
+    assert!(err.contains("one thread"), "{err}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn describe_reports_memory_budget() {
+    use pigeonhole_bench::MemoryBudget;
+    let m = MemoryBudget {
+        write_buffer: 32 << 20,
+        cache: 8 << 20,
+    };
+    let d = PigeonholeRunner::default().memory(m).describe();
+    assert!(d.contains("memtable=32MiB cache=8MiB bloom=10"), "{d}");
+    #[cfg(feature = "rocksdb")]
+    assert!(
+        pigeonhole_bench::RocksDbRunner::default()
+            .memory(m)
+            .describe()
+            .contains("write_buffer=32MiB cache=8MiB bloom=10")
+    );
+    #[cfg(feature = "sqlite")]
+    assert!(
+        pigeonhole_bench::SqliteRunner::default()
+            .memory(m)
+            .describe()
+            .contains("page_cache=40MiB")
+    );
+    #[cfg(feature = "fjall")]
+    assert!(
+        pigeonhole_bench::FjallRunner::default()
+            .memory(m)
+            .describe()
+            .contains("write_buffer=32MiB cache=8MiB")
+    );
+}

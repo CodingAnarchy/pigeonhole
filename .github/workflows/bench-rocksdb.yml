@@ -1,0 +1,35 @@
+name: Bench RocksDB build
+
+# Builds and tests pigeonhole-bench with every comparison runner, including RocksDB
+# (C++ and bindgen), so the `rocksdb` feature cannot rot. Kept out of the PR-gating CI
+# workflow because it compiles RocksDB from source (docs/bench.md).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 5 * * 1" # Mondays 05:47 UTC, after the bench suite
+  push:
+    branches: [main]
+    paths:
+      - "crates/bench/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rocksdb:
+    name: bench (all comparison runners, ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p pigeonhole-bench --all-targets --all-features -- -D warnings
+      - run: cargo test -p pigeonhole-bench --all-features

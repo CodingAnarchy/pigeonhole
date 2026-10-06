@@ -5,30 +5,20 @@ use std::path::Path;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole, Table};
 
-use super::{Counted, Touched, modified};
+use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
 use crate::{BenchOp, Client, PigeonholeRunner, Runner};
 
-/// Default per-shard memtable budget of the runner. Until the engine flushes to SSTs
-/// (#37) all data stays in memtables and one table lives on one shard, so this bounds
-/// the data set of a run.
+/// Default per-shard memtable budget of the runner ([`MemoryBudget`]'s write buffer).
+/// Until the engine flushes to SSTs (#37) all data stays in memtables and one table
+/// lives on one shard, so this bounds the data set of a run.
 pub const DEFAULT_MEMTABLE_BUDGET: u64 = 256 << 20;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Settings {
     pub(crate) shards: Option<usize>,
-    pub(crate) memtable_budget: u64,
+    pub(crate) memory: MemoryBudget,
     pub(crate) sync: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            shards: None,
-            memtable_budget: DEFAULT_MEMTABLE_BUDGET,
-            sync: false,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -56,9 +46,16 @@ impl PigeonholeRunner {
         self
     }
 
-    /// Memtable bytes per shard (default [`DEFAULT_MEMTABLE_BUDGET`]).
+    /// Memtable bytes per shard (default [`DEFAULT_MEMTABLE_BUDGET`]); the write buffer
+    /// of the [`MemoryBudget`].
     pub fn memtable_budget(mut self, bytes: u64) -> Self {
-        self.settings.memtable_budget = bytes;
+        self.settings.memory.write_buffer = bytes;
+        self
+    }
+
+    /// Memtable budget per shard and block cache.
+    pub fn memory(mut self, memory: MemoryBudget) -> Self {
+        self.settings.memory = memory;
         self
     }
 
@@ -90,14 +87,15 @@ impl Runner for PigeonholeRunner {
             } else {
                 Durability::Buffered
             })
-            .memtable_budget(s.memtable_budget);
+            .memtable_budget(s.memory.write_buffer)
+            .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
         if let Some(n) = s.shards {
             options = options.shards(n);
         }
         let db = Pigeonhole::open(dir.join("bench.phdb"), options).map_err(err)?;
         let mut builder = db.table("bench").map_err(err)?;
         for family in FAMILIES {
-            let mut f = Family::default().max_versions(1);
+            let mut f = Family::default().max_versions(1).bloom_bits(BLOOM_BITS);
             if family == METRIC_FAMILY {
                 f = f.ttl(TIME_SERIES_TTL);
             }
@@ -139,9 +137,10 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} budget={}MiB {}",
-            s.memtable_budget >> 20,
-            if s.sync { "sync" } else { "buffered" }
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}",
+            s.memory.write_buffer >> 20,
+            s.memory.cache >> 20,
+            durability(s.sync)
         )
     }
 }

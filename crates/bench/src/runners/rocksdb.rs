@@ -1,13 +1,18 @@
 //! RocksDB with a hand-written wide-column key encoding ([`super::keys`]): one column
-//! family, one key per cell, latest value only. Default RocksDB options; no compression
-//! codecs are compiled in.
+//! family, one key per cell, latest value only. Default RocksDB options except the
+//! [`MemoryBudget`] (write buffer, LRU block cache) and a 10-bit bloom filter; no
+//! compression codecs are compiled in.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch, WriteOptions};
+use rocksdb::{
+    BlockBasedOptions, Cache, DB, Direction, IteratorMode, Options, WriteBatch, WriteOptions,
+};
 
-use super::{Counted, Touched, family_id, keys, modified, scan_rows};
+use super::{
+    BLOOM_BITS, Counted, MemoryBudget, Touched, durability, family_id, keys, modified, scan_rows,
+};
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
 
@@ -21,6 +26,7 @@ use crate::{BenchOp, Client, Runner};
 #[derive(Default)]
 pub struct RocksDbRunner {
     sync: bool,
+    memory: MemoryBudget,
     db: Option<Arc<DB>>,
 }
 
@@ -28,6 +34,7 @@ impl std::fmt::Debug for RocksDbRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RocksDbRunner")
             .field("sync", &self.sync)
+            .field("memory", &self.memory)
             .field("open", &self.db.is_some())
             .finish()
     }
@@ -38,6 +45,12 @@ impl RocksDbRunner {
     /// without fsync, like Pigeonhole's `Buffered`.
     pub fn sync(mut self, yes: bool) -> Self {
         self.sync = yes;
+        self
+    }
+
+    /// Write buffer size and block cache (default [`MemoryBudget::default`]).
+    pub fn memory(mut self, memory: MemoryBudget) -> Self {
+        self.memory = memory;
         self
     }
 }
@@ -64,6 +77,13 @@ impl Runner for RocksDbRunner {
     fn open(&mut self, dir: &Path) -> Result<(), String> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        opts.set_write_buffer_size(usize::try_from(self.memory.write_buffer).unwrap_or(usize::MAX));
+        let mut table = BlockBasedOptions::default();
+        table.set_block_cache(&Cache::new_lru_cache(
+            usize::try_from(self.memory.cache).unwrap_or(usize::MAX),
+        ));
+        table.set_bloom_filter(f64::from(BLOOM_BITS), false);
+        opts.set_block_based_table_factory(&table);
         let db = DB::open(&opts, dir.join("rocksdb")).map_err(|e| e.to_string())?;
         self.db = Some(Arc::new(db));
         Ok(())
@@ -85,7 +105,11 @@ impl Runner for RocksDbRunner {
     }
 
     fn describe(&self) -> String {
-        if self.sync { "sync" } else { "buffered" }.to_owned()
+        format!(
+            "{} bloom={BLOOM_BITS} {}",
+            self.memory,
+            durability(self.sync)
+        )
     }
 }
 

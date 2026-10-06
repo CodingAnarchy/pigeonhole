@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pigeonhole_bench::{
-    Environment, PigeonholeRunner, RunRecord, Runner, Scaling, Suite, Tolerance, WorkloadConfig,
-    WorkloadKind, compare, run_detailed,
+    Environment, MemoryBudget, PigeonholeRunner, RunOptions, RunRecord, Runner, Scaling, Suite,
+    Tolerance, WorkloadConfig, WorkloadKind, compare, run_detailed,
 };
 
 const HELP: &str = "\
@@ -38,8 +38,12 @@ OPTIONS:
     --value-len N          bytes per value
     --threads N            client threads
     --seed N               RNG seed
+    --warmup F             unrecorded warmup, as a fraction of --ops [default: 0.05]
     --shards N             Pigeonhole shards (scaling: N, default all cores)
-    --memtable-budget B    Pigeonhole memtable bytes per shard
+    --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
+                           shard) [default: 256 MiB]
+    --cache B              every engine's read cache (SQLite: page cache gets
+                           write buffer + cache) [default: 256 MiB]
     --sync                 fsync every commit on every engine [default: buffered]
     --dir DIR              where stores are created [default: system temp dir]
     --json PATH            write results as JSON
@@ -59,8 +63,10 @@ struct Args {
     value_len: Option<usize>,
     threads: Option<usize>,
     seed: Option<u64>,
+    warmup: Option<f64>,
     shards: Option<usize>,
-    memtable_budget: Option<u64>,
+    write_buffer: Option<u64>,
+    cache: Option<u64>,
     sync: bool,
     dir: Option<PathBuf>,
     json: Option<PathBuf>,
@@ -93,7 +99,11 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--threads" => a.threads = Some(parse(&arg, it.next())?),
             "--seed" => a.seed = Some(parse(&arg, it.next())?),
             "--shards" => a.shards = Some(parse(&arg, it.next())?),
-            "--memtable-budget" => a.memtable_budget = Some(parse(&arg, it.next())?),
+            "--warmup" => a.warmup = Some(parse(&arg, it.next())?),
+            "--write-buffer" | "--memtable-budget" => {
+                a.write_buffer = Some(parse(&arg, it.next())?)
+            }
+            "--cache" => a.cache = Some(parse(&arg, it.next())?),
             "--sync" => a.sync = true,
             "--dir" => a.dir = Some(parse(&arg, it.next())?),
             "--json" => a.json = Some(parse(&arg, it.next())?),
@@ -132,13 +142,18 @@ fn config(a: &Args, kind: WorkloadKind) -> Result<WorkloadConfig, String> {
     Ok(c)
 }
 
+fn memory(a: &Args) -> MemoryBudget {
+    let d = MemoryBudget::default();
+    MemoryBudget {
+        write_buffer: a.write_buffer.unwrap_or(d.write_buffer),
+        cache: a.cache.unwrap_or(d.cache),
+    }
+}
+
 fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
-    let mut r = PigeonholeRunner::default().sync(a.sync);
+    let mut r = PigeonholeRunner::default().sync(a.sync).memory(memory(a));
     if let Some(n) = shards.or(a.shards) {
         r = r.shards(n);
-    }
-    if let Some(b) = a.memtable_budget {
-        r = r.memtable_budget(b);
     }
     r
 }
@@ -155,19 +170,25 @@ fn runner(a: &Args, engine: &str) -> Result<Box<dyn Runner>, String> {
         "pigeonhole" => Ok(Box::new(pigeonhole(a, None))),
         #[cfg(feature = "rocksdb")]
         "rocksdb" => Ok(Box::new(
-            pigeonhole_bench::RocksDbRunner::default().sync(a.sync),
+            pigeonhole_bench::RocksDbRunner::default()
+                .sync(a.sync)
+                .memory(memory(a)),
         )),
         #[cfg(not(feature = "rocksdb"))]
         "rocksdb" => missing("rocksdb"),
         #[cfg(feature = "sqlite")]
         "sqlite" | "sqlite-eav" => Ok(Box::new(
-            pigeonhole_bench::SqliteRunner::default().sync(a.sync),
+            pigeonhole_bench::SqliteRunner::default()
+                .sync(a.sync)
+                .memory(memory(a)),
         )),
         #[cfg(not(feature = "sqlite"))]
         "sqlite" | "sqlite-eav" => missing("sqlite"),
         #[cfg(feature = "fjall")]
         "fjall" => Ok(Box::new(
-            pigeonhole_bench::FjallRunner::default().sync(a.sync),
+            pigeonhole_bench::FjallRunner::default()
+                .sync(a.sync)
+                .memory(memory(a)),
         )),
         #[cfg(not(feature = "fjall"))]
         "fjall" => missing("fjall"),
@@ -177,6 +198,7 @@ fn runner(a: &Args, engine: &str) -> Result<Box<dyn Runner>, String> {
 
 /// Runs one measurement in a fresh directory under `root`, removed afterwards.
 fn one(
+    a: &Args,
     root: &Path,
     seq: &mut u32,
     runner: &mut dyn Runner,
@@ -191,7 +213,10 @@ fn one(
         runner.name(),
         runner.describe()
     );
-    let result = run_detailed(runner, config, &dir)
+    let options = RunOptions {
+        warmup: a.warmup.unwrap_or(RunOptions::default().warmup),
+    };
+    let result = run_detailed(runner, config, &dir, &options)
         .map_err(|e| format!("{} on {}: {e}", config.kind.name(), runner.name()));
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -213,8 +238,8 @@ fn bench(a: &Args) -> Result<Suite, String> {
             let n = a.shards.unwrap_or(suite.environment.cores);
             let mut c = config(a, WorkloadKind::SkewedMultiShard)?;
             c.threads = a.threads.unwrap_or(n);
-            let single = one(&root, &mut seq, &mut pigeonhole(a, Some(1)), &c)?;
-            let multi = one(&root, &mut seq, &mut pigeonhole(a, Some(n)), &c)?;
+            let single = one(a, &root, &mut seq, &mut pigeonhole(a, Some(1)), &c)?;
+            let multi = one(a, &root, &mut seq, &mut pigeonhole(a, Some(n)), &c)?;
             suite.scaling = Some(Scaling::new(n, &single, &multi));
             suite.results.extend([single, multi]);
             return Ok(());
@@ -228,7 +253,7 @@ fn bench(a: &Args) -> Result<Suite, String> {
             let c = config(a, kind)?;
             for engine in &a.engines {
                 let mut r = runner(a, engine)?;
-                suite.results.push(one(&root, &mut seq, r.as_mut(), &c)?);
+                suite.results.push(one(a, &root, &mut seq, r.as_mut(), &c)?);
             }
         }
         Ok(())
@@ -326,14 +351,14 @@ mod tests {
     fn smoke_suite_end_to_end() {
         let dir = std::env::temp_dir().join(format!("phdb-bench-cli-{}", std::process::id()));
         let a = args(&format!(
-            "ycsb-c --scale smoke --shards 1 --memtable-budget 16777216 --dir {}",
+            "ycsb-c --scale smoke --shards 1 --write-buffer 16777216 --dir {}",
             dir.display()
         ));
         let suite = bench(&a).unwrap();
         assert_eq!(suite.results.len(), 1);
         assert!(suite.to_markdown().contains("| ycsb-c | pigeonhole |"));
         let a = args(&format!(
-            "scaling --scale smoke --shards 2 --memtable-budget 16777216 --dir {}",
+            "scaling --scale smoke --shards 2 --write-buffer 16777216 --dir {}",
             dir.display()
         ));
         let suite = bench(&a).unwrap();

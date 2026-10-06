@@ -1,12 +1,13 @@
 //! fjall with the same hand-written wide-column key encoding as the RocksDB runner
 //! ([`super::keys`]): one keyspace, one key per cell, latest value only. Default fjall
-//! options.
+//! options (which include bloom filters and no global write-buffer cap) except the
+//! [`MemoryBudget`]: keyspace memtable size and block cache.
 
 use std::path::Path;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
-use super::{Counted, Touched, family_id, keys, modified, scan_rows};
+use super::{Counted, MemoryBudget, Touched, durability, family_id, keys, modified, scan_rows};
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
 
@@ -20,6 +21,7 @@ use crate::{BenchOp, Client, Runner};
 #[derive(Default)]
 pub struct FjallRunner {
     sync: bool,
+    memory: MemoryBudget,
     open: Option<Handle>,
 }
 
@@ -27,6 +29,7 @@ impl std::fmt::Debug for FjallRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FjallRunner")
             .field("sync", &self.sync)
+            .field("memory", &self.memory)
             .field("open", &self.open.is_some())
             .finish()
     }
@@ -37,6 +40,12 @@ impl FjallRunner {
     /// the OS without fsync, like Pigeonhole's `Buffered`.
     pub fn sync(mut self, yes: bool) -> Self {
         self.sync = yes;
+        self
+    }
+
+    /// Memtable size and block cache (default [`MemoryBudget::default`]).
+    pub fn memory(mut self, memory: MemoryBudget) -> Self {
+        self.memory = memory;
         self
     }
 }
@@ -55,9 +64,15 @@ impl Runner for FjallRunner {
 
     fn open(&mut self, dir: &Path) -> Result<(), String> {
         let e = |e: fjall::Error| e.to_string();
-        let db = Database::builder(dir.join("fjall")).open().map_err(e)?;
+        let m = self.memory;
+        let db = Database::builder(dir.join("fjall"))
+            .cache_size(m.cache)
+            .open()
+            .map_err(e)?;
         let cells = db
-            .keyspace("cells", KeyspaceCreateOptions::default)
+            .keyspace("cells", || {
+                KeyspaceCreateOptions::default().max_memtable_size(m.write_buffer)
+            })
             .map_err(e)?;
         self.open = Some(Handle {
             db,
@@ -87,7 +102,7 @@ impl Runner for FjallRunner {
     }
 
     fn describe(&self) -> String {
-        if self.sync { "sync" } else { "buffered" }.to_owned()
+        format!("{} bloom=default {}", self.memory, durability(self.sync))
     }
 }
 

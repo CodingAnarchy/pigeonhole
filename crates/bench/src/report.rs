@@ -243,6 +243,9 @@ pub struct RunRecord {
     pub mean_ns: u64,
     /// Largest latency in nanoseconds.
     pub max_ns: u64,
+    /// Unrecorded warmup operations run before the measured ones.
+    #[serde(default)]
+    pub warmup_ops: u64,
 }
 
 impl RunRecord {
@@ -550,7 +553,7 @@ impl Comparison {
 ///     store: "pigeonhole".into(), store_config: String::new(), workload: "ycsb-c".into(),
 ///     seed: 1, records: 10, operations: 10, value_len: 8, threads: 1, load_secs: 0.0,
 ///     run_secs: 1.0, throughput: tput, p50_ns: 1000, p99_ns: 2000, p999_ns: 3000,
-///     mean_ns: 1100, max_ns: 5000,
+///     mean_ns: 1100, max_ns: 5000, warmup_ops: 0,
 /// };
 /// let env = Environment::detect(&std::env::temp_dir());
 /// let mut a = Suite::new(env.clone());
@@ -644,6 +647,7 @@ mod tests {
             p999_ns: p99 * 2,
             mean_ns: p50,
             max_ns: p99 * 3,
+            warmup_ops: 0,
         }
     }
 

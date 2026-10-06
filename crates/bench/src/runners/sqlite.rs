@@ -1,11 +1,12 @@
 //! SQLite as an entity-attribute-value table: one row per cell in a `WITHOUT ROWID`
-//! table keyed by `(row, family, qualifier)`, WAL journal mode.
+//! table keyed by `(row, family, qualifier)`, WAL journal mode, with a page cache of
+//! the whole [`MemoryBudget`] (SQLite has no separate write buffer).
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Counted, Touched, modified};
+use super::{Counted, MemoryBudget, Touched, durability, modified};
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
 
@@ -32,6 +33,7 @@ const SCAN: &str = "SELECT row, value FROM cells WHERE row >= ?1 ORDER BY row, f
 #[derive(Debug, Default)]
 pub struct SqliteRunner {
     sync: bool,
+    memory: MemoryBudget,
     path: Option<PathBuf>,
     conn: Option<Conn>,
 }
@@ -44,12 +46,22 @@ impl SqliteRunner {
         self.sync = yes;
         self
     }
+
+    /// Page cache of `write_buffer + cache` bytes (default [`MemoryBudget::default`]).
+    pub fn memory(mut self, memory: MemoryBudget) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    fn page_cache(&self) -> u64 {
+        self.memory.write_buffer + self.memory.cache
+    }
 }
 
 #[derive(Debug)]
 struct Conn(Connection);
 
-fn connect(path: &Path, sync: bool) -> Result<Conn, String> {
+fn connect(path: &Path, sync: bool, page_cache: u64) -> Result<Conn, String> {
     let e = |e: rusqlite::Error| e.to_string();
     let c = Connection::open(path).map_err(e)?;
     c.busy_timeout(std::time::Duration::from_secs(60))
@@ -57,6 +69,9 @@ fn connect(path: &Path, sync: bool) -> Result<Conn, String> {
     c.pragma_update(None, "journal_mode", "WAL").map_err(e)?;
     c.pragma_update(None, "synchronous", if sync { "FULL" } else { "NORMAL" })
         .map_err(e)?;
+    // Negative cache_size is in KiB.
+    let kib = i64::try_from(page_cache / 1024).unwrap_or(i64::MAX);
+    c.pragma_update(None, "cache_size", -kib).map_err(e)?;
     c.execute(SCHEMA, []).map_err(e)?;
     Ok(Conn(c))
 }
@@ -68,7 +83,7 @@ impl Runner for SqliteRunner {
 
     fn open(&mut self, dir: &Path) -> Result<(), String> {
         let path = dir.join("bench.sqlite");
-        self.conn = Some(connect(&path, self.sync)?);
+        self.conn = Some(connect(&path, self.sync, self.page_cache())?);
         self.path = Some(path);
         Ok(())
     }
@@ -85,12 +100,16 @@ impl Runner for SqliteRunner {
     }
 
     fn client(&self) -> Option<Box<dyn Client>> {
-        let conn = connect(self.path.as_ref()?, self.sync).ok()?;
+        let conn = connect(self.path.as_ref()?, self.sync, self.page_cache()).ok()?;
         Some(Box::new(conn))
     }
 
     fn describe(&self) -> String {
-        if self.sync { "sync" } else { "buffered" }.to_owned()
+        format!(
+            "page_cache={}MiB {}",
+            self.page_cache() >> 20,
+            durability(self.sync)
+        )
     }
 }
 

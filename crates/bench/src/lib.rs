@@ -47,6 +47,7 @@ pub use runners::pigeonhole::DEFAULT_MEMTABLE_BUDGET;
 pub use runners::rocksdb::RocksDbRunner;
 #[cfg(feature = "sqlite")]
 pub use runners::sqlite::SqliteRunner;
+pub use runners::{BLOOM_BITS, MemoryBudget};
 pub use workload::{
     EDGE_FAMILY, FAMILIES, METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY,
 };
@@ -328,16 +329,44 @@ pub struct Report {
     pub hardware: String,
 }
 
-/// Runs `config` against `runner` in `dir` and reports.
+/// How [`run_detailed`] measures, beyond the workload itself.
 ///
-/// Opens a fresh store in `dir`, loads the data set (not measured), generates every
-/// measured operation up front, then times each operation on
+/// ```
+/// let opts = pigeonhole_bench::RunOptions::default();
+/// assert_eq!(opts.warmup, 0.05);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunOptions {
+    /// Unrecorded warmup operations before the measured ones, as a fraction of
+    /// [`WorkloadConfig::operations`] (default 0.05). They are the first operations of
+    /// the same seeded stream, executed on one thread, so caches, allocators and lazily
+    /// built structures are warm when the clock starts.
+    pub warmup: f64,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self { warmup: 0.05 }
+    }
+}
+
+impl RunOptions {
+    fn warmup_ops(&self, config: &WorkloadConfig) -> u64 {
+        (config.operations as f64 * self.warmup.max(0.0)).round() as u64
+    }
+}
+
+/// Runs `config` against `runner` in `dir` and reports, with the default
+/// [`RunOptions`].
+///
+/// Opens a fresh store in `dir`, loads the data set (not measured), runs the warmup,
+/// generates every measured operation up front, then times each operation on
 /// [`WorkloadConfig::threads`] client threads (one when the runner has no
 /// [`Runner::client`]). Throughput is operations over the wall time of the measured
 /// phase.
 pub fn run(runner: &mut dyn Runner, config: &WorkloadConfig, dir: &Path) -> Result<Report, String> {
     let env = Environment::detect(dir);
-    let record = run_detailed(runner, config, dir)?;
+    let record = run_detailed(runner, config, dir, &RunOptions::default())?;
     Ok(Report {
         store: runner.name(),
         workload: config.kind,
@@ -350,15 +379,32 @@ pub fn run(runner: &mut dyn Runner, config: &WorkloadConfig, dir: &Path) -> Resu
     })
 }
 
-/// [`run`], returning the full record written to JSON reports.
+/// [`run`] with explicit [`RunOptions`], returning the full record written to JSON
+/// reports.
+///
+/// Fails up front for [`WorkloadKind::YcsbF`] with more than one thread: its
+/// read-modify-write is a get and then a put, not atomic, so concurrent clients would
+/// lose each other's updates and the stores would no longer do the same work.
 pub fn run_detailed(
     runner: &mut dyn Runner,
     config: &WorkloadConfig,
     dir: &Path,
+    options: &RunOptions,
 ) -> Result<RunRecord, String> {
-    let mut workload = Workload::new(config.clone());
+    if config.threads > 1 && config.kind == WorkloadKind::YcsbF {
+        return Err(
+            "ycsb-f runs on one thread: read-modify-write is not atomic in the runners, \
+             so concurrent clients would race"
+                .to_owned(),
+        );
+    }
+    let warmup = options.warmup_ops(config);
+    let mut workload = Workload::new(WorkloadConfig {
+        operations: config.operations + warmup,
+        ..config.clone()
+    });
     runner.open(dir)?;
-    let result = measure(runner, config, &mut workload);
+    let result = measure(runner, config, &mut workload, warmup);
     let closed = runner.close();
     let (load, elapsed, threads, hist) = result?;
     closed?;
@@ -380,6 +426,7 @@ pub fn run_detailed(
         p999_ns: hist.percentile(0.999).as_nanos() as u64,
         mean_ns: hist.mean().as_nanos() as u64,
         max_ns: hist.max().as_nanos() as u64,
+        warmup_ops: warmup,
     })
 }
 
@@ -389,6 +436,7 @@ fn measure(
     runner: &mut dyn Runner,
     config: &WorkloadConfig,
     workload: &mut Workload,
+    warmup: u64,
 ) -> Result<Measured, String> {
     let load_start = Instant::now();
     for op in workload.load_ops() {
@@ -396,7 +444,11 @@ fn measure(
     }
     let load = load_start.elapsed();
 
-    let ops: Vec<BenchOp> = workload.run_ops().collect();
+    let mut ops = workload.run_ops();
+    for op in ops.by_ref().take(warmup as usize) {
+        runner.execute(&op).map_err(|e| format!("warmup: {e}"))?;
+    }
+    let ops: Vec<BenchOp> = ops.collect();
     let threads = config.threads.max(1);
     let clients: Vec<Box<dyn Client>> = if threads > 1 {
         (0..threads).map_while(|_| runner.client()).collect()
