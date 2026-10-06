@@ -46,8 +46,8 @@ enum Op {
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        8 => (0u64..=(300 << 10)).prop_map(Op::Allocate),
-        1 => (0u64..=(4 << 20)).prop_map(Op::Allocate),
+        8 => (0u64..=common::miri_scaled(300 << 10, 64 << 10)).prop_map(Op::Allocate),
+        1 => (0u64..=common::miri_scaled(4 << 20, 256 << 10)).prop_map(Op::Allocate),
         2 => any::<usize>().prop_map(Op::Abandon),
         4 => any::<u64>().prop_map(Op::Publish),
         2 => Just(Op::Pin),
@@ -300,8 +300,9 @@ fn reclaim_waits_for_the_oldest_view() {
 #[test]
 fn online_shrink_relocates_tail_and_truncates() {
     let mut h = Harness::new(common::seed());
+    let size = common::miri_scaled(256 << 10, 64 << 10);
     for _ in 0..64 {
-        h.apply(&Op::Allocate(256 << 10));
+        h.apply(&Op::Allocate(size));
     }
     h.apply(&Op::Publish(0));
     // Drop everything except every eighth extent, spread over the file.
@@ -313,8 +314,11 @@ fn online_shrink_relocates_tail_and_truncates() {
     h.apply(&Op::Reclaim);
     h.apply(&Op::Truncate);
     let after = h.pager.stats().file_bytes;
-    // Eight 256 KiB extents pack into the first 3 MiB (unit 0 plus alignment).
-    assert!(after <= 3 << 20, "file still {after} bytes (was {before})");
+    // Eight extents pack near the start (unit 0 plus alignment waste below 1 MiB).
+    assert!(
+        after <= size * 8 + (1 << 20),
+        "file still {after} bytes (was {before})"
+    );
     assert!(h.pager.shrink_plan().is_empty());
     h.apply(&Op::Reopen);
 }

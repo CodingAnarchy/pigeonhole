@@ -389,6 +389,10 @@ fn power_loss_at_every_write_point() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "a full crash sweep is too slow under Miri; the pager has no unsafe"
+)]
 fn torn_writes_at_every_write_point() {
     let mut plan = FaultPlan::none();
     plan.torn_writes = true;
@@ -396,6 +400,10 @@ fn torn_writes_at_every_write_point() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "a full crash sweep is too slow under Miri; the pager has no unsafe"
+)]
 fn reordered_unsynced_writes_at_every_write_point() {
     let mut plan = FaultPlan::none();
     plan.torn_writes = true;

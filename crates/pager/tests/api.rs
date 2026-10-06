@@ -269,7 +269,12 @@ fn allocation_sizes() {
         (1, 0),
         (64 << 10, 0),
         ((64 << 10) + 1, 1),
-        (64 << 20, 10),
+        // A 64 MiB extent is 64 MiB of simulated file; Miri stops at 512 KiB.
+        if cfg!(miri) {
+            (512 << 10, 3)
+        } else {
+            (64 << 20, 10)
+        },
     ] {
         let e = pager.allocate(bytes).unwrap();
         assert_eq!(e.size_class, class, "{bytes} bytes");
