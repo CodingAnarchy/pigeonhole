@@ -581,8 +581,10 @@ dependencies = [
 name = "pigeonhole-shm"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pigeonhole-format",
  "pigeonhole-io",
+ "proptest",
 ]
 
 [[package]]

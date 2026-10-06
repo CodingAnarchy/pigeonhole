@@ -455,7 +455,7 @@ The tablet map and the memtable list travel together in one view record (decisio
 | 32 | 8 | `generation` u64: region generation at claim |
 | 40 | 24 | reserved |
 
-Claim: CAS `state` 0 to 1, write `pid`, `start_time`, `generation`, store `state` = 2. Pin: store `pinned_view = v` (SeqCst), store `pinned_seqno`, then re-load `view_pointer`; if the view version moved past `v`, pin again with the new version. The writer frees a view's memtables, and the extents its manifest version uses, only after publishing a newer view and finding no slot pinning that view or an older one. A slot whose process is gone (`pid` absent or `start_time` changed) is reset to free by the writer. Readers write nothing in the region except their own slot.
+Claim: CAS `state` 0 to 1, write `pid`, `start_time`, `generation`, store `state` = 2. Pin: store `pinned_view = v` (SeqCst), store `pinned_seqno = s`, then re-load `view_pointer`; if the view version moved past `v`, take a fresh snapshot seqno `s' >= s` and pin again with the new version and `s'` (the seqno and the view always move as a pair, and the reader uses the pair it ended up pinning). The writer frees a view's memtables, and the extents its manifest version uses, only after publishing a newer view and finding no slot pinning that view or an older one. A slot whose process is gone (`pid` absent or `start_time` changed) is reset to free by the writer. Readers write nothing in the region except their own slot.
 
 ### 11.6 Arenas and memtables
 

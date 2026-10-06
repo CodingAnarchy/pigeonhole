@@ -6,20 +6,67 @@
 //! lifecycle (create, attach, rebuild, remove), the locks on the main file's lock page, and
 //! the reader protocol. What goes inside the arenas belongs to `pigeonhole-memtable`.
 //!
-//! All shared fields are accessed through [`SharedRegion`] atomics, so this crate needs no
+//! All shared fields are accessed through [`SharedRegion`](pigeonhole_io::SharedRegion) atomics, so this crate needs no
 //! `unsafe`. [`ShmRegion::in_memory`] is the heap-backed mock for engine tests.
+//!
+//! # Lifecycle
+//!
+//! Every process opens the main file **for writing** (even readers, which still write
+//! nothing: byte-range locks that are exclusive, such as the shm-init byte and the
+//! presence-byte upgrade at close, need a writable handle; see decision Q1 (io)).
+//!
+//! - The writer takes the [`WriterLock`] and the [`Presence`] lock, then calls
+//!   [`ShmRegion::open`] with [`Role::Writer`], which always builds a region under a new
+//!   [`Generation`]: it creates the new region, marks the old one abandoned, records the new
+//!   generation in the directory region and removes the old region's name.
+//! - A reader takes [`Presence`], opens with [`Role::Reader`], claims a [`ReaderSlot`] and
+//!   pins before each snapshot. When [`ShmRegion::is_stale`] reports that a new writer built
+//!   a new generation, it calls [`ShmRegion::reattach`], re-claims a slot and re-pins.
+//! - At close, the process that can [`Presence::try_become_last`] calls [`ShmRegion::remove`].
+//!
+//! ```
+//! use pigeonhole_format::shm::ViewRecord;
+//! use pigeonhole_io::ProcessId;
+//! use pigeonhole_shm::{ShmConfig, ShmRegion};
+//!
+//! let mut config = ShmConfig::new(2);
+//! config.arena_bytes = 2 << 20;
+//! config.view_buffer_bytes = 64 << 10;
+//! let shm = ShmRegion::in_memory([7; 16], &config);
+//!
+//! // Writer side: a group of three commits on shard 0.
+//! shm.publish_pending(0, shm.visible_seqno() + 1);
+//! let first = shm.reserve_seqnos(3);
+//! shm.publish_pending(0, first);
+//! // ... apply the group ...
+//! shm.publish_pending(0, u64::MAX);
+//! assert_eq!(shm.visible_seqno(), first + 2);
+//!
+//! shm.publish_view(&ViewRecord { view_version: 1, ..Default::default() }).unwrap();
+//!
+//! // Reader side: pin, then read through the pinned view.
+//! let slot = shm.claim_reader_slot(ProcessId { pid: 42, start_time: 1 }).unwrap();
+//! slot.pin(shm.visible_seqno(), shm.view_version());
+//! let view = shm.read_view().unwrap();
+//! assert_eq!(view.view_version, 1);
+//! assert_eq!(shm.oldest_reader_pin(), Some((first + 2, 1)));
+//! drop(slot);
+//! assert_eq!(shm.oldest_reader_pin(), None);
+//! ```
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
+
+mod lock;
+mod region;
 
 use std::fmt;
-use std::path::Path;
+use std::sync::Arc;
 
-use pigeonhole_format::shm::ViewRecord;
-use pigeonhole_format::{ManifestVersion, Seqno};
-use pigeonhole_io::{FileIdentity, FileRef, ProcessId, SharedRegion, VfsRef};
+use pigeonhole_format::{Seqno, ShmLayoutVersion};
+use pigeonhole_io::FileRef;
+
+pub use region::ShmRegion;
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -55,15 +102,56 @@ pub enum Error {
     },
     /// This mapping was replaced by a newer generation; call [`ShmRegion::reattach`].
     Stale,
+    /// [`ShmRegion::publish_view`] was given a view version at or below the published one.
+    /// Versions are strictly increasing (readers pin by version) and 0 means "no view".
+    ViewVersionNotNewer {
+        /// The version currently published.
+        published: u64,
+        /// The version offered.
+        offered: u64,
+    },
+    /// An [`ShmConfig`] field is out of range (see [`ShmConfig::validate`]).
+    InvalidConfig(&'static str),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        match self {
+            Error::Io(e) => write!(f, "shared memory: {e}"),
+            Error::WriterLocked => f.write_str("another process holds the writer lock"),
+            Error::VersionMismatch { found, expected } => write!(
+                f,
+                "shared-memory layout version {found} differs from this build's {expected}"
+            ),
+            Error::Corrupt(what) => write!(f, "shared-memory region is invalid: {what}"),
+            Error::NoReaderSlot => f.write_str("every reader slot is taken"),
+            Error::Unavailable => {
+                f.write_str("the shared-memory region could not be allocated at the requested size")
+            }
+            Error::ViewTooLarge { needed, capacity } => write!(
+                f,
+                "encoded view ({needed} bytes) does not fit the view buffer ({capacity} bytes)"
+            ),
+            Error::Stale => {
+                f.write_str("this mapping was replaced by a newer generation; re-attach")
+            }
+            Error::ViewVersionNotNewer { published, offered } => write!(
+                f,
+                "view version {offered} is not newer than the published version {published}"
+            ),
+            Error::InvalidConfig(what) => write!(f, "invalid shared-memory configuration: {what}"),
+        }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<pigeonhole_io::Error> for Error {
     fn from(e: pigeonhole_io::Error) -> Self {
@@ -71,13 +159,51 @@ impl From<pigeonhole_io::Error> for Error {
     }
 }
 
+impl From<pigeonhole_format::Error> for Error {
+    /// A header or view that fails to decode. A layout version other than this build's is
+    /// [`Error::VersionMismatch`]; everything else is [`Error::Corrupt`].
+    fn from(e: pigeonhole_format::Error) -> Self {
+        match e {
+            pigeonhole_format::Error::UnsupportedVersion { found, .. } => Error::VersionMismatch {
+                found,
+                expected: ShmLayoutVersion::CURRENT.0,
+            },
+            pigeonhole_format::Error::Truncated { what }
+            | pigeonhole_format::Error::BadMagic { what }
+            | pigeonhole_format::Error::Checksum { what }
+            | pigeonhole_format::Error::Corrupt { what } => Error::Corrupt(what),
+            _ => Error::Corrupt("shared-memory structure"),
+        }
+    }
+}
+
 /// Region generation: bumped each time a writer (re)builds the region, and part of the
 /// region's name. The directory region records the current one; readers re-attach when it
 /// changes.
+///
+/// ```
+/// use pigeonhole_shm::Generation;
+///
+/// assert!(Generation(1) < Generation(2));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(pub u64);
 
 /// Region sizing and placement.
+///
+/// ```
+/// use pigeonhole_shm::ShmConfig;
+///
+/// let config = ShmConfig::new(8);
+/// assert_eq!(config.shards, 8);
+/// assert_eq!(config.arena_bytes, 64 << 20);
+/// assert_eq!(config.reader_slots, 126);
+/// assert_eq!(config.view_buffer_bytes, 4 << 20);
+/// assert_eq!(config.first_seqno, 1);
+/// assert!(config.dir.is_none());
+/// assert!(config.validate().is_ok());
+/// assert!(ShmConfig::new(0).validate().is_err());
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ShmConfig {
@@ -92,46 +218,88 @@ pub struct ShmConfig {
     pub view_buffer_bytes: u32,
     /// Directory for a file-backed region instead of the default memory-backed one.
     pub dir: Option<std::path::PathBuf>,
+    /// The first seqno a region built with this config hands out (default 1). A writer
+    /// passes the seqno ceiling it recovered, so visible seqnos never go backwards across a
+    /// writer restart (ICR 0002). Values below 1 are raised to 1: 0 means "none" in reader
+    /// slots.
+    pub first_seqno: Seqno,
 }
 
 impl ShmConfig {
     /// Defaults for `shards` shards.
     pub fn new(shards: u32) -> Self {
-        todo!()
+        Self {
+            shards,
+            arena_bytes: 64 << 20,
+            reader_slots: 126,
+            view_buffer_bytes: 4 << 20,
+            dir: None,
+            first_seqno: 1,
+        }
+    }
+
+    /// Checks the ranges a region can be built from: at least one shard, at least one
+    /// reader slot, and a view buffer that holds at least a view header (32 bytes).
+    pub fn validate(&self) -> Result<()> {
+        if self.shards == 0 {
+            return Err(Error::InvalidConfig("shards must be at least 1"));
+        }
+        if self.reader_slots == 0 {
+            return Err(Error::InvalidConfig("reader_slots must be at least 1"));
+        }
+        if self.view_buffer_bytes < 32 {
+            return Err(Error::InvalidConfig(
+                "view_buffer_bytes must be at least 32 (one view header)",
+            ));
+        }
+        Ok(())
     }
 }
 
 /// The writer lock: the exclusive lock on the writer byte of the lock page. Held for the life
 /// of the writer; released on drop.
+///
+/// ```
+/// use std::path::Path;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_io::{OpenOptions, Vfs};
+/// use pigeonhole_shm::{Error, WriterLock};
+///
+/// let vfs = SimVfs::new(1);
+/// let file = vfs.open(Path::new("/db/data.phdb"), OpenOptions::read_write_create()).unwrap();
+/// let other = vfs.open(Path::new("/db/data.phdb"), OpenOptions::read_write_create()).unwrap();
+///
+/// let lock = WriterLock::acquire(&file).unwrap();
+/// assert!(matches!(WriterLock::acquire(&other), Err(Error::WriterLocked)));
+/// drop(lock);
+/// assert!(WriterLock::acquire(&other).is_ok());
+/// ```
 #[derive(Debug)]
 pub struct WriterLock {
-    _priv: (),
-}
-
-impl WriterLock {
-    /// Takes the writer byte; fails at once with [`Error::WriterLocked`].
-    pub fn acquire(file: &FileRef) -> Result<WriterLock> {
-        todo!()
-    }
+    file: FileRef,
 }
 
 /// The shared presence lock every open process holds on the presence byte.
+///
+/// ```
+/// use std::path::Path;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_io::{OpenOptions, Vfs};
+/// use pigeonhole_shm::Presence;
+///
+/// let vfs = SimVfs::new(1);
+/// let file = vfs.open(Path::new("/db/data.phdb"), OpenOptions::read_write_create()).unwrap();
+/// let other = vfs.open(Path::new("/db/data.phdb"), OpenOptions::read_write_create()).unwrap();
+///
+/// let mine = Presence::acquire(&file).unwrap();
+/// let theirs = Presence::acquire(&other).unwrap();
+/// assert!(!mine.try_become_last().unwrap(), "another process is present");
+/// drop(theirs);
+/// assert!(mine.try_become_last().unwrap(), "now the last one: clean up");
+/// ```
 #[derive(Debug)]
 pub struct Presence {
-    _priv: (),
-}
-
-impl Presence {
-    /// Takes the presence byte shared.
-    pub fn acquire(file: &FileRef) -> Result<Presence> {
-        todo!()
-    }
-
-    /// Tries to upgrade to exclusive. Success means this is the last process: it may
-    /// checkpoint, remove the WAL files and remove the region. Releases on drop either way.
-    pub fn try_become_last(&self) -> Result<bool> {
-        todo!()
-    }
+    file: FileRef,
 }
 
 /// How the calling process uses the region.
@@ -144,165 +312,28 @@ pub enum Role {
     Reader,
 }
 
-/// The mapped region for one database.
-#[derive(Debug, Clone)]
-pub struct ShmRegion {
-    _priv: (),
-}
-
-impl ShmRegion {
-    /// Creates or attaches to the region for the database file `identity`, holding the
-    /// shm-init lock byte on `file` while creating or validating. Finds the current
-    /// generation through the directory region (FORMAT §11). A writer always builds a new
-    /// generation: it creates the new region, marks the old one abandoned, then records the
-    /// new generation in the directory. Refuses a live region with another layout version
-    /// ([`Error::VersionMismatch`]) unless no other process is attached.
-    pub fn open(
-        vfs: &VfsRef,
-        file: &FileRef,
-        identity: FileIdentity,
-        db_id: [u8; 16],
-        role: Role,
-        config: &ShmConfig,
-    ) -> Result<ShmRegion> {
-        todo!()
-    }
-
-    /// A private heap-backed region with the same layout (the mock for engine tests).
-    pub fn in_memory(db_id: [u8; 16], config: &ShmConfig) -> ShmRegion {
-        todo!()
-    }
-
-    /// Removes the region's and the directory's names (by the last process, after
-    /// [`Presence::try_become_last`]).
-    pub fn remove(vfs: &VfsRef, identity: FileIdentity, dir: Option<&Path>) -> Result<()> {
-        todo!()
-    }
-
-    /// Whether a newer generation replaced this mapping (its state is abandoned or the
-    /// directory names another generation). Cheap: two atomic loads.
-    pub fn is_stale(&self) -> bool {
-        todo!()
-    }
-
-    /// Attaches to the current generation (reader processes, after [`ShmRegion::is_stale`]).
-    /// The caller re-claims its reader slot and re-pins in the new region.
-    pub fn reattach(&self, vfs: &VfsRef, file: &FileRef) -> Result<ShmRegion> {
-        todo!()
-    }
-
-    /// Current generation.
-    pub fn generation(&self) -> Generation {
-        todo!()
-    }
-
-    /// Shard count of the region's layout.
-    pub fn shard_count(&self) -> u32 {
-        todo!()
-    }
-
-    /// The underlying mapping and the `(offset, len)` of `shard`'s arena within it, for
-    /// `pigeonhole_memtable::ArenaRegion::new`.
-    pub fn arena(&self, shard: u32) -> (SharedRegion, usize, usize) {
-        todo!()
-    }
-
-    /// Binds `shard`'s arena to NUMA node `node` (writer, at shard start).
-    pub fn bind_arena(&self, shard: u32, node: u32) -> Result<()> {
-        todo!()
-    }
-
-    // ---- seqnos and watermarks ----
-
-    /// Reserves `count` consecutive seqnos (one atomic `fetch_add` per commit group) and
-    /// returns the first. The caller must already have published a pending watermark no
-    /// higher than the result (see `FORMAT.md` §11.3). A cross-shard commit reserves one.
-    pub fn reserve_seqnos(&self, count: u64) -> Seqno {
-        todo!()
-    }
-
-    /// Publishes `shard`'s pending watermark with release ordering: the minimum of its current
-    /// group's lower bound and every cross-shard seqno it coordinates and has not released;
-    /// `u64::MAX` when it holds nothing, so an idle shard never holds back snapshots.
-    pub fn publish_pending(&self, shard: u32, pending: Seqno) {
-        todo!()
-    }
-
-    /// The highest seqno a new snapshot may include: every commit at or below it is applied
-    /// on every shard.
-    pub fn visible_seqno(&self) -> Seqno {
-        todo!()
-    }
-
-    // ---- views and manifest ----
-
-    /// Publishes a view (writer only): writes the inactive buffer, then swaps the view
-    /// pointer with release ordering. Fails with [`Error::ViewTooLarge`] (publishing nothing)
-    /// if the encoded view exceeds the buffer.
-    pub fn publish_view(&self, view: &ViewRecord) -> Result<()> {
-        todo!()
-    }
-
-    /// Copies and decodes the current view, retrying if the writer swapped buffers mid-copy.
-    pub fn read_view(&self) -> Result<ViewRecord> {
-        todo!()
-    }
-
-    /// Current view version, without copying the view.
-    pub fn view_version(&self) -> u64 {
-        todo!()
-    }
-
-    /// Records the manifest version readers should load.
-    pub fn set_manifest_version(&self, version: ManifestVersion) {
-        todo!()
-    }
-
-    /// The manifest version readers should load.
-    pub fn manifest_version(&self) -> ManifestVersion {
-        todo!()
-    }
-
-    // ---- reader slots ----
-
-    /// Claims a free reader slot for `process`.
-    pub fn claim_reader_slot(&self, process: ProcessId) -> Result<ReaderSlot> {
-        todo!()
-    }
-
-    /// The oldest `(seqno, view_version)` pinned by any live reader slot, or `None`.
-    pub fn oldest_reader_pin(&self) -> Option<(Seqno, u64)> {
-        todo!()
-    }
-
-    /// Frees slots whose process is gone (pid missing or start time changed). Returns how
-    /// many were reclaimed. Run by the writer before computing reclamation bounds.
-    pub fn reclaim_dead_slots(&self, vfs: &VfsRef) -> usize {
-        todo!()
-    }
-}
-
 /// One reader process's slot. Released on drop.
+///
+/// ```
+/// use pigeonhole_io::ProcessId;
+/// use pigeonhole_shm::{ShmConfig, ShmRegion};
+///
+/// let mut config = ShmConfig::new(1);
+/// config.arena_bytes = 2 << 20;
+/// config.reader_slots = 1;
+/// let shm = ShmRegion::in_memory([1; 16], &config);
+/// let me = ProcessId { pid: 7, start_time: 1 };
+///
+/// let slot = shm.claim_reader_slot(me).unwrap();
+/// assert_eq!(slot.index(), 0);
+/// assert!(shm.claim_reader_slot(me).is_err(), "one slot, already taken");
+/// assert_eq!(slot.pin(10, 0), (10, 0));
+/// assert_eq!(shm.oldest_reader_pin(), Some((10, 0)));
+/// slot.unpin();
+/// assert_eq!(shm.oldest_reader_pin(), None);
+/// ```
 #[derive(Debug)]
 pub struct ReaderSlot {
-    _priv: (),
-}
-
-impl ReaderSlot {
-    /// Slot index.
-    pub fn index(&self) -> u32 {
-        todo!()
-    }
-
-    /// Pins a snapshot: record the view version and seqno before reading through them.
-    /// Protocol: store view, store seqno, re-read the view pointer; if it moved past a
-    /// reclaimed version, retry (`FORMAT.md` §11.5).
-    pub fn pin(&self, seqno: Seqno, view_version: u64) {
-        todo!()
-    }
-
-    /// Clears the pin.
-    pub fn unpin(&self) {
-        todo!()
-    }
+    region: Arc<region::Inner>,
+    index: u32,
 }
