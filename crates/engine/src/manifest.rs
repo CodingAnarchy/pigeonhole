@@ -675,7 +675,10 @@ pub(crate) fn end(
     });
     if let Err(e) = &published {
         // The manifest is durable but the view could not be published (an oversized view,
-        // decision D28): the engine keeps the old view; readers see it at the next publish.
+        // decision D28). The published view now lags the durable catalog, and the next
+        // commit would retire what this one already retired: no further commits (the
+        // pager is poisoned until reopen), and the requesters must not touch their extents.
+        shared.pager_poisoned.store(true, Ordering::Release);
         let msg = e.to_string();
         for (req, r) in reqs {
             (req.reply)(r.and_then(|()| Err(Error::Corruption(msg.clone()))));

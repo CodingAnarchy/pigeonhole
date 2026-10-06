@@ -247,11 +247,20 @@ impl FlushTask {
                 Stage::Done => "done",
             }
         );
-        if let Some(mut s) = self.sink.take() {
+        // Once submitted, the outputs belong to the manifest: a refused request's extents
+        // are abandoned by `manifest::begin`, a committed one's are named by the catalog
+        // (even when the reply is an error from a failed view publish). Abandoning them
+        // here again would free an extent another writer may hold by now.
+        let submitted = matches!(self.stage, Stage::Commit(_));
+        if let Some(mut s) = self.sink.take()
+            && !submitted
+        {
             s.abandon();
         }
         for (_, mut s) in self.written.drain(..) {
-            s.abandon();
+            if !submitted {
+                s.abandon();
+            }
         }
         self.report(Err(e));
     }

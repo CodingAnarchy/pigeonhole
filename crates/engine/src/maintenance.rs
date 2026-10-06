@@ -287,11 +287,9 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         unclaim(shared, &claimed);
         drop(view);
         drop(catalog);
-        committed.inspect_err(|_| {
-            for e in &fresh {
-                shared.pager.abandon(*e);
-            }
-        })?;
+        // On an error the targets are the manifest's to abandon (`begin` does, for a
+        // refused request) or already named (a commit whose view publish failed).
+        committed?;
         shared.reclaim();
         released += shared.pager.truncate_tail()?;
         if stop {
