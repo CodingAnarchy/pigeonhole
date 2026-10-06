@@ -93,6 +93,8 @@ View buffers default to 4 MiB (configurable). If an encoded view would not fit, 
 ## D29 — small memtable values are copied; one-shot gets avoid view refcounts (approved)
 `CellData` copies memtable values of at most 128 bytes (and merge results and blob reads); larger memtable values are pinned by `ArenaSlice` plus an `Arc<View>`. `Engine::get_latest` loads the view through an `arc-swap` guard, so a hot small point get touches no shared reference count. The threshold is to be confirmed by benchmark once the engine exists ([#15](https://github.com/CodingAnarchy/pigeonhole/issues/15)).
 
+**Measured (#15, Apple M5, memtable-resident, non-reference):** `get_latest` 263–303 ns and `get` with a snapshot 272–309 ns across 16 B–4 KiB values; a miss 194 ns; 10 cores reading one cell 30 ns per get aggregate. The 128-byte threshold and the guard are within noise of the alternatives (two skiplist seeks dominate); kept as written.
+
 ## D30 — no fsync on a shard's foreground loop (approved)
 WAL group syncs use `Wal::submit_sync` and root commits use `Pager::submit_commit_root`; both return `io::Completion`s served by the I/O backend (the pread pool now, io_uring in Phase 3). Shards keep draining queues and building the next group while syncs run; the manifest task on shard 0 is a background task that waits on its completion.
 
@@ -131,7 +133,7 @@ Application-owned mode starts no threads (spec "Threading"), so `compaction_core
 ## D41 — merge folding across timestamps; a non-`i64` base fails (approved; audit K14, K15, C2)
 `Incr` operands carry the commit timestamp, while a base put may carry an older or explicit one. Walking a column newest first, a run of operands folds into one version at the newest operand's timestamp, consuming the next older put as its base, with wrapping addition; deletes and TTL apply to entries before folding and `max_versions` after. So an expired base is dropped before folding and the counter restarts from the operands, which is accepted. A base whose value is not an 8-byte `i64` makes the read fail with `MergeFailed`, as the guide promises (never silently 0). A put no operand folds onto is returned as written. `Incr` on a family without the `i64` operator is rejected (`ModelError::NoMergeOperator` in the model; the engine maps its typed error to the same case). The sim model implements this (ICR 0003). Compaction's `I64Add`: [#21](https://github.com/CodingAnarchy/pigeonhole/issues/21).
 
-## D42 — the reference model's crash windows (approved; audit K11)
+## D42 — the reference model's crash windows, per WAL stream (approved; audit K11; amended by D84)
 After a power loss the model promises every commit up to the last `GroupSync`/`Sync` one; after a process crash, every commit up to the last `Buffered`-or-stronger one. Survivors are always a prefix (the spec's "only a suffix is lost"), so `None` commits before a stronger one are durable too, as the spec's durability section states. A commit in flight at a crash is registered with `Durability::None`. `Model::recover` truncates to the survivors and, after power loss, marks them durable.
 
 ## D43 — WAL segments are at most 4 GiB − 32 KiB (approved; audit K13, C6)
@@ -292,6 +294,36 @@ A delete can follow the put it hides inside one `(column, timestamp)` group (it 
 D22 pushes a scan's time range down to puts (operands and deletes always pass). For a family with a merge operator that can drop a counter's base while keeping its operands, so the read returns a wrong sum (for example base 100 at ts 10, operands at 20 and 30, range `[25, 40)`: pushdown returns 3, the counter is 103 at ts 30).
 
 **Interim behavior (coordinator decision, to be numbered):** for a family with a merge operator the time range is not pushed down; it applies to *resolved* versions (`ResolveOptions::time_range`: a version, merged or not, is kept iff its timestamp is in range), after deletes, TTL and folding and before the value predicate and version limits. For a family without merge operands that equals pushdown, so `ResolveOptions::route_time_range(&mut filter, range)` sends the range to `ScanFilter::time_range` when there is no operator and to the resolver when there is one; the engine calls it when building a scan. A version whose fold fails but which is outside the range is not returned and so does not fail the read. Tests: `counter_time_range_applies_to_resolved_versions` and the time-range case of the resolver oracle.
+
+## D83 — a cross-shard commit is recovered all or nothing (approved; engine)
+Recovery applies a decided cross-shard commit only if every participant named by its COMMIT record still holds its PREPARE; otherwise it is discarded everywhere. A flush may not persist a share of a cross-shard commit until every PREPARE and the COMMIT are durable (Milestone B, #37). The model checker found that without this rule a `Buffered` cross-shard commit could be recovered in part after a power loss.
+
+## D84 — durability promises are per WAL stream (approved; engine; amends D42)
+Single-shard commits keep D42's prefix promise within their shard's stream. A cross-shard commit is durable once every participant's PREPARE and the coordinator's COMMIT meet the requested level, and is otherwise lost as a whole (D83); there is no global prefix across streams.
+
+## D85 — a failed WAL sync after a group was applied leaves its data visible (approved; engine)
+The group's members are told the commit failed and the stream is poisoned (wal contract), but entries already applied to memtables stay readable until restart, like `Durability::None` data. Documented on `Engine::commit` next to `Durability::None`.
+
+## D86 — default timestamps use a per-shard floor seeded at replay (approved; engine)
+Each shard's default-timestamp floor (D11) is seeded from every replayed commit timestamp at open and persisted in `Counters`. Per-tablet floors arrive with tablet moves (#38).
+
+## D87 — reader processes re-pin when idle (approved; engine; changed in review)
+A reader re-pins at its next snapshot once its live-snapshot count drops to zero, so a long-lived reader never blocks reclamation forever. Pinning the oldest live snapshot precisely is #39 (Phase 4).
+
+## D88 — application-owned close does not block (approved; engine)
+`close` in application-owned mode returns once shutdown is requested; the application keeps driving its shards until they finish. Calling `PendingCommit::wait` on the thread that drives the commit's shard deadlocks; poll the future from the event loop instead (documented).
+
+## D89 — `From<format::Error>` maps unknown variants to `Corruption` (approved; engine)
+`format::Error` is `#[non_exhaustive]`, so the conversion keeps a wildcard arm, which maps to `Corruption`; `InvalidArgument` maps to code 19 (ICR 0001).
+
+## D90 — `Snapshot::at_seqno` is a test hook behind `test-hooks` (approved; engine)
+The hook is not public API: it compiles only with the non-default `test-hooks` cargo feature, which only the engine's own tests enable.
+
+## D91 — conditional writes, OCC and prepared shares (approved; changed in review)
+A conditional member's written rows, read keys and predicate row are checked against earlier writers in its group (it then runs in the next group) and against prepared, undecided shares (a single member waits for the decision; a PREPARE aborts with `Conflict` rather than wait on another commit's decision). Every shard owning a row a transaction read is a two-phase-commit participant with an empty PREPARE that validates it, so there is no cross-shard write skew. Arena room is reserved per group and per prepared share, and a participant's apply error reaches the coordinator, so a half-applied commit is never acknowledged. Every decide is answered, so an aborted commit never blocks the watermark.
+
+## D92 — one resolver for reads and compaction (approved; coordinator)
+The engine's Milestone A resolver (`resolve.rs`) is replaced in Milestone B (#37) by `pigeonhole-compaction`'s `MergingCursor` + `FilteredCursor` + `CellResolver`; where they differ, compaction's behavior wins (D75–D77, D82). `EngineOptions::merge_operators` takes effect then. Milestone A has no tablet splits (#38) and no WAL checkpoints (#37).
 
 ## Open questions
 _None._
