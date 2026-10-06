@@ -59,17 +59,17 @@ fn pigeonhole_sync_durability() {
 }
 
 #[test]
-fn pigeonhole_reports_memory_bound() {
-    // Until the engine flushes to SSTs (#37), a data set larger than the memtable
-    // budget fails with a clear error instead of a bogus number.
+fn pigeonhole_loads_more_than_the_memtable_budget() {
+    // The engine flushes to SSTs (#37): a data set many times the memtable budget loads
+    // and runs; sizing the presets for that is #52.
     let root = temp_dir("pigeonhole-bound");
     let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
     config.records = 20_000;
     let mut r = PigeonholeRunner::default()
         .shards(1)
         .memtable_budget(1 << 20);
-    let err = run(&mut r, &config, &root).unwrap_err();
-    assert!(err.contains("load"), "{err}");
+    let report = run(&mut r, &config, &root).unwrap_or_else(|e| panic!("{e}"));
+    assert!(report.throughput > 0.0, "{report:?}");
     std::fs::remove_dir_all(&root).ok();
 }
 
