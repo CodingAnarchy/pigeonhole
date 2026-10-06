@@ -253,6 +253,9 @@ pub struct Stats {
     pub helper_checked: usize,
     /// Commits recovered only from SSTs (their WAL records were checkpointed away).
     pub sst_only: usize,
+    /// Mutating VFS operations the run made before its final crash: the crash points a
+    /// sweep of the same seed and config must cover.
+    pub mutating_ops: u64,
 }
 
 /// What kind of divergence the checker saw.
@@ -3462,6 +3465,7 @@ fn run_with(
             trace: std::mem::take(&mut w.trace),
         });
     }
+    w.stats.mutating_ops = vfs.mutating_ops();
     if w.failure.is_none() {
         // Finish with one more crash so the tail of every run is checked.
         let mut rng = sim.rng().fork();

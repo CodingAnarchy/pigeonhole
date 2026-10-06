@@ -462,6 +462,10 @@ impl Engine {
             compactions: Mutex::new(Vec::new()),
             #[cfg(feature = "test-hooks")]
             appended: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            manifest_race: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            manifest_race_waiter: Mutex::new(None),
             picker: options.compaction.clone(),
             locks: Mutex::new(Some(Locks {
                 _writer: writer_lock,
@@ -899,6 +903,10 @@ impl Engine {
             compactions: Mutex::new(Vec::new()),
             #[cfg(feature = "test-hooks")]
             appended: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            manifest_race: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            manifest_race_waiter: Mutex::new(None),
             picker: options.compaction.clone(),
             locks: Mutex::new(None),
             default_durability: AtomicU8::new(options.durability as u8),
@@ -1281,6 +1289,33 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// Commits an empty manifest delta from this thread while a second request lands in
+    /// the window between the drain's last `begin` and the release of the writer's
+    /// exclusion (as a shard's submit would, whose pump then leaves). Returns whether that
+    /// second request was committed too, which the release-then-re-check rule guarantees.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn probe_manifest_release_window(&self) -> Result<bool> {
+        use std::task::{Context, Poll, Waker};
+        let shared = &self.inner.shared;
+        shared.manifest_race.store(true, Ordering::Release);
+        manifest::commit_from_thread(shared, manifest::ReqKind::Edits(Vec::new()))?;
+        let waiter = shared
+            .manifest_race_waiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(mut waiter) = waiter else {
+            return Err(Error::Corruption("the race window was not entered".into()));
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        Ok(match std::pin::Pin::new(&mut waiter).poll(&mut cx) {
+            Poll::Ready(Some(Ok(_))) => true,
+            Poll::Ready(Some(Err(e))) => return Err(e),
+            Poll::Ready(None) | Poll::Pending => false,
+        })
     }
 
     /// Reads the manifest of a database no writer has open.

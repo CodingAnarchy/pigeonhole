@@ -36,6 +36,12 @@ pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Resul
     let view = &snapshot.view;
     let seqno = snapshot.seqno;
     let source = &view.catalog;
+    if !source.blob_files.is_empty() {
+        // The copy would hold dangling blob pointers (issue #58).
+        return Err(crate::Error::Unsupported(
+            "backup of a database with blob extents is not available yet",
+        ));
+    }
     let pager = Arc::new(Pager::create(&shared.vfs, dest)?);
     let mut catalog = Catalog::with_registry(Arc::clone(source.registry()));
     let mut edits = Vec::new();

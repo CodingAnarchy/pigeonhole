@@ -630,15 +630,6 @@ pub(crate) fn end(
     let tablets = catalog.tablets();
     let live: std::collections::HashSet<_> = tablets.iter().map(|t| t.id).collect();
     let published = shared.publish_view(|cur, view_version| {
-        // Memtables whose SSTs this commit adds leave every view from now on; their shards
-        // keep excluding them until they retire them (`Shared::flushed_roots`).
-        if !flushed_roots.is_empty() {
-            shared
-                .flushed_roots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend(flushed_roots.iter().copied());
-        }
         let mems = cur
             .mems
             .iter()
@@ -690,6 +681,16 @@ pub(crate) fn end(
             (req.reply)(r.and_then(|()| Err(Error::Corruption(msg.clone()))));
         }
         return;
+    }
+    // Memtables whose SSTs this commit adds leave every view from now on; their shards keep
+    // excluding them until they retire them (`Shared::flushed_roots`). Only once the view
+    // is published: a failed publish keeps the old view, which still needs them.
+    if !flushed_roots.is_empty() {
+        shared
+            .flushed_roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(flushed_roots.iter().copied());
     }
     // Extents no tablet references any more are reclaimable once no view older than this
     // version lives (decision D61).
@@ -762,8 +763,17 @@ pub(crate) fn commit_req_from_thread(
     let mut spins = 0u32;
     loop {
         if claim(shared) {
-            drain_sync(shared);
-            release(shared);
+            // Release, then re-check: a request pushed after the last `begin` returned
+            // `None` found the exclusion held, and its pump left; nobody else will run it.
+            loop {
+                drain_sync(shared);
+                #[cfg(feature = "test-hooks")]
+                race_window(shared);
+                release(shared);
+                if shared.manifest_queue.is_empty() || !claim(shared) {
+                    break;
+                }
+            }
         }
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
@@ -778,6 +788,21 @@ pub(crate) fn commit_req_from_thread(
         } else {
             std::thread::sleep(std::time::Duration::from_micros(50));
         }
+    }
+}
+
+/// Test hook: when armed, pushes a request into the queue inside the window between the
+/// last `begin` of a drain and the release of the exclusion (as a shard's submit would,
+/// whose pump then finds the exclusion held and leaves), and keeps its waiter.
+#[cfg(feature = "test-hooks")]
+fn race_window(shared: &Shared) {
+    if shared.manifest_race.swap(false, Ordering::AcqRel) {
+        let (req, waiter) = ManifestReq::with_waiter(ReqKind::Edits(Vec::new()));
+        shared.manifest_queue.push(req);
+        *shared
+            .manifest_race_waiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(waiter);
     }
 }
 

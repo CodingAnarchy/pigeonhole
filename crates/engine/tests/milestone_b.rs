@@ -510,20 +510,28 @@ fn deep_l0_stalls_writes_without_refusing_them() {
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
-    for i in 0..600u32 {
-        let mut wb = WriteBatch::new();
-        put(
-            &mut wb,
-            &t,
-            format!("row{i:05}").as_bytes(),
-            b"q",
-            &vec![1u8; 500],
-        );
-        db.commit(wb, Some(Durability::None)).unwrap();
+    // Writes outrun compaction (2 KiB cells against 8 KiB memtables and 64 KiB SSTs):
+    // once the tree is a few levels deep, a compaction takes longer than the token bucket
+    // lets commits through, and the writer is held, never refused.
+    let mut written = 0u32;
+    while written < 20_000 && db.metrics().stalls.0 == 0 {
+        for _ in 0..50 {
+            let mut wb = WriteBatch::new();
+            put(
+                &mut wb,
+                &t,
+                format!("row{written:05}").as_bytes(),
+                b"q",
+                &vec![1u8; 2048],
+            );
+            db.commit(wb, Some(Durability::None)).unwrap();
+            written += 1;
+        }
     }
     let m = db.metrics();
     assert!(m.flushes >= 4 && m.compactions >= 1, "{m:?}");
-    assert_eq!(row_count(&db, &t), 600);
+    assert!(m.stalls.0 > 0, "writers were never stalled: {m:?}");
+    assert_eq!(row_count(&db, &t), written as usize);
     db.close().unwrap();
 }
 
@@ -653,5 +661,23 @@ fn writes_after_a_clean_reopen_survive_a_power_loss() {
             "row {i}"
         );
     }
+    db.close().unwrap();
+}
+
+// ---- the manifest queue never strands a request pushed while the writer lets go ----
+
+#[test]
+fn a_manifest_request_pushed_in_the_release_window_is_committed() {
+    let vfs = SimVfs::new(41);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    write_rows(&db, &t, 0..10, Durability::Buffered);
+    let before = db.snapshot().unwrap().view().manifest_version();
+    // Without the release-then-re-check rule the second request would wait for an
+    // unrelated commit; with it, both are committed before the probe returns.
+    assert!(db.probe_manifest_release_window().unwrap());
+    assert!(db.snapshot().unwrap().view().manifest_version() >= before + 2);
     db.close().unwrap();
 }

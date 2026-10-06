@@ -7,7 +7,6 @@ mod common;
 
 use common::{Config, final_dump, run};
 use pigeonhole_format::Durability;
-use pigeonhole_io::Vfs;
 
 fn seeds() -> Vec<u64> {
     let n: u64 = std::env::var("PIGEONHOLE_SEEDS")
@@ -133,21 +132,42 @@ fn crash_at_every_write_point() {
     cfg.spec.max_batch = 6;
     cfg.spec.rows = 12;
     cfg.faults.torn_writes = true;
-    let step: u64 = std::env::var("PIGEONHOLE_SWEEP_STEP")
+    // The same, flush-heavy: tiny memtables, frequent flushes and compactions, so the
+    // sweep crosses SST writes, manifest commits, checkpoints and compaction outputs.
+    let mut heavy = Config::quiet(20);
+    heavy.shards = 4;
+    heavy.spec.read_fraction = 0.2;
+    heavy.spec.max_batch = 6;
+    heavy.spec.rows = 12;
+    heavy.faults.torn_writes = true;
+    heavy.memtable_freeze_bytes = 2 << 10;
+    heavy.flush_ppm = 150_000;
+    heavy.compact_ppm = 100_000;
+    // Every point of the commit-only runs; every third of the flush-heavy ones by default
+    // (about 1,300 points, a few minutes in CI); `PIGEONHOLE_SWEEP_STEP` sets both.
+    let env_step: Option<u64> = std::env::var("PIGEONHOLE_SWEEP_STEP")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    for seed in seeds() {
-        let total = count_ops(seed, &cfg);
-        eprintln!("seed {seed}: sweeping {total} crash points");
-        let mut n = 1;
-        while n <= total {
-            let mut c = cfg.clone();
-            c.crash_at = Some(n);
-            if let Err(f) = run(seed, &c) {
-                panic!("seed {seed}, crash after mutating op {n}: {f}");
+        .and_then(|s| s.parse().ok());
+    for (name, cfg, step) in [
+        ("commits", &cfg, env_step.unwrap_or(1)),
+        ("flush-heavy", &heavy, env_step.unwrap_or(3)),
+    ] {
+        for seed in seeds() {
+            // The crash points are exactly the mutating operations of the uncrashed run
+            // of this seed and config (the same workload, flushes and compactions).
+            let total = run(seed, cfg)
+                .unwrap_or_else(|f| panic!("{name} seed {seed} without a crash: {f}"))
+                .mutating_ops;
+            eprintln!("{name} seed {seed}: sweeping {total} crash points");
+            let mut n = 1;
+            while n <= total {
+                let mut c = cfg.clone();
+                c.crash_at = Some(n);
+                if let Err(f) = run(seed, &c) {
+                    panic!("{name} seed {seed}, crash after mutating op {n}: {f}");
+                }
+                n += step;
             }
-            n += step;
         }
     }
 }
@@ -194,46 +214,4 @@ fn results_are_identical_across_shard_counts_under_faults() {
             );
         }
     }
-}
-
-/// Mutating operations a run performs before its final crash.
-fn count_ops(seed: u64, cfg: &Config) -> u64 {
-    let sim = pigeonhole_sim::Sim::new(seed);
-    let vfs = sim.vfs();
-    let mut store =
-        common::Store::open(&vfs, cfg.shards, cfg.memtable_budget, &common::families()).unwrap();
-    let base = vfs.now_micros();
-    use pigeonhole_sim::{ModelOp, Op, Workload};
-    for op in Workload::new(seed ^ 0x5eed, common::TABLE, cfg.spec.clone()).take(cfg.ops) {
-        vfs.advance(1_000);
-        if let Op::Commit(mut ops, durability) = op {
-            for o in &mut ops {
-                common::place(o);
-                match o {
-                    ModelOp::Put { ts: Some(t), .. } | ModelOp::DeleteCell { ts: t, .. } => {
-                        *t += base
-                    }
-                    _ => {}
-                }
-            }
-            let batch = store.batch(&ops).unwrap();
-            let mut pc = store.engine.submit(batch, Some(durability)).unwrap();
-            loop {
-                match common::poll_commit(&mut pc) {
-                    std::task::Poll::Ready(r) => {
-                        r.unwrap();
-                        break;
-                    }
-                    std::task::Poll::Pending => store.step_shards(vfs.monotonic_nanos()),
-                }
-            }
-        }
-    }
-    let n = vfs.mutating_ops();
-    let _ = store.engine.close();
-    for _ in 0..4 {
-        store.step_shards(vfs.monotonic_nanos());
-    }
-    drop(sim);
-    n
 }

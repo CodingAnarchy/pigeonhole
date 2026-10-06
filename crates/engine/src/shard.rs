@@ -170,6 +170,12 @@ pub(crate) struct Shared {
     /// Every WAL record appended, in append order (test hook).
     #[cfg(feature = "test-hooks")]
     pub appended: Mutex<Vec<AppendedRecord>>,
+    /// Test hook: arm the manifest queue's release window (see `manifest::race_window`).
+    #[cfg(feature = "test-hooks")]
+    pub manifest_race: AtomicBool,
+    #[cfg(feature = "test-hooks")]
+    pub manifest_race_waiter:
+        Mutex<Option<pigeonhole_runtime::Waiter<Result<pigeonhole_format::ManifestVersion>>>>,
     pub picker: PickerOptions,
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
@@ -3385,7 +3391,25 @@ impl ShardState {
                     tablet.end.clone(),
                 ),
             });
-        let work = CompactionWork::new(
+        // Claim the inputs under one lock: a shrink may have claimed one since the plan
+        // was made against the busy set (then this round is skipped; `maintain` retries).
+        let ids: Vec<SstId> = task
+            .inputs
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        {
+            let mut busy = self
+                .shared
+                .busy_ssts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if ids.iter().any(|id| busy.contains(id)) {
+                return Ok(());
+            }
+            busy.extend(ids.iter().copied());
+        }
+        let work = match CompactionWork::new(
             Arc::clone(&self.shared),
             self.id,
             Arc::clone(view),
@@ -3394,15 +3418,20 @@ impl ShardState {
             task,
             gc,
             record,
-        )?;
-        {
-            let mut busy = self
-                .shared
-                .busy_ssts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            busy.extend(work.inputs());
-        }
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                let mut busy = self
+                    .shared
+                    .busy_ssts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                for id in &ids {
+                    busy.remove(id);
+                }
+                return Err(e);
+            }
+        };
         self.compaction = Some(key);
         ctx.spawn(Box::new(work));
         Ok(())

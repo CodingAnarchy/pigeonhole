@@ -5,7 +5,7 @@ Questions the spec and decisions leave open for flush, checkpoints, compaction s
 ## Q: Which WAL streams must a flush sync before its SSTs become visible?
 The spec says a flush "must not persist a share of a cross-shard commit until every PREPARE and the COMMIT are durable" but does not say how the flush learns that. Checking per commit (which shards hold shares, whether their records are past each stream's durable LSN) needs cross-shard state the flush task does not have.
 
-**Interim behavior:** before committing its manifest edit, a flush task sends a `SyncBarrier` to its own shard always (so an earlier commit of the same stream is never lost while a later one survives in an SST) and to every shard when any flushed memtable holds a share of a cross-shard commit (`MemEntry::has_shares`). Each barrier is one `submit_sync` of that stream; the task waits for all replies. This over-syncs (every stream, not just the participants') but needs no bookkeeping; a flush is rare compared with commits.
+**Interim behavior:** before committing its manifest edit, a flush task sends a `SyncBarrier` to its own shard always (so an earlier commit of the same stream is never lost while a later one survives in an SST) and to every shard when any flushed memtable holds a share of a cross-shard commit (`MemEntry::has_shares`). Each barrier is one `submit_sync` of that stream; the task waits for all replies. This over-syncs (every stream, not just the participants') but needs no bookkeeping; a flush is rare compared with commits. Confirmed in review; syncing only the participants' streams is a Phase 3 optimization (issue #64).
 
 ## Q: When may a shard checkpoint a PREPARE or COMMIT record?
 D24 says a checkpoint never strands a prepared commit, and D83 that a cross-shard commit is recovered all or nothing. Neither says what a participant needs to know about the coordinator's COMMIT before it moves its checkpoint past its own PREPARE.
@@ -20,7 +20,7 @@ The manifest brief says `SetFlushed { tablet, family, seqno }` and replay skips 
 ## Q: How conservative is `GcPolicy` about reader-process snapshots?
 D70 narrows purge by `min_ts_above`; D74 purge needs the set of live snapshot seqnos. Reader processes only publish a reader-slot pin (a view version), not their snapshot seqnos.
 
-**Interim behavior:** `gc_policy` takes the writer's live snapshot seqnos (`LiveSeqnos`) plus, for every pinned reader slot, the seqno the pinned view version was published at, treating that as a live snapshot at that seqno and everything above it as reachable. This is conservative (a reader pinned at version v may hold no snapshot at all) and loses only purge work, never visibility. Exact reader snapshot sets are issue #39's territory.
+**Interim behavior:** `gc_policy` takes the writer's live snapshot seqnos (`LiveSeqnos`) plus the oldest reader pin's seqno (`oldest_reader_pin`): a reader's snapshots pin its own view, so the oldest pin bounds everything any reader can still read, and everything at or above it counts as reachable. This is conservative (a reader pinned at a version may hold no snapshot at all) and loses only purge work, never visibility. Precise per-slot pinning is issue #39's territory.
 
 ## Q: How should the L0 write stall behave with a frozen or coarse clock?
 The spec's token bucket refills with time. Under the simulator the clock advances only when the workload says so, so a stalled shard with nothing else running would wait forever.
@@ -30,7 +30,7 @@ The spec's token bucket refills with time. Under the simulator the clock advance
 ## Q: What does `backup` write for an engine with memtables and many levels?
 The spec says a backup is a consistent single-file copy; D60 covers shrink. Copying SST extents verbatim would still need the WAL (unflushed memtables) and the file's free-space layout.
 
-**Interim behavior:** `backup` takes a snapshot and writes a new file: every `(tablet, family)` is merged from the snapshot's memtables and SSTs (raw entries at seqnos `<= snapshot`, no purge) into one SST at the last level, a manifest snapshot names them, and the file is marked clean. The result opens without replay and with no sidecars. Blob extents are not yet copied (filed as a follow-up); data stays inline below the D29 threshold.
+**Interim behavior:** `backup` takes a snapshot and writes a new file: every `(tablet, family)` is merged from the snapshot's memtables and SSTs (raw entries at seqnos `<= snapshot`, no purge) into one SST at the last level, a manifest snapshot names them, and the file is marked clean. The result opens without replay and with no sidecars. Blob extents are not copied yet: a database whose catalog names blob files is refused with `Unsupported` until issue #58 lands; data stays inline below the D29 threshold.
 
 ## Q: What happens at open when the discovered streams do not match `0..shards`?
 D20 says streams beyond a reduced shard count are flushed then removed, but says nothing about the opposite direction (more shards than streams) or whether the flush is synchronous.
@@ -45,7 +45,7 @@ The spec targets `open()` under 5 ms; a manifest can name hundreds of SSTs whose
 ## Q: Does the sim's recovery helper cover a coordinator that is also a participant?
 Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledged_survive`. The helper counts one record per stream per commit, so a coordinator's PREPARE and COMMIT on its own stream must be adjacent; the engine interleaves other commits' PREPAREs between them whenever commits overlap.
 
-**Interim behavior:** the harness takes the engine's own append order (the `test-hooks` `AppendedRecord` stream), applies the record-level prefix rule itself, and cross-checks `recovered_commits` only over commits whose records are adjacent per stream and all appended (`sim_helper_recovered`), skipping the check when the streams cannot be represented. `check_acknowledged_survive` and `Model::from_commits` are used as is. A record-level helper in `pigeonhole-sim` would let the check run on every crash; filed as a follow-up on #48.
+**Interim behavior:** the harness takes the engine's own append order (the `test-hooks` `AppendedRecord` stream), applies the record-level prefix rule itself, and cross-checks `recovered_commits` only over commits whose records are adjacent per stream and all appended (`sim_helper_recovered`), skipping the check when the streams cannot be represented. `check_acknowledged_survive` and `Model::from_commits` are used as is. A record-level helper in `pigeonhole-sim` (issue #59) will let the check run on every crash and the harness drop its own rule; the engine half of #48 waits for it.
 
 ## Q: How does a group waiting for arena room learn that a flush freed some?
 `ShardArena` reports free bytes only through `reserve`; nothing signals the shard when `reclaim` returns memory.

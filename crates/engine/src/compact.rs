@@ -141,9 +141,10 @@ pub(crate) fn plan_full(
     })
 }
 
-/// The GC policy of `task` over `fam` (decision D70): every live snapshot, whether the
-/// output is bottommost, and the smallest timestamp above the inputs (other SSTs of the
-/// slot and its memtables).
+/// The GC policy of `task` over `fam` (decision D70): every live snapshot of this process
+/// plus the oldest reader pin's seqno (a reader's snapshots pin its own view, so the
+/// oldest pin bounds everything a reader can still read), whether the output is bottommost,
+/// and the smallest timestamp above the inputs (other SSTs of the slot and its memtables).
 pub(crate) fn gc_policy(
     shared: &Shared,
     fam: &FamilySsts,
