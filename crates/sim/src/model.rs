@@ -581,6 +581,12 @@ impl Model {
 
     /// What a crash of `kind` may lose, given each commit's acknowledged durability.
     ///
+    /// This is the single-stream special case (D84): durability is per WAL stream, so with
+    /// several streams (one per shard) there is no global prefix and a later `GroupSync`
+    /// commit on one stream says nothing about an earlier `Buffered` one on another. Use
+    /// [`recovered_commits`](crate::recovered_commits) and
+    /// [`check_acknowledged_survive`](crate::check_acknowledged_survive) for that.
+    ///
     /// Every stream is ordered, so a commit at level `L` also makes every earlier commit
     /// durable at `L` (the spec's "a `GroupSync` commit also makes earlier `Buffered` or
     /// `None` records durable"); the survivors are always a prefix. After a process crash

@@ -521,8 +521,10 @@ name = "pigeonhole-engine"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "criterion",
  "pigeonhole-cache",
  "pigeonhole-compaction",
+ "pigeonhole-engine",
  "pigeonhole-format",
  "pigeonhole-io",
  "pigeonhole-memtable",
@@ -532,6 +534,7 @@ dependencies = [
  "pigeonhole-sim",
  "pigeonhole-sst",
  "pigeonhole-wal",
+ "proptest",
 ]
 
 [[package]]
@@ -603,6 +606,7 @@ version = "0.1.0"
 dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",
+ "proptest",
 ]
 
 [[package]]
