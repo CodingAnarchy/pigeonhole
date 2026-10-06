@@ -13,12 +13,14 @@
 //!
 //! Every process opens the main file **for writing** (even readers, which still write
 //! nothing: byte-range locks that are exclusive, such as the shm-init byte and the
-//! presence-byte upgrade at close, need a writable handle; see decision Q1 (io)).
+//! presence-byte upgrade at close, need a writable handle; decision D36).
 //!
-//! - The writer takes the [`WriterLock`] and the [`Presence`] lock, then calls
-//!   [`ShmRegion::open`] with [`Role::Writer`], which always builds a region under a new
-//!   [`Generation`]: it creates the new region, marks the old one abandoned, records the new
-//!   generation in the directory region and removes the old region's name.
+//! - The writer takes the [`WriterLock`], then calls [`ShmRegion::open`] with
+//!   [`Role::Writer`], then takes [`Presence`], all on the same handle (decision D37). The
+//!   open always builds a region under a new [`Generation`]: it creates the new region, marks
+//!   the old one abandoned, records the new generation in the directory region and removes
+//!   the old region's name. It takes the presence byte shared itself before publishing, so
+//!   the later [`Presence::acquire`] only returns the guard.
 //! - A reader takes [`Presence`], opens with [`Role::Reader`], claims a [`ReaderSlot`] and
 //!   pins before each snapshot. When [`ShmRegion::is_stale`] reports that a new writer built
 //!   a new generation, it calls [`ShmRegion::reattach`], re-claims a slot and re-pins.
@@ -56,6 +58,11 @@
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
+
+// The region's atomics are native-endian while FORMAT.md fixes its integers as
+// little-endian; refuse to build where the two differ (decision D56).
+#[cfg(not(target_endian = "little"))]
+compile_error!("pigeonhole-shm supports little-endian targets only (FORMAT.md §11)");
 
 mod lock;
 mod region;

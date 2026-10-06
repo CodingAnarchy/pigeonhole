@@ -10,18 +10,21 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Row key, qualifier | Arbitrary bytes, each ≤ 64 KiB, else `KeyTooLarge`. Sorted byte-wise. |
 | Value | P1: ≤ `min(WAL segment payload, 64 MiB, ½ memtable arena)`, else `ValueTooLarge` (D16). P2 blobs lift it; ceiling 2³²−1 bytes. |
 | Timestamp | `u64` **microseconds** since the Unix epoch (D11). Default = `max(now, tablet floor + 1)`, never goes backwards. User timestamps are microseconds for TTL. |
-| Version order | Newest timestamp first; the same timestamp is ordered by inverted seqno (later commit first). Multiple mutations to the same (row, family, qualifier, timestamp) **within one commit** collapse to the last one written (D34, pending). |
+| Version order | Newest timestamp first; the same timestamp is ordered by inverted seqno (later commit first). Multiple mutations to the same (row, family, qualifier, timestamp) **within one commit** collapse to the last one written (D34). |
 | Atomicity | One `RowMutation` = one row, all families, all-or-nothing. `WriteBatch` = any rows/tables, atomic, one durability point. |
 | Builder errors | Surface at `commit`/`read`/`iter`, not at the builder call. |
-| Delete rule (D9) | `delete_column`/`delete_family` at ts `T` hides every version in scope with ts ≤ `T`, regardless of commit order. `delete_cell(ts)` hides exactly that version. |
+| Delete rule (D9, D38) | `delete_column`/`delete_family` at ts `T` hides every version in scope with ts ≤ `T`, regardless of commit order. `delete_cell(ts)` hides every version at exactly `ts`, also regardless of commit order: a later `put_at(.., ts, ..)` at that timestamp stays hidden. To rewrite a deleted version, use another timestamp. |
 | `delete_row` (D10) | One family marker per family, same commit. |
 | Read-your-writes (D19) | `commit` returns after durable at level **and** visible. |
 | Durability resolution | per-call → writer default → `GroupSync`. |
 | Writer | One writer per file; second open → `WriterLocked`. |
+| Reader processes (D36, P4) | `open_reader` opens the `.phdb` file **read-write** (it never writes): the coordination locks are exclusive byte-range locks, which need a writable handle, as in SQLite WAL mode. Readers need write permission on the file; read-only media are not supported. |
+| Family order (D39) | A row's cells come by family in **creation order**, or in the order you listed families (`family(..)` calls); then qualifier; then newest version first. |
+| Application-owned mode (D40) | Starts no threads: `open_application_owned` with `compaction_cores(k)`, `k > 0`, fails with `InvalidArgument`. |
 | Handles | `Pigeonhole`, `Table`, `Snapshot`, `Cell`, `Row` are cheap `Clone`. `Table`: `Send + Sync`. |
 | Snapshots | Pin data. Drop promptly. |
 | Filesystem | Local only (`NetworkFilesystem`). |
-| Typed values | `incr` columns are `i64`. Write counters only with `incr` / `put_i64`. |
+| Typed values | `incr` columns are `i64`. Write counters only with `incr` / `put_i64`: reading an `incr` on top of a base that is not an 8-byte `i64` fails with `MergeFailed` (D41). |
 
 ## Types
 | Type | Role |
@@ -48,8 +51,8 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Signature | Semantics |
 |---|---|
 | `open(path: impl AsRef<Path>, Options) -> Result<Pigeonhole>` | Open or create as writer; replays WAL. |
-| `open_reader(path, ReaderOptions) -> Result<PigeonholeReader>` | P4. Read-only, any number of processes. |
-| `open_application_owned(path, Options) -> Result<(Pigeonhole, Vec<Shard>)>` | Writer with no threads; you drive each `Shard`. |
+| `open_reader(path, ReaderOptions) -> Result<PigeonholeReader>` | P4. Read-only, any number of processes. Needs write permission on the file (D36). |
+| `open_application_owned(path, Options) -> Result<(Pigeonhole, Vec<Shard>)>` | Writer with no threads; you drive each `Shard`. `compaction_cores(k > 0)` → `InvalidArgument` (D40). |
 | `table(&self, name: &str) -> Result<TableBuilder<'_>>` | Start define/open. |
 | `tables(&self) -> Vec<String>` | Table names. |
 | `drop_table(&self, name: &str) -> Result<()>` | Drop table and data. |
@@ -72,7 +75,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 |---|---|
 | `durability(Durability)` | Writer default (default `GroupSync`). |
 | `shards(usize)` | Shard threads (default CPUs available). `1` is valid. |
-| `compaction_cores(usize)` | Extra pinned threads for flush/compaction. |
+| `compaction_cores(usize)` | Extra pinned threads for flush/compaction. Engine-owned mode only (D40). |
 | `memtable_budget(u64)` | Arena bytes per shard (default 64 MiB). |
 | `block_cache(usize)` | Block cache bytes. |
 | `row_cache(usize)` | Row cache bytes (default 0 = off). |
@@ -125,7 +128,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `put_i64(family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. |
 | `incr(family, qualifier, delta: i64)` | Blind atomic `i64` add (merge operand). |
 | `merge(family, qualifier, operand: &[u8])` | Operand for the family's operator (P2 for custom). |
-| `delete_cell(family, qualifier, ts: u64)` | Delete exactly one version. |
+| `delete_cell(family, qualifier, ts: u64)` | Delete the version at `ts`; later puts at that `ts` stay hidden (D38). |
 | `delete_column(family, qualifier)` | Delete all versions. |
 | `delete_family(family)` | Delete all columns of a family in this row. |
 | `delete_row()` | Delete whole row. |
@@ -179,7 +182,7 @@ Pushdown (D22): qualifier and time filters in the block decoder; versions, colum
 | `Value<'a>` | `Bytes(&[u8])`, `I64(i64)`, `F64(f64)`, `Varint(i64)` |
 | `CommitInfo` | `seqno`, `durability` |
 
-Cells within a row: ordered by family, qualifier, newest version first.
+Cells within a row: ordered by family (creation order, or the order the read listed families; D39), then qualifier, then newest version first.
 
 ## Error codes (`ErrorCode`, `#[non_exhaustive]`, `repr(u32)`)
 `Io`=1 `Corruption`=2 `WriterLocked`=3 `ShmVersionMismatch`=4 `ShmUnavailable`=5 `UnsupportedFormat`=6 `NetworkFilesystem`=7 `TableNotFound`=8 `TableExists`=9 `FamilyNotFound`=10 `FamilyExists`=11 `UnknownMergeOperator`=12 `MergeFailed`=13 `Conflict`=14 `ReadOnly`=15 `KeyTooLarge`=16 `ValueTooLarge`=17 `NoSpace`=18 `InvalidArgument`=19 `Unsupported`=20 `Closed`=21 `NoReaderSlot`=22 `RecordTooLarge`=23 `Busy`=24. Causes and fixes: [`errors.md`](errors.md). `Error::code()`, `Error::message()`.

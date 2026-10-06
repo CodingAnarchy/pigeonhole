@@ -21,12 +21,20 @@ impl Pigeonhole {
 
     /// Opens a read-only handle (Phase 4). Any number of reader processes may open the same
     /// file while a writer runs; they see each commit as soon as the writer publishes it.
+    ///
+    /// **Readers need write access to the file.** The handle never writes, but the process
+    /// opens the `.phdb` file read-write, because the coordination locks it takes are
+    /// exclusive byte-range locks, which POSIX grants only on a writable descriptor (the same
+    /// requirement as SQLite in WAL mode). A file on read-only media, or one the reader's
+    /// user cannot write, cannot be opened this way (decision D36).
     pub fn open_reader(path: impl AsRef<Path>, options: ReaderOptions) -> Result<PigeonholeReader> {
         todo!()
     }
 
     /// Opens as the writer in application-owned mode: no threads are started; drive each
-    /// returned [`Shard`] from one of your own (typically pinned) threads.
+    /// returned [`Shard`] from one of your own (typically pinned) threads. Because no thread
+    /// is started, [`Options::compaction_cores`] with `k > 0` is refused with
+    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) (decision D40).
     pub fn open_application_owned(
         path: impl AsRef<Path>,
         options: Options,

@@ -590,6 +590,20 @@ both_modes!(
 // Engine-owned specifics.
 
 #[test]
+fn application_owned_refuses_compaction_threads() {
+    let (mut cfg, _) = sim_config(2);
+    cfg.compaction_threads = 1;
+    match Runtime::application_owned(cfg, handlers(2)) {
+        Err(Error::InvalidConfig(what)) => assert!(what.contains("compaction_threads")),
+        Err(e) => panic!("expected InvalidConfig, got {e}"),
+        Ok(_) => panic!("expected InvalidConfig, got drivers"),
+    }
+    // `pin_threads` (on in this config) is simply not applicable and stays accepted.
+    let (cfg, _) = sim_config(2);
+    assert!(Runtime::application_owned(cfg, handlers(2)).is_ok());
+}
+
+#[test]
 fn compaction_threads_run_spawned_tasks() {
     let (mut cfg, _) = sim_config(2);
     cfg.compaction_threads = 2;

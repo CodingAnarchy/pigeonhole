@@ -128,7 +128,7 @@ impl Toy {
         self.end = pos as u64;
         if self.end < len {
             self.file.set_len(self.end)?;
-            self.file.sync_data()?;
+            self.file.sync_all()?; // a length change: `sync_data` would not persist it
         }
         Ok(())
     }
@@ -194,8 +194,10 @@ impl Toy {
                 [std::mem::take(&mut self.unflushed), bytes].concat()
             };
             let strong = durability >= Durability::GroupSync && self.variant != Variant::NoFsync;
+            // Appends grow the file, so the syncs are `sync_all` (`sync_data` need not
+            // persist the new length).
             if strong && self.variant == Variant::SyncBeforeWrite {
-                self.file.sync_data()?;
+                self.file.sync_all()?;
             }
             if self.variant == Variant::PartialCommit {
                 // One write per record, so a crash can land between them.
@@ -208,7 +210,7 @@ impl Toy {
                 self.end += out.len() as u64;
             }
             if strong && self.variant != Variant::SyncBeforeWrite {
-                self.file.sync_data()?;
+                self.file.sync_all()?;
             }
         }
         let ops = self.effective(ops.to_vec());

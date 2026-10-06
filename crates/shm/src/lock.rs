@@ -40,7 +40,7 @@ impl Presence {
     /// checkpoint, remove the WAL files and remove the region. Releases on drop either way.
     ///
     /// The upgrade needs a handle opened for writing; on a read-only handle it fails with
-    /// `Unsupported` (decision Q1 (io)).
+    /// `Unsupported` (decision D36).
     pub fn try_become_last(&self) -> Result<bool> {
         match self.file.lock(PRESENCE_BYTE, LockMode::Exclusive) {
             Ok(()) => Ok(true),
@@ -91,11 +91,13 @@ impl Drop for ShmInit {
 }
 
 /// Whether no other process has the database open: tries to take the presence byte
-/// exclusively through `file`. On success the byte is left **shared**, so a presence lock the
-/// caller already holds on this handle is kept (converted back) and a process that held none
-/// is now simply present, which it is while `file` stays open. `Locked` means another process
-/// is present; any other failure (for example a read-only handle, which cannot try) is
-/// returned.
+/// exclusively through `file`. On success the byte is left **shared**: the caller is now
+/// present, as it is while `file` stays open. `Locked` means another process is present; any
+/// other failure (for example a read-only handle, which cannot try) is returned.
+///
+/// The caller must not already hold the presence byte on `file`: on Windows an upgrade from
+/// shared is not atomic and can lose the shared lock (decision D37). The writer's open
+/// sequence guarantees this by calling `ShmRegion::open` before `Presence::acquire`.
 pub(crate) fn alone(file: &FileRef) -> Result<bool> {
     match file.lock(PRESENCE_BYTE, LockMode::Exclusive) {
         Ok(()) => {
@@ -105,4 +107,9 @@ pub(crate) fn alone(file: &FileRef) -> Result<bool> {
         Err(e) if e.kind == ErrorKind::Locked => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Takes the presence byte shared through `file` (a no-op if this handle already holds it).
+pub(crate) fn present(file: &FileRef) -> Result<()> {
+    Ok(file.lock(PRESENCE_BYTE, LockMode::Shared)?)
 }

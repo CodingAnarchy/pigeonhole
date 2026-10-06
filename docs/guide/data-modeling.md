@@ -126,7 +126,7 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 - **Event time:** `put_at(.., ts, ..)` for data that arrives late or out of order. A read of the newest version then returns the one with the **largest timestamp**, not the most recently written.
 - **Limit retention** with `max_versions(n)` (0 keeps all) and `ttl`.
 - **Read history** with `.versions(n)`, `.time_range(a..b)`.
-- **Deleting:** `delete_cell(family, qualifier, ts)` removes exactly the version at `ts`. `delete_column` removes every version, and a later put with a timestamp at or before the delete's timestamp stays hidden (decision D9). A put with a **newer** timestamp is visible again.
+- **Deleting:** `delete_cell(family, qualifier, ts)` removes the version at `ts`, and a put at that same `ts` committed later stays hidden too (decision D38); write the replacement at another timestamp. `delete_column` removes every version, and a later put with a timestamp at or before the delete's timestamp stays hidden (decision D9). A put with a **newer** timestamp is visible again.
 
 ## Anti-patterns
 | Don't | Why | Instead |

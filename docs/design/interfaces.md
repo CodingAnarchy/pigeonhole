@@ -9,7 +9,7 @@ Every public item has rustdoc; bodies are `todo!()`. Each stub crate carries `#!
 - **Static dispatch on per-cell paths.** Sorted sources implement `format::Cursor`; merging and resolution are generic over `C: Cursor`; the engine wraps heterogeneous sources (memtable, SST) in an enum. No trait objects per entry.
 - **Trait objects only at I/O and lifecycle boundaries:** `Arc<dyn Vfs>`, `Arc<dyn File>`, `Box<dyn Wal>` (one call per group commit), `Box<dyn Task>` (background jobs), `Arc<dyn MergeOperator>` (merge resolution only).
 - **Zero copy, owning cursors.** Keys and values borrow block buffers or arena memory. Cursors own what keeps those bytes alive (`BlockIter<BlockHandle>`, `SstIter` holds an `Arc<SstReader>`, `MemIter` a `MemtableReader` clone), so scan cursors and compaction jobs store them without self-references (D32). Anything that outlives a cursor is a ref-counted pin (`cache::Cell`, `memtable::ArenaSlice`, `engine::CellData`); only small values are copied (D29).
-- **No fsync on a foreground loop.** WAL group syncs and root commits are submitted as `io::Completion`s (D30).
+- **No fsync on a foreground loop.** WAL group syncs and root commits are submitted as `io::Completion`s (D30). One recorded exception: a WAL rollover syncs the full segment inline only when no recyclable or prepared spare slot is ready (counted by `WalStream::inline_rollover_syncs`); otherwise its sync is submitted too.
 - **Config structs are `#[non_exhaustive]`** with constructors or `Default` (D33).
 - **One generic where it pays:** `runtime::Runtime<H: ShardHandler>`, so shard messages are an engine enum with no boxing.
 - **Errors:** one enum per crate with `From` conversions upward; the public crate flattens to `ErrorCode` + message.
@@ -107,16 +107,16 @@ Additions after review (additive): `Wal::spares() -> Option<SpareSegments>` (def
 4. After the commit at version `v`, each removed SST's extent is `pager.retire(extent, v)` (only when no tablet references it); `pager.reclaim(oldest_live)` frees extents whose views have all been released; `cache.erase_files` for the removed SSTs and dropped blob files.
 
 ### Recovery (open as writer)
-1. `vfs.open(path)`, `Presence::acquire`, `WriterLock::acquire` (else `WriterLocked`), `file.is_local()` (else `NetworkFilesystem`).
+1. `vfs.open(path)` read-write, `WriterLock::acquire` (else `WriterLocked`), `file.is_local()` (else `NetworkFilesystem`). `Presence` is taken in step 4, after the shm open (D37); holding the writer byte in between keeps a closing process from cleaning up under the opening writer.
 2. `Pager::open`: pick the valid newest superblock. Read the snapshot block and the live delta log named by `root()` (`format::manifest::decode_block`), apply edits to build the catalog, tablets, `Levels`, per-stream checkpoints and the timestamp floor. Check every family's merge operator is registered (else `UnknownMergeOperator`, unless `allow_unregistered_merge`).
 3. `OpenedPager::finish(live extents: manifest snapshot and log, SSTs, blob extents)`.
-4. `ShmRegion::open(.., Role::Writer, ..)`: build a new generation, mark the old one abandoned (readers re-attach); `next_seqno` = `Counters.seqno_ceiling`.
+4. `ShmRegion::open(.., Role::Writer, ..)`: build a new generation, mark the old one abandoned (readers re-attach); `next_seqno` = `Counters.seqno_ceiling`. It takes the presence byte shared before publishing; then `Presence::acquire` on the same handle returns the guard (D37).
 5. For every stream from `wal::discover_streams` (not just `0..shards`): `Recovery::open(checkpoint)`, `next_record` until the end. `Batch` records apply to memtables if `seqno > SetFlushed` for that `(tablet, family)`; `Prepare` records are stashed; `Commit` decisions are collected. Then apply each stashed Prepare whose coordinator holds a Commit with its seqno; discard the rest. Raise `next_seqno` above `Recovery::max_seqno()` of every stream (discarded Prepares included, D26), and the timestamp floor above every replayed `commit_ts`.
 6. `Recovery::into_stream` starts a fresh segment chained to where replay ended (D25). If the shard count changed, flush the recovered memtables and checkpoint before removing streams `>= shards` (D20).
 7. Assign tablets to shards, publish the first view, start the runtime.
 
 ### Reader process (Phase 4)
-`Presence::acquire`, `ShmRegion::open(.., Role::Reader, ..)` (refuses a layout mismatch), `claim_reader_slot`, load the manifest named by `manifest_version` through its own `Pager::open` (read-only) and `BlockCache`; memtables via `MemtableReader::open(arena, root)` from `read_view`. When `is_stale()`, `reattach`, re-claim a slot and re-pin.
+`vfs.open(path)` read-write (D36; the reader writes nothing), `Presence::acquire`, `ShmRegion::open(.., Role::Reader, ..)` (refuses a layout mismatch), `claim_reader_slot`, load the manifest named by `manifest_version` through its own `Pager::open` (read-only) and `BlockCache`; memtables via `MemtableReader::open(arena, root)` from `read_view`. When `is_stale()`, `reattach`, re-claim a slot and re-pin.
 
 ## External dependencies
 

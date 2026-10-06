@@ -164,7 +164,8 @@ impl From<pigeonhole_format::Error> for Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WalOptions {
-    /// Segment size in bytes; a multiple of 32 KiB, at most 4 GiB. Default 64 MiB.
+    /// Segment size in bytes; a multiple of 32 KiB, at most 4 GiB − 32 KiB (decision D43).
+    /// Default 64 MiB.
     pub segment_size: u64,
     /// Segments kept preallocated ahead of the writer. Default 2.
     pub spare_segments: u32,

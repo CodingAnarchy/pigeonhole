@@ -59,6 +59,11 @@
 // `unsafe` is permitted in this crate; every block carries a `// SAFETY:` argument.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// Arena integers are native-endian in memory while FORMAT.md §11.6 fixes them as
+// little-endian; refuse to build where the two differ (decision D56).
+#[cfg(not(target_endian = "little"))]
+compile_error!("pigeonhole-memtable supports little-endian targets only (FORMAT.md §11.6)");
+
 use std::cmp::Ordering as Cmp;
 use std::collections::HashMap;
 use std::fmt;

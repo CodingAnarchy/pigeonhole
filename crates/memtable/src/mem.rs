@@ -13,7 +13,8 @@
 //!   discipline does not order, which is exactly the bug the loom tests must catch.
 //!
 //! Integers are native-endian in memory. Every process that maps a region runs on the same
-//! host, and every supported target is little-endian, so this matches `FORMAT.md` §11.6.
+//! host, and only little-endian targets are supported (the crate refuses to build on others,
+//! decision D56), so this matches `FORMAT.md` §11.6.
 
 use std::cmp::Ordering as Cmp;
 use std::fmt;

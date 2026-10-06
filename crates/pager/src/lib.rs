@@ -601,16 +601,19 @@ impl Pager {
         if let Some(e) = alloc.alloc_free(class) {
             return Ok(e);
         }
-        // The allocator lock is held across this one `fallocate` (at most 64 MiB, once per
-        // file growth) so two growths cannot claim the same tail; other allocations wait.
-        // Preallocate rather than extend sparsely: a full disk fails here, as `NoSpace`, and
-        // later writes into the extent need no metadata update before the commit's fsync.
+        // The allocator lock is held across this one `fallocate` and `sync_all` (at most
+        // 64 MiB, once per file growth) so two growths cannot claim the same tail; other
+        // allocations wait. Preallocate rather than extend sparsely: a full disk fails here,
+        // as `NoSpace`. The `sync_all` makes the new length durable now, because root commits
+        // sync with `sync_data`, which need not persist a length change: without it a
+        // power loss after the commit could cut the file short of a published extent.
         let (_, end) = alloc.grow_target(class);
         let from = alloc.frontier() * UNIT_BYTES;
         self.inner
             .file
             .allocate(from, end * UNIT_BYTES - from)
             .map_err(grow_error)?;
+        self.inner.file.sync_all()?;
         Ok(alloc.alloc_grown(class))
     }
 

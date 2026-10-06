@@ -89,7 +89,9 @@ impl Engine {
     }
 
     /// Opens in application-owned mode: as [`Engine::open`], but returns one [`EngineShard`]
-    /// per shard for the application to drive instead of starting threads.
+    /// per shard for the application to drive instead of starting threads. Starts no
+    /// threads at all, so a nonzero `options.compaction_threads` fails with
+    /// `InvalidArgument` before anything is opened (decision D40).
     pub fn open_application_owned(
         path: &Path,
         options: EngineOptions,
@@ -99,6 +101,12 @@ impl Engine {
 
     /// Opens a read-only handle in another process (Phase 4): attaches to the live region,
     /// claims a reader slot, loads the manifest named in the region header.
+    ///
+    /// The handle is read-only, but the process opens the database file **read-write**
+    /// (decision D36): the shm-init and last-one-out presence locks are exclusive byte-range
+    /// locks, which POSIX grants only on a writable descriptor. A reader writes nothing to
+    /// the file. As with SQLite in WAL mode, a reader therefore needs write permission on
+    /// the file and cannot open it on read-only media.
     pub fn open_reader(path: &Path, options: EngineOptions) -> Result<Arc<Engine>> {
         todo!()
     }

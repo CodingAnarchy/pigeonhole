@@ -209,6 +209,11 @@ fn segments_are_preallocated_and_recycled_after_checkpoint() {
     }
     assert_eq!(file_len(&vfs), 3 * opts.segment_size);
     assert_eq!(wal.inline_grows(), 0, "spares were always ready");
+    assert_eq!(
+        wal.inline_rollover_syncs(),
+        0,
+        "every rollover sync was submitted"
+    );
     let epoch = wal.written().epoch();
     assert!(epoch > 10, "many segments were started: {epoch}");
     let hs = headers(&vfs, opts.segment_size);
@@ -343,6 +348,7 @@ fn spares_are_prepared_off_the_shard_thread_and_taken_before_growing() {
     assert_eq!(spares.ready(), 0);
     assert_eq!(file_len(&vfs), 3 * opts.segment_size);
     assert_eq!(wal.inline_grows(), 0);
+    assert_eq!(wal.inline_rollover_syncs(), 0);
     // No spare and nothing recyclable: the next rollover grows inline and says so.
     while wal.written().epoch() < 4 {
         seqno += 1;
@@ -351,6 +357,11 @@ fn spares_are_prepared_off_the_shard_thread_and_taken_before_growing() {
         wal.sync().unwrap();
     }
     assert_eq!(wal.inline_grows(), 1);
+    assert_eq!(
+        wal.inline_rollover_syncs(),
+        1,
+        "no slot was ready: synced inline"
+    );
     assert_eq!(file_len(&vfs), 4 * opts.segment_size);
     // Recyclable slots count as free: after a checkpoint no spare needs preparing, and the
     // next rollover recycles instead of taking a spare.
@@ -365,6 +376,11 @@ fn spares_are_prepared_off_the_shard_thread_and_taken_before_growing() {
     }
     assert_eq!(file_len(&vfs), 4 * opts.segment_size);
     assert_eq!(wal.inline_grows(), 1);
+    assert_eq!(
+        wal.inline_rollover_syncs(),
+        1,
+        "a recyclable slot was ready"
+    );
     // The trait exposes the same handle; the mock has none.
     let boxed: Box<dyn Wal> = Box::new(wal);
     assert!(boxed.spares().is_some());

@@ -20,6 +20,8 @@ pub struct EngineOptions {
     /// other mode).
     pub pin_threads: bool,
     /// Extra threads dedicated to flush and compaction; 0 runs them on the shards.
+    /// Engine-owned mode only: [`Engine::open_application_owned`](crate::Engine::open_application_owned)
+    /// refuses a nonzero value with `InvalidArgument` (decision D40).
     pub compaction_threads: usize,
     /// Writer default durability.
     pub durability: Durability,

@@ -13,7 +13,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 6. [Errors](errors.md): every `ErrorCode` with cause and remedy.
 7. [Agent reference](agent-reference.md): every public type and method, limits, error codes and copy-paste recipes on one page.
 
-Multi-process readers (P4) will get their own page when they are implemented; the API (`Pigeonhole::open_reader`, `PigeonholeReader`) is listed in the agent reference.
+Multi-process readers (P4) will get their own page when they are implemented; for now see [Concepts](concepts.md#multi-process-readers-phase-4) (including why readers need write permission on the file) and the API in the agent reference.
 
 ## For agents integrating Pigeonhole
 Start with [`agent-reference.md`](agent-reference.md): dense tables, no prose padding. Use [`errors.md`](errors.md) to decide what to do about a failure. Signatures in `crates/pigeonhole/src/*.rs` are the final authority.
