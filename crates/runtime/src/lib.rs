@@ -88,6 +88,8 @@ pub enum Error {
     Closed,
     /// A thread could not be spawned or pinned.
     Spawn(std::io::Error),
+    /// The configuration is not valid for the chosen mode; names the field.
+    InvalidConfig(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -95,6 +97,7 @@ impl fmt::Display for Error {
         match self {
             Error::Closed => f.write_str("shard queue is closed"),
             Error::Spawn(e) => write!(f, "could not start runtime thread: {e}"),
+            Error::InvalidConfig(what) => write!(f, "invalid runtime configuration: {what}"),
         }
     }
 }
@@ -102,7 +105,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Closed => None,
+            Error::Closed | Error::InvalidConfig(_) => None,
             Error::Spawn(e) => Some(e),
         }
     }
@@ -131,9 +134,10 @@ pub struct RuntimeConfig {
     /// Pin shard threads to CPUs (engine-owned mode).
     pub pin_threads: bool,
     /// Extra pinned threads dedicated to background tasks; 0 runs them on the shards.
-    /// Engine-owned mode only: application-owned mode starts no threads and runs tasks on
-    /// the shards. As with tasks on shards, tasks still queued or running on these threads
-    /// at shutdown are dropped unfinished.
+    /// Engine-owned mode only: application-owned mode starts no threads, so
+    /// [`Runtime::application_owned`] refuses a nonzero value with
+    /// [`Error::InvalidConfig`] (decision D40). As with tasks on shards, tasks still queued
+    /// or running on these threads at shutdown are dropped unfinished.
     pub compaction_threads: usize,
     /// Longest a background task runs before yielding.
     pub time_slice: Duration,
@@ -620,8 +624,9 @@ impl<H: ShardHandler> Runtime<H> {
 
     /// Application-owned mode: no threads; one driver per shard.
     ///
-    /// `config.pin_threads` and `config.compaction_threads` are ignored: the application owns
-    /// every thread, and background tasks run on the shards.
+    /// The application owns every thread and background tasks run on the shards, so
+    /// `config.pin_threads` is ignored and a nonzero `config.compaction_threads` fails with
+    /// [`Error::InvalidConfig`] (decision D40) rather than being silently dropped.
     ///
     /// # Panics
     /// If `handlers.len() != config.shards` or the count is not in `1..=65536`.
@@ -629,6 +634,11 @@ impl<H: ShardHandler> Runtime<H> {
         config: RuntimeConfig,
         handlers: Vec<H>,
     ) -> Result<Vec<ShardDriver<H>>> {
+        if config.compaction_threads != 0 {
+            return Err(Error::InvalidConfig(
+                "compaction_threads must be 0 in application-owned mode",
+            ));
+        }
         let (_, cores) = build(&config, handlers, Arc::from(Vec::new()));
         Ok(cores
             .into_iter()
