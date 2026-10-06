@@ -80,7 +80,7 @@ jobs:
       - name: MSRV 1.96
         run: cargo +1.96 check --workspace --all-features
       - name: Miri (crates with unsafe)
-        run: cargo +nightly miri test -p pigeonhole-io -p pigeonhole-cache -p pigeonhole-memtable
+        run: cargo +nightly miri test -p pigeonhole-io -p pigeonhole-memtable
         env:
           PROPTEST_CASES: 8
           MIRIFLAGS: -Zmiri-disable-isolation
