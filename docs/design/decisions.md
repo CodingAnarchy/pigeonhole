@@ -194,5 +194,26 @@ The pager tracks allocated versus retired, not which extents the manifest names,
 ## D62 — each phase gate includes an empty phase milestone (approved; owner)
 Deferred work is a GitHub issue labeled with its crate and `phase-N`, and assigned to the matching milestone ("Phase 1 — Core engine" … "Phase 4 — Hardening and 1.0"). A phase's gate passes only when its measurable gate is met **and** its milestone has no open issues (`scripts/phase-gate.sh N`). Work found after a gate passes goes to a later milestone, never back into a closed one.
 
+## D63 — `SstWriterOptions::created_micros` (approved; sst)
+`SstWriter` has no clock, so the properties block's `created_micros` comes from an added `SstWriterOptions::created_micros` field (default 0; additive under D33). The engine sets it from `Vfs::now_micros` on flush and compaction, keeping simulated runs deterministic.
+
+## D64 — block-cache namespaces for SSTs and blob files (approved; sst)
+`pigeonhole_sst::sst_cache_file(SstId)` is the id with bit 63 clear and `blob_cache_file(BlobFileId)` sets bit 63; the engine passes the same values to `BlockCache::erase_files`. SST ids stay below 2^63 (`debug_assert`; stated in interfaces.md).
+
+## D65 — sst error classification (approved; sst)
+`Error::is_corruption()` covers truncated, bad-magic, checksum and corrupt errors; `Error::is_unsupported()` covers an unsupported format version or codec; `KeyTooLarge` is a caller error and in neither.
+
+## D66 — what `SstReader::open` promises about an interrupted build (approved; sst)
+The footer is written last in its own write. `open` checks footer, top index, filters and properties but does not checksum data blocks or index partitions (that would read the whole SST); a block lost to reordered unsynced writes fails its checksum when read, as a corruption error, never wrong data. Safe because nothing references an SST until its manifest commit is durable and the root commit syncs the SST first.
+
+## D67 — one block decoder (approved; sst, ICR 0004)
+SST data and index blocks are decoded only by `format::block::BlockIter` (O(1) `Block::new`, `Block::validate` for verify/fuzz, `BlockIter::reset`, inline key buffer). No crate keeps a private block decoder.
+
+## D68 — index partitions and readahead (approved; sst)
+Index partitions target `min(block_size, 4 KiB)`. `ReadOptions::readahead_blocks` reads up to that many adjacent uncached data blocks in one read during forward movement (never on seeks), within the current index partition; with `fill_cache = false` read-ahead blocks are held by the cursor and dropped on every seek.
+
+## D69 — blob record caching and logical length (approved; sst)
+`BlobReader` caches verified records at `Priority::Low`, except records larger than `min(1 MiB, cache capacity / 8)`, which are returned pinned but uncached. Each blob extent's header is verified the first time a read touches that extent. `BlobWriter::finish` returns the logical length (record headers plus values, without extent headers).
+
 ## Open questions
 _None._
