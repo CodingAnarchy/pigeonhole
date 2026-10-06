@@ -30,7 +30,7 @@ The spec calls the manifest "a small copy-on-write tree"; the format brief calls
 ## D8 — the free-space bitmap is not persisted (approved)
 The pager keeps the bitmap in memory and rebuilds it at open from the live extents the manifest names (the manifest snapshot and delta log, SSTs, blob extents). The engine reads the manifest anyway at open, so this costs nothing extra, a crash can never leak an extent, and no persisted bitmap can disagree with the manifest.
 
-## D9 — family-in-row deletes use a marker key; BigTable delete rule (approved; revised after review)
+## D9 — family-in-row deletes use a marker key; BigTable delete rule (approved; revised after review; amended by D74 and D78)
 A family-in-row delete is the key `[row][00 01][00 00][!ts][!seqno][FamilyDelete]`: `00 00` never appears in an escaped string and sorts before every qualifier, so a reader sees a row's markers before its cells. **Delete rule:** a `ColumnDelete` or `FamilyDelete` with timestamp `T` hides every version in its scope with timestamp `<= T` regardless of seqno (so a later put with an older timestamp stays hidden); a `CellDelete` hides exactly the versions at its timestamp, also regardless of seqno (D38); seqnos decide only snapshot visibility. Point gets use `CellResolver::seek_column`, which seeks each source to the row's marker prefix before the column (one extra seek per source, normally inside an already-loaded block); filters add a marker key so a column-filter miss never hides a marker.
 
 ## D10 — a whole-row delete is one family marker per family (approved)
@@ -69,7 +69,7 @@ The spec replays every WAL stream at open regardless of shard count. If streams 
 ## D21 — lock page byte assignments (approved)
 Refines D3. On page 2: offset 8192 is the writer byte, 8193 the presence byte, 8194 an shm-init byte held exclusive while a process creates, validates or rebuilds the shared-memory region (so two processes opening at once never both build it). Locks never block; callers retry.
 
-## D22 — filter pushdown semantics, uniform across sources (approved; revised after review)
+## D22 — filter pushdown semantics, uniform across sources (approved; revised after review; amended by D82)
 `format::scan::ScanFilter` holds the entry-safe conditions (qualifier selection, time range on puts) and one rule, `ScanFilter::admits`. **Amended in the audit:** the qualifier selection applies to every cell entry, deletes and merge operands included (nothing of an excluded column is returned, so its deletes and operands cannot change a result, and `next_admissible` can seek past excluded columns); the time range applies to puts only, so deletes and merge operands always pass it (hiding a delete would resurrect older versions, and dropping some operands would produce partial counters); family markers always pass. `admits` and `next_admissible` agree, so pushdown still equals filter-after. `SstIter` applies it inside the block decoder; memtable sources are wrapped in `compaction::FilteredCursor`, so every source filters identically. Version count, columns per row and value predicates need snapshot visibility and run in `CellResolver`, still before materialization; a value predicate tests the newest visible value of a column. The sst acceptance test (pushdown equals filter-after) is defined over these semantics.
 
 ## D23 — one shared-memory view record carries the tablet map and memtables (approved)
@@ -119,7 +119,7 @@ POSIX `fcntl` (and Linux OFD) locks refuse a write lock on a descriptor opened r
 ## D37 — Windows lock upgrades are not atomic; the writer opens shared memory before taking `Presence` (approved; audit C1, K10)
 `LockFileEx` cannot convert a held shared lock, so `PreadVfs` unlocks, tries exclusive, and re-takes shared on failure; if another process takes the byte exclusively in that window, the shared lock is lost (the call still reports `Locked`). That is accepted in `pigeonhole-io`. **No caller may upgrade a lock it must keep.** The only such caller was shm's layout-version probe (D45), which upgraded the writer's held presence lock. The writer's order is therefore `WriterLock::acquire` → `Pager::open` and manifest → `ShmRegion::open(Role::Writer)` → `Presence::acquire`, on one handle. `ShmRegion::open` probes presence from no lock and then takes it shared **before** publishing the new generation, so a closing process can never remove a generation being built; the later `Presence::acquire` only returns the guard. Because the writer is not present between taking the writer byte and opening shared memory, last-one-out cleanup (removing WAL files and the region) must also take the writer byte, which a writer holds while it opens. Engine work: [#20](https://github.com/CodingAnarchy/pigeonhole/issues/20).
 
-## D38 — a cell delete is timestamp-only (approved; owner decision U2)
+## D38 — a cell delete is timestamp-only (approved; owner decision U2; purge behavior in D74)
 A `CellDelete` at timestamp `T` hides every version at exactly `T` **whatever its seqno**, including a put or merge operand at `T` committed after the delete, uniform with the column and family rule of D9 (and with HBase). Seqnos only decide what a snapshot sees: a snapshot taken before the delete still sees the version. A cell cannot be rewritten at the same timestamp while the marker exists; write the replacement at another timestamp. Compaction drops the marker only at the bottommost level together with everything at `T` it covers. FORMAT §2, the sim `Model` (ICR 0003) and the guide state this. Resolver and GC work: [#25](https://github.com/CodingAnarchy/pigeonhole/issues/25).
 
 ## D39 — a row read returns families in creation order, or in the caller's order (approved; owner decision U3)
@@ -214,6 +214,84 @@ Index partitions target `min(block_size, 4 KiB)`. `ReadOptions::readahead_blocks
 
 ## D69 — blob record caching and logical length (approved; sst)
 `BlobReader` caches verified records at `Priority::Low`, except records larger than `min(1 MiB, cache capacity / 8)`, which are returned pinned but uncached. Each blob extent's header is verified the first time a read touches that extent. `BlobWriter::finish` returns the logical length (record headers plus values, without extent headers).
+
+## D70 — `GcPolicy::min_ts_above` bounds bottommost purges (approved; compaction)
+A bottommost compaction may drop a delete that is visible at every live snapshot, and versions beyond `max_versions`. Both are safe for the inputs, but data *above* the inputs (L0 files and levels not in the task, memtables) is newer by seqno and can still carry older user timestamps (written later with an explicit timestamp): a dropped column, family or cell delete would uncover such an entry, and an upper `CellDelete` at a kept version's timestamp would make a purged older version the newest. Either changes a read at a live snapshot, which done-when (2) forbids, and the random test finds it quickly.
+
+**Decision:** an added public field `GcPolicy::min_ts_above: Timestamp` (additive; `GcPolicy` is `#[non_exhaustive]`): the smallest timestamp of any entry above the inputs in the task's range, `u64::MAX` when there is none. Bottommost delete purges apply only to deletes with `ts < min_ts_above`, and the `max_versions` purge only to columns whose newest timestamp is below it. `GcPolicy::new` sets it to 0, which purges nothing at the bottom (always safe). The engine computes it from the `ts_range` of upper SSTs overlapping the range and the minimum timestamp of each memtable (which the engine has to track on insert; `Memtable` exposes only `seqno_range`). With default timestamps (D11) everything above is newer than old tombstones, so purging works normally. Expired data, and entries hidden or shadowed within the inputs, are dropped at any level regardless.
+
+## D71 — additive `JobContext` fields `target_sst_bytes` and `clock` (approved; compaction)
+`CompactionJob::run(deadline_nanos)` must compare against the Vfs monotonic clock, but `JobContext` has no `Vfs`; and nothing tells the job the output SST size (`PickerOptions::target_sst_bytes` lives in the picker).
+
+**Decision:** `JobContext::target_sst_bytes: u64` (default 64 MiB) and `JobContext::clock: Option<VfsRef>` (default `None`), both additive under D33. With a clock, `run` checks it every 64 units of work (a unit is a family marker or one `(column, timestamp)` group); without one, `run` does 4096 units per call, or everything when the deadline is `u64::MAX`. `SstWriterOptions::created_micros` is set from `GcPolicy::now`.
+
+## D72 — other additive public API (approved; compaction)
+None of these change a frozen signature:
+- `ResolveOptions::time_range` and `ResolveOptions::route_time_range` (see the D22 amendment below).
+- `MergingCursor::current()` and `sources()`, `FilteredCursor::inner()`: the engine pins a zero-copy value through the source the merged cursor is on (`ResolvedCell::from_source`).
+- `CellResolver::set_upper_bound(Option<&[u8]>)` (a scan over deleted rows stops at its range end instead of running to the next visible cell) and `into_cursor()`.
+- `VecCursor`: an in-memory sorted cursor, the mock source for tests and examples above.
+- `ValuePredicate::matches`, `Levels::level_bytes`, `PickerOptions::level_target`, `KeyRange::{all, intersect}`, `CompactionPicker::options`, `CompactionJob::{entries_read, entries_written}`.
+- `MergeRegistry`'s `Default` is now a manual impl equal to `new()`, so built-ins are always present as documented (the frozen stub derived it, which would have produced an empty registry).
+
+## D73 — counter operands are not folded across timestamps in Phase 1 (approved; Phase 2 folding tracked in #34)
+Every `incr` gets its own commit timestamp (D11), so a hot counter accumulates one operand per increment and every read folds them all. Folding a run across timestamps (or onto its base) in compaction is not read-preserving in general: a later `delete_cell` at one operand's timestamp, or a `put_at`/`delete_column` with an explicit timestamp inside the run, splits it in the model; TTL expires operands one by one; and a `time_range` scan sees operands but not a base outside its range (D22).
+
+**Decision:** compaction combines operands only within one `(column, timestamp)` group and one snapshot stripe (preserving every read), never across timestamps and never onto a base. A bad base is therefore never folded (#21): the read keeps failing with `MergeFailed`. Proposal for the owner: fold a run (and its base) at the bottommost level when the family has no TTL and the run lies below `min_ts_above`, accepting that a later explicit-timestamp delete inside the run no longer splits it. **Deferred to Phase 2 (#34)** per review. Until then operands accumulate: the guide (data-modeling.md, counters) says so, and `cargo bench -p pigeonhole-compaction` measures it (`counter_get/operands_N`: about 0.3 µs for 1 operand, 3.4 µs for 100, 307 µs for 10,000, i.e. ~30 ns per operand).
+
+## D74 — purges follow HBase semantics (approved; owner decision; amends D9 and D38)
+Before compaction purges a delete marker, or versions beyond `max_versions`, a later write with an older explicit timestamp stays hidden: by the marker (D9, D38), or behind the newer versions. A bottommost compaction may purge them, but only below `GcPolicy::min_ts_above` and only when no live snapshot needs them. After that, such a write behaves as if they never existed: a `put_at` below a purged delete becomes visible, and a `delete_cell` of the newest version does not bring back a purged older one. Writes at default timestamps are never affected.
+
+**Behavior:** as described. The oracle stays strict. `pigeonhole_sim::Model::purge(&ModelPurge)` (approved sim addition) removes exactly what such a compaction may purge from the model:
+- deletes visible at every read point below `min_ts_above`, with what they cover and the deletes they make redundant, in the compaction's processing order;
+- puts and operands outside the newest `max_versions` versions at every read point.
+
+The compaction tests apply it after each bottommost compaction and then compare reads after unrestricted later writes (explicit older timestamps and cell deletes included). Coverage:
+- `compaction_preserves_reads_at_live_snapshots`, which fails without the purge;
+- `purges_match_the_model_purge_hook`, deterministic scenarios that pin the redundancy ordering;
+- `purge_follows_hbase_semantics` in sim.
+
+The guide (data-modeling.md, Versions) states the rule.
+
+## D75 — `I64Add` accepts only `ValueTag::I64` values (approved; compaction)
+The model treats any 8-byte value as an `i64` base (it has no tags). Stored values have tags: `put_i64` and `incr` write tag `0x01`.
+
+**Decision:** operands and bases must be `ValueTag::I64` (tag plus 8 bytes); a `Bytes` value of 8 bytes is a `MergeError`. The engine's model adapter should map the model's 8-byte values to `put_i64` (the compaction tests do), and the guide already says to write counters only with `incr`/`put_i64`.
+
+## D76 — `ResolveOptions::versions` and the family's `max_versions` (approved; compaction)
+`ResolveOptions` has no `max_versions`, but the model caps every read at it, and reads must not depend on whether compaction has purged yet.
+
+**Decision:** the caller passes `versions = min(requested, max_versions)` (0 meaning unlimited on either side); documented on the field.
+
+## D77 — value predicates on typed and blob values (approved; compaction)
+D22 says a value predicate tests the newest visible value of a column; the byte-level meaning is unstated.
+
+**Decision:** the column is returned (all requested versions) iff its newest visible version matches. Byte predicates compare the payload (stored value without the tag); `I64` matches `i64` and varint values; a blob pointer matches no byte predicate (the resolver does not read blobs).
+
+## D78 — rows split across SSTs of one level move together; point gets consult every overlapping SST of a level (approved; compaction; amends D9)
+D9's point get seeks the row's markers and then the column in "one SST per deeper level". If a level splits a row across two SSTs, the marker and the column can be in different SSTs, and a GC that sees only part of a row could drop a family delete that still hides cells of the same row elsewhere in the level.
+
+**Decision:** outputs are cut between rows once less than an eighth of the extent is left, so only a row larger than that is split. The picker takes inputs *and* the overlapping SSTs of the level below by row ranges, and expands both to a clean cut, to a fixpoint: an SST sharing an edge row with a chosen one comes along. A row's data in a level therefore always moves down together, and a bottommost run sees every SST of the output level holding its rows (regression test `a_row_split_across_bottom_ssts_moves_together`; the picker proptest generates shared edge rows and asserts clean cuts). The task's `range` stays `KeyRange::all()`, which covers the expansion. The engine's point get must consult every SST of a level whose range overlaps the row (normally one): D9's "one SST per deeper level" wording needs amending (coordinator).
+
+## D79 — what the engine does with picker tasks (approved; compaction)
+The picker does not know the tablet's row range or whether an SST is shared with a sibling after a split (D13).
+
+**Decision:** `pick` returns `range = KeyRange::all()` and one subrange; the engine narrows `range`/`subranges` to the tablet range and turns a `TrivialMove` of a shared SST into a `Rewrite`. `TrivialMove` and `Drop` need no job (the engine has the `SstMeta`s); a job given one finishes at once with an empty output. Subranges run one after another inside one job; splitting large tasks and running subranges in parallel is deferred (#35). `CompactionJob::new` debug-asserts that `range` and every subrange bound is an encoded row prefix.
+
+## D80 — blob accounting in Phase 1 (approved; compaction)
+Value separation is Phase 2 (FORMAT §7), so Phase 1 writes no blob files.
+
+**Decision:** `blob_live_delta` records `-(16 + len)` per dropped put holding a blob pointer (the record header plus the value, matching `BlobWriter`'s byte count). `new_blob_files` and `dropped_blob_files` stay empty: the job does not know a file's current live bytes, so the engine decides when a file reaches zero. A `BlobGc` task finishes empty.
+
+## D81 — point gets copy small values (approved; compaction)
+A delete can follow the put it hides inside one `(column, timestamp)` group (it was committed earlier), so the resolver must read the whole group before returning the put, and `Cursor` cannot look ahead without moving.
+
+**Decision:** values up to 4 KiB are copied into a reused buffer while the group is read (`from_source == false`); a larger value is re-found with one seek and returned borrowed from the source (`from_source == true`). Nothing allocates per cell once the buffers have grown.
+
+## D82 — time ranges on merge families apply to resolved versions (approved; coordinator; amends D22)
+D22 pushes a scan's time range down to puts (operands and deletes always pass). For a family with a merge operator that can drop a counter's base while keeping its operands, so the read returns a wrong sum (for example base 100 at ts 10, operands at 20 and 30, range `[25, 40)`: pushdown returns 3, the counter is 103 at ts 30).
+
+**Interim behavior (coordinator decision, to be numbered):** for a family with a merge operator the time range is not pushed down; it applies to *resolved* versions (`ResolveOptions::time_range`: a version, merged or not, is kept iff its timestamp is in range), after deletes, TTL and folding and before the value predicate and version limits. For a family without merge operands that equals pushdown, so `ResolveOptions::route_time_range(&mut filter, range)` sends the range to `ScanFilter::time_range` when there is no operator and to the resolver when there is one; the engine calls it when building a scan. A version whose fold fails but which is outside the range is not returned and so does not fail the read. Tests: `counter_time_range_applies_to_resolved_versions` and the time-range case of the resolver oracle.
 
 ## Open questions
 _None._
