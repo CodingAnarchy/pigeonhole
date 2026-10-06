@@ -1,4 +1,4 @@
-<!-- Source of truth: https://claude.ai/artifact/4zEQ4RyDCMoovUiUNVwrco (exported 2026-10-05). -->
+<!-- Exported from https://claude.ai/artifact/4zEQ4RyDCMoovUiUNVwrco on 2026-10-05; corrected since to match decisions.md, which wins on any conflict. -->
 # Pigeonhole: An Embedded Wide-Column Store in Rust
 
 2026-10-05 · 
@@ -115,13 +115,13 @@ let row = pages.row(b"com.example/a").families(["meta"]).latest().read()?;
 for row in pages.scan(b"com.example/"..b"com.example0")
     .family("links")
     .qualifier_prefix(b"org.")
-    .snapshot(snap)
+    .snapshot(&snap)
     .iter()? { /* ... */ }
 
 // Batched multi-row write with one durability point
 let mut wb = db.write_batch();
 for e in events { wb.put(&tbl, &e.row, "ev", &e.qual, &e.val); }
-wb.commit(Durability::GroupSync)?;
+wb.commit_with(Durability::GroupSync)?;   // D12: commit() uses the writer default
 ```
 
 - **Reads** return borrowed `CellRef`/`RowRef` views tied to a snapshot; `.to_owned()` when needed.
@@ -177,7 +177,7 @@ while let Some(row) = rows.next().await { /* ... */ }
 wb.commit_async(Durability::GroupSync).await?;
 ```
 
-- **One engine, two front doors.** The core is sync and owns its threads. The async layer lives in the same crate behind a default-on `async` feature; disabling it removes all async dependencies.
+- **One engine, two front doors.** The core is sync and owns its threads. The async layer lives in the same crate behind an `async` feature (default-on once implemented in Phase 3; off until then, D17); disabling it removes all async dependencies.
 - **Truly async I/O, not ****`spawn_blocking`****.** Async calls submit to the engine's I/O backend and register a waker; io_uring completions (or the `pread` pool on other platforms) wake the task. Memtable and cache hits return `Ready` on first poll, so hot async reads cost about the same as sync ones.
 - **Runtime-agnostic.** Futures depend only on `std::task` wakers and `futures-core` traits, so they run on Tokio, smol, async-std, or a custom executor. An optional `tokio` feature adds conveniences, never requirements.
 - **Owned results across ****`.await`****.** Sync reads can borrow `CellRef<'_>` from the cache; async reads return `Cell`, a cheap ref-counted handle that pins its cache block, so values can be held across await points without copying.
@@ -261,7 +261,7 @@ Thread-per-core is a v1 requirement: every write executes on exactly one pinned 
 - **MVCC by sequence number.** Every commit gets a global u64 seqno, encoded in every internal key right after the user timestamp (see Data model). A snapshot is a seqno taken from the watermark plus the view current at that moment (see Views); reads ignore anything newer. Snapshots pin SST extents via epoch-based reclamation (crossbeam-epoch style), never via locks.
 - **Writers.** Each write runs on its owning shard. The shard's group-commit leader issues one write() to the shard's WAL stream and, for `GroupSync`, one `fsync` for the whole group, then publishes the group's seqnos. Except under `None`, no commit returns until its record has been handed to the kernel with write(); `Buffered` skips only the fsync, so a returned `Buffered` commit survives a process crash. Merge operands such as `incr` are written blind and resolved at read and compaction time.
 - **Memtables.** One per tablet and family, written only by the owning shard and read concurrently by any thread: a single-writer, multi-reader skiplist over the shard's arena, which lives in the shared-memory file and links nodes by offset so reader processes can read it too; immutable once full, then flushed by the shard. Write stalls use a per-shard token bucket on L0 depth rather than hard stops, to keep p99 smooth.
-- **Conditional writes.** `check_and_mutate(row, predicate, mutation)` gives BigTable-style compare-and-set per row without a transaction. It runs on the owning shard, which executes writes for its rows one at a time, so the check and the mutation are atomic with no latch, and later writes to the row queue behind it in order.
+- **Conditional writes.** `check_and_mutate(row, predicate, mutation)` (the engine name; the public API spells it `RowMutation::commit_if(condition)`) gives BigTable-style compare-and-set per row without a transaction. It runs on the owning shard, which executes writes for its rows one at a time, so the check and the mutation are atomic with no latch, and later writes to the row queue behind it in order.
 - **Multi-row transactions (opt-in).** Optimistic concurrency: reads record the (row, family) ranges they touched. At commit, each participant shard checks its own tablets for conflicting commits since the snapshot seqno during PREPARE; any conflict aborts the whole commit. Serializable for the touched ranges, with no lock manager.
 - **Multi-process.** One writer process and any number of reader processes on the same host, coordinated through a shared-memory file; see Multi-process readers below.
 - **Crash safety.** Superblock flip is the only in-place write in the main file (recycled WAL segments are overwritten too, guarded by their epoch). On open: read both superblocks and pick the valid newest, replay every shard's WAL stream past its checkpoint, then resolve prepared cross-shard commits against their coordinators' decision records. Torn WAL tails are detected by CRC and truncated.
