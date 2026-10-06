@@ -14,8 +14,16 @@ readme = "README.md"
 [dependencies]
 pigeonhole-io = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
 [target.'cfg(loom)'.dev-dependencies]
 loom = { workspace = true }
+
+[[bench]]
+name = "hit"
+harness = false
 
 [lints]
 workspace = true
