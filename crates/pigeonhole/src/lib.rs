@@ -61,7 +61,7 @@
 //! # Sync and async
 //!
 //! Phase 1 ships the blocking API, which needs no async runtime. The async front door
-//! (Phase 3) lives behind the `async` feature in [`nonblocking`].
+//! (Phase 3) lives behind the `async` feature in the `nonblocking` module.
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
