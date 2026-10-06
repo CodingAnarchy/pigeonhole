@@ -6,8 +6,8 @@ Live progress against the [build plan](design/spec.md#build-plan). Updated by th
 |---|---|
 | 1. Bootstrap — workspace, CI, contributor docs | done |
 | 2. Interface freeze — public traits/types for every crate, `FORMAT.md` | done ([#1](https://github.com/CodingAnarchy/pigeonhole/pull/1); see [interfaces.md](design/interfaces.md)) |
-| 3. Foundations — `format`, `io`, `sim` | `io` merged ([#2](https://github.com/CodingAnarchy/pigeonhole/pull/2)); `format` ([#4](https://github.com/CodingAnarchy/pigeonhole/pull/4)) and `sim` ([#3](https://github.com/CodingAnarchy/pigeonhole/pull/3)) in final review |
-| 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | in progress (six agents in parallel) |
+| 3. Foundations — `format`, `io`, `sim` | done ([#2](https://github.com/CodingAnarchy/pigeonhole/pull/2), [#3](https://github.com/CodingAnarchy/pigeonhole/pull/3), [#4](https://github.com/CodingAnarchy/pigeonhole/pull/4)) |
+| 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | six PRs reviewed ([#6](https://github.com/CodingAnarchy/pigeonhole/pull/6)–[#11](https://github.com/CodingAnarchy/pigeonhole/pull/11)), rebasing onto main |
 | 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | not started |
 
 ## Phases
