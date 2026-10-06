@@ -555,9 +555,11 @@ dependencies = [
 name = "pigeonhole-memtable"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "loom",
  "pigeonhole-format",
  "pigeonhole-io",
+ "proptest",
 ]
 
 [[package]]

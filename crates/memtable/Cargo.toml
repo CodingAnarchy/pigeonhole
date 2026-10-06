@@ -15,8 +15,16 @@ readme = "README.md"
 pigeonhole-io = { workspace = true }
 pigeonhole-format = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
 [target.'cfg(loom)'.dev-dependencies]
 loom = { workspace = true }
+
+[[bench]]
+name = "memtable"
+harness = false
 
 [lints]
 workspace = true
