@@ -21,6 +21,7 @@ mod workload;
 pub use model::{CrashWindow, Model, ModelCell, ModelError, ModelFamily, ModelOp, ModelPurge};
 pub use sim::{Rng, Sim, Step, TaskId};
 pub use streams::{
-    CommitStreams, StreamCommit, check_acknowledged_survive, recovered_commits, stream_lengths,
+    CommitStreams, StreamCommit, StreamRecord, check_acknowledged_survive, commit_records,
+    recovered_commits, recovered_from_records, stream_lengths,
 };
 pub use workload::{Op, Workload, WorkloadSpec};
