@@ -18,7 +18,7 @@ use crate::{CommitTicket, Error, Result, Wal, WalOptions, stream_path, sync_pare
 pub(crate) const FRAME: u64 = FRAME_SIZE as u64;
 
 /// Largest segment: 4 GiB minus one frame, so a successor's `prev_end` always fits a `u32`
-/// (decisions log, open question on `prev_end`).
+/// (decision D43).
 pub(crate) const MAX_SEGMENT_SIZE: u64 = (1 << 32) - FRAME;
 
 /// Bytes written per call when zero-filling a slot.
@@ -147,6 +147,8 @@ struct Pool {
     recyclable: usize,
     /// Rollovers that found no recyclable or ready slot and grew the file inline.
     inline_grows: u64,
+    /// Rollovers that synced the full segment on the shard thread (no slot was ready).
+    inline_rollover_syncs: u64,
 }
 
 impl Shared {
@@ -288,8 +290,13 @@ impl SpareSegments {
 ///
 /// Appends are buffered in memory and framed as they arrive; [`Wal::write`] hands the buffer
 /// to the kernel with one positional write. When a segment fills, the stream writes what is
-/// left of it, fdatasyncs it (the one blocking sync on the shard's path, once per segment) and
-/// then buffers the successor's header with `prev_end` set to where the full segment ended.
+/// left of it, syncs it and then buffers the successor's header with `prev_end` set to where
+/// the full segment ended. FORMAT §10.1 rule 1 (a full segment is durable before its
+/// successor's header is written) holds either way, and D30 is kept as follows: when a
+/// recyclable or prepared slot is ready, the old segment's sync is submitted to the I/O
+/// backend and the next write waits for it before writing the successor's header (normally
+/// it has completed by then); only when no such slot is ready does the stream sync inline
+/// ([`WalStream::inline_rollover_syncs`] counts those).
 ///
 /// The successor goes into a slot whose epoch is below the latest checkpoint if there is one,
 /// else into a slot prepared by [`SpareSegments::prepare`] (zero-filled and synced, so its
@@ -353,6 +360,9 @@ pub struct WalStream {
     buf: Vec<u8>,
     /// Record encoding scratch, reused across appends.
     scratch: Vec<u8>,
+    /// The submitted sync of the previous segment, which must complete before the current
+    /// segment's header is written (FORMAT §10.1 rule 1).
+    rollover_sync: Option<Completion<()>>,
     shared: Arc<Shared>,
 }
 
@@ -445,6 +455,7 @@ impl WalStream {
             written_off: 0,
             buf: Vec::new(),
             scratch: Vec::new(),
+            rollover_sync: None,
             shared: Arc::new(Shared {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
@@ -501,6 +512,18 @@ impl WalStream {
     /// inline, on the shard thread (a sign that spares are not being prepared fast enough).
     pub fn inline_grows(&self) -> u64 {
         self.shared.pool().inline_grows
+    }
+
+    /// Rollovers that synced the full segment on the shard thread because neither a
+    /// recyclable nor a prepared slot was ready (decision D30's one exception). With spares
+    /// prepared in time this stays 0.
+    pub fn inline_rollover_syncs(&self) -> u64 {
+        self.shared.pool().inline_rollover_syncs
+    }
+
+    /// Whether the next segment can start in a recyclable or prepared slot.
+    fn spare_ready(&self) -> bool {
+        (0..self.slots.len()).any(|i| self.is_recyclable(i)) || !self.shared.pool().ready.is_empty()
     }
 
     fn is_recyclable(&self, slot: usize) -> bool {
@@ -586,15 +609,25 @@ impl WalStream {
     }
 
     /// The current segment is full: write and sync it, then chain a new one to its end
-    /// (FORMAT §10.1 rule 1).
+    /// (FORMAT §10.1 rule 1). With a spare slot ready the sync is submitted and `write_buf`
+    /// waits for it before writing the successor's header; otherwise it runs inline (D30).
     fn rollover(&mut self) -> Result<()> {
         self.write_buf()?;
-        self.file.sync_data()?;
-        let end = self.written_off as u32;
-        self.shared
-            .durable
-            .fetch_max(Lsn::new(self.epoch, end).0, Ordering::Release);
-        self.start_segment(self.epoch, end, false)?;
+        let end = Lsn::new(self.epoch, self.written_off as u32);
+        if self.spare_ready() {
+            let shared = Arc::clone(&self.shared);
+            // A failure surfaces from the next `write_buf`, whose caller poisons the stream.
+            self.rollover_sync = Some(self.file.submit_sync_data().map(move |r| {
+                r?;
+                shared.durable.fetch_max(end.0, Ordering::Release);
+                Ok(())
+            }));
+        } else {
+            self.file.sync_data()?;
+            self.shared.durable.fetch_max(end.0, Ordering::Release);
+            self.shared.pool().inline_rollover_syncs += 1;
+        }
+        self.start_segment(end.epoch(), end.offset(), false)?;
         Ok(())
     }
 
@@ -618,6 +651,9 @@ impl WalStream {
     }
 
     fn write_buf(&mut self) -> Result<()> {
+        if let Some(synced) = self.rollover_sync.take() {
+            synced.wait()?;
+        }
         if !self.buf.is_empty() {
             let at = self.slot as u64 * self.segment_size + self.written_off;
             self.file.write_at(&self.buf, at)?;
