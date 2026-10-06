@@ -29,7 +29,7 @@ Deferred work from the [decisions audit](design/decisions.md), one GitHub issue 
 | [#20](https://github.com/CodingAnarchy/pigeonhole/issues/20) | engine | 1 | D37 | Writer open order; writer-byte check in last-one-out cleanup |
 | [#22](https://github.com/CodingAnarchy/pigeonhole/issues/22) | engine | 1 | D40 | Refuse `compaction_cores` in application-owned mode |
 | [#23](https://github.com/CodingAnarchy/pigeonhole/issues/23) | engine | 1 | D57, D58, D60, D61 | Honor the pager's contracts (clean flag, poisoning, shrink, reclaim) |
-| [#24](https://github.com/CodingAnarchy/pigeonhole/issues/24) | engine | 1 | D59 | Interrupted `Pager::create` at open: recreate or refuse (**owner question**) |
+| [#24](https://github.com/CodingAnarchy/pigeonhole/issues/24) | engine | 1 | D59 | Refuse an interrupted `Pager::create` with `Corruption`; never delete the file |
 | [#26](https://github.com/CodingAnarchy/pigeonhole/issues/26) | engine | 1 | D39 | Families in creation or requested order |
 | [#21](https://github.com/CodingAnarchy/pigeonhole/issues/21) | compaction | 1 | D41 | `I64Add` fails on a non-`i64` base |
 | [#25](https://github.com/CodingAnarchy/pigeonhole/issues/25) | compaction | 1 | D38 | Timestamp-only `CellDelete` in the resolver and GC |
