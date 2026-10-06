@@ -183,7 +183,7 @@ fn commits(c: &mut Criterion) {
                     );
                     black_box(db.commit(wb, Some(d)).unwrap());
                 }
-                start.elapsed() * (iters / n) as u32
+                start.elapsed().mul_f64(iters as f64 / n as f64)
             })
         });
     }
@@ -213,7 +213,8 @@ fn commits(c: &mut Criterion) {
                     }
                 });
                 // Per-commit latency as seen by one committer, scaled to criterion's count.
-                start.elapsed() / threads as u32 * (iters / (per * threads as u64)).max(1) as u32
+                (start.elapsed() / threads as u32)
+                    .mul_f64(iters as f64 / (per * threads as u64) as f64)
             })
         });
     }
@@ -272,7 +273,8 @@ fn scaling(c: &mut Criterion) {
                         });
                     }
                 });
-                start.elapsed() / shards as u32 * (iters / (per * shards as u64)).max(1) as u32
+                (start.elapsed() / shards as u32)
+                    .mul_f64(iters as f64 / (per * shards as u64) as f64)
             })
         });
         db.close().unwrap();

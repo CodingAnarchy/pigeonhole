@@ -117,3 +117,22 @@ wait for the next group, so conditions see the applied state and per-row submiss
 holds.
 
 **Interim behavior:** as described (the cut costs one extra group commit in that case).
+
+## Measured: the D29 copy threshold and the `arc-swap` guard (#15)
+`cargo bench -p pigeonhole-engine --bench engine`, Apple M5 (10 cores), macOS, memtable-resident
+data (non-reference hardware, D5). Point get of one cell by value size, `get_latest`
+(arc-swap guard) versus `get` (snapshot: `Arc<View>` clone):
+
+| value bytes | 16 | 64 | 128 | 256 | 512 | 4096 |
+|---|---|---|---|---|---|---|
+| `get_latest` | 303 ns | 263 ns | 289 ns | 299 ns | 270 ns | 270 ns |
+| `get` + snapshot | 309 ns | 272 ns | 301 ns | 307 ns | 281 ns | 280 ns |
+
+A miss costs 194 ns. With all 10 cores reading one cell: 30.0 ns per get aggregate
+(`get_latest`, 64-byte value) versus 30.3 ns (`get`); 43.6 versus 44.0 ns for a 512-byte
+value. Copying at or below 128 bytes and pinning above it are indistinguishable within noise
+(the two skiplist seeks of a point get dominate), and the guard saves about 3 % single-threaded
+and nothing measurable under contention.
+
+**Interim behavior:** D29 stands as written (128-byte threshold, guard on `get_latest`); the
+coordinator may record these numbers in D29.
