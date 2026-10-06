@@ -325,7 +325,7 @@ A conditional member's written rows, read keys and predicate row are checked aga
 ## D92 — one resolver for reads and compaction (approved; coordinator)
 The engine's Milestone A resolver (`resolve.rs`) is replaced in Milestone B (#37) by `pigeonhole-compaction`'s `MergingCursor` + `FilteredCursor` + `CellResolver`; where they differ, compaction's behavior wins (D75–D77, D82). `EngineOptions::merge_operators` takes effect then. Milestone A has no tablet splits (#38) and no WAL checkpoints (#37).
 
-## D93 — the per-stream recovery oracle lives in `pigeonhole-sim` (approved; sim, #40)
+## D93 — the per-stream recovery oracle lives in `pigeonhole-sim` (approved; sim, #40; extended by D114)
 `pigeonhole-sim` provides `StreamCommit`, `recovered_commits`, `check_acknowledged_survive` and `Model::from_commits`: each WAL stream keeps a prefix of its records, a single-shard commit survives iff its record does, and a cross-shard commit iff every PREPARE and its COMMIT do (D83, D84). `Model::crash_window` remains the single-stream special case. The engine and public suites adopt it in #48, replacing their own copies of the rule.
 
 ## D94 — a later stronger commit makes earlier `None` commits durable (approved; owner decision; implemented by #50)
@@ -483,6 +483,11 @@ fjall (2.x and 3.x) depends on `varint-rs` (0BSD) and `xxhash-rust` (BSL-1.0). B
 **Decision:** the `metric` family has a 1-day TTL, so reads pay the TTL check but nothing expires. Expiry under load (and FIFO-by-time compaction) needs a timestamped put op (ICR) and the engine's Phase 2 TTL compaction: [#54](https://github.com/CodingAnarchy/pigeonhole/issues/54).
 
 **Status:** deferred to #54 (coordinator's review of PR #55).
+
+## D114 — the recovery oracle also works on record lists (approved; sim, #59; extends D93)
+`pigeonhole-sim` offers `recovered_from_records(streams, survivors)`: the caller passes each stream's records in append order as `StreamRecord::{Single, Prepare, Commit { commit, participants }}` plus the surviving prefix length per stream. A single-shard commit survives iff its record does; a cross-shard commit iff its COMMIT survives and every participant the COMMIT names still holds its PREPARE (D83). A commit whose COMMIT was never appended is lost. PREPARE and COMMIT need not be adjacent. `recovered_commits` is now `recovered_from_records` over `commit_records`, so the commit-level API is unchanged.
+
+**Decision:** as described; suites with overlapping commits (engine, pigeonhole) call the record-level helper. Adoption is tracked by #48.
 
 ## Open questions
 _None._
