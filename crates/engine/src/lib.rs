@@ -9,15 +9,28 @@
 //! explicit snapshots, no ergonomics. Data flow through the lower crates is described in
 //! `docs/design/interfaces.md`.
 //!
+//! # Milestone A
+//!
+//! This build assembles everything that does not need SSTs: open, create and recovery,
+//! the catalog, the write path (group commit, two-phase commit, `check_and_mutate`,
+//! optimistic transactions), the read path over memtables, and close. Flush to SSTs,
+//! compaction, backup and shrink land with `pigeonhole-sst` and `pigeonhole-compaction`
+//! (Milestone B); until then frozen memtables are retained in memory, WAL streams are never
+//! checkpointed or removed, and a full memtable arena turns commits into
+//! [`Error::Busy`].
+//!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
 
+mod catalog;
 mod engine;
 mod error;
+mod flush;
+mod manifest;
 mod options;
 mod read;
+mod resolve;
+mod shard;
 mod snapshot;
 mod write;
 

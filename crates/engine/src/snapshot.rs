@@ -1,25 +1,102 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use pigeonhole_format::{ManifestVersion, Seqno, TableId, TabletId};
+use pigeonhole_format::shm::{ViewMemtable, ViewRecord, ViewTablet};
+use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, TableId, TabletId};
+use pigeonhole_memtable::MemtableReader;
 use pigeonhole_runtime::ShardId;
+
+use crate::catalog::Catalog;
+
+/// One tablet of the routing table: a contiguous row range of one table and its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TabletEntry {
+    pub id: TabletId,
+    pub table: TableId,
+    /// Inclusive start row; empty means unbounded.
+    pub start: Vec<u8>,
+    /// Exclusive end row; `None` means unbounded.
+    pub end: Option<Vec<u8>>,
+    pub shard: ShardId,
+}
 
 /// An immutable routing table: for each table, its tablets' row ranges and owning shards.
 /// Swapped atomically as a whole; read without locks.
-#[derive(Debug)]
+///
+/// Tablets are assigned to shards deterministically from their id (`tablet % shards`), so
+/// the same database opened with the same shard count routes the same way every time, and a
+/// different shard count only changes which shard applies a row, never the result.
+#[derive(Debug, Default)]
 pub struct TabletMap {
-    _priv: (),
+    version: u64,
+    /// Per table, tablets sorted by start row.
+    tables: HashMap<TableId, Vec<TabletEntry>>,
 }
 
 impl TabletMap {
+    pub(crate) fn build(version: u64, tablets: &[TabletEntry]) -> Self {
+        let mut tables: HashMap<TableId, Vec<TabletEntry>> = HashMap::new();
+        for t in tablets {
+            tables.entry(t.table).or_default().push(t.clone());
+        }
+        for list in tables.values_mut() {
+            list.sort_by(|a, b| a.start.cmp(&b.start));
+        }
+        Self { version, tables }
+    }
+
     /// Version (bumped by every split, merge or move).
     pub fn version(&self) -> u64 {
-        todo!()
+        self.version
     }
 
     /// The tablet holding `row` of `table` and its owner (binary search).
     pub fn route(&self, table: TableId, row: &[u8]) -> Option<(TabletId, ShardId)> {
-        todo!()
+        let list = self.tables.get(&table)?;
+        // The last tablet whose start is <= row.
+        let idx = list.partition_point(|t| t.start.as_slice() <= row);
+        let t = list.get(idx.checked_sub(1)?)?;
+        match &t.end {
+            Some(end) if row >= end.as_slice() => None,
+            _ => Some((t.id, t.shard)),
+        }
     }
+
+    /// The tablets of `table` in row order.
+    pub(crate) fn tablets_of(&self, table: TableId) -> &[TabletEntry] {
+        self.tables.get(&table).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every tablet, in table and row order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &TabletEntry> {
+        let mut ids: Vec<&TableId> = self.tables.keys().collect();
+        ids.sort();
+        ids.into_iter().flat_map(|t| self.tables[t].iter())
+    }
+
+    pub(crate) fn to_view_tablets(&self) -> Vec<ViewTablet> {
+        self.iter()
+            .map(|t| ViewTablet {
+                tablet: t.id,
+                table: t.table,
+                shard: t.shard.0,
+                start: t.start.clone(),
+                end: t.end.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The memtables of one `(tablet, family)` as a view sees them: the active one first, then
+/// frozen ones newest first. Readers of any thread or process open them through
+/// [`MemtableReader`]s.
+#[derive(Debug, Clone)]
+pub(crate) struct MemSet {
+    pub shard: ShardId,
+    /// Active first, then frozen newest first.
+    pub readers: Vec<MemtableReader>,
+    /// Header offsets within the shard arena, parallel to `readers`.
+    pub roots: Vec<u32>,
 }
 
 /// One immutable, consistent picture of the database: the tablet map, every tablet's active
@@ -28,23 +105,56 @@ impl TabletMap {
 /// in the manifest.
 #[derive(Debug)]
 pub struct View {
-    _priv: (),
+    pub(crate) version: u64,
+    pub(crate) manifest_version: ManifestVersion,
+    pub(crate) tablets: Arc<TabletMap>,
+    pub(crate) catalog: Arc<Catalog>,
+    pub(crate) memtables: HashMap<(TabletId, FamilyId), Arc<MemSet>>,
 }
 
 impl View {
     /// View version.
     pub fn version(&self) -> u64 {
-        todo!()
+        self.version
     }
 
     /// Manifest version of its SST set.
     pub fn manifest_version(&self) -> ManifestVersion {
-        todo!()
+        self.manifest_version
     }
 
     /// The tablet map.
     pub fn tablets(&self) -> &TabletMap {
-        todo!()
+        &self.tablets
+    }
+
+    pub(crate) fn memtables(&self, tablet: TabletId, family: FamilyId) -> Option<&Arc<MemSet>> {
+        self.memtables.get(&(tablet, family))
+    }
+
+    /// The record published in shared memory for this view.
+    pub(crate) fn to_record(&self) -> ViewRecord {
+        let mut memtables = Vec::new();
+        let mut keys: Vec<&(TabletId, FamilyId)> = self.memtables.keys().collect();
+        keys.sort();
+        for key in keys {
+            let set = &self.memtables[key];
+            for (age, root) in set.roots.iter().enumerate() {
+                memtables.push(ViewMemtable {
+                    tablet: key.0,
+                    family: key.1,
+                    shard: set.shard.0,
+                    age: age.min(u8::MAX as usize) as u8,
+                    root: *root,
+                });
+            }
+        }
+        ViewRecord {
+            view_version: self.version,
+            manifest_version: self.manifest_version,
+            tablets: self.tablets.to_view_tablets(),
+            memtables,
+        }
     }
 }
 
@@ -53,17 +163,18 @@ impl View {
 /// (epoch-based; no locks). Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    _view: Arc<View>,
+    pub(crate) seqno: Seqno,
+    pub(crate) view: Arc<View>,
 }
 
 impl Snapshot {
     /// The snapshot seqno.
     pub fn seqno(&self) -> Seqno {
-        todo!()
+        self.seqno
     }
 
     /// The pinned view.
     pub fn view(&self) -> &Arc<View> {
-        todo!()
+        &self.view
     }
 }
