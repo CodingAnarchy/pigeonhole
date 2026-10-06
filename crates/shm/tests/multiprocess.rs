@@ -69,8 +69,8 @@ fn commands() -> impl Iterator<Item = String> {
 /// Builds a generation, publishes view 1, then waits for `quit` (or to be killed).
 fn writer_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
     let _lock = WriterLock::acquire(file).unwrap();
-    let _presence = Presence::acquire(file).unwrap();
     let shm = ShmRegion::open(vfs, file, identity, DB_ID, Role::Writer, &small_config()).unwrap();
+    let _presence = Presence::acquire(file).unwrap();
     shm.publish_view(&view(1, 3, 8)).unwrap();
     shm.set_manifest_version(10);
     shm.reserve_seqnos(9);
@@ -294,9 +294,9 @@ impl Db {
         config: &ShmConfig,
     ) -> (WriterLock, Presence, ShmRegion) {
         let lock = WriterLock::acquire(file).unwrap();
-        let presence = Presence::acquire(file).unwrap();
         let shm =
             ShmRegion::open(&self.vfs, file, self.identity, DB_ID, Role::Writer, config).unwrap();
+        let presence = Presence::acquire(file).unwrap();
         (lock, presence, shm)
     }
 

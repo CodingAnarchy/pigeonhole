@@ -15,7 +15,7 @@ use pigeonhole_io::{
     ErrorKind, FileIdentity, FileRef, ProcessId, SharedOpen, SharedRegion, VfsRef,
 };
 
-use crate::lock::{ShmInit, alone};
+use crate::lock::{ShmInit, alone, present};
 use crate::{Error, Generation, ReaderSlot, Result, Role, ShmConfig};
 
 /// `state` values of the region header.
@@ -350,6 +350,9 @@ fn build(
             Err(e) => return Err(e.into()),
         }
     };
+    // Present before the new generation is published, so a closing process cannot pass
+    // `Presence::try_become_last` and remove it. After the probe above this is a no-op.
+    present(file)?;
 
     let generation = Generation(
         current
@@ -360,7 +363,7 @@ fn build(
     if name.len() > MAX_REGION_NAME {
         return Err(io_error(
             ErrorKind::Other,
-            "shared-memory region name exceeds 31 bytes",
+            "shared-memory region name exceeds 30 bytes (31 with the leading `/`)",
         ));
     }
     let h = ShmHeader::layout(
@@ -428,7 +431,16 @@ impl ShmRegion {
     /// ([`Error::VersionMismatch`]) unless no other process is attached.
     ///
     /// `file` must be opened for writing in both roles (the shm-init byte is an exclusive
-    /// lock). A reader with no region to attach to (no writer has built one yet) gets
+    /// lock).
+    ///
+    /// **Writer call order:** [`WriterLock::acquire`](crate::WriterLock::acquire), then this,
+    /// then [`Presence::acquire`](crate::Presence::acquire) on the same handle (decision
+    /// D37). The writer role takes the presence byte shared itself, after the layout-version
+    /// probe and before it publishes the new generation, so a closing process can never
+    /// remove a generation being built; the later `Presence::acquire` only returns the
+    /// guard. Taking `Presence` first would make the probe upgrade a lock the writer must
+    /// keep, which Windows cannot do atomically. If this fails, the presence byte may stay
+    /// held until `file` is closed. A reader with no region to attach to (no writer has built one yet) gets
     /// [`Error::Io`] with `ErrorKind::NotFound`. A writer's new generation starts its seqno
     /// counter at `config.first_seqno` (ICR 0002). `config` must pass
     /// [`ShmConfig::validate`].

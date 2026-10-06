@@ -68,9 +68,10 @@ impl Proc {
     }
 
     fn open_writer(&self) -> (WriterLock, Presence, ShmRegion) {
+        // The writer's order (decision D37): writer lock, region, then presence.
         let lock = WriterLock::acquire(&self.file).unwrap();
-        let presence = Presence::acquire(&self.file).unwrap();
         let shm = self.open(Role::Writer).unwrap();
+        let presence = Presence::acquire(&self.file).unwrap();
         (lock, presence, shm)
     }
 
@@ -283,10 +284,10 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
     // ceiling of 9 and seeds the counter past it (ICR 0002).
     let w2 = Proc::start(&sim, pid(2));
     let _lock2 = WriterLock::acquire(&w2.file).unwrap();
-    let _wp2 = Presence::acquire(&w2.file).unwrap();
     let mut config = small_config();
     config.first_seqno = 10;
     let shm2 = w2.open_with(Role::Writer, &config).unwrap();
+    let _wp2 = Presence::acquire(&w2.file).unwrap();
     assert_eq!(shm2.generation(), Generation(2));
     assert_eq!(w2.directory_generation(), 2);
     assert!(!w2.region_exists(1), "old region's name is removed");
@@ -364,14 +365,15 @@ fn layout_version_mismatch_is_refused_unless_alone() {
     std::mem::forget((lock, wp));
     let w2 = Proc::start(&sim, pid(2));
     let lock2 = WriterLock::acquire(&w2.file).unwrap();
-    let wp2 = Presence::acquire(&w2.file).unwrap();
     match w2.open(Role::Writer) {
         Err(Error::VersionMismatch { found, .. }) => assert_eq!(found, 2),
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
-    // ...and rebuilds once it is alone (its own presence lock stays shared).
+    // ...and rebuilds once it is alone. The probe ran with no presence lock held (D37) and
+    // left the byte shared, so taking `Presence` afterwards is a no-op.
     drop(rp);
     let shm2 = w2.open(Role::Writer).unwrap();
+    let wp2 = Presence::acquire(&w2.file).unwrap();
     assert_eq!(shm2.generation(), Generation(2));
     assert!(
         matches!(w2.file.lock(8193, LockMode::Exclusive), Ok(())),
@@ -475,4 +477,22 @@ fn file_backed_region_in_a_directory() {
     );
     ShmRegion::remove(&w.vfs, w.identity, config.dir.as_deref()).unwrap();
     assert!(shm_r.read_view().is_ok(), "mappings outlive the name");
+}
+
+/// The writer is present once its open publishes a generation, before it takes `Presence`:
+/// a reader closing in that window cannot pass the last-one-out check and remove the region.
+#[test]
+fn writer_open_is_present_before_presence_is_taken() {
+    let sim = SimVfs::new(14);
+    let r = Proc::start(&sim, pid(11));
+    let w = Proc::start(&sim, pid(1));
+    let _lock = WriterLock::acquire(&w.file).unwrap();
+    let shm = w.open(Role::Writer).unwrap();
+    // A reader that was present (and opens nothing more) now closes.
+    let rp = Presence::acquire(&r.file).unwrap();
+    assert!(!rp.try_become_last().unwrap(), "the writer is present");
+    drop(rp);
+    let _wp = Presence::acquire(&w.file).unwrap();
+    assert_eq!(w.directory_generation(), shm.generation().0);
+    assert!(w.region_exists(shm.generation().0));
 }
