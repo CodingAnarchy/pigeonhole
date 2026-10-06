@@ -506,11 +506,14 @@ dependencies = [
 name = "pigeonhole-compaction"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pigeonhole-cache",
  "pigeonhole-format",
  "pigeonhole-io",
  "pigeonhole-pager",
+ "pigeonhole-sim",
  "pigeonhole-sst",
+ "proptest",
 ]
 
 [[package]]
