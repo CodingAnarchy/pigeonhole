@@ -113,13 +113,16 @@ pub fn families() -> Vec<ModelFamily> {
 }
 
 fn family_options(f: &ModelFamily) -> FamilyOptions {
-    let mut o = FamilyOptions::default();
-    o.max_versions = f.max_versions;
-    o.ttl_micros = f.ttl_micros;
-    if f.i64_add {
-        o.merge_operator = "pigeonhole.i64_add".to_owned();
+    FamilyOptions {
+        max_versions: f.max_versions,
+        ttl_micros: f.ttl_micros,
+        merge_operator: if f.i64_add {
+            "pigeonhole.i64_add".to_owned()
+        } else {
+            String::new()
+        },
+        ..FamilyOptions::default()
     }
-    o
 }
 
 #[derive(Clone)]
@@ -571,6 +574,9 @@ pub fn model_dump(
 // WAL survivors
 // ---------------------------------------------------------------------------------------
 
+/// Surviving commits by seqno, and each stream's record seqnos in log order.
+pub type Survivors = (BTreeMap<Seqno, Survivor>, BTreeMap<StreamId, Vec<Seqno>>);
+
 /// A surviving commit as the WAL holds it.
 #[derive(Debug, Clone)]
 pub struct Survivor {
@@ -585,10 +591,7 @@ pub struct Survivor {
 /// Reads every stream of `db` and returns the commits recovery must apply: Batch records,
 /// and Prepare records whose coordinator stream holds the matching Commit. Also returns the
 /// per-stream list of record seqnos in log order (for the prefix check).
-pub fn wal_survivors(
-    vfs: &Arc<SimVfs>,
-    db: &Path,
-) -> Result<(BTreeMap<Seqno, Survivor>, BTreeMap<StreamId, Vec<Seqno>>), String> {
+pub fn wal_survivors(vfs: &Arc<SimVfs>, db: &Path) -> Result<Survivors, String> {
     let vfs_ref: pigeonhole_io::VfsRef = Arc::clone(vfs) as pigeonhole_io::VfsRef;
     let opened =
         pigeonhole_pager::Pager::open(&vfs_ref, db, false).map_err(|e| format!("pager: {e}"))?;
@@ -778,8 +781,7 @@ impl World {
         if self.cfg.reopen_shards.is_empty() {
             self.cfg.shards
         } else {
-            let n = self.cfg.reopen_shards[self.reopens % self.cfg.reopen_shards.len()];
-            n
+            self.cfg.reopen_shards[self.reopens % self.cfg.reopen_shards.len()]
         }
     }
 
