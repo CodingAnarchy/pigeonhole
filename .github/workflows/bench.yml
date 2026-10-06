@@ -1,0 +1,54 @@
+name: Bench
+
+# Pigeonhole-only benchmark suite at small scale. Not on pull requests: numbers from
+# shared runners are noisy and non-reference (D5), so they are tracked, never gated.
+# Comparison engines (RocksDB, SQLite, fjall) are not built here; run them locally with
+# `--features rocksdb,sqlite,fjall` (see docs/bench.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Preset size (smoke or small)"
+        required: false
+        default: small
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Passed through the environment, never interpolated into the shell script.
+  SCALE: ${{ inputs.scale || 'small' }}
+
+jobs:
+  bench:
+    name: bench (pigeonhole, ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p pigeonhole-bench
+      - name: Suite
+        run: >
+          ./target/release/phdb-bench all --scale "$SCALE"
+          --json bench.json --markdown bench.md
+      - name: Scaling gate
+        run: >
+          ./target/release/phdb-bench scaling --scale "$SCALE"
+          --json scaling.json --markdown scaling.md
+      - name: Summary
+        run: cat bench.md scaling.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_id }}
+          path: |
+            bench.json
+            bench.md
+            scaling.json
+            scaling.md

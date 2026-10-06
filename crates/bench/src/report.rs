@@ -1,0 +1,738 @@
+//! Machine-readable results, the environment fingerprint, markdown summaries and the
+//! run-to-run comparison used by the reproducibility gate.
+
+use std::fmt::Write as _;
+use std::path::Path;
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+/// Version of the JSON layout written by [`Suite`].
+pub const SUITE_FORMAT: u32 = 1;
+
+/// Where a run happened. Every result carries one; only reference hardware gates a
+/// phase, and none exists yet (decision D5), so every run is labeled non-reference.
+///
+/// ```
+/// let env = pigeonhole_bench::Environment::detect(&std::env::temp_dir());
+/// assert!(!env.reference);
+/// assert!(env.summary().contains("non-reference"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Environment {
+    /// CPU model.
+    pub cpu: String,
+    /// Logical CPUs available to the process.
+    pub cores: usize,
+    /// Total memory in bytes, when known.
+    pub memory_bytes: Option<u64>,
+    /// Operating system and version.
+    pub os: String,
+    /// CPU architecture.
+    pub arch: String,
+    /// Filesystem type of the benchmark directory, when known.
+    pub filesystem: String,
+    /// Whether this is the reference hardware (enterprise NVMe with power-loss
+    /// protection, Linux 6.x, io_uring). Set only by an operator through
+    /// `PHDB_BENCH_REFERENCE=1` on Linux; never inferred.
+    pub reference: bool,
+    /// `"reference"` or `"non-reference (D5)"`.
+    pub label: String,
+    /// `release` or `debug`. Debug numbers are meaningless; the CLI warns.
+    pub profile: String,
+    /// Git revision of the code under test, when known.
+    pub git_rev: Option<String>,
+    /// Seconds since the Unix epoch when the suite started.
+    pub started_unix: u64,
+    /// One-minute load average when the suite started, when known. Other work on the
+    /// machine skews every number; [`compare`] warns when this is high.
+    #[serde(default)]
+    pub load_average: Option<f64>,
+}
+
+fn cmd(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!s.is_empty()).then_some(s)
+}
+
+fn cpu_model() -> String {
+    if cfg!(target_os = "macos")
+        && let Some(s) = cmd("sysctl", &["-n", "machdep.cpu.brand_string"])
+    {
+        return s;
+    }
+    if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+        for key in ["model name", "Model", "Hardware", "CPU part"] {
+            if let Some(line) = info.lines().find(|l| l.starts_with(key))
+                && let Some((_, v)) = line.split_once(':')
+            {
+                return v.trim().to_owned();
+            }
+        }
+    }
+    "unknown".to_owned()
+}
+
+fn memory_bytes() -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        return cmd("sysctl", &["-n", "hw.memsize"])?.parse().ok();
+    }
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
+fn load_average() -> Option<f64> {
+    let s = if cfg!(target_os = "macos") {
+        // "{ 1.23 4.56 7.89 }"
+        cmd("sysctl", &["-n", "vm.loadavg"])?
+    } else {
+        std::fs::read_to_string("/proc/loadavg").ok()?
+    };
+    s.split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?
+        .parse()
+        .ok()
+}
+
+fn os_version() -> String {
+    let os = std::env::consts::OS;
+    let version = if cfg!(target_os = "macos") {
+        cmd("sw_vers", &["-productVersion"])
+    } else if cfg!(unix) {
+        cmd("uname", &["-r"])
+    } else {
+        None
+    };
+    match version {
+        Some(v) => format!("{os} {v}"),
+        None => os.to_owned(),
+    }
+}
+
+fn filesystem(dir: &Path) -> String {
+    let d = dir.to_string_lossy();
+    if cfg!(target_os = "linux") {
+        if let Some(t) = cmd("stat", &["-f", "-c", "%T", &d]) {
+            return t;
+        }
+    } else if cfg!(unix) {
+        // `df -P` names the mount point; `mount` lists "... on <mp> (<type>, ...)".
+        let mp = cmd("df", &["-P", &d]).and_then(|out| {
+            let last = out.lines().last()?.to_owned();
+            last.split_whitespace().nth(5).map(str::to_owned)
+        });
+        if let (Some(mp), Some(mounts)) = (mp, cmd("mount", &[])) {
+            let needle = format!(" on {mp} (");
+            if let Some(line) = mounts.lines().find(|l| l.contains(&needle)) {
+                let rest = &line[line.find(&needle).unwrap_or(0) + needle.len()..];
+                if let Some(t) = rest.split([',', ')']).next() {
+                    return t.trim().to_owned();
+                }
+            }
+        }
+    }
+    "unknown".to_owned()
+}
+
+impl Environment {
+    /// Fingerprints this machine, with the filesystem that holds `dir`.
+    pub fn detect(dir: &Path) -> Self {
+        let reference = cfg!(target_os = "linux")
+            && std::env::var("PHDB_BENCH_REFERENCE").is_ok_and(|v| v == "1");
+        Self {
+            cpu: cpu_model(),
+            cores: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            memory_bytes: memory_bytes(),
+            os: os_version(),
+            arch: std::env::consts::ARCH.to_owned(),
+            filesystem: filesystem(dir),
+            reference,
+            label: if reference {
+                "reference"
+            } else {
+                "non-reference (D5)"
+            }
+            .to_owned(),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .to_owned(),
+            git_rev: cmd("git", &["rev-parse", "--short=12", "HEAD"]),
+            started_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            load_average: load_average(),
+        }
+    }
+
+    /// Whether other work was running when the suite started: a one-minute load
+    /// average of at least one busy core.
+    pub fn busy(&self) -> bool {
+        self.load_average.is_some_and(|l| l >= 1.0)
+    }
+
+    /// One line: CPU, cores, memory, OS, filesystem and the reference label.
+    pub fn summary(&self) -> String {
+        let mem = self
+            .memory_bytes
+            .map(|b| format!(", {} GiB", b >> 30))
+            .unwrap_or_default();
+        let load = self
+            .load_average
+            .map(|l| format!(", load {l:.2}"))
+            .unwrap_or_default();
+        format!(
+            "{} ({} cores{mem}), {} {}, {}{load} [{}]",
+            self.cpu, self.cores, self.os, self.arch, self.filesystem, self.label
+        )
+    }
+
+    /// Whether two runs come from the same machine type, so comparing them means
+    /// something.
+    pub fn same_machine(&self, other: &Environment) -> bool {
+        self.cpu == other.cpu
+            && self.cores == other.cores
+            && self.os == other.os
+            && self.arch == other.arch
+            && self.filesystem == other.filesystem
+            && self.profile == other.profile
+    }
+}
+
+/// The full result of one workload against one store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// Store name.
+    pub store: String,
+    /// Store settings that affect results (shards, durability, ...).
+    pub store_config: String,
+    /// Workload name, as the CLI spells it.
+    pub workload: String,
+    /// Seed.
+    pub seed: u64,
+    /// Records loaded.
+    pub records: u64,
+    /// Operations measured.
+    pub operations: u64,
+    /// Value size in bytes.
+    pub value_len: usize,
+    /// Client threads used.
+    pub threads: usize,
+    /// Wall time of the load phase (not measured for latency).
+    pub load_secs: f64,
+    /// Wall time of the measured phase.
+    pub run_secs: f64,
+    /// Measured operations per second.
+    pub throughput: f64,
+    /// Median latency in nanoseconds.
+    pub p50_ns: u64,
+    /// 99th percentile in nanoseconds.
+    pub p99_ns: u64,
+    /// 99.9th percentile in nanoseconds.
+    pub p999_ns: u64,
+    /// Mean latency in nanoseconds.
+    pub mean_ns: u64,
+    /// Largest latency in nanoseconds.
+    pub max_ns: u64,
+}
+
+impl RunRecord {
+    /// The key that identifies "the same measurement" across two suites.
+    pub fn key(&self) -> String {
+        format!(
+            "{}/{} [{}] t={}",
+            self.workload, self.store, self.store_config, self.threads
+        )
+    }
+}
+
+/// The scaling gate: write throughput at N shards against one shard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Scaling {
+    /// Shards in the scaled run.
+    pub shards: usize,
+    /// Throughput with one shard.
+    pub single_shard_throughput: f64,
+    /// Throughput with `shards` shards.
+    pub multi_shard_throughput: f64,
+    /// `multi / (shards * single)`; the gate needs at least 0.8.
+    pub efficiency: f64,
+    /// Single-shard p99 in nanoseconds (the gate also needs no regression here,
+    /// checked by [`compare`] against a baseline).
+    pub single_shard_p99_ns: u64,
+}
+
+impl Scaling {
+    /// Minimum efficiency for the scaling gate (spec, Goals).
+    pub const GATE: f64 = 0.8;
+
+    /// Builds the gate result from a one-shard and an N-shard record.
+    pub fn new(shards: usize, single: &RunRecord, multi: &RunRecord) -> Self {
+        let efficiency = multi.throughput / (shards as f64 * single.throughput);
+        Self {
+            shards,
+            single_shard_throughput: single.throughput,
+            multi_shard_throughput: multi.throughput,
+            efficiency,
+            single_shard_p99_ns: single.p99_ns,
+        }
+    }
+
+    /// Whether the scaling target is met.
+    pub fn passes(&self) -> bool {
+        self.efficiency >= Self::GATE
+    }
+}
+
+/// Every result of one invocation, as written to `--json`.
+///
+/// ```
+/// use pigeonhole_bench::{Environment, Suite};
+///
+/// let suite = Suite::new(Environment::detect(&std::env::temp_dir()));
+/// let json = suite.to_json();
+/// assert_eq!(Suite::from_json(&json).unwrap(), suite);
+/// assert!(suite.to_markdown().contains("non-reference"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Suite {
+    /// [`SUITE_FORMAT`].
+    pub format: u32,
+    /// Where it ran.
+    pub environment: Environment,
+    /// One record per (workload, store, settings).
+    pub results: Vec<RunRecord>,
+    /// The scaling gate, when measured.
+    pub scaling: Option<Scaling>,
+}
+
+fn us(ns: u64) -> String {
+    let us = ns as f64 / 1000.0;
+    if us >= 100.0 {
+        format!("{us:.0}")
+    } else if us >= 10.0 {
+        format!("{us:.1}")
+    } else {
+        format!("{us:.2}")
+    }
+}
+
+fn ops(t: f64) -> String {
+    if t >= 1e6 {
+        format!("{:.2}M", t / 1e6)
+    } else if t >= 1e3 {
+        format!("{:.1}K", t / 1e3)
+    } else {
+        format!("{t:.0}")
+    }
+}
+
+impl Suite {
+    /// An empty suite.
+    pub fn new(environment: Environment) -> Self {
+        Self {
+            format: SUITE_FORMAT,
+            environment,
+            results: Vec::new(),
+            scaling: None,
+        }
+    }
+
+    /// Pretty JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("suite serializes")
+    }
+
+    /// Parses JSON written by [`Suite::to_json`].
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        let suite: Suite = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        if suite.format != SUITE_FORMAT {
+            return Err(format!(
+                "suite format {} (expected {SUITE_FORMAT})",
+                suite.format
+            ));
+        }
+        Ok(suite)
+    }
+
+    /// A markdown summary: environment line, one table row per result, and the
+    /// scaling verdict.
+    pub fn to_markdown(&self) -> String {
+        let env = &self.environment;
+        let mut s = String::new();
+        let _ = writeln!(s, "**Environment:** {}", env.summary());
+        let _ = writeln!(
+            s,
+            "Build: {}{}. {}",
+            env.profile,
+            env.git_rev
+                .as_ref()
+                .map(|r| format!(", rev {r}"))
+                .unwrap_or_default(),
+            if env.reference {
+                "Reference hardware."
+            } else {
+                "Not reference hardware: reported, never gates a phase (D5)."
+            }
+        );
+        s.push('\n');
+        s.push_str("| Workload | Store | Settings | Records | Ops | Threads | Ops/s | p50 µs | p99 µs | p99.9 µs |\n");
+        s.push_str("|---|---|---|--:|--:|--:|--:|--:|--:|--:|\n");
+        for r in &self.results {
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                r.workload,
+                r.store,
+                r.store_config,
+                r.records,
+                r.operations,
+                r.threads,
+                ops(r.throughput),
+                us(r.p50_ns),
+                us(r.p99_ns),
+                us(r.p999_ns)
+            );
+        }
+        if let Some(sc) = &self.scaling {
+            let _ = writeln!(
+                s,
+                "\n**Scaling gate:** {} shards reach {} ops/s against {} ops/s on one shard: \
+                 efficiency {:.2} (gate ≥ {:.1}) — {}.",
+                sc.shards,
+                ops(sc.multi_shard_throughput),
+                ops(sc.single_shard_throughput),
+                sc.efficiency,
+                Scaling::GATE,
+                if sc.passes() { "pass" } else { "fail" }
+            );
+        }
+        s
+    }
+}
+
+/// How far a candidate run may drift from a baseline and still count as the same
+/// result. Relative: 0.15 allows ±15%.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tolerance {
+    /// Throughput.
+    pub throughput: f64,
+    /// Median latency.
+    pub p50: f64,
+    /// 99th percentile. Tails are noisier, so this is looser.
+    pub p99: f64,
+}
+
+impl Default for Tolerance {
+    /// The documented reproducibility tolerance (docs/bench.md): ±15% throughput and
+    /// p50, ±30% p99. p99.9 and max are reported but not checked.
+    fn default() -> Self {
+        Self::uniform(0.15)
+    }
+}
+
+impl Tolerance {
+    /// `t` for throughput and p50, `2t` for p99.
+    pub fn uniform(t: f64) -> Self {
+        Self {
+            throughput: t,
+            p50: t,
+            p99: 2.0 * t,
+        }
+    }
+}
+
+/// One metric of one record, baseline against candidate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delta {
+    /// Record key (see [`RunRecord::key`]).
+    pub key: String,
+    /// `throughput`, `p50`, `p99` or `p99.9`.
+    pub metric: &'static str,
+    /// Baseline value.
+    pub baseline: f64,
+    /// Candidate value.
+    pub candidate: f64,
+    /// `candidate / baseline - 1`.
+    pub change: f64,
+    /// Allowed `|change|`; `None` for informational metrics.
+    pub allowed: Option<f64>,
+}
+
+impl Delta {
+    /// Whether this metric is within tolerance (informational metrics always are).
+    pub fn ok(&self) -> bool {
+        self.allowed.is_none_or(|a| self.change.abs() <= a)
+    }
+}
+
+/// The result of [`compare`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comparison {
+    /// Every compared metric.
+    pub deltas: Vec<Delta>,
+    /// Records present in only one suite.
+    pub unmatched: Vec<String>,
+    /// Set when the suites ran on different machines or build profiles, or on a busy
+    /// machine.
+    pub environment_warning: Option<String>,
+}
+
+impl Comparison {
+    /// Whether every checked metric is within tolerance and every record matched.
+    pub fn passes(&self) -> bool {
+        self.unmatched.is_empty() && self.deltas.iter().all(Delta::ok)
+    }
+
+    /// A markdown report of the comparison.
+    pub fn to_markdown(&self) -> String {
+        let mut s = String::new();
+        if let Some(w) = &self.environment_warning {
+            let _ = writeln!(s, "**Warning:** {w}\n");
+        }
+        s.push_str("| Result | Metric | Baseline | Candidate | Change | Allowed | |\n");
+        s.push_str("|---|---|--:|--:|--:|--:|---|\n");
+        for d in &self.deltas {
+            let fmt = |v: f64| {
+                if d.metric == "throughput" {
+                    ops(v)
+                } else {
+                    format!("{} µs", us(v as u64))
+                }
+            };
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {:+.1}% | {} | {} |",
+                d.key,
+                d.metric,
+                fmt(d.baseline),
+                fmt(d.candidate),
+                d.change * 100.0,
+                d.allowed
+                    .map(|a| format!("±{:.0}%", a * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                if d.ok() { "ok" } else { "**FAIL**" }
+            );
+        }
+        for u in &self.unmatched {
+            let _ = writeln!(s, "\nOnly in one run: {u}");
+        }
+        let _ = writeln!(
+            s,
+            "\n**{}**",
+            if self.passes() {
+                "Runs agree within tolerance."
+            } else {
+                "Runs disagree beyond tolerance."
+            }
+        );
+        s
+    }
+}
+
+/// Compares `candidate` against `baseline`, record by record (matched by
+/// [`RunRecord::key`]). This is the reproducibility gate: two runs of the same suite on
+/// the same machine must agree within `tolerance`.
+///
+/// ```
+/// use pigeonhole_bench::{Environment, RunRecord, Suite, Tolerance, compare};
+///
+/// let rec = |tput: f64| RunRecord {
+///     store: "pigeonhole".into(), store_config: String::new(), workload: "ycsb-c".into(),
+///     seed: 1, records: 10, operations: 10, value_len: 8, threads: 1, load_secs: 0.0,
+///     run_secs: 1.0, throughput: tput, p50_ns: 1000, p99_ns: 2000, p999_ns: 3000,
+///     mean_ns: 1100, max_ns: 5000,
+/// };
+/// let env = Environment::detect(&std::env::temp_dir());
+/// let mut a = Suite::new(env.clone());
+/// a.results.push(rec(100_000.0));
+/// let mut b = Suite::new(env);
+/// b.results.push(rec(110_000.0));
+/// assert!(compare(&a, &b, Tolerance::default()).passes());
+/// b.results[0].throughput = 50_000.0;
+/// assert!(!compare(&a, &b, Tolerance::default()).passes());
+/// ```
+pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Comparison {
+    let mut deltas = Vec::new();
+    let mut unmatched = Vec::new();
+    for b in &baseline.results {
+        let Some(c) = candidate.results.iter().find(|c| c.key() == b.key()) else {
+            unmatched.push(b.key());
+            continue;
+        };
+        let metrics: [(&'static str, f64, f64, Option<f64>); 4] = [
+            (
+                "throughput",
+                b.throughput,
+                c.throughput,
+                Some(tolerance.throughput),
+            ),
+            ("p50", b.p50_ns as f64, c.p50_ns as f64, Some(tolerance.p50)),
+            ("p99", b.p99_ns as f64, c.p99_ns as f64, Some(tolerance.p99)),
+            ("p99.9", b.p999_ns as f64, c.p999_ns as f64, None),
+        ];
+        for (metric, bv, cv, allowed) in metrics {
+            let change = if bv > 0.0 { cv / bv - 1.0 } else { 0.0 };
+            deltas.push(Delta {
+                key: b.key(),
+                metric,
+                baseline: bv,
+                candidate: cv,
+                change,
+                allowed,
+            });
+        }
+    }
+    for c in &candidate.results {
+        if !baseline.results.iter().any(|b| b.key() == c.key()) {
+            unmatched.push(c.key());
+        }
+    }
+    let (b, c) = (&baseline.environment, &candidate.environment);
+    let environment_warning = if !b.same_machine(c) {
+        Some(format!(
+            "the runs come from different machines or builds ({} vs {}); the \
+             reproducibility tolerance only applies to one machine",
+            b.summary(),
+            c.summary()
+        ))
+    } else if b.busy() || c.busy() {
+        Some(format!(
+            "the machine was busy when a run started (load {:.2} and {:.2}); other work \
+             skews every number",
+            b.load_average.unwrap_or(0.0),
+            c.load_average.unwrap_or(0.0)
+        ))
+    } else {
+        None
+    };
+    Comparison {
+        deltas,
+        unmatched,
+        environment_warning,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(workload: &str, tput: f64, p50: u64, p99: u64) -> RunRecord {
+        RunRecord {
+            store: "pigeonhole".into(),
+            store_config: "shards=1".into(),
+            workload: workload.into(),
+            seed: 1,
+            records: 100,
+            operations: 100,
+            value_len: 100,
+            threads: 1,
+            load_secs: 0.1,
+            run_secs: 0.1,
+            throughput: tput,
+            p50_ns: p50,
+            p99_ns: p99,
+            p999_ns: p99 * 2,
+            mean_ns: p50,
+            max_ns: p99 * 3,
+        }
+    }
+
+    fn suite(records: Vec<RunRecord>) -> Suite {
+        let mut s = Suite::new(Environment::detect(Path::new(".")));
+        s.results = records;
+        s
+    }
+
+    #[test]
+    fn identical_runs_pass() {
+        let a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
+        let mut a = a;
+        a.environment.load_average = Some(0.2);
+        let cmp = compare(&a, &a, Tolerance::default());
+        assert!(cmp.passes());
+        assert!(cmp.environment_warning.is_none());
+        let mut busy = a.clone();
+        busy.environment.load_average = Some(3.5);
+        assert!(busy.environment.summary().contains("load 3.50"));
+        let cmp = compare(&a, &busy, Tolerance::default());
+        assert!(cmp.passes(), "a busy machine warns but does not fail on its own");
+        assert!(cmp.environment_warning.unwrap().contains("busy"));
+        assert_eq!(cmp.deltas.len(), 4);
+    }
+
+    #[test]
+    fn each_checked_metric_can_fail() {
+        let a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
+        for b in [
+            rec("ycsb-a", 0.8e5, 1000, 5000),
+            rec("ycsb-a", 1e5, 1200, 5000),
+            rec("ycsb-a", 1e5, 1000, 7000),
+        ] {
+            let cmp = compare(&a, &suite(vec![b]), Tolerance::default());
+            assert!(!cmp.passes());
+            assert!(cmp.to_markdown().contains("FAIL"));
+        }
+        // p99.9 is informational only.
+        let mut b = rec("ycsb-a", 1e5, 1000, 5000);
+        b.p999_ns *= 10;
+        assert!(compare(&a, &suite(vec![b]), Tolerance::default()).passes());
+    }
+
+    #[test]
+    fn unmatched_records_fail() {
+        let a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
+        let b = suite(vec![rec("ycsb-b", 1e5, 1000, 5000)]);
+        let cmp = compare(&a, &b, Tolerance::default());
+        assert!(!cmp.passes());
+        assert_eq!(cmp.unmatched.len(), 2);
+    }
+
+    #[test]
+    fn different_machines_warn() {
+        let a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
+        let mut b = a.clone();
+        b.environment.cpu = "Some Other CPU".into();
+        assert!(
+            compare(&a, &b, Tolerance::default())
+                .environment_warning
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn json_round_trip_and_markdown() {
+        let mut a = suite(vec![rec("ycsb-a", 1.5e6, 1500, 25_000)]);
+        a.scaling = Some(Scaling::new(
+            4,
+            &rec("skewed-multi-shard", 1e5, 1000, 5000),
+            &rec("skewed-multi-shard", 3.6e5, 1000, 5000),
+        ));
+        let back = Suite::from_json(&a.to_json()).unwrap();
+        assert_eq!(back, a);
+        let md = a.to_markdown();
+        assert!(md.contains("| ycsb-a | pigeonhole | shards=1 |"));
+        assert!(md.contains("1.50M"));
+        assert!(md.contains("efficiency 0.90"));
+        assert!(md.contains("pass"));
+        assert!(Suite::from_json("{}").is_err());
+    }
+
+    #[test]
+    fn environment_is_never_reference_by_default() {
+        let env = Environment::detect(Path::new("."));
+        if std::env::var("PHDB_BENCH_REFERENCE").is_err() {
+            assert!(!env.reference);
+            assert_eq!(env.label, "non-reference (D5)");
+        }
+        assert!(env.cores >= 1);
+    }
+}
