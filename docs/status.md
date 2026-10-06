@@ -7,8 +7,8 @@ Live progress against the [build plan](design/spec.md#build-plan). Updated by th
 | 1. Bootstrap — workspace, CI, contributor docs | done |
 | 2. Interface freeze — public traits/types for every crate, `FORMAT.md` | done ([#1](https://github.com/CodingAnarchy/pigeonhole/pull/1); see [interfaces.md](design/interfaces.md)) |
 | 3. Foundations — `format`, `io`, `sim` | done ([#2](https://github.com/CodingAnarchy/pigeonhole/pull/2), [#3](https://github.com/CodingAnarchy/pigeonhole/pull/3), [#4](https://github.com/CodingAnarchy/pigeonhole/pull/4)) |
-| 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | six merged ([#6](https://github.com/CodingAnarchy/pigeonhole/pull/6), [#7](https://github.com/CodingAnarchy/pigeonhole/pull/7), [#10](https://github.com/CodingAnarchy/pigeonhole/pull/10), [#11](https://github.com/CodingAnarchy/pigeonhole/pull/11), [#13](https://github.com/CodingAnarchy/pigeonhole/pull/13)); decisions audit [#27](https://github.com/CodingAnarchy/pigeonhole/pull/27); `sst` in progress |
-| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | `engine` milestone A in progress (parallel with `sst`) |
+| 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | done — all seven merged, last [#30](https://github.com/CodingAnarchy/pigeonhole/pull/30) (`sst`) |
+| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | `compaction` and `engine` milestone A in progress |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
