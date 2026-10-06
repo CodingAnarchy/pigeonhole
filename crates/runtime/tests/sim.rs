@@ -264,7 +264,10 @@ fn different_seeds_differ() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(24))]
+    // Honors PROPTEST_CASES (CI sets it low); 24 cases otherwise.
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(24)
+    ))]
     #[test]
     fn deterministic_for_any_seed(seed in any::<u64>()) {
         let a = run(seed, 300);
