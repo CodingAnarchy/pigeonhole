@@ -2132,7 +2132,19 @@ pub fn run(seed: u64, cfg: &Config) -> Result<Stats, Failure> {
         .open(Path::new("/db/probe"), OpenOptions::read_write_create())
         .expect("probe");
     let model = new_model();
-    let store = match Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families()) {
+    // The first open and table creation run without random I/O errors (a crash point can
+    // still hit them); the plan applies from the first operation on.
+    if cfg.faults.io_error_ppm > 0 {
+        let mut plan = cfg.faults.clone();
+        plan.io_error_ppm = 0;
+        plan.crash_after_ops = cfg.crash_at;
+        vfs.set_faults(plan);
+    }
+    let opened = Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families());
+    if cfg.faults.io_error_ppm > 0 && cfg.crash_at.is_none() {
+        vfs.set_faults(cfg.faults.clone());
+    }
+    let store = match opened {
         Ok(s) => s,
         Err(e) => {
             // A crash-at-every-point sweep can hit the create itself.
