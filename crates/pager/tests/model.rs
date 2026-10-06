@@ -260,7 +260,7 @@ proptest! {
     #![proptest_config(common::config(128))]
 
     #[test]
-    fn allocator_matches_model(seed in any::<u64>(), ops in proptest::collection::vec(op(), 1..200)) {
+    fn allocator_matches_model(seed in any::<u64>(), ops in proptest::collection::vec(op(), 1..common::miri_scaled(200, 24) as usize)) {
         let mut h = Harness::new(seed);
         for op in &ops {
             h.apply(op);

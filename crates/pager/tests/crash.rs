@@ -333,7 +333,9 @@ fn sweep(name: &str, plan: FaultPlan, seeds: &[u64]) {
         relocations += coverage.relocations;
         let total = clean.mutating_ops();
         let mut recovered_versions = std::collections::BTreeSet::new();
-        for n in 1..=total {
+        // Under Miri, crash at a handful of evenly spaced points instead of every one.
+        let stride = common::miri_scaled(1, total.div_ceil(6)) as usize;
+        for n in (1..=total).step_by(stride) {
             let mut p = plan.clone();
             p.crash_after_ops = Some(n);
             let sim = SimVfs::with_faults(seed, p);
@@ -363,7 +365,7 @@ fn sweep(name: &str, plan: FaultPlan, seeds: &[u64]) {
         }
         // The sweep really crossed every commit.
         assert!(
-            recovered_versions.len() as u64 >= STEPS,
+            cfg!(miri) || recovered_versions.len() as u64 >= STEPS,
             "{name}: recovered only {recovered_versions:?}"
         );
     }
@@ -374,6 +376,9 @@ fn sweep(name: &str, plan: FaultPlan, seeds: &[u64]) {
 /// a hole below a published extent, which a random seed does not always produce).
 fn seeds() -> Vec<u64> {
     const RELOCATES: u64 = 3_766_993_824_058_584_241;
+    if cfg!(miri) {
+        return vec![RELOCATES];
+    }
     let s = common::seed();
     vec![s, s.wrapping_add(1), RELOCATES]
 }
@@ -401,7 +406,7 @@ fn reordered_unsynced_writes_at_every_write_point() {
 #[test]
 fn process_crash_keeps_every_completed_write() {
     let seed = common::seed();
-    for crash_at in 1..=STEPS {
+    for crash_at in (1..=STEPS).step_by(common::miri_scaled(1, 4) as usize) {
         let sim = SimVfs::new(seed);
         let vfs: VfsRef = sim.clone();
         let mut rng = Rng(seed);

@@ -192,6 +192,10 @@ fn submit_commit_root_on_sim() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "real files: fallocate and fsync are foreign calls Miri cannot run"
+)]
 fn submit_commit_root_on_real_files() {
     let dir = std::env::temp_dir().join(format!("pigeonhole-pager-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

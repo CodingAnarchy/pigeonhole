@@ -6,7 +6,13 @@ use proptest::test_runner::{Config, RngSeed};
 
 /// A proptest config with a fixed seed: `PROPTEST_RNG_SEED` if set, otherwise a fresh random
 /// one. The seed is printed so a failing run (whose output cargo shows) can be replayed.
+/// `cases` is the default; `PROPTEST_CASES` overrides it, and Miri caps it at 2.
 pub fn config(cases: u32) -> Config {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(cases);
+    let cases = if cfg!(miri) { cases.min(2) } else { cases };
     let seed = std::env::var("PROPTEST_RNG_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -30,7 +36,16 @@ pub fn seed() -> u64 {
     seed
 }
 
+/// Miri is roughly a thousand times slower: tests scale their sweeps down by this much.
+pub fn miri_scaled(full: u64, under_miri: u64) -> u64 {
+    if cfg!(miri) { under_miri } else { full }
+}
+
 fn random_seed() -> u64 {
+    // Miri isolates the clock unless isolation is disabled; any fixed seed will do there.
+    if cfg!(miri) {
+        return 0x5EED;
+    }
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(
