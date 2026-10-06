@@ -55,11 +55,30 @@ pub enum ErrorCode {
     NoReaderSlot = 22,
     /// A commit is too large for one WAL record.
     RecordTooLarge = 23,
-    /// Writes are stalled and the call asked not to wait.
+    /// Writes are stalled and the call asked not to wait. In Phase 1 this means the
+    /// memtable arena is full, which nothing frees until the engine flushes to SSTs: not
+    /// retryable; raise `Options::memtable_budget`.
     Busy = 24,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
+///
+/// Branch on [`Error::code`]; the message is for people and may change between releases.
+///
+/// ```
+/// use pigeonhole::{ErrorCode, Family, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+/// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+/// let err = t.mutate(b"row").put("nope", b"q", b"v").commit().unwrap_err();
+/// assert_eq!(err.code(), ErrorCode::FamilyNotFound);
+/// assert!(err.message().contains("nope"));
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     code: ErrorCode,
@@ -67,6 +86,13 @@ pub struct Error {
 }
 
 impl Error {
+    pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
     /// The stable code.
     pub fn code(&self) -> ErrorCode {
         self.code
@@ -80,14 +106,56 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for Error {}
 
 impl From<pigeonhole_engine::Error> for Error {
+    /// Every engine error maps to exactly one code; the message is the engine's.
     fn from(e: pigeonhole_engine::Error) -> Self {
-        todo!()
+        use pigeonhole_engine::Error as E;
+        let code = match &e {
+            E::Io(_) => ErrorCode::Io,
+            E::Corruption(_) => ErrorCode::Corruption,
+            E::WriterLocked => ErrorCode::WriterLocked,
+            E::ShmVersionMismatch { .. } => ErrorCode::ShmVersionMismatch,
+            E::ShmUnavailable => ErrorCode::ShmUnavailable,
+            E::UnsupportedFormat(_) => ErrorCode::UnsupportedFormat,
+            E::NetworkFilesystem => ErrorCode::NetworkFilesystem,
+            E::TableNotFound(_) => ErrorCode::TableNotFound,
+            E::TableExists(_) => ErrorCode::TableExists,
+            E::FamilyNotFound(_) => ErrorCode::FamilyNotFound,
+            E::FamilyExists(_) => ErrorCode::FamilyExists,
+            E::UnknownMergeOperator(_) => ErrorCode::UnknownMergeOperator,
+            E::Merge(_) => ErrorCode::MergeFailed,
+            E::Conflict => ErrorCode::Conflict,
+            E::ReadOnly => ErrorCode::ReadOnly,
+            E::KeyTooLarge => ErrorCode::KeyTooLarge,
+            E::ValueTooLarge => ErrorCode::ValueTooLarge,
+            E::NoSpace => ErrorCode::NoSpace,
+            E::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            E::Unsupported(_) => ErrorCode::Unsupported,
+            E::Closed => ErrorCode::Closed,
+            E::NoReaderSlot => ErrorCode::NoReaderSlot,
+            E::RecordTooLarge => ErrorCode::RecordTooLarge,
+            E::Busy => ErrorCode::Busy,
+            // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
+            // here surfaces as `Io` (the message names it) until it gets its own code; the
+            // mapping test lists every current variant.
+            _ => ErrorCode::Io,
+        };
+        let message = match &e {
+            // Built from the fields: the message does not depend on the operator's `Display`.
+            E::Merge(m) => format!("merge operator {:?} failed: {}", m.operator, m.message),
+            // Until the engine flushes memtables to SSTs (engine Milestone B, #37) nothing
+            // frees the arena, so this is not a transient stall yet.
+            E::Busy => "memtable arena full: raise Options::memtable_budget (flush to SSTs \
+                        arrives with engine Milestone B, #37)"
+                .to_owned(),
+            _ => e.to_string(),
+        };
+        Self::new(code, message)
     }
 }

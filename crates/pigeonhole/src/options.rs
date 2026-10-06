@@ -2,38 +2,82 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pigeonhole_engine::{
+    CachePriority, CompactionStyle, Compression, EngineOptions, FamilyOptions,
+};
 use pigeonhole_format::Durability;
+use pigeonhole_io::VfsRef;
 
-use crate::MergeOperator;
+use crate::{ErrorCode, MergeOperator, Result};
 
-/// `n` days, for TTLs: `Family::default().ttl(days(30))`.
+/// Name of the built-in `i64` add operator, the default operator of every family.
+pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
+
+/// `n` days, for TTLs: `Family::default().ttl(days(30))`. Saturates instead of overflowing.
 pub fn days(n: u64) -> Duration {
-    Duration::from_secs(n * 86_400)
+    Duration::from_secs(n.saturating_mul(86_400))
 }
 
 /// Database options. Process-local: nothing here is stored in the file, so reopening with
 /// different options changes them. Zero config is valid.
+///
+/// ```
+/// use pigeonhole::{Durability, Options};
+///
+/// let options = Options::default()
+///     .durability(Durability::Buffered)
+///     .shards(2)
+///     .memtable_budget(8 << 20)
+///     .block_cache(64 << 20);
+/// # let _ = options;
+/// ```
 #[derive(Debug, Clone)]
 pub struct Options {
-    _priv: (),
+    durability: Durability,
+    shards: usize,
+    compaction_cores: usize,
+    memtable_budget: u64,
+    block_cache: Option<usize>,
+    row_cache: usize,
+    shm_dir: Option<PathBuf>,
+    create_if_missing: bool,
+    merge_operators: Vec<Arc<dyn MergeOperator>>,
+    allow_unregistered_merge_operators: bool,
+    vfs: Option<VfsRef>,
+    wal_segment_size: Option<u64>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        todo!()
+        Self {
+            durability: Durability::GroupSync,
+            shards: 0,
+            compaction_cores: 0,
+            memtable_budget: 64 << 20,
+            block_cache: None,
+            row_cache: 0,
+            shm_dir: None,
+            create_if_missing: true,
+            merge_operators: Vec::new(),
+            allow_unregistered_merge_operators: false,
+            vfs: None,
+            wal_segment_size: None,
+        }
     }
 }
 
 impl Options {
     /// Writer default durability (default [`Durability::GroupSync`]).
-    pub fn durability(self, durability: Durability) -> Self {
-        todo!()
+    pub fn durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
     }
 
     /// Number of shard threads (default: CPUs available to the process). `1` is a valid
     /// single-threaded configuration.
-    pub fn shards(self, n: usize) -> Self {
-        todo!()
+    pub fn shards(mut self, n: usize) -> Self {
+        self.shards = n;
+        self
     }
 
     /// Dedicate `k` extra pinned threads to flush and compaction.
@@ -42,88 +86,118 @@ impl Options {
     /// starts no threads, so it fails with
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when `k > 0`
     /// (decision D40); flush and compaction then run on the shards you drive.
-    pub fn compaction_cores(self, k: usize) -> Self {
-        todo!()
+    pub fn compaction_cores(mut self, k: usize) -> Self {
+        self.compaction_cores = k;
+        self
     }
 
     /// Memtable arena per shard, in bytes (default 64 MiB).
-    pub fn memtable_budget(self, bytes: u64) -> Self {
-        todo!()
+    pub fn memtable_budget(mut self, bytes: u64) -> Self {
+        self.memtable_budget = bytes;
+        self
     }
 
     /// Block cache capacity in bytes.
-    pub fn block_cache(self, bytes: usize) -> Self {
-        todo!()
+    pub fn block_cache(mut self, bytes: usize) -> Self {
+        self.block_cache = Some(bytes);
+        self
     }
 
     /// Row cache capacity in bytes (default 0: disabled).
-    pub fn row_cache(self, bytes: usize) -> Self {
-        todo!()
+    pub fn row_cache(mut self, bytes: usize) -> Self {
+        self.row_cache = bytes;
+        self
     }
 
     /// Put the shared-memory file in `dir` (for example a tmpfs mount) instead of the
     /// memory-backed default.
-    pub fn shm_dir(self, dir: impl Into<PathBuf>) -> Self {
-        todo!()
+    pub fn shm_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.shm_dir = Some(dir.into());
+        self
     }
 
     /// Create the file if missing (default true).
-    pub fn create_if_missing(self, yes: bool) -> Self {
-        todo!()
+    pub fn create_if_missing(mut self, yes: bool) -> Self {
+        self.create_if_missing = yes;
+        self
     }
 
     /// Registers a merge operator, referenced by families through its name.
-    pub fn merge_operator(self, op: Arc<dyn MergeOperator>) -> Self {
-        todo!()
+    ///
+    /// Phase 2: the engine resolves only the built-in `pigeonhole.i64_add` so far, so a
+    /// family that names any other operator is refused with
+    /// [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator).
+    pub fn merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
+        self.merge_operators.push(op);
+        self
     }
 
     /// Open even if a family names an unregistered merge operator: the handle is read-only,
     /// compaction is off, and reads of affected cells fail with
     /// [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator).
-    pub fn allow_unregistered_merge_operators(self, yes: bool) -> Self {
-        todo!()
+    pub fn allow_unregistered_merge_operators(mut self, yes: bool) -> Self {
+        self.allow_unregistered_merge_operators = yes;
+        self
     }
 
     /// Run on a custom filesystem implementation. Used by the deterministic simulation
     /// suites; applications never need it.
     #[doc(hidden)]
-    pub fn vfs(self, vfs: pigeonhole_io::VfsRef) -> Self {
-        todo!()
+    pub fn vfs(mut self, vfs: pigeonhole_io::VfsRef) -> Self {
+        self.vfs = Some(vfs);
+        self
+    }
+
+    /// WAL segment size in bytes (default 64 MiB; a multiple of 32 KiB, decision D43). A test
+    /// hook (ICR 0005): small segments keep simulated opens fast. It also lowers the largest
+    /// value a commit may carry (decision D16). Applications never need it.
+    #[doc(hidden)]
+    pub fn wal_segment_size(mut self, bytes: u64) -> Self {
+        self.wal_segment_size = Some(bytes);
+        self
     }
 }
 
 /// Options for a read-only handle in another process.
-#[derive(Debug, Clone)]
+///
+/// ```
+/// use pigeonhole::ReaderOptions;
+///
+/// let options = ReaderOptions::default().block_cache(32 << 20);
+/// # let _ = options;
+/// ```
+#[derive(Debug, Clone, Default)]
 pub struct ReaderOptions {
-    _priv: (),
-}
-
-impl Default for ReaderOptions {
-    fn default() -> Self {
-        todo!()
-    }
+    block_cache: Option<usize>,
+    shm_dir: Option<PathBuf>,
+    merge_operators: Vec<Arc<dyn MergeOperator>>,
+    vfs: Option<VfsRef>,
 }
 
 impl ReaderOptions {
     /// Block cache capacity in bytes (each reader process has its own).
-    pub fn block_cache(self, bytes: usize) -> Self {
-        todo!()
+    pub fn block_cache(mut self, bytes: usize) -> Self {
+        self.block_cache = Some(bytes);
+        self
     }
 
     /// Where the writer put the shared-memory file, if not the default.
-    pub fn shm_dir(self, dir: impl Into<PathBuf>) -> Self {
-        todo!()
+    pub fn shm_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.shm_dir = Some(dir.into());
+        self
     }
 
     /// Registers a merge operator.
-    pub fn merge_operator(self, op: Arc<dyn MergeOperator>) -> Self {
-        todo!()
+    pub fn merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
+        self.merge_operators.push(op);
+        self
     }
 
     /// Custom filesystem (simulation).
     #[doc(hidden)]
-    pub fn vfs(self, vfs: pigeonhole_io::VfsRef) -> Self {
-        todo!()
+    pub fn vfs(mut self, vfs: pigeonhole_io::VfsRef) -> Self {
+        self.vfs = Some(vfs);
+        self
     }
 }
 
@@ -152,71 +226,186 @@ pub enum Compaction {
 }
 
 /// A column family's policy. Stored in the file with the family.
+///
+/// The defaults: every version kept, no TTL, 10 bloom bits per key, LZ4 blocks of 16 KiB,
+/// values over 4 KiB separated (Phase 2), the built-in `pigeonhole.i64_add` merge operator
+/// (so `incr` works on any family), normal cache priority, leveled compaction.
+///
+/// Because every family carries the `i64` add operator, a column holds either plain values or
+/// a counter: an `incr` on top of a base that is not an 8-byte `i64` fails at read with
+/// [`ErrorCode::MergeFailed`] (decision D41). Use `merge_operator("")` for a family without
+/// one.
+///
+/// ```
+/// use pigeonhole::{days, Family, Priority};
+///
+/// let hot = Family::default().max_versions(1).cache_priority(Priority::High);
+/// let expiring = Family::default().ttl(days(30)).uncompressed();
+/// assert_ne!(hot, expiring);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Family {
-    _priv: (),
+    options: FamilyOptions,
 }
 
 impl Default for Family {
     fn default() -> Self {
-        todo!()
+        Self {
+            options: FamilyOptions {
+                merge_operator: I64_ADD.to_owned(),
+                ..FamilyOptions::default()
+            },
+        }
     }
 }
 
 impl Family {
     /// Keep at most `n` versions per column (0 keeps all).
-    pub fn max_versions(self, n: u32) -> Self {
-        todo!()
+    pub fn max_versions(mut self, n: u32) -> Self {
+        self.options.max_versions = n;
+        self
     }
 
     /// Cells older than `ttl` (by timestamp) expire.
-    pub fn ttl(self, ttl: Duration) -> Self {
-        todo!()
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.options.ttl_micros = u64::try_from(ttl.as_micros()).unwrap_or(u64::MAX);
+        self
     }
 
     /// Bloom filter bits per key (0 disables filters; default 10).
-    pub fn bloom_bits(self, bits: u8) -> Self {
-        todo!()
+    pub fn bloom_bits(mut self, bits: u8) -> Self {
+        self.options.bloom_bits = bits;
+        self
     }
 
-    /// Store values longer than `bytes` in blob extents (default 4096; Phase 2).
-    pub fn blob_threshold(self, bytes: u32) -> Self {
-        todo!()
+    /// Store values longer than `bytes` in blob extents (default 4096; Phase 2). Stored with
+    /// the family now; values stay inline until blob separation lands.
+    pub fn blob_threshold(mut self, bytes: u32) -> Self {
+        self.options.blob_threshold = bytes;
+        self
     }
 
     /// LZ4 block compression (the default).
-    pub fn lz4(self) -> Self {
-        todo!()
+    pub fn lz4(mut self) -> Self {
+        self.options.compression = Compression::Lz4;
+        self
     }
 
-    /// zstd block compression at `level` (Phase 2).
-    pub fn zstd(self, level: i8) -> Self {
-        todo!()
+    /// zstd block compression at `level` (Phase 2). Until then, creating a table or family
+    /// with it fails with [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported).
+    pub fn zstd(mut self, level: i8) -> Self {
+        self.options.compression = Compression::Zstd;
+        self.options.compression_level = level;
+        self
     }
 
     /// No block compression (hot, small families).
-    pub fn uncompressed(self) -> Self {
-        todo!()
+    pub fn uncompressed(mut self) -> Self {
+        self.options.compression = Compression::None;
+        self
     }
 
     /// Target uncompressed data-block size in bytes (default 16 KiB).
-    pub fn block_size(self, bytes: u32) -> Self {
-        todo!()
+    pub fn block_size(mut self, bytes: u32) -> Self {
+        self.options.block_size = bytes;
+        self
     }
 
     /// Merge operator for this family, by registered name. `incr` needs none: it uses the
-    /// built-in `pigeonhole.i64_add`, which is the default operator.
-    pub fn merge_operator(self, name: &str) -> Self {
-        todo!()
+    /// built-in `pigeonhole.i64_add`, which is the default operator. An empty name leaves
+    /// the family without one, so merge operands (and `incr`) are refused at commit.
+    pub fn merge_operator(mut self, name: &str) -> Self {
+        name.clone_into(&mut self.options.merge_operator);
+        self
     }
 
     /// Block-cache priority.
-    pub fn cache_priority(self, priority: Priority) -> Self {
-        todo!()
+    pub fn cache_priority(mut self, priority: Priority) -> Self {
+        self.options.cache_priority = match priority {
+            Priority::Low => CachePriority::Low,
+            Priority::Normal => CachePriority::Normal,
+            Priority::High => CachePriority::High,
+        };
+        self
     }
 
-    /// Compaction strategy.
-    pub fn compaction(self, strategy: Compaction) -> Self {
-        todo!()
+    /// Compaction strategy. `Tiered` and `FifoByTime` are Phase 2: until then, creating a
+    /// table or family with them fails with
+    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported).
+    pub fn compaction(mut self, strategy: Compaction) -> Self {
+        self.options.compaction = match strategy {
+            Compaction::Leveled => CompactionStyle::Leveled,
+            Compaction::Tiered => CompactionStyle::Tiered,
+            Compaction::FifoByTime => CompactionStyle::FifoByTime,
+        };
+        self
     }
+}
+
+impl Options {
+    /// The engine configuration these options describe.
+    pub(crate) fn to_engine(&self) -> EngineOptions {
+        let vfs = self.vfs.clone().unwrap_or_else(default_vfs);
+        let mut o = EngineOptions::new(vfs);
+        o.create_if_missing = self.create_if_missing;
+        o.shards = self.shards;
+        o.compaction_threads = self.compaction_cores;
+        o.durability = self.durability;
+        o.memtable_budget = self.memtable_budget;
+        o.memtable_freeze_bytes = self.memtable_budget / 4;
+        if let Some(bytes) = self.block_cache {
+            o.block_cache_bytes = bytes;
+        }
+        o.row_cache_bytes = self.row_cache;
+        o.shm_dir.clone_from(&self.shm_dir);
+        o.allow_unregistered_merge = self.allow_unregistered_merge_operators;
+        if let Some(bytes) = self.wal_segment_size {
+            o.wal.segment_size = bytes;
+        }
+        // Custom operators (`merge_operators`) are kept for Phase 2: the engine resolves only
+        // the built-in `pigeonhole.i64_add` so far, and refuses a family naming any other.
+        o
+    }
+}
+
+impl ReaderOptions {
+    /// The engine configuration these options describe.
+    pub(crate) fn to_engine(&self) -> EngineOptions {
+        let vfs = self.vfs.clone().unwrap_or_else(default_vfs);
+        let mut o = EngineOptions::new(vfs);
+        if let Some(bytes) = self.block_cache {
+            o.block_cache_bytes = bytes;
+        }
+        o.shm_dir.clone_from(&self.shm_dir);
+        // A reader never resolves custom operators before Phase 2 (see `Options::to_engine`).
+        let _ = &self.merge_operators;
+        o
+    }
+}
+
+impl Family {
+    /// The persisted options, after refusing what this build cannot store safely: settings
+    /// whose implementation lands in a later phase would otherwise be written into the file
+    /// and fail (or be silently ignored) when flush and compaction meet them.
+    pub(crate) fn to_engine(&self, name: &str) -> Result<FamilyOptions> {
+        let o = &self.options;
+        let unsupported = |what: &str| {
+            Err(crate::Error::new(
+                ErrorCode::Unsupported,
+                format!("family {name:?}: {what} is not available yet (Phase 2)"),
+            ))
+        };
+        if o.compression == Compression::Zstd {
+            return unsupported("zstd compression");
+        }
+        if o.compaction != CompactionStyle::Leveled {
+            return unsupported("a compaction strategy other than Leveled");
+        }
+        Ok(o.clone())
+    }
+}
+
+/// The platform's default filesystem backend.
+fn default_vfs() -> VfsRef {
+    pigeonhole_io::pread::PreadVfs::new(0)
 }

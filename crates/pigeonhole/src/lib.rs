@@ -4,16 +4,17 @@
 //! A Pigeonhole database is a sorted, sparse, versioned map
 //! `(table, row, family, qualifier, timestamp) → value` in one file.
 //!
-//! ```no_run
+//! ```
 //! use pigeonhole::{days, Durability, Family, Options, Pigeonhole};
 //!
 //! # fn main() -> pigeonhole::Result<()> {
-//! let db = Pigeonhole::open("crawl.phdb", Options::default())?;
+//! # let dir = pigeonhole::doc_support::temp_dir();
+//! let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 //! let pages = db
 //!     .table("pages")?
 //!     .family("meta", Family::default().max_versions(1))
 //!     .family("links", Family::default().bloom_bits(10))
-//!     .family("body", Family::default().blob_threshold(4096).zstd(3).ttl(days(30)))
+//!     .family("body", Family::default().blob_threshold(4096).ttl(days(30)))
 //!     .create_if_missing()?;
 //!
 //! // Single-row atomic mutation.
@@ -27,9 +28,11 @@
 //!
 //! // Point read: borrows from the cache, no allocation.
 //! let status = pages.get(b"com.example/a", "meta", b"status")?;
+//! assert_eq!(status.unwrap().value(), b"200");
 //!
 //! // Row read, projected to families.
 //! let row = pages.row(b"com.example/a").families(["meta"]).latest().read()?;
+//! assert_eq!(row.unwrap().get("meta", b"hits").unwrap().as_i64(), Some(1));
 //!
 //! // Ordered scan with filters pushed into the block decoder.
 //! let snap = db.snapshot()?;
@@ -41,12 +44,14 @@
 //!     .iter()?
 //! {
 //!     let row = row?;
+//!     assert!(row.is_empty() || row.key().starts_with(b"com.example/"));
 //! }
 //!
 //! // Batched multi-row write with one durability point.
 //! let mut wb = db.write_batch();
 //! wb.put(&pages, b"com.example/c", "meta", b"status", b"404");
 //! wb.commit_with(Durability::GroupSync)?;
+//! db.close()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -65,8 +70,6 @@
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
-// Interface freeze: bodies are `todo!()`. Remove this allow when implementing.
-#![allow(unused_variables, clippy::ptr_arg)]
 
 mod cell;
 mod db;
@@ -75,6 +78,32 @@ mod options;
 mod read;
 mod table;
 mod write;
+
+#[doc(hidden)]
+pub mod doc_support;
+
+/// The user guide's and the READMEs' code samples, compiled and run as doctests.
+#[cfg(doctest)]
+mod guide {
+    #[doc = include_str!("../../../docs/guide/getting-started.md")]
+    struct GettingStarted;
+    #[doc = include_str!("../../../docs/guide/durability.md")]
+    struct Durability;
+    #[doc = include_str!("../../../docs/guide/scans-and-filters.md")]
+    struct ScansAndFilters;
+    #[doc = include_str!("../../../docs/guide/data-modeling.md")]
+    struct DataModeling;
+    #[doc = include_str!("../../../docs/guide/errors.md")]
+    struct Errors;
+    #[doc = include_str!("../../../docs/guide/agent-reference.md")]
+    struct AgentReference;
+    #[doc = include_str!("../../../docs/guide/concepts.md")]
+    struct Concepts;
+    #[doc = include_str!("../README.md")]
+    struct CrateReadme;
+    #[doc = include_str!("../../../README.md")]
+    struct RepositoryReadme;
+}
 
 #[cfg(feature = "async")]
 pub mod nonblocking;

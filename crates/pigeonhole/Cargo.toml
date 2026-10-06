@@ -25,6 +25,11 @@ pigeonhole-io = { workspace = true }
 
 [dev-dependencies]
 pigeonhole-sim = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "public"
+harness = false
 
 [lints]
 workspace = true

@@ -458,6 +458,7 @@ dependencies = [
 name = "pigeonhole"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pigeonhole-engine",
  "pigeonhole-format",
  "pigeonhole-io",

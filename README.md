@@ -5,14 +5,15 @@
 [![CI](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml/badge.svg)](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status: under construction (Phase 1).** The API below is the target design and is not usable yet. See [`docs/status.md`](docs/status.md) for progress.
+> **Status: Phase 1 in progress: usable in-memory-bounded API; flush to disk arrives with engine Milestone B** ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)). The sync API below works and is crash-safe through the write-ahead log, but until memtables are flushed into the file all data must fit in the memtable budget (`Options::memtable_budget` per shard). See [`docs/status.md`](docs/status.md) for progress.
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
 
-```rust,ignore
-use pigeonhole::{Pigeonhole, Options, Family, Durability};
+```rust
+use pigeonhole::{Pigeonhole, Options, Family};
 
-let db = Pigeonhole::open("crawl.phdb", Options::default())?;
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 let pages = db.table("pages")?
     .family("meta", Family::default().max_versions(1))
     .family("links", Family::default().bloom_bits(10))
@@ -31,7 +32,10 @@ let status = pages.get(b"com.example/a", "meta", b"status")?;
 for row in pages.scan(b"com.example/"..b"com.example0").family("links").iter()? {
     let row = row?;
     // ...
+#   assert_eq!(row.key(), b"com.example/a");
 }
+# assert_eq!(status.unwrap().value(), b"200");
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 ## Data model
