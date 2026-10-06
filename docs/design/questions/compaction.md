@@ -1,6 +1,6 @@
 # pigeonhole-compaction questions
 
-Coordinator review of PR #36 confirmed the interim behavior of: `min_ts_above`, the `JobContext` fields, the other additive API, the `I64Add` tag rule, `versions = min(requested, max_versions)`, value predicate semantics, engine task handling, blob accounting and small-value copying. They are kept below for numbering. Still open: purges vs later explicit-timestamp writes (owner decision).
+Coordinator review of PR #36 confirmed the interim behavior of: `min_ts_above`, the `JobContext` fields, the other additive API, the `I64Add` tag rule, `versions = min(requested, max_versions)`, value predicate semantics, engine task handling, blob accounting and small-value copying. They are kept below for numbering. The owner decided purges vs later explicit-timestamp writes: HBase semantics (below).
 
 ## Proposed decision (confirmed): `GcPolicy::min_ts_above` bounds bottommost purges
 A bottommost compaction may drop a delete that is visible at every live snapshot, and versions beyond `max_versions`. Both are safe for the inputs, but data *above* the inputs (L0 files and levels not in the task, memtables) is newer by seqno and can still carry older user timestamps (written later with an explicit timestamp): a dropped column, family or cell delete would uncover such an entry, and an upper `CellDelete` at a kept version's timestamp would make a purged older version the newest. Either changes a read at a live snapshot, which done-when (2) forbids, and the random test finds it quickly.
@@ -26,10 +26,19 @@ Every `incr` gets its own commit timestamp (D11), so a hot counter accumulates o
 
 **Interim behavior:** compaction combines operands only within one `(column, timestamp)` group and one snapshot stripe (preserving every read), never across timestamps and never onto a base. A bad base is therefore never folded (#21): the read keeps failing with `MergeFailed`. Proposal for the owner: fold a run (and its base) at the bottommost level when the family has no TTL and the run lies below `min_ts_above`, accepting that a later explicit-timestamp delete inside the run no longer splits it. **Deferred to Phase 2 (#34)** per review. Until then operands accumulate: the guide (data-modeling.md, counters) says so, and `cargo bench -p pigeonhole-compaction` measures it (`counter_get/operands_N`: about 0.3 µs for 1 operand, 3.4 µs for 100, 307 µs for 10,000, i.e. ~30 ns per operand).
 
-## Q (open, owner decision pending): purges diverge from the model for later explicit-timestamp writes
-D38 accepts that once compaction drops a cell delete, a *later* put at that timestamp is visible (the model never drops markers). The same holds for column and family deletes (a later put with an older explicit timestamp) and for `max_versions` (a later `delete_cell` of the newest version does not bring back a purged older one, as in HBase). `min_ts_above` makes every compaction read-preserving for the data that exists when it runs; the divergence is only for writes made afterwards.
+## Proposed decision: purges follow HBase semantics (owner decision; amends D38/D9)
+Before compaction purges a delete marker, or versions beyond `max_versions`, a later write with an older explicit timestamp stays hidden: by the marker (D9, D38), or behind the newer versions. A bottommost compaction may purge them, but only below `GcPolicy::min_ts_above` and only when no live snapshot needs them. After that, such a write behaves as if they never existed: a `put_at` below a purged delete becomes visible, and a `delete_cell` of the newest version does not bring back a purged older one. Writes at default timestamps are never affected.
 
-**Interim behavior:** as described. The engine's model-checked suite must either not combine explicit-timestamp deletes/puts below purged tombstones with compaction, or teach the model the same purge rule.
+**Behavior:** as described. The oracle stays strict. `pigeonhole_sim::Model::purge(&ModelPurge)` (approved sim addition) removes exactly what such a compaction may purge from the model:
+- deletes visible at every read point below `min_ts_above`, with what they cover and the deletes they make redundant, in the compaction's processing order;
+- puts and operands outside the newest `max_versions` versions at every read point.
+
+The compaction tests apply it after each bottommost compaction and then compare reads after unrestricted later writes (explicit older timestamps and cell deletes included). Coverage:
+- `compaction_preserves_reads_at_live_snapshots`, which fails without the purge;
+- `purges_match_the_model_purge_hook`, deterministic scenarios that pin the redundancy ordering;
+- `purge_follows_hbase_semantics` in sim.
+
+The guide (data-modeling.md, Versions) states the rule.
 
 ## Q (confirmed): `I64Add` accepts only `ValueTag::I64` values
 The model treats any 8-byte value as an `i64` base (it has no tags). Stored values have tags: `put_i64` and `incr` write tag `0x01`.

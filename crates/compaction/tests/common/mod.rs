@@ -169,63 +169,99 @@ pub fn extend_history(h: &mut History, rng: &mut Rng, commits: usize, later: boo
             };
             ops.push(op);
         }
-        let seqno = model.commit(&ops, commit_ts, Durability::Sync);
-        // The same commit as stored entries, collapsed like the model (D34).
-        let mut cells: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        let mut collapse: BTreeMap<(Vec<u8>, Vec<u8>, Timestamp), Vec<u8>> = BTreeMap::new();
-        for op in &ops {
-            let mut key = Vec::new();
-            let (row, q, ts, kind, value) = match op {
-                ModelOp::Put {
-                    row,
-                    qualifier,
-                    ts,
-                    value,
-                    ..
-                } => (
-                    row,
-                    qualifier,
-                    ts.unwrap_or(commit_ts),
-                    Kind::Put,
-                    stored(value),
-                ),
-                ModelOp::Incr {
-                    row,
-                    qualifier,
-                    delta,
-                    ..
-                } => (
-                    row,
-                    qualifier,
-                    commit_ts,
-                    Kind::Merge,
-                    stored(&delta.to_le_bytes()),
-                ),
-                ModelOp::DeleteCell {
-                    row, qualifier, ts, ..
-                } => (row, qualifier, *ts, Kind::CellDelete, Vec::new()),
-                ModelOp::DeleteColumn { row, qualifier, .. } => {
-                    (row, qualifier, commit_ts, Kind::ColumnDelete, Vec::new())
-                }
-                ModelOp::DeleteFamily { row, .. } | ModelOp::DeleteRow { row, .. } => {
-                    encode_marker_key(&mut key, row, commit_ts, seqno).unwrap();
-                    cells.insert(key, Vec::new());
-                    continue;
-                }
-            };
-            encode_key(&mut key, row, q, ts, seqno, kind).unwrap();
-            // A later op on the same (row, qualifier, ts) replaces the earlier one.
-            if let Some(old) = collapse.insert((row.clone(), q.clone(), ts), key.clone()) {
-                cells.remove(&old);
-            }
-            cells.insert(key, value);
-            used_ts.push(ts);
-        }
+        added.extend(commit_ops(model, used_ts, &ops, commit_ts));
         used_ts.push(commit_ts);
-        added.extend(cells.into_iter().map(|(k, v)| (k, v, seqno)));
     }
     h.entries.extend(added.iter().cloned());
     added
+}
+
+/// Commits `ops` to the model and returns the same commit as stored entries, collapsed like
+/// the model (D34); records the timestamps it used.
+fn commit_ops(
+    model: &mut Model,
+    used_ts: &mut Vec<Timestamp>,
+    ops: &[ModelOp],
+    commit_ts: Timestamp,
+) -> Vec<Entry> {
+    let seqno = model.commit(ops, commit_ts, Durability::Sync);
+    // The same commit as stored entries, collapsed like the model (D34).
+    let mut cells: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut collapse: BTreeMap<(Vec<u8>, Vec<u8>, Timestamp), Vec<u8>> = BTreeMap::new();
+    for op in ops {
+        let mut key = Vec::new();
+        let (row, q, ts, kind, value) = match op {
+            ModelOp::Put {
+                row,
+                qualifier,
+                ts,
+                value,
+                ..
+            } => (
+                row,
+                qualifier,
+                ts.unwrap_or(commit_ts),
+                Kind::Put,
+                stored(value),
+            ),
+            ModelOp::Incr {
+                row,
+                qualifier,
+                delta,
+                ..
+            } => (
+                row,
+                qualifier,
+                commit_ts,
+                Kind::Merge,
+                stored(&delta.to_le_bytes()),
+            ),
+            ModelOp::DeleteCell {
+                row, qualifier, ts, ..
+            } => (row, qualifier, *ts, Kind::CellDelete, Vec::new()),
+            ModelOp::DeleteColumn { row, qualifier, .. } => {
+                (row, qualifier, commit_ts, Kind::ColumnDelete, Vec::new())
+            }
+            ModelOp::DeleteFamily { row, .. } | ModelOp::DeleteRow { row, .. } => {
+                encode_marker_key(&mut key, row, commit_ts, seqno).unwrap();
+                cells.insert(key, Vec::new());
+                continue;
+            }
+        };
+        encode_key(&mut key, row, q, ts, seqno, kind).unwrap();
+        // A later op on the same (row, qualifier, ts) replaces the earlier one.
+        if let Some(old) = collapse.insert((row.clone(), q.clone(), ts), key.clone()) {
+            cells.remove(&old);
+        }
+        cells.insert(key, value);
+        used_ts.push(ts);
+    }
+    cells.into_iter().map(|(k, v)| (k, v, seqno)).collect()
+}
+
+impl History {
+    /// An empty history of one family.
+    pub fn new(family: ModelFamily) -> Self {
+        let mut model = Model::new();
+        model.create_table(TABLE, vec![family.clone()]);
+        Self {
+            model,
+            family,
+            entries: Vec::new(),
+            last_ts: 0,
+            used_ts: vec![5],
+            commits: 0,
+        }
+    }
+
+    /// Commits `ops` at `commit_ts` and returns its entries.
+    pub fn commit(&mut self, ops: &[ModelOp], commit_ts: Timestamp) -> Vec<Entry> {
+        self.commits += 1;
+        self.last_ts = self.last_ts.max(commit_ts);
+        let added = commit_ops(&mut self.model, &mut self.used_ts, ops, commit_ts);
+        self.entries.extend(added.iter().cloned());
+        added
+    }
 }
 
 /// Resolve options for a history's family.

@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
@@ -19,7 +20,7 @@ use pigeonhole_format::{FamilyId, Seqno, SstId, TableId, TabletId, Timestamp};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 use pigeonhole_io::{Vfs, VfsRef};
 use pigeonhole_pager::Pager;
-use pigeonhole_sim::Rng;
+use pigeonhole_sim::{ModelPurge, Rng};
 use pigeonhole_sst::SstReader;
 use proptest::prelude::*;
 
@@ -189,6 +190,21 @@ fn check_compaction(seed: u64, commits: usize) {
     if rng.below(4) == 0 {
         gc.min_ts_above = 0;
     }
+    // What the model drops when this compaction purges (owner decision: HBase semantics).
+    let purge = ModelPurge {
+        table: TABLE.into(),
+        family: FAMILY.into(),
+        rows: (Bound::Unbounded, Bound::Unbounded),
+        snapshots: snapshots.clone(),
+        now: gc_now,
+        min_ts_above: gc.min_ts_above,
+        max_seqno: from
+            .iter()
+            .flat_map(|&l| &levels[l])
+            .map(|s| s.0.seqno_range.1)
+            .max()
+            .unwrap_or(0),
+    };
     let mut job = CompactionJob::new(task(by_level, to), inputs, db.context(family.clone(), gc));
     run_sliced(&db, &mut job);
     let read = job.entries_read();
@@ -238,10 +254,23 @@ fn check_compaction(seed: u64, commits: usize) {
         }
     }
 
-    // Writes after the compaction (at commit timestamps, flushed on top) read as in the
-    // model at the old live snapshots and the new latest one.
+    // A bottommost compaction may purge deletes and versions (HBase semantics): apply the
+    // same purge to the model, which leaves every read at the live snapshots unchanged.
+    if bottommost {
+        h.model.purge(&purge);
+    }
+    for &s in &points {
+        let what = format!("seed {seed}: choice {choice}, purged model, read at {s}/{gc_now}");
+        let expected = model_reads(&h, s, gc_now);
+        let a = resolver_reads(&h, s, gc_now, |o| sst_resolver(&after, o));
+        assert_same(&what, &expected, &a);
+    }
+
+    // Any writes after the compaction, explicit older timestamps and cell deletes included,
+    // flushed on top, read as in the (purged) model at the old live snapshots and the new
+    // latest one.
     let n_later = 1 + rng.below(8) as usize;
-    let later = extend_history(&mut h, &mut rng, n_later, true);
+    let later = extend_history(&mut h, &mut rng, n_later, false);
     let mut flush: Vec<_> = later.iter().map(|e| (e.0.clone(), e.1.clone())).collect();
     flush.sort();
     after.push(db.sst(&family, &flush).1);
@@ -810,4 +839,181 @@ fn a_row_split_across_bottom_ssts_moves_together() {
     assert_eq!(get(&after, b"m", b"b"), None);
     assert_eq!(get(&after, b"c", b"q"), Some(stored(b"c")));
     assert_eq!(get(&after, b"z", b"q"), Some(stored(b"z")));
+}
+
+/// Commits `before`, compacts all of it as the bottommost level with nothing above, purges
+/// the model the same way, then commits `later` on top and compares every read with the
+/// model at the live snapshots and the latest one.
+fn check_purge_scenario(
+    seed: u64,
+    family: pigeonhole_sim::ModelFamily,
+    before: &[(Vec<pigeonhole_sim::ModelOp>, Timestamp)],
+    snapshots: Vec<Seqno>,
+    later: &[(Vec<pigeonhole_sim::ModelOp>, Timestamp)],
+) {
+    let mut db = Db::new(seed);
+    let mut h = History::new(family);
+    for (ops, ts) in before {
+        h.commit(ops, *ts);
+    }
+    let fam = family_options(&h);
+    let mut entries: Vec<_> = h
+        .entries
+        .iter()
+        .map(|e| (e.0.clone(), e.1.clone()))
+        .collect();
+    entries.sort();
+    let input = db.sst(&fam, &entries);
+    let now = h.last_ts + 1;
+    let gc = policy(snapshots.clone(), now, true);
+    let (out, _) = compact(&db, &fam, std::slice::from_ref(&input), gc);
+    h.model.purge(&ModelPurge {
+        table: TABLE.into(),
+        family: FAMILY.into(),
+        rows: (Bound::Unbounded, Bound::Unbounded),
+        snapshots: snapshots.clone(),
+        now,
+        min_ts_above: u64::MAX,
+        max_seqno: h.model.snapshot(),
+    });
+    let max = h.model.snapshot();
+    let mut ssts: Vec<_> = out
+        .added
+        .iter()
+        .map(|(_, m)| open_sst(&db.pager, &db.cache, m))
+        .collect();
+    let mut flushed = Vec::new();
+    for (ops, ts) in later {
+        flushed.extend(h.commit(ops, *ts).into_iter().map(|e| (e.0, e.1)));
+    }
+    flushed.sort();
+    if !flushed.is_empty() {
+        ssts.push(db.sst(&fam, &flushed).1);
+    }
+    let read_now = h.last_ts + 1;
+    for s in snapshots.iter().copied().chain([max, h.model.snapshot()]) {
+        let expected = model_reads(&h, s, read_now);
+        let actual = resolver_reads(&h, s, read_now, |o| sst_resolver(&ssts, o));
+        assert_same(&format!("scenario {seed}, read at {s}"), &expected, &actual);
+    }
+}
+
+/// Owner decision (HBase semantics): a purge may uncover later writes with older explicit
+/// timestamps; the model's purge hook removes exactly what compaction does, including the
+/// deletes it keeps because they are newer than the one purged at the same timestamp.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn purges_match_the_model_purge_hook() {
+    use pigeonhole_sim::{ModelFamily, ModelOp};
+    let fam = |max_versions| ModelFamily {
+        name: FAMILY.into(),
+        max_versions,
+        ttl_micros: 0,
+        i64_add: true,
+    };
+    let (t, f, r, q) = (
+        TABLE.to_string(),
+        FAMILY.to_string(),
+        b"r".to_vec(),
+        b"q".to_vec(),
+    );
+    let put = |ts: Option<Timestamp>, v: &[u8]| ModelOp::Put {
+        table: t.clone(),
+        row: r.clone(),
+        family: f.clone(),
+        qualifier: q.clone(),
+        ts,
+        value: v.to_vec(),
+    };
+    let del_cell = |ts| ModelOp::DeleteCell {
+        table: t.clone(),
+        row: r.clone(),
+        family: f.clone(),
+        qualifier: q.clone(),
+        ts,
+    };
+    let del_col = || ModelOp::DeleteColumn {
+        table: t.clone(),
+        row: r.clone(),
+        family: f.clone(),
+        qualifier: q.clone(),
+    };
+    let del_fam = || ModelOp::DeleteFamily {
+        table: t.clone(),
+        row: r.clone(),
+        family: f.clone(),
+    };
+    // Two cell deletes at one timestamp on either side of a snapshot: the older is purged,
+    // the newer stays and keeps hiding a later put at that timestamp.
+    check_purge_scenario(
+        1,
+        fam(0),
+        &[
+            (vec![put(Some(5), b"a")], 10),
+            (vec![del_cell(5)], 20),
+            (vec![del_cell(5)], 30),
+        ],
+        vec![2],
+        &[(vec![put(Some(5), b"later")], 40)],
+    );
+    // The same for column deletes and family markers at one timestamp.
+    check_purge_scenario(
+        2,
+        fam(0),
+        &[
+            (vec![put(Some(40), b"a")], 10),
+            (vec![del_col()], 50),
+            (vec![del_col()], 50),
+        ],
+        vec![2],
+        &[(vec![put(Some(45), b"later")], 60)],
+    );
+    check_purge_scenario(
+        3,
+        fam(0),
+        &[
+            (vec![put(Some(40), b"a")], 10),
+            (vec![del_fam()], 50),
+            (vec![del_fam()], 50),
+        ],
+        vec![2],
+        &[(vec![put(Some(45), b"later")], 60)],
+    );
+    // A purged marker takes the column delete it covers with it: the later put is visible.
+    check_purge_scenario(
+        4,
+        fam(0),
+        &[
+            (vec![put(Some(40), b"a")], 10),
+            (vec![del_fam(), del_col()], 50),
+        ],
+        vec![],
+        &[(vec![put(Some(45), b"later")], 60)],
+    );
+    // A cell delete at a purged column delete's timestamp goes with it, even when newer.
+    check_purge_scenario(
+        6,
+        fam(0),
+        &[
+            (vec![put(Some(40), b"a")], 10),
+            (vec![del_col()], 50),
+            (vec![del_cell(50)], 60),
+        ],
+        vec![2],
+        &[(vec![put(Some(50), b"later")], 70)],
+    );
+    // A version purged over max_versions does not come back when the newest is deleted.
+    check_purge_scenario(
+        5,
+        fam(1),
+        &[
+            (vec![put(Some(10), b"old")], 10),
+            (vec![put(Some(20), b"new")], 20),
+        ],
+        vec![],
+        &[(vec![del_cell(20)], 30)],
+    );
 }
