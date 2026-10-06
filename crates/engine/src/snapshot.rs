@@ -177,4 +177,14 @@ impl Snapshot {
     pub fn view(&self) -> &Arc<View> {
         &self.view
     }
+
+    /// The same view at an older seqno (a view covers every seqno at or below the one it was
+    /// taken with). A test hook for recovery checks; not part of the stable API.
+    #[doc(hidden)]
+    pub fn at_seqno(&self, seqno: Seqno) -> Snapshot {
+        Snapshot {
+            seqno: seqno.min(self.seqno),
+            view: Arc::clone(&self.view),
+        }
+    }
 }

@@ -466,23 +466,41 @@ struct PreparedShare {
     coordinator: ShardId,
 }
 
+/// A memtable with the smallest user timestamp written to it: a compaction's
+/// `GcPolicy::min_ts_above` is the minimum over the live memtables above its inputs
+/// (data above an input can hold newer entries with older explicit timestamps).
+#[derive(Debug)]
+struct MemEntry {
+    table: Memtable,
+    min_ts: Timestamp,
+}
+
+impl MemEntry {
+    fn new(table: Memtable) -> Self {
+        Self {
+            table,
+            min_ts: u64::MAX,
+        }
+    }
+}
+
 /// The memtables of one `(tablet, family)` on this shard.
 #[derive(Debug)]
 struct MemSlot {
-    active: Memtable,
+    active: MemEntry,
     /// Newest first.
-    frozen: Vec<Memtable>,
+    frozen: Vec<MemEntry>,
 }
 
 impl MemSlot {
     fn set(&self, shard: ShardId) -> Arc<MemSet> {
         let mut readers = Vec::with_capacity(1 + self.frozen.len());
         let mut roots = Vec::with_capacity(1 + self.frozen.len());
-        readers.push(self.active.reader());
-        roots.push(self.active.root());
+        readers.push(self.active.table.reader());
+        roots.push(self.active.table.root());
         for m in &self.frozen {
-            readers.push(m.reader());
-            roots.push(m.root());
+            readers.push(m.table.reader());
+            roots.push(m.table.root());
         }
         Arc::new(MemSet {
             shard,
@@ -492,9 +510,18 @@ impl MemSlot {
     }
 
     fn readers(&self) -> Vec<MemtableReader> {
-        std::iter::once(self.active.reader())
-            .chain(self.frozen.iter().map(Memtable::reader))
+        std::iter::once(self.active.table.reader())
+            .chain(self.frozen.iter().map(|m| m.table.reader()))
             .collect()
+    }
+
+    /// The smallest user timestamp in any of these memtables.
+    #[allow(dead_code)]
+    fn min_ts(&self) -> Timestamp {
+        self.frozen
+            .iter()
+            .map(|m| m.min_ts)
+            .fold(self.active.min_ts, Timestamp::min)
     }
 }
 
@@ -508,7 +535,7 @@ fn slot_of<'a>(
     match memtables.entry(key) {
         std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
         std::collections::hash_map::Entry::Vacant(e) => {
-            let active = Memtable::create(arena)?;
+            let active = MemEntry::new(Memtable::create(arena)?);
             *view_dirty = true;
             Ok(e.insert(MemSlot {
                 active,
@@ -613,6 +640,7 @@ pub(crate) struct ShardState {
     /// A write or sync failed: the stream is poisoned until reopen.
     poisoned: bool,
     arena: ShardArena,
+    chunk_size: usize,
     memtables: HashMap<(TabletId, FamilyId), MemSlot>,
     /// Retired memtables (dropped tables) waiting for reader processes to release their
     /// views: `(view version that dropped them, token)`.
@@ -668,6 +696,7 @@ impl ShardState {
             wal: None,
             poisoned: false,
             arena: ShardArena::new(region, chunk_size),
+            chunk_size,
             memtables: HashMap::new(),
             retired: Vec::new(),
             tablets,
@@ -744,7 +773,7 @@ impl ShardState {
 
     /// Worst-case arena bytes `batch` needs, so a commit is refused (`Busy`) before its
     /// record is logged rather than half-applied.
-    fn arena_needed(batch: BatchRef<'_>) -> usize {
+    fn arena_needed(batch: BatchRef<'_>, chunk: usize) -> usize {
         let mut total = 0usize;
         for m in batch.iter().flatten() {
             let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
@@ -752,12 +781,12 @@ impl ShardState {
         }
         // Each allocation may waste the tail of the previous run (less than the entry), and a
         // new memtable needs a chunk of its own.
-        2 * total + 2 * ShardArena::DEFAULT_CHUNK
+        2 * total + 2 * chunk
     }
 
     fn has_room(&self, bytes: &[u8]) -> bool {
         match BatchRef::new(bytes) {
-            Ok(batch) => self.arena.free_bytes() >= Self::arena_needed(batch),
+            Ok(batch) => self.arena.free_bytes() >= Self::arena_needed(batch, self.chunk_size),
             Err(_) => true,
         }
     }
@@ -768,8 +797,8 @@ impl ShardState {
         let keys: Vec<(TabletId, FamilyId)> = self.memtables.keys().copied().collect();
         for key in keys {
             let slot = self.memtables.get_mut(&key).expect("key listed");
-            let big = slot.active.allocated_bytes() >= threshold;
-            if slot.active.is_empty() || !(all || big) {
+            let big = slot.active.table.allocated_bytes() >= threshold;
+            if slot.active.table.is_empty() || !(all || big) {
                 continue;
             }
             let Ok(fresh) = Memtable::create(&mut self.arena) else {
@@ -777,8 +806,8 @@ impl ShardState {
                 // arena-room check turns later commits into `Busy`.
                 continue;
             };
-            let mut old = std::mem::replace(&mut slot.active, fresh);
-            old.freeze();
+            let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
+            old.table.freeze();
             // Without a persisting backend the frozen memtable stays in every view.
             if !self.shared.flush.persists() {
                 slot.frozen.insert(0, old);
@@ -820,8 +849,8 @@ impl ShardState {
         let mut retired = Vec::new();
         for key in keys {
             let slot = self.memtables.remove(&key).expect("listed");
-            retired.push(slot.active.retire());
-            retired.extend(slot.frozen.into_iter().map(Memtable::retire));
+            retired.push(slot.active.table.retire());
+            retired.extend(slot.frozen.into_iter().map(|m| m.table.retire()));
         }
         self.view_dirty = true;
         self.publish_memtables()?;
@@ -1019,10 +1048,11 @@ impl ShardState {
                     break;
                 }
             };
-            if let Err(e) = slot.active.insert(&mut self.arena, &key_buf, m.value) {
+            if let Err(e) = slot.active.table.insert(&mut self.arena, &key_buf, m.value) {
                 result = Err(e.into());
                 break;
             }
+            slot.active.min_ts = slot.active.min_ts.min(ts);
         }
         self.key_buf = key_buf;
         result
