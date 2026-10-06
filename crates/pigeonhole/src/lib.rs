@@ -8,8 +8,8 @@
 //! use pigeonhole::{days, Durability, Family, Options, Pigeonhole};
 //!
 //! # fn main() -> pigeonhole::Result<()> {
-//! # let path = pigeonhole::doc_support::temp_db("crawl.phdb");
-//! let db = Pigeonhole::open(&path, Options::default())?;
+//! # let dir = pigeonhole::doc_support::temp_dir();
+//! let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 //! let pages = db
 //!     .table("pages")?
 //!     .family("meta", Family::default().max_versions(1))
@@ -81,6 +81,25 @@ mod write;
 
 #[doc(hidden)]
 pub mod doc_support;
+
+/// The user guide's code samples, compiled and run as doctests.
+#[cfg(doctest)]
+mod guide {
+    #[doc = include_str!("../../../docs/guide/getting-started.md")]
+    struct GettingStarted;
+    #[doc = include_str!("../../../docs/guide/durability.md")]
+    struct Durability;
+    #[doc = include_str!("../../../docs/guide/scans-and-filters.md")]
+    struct ScansAndFilters;
+    #[doc = include_str!("../../../docs/guide/data-modeling.md")]
+    struct DataModeling;
+    #[doc = include_str!("../../../docs/guide/errors.md")]
+    struct Errors;
+    #[doc = include_str!("../../../docs/guide/agent-reference.md")]
+    struct AgentReference;
+    #[doc = include_str!("../../../docs/guide/concepts.md")]
+    struct Concepts;
+}
 
 #[cfg(feature = "async")]
 pub mod nonblocking;

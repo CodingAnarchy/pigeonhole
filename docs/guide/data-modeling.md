@@ -1,6 +1,6 @@
 # Data modeling
 
-> **Status: API frozen; implementation in progress (Phase 1).** Patterns use only the frozen API. Phase 2+ features are labeled.
+> **Status: Phase 1 sync API implemented.** Phase 2+ features are labeled. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole is a sorted map. Good models make the reads you do most **one point get or one contiguous scan**. Everything below follows from three facts:
 
@@ -29,13 +29,17 @@ Rules of thumb:
 ## Split families by access pattern
 A family is a physical tree and carries its own policy. Split when data differs in **how it is read, how big it is, or how long it lives**.
 
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
 let pages = db
     .table("pages")?
     .family("meta", Family::default().max_versions(1).cache_priority(Priority::High))
     .family("links", Family::default().bloom_bits(10))
     .family("body", Family::default().ttl(days(30)).cache_priority(Priority::Low))
     .create_if_missing()?;
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 | Family holds | Settings that help |
@@ -50,7 +54,14 @@ Do not split just to organize: every family is another tree to flush and compact
 ## Time series with TTL
 Key by entity, qualifier by time bucket, value is the reading:
 
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let ts_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+# let ts_micros = ts_secs * 1_000_000;
+# let value_bytes = 21.5f64.to_le_bytes();
+# let (t0_secs, t1_secs) = (ts_secs - 60, ts_secs + 60);
 let readings = db
     .table("readings")?
     .family("temp", Family::default().max_versions(1).ttl(days(30)))
@@ -68,6 +79,8 @@ let row = readings
     .family("temp")
     .qualifier_range(&lo[..]..&hi[..])
     .read()?;
+# assert_eq!(row.unwrap().len(), 1);
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 Notes:
@@ -79,7 +92,10 @@ Notes:
 ## Adjacency lists (graphs)
 One row per node; one column per edge, qualifier `<dst>`, in a family per edge type:
 
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
 let g = db
     .table("graph")?
     .family("out", Family::default().bloom_bits(10).max_versions(1))
@@ -97,9 +113,11 @@ let row = g.row(b"node:a").family("out").read()?;
 
 // Is there an edge a -> b? A point get; the bloom filter makes misses cheap.
 let exists = g.get(b"node:a", "out", b"node:b")?.is_some();
+# assert!(exists);
 
 // The first 100 neighbors only:
 let page = g.row(b"node:a").family("out").column_limit(100).read()?;
+# Ok::<(), pigeonhole::Error>(())
 ```
 - Edge properties go in the value, or as extra families keyed the same way.
 - `delete_column("out", b"node:b")` removes the edge; `delete_family("out")` removes all out-edges of a node.
@@ -108,10 +126,16 @@ let page = g.row(b"node:a").family("out").column_limit(100).read()?;
 ## Counters with merge operators
 `incr` adds to an `i64` **without reading it**: the write is a blind merge operand resolved at read and compaction time. Concurrent writers never lose updates.
 
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta"])?;
 pages.mutate(b"com.example/a").incr("meta", b"hits", 1).commit()?;
 
 let hits = pages.get(b"com.example/a", "meta", b"hits")?.and_then(|c| c.as_i64());
+# assert_eq!(hits, Some(1));
+# Ok::<(), pigeonhole::Error>(())
 ```
 - The built-in `pigeonhole.i64_add` is the default operator. A missing counter counts as 0; overflow wraps.
 - Write a counter column **only** with `incr` (and `put_i64` to set or reset a base). Mixing arbitrary `put` bytes into a counter column can make resolution fail with `ErrorCode::MergeFailed`.
@@ -144,4 +168,4 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 | Long-lived snapshots | Pin memory and space | Take, read, drop |
 | `scan` with different-length byte-array literals (`b"a"..b"bcd"`) | Does not compile (end types differ) | Slices, `scan_prefix` or `scan_bounds` |
 | Relying on cross-family or cross-row atomicity beyond a row without a batch | Only a single row, or a `WriteBatch`, is atomic | Put it in one row, or use `write_batch()` |
-| Multi-row read-then-write invariants | Phase 1 has no transactions | Phase 4 `Transaction`; today use one row and `commit_if` (Phase 2) |
+| Multi-row read-then-write invariants | Separate reads and writes race | `Transaction` (optimistic, retry on `Conflict`), or one row and `commit_if` |

@@ -176,16 +176,21 @@ impl Pigeonhole {
     }
 
     /// Flushes every memtable to the file.
+    ///
+    /// Until the engine writes SSTs (the rest of Phase 1), this freezes the memtables and
+    /// writes nothing to the file; the data stays durable through the WAL.
     pub fn flush(&self) -> Result<()> {
         Ok(self.engine.flush()?)
     }
 
-    /// Compacts every table fully.
+    /// Compacts every table fully. Fails with
+    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) until the engine writes SSTs.
     pub fn compact(&self) -> Result<()> {
         Ok(self.engine.compact(None)?)
     }
 
-    /// Writes a consistent single-file copy to `dest` while writes continue.
+    /// Writes a consistent single-file copy to `dest` while writes continue. Fails with
+    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) until the engine writes SSTs.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         Ok(self.engine.backup(dest.as_ref())?)
     }
@@ -193,6 +198,10 @@ impl Pigeonhole {
     /// Closes this handle's database. If this is the last process with it open, checkpoints
     /// the WAL and removes the sidecar files and shared-memory region, leaving one file.
     /// Dropping the last clone does the same, ignoring errors.
+    ///
+    /// Until the engine writes SSTs, the WAL sidecar files stay (the data has nowhere else to
+    /// go) and are replayed at the next open. Every handle derived from this database
+    /// (tables, batches) fails with [`ErrorCode::Closed`](crate::ErrorCode::Closed) afterwards.
     pub fn close(self) -> Result<()> {
         Ok(self.engine.close()?)
     }

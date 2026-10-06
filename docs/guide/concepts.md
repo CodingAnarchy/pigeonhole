@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status: API frozen; implementation in progress (Phase 1).** Features from later phases are labeled.
+> **Status: Phase 1 sync API implemented.** Features from later phases are labeled.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 
@@ -44,7 +44,7 @@ Values are bytes, with typed forms for `i64` and `f64`. In Phase 1 a value is li
 ## Deletes
 Deletes write markers: one cell version (`delete_cell`), a whole column (`delete_column`), a family within a row (`delete_family`), or a whole row (`delete_row`, which writes one family marker per family in the same atomic commit). A column or family delete with timestamp *T* hides every version in its scope with timestamp ≤ *T*, regardless of when it was written, so a later `put` with an older timestamp stays hidden; a `put` with a newer timestamp is visible again. A cell delete hides the version at exactly its timestamp, again regardless of when it was written: a later `put` at that same timestamp stays hidden, so write the replacement at another timestamp.
 
-## Multi-process readers (Phase 4)
+## Multi-process readers (Phase 4; available now)
 One writer process and any number of reader processes on the same host can open the same `.phdb` file; readers see each commit as soon as the writer publishes it. A reader's handle (`Pigeonhole::open_reader`) has no write methods, but the reader process still opens the file **read-write** and writes nothing to it: the processes coordinate with byte-range locks on the file, and some of those locks are exclusive, which POSIX grants only on a writable file descriptor. This is the same requirement SQLite has in WAL mode. So every reader process needs write permission on the database file, and a database on read-only media cannot be opened by readers.
 
 ## Where next

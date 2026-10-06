@@ -67,8 +67,8 @@ pub enum ErrorCode {
 /// use pigeonhole::{ErrorCode, Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let path = pigeonhole::doc_support::temp_db("error.phdb");
-/// let db = Pigeonhole::open(&path, Options::default())?;
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
 /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
 /// let err = t.mutate(b"row").put("nope", b"q", b"v").commit().unwrap_err();
 /// assert_eq!(err.code(), ErrorCode::FamilyNotFound);

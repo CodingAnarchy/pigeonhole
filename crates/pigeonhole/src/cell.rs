@@ -18,6 +18,7 @@ pub enum Value<'a> {
 }
 
 /// The value bytes of a stored value: everything after the tag byte.
+#[inline]
 fn payload(data: &CellData) -> &[u8] {
     data.stored().get(1..).unwrap_or_default()
 }
@@ -75,6 +76,7 @@ pub struct CellRef<'a> {
 }
 
 impl<'a> CellRef<'a> {
+    #[inline]
     pub(crate) fn owned(data: CellData) -> Self {
         Self {
             data: Cow::Owned(data),
@@ -88,6 +90,7 @@ impl<'a> CellRef<'a> {
     }
 
     /// The value bytes (for typed values, their encoding without the tag).
+    #[inline]
     pub fn value(&self) -> &[u8] {
         payload(&self.data)
     }
@@ -133,6 +136,7 @@ impl Cell {
     }
 
     /// The value bytes.
+    #[inline]
     pub fn value(&self) -> &[u8] {
         payload(&self.data)
     }

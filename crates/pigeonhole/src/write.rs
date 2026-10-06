@@ -12,8 +12,8 @@ use crate::{CellRef, Condition, Error, ErrorCode, Result, Table};
 /// use pigeonhole::{Durability, Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let path = pigeonhole::doc_support::temp_db("commitinfo.phdb");
-/// let db = Pigeonhole::open(&path, Options::default().shards(2))?;
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(2))?;
 /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
 /// let a = t.mutate(b"row").put("f", b"q", b"1").commit()?;
 /// let b = t.mutate(b"row").put("f", b"q", b"2").durability(Durability::Buffered).commit()?;
@@ -105,8 +105,8 @@ impl Builder {
 /// use pigeonhole::{Condition, Durability, Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let path = pigeonhole::doc_support::temp_db("rowmutation.phdb");
-/// let db = Pigeonhole::open(&path, Options::default().shards(2))?;
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(2))?;
 /// let pages = db.table("pages")?
 ///     .family("meta", Family::default())
 ///     .family("links", Family::default())
@@ -291,8 +291,8 @@ impl RowMutation<'_> {
 /// use pigeonhole::{Durability, Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let path = pigeonhole::doc_support::temp_db("writebatch.phdb");
-/// let db = Pigeonhole::open(&path, Options::default().shards(2))?;
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(2))?;
 /// let g = db.table("g")?
 ///     .family("out", Family::default())
 ///     .family("in", Family::default())
@@ -435,8 +435,8 @@ impl WriteBatch {
 /// use pigeonhole::{ErrorCode, Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let path = pigeonhole::doc_support::temp_db("transaction.phdb");
-/// let db = Pigeonhole::open(&path, Options::default().shards(2))?;
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(2))?;
 /// let bank = db.table("bank")?.family("acct", Family::default()).create_if_missing()?;
 /// bank.mutate(b"alice").put("acct", b"balance", b"10").commit()?;
 ///

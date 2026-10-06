@@ -1,6 +1,6 @@
 # Durability
 
-> **Status: API frozen; implementation in progress (Phase 1).** Semantics here come from the spec and decisions D12 and D19. Async commit forms are Phase 3.
+> **Status: Phase 1 sync API implemented.** Semantics here come from the spec and decisions D12 and D19. Async commit forms are Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every commit says how durable it must be before it returns. The default is the strongest batched level, so a commit that returns is on disk unless you asked for less.
 
@@ -19,29 +19,35 @@ In **every** level a crash loses only a suffix of recent commits: never one from
 ## Resolution order
 For each commit, the level is the first of:
 
-1. the **per-call override**: `RowMutation::durability(d)`, `WriteBatch::commit_with(d)`, `Transaction::commit_with(d)` (Phase 4);
+1. the **per-call override**: `RowMutation::durability(d)`, `WriteBatch::commit_with(d)`, `Transaction::commit_with(d)`;
 2. the **writer default**: `Options::durability(d)` at open, or `Pigeonhole::set_default_durability(d)` at runtime;
 3. `Durability::GroupSync`.
 
-```rust,ignore
+```rust
 use pigeonhole::{Durability, Options, Pigeonhole};
 
+# let dir = pigeonhole::doc_support::temp_dir();
 // Writer default, set at open.
-let db = Pigeonhole::open("ingest.phdb", Options::default().durability(Durability::Buffered))?;
+let db = Pigeonhole::open(dir.join("ingest.phdb"), Options::default().durability(Durability::Buffered))?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta"])?;
 
 // Changed at runtime; applies to commits that start afterwards.
 db.set_default_durability(Durability::GroupSync);
 let current = db.default_durability();
+# assert_eq!(current, Durability::GroupSync);
 
 // Per-call override.
 let mut wb = db.write_batch();
 // ... wb.put(..) ...
+# wb.put(&pages, b"row", "meta", b"k", b"v");
 wb.commit()?;                         // writer default
 // (a batch is consumed by commit; build another for the next line)
 let mut wb = db.write_batch();
+# wb.put(&pages, b"row", "meta", b"k", b"v");
 wb.commit_with(Durability::Sync)?;    // this commit only
 
 pages.mutate(b"row").put("meta", b"k", b"v").durability(Durability::Buffered).commit()?;
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 The writer default is process-local and **not stored in the file**. Reopening with different options changes it.
@@ -49,16 +55,18 @@ The writer default is process-local and **not stored in the file**. Reopening wi
 ## Mixed levels
 Commits at different levels share each shard's WAL stream, which is ordered.
 
-- A `GroupSync` or `Sync` commit also makes every **earlier** `Buffered` or `None` record in that stream durable.
+- A `GroupSync` or `Sync` commit also makes every **earlier** `Buffered` record in that stream durable.
 - A weaker commit never weakens a stronger one in the same group: the group is written to the strongest level any member requested.
-- A `None` commit followed by a `GroupSync` commit on the same shard is therefore durable after the second returns. The reverse is not true: a later `None` commit is not durable.
+- A `None` commit writes no WAL record at all, so a later `GroupSync` commit does **not** make it durable: it lives in the memtable until a flush writes it to the file. In the current build flushes do not write to the file yet, so a `None` commit is lost at the next close or crash.
+- Each shard has its own stream. A `GroupSync` commit on one shard does not make an earlier `Buffered` commit on another shard durable; after a power loss, every commit acknowledged at `GroupSync` or `Sync` survives, and weaker ones may or may not.
 
-So you can run a mostly-`Buffered` ingest path and put a periodic `GroupSync` commit (or `db.flush()`) on it as a checkpoint.
+So you can run a mostly-`Buffered` ingest path and put a periodic `GroupSync` commit on it as a checkpoint for that shard.
 
 ## Reporting what happened
 `commit()` and `commit_with()` return `CommitInfo`:
 
-```rust,ignore
+```rust
+# use pigeonhole::Durability;
 pub struct CommitInfo {
     pub seqno: u64,             // the commit's sequence number
     pub durability: Durability, // the level actually applied

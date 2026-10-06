@@ -147,6 +147,7 @@ impl TableCore {
 
     /// Resolves a family name: from the handle's entry (no allocation), else from the
     /// current catalog.
+    #[inline]
     pub(crate) fn family_id(&self, name: &str) -> Result<FamilyId> {
         if let Some(f) = self.info.family(name) {
             return Ok(f.id);
@@ -158,6 +159,7 @@ impl TableCore {
     }
 
     /// The newest version of one cell, as of `snapshot` or now.
+    #[inline]
     pub(crate) fn get(
         &self,
         snapshot: Option<&Snapshot>,
@@ -281,6 +283,7 @@ impl Table {
     }
 
     /// The newest version of one cell. Borrows from the cache: no allocation.
+    #[inline]
     pub fn get(&self, row: &[u8], family: &str, qualifier: &[u8]) -> Result<Option<CellRef<'_>>> {
         self.core.get(None, row, family, qualifier)
     }

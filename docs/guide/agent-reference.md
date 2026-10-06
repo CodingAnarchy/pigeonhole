@@ -1,6 +1,6 @@
 # Agent reference
 
-> **Status: API frozen; implementation in progress (Phase 1).** Signatures are authoritative (from `crates/pigeonhole/src`); bodies are `todo!()` until Phase 1 lands. Samples are `rust,ignore`. **P2/P3/P4** mark the phase a feature ships in. If this page and the rustdoc disagree, the rustdoc wins.
+> **Status: Phase 1 sync API implemented.** Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). **P2/P3/P4** mark the phase a feature ships in; "early" marks one that already works. If this page and the rustdoc disagree, the rustdoc wins.
 
 Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Errors: [`errors.md`](errors.md).
 
@@ -18,7 +18,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Read-your-writes (D19) | `commit` returns after durable at level **and** visible. |
 | Durability resolution | per-call → writer default → `GroupSync`. |
 | Writer | One writer per file; second open → `WriterLocked`. |
-| Reader processes (D36, P4) | `open_reader` opens the `.phdb` file **read-write** (it never writes): the coordination locks are exclusive byte-range locks, which need a writable handle, as in SQLite WAL mode. Readers need write permission on the file; read-only media are not supported. |
+| Reader processes (D36, P4, early) | `open_reader` opens the `.phdb` file **read-write** (it never writes): the coordination locks are exclusive byte-range locks, which need a writable handle, as in SQLite WAL mode. Readers need write permission on the file; read-only media are not supported. |
 | Family order (D39) | A row's cells come by family in **creation order**, or in the order you listed families (`family(..)` calls); then qualifier; then newest version first. |
 | Application-owned mode (D40) | Starts no threads: `open_application_owned` with `compaction_cores(k)`, `k > 0`, fails with `InvalidArgument`. |
 | Handles | `Pigeonhole`, `Table`, `Snapshot`, `Cell`, `Row` are cheap `Clone`. `Table`: `Send + Sync`. |
@@ -30,43 +30,43 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Type | Role |
 |---|---|
 | `Pigeonhole` | Writer handle. |
-| `PigeonholeReader` | Read-only handle in another process (P4). |
+| `PigeonholeReader` | Read-only handle in another process (P4, early). |
 | `Shard` | One shard in application-owned mode. |
 | `Snapshot` | Point-in-time view. |
 | `Options`, `ReaderOptions`, `Family` | Config builders (consume and return `Self`). |
 | `Priority` | `Low`, `Normal` (default), `High`. |
-| `Compaction` | `Leveled` (default), `Tiered` (P2), `FifoByTime` (P2). |
+| `Compaction` | `Leveled` (default), `Tiered` (P2), `FifoByTime` (P2); P2 ones are refused with `Unsupported` today. |
 | `Durability` | `None`, `Buffered`, `GroupSync` (default), `Sync`. |
-| `TableBuilder`, `Table`, `ReadTable` | Define/open a table; read-write handle; read-only handle (P4). |
-| `RowMutation`, `WriteBatch`, `Transaction` | Writes; `Transaction` is P4. |
+| `TableBuilder`, `Table`, `ReadTable` | Define/open a table; read-write handle; read-only handle (P4, early). |
+| `RowMutation`, `WriteBatch`, `Transaction` | Writes; `Transaction` is P4, early. |
 | `CommitInfo { seqno: u64, durability: Durability }` | Commit result. |
 | `RowRead`, `Scan`, `RowIter` | Read builders; scan iterator. |
-| `ValueFilter`, `Condition` | Value predicate; `commit_if` condition (P2). |
+| `ValueFilter`, `Condition` | Value predicate; `commit_if` condition (P2, early). |
 | `CellRef<'a>`, `Cell`, `Row`, `RowRef<'a>`, `CellEntry<'a>`, `Value<'a>` | Borrowed and owned results. |
 | `Error`, `ErrorCode`, `Result<T>` | Errors. |
-| `MergeOperator`, `MergeError` | Custom merge (P2). |
+| `MergeOperator`, `MergeError` | Custom merge (P2; a family naming a custom operator fails with `UnknownMergeOperator` today). |
 | `days(n: u64) -> Duration` | TTL helper. |
 
 ## `Pigeonhole`
 | Signature | Semantics |
 |---|---|
 | `open(path: impl AsRef<Path>, Options) -> Result<Pigeonhole>` | Open or create as writer; replays WAL. |
-| `open_reader(path, ReaderOptions) -> Result<PigeonholeReader>` | P4. Read-only, any number of processes. Needs write permission on the file (D36). |
+| `open_reader(path, ReaderOptions) -> Result<PigeonholeReader>` | P4, early. Read-only, any number of processes. Needs write permission on the file (D36). |
 | `open_application_owned(path, Options) -> Result<(Pigeonhole, Vec<Shard>)>` | Writer with no threads; you drive each `Shard`. `compaction_cores(k > 0)` → `InvalidArgument` (D40). |
 | `table(&self, name: &str) -> Result<TableBuilder<'_>>` | Start define/open. |
 | `tables(&self) -> Vec<String>` | Table names. |
 | `drop_table(&self, name: &str) -> Result<()>` | Drop table and data. |
 | `write_batch(&self) -> WriteBatch` | New multi-row batch. |
-| `transaction(&self) -> Result<Transaction>` | P4. Optimistic transaction. |
+| `transaction(&self) -> Result<Transaction>` | P4, early. Optimistic transaction. |
 | `snapshot(&self) -> Result<Snapshot>` | Consistent view of everything committed. |
 | `default_durability(&self) -> Durability` | Writer default. |
 | `set_default_durability(&self, Durability)` | Applies to later commits. |
-| `flush(&self) -> Result<()>` | Flush all memtables. |
-| `compact(&self) -> Result<()>` | Compact all tables. |
-| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent copy while writing. |
-| `close(self) -> Result<()>` | Last handle out removes sidecars. |
+| `flush(&self) -> Result<()>` | Flush all memtables. Today: freezes them only; data stays in the WAL. |
+| `compact(&self) -> Result<()>` | Compact all tables. Today: `Unsupported`. |
+| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent copy while writing. Today: `Unsupported`. |
+| `close(self) -> Result<()>` | Last handle out removes sidecars (today the WAL sidecars stay until SST flushes land). |
 
-`PigeonholeReader` (P4): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
+`PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
 `Snapshot`: `seqno(&self) -> u64`.
 `Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)`.
 
@@ -84,7 +84,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `merge_operator(Arc<dyn MergeOperator>)` | P2. Register custom operator. |
 | `allow_unregistered_merge_operators(bool)` | Open read-only with compaction off if a family names an unregistered operator. |
 
-`ReaderOptions` (P4): `block_cache(usize)`, `shm_dir(..)`, `merge_operator(..)`.
+`ReaderOptions` (P4, early): `block_cache(usize)`, `shm_dir(..)`, `merge_operator(..)`.
 
 ## `Family` (all `self -> Self`; stored in file)
 | Method | Meaning |
@@ -92,14 +92,14 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `max_versions(u32)` | Keep ≤ n versions per column (0 = all). |
 | `ttl(Duration)` | Expire cells older than this by timestamp. |
 | `bloom_bits(u8)` | Filter bits per key (0 off; default 10). |
-| `blob_threshold(u32)` | P2. Values above go to blobs (default 4096). |
+| `blob_threshold(u32)` | P2. Values above go to blobs (default 4096). Today: stored, values stay inline. |
 | `lz4()` | Default compression. |
-| `zstd(i8)` | P2. zstd at level. |
+| `zstd(i8)` | P2. zstd at level. Today: table or family creation fails with `Unsupported`. |
 | `uncompressed()` | No compression. |
 | `block_size(u32)` | Data block bytes (default 16 KiB). |
 | `merge_operator(&str)` | P2 for custom. Name of registered operator. `incr` needs none (`pigeonhole.i64_add` default). |
 | `cache_priority(Priority)` | Block cache priority. |
-| `compaction(Compaction)` | Strategy (`Tiered`, `FifoByTime` are P2; the latter needs a TTL). |
+| `compaction(Compaction)` | Strategy (`Tiered`, `FifoByTime` are P2 and refused with `Unsupported` today; the latter needs a TTL). |
 
 ## `TableBuilder` / `Table` / `ReadTable`
 | Signature | Semantics |
@@ -118,7 +118,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `Table::scan_prefix(&self, prefix: &[u8]) -> Scan<'_>` | Rows starting with prefix. |
 | `Table::scan_bounds(&self, Bound<&[u8]>, Bound<&[u8]>) -> Scan<'_>` | Explicit bounds. |
 
-`ReadTable` (P4) has `name`, `get`, `get_at`, `row`, `scan`, `scan_prefix`, `scan_bounds` with the same signatures.
+`ReadTable` (P4, early) has `name`, `get`, `get_at`, `row`, `scan`, `scan_prefix`, `scan_bounds` with the same signatures.
 
 ## `RowMutation` (builder; each `self -> Self`)
 | Method | Semantics |
@@ -134,7 +134,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `delete_row()` | Delete whole row. |
 | `durability(Durability)` | Override for this commit. |
 | `commit(self) -> Result<CommitInfo>` | Commit. |
-| `commit_if(self, &Condition) -> Result<Option<CommitInfo>>` | P2. Compare-and-set on this row; `None` if condition failed. |
+| `commit_if(self, &Condition) -> Result<Option<CommitInfo>>` | P2, early. Compare-and-set on this row; `None` if condition failed. |
 
 `Condition` variants: `Exists { family: String, qualifier: Vec<u8> }`, `Absent { .. }`, `Value { family, qualifier, filter: ValueFilter }`.
 
@@ -150,7 +150,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `commit(self) -> Result<CommitInfo>` | Writer default durability. |
 | `commit_with(self, Durability) -> Result<CommitInfo>` | Override. |
 
-`Transaction` (P4): `get(&mut self, &Table, row, family, qualifier) -> Result<Option<CellRef<'_>>>`, `put(..)`, `delete_column(..)` (as `WriteBatch`, `&mut Self`), `commit(self)`, `commit_with(self, Durability)`; `Conflict` on a conflicting commit.
+`Transaction` (P4, early): `get(&mut self, &Table, row, family, qualifier) -> Result<Option<CellRef<'_>>>`, `put(..)`, `delete_column(..)` (as `WriteBatch`, `&mut Self`), `commit(self)`, `commit_with(self, Durability)`; `Conflict` on a conflicting commit.
 
 ## `RowRead` / `Scan` (builders, `self -> Self`)
 | Method | `RowRead` | `Scan` |
@@ -163,7 +163,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `column_limit(u32)` | ✓ | |
 | `columns_per_row(u32)` | | ✓ |
 | `value_filter(ValueFilter)` | ✓ | ✓ |
-| `limit(u64)` rows | | ✓ |
+| `limit(u64)` rows (0: none) | | ✓ |
 | `snapshot(&Snapshot)` | ✓ | ✓ |
 | terminal | `read(self) -> Result<Option<RowRef<'t>>>` | `iter(self) -> Result<RowIter<'t>>` |
 
@@ -190,16 +190,17 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 ## Not yet available
 | Feature | Phase |
 |---|---|
-| zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators, `commit_if` | P2 |
+| Memtables written to SSTs: `flush` writing to the file, `compact`, `backup`, WAL checkpoints (sidecars removed at close), durable `Durability::None` commits | P1 (engine, in progress) |
+| zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
-| `open_reader`, `PigeonholeReader`, `ReadTable`, `Transaction` | P4 |
 
 ## Recipes
 ### 1. Open, create table, write, read
-```rust,ignore
+```rust
 use pigeonhole::{Family, Options, Pigeonhole};
 
-let db = Pigeonhole::open("app.phdb", Options::default())?;
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
 let users = db.table("users")?
     .family("profile", Family::default().max_versions(1))
     .create_if_missing()?;
@@ -207,17 +208,31 @@ let users = db.table("users")?
 users.mutate(b"user:42").put("profile", b"name", b"Ada").commit()?;
 let name = users.get(b"user:42", "profile", b"name")?.map(|c| c.value().to_vec());
 db.close()?;
+# assert_eq!(name.as_deref(), Some(&b"Ada"[..]));
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 ### 2. Counter
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let users = pigeonhole::doc_support::table(&db, "users", &["profile"])?;
 users.mutate(b"user:42").incr("profile", b"logins", 1).commit()?;
 let n: i64 = users.get(b"user:42", "profile", b"logins")?
     .and_then(|c| c.as_i64()).unwrap_or(0);
+# assert_eq!(n, 1);
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 ### 3. Prefix scan with pagination
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let users = pigeonhole::doc_support::table(&db, "users", &["profile"])?;
+# for i in 0..250 { users.mutate(format!("user:{i:03}").as_bytes()).put("profile", b"name", b"x").commit()?; }
+# let mut seen = 0;
 use std::ops::Bound;
 
 let mut after: Option<Vec<u8>> = None;
@@ -234,13 +249,20 @@ loop {
         after = Some(row.key().to_vec());
         n += 1;
         // use row
+#       seen += 1;
     }
     if n < 100 { break; }
 }
+# assert_eq!(seen, 250);
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 ### 4. Atomic multi-row write with chosen durability
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let users = pigeonhole::doc_support::table(&db, "users", &["profile"])?;
 use pigeonhole::Durability;
 
 let mut wb = db.write_batch();
@@ -249,10 +271,16 @@ wb.put(&users, b"user:1", "profile", b"name", b"A")
   .delete_row(&users, b"user:0");
 let info = wb.commit_with(Durability::GroupSync)?;
 assert_eq!(info.durability, Durability::GroupSync);
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 ### 5. Consistent multi-read, versions, event time
-```rust,ignore
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let users = pigeonhole::doc_support::table(&db, "users", &["profile"])?;
+# let (t0_us, t1_us, event_ts_us) = (0u64, u64::MAX, 1_759_622_400_000_000u64);
 let snap = db.snapshot()?;
 let a = users.get_at(&snap, b"user:1", "profile", b"name")?.map(|c| c.to_owned());
 let history = users
@@ -261,4 +289,5 @@ let history = users
 drop(snap); // release promptly
 
 users.mutate(b"user:1").put_at("profile", b"name", event_ts_us, b"Ada").commit()?;
+# Ok::<(), pigeonhole::Error>(())
 ```

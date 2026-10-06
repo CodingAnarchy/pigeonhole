@@ -121,6 +121,10 @@ impl Options {
     }
 
     /// Registers a merge operator, referenced by families through its name.
+    ///
+    /// Phase 2: the engine resolves only the built-in `pigeonhole.i64_add` so far, so a
+    /// family that names any other operator is refused with
+    /// [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator).
     pub fn merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
         self.merge_operators.push(op);
         self
@@ -258,7 +262,8 @@ impl Family {
         self
     }
 
-    /// Store values longer than `bytes` in blob extents (default 4096; Phase 2).
+    /// Store values longer than `bytes` in blob extents (default 4096; Phase 2). Stored with
+    /// the family now; values stay inline until blob separation lands.
     pub fn blob_threshold(mut self, bytes: u32) -> Self {
         self.options.blob_threshold = bytes;
         self
@@ -270,7 +275,8 @@ impl Family {
         self
     }
 
-    /// zstd block compression at `level` (Phase 2).
+    /// zstd block compression at `level` (Phase 2). Until then, creating a table or family
+    /// with it fails with [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported).
     pub fn zstd(mut self, level: i8) -> Self {
         self.options.compression = Compression::Zstd;
         self.options.compression_level = level;
@@ -290,7 +296,8 @@ impl Family {
     }
 
     /// Merge operator for this family, by registered name. `incr` needs none: it uses the
-    /// built-in `pigeonhole.i64_add`, which is the default operator.
+    /// built-in `pigeonhole.i64_add`, which is the default operator. An empty name leaves
+    /// the family without one, so merge operands (and `incr`) are refused at commit.
     pub fn merge_operator(mut self, name: &str) -> Self {
         name.clone_into(&mut self.options.merge_operator);
         self
@@ -306,7 +313,9 @@ impl Family {
         self
     }
 
-    /// Compaction strategy.
+    /// Compaction strategy. `Tiered` and `FifoByTime` are Phase 2: until then, creating a
+    /// table or family with them fails with
+    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported).
     pub fn compaction(mut self, strategy: Compaction) -> Self {
         self.options.compaction = match strategy {
             Compaction::Leveled => CompactionStyle::Leveled,
