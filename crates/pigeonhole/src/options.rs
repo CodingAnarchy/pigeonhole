@@ -13,9 +13,9 @@ use crate::{ErrorCode, MergeOperator, Result};
 /// Name of the built-in `i64` add operator, the default operator of every family.
 pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
 
-/// `n` days, for TTLs: `Family::default().ttl(days(30))`.
+/// `n` days, for TTLs: `Family::default().ttl(days(30))`. Saturates instead of overflowing.
 pub fn days(n: u64) -> Duration {
-    Duration::from_secs(n * 86_400)
+    Duration::from_secs(n.saturating_mul(86_400))
 }
 
 /// Database options. Process-local: nothing here is stored in the file, so reopening with
@@ -44,6 +44,7 @@ pub struct Options {
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     allow_unregistered_merge_operators: bool,
     vfs: Option<VfsRef>,
+    wal_segment_size: Option<u64>,
 }
 
 impl Default for Options {
@@ -60,6 +61,7 @@ impl Default for Options {
             merge_operators: Vec::new(),
             allow_unregistered_merge_operators: false,
             vfs: None,
+            wal_segment_size: None,
         }
     }
 }
@@ -145,6 +147,15 @@ impl Options {
         self.vfs = Some(vfs);
         self
     }
+
+    /// WAL segment size in bytes (default 64 MiB; a multiple of 32 KiB, decision D43). A test
+    /// hook (ICR 0005): small segments keep simulated opens fast. It also lowers the largest
+    /// value a commit may carry (decision D16). Applications never need it.
+    #[doc(hidden)]
+    pub fn wal_segment_size(mut self, bytes: u64) -> Self {
+        self.wal_segment_size = Some(bytes);
+        self
+    }
 }
 
 /// Options for a read-only handle in another process.
@@ -219,6 +230,11 @@ pub enum Compaction {
 /// The defaults: every version kept, no TTL, 10 bloom bits per key, LZ4 blocks of 16 KiB,
 /// values over 4 KiB separated (Phase 2), the built-in `pigeonhole.i64_add` merge operator
 /// (so `incr` works on any family), normal cache priority, leveled compaction.
+///
+/// Because every family carries the `i64` add operator, a column holds either plain values or
+/// a counter: an `incr` on top of a base that is not an 8-byte `i64` fails at read with
+/// [`ErrorCode::MergeFailed`] (decision D41). Use `merge_operator("")` for a family without
+/// one.
 ///
 /// ```
 /// use pigeonhole::{days, Family, Priority};
@@ -343,6 +359,9 @@ impl Options {
         o.row_cache_bytes = self.row_cache;
         o.shm_dir.clone_from(&self.shm_dir);
         o.allow_unregistered_merge = self.allow_unregistered_merge_operators;
+        if let Some(bytes) = self.wal_segment_size {
+            o.wal.segment_size = bytes;
+        }
         // Custom operators (`merge_operators`) are kept for Phase 2: the engine resolves only
         // the built-in `pigeonhole.i64_add` so far, and refuses a family naming any other.
         o

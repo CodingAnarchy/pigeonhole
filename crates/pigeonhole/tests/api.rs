@@ -26,6 +26,7 @@ fn sim_options(vfs: &Arc<SimVfs>) -> Options {
         .vfs(Arc::clone(vfs) as _)
         .shards(2)
         .memtable_budget(4 << 20)
+        .wal_segment_size(256 << 10)
 }
 
 fn table(db: &Pigeonhole) -> Table {
@@ -318,6 +319,9 @@ fn every_engine_error_maps_to_its_code() {
         let what = format!("{e:?}");
         let message = match &e {
             E::Merge(_) => "merge operator \"op\" failed: bad".to_owned(),
+            E::Busy => "memtable arena full: raise Options::memtable_budget (flush to SSTs \
+                        arrives with engine Milestone B, #37)"
+                .to_owned(),
             _ => e.to_string(),
         };
         let public: pigeonhole::Error = e.into();
@@ -1041,4 +1045,236 @@ fn reader_handles_see_the_writers_commits() {
     drop(reader);
     drop(t);
     db.close().unwrap();
+}
+
+// ---- review fixes ----
+
+#[test]
+fn snapshots_from_another_database_are_refused() {
+    let db = db();
+    let t = table(&db);
+    t.mutate(b"r").put("a", b"q", b"v").commit().unwrap();
+    let other = self::db();
+    let foreign = other.snapshot().unwrap();
+    let code = |r: pigeonhole::Result<()>| r.unwrap_err().code();
+    assert_eq!(
+        code(t.get_at(&foreign, b"r", "a", b"q").map(|_| ())),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        code(t.row(b"r").snapshot(&foreign).read().map(|_| ())),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        code(t.scan_prefix(b"").snapshot(&foreign).iter().map(|_| ())),
+        ErrorCode::InvalidArgument
+    );
+    // Its own snapshots still work, including from a clone of the handle.
+    let own = db.clone().snapshot().unwrap();
+    assert!(t.get_at(&own, b"r", "a", b"q").unwrap().is_some());
+}
+
+#[test]
+fn reads_after_close_fail_with_closed() {
+    let db = db();
+    let t = table(&db);
+    t.mutate(b"r").put("a", b"q", b"v").commit().unwrap();
+    let snap = db.snapshot().unwrap();
+    let handle = db.clone();
+    db.close().unwrap();
+    let code = |r: pigeonhole::Result<()>| r.unwrap_err().code();
+    assert_eq!(code(t.get(b"r", "a", b"q").map(|_| ())), ErrorCode::Closed);
+    assert_eq!(
+        code(t.get_at(&snap, b"r", "a", b"q").map(|_| ())),
+        ErrorCode::Closed
+    );
+    assert_eq!(code(t.row(b"r").read().map(|_| ())), ErrorCode::Closed);
+    assert_eq!(
+        code(t.scan_prefix(b"").iter().map(|_| ())),
+        ErrorCode::Closed
+    );
+    assert_eq!(code(handle.snapshot().map(|_| ())), ErrorCode::Closed);
+    assert_eq!(code(handle.transaction().map(|_| ())), ErrorCode::Closed);
+    assert_eq!(
+        code(handle.table("t").unwrap().open().map(|_| ())),
+        ErrorCode::Closed
+    );
+    let mut wb = handle.write_batch();
+    wb.put(&t, b"r", "a", b"q", b"v");
+    assert_eq!(code(wb.commit().map(|_| ())), ErrorCode::Closed);
+}
+
+#[test]
+fn a_full_memtable_arena_is_busy_with_a_precise_message() {
+    let vfs = SimVfs::new(11);
+    let opts = |budget| {
+        Options::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .shards(1)
+            .memtable_budget(budget)
+            .wal_segment_size(256 << 10)
+    };
+    let db = Pigeonhole::open("/db/busy.phdb", opts(1 << 20)).unwrap();
+    let t = table(&db);
+    let value = vec![1u8; 1000];
+    let err = (0..10_000u32)
+        .find_map(|i| {
+            t.mutate(&i.to_be_bytes())
+                .put("a", b"q", &value)
+                .commit()
+                .err()
+        })
+        .expect("the arena fills");
+    assert_eq!(err.code(), ErrorCode::Busy);
+    assert!(err.message().contains("memtable_budget"), "{err}");
+    drop(t);
+    db.close().unwrap();
+    // Reopening with a smaller budget than the data needs is refused.
+    let err = Pigeonhole::open("/db/busy.phdb", opts(256 << 10)).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+    eprintln!("smaller budget on reopen: {err}");
+}
+
+#[test]
+fn size_errors_name_the_size_and_the_limit() {
+    let db = db();
+    let t = table(&db);
+    let err = t
+        .mutate(&[0u8; 70_000])
+        .put("a", b"q", b"v")
+        .commit()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::KeyTooLarge);
+    assert!(err.message().contains("row key of 70000 bytes"), "{err}");
+    assert!(err.message().contains("65536"), "{err}");
+    let err = t
+        .mutate(b"r")
+        .put("a", &[0u8; 66_000], b"v")
+        .commit()
+        .unwrap_err();
+    assert!(err.message().contains("qualifier of 66000 bytes"), "{err}");
+    let mut wb = db.write_batch();
+    wb.delete_row(&t, &[0u8; 70_000]);
+    assert!(
+        wb.commit()
+            .unwrap_err()
+            .message()
+            .contains("row key of 70000 bytes")
+    );
+    // 256 KiB segments: the limit is the segment payload, 256 KiB - 64 KiB.
+    let big = vec![0u8; 300_000];
+    let err = t.mutate(b"r").put("a", b"q", &big).commit().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ValueTooLarge);
+    assert!(err.message().contains("value of 300000 bytes"), "{err}");
+    assert!(err.message().contains(&(192 * 1024).to_string()), "{err}");
+    let mut txn = db.transaction().unwrap();
+    txn.put(&t, b"r", "a", b"q", &big);
+    let err = txn.commit().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ValueTooLarge);
+    assert!(err.message().contains("value of 300000 bytes"), "{err}");
+}
+
+#[test]
+fn write_batches_have_every_row_mutation() {
+    let db = db();
+    let t = table(&db);
+    t.mutate(b"r")
+        .put_at("a", b"x", 10, b"old")
+        .put("b", b"y", b"1")
+        .commit()
+        .unwrap();
+    let mut wb = db.write_batch();
+    wb.put_i64(&t, b"r", "a", b"n", 41)
+        .put_f64(&t, b"s", "a", b"f", 1.5)
+        .delete_cell(&t, b"r", "a", b"x", 10)
+        .delete_family(&t, b"r", "b");
+    assert_eq!(wb.len(), 4);
+    wb.commit().unwrap();
+    let mut wb = db.write_batch();
+    wb.incr(&t, b"r", "a", b"n", 1);
+    wb.commit().unwrap();
+    assert_eq!(t.get(b"r", "a", b"n").unwrap().unwrap().as_i64(), Some(42));
+    // `merge` writes an untyped operand (for custom operators); the built-in i64 add
+    // refuses it at read time, so counters use `incr`.
+    let mut wb = db.write_batch();
+    wb.merge(&t, b"m", "a", b"n", &1i64.to_le_bytes());
+    wb.commit().unwrap();
+    assert_eq!(
+        t.get(b"m", "a", b"n").map(|_| ()).unwrap_err().code(),
+        ErrorCode::MergeFailed
+    );
+    assert_eq!(
+        t.get(b"s", "a", b"f").unwrap().unwrap().typed(),
+        Value::F64(1.5)
+    );
+    assert!(t.get(b"r", "a", b"x").unwrap().is_none());
+    assert!(t.get(b"r", "b", b"y").unwrap().is_none());
+}
+
+#[test]
+fn durability_defaults_and_overrides_on_every_commit_path() {
+    let vfs = SimVfs::new(13);
+    let db = Pigeonhole::open("/db/dd.phdb", sim_options(&vfs)).unwrap();
+    assert_eq!(db.default_durability(), Durability::GroupSync);
+    let t = table(&db);
+    assert_eq!(
+        t.mutate(b"r")
+            .put("a", b"q", b"v")
+            .commit()
+            .unwrap()
+            .durability,
+        Durability::GroupSync
+    );
+    let mut txn = db.transaction().unwrap();
+    txn.put(&t, b"r", "a", b"q", b"t");
+    assert_eq!(
+        txn.commit_with(Durability::Buffered).unwrap().durability,
+        Durability::Buffered
+    );
+    let mut txn = db.transaction().unwrap();
+    txn.put(&t, b"r", "a", b"q", b"u");
+    assert_eq!(txn.commit().unwrap().durability, Durability::GroupSync);
+    let always = Condition::Exists {
+        family: "a".into(),
+        qualifier: b"q".to_vec(),
+    };
+    let info = t
+        .mutate(b"r")
+        .put("a", b"q", b"w")
+        .durability(Durability::None)
+        .commit_if(&always)
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.durability, Durability::None);
+}
+
+#[test]
+fn empty_table_names_and_tables_without_families_are_refused() {
+    let db = db();
+    let err = db
+        .table("")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    for r in [
+        db.table("t").unwrap().create(),
+        db.table("t").unwrap().create_if_missing(),
+    ] {
+        assert_eq!(r.unwrap_err().code(), ErrorCode::InvalidArgument);
+    }
+    assert!(db.tables().is_empty());
+    // Opening an existing table needs no declared family.
+    table(&db);
+    assert_eq!(
+        db.table("t").unwrap().open().unwrap().families(),
+        ["a", "b"]
+    );
+}
+
+#[test]
+fn days_saturates() {
+    assert_eq!(days(2), Duration::from_secs(2 * 86_400));
+    assert_eq!(days(u64::MAX), Duration::from_secs(u64::MAX));
 }

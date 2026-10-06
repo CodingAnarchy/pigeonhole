@@ -5,7 +5,7 @@ use pigeonhole_engine::{
     FamilyId, QualifierFilter, ReadSpec, ScanCursor, ScanSpec, TableInfo, ValuePredicate,
 };
 
-use crate::cell::{Cell, RowBuf, RowCell};
+use crate::cell::RowBuf;
 use crate::table::{TableCore, family_not_found};
 use crate::{Result, Row, RowRef, Snapshot};
 
@@ -19,8 +19,7 @@ use crate::{Result, Row, RowRef, Snapshot};
 /// use pigeonhole::{Family, Options, Pigeonhole, ValueFilter};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-valuefilter", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
 /// t.mutate(b"a").put_i64("f", b"score", 10).commit()?;
@@ -34,7 +33,6 @@ use crate::{Result, Row, RowRef, Snapshot};
 ///     .collect::<pigeonhole::Result<_>>()?;
 /// assert_eq!(high, [b"b".to_vec()]);
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -94,7 +92,7 @@ pub enum Condition {
 struct Selection {
     families: Vec<String>,
     spec: ReadSpec,
-    snapshot: Option<pigeonhole_engine::Snapshot>,
+    snapshot: Option<Snapshot>,
 }
 
 impl Selection {
@@ -120,10 +118,14 @@ impl Selection {
     /// Resolves the projection against the catalog as of now and takes the snapshot. Returns
     /// the catalog entry, which names every family the read can return.
     fn start(&mut self, core: &TableCore) -> Result<(Arc<TableInfo>, pigeonhole_engine::Snapshot)> {
+        core.db.check_open()?;
         // The snapshot first: the catalog read afterwards includes every family it can see.
         let snapshot = match self.snapshot.take() {
-            Some(s) => s,
-            None => core.engine.snapshot()?,
+            Some(s) => {
+                core.db.check_snapshot(&s)?;
+                s.inner
+            }
+            None => core.db.engine.snapshot()?,
         };
         let info = core.current_info();
         let mut ids: Vec<FamilyId> = Vec::with_capacity(self.families.len());
@@ -200,7 +202,7 @@ macro_rules! selection_methods {
 
         /// Read as of `snapshot` instead of now.
         pub fn snapshot(mut self, snapshot: &Snapshot) -> Self {
-            self.sel.snapshot = Some(snapshot.inner.clone());
+            self.sel.snapshot = Some(snapshot.clone());
             self
         }
     };
@@ -212,8 +214,7 @@ macro_rules! selection_methods {
 /// use pigeonhole::{Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-rowread", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let t = db.table("t")?.family("temp", Family::default()).create_if_missing()?;
 /// for (ts, v) in [(10u64, b"20.5"), (20, b"21.0"), (30, b"21.5")] {
@@ -228,7 +229,6 @@ macro_rules! selection_methods {
 /// assert_eq!(window.len(), 2);
 /// assert!(t.row(b"sensor:8").read()?.is_none());
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -266,28 +266,24 @@ impl<'t> RowRead<'t> {
     /// Performs the read. `None` if the row has no matching cell.
     pub fn read(mut self) -> Result<Option<RowRef<'t>>> {
         let (info, snapshot) = self.sel.start(self.core)?;
-        let Some(data) =
-            self.core
-                .engine
-                .read_row(&snapshot, self.core.info.id, &self.row, &self.sel.spec)?
+        let Some(data) = self.core.db.engine.read_row(
+            &snapshot,
+            self.core.info.id,
+            &self.row,
+            &self.sel.spec,
+        )?
         else {
             return Ok(None);
         };
         if data.cells.is_empty() {
             return Ok(None);
         }
-        let mut buf = RowBuf {
-            info: Some(info),
-            key: data.row,
-            qualifiers: data.qualifiers,
-            cells: Vec::with_capacity(data.cells.len()),
-        };
+        let mut buf = RowBuf::new(info, data.cells.len());
+        buf.key = data.row;
+        buf.qualifiers = data.qualifiers;
         for c in data.cells {
-            buf.cells.push(RowCell {
-                family: c.family,
-                qualifier: c.qualifier,
-                cell: Cell::from_data(c.data),
-            });
+            let qualifier = c.qualifier.start as usize..c.qualifier.end as usize;
+            buf.push(c.family, qualifier, c.data);
         }
         Ok(Some(RowRef::owned(buf)))
     }
@@ -300,8 +296,7 @@ impl<'t> RowRead<'t> {
 /// use pigeonhole::{Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-scan", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
 /// for k in [&b"user:1"[..], b"user:2", b"user:3", b"vendor:1"] {
@@ -322,7 +317,6 @@ impl<'t> RowRead<'t> {
 ///     .count();
 /// assert_eq!(rest, 1);
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -375,13 +369,14 @@ impl<'t> Scan<'t> {
         spec.read = self.sel.spec;
         // `ScanSpec::limit` uses 0 for "unlimited"; `limit(0)` asks for no rows.
         spec.limit = self.limit.unwrap_or(0);
-        let cursor = self.core.engine.scan(&snapshot, self.core.info.id, spec)?;
+        let cursor = self
+            .core
+            .db
+            .engine
+            .scan(&snapshot, self.core.info.id, spec)?;
         Ok(RowIter {
             cursor,
-            buf: RowBuf {
-                info: Some(info),
-                ..RowBuf::default()
-            },
+            buf: RowBuf::new(info, 0),
             done: self.limit == Some(0),
             _table: std::marker::PhantomData,
         })
@@ -426,7 +421,8 @@ impl RowIter<'_> {
             self.buf.qualifiers.extend_from_slice(cell.qualifier);
             // `cell` borrows the cursor; the pinned value is taken once it is released.
             let data = self.cursor.current_data();
-            self.buf.push_appended(family, start, data);
+            let end = self.buf.qualifiers.len();
+            self.buf.push(family, start..end, data);
         }
         Ok(true)
     }
@@ -447,12 +443,7 @@ impl Iterator for RowIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self.fill() {
             Ok(true) => {
-                let next = RowBuf {
-                    info: self.buf.info.clone(),
-                    key: Vec::with_capacity(self.buf.key.len()),
-                    qualifiers: Vec::with_capacity(self.buf.qualifiers.len()),
-                    cells: Vec::with_capacity(self.buf.cells.len()),
-                };
+                let next = self.buf.empty_like();
                 Some(Ok(Row::new(std::mem::replace(&mut self.buf, next))))
             }
             Ok(false) => None,

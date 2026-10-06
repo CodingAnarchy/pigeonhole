@@ -24,7 +24,8 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Handles | `Pigeonhole`, `Table`, `Snapshot`, `Cell`, `Row` are cheap `Clone`. `Table`: `Send + Sync`. |
 | Snapshots | Pin data. Drop promptly. |
 | Filesystem | Local only (`NetworkFilesystem`). |
-| Typed values | `incr` columns are `i64`. Write counters only with `incr` / `put_i64`: reading an `incr` on top of a base that is not an 8-byte `i64` fails with `MergeFailed` (D41). |
+| Memory bound (P1, until #37) | Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), everything written stays in the memtable arenas: total data ≤ `memtable_budget` × shards, and less in practice, since every version and delete marker counts and each table lives on one shard until tablets split. Beyond it, commits fail with `Busy`. Reopening with a `memtable_budget` too small for the data in the WAL fails with `InvalidArgument`. |
+| Typed values | `incr` columns are `i64`. Write counters only with `incr` / `put_i64`: reading an `incr` on top of a base that is not an 8-byte `i64` fails with `MergeFailed` (D41). `merge` writes untyped operands (custom operators); the built-in `i64` add refuses them at read time. |
 
 ## Types
 | Type | Role |
@@ -143,8 +144,12 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 |---|---|
 | `put(&Table, row, family, qualifier, value)` | |
 | `put_at(&Table, row, family, qualifier, ts, value)` | |
+| `put_i64(&Table, row, family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. |
 | `incr(&Table, row, family, qualifier, delta)` | |
+| `merge(&Table, row, family, qualifier, operand)` | Untyped operand (custom operators, P2). |
+| `delete_cell(&Table, row, family, qualifier, ts)` | D38. |
 | `delete_column(&Table, row, family, qualifier)` | |
+| `delete_family(&Table, row, family)` | |
 | `delete_row(&Table, row)` | |
 | `len(&self) -> usize`, `is_empty(&self) -> bool` | |
 | `commit(self) -> Result<CommitInfo>` | Writer default durability. |
@@ -190,7 +195,8 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 ## Not yet available
 | Feature | Phase |
 |---|---|
-| Memtables written to SSTs: `flush` writing to the file, `compact`, `backup`, WAL checkpoints (sidecars removed at close), durable `Durability::None` commits | P1 (engine, in progress) |
+| Memtables written to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)): `flush` writing to the file, `compact`, `backup`, WAL checkpoints (sidecars removed at close), data beyond the memory bound (`Busy` today) | P1 (engine, in progress) |
+| `None` commits made durable by a later stronger commit on the same shard ([#50](https://github.com/CodingAnarchy/pigeonhole/issues/50)) | P1 (engine Milestone B) |
 | zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
 

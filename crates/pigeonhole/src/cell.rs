@@ -48,8 +48,7 @@ fn as_i64(data: &CellData) -> Option<i64> {
 /// use pigeonhole::{Family, Options, Pigeonhole, Value};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-cellref", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
 /// t.mutate(b"row").put("f", b"name", b"Ada").put_i64("f", b"age", 36).commit()?;
@@ -66,7 +65,6 @@ fn as_i64(data: &CellData) -> Option<i64> {
 /// drop(t);
 /// assert_eq!(owned.value(), b"Ada");
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -131,10 +129,6 @@ pub struct Cell {
 }
 
 impl Cell {
-    pub(crate) fn from_data(data: CellData) -> Self {
-        Self { data }
-    }
-
     /// The value bytes.
     #[inline]
     pub fn value(&self) -> &[u8] {
@@ -168,13 +162,13 @@ pub struct CellEntry<'a> {
     pub cell: CellRef<'a>,
 }
 
-/// One cell of a row: its family, its qualifier as a range of the row's qualifier buffer,
-/// and the version.
+/// One cell of a row: its family (an index into the row's catalog entry), its qualifier as
+/// a range of the row's qualifier buffer, and the version.
 #[derive(Debug, Clone)]
 pub(crate) struct RowCell {
-    pub(crate) family: FamilyId,
-    pub(crate) qualifier: Range<u32>,
-    pub(crate) cell: Cell,
+    family: usize,
+    qualifier: Range<usize>,
+    cell: Cell,
 }
 
 /// The storage behind [`Row`] and [`RowRef`]: a few buffers per row, none per cell.
@@ -185,10 +179,34 @@ pub(crate) struct RowBuf {
     pub(crate) key: Vec<u8>,
     /// Every qualifier of the row, concatenated.
     pub(crate) qualifiers: Vec<u8>,
-    pub(crate) cells: Vec<RowCell>,
+    cells: Vec<RowCell>,
+    /// The family pushed last and its index in `info`: cells come grouped by family, so
+    /// resolving one is a lookup per family run, not per cell.
+    last_family: Option<(FamilyId, usize)>,
 }
 
 impl RowBuf {
+    /// An empty row whose families are named by `info`, with room for `cells` cells.
+    pub(crate) fn new(info: Arc<TableInfo>, cells: usize) -> Self {
+        Self {
+            info: Some(info),
+            cells: Vec::with_capacity(cells),
+            ..Self::default()
+        }
+    }
+
+    /// An empty row for the same families, with this row's capacities (the next row of a
+    /// scan is likely shaped like the last).
+    pub(crate) fn empty_like(&self) -> Self {
+        Self {
+            info: self.info.clone(),
+            key: Vec::with_capacity(self.key.len()),
+            qualifiers: Vec::with_capacity(self.qualifiers.len()),
+            cells: Vec::with_capacity(self.cells.len()),
+            last_family: self.last_family,
+        }
+    }
+
     /// Empties the buffers, keeping their capacity.
     pub(crate) fn clear(&mut self) {
         self.key.clear();
@@ -196,24 +214,47 @@ impl RowBuf {
         self.cells.clear();
     }
 
-    /// Appends a cell whose qualifier was just appended to `qualifiers` at `start`.
-    pub(crate) fn push_appended(&mut self, family: FamilyId, start: usize, data: CellData) {
+    /// Number of cells.
+    pub(crate) fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Appends a cell whose qualifier is `qualifier` within `qualifiers`.
+    pub(crate) fn push(&mut self, family: FamilyId, qualifier: Range<usize>, data: CellData) {
+        let family = self.family_index(family);
         self.cells.push(RowCell {
             family,
-            qualifier: start as u32..self.qualifiers.len() as u32,
+            qualifier,
             cell: Cell { data },
         });
     }
 
-    fn family_name(&self, id: FamilyId) -> &str {
+    /// The index of family `id` in `info` (`usize::MAX` if it is not there, which names it
+    /// `""`).
+    fn family_index(&mut self, id: FamilyId) -> usize {
+        if let Some((last, i)) = self.last_family
+            && last == id
+        {
+            return i;
+        }
+        let i = self
+            .info
+            .as_deref()
+            .and_then(|info| info.families.iter().position(|f| f.id == id))
+            .unwrap_or(usize::MAX);
+        self.last_family = Some((id, i));
+        i
+    }
+
+    fn family_name(&self, i: usize) -> &str {
         self.info
             .as_deref()
-            .and_then(|info| info.families.iter().find(|f| f.id == id))
+            .and_then(|info| info.families.get(i))
             .map_or("", |f| f.name.as_str())
     }
 
     fn qualifier(&self, cell: &RowCell) -> &[u8] {
-        &self.qualifiers[cell.qualifier.start as usize..cell.qualifier.end as usize]
+        &self.qualifiers[cell.qualifier.clone()]
     }
 
     fn entry(&self, i: usize) -> Option<(&str, &[u8], &Cell)> {
@@ -224,10 +265,15 @@ impl RowBuf {
     /// The newest version of one column: the first cell of it, since versions come newest
     /// first.
     fn get(&self, family: &str, qualifier: &[u8]) -> Option<&Cell> {
-        let id = self.info.as_deref()?.family(family)?.id;
+        let i = self
+            .info
+            .as_deref()?
+            .families
+            .iter()
+            .position(|f| f.name == family)?;
         self.cells
             .iter()
-            .find(|c| c.family == id && self.qualifier(c) == qualifier)
+            .find(|c| c.family == i && self.qualifier(c) == qualifier)
             .map(|c| &c.cell)
     }
 }
@@ -245,8 +291,7 @@ enum RowSrc<'a> {
 /// use pigeonhole::{Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-rowref", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let t = db
 ///     .table("t")?
@@ -261,7 +306,6 @@ enum RowSrc<'a> {
 /// assert_eq!(cells, [("a", &b"y"[..]), ("a", b"z"), ("b", b"x")]);
 /// assert_eq!(row.get("a", b"z").unwrap().value(), b"2");
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -297,7 +341,7 @@ impl<'a> RowRef<'a> {
 
     /// Number of cells.
     pub fn len(&self) -> usize {
-        self.buf().cells.len()
+        self.buf().len()
     }
 
     /// Whether the row has no cells.
@@ -343,8 +387,7 @@ impl<'a> RowRef<'a> {
 /// use pigeonhole::{Family, Options, Pigeonhole, Row};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-row", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
 /// t.mutate(b"a").put("f", b"q", b"1").commit()?;
@@ -356,7 +399,6 @@ impl<'a> RowRef<'a> {
 /// assert_eq!((family, qualifier, cell.value()), ("f", &b"q"[..], &b"2"[..]));
 /// assert_eq!(rows[0].get("f", b"q").unwrap().value(), b"1");
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -377,7 +419,7 @@ impl Row {
 
     /// Number of cells.
     pub fn len(&self) -> usize {
-        self.buf.cells.len()
+        self.buf.len()
     }
 
     /// Whether the row has no cells.

@@ -55,9 +55,9 @@ The writer default is process-local and **not stored in the file**. Reopening wi
 ## Mixed levels
 Commits at different levels share each shard's WAL stream, which is ordered.
 
-- A `GroupSync` or `Sync` commit also makes every **earlier** `Buffered` record in that stream durable.
+- A `GroupSync` or `Sync` commit also makes every **earlier** `Buffered` or `None` record in that stream durable.
 - A weaker commit never weakens a stronger one in the same group: the group is written to the strongest level any member requested.
-- A `None` commit writes no WAL record at all, so a later `GroupSync` commit does **not** make it durable: it lives in the memtable until a flush writes it to the file. In the current build flushes do not write to the file yet, so a `None` commit is lost at the next close or crash.
+- A `None` commit followed by a `GroupSync` commit on the same shard is therefore durable after the second returns. The reverse is not true: a later `None` commit is not durable. **Arriving with engine Milestone B ([#50](https://github.com/CodingAnarchy/pigeonhole/issues/50)):** the current build writes no WAL record for a `None` commit, so today a `None` commit is lost at the next close or crash, even after a later stronger commit.
 - Each shard has its own stream. A `GroupSync` commit on one shard does not make an earlier `Buffered` commit on another shard durable; after a power loss, every commit acknowledged at `GroupSync` or `Sync` survives, and weaker ones may or may not.
 
 So you can run a mostly-`Buffered` ingest path and put a periodic `GroupSync` commit on it as a checkpoint for that shard.

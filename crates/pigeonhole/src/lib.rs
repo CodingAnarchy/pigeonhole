@@ -82,7 +82,7 @@ mod write;
 #[doc(hidden)]
 pub mod doc_support;
 
-/// The user guide's code samples, compiled and run as doctests.
+/// The user guide's and the READMEs' code samples, compiled and run as doctests.
 #[cfg(doctest)]
 mod guide {
     #[doc = include_str!("../../../docs/guide/getting-started.md")]
@@ -99,6 +99,10 @@ mod guide {
     struct AgentReference;
     #[doc = include_str!("../../../docs/guide/concepts.md")]
     struct Concepts;
+    #[doc = include_str!("../README.md")]
+    struct CrateReadme;
+    #[doc = include_str!("../../../README.md")]
+    struct RepositoryReadme;
 }
 
 #[cfg(feature = "async")]

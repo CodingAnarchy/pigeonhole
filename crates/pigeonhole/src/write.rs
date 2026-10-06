@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, Predicate, Txn, ValueRef};
+use pigeonhole_engine::{FamilyId, Predicate, TableId, Txn, ValueRef};
 use pigeonhole_format::Durability;
+use pigeonhole_format::key::MAX_KEY_PART;
 
+use crate::db::Db;
 use crate::table::TableCore;
 use crate::{CellRef, Condition, Error, ErrorCode, Result, Table};
+
+type EngineBatch = pigeonhole_engine::WriteBatch;
 
 /// The outcome of a commit.
 ///
@@ -41,12 +45,63 @@ impl From<pigeonhole_engine::CommitInfo> for CommitInfo {
     }
 }
 
+/// The lengths of one mutation's parts, for size errors.
+#[derive(Debug, Clone, Copy)]
+struct Sizes {
+    row: usize,
+    qualifier: usize,
+    value: usize,
+}
+
+impl Sizes {
+    fn new(row: &[u8], qualifier: &[u8], value: usize) -> Self {
+        Self {
+            row: row.len(),
+            qualifier: qualifier.len(),
+            value,
+        }
+    }
+}
+
+/// An engine error with the sizes and limits filled in for `KeyTooLarge` and
+/// `ValueTooLarge` (the engine's variants carry neither).
+fn size_error(e: pigeonhole_engine::Error, sizes: Sizes, max_value: usize) -> Error {
+    use pigeonhole_engine::Error as E;
+    match e {
+        E::KeyTooLarge => {
+            let (what, len) = if sizes.row > MAX_KEY_PART {
+                ("row key", sizes.row)
+            } else {
+                ("qualifier", sizes.qualifier)
+            };
+            Error::new(
+                ErrorCode::KeyTooLarge,
+                format!("{what} of {len} bytes exceeds the limit of {MAX_KEY_PART} bytes"),
+            )
+        }
+        E::ValueTooLarge => value_too_large(sizes.value, max_value),
+        e => e.into(),
+    }
+}
+
+fn value_too_large(len: usize, max_value: usize) -> Error {
+    Error::new(
+        ErrorCode::ValueTooLarge,
+        format!(
+            "value of {len} bytes exceeds the limit of {max_value} bytes (the smallest of the \
+             WAL segment payload, 64 MiB and half a shard's memtable arena; decision D16)"
+        ),
+    )
+}
+
 /// An engine batch plus the first error met while building it (builders never fail; the
 /// error surfaces at commit).
 #[derive(Debug, Default)]
 struct Builder {
-    batch: pigeonhole_engine::WriteBatch,
+    batch: EngineBatch,
     error: Option<Error>,
+    /// The largest value added, for a `ValueTooLarge` message at commit.
+    largest_value: usize,
 }
 
 impl Builder {
@@ -55,17 +110,17 @@ impl Builder {
         &mut self,
         table: &TableCore,
         family: &str,
-        f: impl FnOnce(
-            &mut pigeonhole_engine::WriteBatch,
-            pigeonhole_engine::FamilyId,
-        ) -> pigeonhole_engine::Result<()>,
+        sizes: Sizes,
+        f: impl FnOnce(&mut EngineBatch, FamilyId) -> pigeonhole_engine::Result<()>,
     ) {
         if self.error.is_some() {
             return;
         }
+        self.largest_value = self.largest_value.max(sizes.value);
+        let max_value = table.db.max_value;
         let r = table
             .family_id(family)
-            .and_then(|id| f(&mut self.batch, id).map_err(Error::from));
+            .and_then(|id| f(&mut self.batch, id).map_err(|e| size_error(e, sizes, max_value)));
         if let Err(e) = r {
             self.error = Some(e);
         }
@@ -75,26 +130,50 @@ impl Builder {
         if self.error.is_none()
             && let Err(e) = self.batch.delete_row(table.info.id, row, None)
         {
-            self.error = Some(e.into());
+            self.error = Some(size_error(e, Sizes::new(row, &[], 0), 0));
         }
     }
 
     /// Refuses a table handle from another database.
-    fn check_engine(&mut self, engine: &Arc<Engine>, table: &Table) -> bool {
-        if self.error.is_none() && !Arc::ptr_eq(engine, &table.core.engine) {
-            self.error = Some(Error::new(
-                ErrorCode::InvalidArgument,
-                format!("table {:?} belongs to another database", table.name()),
-            ));
+    fn check_table(&mut self, db: &Arc<Db>, table: &Table) -> bool {
+        if self.error.is_none()
+            && let Err(e) = check_table(db, table)
+        {
+            self.error = Some(e);
         }
         self.error.is_none()
     }
 
-    fn finish(self) -> Result<pigeonhole_engine::WriteBatch> {
-        match self.error {
-            Some(e) => Err(e),
-            None => Ok(self.batch),
+    /// Commits through `db`, reporting the first builder error instead if there was one.
+    fn commit(self, db: &Db, durability: Option<Durability>) -> Result<CommitInfo> {
+        if let Some(e) = self.error {
+            return Err(e);
         }
+        let largest = self.largest_value;
+        db.engine
+            .commit(self.batch, durability)
+            .map(CommitInfo::from)
+            .map_err(|e| commit_error(e, largest, db.max_value))
+    }
+}
+
+/// A commit's error: `ValueTooLarge` names the largest value of the commit.
+fn commit_error(e: pigeonhole_engine::Error, largest_value: usize, max_value: usize) -> Error {
+    match e {
+        pigeonhole_engine::Error::ValueTooLarge => value_too_large(largest_value, max_value),
+        e => e.into(),
+    }
+}
+
+/// Refuses a table handle from another database.
+fn check_table(db: &Arc<Db>, table: &Table) -> Result<()> {
+    if Arc::ptr_eq(db, &table.core.db) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!("table {:?} belongs to another database", table.name()),
+        ))
     }
 }
 
@@ -148,20 +227,18 @@ impl<'t> RowMutation<'t> {
         }
     }
 
-    /// Adds one mutation of this row in `family`.
+    /// Adds one mutation of this row in `family` (`qualifier` and `value` only size errors).
     fn op(
         mut self,
         family: &str,
-        f: impl FnOnce(
-            &mut pigeonhole_engine::WriteBatch,
-            pigeonhole_engine::TableId,
-            pigeonhole_engine::FamilyId,
-            &[u8],
-        ) -> pigeonhole_engine::Result<()>,
+        qualifier: &[u8],
+        value: usize,
+        f: impl FnOnce(&mut EngineBatch, TableId, FamilyId, &[u8]) -> pigeonhole_engine::Result<()>,
     ) -> Self {
         let (table, row) = (self.table.info.id, &self.row);
+        let sizes = Sizes::new(row, qualifier, value);
         self.builder
-            .with(self.table, family, |b, fam| f(b, table, fam, row));
+            .with(self.table, family, sizes, |b, fam| f(b, table, fam, row));
         self
     }
 }
@@ -169,63 +246,67 @@ impl<'t> RowMutation<'t> {
 impl RowMutation<'_> {
     /// Puts bytes at the commit timestamp.
     pub fn put(self, family: &str, qualifier: &[u8], value: &[u8]) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, value.len(), |b, t, f, row| {
             b.put(t, f, row, qualifier, None, ValueRef::Bytes(value))
         })
     }
 
     /// Puts bytes at an explicit timestamp (event time).
     pub fn put_at(self, family: &str, qualifier: &[u8], ts: u64, value: &[u8]) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, value.len(), |b, t, f, row| {
             b.put(t, f, row, qualifier, Some(ts), ValueRef::Bytes(value))
         })
     }
 
     /// Puts a typed `i64`.
     pub fn put_i64(self, family: &str, qualifier: &[u8], value: i64) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, 8, |b, t, f, row| {
             b.put(t, f, row, qualifier, None, ValueRef::I64(value))
         })
     }
 
     /// Puts a typed `f64`.
     pub fn put_f64(self, family: &str, qualifier: &[u8], value: f64) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, 8, |b, t, f, row| {
             b.put(t, f, row, qualifier, None, ValueRef::F64(value))
         })
     }
 
     /// Atomically adds `delta` to an `i64` counter without reading it (a merge operand).
     pub fn incr(self, family: &str, qualifier: &[u8], delta: i64) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, 8, |b, t, f, row| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))
         })
     }
 
-    /// Writes an operand for the family's merge operator.
+    /// Writes an untyped operand for the family's merge operator (custom operators, Phase 2).
+    /// The built-in `i64` add takes typed operands only: use `incr`, or the read fails with
+    /// [`ErrorCode::MergeFailed`](crate::ErrorCode::MergeFailed).
     pub fn merge(self, family: &str, qualifier: &[u8], operand: &[u8]) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, operand.len(), |b, t, f, row| {
             b.merge(t, f, row, qualifier, ValueRef::Bytes(operand))
         })
     }
 
     /// Deletes one version.
     pub fn delete_cell(self, family: &str, qualifier: &[u8], ts: u64) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, 0, |b, t, f, row| {
             b.delete_cell(t, f, row, qualifier, ts)
         })
     }
 
     /// Deletes every version of a column.
     pub fn delete_column(self, family: &str, qualifier: &[u8]) -> Self {
-        self.op(family, |b, t, f, row| {
+        self.op(family, qualifier, 0, |b, t, f, row| {
             b.delete_column(t, f, row, qualifier, None)
         })
     }
 
     /// Deletes every column of a family in this row.
     pub fn delete_family(self, family: &str) -> Self {
-        self.op(family, |b, t, f, row| b.delete_family(t, f, row, None))
+        self.op(family, &[], 0, |b, t, f, row| {
+            b.delete_family(t, f, row, None)
+        })
     }
 
     /// Deletes the whole row.
@@ -242,14 +323,15 @@ impl RowMutation<'_> {
 
     /// Commits.
     pub fn commit(self) -> Result<CommitInfo> {
-        let batch = self.builder.finish()?;
-        Ok(self.table.engine.commit(batch, self.durability)?.into())
+        self.builder.commit(&self.table.db, self.durability)
     }
 
     /// Commits only if `condition` holds on this row, atomically (BigTable's
     /// `check_and_mutate`; Phase 2). Returns `None` if the condition failed.
     pub fn commit_if(self, condition: &Condition) -> Result<Option<CommitInfo>> {
-        let batch = self.builder.finish()?;
+        if let Some(e) = self.builder.error {
+            return Err(e);
+        }
         let predicate = match condition {
             Condition::Exists { family, qualifier } => Predicate::Exists {
                 family: self.table.family_id(family)?,
@@ -269,13 +351,18 @@ impl RowMutation<'_> {
                 predicate: filter.to_engine(),
             },
         };
-        let (applied, info) = self.table.engine.check_and_mutate(
-            self.table.info.id,
-            &self.row,
-            &predicate,
-            batch,
-            self.durability,
-        )?;
+        let db = &self.table.db;
+        let largest = self.builder.largest_value;
+        let (applied, info) = db
+            .engine
+            .check_and_mutate(
+                self.table.info.id,
+                &self.row,
+                &predicate,
+                self.builder.batch,
+                self.durability,
+            )
+            .map_err(|e| commit_error(e, largest, db.max_value))?;
         Ok(if applied {
             info.map(CommitInfo::from)
         } else {
@@ -312,36 +399,38 @@ impl RowMutation<'_> {
 /// ```
 #[derive(Debug)]
 pub struct WriteBatch {
-    engine: Arc<Engine>,
+    db: Arc<Db>,
     builder: Builder,
 }
 
 impl WriteBatch {
-    pub(crate) fn new(engine: Arc<Engine>) -> Self {
+    pub(crate) fn new(db: Arc<Db>) -> Self {
         Self {
-            engine,
+            db,
             builder: Builder::default(),
         }
     }
 
-    /// Adds one mutation in `table`'s `family`.
+    /// Adds one mutation of `row` in `table`'s `family` (`qualifier` and `value` only size
+    /// errors).
     fn op(
         &mut self,
         table: &Table,
+        row: &[u8],
         family: &str,
-        f: impl FnOnce(
-            &mut pigeonhole_engine::WriteBatch,
-            pigeonhole_engine::TableId,
-            pigeonhole_engine::FamilyId,
-        ) -> pigeonhole_engine::Result<()>,
+        qualifier: &[u8],
+        value: usize,
+        f: impl FnOnce(&mut EngineBatch, TableId, FamilyId) -> pigeonhole_engine::Result<()>,
     ) -> &mut Self {
-        if self.builder.check_engine(&self.engine, table) {
+        if self.builder.check_table(&self.db, table) {
             let id = table.core.info.id;
+            let sizes = Sizes::new(row, qualifier, value);
             self.builder
-                .with(&table.core, family, |b, fam| f(b, id, fam));
+                .with(&table.core, family, sizes, |b, fam| f(b, id, fam));
         }
         self
     }
+
     /// Puts bytes at the commit timestamp.
     pub fn put(
         &mut self,
@@ -351,7 +440,7 @@ impl WriteBatch {
         qualifier: &[u8],
         value: &[u8],
     ) -> &mut Self {
-        self.op(table, family, |b, t, f| {
+        self.op(table, row, family, qualifier, value.len(), |b, t, f| {
             b.put(t, f, row, qualifier, None, ValueRef::Bytes(value))
         })
     }
@@ -366,8 +455,36 @@ impl WriteBatch {
         ts: u64,
         value: &[u8],
     ) -> &mut Self {
-        self.op(table, family, |b, t, f| {
+        self.op(table, row, family, qualifier, value.len(), |b, t, f| {
             b.put(t, f, row, qualifier, Some(ts), ValueRef::Bytes(value))
+        })
+    }
+
+    /// Puts a typed `i64`.
+    pub fn put_i64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, None, ValueRef::I64(value))
+        })
+    }
+
+    /// Puts a typed `f64`.
+    pub fn put_f64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: f64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, None, ValueRef::F64(value))
         })
     }
 
@@ -380,8 +497,38 @@ impl WriteBatch {
         qualifier: &[u8],
         delta: i64,
     ) -> &mut Self {
-        self.op(table, family, |b, t, f| {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))
+        })
+    }
+
+    /// Writes an untyped operand for the family's merge operator (custom operators, Phase 2).
+    /// The built-in `i64` add takes typed operands only: use `incr`, or the read fails with
+    /// [`ErrorCode::MergeFailed`](crate::ErrorCode::MergeFailed).
+    pub fn merge(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        operand: &[u8],
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, operand.len(), |b, t, f| {
+            b.merge(t, f, row, qualifier, ValueRef::Bytes(operand))
+        })
+    }
+
+    /// Deletes one version.
+    pub fn delete_cell(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 0, |b, t, f| {
+            b.delete_cell(t, f, row, qualifier, ts)
         })
     }
 
@@ -393,14 +540,21 @@ impl WriteBatch {
         family: &str,
         qualifier: &[u8],
     ) -> &mut Self {
-        self.op(table, family, |b, t, f| {
+        self.op(table, row, family, qualifier, 0, |b, t, f| {
             b.delete_column(t, f, row, qualifier, None)
+        })
+    }
+
+    /// Deletes every column of a family in a row.
+    pub fn delete_family(&mut self, table: &Table, row: &[u8], family: &str) -> &mut Self {
+        self.op(table, row, family, &[], 0, |b, t, f| {
+            b.delete_family(t, f, row, None)
         })
     }
 
     /// Deletes a whole row.
     pub fn delete_row(&mut self, table: &Table, row: &[u8]) -> &mut Self {
-        if self.builder.check_engine(&self.engine, table) {
+        if self.builder.check_table(&self.db, table) {
             self.builder.row_delete(&table.core, row);
         }
         self
@@ -418,14 +572,12 @@ impl WriteBatch {
 
     /// Commits with the writer default durability.
     pub fn commit(self) -> Result<CommitInfo> {
-        let batch = self.builder.finish()?;
-        Ok(self.engine.commit(batch, None)?.into())
+        self.builder.commit(&self.db, None)
     }
 
     /// Commits with `durability` for this commit only.
     pub fn commit_with(self, durability: Durability) -> Result<CommitInfo> {
-        let batch = self.builder.finish()?;
-        Ok(self.engine.commit(batch, Some(durability))?.into())
+        self.builder.commit(&self.db, Some(durability))
     }
 }
 
@@ -455,37 +607,42 @@ impl WriteBatch {
 /// ```
 #[derive(Debug)]
 pub struct Transaction {
-    engine: Arc<Engine>,
+    db: Arc<Db>,
     txn: Txn,
     error: Option<Error>,
+    largest_value: usize,
 }
 
 impl Transaction {
-    pub(crate) fn new(engine: Arc<Engine>, txn: Txn) -> Self {
+    pub(crate) fn new(db: Arc<Db>, txn: Txn) -> Self {
         Self {
-            engine,
+            db,
             txn,
             error: None,
+            largest_value: 0,
         }
     }
 
-    /// Buffers one mutation in `table`'s `family`.
+    /// Buffers one mutation of `row` in `table`'s `family`.
     fn op(
         &mut self,
         table: &Table,
+        row: &[u8],
         family: &str,
-        f: impl FnOnce(
-            &mut pigeonhole_engine::WriteBatch,
-            pigeonhole_engine::TableId,
-            pigeonhole_engine::FamilyId,
-        ) -> pigeonhole_engine::Result<()>,
+        qualifier: &[u8],
+        value: usize,
+        f: impl FnOnce(&mut EngineBatch, TableId, FamilyId) -> pigeonhole_engine::Result<()>,
     ) -> &mut Self {
         if self.error.is_some() {
             return self;
         }
-        let r = check_table(&self.engine, table).and_then(|()| {
+        self.largest_value = self.largest_value.max(value);
+        let sizes = Sizes::new(row, qualifier, value);
+        let max_value = self.db.max_value;
+        let r = check_table(&self.db, table).and_then(|()| {
             let fam = table.core.family_id(family)?;
-            Ok(f(self.txn.batch(), table.core.info.id, fam)?)
+            f(self.txn.batch(), table.core.info.id, fam)
+                .map_err(|e| size_error(e, sizes, max_value))
         });
         if let Err(e) = r {
             self.error = Some(e);
@@ -497,8 +654,14 @@ impl Transaction {
         if let Some(e) = self.error {
             return Err(e);
         }
-        Ok(self.txn.commit(durability)?.into())
+        self.db.check_open()?;
+        let (largest, max) = (self.largest_value, self.db.max_value);
+        self.txn
+            .commit(durability)
+            .map(CommitInfo::from)
+            .map_err(|e| commit_error(e, largest, max))
     }
+
     /// Reads a cell at the transaction's snapshot and records the read.
     pub fn get(
         &mut self,
@@ -507,7 +670,8 @@ impl Transaction {
         family: &str,
         qualifier: &[u8],
     ) -> Result<Option<CellRef<'_>>> {
-        check_table(&self.engine, table)?;
+        check_table(&self.db, table)?;
+        self.db.check_open()?;
         let family = table.core.family_id(family)?;
         Ok(self
             .txn
@@ -524,7 +688,7 @@ impl Transaction {
         qualifier: &[u8],
         value: &[u8],
     ) -> &mut Self {
-        self.op(table, family, |b, t, f| {
+        self.op(table, row, family, qualifier, value.len(), |b, t, f| {
             b.put(t, f, row, qualifier, None, ValueRef::Bytes(value))
         })
     }
@@ -537,7 +701,7 @@ impl Transaction {
         family: &str,
         qualifier: &[u8],
     ) -> &mut Self {
-        self.op(table, family, |b, t, f| {
+        self.op(table, row, family, qualifier, 0, |b, t, f| {
             b.delete_column(t, f, row, qualifier, None)
         })
     }
@@ -551,17 +715,5 @@ impl Transaction {
     /// Commits with `durability`.
     pub fn commit_with(self, durability: Durability) -> Result<CommitInfo> {
         self.finish(Some(durability))
-    }
-}
-
-/// Refuses a table handle from another database.
-fn check_table(engine: &Arc<Engine>, table: &Table) -> Result<()> {
-    if Arc::ptr_eq(engine, &table.core.engine) {
-        Ok(())
-    } else {
-        Err(Error::new(
-            ErrorCode::InvalidArgument,
-            format!("table {:?} belongs to another database", table.name()),
-        ))
     }
 }

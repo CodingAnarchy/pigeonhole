@@ -73,7 +73,8 @@ fn open(name: &str) -> (Pigeonhole, Table) {
         Options::default()
             .vfs(Arc::clone(&vfs) as _)
             .shards(1)
-            .memtable_budget(8 << 20),
+            .memtable_budget(8 << 20)
+            .wal_segment_size(256 << 10),
     )
     .expect("open");
     let t = db

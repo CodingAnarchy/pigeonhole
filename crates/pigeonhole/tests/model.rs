@@ -7,8 +7,8 @@
 //! clock only moves when the harness advances it (one microsecond per operation), so a
 //! default commit timestamp is the clock at the commit (decision D11) and the model gets the
 //! same value. A commit that touches one row uses `RowMutation` (every mutation kind); a
-//! multi-row commit uses `WriteBatch`, which has no `delete_cell`, `delete_family` or
-//! `put_i64`, so those mutations are dropped from multi-row commits on both sides.
+//! multi-row commit uses `WriteBatch` (every mutation kind too). A counter base at an
+//! explicit timestamp is dropped on both sides: there is no typed `put_at`.
 //!
 //! **Crashes.** Process crashes and power losses between operations, and power losses in
 //! the middle of a commit (`FaultPlan::crash_after_ops`). Crash runs use one shard, so the
@@ -313,6 +313,7 @@ impl Run {
             .vfs(Arc::clone(&self.vfs) as _)
             .shards(self.cfg.shards)
             .memtable_budget(4 << 20)
+            .wal_segment_size(256 << 10)
             .block_cache(1 << 20);
         let db = Pigeonhole::open(DB, options).map_err(|e| format!("open: {e}"))?;
         let mut tables = Vec::new();
@@ -407,6 +408,16 @@ impl Run {
                         ts: None,
                         value,
                         ..
+                    } if family.starts_with("counter") => {
+                        let v = <[u8; 8]>::try_from(&value[..]).expect("8-byte counter base");
+                        wb.put_i64(t, &row, family, qualifier, i64::from_le_bytes(v))
+                    }
+                    ModelOp::Put {
+                        family,
+                        qualifier,
+                        ts: None,
+                        value,
+                        ..
                     } => wb.put(t, &row, family, qualifier, value),
                     ModelOp::Put {
                         family,
@@ -424,10 +435,14 @@ impl Run {
                     ModelOp::DeleteColumn {
                         family, qualifier, ..
                     } => wb.delete_column(t, &row, family, qualifier),
+                    ModelOp::DeleteCell {
+                        family,
+                        qualifier,
+                        ts,
+                        ..
+                    } => wb.delete_cell(t, &row, family, qualifier, *ts),
+                    ModelOp::DeleteFamily { family, .. } => wb.delete_family(t, &row, family),
                     ModelOp::DeleteRow { .. } => wb.delete_row(t, &row),
-                    ModelOp::DeleteCell { .. } | ModelOp::DeleteFamily { .. } => {
-                        unreachable!("filtered out of multi-row commits")
-                    }
                 };
             }
             assert_eq!(wb.len(), ops.len());
@@ -436,7 +451,7 @@ impl Run {
     }
 
     /// Prepares a generated commit: tables by row, explicit timestamps after the base, and
-    /// for multi-row commits only what `WriteBatch` can express.
+    /// no counter base at an explicit timestamp (there is no typed `put_at`).
     fn prepare(&self, ops: Vec<ModelOp>) -> Vec<ModelOp> {
         let mut ops: Vec<ModelOp> = ops
             .into_iter()
@@ -458,29 +473,10 @@ impl Run {
                 op
             })
             .collect();
-        let rows: std::collections::BTreeSet<(String, Vec<u8>)> = ops
-            .iter()
-            .map(|op| match op {
-                ModelOp::Put { table, row, .. }
-                | ModelOp::Incr { table, row, .. }
-                | ModelOp::DeleteCell { table, row, .. }
-                | ModelOp::DeleteColumn { table, row, .. }
-                | ModelOp::DeleteFamily { table, row, .. }
-                | ModelOp::DeleteRow { table, row, .. } => (table.clone(), row.clone()),
-            })
-            .collect();
         // There is no typed put at an explicit timestamp: a counter's base is `put_i64`.
         ops.retain(|op| {
             !matches!(op, ModelOp::Put { family, ts: Some(_), .. } if family.starts_with("counter"))
         });
-        if rows.len() > 1 {
-            ops.retain(|op| match op {
-                ModelOp::DeleteCell { .. } | ModelOp::DeleteFamily { .. } => false,
-                // `WriteBatch` has no `put_i64`: counters there take operands only.
-                ModelOp::Put { family, .. } => !family.starts_with("counter"),
-                _ => true,
-            });
-        }
         ops
     }
 
@@ -862,14 +858,14 @@ fn check(cfg: &Config) {
 
 #[test]
 fn quiet_runs_match_the_model() {
-    for shards in [1, 2, 4] {
-        check(&Config::quiet(300, shards));
+    for shards in [1, 2, 4, 8] {
+        check(&Config::quiet(1000, shards));
     }
 }
 
 #[test]
 fn crashes_and_reopens_match_a_durable_prefix() {
-    check(&Config::crashing(300));
+    check(&Config::crashing(1000));
 }
 
 #[test]
@@ -880,7 +876,7 @@ fn every_durability_level_under_crashes() {
         Durability::GroupSync,
         Durability::Sync,
     ] {
-        let mut cfg = Config::crashing(150);
+        let mut cfg = Config::crashing(500);
         cfg.durability = Some(level);
         cfg.crash_ppm = 40_000;
         cfg.mid_commit_crash_ppm = 60_000;
@@ -894,7 +890,7 @@ fn identical_results_across_shard_counts() {
     let seed = seeds()[0];
     let mut dumps: BTreeMap<usize, Rows> = BTreeMap::new();
     for shards in [1, 3] {
-        let mut cfg = Config::quiet(200, shards);
+        let mut cfg = Config::quiet(600, shards);
         cfg.reopen_ppm = 0;
         let mut run = Run::new(seed, cfg.clone()).expect("open");
         let mut rng = Rng::new(seed);

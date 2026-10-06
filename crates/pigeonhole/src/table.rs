@@ -1,7 +1,9 @@
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, FamilyId, TableInfo};
+use pigeonhole_engine::{FamilyId, TableInfo};
+
+use crate::db::Db;
 
 use crate::cell::CellRef;
 use crate::{Error, ErrorCode, Family, Pigeonhole, Result, RowMutation, RowRead, Scan, Snapshot};
@@ -12,8 +14,7 @@ use crate::{Error, ErrorCode, Family, Pigeonhole, Result, RowMutation, RowRead, 
 /// use pigeonhole::{days, ErrorCode, Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-builder", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let events = db
 ///     .table("events")?
@@ -27,7 +28,6 @@ use crate::{Error, ErrorCode, Family, Pigeonhole, Result, RowMutation, RowRead, 
 /// let events = db.table("events")?.family("meta", Family::default()).open()?;
 /// assert_eq!(events.families(), ["ev", "meta"]);
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -64,12 +64,15 @@ impl TableBuilder<'_> {
         self
     }
 
-    /// Opens the table, creating it (and any missing declared families) if needed.
+    /// Opens the table, creating it (and any missing declared families) if needed. Creating
+    /// a table needs at least one declared family; an empty name or a new table without one
+    /// fails with [`ErrorCode::InvalidArgument`].
     pub fn create_if_missing(self) -> Result<Table> {
         self.finish(Finish::CreateIfMissing)
     }
 
-    /// Creates the table; fails with `TableExists` if it exists.
+    /// Creates the table; fails with `TableExists` if it exists, and with `InvalidArgument`
+    /// for an empty name or no declared family.
     pub fn create(self) -> Result<Table> {
         self.finish(Finish::Create)
     }
@@ -81,7 +84,12 @@ impl TableBuilder<'_> {
     }
 
     fn finish(self, how: Finish) -> Result<Table> {
-        let engine = &self.db.engine;
+        let db = &self.db.db;
+        db.check_open()?;
+        if self.name.is_empty() {
+            return Err(Error::new(ErrorCode::InvalidArgument, "empty table name"));
+        }
+        let engine = &db.engine;
         let mut defs = Vec::with_capacity(self.families.len());
         for (name, family) in &self.families {
             if !defs.iter().any(|(n, _)| n == name) {
@@ -95,6 +103,15 @@ impl TableBuilder<'_> {
             Some(info) => info,
             None if how == Finish::Open => {
                 return Err(pigeonhole_engine::Error::TableNotFound(self.name).into());
+            }
+            None if defs.is_empty() => {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "table {:?} needs at least one family: declare one with .family(..)",
+                        self.name
+                    ),
+                ));
             }
             None => match engine.create_table(&self.name, &defs) {
                 Ok(info) => info,
@@ -119,27 +136,27 @@ impl TableBuilder<'_> {
             };
         }
         Ok(Table {
-            core: Arc::new(TableCore::new(Arc::clone(engine), info)),
+            core: Arc::new(TableCore::new(Arc::clone(db), info)),
         })
     }
 }
 
-/// What every table handle shares: the engine and the catalog entry it was opened with.
+/// What every table handle shares: the database and the catalog entry it was opened with.
 #[derive(Debug)]
 pub(crate) struct TableCore {
-    pub(crate) engine: Arc<Engine>,
+    pub(crate) db: Arc<Db>,
     pub(crate) info: Arc<TableInfo>,
 }
 
 impl TableCore {
-    pub(crate) fn new(engine: Arc<Engine>, info: Arc<TableInfo>) -> Self {
-        Self { engine, info }
+    pub(crate) fn new(db: Arc<Db>, info: Arc<TableInfo>) -> Self {
+        Self { db, info }
     }
 
     /// The catalog entry as of now: a family added through another handle shows up here.
     /// Falls back to the handle's own entry if the table was dropped or replaced.
     pub(crate) fn current_info(&self) -> Arc<TableInfo> {
-        match self.engine.table(&self.info.name) {
+        match self.db.engine.table(&self.info.name) {
             Some(info) if info.id == self.info.id => info,
             _ => Arc::clone(&self.info),
         }
@@ -167,11 +184,17 @@ impl TableCore {
         family: &str,
         qualifier: &[u8],
     ) -> Result<Option<CellRef<'_>>> {
+        self.db.check_open()?;
         let family = self.family_id(family)?;
         let table = self.info.id;
         let data = match snapshot {
-            None => self.engine.get_latest(table, family, row, qualifier)?,
-            Some(s) => self.engine.get(&s.inner, table, family, row, qualifier)?,
+            None => self.db.engine.get_latest(table, family, row, qualifier)?,
+            Some(s) => {
+                self.db.check_snapshot(s)?;
+                self.db
+                    .engine
+                    .get(&s.inner, table, family, row, qualifier)?
+            }
         };
         Ok(data.map(CellRef::owned))
     }
@@ -221,8 +244,7 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 /// use pigeonhole::{Family, Options, Pigeonhole};
 ///
 /// # fn main() -> pigeonhole::Result<()> {
-/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-table", std::process::id()));
-/// # std::fs::create_dir_all(&dir).unwrap();
+/// # let dir = pigeonhole::doc_support::temp_dir();
 /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
 /// let pages = db
 ///     .table("pages")?
@@ -252,7 +274,6 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 ///     .collect::<pigeonhole::Result<_>>()?;
 /// assert_eq!(keys, [b"com.example/a".to_vec()]);
 /// # db.close()?;
-/// # std::fs::remove_dir_all(&dir).unwrap();
 /// # Ok(())
 /// # }
 /// ```

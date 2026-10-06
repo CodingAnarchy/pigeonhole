@@ -55,7 +55,9 @@ pub enum ErrorCode {
     NoReaderSlot = 22,
     /// A commit is too large for one WAL record.
     RecordTooLarge = 23,
-    /// Writes are stalled and the call asked not to wait.
+    /// Writes are stalled and the call asked not to wait. In Phase 1 this means the
+    /// memtable arena is full, which nothing frees until the engine flushes to SSTs: not
+    /// retryable; raise `Options::memtable_budget`.
     Busy = 24,
 }
 
@@ -147,6 +149,11 @@ impl From<pigeonhole_engine::Error> for Error {
         let message = match &e {
             // Built from the fields: the message does not depend on the operator's `Display`.
             E::Merge(m) => format!("merge operator {:?} failed: {}", m.operator, m.message),
+            // Until the engine flushes memtables to SSTs (engine Milestone B, #37) nothing
+            // frees the arena, so this is not a transient stall yet.
+            E::Busy => "memtable arena full: raise Options::memtable_budget (flush to SSTs \
+                        arrives with engine Milestone B, #37)"
+                .to_owned(),
             _ => e.to_string(),
         };
         Self::new(code, message)

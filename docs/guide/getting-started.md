@@ -237,8 +237,8 @@ The storage engine writes memtables to SSTs in the file in the second half of Ph
 | `db.flush()` | Freezes the memtables; nothing is written to the file. Data stays durable through the WAL. |
 | `db.compact()`, `db.backup(dest)` | Fail with `ErrorCode::Unsupported`. |
 | Clean close | Leaves the WAL sidecar files next to the database (the data has nowhere else to go); reopening replays them. |
-| `Durability::None` commits | Lost at the next close or crash, even when a later stronger commit returned (see [Durability](durability.md#mixed-levels)). |
-| Memtable size | A full memtable arena makes commits fail with `ErrorCode::Busy`. Size `Options::memtable_budget` for your data. |
+| `Durability::None` commits | Lost at the next close or crash, even when a later stronger commit returned; [#50](https://github.com/CodingAnarchy/pigeonhole/issues/50) makes a later stronger commit cover them (see [Durability](durability.md#mixed-levels)). |
+| Memory bound | Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), everything written stays in the memtable arenas: total data ≤ `memtable_budget` × shards, and less in practice, since every version and delete marker counts and each table lives on one shard until tablets split. Beyond it, commits fail with `Busy`. Reopening with a `memtable_budget` too small for the data in the WAL fails with `InvalidArgument`. Size `Options::memtable_budget` for your data. |
 
 Later phases:
 
