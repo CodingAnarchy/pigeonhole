@@ -8,7 +8,7 @@ Live progress against the [build plan](design/spec.md#build-plan). Updated by th
 | 2. Interface freeze — public traits/types for every crate, `FORMAT.md` | done ([#1](https://github.com/CodingAnarchy/pigeonhole/pull/1); see [interfaces.md](design/interfaces.md)) |
 | 3. Foundations — `format`, `io`, `sim` | done ([#2](https://github.com/CodingAnarchy/pigeonhole/pull/2), [#3](https://github.com/CodingAnarchy/pigeonhole/pull/3), [#4](https://github.com/CodingAnarchy/pigeonhole/pull/4)) |
 | 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | done — all seven merged, last [#30](https://github.com/CodingAnarchy/pigeonhole/pull/30) (`sst`) |
-| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | `compaction` ([#36](https://github.com/CodingAnarchy/pigeonhole/pull/36)), `engine` Milestone A ([#41](https://github.com/CodingAnarchy/pigeonhole/pull/41)) and the public `pigeonhole` API ([#47](https://github.com/CodingAnarchy/pigeonhole/pull/47)) merged; engine Milestone B ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)) in progress; then `bench` and the Phase 1 gate |
+| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | all crates merged incl. engine Milestone B ([#63](https://github.com/CodingAnarchy/pigeonhole/pull/63)) and `bench` ([#55](https://github.com/CodingAnarchy/pigeonhole/pull/55)); remaining Phase 1 milestone: tablet splits (#38), harness oracle (#48, #62), docs (#45), bench sizes (#52), deterministic background I/O (#61), scaling gate (#51) |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
