@@ -1,32 +1,39 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
+use pigeonhole_cache::BlockCache;
+use pigeonhole_compaction::MergeRegistry;
 use pigeonhole_format::manifest::{Edit, FamilyOptions};
 use pigeonhole_format::shm::ViewRecord;
 use pigeonhole_format::wal::{BatchBuilder, WalRecord};
 use pigeonhole_format::{
-    Durability, FamilyId, Kind, ManifestVersion, Seqno, StreamId, TableId, TabletId,
+    Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, StreamId, TableId, TabletId,
 };
 use pigeonhole_io::{ErrorKind, FileRef, OpenOptions};
 use pigeonhole_memtable::{ArenaRegion, MemtableReader, ShardArena};
 use pigeonhole_pager::Pager;
-use pigeonhole_runtime::{Runtime, RuntimeConfig, ShardDriver, ShardId, Submitter, completion};
+use pigeonhole_runtime::{
+    Runtime, RuntimeConfig, ShardDriver, ShardId, Submitter, Waiter, completion,
+};
 use pigeonhole_shm::{Presence, ReaderSlot, Role as ShmRole, ShmConfig, ShmRegion, WriterLock};
-use pigeonhole_wal::{Recovery, WalStream, discover_streams};
+use pigeonhole_sst::SstWriterOptions;
+use pigeonhole_wal::{Recovery, Wal, WalStream, discover_streams, stream_path};
 
 use crate::catalog::{Catalog, MergeKind};
-use crate::flush::FlushBackend;
-use crate::manifest::{self, ManifestWriter};
-use crate::read::{self, sources_for};
-use crate::resolve::{Merge, Resolver};
+use crate::flush::{SstSink, write_memtable};
+use crate::manifest::{self, ManifestWriter, ReqKind};
+use crate::read::{self, get_in};
 use crate::shard::{
-    CloseState, CommitReq, CoordinateReq, Locks, Padded, Reply, ShardMetrics, ShardMsg, ShardState,
-    Shared, VisibilityWaiters, bucket_floor,
+    CloseState, CommitReq, CoordinateReq, Locks, Padded, ReplayedKind, Reply, ShardMetrics,
+    ShardMsg, ShardState, Shared, VisibilityWaiters, bucket_floor,
 };
-use crate::snapshot::{LiveSnapshot, MemSet, ShardMems, TabletEntry, TabletMap, View};
+use crate::snapshot::{
+    LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
+    TabletMap, View, ViewPin,
+};
 use crate::write::ReadKey;
 use crate::{
     CellData, EngineOptions, Error, PendingCommit, Predicate, ReadSpec, Result, RowData,
@@ -92,9 +99,9 @@ pub struct Metrics {
     pub flushes: u64,
     /// Compactions completed.
     pub compactions: u64,
-    /// Write stalls (token-bucket waits) and total stalled nanoseconds.
+    /// Write stalls (token-bucket waits and refused commits) and total stalled nanoseconds.
     pub stalls: (u64, u64),
-    /// Block cache hits and misses.
+    /// Block cache hits and misses (the cache does not count them yet: always zero).
     pub block_cache: (u64, u64),
 }
 
@@ -106,13 +113,14 @@ struct ReaderState {
     file: FileRef,
     presence: Mutex<Option<Presence>>,
     shm: Mutex<(ShmRegion, ReaderSlot, bool)>,
-    /// `(manifest version, catalog)` as last loaded.
-    catalog: Mutex<(ManifestVersion, Arc<Catalog>)>,
+    /// `(manifest version, catalog, the file the manifest was read from)` as last loaded.
+    catalog: Mutex<(ManifestVersion, Arc<Catalog>, FileRef)>,
     /// The last view built from the region, by view version.
     view: Mutex<Option<Arc<View>>>,
     shards: usize,
     /// Snapshots of this process still alive; the pin moves forward when it drops to zero.
     live: Arc<AtomicUsize>,
+    registry: Arc<MergeRegistry>,
 }
 
 /// Everything behind an [`Engine`] (and the handle a [`Txn`] keeps).
@@ -123,8 +131,6 @@ pub(crate) struct Inner {
     path: PathBuf,
     runtime: Mutex<Option<Runtime<ShardState>>>,
     application_owned: bool,
-    /// Serializes catalog changes (each is a manifest commit).
-    catalog_lock: Mutex<()>,
     closing: AtomicBool,
     reader: Option<ReaderState>,
     /// Largest value accepted at write time (decision D16).
@@ -165,6 +171,11 @@ impl std::fmt::Debug for Inner {
 /// assert_eq!(cell.value(), ValueRef::Bytes(b"200"));
 /// let row = db.read_row(&snap, pages.id, b"com.example/a", &ReadSpec::default())?.unwrap();
 /// assert_eq!(row.cells.len(), 1);
+/// // Flush to an SST; the same reads now come from the page file.
+/// db.flush()?;
+/// let snap = db.snapshot()?;
+/// let cell = db.get(&snap, pages.id, meta, b"com.example/a", b"status")?.unwrap();
+/// assert_eq!(cell.value(), ValueRef::Bytes(b"200"));
 /// db.close()?;
 /// # Ok(())
 /// # }
@@ -191,6 +202,109 @@ fn chunk_size(budget: u64) -> usize {
     chunk & !63
 }
 
+fn block_cache(bytes: usize, shards: usize) -> Arc<BlockCache> {
+    Arc::new(if bytes == 0 {
+        BlockCache::disabled()
+    } else {
+        BlockCache::new(bytes, shards.clamp(1, 64))
+    })
+}
+
+/// The `(tablet, family)` slots one record writes on one shard.
+type Slots = Vec<(TabletId, FamilyId)>;
+
+/// A replayed record of one stream, kept until every stream is read and the cross-shard
+/// decisions are resolved.
+struct ReplayedRecord {
+    end: Lsn,
+    seqno: Seqno,
+    kind: ReplayedRecordKind,
+}
+
+enum ReplayedRecordKind {
+    Single { slots: Vec<(TabletId, FamilyId)> },
+    Prepare { coordinator: StreamId },
+    Commit { participants: Vec<StreamId> },
+}
+
+/// A future for a maintenance operation (`flush`, `compact`) a test harness drives without
+/// blocking (the `test-hooks` feature).
+#[cfg(feature = "test-hooks")]
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct PendingMaintenance {
+    waiters: Vec<Waiter<Result<()>>>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl std::future::Future for PendingMaintenance {
+    type Output = Result<()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut failed = None;
+        let mut i = 0;
+        while i < self.waiters.len() {
+            match std::pin::Pin::new(&mut self.waiters[i]).poll(cx) {
+                std::task::Poll::Ready(Some(Ok(()))) => {
+                    self.waiters.swap_remove(i);
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    self.waiters.swap_remove(i);
+                    failed = Some(e);
+                }
+                std::task::Poll::Ready(None) => {
+                    self.waiters.swap_remove(i);
+                    failed = Some(Error::Closed);
+                }
+                std::task::Poll::Pending => i += 1,
+            }
+        }
+        if let Some(e) = failed {
+            return std::task::Poll::Ready(Err(e));
+        }
+        if self.waiters.is_empty() {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// One raw entry of a table (a test hook).
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct RawEntry {
+    /// Table.
+    pub table: TableId,
+    /// Family.
+    pub family: FamilyId,
+    /// Internal key.
+    pub key: Vec<u8>,
+    /// Stored value.
+    pub value: Vec<u8>,
+}
+
+/// What the manifest of a closed database records (a test hook).
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct ManifestInfo {
+    /// Manifest version.
+    pub version: ManifestVersion,
+    /// Per-stream checkpoints.
+    pub checkpoints: BTreeMap<StreamId, Lsn>,
+    /// Flushed-through seqno per `(tablet, family)`.
+    pub flushed: BTreeMap<(TabletId, FamilyId), Seqno>,
+    /// Tablets and their tables.
+    pub tablets: Vec<(TabletId, TableId)>,
+    /// Whether the last close was clean.
+    pub clean: bool,
+}
+
 impl Engine {
     /// Opens (or creates) the database as the writer: takes the writer lock, reads the
     /// superblock and manifest, sets up shared memory, replays every WAL stream, resolves
@@ -206,8 +320,12 @@ impl Engine {
     /// `InvalidArgument` before anything is opened (decision D40).
     ///
     /// After [`Engine::close`], keep driving each shard with [`EngineShard::run_once`] until
-    /// it returns `false`, then drop it: the shards finish their in-flight work and sync
-    /// their streams as part of the close.
+    /// it returns `false`, then drop it: the shards finish their in-flight work, flush,
+    /// checkpoint and sync their streams as part of the close.
+    ///
+    /// Catalog changes (`create_table`, `add_family`, `drop_table`) and `flush`, `compact`
+    /// and `shrink` wait for a manifest commit; call them from a thread that does not drive
+    /// the shards, or they wait for ever.
     pub fn open_application_owned(
         path: &Path,
         options: EngineOptions,
@@ -240,6 +358,7 @@ impl Engine {
             ));
         }
         let vfs = Arc::clone(&options.vfs);
+        let registry = Arc::new(options.merge_operators.clone());
 
         // Create first, then open through the normal path (the writer lock comes first).
         if !vfs.exists(path)? {
@@ -277,7 +396,8 @@ impl Engine {
         let db_id = opened.db_id();
         // The clean flag is informational only: WAL replay is never skipped (decision D57).
         let _clean = opened.clean_shutdown();
-        let (mut catalog, manifest_extents) = manifest::load(&opened, shards)?;
+        let (mut catalog, manifest_extents) =
+            manifest::load(&opened, shards, Arc::clone(&registry))?;
         catalog.reassign(shards);
         let mut live = manifest_extents;
         live.extend(catalog.data_extents());
@@ -287,7 +407,7 @@ impl Engine {
                 .tables()
                 .flat_map(|t| t.families.iter())
                 .map(|f| f.options.merge_operator.clone())
-                .find(|n| !n.is_empty() && n != crate::catalog::I64_ADD)
+                .find(|n| !n.is_empty() && registry.get(n).is_none())
                 .unwrap_or_default();
             return Err(Error::UnknownMergeOperator(name));
         }
@@ -304,14 +424,22 @@ impl Engine {
         // 4. Shard states over the arenas.
         let tablets = Arc::new(TabletMap::build(1, &catalog.tablets()));
         let manifest_version = pager.root().manifest_version;
+        let cache = block_cache(options.block_cache_bytes, shards);
+        let live_views = Arc::new(LiveViews::default());
+        // A memtable's allocation grows a chunk at a time: a threshold at or below one chunk
+        // would freeze it at its first insert.
+        let chunk = chunk_size(options.memtable_budget);
+        let freeze_bytes = options.memtable_freeze_bytes.max(2 * chunk as u64);
         let empty_view = Arc::new(View {
             version: 0,
             manifest_version,
             tablets: Arc::new(TabletMap::default()),
-            catalog: Arc::new(Catalog::default()),
+            catalog: Arc::new(Catalog::with_registry(Arc::clone(&registry))),
             mems: (0..shards)
                 .map(|_| Arc::new(ShardMems::default()))
                 .collect(),
+            ssts: Arc::new(SstSet::empty(pager.file().clone(), Arc::clone(&cache))),
+            _pin: None,
         });
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
@@ -320,12 +448,33 @@ impl Engine {
             view: ArcSwap::new(empty_view),
             view_lock: Mutex::new(0),
             manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
+            manifest_queue: Default::default(),
+            manifest_busy: AtomicBool::new(false),
+            pager: Arc::clone(&pager),
+            cache: Arc::clone(&cache),
+            sst_ids: Arc::new(AtomicU64::new(catalog.counters.next_sst.max(1))),
+            blob_ids: Arc::new(AtomicU32::new(catalog.counters.next_blob_file.max(1))),
+            live_views: Arc::clone(&live_views),
+            live_seqnos: Arc::new(LiveSeqnos::default()),
+            flushed_roots: Mutex::new(HashSet::new()),
+            busy_ssts: Mutex::new(HashSet::new()),
+            view_versions: Mutex::new(BTreeMap::new()),
+            compactions: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            appended: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            manifest_race: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            manifest_race_waiter: Mutex::new(None),
+            picker: options.compaction.clone(),
+            write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(Some(Locks {
                 _writer: writer_lock,
                 presence,
             })),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             pager_poisoned: AtomicBool::new(false),
             close: CloseState {
                 remaining: AtomicUsize::new(shards),
@@ -337,25 +486,39 @@ impl Engine {
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
             waiters: VisibilityWaiters::default(),
-            memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
-            flush: FlushBackend::default(),
+            freeze_waiting: AtomicUsize::new(0),
+            freeze_waiters: Mutex::new(Vec::new()),
+            memtable_freeze_bytes: freeze_bytes,
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
             identity,
+            path: path.to_path_buf(),
         });
-        let chunk = chunk_size(options.memtable_budget);
         let mut states: Vec<ShardState> = Vec::with_capacity(shards);
+        let flushed: HashMap<(TabletId, FamilyId), Seqno> =
+            catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect();
         for i in 0..shards {
             let (region, offset, len) = shm.arena(i as u32);
             let arena = ArenaRegion::new(region, offset, len)?;
-            states.push(ShardState::new(
+            let mut state = ShardState::new(
                 ShardId(i as u16),
                 Arc::clone(&shared),
                 arena,
                 chunk,
                 Arc::clone(&tablets),
                 catalog.counters.ts_floor,
-            ));
+            );
+            let stream = StreamId(i as u32);
+            state.set_recovery_state(
+                flushed.clone(),
+                catalog
+                    .checkpoints
+                    .get(&stream)
+                    .copied()
+                    .unwrap_or_default(),
+                None,
+            );
+            states.push(state);
         }
 
         // 5. Replay every WAL stream (whatever the shard count was), then resolve PREPAREs.
@@ -364,47 +527,72 @@ impl Engine {
         let mut stashed: Vec<(StreamId, Seqno, u64, StreamId, Vec<u8>)> = Vec::new();
         // `(coordinator stream, seqno) -> participant streams` of every COMMIT decision.
         let mut commits: HashMap<(StreamId, Seqno), Vec<StreamId>> = HashMap::new();
-        for stream in discover_streams(&vfs, path)? {
+        let mut replayed: Vec<(StreamId, Vec<ReplayedRecord>)> = Vec::new();
+        let streams = discover_streams(&vfs, path)?;
+        for &stream in &streams {
             let checkpoint = catalog
                 .checkpoints
                 .get(&stream)
                 .copied()
                 .unwrap_or_default();
             let mut rec = Recovery::open(&vfs, path, stream, db_id, checkpoint)?;
-            while let Some((_, record)) = rec.next_record()? {
+            let mut records = Vec::new();
+            while let Some((end, record)) = rec.next_record()? {
                 match record {
                     WalRecord::Batch {
                         seqno,
                         commit_ts,
                         batch,
                     } => {
+                        let mut slots = Vec::new();
                         for s in &mut states {
-                            s.replay(batch.as_bytes(), seqno, commit_ts)
-                                .map_err(replay_error)?;
+                            slots.extend(
+                                s.replay(batch.as_bytes(), seqno, commit_ts)
+                                    .map_err(replay_error)?,
+                            );
                         }
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Single { slots },
+                        });
                     }
                     WalRecord::Prepare {
                         seqno,
                         commit_ts,
                         coordinator,
                         batch,
-                    } => stashed.push((
-                        stream,
-                        seqno,
-                        commit_ts,
-                        coordinator,
-                        batch.as_bytes().to_vec(),
-                    )),
+                    } => {
+                        stashed.push((
+                            stream,
+                            seqno,
+                            commit_ts,
+                            coordinator,
+                            batch.as_bytes().to_vec(),
+                        ));
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Prepare { coordinator },
+                        });
+                    }
                     WalRecord::Commit {
                         seqno,
                         participants,
                     } => {
-                        commits.insert((stream, seqno), participants.iter().collect());
+                        let list: Vec<StreamId> = participants.iter().collect();
+                        commits.insert((stream, seqno), list.clone());
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Commit { participants: list },
+                        });
                     }
                 }
             }
             max_seqno = max_seqno.max(rec.max_seqno());
             recoveries.push((stream, rec));
+            replayed.push((stream, records));
         }
         // A decided commit is applied only if every participant its COMMIT names still
         // holds its PREPARE: all or nothing. A `GroupSync`/`Sync` commit's prepares were
@@ -414,34 +602,125 @@ impl Engine {
             .iter()
             .map(|(stream, seqno, ..)| (*stream, *seqno))
             .collect();
-        for (_, seqno, commit_ts, coordinator, bytes) in &stashed {
-            let Some(participants) = commits.get(&(*coordinator, *seqno)) else {
-                continue;
-            };
-            if !participants
-                .iter()
-                .all(|p| prepared.contains(&(*p, *seqno)))
-            {
+        let complete = |coordinator: StreamId, seqno: Seqno| -> bool {
+            commits
+                .get(&(coordinator, seqno))
+                .is_some_and(|ps| ps.iter().all(|p| prepared.contains(&(*p, seqno))))
+        };
+        // `(participant stream, seqno) -> slots written on each shard` of applied prepares.
+        let mut applied_slots: HashMap<(StreamId, Seqno), Vec<Slots>> = HashMap::new();
+        for (stream, seqno, commit_ts, coordinator, bytes) in &stashed {
+            crate::shard::trace!(
+                "replay prepare stream {} seqno {seqno} coordinator {} complete={} decision={:?}",
+                stream.0,
+                coordinator.0,
+                complete(*coordinator, *seqno),
+                commits.get(&(*coordinator, *seqno))
+            );
+            if !complete(*coordinator, *seqno) {
                 continue;
             }
+            let mut per_shard = Vec::with_capacity(states.len());
             for s in &mut states {
-                s.replay(bytes, *seqno, *commit_ts).map_err(replay_error)?;
+                per_shard.push(s.replay(bytes, *seqno, *commit_ts).map_err(replay_error)?);
             }
+            applied_slots.insert((*stream, *seqno), per_shard);
         }
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
         let current = shm.next_seqno();
         if next > current {
             shm.reserve_seqnos(next - current);
         }
+
+        // 6. Streams. With the same layout as before, every stream's unflushed records are
+        // logged on its shard for checkpointing. Otherwise (D20) everything recovered is
+        // flushed now, every stream checkpointed to its end, and the extra streams removed.
+        let same_layout =
+            streams.len() == shards && streams.iter().enumerate().all(|(i, s)| s.0 as usize == i);
         let mut have_wal = vec![false; shards];
-        for (stream, rec) in recoveries {
-            let i = stream.0 as usize;
-            if i < shards {
+        if same_layout {
+            for ((stream, records), (_, rec)) in replayed.into_iter().zip(&recoveries) {
+                let i = stream.0 as usize;
+                let state = &mut states[i];
+                let end = rec.end();
+                state.set_recovery_state(
+                    flushed.clone(),
+                    catalog
+                        .checkpoints
+                        .get(&stream)
+                        .copied()
+                        .unwrap_or_default(),
+                    Some(end),
+                );
+                for r in records {
+                    let kind = match r.kind {
+                        ReplayedRecordKind::Single { slots } => ReplayedKind::Single { slots },
+                        ReplayedRecordKind::Prepare { coordinator } => {
+                            let applied = applied_slots.get(&(stream, r.seqno));
+                            let slots = applied
+                                .map(|per| per.get(i).cloned().unwrap_or_default())
+                                .unwrap_or_default();
+                            ReplayedKind::Prepare {
+                                slots,
+                                coordinator: ShardId(coordinator.0 as u16),
+                                applied: applied.is_some(),
+                            }
+                        }
+                        ReplayedRecordKind::Commit { participants } => ReplayedKind::Commit {
+                            participants: participants
+                                .iter()
+                                .map(|p| ShardId(p.0 as u16))
+                                .collect(),
+                            complete: complete(stream, r.seqno),
+                        },
+                    };
+                    state.log_replayed(r.end, r.seqno, kind);
+                }
+            }
+            for (stream, rec) in recoveries {
+                let i = stream.0 as usize;
                 states[i].set_wal(Box::new(rec.into_stream(options.wal)?));
                 have_wal[i] = true;
             }
-            // Streams beyond the shard count are replayed every open and kept until a flush
-            // can persist them (decision D20; Milestone B).
+        } else {
+            flush_recovered(
+                &shared,
+                &mut catalog,
+                &mut states,
+                &recoveries,
+                shards,
+                &options,
+            )?;
+            let extra: Vec<StreamId> = streams
+                .iter()
+                .copied()
+                .filter(|s| s.0 as usize >= shards)
+                .collect();
+            for (stream, rec) in recoveries {
+                let i = stream.0 as usize;
+                if i < shards {
+                    let end = rec.end();
+                    let mut wal = rec.into_stream(options.wal)?;
+                    wal.checkpoint(end)?;
+                    states[i].set_wal(Box::new(wal));
+                    states[i].set_recovery_state(
+                        catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect(),
+                        end,
+                        Some(end),
+                    );
+                    have_wal[i] = true;
+                }
+            }
+            for stream in extra {
+                vfs.remove(&stream_path(path, stream))?;
+            }
+            if !streams.is_empty() {
+                let dir = match path.parent() {
+                    Some(d) if !d.as_os_str().is_empty() => d,
+                    _ => Path::new("."),
+                };
+                vfs.sync_dir(dir)?;
+            }
         }
         for (i, have) in have_wal.iter().enumerate() {
             if !have {
@@ -449,13 +728,16 @@ impl Engine {
                 states[i].set_wal(Box::new(wal));
             }
         }
+        for s in &mut states {
+            s.finish_replay();
+        }
 
         // The timestamp floor starts above every replayed commit (D11).
         for (i, s) in states.iter().enumerate() {
             shared.ts_floors[i].0.store(s.ts_floor(), Ordering::Release);
         }
 
-        // 6. The first view: tablets, recovered memtables, the manifest version.
+        // 7. The first view: tablets, recovered memtables, the manifest version and its SSTs.
         let mems: Vec<Arc<ShardMems>> = states
             .iter()
             .map(|s| {
@@ -464,23 +746,39 @@ impl Engine {
                 })
             })
             .collect();
+        let manifest_version = pager.root().manifest_version;
         let catalog = Arc::new(catalog);
+        let mut no_readers = HashMap::new();
+        let ssts = Arc::new(SstSet::build(
+            &catalog,
+            None,
+            &mut no_readers,
+            pager.file().clone(),
+            Arc::clone(&cache),
+        ));
         let first_view = Arc::new(View {
             version: 1,
             manifest_version,
             tablets: Arc::clone(&tablets),
             catalog: Arc::clone(&catalog),
             mems,
+            ssts,
+            _pin: Some(ViewPin::new(&live_views, manifest_version)),
         });
         shm.publish_view(&first_view.to_record())?;
         shm.set_manifest_version(manifest_version);
+        shared
+            .view_versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, manifest_version);
         shared.view.store(Arc::clone(&first_view));
         *shared
             .view_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = 1;
 
-        // 7. The runtime.
+        // 8. The runtime.
         let max_value = (options.wal.segment_size as usize)
             .saturating_sub(64 * 1024)
             .min(64 << 20)
@@ -496,7 +794,6 @@ impl Engine {
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
             application_owned: mode == Mode::ApplicationOwned,
-            catalog_lock: Mutex::new(()),
             closing: AtomicBool::new(false),
             reader: None,
             max_value,
@@ -547,6 +844,7 @@ impl Engine {
     /// the file and cannot open it on read-only media.
     pub fn open_reader(path: &Path, options: EngineOptions) -> Result<Arc<Engine>> {
         let vfs = Arc::clone(&options.vfs);
+        let registry = Arc::new(options.merge_operators.clone());
         let mut open_opts = OpenOptions::read();
         open_opts.write = true;
         let file = vfs.open(path, open_opts)?;
@@ -568,18 +866,22 @@ impl Engine {
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Reader, &shm_config)?;
         let shards = shm.shard_count() as usize;
         let slot = shm.claim_reader_slot(vfs.current_process())?;
-        let (catalog, _) = manifest::load(&opened, shards)?;
+        let (catalog, _) = manifest::load(&opened, shards, Arc::clone(&registry))?;
         let manifest_version = opened.root().manifest_version;
+        let manifest_file = opened.file().clone();
         let pager = Arc::new(opened.finish([])?);
+        let cache = block_cache(options.block_cache_bytes, shards);
         // The read-only pager is kept by the manifest writer (which never commits here).
         let empty_view = Arc::new(View {
             version: 0,
             manifest_version,
             tablets: Arc::new(TabletMap::default()),
-            catalog: Arc::new(Catalog::default()),
+            catalog: Arc::new(Catalog::with_registry(Arc::clone(&registry))),
             mems: (0..shards)
                 .map(|_| Arc::new(ShardMems::default()))
                 .collect(),
+            ssts: Arc::new(SstSet::empty(pager.file().clone(), Arc::clone(&cache))),
+            _pin: None,
         });
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
@@ -588,28 +890,52 @@ impl Engine {
             view: ArcSwap::new(empty_view),
             view_lock: Mutex::new(0),
             manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
+            manifest_queue: Default::default(),
+            manifest_busy: AtomicBool::new(false),
+            pager: Arc::clone(&pager),
+            cache: Arc::clone(&cache),
+            sst_ids: Arc::new(AtomicU64::new(0)),
+            blob_ids: Arc::new(AtomicU32::new(0)),
+            live_views: Arc::new(LiveViews::default()),
+            live_seqnos: Arc::new(LiveSeqnos::default()),
+            flushed_roots: Mutex::new(HashSet::new()),
+            busy_ssts: Mutex::new(HashSet::new()),
+            view_versions: Mutex::new(BTreeMap::new()),
+            compactions: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            appended: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            manifest_race: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            manifest_race_waiter: Mutex::new(None),
+            picker: options.compaction.clone(),
+            write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(None),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             pager_poisoned: AtomicBool::new(false),
             close: CloseState::default(),
             metrics: Vec::new(),
             ts_floors: Vec::new(),
             waiters: VisibilityWaiters::default(),
+            freeze_waiting: AtomicUsize::new(0),
+            freeze_waiters: Mutex::new(Vec::new()),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
-            flush: FlushBackend::default(),
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
             identity,
+            path: path.to_path_buf(),
         });
         let reader = ReaderState {
             file,
             presence: Mutex::new(Some(presence)),
             shm: Mutex::new((shm, slot, false)),
-            catalog: Mutex::new((manifest_version, Arc::new(catalog))),
+            catalog: Mutex::new((manifest_version, Arc::new(catalog), manifest_file)),
             view: Mutex::new(None),
             shards,
             live: Arc::new(AtomicUsize::new(0)),
+            registry,
         };
         let inner = Arc::new(Inner {
             shared,
@@ -618,7 +944,6 @@ impl Engine {
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
             application_owned: false,
-            catalog_lock: Mutex::new(()),
             closing: AtomicBool::new(false),
             reader: Some(reader),
             max_value: 0,
@@ -698,10 +1023,14 @@ impl Engine {
     /// latency includes the slowest participant's group.
     ///
     /// A `Durability::None` commit writes no log record: it is visible at once and lost by
-    /// any crash. The same holds for a commit whose WAL sync fails after its records were
-    /// written and applied: the caller gets an `Io` error, the shard refuses further writes
-    /// until the database is reopened, and the data stays visible until then (it may or
-    /// may not survive the reopen).
+    /// any crash unless a flush persisted it first. The same holds for a commit whose WAL
+    /// sync fails after its records were written and applied: the caller gets an `Io`
+    /// error, the shard refuses further writes until the database is reopened, and the
+    /// data stays visible until then (it may or may not survive the reopen).
+    ///
+    /// A commit waits (inside the engine) while the memtable arena is full until a flush
+    /// frees room, and while L0 is deep for the token bucket's next slot; it fails with
+    /// [`Error::Busy`] only when no flush could ever make it fit.
     pub fn commit(&self, batch: WriteBatch, durability: Option<Durability>) -> Result<CommitInfo> {
         self.submit(batch, durability)?.wait()
     }
@@ -809,47 +1138,37 @@ impl Engine {
     // ---- maintenance ----
 
     /// Freezes and flushes every memtable; returns when the SSTs are in the manifest.
-    ///
-    /// Until SST flushes land (Milestone B) this freezes every non-empty active memtable and
-    /// retains the frozen ones in every view; nothing is written to the page file.
     pub fn flush(&self) -> Result<()> {
+        self.inner.flush_pending()?.wait()
+    }
+
+    /// Compacts every family of `table` (or all tables) fully: flushes, then merges every
+    /// level into the last one.
+    pub fn compact(&self, table: Option<TableId>) -> Result<()> {
+        self.inner.compact_pending(table)?.wait()
+    }
+
+    /// Writes a consistent single-file copy to `dest` while writers run: everything visible
+    /// at a snapshot taken now, as a clean database that opens without WAL replay.
+    pub fn backup(&self, dest: &Path) -> Result<()> {
         let inner = &self.inner;
         if inner.role != Role::Writer {
             return Err(Error::ReadOnly);
         }
         inner.check_open()?;
-        let mut waiters = Vec::with_capacity(inner.shared.shards);
-        for i in 0..inner.shared.shards {
-            let (tx, rx) = completion();
-            inner
-                .shared
-                .submitter(ShardId(i as u16))
-                .submit(ShardMsg::Freeze { reply: tx })?;
-            waiters.push(rx);
-        }
-        for rx in waiters {
-            rx.wait().unwrap_or(Err(Error::Closed))?;
-        }
-        Ok(())
+        let snapshot = inner.snapshot()?;
+        crate::maintenance::backup(&inner.shared, &snapshot, dest)
     }
 
-    /// Compacts every family of `table` (or all tables) fully.
-    pub fn compact(&self, table: Option<TableId>) -> Result<()> {
-        let _ = table;
-        Err(Error::Unsupported(
-            "compaction lands with pigeonhole-compaction (Milestone B)",
-        ))
-    }
-
-    /// Writes a consistent single-file copy to `dest` while writers run.
-    pub fn backup(&self, dest: &Path) -> Result<()> {
-        let _ = dest;
-        Err(Error::Unsupported("online backup lands with Milestone B"))
-    }
-
-    /// Relocates tail extents and truncates the file.
+    /// Relocates tail extents the manifest names and truncates the file (decision D60).
+    /// Returns the bytes released.
     pub fn shrink(&self) -> Result<u64> {
-        Err(Error::Unsupported("online shrink lands with Milestone B"))
+        let inner = &self.inner;
+        if inner.role != Role::Writer {
+            return Err(Error::ReadOnly);
+        }
+        inner.check_open()?;
+        crate::maintenance::shrink(&inner.shared)
     }
 
     /// Current metrics.
@@ -881,19 +1200,17 @@ impl Engine {
         }
         for s in &shared.metrics {
             m.flushes += s.flushes.load(Ordering::Relaxed);
+            m.compactions += s.compactions.load(Ordering::Relaxed);
             m.stalls.0 += s.stalls.load(Ordering::Relaxed);
             m.stalls.1 += s.stall_nanos.load(Ordering::Relaxed);
         }
         m
     }
 
-    /// Stops the shards, flushes nothing extra, and if this is the last process checkpoints
-    /// and removes the WAL files and the shared-memory region.
-    ///
-    /// Every shard finishes its in-flight groups and cross-shard commits, syncs its stream,
-    /// and the last one records the clean close and removes the shared-memory region when no
-    /// reader is attached. WAL files stay until SST flushes exist (Milestone B): the data
-    /// in them has nowhere else to go yet.
+    /// Stops the shards: every shard finishes its in-flight groups and cross-shard commits,
+    /// flushes its memtables, checkpoints and syncs its stream; the last one records the
+    /// clean close and, if no reader is attached, removes the WAL files and the
+    /// shared-memory region, leaving one file at rest.
     ///
     /// In engine-owned mode this waits for the shards and returns the final result. In
     /// application-owned mode it returns at once after telling every shard to close: the
@@ -901,6 +1218,122 @@ impl Engine {
     /// (the last shard to finish records the clean close), then drops the shards.
     pub fn close(&self) -> Result<()> {
         self.inner.close(true)
+    }
+
+    // ---- test hooks ----
+
+    /// `flush` as a future (test harnesses that drive the shards themselves).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn flush_pending(&self) -> Result<PendingMaintenance> {
+        self.inner.flush_pending()
+    }
+
+    /// `compact` as a future.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn compact_pending(&self, table: Option<TableId>) -> Result<PendingMaintenance> {
+        self.inner.compact_pending(table)
+    }
+
+    /// Every entry of every table in `snapshot`'s view, raw (no resolution), in key order
+    /// per `(table, family)`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn raw_entries(&self, snapshot: &Snapshot) -> Result<Vec<RawEntry>> {
+        use pigeonhole_compaction::MergingCursor;
+        use pigeonhole_format::Cursor;
+        let view = &snapshot.view;
+        let mut out = Vec::new();
+        let all = pigeonhole_format::scan::ScanFilter::all();
+        for t in view.catalog.tablets() {
+            for family in view.catalog.family_ids_of(t.table) {
+                let sources = view.scan_sources(t.shard, t.id, family, &all, None, None)?;
+                let mut merged = MergingCursor::new(sources);
+                merged.seek_to_first()?;
+                while merged.valid() {
+                    out.push(RawEntry {
+                        table: t.table,
+                        family,
+                        key: merged.key().to_vec(),
+                        value: merged.value().to_vec(),
+                    });
+                    merged.next()?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The compactions committed since the last call (or since open).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn take_compactions(&self) -> Vec<crate::compact::CompactionRecord> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .shared
+                .compactions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// The WAL records appended since the last call (or since open), in append order.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn take_appended(&self) -> Vec<crate::shard::AppendedRecord> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .shared
+                .appended
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Commits an empty manifest delta from this thread while a second request lands in
+    /// the window between the drain's last `begin` and the release of the writer's
+    /// exclusion (as a shard's submit would, whose pump then leaves). Returns whether that
+    /// second request was committed too, which the release-then-re-check rule guarantees.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn probe_manifest_release_window(&self) -> Result<bool> {
+        use std::task::{Context, Poll, Waker};
+        let shared = &self.inner.shared;
+        shared.manifest_race.store(true, Ordering::Release);
+        manifest::commit_from_thread(shared, manifest::ReqKind::Edits(Vec::new()))?;
+        let waiter = shared
+            .manifest_race_waiter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(mut waiter) = waiter else {
+            return Err(Error::Corruption("the race window was not entered".into()));
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        Ok(match std::pin::Pin::new(&mut waiter).poll(&mut cx) {
+            Poll::Ready(Some(Ok(_))) => true,
+            Poll::Ready(Some(Err(e))) => return Err(e),
+            Poll::Ready(None) | Poll::Pending => false,
+        })
+    }
+
+    /// Reads the manifest of a database no writer has open.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inspect_manifest(vfs: &pigeonhole_io::VfsRef, path: &Path) -> Result<ManifestInfo> {
+        let opened = Pager::open(vfs, path, false)?;
+        let clean = opened.clean_shutdown();
+        let (catalog, _) = manifest::load(&opened, 1, Arc::new(MergeRegistry::default()))?;
+        Ok(ManifestInfo {
+            version: opened.root().manifest_version,
+            checkpoints: catalog.checkpoints.clone(),
+            flushed: catalog.flushed.clone(),
+            tablets: catalog.tablets().iter().map(|t| (t.id, t.table)).collect(),
+            clean,
+        })
     }
 }
 
@@ -912,6 +1345,84 @@ impl Drop for Engine {
             let _ = self.inner.close_reader();
         }
     }
+}
+
+/// Flushes every recovered memtable synchronously at open (the shard count changed, so the
+/// streams' records no longer map to shards; decision D20): one SST per non-empty memtable,
+/// `SetFlushed` per slot, every stream checkpointed to its end (extra streams to zero, since
+/// they are removed afterwards).
+fn flush_recovered(
+    shared: &Shared,
+    catalog: &mut Catalog,
+    states: &mut [ShardState],
+    recoveries: &[(StreamId, Recovery)],
+    shards: usize,
+    options: &EngineOptions,
+) -> Result<()> {
+    let mut edits = Vec::new();
+    let created = shared.vfs.now_micros();
+    for state in states.iter_mut() {
+        for ((tablet, family), reader, bytes, max_seqno) in state.take_memtables() {
+            let Some(meta) = catalog.family(family) else {
+                continue;
+            };
+            let mut opts = SstWriterOptions::for_family(&meta.options, meta.table, family, tablet);
+            opts.created_micros = created;
+            let mut sink = SstSink::new(
+                Arc::clone(&shared.pager),
+                Arc::clone(&shared.sst_ids),
+                opts,
+                bytes,
+            );
+            if let Err(e) = write_memtable(&mut sink, &reader) {
+                sink.abandon();
+                return Err(e);
+            }
+            for meta in sink.outputs.drain(..) {
+                edits.push(Edit::AddSst {
+                    tablet,
+                    family,
+                    level: 0,
+                    meta,
+                });
+            }
+            edits.push(Edit::SetFlushed {
+                tablet,
+                family,
+                seqno: max_seqno,
+            });
+        }
+    }
+    for (stream, rec) in recoveries {
+        let lsn = if (stream.0 as usize) < shards {
+            rec.end()
+        } else {
+            Lsn::default()
+        };
+        edits.push(Edit::WalCheckpoint {
+            stream: *stream,
+            lsn,
+        });
+    }
+    catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
+    catalog.counters.seqno_ceiling = shared.shm.next_seqno();
+    let _ = options;
+    edits.push(catalog.counters_edit());
+    for e in &edits {
+        catalog.apply(e, shards)?;
+    }
+    let mut writer = shared
+        .manifest
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    writer.commit(catalog, &edits).inspect_err(|_| {
+        for e in &edits {
+            if let Edit::AddSst { meta, .. } = e {
+                shared.pager.abandon(meta.extent);
+            }
+        }
+    })?;
+    Ok(())
 }
 
 /// Decision D59: a file without a valid superblock that is at most 64 KiB long looks like an
@@ -959,41 +1470,24 @@ fn families_in_order(view: &View, table: TableId, listed: &[FamilyId]) -> Result
     Ok(out)
 }
 
-/// A point get through `view` at `seqno`.
-#[allow(clippy::too_many_arguments)]
-fn get_in(
-    view: &View,
-    seqno: Seqno,
-    now: u64,
-    table: TableId,
-    family: FamilyId,
-    row: &[u8],
-    qualifier: &[u8],
-    pin: impl FnOnce() -> Arc<View>,
-) -> Result<Option<CellData>> {
-    let Some((tablet, shard)) = view.tablets().route(table, row) else {
-        return Err(Error::TableNotFound(format!("table {}", table.0)));
-    };
-    let Some(meta) = view.catalog.family(family) else {
-        return Err(Error::FamilyNotFound(format!("family {}", family.0)));
-    };
-    if meta.table != table {
-        return Err(Error::FamilyNotFound(format!("family {}", family.0)));
-    }
-    let sources = sources_for(view, shard, tablet, family);
-    if sources.is_empty() {
-        return Ok(None);
-    }
-    let opts = ReadSpec {
-        versions: 1,
-        ..ReadSpec::default()
-    }
-    .resolve_opts(meta, seqno, now);
-    let mut resolver = Resolver::new(Merge::new(sources), opts);
-    resolver.seek_column(row, qualifier)?;
-    match resolver.next_cell()? {
-        Some(cell) => Ok(Some(CellData::from_resolved(&cell, pin))),
-        None => Ok(None),
+/// A maintenance future: the replies of every shard.
+#[cfg(not(feature = "test-hooks"))]
+#[derive(Debug)]
+pub(crate) struct PendingMaintenance {
+    waiters: Vec<Waiter<Result<()>>>,
+}
+
+impl PendingMaintenance {
+    /// Blocks until every shard replied.
+    pub(crate) fn wait(self) -> Result<()> {
+        let mut result = Ok(());
+        for w in self.waiters {
+            match w.wait().unwrap_or(Err(Error::Closed)) {
+                Ok(()) => {}
+                Err(e) => result = Err(e),
+            }
+        }
+        result
     }
 }
 
@@ -1003,10 +1497,7 @@ impl Inner {
             return Err(Error::Closed);
         }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
-            return Err(Error::Io(pigeonhole_io::Error::new(
-                ErrorKind::Other,
-                "a manifest commit failed earlier; reopen the database (decision D58)",
-            )));
+            return Err(ManifestWriter::poisoned_error());
         }
         Ok(())
     }
@@ -1020,75 +1511,21 @@ impl Inner {
         Arc::clone(&self.shared.view.load().catalog)
     }
 
-    /// Runs a catalog change: `f` edits a copy of the catalog and returns the edits, which
-    /// are committed to the manifest and published in a new view.
+    /// Runs a catalog change: `f` edits a copy of the catalog (under the manifest writer's
+    /// exclusion) and returns the edits, which are committed to the manifest and published
+    /// in a new view.
     fn catalog_change(
         &self,
-        f: impl FnOnce(&mut Catalog) -> Result<Vec<Edit>>,
+        f: impl FnOnce(&mut Catalog) -> Result<Vec<Edit>> + Send + 'static,
     ) -> Result<Arc<View>> {
         if self.role != Role::Writer {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
-        let _guard = self
-            .catalog_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let current = self.shared.view.load_full();
-        let mut catalog = (*current.catalog).clone();
-        let mut edits = f(&mut catalog)?;
-        // Counters go with every commit: ids, the seqno ceiling and the timestamp floor.
-        catalog.counters.seqno_ceiling = self.shared.shm.next_seqno();
-        catalog.counters.ts_floor = self
-            .shared
-            .ts_floors
-            .iter()
-            .map(|f| f.0.load(Ordering::Acquire))
-            .max()
-            .unwrap_or(0)
-            .max(catalog.counters.ts_floor);
-        edits.push(catalog.counters_edit());
-        for e in &edits {
-            catalog.apply(e, self.shared.shards)?;
-        }
-        let version = self
-            .shared
-            .manifest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .commit(&catalog, &edits)
-            .inspect_err(|_| self.shared.pager_poisoned.store(true, Ordering::Release))?;
-        let catalog = Arc::new(catalog);
-        let tablets = catalog.tablets();
-        let live: HashSet<TabletId> = tablets.iter().map(|t| t.id).collect();
-        self.shared.publish_view(|cur, view_version| {
-            // Pieces of shards that held a dropped tablet are rebuilt without it (rare).
-            let mems = cur
-                .mems
-                .iter()
-                .map(|piece| {
-                    if piece.map.keys().all(|k| live.contains(&k.0)) {
-                        Arc::clone(piece)
-                    } else {
-                        Arc::new(ShardMems {
-                            map: piece
-                                .map
-                                .iter()
-                                .filter(|(k, _)| live.contains(&k.0))
-                                .map(|(k, v)| (*k, Arc::clone(v)))
-                                .collect(),
-                        })
-                    }
-                })
-                .collect();
-            View {
-                version: view_version,
-                manifest_version: version,
-                tablets: Arc::new(TabletMap::build(cur.tablets.version() + 1, &tablets)),
-                catalog: Arc::clone(&catalog),
-                mems,
-            }
-        })
+        let version = manifest::commit_from_thread(&self.shared, ReqKind::Catalog(Box::new(f)))?;
+        let view = self.shared.view.load_full();
+        debug_assert!(view.manifest_version >= version);
+        Ok(view)
     }
 
     fn create_table(
@@ -1107,18 +1544,24 @@ impl Inner {
             if !seen.insert(fname.as_str()) {
                 return Err(Error::FamilyExists(fname.clone()));
             }
-            check_merge_operator(options, self.options.allow_unregistered_merge)?;
+            check_merge_operator(
+                options,
+                &self.options.merge_operators,
+                self.options.allow_unregistered_merge,
+            )?;
         }
-        let view = self.catalog_change(|catalog| {
-            if catalog.table_by_name(name).is_some() {
-                return Err(Error::TableExists(name.to_owned()));
+        let name_owned = name.to_owned();
+        let families = families.to_vec();
+        let view = self.catalog_change(move |catalog| {
+            if catalog.table_by_name(&name_owned).is_some() {
+                return Err(Error::TableExists(name_owned.clone()));
             }
             let table = catalog.alloc_table();
             let mut edits = vec![Edit::CreateTable {
                 table,
-                name: name.to_owned(),
+                name: name_owned.clone(),
             }];
-            for (fname, options) in families {
+            for (fname, options) in &families {
                 let family = catalog.alloc_family();
                 edits.push(Edit::PutFamily {
                     table,
@@ -1151,19 +1594,24 @@ impl Inner {
         if name.is_empty() {
             return Err(Error::InvalidArgument("empty family name".to_owned()));
         }
-        check_merge_operator(&options, self.options.allow_unregistered_merge)?;
-        let view = self.catalog_change(|catalog| {
+        check_merge_operator(
+            &options,
+            &self.options.merge_operators,
+            self.options.allow_unregistered_merge,
+        )?;
+        let name_owned = name.to_owned();
+        let view = self.catalog_change(move |catalog| {
             let info = catalog
                 .table(table)
                 .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))?;
-            if info.family(name).is_some() {
-                return Err(Error::FamilyExists(name.to_owned()));
+            if info.family(&name_owned).is_some() {
+                return Err(Error::FamilyExists(name_owned.clone()));
             }
             let family = catalog.alloc_family();
             Ok(vec![Edit::PutFamily {
                 table,
                 family,
-                name: name.to_owned(),
+                name: name_owned.clone(),
                 options,
             }])
         })?;
@@ -1175,20 +1623,15 @@ impl Inner {
 
     fn drop_table(&self, table: TableId) -> Result<()> {
         let dropped = self.catalog().tablet_ids_of(table);
-        self.catalog_change(|catalog| {
+        self.catalog_change(move |catalog| {
             if catalog.table(table).is_none() {
                 return Err(Error::TableNotFound(format!("table {}", table.0)));
             }
             Ok(vec![Edit::DropTable { table }])
         })?;
-        for i in 0..self.shared.shards {
-            let _ = self
-                .shared
-                .submitter(ShardId(i as u16))
-                .submit(ShardMsg::DropTablets {
-                    tablets: dropped.clone(),
-                });
-        }
+        self.shared.broadcast(|| ShardMsg::DropTablets {
+            tablets: dropped.clone(),
+        });
         Ok(())
     }
 
@@ -1231,7 +1674,7 @@ impl Inner {
                             meta.options.merge_operator.clone(),
                         ));
                     }
-                    MergeKind::I64Add => {}
+                    MergeKind::I64Add | MergeKind::Registered => {}
                 }
             }
             if m.value.len() > self.max_value + 1 {
@@ -1385,6 +1828,7 @@ impl Inner {
             seqno,
             view,
             _live: None,
+            _pin: Some(Arc::new(SeqnoPin::new(&self.shared.live_seqnos, seqno))),
         })
     }
 
@@ -1407,6 +1851,38 @@ impl Inner {
             qualifier,
             || Arc::clone(&snapshot.view),
         )
+    }
+
+    fn flush_pending(&self) -> Result<PendingMaintenance> {
+        if self.role != Role::Writer {
+            return Err(Error::ReadOnly);
+        }
+        self.check_open()?;
+        let mut waiters = Vec::with_capacity(self.shared.shards);
+        for i in 0..self.shared.shards {
+            let (tx, rx) = completion();
+            self.shared
+                .submitter(ShardId(i as u16))
+                .submit(ShardMsg::FlushAll { reply: tx })?;
+            waiters.push(rx);
+        }
+        Ok(PendingMaintenance { waiters })
+    }
+
+    fn compact_pending(&self, table: Option<TableId>) -> Result<PendingMaintenance> {
+        if self.role != Role::Writer {
+            return Err(Error::ReadOnly);
+        }
+        self.check_open()?;
+        let mut waiters = Vec::with_capacity(self.shared.shards);
+        for i in 0..self.shared.shards {
+            let (tx, rx) = completion();
+            self.shared
+                .submitter(ShardId(i as u16))
+                .submit(ShardMsg::CompactAll { table, reply: tx })?;
+            waiters.push(rx);
+        }
+        Ok(PendingMaintenance { waiters })
     }
 
     // ---- close ----
@@ -1473,6 +1949,14 @@ impl Inner {
             // Last one out (issue #20): only if no writer holds or is taking the writer byte,
             // which a writer keeps from before it is present until it is.
             if let Ok(lock) = WriterLock::acquire(&r.file) {
+                // The writer closed cleanly (its streams are checkpointed to their ends): the
+                // WAL files are not needed. After a writer crash they are, so they stay.
+                if Pager::open(&self.shared.vfs, &self.path, false)
+                    .map(|o| o.clean_shutdown())
+                    .unwrap_or(false)
+                {
+                    crate::shard::remove_wal_files(&self.shared.vfs, &self.path)?;
+                }
                 ShmRegion::remove(
                     &self.shared.vfs,
                     self.shared.identity,
@@ -1501,8 +1985,12 @@ impl Inner {
             return Ok(());
         }
         let opened = Pager::open(&self.shared.vfs, &self.path, false)?;
-        let (catalog, _) = manifest::load(&opened, r.shards)?;
-        *cached = (opened.root().manifest_version, Arc::new(catalog));
+        let (catalog, _) = manifest::load(&opened, r.shards, Arc::clone(&r.registry))?;
+        *cached = (
+            opened.root().manifest_version,
+            Arc::new(catalog),
+            opened.file().clone(),
+        );
         Ok(())
     }
 
@@ -1535,14 +2023,25 @@ impl Inner {
         let shm = shm.clone();
         drop(guard);
         self.reader_refresh()?;
-        let catalog = Arc::clone(&r.catalog.lock().unwrap_or_else(PoisonError::into_inner).1);
+        let (catalog, file) = {
+            let c = r.catalog.lock().unwrap_or_else(PoisonError::into_inner);
+            (Arc::clone(&c.1), c.2.clone())
+        };
         let mut cached = r.view.lock().unwrap_or_else(PoisonError::into_inner);
         let view = match &*cached {
             Some(v) if v.version == record.view_version && Arc::ptr_eq(&v.catalog, &catalog) => {
                 Arc::clone(v)
             }
             _ => {
-                let view = Arc::new(view_from_record(&shm, &record, catalog)?);
+                let prev = cached.as_ref().map(|v| Arc::clone(&v.ssts));
+                let view = Arc::new(view_from_record(
+                    &shm,
+                    &record,
+                    catalog,
+                    prev.as_deref(),
+                    file,
+                    Arc::clone(&self.shared.cache),
+                )?);
                 *cached = Some(Arc::clone(&view));
                 view
             }
@@ -1551,12 +2050,20 @@ impl Inner {
             seqno,
             view,
             _live: live,
+            _pin: None,
         })
     }
 }
 
 /// Builds a reader's view from the record published in shared memory.
-fn view_from_record(shm: &ShmRegion, record: &ViewRecord, catalog: Arc<Catalog>) -> Result<View> {
+fn view_from_record(
+    shm: &ShmRegion,
+    record: &ViewRecord,
+    catalog: Arc<Catalog>,
+    prev: Option<&SstSet>,
+    file: FileRef,
+    cache: Arc<BlockCache>,
+) -> Result<View> {
     let tablets: Vec<TabletEntry> = record
         .tablets
         .iter()
@@ -1604,6 +2111,8 @@ fn view_from_record(shm: &ShmRegion, record: &ViewRecord, catalog: Arc<Catalog>)
             );
         }
     }
+    let mut no_readers = HashMap::new();
+    let ssts = Arc::new(SstSet::build(&catalog, prev, &mut no_readers, file, cache));
     Ok(View {
         version: record.view_version,
         manifest_version: record.manifest_version,
@@ -1613,12 +2122,18 @@ fn view_from_record(shm: &ShmRegion, record: &ViewRecord, catalog: Arc<Catalog>)
             .into_iter()
             .map(|map| Arc::new(ShardMems { map }))
             .collect(),
+        ssts,
+        _pin: None,
     })
 }
 
-fn check_merge_operator(options: &FamilyOptions, allow_unregistered: bool) -> Result<()> {
+fn check_merge_operator(
+    options: &FamilyOptions,
+    registry: &MergeRegistry,
+    allow_unregistered: bool,
+) -> Result<()> {
     let name = options.merge_operator.as_str();
-    if name.is_empty() || name == crate::catalog::I64_ADD || allow_unregistered {
+    if name.is_empty() || registry.get(name).is_some() || allow_unregistered {
         Ok(())
     } else {
         Err(Error::UnknownMergeOperator(name.to_owned()))

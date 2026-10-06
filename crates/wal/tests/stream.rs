@@ -282,21 +282,34 @@ fn stale_records_in_a_recycled_slot_are_not_replayed() {
 }
 
 #[test]
-fn durability_none_is_never_logged() {
+fn durability_none_is_buffered_until_a_stronger_commit_writes() {
+    // A `None` record alone is never handed to the kernel: it survives nothing.
     let vfs = sim(12);
     let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts(2, 1)).unwrap();
-    assert!(matches!(
-        wal.append(&batch(1, 10).record(), Durability::None),
-        Err(Error::InvalidArgument { .. })
-    ));
-    // The refusal leaves the stream usable and nothing was framed.
+    let t = wal
+        .append(&batch(1, 10).record(), Durability::None)
+        .unwrap();
+    assert!(wal.satisfies(&t), "a None ticket asks for nothing");
+    assert_eq!(wal.written(), Lsn::new(1, 32 * 1024));
+    drop(wal);
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert!(got.seqnos().is_empty());
+
+    // The next stronger commit's write and sync carry it (the mixed-levels rule).
+    let sim = pigeonhole_io::sim::SimVfs::new(13);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts(2, 1)).unwrap();
+    wal.append(&batch(1, 10).record(), Durability::None)
+        .unwrap();
     let t = wal
         .append(&batch(2, 10).record(), Durability::GroupSync)
         .unwrap();
     wal.sync().unwrap();
     assert!(wal.satisfies(&t));
+    drop(wal);
+    sim.crash(pigeonhole_io::sim::CrashKind::Power);
     let (got, _) = replay(&vfs, Lsn::default()).unwrap();
-    assert_eq!(got.seqnos(), [2]);
+    assert_eq!(got.seqnos(), [1, 2]);
 }
 
 #[test]
@@ -553,4 +566,25 @@ fn discover_and_remove_streams() {
     let wal = WalStream::create(&vfs, db(), StreamId(3), DB_ID, opts(2, 0)).unwrap();
     assert_eq!(wal.written().epoch(), 1);
     assert_eq!(WalOptions::default().segment_size, 64 << 20);
+}
+
+#[test]
+fn buffered_none_records_roll_segments_over() {
+    // Sixty 16 KiB `None` records (no write of their own) cross several 256 KiB segments:
+    // each rollover writes and syncs the buffered records before opening the next segment,
+    // and a later stronger commit's sync covers the rest.
+    let vfs = sim(21);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts(8, 1)).unwrap();
+    for seqno in 1..=60 {
+        wal.append(&batch(seqno, 16 * 1024).record(), Durability::None)
+            .unwrap();
+    }
+    let t = wal
+        .append(&batch(61, 10).record(), Durability::GroupSync)
+        .unwrap();
+    wal.sync().unwrap();
+    assert!(wal.satisfies(&t));
+    drop(wal);
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), (1..=61).collect::<Vec<_>>());
 }

@@ -1,11 +1,23 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+//! Views and snapshots: the immutable picture of the database a read uses (tablet map,
+//! memtables and the open SST set of one manifest version), and the registries that tell
+//! flush and compaction which views and seqnos are still live in this process.
 
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+use pigeonhole_cache::{BlockCache, Priority};
+use pigeonhole_compaction::Levels;
+use pigeonhole_format::key::row_prefix_len;
+use pigeonhole_format::manifest::{CachePriority, SstMeta};
 use pigeonhole_format::shm::{ViewMemtable, ViewRecord, ViewTablet};
-use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, TableId, TabletId};
+use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId};
+use pigeonhole_io::FileRef;
 use pigeonhole_memtable::MemtableReader;
 use pigeonhole_runtime::ShardId;
+use pigeonhole_sst::SstReader;
 
+use crate::Result;
 use crate::catalog::Catalog;
 
 /// One tablet of the routing table: a contiguous row range of one table and its owner.
@@ -74,6 +86,11 @@ impl TabletMap {
         ids.into_iter().flat_map(|t| self.tables[t].iter())
     }
 
+    /// The entry of tablet `id`, if it exists.
+    pub(crate) fn entry(&self, id: TabletId) -> Option<&TabletEntry> {
+        self.iter().find(|t| t.id == id)
+    }
+
     pub(crate) fn to_view_tablets(&self) -> Vec<ViewTablet> {
         self.iter()
             .map(|t| ViewTablet {
@@ -99,6 +116,28 @@ pub(crate) struct MemSet {
     pub roots: Vec<u32>,
 }
 
+impl MemSet {
+    /// The same set without the memtables whose roots are in `drop`.
+    pub(crate) fn without(&self, drop: &dyn Fn(u32) -> bool) -> Option<Arc<MemSet>> {
+        if !self.roots.iter().any(|r| drop(*r)) {
+            return None;
+        }
+        let mut readers = Vec::with_capacity(self.readers.len());
+        let mut roots = Vec::with_capacity(self.roots.len());
+        for (r, root) in self.readers.iter().zip(&self.roots) {
+            if !drop(*root) {
+                readers.push(r.clone());
+                roots.push(*root);
+            }
+        }
+        Some(Arc::new(MemSet {
+            shard: self.shard,
+            readers,
+            roots,
+        }))
+    }
+}
+
 /// One shard's memtable sets, as a view holds them. A shard publishes a new piece when one
 /// of its memtables is created or frozen; the other shards' pieces are shared by reference.
 #[derive(Debug, Default)]
@@ -106,10 +145,336 @@ pub(crate) struct ShardMems {
     pub map: HashMap<(TabletId, FamilyId), Arc<MemSet>>,
 }
 
+impl ShardMems {
+    /// The piece without the memtables `drop` names, or `None` if it holds none of them.
+    pub(crate) fn without(&self, drop: &dyn Fn(u32) -> bool) -> Option<Arc<ShardMems>> {
+        let mut changed = false;
+        let mut map = HashMap::with_capacity(self.map.len());
+        for (k, set) in &self.map {
+            match set.without(drop) {
+                Some(s) => {
+                    changed = true;
+                    map.insert(*k, s);
+                }
+                None => {
+                    map.insert(*k, Arc::clone(set));
+                }
+            }
+        }
+        changed.then(|| Arc::new(ShardMems { map }))
+    }
+}
+
+/// An SST the manifest names, with its reader opened on first use (or handed in by the
+/// flush or compaction that wrote it, so a hot path never opens one).
+pub(crate) struct OpenSst {
+    pub meta: Arc<SstMeta>,
+    reader: OnceLock<Arc<SstReader>>,
+}
+
+impl std::fmt::Debug for OpenSst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenSst")
+            .field("id", &self.meta.id)
+            .field("open", &self.reader.get().is_some())
+            .finish()
+    }
+}
+
+impl OpenSst {
+    pub(crate) fn new(meta: Arc<SstMeta>, reader: Option<Arc<SstReader>>) -> Self {
+        let slot = OnceLock::new();
+        if let Some(r) = reader {
+            let _ = slot.set(r);
+        }
+        Self { meta, reader: slot }
+    }
+
+    /// The row prefix of the smallest key.
+    pub(crate) fn first_row(&self) -> &[u8] {
+        row_of(&self.meta.smallest_key)
+    }
+
+    /// The row prefix of the largest key.
+    pub(crate) fn last_row(&self) -> &[u8] {
+        row_of(&self.meta.largest_key)
+    }
+
+    /// The reader, opened through `set` if this is its first use.
+    pub(crate) fn reader(&self, set: &SstSet, priority: Priority) -> Result<Arc<SstReader>> {
+        if let Some(r) = self.reader.get() {
+            return Ok(Arc::clone(r));
+        }
+        let r = Arc::new(SstReader::open(
+            set.file.clone(),
+            &self.meta,
+            Arc::clone(&set.cache),
+            priority,
+        )?);
+        let _ = self.reader.set(Arc::clone(&r));
+        Ok(self.reader.get().map_or(r, Arc::clone))
+    }
+}
+
+/// The row prefix of an internal key (the whole key if it has none).
+pub(crate) fn row_of(key: &[u8]) -> &[u8] {
+    &key[..row_prefix_len(key).unwrap_or(key.len())]
+}
+
+/// The SSTs of one `(tablet, family)` by level: level 0 newest first, deeper levels sorted
+/// by key and disjoint.
+#[derive(Debug, Default)]
+pub(crate) struct FamilySsts {
+    pub levels: Vec<Vec<Arc<OpenSst>>>,
+}
+
+impl FamilySsts {
+    /// The picker's view of the levels.
+    pub(crate) fn levels_meta(&self) -> Levels {
+        Levels {
+            levels: self
+                .levels
+                .iter()
+                .map(|l| l.iter().map(|s| Arc::clone(&s.meta)).collect())
+                .collect(),
+        }
+    }
+
+    /// Every SST, newest level first.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Arc<OpenSst>> {
+        self.levels.iter().flatten()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.levels.iter().all(Vec::is_empty)
+    }
+
+    pub(crate) fn find(&self, id: SstId) -> Option<(u8, &Arc<OpenSst>)> {
+        self.levels
+            .iter()
+            .enumerate()
+            .find_map(|(l, files)| files.iter().find(|s| s.meta.id == id).map(|s| (l as u8, s)))
+    }
+}
+
+/// The open SST set of one manifest version: every `(tablet, family)`'s levels, with
+/// readers shared across versions by SST id.
+pub(crate) struct SstSet {
+    pub file: FileRef,
+    pub cache: Arc<BlockCache>,
+    pub map: HashMap<(TabletId, FamilyId), Arc<FamilySsts>>,
+    by_id: HashMap<SstId, Arc<OpenSst>>,
+}
+
+impl std::fmt::Debug for SstSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SstSet")
+            .field("families", &self.map.len())
+            .field("ssts", &self.by_id.len())
+            .finish()
+    }
+}
+
+impl SstSet {
+    /// An empty set over `file` and `cache`.
+    pub(crate) fn empty(file: FileRef, cache: Arc<BlockCache>) -> Self {
+        Self {
+            file,
+            cache,
+            map: HashMap::new(),
+            by_id: HashMap::new(),
+        }
+    }
+
+    /// Builds the set of `catalog`, reusing the open SSTs of `prev` and taking the readers
+    /// in `readers` for SSTs just written.
+    pub(crate) fn build(
+        catalog: &Catalog,
+        prev: Option<&SstSet>,
+        readers: &mut HashMap<SstId, Arc<SstReader>>,
+        file: FileRef,
+        cache: Arc<BlockCache>,
+    ) -> Self {
+        let mut by_id: HashMap<SstId, Arc<OpenSst>> = HashMap::new();
+        let mut map = HashMap::new();
+        for (key, list) in &catalog.ssts {
+            let mut levels: Vec<Vec<Arc<OpenSst>>> = Vec::new();
+            for (level, meta) in list {
+                let open = match by_id.get(&meta.id) {
+                    Some(o) => Arc::clone(o),
+                    None => {
+                        let o = prev
+                            .and_then(|p| p.by_id.get(&meta.id))
+                            .map(Arc::clone)
+                            .unwrap_or_else(|| {
+                                Arc::new(OpenSst::new(Arc::clone(meta), readers.remove(&meta.id)))
+                            });
+                        by_id.insert(meta.id, Arc::clone(&o));
+                        o
+                    }
+                };
+                let l = usize::from(*level);
+                if levels.len() <= l {
+                    levels.resize_with(l + 1, Vec::new);
+                }
+                levels[l].push(open);
+            }
+            for (l, files) in levels.iter_mut().enumerate() {
+                if l == 0 {
+                    // Newest first: by largest seqno, then by id.
+                    files.sort_by(|a, b| {
+                        (b.meta.seqno_range.1, b.meta.id.0)
+                            .cmp(&(a.meta.seqno_range.1, a.meta.id.0))
+                    });
+                } else {
+                    files.sort_by(|a, b| a.meta.smallest_key.cmp(&b.meta.smallest_key));
+                }
+            }
+            map.insert(*key, Arc::new(FamilySsts { levels }));
+        }
+        Self {
+            file,
+            cache,
+            map,
+            by_id,
+        }
+    }
+
+    pub(crate) fn family(&self, tablet: TabletId, family: FamilyId) -> Option<&Arc<FamilySsts>> {
+        self.map.get(&(tablet, family))
+    }
+
+    /// The cache priority of a family option.
+    pub(crate) fn priority(p: CachePriority) -> Priority {
+        match p {
+            CachePriority::Low => Priority::Low,
+            CachePriority::Normal => Priority::Normal,
+            CachePriority::High => Priority::High,
+        }
+    }
+}
+
+/// The manifest versions of every live in-process view, so the pager reclaims only extents
+/// no view can reach (decision D61).
+#[derive(Debug, Default)]
+pub(crate) struct LiveViews {
+    versions: Mutex<BTreeMap<ManifestVersion, u32>>,
+}
+
+impl LiveViews {
+    fn register(&self, v: ManifestVersion) {
+        *self
+            .versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(v)
+            .or_insert(0) += 1;
+    }
+
+    fn unregister(&self, v: ManifestVersion) {
+        let mut m = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = m.get_mut(&v) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&v);
+            }
+        }
+    }
+
+    /// The oldest manifest version any live view uses.
+    pub(crate) fn oldest(&self) -> Option<ManifestVersion> {
+        self.versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .next()
+            .copied()
+    }
+}
+
+/// Keeps a view's manifest version registered while the view lives.
+#[derive(Debug)]
+pub(crate) struct ViewPin {
+    registry: Arc<LiveViews>,
+    version: ManifestVersion,
+}
+
+impl ViewPin {
+    pub(crate) fn new(registry: &Arc<LiveViews>, version: ManifestVersion) -> Self {
+        registry.register(version);
+        Self {
+            registry: Arc::clone(registry),
+            version,
+        }
+    }
+}
+
+impl Drop for ViewPin {
+    fn drop(&mut self) {
+        self.registry.unregister(self.version);
+    }
+}
+
+/// Every live in-process snapshot seqno, for compaction's `GcPolicy::snapshots`.
+#[derive(Debug, Default)]
+pub(crate) struct LiveSeqnos {
+    seqnos: Mutex<BTreeMap<Seqno, u32>>,
+}
+
+impl LiveSeqnos {
+    /// The live seqnos, ascending.
+    pub(crate) fn list(&self) -> Vec<Seqno> {
+        self.seqnos
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+}
+
+/// Keeps a snapshot's seqno registered while any clone of the snapshot lives.
+#[derive(Debug)]
+pub(crate) struct SeqnoPin {
+    registry: Arc<LiveSeqnos>,
+    seqno: Seqno,
+}
+
+impl SeqnoPin {
+    pub(crate) fn new(registry: &Arc<LiveSeqnos>, seqno: Seqno) -> Self {
+        *registry
+            .seqnos
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(seqno)
+            .or_insert(0) += 1;
+        Self {
+            registry: Arc::clone(registry),
+            seqno,
+        }
+    }
+}
+
+impl Drop for SeqnoPin {
+    fn drop(&mut self) {
+        let mut m = self
+            .registry
+            .seqnos
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = m.get_mut(&self.seqno) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.seqno);
+            }
+        }
+    }
+}
+
 /// One immutable, consistent picture of the database: the tablet map, every tablet's active
 /// and frozen memtables, and the SST set of one manifest version. Any change to any of these
 /// publishes a new view. A frozen memtable stays in every new view until its flushed SST is
-/// in the manifest.
+/// in the manifest, and never appears together with that SST.
 #[derive(Debug)]
 pub struct View {
     pub(crate) version: u64,
@@ -118,6 +483,10 @@ pub struct View {
     pub(crate) catalog: Arc<Catalog>,
     /// One piece per shard.
     pub(crate) mems: Vec<Arc<ShardMems>>,
+    pub(crate) ssts: Arc<SstSet>,
+    /// Registered in the writer's live-view registry while the view lives (none in a
+    /// reader process).
+    pub(crate) _pin: Option<ViewPin>,
 }
 
 impl View {
@@ -186,24 +555,27 @@ impl View {
 /// reclamation for ever.
 #[derive(Debug)]
 pub(crate) struct LiveSnapshot {
-    pub count: Arc<std::sync::atomic::AtomicUsize>,
+    pub count: Arc<AtomicUsize>,
 }
 
 impl Drop for LiveSnapshot {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 /// A seqno plus the view current when it was taken. Reads through a snapshot ignore newer
 /// commits and use only its view. Holding it pins the view's memtables and SST extents
-/// (epoch-based; no locks). Cheap to clone.
+/// (epoch-based; no locks) and keeps compaction from dropping anything the snapshot can see.
+/// Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub(crate) seqno: Seqno,
     pub(crate) view: Arc<View>,
     /// Reader processes only: counted while any clone of this snapshot lives (a drop guard).
     pub(crate) _live: Option<Arc<LiveSnapshot>>,
+    /// Writer process: the seqno stays in the live-snapshot list while any clone lives.
+    pub(crate) _pin: Option<Arc<SeqnoPin>>,
 }
 
 impl Snapshot {
@@ -219,13 +591,15 @@ impl Snapshot {
 
     /// The same view at an older seqno (a view covers every seqno at or below the one it was
     /// taken with). A test hook for recovery checks (the `test-hooks` feature); not part of
-    /// the stable API.
+    /// the stable API. Compaction may have dropped versions no live snapshot needed, so only
+    /// seqnos above every compaction's inputs read as the model does.
     #[cfg(feature = "test-hooks")]
     pub fn at_seqno(&self, seqno: Seqno) -> Snapshot {
         Snapshot {
             seqno: seqno.min(self.seqno),
             view: Arc::clone(&self.view),
             _live: self._live.clone(),
+            _pin: self._pin.clone(),
         }
     }
 }

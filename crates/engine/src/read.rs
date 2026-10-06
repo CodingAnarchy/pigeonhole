@@ -1,29 +1,38 @@
+//! The read path: point gets, row reads and ordered scans over a snapshot's view, through
+//! `pigeonhole-compaction`'s `CellResolver` (snapshot visibility, deletes, TTL, versions,
+//! filters, merge folding) over a `MergingCursor` of the engine's [`Source`]s.
+
 use std::ops::Bound;
 use std::sync::Arc;
 
-use pigeonhole_compaction::ValuePredicate;
-use pigeonhole_format::key::{Escaped, encode_row_prefix, row_prefix_len};
+use pigeonhole_compaction::{MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate};
+use pigeonhole_format::key::{
+    Escaped, Kind, SUFFIX_LEN, decode_key, encode_row_prefix, row_prefix_len,
+};
+use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{ValueRef, decode_value};
-use pigeonhole_format::{FamilyId, Seqno, TableId, Timestamp};
+use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
-use crate::catalog::FamilyMeta;
-use crate::resolve::{Hold, Merge, ResolveOpts, ResolvedCell, Resolver, SourceCursor};
+use crate::catalog::{FamilyMeta, MergeKind};
 use crate::snapshot::{Snapshot, TabletEntry, View};
+use crate::source::{Pinned, Resolver, Source};
 use crate::{Error, Result};
 
 /// How a [`CellData`] keeps its value alive.
 #[derive(Clone)]
 enum CellValue {
-    /// A copy (small memtable values, merge results, blob reads).
+    /// A copy (small values, merge results, blob reads).
     Inline {
         len: u8,
         bytes: [u8; CellData::INLINE_MAX],
     },
     /// A pinned memtable range plus the view that keeps the memtable from being reclaimed.
     Arena { slice: ArenaSlice, _view: Arc<View> },
-    /// A heap copy larger than the inline limit (merge results).
+    /// A pinned range of a cached SST block.
+    Block(pigeonhole_cache::Cell),
+    /// A heap copy larger than the inline limit (merge results, mid-sized values).
     Owned(Vec<u8>),
 }
 
@@ -32,6 +41,7 @@ impl std::fmt::Debug for CellValue {
         match self {
             CellValue::Inline { len, .. } => write!(f, "Inline({len} bytes)"),
             CellValue::Arena { slice, .. } => write!(f, "Arena({} bytes)", slice.len()),
+            CellValue::Block(c) => write!(f, "Block({} bytes)", c.len()),
             CellValue::Owned(v) => write!(f, "Owned({} bytes)", v.len()),
         }
     }
@@ -39,10 +49,10 @@ impl std::fmt::Debug for CellValue {
 
 /// A resolved cell value that pins its storage instead of copying it: a range of a cached
 /// block (`cache::Cell`), or a range of a memtable arena plus the view pin that keeps it alive
-/// (`memtable::ArenaSlice` + `Arc<View>`). Memtable values of at most
-/// [`CellData::INLINE_MAX`] bytes, merge results and blob reads are copied into the cell
-/// instead (decision D29), so a hot small get never takes a view reference. Holds no
-/// lifetime and clones cheaply.
+/// (`memtable::ArenaSlice` + `Arc<View>`). Values of at most [`CellData::INLINE_MAX`] bytes,
+/// merge results and values the resolver had to buffer (up to 4 KiB, decision D81) are copied
+/// into the cell instead (decision D29), so a hot small get never takes a view reference.
+/// Holds no lifetime and clones cheaply.
 #[derive(Debug, Clone)]
 pub struct CellData {
     ts: Timestamp,
@@ -50,12 +60,17 @@ pub struct CellData {
 }
 
 impl CellData {
-    /// Memtable values up to this many bytes are copied rather than pinned.
+    /// Values up to this many bytes are copied rather than pinned.
     pub const INLINE_MAX: usize = 128;
 
-    /// Builds a cell from a resolved one. `pin` is called only when the value is large and
-    /// borrowed from a memtable, so a hot small get never touches a view reference count.
-    pub(crate) fn from_resolved(cell: &ResolvedCell<'_>, pin: impl FnOnce() -> Arc<View>) -> Self {
+    /// Builds a cell from a resolved one. `source` is the source the merged cursor is on
+    /// (to pin a large value without copying); `pin` is called only when the value is large
+    /// and borrowed from a memtable, so a hot small get never touches a view reference count.
+    pub(crate) fn from_cell(
+        cell: &ResolvedCell<'_>,
+        source: Option<&Source>,
+        pin: impl FnOnce() -> Arc<View>,
+    ) -> Self {
         let stored = cell.value;
         let value = if stored.len() <= Self::INLINE_MAX {
             let mut bytes = [0u8; Self::INLINE_MAX];
@@ -64,17 +79,45 @@ impl CellData {
                 len: stored.len() as u8,
                 bytes,
             }
-        } else {
-            match cell.hold {
-                Some(Hold::Arena(slice)) => CellValue::Arena {
-                    slice: slice.clone(),
+        } else if cell.from_source {
+            match source.map(Source::pin_value) {
+                Some(Pinned::Arena(slice)) => CellValue::Arena {
+                    slice,
                     _view: pin(),
                 },
-                Some(Hold::Owned(v)) => CellValue::Owned(v.clone()),
+                Some(Pinned::Block(c)) => CellValue::Block(c),
+                Some(Pinned::Owned(v)) => CellValue::Owned(v),
                 None => CellValue::Owned(stored.to_vec()),
             }
+        } else {
+            CellValue::Owned(stored.to_vec())
         };
         Self { ts: cell.ts, value }
+    }
+
+    fn from_pinned(ts: Timestamp, value: &LaneValue, pin: impl FnOnce() -> Arc<View>) -> Self {
+        let bytes: &[u8] = value;
+        if bytes.len() <= Self::INLINE_MAX {
+            let mut inline = [0u8; Self::INLINE_MAX];
+            inline[..bytes.len()].copy_from_slice(bytes);
+            return Self {
+                ts,
+                value: CellValue::Inline {
+                    len: bytes.len() as u8,
+                    bytes: inline,
+                },
+            };
+        }
+        let value = match value {
+            LaneValue::Copied(v) => CellValue::Owned(v.clone()),
+            LaneValue::Pinned(Pinned::Arena(slice)) => CellValue::Arena {
+                slice: slice.clone(),
+                _view: pin(),
+            },
+            LaneValue::Pinned(Pinned::Block(c)) => CellValue::Block(c.clone()),
+            LaneValue::Pinned(Pinned::Owned(v)) => CellValue::Owned(v.clone()),
+        };
+        Self { ts, value }
     }
 
     /// Timestamp of this version.
@@ -87,6 +130,7 @@ impl CellData {
         match &self.value {
             CellValue::Inline { len, bytes } => &bytes[..usize::from(*len)],
             CellValue::Arena { slice, .. } => slice,
+            CellValue::Block(c) => c,
             CellValue::Owned(v) => v,
         }
     }
@@ -107,7 +151,8 @@ pub struct ReadSpec {
     pub qualifiers: QualifierFilter,
     /// Versions per column (1 = latest; 0 = all retained).
     pub versions: u32,
-    /// Keep versions with `min <= ts < max` (pushed into the block decoder).
+    /// Keep versions with `min <= ts < max` (pushed into the block decoder, or applied to
+    /// resolved versions on a family with a merge operator, decision D82).
     pub time_range: Option<(Timestamp, Timestamp)>,
     /// Columns per row and family (0 = unlimited); the rest of the row is skipped.
     pub columns_per_row: u32,
@@ -116,29 +161,28 @@ pub struct ReadSpec {
 }
 
 impl ReadSpec {
-    /// The resolver options for one family under this spec.
+    /// The resolver options and entry filter for one family under this spec.
     pub(crate) fn resolve_opts(
         &self,
         meta: &FamilyMeta,
         snapshot: Seqno,
         now: Timestamp,
-    ) -> ResolveOpts {
-        let mut opts = ResolveOpts::new(snapshot, now);
+    ) -> (ResolveOptions, ScanFilter) {
+        let mut opts = ResolveOptions::new(snapshot, now);
         opts.ttl_micros = meta.options.ttl_micros;
-        opts.max_versions = meta.options.max_versions;
-        opts.versions = self.versions;
+        // Decision D76: the caller folds the family's max_versions in (0 = unlimited).
+        opts.versions = match (meta.options.max_versions, self.versions) {
+            (0, v) => v,
+            (m, 0) => m,
+            (m, v) => m.min(v),
+        };
         opts.columns_per_row = self.columns_per_row;
         opts.value = self.value.clone();
-        opts.merge = meta.merge;
-        opts.filter.qualifiers = self.qualifiers.clone();
-        // D82: on a family with a merge operator the time range applies to resolved
-        // versions (pushing it to puts could drop a counter's base but keep its operands).
-        if meta.merge == crate::catalog::MergeKind::None {
-            opts.filter.time_range = self.time_range;
-        } else {
-            opts.resolved_time_range = self.time_range;
-        }
-        opts
+        opts.merge = meta.merge_op.clone();
+        let mut filter = ScanFilter::all();
+        filter.qualifiers = self.qualifiers.clone();
+        opts.route_time_range(&mut filter, self.time_range);
+        (opts, filter)
     }
 }
 
@@ -199,19 +243,24 @@ impl RowData {
     }
 
     /// Appends a resolved cell (its qualifier unescaped into the shared buffer).
-    pub(crate) fn push(&mut self, family: FamilyId, cell: &ResolvedCell<'_>, view: &Arc<View>) {
+    fn push(&mut self, family: FamilyId, column: &[u8], data: CellData) {
         let start = self.qualifiers.len() as u32;
-        qualifier_of(cell.column).unescape_into(&mut self.qualifiers);
+        qualifier_of(column).unescape_into(&mut self.qualifiers);
         self.cells.push(RowCell {
             family,
             qualifier: start..self.qualifiers.len() as u32,
-            data: CellData::from_resolved(cell, || Arc::clone(view)),
+            data,
         });
     }
 }
 
-/// The escaped qualifier inside a column prefix (escaped row, terminator, escaped qualifier,
+/// The column prefix of a resolved cell's key (escaped row, terminator, escaped qualifier,
 /// terminator).
+pub(crate) fn column_of(key: &[u8]) -> &[u8] {
+    &key[..key.len().saturating_sub(SUFFIX_LEN)]
+}
+
+/// The escaped qualifier inside a column prefix.
 pub(crate) fn qualifier_of(column: &[u8]) -> Escaped<'_> {
     let n = row_prefix_len(column).unwrap_or(column.len());
     let end = column.len().saturating_sub(2).max(n);
@@ -222,6 +271,26 @@ pub(crate) fn qualifier_of(column: &[u8]) -> Escaped<'_> {
 pub(crate) fn row_of(column: &[u8]) -> &[u8] {
     let n = row_prefix_len(column).unwrap_or(column.len());
     &column[..n.saturating_sub(2)]
+}
+
+/// The smallest key past every key of the row whose prefix is `prefix` (the terminator's
+/// last byte bumped), appended to `out`.
+pub(crate) fn past_row(prefix: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(prefix);
+    if let Some(last) = out.last_mut() {
+        *last += 1;
+    }
+}
+
+/// Maps a resolver error for `meta`: the shared resolver reports a missing operator as a
+/// merge error; the engine promises `UnknownMergeOperator` for such reads.
+pub(crate) fn read_error(e: Error, meta: &FamilyMeta) -> Error {
+    match (e, meta.merge) {
+        (Error::Merge(_), MergeKind::Unknown) => {
+            Error::UnknownMergeOperator(meta.options.merge_operator.clone())
+        }
+        (e, _) => e,
+    }
 }
 
 /// A cell borrowed from a [`ScanCursor`]; valid until the cursor moves.
@@ -237,12 +306,39 @@ pub struct ScanCell<'a> {
     pub stored: &'a [u8],
 }
 
-/// The resolver of one family within one tablet, plus whether it holds a cell not yet handed
-/// out.
+/// A scan's `[start, end)` as encoded row prefixes (`None` = unbounded).
+type RowBounds = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// A lane's held value.
+#[derive(Debug)]
+enum LaneValue {
+    Copied(Vec<u8>),
+    Pinned(Pinned),
+}
+
+impl std::ops::Deref for LaneValue {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            LaneValue::Copied(v) => v,
+            LaneValue::Pinned(p) => p,
+        }
+    }
+}
+
+/// The resolver of one family within one tablet, plus the cell it holds but has not handed
+/// out yet.
 struct Lane {
     family: FamilyId,
-    resolver: Resolver<Merge<SourceCursor>>,
+    meta: FamilyMeta,
+    resolver: Resolver,
+    /// The held cell: column prefix, timestamp, value.
+    col: Vec<u8>,
+    ts: Timestamp,
+    value: LaneValue,
     pending: bool,
+    done: bool,
 }
 
 impl std::fmt::Debug for Lane {
@@ -254,10 +350,55 @@ impl std::fmt::Debug for Lane {
     }
 }
 
+impl Lane {
+    /// Fetches the next visible cell into the lane. Values the resolver buffered are
+    /// copied; large ones borrowed from a source are pinned.
+    fn fetch(&mut self) -> Result<()> {
+        self.pending = false;
+        if self.done {
+            return Ok(());
+        }
+        let (from_source, large) = {
+            let Some(cell) = self
+                .resolver
+                .next_cell()
+                .map_err(|e| read_error(e, &self.meta))?
+            else {
+                self.done = true;
+                return Ok(());
+            };
+            self.col.clear();
+            self.col.extend_from_slice(column_of(cell.key));
+            self.ts = cell.ts;
+            let large = cell.value.len() > CellData::INLINE_MAX;
+            if !(cell.from_source && large) {
+                match &mut self.value {
+                    LaneValue::Copied(v) => {
+                        v.clear();
+                        v.extend_from_slice(cell.value);
+                    }
+                    other => *other = LaneValue::Copied(cell.value.to_vec()),
+                }
+            }
+            (cell.from_source, large)
+        };
+        if from_source && large {
+            let src = self
+                .resolver
+                .cursor()
+                .current()
+                .expect("the merged cursor is on the returned entry");
+            self.value = LaneValue::Pinned(src.pin_value());
+        }
+        self.pending = true;
+        Ok(())
+    }
+}
+
 /// An ordered scan over a snapshot: walks tablets in key order and, per family, a resolver
-/// over a merge of owning sources (memtables now, SSTs from Milestone B) stored inside the
-/// cursor beside the snapshot that keeps them valid. Rows come out in order; within a row,
-/// cells come out by family, qualifier, newest first.
+/// over a merge of the owning sources (memtables and SSTs) stored inside the cursor beside
+/// the snapshot that keeps them valid. Rows come out in order; within a row, cells come out
+/// by family, qualifier, newest first.
 #[derive(Debug)]
 pub struct ScanCursor {
     snapshot: Snapshot,
@@ -313,34 +454,74 @@ impl ScanCursor {
         }
     }
 
+    /// The scan's start and end as row-prefix bounds (`None` = unbounded).
+    fn bounds(&self) -> Result<RowBounds> {
+        let start = match &self.spec.start {
+            Bound::Included(s) | Bound::Excluded(s) => {
+                let mut k = Vec::new();
+                encode_row_prefix(&mut k, s)?;
+                Some(k)
+            }
+            Bound::Unbounded => None,
+        };
+        let end = match &self.spec.end {
+            Bound::Excluded(e) => {
+                let mut k = Vec::new();
+                encode_row_prefix(&mut k, e)?;
+                Some(k)
+            }
+            Bound::Included(e) => {
+                let mut k = Vec::new();
+                encode_row_prefix(&mut k, e)?;
+                let mut past = Vec::new();
+                past_row(&k, &mut past);
+                Some(past)
+            }
+            Bound::Unbounded => None,
+        };
+        Ok((start, end))
+    }
+
     /// Builds the lanes for the next tablet, seeking each to the scan start. Returns false
     /// when no tablet is left.
     fn open_next_tablet(&mut self) -> Result<bool> {
         let Some(tablet) = self.tablets.pop_front() else {
             return Ok(false);
         };
-        let view = &self.snapshot.view;
-        let mut start_key = Vec::new();
-        match &self.spec.start {
-            Bound::Included(s) | Bound::Excluded(s) => encode_row_prefix(&mut start_key, s)?,
-            Bound::Unbounded => {}
-        }
+        let view = Arc::clone(&self.snapshot.view);
+        let (start, end) = self.bounds()?;
         self.lanes.clear();
         for &family in &self.families {
             let Some(meta) = view.catalog.family(family) else {
                 continue;
             };
-            let sources = sources_for(view, tablet.shard, tablet.id, family);
-            let opts = self
+            let (opts, filter) = self
                 .spec
                 .read
                 .resolve_opts(meta, self.snapshot.seqno, self.now);
-            let mut resolver = Resolver::new(Merge::new(sources), opts);
-            resolver.seek(&start_key)?;
+            let sources = view.scan_sources(
+                tablet.shard,
+                tablet.id,
+                family,
+                &filter,
+                start.as_deref(),
+                end.as_deref(),
+            )?;
+            let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
+            resolver.set_upper_bound(end.as_deref());
+            match &start {
+                Some(s) => resolver.seek(s)?,
+                None => resolver.seek(&[])?,
+            }
             self.lanes.push(Lane {
                 family,
+                meta: meta.clone(),
                 resolver,
+                col: Vec::new(),
+                ts: 0,
+                value: LaneValue::Copied(Vec::new()),
                 pending: false,
+                done: false,
             });
         }
         Ok(true)
@@ -349,8 +530,8 @@ impl ScanCursor {
     /// Makes sure every lane either holds a pending cell or is exhausted.
     fn fill_lanes(&mut self) -> Result<()> {
         for lane in &mut self.lanes {
-            if !lane.pending {
-                lane.pending = lane.resolver.next_cell()?.is_some();
+            if !lane.pending && !lane.done {
+                lane.fetch()?;
             }
         }
         Ok(())
@@ -365,6 +546,17 @@ impl ScanCursor {
         }
     }
 
+    /// Drops the rest of the current row in every lane.
+    fn skip_current_row(&mut self) -> Result<()> {
+        for lane in &mut self.lanes {
+            if lane.pending && row_of(&lane.col) == self.row_esc {
+                lane.pending = false;
+                lane.resolver.skip_row()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Advances to the next row with at least one visible cell. Returns `false` at the end.
     pub fn next_row(&mut self) -> Result<bool> {
         if self.done {
@@ -375,12 +567,7 @@ impl ScanCursor {
             if let Some(i) = self.last_lane.take() {
                 self.lanes[i].pending = false;
             }
-            for lane in &mut self.lanes {
-                if lane.pending && row_of(lane.resolver.current_column()) == self.row_esc {
-                    lane.pending = false;
-                    lane.resolver.skip_row()?;
-                }
-            }
+            self.skip_current_row()?;
             self.in_row = false;
         }
         loop {
@@ -395,7 +582,7 @@ impl ScanCursor {
                 if !lane.pending {
                     continue;
                 }
-                let row = row_of(lane.resolver.current_column());
+                let row = row_of(&lane.col);
                 if best.is_none_or(|b| row < b) {
                     best = Some(row);
                 }
@@ -411,12 +598,7 @@ impl ScanCursor {
             Escaped::new(&self.row_esc).unescape_into(&mut self.row);
             if matches!(&self.spec.start, Bound::Excluded(s) if s.as_slice() == self.row.as_slice())
             {
-                for lane in &mut self.lanes {
-                    if lane.pending && row_of(lane.resolver.current_column()) == self.row_esc {
-                        lane.pending = false;
-                        lane.resolver.skip_row()?;
-                    }
-                }
+                self.skip_current_row()?;
                 continue;
             }
             if self.past_end(&self.row)
@@ -445,23 +627,21 @@ impl ScanCursor {
             return Ok(None);
         }
         if let Some(i) = self.last_lane.take() {
-            let lane = &mut self.lanes[i];
-            lane.pending = lane.resolver.next_cell()?.is_some();
+            self.lanes[i].fetch()?;
         }
         while self.lane_idx < self.lanes.len() {
             let i = self.lane_idx;
             let lane = &self.lanes[i];
-            if lane.pending && row_of(lane.resolver.current_column()) == self.row_esc {
+            if lane.pending && row_of(&lane.col) == self.row_esc {
                 self.last_lane = Some(i);
                 let lane = &self.lanes[i];
-                let cell = lane.resolver.current().expect("pending lane has a cell");
                 self.qual_buf.clear();
-                qualifier_of(cell.column).unescape_into(&mut self.qual_buf);
+                qualifier_of(&lane.col).unescape_into(&mut self.qual_buf);
                 return Ok(Some(ScanCell {
                     family: lane.family,
                     qualifier: &self.qual_buf,
-                    ts: cell.ts,
-                    stored: cell.value,
+                    ts: lane.ts,
+                    stored: &lane.value,
                 }));
             }
             self.lane_idx += 1;
@@ -470,49 +650,14 @@ impl ScanCursor {
     }
 
     /// The cell last returned by [`ScanCursor::next_cell`], as a pinned [`CellData`] (no
-    /// copy of the value).
+    /// copy of a large value).
     ///
     /// # Panics
     /// If no cell has been returned for the current row.
     pub fn current_data(&self) -> CellData {
         let i = self.last_lane.expect("current_data before next_cell");
-        let cell = self.lanes[i]
-            .resolver
-            .current()
-            .expect("the last lane holds a cell");
-        CellData::from_resolved(&cell, || Arc::clone(&self.snapshot.view))
-    }
-}
-
-/// The sources of `(tablet, family)` on `shard` in `view`, newest first.
-pub(crate) fn sources_for(
-    view: &View,
-    shard: pigeonhole_runtime::ShardId,
-    tablet: pigeonhole_format::TabletId,
-    family: FamilyId,
-) -> Vec<SourceCursor> {
-    match view.memtables(shard, tablet, family) {
-        Some(set) => set
-            .readers
-            .iter()
-            .map(|r| SourceCursor::Mem(r.iter()))
-            .collect(),
-        None => Vec::new(),
-    }
-}
-
-impl<S: crate::resolve::Source> Resolver<S> {
-    /// The cell last emitted, if any.
-    pub(crate) fn current(&self) -> Option<ResolvedCell<'_>> {
-        self.has_cell().then(|| self.current_cell())
-    }
-
-    /// The column prefix of the cell last emitted.
-    ///
-    /// # Panics
-    /// If no cell is held.
-    pub(crate) fn current_column(&self) -> &[u8] {
-        self.current_cell().column
+        let lane = &self.lanes[i];
+        CellData::from_pinned(lane.ts, &lane.value, || Arc::clone(&self.snapshot.view))
     }
 }
 
@@ -531,6 +676,8 @@ pub(crate) fn read_row(
     };
     let mut prefix = Vec::new();
     encode_row_prefix(&mut prefix, row)?;
+    let mut past = Vec::new();
+    past_row(&prefix, &mut past);
     let mut out = RowData {
         row: row.to_vec(),
         ..RowData::default()
@@ -539,19 +686,462 @@ pub(crate) fn read_row(
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
-        let sources = sources_for(view, shard, tablet, family);
+        let (opts, filter) = spec.resolve_opts(meta, snapshot.seqno, now);
+        let sources = view.row_sources(shard, tablet, family, &filter, row, &prefix)?;
         if sources.is_empty() {
             continue;
         }
-        let opts = spec.resolve_opts(meta, snapshot.seqno, now);
-        let mut resolver = Resolver::new(Merge::new(sources), opts);
+        let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
+        resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;
-        while let Some(cell) = resolver.next_cell()? {
-            if !cell.column.starts_with(&prefix) {
-                break;
-            }
-            out.push(family, &cell, view);
+        loop {
+            let (data, column) = {
+                let Some(cell) = resolver.next_cell().map_err(|e| read_error(e, meta))? else {
+                    break;
+                };
+                if !cell.key.starts_with(&prefix) {
+                    break;
+                }
+                let column = column_of(cell.key).to_vec();
+                let data = if cell.from_source && cell.value.len() > CellData::INLINE_MAX {
+                    // Pinned below, once the borrow of the resolver ends.
+                    None
+                } else {
+                    Some(CellData::from_cell(&cell, None, || Arc::clone(view)))
+                };
+                (data, column)
+            };
+            let data = match data {
+                Some(d) => d,
+                None => {
+                    let src = resolver
+                        .cursor()
+                        .current()
+                        .expect("the merged cursor is on the returned entry");
+                    let ts = {
+                        let (_, ts, _, _) = pigeonhole_format::key::split_suffix(src.key())?;
+                        ts
+                    };
+                    let value = LaneValue::Pinned(src.pin_value());
+                    CellData::from_pinned(ts, &value, || Arc::clone(view))
+                }
+            };
+            out.push(family, &column, data);
         }
     }
     Ok((!out.cells.is_empty()).then_some(out))
+}
+
+/// A point get through `view` at `seqno`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn get_in(
+    view: &View,
+    seqno: Seqno,
+    now: Timestamp,
+    table: TableId,
+    family: FamilyId,
+    row: &[u8],
+    qualifier: &[u8],
+    pin: impl FnOnce() -> Arc<View>,
+) -> Result<Option<CellData>> {
+    let Some((tablet, shard)) = view.tablets().route(table, row) else {
+        return Err(Error::TableNotFound(format!("table {}", table.0)));
+    };
+    let Some(meta) = view.catalog.family(family) else {
+        return Err(Error::FamilyNotFound(format!("family {}", family.0)));
+    };
+    if meta.table != table {
+        return Err(Error::FamilyNotFound(format!("family {}", family.0)));
+    }
+    let sources = view.point_sources(shard, tablet, family, row, qualifier)?;
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let (opts, _) = ReadSpec {
+        versions: 1,
+        ..ReadSpec::default()
+    }
+    .resolve_opts(meta, seqno, now);
+    let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
+    resolver.seek_column(row, qualifier)?;
+    // A value above the inline threshold is pinned, not copied (D29). The resolver copies
+    // values up to its own limit while it reads the group; a copy of a put (the output key
+    // names exactly that entry; a fold's key is an operand's) is re-found with one seek and
+    // pinned, so the pinned bytes are the version itself.
+    let mut key_buf = [0u8; 512];
+    let mut key_vec: Vec<u8> = Vec::new();
+    let mut key_len = 0;
+    let (ts, refind) = {
+        let Some(cell) = resolver.next_cell().map_err(|e| read_error(e, meta))? else {
+            return Ok(None);
+        };
+        if cell.value.len() <= CellData::INLINE_MAX {
+            return Ok(Some(CellData::from_cell(&cell, None, pin)));
+        }
+        if cell.from_source {
+            (cell.ts, false)
+        } else if decode_key(cell.key).is_ok_and(|k| k.kind == Kind::Put) {
+            key_len = cell.key.len();
+            if key_len <= key_buf.len() {
+                key_buf[..key_len].copy_from_slice(cell.key);
+            } else {
+                key_vec.extend_from_slice(cell.key);
+            }
+            (cell.ts, true)
+        } else {
+            return Ok(Some(CellData::from_cell(&cell, None, pin)));
+        }
+    };
+    if !refind {
+        let src = resolver
+            .cursor()
+            .current()
+            .expect("the merged cursor is on the returned entry");
+        let value = LaneValue::Pinned(src.pin_value());
+        return Ok(Some(CellData::from_pinned(ts, &value, pin)));
+    }
+    let key: &[u8] = if key_vec.is_empty() {
+        &key_buf[..key_len]
+    } else {
+        &key_vec
+    };
+    let mut cursor = resolver.into_cursor();
+    cursor.seek(key)?;
+    if cursor.valid()
+        && cursor.key() == key
+        && let Some(src) = cursor.current()
+    {
+        let value = LaneValue::Pinned(src.pin_value());
+        return Ok(Some(CellData::from_pinned(ts, &value, pin)));
+    }
+    Err(Error::Corruption(
+        "point get: a resolved entry is not in its sources".into(),
+    ))
+}
+
+/// Whether a stored value satisfies a predicate (decision D77).
+pub(crate) fn predicate_matches(p: &ValuePredicate, stored: &[u8]) -> bool {
+    p.matches(stored)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The resolver rules as the engine relies on them (snapshot visibility, the delete rules
+    //! D9/D38, TTL, merge folding D41, limits and filters), run through the engine's
+    //! `Source` enum against `pigeonhole-compaction`'s shared `CellResolver`.
+
+    use std::sync::Arc;
+
+    use pigeonhole_compaction::{I64Add, MergingCursor, ResolveOptions, VecCursor};
+    use pigeonhole_format::key::{Kind, decode_key, encode_key, encode_marker_key};
+    use pigeonhole_format::value::{ValueRef, decode_value, encode_value};
+
+    use crate::source::{Resolver, Source};
+    use crate::{Error, ValuePredicate};
+
+    fn put(row: &str, q: &str, ts: u64, seqno: u64, v: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut k = Vec::new();
+        encode_key(&mut k, row.as_bytes(), q.as_bytes(), ts, seqno, Kind::Put).unwrap();
+        let mut val = Vec::new();
+        // Eight raw bytes are written as a tagged `i64` (what `put_i64` does).
+        match <[u8; 8]>::try_from(v) {
+            Ok(b) => encode_value(&mut val, ValueRef::I64(i64::from_le_bytes(b))),
+            Err(_) => encode_value(&mut val, ValueRef::Bytes(v)),
+        }
+        (k, val)
+    }
+
+    fn incr(row: &str, q: &str, ts: u64, seqno: u64, d: i64) -> (Vec<u8>, Vec<u8>) {
+        let mut k = Vec::new();
+        encode_key(&mut k, row.as_bytes(), q.as_bytes(), ts, seqno, Kind::Merge).unwrap();
+        let mut val = Vec::new();
+        encode_value(&mut val, ValueRef::I64(d));
+        (k, val)
+    }
+
+    fn del(row: &str, q: &str, ts: u64, seqno: u64, kind: Kind) -> (Vec<u8>, Vec<u8>) {
+        let mut k = Vec::new();
+        encode_key(&mut k, row.as_bytes(), q.as_bytes(), ts, seqno, kind).unwrap();
+        (k, Vec::new())
+    }
+
+    fn marker(row: &str, ts: u64, seqno: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut k = Vec::new();
+        encode_marker_key(&mut k, row.as_bytes(), ts, seqno).unwrap();
+        (k, Vec::new())
+    }
+
+    type Cell = (String, String, u64, Vec<u8>);
+
+    fn cell(key: &[u8], ts: u64, value: &[u8]) -> Cell {
+        let parts = decode_key(key).unwrap();
+        let (mut r, mut q) = (Vec::new(), Vec::new());
+        parts.row.unescape_into(&mut r);
+        parts.qualifier.unwrap().unescape_into(&mut q);
+        let v = match decode_value(value).unwrap() {
+            ValueRef::Bytes(b) => b.to_vec(),
+            ValueRef::I64(x) => x.to_le_bytes().to_vec(),
+            other => panic!("{other:?}"),
+        };
+        (
+            String::from_utf8(r).unwrap(),
+            String::from_utf8(q).unwrap(),
+            ts,
+            v,
+        )
+    }
+
+    fn resolver(sources: Vec<Vec<(Vec<u8>, Vec<u8>)>>, opts: ResolveOptions) -> Resolver {
+        let sources = sources
+            .into_iter()
+            .map(|e| Source::Vec(VecCursor::new(e)))
+            .collect();
+        Resolver::new(MergingCursor::new(sources), opts)
+    }
+
+    fn collect(src: Vec<(Vec<u8>, Vec<u8>)>, opts: ResolveOptions) -> Vec<Cell> {
+        let mut r = resolver(vec![src], opts);
+        r.seek(b"").unwrap();
+        let mut out = Vec::new();
+        while let Some(c) = r.next_cell().unwrap() {
+            out.push(cell(c.key, c.ts, c.value));
+        }
+        out
+    }
+
+    fn opts(snapshot: u64) -> ResolveOptions {
+        let mut o = ResolveOptions::new(snapshot, 1_000);
+        o.versions = 0;
+        o.merge = Some(Arc::new(I64Add));
+        o
+    }
+
+    fn c(row: &str, q: &str, ts: u64, v: &[u8]) -> Cell {
+        (row.into(), q.into(), ts, v.to_vec())
+    }
+
+    #[test]
+    fn newest_first_and_snapshot() {
+        let src = vec![
+            put("r", "q", 10, 1, b"a"),
+            put("r", "q", 20, 2, b"b"),
+            put("r", "q", 15, 3, b"c"),
+        ];
+        assert_eq!(
+            collect(src.clone(), opts(3)),
+            vec![
+                c("r", "q", 20, b"b"),
+                c("r", "q", 15, b"c"),
+                c("r", "q", 10, b"a")
+            ]
+        );
+        assert_eq!(collect(src.clone(), opts(1)), vec![c("r", "q", 10, b"a")]);
+        let mut one = opts(3);
+        one.versions = 1;
+        assert_eq!(collect(src, one), vec![c("r", "q", 20, b"b")]);
+    }
+
+    #[test]
+    fn cell_delete_hides_exact_timestamp_whatever_the_seqno() {
+        let src = vec![
+            put("r", "q", 10, 1, b"a"),
+            del("r", "q", 10, 2, Kind::CellDelete),
+            put("r", "q", 10, 3, b"later"),
+            put("r", "q", 9, 4, b"old"),
+        ];
+        assert_eq!(collect(src.clone(), opts(4)), vec![c("r", "q", 9, b"old")]);
+        assert_eq!(collect(src, opts(1)), vec![c("r", "q", 10, b"a")]);
+    }
+
+    #[test]
+    fn column_delete_hides_by_timestamp_not_seqno() {
+        let src = vec![
+            put("r", "q", 10, 1, b"a"),
+            put("r", "q", 30, 2, b"c"),
+            del("r", "q", 20, 3, Kind::ColumnDelete),
+            put("r", "q", 15, 4, b"late-old"),
+            put("r", "q", 20, 5, b"at-delete"),
+            put("r", "z", 1, 6, b"next-column"),
+        ];
+        assert_eq!(
+            collect(src, opts(6)),
+            vec![c("r", "q", 30, b"c"), c("r", "z", 1, b"next-column")]
+        );
+    }
+
+    #[test]
+    fn family_marker_hides_row_cells_at_or_below_it() {
+        let src = vec![
+            put("r", "a", 10, 1, b"a"),
+            put("r", "b", 30, 1, b"b"),
+            marker("r", 20, 2),
+            put("r", "a", 20, 3, b"a2"),
+            put("s", "a", 5, 1, b"other-row"),
+        ];
+        assert_eq!(
+            collect(src.clone(), opts(3)),
+            vec![c("r", "b", 30, b"b"), c("s", "a", 5, b"other-row")]
+        );
+        assert_eq!(
+            collect(src, opts(1)),
+            vec![
+                c("r", "a", 10, b"a"),
+                c("r", "b", 30, b"b"),
+                c("s", "a", 5, b"other-row")
+            ]
+        );
+    }
+
+    #[test]
+    fn ttl_expires_at_the_boundary() {
+        let src = vec![put("r", "q", 900, 1, b"old"), put("r", "q", 950, 2, b"new")];
+        let mut o = opts(2);
+        o.ttl_micros = 100; // now = 1000: 900 + 100 <= 1000 expired, 950 lives
+        assert_eq!(collect(src, o), vec![c("r", "q", 950, b"new")]);
+    }
+
+    #[test]
+    fn merge_folds_onto_base_and_runs() {
+        let base = 5i64.to_le_bytes();
+        let src = vec![
+            put("r", "c", 10, 1, &base),
+            incr("r", "c", 20, 2, 3),
+            incr("r", "c", 30, 3, 4),
+            put("r", "d", 10, 1, &base),
+            incr("r", "d", 10, 2, 1),
+            incr("r", "e", 7, 1, 2),
+        ];
+        assert_eq!(
+            collect(src.clone(), opts(3)),
+            vec![
+                c("r", "c", 30, &12i64.to_le_bytes()),
+                c("r", "d", 10, &6i64.to_le_bytes()),
+                c("r", "e", 7, &2i64.to_le_bytes()),
+            ]
+        );
+        // A snapshot before the operands returns the base as written.
+        assert_eq!(collect(src, opts(1))[0], c("r", "c", 10, &base));
+    }
+
+    #[test]
+    fn merge_onto_non_i64_base_fails_only_when_returned() {
+        let src = vec![
+            put("r", "c", 10, 1, b"bad"),
+            incr("r", "c", 20, 2, 3),
+            put("r", "c", 30, 3, b"newest"),
+        ];
+        let mut o = opts(3);
+        o.versions = 1;
+        assert_eq!(collect(src.clone(), o), vec![c("r", "c", 30, b"newest")]);
+        let mut r = resolver(vec![src], opts(3));
+        r.seek(b"").unwrap();
+        assert!(r.next_cell().unwrap().is_some());
+        assert!(matches!(r.next_cell(), Err(Error::Merge(_))));
+    }
+
+    #[test]
+    fn point_get_sees_markers_before_the_column() {
+        let src = vec![
+            put("r", "q", 10, 1, b"a"),
+            marker("r", 10, 2),
+            put("r", "q", 11, 3, b"b"),
+            put("r", "q", 9, 4, b"hidden"),
+            put("r", "r", 50, 5, b"other-column"),
+        ];
+        let mut r = resolver(vec![src], opts(5));
+        r.seek_column(b"r", b"q").unwrap();
+        let ts = r.next_cell().unwrap().unwrap().ts;
+        assert_eq!(ts, 11);
+        assert!(r.next_cell().unwrap().is_none());
+        assert!(r.next_cell().unwrap().is_none());
+        r.seek_column(b"r", b"zz").unwrap();
+        assert!(r.next_cell().unwrap().is_none());
+        r.seek_column(b"r", b"r").unwrap();
+        assert_eq!(r.next_cell().unwrap().unwrap().ts, 50);
+    }
+
+    #[test]
+    fn columns_per_row_and_max_versions() {
+        let src = vec![
+            put("r", "a", 1, 1, b"1"),
+            put("r", "a", 2, 2, b"2"),
+            put("r", "b", 1, 1, b"x"),
+            put("r", "c", 1, 1, b"y"),
+            put("s", "a", 1, 1, b"s"),
+        ];
+        let mut o = opts(2);
+        o.versions = 1; // the family's max_versions folded in (D76)
+        o.columns_per_row = 2;
+        assert_eq!(
+            collect(src, o),
+            vec![
+                c("r", "a", 2, b"2"),
+                c("r", "b", 1, b"x"),
+                c("s", "a", 1, b"s")
+            ]
+        );
+    }
+
+    #[test]
+    fn value_predicate_tests_the_newest_version() {
+        let src = vec![
+            put("r", "a", 1, 1, b"yes"),
+            put("r", "a", 2, 2, b"no"),
+            put("r", "b", 1, 1, b"yes"),
+        ];
+        let mut o = opts(2);
+        o.value = Some(ValuePredicate::Equals(b"yes".to_vec()));
+        assert_eq!(collect(src, o), vec![c("r", "b", 1, b"yes")]);
+    }
+
+    #[test]
+    fn qualifier_filter_skips_columns() {
+        let src = vec![
+            put("r", "a", 1, 1, b"1"),
+            put("r", "meta:x", 1, 1, b"2"),
+            put("r", "meta:y", 1, 1, b"3"),
+            put("r", "z", 1, 1, b"4"),
+            put("s", "meta:z", 1, 1, b"5"),
+        ];
+        // The filter is applied by the sources (FilteredCursor / SstIter), not the resolver:
+        // wrap the in-memory source the way memtables are wrapped.
+        let mut filter = pigeonhole_format::scan::ScanFilter::all();
+        filter.qualifiers = pigeonhole_format::scan::QualifierFilter::Prefix(b"meta:".to_vec());
+        let filtered = pigeonhole_compaction::FilteredCursor::new(VecCursor::new(src), filter);
+        let mut out = Vec::new();
+        let mut r = pigeonhole_compaction::CellResolver::new(filtered, opts(2));
+        r.seek(b"").unwrap();
+        while let Some(cell_) = r.next_cell().unwrap() {
+            out.push(cell(cell_.key, cell_.ts, cell_.value));
+        }
+        assert_eq!(
+            out,
+            vec![
+                c("r", "meta:x", 1, b"2"),
+                c("r", "meta:y", 1, b"3"),
+                c("s", "meta:z", 1, b"5")
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_sources_interleave_in_key_order() {
+        let a = vec![put("r", "q", 20, 2, b"new"), put("s", "q", 1, 4, b"s")];
+        let b = vec![put("r", "q", 10, 1, b"old"), put("r", "z", 5, 3, b"z")];
+        let mut r = resolver(vec![a, b], opts(4));
+        r.seek(b"").unwrap();
+        let mut out = Vec::new();
+        while let Some(c) = r.next_cell().unwrap() {
+            out.push(cell(c.key, c.ts, c.value));
+        }
+        assert_eq!(
+            out,
+            vec![
+                c("r", "q", 20, b"new"),
+                c("r", "q", 10, b"old"),
+                c("r", "z", 5, b"z"),
+                c("s", "q", 1, b"s")
+            ]
+        );
+    }
 }

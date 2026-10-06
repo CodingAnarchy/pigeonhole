@@ -662,25 +662,34 @@ fn value_limits_arena_pressure_and_closed_handles() {
         matches!(db.commit(wb, None), Err(Error::ValueTooLarge)),
         "over half the arena (D16)"
     );
-    // Fill the arena: commits turn into Busy, never into a partial apply.
-    let mut busy = false;
+    // Fill the arena several times over: a full arena waits for a flush, never refuses and
+    // never applies a commit in part.
     let mut written = 0;
     for i in 0..400u32 {
         let mut wb = WriteBatch::new();
         put(&mut wb, &t, "f", &i.to_be_bytes(), b"q", &vec![1u8; 4096]);
-        match db.commit(wb, Some(Durability::None)) {
-            Ok(_) => written += 1,
-            Err(Error::Busy) => {
-                busy = true;
-                break;
-            }
-            Err(e) => panic!("{e}"),
-        }
+        db.commit(wb, Some(Durability::None)).unwrap();
+        written += 1;
     }
-    assert!(busy, "the arena fills up without flushes");
-    assert!(written > 10);
+    assert!(db.metrics().flushes >= 1, "flushes freed the arena");
+    // A batch that could never fit, even in an empty arena, is refused at once.
+    let mut wb = WriteBatch::new();
+    for i in 0..300u32 {
+        put(
+            &mut wb,
+            &t,
+            "f",
+            &(1000 + i).to_be_bytes(),
+            b"q",
+            &vec![1u8; 4096],
+        );
+    }
+    assert!(matches!(
+        db.commit(wb, Some(Durability::None)),
+        Err(Error::Busy)
+    ));
     assert!(db.metrics().stalls.0 >= 1);
-    // Everything written is readable; frozen memtables are retained in the view.
+    // Everything written is readable, from memtables and SSTs alike.
     let snap = db.snapshot().unwrap();
     let mut cursor = db
         .scan(

@@ -354,10 +354,6 @@ fn a_failed_blocking_sync_or_write_poisons_the_stream() {
         wal.append(&batch(1, 100_000).record(), Durability::Buffered),
         Err(Error::RecordTooLarge)
     ));
-    assert!(matches!(
-        wal.append(&batch(1, 10).record(), Durability::None),
-        Err(Error::InvalidArgument { .. })
-    ));
     wal.append(&batch(1, 10).record(), Durability::Buffered)
         .unwrap();
     wal.sync().unwrap();

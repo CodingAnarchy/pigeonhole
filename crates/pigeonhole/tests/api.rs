@@ -319,8 +319,9 @@ fn every_engine_error_maps_to_its_code() {
         let what = format!("{e:?}");
         let message = match &e {
             E::Merge(_) => "merge operator \"op\" failed: bad".to_owned(),
-            E::Busy => "memtable arena full: raise Options::memtable_budget (flush to SSTs \
-                        arrives with engine Milestone B, #37)"
+            E::Busy => "memtable arena full: a flush did not free room within the write-stall \
+                        timeout, or one batch is larger than the arena; retry, or raise \
+                        Options::memtable_budget"
                 .to_owned(),
             _ => e.to_string(),
         };
@@ -995,13 +996,16 @@ fn real_files_reopen_and_lock() {
     let db = Pigeonhole::open(&path, opts()).unwrap();
     let t = db.table("t").unwrap().open().unwrap();
     assert_eq!(value(&t, b"r", "a", b"q").as_deref(), Some(&b"durable"[..]));
-    // Not in Milestone A of the engine: compaction and backup.
-    assert_eq!(db.compact().unwrap_err().code(), ErrorCode::Unsupported);
-    assert_eq!(
-        db.backup(dir.0.join("copy.phdb")).unwrap_err().code(),
-        ErrorCode::Unsupported
-    );
+    // Engine Milestone B: compaction and backup work; the backup is one file that opens on
+    // its own and holds the data.
+    db.compact().unwrap();
+    db.backup(dir.0.join("copy.phdb")).unwrap();
     db.close().unwrap();
+    let copy = Pigeonhole::open(dir.0.join("copy.phdb"), opts().create_if_missing(false)).unwrap();
+    let t = copy.table("t").unwrap().open().unwrap();
+    assert_eq!(value(&t, b"r", "a", b"q").as_deref(), Some(&b"durable"[..]));
+    drop(t);
+    copy.close().unwrap();
 }
 
 #[test]
@@ -1116,23 +1120,36 @@ fn a_full_memtable_arena_is_busy_with_a_precise_message() {
     };
     let db = Pigeonhole::open("/db/busy.phdb", opts(1 << 20)).unwrap();
     let t = table(&db);
-    let value = vec![1u8; 1000];
-    let err = (0..10_000u32)
-        .find_map(|i| {
-            t.mutate(&i.to_be_bytes())
-                .put("a", b"q", &value)
-                .commit()
-                .err()
-        })
-        .expect("the arena fills");
+    // Engine Milestone B: a full arena waits for a flush, so steady writes never see
+    // `Busy`; a batch that can never fit the arena is refused at once.
+    let cell = vec![1u8; 1000];
+    for i in 0..3_000u32 {
+        t.mutate(&i.to_be_bytes())
+            .put("a", b"q", &cell)
+            .commit()
+            .unwrap();
+    }
+    let mut wb = db.write_batch();
+    let big = vec![2u8; 4096];
+    for i in 0..400u32 {
+        wb.put(&t, &i.to_be_bytes(), "a", b"big", &big);
+    }
+    let err = wb
+        .commit()
+        .expect_err("a batch larger than the arena is refused");
     assert_eq!(err.code(), ErrorCode::Busy);
     assert!(err.message().contains("memtable_budget"), "{err}");
     drop(t);
     db.close().unwrap();
-    // Reopening with a smaller budget than the data needs is refused.
-    let err = Pigeonhole::open("/db/busy.phdb", opts(256 << 10)).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
-    eprintln!("smaller budget on reopen: {err}");
+    // A clean close leaves nothing to replay: a smaller budget reopens fine.
+    let db = Pigeonhole::open("/db/busy.phdb", opts(256 << 10)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    assert_eq!(
+        value(&t, &0u32.to_be_bytes(), "a", b"q").as_deref(),
+        Some(&cell[..])
+    );
+    drop(t);
+    db.close().unwrap();
 }
 
 #[test]

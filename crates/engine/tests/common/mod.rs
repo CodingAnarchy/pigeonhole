@@ -8,13 +8,24 @@
 //! timestamp is the clock at submission (decision D11) and the model gets the same value.
 //!
 //! **Crashes.** Power loss and process crashes between operations, and power loss in the
-//! middle of a commit (`FaultPlan::crash_after_ops`). Recovery is checked against the WAL
-//! itself: the harness reads every stream's surviving records (a Batch, or a Prepare whose
-//! coordinator stream holds the Commit) to learn which commits the engine must have
-//! recovered, checks the per-stream durability promises (every acknowledged commit at or
-//! below a stream's last `GroupSync`/`Sync` commit, or `Buffered` after a process crash,
-//! must be there, and survivors are a prefix per stream), rebuilds the model from those
-//! commits, and compares the reopened engine with it.
+//! middle of a commit (`FaultPlan::crash_after_ops`). Recovery is checked against what the
+//! files hold: the manifest's per-stream checkpoints and per-slot flushed seqnos (read before
+//! the reopen), and every stream's surviving records after its checkpoint. Each stream keeps
+//! a prefix of its records (decision D84): a record survives if the WAL still holds it or
+//! its commit is in SSTs below the checkpoint. A single-shard commit survives iff its record
+//! does, a cross-shard commit iff every PREPARE and its COMMIT do (D83); the harness tracks
+//! the order records were appended to each stream, so the prefix rule is exact, and checks
+//! it against `pigeonhole_sim::recovered_commits` wherever that helper's commit-level view
+//! can represent the stream (see `sim_helper_agrees`). Commits only SSTs still hold are
+//! recognized by their raw entries (`Engine::raw_entries`). The model is rebuilt with
+//! `Model::from_commits`, the durability promise checked with `check_acknowledged_survive`,
+//! and the purges of every durable bottommost compaction re-applied (decision D74).
+//!
+//! **Flush and compaction.** Memtables are tiny, so flushes and compactions run throughout;
+//! the workload also calls `flush` and `compact` explicitly. Every compaction the engine
+//! commits is read back (`Engine::take_compactions`): bottommost ones are applied to the model
+//! as `Model::purge`, and the dumps of every held snapshot are re-checked, so a compaction
+//! never changes a read at a live snapshot.
 #![allow(dead_code)]
 
 use std::cell::RefCell;
@@ -25,20 +36,24 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, EngineShard, Error, FamilyId, FamilyOptions, PendingCommit, Predicate,
-    ScanSpec, Snapshot, TableInfo, ValueRef, WriteBatch,
+    AppendedKind, CompactionRecord, Engine, EngineOptions, EngineShard, Error, FamilyId,
+    FamilyOptions, PendingCommit, PendingMaintenance, PickerOptions, Predicate, ScanSpec, Snapshot,
+    TableInfo, ValueRef, WriteBatch,
 };
+use pigeonhole_format::key::decode_key;
 use pigeonhole_format::wal::WalRecord;
-use pigeonhole_format::{Durability, Lsn, Seqno, StreamId, Timestamp};
+use pigeonhole_format::{Durability, Lsn, ManifestVersion, Seqno, StreamId, TableId, Timestamp};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
-    Model, ModelCell, ModelFamily, ModelOp, Op, Rng, Sim, Step, Workload, WorkloadSpec,
+    CommitStreams, Model, ModelCell, ModelFamily, ModelOp, ModelPurge, Op, Rng, Sim, Step,
+    StreamCommit, Workload, WorkloadSpec, check_acknowledged_survive, recovered_commits,
 };
 
 pub const TABLE: &str = "t";
@@ -155,6 +170,16 @@ pub struct Config {
     pub txn_ppm: u32,
     /// `final_dump` only: a process crash and reopen every this many ops.
     pub crash_every: Option<usize>,
+    /// `final_dump` only: a flush and full compaction every this many ops (with background
+    /// compaction off, so purges happen at the same points for every shard count).
+    pub compact_every: Option<usize>,
+    /// A memtable freezes at this many bytes (tiny, so flushes run throughout).
+    pub memtable_freeze_bytes: u64,
+    /// Compaction tuning (small levels, so compactions run throughout).
+    pub compaction: PickerOptions,
+    /// Per-op probability (ppm) of an explicit `flush` / `compact`.
+    pub flush_ppm: u32,
+    pub compact_ppm: u32,
 }
 
 impl Config {
@@ -168,6 +193,12 @@ impl Config {
         spec.families = families().into_iter().map(|f| f.name).collect();
         spec.max_value_len = 160;
         spec.max_batch = 5;
+        let mut compaction = PickerOptions::default();
+        compaction.l0_trigger = 2;
+        compaction.level_base_bytes = 48 << 10;
+        compaction.level_multiplier = 2;
+        compaction.max_levels = 4;
+        compaction.target_sst_bytes = 64 << 10;
         Config {
             ops,
             faults,
@@ -176,7 +207,7 @@ impl Config {
             spec,
             shards: 2,
             reopen_shards: Vec::new(),
-            memtable_budget: 4 << 20,
+            memtable_budget: 1 << 20,
             durability: None,
             crash_at: None,
             dump_ppm: 100_000,
@@ -184,6 +215,11 @@ impl Config {
             cas_ppm: 80_000,
             txn_ppm: 80_000,
             crash_every: None,
+            compact_every: None,
+            memtable_freeze_bytes: 16 << 10,
+            compaction,
+            flush_ppm: 30_000,
+            compact_ppm: 15_000,
         }
     }
 
@@ -210,6 +246,16 @@ pub struct Stats {
     pub crashes: usize,
     pub mid_commit_crashes: usize,
     pub busy: usize,
+    pub flushes: u64,
+    pub compactions: u64,
+    pub purges: usize,
+    /// Recoveries where the sim helper's commit-level view could be checked.
+    pub helper_checked: usize,
+    /// Commits recovered only from SSTs (their WAL records were checkpointed away).
+    pub sst_only: usize,
+    /// Mutating VFS operations the run made before its final crash: the crash points a
+    /// sweep of the same seed and config must cover.
+    pub mutating_ops: u64,
 }
 
 /// What kind of divergence the checker saw.
@@ -223,6 +269,8 @@ pub enum FailureClass {
     RecoveredStateMismatch,
     /// A live read or scan disagreed with the model.
     LiveReadMismatch,
+    /// A flush or compaction changed a read at a snapshot that was live when it ran.
+    SnapshotChanged,
     /// The engine and model disagree about a seqno, or an unexpected error occurred.
     Protocol,
 }
@@ -368,6 +416,8 @@ pub struct Store {
     /// `(table, family) -> id`.
     pub family_ids: HashMap<(String, String), FamilyId>,
     pub family_names: HashMap<FamilyId, String>,
+    /// Set by any shard's wakeup callback: work arrived for a shard that reported idle.
+    pub woke: Arc<AtomicBool>,
 }
 
 pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineOptions {
@@ -383,6 +433,14 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
     o
 }
 
+/// Options with the checker's flush and compaction knobs.
+pub fn options_for(vfs: Arc<SimVfs>, shards: usize, cfg: &Config) -> EngineOptions {
+    let mut o = options(vfs, shards, cfg.memtable_budget);
+    o.memtable_freeze_bytes = cfg.memtable_freeze_bytes;
+    o.compaction = cfg.compaction.clone();
+    o
+}
+
 impl Store {
     /// Opens (creating the table on a fresh database).
     pub fn open(
@@ -391,10 +449,25 @@ impl Store {
         budget: u64,
         fams: &[ModelFamily],
     ) -> Result<Self, Error> {
-        let (engine, shards) = Engine::open_application_owned(
-            Path::new(DB),
-            options(Arc::clone(vfs), shards, budget),
-        )?;
+        Self::open_with(vfs, options(Arc::clone(vfs), shards, budget), fams)
+    }
+
+    /// Opens with the checker's options.
+    pub fn open_cfg(vfs: &Arc<SimVfs>, shards: usize, cfg: &Config) -> Result<Self, Error> {
+        Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())
+    }
+
+    fn open_with(
+        _vfs: &Arc<SimVfs>,
+        options: EngineOptions,
+        fams: &[ModelFamily],
+    ) -> Result<Self, Error> {
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), options)?;
+        let woke = Arc::new(AtomicBool::new(false));
+        for s in &mut shards {
+            let w = Arc::clone(&woke);
+            s.set_wakeup(Box::new(move || w.store(true, Ordering::Release)));
+        }
         let mut tables = HashMap::new();
         let mut family_ids = HashMap::new();
         let mut family_names = HashMap::new();
@@ -421,7 +494,23 @@ impl Store {
             tables,
             family_ids,
             family_names,
+            woke,
         })
+    }
+
+    /// Runs every shard until none has work left and no shard was woken during the last
+    /// pass (a shard may wake another one that already reported idle in the same pass).
+    pub fn run_until_idle(&mut self) {
+        loop {
+            self.woke.store(false, Ordering::Release);
+            let mut more = false;
+            for s in &mut self.shards {
+                more |= s.run_once(u64::MAX);
+            }
+            if !more && !self.woke.load(Ordering::Acquire) {
+                return;
+            }
+        }
     }
 
     /// Encodes model ops into an engine batch, mapping names to ids.
@@ -483,6 +572,37 @@ impl Store {
         for s in &mut self.shards {
             s.run_once(now + 1_000);
         }
+    }
+
+    /// Drives the shards until `m` resolves (or the engine dies).
+    pub fn drive(
+        &mut self,
+        vfs: &Arc<SimVfs>,
+        mut m: PendingMaintenance,
+        alive: impl Fn() -> bool,
+    ) -> Result<(), Error> {
+        let mut cx = Context::from_waker(Waker::noop());
+        for step in 0..200_000 {
+            match Pin::new(&mut m).poll(&mut cx) {
+                Poll::Ready(r) => return r,
+                Poll::Pending => self.step_shards(vfs.monotonic_nanos()),
+            }
+            if step % 64 == 63 && !alive() {
+                return Err(Error::Io(pigeonhole_io::Error::new(
+                    ErrorKind::Crashed,
+                    "crashed during maintenance",
+                )));
+            }
+        }
+        panic!("maintenance did not finish in 200k steps")
+    }
+
+    /// The table and family ids of a model op's `(table, family)`.
+    pub fn ids(&self, table: &str, family: &str) -> (TableId, FamilyId) {
+        (
+            self.tables[table].id,
+            self.family_ids[&(table.to_owned(), family.to_owned())],
+        )
     }
 
     pub fn get(
@@ -588,36 +708,43 @@ pub fn model_dump(
 }
 
 // ---------------------------------------------------------------------------------------
-// WAL survivors
+// WAL records
 // ---------------------------------------------------------------------------------------
 
-/// What the WAL holds after a crash.
-#[derive(Debug, Default)]
-pub struct Survivors {
-    /// Commits recovery must apply, by seqno.
-    pub commits: BTreeMap<Seqno, Survivor>,
-    /// Each stream's record seqnos (Batch records and applied Prepares), sorted.
-    pub order: BTreeMap<StreamId, Vec<Seqno>>,
-    /// Decided cross-shard commits (COMMIT present) with at least one PREPARE missing:
-    /// recovery must apply nothing of them.
-    pub ambiguous: Vec<Seqno>,
+/// A record kind, as it sits in a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecKind {
+    Batch,
+    Prepare,
+    Commit,
 }
 
-/// A surviving commit as the WAL holds it.
+/// What the WAL holds (after every stream's checkpoint).
+#[derive(Debug, Default)]
+pub struct WalRead {
+    /// Per stream, its records in log order.
+    pub streams: BTreeMap<u32, Vec<(Seqno, RecKind)>>,
+    /// The mutations and timestamp of every seqno with a Batch or Prepare record.
+    pub batches: BTreeMap<Seqno, Survivor>,
+    /// COMMIT decisions: `(coordinator stream, seqno) -> participant streams`.
+    pub commits: BTreeMap<(u32, Seqno), Vec<u32>>,
+}
+
+/// A commit's records as the WAL holds them.
 #[derive(Debug, Clone)]
 pub struct Survivor {
     pub seqno: Seqno,
     pub commit_ts: Timestamp,
-    /// Every stream that holds a record of it (one for a single-shard commit).
-    pub streams: Vec<StreamId>,
-    /// The encoded mutations, per stream.
+    /// The encoded mutations, per record.
     pub batches: Vec<Vec<u8>>,
 }
 
-/// Reads every stream of `db` and returns the commits recovery must apply: Batch records,
-/// and Prepare records whose coordinator stream holds the matching Commit. Also returns the
-/// per-stream list of record seqnos in log order (for the prefix check).
-pub fn wal_survivors(vfs: &Arc<SimVfs>, db: &Path) -> Result<Survivors, String> {
+/// Reads every stream of `db` from its manifest checkpoint.
+pub fn read_wal(
+    vfs: &Arc<SimVfs>,
+    db: &Path,
+    checkpoints: &BTreeMap<StreamId, Lsn>,
+) -> Result<WalRead, String> {
     let vfs_ref: pigeonhole_io::VfsRef = Arc::clone(vfs) as pigeonhole_io::VfsRef;
     let opened =
         pigeonhole_pager::Pager::open(&vfs_ref, db, false).map_err(|e| format!("pager: {e}"))?;
@@ -625,13 +752,12 @@ pub fn wal_survivors(vfs: &Arc<SimVfs>, db: &Path) -> Result<Survivors, String> 
     drop(opened);
     let streams =
         pigeonhole_wal::discover_streams(&vfs_ref, db).map_err(|e| format!("discover: {e}"))?;
-    let mut survivors: BTreeMap<Seqno, Survivor> = BTreeMap::new();
-    let mut prepares: Vec<(StreamId, Seqno, Timestamp, StreamId, Vec<u8>)> = Vec::new();
-    let mut commits: BTreeMap<(StreamId, Seqno), Vec<StreamId>> = BTreeMap::new();
-    let mut order: BTreeMap<StreamId, Vec<Seqno>> = BTreeMap::new();
+    let mut out = WalRead::default();
     for stream in streams {
-        let mut rec = pigeonhole_wal::Recovery::open(&vfs_ref, db, stream, db_id, Lsn::default())
+        let checkpoint = checkpoints.get(&stream).copied().unwrap_or_default();
+        let mut rec = pigeonhole_wal::Recovery::open(&vfs_ref, db, stream, db_id, checkpoint)
             .map_err(|e| format!("recovery open {}: {e}", stream.0))?;
+        let list = out.streams.entry(stream.0).or_default();
         loop {
             let next = rec
                 .next_record()
@@ -643,74 +769,53 @@ pub fn wal_survivors(vfs: &Arc<SimVfs>, db: &Path) -> Result<Survivors, String> 
                     commit_ts,
                     batch,
                 } => {
-                    order.entry(stream).or_default().push(seqno);
-                    survivors.insert(
-                        seqno,
-                        Survivor {
+                    list.push((seqno, RecKind::Batch));
+                    out.batches
+                        .entry(seqno)
+                        .or_insert_with(|| Survivor {
                             seqno,
                             commit_ts,
-                            streams: vec![stream],
-                            batches: vec![batch.as_bytes().to_vec()],
-                        },
-                    );
+                            batches: Vec::new(),
+                        })
+                        .batches
+                        .push(batch.as_bytes().to_vec());
                 }
                 WalRecord::Prepare {
                     seqno,
                     commit_ts,
-                    coordinator,
                     batch,
+                    ..
                 } => {
-                    prepares.push((
-                        stream,
-                        seqno,
-                        commit_ts,
-                        coordinator,
-                        batch.as_bytes().to_vec(),
-                    ));
+                    list.push((seqno, RecKind::Prepare));
+                    out.batches
+                        .entry(seqno)
+                        .or_insert_with(|| Survivor {
+                            seqno,
+                            commit_ts,
+                            batches: Vec::new(),
+                        })
+                        .batches
+                        .push(batch.as_bytes().to_vec());
                 }
                 WalRecord::Commit {
                     seqno,
                     participants,
                 } => {
-                    commits.insert((stream, seqno), participants.iter().collect());
+                    list.push((seqno, RecKind::Commit));
+                    out.commits.insert(
+                        (stream.0, seqno),
+                        participants.iter().map(|p| p.0).collect(),
+                    );
                 }
             }
         }
     }
-    // All or nothing: a decided commit counts only if every listed participant holds its
-    // PREPARE (the engine's recovery rule).
-    let prepared: BTreeSet<(StreamId, Seqno)> = prepares.iter().map(|p| (p.0, p.1)).collect();
-    let mut ambiguous: Vec<Seqno> = commits
-        .iter()
-        .filter(|((_, seqno), ps)| !ps.iter().all(|p| prepared.contains(&(*p, *seqno))))
-        .map(|((_, seqno), _)| *seqno)
-        .collect();
-    ambiguous.sort_unstable();
-    ambiguous.dedup();
-    for (stream, seqno, commit_ts, coordinator, bytes) in prepares {
-        let decided = commits
-            .get(&(coordinator, seqno))
-            .is_some_and(|ps| ps.iter().all(|p| prepared.contains(&(*p, seqno))));
-        if decided {
-            order.entry(stream).or_default().push(seqno);
-            let s = survivors.entry(seqno).or_insert_with(|| Survivor {
-                seqno,
-                commit_ts,
-                streams: Vec::new(),
-                batches: Vec::new(),
-            });
-            s.streams.push(stream);
-            s.batches.push(bytes);
-        }
-    }
-    for list in order.values_mut() {
-        list.sort_unstable();
-    }
-    Ok(Survivors {
-        commits: survivors,
-        order,
-        ambiguous,
-    })
+    Ok(out)
+}
+
+/// The commit timestamps of every logged seqno.
+pub fn logged_timestamps_of(wal: &WalRead) -> BTreeMap<Seqno, Timestamp> {
+    wal.batches.iter().map(|(k, v)| (*k, v.commit_ts)).collect()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -755,8 +860,61 @@ struct Committed {
     durability: Durability,
     /// The shards its rows route to.
     shards: Vec<u16>,
+    /// The streams its records go to (as submitted; fixed for the commit's life).
+    streams: CommitStreams,
     acked: bool,
     kind: Kind,
+}
+
+/// Where a commit's records go: one stream, or every written and read shard with the shard
+/// of the first row as coordinator (the engine's routing).
+fn streams_of(shards: &[u16], reads: &[u16]) -> CommitStreams {
+    let mut all: Vec<usize> = shards.iter().map(|s| *s as usize).collect();
+    for r in reads {
+        if !all.contains(&(*r as usize)) {
+            all.push(*r as usize);
+        }
+    }
+    match all.as_slice() {
+        [] => CommitStreams::Single(0),
+        [s] => CommitStreams::Single(*s),
+        _ => CommitStreams::Cross {
+            coordinator: all[0],
+            participants: all,
+        },
+    }
+}
+
+/// The records of `streams`, as `(stream, kind)` in the order the engine appends them per
+/// stream (a participant's PREPARE before the coordinator's COMMIT).
+fn records_of(streams: &CommitStreams) -> Vec<(u32, RecKind)> {
+    match streams {
+        CommitStreams::Single(s) => vec![(*s as u32, RecKind::Batch)],
+        CommitStreams::Cross {
+            participants,
+            coordinator,
+        } => participants
+            .iter()
+            .map(|p| (*p as u32, RecKind::Prepare))
+            .chain(std::iter::once((*coordinator as u32, RecKind::Commit)))
+            .collect(),
+    }
+}
+
+/// A bottommost compaction the engine committed, to replay on the model after a recovery.
+#[derive(Debug, Clone)]
+struct PurgeEvent {
+    manifest_version: ManifestVersion,
+    /// Only a bottommost compaction purges; the others still bound historical reads.
+    bottommost: bool,
+    table: String,
+    family: String,
+    /// Engine seqnos (mapped to model seqnos when applied).
+    snapshots: Vec<Seqno>,
+    now: Timestamp,
+    min_ts_above: Timestamp,
+    max_seqno: Seqno,
+    rows: (Bound<Vec<u8>>, Bound<Vec<u8>>),
 }
 
 impl Committed {
@@ -822,6 +980,9 @@ struct World {
     history: BTreeMap<Seqno, Committed>,
     /// Commits that returned an error (or were in flight at a crash): maybe landed.
     unacked: Vec<Committed>,
+    /// Attempts the engine refused (a false predicate, a conflict, a full arena): a
+    /// cross-shard one may have left PREPARE records under a seqno of its own.
+    aborted: Vec<Committed>,
     in_flight: Vec<InFlight>,
     /// A shard reported a poisoned stream: reopen once nothing is in flight.
     need_reopen: bool,
@@ -839,6 +1000,18 @@ struct World {
     workload: Option<std::iter::Take<Workload>>,
     /// Ops taken from the workload but not yet run (lookahead for batching).
     queued: std::collections::VecDeque<Op>,
+    /// Per stream, the records appended to it in order, as observed in the WAL (plus
+    /// `None` commits, placed when they resolve: their records wait in the buffer).
+    stream_records: BTreeMap<u32, Vec<(Seqno, RecKind)>>,
+    /// Bottommost compactions applied to the model, by manifest version.
+    purges: Vec<PurgeEvent>,
+    /// Compactions reported by the engine whose manifest version is not published yet.
+    pending_purges: Vec<CompactionRecord>,
+    /// Reads at seqnos at or below this (engine seqnos) may differ from the model: a
+    /// compaction dropped versions no live snapshot needed.
+    compaction_floor: Seqno,
+    /// Whether the configured fault plan is active (off while recovery checks the files).
+    faults_active: bool,
 }
 
 impl World {
@@ -877,10 +1050,316 @@ impl World {
         std::env::var("PIGEONHOLE_TRACE").is_ok()
     }
 
+    /// Appends the records the engine logged since the last call to the per-stream append
+    /// order (the engine reports every record it appends, in order, test hook).
+    fn drain_appended(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        for r in store.engine.take_appended() {
+            let kind = match r.kind {
+                AppendedKind::Batch => RecKind::Batch,
+                AppendedKind::Prepare => RecKind::Prepare,
+                AppendedKind::Commit => RecKind::Commit,
+            };
+            self.stream_records
+                .entry(u32::from(r.stream))
+                .or_default()
+                .push((r.seqno, kind));
+        }
+    }
+
+    /// The streams holding records of `seqno`, from the engine's append order: `None` when
+    /// it appended none. A cross-shard commit whose COMMIT was never appended keeps
+    /// `guess`'s coordinator.
+    fn streams_from_records(&self, seqno: Seqno, guess: &CommitStreams) -> Option<CommitStreams> {
+        let mut single = None;
+        let mut participants = Vec::new();
+        let mut coordinator = None;
+        for (stream, list) in &self.stream_records {
+            for (q, kind) in list {
+                if *q != seqno {
+                    continue;
+                }
+                match kind {
+                    RecKind::Batch => single = Some(*stream as usize),
+                    RecKind::Prepare => participants.push(*stream as usize),
+                    RecKind::Commit => coordinator = Some(*stream as usize),
+                }
+            }
+        }
+        if let Some(s) = single {
+            return Some(CommitStreams::Single(s));
+        }
+        if participants.is_empty() && coordinator.is_none() {
+            return None;
+        }
+        let coordinator = coordinator.unwrap_or(match guess {
+            CommitStreams::Cross { coordinator, .. } => *coordinator,
+            CommitStreams::Single(s) => *s,
+        });
+        Some(CommitStreams::Cross {
+            participants,
+            coordinator,
+        })
+    }
+
+    /// Checks the records the WAL holds now against the engine's append order: they are a
+    /// contiguous window of each stream (everything before it was checkpointed, everything
+    /// after it is still buffered or was lost).
+    fn observe_streams(&mut self, wal: &WalRead) -> Result<(), Fail> {
+        self.drain_appended();
+        for (stream, observed) in &wal.streams {
+            let known = self.stream_records.entry(*stream).or_default();
+            let Some(first) = observed.first() else {
+                continue;
+            };
+            let Some(k) = known.iter().position(|r| r == first) else {
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "stream {stream}: the WAL holds {first:?}, which the engine never appended (appended: {known:?}, WAL: {observed:?})"
+                    ),
+                );
+            };
+            for (i, r) in observed.iter().enumerate() {
+                match known.get(k + i) {
+                    Some(have) if have == r => {}
+                    Some(have) => {
+                        return fail(
+                            FailureClass::Protocol,
+                            format!(
+                                "stream {stream}: record {i} after the checkpoint is {r:?} but the engine appended {have:?} there"
+                            ),
+                        );
+                    }
+                    None => {
+                        return fail(
+                            FailureClass::Protocol,
+                            format!(
+                                "stream {stream}: record {i} after the checkpoint is {r:?}, beyond everything the engine appended (appended: {known:?}, WAL: {observed:?})"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the WAL (faults off) and merges its record order.
+    fn observe_wal(&mut self) -> Result<WalRead, Fail> {
+        self.vfs.set_faults(FaultPlan::none());
+        self.faults_active = false;
+        let manifest = Engine::inspect_manifest(
+            &(Arc::clone(&self.vfs) as pigeonhole_io::VfsRef),
+            Path::new(DB),
+        );
+        let wal = manifest.and_then(|m| {
+            read_wal(&self.vfs, Path::new(DB), &m.checkpoints).map_err(Error::Corruption)
+        });
+        self.vfs.set_faults(self.cfg.faults.clone());
+        self.faults_active = true;
+        let wal = match wal {
+            Ok(w) => w,
+            Err(e) => return fail(FailureClass::Protocol, format!("reading the WAL: {e}")),
+        };
+        if self.trace_on() {
+            eprintln!(
+                "wal: streams {:?} batches {:?}",
+                wal.streams,
+                wal.batches.keys().collect::<Vec<_>>()
+            );
+        }
+        self.observe_streams(&wal)?;
+        Ok(wal)
+    }
+
+    /// Takes the compactions the engine committed; applies the purge of every durable
+    /// bottommost one to the model and re-checks the held snapshots.
+    fn drain_compactions(&mut self) -> Result<(), Fail> {
+        let store = self.store.as_ref().expect("store open");
+        let mut records = store.engine.take_compactions();
+        records.append(&mut self.pending_purges);
+        if records.is_empty() {
+            return Ok(());
+        }
+        let published = store
+            .engine
+            .snapshot()
+            .map_or(0, |s| s.view().manifest_version());
+        let table_names: HashMap<TableId, String> = store
+            .tables
+            .iter()
+            .map(|(n, t)| (t.id, n.clone()))
+            .collect();
+        let family_names = store.family_names.clone();
+        let mut applied = false;
+        for r in records {
+            if r.manifest_version > published {
+                self.pending_purges.push(r);
+                continue;
+            }
+            self.stats.compactions += 1;
+            self.compaction_floor = self.compaction_floor.max(r.max_seqno);
+            applied = true;
+            let (Some(table), Some(family)) =
+                (table_names.get(&r.table), family_names.get(&r.family))
+            else {
+                continue;
+            };
+            let event = PurgeEvent {
+                manifest_version: r.manifest_version,
+                bottommost: r.bottommost,
+                table: table.clone(),
+                family: family.clone(),
+                snapshots: r.snapshots.clone(),
+                now: r.now,
+                min_ts_above: r.min_ts_above,
+                max_seqno: r.max_seqno,
+                rows: (
+                    r.rows.0.clone().map_or(Bound::Unbounded, Bound::Included),
+                    r.rows.1.clone().map_or(Bound::Unbounded, Bound::Excluded),
+                ),
+            };
+            if event.bottommost {
+                self.trace.push(format!(
+                    "purge {}/{} at manifest {} (snapshots {:?}, min_ts_above {}, max_seqno {})",
+                    event.table,
+                    event.family,
+                    event.manifest_version,
+                    event.snapshots,
+                    event.min_ts_above,
+                    event.max_seqno
+                ));
+                self.apply_purge(&event);
+                self.stats.purges += 1;
+            }
+            self.purges.push(event);
+        }
+        if applied {
+            self.check_held_snapshots()?;
+        }
+        Ok(())
+    }
+
+    /// Records every compaction the engine committed but the harness has not applied yet
+    /// (a maintenance call that failed, a crash): the recovery replays the durable ones.
+    fn stash_compactions(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            self.pending_purges.clear();
+            return;
+        };
+        let mut records = store.engine.take_compactions();
+        records.append(&mut self.pending_purges);
+        let table_names: HashMap<TableId, String> = store
+            .tables
+            .iter()
+            .map(|(n, t)| (t.id, n.clone()))
+            .collect();
+        for r in records {
+            let (Some(table), Some(family)) =
+                (table_names.get(&r.table), store.family_names.get(&r.family))
+            else {
+                continue;
+            };
+            self.purges.push(PurgeEvent {
+                manifest_version: r.manifest_version,
+                bottommost: r.bottommost,
+                table: table.clone(),
+                family: family.clone(),
+                snapshots: r.snapshots.clone(),
+                now: r.now,
+                min_ts_above: r.min_ts_above,
+                max_seqno: r.max_seqno,
+                rows: (
+                    r.rows.0.clone().map_or(Bound::Unbounded, Bound::Included),
+                    r.rows.1.clone().map_or(Bound::Unbounded, Bound::Excluded),
+                ),
+            });
+        }
+    }
+
+    fn faults_on(&self) -> bool {
+        self.faults_active
+    }
+
+    fn apply_purge(&mut self, e: &PurgeEvent) {
+        let p = ModelPurge {
+            table: e.table.clone(),
+            family: e.family.clone(),
+            rows: e.rows.clone(),
+            snapshots: e.snapshots.iter().map(|s| self.model_seqno(*s)).collect(),
+            now: e.now,
+            min_ts_above: e.min_ts_above,
+            max_seqno: self.model_seqno(e.max_seqno),
+        };
+        self.model.purge(&p);
+    }
+
+    /// Every held snapshot still reads as the model says (at the current clock: TTL moves
+    /// on), so a flush or compaction never changed a read at a live snapshot.
+    fn check_held_snapshots(&self) -> Result<(), Fail> {
+        for snap in &self.snaps {
+            self.compare_dump(snap, FailureClass::SnapshotChanged)?;
+        }
+        Ok(())
+    }
+
+    /// Runs an explicit flush or full compaction, driving the shards until it finishes.
+    fn maintenance(&mut self, compact: bool, rng: &mut Rng) -> Result<(), Fail> {
+        self.trace
+            .push(if compact { "compact" } else { "flush" }.to_owned());
+        let armed = self.arm(rng);
+        let vfs = Arc::clone(&self.vfs);
+        let store = self.store.as_mut().expect("store open");
+        let pending = if compact {
+            store.engine.compact_pending(None)
+        } else {
+            store.engine.flush_pending()
+        };
+        let probe = self.probe.clone();
+        let result = match pending {
+            Ok(m) => store.drive(&vfs, m, || probe.len().is_ok()),
+            Err(e) => Err(e),
+        };
+        if armed {
+            self.vfs.set_faults(self.cfg.faults.clone());
+            self.faults_active = true;
+            self.faults_active = true;
+        }
+        match result {
+            Ok(()) => {
+                if !compact {
+                    self.stats.flushes += 1;
+                }
+            }
+            Err(e) if !self.alive() || is_crashed(&e) => {
+                self.stats.mid_commit_crashes += usize::from(armed);
+                self.crash_and_recover(CrashKind::Power, true, rng)?;
+                return Ok(());
+            }
+            Err(Error::Io(_)) => {
+                self.stats.io_errors += 1;
+                self.trace
+                    .push("  -> maintenance I/O error; reopen pending".into());
+                self.need_reopen = true;
+                return Ok(());
+            }
+            Err(e) => return fail(FailureClass::Protocol, format!("maintenance: {e}")),
+        }
+        self.drain_compactions()?;
+        self.check_held_snapshots()
+    }
+
     fn compare_dump(&self, snap: &Snapshot, class: FailureClass) -> Result<(), Fail> {
         let now = self.now();
         let engine = match self.store().dump(snap) {
             Ok(d) => d,
+            Err(Error::Io(_)) if self.cfg.faults.io_error_ppm > 0 && self.faults_on() => {
+                // An injected read failure: the dump reports it, nothing else.
+                return Ok(());
+            }
             Err(e) => return fail(FailureClass::Protocol, format!("dump failed: {e}")),
         };
         let model = match model_dump(&self.model, self.model_seqno(snap.seqno()), now) {
@@ -1047,8 +1526,10 @@ impl World {
         out
     }
 
-    /// Crashes (or notes the fault plan already did), checks the WAL against the promises,
-    /// rebuilds the model from the survivors and reopens.
+    /// Crashes (or notes the fault plan already did), works out from the manifest, the WAL
+    /// and the reopened engine's raw entries which commits recovery must have applied,
+    /// checks the durability promises, rebuilds the model from those commits and compares
+    /// the reopened engine with it.
     fn crash_and_recover(
         &mut self,
         kind: CrashKind,
@@ -1073,149 +1554,503 @@ impl World {
             self.unacked.push(c);
         }
         self.need_reopen = false;
-        self.pending_advance = 0;
+        // Whatever was in flight may have consumed default timestamps the recovered floor
+        // keeps: the clock moves past them, as it would have after their acknowledgement.
+        if self.pending_advance > 0 {
+            self.vfs.advance(1_000 * self.pending_advance);
+            self.pending_advance = 0;
+        }
+        self.stash_compactions();
+        self.drain_appended();
         self.store = None;
         self.snaps.clear();
         self.vfs.set_faults(FaultPlan::none());
+        self.faults_active = false;
 
-        let survivors = match wal_survivors(&self.vfs, Path::new(DB)) {
-            Ok(s) => s,
+        // What the files hold, before the reopen changes them (a changed shard count flushes
+        // and checkpoints everything at open).
+        let vfs_ref: pigeonhole_io::VfsRef = Arc::clone(&self.vfs) as pigeonhole_io::VfsRef;
+        let manifest = match Engine::inspect_manifest(&vfs_ref, Path::new(DB)) {
+            Ok(m) => m,
+            Err(e) => return fail(FailureClass::Protocol, format!("reading the manifest: {e}")),
+        };
+        let wal = match read_wal(&self.vfs, Path::new(DB), &manifest.checkpoints) {
+            Ok(w) => w,
             Err(e) => return fail(FailureClass::Protocol, format!("reading the WAL: {e}")),
         };
-        let floor = match kind {
-            CrashKind::Process => Durability::Buffered,
-            CrashKind::Power => Durability::GroupSync,
-        };
+        self.observe_streams(&wal)?;
+        if self.trace_on() {
+            eprintln!(
+                "crash: checkpoints {:?} wal {:?} known {:?}",
+                manifest.checkpoints, wal.streams, self.stream_records
+            );
+        }
 
-        // The reopened engine is needed to decode survivors (ids to names).
+        // The reopened engine is needed to decode survivors (ids to names) and for the raw
+        // entries of commits only SSTs still hold.
         let shards = self.next_shards();
         self.reopens += 1;
-        let budget = self.cfg.memtable_budget;
-        let store = match Store::open(&self.vfs, shards, budget, &families()) {
+        let cfg = self.cfg.clone();
+        let store = match Store::open_cfg(&self.vfs, shards, &cfg) {
             Ok(s) => s,
             Err(e) => return fail(FailureClass::Protocol, format!("recovery failed: {e}")),
         };
         self.store = Some(store);
-        self.vfs.set_faults(self.cfg.faults.clone());
+        // The crash killed every handle, the liveness probe's included.
+        self.probe = match self
+            .vfs
+            .open(Path::new("/db/probe"), OpenOptions::read_write_create())
+        {
+            Ok(p) => p,
+            Err(e) => return fail(FailureClass::Protocol, format!("reopening the probe: {e}")),
+        };
+        // Faults stay off until the recovered state has been checked: the checks read the
+        // files directly and must not fail on an injected error.
 
-        // Unknown seqnos must match unacknowledged commits, by their mutations.
+        // Unknown seqnos in the WAL must match unacknowledged commits, by their mutations.
         let mut unacked = std::mem::take(&mut self.unacked);
         let mut matched: BTreeMap<Seqno, Committed> = BTreeMap::new();
-        for (seqno, s) in &survivors.commits {
+        for (seqno, sv) in &wal.batches {
             if self.history.contains_key(seqno) {
                 continue;
             }
-            let keys = self.survivor_keys(s);
-            match unacked
+            // A cross-shard commit may have lost some shares: the surviving records hold a
+            // subset of its mutations. An exact match wins over a superset.
+            let keys = self.survivor_keys(sv);
+            if keys.is_empty() {
+                // A read-only share (a transaction's reads on this shard): nothing to
+                // recover from it, and its commit is known through its other records.
+                continue;
+            }
+            let found = unacked
                 .iter()
                 .position(|c| Self::mutation_keys(&c.ops) == keys)
-            {
+                .or_else(|| {
+                    unacked.iter().position(|c| {
+                        !keys.is_empty() && keys.is_subset(&Self::mutation_keys(&c.ops))
+                    })
+                });
+            match found {
                 Some(i) => {
                     let mut c = unacked.remove(i);
                     c.seqno = Some(*seqno);
-                    c.commit_ts = Some(s.commit_ts);
+                    c.commit_ts = Some(sv.commit_ts);
                     matched.insert(*seqno, c);
                 }
                 None => {
+                    // The PREPARE records of a refused attempt (never committed).
+                    if self
+                        .aborted
+                        .iter()
+                        .any(|c| !keys.is_empty() && keys.is_subset(&Self::mutation_keys(&c.ops)))
+                    {
+                        continue;
+                    }
                     return fail(
                         FailureClass::RecoveredFromTheFuture,
-                        format!("the WAL holds commit {seqno}, which the client never made"),
-                    );
-                }
-            }
-        }
-        // The promise: every commit acknowledged at the floor level or stronger survives.
-        for c in self.history.values() {
-            let Some(seqno) = c.seqno else { continue };
-            if c.acked && c.durability >= floor && !survivors.commits.contains_key(&seqno) {
-                return fail(
-                    FailureClass::LostAckedCommit,
-                    format!(
-                        "commit {seqno} ({:?}, shards {:?}) was acknowledged but did not survive",
-                        c.durability, c.shards
-                    ),
-                );
-            }
-        }
-        // Per stream, a single-shard commit's record precedes every later single-shard
-        // commit of that stream in the log, so everything below the stream's last synced
-        // commit must be there (a sync covers every earlier append).
-        let mut by_shard: BTreeMap<u16, Vec<&Committed>> = BTreeMap::new();
-        for c in self.history.values() {
-            if c.acked && c.shards.len() == 1 && c.durability != Durability::None {
-                by_shard.entry(c.shards[0]).or_default().push(c);
-            }
-        }
-        for (shard, commits) in &by_shard {
-            let last_strong = commits
-                .iter()
-                .filter(|c| c.durability >= floor)
-                .filter_map(|c| c.seqno)
-                .max();
-            for c in commits {
-                let Some(seqno) = c.seqno else { continue };
-                if last_strong.is_some_and(|l| seqno < l) && !survivors.commits.contains_key(&seqno)
-                {
-                    return fail(
-                        FailureClass::LostAckedCommit,
                         format!(
-                            "stream {shard} lost commit {seqno} ({:?}) although its later commit {} was synced",
-                            c.durability,
-                            last_strong.unwrap()
+                            "the WAL holds commit {seqno}, which the client never made: {:?} (unacked: {:?}; history has {:?})",
+                            keys.iter()
+                                .map(|k| (
+                                    &k.0,
+                                    &k.1,
+                                    k.2,
+                                    String::from_utf8_lossy(&k.3).into_owned(),
+                                    k.5
+                                ))
+                                .collect::<Vec<_>>(),
+                            unacked.iter().map(|c| &c.ops).collect::<Vec<_>>(),
+                            self.history.keys().collect::<Vec<_>>()
                         ),
                     );
                 }
             }
         }
-        // All or nothing, checked against the WAL directly: a decided commit with a missing
-        // PREPARE was never acknowledged at the floor level or stronger (those prepares were
-        // durable before the COMMIT), and the engine applies none of it (checked below
-        // through the model, which excludes it).
-        for a in &survivors.ambiguous {
-            if let Some(c) = self.history.get(a)
-                && c.acked
-                && c.durability >= floor
+        // Commits whose records were checkpointed away survive in SSTs: the reopened
+        // engine's raw entries name their seqnos.
+        let raw = {
+            let store = self.store();
+            let snap = store.engine.snapshot().map_err(|e| Fail {
+                class: FailureClass::Protocol,
+                message: format!("snapshot after recovery: {e}"),
+            })?;
+            store.engine.raw_entries(&snap).map_err(|e| Fail {
+                class: FailureClass::Protocol,
+                message: format!("raw entries: {e}"),
+            })?
+        };
+        let mut raw_by_seqno: BTreeMap<Seqno, BTreeSet<MutationKey>> = BTreeMap::new();
+        {
+            let store = self.store();
+            let table_names: HashMap<TableId, String> = store
+                .tables
+                .iter()
+                .map(|(n, t)| (t.id, n.clone()))
+                .collect();
+            for e in &raw {
+                let Ok(parts) = decode_key(&e.key) else {
+                    continue;
+                };
+                let mut row = Vec::new();
+                parts.row.unescape_into(&mut row);
+                let mut qualifier = Vec::new();
+                if let Some(q) = parts.qualifier {
+                    q.unescape_into(&mut qualifier);
+                }
+                let payload = match pigeonhole_format::value::decode_value(&e.value) {
+                    Ok(v) => value_bytes(v),
+                    Err(_) => e.value.to_vec(),
+                };
+                raw_by_seqno.entry(parts.seqno).or_default().insert((
+                    table_names.get(&e.table).cloned().unwrap_or_default(),
+                    store
+                        .family_names
+                        .get(&e.family)
+                        .cloned()
+                        .unwrap_or_default(),
+                    parts.kind as u8,
+                    row,
+                    qualifier,
+                    Some(parts.ts),
+                    payload,
+                ));
+            }
+        }
+        let mut sst_only: BTreeSet<Seqno> = BTreeSet::new();
+        for (seqno, entries) in &raw_by_seqno {
+            if self.history.contains_key(seqno) || matched.contains_key(seqno) {
+                continue;
+            }
+            // Every raw entry must come from the unacknowledged commit (compaction may
+            // have dropped some of its entries, never added any).
+            let candidates: BTreeSet<Timestamp> = entries.iter().filter_map(|k| k.5).collect();
+            let found = unacked.iter().position(|c| {
+                candidates.iter().any(|t| {
+                    let expected = Self::applied_keys(&c.ops, *t);
+                    entries.iter().all(|k| expected.contains(k))
+                })
+            });
+            match found {
+                Some(i) => {
+                    let mut c = unacked.remove(i);
+                    let ts = candidates
+                        .iter()
+                        .find(|t| {
+                            let expected = Self::applied_keys(&c.ops, **t);
+                            entries.iter().all(|k| expected.contains(k))
+                        })
+                        .copied()
+                        .expect("matched above");
+                    c.seqno = Some(*seqno);
+                    c.commit_ts = Some(ts);
+                    matched.insert(*seqno, c);
+                    sst_only.insert(*seqno);
+                }
+                None => {
+                    return fail(
+                        FailureClass::RecoveredFromTheFuture,
+                        format!(
+                            "the SSTs hold entries of seqno {seqno}, which no commit of the client explains: {entries:?}"
+                        ),
+                    );
+                }
+            }
+        }
+        self.stats.sst_only += sst_only.len();
+
+        // Every commit the client knows about, in seqno order, with its streams.
+        let mut all: Vec<Committed> = self.history.values().cloned().collect();
+        all.extend(matched.into_values());
+        all.sort_by_key(|c| c.seqno);
+        // The streams a commit's records went to, from the engine's append order (the
+        // routing guess stands for a commit that never reached a stream).
+        for c in &mut all {
+            if let Some(seqno) = c.seqno
+                && let Some(streams) = self.streams_from_records(seqno, &c.streams)
             {
+                c.streams = streams;
+            }
+        }
+        let flushed_table_ids: HashMap<String, TableId> = self
+            .store()
+            .tables
+            .iter()
+            .map(|(n, t)| (n.clone(), t.id))
+            .collect();
+        let tablet_of: HashMap<TableId, pigeonhole_format::TabletId> = manifest
+            .tablets
+            .iter()
+            .map(|(tablet, table)| (*table, *tablet))
+            .collect();
+        let fully_flushed = |c: &Committed| -> bool {
+            let Some(seqno) = c.seqno else { return false };
+            c.ops.iter().all(|op| {
+                let table = op_table(op);
+                let fams: Vec<String> = match op {
+                    ModelOp::DeleteRow { .. } => families().into_iter().map(|f| f.name).collect(),
+                    ModelOp::Put { family, .. }
+                    | ModelOp::Incr { family, .. }
+                    | ModelOp::DeleteCell { family, .. }
+                    | ModelOp::DeleteColumn { family, .. }
+                    | ModelOp::DeleteFamily { family, .. } => vec![family.clone()],
+                };
+                fams.iter().all(|f| {
+                    let Some(tid) = flushed_table_ids.get(table) else {
+                        return false;
+                    };
+                    let Some(tablet) = tablet_of.get(tid) else {
+                        return false;
+                    };
+                    let fid = self.store().family_ids[&(table.to_owned(), f.clone())];
+                    manifest.flushed.get(&(*tablet, fid)).copied().unwrap_or(0) >= seqno
+                })
+            })
+        };
+        let flushed: Vec<bool> = all.iter().map(fully_flushed).collect();
+        let position = |stream: u32, seqno: Seqno, kind: RecKind| -> Option<usize> {
+            self.stream_records
+                .get(&stream)
+                .and_then(|l| l.iter().position(|r| *r == (seqno, kind)))
+        };
+        // Per stream, the surviving prefix: everything the WAL still holds, and everything
+        // below it or beyond it that SSTs hold.
+        let mut survivors: BTreeMap<u32, usize> = BTreeMap::new();
+        for (stream, list) in &self.stream_records {
+            let observed = wal
+                .streams
+                .get(stream)
+                .and_then(|o| o.last())
+                .map_or(0, |last| {
+                    list.iter().position(|r| r == last).map_or(0, |i| i + 1)
+                });
+            let mut cut = observed;
+            for (c, is_flushed) in all.iter().zip(&flushed) {
+                if !*is_flushed {
+                    continue;
+                }
+                for (s, kind) in records_of(&c.streams) {
+                    if s == *stream
+                        && let Some(i) =
+                            position(s, c.seqno.expect("flushed commits have a seqno"), kind)
+                    {
+                        cut = cut.max(i + 1);
+                    }
+                }
+            }
+            survivors.insert(*stream, cut);
+        }
+        // Every record below a stream's cut is recoverable (WAL or SSTs): a hole would
+        // mean the engine lost a record in the middle of a stream.
+        for (stream, cut) in &survivors {
+            let list = &self.stream_records[stream];
+            let observed_from = wal
+                .streams
+                .get(stream)
+                .and_then(|o| o.first())
+                .and_then(|f| list.iter().position(|r| r == f))
+                .unwrap_or(list.len());
+            for (i, (seqno, _)) in list.iter().enumerate().take(*cut) {
+                if i >= observed_from {
+                    continue;
+                }
+                let ok = all
+                    .iter()
+                    .zip(&flushed)
+                    .any(|(c, f)| *f && c.seqno == Some(*seqno));
+                if !ok {
+                    let commit = all.iter().find(|c| c.seqno == Some(*seqno));
+                    if commit.is_none() {
+                        // A refused attempt's PREPARE (no commit to recover) or an
+                        // unacknowledged commit that left nothing behind.
+                        continue;
+                    }
+                    return fail(
+                        FailureClass::LostAckedCommit,
+                        format!(
+                            "stream {stream} record {i} (seqno {seqno}) is below the checkpoint but not in SSTs, while record {} survived (commit: {:?}; flushed: {:?}; tablets: {:?}; wal: {:?})",
+                            cut - 1,
+                            commit.map(|c| (&c.ops, &c.streams, c.acked, c.durability)),
+                            manifest.flushed,
+                            manifest.tablets,
+                            wal.streams.get(stream)
+                        ),
+                    );
+                }
+            }
+        }
+        // The prefix rule per record: a commit survives iff every one of its records does
+        // (a cross-shard commit all or nothing, D83). Commits whose records were never
+        // appended survive only through SSTs.
+        let recovered: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                flushed[*i]
+                    || c.seqno.is_some_and(|seqno| {
+                        records_of(&c.streams).iter().all(|(s, kind)| {
+                            position(*s, seqno, *kind)
+                                .is_some_and(|p| p < survivors.get(s).copied().unwrap_or(0))
+                        })
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for &i in &recovered {
+            if let Some(seqno) = all[i].seqno
+                && !raw_by_seqno.contains_key(&seqno)
+                && !wal.batches.contains_key(&seqno)
+                && !all[i].ops.is_empty()
+                && !flushed[i]
+            {
+                // Recovered by the rule but nowhere in the files: only possible for a commit
+                // whose entries a compaction dropped entirely, which cannot happen to one the
+                // WAL still had to replay.
                 return fail(
-                    FailureClass::LostAckedCommit,
+                    FailureClass::RecoveredStateMismatch,
                     format!(
-                        "commit {a} ({:?}) was acknowledged but a participant's PREPARE is gone",
-                        c.durability
+                        "commit {seqno} should have been recovered but neither the WAL nor the SSTs hold it"
                     ),
                 );
             }
         }
-        // Rebuild the model from the survivors, in seqno order.
-        let mut kept: Vec<Committed> = Vec::new();
-        for (seqno, c) in &self.history {
-            if survivors.commits.contains_key(seqno) {
-                kept.push(c.clone());
+        // The durability promise (D42, D84), through the sim's checker.
+        let stream_commits: Vec<StreamCommit> = all
+            .iter()
+            .map(|c| StreamCommit {
+                ops: c.ops.clone(),
+                commit_ts: c.commit_ts.unwrap_or(0),
+                durability: if c.acked {
+                    c.durability
+                } else {
+                    Durability::None
+                },
+                streams: c.streams.clone(),
+            })
+            .collect();
+        if let Err(i) = check_acknowledged_survive(&stream_commits, &recovered, kind) {
+            let c = &all[i];
+            return fail(
+                FailureClass::LostAckedCommit,
+                format!(
+                    "commit {:?} ({:?}, streams {:?}) was acknowledged but did not survive",
+                    c.seqno, c.durability, c.streams
+                ),
+            );
+        }
+        // Where the sim helper's commit-level view can represent the streams, it must agree
+        // (over the commits whose records were all observed and not persisted by a flush).
+        if let Some((helper, considered)) = self.sim_helper_recovered(&all, &survivors) {
+            self.stats.helper_checked += 1;
+            let mut ours: Vec<usize> = recovered
+                .iter()
+                .copied()
+                .filter(|i| !flushed[*i] && considered.contains(i))
+                .collect();
+            let mut theirs: Vec<usize> = helper
+                .into_iter()
+                .filter(|i| !flushed[*i] && considered.contains(i))
+                .collect();
+            ours.sort_unstable();
+            theirs.sort_unstable();
+            if ours != theirs {
+                let detail: Vec<String> = ours
+                    .iter()
+                    .chain(&theirs)
+                    .filter(|i| !(ours.contains(i) && theirs.contains(i)))
+                    .map(|&i| {
+                        let c = &all[i];
+                        format!(
+                            "#{i} seqno {:?} streams {:?} positions {:?}",
+                            c.seqno,
+                            c.streams,
+                            records_of(&c.streams)
+                                .iter()
+                                .map(|(s, k)| (*s, *k, position(*s, c.seqno.unwrap_or(0), *k)))
+                                .collect::<Vec<_>>()
+                        )
+                    })
+                    .collect();
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "the sim's recovered_commits disagrees with the record-level rule: {theirs:?} vs {ours:?}; differing: {detail:?}; survivors {survivors:?}; streams {:?}",
+                        self.stream_records
+                    ),
+                );
             }
         }
-        kept.extend(matched.into_values());
-        kept.sort_by_key(|c| c.seqno);
-        let mut model = new_model();
+
+        // A commit lost here stays lost, but its appended records (a PREPARE without its
+        // COMMIT) remain valid WAL records until a checkpoint passes them.
+        for (i, c) in all.iter().enumerate() {
+            if !recovered.contains(&i) && c.seqno.is_some() {
+                self.aborted.push(c.clone());
+            }
+        }
+        // Rebuild the model from the survivors, in seqno order, then re-apply every durable
+        // purge.
+        let kept: Vec<Committed> = recovered.iter().map(|i| all[*i].clone()).collect();
+        let model = Model::from_commits(
+            |m| {
+                for t in TABLES {
+                    m.create_table(t, families());
+                }
+            },
+            &kept
+                .iter()
+                .map(|c| StreamCommit {
+                    ops: c.ops.clone(),
+                    commit_ts: c.commit_ts.expect("kept commits have a timestamp"),
+                    durability: Durability::Sync,
+                    streams: c.streams.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
         self.history.clear();
         self.engine_seqnos.clear();
         for mut c in kept {
             let seqno = c.seqno.expect("kept commits have a seqno");
-            let ts = c.commit_ts.expect("kept commits have a timestamp");
-            if let Err(e) = model.try_commit(&c.ops, ts, Durability::Sync) {
-                return fail(FailureClass::Protocol, format!("model rebuild: {e}"));
-            }
             self.engine_seqnos.push(seqno);
             c.acked = true;
-            c.shards = Vec::new();
             self.history.insert(seqno, c);
         }
         self.model = model;
-        // Routing under the new shard count, for the next crash's per-stream check.
+        // Each stream goes on from the last record the WAL kept: what came after it is
+        // gone (the next crash's records continue from there, possibly reusing seqnos).
+        // Streams beyond the new shard count were flushed and removed at open (D20).
+        for (stream, list) in &mut self.stream_records {
+            let keep = if *stream as usize >= shards {
+                0
+            } else {
+                wal.streams
+                    .get(stream)
+                    .and_then(|o| o.last())
+                    .and_then(|last| list.iter().position(|r| r == last))
+                    .map_or(0, |i| i + 1)
+            };
+            list.truncate(keep);
+        }
+        let purges: Vec<PurgeEvent> = self
+            .purges
+            .iter()
+            .filter(|p| p.manifest_version <= manifest.version)
+            .cloned()
+            .collect();
+        for p in &purges {
+            self.compaction_floor = self.compaction_floor.max(p.max_seqno);
+            if p.bottommost {
+                self.apply_purge(p);
+            }
+        }
+        self.purges = purges;
+        // Routing under the new shard count (for the shards of later commits).
         let keys: Vec<Seqno> = self.history.keys().copied().collect();
         for k in keys {
             let ops = self.history[&k].ops.clone();
             let shards = self.shards_of(&ops);
             self.history.get_mut(&k).unwrap().shards = shards;
         }
+        self.drain_compactions()?;
 
         let snap = match self.store().engine.snapshot() {
             Ok(s) => s,
@@ -1226,25 +2061,244 @@ impl World {
                 );
             }
         };
-        let recovered = snap.seqno();
+        let recovered_seqno = snap.seqno();
         let last_kept = self.engine_seqnos.last().copied().unwrap_or(0);
         self.trace.push(format!(
-            "RECOVERED with {shards} shards: engine seqno {recovered}, {} commits kept (last {last_kept}), {} ambiguous",
+            "RECOVERED with {shards} shards: engine seqno {recovered_seqno}, {} commits kept (last {last_kept}), manifest {} ({} from SSTs only)",
             self.engine_seqnos.len(),
-            survivors.ambiguous.len()
+            manifest.version,
+            sst_only.len()
         ));
-        if recovered < last_kept {
+        if recovered_seqno < last_kept {
             return fail(
                 FailureClass::RecoveredStateMismatch,
-                format!("visible seqno {recovered} is below the last surviving commit {last_kept}"),
+                format!(
+                    "visible seqno {recovered_seqno} is below the last surviving commit {last_kept}"
+                ),
             );
         }
         self.compare_dump(&snap, FailureClass::RecoveredStateMismatch)?;
-        if recovered > 0 {
-            let s = 1 + rng.below(recovered);
+        if recovered_seqno > self.compaction_floor {
+            let s = self.compaction_floor + 1 + rng.below(recovered_seqno - self.compaction_floor);
             self.compare_dump(&snap.at_seqno(s), FailureClass::RecoveredStateMismatch)?;
         }
+        self.vfs.set_faults(self.cfg.faults.clone());
+        self.faults_active = true;
         Ok(())
+    }
+
+    /// `pigeonhole_sim::recovered_commits` over the commits in an order consistent with every
+    /// stream's append order, when one exists and each commit's records on one stream are
+    /// adjacent (the helper counts them so). Returns `None` when the streams cannot be
+    /// represented that way (a coordinator's COMMIT separated from its own PREPARE by other
+    /// records, or concurrent cross-shard commits prepared in opposite orders on two
+    /// shards).
+    fn sim_helper_recovered(
+        &self,
+        all: &[Committed],
+        survivors: &BTreeMap<u32, usize>,
+    ) -> Option<(Vec<usize>, Vec<usize>)> {
+        let index: HashMap<Seqno, usize> = all
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.seqno.map(|s| (s, i)))
+            .collect();
+        // Commits whose every record was observed: the only ones the helper can place.
+        let considered: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.seqno.is_some_and(|seqno| {
+                    records_of(&c.streams).iter().all(|(s, kind)| {
+                        self.stream_records
+                            .get(s)
+                            .is_some_and(|l| l.contains(&(seqno, *kind)))
+                    })
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // The helper's streams hold only whole commits: one whose records were not all
+        // appended (a crash between its PREPAREs and its COMMIT) is left out everywhere,
+        // its appended records included.
+        let considered_set: BTreeSet<usize> = considered.iter().copied().collect();
+        let index: HashMap<Seqno, usize> = index
+            .into_iter()
+            .filter(|(_, i)| considered_set.contains(i))
+            .collect();
+        // Per stream, the sequence of commits (a commit's records collapsed to one entry;
+        // they must be adjacent).
+        let mut sequences: Vec<Vec<usize>> = Vec::new();
+        let streams = all
+            .iter()
+            .flat_map(|c| records_of(&c.streams).into_iter().map(|(s, _)| s))
+            .max()
+            .map_or(0, |m| m as usize + 1);
+        for stream in 0..streams as u32 {
+            let list = self
+                .stream_records
+                .get(&stream)
+                .cloned()
+                .unwrap_or_default();
+            let mut seq: Vec<usize> = Vec::new();
+            let mut last: Option<usize> = None;
+            for (seqno, _) in list {
+                // Records of refused attempts and of commits left out belong to no commit.
+                let Some(&i) = index.get(&seqno) else {
+                    continue;
+                };
+                if last == Some(i) {
+                    continue;
+                }
+                if seq.contains(&i) {
+                    return None; // split records: not representable
+                }
+                seq.push(i);
+                last = Some(i);
+            }
+            sequences.push(seq);
+        }
+        // Topological order of the per-stream sequences (Kahn, smallest index first), over
+        // the considered commits only: the helper counts every record of every commit it
+        // is given, and the others left records it must not see (or none at all).
+        let n = all.len();
+        let mut indeg = vec![0usize; n];
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for seq in &sequences {
+            for w in seq.windows(2) {
+                succ[w[0]].push(w[1]);
+                indeg[w[1]] += 1;
+            }
+        }
+        let mut ready: BTreeSet<usize> = (0..n)
+            .filter(|i| indeg[*i] == 0 && considered_set.contains(i))
+            .collect();
+        let mut order = Vec::with_capacity(n);
+        while let Some(&i) = ready.iter().next() {
+            ready.remove(&i);
+            order.push(i);
+            for &j in &succ[i] {
+                indeg[j] -= 1;
+                if indeg[j] == 0 {
+                    ready.insert(j);
+                }
+            }
+        }
+        if order.len() != considered.len() {
+            return None;
+        }
+        let commits: Vec<StreamCommit> = order
+            .iter()
+            .map(|&i| StreamCommit {
+                ops: Vec::new(),
+                commit_ts: 0,
+                durability: all[i].durability,
+                streams: all[i].streams.clone(),
+            })
+            .collect();
+        let counts: Vec<usize> = (0..streams as u32)
+            .map(|s| {
+                // Records surviving on this stream, counted as the helper counts (one per
+                // record, the records of one commit adjacent).
+                let list = self.stream_records.get(&s).cloned().unwrap_or_default();
+                let cut = survivors.get(&s).copied().unwrap_or(0).min(list.len());
+                list[..cut]
+                    .iter()
+                    .filter(|(seqno, _)| index.contains_key(seqno))
+                    .count()
+            })
+            .collect();
+        let rec = recovered_commits(&commits, &counts);
+        Some((rec.into_iter().map(|k| order[k]).collect(), considered))
+    }
+
+    /// The entries `ops` leave in the store when committed at `commit_ts` (same-commit
+    /// collapse, decision D34; a row delete is one marker per family).
+    fn applied_keys(ops: &[ModelOp], commit_ts: Timestamp) -> BTreeSet<MutationKey> {
+        #[allow(clippy::type_complexity)]
+        let mut last: BTreeMap<(String, String, Vec<u8>, Vec<u8>, Timestamp), MutationKey> =
+            BTreeMap::new();
+        for op in ops {
+            let t = op_table(op).to_owned();
+            let mut push = |family: String,
+                            kind: u8,
+                            row: &[u8],
+                            qualifier: &[u8],
+                            ts: Timestamp,
+                            value: Vec<u8>| {
+                last.insert(
+                    (
+                        t.clone(),
+                        family.clone(),
+                        row.to_vec(),
+                        qualifier.to_vec(),
+                        ts,
+                    ),
+                    (
+                        t.clone(),
+                        family,
+                        kind,
+                        row.to_vec(),
+                        qualifier.to_vec(),
+                        Some(ts),
+                        value,
+                    ),
+                );
+            };
+            match op {
+                ModelOp::Put {
+                    row,
+                    family,
+                    qualifier,
+                    ts,
+                    value,
+                    ..
+                } => push(
+                    family.clone(),
+                    1,
+                    row,
+                    qualifier,
+                    ts.unwrap_or(commit_ts),
+                    value.clone(),
+                ),
+                ModelOp::Incr {
+                    row,
+                    family,
+                    qualifier,
+                    delta,
+                    ..
+                } => push(
+                    family.clone(),
+                    2,
+                    row,
+                    qualifier,
+                    commit_ts,
+                    delta.to_le_bytes().to_vec(),
+                ),
+                ModelOp::DeleteCell {
+                    row,
+                    family,
+                    qualifier,
+                    ts,
+                    ..
+                } => push(family.clone(), 3, row, qualifier, *ts, Vec::new()),
+                ModelOp::DeleteColumn {
+                    row,
+                    family,
+                    qualifier,
+                    ..
+                } => push(family.clone(), 4, row, qualifier, commit_ts, Vec::new()),
+                ModelOp::DeleteFamily { row, family, .. } => {
+                    push(family.clone(), 5, row, &[], commit_ts, Vec::new())
+                }
+                ModelOp::DeleteRow { row, .. } => {
+                    for f in families() {
+                        push(f.name, 5, row, &[], commit_ts, Vec::new());
+                    }
+                }
+            }
+        }
+        last.into_values().collect()
     }
 
     fn maybe_crash(&mut self, rng: &mut Rng) -> Result<(), Fail> {
@@ -1260,18 +2314,93 @@ impl World {
     }
 
     /// The commit timestamps the engine assigned, read from the WAL records (batched
-    /// commits are always logged).
-    fn logged_timestamps(&self) -> Result<BTreeMap<Seqno, Timestamp>, Fail> {
-        self.vfs.set_faults(FaultPlan::none());
-        let survivors = wal_survivors(&self.vfs, Path::new(DB));
-        self.vfs.set_faults(self.cfg.faults.clone());
-        match survivors {
-            Ok(s) => Ok(s.commits.iter().map(|(k, v)| (*k, v.commit_ts)).collect()),
-            Err(e) => fail(
-                FailureClass::Protocol,
-                format!("reading the WAL for timestamps: {e}"),
-            ),
+    /// commits are always logged). Also records the order of every stream's records.
+    fn logged_timestamps(&mut self) -> Result<BTreeMap<Seqno, Timestamp>, Fail> {
+        let wal = self.observe_wal()?;
+        Ok(logged_timestamps_of(&wal))
+    }
+
+    /// The timestamp of commit `seqno` from the entries it left in the store, for a record
+    /// a flush already checkpointed away: the timestamp of any entry an op with a default
+    /// timestamp produced (0 when every op carries its own).
+    fn raw_commit_ts(&self, seqno: Seqno, ops: &[ModelOp]) -> Result<Timestamp, Fail> {
+        if !ops.iter().any(|op| match op {
+            ModelOp::Put { ts, .. } => ts.is_none(),
+            ModelOp::DeleteCell { .. } => false,
+            _ => true,
+        }) {
+            return Ok(0);
         }
+        let store = self.store();
+        let snap = store.engine.snapshot().map_err(|e| Fail {
+            class: FailureClass::Protocol,
+            message: format!("snapshot: {e}"),
+        })?;
+        let raw = store.engine.raw_entries(&snap).map_err(|e| Fail {
+            class: FailureClass::Protocol,
+            message: format!("raw entries: {e}"),
+        })?;
+        let table_names: HashMap<TableId, String> = store
+            .tables
+            .iter()
+            .map(|(n, t)| (t.id, n.clone()))
+            .collect();
+        for e in &raw {
+            let Ok(parts) = decode_key(&e.key) else {
+                continue;
+            };
+            if parts.seqno != seqno {
+                continue;
+            }
+            let mut row = Vec::new();
+            parts.row.unescape_into(&mut row);
+            let mut qualifier = Vec::new();
+            if let Some(q) = parts.qualifier {
+                q.unescape_into(&mut qualifier);
+            }
+            let table = table_names.get(&e.table).cloned().unwrap_or_default();
+            let family = store
+                .family_names
+                .get(&e.family)
+                .cloned()
+                .unwrap_or_default();
+            let default_ts = ops.iter().any(|op| {
+                op_table(op) == table
+                    && op_row(op) == row
+                    && match op {
+                        ModelOp::Put {
+                            family: f,
+                            qualifier: q,
+                            ts,
+                            ..
+                        } => f == &family && q == &qualifier && ts.is_none(),
+                        ModelOp::Incr {
+                            family: f,
+                            qualifier: q,
+                            ..
+                        }
+                        | ModelOp::DeleteColumn {
+                            family: f,
+                            qualifier: q,
+                            ..
+                        } => f == &family && q == &qualifier,
+                        ModelOp::DeleteFamily { family: f, .. } => {
+                            f == &family && qualifier.is_empty()
+                        }
+                        ModelOp::DeleteRow { .. } => qualifier.is_empty(),
+                        ModelOp::DeleteCell { .. } => false,
+                    }
+            });
+            if default_ts {
+                return Ok(parts.ts);
+            }
+        }
+        fail(
+            FailureClass::Protocol,
+            format!(
+                "commit {seqno} is checkpointed and none of its entries is left to read its timestamp from"
+            ),
+        )
     }
 
     /// Settles every in-flight commit that resolved. Returns whether the client may go on
@@ -1333,12 +2462,14 @@ impl World {
                         None => {
                             self.stats.cas_refused += 1;
                             self.trace.push("  -> predicate false, not applied".into());
+                            self.aborted.push(inf.commit);
                         }
                     }
                 }
                 Outcome::Commit(Err(Error::Busy)) | Outcome::Cas(Err(Error::Busy)) => {
                     self.stats.busy += 1;
                     self.trace.push("  -> busy (arena full)".into());
+                    self.aborted.push(inf.commit);
                 }
                 Outcome::Commit(Err(Error::Conflict)) => {
                     let Kind::Txn { snapshot, reads } = &inf.commit.kind else {
@@ -1359,6 +2490,7 @@ impl World {
                     }
                     self.stats.conflicts += 1;
                     self.trace.push("  -> conflict".into());
+                    self.aborted.push(inf.commit);
                 }
                 Outcome::Commit(Err(e)) | Outcome::Cas(Err(e))
                     if !self.alive() || is_crashed(&e) =>
@@ -1398,6 +2530,9 @@ impl World {
             }
             if armed {
                 self.vfs.set_faults(self.cfg.faults.clone());
+                self.faults_active = true;
+                self.faults_active = true;
+                self.faults_active = true;
             }
         }
         successes.sort_by_key(|(s, ..)| *s);
@@ -1430,15 +2565,8 @@ impl World {
                 }
                 match logged.as_ref().and_then(|m| m.get(&seqno)) {
                     Some(ts) => *ts,
-                    None => {
-                        return fail(
-                            FailureClass::Protocol,
-                            format!(
-                                "acknowledged commit {seqno} ({:?}) has no WAL record",
-                                c.durability
-                            ),
-                        );
-                    }
+                    // Flushed and checkpointed before the client looked: the entries say.
+                    None => self.raw_commit_ts(seqno, &c.ops)?,
                 }
             };
             if let Kind::Txn { snapshot, reads } = &c.kind {
@@ -1474,8 +2602,10 @@ impl World {
             if c.shards.len() > 1 {
                 self.stats.cross_shard += 1;
             }
+            self.drain_appended();
             self.history.insert(seqno, c);
         }
+        self.drain_compactions()?;
         // Read-your-writes: everything acknowledged is visible now.
         let snap = self.store().engine.snapshot().map_err(|e| Fail {
             class: FailureClass::Protocol,
@@ -1518,6 +2648,7 @@ impl World {
             let mut plan = self.cfg.faults.clone();
             plan.crash_after_ops = Some(self.vfs.mutating_ops() + 1 + rng.below(6));
             self.vfs.set_faults(plan);
+            self.faults_active = true;
             true
         } else {
             false
@@ -1563,6 +2694,7 @@ impl World {
             ops,
             commit_ts: alone.then_some(now),
             durability,
+            streams: streams_of(&shards, &[]),
             shards,
             acked: false,
             kind: Kind::Plain,
@@ -1582,6 +2714,14 @@ impl World {
                 c.acked = false;
                 self.unacked.push(c);
                 self.crash_and_recover(CrashKind::Power, true, rng)?;
+                Ok(false)
+            }
+            Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
+                // Refused outright (a poisoned pager, D58): nothing was logged.
+                self.stats.io_errors += 1;
+                self.trace
+                    .push(format!("  -> refused ({e}); reopen pending"));
+                self.need_reopen = true;
                 Ok(false)
             }
             Err(e) => fail(FailureClass::Protocol, format!("submit: {e}")),
@@ -1676,6 +2816,7 @@ impl World {
                 ops,
                 commit_ts: Some(now),
                 durability,
+                streams: streams_of(&shards, &[]),
                 shards,
                 acked: false,
                 kind: Kind::Cas {
@@ -1799,6 +2940,19 @@ impl World {
         std::thread::spawn(move || {
             let _ = tx.send(Outcome::Commit(txn.commit(Some(durability))));
         });
+        // Every shard owning a read row is a participant with an empty PREPARE (D91).
+        let read_shards: Vec<u16> = {
+            let store = self.store();
+            let view = store.engine.snapshot().expect("snapshot").view().clone();
+            reads
+                .iter()
+                .filter_map(|(t, r, _)| {
+                    view.tablets()
+                        .route(store.tables[t].id, r)
+                        .map(|(_, s)| s.0)
+                })
+                .collect()
+        };
         self.in_flight.push(InFlight {
             pending: Pending::Thread(rx),
             commit: Committed {
@@ -1806,6 +2960,7 @@ impl World {
                 ops,
                 commit_ts: Some(now),
                 durability,
+                streams: streams_of(&shards, &read_shards),
                 shards,
                 acked: false,
                 kind: Kind::Txn { snapshot, reads },
@@ -1837,6 +2992,7 @@ impl World {
             ops: ops.clone(),
             commit_ts: Some(now),
             durability,
+            streams: streams_of(&shards, &[]),
             shards: shards.clone(),
             acked: false,
             kind: Kind::Plain,
@@ -1846,6 +3002,13 @@ impl World {
             Err(e) if is_crashed(&e) => {
                 self.unacked.push(unacked);
                 self.crash_and_recover(CrashKind::Power, true, rng)?;
+                return Ok(false);
+            }
+            Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
+                self.stats.io_errors += 1;
+                self.trace
+                    .push(format!("  -> refused ({e}); reopen pending"));
+                self.need_reopen = true;
                 return Ok(false);
             }
             Err(e) => return fail(FailureClass::Protocol, format!("submit: {e}")),
@@ -1890,16 +3053,7 @@ impl World {
         let logged = self.logged_timestamps()?;
         let ts = match logged.get(&info.seqno) {
             Some(ts) => *ts,
-            None => {
-                return fail(
-                    FailureClass::Protocol,
-                    format!(
-                        "interferer {} has no WAL record (records seen: {:?})",
-                        info.seqno,
-                        logged.keys().collect::<Vec<_>>()
-                    ),
-                );
-            }
+            None => self.raw_commit_ts(info.seqno, &ops)?,
         };
         self.trace.push(format!(
             "interferer {durability:?} ts={ts} seqno={} [{}]",
@@ -1918,18 +3072,18 @@ impl World {
         }
         self.engine_seqnos.push(info.seqno);
         self.stats.commits += 1;
-        self.history.insert(
-            info.seqno,
-            Committed {
-                seqno: Some(info.seqno),
-                ops,
-                commit_ts: Some(ts),
-                durability,
-                shards,
-                acked: true,
-                kind: Kind::Plain,
-            },
-        );
+        let c = Committed {
+            seqno: Some(info.seqno),
+            ops,
+            commit_ts: Some(ts),
+            durability,
+            streams: streams_of(&shards, &[]),
+            shards,
+            acked: true,
+            kind: Kind::Plain,
+        };
+        self.drain_appended();
+        self.history.insert(info.seqno, c);
         Ok(true)
     }
 
@@ -1938,6 +3092,17 @@ impl World {
             eprintln!("op #{} {op:?}", self.op_index);
         }
         self.vfs.advance(1_000);
+        if rng.chance(self.cfg.flush_ppm) {
+            self.maintenance(false, rng)?;
+            if self.store.is_none() {
+                return Ok(());
+            }
+        } else if rng.chance(self.cfg.compact_ppm) {
+            self.maintenance(true, rng)?;
+            if self.store.is_none() {
+                return Ok(());
+            }
+        }
         let now = self.now();
         match op {
             Op::Commit(mut ops, durability) => {
@@ -2012,6 +3177,11 @@ impl World {
                 match (got, want) {
                     (Ok(g), Ok(w)) if g == w => {}
                     (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => {}
+                    (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 => {
+                        // An injected read failure: the read reports it, nothing else.
+                        self.stats.io_errors += 1;
+                        self.trace.push(format!("  -> read I/O error ({e})"));
+                    }
                     (g, w) => {
                         return fail(
                             FailureClass::LiveReadMismatch,
@@ -2062,6 +3232,10 @@ impl World {
                             }
                         }
                         (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => {
+                        }
+                        (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 => {
+                            self.stats.io_errors += 1;
+                            self.trace.push(format!("  -> read I/O error ({e})"));
                         }
                         (g, w) => {
                             return fail(
@@ -2140,7 +3314,7 @@ pub fn run(seed: u64, cfg: &Config) -> Result<Stats, Failure> {
         plan.crash_after_ops = cfg.crash_at;
         vfs.set_faults(plan);
     }
-    let opened = Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families());
+    let opened = Store::open_cfg(&vfs, cfg.shards, cfg);
     if cfg.faults.io_error_ppm > 0 && cfg.crash_at.is_none() {
         vfs.set_faults(cfg.faults.clone());
     }
@@ -2155,7 +3329,7 @@ pub fn run(seed: u64, cfg: &Config) -> Result<Stats, Failure> {
                 let probe = vfs
                     .open(Path::new("/db/probe"), OpenOptions::read_write_create())
                     .expect("probe");
-                let store = Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families())
+                let store = Store::open_cfg(&vfs, cfg.shards, cfg)
                     .unwrap_or_else(|e| panic!("reopen after a crash during create: {e}"));
                 return run_with(seed, cfg, sim, vfs, probe, model, store, 1);
             }
@@ -2188,6 +3362,7 @@ fn run_with(
         engine_seqnos: Vec::new(),
         history: BTreeMap::new(),
         unacked: Vec::new(),
+        aborted: Vec::new(),
         in_flight: Vec::new(),
         need_reopen: false,
         pending_advance: 0,
@@ -2201,6 +3376,11 @@ fn run_with(
         done: false,
         workload: Some(workload),
         queued: std::collections::VecDeque::new(),
+        stream_records: BTreeMap::new(),
+        purges: Vec::new(),
+        pending_purges: Vec::new(),
+        compaction_floor: 0,
+        faults_active: true,
     }));
 
     // Shard drivers as scheduler tasks: whichever shard the scheduler picks runs one slice.
@@ -2285,6 +3465,7 @@ fn run_with(
             trace: std::mem::take(&mut w.trace),
         });
     }
+    w.stats.mutating_ops = vfs.mutating_ops();
     if w.failure.is_none() {
         // Finish with one more crash so the tail of every run is checked.
         let mut rng = sim.rng().fork();
@@ -2324,7 +3505,7 @@ fn run_with(
 pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
     let sim = Sim::with_faults(seed, cfg.faults.clone());
     let vfs = sim.vfs();
-    let mut store = Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families()).expect("open");
+    let mut store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("open");
     let base = vfs.now_micros();
     let mut results: Vec<String> = Vec::new();
     for (i, op) in Workload::new(seed ^ 0x5eed, TABLE, cfg.spec.clone())
@@ -2338,12 +3519,19 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
         {
             vfs.crash(CrashKind::Process);
             drop(store);
-            store =
-                Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families()).expect("reopen");
+            store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("reopen");
             results.push(format!(
                 "reopen at {i}: seqno {}",
                 store.engine.snapshot().unwrap().seqno()
             ));
+        }
+        if let Some(every) = cfg.compact_every
+            && i > 0
+            && i % every == 0
+        {
+            let m = store.engine.compact_pending(None).expect("compact");
+            store.drive(&vfs, m, || true).expect("compact");
+            results.push(format!("compact at {i}"));
         }
         match op {
             Op::Commit(mut ops, durability) => {
@@ -2356,6 +3544,7 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
                         _ => {}
                     }
                 }
+                let durability = cfg.durability.unwrap_or(durability);
                 let batch = store.batch(&ops).expect("batch");
                 let mut pc = store
                     .engine

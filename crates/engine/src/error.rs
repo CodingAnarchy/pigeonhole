@@ -5,6 +5,14 @@ use pigeonhole_io::ErrorKind;
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// An `Io` error carrying a dynamic message (a background failure reported to a caller).
+pub(crate) fn io_other(context: &'static str, message: impl Into<String>) -> Error {
+    Error::Io(pigeonhole_io::Error::os(
+        context,
+        std::io::Error::other(message.into()),
+    ))
+}
+
 /// Engine errors. Each variant maps to exactly one public `ErrorCode`.
 ///
 /// ```
@@ -108,7 +116,10 @@ impl fmt::Display for Error {
             Error::RecordTooLarge => {
                 f.write_str("the commit's WAL record is larger than a segment can hold")
             }
-            Error::Busy => f.write_str("writes are stalled; retry later"),
+            Error::Busy => f.write_str(
+                "memtable arena full past the write-stall timeout, or a batch larger than the \
+                 arena: retry later, or raise memtable_budget",
+            ),
         }
     }
 }

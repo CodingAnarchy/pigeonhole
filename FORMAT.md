@@ -356,7 +356,7 @@ The payload of a reassembled record:
 
 **Cross-shard commits.** The commit's id is its seqno, reserved once by the coordinator, so it is unique for the life of the database (decision D26). Each participant writes a Prepare with its share of the mutations. The coordinator writes a Commit to its own stream once every Prepare meets the requested durability. At recovery, a Prepare is applied if and only if its coordinator's stream holds a Commit with the same seqno. Recovery sets `next_seqno` above every seqno in every replayed record, **including discarded Prepares**, so no seqno is ever reused. A stream's checkpoint never advances past a Commit record while any of its participants' Prepares may still need replay (decision D24).
 
-`Durability::None` commits write no WAL record.
+A `Durability::None` commit's record is appended to the shard's in-memory stream buffer with no I/O of its own; the next `write()` or fsync, triggered by a stronger commit on the same stream, carries it to the file. So a stronger commit also makes every earlier `None` commit of its stream durable (the mixed-levels rule), and a `None` commit that no stronger commit follows survives nothing past the last flush.
 
 ## 11. Shared-memory region
 
