@@ -57,14 +57,16 @@ fn allocations(f: impl FnOnce()) -> u64 {
 #[test]
 fn block_cache_hit_path_allocates_nothing() {
     let cache = BlockCache::new(64 << 20, 0);
-    let keys: Vec<BlockKey> = (0..1000)
+    // Miri runs this interpreted; a smaller sweep checks the same path.
+    let (count, len) = if cfg!(miri) { (64, 256) } else { (1000, 4096) };
+    let keys: Vec<BlockKey> = (0..count)
         .map(|i| BlockKey {
             file: i % 5,
             offset: i * 4096,
         })
         .collect();
     for k in &keys {
-        drop(cache.insert(*k, vec![k.offset as u8; 4096].into(), Priority::Normal));
+        drop(cache.insert(*k, vec![k.offset as u8; len].into(), Priority::Normal));
     }
     let n = allocations(|| {
         let mut sum = 0u64;
@@ -99,7 +101,8 @@ fn block_cache_miss_allocates_nothing() {
 #[test]
 fn row_cache_hit_path_allocates_nothing() {
     let rows = RowCache::new(16 << 20);
-    let names: Vec<Vec<u8>> = (0..500u32)
+    let count = if cfg!(miri) { 50 } else { 500u32 };
+    let names: Vec<Vec<u8>> = (0..count)
         .map(|i| format!("user:{i}").into_bytes())
         .collect();
     for (i, r) in names.iter().enumerate() {

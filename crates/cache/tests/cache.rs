@@ -206,9 +206,17 @@ fn contents(generation: u64, len: usize) -> Vec<u8> {
     v
 }
 
+/// Ops per model case: enough to cycle a 1500-byte cache many times; fewer under Miri.
+const MAX_OPS: usize = if cfg!(miri) { 40 } else { 200 };
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: if cfg!(miri) { 4 } else { ProptestConfig::default().cases },
+        // `PROPTEST_CASES` always wins; under Miri the default drops to 8.
+        cases: if cfg!(miri) && std::env::var_os("PROPTEST_CASES").is_none() {
+            8
+        } else {
+            ProptestConfig::default().cases
+        },
         ..ProptestConfig::default()
     })]
 
@@ -216,7 +224,7 @@ proptest! {
     /// contents, a pinned latest block is always a hit, held handles never change, and with
     /// nothing pinned the cache is within capacity.
     #[test]
-    fn model(ops in prop::collection::vec(op(), 1..200), shards in 1..3usize) {
+    fn model(ops in prop::collection::vec(op(), 1..MAX_OPS), shards in 1..3usize) {
         let cache = BlockCache::new(1500, shards);
         let mut latest: HashMap<BlockKey, Vec<u8>> = HashMap::new();
         let mut pins: Vec<(BlockKey, Vec<u8>, BlockHandle)> = Vec::new();
