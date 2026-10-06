@@ -25,8 +25,8 @@ fn options(vfs: VfsRef, shards: usize) -> EngineOptions {
     o.create_if_missing = true;
     o.shards = shards;
     o.pin_threads = false;
-    o.memtable_budget = 64 << 20;
-    o.memtable_freeze_bytes = 16 << 20;
+    o.memtable_budget = 256 << 20;
+    o.memtable_freeze_bytes = 32 << 20;
     o.reader_slots = 8;
     o.wal.segment_size = 16 << 20;
     o
@@ -168,16 +168,22 @@ fn commits(c: &mut Criterion) {
         Durability::Sync,
     ] {
         group.bench_function(format!("{d:?}"), |b| {
-            b.iter(|| {
-                i += 1;
-                let mut wb = WriteBatch::new();
-                put(
-                    &mut wb,
-                    &t,
-                    &i.to_be_bytes(),
-                    b"value-of-32-bytes-padding-......",
-                );
-                black_box(db.commit(wb, Some(d)).unwrap())
+            // Without flushes the arena is finite: cap the commits per sample and scale.
+            b.iter_custom(|iters| {
+                let n = iters.min(5_000);
+                let start = Instant::now();
+                for _ in 0..n {
+                    i += 1;
+                    let mut wb = WriteBatch::new();
+                    put(
+                        &mut wb,
+                        &t,
+                        &i.to_be_bytes(),
+                        b"value-of-32-bytes-padding-......",
+                    );
+                    black_box(db.commit(wb, Some(d)).unwrap());
+                }
+                start.elapsed() * (iters / n) as u32
             })
         });
     }
@@ -191,7 +197,7 @@ fn commits(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1));
         group.bench_function(BenchmarkId::new("GroupSync committers", threads), |b| {
             b.iter_custom(|iters| {
-                let per = iters / threads as u64 + 1;
+                let per = (iters / threads as u64 + 1).min(2_000);
                 let start = Instant::now();
                 std::thread::scope(|s| {
                     for k in 0..threads {
@@ -206,7 +212,8 @@ fn commits(c: &mut Criterion) {
                         });
                     }
                 });
-                start.elapsed() / threads as u32
+                // Per-commit latency as seen by one committer, scaled to criterion's count.
+                start.elapsed() / threads as u32 * (iters / (per * threads as u64)).max(1) as u32
             })
         });
     }
@@ -246,7 +253,7 @@ fn scaling(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1));
         group.bench_function(BenchmarkId::new("commits/s per thread", shards), |b| {
             b.iter_custom(|iters| {
-                let per = iters / shards as u64 + 1;
+                let per = (iters / shards as u64 + 1).min(5_000);
                 let start = Instant::now();
                 std::thread::scope(|s| {
                     for t in &tables {
@@ -265,7 +272,7 @@ fn scaling(c: &mut Criterion) {
                         });
                     }
                 });
-                start.elapsed() / shards as u32
+                start.elapsed() / shards as u32 * (iters / (per * shards as u64)).max(1) as u32
             })
         });
         db.close().unwrap();
