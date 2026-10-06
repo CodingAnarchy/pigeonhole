@@ -16,12 +16,12 @@ use proptest::prelude::*;
 
 const ROWS: u64 = 100_000;
 
-fn row_key(row: u64) -> Vec<u8> {
+fn row_key(row: u64, qualifier: &[u8]) -> Vec<u8> {
     let mut k = Vec::new();
     encode_key(
         &mut k,
         format!("r{row:08}").as_bytes(),
-        b"q",
+        qualifier,
         1,
         1,
         Kind::Put,
@@ -39,6 +39,12 @@ fn row_num(key: &[u8]) -> u64 {
 }
 
 fn sst(id: &mut u64, lo: u64, hi: u64, len: u64) -> Arc<SstMeta> {
+    sst_cut(id, (lo, b"a"), (hi, b"z"), len)
+}
+
+/// An SST from `(row, qualifier)` to `(row, qualifier)`: two SSTs can share an edge row,
+/// one ending at qualifier `m` and the next starting at `n`.
+fn sst_cut(id: &mut u64, lo: (u64, &[u8]), hi: (u64, &[u8]), len: u64) -> Arc<SstMeta> {
     *id += 1;
     Arc::new(SstMeta {
         id: SstId(*id),
@@ -47,8 +53,8 @@ fn sst(id: &mut u64, lo: u64, hi: u64, len: u64) -> Arc<SstMeta> {
             size_class: 0,
         },
         len,
-        smallest_key: row_key(lo),
-        largest_key: row_key(hi),
+        smallest_key: row_key(lo.0, lo.1),
+        largest_key: row_key(hi.0, hi.1),
         seqno_range: (*id, *id),
         ts_range: (1, 1),
         entries: len / 100,
@@ -65,7 +71,9 @@ fn apply(
     kind: &TaskKind,
     target: u64,
     id: &mut u64,
+    rng: &mut Rng,
 ) {
+    assert_clean_cut(levels, inputs);
     let mut taken = Vec::new();
     for (level, ids) in inputs {
         let l = &mut levels.levels[*level as usize];
@@ -89,11 +97,24 @@ fn apply(
         let hi = taken.iter().map(|s| row_num(&s.largest_key)).max().unwrap();
         let bytes: u64 = taken.iter().map(|s| s.len).sum::<u64>() * 9 / 10;
         let n = bytes.div_ceil(target).clamp(1, hi - lo + 1);
+        // Chunks sometimes share an edge row (a row too big for one SST is split).
+        let mut start = (lo, &b"a"[..]);
         (0..n)
             .map(|i| {
-                let a = lo + (hi - lo + 1) * i / n;
                 let b = lo + (hi - lo + 1) * (i + 1) / n - 1;
-                sst(id, a, b, bytes / n)
+                let shared = i + 1 < n && rng.below(3) == 0;
+                let end = if shared {
+                    (b + 1, &b"m"[..])
+                } else {
+                    (b, &b"z"[..])
+                };
+                let s = sst_cut(id, start, end, bytes / n);
+                start = if shared {
+                    (b + 1, &b"n"[..])
+                } else {
+                    (b + 1, &b"a"[..])
+                };
+                s
             })
             .collect()
     };
@@ -102,6 +123,49 @@ fn apply(
     l.sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
     for w in l.windows(2) {
         assert!(w[0].largest_key < w[1].smallest_key, "level {out} overlaps");
+    }
+}
+
+/// First and last row of an SST.
+type RowRange = (Vec<u8>, Vec<u8>);
+
+fn row_of(key: &[u8]) -> &[u8] {
+    &key[..row_prefix_len(key).unwrap()]
+}
+
+/// No SST left behind in the input level shares a row with a taken one of that level, and
+/// none left in the level below shares a row with a taken one of either level.
+fn assert_clean_cut(levels: &Levels, inputs: &[(u8, Vec<SstId>)]) {
+    let top = inputs[0].0 as usize;
+    let taken = |s: &SstMeta| inputs.iter().any(|(_, ids)| ids.contains(&s.id));
+    let rows_of = |levels_: &[usize]| -> Vec<RowRange> {
+        levels_
+            .iter()
+            .flat_map(|&l| levels.levels[l].iter())
+            .filter(|s| taken(s))
+            .map(|s| {
+                (
+                    row_of(&s.smallest_key).to_vec(),
+                    row_of(&s.largest_key).to_vec(),
+                )
+            })
+            .collect()
+    };
+    let checks: Vec<(usize, Vec<RowRange>)> = if top == 0 {
+        vec![(1, rows_of(&[0, 1]))]
+    } else {
+        vec![(top, rows_of(&[top])), (top + 1, rows_of(&[top, top + 1]))]
+    };
+    for (level, rows) in checks {
+        for s in levels.levels[level].iter().filter(|s| !taken(s)) {
+            let (lo, hi) = (row_of(&s.smallest_key), row_of(&s.largest_key));
+            assert!(
+                rows.iter()
+                    .all(|(a, b)| hi < a.as_slice() || b.as_slice() < lo),
+                "level {level}: SST {:?} shares rows with the inputs {inputs:?}",
+                s.id
+            );
+        }
     }
 }
 
@@ -141,6 +205,7 @@ fn check(seed: u64, flushes: usize) {
                 &task.kind,
                 options.target_sst_bytes,
                 &mut id,
+                &mut rng,
             );
             compactions += 1;
             guard += 1;

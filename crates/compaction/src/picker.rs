@@ -156,8 +156,10 @@ fn overlaps(s: &SstMeta, lo: &[u8], hi: &[u8]) -> bool {
 /// compacts into `n + 1` once it outgrows `level_base_bytes × level_multiplier^(n-1)`,
 /// choosing the file whose rewrite costs least (fewest overlapping bytes below per byte
 /// moved). Inputs and overlaps are whole rows: an SST sharing an edge row with a neighbour
-/// is taken together with it, so every row of a level moves down at once and GC always sees
-/// all of a row's older data.
+/// is taken together with it, in the input level and in the level below (to a fixpoint), so
+/// every row of a level moves down at once and GC always sees all of a row's data at and
+/// below the input level. The task's `range` stays [`KeyRange::all`], which covers that
+/// expansion; the engine narrows it only to the tablet's rows.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -282,7 +284,10 @@ impl CompactionPicker {
         })
     }
 
-    /// Files of `level` holding rows in `[lo, hi]`, or `None` if one is busy.
+    /// Files of `level` holding rows in `[lo, hi]`, expanded to a clean cut (neighbours
+    /// sharing an edge row come along, to a fixpoint), or `None` if one is busy. Without the
+    /// expansion a row split across two SSTs of the level could be rewritten half at a time,
+    /// and a bottommost run could purge a family marker that still hides the other half.
     fn overlapping(
         levels: &Levels,
         level: usize,
@@ -290,18 +295,32 @@ impl CompactionPicker {
         hi: &[u8],
         busy: &[SstId],
     ) -> Option<(Vec<SstId>, u64)> {
-        let mut ids = Vec::new();
-        let mut bytes = 0;
-        for s in levels.levels.get(level).into_iter().flatten() {
-            if overlaps(s, lo, hi) {
-                if busy.contains(&s.id) {
-                    return None;
-                }
-                ids.push(s.id);
-                bytes += s.len;
-            }
+        let Some(files) = levels.levels.get(level) else {
+            return Some((Vec::new(), 0));
+        };
+        // Deeper levels are sorted and disjoint, so the overlap is one contiguous run.
+        let Some(mut first) = files.iter().position(|s| overlaps(s, lo, hi)) else {
+            return Some((Vec::new(), 0));
+        };
+        let mut last = files.iter().rposition(|s| overlaps(s, lo, hi))?;
+        while first > 0
+            && row_of(&files[first - 1].largest_key) == row_of(&files[first].smallest_key)
+        {
+            first -= 1;
         }
-        Some((ids, bytes))
+        while last + 1 < files.len()
+            && row_of(&files[last].largest_key) == row_of(&files[last + 1].smallest_key)
+        {
+            last += 1;
+        }
+        let run = &files[first..=last];
+        if run.iter().any(|s| busy.contains(&s.id)) {
+            return None;
+        }
+        Some((
+            run.iter().map(|s| s.id).collect(),
+            run.iter().map(|s| s.len).sum(),
+        ))
     }
 
     fn pick_l0(

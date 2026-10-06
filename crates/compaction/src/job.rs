@@ -364,6 +364,15 @@ impl CompactionJob {
                 .map(|s| s.intersect(&task.range))
                 .collect()
         };
+        debug_assert!(
+            subranges.iter().chain([&task.range]).all(|r| {
+                [&r.start, &r.end]
+                    .into_iter()
+                    .flatten()
+                    .all(|b| row_prefix_len(b).is_ok_and(|n| n == b.len()))
+            }),
+            "task range and subrange bounds must be encoded row prefixes"
+        );
         let done = task.kind != TaskKind::Rewrite;
         Self {
             sink: Sink {
@@ -447,9 +456,14 @@ impl CompactionJob {
 
     /// The result. Call once after `Done` (if called earlier, it first runs the job to
     /// completion).
+    ///
+    /// If the remaining work fails, the outputs written so far are returned to the pager.
     pub fn finish(mut self) -> Result<CompactionOutput> {
-        if !self.done {
-            self.run(u64::MAX)?;
+        if !self.done
+            && let Err(e) = self.run(u64::MAX)
+        {
+            self.sink.abandon();
+            return Err(e);
         }
         if self.task.kind != TaskKind::Rewrite {
             return Ok(CompactionOutput::default());

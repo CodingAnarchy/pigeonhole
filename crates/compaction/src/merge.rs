@@ -107,11 +107,14 @@ pub trait MergeOperator: Send + Sync + fmt::Debug {
     fn name(&self) -> &str;
 
     /// Folds `older` into `acc`, where `acc` holds the combination of every newer operand:
-    /// afterwards `acc` is the combination of `older` followed by them.
+    /// afterwards `acc` is the combination of `older` followed by them. On error the contents
+    /// of `acc` are unspecified; callers never use them (compaction merges into a copy and
+    /// keeps the operands apart, the resolver fails the read).
     fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError>;
 
     /// Applies the combined operands in `acc` to `base` (`None`: no value below them),
-    /// leaving the resulting stored value in `acc`.
+    /// leaving the resulting stored value in `acc`. On error the contents of `acc` are
+    /// unspecified.
     fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError>;
 }
 

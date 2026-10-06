@@ -104,7 +104,7 @@ fn run_sliced(db: &Db, job: &mut CompactionJob) -> usize {
 }
 
 fn check_compaction(seed: u64, commits: usize) {
-    let h = random_history(seed, commits);
+    let mut h = random_history(seed, common::commits(commits));
     let mut rng = Rng::new(seed ^ 0xc0c0);
     let mut db = Db::new(seed);
     let family = family_options(&h);
@@ -228,6 +228,21 @@ fn check_compaction(seed: u64, commits: usize) {
             let a = resolver_reads(&h, s, now, |o| sst_resolver(&after, o));
             assert_same(&format!("after, {what}"), &expected, &a);
         }
+    }
+
+    // Writes after the compaction (at commit timestamps, flushed on top) read as in the
+    // model at the old live snapshots and the new latest one.
+    let n_later = 1 + rng.below(8) as usize;
+    let later = extend_history(&mut h, &mut rng, n_later, true);
+    let mut flush: Vec<_> = later.iter().map(|e| (e.0.clone(), e.1.clone())).collect();
+    flush.sort();
+    after.push(db.sst(&family, &flush).1);
+    let now = gc_now.max(h.last_ts) + rng.below(100);
+    for s in snapshots.iter().copied().chain([max, h.model.snapshot()]) {
+        let what = format!("seed {seed}: choice {choice}, later writes, read at {s}/{now}");
+        let expected = model_reads(&h, s, now);
+        let a = resolver_reads(&h, s, now, |o| sst_resolver(&after, o));
+        assert_same(&what, &expected, &a);
     }
 }
 
@@ -481,6 +496,7 @@ fn operands_combine_within_a_timestamp() {
 
 /// Large inputs cut into several outputs at row boundaries.
 #[test]
+#[cfg_attr(miri, ignore = "writes several 64 KiB SSTs: too slow under Miri")]
 fn outputs_are_cut_near_the_target_between_rows() {
     let mut db = Db::new(7);
     let mut family = FamilyOptions::default();
@@ -515,12 +531,15 @@ fn outputs_are_cut_near_the_target_between_rows() {
     }
 }
 
+/// Slices run before interrupting a job (each ends at the deadline after 64 groups).
+const SLICES: usize = if cfg!(miri) { 2 } else { 12 };
+
 fn inputs_for_interrupt(db: &mut Db) -> (FamilyOptions, Vec<(SstMeta, Arc<SstReader>)>) {
     let family = FamilyOptions::default();
     let mut ssts = Vec::new();
     for s in 0..3u64 {
         let mut e = Vec::new();
-        for row in 0..300u32 {
+        for row in 0..if cfg!(miri) { 100 } else { 300u32 } {
             e.push((
                 key(
                     format!("row{row:05}").as_bytes(),
@@ -551,7 +570,7 @@ fn abort_leaves_inputs_intact() {
         db.context(family, policy(vec![], 100, true)),
     );
     // A few slices: some outputs are finished, one is open.
-    for _ in 0..12 {
+    for _ in 0..SLICES {
         assert_eq!(job.run(db.vfs.monotonic_nanos()).unwrap(), JobPoll::Pending);
     }
     assert!(db.pager.stats().allocated_bytes > allocated);
@@ -575,7 +594,7 @@ fn crash_mid_job_leaves_inputs_intact() {
         inputs.iter().map(|s| s.1.clone()).collect(),
         db.context(family, policy(vec![], 100, true)),
     );
-    for _ in 0..12 {
+    for _ in 0..SLICES {
         assert_eq!(job.run(db.vfs.monotonic_nanos()).unwrap(), JobPoll::Pending);
     }
     db.vfs.crash(CrashKind::Power);
@@ -681,4 +700,77 @@ fn same_timestamp_puts_shadow_older_ones() {
     // A snapshot at 2 still needs the operand and its base.
     let (_, kept) = compact(&db, &family, &[input], policy(vec![2], 100, false));
     assert_eq!(kept, e);
+}
+
+/// A row split across two bottom-level SSTs: X ends with row `m`'s family marker, Y starts
+/// with the cells it hides. An L1 file overlapping only X must still bring Y along, or the
+/// bottommost rewrite of X purges the marker and Y's cells come back.
+#[test]
+fn a_row_split_across_bottom_ssts_moves_together() {
+    use pigeonhole_compaction::{CompactionPicker, Levels, PickerOptions};
+    use pigeonhole_format::manifest::CompactionStyle;
+
+    let mut db = Db::new(13);
+    let family = FamilyOptions::default();
+    let mut marker = Vec::new();
+    encode_marker_key(&mut marker, b"m", 50, 5).unwrap();
+    let x = db.sst(
+        &family,
+        &[
+            (key(b"c", b"q", 10, 2, Kind::Put), stored(b"c")),
+            (marker, vec![]),
+        ],
+    );
+    let y = db.sst(
+        &family,
+        &[
+            (key(b"m", b"b", 10, 1, Kind::Put), stored(b"hidden")),
+            (key(b"z", b"q", 10, 3, Kind::Put), stored(b"z")),
+        ],
+    );
+    let f = db.sst(
+        &family,
+        &[
+            (key(b"a", b"q", 60, 6, Kind::Put), stored(b"a")),
+            (key(b"d", b"q", 60, 7, Kind::Put), stored(b"d")),
+        ],
+    );
+    let all = [&f, &x, &y];
+
+    let get = |ssts: &[Arc<SstReader>], row: &[u8], q: &[u8]| {
+        let mut r = sst_resolver(ssts, pigeonhole_compaction::ResolveOptions::new(99, 100));
+        r.seek_column(row, q).unwrap();
+        r.next_cell().unwrap().map(|c| c.value.to_vec())
+    };
+    let before: Vec<_> = all.iter().map(|s| s.1.clone()).collect();
+    assert_eq!(get(&before, b"m", b"b"), None);
+
+    let mut options = PickerOptions::default();
+    options.level_base_bytes = 1;
+    options.max_levels = 3;
+    let picker = CompactionPicker::new(CompactionStyle::Leveled, options);
+    let levels = Levels {
+        levels: vec![
+            vec![],
+            vec![Arc::new(f.0.clone())],
+            vec![Arc::new(x.0.clone()), Arc::new(y.0.clone())],
+        ],
+    };
+    let t = picker
+        .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
+        .unwrap();
+    assert_eq!(t.inputs, [(1, vec![f.0.id]), (2, vec![x.0.id, y.0.id])]);
+
+    let inputs: Vec<_> = all.iter().map(|s| s.1.clone()).collect();
+    let mut job = CompactionJob::new(t, inputs, db.context(family, policy(vec![], 100, true)));
+    run_sliced(&db, &mut job);
+    let out = job.finish().unwrap();
+    let after: Vec<_> = out
+        .added
+        .iter()
+        .map(|(_, m)| open_sst(&db.pager, &db.cache, m))
+        .collect();
+    assert_eq!(get(&after, b"m", b"b"), None);
+    assert_eq!(get(&after, b"c", b"q"), Some(stored(b"c")));
+    assert_eq!(get(&after, b"z", b"q"), Some(stored(b"z")));
 }

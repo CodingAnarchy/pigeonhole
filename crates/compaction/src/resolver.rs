@@ -6,6 +6,7 @@ use std::sync::Arc;
 use pigeonhole_format::key::{
     Kind, MARKER_QUALIFIER, SUFFIX_LEN, TERMINATOR, escape_into, row_prefix_len, split_suffix,
 };
+use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{ValueRef, ValueTag, decode_value};
 use pigeonhole_format::{Cursor, Seqno, Timestamp};
 
@@ -91,6 +92,13 @@ pub struct ResolveOptions {
     pub value: Option<ValuePredicate>,
     /// The family's merge operator, if any.
     pub merge: Option<Arc<dyn MergeOperator>>,
+    /// Keep only resolved versions with `min <= ts < max`. Applied after deletes, TTL and
+    /// merge folding and before the value predicate and version limits, so for a family
+    /// without merge operands it equals pushing the range down to puts (D22). Families with
+    /// a merge operator must use this instead of `ScanFilter::time_range`, which could drop
+    /// a counter's base while keeping its operands; [`ResolveOptions::route_time_range`]
+    /// picks the right place.
+    pub time_range: Option<(Timestamp, Timestamp)>,
 }
 
 impl ResolveOptions {
@@ -104,7 +112,46 @@ impl ResolveOptions {
             columns_per_row: 0,
             value: None,
             merge: None,
+            time_range: None,
         }
+    }
+
+    /// Puts a scan's time range where it belongs: pushed down into `filter` for a family
+    /// without a merge operator, or onto resolved versions (`self.time_range`) for one with
+    /// an operator (proposed D22 amendment). Set [`ResolveOptions::merge`] first.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use pigeonhole_compaction::{I64Add, ResolveOptions};
+    /// use pigeonhole_format::scan::ScanFilter;
+    ///
+    /// let mut filter = ScanFilter::all();
+    /// let mut counters = ResolveOptions::new(9, 0);
+    /// counters.merge = Some(Arc::new(I64Add));
+    /// counters.route_time_range(&mut filter, Some((10, 20)));
+    /// assert_eq!((filter.time_range, counters.time_range), (None, Some((10, 20))));
+    ///
+    /// let mut plain = ResolveOptions::new(9, 0);
+    /// plain.route_time_range(&mut filter, Some((10, 20)));
+    /// assert_eq!((filter.time_range, plain.time_range), (Some((10, 20)), None));
+    /// ```
+    pub fn route_time_range(
+        &mut self,
+        filter: &mut ScanFilter,
+        range: Option<(Timestamp, Timestamp)>,
+    ) {
+        if self.merge.is_some() {
+            filter.time_range = None;
+            self.time_range = range;
+        } else {
+            filter.time_range = range;
+            self.time_range = None;
+        }
+    }
+
+    fn in_time_range(&self, ts: Timestamp) -> bool {
+        self.time_range
+            .is_none_or(|(min, max)| min <= ts && ts < max)
     }
 }
 
@@ -573,6 +620,9 @@ where
                 self.emit_buffer(ts, None)
             }
             (Base::Large, false) => {
+                if !self.opts.in_time_range(ts) {
+                    return Ok(None);
+                }
                 self.cursor.seek(&self.base_key)?;
                 debug_assert!(self.cursor.valid() && self.cursor.key() == self.base_key);
                 if !self.admit_source() {
@@ -621,6 +671,9 @@ where
         ts: Timestamp,
         err: Option<MergeError>,
     ) -> Result<Option<Out>, C::Error> {
+        if !self.opts.in_time_range(ts) {
+            return Ok(None);
+        }
         if let Some(e) = err {
             return Err(e.into());
         }

@@ -1,5 +1,6 @@
-//! Compaction throughput (a two-level merge, MB/s of input) and resolver throughput
-//! (cells/s over a merge of SSTs).
+//! Compaction throughput (a two-level merge, MB/s of input, incompressible values),
+//! resolver throughput (cells/s over a merge of SSTs, warm and cold cache), and the read
+//! amplification of an unfolded counter (one point get over N `incr` operands).
 #![allow(missing_docs)]
 
 use std::hint::black_box;
@@ -9,8 +10,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use pigeonhole_cache::{BlockCache, Priority};
 use pigeonhole_compaction::{
-    CellResolver, CompactionJob, CompactionTask, Error, GcPolicy, JobContext, JobPoll, KeyRange,
-    MergingCursor, ResolveOptions, TaskKind,
+    CellResolver, CompactionJob, CompactionTask, Error, GcPolicy, I64Add, JobContext, JobPoll,
+    KeyRange, MergingCursor, ResolveOptions, TaskKind,
 };
 use pigeonhole_format::key::{Kind, encode_key};
 use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
@@ -51,8 +52,16 @@ fn fixture() -> Fixture {
         let extent = pager.allocate(64 << 20).unwrap();
         let mut w = SstWriter::new(pager.file().clone(), extent, SstId(id as u64 + 1), opts);
         let mut k = Vec::new();
-        let value = vec![0u8; VALUE + 1];
+        let mut value = vec![0u8; VALUE + 1];
+        let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ id as u64;
         for row in rows {
+            // Incompressible: a fresh xorshift payload per entry.
+            for b in &mut value[1..] {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
+            }
             for (i, &ts) in versions.iter().enumerate() {
                 k.clear();
                 encode_key(
@@ -155,32 +164,96 @@ impl Cursor for Src {
     }
 }
 
+fn scan_all(inputs: &[Arc<SstReader>]) -> u32 {
+    let sources = inputs
+        .iter()
+        .map(|s| Src(s.iter(ScanFilter::all(), ReadOptions::default())))
+        .collect();
+    let mut r = CellResolver::new(
+        MergingCursor::new(sources),
+        ResolveOptions::new(u64::MAX, 0),
+    );
+    r.seek(b"").unwrap();
+    let mut n = 0u32;
+    while let Some(cell) = r.next_cell().unwrap() {
+        black_box(cell.value);
+        n += 1;
+    }
+    n
+}
+
 fn resolver(c: &mut Criterion) {
     let f = fixture();
     let mut g = c.benchmark_group("resolver");
     g.throughput(Throughput::Elements(u64::from(ROWS)));
+    let warm: Vec<_> = f.inputs.iter().map(|s| s.1.clone()).collect();
     g.bench_function("scan_latest_two_ssts", |b| {
-        b.iter(|| {
-            let sources = f
-                .inputs
-                .iter()
-                .map(|s| Src(s.1.iter(ScanFilter::all(), ReadOptions::default())))
-                .collect();
-            let mut r = CellResolver::new(
-                MergingCursor::new(sources),
-                ResolveOptions::new(u64::MAX, 0),
-            );
-            r.seek(b"").unwrap();
-            let mut n = 0u32;
-            while let Some(cell) = r.next_cell().unwrap() {
-                black_box(cell.value);
-                n += 1;
-            }
-            assert_eq!(n, ROWS);
-        })
+        b.iter(|| assert_eq!(scan_all(&warm), ROWS))
+    });
+    // Cold: every block is read, verified and decompressed again (readers opened over an
+    // empty cache each iteration).
+    g.bench_function("scan_latest_two_ssts_cold", |b| {
+        b.iter_batched(
+            || {
+                let cache = Arc::new(BlockCache::new(256 << 20, 4));
+                f.inputs
+                    .iter()
+                    .map(|s| {
+                        Arc::new(
+                            SstReader::open(
+                                f.pager.file().clone(),
+                                &s.0,
+                                cache.clone(),
+                                Priority::Normal,
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |cold| assert_eq!(scan_all(&cold), ROWS),
+            BatchSize::PerIteration,
+        )
     });
     g.finish();
 }
 
-criterion_group!(benches, compaction, resolver);
+/// One counter column holding `n` unfolded `incr` operands (compaction does not fold across
+/// timestamps until #34): the cost of a point get grows with `n`.
+fn counter(c: &mut Criterion) {
+    let vfs: VfsRef = SimVfs::new(2);
+    let pager = Pager::create(&vfs, "/counter.phdb".as_ref()).unwrap();
+    let cache = Arc::new(BlockCache::new(64 << 20, 1));
+    let family = FamilyOptions::default();
+    let mut g = c.benchmark_group("counter_get");
+    for n in [1u64, 100, 10_000] {
+        let opts = SstWriterOptions::for_family(&family, TableId(1), FamilyId(1), TabletId(1));
+        let extent = pager.allocate(8 << 20).unwrap();
+        let mut w = SstWriter::new(pager.file().clone(), extent, SstId(100 + n), opts);
+        let mut k = Vec::new();
+        for i in (1..=n).rev() {
+            k.clear();
+            encode_key(&mut k, b"page", b"hits", i, i, Kind::Merge).unwrap();
+            w.add(&k, &[&[1u8][..], &1i64.to_le_bytes()].concat())
+                .unwrap();
+        }
+        let meta = w.finish().unwrap();
+        let sst = Arc::new(
+            SstReader::open(pager.file().clone(), &meta, cache.clone(), Priority::Normal).unwrap(),
+        );
+        g.bench_function(format!("operands_{n}"), |b| {
+            b.iter(|| {
+                let mut o = ResolveOptions::new(u64::MAX, 0);
+                o.merge = Some(Arc::new(I64Add));
+                let src = Src(sst.iter(ScanFilter::all(), ReadOptions::default()));
+                let mut r = CellResolver::new(MergingCursor::new(vec![src]), o);
+                r.seek_column(b"page", b"hits").unwrap();
+                black_box(r.next_cell().unwrap().unwrap().value.len())
+            })
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, compaction, resolver, counter);
 criterion_main!(benches);

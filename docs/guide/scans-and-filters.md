@@ -128,6 +128,6 @@ Filters run **before values are materialized**, and every data source (memtables
 
 Consequences you should know:
 - **Deletes always win.** Delete markers (cell, column, family-in-row) always pass the decoder filters, even when their qualifier or timestamp is outside your filter. Hiding a marker would resurrect older versions, so a `time_range` that excludes a column delete's timestamp still honors the delete. A delete with timestamp `T` hides every version in its scope with timestamp `<= T` (decision D9).
-- **Merge operands are never dropped by pushdown.** Dropping some operands would yield a partial counter, so a counter's resolved value always reflects all its operands. Do not expect `time_range` to compute a windowed sum over an `incr` counter; use time-bucketed qualifiers instead.
+- **Counters are filtered after they are resolved.** In a family with a merge operator, `time_range` is not pushed down: the counter is resolved from all its operands and its base first, and the resolved value is kept if its timestamp (that of its newest operand) is in the range (proposed D22 amendment). Pushing it down could drop the base and keep the operands, a wrong sum. So `time_range` never computes a windowed sum over an `incr` counter; use time-bucketed qualifiers for that.
 - **`versions(n)` and value predicates see snapshot-visible data.** `value_filter` tests the newest visible value, not any older version of the column.
 - Filtering by qualifier does not change the visibility of a version of a different qualifier.

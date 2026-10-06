@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use pigeonhole_cache::{BlockCache, Priority};
 use pigeonhole_compaction::{
-    CellResolver, Error, I64Add, MergeError, MergingCursor, ResolveOptions, VecCursor,
+    CellResolver, Error, I64Add, MergeError, MergingCursor, ResolveOptions, ValuePredicate,
+    VecCursor,
 };
 use pigeonhole_format::key::{Kind, TERMINATOR, encode_key, encode_marker_key, escape_into};
 use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
@@ -29,7 +30,7 @@ pub fn cases(default: u32) -> u32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default);
-    if cfg!(miri) { base.min(4) } else { base }
+    if cfg!(miri) { base.min(2) } else { base }
 }
 
 /// One stored entry: internal key, stored value, seqno.
@@ -41,6 +42,9 @@ pub struct History {
     pub family: ModelFamily,
     pub entries: Vec<Entry>,
     pub last_ts: Timestamp,
+    /// Timestamps used so far (targets for explicit puts and cell deletes).
+    used_ts: Vec<Timestamp>,
+    commits: usize,
 }
 
 /// The stored form of a model value: 8-byte values as `i64`, everything else as bytes.
@@ -75,22 +79,47 @@ pub fn random_history(seed: u64, commits: usize) -> History {
     };
     let mut model = Model::new();
     model.create_table(TABLE, vec![family.clone()]);
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut used_ts: Vec<Timestamp> = vec![5];
-    let mut last_ts = 0;
-    for c in 0..commits {
-        let commit_ts = 10 * (c as u64 + 1);
-        last_ts = commit_ts;
+    let mut h = History {
+        model,
+        family,
+        entries: Vec::new(),
+        last_ts: 0,
+        used_ts: vec![5],
+        commits: 0,
+    };
+    extend_history(&mut h, &mut rng, commits, false);
+    h
+}
+
+/// Appends `commits` random commits to `h` and returns their entries. With `later`, only
+/// writes at the commit timestamp (default-timestamp puts, increments, column, family and
+/// row deletes): commit timestamps are multiples of 10 and explicit ones never are, so such
+/// writes never meet an existing timestamp exactly and never sort below a purged delete.
+pub fn extend_history(h: &mut History, rng: &mut Rng, commits: usize, later: bool) -> Vec<Entry> {
+    let mut added = Vec::new();
+    for _ in 0..commits {
+        h.commits += 1;
+        let commit_ts = 10 * h.commits as u64;
+        h.last_ts = commit_ts;
+        let used_ts = &mut h.used_ts;
+        let model = &mut h.model;
         let n_ops = 1 + rng.below(3) as usize;
         let mut ops = Vec::new();
         for _ in 0..n_ops {
-            let row = pick(&mut rng, &ROWS).to_vec();
-            let qualifier = pick(&mut rng, &QUALS).to_vec();
+            let row = pick(rng, &ROWS).to_vec();
+            let qualifier = pick(rng, &QUALS).to_vec();
             let (table, family_name) = (TABLE.to_string(), FAMILY.to_string());
-            let op = match rng.below(20) {
+            let mut choice = rng.below(20);
+            if later && (12..=14).contains(&choice) {
+                choice = 15; // no cell deletes at old timestamps
+            }
+            let op = match choice {
                 0..=6 => {
-                    let ts = match rng.below(3) {
+                    let ts = match rng.below(4) {
+                        _ if later => None,
                         0 => Some(used_ts[rng.below(used_ts.len() as u64) as usize]),
+                        // Above later commit timestamps, but never equal to one.
+                        1 => Some(commit_ts + 5 + 10 * rng.below(5)),
                         _ => None,
                     };
                     let value = match rng.below(10) {
@@ -193,14 +222,10 @@ pub fn random_history(seed: u64, commits: usize) -> History {
             used_ts.push(ts);
         }
         used_ts.push(commit_ts);
-        entries.extend(cells.into_iter().map(|(k, v)| (k, v, seqno)));
+        added.extend(cells.into_iter().map(|(k, v)| (k, v, seqno)));
     }
-    History {
-        model,
-        family,
-        entries,
-        last_ts,
-    }
+    h.entries.extend(added.iter().cloned());
+    added
 }
 
 /// Resolve options for a history's family.
@@ -492,4 +517,181 @@ pub fn sst_entries(sst: &Arc<SstReader>) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// A merge error converts into the crate error (resolvers need `From<MergeError>`).
 pub fn _assert_from(e: MergeError) -> Error {
     e.into()
+}
+
+/// A model row read as `(row, qualifier, ts, value)` cells, or `None` if it fails.
+fn model_rows(
+    h: &History,
+    snapshot: Seqno,
+    now: Timestamp,
+    versions: u32,
+) -> Option<Vec<Vec<FullCell>>> {
+    let mut rows = Vec::new();
+    for row in ROWS {
+        let cells = h
+            .model
+            .try_read_row(TABLE, row, &[FAMILY], versions, snapshot, now)
+            .ok()?;
+        rows.push(
+            cells
+                .into_iter()
+                .map(|c| (row.to_vec(), c.qualifier, c.ts, c.value))
+                .collect(),
+        );
+    }
+    Some(rows)
+}
+
+type FullCell = (Vec<u8>, Vec<u8>, Timestamp, Vec<u8>);
+
+fn full(key: &[u8], ts: Timestamp, value: &[u8]) -> FullCell {
+    (row_of(key), qualifier(key), ts, unstored(value))
+}
+
+/// Groups one row's cells by qualifier, preserving order.
+fn columns(row: &[FullCell]) -> Vec<Vec<FullCell>> {
+    let mut out: Vec<Vec<FullCell>> = Vec::new();
+    for c in row {
+        match out.last_mut() {
+            Some(col) if col[0].1 == c.1 => col.push(c.clone()),
+            _ => out.push(vec![c.clone()]),
+        }
+    }
+    out
+}
+
+/// Scans the whole family through a fresh resolver, calling `after_cell` after each cell
+/// (true: skip the rest of the row). `Err(())` on a merge failure.
+fn scan_with<C, F>(r: &mut CellResolver<C>, mut after_cell: F) -> Result<Vec<FullCell>, ()>
+where
+    C: Cursor<Error = Error>,
+    F: FnMut() -> bool,
+{
+    r.seek(b"").unwrap();
+    let mut out = Vec::new();
+    loop {
+        match r.next_cell() {
+            Ok(Some(c)) => out.push(full(c.key, c.ts, c.value)),
+            Ok(None) => return Ok(out),
+            Err(Error::Merge(_)) => return Err(()),
+            Err(e) => panic!("read failed: {e}"),
+        }
+        if after_cell() {
+            r.skip_row().unwrap();
+        }
+    }
+}
+
+/// Reads the oracle checks beyond gets, row reads and latest-only scans: multi-version
+/// scans across rows, `columns_per_row`, value predicates, caller `skip_row`, and
+/// resolved-version time ranges (D22 amendment). Cases where the model's read fails are
+/// checked only for multi-version scans (a limit or filter may legitimately avoid the
+/// failing version).
+pub fn check_extras<C, F>(h: &History, snapshot: Seqno, now: Timestamp, rng: &mut Rng, mut make: F)
+where
+    C: Cursor<Error = Error>,
+    F: FnMut(ResolveOptions) -> CellResolver<C>,
+{
+    let what = format!("snapshot {snapshot} now {now}");
+    for versions in [0u32, 2] {
+        let expected = model_rows(h, snapshot, now, versions);
+        let mut r = make(options(h, snapshot, now, versions));
+        let got = scan_with(&mut r, || false);
+        match &expected {
+            Some(rows) => assert_eq!(
+                got.as_ref().ok(),
+                Some(&rows.concat()),
+                "{what}: scan v{versions}"
+            ),
+            None => assert!(got.is_err(), "{what}: scan v{versions} should fail"),
+        }
+        let Some(rows) = expected else { continue };
+
+        // Columns per row.
+        let limit = 1 + rng.below(2) as u32;
+        let mut o = options(h, snapshot, now, versions);
+        o.columns_per_row = limit;
+        let want: Vec<FullCell> = rows
+            .iter()
+            .flat_map(|row| columns(row).into_iter().take(limit as usize).flatten())
+            .collect();
+        assert_eq!(
+            scan_with(&mut make(o), || false),
+            Ok(want),
+            "{what}: columns_per_row {limit} v{versions}"
+        );
+
+        // A value predicate on each column's newest version.
+        let pred = match rng.below(3) {
+            0 => ValuePredicate::Prefix(vec![rng.below(256) as u8]),
+            1 => ValuePredicate::I64(std::cmp::Ordering::Greater, rng.below(400) as i64 - 200),
+            _ => ValuePredicate::Range(Bound::Included(vec![0x40]), Bound::Unbounded),
+        };
+        let mut o = options(h, snapshot, now, versions);
+        o.value = Some(pred.clone());
+        let want: Vec<FullCell> = rows
+            .iter()
+            .flat_map(|row| columns(row))
+            .filter(|col| pred.matches(&stored(&col[0].3)))
+            .flatten()
+            .collect();
+        assert_eq!(
+            scan_with(&mut make(o), || false),
+            Ok(want),
+            "{what}: predicate {pred:?} v{versions}"
+        );
+
+        // The caller skipping rows at random points.
+        let decide_seed = rng.next_u64();
+        let mut decide = Rng::new(decide_seed);
+        let mut want = Vec::new();
+        for row in &rows {
+            for c in row {
+                want.push(c.clone());
+                if decide.below(3) == 0 {
+                    break;
+                }
+            }
+        }
+        let mut decide = Rng::new(decide_seed);
+        let got = scan_with(&mut make(options(h, snapshot, now, versions)), || {
+            decide.below(3) == 0
+        });
+        assert_eq!(got, Ok(want), "{what}: skip_row v{versions}");
+    }
+
+    // A resolved-version time range (families with a merge operator, D22 amendment).
+    if h.family.max_versions == 0
+        && let Some(rows) = model_rows(h, snapshot, now, 0)
+    {
+        let lo = rng.below(h.last_ts + 60);
+        let hi = lo + rng.below(200);
+        let versions = rng.below(3) as u32;
+        let mut filter = ScanFilter::all();
+        let mut o = options(h, snapshot, now, versions);
+        o.route_time_range(&mut filter, Some((lo, hi)));
+        assert!(filter.time_range.is_none());
+        let want: Vec<FullCell> = rows
+            .iter()
+            .flat_map(|row| columns(row))
+            .flat_map(|col| {
+                let kept = col.into_iter().filter(|c| lo <= c.2 && c.2 < hi);
+                kept.take(if versions == 0 {
+                    usize::MAX
+                } else {
+                    versions as usize
+                })
+            })
+            .collect();
+        assert_eq!(
+            scan_with(&mut make(o), || false),
+            Ok(want),
+            "{what}: time range [{lo}, {hi}) v{versions}"
+        );
+    }
+}
+
+/// History length, scaled down under Miri.
+pub fn commits(n: usize) -> usize {
+    if cfg!(miri) { n.min(8) } else { n }
 }

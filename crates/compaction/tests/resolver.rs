@@ -16,11 +16,11 @@ use pigeonhole_format::{Cursor, Seqno, Timestamp};
 use pigeonhole_sim::Rng;
 use proptest::prelude::*;
 
-fn check_history(seed: u64, commits: usize) {
-    let h = random_history(seed, commits);
+fn check_history(seed: u64, n: usize) {
+    let h = random_history(seed, commits(n));
     let mut rng = Rng::new(seed ^ 0x5eed);
     let max = h.model.snapshot();
-    for _ in 0..4 {
+    for _ in 0..if cfg!(miri) { 1 } else { 4 } {
         let snapshot = 1 + rng.below(max.max(1));
         let now = h.last_ts + rng.below(400);
         let expected = model_reads(&h, snapshot, now);
@@ -45,6 +45,10 @@ fn check_history(seed: u64, commits: usize) {
             CellResolver::new(MergingCursor::new(sources), o)
         });
         assert_same(&format!("filtered, seed {seed}"), &expected, &actual);
+        check_extras(&h, snapshot, now, &mut rng, |o| {
+            let mut r = Rng::new(parts_seed);
+            CellResolver::new(MergingCursor::new(vec_sources(&h.entries, n, &mut r)), o)
+        });
     }
 }
 
@@ -61,7 +65,7 @@ proptest! {
 
 #[test]
 fn resolver_matches_model_fixed_seeds() {
-    for seed in 0..if cfg!(miri) { 2 } else { 64 } {
+    for seed in 0..if cfg!(miri) { 1 } else { 64 } {
         check_history(seed, 30);
     }
 }
@@ -283,4 +287,37 @@ fn merging_cursor_skip_row_spans_sources() {
     assert_eq!(m.key(), &key(b"t", b"a", 1, 2, Kind::Put)[..]);
     m.next().unwrap();
     assert!(!m.valid());
+}
+
+/// Proposed D22 amendment: for a merge family the time range applies to resolved versions,
+/// so a counter whose base is outside the range still sums it; pushing the range down to
+/// puts would drop the base and keep the operands.
+#[test]
+fn counter_time_range_applies_to_resolved_versions() {
+    let e = vec![
+        (key(b"r", b"n", 10, 1, Kind::Put), i64v(100)),
+        (key(b"r", b"n", 20, 2, Kind::Merge), i64v(1)),
+        (key(b"r", b"n", 30, 3, Kind::Merge), i64v(2)),
+    ];
+    let mut filter = ScanFilter::all();
+    let mut o = ResolveOptions::new(3, 100);
+    o.merge = Some(Arc::new(I64Add));
+    o.route_time_range(&mut filter, Some((25, 40)));
+    let src = FilteredCursor::new(VecCursor::new(e.clone()), filter);
+    let mut r = CellResolver::new(src, o.clone());
+    r.seek(b"").unwrap();
+    let c = r.next_cell().unwrap().unwrap();
+    assert_eq!((c.ts, c.value), (30, &i64v(103)[..]));
+    // Outside the range the folded version is not returned at all.
+    o.time_range = Some((0, 25));
+    assert_eq!(resolve(e.clone(), o), []);
+
+    // Pushed down (the old D22 rule), the base is dropped and the sum is wrong.
+    let mut pushed = ScanFilter::all();
+    pushed.time_range = Some((25, 40));
+    let mut o = ResolveOptions::new(3, 100);
+    o.merge = Some(Arc::new(I64Add));
+    let mut r = CellResolver::new(FilteredCursor::new(VecCursor::new(e), pushed), o);
+    r.seek(b"").unwrap();
+    assert_eq!(r.next_cell().unwrap().unwrap().value, i64v(3));
 }

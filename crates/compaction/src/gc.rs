@@ -136,6 +136,7 @@ pub(crate) struct Gc {
     gbase: Vec<usize>,
     acc: Vec<u8>,
     acc_key: Vec<u8>,
+    scratch: Vec<u8>,
 
     /// Live-byte change per blob file from dropped values.
     pub(crate) blob_delta: Vec<(BlobFileId, i64)>,
@@ -174,6 +175,7 @@ impl Gc {
             gbase: vec![0; n],
             acc: Vec::new(),
             acc_key: Vec::new(),
+            scratch: Vec::new(),
             blob_delta: Vec::new(),
             read: 0,
             kept: 0,
@@ -396,13 +398,19 @@ impl Gc {
             if e.kind == Kind::Merge
                 && let Some(op) = &self.merge
             {
-                if pending == Some(i)
-                    && op
-                        .merge(&mut self.acc, &self.group_data[value.clone()])
+                if pending == Some(i) {
+                    // Merge into a scratch copy: a failed merge may leave its accumulator
+                    // half-written, and the operands are then kept apart unchanged.
+                    self.scratch.clear();
+                    self.scratch.extend_from_slice(&self.acc);
+                    if op
+                        .merge(&mut self.scratch, &self.group_data[value.clone()])
                         .is_ok()
-                {
-                    self.kept -= 1;
-                    continue;
+                    {
+                        std::mem::swap(&mut self.acc, &mut self.scratch);
+                        self.kept -= 1;
+                        continue;
+                    }
                 }
                 if pending.is_some() {
                     out.push(&self.acc_key, &self.acc);
