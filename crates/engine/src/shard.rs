@@ -117,6 +117,9 @@ pub(crate) struct Shared {
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
+    /// A manifest (root) commit failed: the pager is poisoned (decision D58) and every later
+    /// write fails until the database is reopened.
+    pub pager_poisoned: AtomicBool,
     pub close: CloseState,
     pub metrics: Vec<ShardMetrics>,
     /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits.

@@ -322,6 +322,7 @@ impl Engine {
             })),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
+            pager_poisoned: AtomicBool::new(false),
             close: CloseState {
                 remaining: AtomicUsize::new(shards),
                 done: Mutex::new(None),
@@ -575,6 +576,7 @@ impl Engine {
             locks: Mutex::new(None),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
+            pager_poisoned: AtomicBool::new(false),
             close: CloseState::default(),
             metrics: Vec::new(),
             ts_floors: Vec::new(),
@@ -977,6 +979,12 @@ impl Inner {
         if self.closing.load(Ordering::Acquire) || self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
+        if self.shared.pager_poisoned.load(Ordering::Acquire) {
+            return Err(Error::Io(pigeonhole_io::Error::new(
+                ErrorKind::Other,
+                "a manifest commit failed earlier; reopen the database (decision D58)",
+            )));
+        }
         Ok(())
     }
 
@@ -1025,7 +1033,8 @@ impl Inner {
             .manifest
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .commit(&catalog, &edits)?;
+            .commit(&catalog, &edits)
+            .inspect_err(|_| self.shared.pager_poisoned.store(true, Ordering::Release))?;
         let catalog = Arc::new(catalog);
         let tablets = catalog.tablets();
         let live: HashSet<TabletId> = tablets.iter().map(|t| t.id).collect();
