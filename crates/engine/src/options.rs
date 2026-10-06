@@ -7,6 +7,17 @@ use pigeonhole_wal::WalOptions;
 
 /// Engine configuration. Process-local; nothing here is stored in the file except through
 /// table and family creation.
+///
+/// ```
+/// use pigeonhole_engine::EngineOptions;
+/// use pigeonhole_io::sim::SimVfs;
+///
+/// let mut options = EngineOptions::new(SimVfs::new(1));
+/// options.shards = 2;
+/// options.create_if_missing = true;
+/// assert_eq!(options.memtable_budget, 64 << 20);
+/// assert_eq!(options.memtable_freeze_bytes, 16 << 20);
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EngineOptions {
@@ -51,6 +62,24 @@ pub struct EngineOptions {
 impl EngineOptions {
     /// Defaults over the given filesystem.
     pub fn new(vfs: VfsRef) -> Self {
-        todo!()
+        let memtable_budget = 64 << 20;
+        Self {
+            vfs,
+            create_if_missing: false,
+            shards: 0,
+            pin_threads: true,
+            compaction_threads: 0,
+            durability: Durability::GroupSync,
+            memtable_budget,
+            memtable_freeze_bytes: memtable_budget / 4,
+            block_cache_bytes: 256 << 20,
+            row_cache_bytes: 0,
+            shm_dir: None,
+            reader_slots: 126,
+            wal: WalOptions::default(),
+            tablet_split_bytes: 256 << 20,
+            merge_operators: MergeRegistry::default(),
+            allow_unregistered_merge: false,
+        }
     }
 }

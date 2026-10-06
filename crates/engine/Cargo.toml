@@ -24,8 +24,19 @@ pigeonhole-sst = { workspace = true }
 pigeonhole-compaction = { workspace = true }
 arc-swap = { workspace = true }
 
+[features]
+# Test-only hooks (`Snapshot::at_seqno`); never enabled by the public crate.
+test-hooks = []
+
 [dev-dependencies]
 pigeonhole-sim = { workspace = true }
+pigeonhole-engine = { path = ".", features = ["test-hooks"] }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "engine"
+harness = false
 
 [lints]
 workspace = true
