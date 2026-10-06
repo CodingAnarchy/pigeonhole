@@ -147,7 +147,7 @@ fn io_errors_poison_shards_and_recover_on_reopen() {
     // Random read and write failures: a failed write or sync poisons the stream, commits
     // on it fail until the reopen, and whatever was acknowledged survives.
     let mut cfg = Config::standard(250);
-    cfg.faults.io_error_ppm = 3_000;
+    cfg.faults.io_error_ppm = 20_000;
     cfg.crash_ppm = 5_000;
     cfg.mid_commit_crash_ppm = 5_000;
     cfg.shards = 3;

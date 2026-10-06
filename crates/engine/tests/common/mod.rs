@@ -1421,7 +1421,8 @@ impl World {
                 );
             }
             // The commit timestamp: the clock when the commit ran alone, else the record's.
-            let ts = if inf.alone {
+            let ts = if c.durability == Durability::None {
+                // Never logged: it ran alone with the clock past every timestamp floor.
                 c.commit_ts.expect("alone commits know their timestamp")
             } else {
                 if logged.is_none() {
@@ -1489,6 +1490,9 @@ impl World {
             );
         }
         if self.in_flight.is_empty() {
+            // Every commit (and every aborted cross-shard one) may have consumed a default
+            // timestamp: move the clock past them all, so the next `None` commit, which
+            // runs alone, gets exactly the clock (decision D11's `max(now, floor + 1)`).
             if self.pending_advance > 0 {
                 self.vfs.advance(1_000 * self.pending_advance);
                 self.pending_advance = 0;
@@ -1686,6 +1690,7 @@ impl World {
             armed,
             alone: true,
         });
+        self.pending_advance = 2;
         Ok(())
     }
 
@@ -1760,16 +1765,24 @@ impl World {
         let interfere = rng.chance(500_000);
         if interfere {
             let (t, r, f) = reads[0].clone();
+            let value = if f.starts_with("counter") {
+                77i64.to_le_bytes().to_vec()
+            } else {
+                b"interferer".to_vec()
+            };
             let op = ModelOp::Put {
                 table: t,
                 row: r,
                 family: f,
                 qualifier: b"q0".to_vec(),
                 ts: None,
-                value: b"interferer".to_vec(),
+                value,
             };
             self.vfs.advance(1_000);
-            self.run_alone_now(vec![op], Durability::Buffered)?;
+            if !self.run_alone_now(vec![op], Durability::Buffered, rng)? {
+                // The engine crashed under the interferer; the transaction is moot.
+                return Ok(());
+            }
         }
         self.trace.push(format!(
             "txn {durability:?} ts={now} snapshot={snapshot} reads={}{} [{}]{}",
@@ -1800,38 +1813,100 @@ impl World {
             armed,
             alone: true,
         });
+        self.pending_advance = if interfere { 3 } else { 2 };
         Ok(())
     }
 
     /// Commits `ops` right now, driving the shards until it resolves (used for interference
-    /// inside a client step), and applies it to the model.
-    fn run_alone_now(&mut self, ops: Vec<ModelOp>, durability: Durability) -> Result<(), Fail> {
+    /// inside a client step), and applies it to the model. Returns false when the engine
+    /// crashed (or a stream failed) instead, after recovering.
+    fn run_alone_now(
+        &mut self,
+        ops: Vec<ModelOp>,
+        durability: Durability,
+        rng: &mut Rng,
+    ) -> Result<bool, Fail> {
         let now = self.now();
         let shards = self.shards_of(&ops);
         let batch = match self.store().batch(&ops) {
             Ok(b) => b,
             Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
         };
+        let unacked = Committed {
+            seqno: None,
+            ops: ops.clone(),
+            commit_ts: Some(now),
+            durability,
+            shards: shards.clone(),
+            acked: false,
+            kind: Kind::Plain,
+        };
         let mut pc = match self.store().engine.submit(batch, Some(durability)) {
             Ok(pc) => pc,
+            Err(e) if is_crashed(&e) => {
+                self.unacked.push(unacked);
+                self.crash_and_recover(CrashKind::Power, true, rng)?;
+                return Ok(false);
+            }
             Err(e) => return fail(FailureClass::Protocol, format!("submit: {e}")),
         };
-        let store = self.store.as_mut().expect("store open");
         let info = loop {
             match poll_commit(&mut pc) {
                 Poll::Ready(Ok(info)) => break info,
-                Poll::Ready(Err(e)) => {
-                    return fail(FailureClass::Protocol, format!("interferer: {e}"));
+                Poll::Ready(Err(Error::Busy)) => {
+                    self.stats.busy += 1;
+                    return Ok(true);
                 }
-                Poll::Pending => store.step_shards(self.vfs.monotonic_nanos()),
+                Poll::Ready(Err(e)) => {
+                    // Crashed, or a poisoned stream: unacknowledged; recover.
+                    drop(pc);
+                    self.unacked.push(unacked);
+                    let alive = self.alive();
+                    if alive {
+                        self.stats.io_errors += 1;
+                        self.trace
+                            .push(format!("  interferer failed ({e}); reopening"));
+                        self.crash_and_recover(CrashKind::Process, false, rng)?;
+                    } else {
+                        self.crash_and_recover(CrashKind::Power, true, rng)?;
+                    }
+                    return Ok(false);
+                }
+                Poll::Pending => {
+                    let now = self.vfs.monotonic_nanos();
+                    self.store.as_mut().expect("store open").step_shards(now);
+                }
+            }
+        };
+        if !self.alive() {
+            // The armed crash fired right after the record reached the kernel: the commit
+            // resolved, the engine is dead, and the record may be gone (a power loss).
+            drop(pc);
+            self.unacked.push(unacked);
+            self.stats.mid_commit_crashes += 1;
+            self.crash_and_recover(CrashKind::Power, true, rng)?;
+            return Ok(false);
+        }
+        let logged = self.logged_timestamps()?;
+        let ts = match logged.get(&info.seqno) {
+            Some(ts) => *ts,
+            None => {
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "interferer {} has no WAL record (records seen: {:?})",
+                        info.seqno,
+                        logged.keys().collect::<Vec<_>>()
+                    ),
+                );
             }
         };
         self.trace.push(format!(
-            "interferer {durability:?} ts={now} seqno={} [{}]",
+            "interferer {durability:?} ts={ts} seqno={} [{}]",
             info.seqno,
             ops.iter().map(show).collect::<Vec<_>>().join("; ")
         ));
-        let m = match self.model.try_commit(&ops, now, durability) {
+        let m = match self.model.try_commit(&ops, ts, durability) {
             Ok(m) => m,
             Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
         };
@@ -1848,14 +1923,14 @@ impl World {
             Committed {
                 seqno: Some(info.seqno),
                 ops,
-                commit_ts: Some(now),
+                commit_ts: Some(ts),
                 durability,
                 shards,
                 acked: true,
                 kind: Kind::Plain,
             },
         );
-        Ok(())
+        Ok(true)
     }
 
     fn step(&mut self, op: Op, rng: &mut Rng) -> Result<(), Fail> {
@@ -1910,13 +1985,11 @@ impl World {
                             break;
                         }
                     }
-                    // The groups assign up to `n` distinct default timestamps from the clock;
-                    // once they are done the clock moves past them, so the next lone
-                    // commit's timestamp is the clock again.
-                    self.pending_advance = n as u64;
+                    self.pending_advance = n as u64 + 1;
                 } else {
                     let (ops, d) = batch.pop().expect("one");
                     self.submit_plain(ops, d, true, rng)?;
+                    self.pending_advance = 1;
                 }
             }
             Op::Get {
