@@ -177,6 +177,8 @@ pub(crate) struct Shared {
     pub manifest_race_waiter:
         Mutex<Option<pigeonhole_runtime::Waiter<Result<pigeonhole_format::ManifestVersion>>>>,
     pub picker: PickerOptions,
+    /// How long a commit waits for arena room before `Busy`.
+    pub write_stall_timeout_nanos: u64,
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
@@ -1000,6 +1002,14 @@ impl Task for StallTimer {
     }
 }
 
+/// A group waiting for a flush to free memtable arena room (a write stall, counted in the
+/// metrics), refused with `Busy` once `write_stall_timeout_nanos` have passed.
+#[derive(Debug)]
+struct RoomWait {
+    since: u64,
+    timer: Arc<AtomicBool>,
+}
+
 /// A record of this stream the checkpoint cannot pass yet.
 #[derive(Debug)]
 struct Logged {
@@ -1135,6 +1145,8 @@ pub(crate) struct ShardState {
     flush_waiters: Vec<Notifier<Result<()>>>,
     /// A group is deferred until a flush frees arena room.
     wait_room: bool,
+    /// The wait for arena room in progress: when it began and its timeout timer.
+    room_wait: Option<RoomWait>,
     /// A freeze waits for the watermark to pass the memtable (registered in `Shared`).
     freeze_deferred: bool,
     /// A freeze of every memtable (`flush`, `compact`, close) is still owed: some memtable
@@ -1143,9 +1155,6 @@ pub(crate) struct ShardState {
     /// A flush failed while closing: the close gives up on flushing (the WAL keeps the data)
     /// and is not clean.
     flush_failed: bool,
-    /// The last flush failed: a group waiting for arena room is refused rather than kept
-    /// waiting for a retry that may never succeed.
-    flush_error: bool,
     /// Tablets dropped since open: their records need no flush before a checkpoint.
     dropped: HashSet<TabletId>,
 
@@ -1244,10 +1253,10 @@ impl ShardState {
             flush_running: false,
             flush_waiters: Vec::new(),
             wait_room: false,
+            room_wait: None,
             freeze_deferred: false,
             freeze_all_pending: false,
             flush_failed: false,
-            flush_error: false,
             dropped: HashSet::new(),
             log: VecDeque::new(),
             last_end: None,
@@ -1507,19 +1516,18 @@ impl ShardState {
         Ok(needed)
     }
 
-    fn release_room(&mut self, bytes: usize) {
-        self.reserved = self.reserved.saturating_sub(bytes);
+    /// The wait for arena room is over: account the stall and cancel its timer.
+    fn end_room_wait(&mut self, now: u64) {
+        if let Some(w) = self.room_wait.take() {
+            w.timer.store(true, Ordering::Release);
+            self.shared.metrics[usize::from(self.id.0)]
+                .stall_nanos
+                .fetch_add(now.saturating_sub(w.since), Ordering::Relaxed);
+        }
     }
 
-    /// Whether every memtable of this shard is empty, nothing is frozen and no flush runs:
-    /// no flush can free anything more.
-    fn nothing_to_flush(&self) -> bool {
-        !self.flush_running
-            && self.flush_queue.is_empty()
-            && self
-                .memtables
-                .values()
-                .all(|s| s.frozen.is_empty() && s.active.table.is_empty())
+    fn release_room(&mut self, bytes: usize) {
+        self.reserved = self.reserved.saturating_sub(bytes);
     }
 
     /// Freezes the active memtables that crossed the threshold during `apply` (or every
@@ -1693,7 +1701,6 @@ impl ShardState {
                 // at the next flush trigger, never in a tight loop. A poisoned pager stops
                 // flushing until reopen; a failure while closing makes the close unclean.
                 trace!("shard {} flush failed: {e}", self.id.0);
-                self.flush_error = true;
                 self.requeue_frozen();
                 // Whoever asked for this flush hears about the failure now rather than
                 // waiting for a retry that may never come (a dead device).
@@ -1710,7 +1717,7 @@ impl ShardState {
                     self.shared.close.failed.store(true, Ordering::Release);
                 }
                 if self.wait_room && !self.closing {
-                    // Let the waiting members fail with `Busy` rather than wait for ever.
+                    // The waiting members try the flush again (until their stall timeout).
                     self.wait_room = false;
                     let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
                 }
@@ -1723,7 +1730,6 @@ impl ShardState {
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
         self.compaction_backoff = false;
-        self.flush_error = false;
         self.check_flush_waiters();
         self.spawn_flush(ctx);
         self.maintain(ctx);
@@ -2275,16 +2281,14 @@ impl ShardState {
                         continue;
                     }
                     Err(Room::Wait) => {
-                        if (self.nothing_to_flush() || self.flush_error) && !self.wait_room {
-                            // No flush can free anything: refuse now rather than wait.
-                            let metrics = &self.shared.metrics[usize::from(self.id.0)];
-                            metrics.stalls.fetch_add(1, Ordering::Relaxed);
-                            m.failed = Some(Error::Busy);
+                        if self.shared.pager_poisoned.load(Ordering::Acquire) {
+                            // No flush can ever free anything: refuse now.
+                            m.failed = Some(poisoned_error());
                             self.settle(m, Ok(()), ctx);
                             continue;
                         }
-                        // Wait for a flush to free room: this member and everything after
-                        // it run in a later group.
+                        // Wait for a flush to free room (a write stall): this member and
+                        // everything after it run in a later group.
                         cut = true;
                         need_room = true;
                         self.pending.push(m);
@@ -2305,24 +2309,55 @@ impl ShardState {
         }
         if need_room {
             self.wait_room = true;
+            let now = ctx.now_nanos();
+            let timeout = self.shared.write_stall_timeout_nanos;
+            match &self.room_wait {
+                None => {
+                    // The stall begins: count it, and arm the timeout.
+                    let metrics = &self.shared.metrics[usize::from(self.id.0)];
+                    metrics.stalls.fetch_add(1, Ordering::Relaxed);
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    ctx.spawn(Box::new(StallTimer {
+                        vfs: Arc::clone(&self.shared.vfs),
+                        release_at: now.saturating_add(timeout),
+                        cancel: Arc::clone(&cancel),
+                        submitter: ctx.submitter(self.id).clone(),
+                    }));
+                    self.room_wait = Some(RoomWait {
+                        since: now,
+                        timer: cancel,
+                    });
+                }
+                Some(w) if now.saturating_sub(w.since) >= timeout => {
+                    // Nothing freed room in time: refuse the waiting members.
+                    self.end_room_wait(now);
+                    self.wait_room = false;
+                    let waiting = std::mem::take(&mut self.pending);
+                    for mut m in waiting {
+                        if matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                            self.pending.push(m);
+                            continue;
+                        }
+                        m.failed = Some(Error::Busy);
+                        self.settle(m, Ok(()), ctx);
+                    }
+                    return;
+                }
+                Some(_) => {}
+            }
+            // A flush frees room (one that failed is tried again).
             let _ = self.freeze(true);
             self.spawn_flush(ctx);
-            if self.nothing_to_flush() || self.flush_error {
-                // Nothing left to flush (or flushes fail) and still no room: fail the
-                // waiting members.
-                self.wait_room = false;
-                let waiting = std::mem::take(&mut self.pending);
-                for mut m in waiting {
-                    if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                        self.pending.push(m);
-                        continue;
-                    }
-                    m.failed = Some(Error::Busy);
-                    self.settle(m, Ok(()), ctx);
-                }
+        } else {
+            if let Some(w) = &self.room_wait
+                && !self.wait_room
+            {
+                let _ = w;
+                self.end_room_wait(ctx.now_nanos());
             }
-        } else if !self.pending.is_empty() {
-            let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+            if !self.pending.is_empty() {
+                let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+            }
         }
         if admitted.is_empty() {
             self.publish_watermark();

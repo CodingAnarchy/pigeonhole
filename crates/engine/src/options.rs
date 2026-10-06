@@ -61,6 +61,10 @@ pub struct EngineOptions {
     /// Compaction tuning (L0 trigger, level sizes, output SST size). The L0 trigger also
     /// drives write stalls.
     pub compaction: PickerOptions,
+    /// How long a commit waits for a flush to free memtable arena room before it is refused
+    /// with `Busy` (nanoseconds). A full arena stalls writers rather than refusing them; the
+    /// wait is counted in `Metrics::stalls`.
+    pub write_stall_timeout_nanos: u64,
 }
 
 impl EngineOptions {
@@ -85,6 +89,7 @@ impl EngineOptions {
             merge_operators: MergeRegistry::default(),
             allow_unregistered_merge: false,
             compaction: PickerOptions::default(),
+            write_stall_timeout_nanos: 30_000_000_000,
         }
     }
 }

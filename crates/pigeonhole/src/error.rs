@@ -149,10 +149,11 @@ impl From<pigeonhole_engine::Error> for Error {
         let message = match &e {
             // Built from the fields: the message does not depend on the operator's `Display`.
             E::Merge(m) => format!("merge operator {:?} failed: {}", m.operator, m.message),
-            // Until the engine flushes memtables to SSTs (engine Milestone B, #37) nothing
-            // frees the arena, so this is not a transient stall yet.
-            E::Busy => "memtable arena full: raise Options::memtable_budget (flush to SSTs \
-                        arrives with engine Milestone B, #37)"
+            // A write stall that outlasted the engine's timeout, or a batch larger than the
+            // arena: transient unless the batch itself cannot fit.
+            E::Busy => "memtable arena full: a flush did not free room within the write-stall \
+                        timeout, or one batch is larger than the arena; retry, or raise \
+                        Options::memtable_budget"
                 .to_owned(),
             _ => e.to_string(),
         };

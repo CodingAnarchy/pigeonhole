@@ -51,14 +51,14 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | 21 | `Closed` | The database is closed. | A table or snapshot handle used after `close()`. | Reopen the database. |
 | 22 | `NoReaderSlot` | Every reader slot in the shared-memory region is taken. | Too many concurrent reader processes. | Close idle readers, then retry. |
 | 23 | `RecordTooLarge` | A commit is too large for one WAL record. | A very large `WriteBatch`. | Split it into smaller batches (each atomic on its own). |
-| 24 | `Busy` | Writes are stalled and the call asked not to wait. | Phase 1: the memtable arena is full. Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)) nothing frees it, so this is **permanent**, not a stall. | **Do not retry.** Raise `Options::memtable_budget` (or use more shards) and reopen. Once flushes land, `Busy` becomes a transient write stall: back off and retry. |
+| 24 | `Busy` | Writes are stalled past the engine's write-stall timeout, or one batch cannot fit the memtable arena. | The memtable arena is full and a flush did not free room within the timeout (a slow disk, or snapshots pinning memtables), or a single batch is larger than the arena. | **Transient: back off and retry.** A batch that keeps failing is larger than the arena: split it, or raise `Options::memtable_budget`. |
 
 ## Handling guide
 | Situation | Action |
 |---|---|
 | Retryable | `Conflict` (retry the whole transaction); `WriterLocked` (after the other writer exits); `NoSpace` and `Io` once the cause is fixed; `NoReaderSlot` (after a reader process closes). |
 | Programmer error | `FamilyNotFound`, `TableNotFound`, `TableExists`, `FamilyExists`, `KeyTooLarge`, `ValueTooLarge`, `RecordTooLarge` (split the batch), `MergeFailed` (bad operand or mixed counter data), `InvalidArgument`, `Unsupported`, `Closed`, `ReadOnly`. Fix the code or the data model. |
-| Configuration | `Busy` in Phase 1 (memtable budget too small; see its row), `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
+| Configuration | `Busy` for a batch larger than the arena (see its row), `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
 | Data integrity | `Corruption`. Do not retry; restore from backup. |
 
 If this table disagrees with `crates/pigeonhole/src/error.rs`, the source wins; please report it.

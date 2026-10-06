@@ -50,4 +50,4 @@ Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledg
 ## Q: How does a group waiting for arena room learn that a flush freed some?
 `ShardArena` reports free bytes only through `reserve`; nothing signals the shard when `reclaim` returns memory.
 
-**Interim behavior:** a flush completion (`Flushed`) and every `Maintain` message re-run `reserve_room` for the waiting group (`refresh_free`), and the shard `Kick`s itself. A batch that can never fit in an empty arena fails with `Busy` at once.
+**Interim behavior:** a group that finds no room waits (a write stall, counted in `Metrics::stalls` with its duration): the shard freezes and flushes, and a flush completion (`Flushed`), every `Maintain` message and the stall's timeout timer re-run `reserve_room` for the waiting group (`refresh_free`). A flush that fails is tried again on the next retry. The wait ends with `Busy` only after `EngineOptions::write_stall_timeout_nanos` (30 s by default) passed without room, or at once for a batch that can never fit an empty arena, or with the poison error when the pager is poisoned.

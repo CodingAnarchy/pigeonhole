@@ -681,3 +681,166 @@ fn a_manifest_request_pushed_in_the_release_window_is_committed() {
     assert!(db.snapshot().unwrap().view().manifest_version() >= before + 2);
     db.close().unwrap();
 }
+
+// ---- a full arena stalls writers while a slow flush frees it, never refuses them ----
+
+/// A VFS whose syncs take real time, as a slow disk's would.
+#[derive(Debug)]
+struct SlowSyncVfs {
+    inner: Arc<SimVfs>,
+    delay: std::time::Duration,
+}
+
+#[derive(Debug)]
+struct SlowSyncFile {
+    inner: pigeonhole_io::FileRef,
+    delay: std::time::Duration,
+}
+
+impl Vfs for SlowSyncVfs {
+    fn open(
+        &self,
+        path: &Path,
+        opts: pigeonhole_io::OpenOptions,
+    ) -> pigeonhole_io::Result<pigeonhole_io::FileRef> {
+        let inner = self.inner.open(path, opts)?;
+        Ok(Arc::new(SlowSyncFile {
+            inner,
+            delay: self.delay,
+        }))
+    }
+    fn remove(&self, path: &Path) -> pigeonhole_io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn exists(&self, path: &Path) -> pigeonhole_io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn list_dir(&self, dir: &Path) -> pigeonhole_io::Result<Vec<std::path::PathBuf>> {
+        self.inner.list_dir(dir)
+    }
+    fn sync_dir(&self, dir: &Path) -> pigeonhole_io::Result<()> {
+        std::thread::sleep(self.delay);
+        self.inner.sync_dir(dir)
+    }
+    fn open_shared(
+        &self,
+        name: &str,
+        dir: Option<&Path>,
+        len: u64,
+        mode: pigeonhole_io::SharedOpen,
+    ) -> pigeonhole_io::Result<pigeonhole_io::SharedRegion> {
+        self.inner.open_shared(name, dir, len, mode)
+    }
+    fn remove_shared(&self, name: &str, dir: Option<&Path>) -> pigeonhole_io::Result<()> {
+        self.inner.remove_shared(name, dir)
+    }
+    fn now_micros(&self) -> u64 {
+        self.inner.now_micros()
+    }
+    fn monotonic_nanos(&self) -> u64 {
+        self.inner.monotonic_nanos()
+    }
+    fn current_process(&self) -> pigeonhole_io::ProcessId {
+        self.inner.current_process()
+    }
+    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
+        self.inner.process_alive(process)
+    }
+}
+
+impl pigeonhole_io::File for SlowSyncFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.inner.read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.inner.write_at(buf, offset)
+    }
+    fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        self.inner.submit_read(buf, offset)
+    }
+    fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        self.inner.submit_write(buf, offset)
+    }
+    fn sync_data(&self) -> pigeonhole_io::Result<()> {
+        std::thread::sleep(self.delay);
+        self.inner.sync_data()
+    }
+    fn submit_sync_data(&self) -> pigeonhole_io::Completion<()> {
+        std::thread::sleep(self.delay);
+        self.inner.submit_sync_data()
+    }
+    fn sync_all(&self) -> pigeonhole_io::Result<()> {
+        std::thread::sleep(self.delay);
+        self.inner.sync_all()
+    }
+    fn len(&self) -> pigeonhole_io::Result<u64> {
+        self.inner.len()
+    }
+    fn set_len(&self, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn allocate(&self, offset: u64, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.allocate(offset, len)
+    }
+    fn lock(&self, byte: u64, mode: pigeonhole_io::LockMode) -> pigeonhole_io::Result<()> {
+        self.inner.lock(byte, mode)
+    }
+    fn unlock(&self, byte: u64) -> pigeonhole_io::Result<()> {
+        self.inner.unlock(byte)
+    }
+    fn identity(&self) -> pigeonhole_io::Result<pigeonhole_io::FileIdentity> {
+        self.inner.identity()
+    }
+    fn is_local(&self) -> pigeonhole_io::Result<bool> {
+        self.inner.is_local()
+    }
+}
+
+#[test]
+fn a_full_arena_stalls_writers_until_a_slow_flush_frees_it() {
+    // Syncs take 2 ms, so flushes lag the writer far behind: the arena fills many times
+    // over, and every commit waits for room rather than being refused.
+    let vfs: VfsRef = Arc::new(SlowSyncVfs {
+        inner: SimVfs::new(43),
+        delay: std::time::Duration::from_millis(2),
+    });
+    let mut o = EngineOptions::new(Arc::clone(&vfs));
+    o.create_if_missing = true;
+    o.shards = 1;
+    o.pin_threads = false;
+    o.memtable_budget = 256 << 10;
+    o.memtable_freeze_bytes = 16 << 10;
+    o.wal.segment_size = 256 << 10;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    // Four writers, 32 KiB batches: the arena (256 KiB) fills in a few commits while each
+    // flush spends milliseconds in syncs.
+    let value = vec![9u8; 1024];
+    std::thread::scope(|s| {
+        for w in 0..4u32 {
+            let (db, t, value) = (&db, &t, &value);
+            s.spawn(move || {
+                for i in 0..60u32 {
+                    let mut wb = WriteBatch::new();
+                    for j in 0..32u32 {
+                        put(
+                            &mut wb,
+                            t,
+                            format!("w{w}-{i:03}-{j:02}").as_bytes(),
+                            b"q",
+                            value,
+                        );
+                    }
+                    db.commit(wb, Some(Durability::Buffered)).unwrap();
+                }
+            });
+        }
+    });
+    let m = db.metrics();
+    assert!(m.flushes >= 8, "{m:?}");
+    assert!(m.stalls.0 > 0, "writers were never stalled: {m:?}");
+    assert_eq!(row_count(&db, &t), 4 * 60 * 32);
+    db.close().unwrap();
+}

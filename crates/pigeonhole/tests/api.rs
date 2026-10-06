@@ -319,8 +319,9 @@ fn every_engine_error_maps_to_its_code() {
         let what = format!("{e:?}");
         let message = match &e {
             E::Merge(_) => "merge operator \"op\" failed: bad".to_owned(),
-            E::Busy => "memtable arena full: raise Options::memtable_budget (flush to SSTs \
-                        arrives with engine Milestone B, #37)"
+            E::Busy => "memtable arena full: a flush did not free room within the write-stall \
+                        timeout, or one batch is larger than the arena; retry, or raise \
+                        Options::memtable_budget"
                 .to_owned(),
             _ => e.to_string(),
         };

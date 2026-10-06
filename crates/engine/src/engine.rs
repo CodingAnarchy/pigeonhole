@@ -467,6 +467,7 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             manifest_race_waiter: Mutex::new(None),
             picker: options.compaction.clone(),
+            write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(Some(Locks {
                 _writer: writer_lock,
                 presence,
@@ -908,6 +909,7 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             manifest_race_waiter: Mutex::new(None),
             picker: options.compaction.clone(),
+            write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(None),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
