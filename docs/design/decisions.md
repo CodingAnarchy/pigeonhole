@@ -1,40 +1,42 @@
 # Decisions log
 
-Project-level decisions that refine or deviate from [spec.md](spec.md) and [task-briefs.md](task-briefs.md). Newest last. An entry here wins over those files. Agents: when the spec is silent or contradictory, add a question under **Open questions** instead of guessing; the coordinator turns answers into numbered decisions.
+Project-level decisions that refine or deviate from [spec.md](spec.md) and [task-briefs.md](task-briefs.md). Newest last. An entry here wins over those files. Every entry is numbered and approved. Agents: when the spec is silent or contradictory, record the question and your interim behavior in `docs/design/questions/<crate>.md` instead of guessing (see [questions/README.md](questions/README.md)); the coordinator turns answers into numbered decisions here and tracks deferred work as GitHub issues ([status](../status.md#tracked-follow-ups)).
 
-## D1 — `pigeonhole-sim` does not depend on `pigeonhole`
+## D1 — `pigeonhole-sim` does not depend on `pigeonhole` (approved)
 The spec lists `pigeonhole` as a dependency of `sim` ("drives the public API from above"). That creates a cycle the moment `engine` or `pigeonhole` use `sim` in tests. Instead `sim` depends only on `io` and `format`; the full-stack simulation suites live in `crates/pigeonhole/tests/` and `crates/engine/tests/`, which take `pigeonhole-sim` as a dev-dependency. Same coverage, strictly downward graph.
 
-## D2 — the simulated VFS lives in `pigeonhole-io`
+## D2 — the simulated VFS lives in `pigeonhole-io` (approved)
 Per the io brief, `SimVfs` (fault injection, deterministic from a seed) is an `io` backend at `pigeonhole_io::sim`. `pigeonhole-sim` builds the scheduler, crash points and reference model on top of it.
 
-## D3 — writer lock is a byte-range lock on the lock page
+## D3 — writer lock is a byte-range lock on the lock page (approved)
 "Multi-process readers" mentions `flock`; "Files and locks" specifies byte-range locks on a reserved lock page (OFD on Linux, `fcntl` with a per-process registry on macOS/BSD, `LockFileEx` on Windows). The more specific section wins.
 
-## D4 — interface-freeze gate
+## D4 — interface-freeze gate (approved)
 The spec gates the interface freeze on owner review. The owner directed autonomous progress, so the coordinator reviews and approves interfaces, records the approval here, and the owner may revisit at any time through an interface-change request.
 
 **Approved 2026-10-05:** the interface freeze (PR #1), including D7–D24 as revised after review.
 
-## D5 — reference hardware
+**Approved 2026-10-06 (decisions audit, owner decisions U1–U4):** D25–D61. Every entry in this log is approved; the Open questions section is empty.
+
+## D5 — reference hardware (approved)
 No enterprise-NVMe Linux box with power-loss protection is attached to this project yet. Benchmarks run on available hardware (developer macOS arm64 and GitHub Linux runners), are reported in every run, and are labeled as non-reference. Performance gates are evaluated against those numbers until reference hardware is available.
 
-## D6 — dependency policy
+## D6 — dependency policy (approved)
 Allowed licenses: MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, Unicode-3.0, CC0-1.0 (enforced by `deny.toml`). Engine crates keep dependencies minimal; each new dependency gets a one-line justification in the PR description.
 
-## D7 — manifest is a snapshot block plus a delta log (revised after review)
+## D7 — manifest is a snapshot block plus a delta log (approved; revised after review)
 The spec calls the manifest "a small copy-on-write tree"; the format brief calls for "manifest edit records". The manifest is one immutable snapshot block (the whole state as edits) in its own extent, plus one 256 KiB delta-log extent holding consecutive delta blocks, one per manifest commit. The superblock names both and the log's live length. A commit appends its delta past the live end of the log (bytes no root references, so nothing live is overwritten and the superblock flip stays the only in-place write of live data) and then commits the root; the root commit's first sync covers the delta, so a commit costs two syncs and no new extent. When the log is full or outgrows the snapshot, the writer writes a new snapshot and an empty log. Open always reads exactly three things (superblocks, snapshot, live log), keeping it well under the 5 ms target, and readers catch up by reading only new log bytes. The first proposal (one extent and fsync per delta, chain of up to 64) failed the open-time budget. Root commits run off the shard foreground loop (D30). Layout: FORMAT §9.
 
 ## D8 — the free-space bitmap is not persisted (approved)
 The pager keeps the bitmap in memory and rebuilds it at open from the live extents the manifest names (the manifest snapshot and delta log, SSTs, blob extents). The engine reads the manifest anyway at open, so this costs nothing extra, a crash can never leak an extent, and no persisted bitmap can disagree with the manifest.
 
-## D9 — family-in-row deletes use a marker key; BigTable delete rule (revised after review)
-A family-in-row delete is the key `[row][00 01][00 00][!ts][!seqno][FamilyDelete]`: `00 00` never appears in an escaped string and sorts before every qualifier, so a reader sees a row's markers before its cells. **Delete rule:** a `ColumnDelete` or `FamilyDelete` with timestamp `T` hides every version in its scope with timestamp `<= T` regardless of seqno (so a later put with an older timestamp stays hidden); a `CellDelete` hides exactly the versions at its timestamp; seqnos decide only snapshot visibility. Point gets use `CellResolver::seek_column`, which seeks each source to the row's marker prefix before the column (one extra seek per source, normally inside an already-loaded block); filters add a marker key so a column-filter miss never hides a marker.
+## D9 — family-in-row deletes use a marker key; BigTable delete rule (approved; revised after review)
+A family-in-row delete is the key `[row][00 01][00 00][!ts][!seqno][FamilyDelete]`: `00 00` never appears in an escaped string and sorts before every qualifier, so a reader sees a row's markers before its cells. **Delete rule:** a `ColumnDelete` or `FamilyDelete` with timestamp `T` hides every version in its scope with timestamp `<= T` regardless of seqno (so a later put with an older timestamp stays hidden); a `CellDelete` hides exactly the versions at its timestamp, also regardless of seqno (D38); seqnos decide only snapshot visibility. Point gets use `CellResolver::seek_column`, which seeks each source to the row's marker prefix before the column (one extra seek per source, normally inside an already-loaded block); filters add a marker key so a column-filter miss never hides a marker.
 
 ## D10 — a whole-row delete is one family marker per family (approved)
 Each family is its own tree, so there is no single place for a row tombstone. `delete_row` writes a `FamilyDelete` marker into every family of the table in the same atomic commit. Families added later cannot hold older data for that row, so nothing is missed.
 
-## D11 — timestamps are microseconds; default timestamps never go backwards (revised after review)
+## D11 — timestamps are microseconds; default timestamps never go backwards (approved; revised after review)
 Timestamps are microseconds since the Unix epoch. Each tablet keeps a floor: the largest default timestamp assigned to it. The default timestamp is `max(now_micros, floor + 1)`. The floor travels with a tablet when it moves between shards, is persisted as `ts_floor` in the manifest's `Counters` edit (the maximum over tablets at each manifest commit), and at open starts from `max(ts_floor, largest commit_ts replayed from the WAL)`, so a clock step back or a restart never reorders default timestamps. User-supplied timestamps are taken as microseconds for TTL.
 
 ## D12 — `WriteBatch::commit()` uses the writer default (approved)
@@ -49,7 +51,7 @@ A `FamilyId` is never shared across tables, so `(TabletId, FamilyId)` names one 
 ## D15 — shared vocabulary types live in `format` (approved)
 Ids, `Seqno`, `Timestamp`, `Lsn`, `Durability` and the `Cursor` trait are used by nearly every crate; `format` is the only crate all of them depend on, so they live there rather than being duplicated.
 
-## D16 — value size limits (revised after review)
+## D16 — value size limits (approved; revised after review)
 The blob pointer stores the length as a `u32`, so the ceiling is `2^32 - 1` bytes, one short of the spec's 4 GiB. Until blob separation lands, Phase 1 rejects at write time, with `ValueTooLarge`, any value larger than `min(WAL segment payload, 64 MiB max extent, half the shard's memtable arena)`. Phase 2 blob separation lifts this: blob pointers address a logical blob file whose payload spans many extents, so a value can exceed one extent with no format change.
 
 ## D17 — the `async` feature is off by default until Phase 3 (approved)
@@ -58,7 +60,7 @@ The spec makes `async` a default-on feature. In Phase 1 it gates only an empty p
 ## D18 — filters are cache-line-blocked bloom filters in Phase 1 (approved)
 The spec allows "a ribbon (or blocked bloom) filter". Blocked bloom is simpler and fast enough for Phase 1; the filter block's kind byte leaves room for ribbon later without a format break.
 
-## D19 — read-your-writes: commits return once visible (revised after review)
+## D19 — read-your-writes: commits return once visible (approved; revised after review)
 A shard publishes a group's seqnos only after the group's WAL write meets the strongest level any member requested, and a commit returns only once it is durable at its level **and** `visible_seqno >= seqno`, so a caller always reads its own write. Idle shards publish `pending = u64::MAX` and never hold back the watermark. Cost: a cross-shard commit becomes visible only after every participant applies, so its latency includes the slowest participant's group, and any shard's in-flight group briefly delays visibility for all. A reader can still observe a `Buffered` or `None` commit that a later power loss removes; that is inherent in those levels.
 
 ## D20 — a changed shard count flushes recovered data before dropping streams (approved)
@@ -67,8 +69,8 @@ The spec replays every WAL stream at open regardless of shard count. If streams 
 ## D21 — lock page byte assignments (approved)
 Refines D3. On page 2: offset 8192 is the writer byte, 8193 the presence byte, 8194 an shm-init byte held exclusive while a process creates, validates or rebuilds the shared-memory region (so two processes opening at once never both build it). Locks never block; callers retry.
 
-## D22 — filter pushdown semantics, uniform across sources (revised after review)
-`format::scan::ScanFilter` holds the entry-safe conditions (qualifier selection, time range on puts) and one rule, `ScanFilter::admits`. Delete entries, family markers and merge operands always pass: hiding a delete would resurrect older versions, and dropping some operands would produce partial counters. `SstIter` applies it inside the block decoder; memtable sources are wrapped in `compaction::FilteredCursor`, so every source filters identically. Version count, columns per row and value predicates need snapshot visibility and run in `CellResolver`, still before materialization; a value predicate tests the newest visible value of a column. The sst acceptance test (pushdown equals filter-after) is defined over these semantics.
+## D22 — filter pushdown semantics, uniform across sources (approved; revised after review)
+`format::scan::ScanFilter` holds the entry-safe conditions (qualifier selection, time range on puts) and one rule, `ScanFilter::admits`. **Amended in the audit:** the qualifier selection applies to every cell entry, deletes and merge operands included (nothing of an excluded column is returned, so its deletes and operands cannot change a result, and `next_admissible` can seek past excluded columns); the time range applies to puts only, so deletes and merge operands always pass it (hiding a delete would resurrect older versions, and dropping some operands would produce partial counters); family markers always pass. `admits` and `next_admissible` agree, so pushdown still equals filter-after. `SstIter` applies it inside the block decoder; memtable sources are wrapped in `compaction::FilteredCursor`, so every source filters identically. Version count, columns per row and value predicates need snapshot visibility and run in `CellResolver`, still before materialization; a value predicate tests the newest visible value of a column. The sst acceptance test (pushdown equals filter-after) is defined over these semantics.
 
 ## D23 — one shared-memory view record carries the tablet map and memtables (approved)
 The spec lists "the current tablet map" and published views separately. A view already includes the tablet map, so the region holds one double-buffered view record (tablet map, memtable roots, manifest version) published by a single pointer swap; a reader can never pair a tablet map with the wrong memtables.
@@ -76,64 +78,118 @@ The spec lists "the current tablet map" and published views separately. A view a
 ## D24 — WAL checkpoints never strand a prepared commit (approved)
 A participant's PREPARE is applied at recovery only if the coordinator's stream still holds the COMMIT. So a stream's checkpoint may not pass a COMMIT record until every participant's share of that commit is flushed (its `SetFlushed` covers the seqno). The engine computes checkpoints with this rule.
 
-## D25 — WAL segments are chained; recovery never appends to a torn segment (proposed after review)
+## D25 — WAL segments are chained; recovery never appends to a torn segment (approved)
 Each segment header records its predecessor's epoch and the offset where the predecessor's data ends. A writer syncs a full segment before writing its successor's header, and after recovery starts a new segment (epoch above every epoch in any header) chained to where replay ended, never appending to the torn one. Replay distinguishes end of segment (a successor names this exact stop offset) from end of log (no successor), and treats a successor naming a different offset as corruption. This closes the hole where stale-but-valid-looking data past a torn tail, or a later segment, could be resurrected. FORMAT §10.
 
-## D26 — a cross-shard commit's id is its seqno (proposed after review)
+## D26 — a cross-shard commit's id is its seqno (approved)
 The coordinator reserves one seqno per cross-shard commit; PREPARE and COMMIT records carry it and no separate commit id exists. Recovery raises `next_seqno` above every seqno in every replayed record, including discarded PREPAREs, so an id is never reused. A coordinator keeps each such seqno in its `held` set, and every `pending` watermark it publishes is `min(held, ..)`, so no snapshot sees half of the commit (FORMAT §11.3).
 
-## D27 — a shared-memory directory plus generation-named regions (proposed after review)
+## D27 — a shared-memory directory plus generation-named regions (approved)
 A one-page directory region with a fixed, never-changing layout records the current generation; the region itself is named with its generation. A writer builds a new generation, marks the old region abandoned, then updates the directory. Readers detect staleness with two atomic loads and re-attach. Changing the name per generation also avoids Windows reusing a named mapping still held by an old process.
 
-## D28 — an oversized view is refused, never truncated (proposed after review)
+## D28 — an oversized view is refused, never truncated (approved)
 View buffers default to 4 MiB (configurable). If an encoded view would not fit, `publish_view` fails with `ViewTooLarge` and the writer refuses the change that grew it (typically a split), keeping the old view; this surfaces in metrics instead of corrupting readers.
 
-## D29 — small memtable values are copied; one-shot gets avoid view refcounts (proposed after review)
-`CellData` copies memtable values of at most 128 bytes (and merge results and blob reads); larger memtable values are pinned by `ArenaSlice` plus an `Arc<View>`. `Engine::get_latest` loads the view through an `arc-swap` guard, so a hot small point get touches no shared reference count.
+## D29 — small memtable values are copied; one-shot gets avoid view refcounts (approved)
+`CellData` copies memtable values of at most 128 bytes (and merge results and blob reads); larger memtable values are pinned by `ArenaSlice` plus an `Arc<View>`. `Engine::get_latest` loads the view through an `arc-swap` guard, so a hot small point get touches no shared reference count. The threshold is to be confirmed by benchmark once the engine exists ([#15](https://github.com/CodingAnarchy/pigeonhole/issues/15)).
 
-## D30 — no fsync on a shard's foreground loop (proposed after review)
+## D30 — no fsync on a shard's foreground loop (approved)
 WAL group syncs use `Wal::submit_sync` and root commits use `Pager::submit_commit_root`; both return `io::Completion`s served by the I/O backend (the pread pool now, io_uring in Phase 3). Shards keep draining queues and building the next group while syncs run; the manifest task on shard 0 is a background task that waits on its completion.
 
-## D31 — merge operators are associative folds (proposed after review)
+**One recorded exception (audit, K5/K19).** FORMAT §10.1 rule 1 requires a full WAL segment to be durable before its successor's header is written. When a recyclable or prepared spare slot is ready, `WalStream`'s rollover submits that sync too, and the next write waits for it before writing the successor's header (normally it has already completed). A rollover syncs inline, on the shard thread, **only when no prepared spare is ready** (it then takes a blank slot or grows the file inline). Both are counted in metrics (`WalStream::inline_rollover_syncs`, `WalStream::inline_grows`) and stay at zero when spares are prepared in time (D35). Making rollover fully off-thread is Phase 3 work ([#19](https://github.com/CodingAnarchy/pigeonhole/issues/19)).
+
+## D31 — merge operators are associative folds (approved)
 `MergeOperator` is `merge(acc, older)` plus `finish(base, acc)`. The resolver streams operands newest first into one accumulator, with no buffered copies; compaction without a base keeps the accumulator as one combined operand. Non-associative operators are not supported.
 
-## D32 — cursors own what they read (proposed after review)
+## D32 — cursors own what they read (approved)
 `BlockIter<B: Deref<Target = [u8]>>` owns its byte owner (a `BlockHandle` in practice), `SstIter` owns an `Arc<SstReader>`, and `MemIter` owns a `MemtableReader` clone. Scan cursors and compaction jobs can then store their sources without self-references or `unsafe`, and values stay zero-copy.
 
-## D33 — configuration structs are non-exhaustive (proposed after review)
+## D33 — configuration structs are non-exhaustive (approved)
 Option and config structs (`EngineOptions`, `ShmConfig`, `WalOptions`, `RuntimeConfig`, `SstWriterOptions`, `ReadOptions`, `ScanFilter`, `ResolveOptions`, `PickerOptions`, `GcPolicy`, `JobContext`, `ReadSpec`, `ScanSpec`, `FaultPlan`, `OpenOptions`, `WorkloadSpec`) are `#[non_exhaustive]` with a constructor or `Default`, so adding a field is not a breaking change. `EngineOptions.embedding` was dropped: the open function chooses the mode.
 
 ## D34 — a commit holds one entry per (column, timestamp); last write wins (approved)
 Within one commit, multiple mutations to the same `(table, row, family, qualifier, timestamp)` collapse to the last one written, at batch-build time (`format`'s `BatchBuilder` or the engine's `WriteBatch` enforces it), because internal keys order entries by `[!ts][!seqno]` and kind only, so write order inside a commit cannot be expressed. `pigeonhole-sim`'s `Model` matches. A family or row delete marker at timestamp `T` in the same commit as a put with timestamp `<= T` hides that put (the marker rule is ts-based, regardless of seqno).
 
-## D?? — WAL spare segments are zero-filled off the shard thread (proposed by wal)
+## D35 — WAL spare segments are zero-filled off the shard thread (approved)
 A freshly allocated slot (`fallocate`) still costs a metadata update at its first fdatasync, so the spec's "fdatasync on preallocated blocks, no metadata update" needs slots that were zero-filled and synced before use. `WalStream` never does that on the shard thread: `SpareSegments::prepare(n)` (a `Send + Sync` handle from `Wal::spares()`) allocates, zero-fills and syncs spare slots on a background task the engine runs; a rollover takes a recyclable slot first, then a prepared one, and only grows the file inline when it has neither, counted in `WalStream::inline_grows()` for metrics. `create` and `into_stream` zero-fill the one slot they start in at open. A failed write or sync poisons the stream (`Error::Poisoned`) until it is reopened through `Recovery`, so a later successful sync can never acknowledge commits behind a hole.
 
+## D36 — reader processes open the database file read-write (approved; owner decision U1)
+POSIX `fcntl` (and Linux OFD) locks refuse a write lock on a descriptor opened read-only; Windows `LockFileEx` does not. For backend parity `pigeonhole-io` refuses `LockMode::Exclusive` on a read-only handle with `ErrorKind::Unsupported` on every platform and in `SimVfs`. The shm-init byte and the presence-byte "last one out" upgrade (D21) are exclusive, so **every process, readers included, opens the `.phdb` file read-write**; a reader writes nothing to it. This is the same requirement SQLite has in WAL mode: reader processes need write permission on the file, and a database on read-only media cannot be opened by readers. The spec's "`open_reader` opens a read-only handle" means the API handle (no write methods), not the OS file mode. Documented on `Pigeonhole::open_reader`, `Engine::open_reader`, in the guide's concepts page and in the agent reference.
+
+## D37 — Windows lock upgrades are not atomic; the writer opens shared memory before taking `Presence` (approved; audit C1, K10)
+`LockFileEx` cannot convert a held shared lock, so `PreadVfs` unlocks, tries exclusive, and re-takes shared on failure; if another process takes the byte exclusively in that window, the shared lock is lost (the call still reports `Locked`). That is accepted in `pigeonhole-io`. **No caller may upgrade a lock it must keep.** The only such caller was shm's layout-version probe (D45), which upgraded the writer's held presence lock. The writer's order is therefore `WriterLock::acquire` → `Pager::open` and manifest → `ShmRegion::open(Role::Writer)` → `Presence::acquire`, on one handle. `ShmRegion::open` probes presence from no lock and then takes it shared **before** publishing the new generation, so a closing process can never remove a generation being built; the later `Presence::acquire` only returns the guard. Because the writer is not present between taking the writer byte and opening shared memory, last-one-out cleanup (removing WAL files and the region) must also take the writer byte, which a writer holds while it opens. Engine work: [#20](https://github.com/CodingAnarchy/pigeonhole/issues/20).
+
+## D38 — a cell delete is timestamp-only (approved; owner decision U2)
+A `CellDelete` at timestamp `T` hides every version at exactly `T` **whatever its seqno**, including a put or merge operand at `T` committed after the delete, uniform with the column and family rule of D9 (and with HBase). Seqnos only decide what a snapshot sees: a snapshot taken before the delete still sees the version. A cell cannot be rewritten at the same timestamp while the marker exists; write the replacement at another timestamp. Compaction drops the marker only at the bottommost level together with everything at `T` it covers. FORMAT §2, the sim `Model` (ICR 0003) and the guide state this. Resolver and GC work: [#25](https://github.com/CodingAnarchy/pigeonhole/issues/25).
+
+## D39 — a row read returns families in creation order, or in the caller's order (approved; owner decision U3)
+Within a row, cells come by family, then qualifier, then newest version first. Families come in creation order (`FamilyId` order, which the engine iterates anyway), or, when the read lists families, in the listed order (a family listed twice appears once). The sim `Model` and its test adapters follow this (ICR 0003); the guide states it. Engine work: [#26](https://github.com/CodingAnarchy/pigeonhole/issues/26).
+
+## D40 — `compaction_cores(k)` is refused in application-owned mode (approved; owner decision U4)
+Application-owned mode starts no threads (spec "Threading"), so `compaction_cores(k)` with `k > 0` together with `open_application_owned` fails at open with `InvalidArgument`, before anything is opened, instead of being silently ignored. `pin_threads` does not apply in that mode and is ignored. `pigeonhole-runtime` enforces its half now (`Runtime::application_owned` returns `Error::InvalidConfig`); the option's rustdoc and the guide document it. Engine enforcement: [#22](https://github.com/CodingAnarchy/pigeonhole/issues/22).
+
+## D41 — merge folding across timestamps; a non-`i64` base fails (approved; audit K14, K15, C2)
+`Incr` operands carry the commit timestamp, while a base put may carry an older or explicit one. Walking a column newest first, a run of operands folds into one version at the newest operand's timestamp, consuming the next older put as its base, with wrapping addition; deletes and TTL apply to entries before folding and `max_versions` after. So an expired base is dropped before folding and the counter restarts from the operands, which is accepted. A base whose value is not an 8-byte `i64` makes the read fail with `MergeFailed`, as the guide promises (never silently 0). A put no operand folds onto is returned as written. `Incr` on a family without the `i64` operator is rejected (`ModelError::NoMergeOperator` in the model; the engine maps its typed error to the same case). The sim model implements this (ICR 0003). Compaction's `I64Add`: [#21](https://github.com/CodingAnarchy/pigeonhole/issues/21).
+
+## D42 — the reference model's crash windows (approved; audit K11)
+After a power loss the model promises every commit up to the last `GroupSync`/`Sync` one; after a process crash, every commit up to the last `Buffered`-or-stronger one. Survivors are always a prefix (the spec's "only a suffix is lost"), so `None` commits before a stronger one are durable too, as the spec's durability section states. A commit in flight at a crash is registered with `Durability::None`. `Model::recover` truncates to the survivors and, after power loss, marks them durable.
+
+## D43 — WAL segments are at most 4 GiB − 32 KiB (approved; audit K13, C6)
+FORMAT §10.1 stores `prev_end` as a `u32`, so a record ending exactly at the end of a 4 GiB segment could not be named. `pigeonhole-wal` refuses a `segment_size` above `4 GiB − 32 KiB` (one frame less) with `InvalidArgument`; `SegmentHeader::decode` still accepts up to 4 GiB, which is harmless. FORMAT §10.1 and `WalOptions::segment_size` state the cap.
+
+## D44 — shared-memory region names are at most 30 bytes (approved; audit K16, C7)
+`phdb-<16 hex>-<generation hex>` must fit macOS's `PSHMNAMLEN` of 31 bytes, which counts the leading `/` that `shm_open` needs, so names are at most 30 bytes (generations below 2^32). Generations grow by one per writer open, so this is unreachable in practice; the shm crate checks the length and fails clearly. FORMAT §11 states the limit.
+
+## D45 — "no other process attached" for a layout-version rebuild is decided by the presence byte (approved; audit K17)
+A writer that finds a live region with another layout version cannot read that region's slot table, so it probes the presence byte: an exclusive lock through its own handle succeeds only if no other process has the database open. The byte is then left shared (the writer is present). Under D37 the writer holds no presence lock when it probes, so no held lock is ever upgraded. No ICR was needed.
+
+## D46 — only `active` reader slots are reclaimed (approved; audit K18)
+A slot in the transient `claiming` state has no trustworthy pid yet (the previous owner's may still be there), so a process that dies between its CAS and its `active` store leaks one slot until the next writer generation clears the table. Reclaiming `claiming` slots by a stale pid could free a slot under a live claimant.
+
+## D47 — the writer removes the old generation's name after switching (approved; audit K20)
+`open(Role::Writer)` removes the old region's name right after the directory names the new generation; mappings other processes still hold stay valid and they re-attach by the new name. Without this every writer restart would leak a `/dev/shm` object (or a file in `shm_dir`) until the last process's `ShmRegion::remove`, which only knows the current generation.
+
+## D48 — `read_view` before the first publish returns an empty view 0 (approved; audit K21)
+A reader that attaches before the writer's first `publish_view` sees an empty `ViewRecord` with `view_version` 0 and the current manifest version ("no tablets"), not an error. Pinning view 0 means "no view", which is harmless because nothing is reclaimable yet.
+
+## D49 — runtime shutdown, pinning and handler counts (approved; audit K22)
+`Runtime::shutdown` handles every queued message but drops unfinished background tasks, so the engine must finish or persist flush and manifest work before calling it ([#16](https://github.com/CodingAnarchy/pigeonhole/issues/16)). Pinning is best-effort where the OS has no affinity control (`Unsupported` is ignored); any other pin failure fails `Runtime::start` with `Error::Spawn`. A handler count that differs from the shard count is a programming error and panics.
+
+## D50 — pinned cache blocks may hold a shard over capacity; `erase_file` drops unpinned blocks only (approved; audit K23)
+`pigeonhole-cache` lets a shard run over capacity while everything evictable is pinned and shrinks it on that shard's next insert (no hook on handle drop, so the hit path stays a refcount decrement). `erase_file` drops only unpinned blocks; pinned ones age out normally (file ids are never reused). The 10-thread hit cost (about 366 ns/op under a mutex per shard) is Phase 3 tuning ([#18](https://github.com/CodingAnarchy/pigeonhole/issues/18)).
+
+## D51 — a checkpoint may name a WAL segment that never reached the disk (approved; audit K24)
+After a power loss the manifest can hold `Lsn(e, X)` while no segment with epoch `e` exists (a `Buffered` commit opened segment `e`, was flushed and checkpointed, and `e` was never synced). `Recovery` treats the missing segment as one that stopped exactly at `X`: a successor chained to `(e, X)` continues the log, otherwise the log ends at the checkpoint, and a header with an epoch above `e` that nothing reaches is corruption. `into_stream` always picks an epoch above the recovered end's epoch. A file with no valid header and a nonzero checkpoint is reported as corruption; `create` syncs the first header, so that case cannot arise.
+
+## D52 — memtable accounting and misuse (approved; audit K25)
+`allocated_bytes` counts arena chunk bytes (not entry bytes); an insert into a frozen memtable is a programming error and panics; a malformed key read back from an arena is `Corrupt`. A 1M-entry lookup measured about 490 ns against the 300 ns target; that is accepted for cache-resident sizes and tracked as Phase 3 tuning ([#17](https://github.com/CodingAnarchy/pigeonhole/issues/17)).
+
+## D53 — `Vfs` edge cases (approved; audit K26)
+`allocate` extends the file length; `create` implies `write`; on Windows `remove_shared` without a directory is a no-op (named mappings vanish with their last handle); a zero-length shared region is refused; a zero-length `allocate` is a no-op.
+
+## D54 — `format` keeps a minimal decoder surface (approved; audit K27)
+`FrameDecoder` has no position accessor (the WAL computes positions itself); one is added by ICR only if a caller needs it. `FamilyOptions::default` is the spec's defaults. The `format::Error::InvalidArgument` variant of ICR 0001 maps to the engine's `InvalidArgument` (code 19) once the engine's conversion exists ([#14](https://github.com/CodingAnarchy/pigeonhole/issues/14)).
+
+## D55 — `sync_data` does not make a length change durable (approved; audit C3)
+`File::sync_data` (fdatasync) makes written bytes durable but callers may not rely on it for a size change; after `set_len`, `allocate` or a write past the end, `sync_all` is needed before the new length must survive a power loss. `SimVfs` models exactly that: a power loss reverts the length to the last `sync_all`'s (data synced past it is lost; an unsynced shrink reads back as zeros), unless a fault plan is active, in which case the pending length may survive. The stricter model found one real bug: `Pager::allocate` grew the file and root commits synced with `sync_data`, so a power loss after a commit could cut the file short of a published extent. The pager now calls `sync_all` once per file growth. The WAL already did (`allocate` + `sync_all` for every new slot).
+
+## D56 — shared memory is little-endian only (approved; audit C4, C5)
+The memtable arena and the shm region are accessed as native-endian atomics while FORMAT.md fixes integers as little-endian, so `pigeonhole-memtable` and `pigeonhole-shm` refuse to build on big-endian targets (`compile_error!`). Every process mapping a region runs on one host, so this loses nothing on supported platforms. FORMAT §11.6 lists `min_seqno` as atomic, as implemented.
+
+## D57 — the pager's clean-close flag outlives the open that read it (approved; pager question)
+Bit 0 of the superblock flags is set by `mark_clean` and cleared only by the next root commit, so a writer that opens a cleanly closed file, appends WAL records and crashes before any root commit leaves it set. The pager reports the flag as stored; the engine never skips WAL replay because of it (or commits a root right after opening if it ever does). Engine duty: [#23](https://github.com/CodingAnarchy/pigeonhole/issues/23).
+
+## D58 — a failed root commit poisons the pager (approved; pager question)
+Once a commit's first sync is issued, a failure leaves the on-disk root uncertain, and an fsync error may have dropped written pages, so retrying could publish a root over lost bytes. Every later `commit_root`, `submit_commit_root` and `mark_clean` fails; the engine surfaces the error and requires a reopen, which recovers to the last durable root ([#23](https://github.com/CodingAnarchy/pigeonhole/issues/23)).
+
+## D59 — a crash inside `Pager::create` can leave a file with no valid superblock (approved; the engine's recovery policy awaits the owner in #24)
+Nothing was ever committed to such a file, and `Pager::open` fails with `Error::Format`. Whether the engine's open-or-create path recreates a file matching "exists, no valid superblock, length <= 64 KiB" automatically, or refuses it, is a product question put to the owner ([#24](https://github.com/CodingAnarchy/pigeonhole/issues/24)); until then the engine must not delete it.
+
+## D60 — `shrink_plan` cannot tell published extents from in-flight output (approved; pager question)
+The pager tracks allocated versus retired, not which extents the manifest names, so the plan lists every non-retired extent past the shrink point. The engine relocates only extents its manifest names (or shrinks with no flush or compaction output in flight). `relocate` fails with `NoSpace` when no free extent of that size lies below the one being moved ([#23](https://github.com/CodingAnarchy/pigeonhole/issues/23)).
+
+## D61 — `reclaim` is clamped to the durable root (approved; pager question)
+`reclaim(oldest_live)` frees nothing newer than the manifest version of the last *completed* root commit, because until the root that drops an extent is durable a crash recovers to a root that still references it; `truncate_tail` releases nothing while a commit is in flight. Callers may retire and reclaim right after submitting a commit; the extents are freed by a later `reclaim` once it completes ([#23](https://github.com/CodingAnarchy/pigeonhole/issues/23)).
+
 ## Open questions
-- **Q1 (io): exclusive locks need a writable handle.** POSIX `fcntl` (and Linux OFD) locks refuse a write lock on a descriptor opened read-only (`EBADF`); Windows `LockFileEx` does not. For backend parity, `pigeonhole-io` refuses `LockMode::Exclusive` on a read-only handle with `ErrorKind::Unsupported` on every platform and in `SimVfs`. Consequence for `shm`/`engine`: a reader process that must try the presence-byte upgrade at close ("last one out", D21) needs its main-file handle opened with `write: true` (it still writes nothing). Alternative: open reader handles read-only and skip the upgrade for readers, leaving cleanup to the writer or the next opener. Interim behavior: the refusal above.
-- **Q2 (io): Windows shared-to-exclusive upgrade is not atomic.** `LockFileEx` cannot convert a held shared lock, so `PreadVfs` unlocks, tries exclusive, and re-takes shared on failure. If another process takes the byte exclusively in that window, the shared lock is lost (the call still reports `Locked`). Only the presence-byte "last one out" check upgrades, at close, where losing the shared lock is harmless. Interim behavior: as described; flag if a caller ever upgrades a lock it must keep.
-- **Q?? (sim/model): `CellDelete` versus later writes.** Beyond D34 (same-commit collapse), a `CellDelete` hides only versions at its timestamp with an older seqno, so a later put at that timestamp is visible again. At one timestamp across commits the newest-seqno put is the version, older entries there are shadowed, and merge operands newer than that put fold onto it. Engine crates are checked against this until a decision says otherwise.
-- **Q?? (sim/model): merge-operand folding across timestamps.** `Incr` operands carry the commit timestamp, while a base put may have an older (or explicit) one. Interim model behavior: walking a column newest first, a run of operands folds into one version at the newest operand's timestamp, consuming the next older put as its base (an `i64`; a base that is not 8 bytes counts as 0), with wrapping addition; deletes and TTL apply to entries before folding, `max_versions` after. `Incr` on a family without the `i64` operator is `ModelError::NoMergeOperator`; the engine's typed error should map to it.
-- **Q?? (sim/model): result order across families.** Reads return cells ordered by family name, then qualifier, then timestamp descending. If the engine orders families by `FamilyId` (declaration order), either the model or the test adapters must normalize; the model sorts by name for determinism.
-- **Q?? (sim/model): crash windows.** The model promises after a power loss every commit up to the last `GroupSync`/`Sync` one, after a process crash every commit up to the last `Buffered`-or-stronger one, and that survivors are a prefix (the spec's "only a suffix is lost"); `None` commits before a stronger one are therefore durable too, as the spec's durability section states. A commit in flight at a crash is registered with `Durability::None`. `Model::recover` was added (it truncates and, after power loss, marks survivors durable); no frozen signature changed.
-- **Q?? (format): does a `ScanFilter`'s qualifier selection apply to deletes and merge operands?** D22 says deletes, family markers and merge operands "always pass". That holds for the time range, but for the qualifier selection it would make `ScanFilter::next_admissible` useless: any skipped column might hold an admitted delete, so no seek could ever skip a column. Nothing of an excluded column is ever returned, so its deletes and operands cannot change a result. Interim behavior: the qualifier selection applies to every cell entry, deletes and merges included; the time range applies to puts only; family markers always pass. `admits` and `next_admissible` agree, so pushdown still equals filter-after. Please confirm or amend D22.
-- **Q?? (format): `prev_end` cannot name the end of a full 4 GiB segment.** FORMAT §10.1 allows segments up to 4 GiB but stores `prev_end` as a `u32`, so a record ending exactly at the end of a 4 GiB segment gives `prev_end = 2^32`. Interim behavior: `SegmentHeader::decode` accepts sizes up to 4 GiB. Suggest capping `segment_size` at `4 GiB - 32 KiB`, enforced by the WAL crate when it creates a stream.
-- **Q?? (format): region names can exceed 31 bytes.** `phdb-<16 hex>-<generation hex>` fits in 31 bytes only for generations below `2^36`, or below `2^32` if macOS's `PSHMNAMLEN` counts the leading `/` that `shm_open` needs. Interim behavior: `region_name` follows FORMAT §11. Generations grow by one per writer open, so this is unreachable in practice, but the shm crate should check the length and fail clearly.
-
-### Q1 — does the qualifier selection of a `ScanFilter` apply to deletes and merge operands? (format agent)
-D22 says delete entries, family markers and merge operands "always pass". That reasoning holds for the time range, but for the qualifier selection it would make `ScanFilter::next_admissible` useless: every skipped column might hold an admitted delete, so no seek could ever skip a column. Nothing of an excluded column is ever returned, so its deletes and operands cannot change a result. **Chosen for now:** the qualifier selection applies to every cell entry (deletes and merges included); the time range applies to puts only; family markers always pass. `admits` and `next_admissible` agree on this, so pushdown still equals filter-after. Please confirm or amend D22.
-
-### Q2 — `prev_end` cannot name the end of a full 4 GiB segment (format agent)
-FORMAT §10.1 allows segments up to 4 GiB and stores `prev_end` as a `u32`. A record that ends exactly at the end of a 4 GiB segment gives `prev_end = 2^32`, which does not fit. **Chosen for now:** nothing changes in the format crate; `SegmentHeader::decode` accepts sizes up to 4 GiB. Suggest capping `segment_size` at `4 GiB - 32 KiB` (the WAL crate can enforce this when creating streams).
-
-### Q3 — region names exceed 31 bytes for large generations (format agent)
-`phdb-<16 hex>-<generation hex>` stays within 31 bytes only for generations below `2^36`, and macOS's `PSHMNAMLEN` (31) may count the leading `/` that `shm_open` needs, which leaves room for generations below `2^32`. **Chosen for now:** `region_name` is implemented as FORMAT §11 specifies. Generations grow by one per writer open, so this cannot be reached in practice; the shm crate should check the length and fail clearly anyway.
-
-- **Q?? (shm): "no other process attached" for a layout-version rebuild is decided by the presence byte.** A writer that finds a live region with another layout version cannot read that region's slot table (it may be laid out differently), so it probes the presence byte: an exclusive lock through its own handle succeeds only if no other process has the database open. The byte is then converted back to shared, so the presence lock the writer already holds on that handle is kept (and a writer that held none is now simply present, as it is while the file is open). Assumes the writer passes the same handle to `ShmRegion::open` as to `Presence::acquire`, which the engine's open sequence does. Alternative: an explicit `attached: bool` from the engine; needs an ICR.
-- **Q?? (shm): only `active` slots are reclaimed.** A slot in the transient `claiming` state has no trustworthy pid yet (the previous owner's may still be there), so a process that dies between its CAS and its `active` store leaks one slot until the next generation. Reclaiming `claiming` slots by the stale pid could free a slot under a live claimant. **Chosen for now:** leak the slot; the next writer rebuild clears it.
-- **Q?? (shm): the writer removes the old generation's name after abandoning it.** FORMAT §11 says a writer marks the old region abandoned and names the new generation in the directory; it does not say when the old name goes. Without removing it, every writer restart leaks a `/dev/shm` object (or a file in `shm_dir`) until the last process's `ShmRegion::remove`, which only knows the current generation. **Chosen for now:** `open(Role::Writer)` removes the old name right after the directory switch; mappings readers still hold stay valid and they re-attach by the new name.
-- **Q?? (shm): `read_view` before any view is published.** Returns an empty `ViewRecord` with `view_version` 0 and the current manifest version, rather than an error: a reader that attaches before the writer's first publish sees "no tablets", and pinning view 0 means "no view", which is harmless because nothing is reclaimable yet. Flag if an error is preferred.
-- **Q?? (runtime): background tasks at shutdown, and `compaction_threads` in application-owned mode.** The spec says the engine starts no threads in application-owned mode but also offers `compaction_cores(k)`. Interim behavior: `Runtime::application_owned` ignores `compaction_threads` and `pin_threads` (tasks run on the shards); `Runtime::shutdown` handles every queued message but drops unfinished background tasks, so the engine must finish or persist flush/manifest work before calling it. Pinning is best-effort where the OS has no affinity control (`Unsupported` is ignored); any other pin failure fails `Runtime::start` with `Error::Spawn`.
-- **Q?? (cache): pinned blocks and capacity.** The spec says eviction respects pins but not what happens when pins hold a shard over capacity, or what `erase_file` does with a pinned block. `pigeonhole-cache` lets a shard run over capacity while everything evictable is pinned and shrinks it on that shard's next insert (no hook on handle drop, so the hit path stays a refcount decrement); `erase_file` drops only unpinned blocks, as its doc says, and pinned ones age out normally (file ids are never reused). Alternative: `erase_file` also unindexes pinned blocks (their bytes stay valid through the `Arc`), freeing their accounting immediately. Interim behavior: as described.
-- **Q?? (wal): a segment rollover fdatasyncs on the shard thread.** FORMAT §10.1 rule 1 says a full segment is synced before its successor's header is written, and D30 says no fsync runs on a shard's foreground loop. `WalStream::append` resolves this with one blocking `sync_data` per segment (every 64 MiB by default), then buffers the successor's header with the group that caused the rollover. Alternative: defer the header write until a submitted sync of the old segment completes, which needs the shard to stall its next `write()` anyway. Interim behavior: the blocking per-segment sync.
-- **Q?? (wal): a checkpoint may name a segment that never reached the disk.** The engine checkpoints positions whose data was flushed, synced or not, so after a power loss the manifest can hold `Lsn(e, X)` while no segment with epoch `e` exists (a `Buffered` commit opened segment `e`, was flushed and checkpointed, and `e` was never synced). FORMAT §10.1 says replay starts at the checkpoint's segment but not what a missing one means. Chosen for now: `Recovery` treats the missing segment as one that stopped exactly at `X`: a successor chained to `(e, X)` continues the log, otherwise the log ends at the checkpoint, and a header with an epoch above `e` that nothing reaches is reported as corruption. `into_stream` always picks an epoch above the recovered end's epoch (not just above every header), so the new segment never chains to its own epoch.
+_None._

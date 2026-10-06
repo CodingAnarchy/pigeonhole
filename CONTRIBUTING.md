@@ -22,7 +22,7 @@ Pigeonhole is built by a mix of humans and coding agents. The rules below apply 
 - Frozen interfaces change only through an **interface-change request**: add a short note to `docs/design/icr/NNNN-title.md` naming the change and every caller, and get it approved before changing code.
 - No new dependency without a passing `cargo deny check` and a one-line justification in the PR.
 - A task is done when its brief's acceptance tests and the workspace simulation suite pass in CI. **Nothing merges on red.**
-- When the spec is silent or contradictory, stop and add a question to `docs/design/decisions.md` under *Open questions* instead of guessing.
+- When the spec is silent or contradictory, stop and record the question and your interim behavior in `docs/design/questions/<crate>.md` (see its [README](docs/design/questions/README.md)) instead of guessing; the coordinator turns it into a numbered decision.
 
 ## Workflow
 1. Work on a branch (`crate/<name>-<topic>`), ideally in its own git worktree.
