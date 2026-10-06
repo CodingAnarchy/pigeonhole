@@ -9,8 +9,13 @@
 //!
 //! The model, precisely:
 //!
-//! - **Files.** Reads see every completed write (the page cache). `sync_data` and `sync_all`
-//!   make everything written to that file so far durable (size included).
+//! - **Files.** Reads see every completed write (the page cache). `sync_all` makes
+//!   everything written to that file so far durable, size included. `sync_data` makes the
+//!   written bytes durable but not the file's length: a size change (`set_len`, `allocate`,
+//!   or a write past the end) since the last `sync_all` is durable only after the next
+//!   `sync_all`. A power loss before then reverts the length to the last `sync_all`'s (data
+//!   synced past it is lost; a shrink that was not made durable reads back as zeros), unless
+//!   a fault plan is active, in which case the pending length may survive.
 //! - **Directory entries.** Creating or removing a file changes the visible namespace at
 //!   once, but the change is durable only after [`Vfs::sync_dir`] on its parent directory. A
 //!   power loss reverts unsynced creations and removals, like a real filesystem. Directories
@@ -122,7 +127,7 @@ pub enum CrashKind {
 /// let file = vfs.open(path, OpenOptions::read_write_create())?;
 /// vfs.sync_dir(Path::new("/db"))?;
 /// file.write_at(b"durable", 0)?;
-/// file.sync_data()?;
+/// file.sync_all()?; // the write grew the file, so `sync_data` alone would not do
 /// file.write_at(b"lost", 7)?;
 ///
 /// vfs.crash(CrashKind::Power);
@@ -180,8 +185,10 @@ struct SimState {
 struct Node {
     /// What reads see.
     data: Vec<u8>,
-    /// What the disk holds.
+    /// The data the disk holds, including bytes synced by `sync_data` past `durable_len`.
     durable: Vec<u8>,
+    /// The file length the disk's metadata holds (as of the last `sync_all`).
+    durable_len: usize,
     /// Changes since the last sync, in order.
     pending: Vec<Pending>,
     /// Live handles and the process that opened each.
@@ -309,6 +316,10 @@ impl SimState {
             for node in self.nodes.values_mut() {
                 let pending = std::mem::take(&mut node.pending);
                 let mut image = std::mem::take(&mut node.durable);
+                // A length synced only by `sync_data` survives only by luck.
+                if image.len() != node.durable_len && !((torn || reorder) && self.rng.coin()) {
+                    image.resize(node.durable_len, 0);
+                }
                 if reorder {
                     for op in &pending {
                         if self.rng.coin() {
@@ -329,6 +340,7 @@ impl SimState {
                     }
                 }
                 node.data.clone_from(&image);
+                node.durable_len = image.len();
                 node.durable = image;
             }
         }
@@ -501,6 +513,21 @@ impl SimFile {
             Ok(())
         })
     }
+
+    /// Makes the pending writes durable, and the length too when `metadata` is set.
+    fn sync(&self, metadata: bool) -> Result<()> {
+        self.with(|st| {
+            let node = st.node(self.node);
+            for op in std::mem::take(&mut node.pending) {
+                apply(&mut node.durable, &op);
+            }
+            if metadata {
+                node.durable_len = node.durable.len();
+            }
+            st.mutated();
+            Ok(())
+        })
+    }
 }
 
 impl Drop for SimFile {
@@ -578,14 +605,7 @@ impl File for SimFile {
     }
 
     fn sync_data(&self) -> Result<()> {
-        self.with(|st| {
-            let node = st.node(self.node);
-            for op in std::mem::take(&mut node.pending) {
-                apply(&mut node.durable, &op);
-            }
-            st.mutated();
-            Ok(())
-        })
+        self.sync(false)
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
@@ -593,7 +613,7 @@ impl File for SimFile {
     }
 
     fn sync_all(&self) -> Result<()> {
-        self.sync_data()
+        self.sync(true)
     }
 
     fn len(&self) -> Result<u64> {

@@ -61,6 +61,10 @@ pub trait File: Send + Sync + Debug {
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion;
 
     /// Makes written data durable (fdatasync / F_FULLFSYNC / FlushFileBuffers).
+    ///
+    /// Callers may not rely on it to make a length change durable: after `set_len`,
+    /// `allocate` or a write past the end, call [`File::sync_all`] before depending on the
+    /// new length surviving a power loss. `SimVfs` enforces this.
     fn sync_data(&self) -> Result<()>;
 
     /// Submits [`File::sync_data`] and returns at once; the backend runs it off the caller's

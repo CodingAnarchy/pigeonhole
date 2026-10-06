@@ -41,11 +41,76 @@ fn power_loss_keeps_only_synced_data() {
     let vfs = SimVfs::new(1);
     let f = create_durable(&vfs, "f");
     f.write_at(b"synced", 0).unwrap();
-    f.sync_data().unwrap();
+    f.sync_all().unwrap();
     f.write_at(b"!unsynced", 6).unwrap();
     f.set_len(100).unwrap();
     vfs.crash(CrashKind::Power);
     assert_eq!(contents(&vfs, "f"), b"synced");
+}
+
+#[test]
+fn sync_data_does_not_persist_a_length_change() {
+    let vfs = SimVfs::new(11);
+    let f = create_durable(&vfs, "f");
+    f.write_at(b"head", 0).unwrap();
+    f.sync_all().unwrap();
+    // Growth by a write past the end, then by `allocate`: data synced, length not.
+    f.write_at(b"tail", 4).unwrap();
+    f.allocate(0, 4096).unwrap();
+    f.write_at(b"in-extent", 1000).unwrap();
+    f.sync_data().unwrap();
+    assert_eq!(f.len().unwrap(), 4096, "reads see the new length");
+    vfs.crash(CrashKind::Power);
+    assert_eq!(contents(&vfs, "f"), b"head", "seed 11");
+
+    // `sync_all` makes the same sequence durable.
+    let f = vfs
+        .open(&path("f"), OpenOptions::read_write_create())
+        .unwrap();
+    f.allocate(0, 4096).unwrap();
+    f.write_at(b"in-extent", 1000).unwrap();
+    f.sync_all().unwrap();
+    vfs.crash(CrashKind::Power);
+    let after = contents(&vfs, "f");
+    assert_eq!(after.len(), 4096, "seed 11");
+    assert_eq!(&after[1000..1009], b"in-extent", "seed 11");
+}
+
+#[test]
+fn sync_data_does_not_persist_a_shrink() {
+    let vfs = SimVfs::new(12);
+    let f = create_durable(&vfs, "f");
+    f.write_at(b"0123456789", 0).unwrap();
+    f.sync_all().unwrap();
+    f.set_len(4).unwrap();
+    f.sync_data().unwrap();
+    vfs.crash(CrashKind::Power);
+    // The old length comes back; the cut bytes read as zeros.
+    assert_eq!(contents(&vfs, "f"), b"0123\0\0\0\0\0\0", "seed 12");
+}
+
+#[test]
+fn sync_data_length_may_survive_under_faults() {
+    // With a fault plan active, a length synced only by `sync_data` survives on some seeds
+    // and not on others; the data synced inside it is intact whenever it does.
+    let (mut kept, mut lost) = (false, false);
+    for seed in 0..64 {
+        let vfs = SimVfs::with_faults(seed, plan(|p| p.torn_writes = true));
+        let f = create_durable(&vfs, "f");
+        f.allocate(0, 512).unwrap();
+        f.write_at(b"data", 0).unwrap();
+        f.sync_data().unwrap();
+        vfs.crash(CrashKind::Power);
+        match contents(&vfs, "f").as_slice() {
+            [] => lost = true,
+            bytes => {
+                assert_eq!(bytes.len(), 512, "seed {seed}");
+                assert_eq!(&bytes[..4], b"data", "seed {seed}");
+                kept = true;
+            }
+        }
+    }
+    assert!(kept && lost);
 }
 
 #[test]
@@ -140,7 +205,7 @@ fn torn_outcome(seed: u64, plan: FaultPlan) -> Vec<u8> {
     let vfs = SimVfs::with_faults(seed, plan);
     let f = create_durable(&vfs, "f");
     f.set_len(4096).unwrap();
-    f.sync_data().unwrap();
+    f.sync_all().unwrap();
     f.write_at(&[0xAB; 4096], 0).unwrap();
     vfs.crash(CrashKind::Power);
     contents(&vfs, "f")
@@ -174,7 +239,7 @@ fn survivors(seed: u64, plan: FaultPlan) -> [bool; 3] {
     let vfs = SimVfs::with_faults(seed, plan);
     let f = create_durable(&vfs, "f");
     f.set_len(3 * 512).unwrap();
-    f.sync_data().unwrap();
+    f.sync_all().unwrap();
     for i in 0..3u64 {
         f.write_at(&[1 + i as u8; 512], i * 512).unwrap();
     }
@@ -237,8 +302,8 @@ fn io_error_injection_rate() {
     );
 }
 
-/// A tiny log: append fixed records, syncing every third one. Returns how many records were
-/// acknowledged as synced before the first error.
+/// A tiny log: append fixed records, syncing every third one (`sync_all`, since appends grow
+/// the file). Returns how many records were acknowledged as synced before the first error.
 fn log_workload(vfs: &SimVfs) -> usize {
     let Ok(f) = vfs.open(&path("log"), OpenOptions::read_write_create()) else {
         return 0;
@@ -252,7 +317,7 @@ fn log_workload(vfs: &SimVfs) -> usize {
             break;
         }
         if i % 3 == 2 {
-            if f.sync_data().is_err() {
+            if f.sync_all().is_err() {
                 break;
             }
             synced = i as usize + 1;

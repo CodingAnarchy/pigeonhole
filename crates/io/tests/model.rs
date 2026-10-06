@@ -1,5 +1,6 @@
 //! Property test: random operation sequences agree with a `Vec<u8>` model on both backends,
-//! and a fault-free power loss restores exactly the last synced model state.
+//! and a fault-free power loss restores exactly the last synced model state: the bytes as of
+//! the last sync of either kind, at the length as of the last `sync_all`.
 
 mod common;
 
@@ -14,7 +15,8 @@ enum Op {
     SetLen(u64),
     Allocate(u64, u64),
     Read(u64, usize),
-    Sync,
+    SyncData,
+    SyncAll,
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -24,15 +26,18 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (0..7000u64).prop_map(Op::SetLen),
         1 => (0..6000u64, 0..2000u64).prop_map(|(o, l)| Op::Allocate(o, l)),
         3 => (0..7000u64, 0..600usize).prop_map(|(o, l)| Op::Read(o, l)),
-        1 => Just(Op::Sync),
+        1 => Just(Op::SyncData),
+        1 => Just(Op::SyncAll),
     ]
 }
 
-/// Runs `ops` against `b` and the model; returns the model as of the last sync.
+/// Runs `ops` against `b` and the model; returns what a fault-free power loss keeps: the
+/// bytes as of the last sync, resized to the length as of the last `sync_all`.
 fn run(b: &Backend, ops: &[Op]) -> Result<Vec<u8>, TestCaseError> {
     let f = b.create("model");
     let mut model: Vec<u8> = Vec::new();
     let mut synced = Vec::new();
+    let mut synced_len = 0;
     for op in ops {
         match op {
             Op::Write(off, data) => {
@@ -67,13 +72,19 @@ fn run(b: &Backend, ops: &[Op]) -> Result<Vec<u8>, TestCaseError> {
                     }
                 }
             }
-            Op::Sync => {
+            Op::SyncData => {
                 f.sync_data().unwrap();
                 synced.clone_from(&model);
+            }
+            Op::SyncAll => {
+                f.sync_all().unwrap();
+                synced.clone_from(&model);
+                synced_len = model.len();
             }
         }
         prop_assert_eq!(f.len().unwrap(), model.len() as u64, "{}", b.name);
     }
+    synced.resize(synced_len, 0);
     Ok(synced)
 }
 
