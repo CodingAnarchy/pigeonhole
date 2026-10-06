@@ -325,5 +325,8 @@ A conditional member's written rows, read keys and predicate row are checked aga
 ## D92 — one resolver for reads and compaction (approved; coordinator)
 The engine's Milestone A resolver (`resolve.rs`) is replaced in Milestone B (#37) by `pigeonhole-compaction`'s `MergingCursor` + `FilteredCursor` + `CellResolver`; where they differ, compaction's behavior wins (D75–D77, D82). `EngineOptions::merge_operators` takes effect then. Milestone A has no tablet splits (#38) and no WAL checkpoints (#37).
 
+## D93 — the per-stream recovery oracle lives in `pigeonhole-sim` (approved; sim, #40)
+`pigeonhole-sim` provides `StreamCommit`, `recovered_commits`, `check_acknowledged_survive` and `Model::from_commits`: each WAL stream keeps a prefix of its records, a single-shard commit survives iff its record does, and a cross-shard commit iff every PREPARE and its COMMIT do (D83, D84). `Model::crash_window` remains the single-stream special case. The engine and public suites adopt it in #48, replacing their own copies of the rule.
+
 ## Open questions
 _None._
