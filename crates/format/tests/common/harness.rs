@@ -71,7 +71,7 @@ pub fn key(data: &[u8]) {
 /// properties.
 pub fn block(data: &[u8]) {
     if let Ok(b) = Block::new(data) {
-        let _ = (b.restart_count(), b.row_start_count());
+        let _ = (b.restart_count(), b.row_start_count(), b.validate());
         let mut it = b.into_cursor();
         let _ = it.seek_to_first();
         for _ in 0..64 {

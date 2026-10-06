@@ -606,9 +606,11 @@ dependencies = [
 name = "pigeonhole-sst"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pigeonhole-cache",
  "pigeonhole-format",
  "pigeonhole-io",
+ "proptest",
 ]
 
 [[package]]
