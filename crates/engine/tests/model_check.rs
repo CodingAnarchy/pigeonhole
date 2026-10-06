@@ -64,10 +64,20 @@ fn sixty_four_shards_behind_env_var() {
     }
 }
 
+/// Background compaction off and a full compaction at fixed points: a bottommost compaction
+/// may purge deletes (decision D74), after which a write with an older explicit timestamp
+/// reads differently, so purges must happen at the same points for every shard count.
+fn deterministic_compactions(cfg: &mut Config) {
+    cfg.compaction.l0_trigger = u32::MAX;
+    cfg.compaction.level_base_bytes = u64::MAX;
+    cfg.compact_every = Some(50);
+}
+
 #[test]
 fn results_are_identical_across_shard_counts() {
     for seed in seeds() {
         let mut cfg = Config::quiet(250);
+        deterministic_compactions(&mut cfg);
         cfg.shards = 1;
         let reference = final_dump(seed, &cfg);
         for shards in 2..=8 {
@@ -165,10 +175,14 @@ fn io_errors_poison_shards_and_recover_on_reopen() {
 fn results_are_identical_across_shard_counts_under_faults() {
     // Torn and reordered unsynced writes plus a process crash and reopen every 60 ops:
     // everything written survives a process crash, so every shard count recovers the same
-    // commits and reads the same results.
+    // commits and reads the same results. Every commit is at least `Buffered`: a `None`
+    // commit survives only if a stronger commit on its own stream writes it or a flush
+    // persists it, which depends on the shard count (decision #50).
     for seed in seeds() {
         let mut cfg = Config::standard(250);
+        deterministic_compactions(&mut cfg);
         cfg.crash_every = Some(60);
+        cfg.durability = Some(Durability::Buffered);
         cfg.shards = 1;
         let reference = final_dump(seed, &cfg);
         for shards in [2, 3, 5, 8] {

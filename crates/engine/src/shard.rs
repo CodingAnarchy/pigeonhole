@@ -1,35 +1,46 @@
 //! The per-shard state and the shard loop body: the group commit on the shard's WAL stream,
 //! memtable application with same-commit collapse (D34), the two-phase commit protocol for
-//! cross-shard batches, freezing, and the close handshake.
+//! cross-shard batches, freezing and flushing, WAL checkpoints (D24), compaction scheduling,
+//! write stalls, and the close handshake.
 //!
 //! One `ShardState` per shard, owned by its thread (or its `EngineShard` driver). Shards
 //! share nothing mutable except the documented queues, the shared-memory watermarks and the
-//! engine-wide [`Shared`] state (lock-free view publication behind a publish mutex).
+//! engine-wide [`Shared`] state (lock-free view publication behind a publish mutex, the
+//! manifest queue, and the registries flush and compaction consult).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hasher;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Waker;
 
 use arc_swap::ArcSwap;
+use pigeonhole_cache::BlockCache;
+use pigeonhole_compaction::{CompactionPicker, MergingCursor, PickerOptions, ResolveOptions};
 use pigeonhole_format::key::{encode_key, encode_marker_key, encode_row_prefix, split_suffix};
+use pigeonhole_format::manifest::{CompactionStyle, Edit};
+use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::wal::{BatchBuilder, BatchRef, StreamList, WalRecord};
 use pigeonhole_format::{
-    Cursor, Durability, FamilyId, Kind, Lsn, Seqno, StreamId, TableId, TabletId, Timestamp,
+    Cursor, Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, SstId, StreamId, TableId,
+    TabletId, Timestamp,
 };
 use pigeonhole_io::{ErrorKind, VfsRef};
 use pigeonhole_memtable::{ArenaRegion, Memtable, MemtableReader, Retired, ShardArena};
+use pigeonhole_pager::Pager;
 use pigeonhole_runtime::{
     Notifier, ShardContext, ShardHandler, ShardId, Submitter, Task, TaskPoll, TaskWaker,
 };
 use pigeonhole_shm::{Presence, ShmRegion, WriterLock};
 use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
-use crate::manifest::ManifestWriter;
-use crate::resolve::{Merge, ResolveOpts, Resolver, SourceCursor};
-use crate::snapshot::{MemSet, ShardMems, TabletMap, View};
+use crate::catalog::MergeKind;
+use crate::compact::{self, CompactionRecord, CompactionWork};
+use crate::flush::{FlushItem, FlushTask, FlushedItem};
+use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
+use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
+use crate::source::{Probe, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::write::ReadKey;
 use crate::{CommitInfo, Error, Predicate, Result};
 
@@ -37,6 +48,9 @@ use crate::{CommitInfo, Error, Predicate, Result};
 const ENTRY_OVERHEAD: usize = 12 + 4 * 16 + 8;
 /// Fixed bytes of an internal key beyond the escaped row and qualifier.
 const KEY_FIXED: usize = 2 + 2 + 17;
+/// Token-bucket capacity (groups) and refill rate at an L0 score of 1 (groups per second).
+const STALL_CAPACITY: f64 = 8.0;
+const STALL_RATE: f64 = 4000.0;
 
 // ---------------------------------------------------------------------------------------
 // Engine-wide state shared with the shards
@@ -51,6 +65,9 @@ pub(crate) struct ShardMetrics {
     pub stalls: AtomicU64,
     pub stall_nanos: AtomicU64,
     pub flushes: AtomicU64,
+    pub flush_nanos: AtomicU64,
+    pub compactions: AtomicU64,
+    pub compaction_nanos: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -61,6 +78,9 @@ impl Default for ShardMetrics {
             stalls: AtomicU64::new(0),
             stall_nanos: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
+            flush_nanos: AtomicU64::new(0),
+            compactions: AtomicU64::new(0),
+            compaction_nanos: AtomicU64::new(0),
         }
     }
 }
@@ -97,13 +117,13 @@ pub(crate) struct Locks {
     pub presence: Presence,
 }
 
-/// The close handshake: each shard reports when its WAL is synced and its queues drained;
-/// the last one runs the final steps and resolves `done`.
+/// The close handshake: each shard reports when its WAL is checkpointed, synced and
+/// dropped; the last one runs the final steps and resolves `done`.
 #[derive(Debug, Default)]
 pub(crate) struct CloseState {
     pub remaining: AtomicUsize,
     pub done: Mutex<Option<Notifier<Result<()>>>>,
-    /// A shard's final WAL sync failed: the close is not clean.
+    /// A shard's final WAL sync (or flush) failed: the close is not clean.
     pub failed: AtomicBool,
 }
 
@@ -125,13 +145,37 @@ pub(crate) struct Shared {
     pub shm: ShmRegion,
     pub shards: usize,
     pub view: ArcSwap<View>,
-    /// Serializes view publishers (shards creating memtables, catalog commits) and holds the
-    /// last published version.
+    /// Serializes view publishers (shards creating memtables, manifest commits) and holds
+    /// the last published version.
     pub view_lock: Mutex<u64>,
     pub manifest: Mutex<ManifestWriter>,
+    pub manifest_queue: ManifestQueue,
+    /// Held by whoever is committing a manifest batch.
+    pub manifest_busy: AtomicBool,
+    pub pager: Arc<Pager>,
+    pub cache: Arc<BlockCache>,
+    pub sst_ids: Arc<AtomicU64>,
+    pub blob_ids: Arc<AtomicU32>,
+    pub live_views: Arc<LiveViews>,
+    pub live_seqnos: Arc<LiveSeqnos>,
+    /// Memtables `(shard, root)` whose SSTs are in the manifest, excluded from every view
+    /// until their shard retires them.
+    pub flushed_roots: Mutex<HashSet<(u16, u32)>>,
+    /// SSTs a running compaction or relocation reads or replaces.
+    pub busy_ssts: Mutex<HashSet<SstId>>,
+    /// Published view version -> manifest version, to map reader-slot pins to extents.
+    pub view_versions: Mutex<BTreeMap<u64, ManifestVersion>>,
+    /// Every committed compaction (test hook).
+    pub compactions: Mutex<Vec<CompactionRecord>>,
+    /// Every WAL record appended, in append order (test hook).
+    #[cfg(feature = "test-hooks")]
+    pub appended: Mutex<Vec<AppendedRecord>>,
+    pub picker: PickerOptions,
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
+    /// `Engine::close` has started: background compaction stops.
+    pub closing: AtomicBool,
     /// A manifest (root) commit failed: the pager is poisoned (decision D58) and every later
     /// write fails until the database is reopened.
     pub pager_poisoned: AtomicBool,
@@ -140,13 +184,16 @@ pub(crate) struct Shared {
     /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits.
     pub ts_floors: Vec<Padded>,
     pub waiters: VisibilityWaiters,
+    /// Shards with a freeze deferred until the watermark passes their memtable (kicked by
+    /// whoever publishes a watermark).
+    pub freeze_waiting: AtomicUsize,
+    pub freeze_waiters: Mutex<Vec<u16>>,
     pub memtable_freeze_bytes: u64,
-    /// Where frozen memtables go.
-    pub flush: crate::flush::FlushBackend,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
     pub shm_dir: Option<std::path::PathBuf>,
     pub identity: pigeonhole_io::FileIdentity,
+    pub path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for Shared {
@@ -161,6 +208,15 @@ impl std::fmt::Debug for Shared {
 impl Shared {
     pub(crate) fn submitter(&self, shard: ShardId) -> &Submitter<ShardMsg> {
         &self.submitters.get().expect("runtime started")[usize::from(shard.0)]
+    }
+
+    /// Sends `f()` to every shard (nothing before the runtime exists).
+    pub(crate) fn broadcast(&self, f: impl Fn() -> ShardMsg) {
+        if let Some(subs) = self.submitters.get() {
+            for s in subs {
+                let _ = s.submit(f());
+            }
+        }
     }
 
     /// Registers an async waiter for `seqno` to become visible; returns true if it already is
@@ -186,6 +242,18 @@ impl Shared {
     /// Wakes every registered waiter whose seqno is visible now. Called by shards after a
     /// watermark publish, and only when someone is registered (one relaxed load otherwise).
     pub(crate) fn wake_visible(&self) {
+        if self.freeze_waiting.load(Ordering::Acquire) != 0 {
+            let shards: Vec<u16> = std::mem::take(
+                &mut *self
+                    .freeze_waiters
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            self.freeze_waiting.store(0, Ordering::Release);
+            for s in shards {
+                let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
+            }
+        }
         if self.waiters.count.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -220,9 +288,49 @@ impl Shared {
         debug_assert_eq!(view.version, version);
         self.shm.publish_view(&view.to_record())?;
         self.shm.set_manifest_version(view.manifest_version);
+        {
+            let mut vv = self
+                .view_versions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            vv.insert(version, view.manifest_version);
+            // Keep what reader pins can still name: the oldest pinned view and newer.
+            let floor = self.shm.oldest_reader_pin().map_or(version, |(_, v)| {
+                if v == 0 { version } else { v.min(version) }
+            });
+            let keep: BTreeMap<u64, ManifestVersion> = vv.split_off(&floor);
+            let last_below = vv.iter().next_back().map(|(k, v)| (*k, *v));
+            *vv = keep;
+            if let Some((k, v)) = last_below {
+                vv.insert(k, v);
+            }
+        }
         self.view.store(Arc::clone(&view));
         *last = version;
         Ok(view)
+    }
+
+    /// The oldest manifest version any view uses: live in-process views and the view a
+    /// reader slot pins (a pin protects its version and newer).
+    pub(crate) fn oldest_live_manifest(&self) -> ManifestVersion {
+        let current = self.view.load().manifest_version;
+        let mut oldest = self.live_views.oldest().unwrap_or(current).min(current);
+        if let Some((_, view_version)) = self.shm.oldest_reader_pin()
+            && view_version != 0
+        {
+            let vv = self
+                .view_versions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let pinned = vv.range(..=view_version).next_back().map_or(0, |(_, m)| *m);
+            oldest = oldest.min(pinned);
+        }
+        oldest
+    }
+
+    /// Frees extents no view can reach any more (decision D61 clamps to the durable root).
+    pub(crate) fn reclaim(&self) {
+        self.pager.reclaim(self.oldest_live_manifest());
     }
 
     pub(crate) fn default_durability(&self) -> Durability {
@@ -235,34 +343,72 @@ impl Shared {
     }
 
     /// The final close, run by the last shard to finish: records a clean close and, if this
-    /// is the last process, removes the shared-memory region. WAL files stay until flushes
-    /// exist (Milestone B), since the memtables they back have nowhere else to go.
+    /// is the last process, removes the WAL files (every stream is checkpointed to its end
+    /// by now) and the shared-memory region, so the database is one file at rest.
     pub(crate) fn final_close(&self) -> Result<()> {
         // A failed final sync means the close is not clean: the flag stays clear so the next
         // open replays, and the caller learns about it.
-        let clean = if self.close.failed.load(Ordering::Acquire) {
+        let mut clean = if self.close.failed.load(Ordering::Acquire) {
             Err(Error::Io(pigeonhole_io::Error::new(
                 ErrorKind::Other,
-                "a shard's final WAL sync failed; the close is not clean",
+                "a shard's final flush, checkpoint or WAL sync failed; the close is not clean",
             )))
         } else {
-            let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
-            manifest.mark_clean()
+            Ok(())
         };
         let locks = self
             .locks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        // Our writer byte is held (so no opening writer can be mid-open); the presence
+        // upgrade tells whether any reader is still attached.
+        let last = match &locks {
+            Some(locks) => locks.presence.try_become_last()?,
+            None => false,
+        };
+        if clean.is_ok() && last {
+            // The WAL files go away with this close: the streams the next open creates
+            // start over at epoch 1, so their checkpoints must not point into the old
+            // files (recovery would skip everything below them).
+            clean = self.forget_checkpoints();
+        }
+        if clean.is_ok() {
+            let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
+            clean = manifest.mark_clean();
+        }
         if let Some(locks) = locks {
-            // Our writer byte is held (so no opening writer can be mid-open); the presence
-            // upgrade tells whether any reader is still attached.
-            if locks.presence.try_become_last()? {
+            if last {
+                if clean.is_ok() {
+                    remove_wal_files(&self.vfs, &self.path)?;
+                }
                 ShmRegion::remove(&self.vfs, self.identity, self.shm_dir.as_deref())?;
             }
             drop(locks);
         }
         clean
+    }
+
+    /// Commits a manifest delta resetting every stream's checkpoint to the start.
+    fn forget_checkpoints(&self) -> Result<()> {
+        let current = self.view.load_full();
+        let mut catalog = (*current.catalog).clone();
+        let edits: Vec<Edit> = catalog
+            .checkpoints
+            .keys()
+            .map(|stream| Edit::WalCheckpoint {
+                stream: *stream,
+                lsn: Lsn::default(),
+            })
+            .collect();
+        if edits.is_empty() {
+            return Ok(());
+        }
+        for e in &edits {
+            catalog.apply(e, self.shards)?;
+        }
+        let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
+        manifest.commit(&catalog, &edits).map(|_| ())
     }
 
     fn report_closed(&self) {
@@ -280,6 +426,19 @@ impl Shared {
             }
         }
     }
+}
+
+/// Removes every WAL stream file of `path` (after a clean close checkpointed them all).
+pub(crate) fn remove_wal_files(vfs: &VfsRef, path: &std::path::Path) -> Result<()> {
+    for stream in pigeonhole_wal::discover_streams(vfs, path)? {
+        vfs.remove(&pigeonhole_wal::stream_path(path, stream))?;
+    }
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    vfs.sync_dir(dir)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -346,6 +505,7 @@ pub(crate) enum PrepareError {
     Conflict,
     Busy,
     Closed,
+    TooLarge,
     Io,
 }
 
@@ -355,6 +515,7 @@ impl From<PrepareError> for Error {
             PrepareError::Conflict => Error::Conflict,
             PrepareError::Busy => Error::Busy,
             PrepareError::Closed => Error::Closed,
+            PrepareError::TooLarge => Error::RecordTooLarge,
             PrepareError::Io => poisoned_error(),
         }
     }
@@ -372,6 +533,7 @@ fn prepare_error_of(e: &Error) -> PrepareError {
         Error::Conflict => PrepareError::Conflict,
         Error::Busy => PrepareError::Busy,
         Error::Closed => PrepareError::Closed,
+        Error::RecordTooLarge => PrepareError::TooLarge,
         _ => PrepareError::Io,
     }
 }
@@ -404,10 +566,51 @@ pub(crate) enum ShardMsg {
         group: u64,
         result: std::result::Result<Lsn, pigeonhole_io::Error>,
     },
-    /// Freeze every non-empty active memtable (`Engine::flush`).
-    Freeze {
+    /// Freeze every non-empty active memtable and reply once everything frozen so far is
+    /// in the manifest (`Engine::flush`).
+    FlushAll {
         reply: Notifier<Result<()>>,
     },
+    /// A flush task finished (its manifest commit succeeded, or it failed).
+    Flushed {
+        items: Vec<FlushedItem>,
+        result: Result<ManifestVersion>,
+        nanos: u64,
+    },
+    /// Sync the stream (a flush's durability barrier) and reply when done.
+    SyncBarrier {
+        reply: Notifier<Result<()>>,
+    },
+    /// A participant's share of cross-shard commit `seqno` is in SSTs.
+    ShareFlushed {
+        seqno: Seqno,
+    },
+    /// The coordinator's checkpoint passed the COMMIT record of `seqno`: the participant's
+    /// PREPARE is no longer needed.
+    CommitCheckpointed {
+        seqno: Seqno,
+    },
+    /// A `WalCheckpoint` edit for this stream is durable (or failed).
+    Checkpointed {
+        lsn: Lsn,
+        commits: Vec<(Seqno, Vec<ShardId>)>,
+        result: Result<ManifestVersion>,
+    },
+    /// The manifest changed: score the shard's slots for compaction, refresh stalls.
+    Maintain,
+    /// A compaction task finished.
+    CompactionDone {
+        inputs: Vec<SstId>,
+        result: Result<ManifestVersion>,
+        nanos: u64,
+    },
+    /// Compact every slot of `table` (or all tables) into the last level (`Engine::compact`).
+    CompactAll {
+        table: Option<TableId>,
+        reply: Notifier<Result<()>>,
+    },
+    /// Run a manifest pump (a request was queued).
+    PumpManifest,
     /// A table was dropped: forget its tablets' memtables.
     DropTablets {
         tablets: Vec<TabletId>,
@@ -416,7 +619,7 @@ pub(crate) enum ShardMsg {
     Start,
     /// Nothing: forces a drain so deferred members form a group.
     Kick,
-    /// Stop accepting writes, finish in-flight work, sync the stream, report.
+    /// Stop accepting writes, finish in-flight work, flush, checkpoint, sync, report.
     Close,
 }
 
@@ -429,6 +632,28 @@ enum MemberKind {
     Single,
     Prepare { coordinator: ShardId },
     CommitRecord { participants: Vec<ShardId> },
+}
+
+/// A WAL record the engine appended to a stream (test hook): the per-stream append order,
+/// which decides what a crash keeps (a stream survives as a prefix).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendedRecord {
+    pub stream: u16,
+    pub seqno: Seqno,
+    pub kind: AppendedKind,
+    pub durability: Durability,
+}
+
+/// The kind of an [`AppendedRecord`].
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendedKind {
+    Batch,
+    Prepare,
+    Commit,
 }
 
 /// One record of a group: a commit, a participant's PREPARE, or a coordinator's COMMIT.
@@ -546,13 +771,15 @@ struct PreparedShare {
     tracked: bool,
 }
 
-/// A memtable with the smallest user timestamp written to it: a compaction's
-/// `GcPolicy::min_ts_above` is the minimum over the live memtables above its inputs
-/// (data above an input can hold newer entries with older explicit timestamps).
+/// A memtable with what flush and compaction need to know about it: the smallest user
+/// timestamp written to it (a compaction's `GcPolicy::min_ts_above`, decision D70) and
+/// whether it holds applied shares of cross-shard commits (a flush then syncs every stream
+/// before it persists them).
 #[derive(Debug)]
 struct MemEntry {
     table: Memtable,
     min_ts: Timestamp,
+    has_shares: bool,
 }
 
 impl MemEntry {
@@ -560,7 +787,12 @@ impl MemEntry {
         Self {
             table,
             min_ts: u64::MAX,
+            has_shares: false,
         }
+    }
+
+    fn max_seqno(&self) -> Seqno {
+        self.table.seqno_range().map_or(0, |(_, max)| max)
     }
 }
 
@@ -573,12 +805,15 @@ struct MemSlot {
 }
 
 impl MemSlot {
-    fn set(&self, shard: ShardId) -> Arc<MemSet> {
+    fn set(&self, shard: ShardId, flushed: &HashSet<(u16, u32)>) -> Arc<MemSet> {
         let mut readers = Vec::with_capacity(1 + self.frozen.len());
         let mut roots = Vec::with_capacity(1 + self.frozen.len());
         readers.push(self.active.table.reader());
         roots.push(self.active.table.root());
         for m in &self.frozen {
+            if flushed.contains(&(shard.0, m.table.root())) {
+                continue;
+            }
             readers.push(m.table.reader());
             roots.push(m.table.root());
         }
@@ -589,14 +824,19 @@ impl MemSlot {
         })
     }
 
-    fn readers(&self) -> Vec<MemtableReader> {
+    /// The readers of the memtables not yet in SSTs, active first.
+    fn readers(&self, shard: ShardId, flushed: &HashSet<(u16, u32)>) -> Vec<MemtableReader> {
         std::iter::once(self.active.table.reader())
-            .chain(self.frozen.iter().map(|m| m.table.reader()))
+            .chain(
+                self.frozen
+                    .iter()
+                    .filter(|m| !flushed.contains(&(shard.0, m.table.root())))
+                    .map(|m| m.table.reader()),
+            )
             .collect()
     }
 
     /// The smallest user timestamp in any of these memtables.
-    #[allow(dead_code)]
     fn min_ts(&self) -> Timestamp {
         self.frozen
             .iter()
@@ -729,6 +969,104 @@ impl Task for SpareTask {
     }
 }
 
+/// Kicks the shard once a write stall's wait has passed (or the stall was cancelled).
+struct StallTimer {
+    vfs: VfsRef,
+    release_at: u64,
+    cancel: Arc<AtomicBool>,
+    submitter: Submitter<ShardMsg>,
+}
+
+impl Task for StallTimer {
+    fn run(&mut self, _deadline_nanos: u64, _waker: &TaskWaker) -> TaskPoll {
+        if self.cancel.load(Ordering::Acquire) {
+            return TaskPoll::Done;
+        }
+        if self.vfs.monotonic_nanos() < self.release_at {
+            return TaskPoll::Pending;
+        }
+        let _ = self.submitter.submit(ShardMsg::Kick);
+        TaskPoll::Done
+    }
+
+    fn name(&self) -> &'static str {
+        "stall"
+    }
+}
+
+/// A record of this stream the checkpoint cannot pass yet.
+#[derive(Debug)]
+struct Logged {
+    /// Position just past the record.
+    end: Lsn,
+    seqno: Seqno,
+    kind: LoggedKind,
+}
+
+#[derive(Debug)]
+enum LoggedKind {
+    /// A single-shard commit writing to these slots.
+    Single { slots: Vec<(TabletId, FamilyId)> },
+    /// A participant's PREPARE writing to these slots.
+    Prepare { slots: Vec<(TabletId, FamilyId)> },
+    /// A coordinator's COMMIT decision.
+    Commit { participants: Vec<ShardId> },
+}
+
+/// A share this shard applied whose coordinator has not yet been told it is in SSTs.
+#[derive(Debug)]
+struct UnreportedShare {
+    seqno: Seqno,
+    coordinator: ShardId,
+    slots: Vec<(TabletId, FamilyId)>,
+}
+
+/// The per-shard token bucket on L0 depth (spec: Write path).
+#[derive(Debug)]
+struct Stall {
+    /// Highest L0 score over the shard's slots (`CompactionPicker::score`).
+    score: f64,
+    tokens: f64,
+    last_refill: u64,
+    /// The running timer's cancel flag.
+    timer: Option<Arc<AtomicBool>>,
+    /// When the current stall started (0 = none).
+    since: u64,
+}
+
+impl Default for Stall {
+    fn default() -> Self {
+        Self {
+            score: 0.0,
+            tokens: STALL_CAPACITY,
+            last_refill: 0,
+            timer: None,
+            since: 0,
+        }
+    }
+}
+
+impl Stall {
+    fn cancel_timer(&mut self) {
+        if let Some(t) = self.timer.take() {
+            t.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Where a shard is in its close sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseStage {
+    Open,
+    /// Writes refused; waiting for in-flight groups and cross-shard commits.
+    Draining,
+    /// Everything frozen; waiting for the flushes and the checkpoint exchange.
+    Flushing,
+    /// The final checkpoint edit is in flight.
+    Checkpointing,
+    Reported,
+}
+
 // ---------------------------------------------------------------------------------------
 // The shard
 // ---------------------------------------------------------------------------------------
@@ -743,8 +1081,8 @@ pub(crate) struct ShardState {
     arena: ShardArena,
     chunk_size: usize,
     memtables: HashMap<(TabletId, FamilyId), MemSlot>,
-    /// Retired memtables (dropped tables) waiting for reader processes to release their
-    /// views: `(view version that dropped them, token)`.
+    /// Retired memtables waiting for reader processes to release their views:
+    /// `(view version that dropped them, token)`.
     retired: Vec<(u64, Retired)>,
     /// Routing, refreshed when the view's tablet map changes.
     tablets: Arc<TabletMap>,
@@ -768,12 +1106,77 @@ pub(crate) struct ShardState {
     key_buf: Vec<u8>,
     dedup: Dedup,
     touched: HashSet<u64>,
+    /// Slots the last `apply` wrote (deduplicated).
+    touched_slots: Vec<(TabletId, FamilyId)>,
     closing: bool,
-    close_reported: bool,
+    close_stage: CloseStage,
     spares: Option<SpareSegments>,
     spares_running: Arc<AtomicBool>,
     /// A memtable was created or frozen since the last view publish.
     view_dirty: bool,
+    /// Replaying the WAL at open: mutations at or below a slot's flushed seqno are skipped.
+    replaying: bool,
+
+    // ---- flush ----
+    /// Every write to `(tablet, family)` with a seqno at or below this is in SSTs.
+    flushed: HashMap<(TabletId, FamilyId), Seqno>,
+    /// Frozen memtables not yet handed to a flush task.
+    flush_queue: Vec<FlushItem>,
+    /// Roots handed to the running flush task.
+    flushing: Vec<u32>,
+    flush_running: bool,
+    /// `Engine::flush` callers waiting for every frozen memtable to reach the manifest.
+    flush_waiters: Vec<Notifier<Result<()>>>,
+    /// A group is deferred until a flush frees arena room.
+    wait_room: bool,
+    /// A freeze waits for the watermark to pass the memtable (registered in `Shared`).
+    freeze_deferred: bool,
+    /// A freeze of every memtable (`flush`, `compact`, close) is still owed: some memtable
+    /// held a seqno the watermark had not reached yet.
+    freeze_all_pending: bool,
+    /// A flush failed while closing: the close gives up on flushing (the WAL keeps the data)
+    /// and is not clean.
+    flush_failed: bool,
+    /// The last flush failed: a group waiting for arena room is refused rather than kept
+    /// waiting for a retry that may never succeed.
+    flush_error: bool,
+    /// Tablets dropped since open: their records need no flush before a checkpoint.
+    dropped: HashSet<TabletId>,
+
+    // ---- checkpoints ----
+    /// Records the checkpoint cannot pass, in log order.
+    log: VecDeque<Logged>,
+    /// End of the newest record ever appended to the stream.
+    last_end: Option<Lsn>,
+    /// The checkpoint the manifest holds.
+    checkpoint: Lsn,
+    /// The checkpoint the next edit should record (end of the longest unneeded prefix).
+    checkpoint_candidate: Lsn,
+    checkpoint_inflight: bool,
+    checkpoint_dirty: bool,
+    /// COMMIT records the candidate passed: participants are told once the edit is durable.
+    passed_commits: Vec<(Seqno, Vec<ShardId>)>,
+    /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
+    aborted: HashSet<Seqno>,
+    /// Commits whose coordinator checkpointed the COMMIT record.
+    commit_ckpt: HashSet<Seqno>,
+    /// Coordinator: `(participants that reported their share flushed, participants)` per
+    /// commit whose COMMIT record is in the log.
+    share_reports: HashMap<Seqno, (usize, usize)>,
+    /// Participant: applied shares whose flush has not been reported to the coordinator.
+    unreported: Vec<UnreportedShare>,
+
+    // ---- compaction and stalls ----
+    picker: CompactionPicker,
+    /// The slot a compaction task is running for.
+    compaction: Option<(TabletId, FamilyId)>,
+    /// `Engine::compact` callers: `(table filter, reply)`, served in order.
+    compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>)>,
+    /// The last compaction error (reported to a `compact` caller).
+    compaction_error: Option<Error>,
+    /// A background compaction failed: none starts until a flush or new writes happen.
+    compaction_backoff: bool,
+    stall: Stall,
 }
 
 impl std::fmt::Debug for ShardState {
@@ -784,6 +1187,7 @@ impl std::fmt::Debug for ShardState {
             .field("pending", &self.pending.len())
             .field("unresolved", &self.unresolved.len())
             .field("held", &self.held)
+            .field("log", &self.log.len())
             .finish_non_exhaustive()
     }
 }
@@ -797,6 +1201,7 @@ impl ShardState {
         tablets: Arc<TabletMap>,
         ts_floor: Timestamp,
     ) -> Self {
+        let picker = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
         Self {
             id,
             shared,
@@ -820,11 +1225,41 @@ impl ShardState {
             key_buf: Vec::new(),
             dedup: Dedup::default(),
             touched: HashSet::new(),
+            touched_slots: Vec::new(),
             closing: false,
-            close_reported: false,
+            close_stage: CloseStage::Open,
             spares: None,
             spares_running: Arc::new(AtomicBool::new(false)),
             view_dirty: false,
+            replaying: true,
+            flushed: HashMap::new(),
+            flush_queue: Vec::new(),
+            flushing: Vec::new(),
+            flush_running: false,
+            flush_waiters: Vec::new(),
+            wait_room: false,
+            freeze_deferred: false,
+            freeze_all_pending: false,
+            flush_failed: false,
+            flush_error: false,
+            dropped: HashSet::new(),
+            log: VecDeque::new(),
+            last_end: None,
+            checkpoint: Lsn::default(),
+            checkpoint_candidate: Lsn::default(),
+            checkpoint_inflight: false,
+            checkpoint_dirty: false,
+            passed_commits: Vec::new(),
+            aborted: HashSet::new(),
+            commit_ckpt: HashSet::new(),
+            share_reports: HashMap::new(),
+            unreported: Vec::new(),
+            picker,
+            compaction: None,
+            compact_all: VecDeque::new(),
+            compaction_error: None,
+            compaction_backoff: false,
+            stall: Stall::default(),
         }
     }
 
@@ -833,7 +1268,26 @@ impl ShardState {
         self.wal = Some(wal);
     }
 
+    /// The per-slot flushed seqnos and this stream's checkpoint, from the manifest at open.
+    pub(crate) fn set_recovery_state(
+        &mut self,
+        flushed: HashMap<(TabletId, FamilyId), Seqno>,
+        checkpoint: Lsn,
+        end: Option<Lsn>,
+    ) {
+        self.flushed = flushed;
+        self.checkpoint = checkpoint;
+        self.checkpoint_candidate = checkpoint;
+        self.last_end = end;
+    }
+
+    /// Replay is over: later applies are live.
+    pub(crate) fn finish_replay(&mut self) {
+        self.replaying = false;
+    }
+
     pub(crate) fn raise_ts_floor(&mut self, ts: Timestamp) {
+        trace!("shard {} raise floor {} -> {ts}", self.id.0, self.ts_floor);
         self.ts_floor = self.ts_floor.max(ts);
     }
 
@@ -844,9 +1298,14 @@ impl ShardState {
 
     /// The memtable sets of this shard, for a view.
     pub(crate) fn mem_sets(&self) -> Vec<((TabletId, FamilyId), Arc<MemSet>)> {
+        let flushed = self
+            .shared
+            .flushed_roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.memtables
             .iter()
-            .map(|(k, slot)| (*k, slot.set(self.id)))
+            .map(|(k, slot)| (*k, slot.set(self.id, &flushed)))
             .collect()
     }
 
@@ -856,9 +1315,108 @@ impl ShardState {
         bytes: &[u8],
         seqno: Seqno,
         commit_ts: Timestamp,
-    ) -> Result<()> {
+    ) -> Result<Vec<(TabletId, FamilyId)>> {
         self.raise_ts_floor(commit_ts);
-        self.apply(bytes, seqno, commit_ts)
+        self.apply(bytes, seqno, commit_ts)?;
+        Ok(self.touched_slots.clone())
+    }
+
+    /// Records a replayed record of this stream for checkpointing: a single commit, an
+    /// applied prepare (`coordinator`), an aborted or incomplete one (`needed == false`), or
+    /// a COMMIT decision.
+    pub(crate) fn log_replayed(&mut self, end: Lsn, seqno: Seqno, kind: ReplayedKind) {
+        self.last_end = Some(self.last_end.map_or(end, |l| l.max(end)));
+        match kind {
+            ReplayedKind::Single { slots } => self.log.push_back(Logged {
+                end,
+                seqno,
+                kind: LoggedKind::Single { slots },
+            }),
+            ReplayedKind::Prepare {
+                slots,
+                coordinator,
+                applied,
+            } => {
+                if applied {
+                    self.unreported.push(UnreportedShare {
+                        seqno,
+                        coordinator,
+                        slots: slots.clone(),
+                    });
+                } else {
+                    self.aborted.insert(seqno);
+                }
+                self.log.push_back(Logged {
+                    end,
+                    seqno,
+                    kind: LoggedKind::Prepare { slots },
+                });
+            }
+            ReplayedKind::Commit {
+                participants,
+                complete,
+            } => {
+                if !complete {
+                    self.aborted.insert(seqno);
+                }
+                self.share_reports.entry(seqno).or_insert((0, 0)).1 = participants.len();
+                self.log.push_back(Logged {
+                    end,
+                    seqno,
+                    kind: LoggedKind::Commit { participants },
+                });
+            }
+        }
+    }
+
+    /// Takes every memtable (open-time flush when the shard count changed, decision D20).
+    pub(crate) fn take_memtables(
+        &mut self,
+    ) -> Vec<((TabletId, FamilyId), MemtableReader, u64, Seqno)> {
+        let mut out = Vec::new();
+        let keys: Vec<_> = self.memtables.keys().copied().collect();
+        for key in keys {
+            let slot = self.memtables.remove(&key).expect("listed");
+            for m in std::iter::once(slot.active).chain(slot.frozen) {
+                if !m.table.is_empty() {
+                    out.push((
+                        key,
+                        m.table.reader(),
+                        m.table.allocated_bytes() as u64,
+                        m.max_seqno(),
+                    ));
+                }
+                let retired = m.table.retire();
+                self.arena.reclaim(retired);
+            }
+        }
+        self.log.clear();
+        self.unreported.clear();
+        self.share_reports.clear();
+        self.aborted.clear();
+        out
+    }
+
+    /// The slots `bytes` writes on this shard (routing only, no apply).
+    fn slots_of(&mut self, bytes: &[u8]) -> Vec<(TabletId, FamilyId)> {
+        let mut out: Vec<(TabletId, FamilyId)> = Vec::new();
+        let Ok(batch) = BatchRef::new(bytes) else {
+            return out;
+        };
+        let tablets = Arc::clone(&self.tablets);
+        for m in batch.iter().flatten() {
+            let Some((tablet, owner)) = tablets.route(m.table, m.row) else {
+                continue;
+            };
+            if owner != self.id {
+                continue;
+            }
+            let key = (tablet, m.family);
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        out
     }
 
     // ---- memtables and views ----
@@ -867,10 +1425,11 @@ impl ShardState {
     /// rebuilt; the other shards' pieces are shared by reference.
     fn publish_memtables(&mut self) -> Result<()> {
         self.view_dirty = false;
-        let piece = Arc::new(ShardMems {
-            map: self.mem_sets().into_iter().collect(),
-        });
         let i = usize::from(self.id.0);
+        let sets = self.mem_sets();
+        let piece = Arc::new(ShardMems {
+            map: sets.into_iter().collect(),
+        });
         self.shared.publish_view(|current, version| {
             let mut mems = current.mems.clone();
             if i < mems.len() {
@@ -882,6 +1441,11 @@ impl ShardState {
                 tablets: Arc::clone(&current.tablets),
                 catalog: Arc::clone(&current.catalog),
                 mems,
+                ssts: Arc::clone(&current.ssts),
+                _pin: Some(crate::snapshot::ViewPin::new(
+                    &self.shared.live_views,
+                    current.manifest_version,
+                )),
             }
         })?;
         Ok(())
@@ -900,27 +1464,65 @@ impl ShardState {
         2 * total + 2 * chunk
     }
 
+    /// Forces the arena to account for retired memtables whose last in-process handle has
+    /// dropped since (the arena releases them on its next allocation).
+    fn refresh_free(&mut self) {
+        if let Ok(m) = Memtable::create(&mut self.arena) {
+            self.arena.reclaim(m.retire());
+        }
+    }
+
     /// Reserves arena room for `bytes` (on top of everything already reserved by members of
     /// this group and undecided shares) or returns `None` when it would not fit.
-    fn reserve_room(&mut self, bytes: &[u8]) -> Option<usize> {
+    fn reserve_room(&mut self, bytes: &[u8]) -> std::result::Result<usize, Room> {
         let needed = match BatchRef::new(bytes) {
             Ok(batch) => Self::arena_needed(batch, self.chunk_size),
             Err(_) => 0,
         };
         if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
-            return None;
+            self.refresh_free();
+        }
+        trace!(
+            "shard {} reserve: needed={needed} free={} reserved={} total={}",
+            self.id.0,
+            self.arena.free_bytes(),
+            self.reserved,
+            self.arena.region().len()
+        );
+        if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+            let total = self.arena.region().len();
+            return Err(if needed + 2 * self.chunk_size > total {
+                Room::Never
+            } else {
+                Room::Wait
+            });
         }
         self.reserved += needed;
-        Some(needed)
+        Ok(needed)
     }
 
     fn release_room(&mut self, bytes: usize) {
         self.reserved = self.reserved.saturating_sub(bytes);
     }
 
+    /// Whether every memtable of this shard is empty, nothing is frozen and no flush runs:
+    /// no flush can free anything more.
+    fn nothing_to_flush(&self) -> bool {
+        !self.flush_running
+            && self.flush_queue.is_empty()
+            && self
+                .memtables
+                .values()
+                .all(|s| s.frozen.is_empty() && s.active.table.is_empty())
+    }
+
     /// Freezes the active memtables that crossed the threshold during `apply` (or every
-    /// non-empty one when `all`).
+    /// non-empty one when `all`), and queues them for flushing. A memtable freezes only
+    /// once every seqno it holds is visible: then its largest seqno is exact as the slot's
+    /// flushed-through seqno (no lower seqno can land in a newer memtable), so replay skips
+    /// exactly what the SST holds.
     fn freeze(&mut self, all: bool) -> Result<()> {
+        let all = all || self.freeze_all_pending;
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let keys: Vec<(TabletId, FamilyId)> = if all {
             self.to_freeze.clear();
@@ -928,31 +1530,226 @@ impl ShardState {
         } else {
             std::mem::take(&mut self.to_freeze)
         };
+        let visible = self.shared.shm.visible_seqno();
+        let view = self.shared.view.load();
+        let mut deferred = false;
         for key in keys {
             let Some(slot) = self.memtables.get_mut(&key) else {
                 continue;
             };
             let big = slot.active.table.allocated_bytes() >= threshold;
+            trace!(
+                "shard {} freeze {:?}: all={all} big={big} empty={} max_seqno={} visible={visible}",
+                self.id.0,
+                key,
+                slot.active.table.is_empty(),
+                slot.active.max_seqno()
+            );
             if slot.active.table.is_empty() || !(all || big) {
                 continue;
             }
+            if slot.active.max_seqno() > visible {
+                deferred = true;
+                if !self.to_freeze.contains(&key) {
+                    self.to_freeze.push(key);
+                }
+                continue;
+            }
+            let Some(meta) = view.catalog.family(key.1) else {
+                continue;
+            };
             let Ok(fresh) = Memtable::create(&mut self.arena) else {
                 // No chunk for a new active memtable: keep writing into this one; the
-                // arena-room check turns later commits into `Busy`.
+                // arena-room check defers later commits until a flush frees space.
+                trace!(
+                    "shard {} freeze {:?}: no chunk for a fresh memtable",
+                    self.id.0, key
+                );
                 continue;
             };
             let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
             old.table.freeze();
-            // Without a persisting backend the frozen memtable stays in every view.
-            if !self.shared.flush.persists() {
-                slot.frozen.insert(0, old);
-            }
+            self.flush_queue.push(FlushItem {
+                table: meta.table,
+                tablet: key.0,
+                family: key.1,
+                root: old.table.root(),
+                reader: old.table.reader(),
+                bytes: old.table.allocated_bytes() as u64,
+                max_seqno: old.max_seqno(),
+                has_shares: old.has_shares,
+                options: meta.options.clone(),
+            });
+            slot.frozen.insert(0, old);
             self.view_dirty = true;
+        }
+        self.freeze_all_pending = all && deferred;
+        if deferred && !self.freeze_deferred {
+            self.freeze_deferred = true;
+            self.shared
+                .freeze_waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.id.0);
+            self.shared.freeze_waiting.fetch_add(1, Ordering::AcqRel);
+        } else if !deferred {
+            self.freeze_deferred = false;
         }
         if self.view_dirty {
             self.publish_memtables()?;
         }
         Ok(())
+    }
+
+    /// Starts a flush task over everything queued, if none is running.
+    fn spawn_flush(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.flush_running || self.flush_queue.is_empty() {
+            return;
+        }
+        if self.shared.pager_poisoned.load(Ordering::Acquire) {
+            for w in self.flush_waiters.drain(..) {
+                w.notify(Err(ManifestWriter::poisoned_error()));
+            }
+            return;
+        }
+        let items = std::mem::take(&mut self.flush_queue);
+        self.flushing = items.iter().map(|i| i.root).collect();
+        self.flush_running = true;
+        ctx.spawn(Box::new(FlushTask::new(
+            Arc::clone(&self.shared),
+            self.id,
+            items,
+        )));
+    }
+
+    /// Whether every frozen memtable has reached the manifest.
+    fn flush_idle(&self) -> bool {
+        !self.flush_running
+            && self.flush_queue.is_empty()
+            && self.memtables.values().all(|s| s.frozen.is_empty())
+    }
+
+    fn check_flush_waiters(&mut self) {
+        if self.freeze_all_pending || !self.to_freeze.is_empty() {
+            return;
+        }
+        if self.flush_idle() {
+            for w in self.flush_waiters.drain(..) {
+                w.notify(Ok(()));
+            }
+        }
+    }
+
+    /// A flush task finished.
+    fn on_flushed(
+        &mut self,
+        items: Vec<FlushedItem>,
+        result: Result<ManifestVersion>,
+        nanos: u64,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        self.flush_running = false;
+        self.flushing.clear();
+        match result {
+            Ok(_) => {
+                let metrics = &self.shared.metrics[usize::from(self.id.0)];
+                metrics.flushes.fetch_add(1, Ordering::Relaxed);
+                metrics.flush_nanos.fetch_add(nanos, Ordering::Relaxed);
+                let version = self.shared.view.load().version;
+                {
+                    let mut roots = self
+                        .shared
+                        .flushed_roots
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    for item in &items {
+                        roots.remove(&(self.id.0, item.root));
+                    }
+                }
+                for item in items {
+                    let key = (item.tablet, item.family);
+                    let e = self.flushed.entry(key).or_insert(0);
+                    *e = (*e).max(item.max_seqno);
+                    if let Some(slot) = self.memtables.get_mut(&key)
+                        && let Some(pos) =
+                            slot.frozen.iter().position(|m| m.table.root() == item.root)
+                    {
+                        let m = slot.frozen.remove(pos);
+                        self.retired.push((version, m.table.retire()));
+                    }
+                }
+                self.reclaim_retired();
+                self.report_shares_flushed(ctx);
+                self.advance_checkpoint(ctx);
+            }
+            Err(e) => {
+                // The frozen memtables stay (the WAL keeps their data); they are queued again
+                // at the next flush trigger, never in a tight loop. A poisoned pager stops
+                // flushing until reopen; a failure while closing makes the close unclean.
+                trace!("shard {} flush failed: {e}", self.id.0);
+                self.flush_error = true;
+                self.requeue_frozen();
+                // Whoever asked for this flush hears about the failure now rather than
+                // waiting for a retry that may never come (a dead device).
+                let msg = e.to_string();
+                for w in self.flush_waiters.drain(..) {
+                    w.notify(Err(crate::error::io_other("flush", msg.clone())));
+                }
+                // A full compaction starts with a flush: it fails with it.
+                for (_, w) in self.compact_all.drain(..) {
+                    w.notify(Err(crate::error::io_other("flush", msg.clone())));
+                }
+                if self.closing {
+                    self.flush_failed = true;
+                    self.shared.close.failed.store(true, Ordering::Release);
+                }
+                if self.wait_room && !self.closing {
+                    // Let the waiting members fail with `Busy` rather than wait for ever.
+                    self.wait_room = false;
+                    let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+                }
+                self.try_finish_close(ctx);
+                return;
+            }
+        }
+        if self.wait_room {
+            self.wait_room = false;
+            let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+        }
+        self.compaction_backoff = false;
+        self.flush_error = false;
+        self.check_flush_waiters();
+        self.spawn_flush(ctx);
+        self.maintain(ctx);
+        self.try_finish_close(ctx);
+    }
+
+    /// Queues every frozen memtable that is not in the manifest (after a failed flush).
+    fn requeue_frozen(&mut self) {
+        let view = self.shared.view.load();
+        let mut items = Vec::new();
+        for (key, slot) in &self.memtables {
+            let Some(meta) = view.catalog.family(key.1) else {
+                continue;
+            };
+            for m in &slot.frozen {
+                if self.flush_queue.iter().any(|i| i.root == m.table.root()) {
+                    continue;
+                }
+                items.push(FlushItem {
+                    table: meta.table,
+                    tablet: key.0,
+                    family: key.1,
+                    root: m.table.root(),
+                    reader: m.table.reader(),
+                    bytes: m.table.allocated_bytes() as u64,
+                    max_seqno: m.max_seqno(),
+                    has_shares: m.has_shares,
+                    options: meta.options.clone(),
+                });
+            }
+        }
+        self.flush_queue.extend(items);
     }
 
     /// Reclaims retired memtables no reader slot pins any more.
@@ -978,6 +1775,9 @@ impl ShardState {
             .filter(|k| tablets.contains(&k.0))
             .copied()
             .collect();
+        self.flushed.retain(|k, _| !tablets.contains(&k.0));
+        self.flush_queue.retain(|i| !tablets.contains(&i.tablet));
+        self.dropped.extend(tablets.iter().copied());
         if keys.is_empty() {
             return Ok(());
         }
@@ -1037,6 +1837,10 @@ impl ShardState {
     fn default_ts(&mut self) -> Timestamp {
         let now = self.shared.vfs.now_micros();
         let ts = now.max(self.ts_floor + 1);
+        trace!(
+            "shard {} default_ts now={now} floor={} -> {ts}",
+            self.id.0, self.ts_floor
+        );
         self.ts_floor = ts;
         self.shared.ts_floors[usize::from(self.id.0)]
             .0
@@ -1046,8 +1850,40 @@ impl ShardState {
 
     // ---- reads on the shard (predicates, validation) ----
 
-    /// Resolves the newest version of one column over this shard's memtables at the latest
-    /// state (everything applied).
+    /// The sources of `(tablet, family)` for a point read at the applied state: this
+    /// shard's memtables (not yet in SSTs) and the view's SSTs.
+    fn point_sources(
+        &self,
+        view: &View,
+        tablet: TabletId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+    ) -> Result<Vec<Source>> {
+        let mut out = Vec::new();
+        if let Some(slot) = self.memtables.get(&(tablet, family)) {
+            let flushed = self
+                .shared
+                .flushed_roots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            mem_sources_from(
+                &slot.readers(self.id, &flushed),
+                &ScanFilter::all(),
+                &mut out,
+            );
+        }
+        let l = view.locate(self.id, tablet, family);
+        if let Some(fam) = l.ssts
+            && !fam.is_empty()
+        {
+            let probe = Probe::new(row, qualifier)?;
+            sst_sources_point(fam, &view.ssts, &probe, l.priority, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Resolves the newest version of one column at the latest state (everything applied).
     fn read_latest(
         &self,
         table: TableId,
@@ -1062,21 +1898,20 @@ impl ShardState {
         let Some(meta) = view.catalog.family(family) else {
             return Ok(None);
         };
-        let Some(slot) = self.memtables.get(&(tablet, family)) else {
+        let sources = self.point_sources(&view, tablet, family, row, qualifier)?;
+        if sources.is_empty() {
             return Ok(None);
-        };
-        let sources: Vec<SourceCursor> = slot
-            .readers()
-            .iter()
-            .map(|r| SourceCursor::Mem(r.iter()))
-            .collect();
-        let mut opts = ResolveOpts::new(u64::MAX, self.shared.vfs.now_micros());
+        }
+        let mut opts = ResolveOptions::new(u64::MAX, self.shared.vfs.now_micros());
         opts.ttl_micros = meta.options.ttl_micros;
-        opts.max_versions = meta.options.max_versions;
-        opts.merge = meta.merge;
-        let mut resolver = Resolver::new(Merge::new(sources), opts);
+        opts.versions = 1;
+        opts.merge = meta.merge_op.clone();
+        let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
         resolver.seek_column(row, qualifier)?;
-        Ok(resolver.next_cell()?.map(|c| c.value.to_vec()))
+        Ok(resolver
+            .next_cell()
+            .map_err(|e| crate::read::read_error(e, meta))?
+            .map(|c| c.value.to_vec()))
     }
 
     fn evaluate(&self, table: TableId, row: &[u8], predicate: &Predicate) -> Result<bool> {
@@ -1093,7 +1928,7 @@ impl ShardState {
                 predicate,
             } => self
                 .read_latest(table, *family, row, qualifier)?
-                .is_some_and(|v| crate::resolve::predicate_matches(predicate, &v)),
+                .is_some_and(|v| crate::read::predicate_matches(predicate, &v)),
         })
     }
 
@@ -1106,30 +1941,66 @@ impl ShardState {
         if shard != self.id {
             return Ok(false);
         }
-        let Some(slot) = self.memtables.get(&(tablet, read.family)) else {
-            return Ok(false);
-        };
         self.key_buf.clear();
         encode_row_prefix(&mut self.key_buf, &read.row)?;
-        let prefix = &self.key_buf;
-        for reader in slot.readers() {
-            let mut it = reader.iter();
-            it.seek(prefix)?;
-            while it.valid() && it.key().starts_with(prefix) {
-                let (_, _, seqno, _) = split_suffix(it.key())?;
-                if seqno > snapshot {
-                    return Ok(true);
+        let prefix = std::mem::take(&mut self.key_buf);
+        let mut found = false;
+        if let Some(slot) = self.memtables.get(&(tablet, read.family)) {
+            let flushed = self
+                .shared
+                .flushed_roots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            'outer: for reader in slot.readers(self.id, &flushed) {
+                let mut it = reader.iter();
+                it.seek(&prefix)?;
+                while it.valid() && it.key().starts_with(&prefix) {
+                    let (_, _, seqno, _) = split_suffix(it.key())?;
+                    if seqno > snapshot {
+                        found = true;
+                        break 'outer;
+                    }
+                    it.next()?;
                 }
-                it.next()?;
             }
         }
-        Ok(false)
+        if !found {
+            let view = self.shared.view.load();
+            let l = view.locate(self.id, tablet, read.family);
+            if let Some(fam) = l.ssts {
+                'ssts: for sst in fam.iter() {
+                    if sst.meta.seqno_range.1 <= snapshot {
+                        continue;
+                    }
+                    let mut past = Vec::new();
+                    crate::read::past_row(&prefix, &mut past);
+                    if sst.first_row() >= past.as_slice() || sst.last_row() < prefix.as_slice() {
+                        continue;
+                    }
+                    let reader = sst.reader(&view.ssts, l.priority)?;
+                    let mut it =
+                        reader.iter(ScanFilter::all(), pigeonhole_sst::ReadOptions::default());
+                    it.seek(&prefix)?;
+                    while it.valid() && it.key().starts_with(&prefix) {
+                        let (_, _, seqno, _) = split_suffix(it.key())?;
+                        if seqno > snapshot {
+                            found = true;
+                            break 'ssts;
+                        }
+                        it.next()?;
+                    }
+                }
+            }
+        }
+        self.key_buf = prefix;
+        Ok(found)
     }
 
     // ---- apply ----
 
     /// Applies `bytes` at `seqno`/`commit_ts` to this shard's memtables, last write winning
-    /// per `(column, timestamp)` (decision D34).
+    /// per `(column, timestamp)` (decision D34). Records the slots written in
+    /// `touched_slots`.
     fn apply(&mut self, bytes: &[u8], seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
         let batch = BatchRef::new(bytes)?;
         let dups = self.dedup.scan(batch, bytes, commit_ts);
@@ -1138,6 +2009,7 @@ impl ShardState {
         let mut last_route: Option<(TableId, &[u8], TabletId)> = None;
         let mut key_buf = std::mem::take(&mut self.key_buf);
         let mut result = Ok(());
+        self.touched_slots.clear();
         for (i, m) in batch.iter().enumerate() {
             let m = match m {
                 Ok(m) => m,
@@ -1164,6 +2036,15 @@ impl ShardState {
                     id
                 }
             };
+            if self.replaying
+                && self
+                    .flushed
+                    .get(&(tablet, m.family))
+                    .is_some_and(|f| seqno <= *f)
+            {
+                // Already in an SST (decision: replay applies only seqnos above SetFlushed).
+                continue;
+            }
             let ts = m.ts.unwrap_or(commit_ts);
             key_buf.clear();
             let encoded = if m.kind == Kind::FamilyDelete {
@@ -1192,6 +2073,9 @@ impl ShardState {
                 break;
             }
             slot.active.min_ts = slot.active.min_ts.min(ts);
+            if !self.touched_slots.contains(&(tablet, m.family)) {
+                self.touched_slots.push((tablet, m.family));
+            }
             if slot.active.table.allocated_bytes() >= threshold
                 && !self.to_freeze.contains(&(tablet, m.family))
             {
@@ -1200,6 +2084,64 @@ impl ShardState {
         }
         self.key_buf = key_buf;
         result
+    }
+
+    // ---- stalls ----
+
+    /// Whether the group must wait for the token bucket (L0 too deep). Spawns the timer
+    /// that re-kicks the shard once a token is due.
+    fn stalled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) -> bool {
+        let now = ctx.now_nanos();
+        // A stall lets compaction catch up; when none can run (the last one failed, the
+        // pager or this shard is poisoned) holding writers would hold them for ever.
+        let hopeless = self.compaction_backoff
+            || self.poisoned
+            || self.shared.pager_poisoned.load(Ordering::Acquire);
+        if self.stall.score < 1.0 || hopeless {
+            self.stall.cancel_timer();
+            self.stall.tokens = STALL_CAPACITY;
+            self.stall.last_refill = now;
+            if self.stall.since != 0 {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .stall_nanos
+                    .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
+                self.stall.since = 0;
+            }
+            return false;
+        }
+        let rate = STALL_RATE / self.stall.score;
+        let elapsed = now.saturating_sub(self.stall.last_refill) as f64 / 1e9;
+        self.stall.last_refill = now;
+        self.stall.tokens = (self.stall.tokens + elapsed * rate).min(STALL_CAPACITY);
+        if self.stall.tokens >= 1.0 {
+            self.stall.tokens -= 1.0;
+            self.stall.cancel_timer();
+            if self.stall.since != 0 {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .stall_nanos
+                    .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
+                self.stall.since = 0;
+            }
+            return false;
+        }
+        if self.stall.since == 0 {
+            self.stall.since = now;
+            self.shared.metrics[usize::from(self.id.0)]
+                .stalls
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.stall.timer.is_none() {
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.stall.timer = Some(Arc::clone(&cancel));
+            let wait = ((1.0 - self.stall.tokens) / rate * 1e9) as u64;
+            ctx.spawn(Box::new(StallTimer {
+                vfs: Arc::clone(&self.shared.vfs),
+                release_at: now + wait.max(1_000),
+                cancel,
+                submitter: ctx.submitter(self.id).clone(),
+            }));
+        }
+        true
     }
 
     // ---- the group commit ----
@@ -1220,7 +2162,11 @@ impl ShardState {
         if self.pending.is_empty() {
             return;
         }
+        if self.stalled(ctx) {
+            return;
+        }
         self.refresh_tablets();
+        self.compaction_backoff = false;
         let members = std::mem::take(&mut self.pending);
 
         // Admission, in order. A conditional member whose row an earlier member of this
@@ -1232,6 +2178,7 @@ impl ShardState {
         // (per-row submission order); two-phase-commit records never wait, since the share
         // the member waits for may need them to be decided.
         let mut cut = false;
+        let mut need_room = false;
         for mut m in members {
             if cut && matches!(m.kind, MemberKind::Single) {
                 self.pending.push(m);
@@ -1313,12 +2260,28 @@ impl ShardState {
             }
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
                 match self.reserve_room(m.bytes.as_slice()) {
-                    Some(bytes) => m.reserved = bytes,
-                    None => {
+                    Ok(bytes) => m.reserved = bytes,
+                    Err(Room::Never) => {
                         let metrics = &self.shared.metrics[usize::from(self.id.0)];
                         metrics.stalls.fetch_add(1, Ordering::Relaxed);
                         m.failed = Some(Error::Busy);
                         self.settle(m, Ok(()), ctx);
+                        continue;
+                    }
+                    Err(Room::Wait) => {
+                        if (self.nothing_to_flush() || self.flush_error) && !self.wait_room {
+                            // No flush can free anything: refuse now rather than wait.
+                            let metrics = &self.shared.metrics[usize::from(self.id.0)];
+                            metrics.stalls.fetch_add(1, Ordering::Relaxed);
+                            m.failed = Some(Error::Busy);
+                            self.settle(m, Ok(()), ctx);
+                            continue;
+                        }
+                        // Wait for a flush to free room: this member and everything after
+                        // it run in a later group.
+                        cut = true;
+                        need_room = true;
+                        self.pending.push(m);
                         continue;
                     }
                 }
@@ -1334,7 +2297,25 @@ impl ShardState {
             }
             admitted.push(m);
         }
-        if !self.pending.is_empty() {
+        if need_room {
+            self.wait_room = true;
+            let _ = self.freeze(true);
+            self.spawn_flush(ctx);
+            if self.nothing_to_flush() || self.flush_error {
+                // Nothing left to flush (or flushes fail) and still no room: fail the
+                // waiting members.
+                self.wait_room = false;
+                let waiting = std::mem::take(&mut self.pending);
+                for mut m in waiting {
+                    if matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                        self.pending.push(m);
+                        continue;
+                    }
+                    m.failed = Some(Error::Busy);
+                    self.settle(m, Ok(()), ctx);
+                }
+            }
+        } else if !self.pending.is_empty() {
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
         if admitted.is_empty() {
@@ -1370,11 +2351,13 @@ impl ShardState {
         };
         self.next_group += 1;
         let mut need_group_sync = false;
+        // A `None` member's record only enters the buffer (decision #50): no write() or sync
+        // of its own; the next stronger member's carries it.
         let mut appended = false;
         let mut unsynced = false;
         let mut last_sync: Option<pigeonhole_io::Completion<Lsn>> = None;
         for m in &mut group.members {
-            if m.durability == Durability::None || m.failed.is_some() {
+            if m.failed.is_some() {
                 continue;
             }
             let Some(wal) = self.wal.as_mut() else {
@@ -1388,11 +2371,37 @@ impl ShardState {
                     continue;
                 }
             };
-            match wal.append(&record, m.durability) {
+            let result = wal.append(&record, m.durability);
+            // Test hook: the append order. A failed write may still have landed (a crash
+            // or an I/O error mid-write), so every attempt the stream accepted counts.
+            #[cfg(feature = "test-hooks")]
+            if !matches!(
+                result,
+                Err(pigeonhole_wal::Error::RecordTooLarge
+                    | pigeonhole_wal::Error::InvalidArgument { .. })
+            ) {
+                self.shared
+                    .appended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(AppendedRecord {
+                        stream: self.id.0,
+                        seqno: m.seqno,
+                        kind: match &m.kind {
+                            MemberKind::Single => AppendedKind::Batch,
+                            MemberKind::Prepare { .. } => AppendedKind::Prepare,
+                            MemberKind::CommitRecord { .. } => AppendedKind::Commit,
+                        },
+                        durability: m.durability,
+                    });
+            }
+            match result {
                 Ok(t) => {
                     m.ticket = Some(t);
-                    appended = true;
-                    unsynced = true;
+                    if m.durability != Durability::None {
+                        appended = true;
+                        unsynced = true;
+                    }
                 }
                 Err(pigeonhole_wal::Error::RecordTooLarge) => {
                     m.failed = Some(Error::RecordTooLarge);
@@ -1402,7 +2411,8 @@ impl ShardState {
                     m.failed = Some(Error::InvalidArgument(what.to_owned()));
                     continue;
                 }
-                Err(_) => {
+                Err(e) => {
+                    trace!("shard {} append failed: {e}", self.id.0);
                     self.poisoned = true;
                     self.fail_all(group.members, ctx);
                     return;
@@ -1452,14 +2462,25 @@ impl ShardState {
             if m.failed.is_some() {
                 continue;
             }
-            match m.kind {
+            match &m.kind {
                 MemberKind::Single => {
                     if let Err(e) = self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts) {
+                        trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
                         self.poisoned = true;
                         m.failed = Some(e);
                     }
                     self.release_room(m.reserved);
                     m.reserved = 0;
+                    if let Some(t) = m.ticket {
+                        self.last_end = Some(t.end);
+                        self.log.push_back(Logged {
+                            end: t.end,
+                            seqno: m.seqno,
+                            kind: LoggedKind::Single {
+                                slots: self.touched_slots.clone(),
+                            },
+                        });
+                    }
                 }
                 MemberKind::Prepare { .. } => {
                     // The share keeps its reservation until the decision.
@@ -1467,8 +2488,29 @@ impl ShardState {
                         share.reserved = m.reserved;
                         m.reserved = 0;
                     }
+                    if let Some(t) = m.ticket {
+                        let slots = self.slots_of(m.bytes.as_slice());
+                        self.last_end = Some(t.end);
+                        self.log.push_back(Logged {
+                            end: t.end,
+                            seqno: m.seqno,
+                            kind: LoggedKind::Prepare { slots },
+                        });
+                    }
                 }
-                MemberKind::CommitRecord { .. } => {}
+                MemberKind::CommitRecord { participants } => {
+                    if let Some(t) = m.ticket {
+                        self.last_end = Some(t.end);
+                        self.share_reports.entry(m.seqno).or_insert((0, 0)).1 = participants.len();
+                        self.log.push_back(Logged {
+                            end: t.end,
+                            seqno: m.seqno,
+                            kind: LoggedKind::Commit {
+                                participants: participants.clone(),
+                            },
+                        });
+                    }
+                }
             }
         }
         if self.view_dirty
@@ -1484,6 +2526,7 @@ impl ShardState {
         if self.freeze(false).is_err() {
             self.poisoned = true;
         }
+        self.spawn_flush(ctx);
 
         // Resolution: now, or when the sync completes.
         match last_sync {
@@ -1654,6 +2697,9 @@ impl ShardState {
                 m.reply.resolve(result);
             }
             MemberKind::Prepare { coordinator } => {
+                if let Err(e) = &result {
+                    trace!("shard {} prepare {} failed: {e}", self.id.0, m.seqno);
+                }
                 let error = result.as_ref().err().map(prepare_error_of);
                 if error.is_some()
                     && let Some(share) = self.prepared.remove(&m.seqno)
@@ -1662,6 +2708,8 @@ impl ShardState {
                         self.track_share_rows(share.bytes.batch().as_bytes(), false);
                     }
                     self.release_room(share.reserved);
+                    // A failed prepare's record (if any) is never needed.
+                    self.aborted.insert(m.seqno);
                 }
                 self.send(
                     coordinator,
@@ -1684,6 +2732,9 @@ impl ShardState {
                 };
                 if let (Err(e), Some(c)) = (result, self.coord.get_mut(&m.seqno)) {
                     c.failed = Some(e);
+                }
+                if !commit {
+                    self.aborted.insert(m.seqno);
                 }
                 for p in participants {
                     self.send(
@@ -1823,6 +2874,7 @@ impl ShardState {
         c.decided = true;
         if c.failed.is_some() {
             let shards = c.shards.clone();
+            self.aborted.insert(seqno);
             for p in shards {
                 self.send(
                     p,
@@ -1841,6 +2893,7 @@ impl ShardState {
         let mut encoded = Vec::new();
         if let Err(e) = StreamList::encode(&streams, &mut encoded) {
             c.failed = Some(e.into());
+            self.aborted.insert(seqno);
             for p in shards {
                 self.send(
                     p,
@@ -1890,10 +2943,30 @@ impl ShardState {
             self.release_room(share.reserved);
             if commit {
                 self.refresh_tablets();
-                if let Err(e) = self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts) {
-                    // Possibly half applied: this shard extends nothing further.
-                    self.poisoned = true;
-                    error = Some(prepare_error_of(&e));
+                match self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts) {
+                    Ok(()) => {
+                        let slots = self.touched_slots.clone();
+                        for key in &slots {
+                            if let Some(slot) = self.memtables.get_mut(key) {
+                                slot.active.has_shares = true;
+                            }
+                        }
+                        if slots.is_empty() {
+                            // An empty share (validation only): nothing to flush.
+                            self.send(coordinator, ShardMsg::ShareFlushed { seqno }, ctx);
+                        } else {
+                            self.unreported.push(UnreportedShare {
+                                seqno,
+                                coordinator,
+                                slots,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        // Possibly half applied: this shard extends nothing further.
+                        self.poisoned = true;
+                        error = Some(prepare_error_of(&e));
+                    }
                 }
                 if self.view_dirty && self.publish_memtables().is_err() {
                     self.poisoned = true;
@@ -1902,6 +2975,10 @@ impl ShardState {
                 if self.freeze(false).is_err() {
                     self.poisoned = true;
                 }
+                self.spawn_flush(ctx);
+            } else {
+                self.aborted.insert(seqno);
+                self.advance_checkpoint(ctx);
             }
             // A conditional member deferred behind this share may run now.
             if !self.pending.is_empty() {
@@ -1962,21 +3039,530 @@ impl ShardState {
         self.try_finish_close(ctx);
     }
 
+    // ---- checkpoints ----
+
+    /// Whether the checkpoint may not pass `l` yet.
+    fn needed(&self, l: &Logged) -> bool {
+        let unflushed = |slots: &[(TabletId, FamilyId)]| {
+            slots
+                .iter()
+                .filter(|s| !self.dropped.contains(&s.0))
+                .any(|s| self.flushed.get(s).copied().unwrap_or(0) < l.seqno)
+        };
+        // A COMMIT this shard coordinates is unneeded once every participant's share is in
+        // SSTs (decision D24); its own PREPARE (logged before it) goes with it.
+        let commit_done = |seqno: Seqno| {
+            self.share_reports
+                .get(&seqno)
+                .is_some_and(|(reported, total)| reported >= total)
+        };
+        match &l.kind {
+            LoggedKind::Single { slots } => unflushed(slots),
+            LoggedKind::Prepare { slots } => {
+                !self.aborted.contains(&l.seqno)
+                    && (unflushed(slots)
+                        || !(self.commit_ckpt.contains(&l.seqno) || commit_done(l.seqno)))
+            }
+            LoggedKind::Commit { .. } => !self.aborted.contains(&l.seqno) && !commit_done(l.seqno),
+        }
+    }
+
+    /// Tells coordinators about applied shares whose slots are all in SSTs now.
+    fn report_shares_flushed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        trace!(
+            "shard {} report shares: flushed={:?} unreported={:?}",
+            self.id.0, self.flushed, self.unreported
+        );
+        let mut i = 0;
+        while i < self.unreported.len() {
+            let u = &self.unreported[i];
+            let done = u.slots.iter().all(|s| {
+                self.dropped.contains(&s.0) || self.flushed.get(s).copied().unwrap_or(0) >= u.seqno
+            });
+            if done {
+                let u = self.unreported.swap_remove(i);
+                self.send(
+                    u.coordinator,
+                    ShardMsg::ShareFlushed { seqno: u.seqno },
+                    ctx,
+                );
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Pops every unneeded record from the front of the log and, if the checkpoint moved,
+    /// submits a `WalCheckpoint` edit (one in flight at a time).
+    fn advance_checkpoint(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        while let Some(front) = self.log.front() {
+            if self.needed(front) {
+                break;
+            }
+            let l = self.log.pop_front().expect("checked");
+            self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
+            self.aborted.remove(&l.seqno);
+            match l.kind {
+                LoggedKind::Commit { participants } => {
+                    self.share_reports.remove(&l.seqno);
+                    self.passed_commits.push((l.seqno, participants));
+                }
+                LoggedKind::Prepare { .. } => {
+                    self.commit_ckpt.remove(&l.seqno);
+                }
+                LoggedKind::Single { .. } => {}
+            }
+        }
+        if self.log.is_empty()
+            && let Some(end) = self.last_end
+        {
+            self.checkpoint_candidate = self.checkpoint_candidate.max(end);
+        }
+        // Never name bytes the kernel has not seen (a `None` record still in the buffer).
+        if let Some(wal) = self.wal.as_ref() {
+            self.checkpoint_candidate = self
+                .checkpoint_candidate
+                .min(wal.written())
+                .max(self.checkpoint);
+        }
+        if self.checkpoint_candidate <= self.checkpoint && self.passed_commits.is_empty() {
+            return;
+        }
+        if self.checkpoint_inflight {
+            self.checkpoint_dirty = true;
+            return;
+        }
+        if self.shared.pager_poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        self.checkpoint_inflight = true;
+        self.checkpoint_dirty = false;
+        let lsn = self.checkpoint_candidate;
+        let commits = std::mem::take(&mut self.passed_commits);
+        let submitter = ctx.submitter(self.id).clone();
+        let stream = StreamId(u32::from(self.id.0));
+        let req = ManifestReq::edits(vec![Edit::WalCheckpoint { stream, lsn }], move |result| {
+            let _ = submitter.submit(ShardMsg::Checkpointed {
+                lsn,
+                commits,
+                result,
+            });
+        });
+        manifest::submit(&self.shared, self.id, req);
+    }
+
+    fn on_checkpointed(
+        &mut self,
+        lsn: Lsn,
+        commits: Vec<(Seqno, Vec<ShardId>)>,
+        result: Result<ManifestVersion>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        self.checkpoint_inflight = false;
+        match result {
+            Ok(_) => {
+                self.checkpoint = self.checkpoint.max(lsn);
+                if let Some(wal) = self.wal.as_mut()
+                    && !self.poisoned
+                    && wal.checkpoint(lsn).is_err()
+                {
+                    self.poisoned = true;
+                }
+                for (seqno, participants) in commits {
+                    for p in participants {
+                        self.send(p, ShardMsg::CommitCheckpointed { seqno }, ctx);
+                    }
+                }
+            }
+            Err(e) => {
+                // Retry at the next checkpoint event; the commits passed stay queued.
+                trace!("shard {} checkpoint failed: {e}", self.id.0);
+                self.passed_commits.extend(commits);
+                self.checkpoint_dirty = true;
+                if self.closing {
+                    self.shared.close.failed.store(true, Ordering::Release);
+                }
+            }
+        }
+        if self.checkpoint_dirty && !self.shared.pager_poisoned.load(Ordering::Acquire) {
+            self.checkpoint_dirty = false;
+            self.advance_checkpoint(ctx);
+        }
+        self.try_finish_close(ctx);
+    }
+
+    // ---- compaction ----
+
+    /// The families of the tablets this shard owns, with their SSTs in `view`.
+    fn owned_slots(&self, view: &View) -> Vec<(TabletId, FamilyId)> {
+        let mut out = Vec::new();
+        for t in view.tablets.iter() {
+            if t.shard != self.id {
+                continue;
+            }
+            for f in view.catalog.family_ids_of(t.table) {
+                out.push((t.id, f));
+            }
+        }
+        out
+    }
+
+    /// Scores the shard's slots, refreshes the stall score and starts the most urgent
+    /// compaction (or the next step of a full compaction) if none is running.
+    fn maintain(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.replaying {
+            return;
+        }
+        let view = self.shared.view.load_full();
+        let mut score = 0.0f64;
+        let mut best: Option<(f64, (TabletId, FamilyId))> = None;
+        for key in self.owned_slots(&view) {
+            let Some(fam) = view.ssts.family(key.0, key.1) else {
+                continue;
+            };
+            let Some(meta) = view.catalog.family(key.1) else {
+                continue;
+            };
+            if meta.merge == MergeKind::Unknown {
+                continue;
+            }
+            let s = self.picker.score(&fam.levels_meta());
+            score = score.max(s);
+            if s >= 1.0 && best.is_none_or(|(b, _)| s > b) {
+                best = Some((s, key));
+            }
+        }
+        trace!(
+            "shard {} maintain: score={score:.2} best={best:?} compaction={:?} full_waiters={}",
+            self.id.0,
+            self.compaction,
+            self.compact_all.len()
+        );
+        let was_stalled = self.stall.score >= 1.0;
+        self.stall.score = score;
+        if was_stalled && score < 1.0 {
+            self.stall.cancel_timer();
+            if !self.pending.is_empty() {
+                let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+            }
+        }
+        if self.compaction.is_some() || self.closing || self.shared.closing.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if self.shared.pager_poisoned.load(Ordering::Acquire) {
+            for (_, w) in self.compact_all.drain(..) {
+                w.notify(Err(poisoned_error()));
+            }
+            return;
+        }
+        // Full compactions first (a caller waits), one slot at a time.
+        while let Some((filter, _)) = self.compact_all.front() {
+            if !self.flush_idle() {
+                self.spawn_flush(ctx);
+                return;
+            }
+            let filter = *filter;
+            let last = self.picker.options().max_levels.max(2) - 1;
+            let busy: Vec<SstId> = self
+                .shared
+                .busy_ssts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .copied()
+                .collect();
+            let mut task = None;
+            for key in self.owned_slots(&view) {
+                let Some(fam) = view.ssts.family(key.0, key.1) else {
+                    continue;
+                };
+                let Some(meta) = view.catalog.family(key.1) else {
+                    continue;
+                };
+                if filter.is_some_and(|t| t != meta.table) || meta.merge == MergeKind::Unknown {
+                    continue;
+                }
+                if let Some(t) = compact::plan_full(key.0, key.1, &fam.levels_meta(), last, &busy) {
+                    task = Some((key, t));
+                    break;
+                }
+            }
+            match task {
+                Some((key, task)) => match self.start_compaction(&view, key, task, ctx) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        let (_, reply) = self.compact_all.pop_front().expect("front");
+                        reply.notify(Err(e));
+                    }
+                },
+                None => {
+                    let (_, reply) = self.compact_all.pop_front().expect("front");
+                    reply.notify(match self.compaction_error.take() {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    });
+                }
+            }
+        }
+        let Some((_, key)) = best else {
+            return;
+        };
+        // After a failure, only a stall (writers wait on this compaction) retries it.
+        if self.compaction_backoff && score < 1.0 {
+            return;
+        }
+        let Some(fam) = view.ssts.family(key.0, key.1) else {
+            return;
+        };
+        let Some(meta) = view.catalog.family(key.1) else {
+            return;
+        };
+        let busy: Vec<SstId> = self
+            .shared
+            .busy_ssts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        let now = self.shared.vfs.now_micros();
+        let Some(task) = self.picker.pick(
+            key.0,
+            key.1,
+            &fam.levels_meta(),
+            &busy,
+            now,
+            meta.options.ttl_micros,
+        ) else {
+            return;
+        };
+        let _ = self.start_compaction(&view, key, task, ctx);
+    }
+
+    fn start_compaction(
+        &mut self,
+        view: &Arc<View>,
+        key: (TabletId, FamilyId),
+        mut task: pigeonhole_compaction::CompactionTask,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) -> Result<()> {
+        let tablet = view
+            .tablets
+            .entry(key.0)
+            .cloned()
+            .ok_or_else(|| Error::TableNotFound(format!("tablet {}", key.0.0)))?;
+        let fam = view
+            .ssts
+            .family(key.0, key.1)
+            .ok_or_else(|| Error::Corruption("no SSTs".to_owned()))?;
+        let meta = view
+            .catalog
+            .family(key.1)
+            .cloned()
+            .ok_or_else(|| Error::FamilyNotFound(format!("family {}", key.1.0)))?;
+        compact::narrow(&mut task, &tablet, &view.catalog)?;
+        trace!(
+            "shard {} compaction start {:?}: inputs {:?} -> level {} ({:?})",
+            self.id.0, key, task.inputs, task.output_level, task.kind
+        );
+        let mem_min_ts = self.memtables.get(&key).map_or(u64::MAX, MemSlot::min_ts);
+        let now = self.shared.vfs.now_micros();
+        let gc = compact::gc_policy(&self.shared, fam, &task, mem_min_ts, now);
+        let record =
+            (task.kind == pigeonhole_compaction::TaskKind::Rewrite).then(|| CompactionRecord {
+                manifest_version: 0,
+                table: meta.table,
+                tablet: key.0,
+                family: key.1,
+                bottommost: gc.bottommost,
+                snapshots: gc.snapshots.clone(),
+                now: gc.now,
+                min_ts_above: gc.min_ts_above,
+                max_seqno: compact::max_input_seqno(fam, &task),
+                rows: (
+                    (!tablet.start.is_empty()).then(|| tablet.start.clone()),
+                    tablet.end.clone(),
+                ),
+            });
+        let work = CompactionWork::new(
+            Arc::clone(&self.shared),
+            self.id,
+            Arc::clone(view),
+            fam,
+            meta,
+            task,
+            gc,
+            record,
+        )?;
+        {
+            let mut busy = self
+                .shared
+                .busy_ssts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            busy.extend(work.inputs());
+        }
+        self.compaction = Some(key);
+        ctx.spawn(Box::new(work));
+        Ok(())
+    }
+
+    fn on_compaction_done(
+        &mut self,
+        inputs: Vec<SstId>,
+        result: Result<ManifestVersion>,
+        nanos: u64,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        {
+            let mut busy = self
+                .shared
+                .busy_ssts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for id in &inputs {
+                busy.remove(id);
+            }
+        }
+        self.compaction = None;
+        trace!(
+            "shard {} compaction done: {:?} ({nanos} ns)",
+            self.id.0,
+            result.as_ref().map(|_| ())
+        );
+        match result {
+            Ok(_) => {
+                let metrics = &self.shared.metrics[usize::from(self.id.0)];
+                metrics.compactions.fetch_add(1, Ordering::Relaxed);
+                metrics.compaction_nanos.fetch_add(nanos, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // A full compaction reports the failure to its caller; a background one
+                // waits for the next trigger (a flush or new writes) rather than retrying
+                // in a loop against a device that keeps failing.
+                match self.compact_all.pop_front() {
+                    Some((_, reply)) => reply.notify(Err(e)),
+                    None => self.compaction_error = Some(e),
+                }
+                self.compaction_backoff = true;
+            }
+        }
+        self.maintain(ctx);
+    }
+
     // ---- close ----
 
-    fn try_finish_close(&mut self, _ctx: &mut ShardContext<'_, ShardMsg>) {
-        if !self.closing
-            || self.close_reported
-            || !self.unresolved.is_empty()
+    fn try_finish_close(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if !self.closing || self.close_stage == CloseStage::Reported {
+            return;
+        }
+        trace!(
+            "shard {} close: stage {:?} unresolved={} coord={} prepared={} pending={} flush_idle={} \
+             flush_running={} queue={} frozen={} to_freeze={:?} deferred={} log={} ckpt_inflight={} \
+             dirty={} failed={} unreported={} share_reports={:?} commit_ckpt={:?} aborted={:?}",
+            self.id.0,
+            self.close_stage,
+            self.unresolved.len(),
+            self.coord.len(),
+            self.prepared.len(),
+            self.pending.len(),
+            self.flush_idle(),
+            self.flush_running,
+            self.flush_queue.len(),
+            self.memtables
+                .values()
+                .map(|s| s.frozen.len())
+                .sum::<usize>(),
+            self.to_freeze,
+            self.freeze_deferred,
+            self.log.len(),
+            self.checkpoint_inflight,
+            self.checkpoint_dirty,
+            self.flush_failed,
+            self.unreported.len(),
+            self.share_reports,
+            self.commit_ckpt,
+            self.aborted,
+        );
+        if tracing() {
+            for l in &self.log {
+                eprintln!(
+                    "  shard {} log: seqno {} {:?} needed={}",
+                    self.id.0,
+                    l.seqno,
+                    l.kind,
+                    self.needed(l)
+                );
+            }
+        }
+        if !self.unresolved.is_empty()
             || !self.coord.is_empty()
             || !self.prepared.is_empty()
             || !self.pending.is_empty()
         {
             return;
         }
-        self.close_reported = true;
-        self.final_sync();
-        self.shared.report_closed();
+        if self.close_stage == CloseStage::Draining {
+            self.close_stage = CloseStage::Flushing;
+            // Abandon the stall: nothing is admitted any more.
+            self.stall.score = 0.0;
+            self.stall.cancel_timer();
+            if self.freeze(true).is_err() {
+                self.shared.close.failed.store(true, Ordering::Release);
+            }
+            self.spawn_flush(ctx);
+        }
+        if self.close_stage == CloseStage::Flushing
+            && !self.flush_running
+            && (self.flush_failed || self.shared.pager_poisoned.load(Ordering::Acquire))
+        {
+            self.flush_failed = true;
+            self.shared.close.failed.store(true, Ordering::Release);
+            // Give up on flushing: the WAL keeps everything, the next open replays it, and
+            // the close is reported unclean.
+            self.close_stage = CloseStage::Checkpointing;
+            self.checkpoint_inflight = false;
+        }
+        if self.close_stage == CloseStage::Flushing {
+            if self.freeze_all_pending || self.freeze_deferred {
+                // A freeze waited for visibility; try again (the watermark moves once the
+                // other shards finish their groups, and they kick us).
+                if self.freeze(true).is_err() {
+                    self.shared.close.failed.store(true, Ordering::Release);
+                }
+                self.spawn_flush(ctx);
+            }
+            if !self.flush_idle() || self.freeze_all_pending || !self.to_freeze.is_empty() {
+                return;
+            }
+            // Buffered `None` records reach the file now, so the final checkpoint can name
+            // the end of the stream.
+            if let Some(wal) = self.wal.as_mut()
+                && !self.poisoned
+                && wal.write().is_err()
+            {
+                self.poisoned = true;
+            }
+            self.report_shares_flushed(ctx);
+            self.advance_checkpoint(ctx);
+            if !self.log.is_empty() || self.checkpoint_inflight || self.checkpoint_dirty {
+                // Waiting for the other shards' flushes and checkpoints (ShareFlushed and
+                // CommitCheckpointed arrive as messages), or for our own edit.
+                return;
+            }
+            self.close_stage = CloseStage::Checkpointing;
+        }
+        if self.close_stage == CloseStage::Checkpointing {
+            if self.checkpoint_inflight {
+                return;
+            }
+            self.close_stage = CloseStage::Reported;
+            self.final_sync();
+            // The stream is checkpointed to its end: the last process removes the files.
+            self.wal = None;
+            self.shared.report_closed();
+        }
     }
 
     /// The final sync of the stream at close; a failure (or an earlier poisoning) makes the
@@ -1987,20 +3573,26 @@ impl ShardState {
             Some(_) => true,
             None => false,
         };
+        trace!(
+            "shard {} final sync failed={failed} poisoned={}",
+            self.id.0, self.poisoned
+        );
         if failed {
             self.shared.close.failed.store(true, Ordering::Release);
         }
     }
 
     /// Finishes a shard whose driver is dropped before the close handshake completed: the
-    /// stream is synced and the close reported, so `Engine::close` never waits forever.
+    /// stream is synced and the close reported, so `Engine::close` never waits forever. The
+    /// WAL files stay (the close is not clean).
     pub(crate) fn abandon(&mut self, shared: &Shared) {
-        if self.close_reported {
+        if self.close_stage == CloseStage::Reported {
             return;
         }
         self.closing = true;
-        self.close_reported = true;
+        self.close_stage = CloseStage::Reported;
         self.final_sync();
+        shared.close.failed.store(true, Ordering::Release);
         if shared.close.remaining.load(Ordering::Acquire) > 0 {
             shared.report_closed();
         }
@@ -2011,6 +3603,45 @@ impl ShardState {
     pub(crate) fn commit_inline(&mut self, req: CommitReq, ctx: &mut ShardContext<'_, ShardMsg>) {
         self.pending.push(Member::single(req));
         self.run_group(ctx);
+    }
+
+    fn on_sync_barrier(
+        &mut self,
+        reply: Notifier<Result<()>>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let _ = ctx;
+        trace!(
+            "shard {} barrier: poisoned={} wal={}",
+            self.id.0,
+            self.poisoned,
+            self.wal.is_some()
+        );
+        if self.poisoned {
+            reply.notify(Err(poisoned_error()));
+            return;
+        }
+        match self.wal.as_mut() {
+            Some(wal) => match wal.submit_sync() {
+                Ok(c) => {
+                    drop(c.map(move |r| {
+                        reply.notify(r.map(|_| ()).map_err(Error::from));
+                        Ok(())
+                    }));
+                }
+                Err(e) => {
+                    self.poisoned = true;
+                    reply.notify(Err(e.into()));
+                }
+            },
+            // Closed cleanly: the stream was synced before it was dropped.
+            None if self.close_stage == CloseStage::Reported
+                && !self.shared.close.failed.load(Ordering::Acquire) =>
+            {
+                reply.notify(Ok(()))
+            }
+            None => reply.notify(Err(Error::Unsupported("no WAL stream"))),
+        }
     }
 
     fn handle_msg(&mut self, msg: ShardMsg, ctx: &mut ShardContext<'_, ShardMsg>) {
@@ -2032,12 +3663,69 @@ impl ShardState {
             } => self.on_decide(seqno, commit, coordinator, ctx),
             ShardMsg::Applied { seqno, from, error } => self.on_applied(seqno, from, error, ctx),
             ShardMsg::SyncDone { group, result } => self.resolve_through(group, result, ctx),
-            ShardMsg::Freeze { reply } => {
-                let r = self.freeze(true);
-                self.shared.metrics[usize::from(self.id.0)]
-                    .flushes
-                    .fetch_add(1, Ordering::Relaxed);
-                reply.notify(r);
+            ShardMsg::FlushAll { reply } => {
+                if let Err(e) = self.freeze(true) {
+                    reply.notify(Err(e));
+                    return;
+                }
+                self.flush_waiters.push(reply);
+                self.spawn_flush(ctx);
+                self.check_flush_waiters();
+            }
+            ShardMsg::Flushed {
+                items,
+                result,
+                nanos,
+            } => self.on_flushed(items, result, nanos, ctx),
+            ShardMsg::SyncBarrier { reply } => self.on_sync_barrier(reply, ctx),
+            ShardMsg::ShareFlushed { seqno } => {
+                // The COMMIT record may not be logged yet (a participant flushed before the
+                // coordinator's group ran): the count waits for it.
+                self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
+                self.advance_checkpoint(ctx);
+                self.try_finish_close(ctx);
+            }
+            ShardMsg::CommitCheckpointed { seqno } => {
+                self.commit_ckpt.insert(seqno);
+                self.advance_checkpoint(ctx);
+                self.try_finish_close(ctx);
+            }
+            ShardMsg::Checkpointed {
+                lsn,
+                commits,
+                result,
+            } => self.on_checkpointed(lsn, commits, result, ctx),
+            ShardMsg::Maintain => {
+                self.maintain(ctx);
+                if self.freeze_deferred || !self.to_freeze.is_empty() {
+                    let _ = self.freeze(false);
+                    self.spawn_flush(ctx);
+                }
+                if !self.flush_queue.is_empty() {
+                    self.spawn_flush(ctx);
+                }
+                self.reclaim_retired();
+            }
+            ShardMsg::CompactionDone {
+                inputs,
+                result,
+                nanos,
+            } => self.on_compaction_done(inputs, result, nanos, ctx),
+            ShardMsg::CompactAll { table, reply } => {
+                if self.closing {
+                    reply.notify(Err(Error::Closed));
+                    return;
+                }
+                if let Err(e) = self.freeze(true) {
+                    reply.notify(Err(e));
+                    return;
+                }
+                self.compact_all.push_back((table, reply));
+                self.spawn_flush(ctx);
+                self.maintain(ctx);
+            }
+            ShardMsg::PumpManifest => {
+                ctx.spawn(Box::new(ManifestPump::new(Arc::clone(&self.shared))));
             }
             ShardMsg::DropTablets { tablets } => {
                 if self.drop_tablets(&tablets).is_err() {
@@ -2045,15 +3733,65 @@ impl ShardState {
                 }
             }
             ShardMsg::Start => {
+                self.replaying = false;
                 self.maybe_prepare_spares(ctx);
+                // Replayed shares with nothing left to flush report at once.
+                self.report_shares_flushed(ctx);
+                self.advance_checkpoint(ctx);
+                self.spawn_flush(ctx);
+                self.maintain(ctx);
             }
             ShardMsg::Kick => {}
             ShardMsg::Close => {
-                self.closing = true;
+                if !self.closing {
+                    self.closing = true;
+                    self.close_stage = CloseStage::Draining;
+                    self.shared.closing.store(true, Ordering::Release);
+                }
                 self.try_finish_close(ctx);
             }
         }
     }
+}
+
+/// Whether `PIGEONHOLE_TRACE` is set: the close and checkpoint protocol logs its steps.
+pub(crate) fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIGEONHOLE_TRACE").is_some())
+}
+
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if $crate::shard::tracing() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+pub(crate) use trace;
+
+/// Why a member could not reserve arena room.
+enum Room {
+    /// It can never fit, even in an empty arena.
+    Never,
+    /// A flush may free enough.
+    Wait,
+}
+
+/// A replayed record, for the checkpoint log.
+#[derive(Debug)]
+pub(crate) enum ReplayedKind {
+    Single {
+        slots: Vec<(TabletId, FamilyId)>,
+    },
+    Prepare {
+        slots: Vec<(TabletId, FamilyId)>,
+        coordinator: ShardId,
+        applied: bool,
+    },
+    Commit {
+        participants: Vec<ShardId>,
+        complete: bool,
+    },
 }
 
 impl ShardHandler for ShardState {
@@ -2065,6 +3803,14 @@ impl ShardHandler for ShardState {
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
         self.run_group(ctx);
+        if (self.freeze_all_pending
+            || (!self.to_freeze.is_empty() && self.freeze_deferred)
+            || self.wait_room)
+            && self.freeze(false).is_ok()
+        {
+            self.spawn_flush(ctx);
+            self.check_flush_waiters();
+        }
         self.try_finish_close(ctx);
     }
 }

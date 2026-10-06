@@ -125,12 +125,15 @@ fn cross_shard_write_skew_is_prevented() {
 
 #[test]
 fn aborts_from_busy_poison_and_close_all_resolve() {
-    // Busy: a participant without arena room refuses its PREPARE; the whole commit aborts.
+    // Busy: a participant whose share can never fit its arena (even empty) refuses its
+    // PREPARE; the whole commit aborts. A merely full arena waits for a flush instead.
     {
         let vfs = SimVfs::new(12);
         let mut o = owned(Arc::clone(&vfs), 2);
         o.memtable_budget = 512 << 10;
         o.memtable_freeze_bytes = 64 << 10;
+        // Segments large enough that the share below is refused for its arena, not its size.
+        o.wal.segment_size = 4 << 20;
         let db = Engine::open(Path::new(DB), o).unwrap();
         let a = db
             .create_table("a", &[("f".into(), FamilyOptions::default())])
@@ -138,28 +141,31 @@ fn aborts_from_busy_poison_and_close_all_resolve() {
         let b = db
             .create_table("b", &[("f".into(), FamilyOptions::default())])
             .unwrap();
-        // Fill table b's shard until it is nearly full.
-        let mut filled = 0u32;
-        loop {
-            match db.commit(
-                put(&b, &filled.to_be_bytes(), &vec![1u8; 16 << 10]),
+        // Table b's shard keeps absorbing writes: full arenas flush.
+        for i in 0..60u32 {
+            db.commit(
+                put(&b, &i.to_be_bytes(), &vec![1u8; 16 << 10]),
                 Some(Durability::None),
-            ) {
-                Ok(_) => filled += 1,
-                Err(Error::Busy) => break,
-                Err(e) => panic!("{e}"),
-            }
+            )
+            .unwrap();
         }
+        assert!(
+            db.metrics().flushes > 0,
+            "the arena was flushed, not refused"
+        );
+        // Larger than the whole arena (the region rounds the budget up to a few MiB).
         let mut wb = put(&a, b"x", b"small");
-        wb.put(
-            b.id,
-            b.families[0].id,
-            b"big",
-            b"q",
-            None,
-            ValueRef::Bytes(&vec![2u8; 32 << 10]),
-        )
-        .unwrap();
+        for i in 0..200u32 {
+            wb.put(
+                b.id,
+                b.families[0].id,
+                &i.to_be_bytes(),
+                b"big",
+                None,
+                ValueRef::Bytes(&vec![2u8; 16 << 10]),
+            )
+            .unwrap();
+        }
         let db2 = Arc::clone(&db);
         let r = within("cross-shard commit with a busy participant", move || {
             db2.commit(wb, None)

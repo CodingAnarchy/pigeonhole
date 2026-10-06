@@ -5,6 +5,14 @@ use pigeonhole_io::ErrorKind;
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// An `Io` error carrying a dynamic message (a background failure reported to a caller).
+pub(crate) fn io_other(context: &'static str, message: impl Into<String>) -> Error {
+    Error::Io(pigeonhole_io::Error::os(
+        context,
+        std::io::Error::other(message.into()),
+    ))
+}
+
 /// Engine errors. Each variant maps to exactly one public `ErrorCode`.
 ///
 /// ```

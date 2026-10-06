@@ -98,7 +98,7 @@ pub enum Error {
     /// A write or sync failed earlier; the stream refuses further appends, writes and syncs
     /// until it is reopened through [`Recovery`] (see [`Wal`]).
     Poisoned,
-    /// A caller error: an option out of range, or a record at [`Durability::None`].
+    /// A caller error: an option out of range.
     InvalidArgument {
         /// What was wrong.
         what: &'static str,
@@ -239,8 +239,10 @@ pub trait Wal: Send + fmt::Debug {
     /// Encodes and frames `record` into the stream's buffer (no syscall). Returns the ticket
     /// for `durability`. Opens a new segment when the current one is full.
     ///
-    /// `Durability::None` commits write no WAL record (FORMAT §10.3): the engine must not
-    /// call this for them, and an implementation refuses with [`Error::InvalidArgument`].
+    /// A `Durability::None` commit's record stays in the buffer with no I/O of its own
+    /// (its ticket is satisfied at once); the next [`Wal::write`] or sync, which a stronger
+    /// commit triggers, carries it to the file (FORMAT §10.3, decision #50). Until then it
+    /// survives nothing.
     fn append(&mut self, record: &WalRecord<'_>, durability: Durability) -> Result<CommitTicket>;
 
     /// Hands every appended byte to the kernel with one `write()`. After this, every ticket

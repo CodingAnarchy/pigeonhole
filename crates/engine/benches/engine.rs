@@ -4,6 +4,10 @@
 //! reading; single-shard commit latency per durability level on real files; group-commit
 //! throughput with many committers; and write scaling from one to N shards.
 //!
+//! Milestone B adds the LSM paths (issue #37): sustained writes with flushes and
+//! compactions running, point gets on flushed data with a hot and a cold block cache, and
+//! scan throughput over SSTs.
+//!
 //! Run with `cargo bench -p pigeonhole-engine`. The write benchmarks use `PreadVfs` on a
 //! temporary directory, so their numbers depend on the disk (D5: non-reference hardware).
 
@@ -14,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pigeonhole_engine::{
-    Durability, Engine, EngineOptions, FamilyOptions, TableInfo, ValueRef, WriteBatch,
+    Durability, Engine, EngineOptions, FamilyOptions, ScanSpec, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_io::VfsRef;
 use pigeonhole_io::pread::PreadVfs;
@@ -283,5 +287,148 @@ fn scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, gets, commits, scaling);
+/// Options for the LSM benchmarks: small memtables so flushes and compactions run during
+/// the measurement, and a block cache of `cache_bytes`.
+fn lsm_options(vfs: VfsRef, cache_bytes: usize) -> EngineOptions {
+    let mut o = options(vfs, 1);
+    o.memtable_budget = 64 << 20;
+    o.memtable_freeze_bytes = 8 << 20;
+    o.block_cache_bytes = cache_bytes;
+    o.compaction.l0_trigger = 4;
+    o
+}
+
+/// Sustained write throughput with flushes and compactions running (1 KiB values, one
+/// shard, `Buffered`): cells per second, and the commit latency percentiles the engine
+/// measured are printed after the run.
+fn sustained_writes(c: &mut Criterion) {
+    let vfs: VfsRef = PreadVfs::new(2);
+    let path = temp_db("sustained");
+    let db = Engine::open(&path, lsm_options(vfs, 64 << 20)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let value = vec![7u8; 1024];
+    let mut group = c.benchmark_group("sustained-write-1-shard");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(1));
+    let mut i = 0u64;
+    group.bench_function("Buffered 1KiB cells/s", |b| {
+        b.iter(|| {
+            i += 1;
+            let mut wb = WriteBatch::new();
+            // Random-ish keys so compactions rewrite overlapping ranges.
+            let key = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_be_bytes();
+            put(&mut wb, &t, &key, &value);
+            black_box(db.commit(wb, Some(Durability::Buffered)).unwrap());
+        })
+    });
+    group.finish();
+    let m = db.metrics();
+    let d = Durability::Buffered as usize;
+    eprintln!(
+        "sustained-write: {} commits, {} flushes, {} compactions, {} stalls; Buffered commit latency p50 {} us, p99 {} us, p99.9 {} us",
+        m.commits[d],
+        m.flushes,
+        m.compactions,
+        m.stalls.0,
+        m.commit_latency_nanos[d][0] / 1_000,
+        m.commit_latency_nanos[d][1] / 1_000,
+        m.commit_latency_nanos[d][2] / 1_000
+    );
+    db.close().unwrap();
+}
+
+/// Loads `rows` rows of `value_len`-byte values, flushes and compacts them into SSTs.
+fn load_flushed(
+    path: &std::path::Path,
+    cache_bytes: usize,
+    rows: u64,
+    value_len: usize,
+) -> (Arc<Engine>, Arc<TableInfo>) {
+    let vfs: VfsRef = PreadVfs::new(2);
+    let db = Engine::open(path, lsm_options(vfs, cache_bytes)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let value = vec![3u8; value_len];
+    for i in 0..rows {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &t, format!("row{i:08}").as_bytes(), &value);
+        db.commit(wb, Some(Durability::None)).unwrap();
+    }
+    db.flush().unwrap();
+    db.compact(None).unwrap();
+    (db, t)
+}
+
+/// Point gets on flushed data: the same 64 rows again and again (blocks cached), and
+/// rows spread over the whole table with a cache far smaller than the data (reads hit the
+/// file through the pager).
+fn flushed_gets(c: &mut Criterion) {
+    const ROWS: u64 = 200_000;
+    let mut group = c.benchmark_group("get-flushed");
+    group.sample_size(20);
+    for (name, cache) in [("hot", 256usize << 20), ("cold", 256 << 10)] {
+        let path = temp_db(&format!("get-{name}"));
+        let (db, t) = load_flushed(&path, cache, ROWS, 256);
+        let f = t.families[0].id;
+        let snap = db.snapshot().unwrap();
+        let mut i = 0u64;
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                i = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let n = if name == "hot" { i % 64 } else { i % ROWS };
+                let row = format!("row{n:08}");
+                black_box(db.get(&snap, t.id, f, row.as_bytes(), b"q").unwrap());
+            })
+        });
+        drop(snap);
+        db.close().unwrap();
+    }
+    group.finish();
+}
+
+/// Full-table scan over SSTs: bytes of cell values per second.
+fn flushed_scans(c: &mut Criterion) {
+    const ROWS: u64 = 100_000;
+    const VALUE: usize = 512;
+    let path = temp_db("scan");
+    let (db, t) = load_flushed(&path, 256 << 20, ROWS, VALUE);
+    let mut group = c.benchmark_group("scan-flushed");
+    group.sample_size(10);
+    group.throughput(Throughput::Bytes(ROWS * VALUE as u64));
+    group.bench_function("full table 512B values", |b| {
+        b.iter(|| {
+            let snap = db.snapshot().unwrap();
+            let mut cur = db
+                .scan(
+                    &snap,
+                    t.id,
+                    ScanSpec::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                )
+                .unwrap();
+            let mut bytes = 0usize;
+            while cur.next_row().unwrap() {
+                while let Some(cell) = cur.next_cell().unwrap() {
+                    bytes += cell.stored.len();
+                }
+            }
+            black_box(bytes)
+        })
+    });
+    group.finish();
+    db.close().unwrap();
+}
+
+criterion_group!(
+    benches,
+    gets,
+    commits,
+    scaling,
+    sustained_writes,
+    flushed_gets,
+    flushed_scans
+);
 criterion_main!(benches);

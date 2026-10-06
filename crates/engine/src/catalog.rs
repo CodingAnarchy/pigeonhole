@@ -1,12 +1,15 @@
 //! The catalog: tables, families, tablets, counters and everything else the manifest
 //! persists, rebuilt from manifest edits at open and updated by every manifest commit.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use pigeonhole_compaction::{MergeOperator, MergeRegistry};
 use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
-use pigeonhole_format::{BlobFileId, FamilyId, Lsn, Seqno, StreamId, TableId, TabletId, Timestamp};
+use pigeonhole_format::{
+    BlobFileId, FamilyId, Lsn, Seqno, SstId, StreamId, TableId, TabletId, Timestamp,
+};
 use pigeonhole_runtime::ShardId;
 
 use crate::snapshot::TabletEntry;
@@ -22,6 +25,8 @@ pub(crate) enum MergeKind {
     None,
     /// The built-in wrapping `i64` add.
     I64Add,
+    /// An operator registered in `EngineOptions::merge_operators`.
+    Registered,
     /// An operator this process has not registered: reads of merged cells fail.
     Unknown,
 }
@@ -32,6 +37,8 @@ pub(crate) struct FamilyMeta {
     pub table: TableId,
     pub options: FamilyOptions,
     pub merge: MergeKind,
+    /// The operator itself (`None` for no operator or an unregistered one).
+    pub merge_op: Option<Arc<dyn MergeOperator>>,
 }
 
 /// Id allocation counters and floors (`Edit::Counters`).
@@ -74,9 +81,24 @@ pub struct Catalog {
     pub(crate) blob_files: BTreeMap<BlobFileId, BlobFile>,
     /// Whether any family names a merge operator this process cannot run.
     pub(crate) has_unknown_merge: bool,
+    /// The operators this process knows (`EngineOptions::merge_operators`).
+    registry: Arc<MergeRegistry>,
 }
 
 impl Catalog {
+    /// An empty catalog resolving operator names through `registry`.
+    pub(crate) fn with_registry(registry: Arc<MergeRegistry>) -> Self {
+        Self {
+            registry,
+            ..Self::default()
+        }
+    }
+
+    /// The operator registry.
+    pub(crate) fn registry(&self) -> &Arc<MergeRegistry> {
+        &self.registry
+    }
+
     /// Applies one edit. Shard assignment of tablets is `tablet % shards`.
     pub(crate) fn apply(&mut self, edit: &Edit, shards: usize) -> Result<()> {
         match edit {
@@ -130,10 +152,17 @@ impl Catalog {
                     Some(existing) => *existing = new,
                     None => info.families.push(new),
                 }
-                let merge = match options.merge_operator.as_str() {
-                    "" => MergeKind::None,
-                    I64_ADD => MergeKind::I64Add,
-                    _ => {
+                let name = options.merge_operator.as_str();
+                let merge_op = if name.is_empty() {
+                    None
+                } else {
+                    self.registry.get(name)
+                };
+                let merge = match (name, &merge_op) {
+                    ("", _) => MergeKind::None,
+                    (I64_ADD, _) => MergeKind::I64Add,
+                    (_, Some(_)) => MergeKind::Registered,
+                    (_, None) => {
                         self.has_unknown_merge = true;
                         MergeKind::Unknown
                     }
@@ -144,6 +173,7 @@ impl Catalog {
                         table: *table,
                         options: options.clone(),
                         merge,
+                        merge_op,
                     },
                 );
                 self.tables.insert(*table, Arc::new(info));
@@ -383,6 +413,68 @@ impl Catalog {
         let id = TabletId(self.counters.next_tablet.max(1));
         self.counters.next_tablet = id.0 + 1;
         id
+    }
+}
+
+impl Catalog {
+    /// Every SST id the catalog names.
+    pub(crate) fn sst_ids(&self) -> HashSet<SstId> {
+        self.ssts
+            .values()
+            .flat_map(|l| l.iter().map(|(_, m)| m.id))
+            .collect()
+    }
+
+    /// The SSTs `old` names that this catalog no longer references from any tablet.
+    pub(crate) fn removed_since(&self, old: &Catalog) -> Vec<Arc<SstMeta>> {
+        let live = self.sst_ids();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for list in old.ssts.values() {
+            for (_, m) in list {
+                if !live.contains(&m.id) && seen.insert(m.id) {
+                    out.push(Arc::clone(m));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `id` is referenced by more than one `(tablet, family)` (shared after a split,
+    /// decision D13).
+    pub(crate) fn sst_shared(&self, id: SstId) -> bool {
+        self.ssts
+            .values()
+            .filter(|l| l.iter().any(|(_, m)| m.id == id))
+            .count()
+            > 1
+    }
+
+    /// The level and meta of `id` within `(tablet, family)`.
+    pub(crate) fn sst(
+        &self,
+        tablet: TabletId,
+        family: FamilyId,
+        id: SstId,
+    ) -> Option<(u8, &Arc<SstMeta>)> {
+        self.ssts
+            .get(&(tablet, family))?
+            .iter()
+            .find(|(_, m)| m.id == id)
+            .map(|(l, m)| (*l, m))
+    }
+
+    /// The tablet entry of `id`.
+    pub(crate) fn tablet(&self, id: TabletId) -> Option<&TabletEntry> {
+        self.tablets.get(&id)
+    }
+
+    /// The families of `table` in creation order.
+    pub(crate) fn family_ids_of(&self, table: TableId) -> Vec<FamilyId> {
+        self.tables
+            .get(&table)
+            .map(|t| t.families.iter().map(|f| f.id).collect())
+            .unwrap_or_default()
     }
 }
 

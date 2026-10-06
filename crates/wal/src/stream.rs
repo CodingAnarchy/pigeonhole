@@ -680,11 +680,6 @@ impl Wal for WalStream {
     }
 
     fn append(&mut self, record: &WalRecord<'_>, durability: Durability) -> Result<CommitTicket> {
-        if durability == Durability::None {
-            return Err(Error::InvalidArgument {
-                what: "Durability::None commits write no WAL record",
-            });
-        }
         self.check_poisoned()?;
         self.scratch.clear();
         record.encode(&mut self.scratch);

@@ -1,24 +1,478 @@
-//! The flush seam: where frozen memtables go.
-//!
-//! Milestone A has no SST writer, so the only backend retains frozen memtables in every view
-//! (they are never flushed, and their WAL streams are never checkpointed). Milestone B adds
-//! the SST backend behind the same seam: a flush task writes the memtable through
-//! `pigeonhole_sst::SstWriter` into a pager extent, sends `AddSst` and `SetFlushed` edits to
-//! the manifest task, and retires the memtable once the edit is durable.
+//! Flushing frozen memtables to SSTs: a cooperative task per shard writes each frozen
+//! memtable through `SstWriter` into pager extents, syncs the WAL streams whose records the
+//! data came from (so a flush never persists a share of a cross-shard commit before every
+//! PREPARE and the COMMIT are durable), commits `AddSst` + `SetFlushed` edits through the
+//! manifest writer, and reports back to the shard, which retires the memtables.
 
-/// How frozen memtables are persisted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum FlushBackend {
-    /// Keep frozen memtables in memory (and in every view) until the SST backend exists.
-    #[default]
-    Retain,
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::task::Poll;
+
+use pigeonhole_cache::BlockCache;
+use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
+use pigeonhole_format::superblock::ExtentRef;
+use pigeonhole_format::{Cursor, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId};
+use pigeonhole_io::FileRef;
+use pigeonhole_memtable::{MemIter, MemtableReader};
+use pigeonhole_pager::Pager;
+use pigeonhole_runtime::{ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
+use pigeonhole_sst::{SstReader, SstWriter, SstWriterOptions};
+
+use crate::manifest::{self, ManifestReq};
+use crate::shard::{ShardMsg, Shared};
+use crate::snapshot::SstSet;
+use crate::waker::StdWaker;
+use crate::{Error, Result};
+
+/// Largest extent the pager hands out.
+const MAX_EXTENT: u64 = 64 << 20;
+/// Entries between clock checks while writing.
+const CLOCK_EVERY: u32 = 256;
+
+/// A frozen memtable to flush.
+#[derive(Debug)]
+pub(crate) struct FlushItem {
+    pub table: TableId,
+    pub tablet: TabletId,
+    pub family: FamilyId,
+    pub root: u32,
+    pub reader: MemtableReader,
+    /// Arena bytes the memtable holds (an upper bound on its SST size).
+    pub bytes: u64,
+    /// Every seqno at or below this of `(tablet, family)` is in the memtable or older ones.
+    pub max_seqno: Seqno,
+    /// Holds applied shares of cross-shard commits: every stream is synced before the
+    /// manifest commit.
+    pub has_shares: bool,
+    pub options: FamilyOptions,
 }
 
-impl FlushBackend {
-    /// Whether a frozen memtable can be persisted and retired.
-    pub(crate) fn persists(self) -> bool {
-        match self {
-            FlushBackend::Retain => false,
+/// What the shard learns when a flush is done.
+#[derive(Debug, Clone)]
+pub(crate) struct FlushedItem {
+    pub tablet: TabletId,
+    pub family: FamilyId,
+    pub root: u32,
+    pub max_seqno: Seqno,
+}
+
+/// Writes entries into SSTs cut at the extent size, allocating extents from the pager.
+pub(crate) struct SstSink {
+    pager: Arc<Pager>,
+    file: FileRef,
+    options: SstWriterOptions,
+    /// Extent size to ask for (rounded up by the pager).
+    estimate: u64,
+    open: Option<(SstWriter, ExtentRef)>,
+    pub outputs: Vec<SstMeta>,
+    sst_ids: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SstSink {
+    pub(crate) fn new(
+        pager: Arc<Pager>,
+        sst_ids: Arc<std::sync::atomic::AtomicU64>,
+        options: SstWriterOptions,
+        estimate: u64,
+    ) -> Self {
+        let file = pager.file().clone();
+        Self {
+            pager,
+            file,
+            options,
+            estimate: estimate.clamp(64 << 10, MAX_EXTENT),
+            open: None,
+            outputs: Vec::new(),
+            sst_ids,
         }
+    }
+
+    pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some((w, _)) = &self.open
+            && !w.fits(key.len(), value.len())
+        {
+            self.cut()?;
+        }
+        if self.open.is_none() {
+            let need = ((key.len() + value.len()) as u64 * 2 + (64 << 10)).max(self.estimate);
+            let extent = self.pager.allocate(need.min(MAX_EXTENT))?;
+            let id = SstId(self.sst_ids.fetch_add(1, Ordering::Relaxed));
+            self.open = Some((
+                SstWriter::new(self.file.clone(), extent, id, self.options.clone()),
+                extent,
+            ));
+        }
+        let (w, _) = self.open.as_mut().expect("opened above");
+        w.add(key, value)?;
+        Ok(())
+    }
+
+    /// Finishes the open SST, if any.
+    pub(crate) fn cut(&mut self) -> Result<()> {
+        let Some((w, extent)) = self.open.take() else {
+            return Ok(());
+        };
+        if w.entries() == 0 {
+            self.pager.abandon(w.abandon());
+            return Ok(());
+        }
+        match w.finish() {
+            Ok(meta) => {
+                self.outputs.push(meta);
+                Ok(())
+            }
+            Err(e) => {
+                self.pager.abandon(extent);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Returns every extent written so far to the pager.
+    pub(crate) fn abandon(&mut self) {
+        if let Some((w, _)) = self.open.take() {
+            self.pager.abandon(w.abandon());
+        }
+        for meta in self.outputs.drain(..) {
+            self.pager.abandon(meta.extent);
+        }
+    }
+
+    /// Opens readers for the outputs (so the manifest commit publishes them without I/O on
+    /// the read path).
+    pub(crate) fn open_readers(
+        &self,
+        cache: &Arc<BlockCache>,
+        priority: pigeonhole_cache::Priority,
+    ) -> Result<Vec<(SstId, Arc<SstReader>)>> {
+        self.outputs
+            .iter()
+            .map(|m| {
+                Ok((
+                    m.id,
+                    Arc::new(SstReader::open(
+                        self.file.clone(),
+                        m,
+                        Arc::clone(cache),
+                        priority,
+                    )?),
+                ))
+            })
+            .collect()
+    }
+}
+
+/// Writes one memtable through a sink, all at once (open-time flushes).
+pub(crate) fn write_memtable(sink: &mut SstSink, reader: &MemtableReader) -> Result<()> {
+    let mut it = reader.iter();
+    it.seek_to_first()?;
+    while it.valid() {
+        sink.add(it.key(), it.value())?;
+        it.next()?;
+    }
+    sink.cut()
+}
+
+enum Stage {
+    Write,
+    Barrier(Vec<Waiter<Result<()>>>),
+    Commit(Waiter<Result<ManifestVersion>>),
+    Done,
+}
+
+/// The flush task of one shard: every item in turn, then the barrier, then the commit.
+pub(crate) struct FlushTask {
+    shared: Arc<Shared>,
+    shard: ShardId,
+    items: Vec<FlushItem>,
+    idx: usize,
+    iter: Option<MemIter>,
+    sink: Option<SstSink>,
+    /// `(item index, sink outputs)` per flushed item.
+    written: Vec<(usize, SstSink)>,
+    stage: Stage,
+    waker: StdWaker,
+    started: u64,
+}
+
+impl FlushTask {
+    pub(crate) fn new(shared: Arc<Shared>, shard: ShardId, items: Vec<FlushItem>) -> Self {
+        let started = shared.vfs.monotonic_nanos();
+        Self {
+            shared,
+            shard,
+            items,
+            idx: 0,
+            iter: None,
+            sink: None,
+            written: Vec::new(),
+            stage: Stage::Write,
+            waker: StdWaker::default(),
+            started,
+        }
+    }
+
+    fn report(&mut self, result: Result<ManifestVersion>) {
+        let items = self
+            .items
+            .iter()
+            .map(|i| FlushedItem {
+                tablet: i.tablet,
+                family: i.family,
+                root: i.root,
+                max_seqno: i.max_seqno,
+            })
+            .collect();
+        let nanos = self
+            .shared
+            .vfs
+            .monotonic_nanos()
+            .saturating_sub(self.started);
+        let _ = self.shared.submitter(self.shard).submit(ShardMsg::Flushed {
+            items,
+            result,
+            nanos,
+        });
+        self.stage = Stage::Done;
+    }
+
+    fn fail(&mut self, e: Error) {
+        crate::shard::trace!(
+            "flush task shard {} failed in stage {}: {e}",
+            self.shard.0,
+            match self.stage {
+                Stage::Write => "write",
+                Stage::Barrier(_) => "barrier",
+                Stage::Commit(_) => "commit",
+                Stage::Done => "done",
+            }
+        );
+        if let Some(mut s) = self.sink.take() {
+            s.abandon();
+        }
+        for (_, mut s) in self.written.drain(..) {
+            s.abandon();
+        }
+        self.report(Err(e));
+    }
+
+    /// Writes until the deadline. Returns whether every item is written.
+    fn write(&mut self, deadline: u64) -> Result<bool> {
+        let mut n = 0u32;
+        while self.idx < self.items.len() {
+            let item = &self.items[self.idx];
+            if self.sink.is_none() {
+                let mut options = SstWriterOptions::for_family(
+                    &item.options,
+                    item.table,
+                    item.family,
+                    item.tablet,
+                );
+                options.created_micros = self.shared.vfs.now_micros();
+                self.sink = Some(SstSink::new(
+                    Arc::clone(&self.shared.pager),
+                    Arc::clone(&self.shared.sst_ids),
+                    options,
+                    item.bytes,
+                ));
+                let mut it = item.reader.iter();
+                it.seek_to_first()?;
+                self.iter = Some(it);
+            }
+            let (Some(it), Some(sink)) = (self.iter.as_mut(), self.sink.as_mut()) else {
+                unreachable!("set above");
+            };
+            while it.valid() {
+                sink.add(it.key(), it.value())?;
+                it.next()?;
+                n += 1;
+                if n.is_multiple_of(CLOCK_EVERY)
+                    && deadline != u64::MAX
+                    && self.shared.vfs.monotonic_nanos() >= deadline
+                {
+                    return Ok(false);
+                }
+            }
+            sink.cut()?;
+            let sink = self.sink.take().expect("open");
+            self.iter = None;
+            self.written.push((self.idx, sink));
+            self.idx += 1;
+        }
+        Ok(true)
+    }
+
+    /// Syncs the WAL streams the flushed data came from: the shard's own always (so a
+    /// crash never loses an earlier commit of the same stream that a flushed later one
+    /// survives), every stream when the memtables hold shares of cross-shard commits.
+    fn barrier(&mut self) -> Vec<Waiter<Result<()>>> {
+        let all = self.items.iter().any(|i| i.has_shares);
+        let shards: Vec<ShardId> = if all {
+            (0..self.shared.shards).map(|i| ShardId(i as u16)).collect()
+        } else {
+            vec![self.shard]
+        };
+        let mut waiters = Vec::with_capacity(shards.len());
+        for s in shards {
+            let (tx, rx) = completion();
+            match self
+                .shared
+                .submitter(s)
+                .submit(ShardMsg::SyncBarrier { reply: tx })
+            {
+                Ok(()) => waiters.push(rx),
+                Err(_) => {
+                    // The shard is gone (shutdown): its stream can no longer be synced.
+                    let (tx, rx) = completion();
+                    tx.notify(Err(Error::Closed));
+                    waiters.push(rx);
+                }
+            }
+        }
+        waiters
+    }
+
+    fn submit_commit(&mut self) -> Result<Waiter<Result<ManifestVersion>>> {
+        let mut edits = Vec::new();
+        let mut readers = Vec::new();
+        for (idx, sink) in &self.written {
+            let item = &self.items[*idx];
+            let priority = SstSet::priority(item.options.cache_priority);
+            readers.extend(sink.open_readers(&self.shared.cache, priority)?);
+            for meta in &sink.outputs {
+                edits.push(Edit::AddSst {
+                    tablet: item.tablet,
+                    family: item.family,
+                    level: 0,
+                    meta: meta.clone(),
+                });
+            }
+            edits.push(Edit::SetFlushed {
+                tablet: item.tablet,
+                family: item.family,
+                seqno: item.max_seqno,
+            });
+        }
+        let (tx, rx) = completion();
+        let req = ManifestReq {
+            kind: manifest::ReqKind::Edits(edits),
+            readers,
+            flushed_roots: self.items.iter().map(|i| (self.shard.0, i.root)).collect(),
+            compaction: None,
+            rewrite_snapshot: false,
+            reply: Box::new(manifest::notify(tx)),
+        };
+        manifest::submit(&self.shared, self.shard, req);
+        Ok(rx)
+    }
+}
+
+impl Task for FlushTask {
+    fn run(&mut self, deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        crate::shard::trace!(
+            "flush task shard {}: run in stage {}",
+            self.shard.0,
+            match self.stage {
+                Stage::Write => "write",
+                Stage::Barrier(_) => "barrier",
+                Stage::Commit(_) => "commit",
+                Stage::Done => "done",
+            }
+        );
+        loop {
+            match &mut self.stage {
+                Stage::Write => match self.write(deadline_nanos) {
+                    Ok(true) => {
+                        let waiters = self.barrier();
+                        crate::shard::trace!(
+                            "flush task shard {}: written {} items, barrier over {} shards",
+                            self.shard.0,
+                            self.items.len(),
+                            waiters.len()
+                        );
+                        self.stage = Stage::Barrier(waiters);
+                    }
+                    Ok(false) => return TaskPoll::Pending,
+                    Err(e) => {
+                        self.fail(e);
+                        return TaskPoll::Done;
+                    }
+                },
+                Stage::Barrier(waiters) => {
+                    // A resolved waiter is dropped (its value is taken by the first poll).
+                    let mut failed = None;
+                    let mut i = 0;
+                    while i < waiters.len() {
+                        match self.waker.poll(waker, &mut waiters[i]) {
+                            Poll::Ready(Some(Ok(()))) => {
+                                waiters.swap_remove(i);
+                            }
+                            Poll::Ready(Some(Err(e))) => {
+                                waiters.swap_remove(i);
+                                failed = Some(e);
+                            }
+                            Poll::Ready(None) => {
+                                waiters.swap_remove(i);
+                                failed = Some(Error::Closed);
+                            }
+                            Poll::Pending => i += 1,
+                        }
+                    }
+                    if let Some(e) = failed {
+                        self.fail(e);
+                        return TaskPoll::Done;
+                    }
+                    if !waiters.is_empty() {
+                        crate::shard::trace!(
+                            "flush task shard {}: {} barrier replies pending",
+                            self.shard.0,
+                            waiters.len()
+                        );
+                        return TaskPoll::Blocked;
+                    }
+                    crate::shard::trace!("flush task shard {}: submitting", self.shard.0);
+                    match self.submit_commit() {
+                        Ok(rx) => self.stage = Stage::Commit(rx),
+                        Err(e) => {
+                            self.fail(e);
+                            return TaskPoll::Done;
+                        }
+                    }
+                }
+                Stage::Commit(rx) => match self.waker.poll(waker, rx) {
+                    Poll::Ready(Some(Ok(v))) => {
+                        self.report(Ok(v));
+                        return TaskPoll::Done;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        // The manifest writer refused or failed: the outputs are not
+                        // referenced (abandoned by the writer on refusal; leaked until reopen
+                        // on a poisoned pager).
+                        crate::shard::trace!(
+                            "flush task shard {} commit refused: {e}",
+                            self.shard.0
+                        );
+                        self.written.clear();
+                        self.report(Err(e));
+                        return TaskPoll::Done;
+                    }
+                    Poll::Ready(None) => {
+                        crate::shard::trace!(
+                            "flush task shard {} commit reply dropped",
+                            self.shard.0
+                        );
+                        self.written.clear();
+                        self.report(Err(Error::Closed));
+                        return TaskPoll::Done;
+                    }
+                    Poll::Pending => return TaskPoll::Blocked,
+                },
+                Stage::Done => return TaskPoll::Done,
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "flush"
     }
 }

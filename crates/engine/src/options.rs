@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use pigeonhole_compaction::MergeRegistry;
+use pigeonhole_compaction::{MergeRegistry, PickerOptions};
 use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
 use pigeonhole_wal::WalOptions;
@@ -38,7 +38,8 @@ pub struct EngineOptions {
     pub durability: Durability,
     /// Memtable arena per shard, in bytes (default 64 MiB).
     pub memtable_budget: u64,
-    /// A memtable freezes at this many bytes (default 1/4 of the budget).
+    /// A memtable freezes at this many bytes (default 1/4 of the budget; never below two
+    /// arena chunks, `memtable_budget / 32`).
     pub memtable_freeze_bytes: u64,
     /// Block cache capacity in bytes.
     pub block_cache_bytes: usize,
@@ -57,6 +58,9 @@ pub struct EngineOptions {
     /// Open even if a family names an unregistered merge operator: read-only, compaction
     /// off, and reads of affected cells fail with `UnknownMergeOperator`.
     pub allow_unregistered_merge: bool,
+    /// Compaction tuning (L0 trigger, level sizes, output SST size). The L0 trigger also
+    /// drives write stalls.
+    pub compaction: PickerOptions,
 }
 
 impl EngineOptions {
@@ -80,6 +84,7 @@ impl EngineOptions {
             tablet_split_bytes: 256 << 20,
             merge_operators: MergeRegistry::default(),
             allow_unregistered_merge: false,
+            compaction: PickerOptions::default(),
         }
     }
 }
