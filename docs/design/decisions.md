@@ -130,7 +130,7 @@ Within a row, cells come by family, then qualifier, then newest version first. F
 ## D40 — `compaction_cores(k)` is refused in application-owned mode (approved; owner decision U4)
 Application-owned mode starts no threads (spec "Threading"), so `compaction_cores(k)` with `k > 0` together with `open_application_owned` fails at open with `InvalidArgument`, before anything is opened, instead of being silently ignored. `pin_threads` does not apply in that mode and is ignored. `pigeonhole-runtime` enforces its half now (`Runtime::application_owned` returns `Error::InvalidConfig`); the option's rustdoc and the guide document it. Engine enforcement: [#22](https://github.com/CodingAnarchy/pigeonhole/issues/22).
 
-## D41 — merge folding across timestamps; a non-`i64` base fails (approved; audit K14, K15, C2)
+## D41 — merge folding across timestamps; a non-`i64` base fails (approved; audit K14, K15, C2; amended by D96)
 `Incr` operands carry the commit timestamp, while a base put may carry an older or explicit one. Walking a column newest first, a run of operands folds into one version at the newest operand's timestamp, consuming the next older put as its base, with wrapping addition; deletes and TTL apply to entries before folding and `max_versions` after. So an expired base is dropped before folding and the counter restarts from the operands, which is accepted. A base whose value is not an 8-byte `i64` makes the read fail with `MergeFailed`, as the guide promises (never silently 0). A put no operand folds onto is returned as written. `Incr` on a family without the `i64` operator is rejected (`ModelError::NoMergeOperator` in the model; the engine maps its typed error to the same case). The sim model implements this (ICR 0003). Compaction's `I64Add`: [#21](https://github.com/CodingAnarchy/pigeonhole/issues/21).
 
 ## D42 — the reference model's crash windows, per WAL stream (approved; audit K11; amended by D84)
@@ -327,6 +327,98 @@ The engine's Milestone A resolver (`resolve.rs`) is replaced in Milestone B (#37
 
 ## D93 — the per-stream recovery oracle lives in `pigeonhole-sim` (approved; sim, #40)
 `pigeonhole-sim` provides `StreamCommit`, `recovered_commits`, `check_acknowledged_survive` and `Model::from_commits`: each WAL stream keeps a prefix of its records, a single-shard commit survives iff its record does, and a cross-shard commit iff every PREPARE and its COMMIT do (D83, D84). `Model::crash_window` remains the single-stream special case. The engine and public suites adopt it in #48, replacing their own copies of the rule.
+
+## D94 — a later stronger commit makes earlier `None` commits durable (approved; owner decision; implemented by #50)
+The spec's "Mixed levels" says a `GroupSync` commit also makes earlier `Buffered` or `None`
+records on its stream durable; the engine wrote no WAL record for a `None` commit, so it was
+lost at the next close or crash even after a later stronger commit.
+
+**Decision:** the spec's rule stands. A `None` commit buffers its WAL record (no write, no
+sync of its own), so a later stronger commit on the same shard writes it and makes it
+durable. Implemented by engine Milestone B, issue #50; this crate changes nothing.
+
+**Until #50:** the guide's durability page states the rule and marks it as arriving with
+#50 (today a `None` commit is lost at the next close or crash). The public model suite
+(`tests/model.rs`, `Logged::reaches_the_wal`) expects today's behavior and is updated with
+#50 and #45.
+
+## D95 — Phase 2 family settings are refused at creation (approved; pigeonhole)
+`Family::zstd`, `Compaction::Tiered` and `Compaction::FifoByTime` are in the frozen API but
+land in Phase 2. `TableBuilder::{create, create_if_missing, open}` refuse a declared family
+with any of them with `ErrorCode::Unsupported` before changing the catalog, so they are never
+stored only to fail later in flush or compaction. `blob_threshold` is accepted and stored
+(values stay inline until blobs exist). Lifting the refusals: #44.
+
+## D96 — every family has the `i64` add operator unless told otherwise (approved; pigeonhole; amends D41)
+`Family::default()` stores `merge_operator = "pigeonhole.i64_add"`, so `incr` works on any
+family, as `Family::merge_operator`'s documentation promised;
+`Family::default().merge_operator("")` stores none (operands then fail at commit with
+`InvalidArgument`). Mixing byte puts and `incr` in one column fails at read with
+`MergeFailed` (D41); `RowMutation::merge` / `WriteBatch::merge` write untyped operands, which
+the built-in operator also refuses at read. The `Family` documentation says so.
+
+## D97 — `Scan::limit(0)` returns no rows (approved; pigeonhole)
+`ScanSpec::limit` uses 0 for "unlimited"; the public `limit(0)` yields an empty iterator
+without starting an engine scan, and no `limit` call means unlimited.
+
+## D98 — `TableBuilder::open` adds declared families that are missing (approved; pigeonhole)
+All three finishers add missing declared families to an existing table (a family listed
+twice is declared once, with its first options); an existing family keeps its stored
+options. Concurrent creation of the same table or family opens what the other caller
+created. Creating a table needs a non-empty name and at least one declared family, else
+`InvalidArgument` (coordinator decision in the same review).
+
+## D99 — table handles resolve families added through other handles (approved; pigeonhole)
+`Table::families()` returns `Vec<&str>` borrowed from the handle, so it reports the families
+the handle was opened with (documented). Mutations, gets and reads resolve a name the handle
+does not know against the current catalog, and a row read or scan names every family it
+returns through the catalog as of the read.
+
+## D100 — `Error`'s `Display` is the message; unknown engine variants map to `Io` (approved; pigeonhole)
+`Display` prints `message()` only. Every current `engine::Error` variant maps to exactly one
+`ErrorCode` (tested); a variant the engine adds later (it is `#[non_exhaustive]`) maps to
+`Io` with the engine's message until it gets its own code. Messages the engine's unit
+variants cannot carry are filled in here: `KeyTooLarge` names the part and its size against
+the 64 KiB limit, `ValueTooLarge` the value's size against the D16 limit computed from the
+open's options, and `Busy` (coordinator decision: a hard failure until engine Milestone B,
+#37) says the memtable arena is full and to raise `Options::memtable_budget`.
+
+## D101 — a hidden `Options::wal_segment_size` test hook (approved; pigeonhole; ICR 0005)
+With the default 64 MiB WAL segments every open on `SimVfs` cost about 0.5 s in a debug
+build. The hook (`docs/design/icr/0005-pigeonhole-wal-segment-size-hook.md`) lets the
+simulation suites use 256 KiB segments; the public model suite went from about 70 s to about
+3 s with three times the operations.
+
+## D102 — registered custom merge operators are not passed to the engine yet (approved; Phase 2 work tracked in #43)
+`Options::merge_operator(Arc<dyn MergeOperator>)` keeps the operators; the engine resolves
+only `pigeonhole.i64_add` so far, so a family naming any other operator is refused with
+`UnknownMergeOperator`. Documented on `Options::merge_operator` and in the guide.
+
+## D103 — features available ahead of their phase (approved; pigeonhole)
+The engine already implements conditional commits, optimistic transactions and reader
+processes, so `RowMutation::commit_if` (P2), `Transaction` and `Pigeonhole::open_reader` (P4)
+work and are tested (`tests/api.rs`); the guide marks them "early". Their hardening stays in
+their phases.
+
+## D104 — what crosses the future C ABI (approved; pigeonhole)
+Checked against the spec's "Language scope":
+- Borrowed results have owned counterparts (`CellRef` → `Cell`, `RowRef` → `Row`), and
+  `RowIter::next_ref` is the cursor form of the scan iterator.
+- Generic conveniences have non-generic equivalents: `scan(range)` → `scan_bounds`,
+  `qualifier_range` → `qualifier_bounds`, `families(iter)` → repeated `family(&str)`;
+  `impl AsRef<Path>` parameters accept a `&Path`.
+- `WriteBatch` has every mutation `RowMutation` has (`put`, `put_at`, `put_i64`, `put_f64`,
+  `incr`, `merge`, `delete_cell`, `delete_column`, `delete_family`, `delete_row`), so a C ABI
+  can export one mutation vocabulary.
+- Errors are `#[repr(u32)]` codes plus a message; merge operators are identified by name in
+  the file.
+- Two frozen signatures take Rust-only types by nature: `Shard::set_wakeup(Box<dyn Fn>)` (a
+  C ABI wraps a function pointer and context in the box) and
+  `Options::merge_operator(Arc<dyn MergeOperator>)` (a C ABI would provide a vtable struct).
+- Builders (`RowMutation`, `RowRead`, `Scan`) borrow their table, but a C ABI builds and
+  finishes one within a single call. `RowIter<'t>` owns its engine cursor and borrows the
+  table only as a lifetime, so a C ABI that keeps the `Table` alive next to it can hold one
+  across calls; an owned `Table::scan_owned` could be added later if a binding needs it.
 
 ## Open questions
 _None._
