@@ -111,7 +111,7 @@ fn check_lower_bounds(landed: &[(Vec<u8>, Option<Vec<u8>>)], before: &Model, aft
 fn readers_see_consistent_prefixes_of_the_writer() {
     let seed = common::seed();
     let (n, readers, arena_len, chunk) = if cfg!(miri) {
-        (150, 2, 1 << 20, 16 * 1024)
+        (60, 2, 256 * 1024, 16 * 1024)
     } else {
         (20_000, 3, 32 << 20, ShardArena::DEFAULT_CHUNK)
     };

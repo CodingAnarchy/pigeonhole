@@ -8,6 +8,10 @@ use pigeonhole_memtable::{ArenaRegion, Memtable, ShardArena};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
+/// Fewer, smaller cases under Miri (interpreted; each case costs seconds).
+const MAX_ENTRIES: usize = if cfg!(miri) { 40 } else { 150 };
+const MAX_TARGETS: usize = if cfg!(miri) { 6 } else { 20 };
+
 fn kind(k: u8) -> Kind {
     match k % 4 {
         0 => Kind::Put,
@@ -18,20 +22,25 @@ fn kind(k: u8) -> Kind {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: if cfg!(miri) { 3 } else { 256 },
-        ..ProptestConfig::default()
+    // `PROPTEST_CASES` is honored (the default config reads it); Miri caps it so a local
+    // run without the variable stays short.
+    #![proptest_config({
+        let default = ProptestConfig::default();
+        ProptestConfig {
+            cases: if cfg!(miri) { default.cases.min(4) } else { default.cases },
+            ..default
+        }
     })]
 
     #[test]
     fn matches_a_btreemap(
         entries in vec(
             (vec(any::<u8>(), 0..6), vec(any::<u8>(), 0..4), 0u64..4, any::<u8>(), vec(any::<u8>(), 0..40)),
-            0..150,
+            0..MAX_ENTRIES,
         ),
-        targets in vec(vec(any::<u8>(), 0..26), 0..20),
+        targets in vec(vec(any::<u8>(), 0..26), 0..MAX_TARGETS),
     ) {
-        let mut arena = ShardArena::new(ArenaRegion::heap(1 << 20), 4096);
+        let mut arena = ShardArena::new(ArenaRegion::heap(128 * 1024), 4096);
         let mut mt = Memtable::create(&mut arena).unwrap();
         let mut model = BTreeMap::new();
         for (i, (row, qual, ts, k, value)) in entries.iter().enumerate() {

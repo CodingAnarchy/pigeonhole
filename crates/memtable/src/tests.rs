@@ -405,9 +405,15 @@ fn reader_reports_corrupt_nodes_instead_of_faulting() {
 
 #[test]
 fn no_pointers_in_the_arena() {
-    let mut arena = ShardArena::new(ArenaRegion::heap(256 * 1024), 4096);
+    // Scaled down under Miri (the byte scan is interpreted).
+    let (len, entries) = if cfg!(miri) {
+        (16 * 1024, 80u64)
+    } else {
+        (256 * 1024, 1000)
+    };
+    let mut arena = ShardArena::new(ArenaRegion::heap(len), 4096);
     let mut mt = Memtable::create(&mut arena).unwrap();
-    for i in 1..=1000u64 {
+    for i in 1..=entries {
         mt.insert(&mut arena, &key(&i.to_le_bytes(), i), &i.to_le_bytes())
             .unwrap();
     }
@@ -428,10 +434,15 @@ fn no_pointers_in_the_arena() {
 
 #[test]
 fn arena_bytes_relocate_to_another_address() {
-    let mut arena = ShardArena::new(ArenaRegion::heap(256 * 1024), 4096);
+    let (len, entries) = if cfg!(miri) {
+        (32 * 1024, 60u64)
+    } else {
+        (256 * 1024, 500)
+    };
+    let mut arena = ShardArena::new(ArenaRegion::heap(len), 4096);
     let mut mt = Memtable::create(&mut arena).unwrap();
     let mut expected = Vec::new();
-    for i in 1..=500u64 {
+    for i in 1..=entries {
         let k = key(&(i * 7919 % 1000).to_be_bytes(), i);
         let v = i.to_le_bytes().to_vec();
         mt.insert(&mut arena, &k, &v).unwrap();
@@ -441,12 +452,12 @@ fn arena_bytes_relocate_to_another_address() {
     mt.freeze();
 
     // Copy the raw arena to a different allocation: offsets must still resolve.
-    let copy = ArenaRegion::heap(256 * 1024);
+    let copy = ArenaRegion::heap(len);
     assert_ne!(copy.mem.base_addr(), arena.region().mem.base_addr());
-    let bytes = arena.region().mem.copy(0, 256 * 1024);
+    let bytes = arena.region().mem.copy(0, len);
     copy.mem.write(0, &bytes);
     let reader = MemtableReader::open(copy, mt.root()).unwrap();
-    assert_eq!(reader.len(), 500);
+    assert_eq!(reader.len(), entries as usize);
     assert_eq!(scan(&reader), expected);
     let mut it = reader.iter();
     for (k, v) in expected.iter().step_by(37) {
@@ -459,16 +470,20 @@ fn arena_bytes_relocate_to_another_address() {
 fn heights_are_geometric_and_bounded() {
     let mut arena = small();
     let mut mt = Memtable::create(&mut arena).unwrap();
+    let draws = if cfg!(miri) { 1000 } else { 10_000 };
     let mut tall = 0;
-    for _ in 0..10_000 {
+    for _ in 0..draws {
         let h = mt.random_height();
         assert!((1..=MAX_HEIGHT).contains(&h));
         if h >= 2 {
             tall += 1;
         }
     }
-    // One in four nodes reaches level 2 (binomial: 2500 ± ~45).
-    assert!((2200..2800).contains(&tall), "{tall} tall nodes");
+    // One in four nodes reaches level 2 (binomial, within about seven standard deviations).
+    assert!(
+        (draws * 22 / 100..draws * 28 / 100).contains(&tall),
+        "{tall} tall nodes"
+    );
 }
 
 #[test]
@@ -588,9 +603,9 @@ fn insert_through_another_arena_panics() {
 
 #[test]
 fn reader_rejects_a_node_linked_above_its_height() {
-    let mut arena = ShardArena::new(ArenaRegion::heap(256 * 1024), 4096);
+    let mut arena = ShardArena::new(ArenaRegion::heap(64 * 1024), 4096);
     let mut mt = Memtable::create(&mut arena).unwrap();
-    for i in 1..=200u64 {
+    for i in 1..=if cfg!(miri) { 40u64 } else { 200 } {
         mt.insert(&mut arena, &key(&i.to_be_bytes(), i), b"")
             .unwrap();
     }
