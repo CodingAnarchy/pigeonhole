@@ -21,7 +21,7 @@ Engines differ in what "commit" means. To compare like with like, every runner d
 **Interim behavior:** as above. The Goals-table "p99 commit < 200 µs with fsync batching" needs concurrent committers under `GroupSync`, which the bench does not measure yet: [#53](https://github.com/CodingAnarchy/pigeonhole/issues/53) (Phase 3).
 
 ## Proposed decision: reproducibility tolerance
-**Interim behavior:** two runs on one machine agree when throughput and p50 are within ±15% and p99 is within ±30%. p99.9 and max are reported but not checked, because at 10⁵ operations p99.9 rests on about 100 samples. `phdb-bench compare --tolerance T` sets T for throughput and p50, and 2T for p99. Comparing runs from different machines or build profiles prints a warning, because the tolerance only applies within one machine. The numbers behind the choice are in `docs/bench.md`.
+**Interim behavior:** two runs on one machine agree when throughput and p50 are within ±15% and p99 is within ±30%. p99.9 and max are reported but not checked, because at 10⁵ operations p99.9 rests on about 100 samples. `phdb-bench compare --tolerance T` sets T for throughput and p50, and 2T for p99. Comparing runs from different machines or build profiles prints a warning, because the tolerance only applies within one machine. Two quiet back-to-back runs on the M5 laptop drifted at most 8.3% (throughput), 8.6% (p50) and 12.1% (p99), but up to 144% on p99.9. Details are in `docs/bench.md`.
 
 ## Proposed decision: license exceptions for fjall's dependencies
 fjall (2.x and 3.x) depends on `varint-rs` (0BSD) and `xxhash-rust` (BSL-1.0). Both licenses are permissive and MIT-compatible but are not in D6's list.

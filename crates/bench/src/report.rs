@@ -174,9 +174,10 @@ impl Environment {
     }
 
     /// Whether other work was running when the suite started: a one-minute load
-    /// average of at least one busy core.
+    /// average of two or more. (A suite started right after another still shows that
+    /// run's one busy core, so 1.0 would flag every back-to-back pair.)
     pub fn busy(&self) -> bool {
-        self.load_average.is_some_and(|l| l >= 1.0)
+        self.load_average.is_some_and(|l| l >= 2.0)
     }
 
     /// One line: CPU, cores, memory, OS, filesystem and the reference label.
@@ -664,7 +665,10 @@ mod tests {
         busy.environment.load_average = Some(3.5);
         assert!(busy.environment.summary().contains("load 3.50"));
         let cmp = compare(&a, &busy, Tolerance::default());
-        assert!(cmp.passes(), "a busy machine warns but does not fail on its own");
+        assert!(
+            cmp.passes(),
+            "a busy machine warns but does not fail on its own"
+        );
         assert!(cmp.environment_warning.unwrap().contains("busy"));
         assert_eq!(cmp.deltas.len(), 4);
     }
