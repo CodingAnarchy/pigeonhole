@@ -210,6 +210,99 @@ proptest! {
     }
 }
 
+/// A damaged blob extent header (magic, version, blob file, position or checksum) is caught
+/// the first time a read touches that extent; values in intact extents still read.
+#[test]
+fn damaged_blob_extent_headers_are_corrupt() {
+    use pigeonhole_format::superblock::ExtentRef;
+    // Header bytes: magic, version, blob_file, extent_index, reserved, checksum.
+    for at in [0usize, 9, 13, 17, 30, 60] {
+        let (_vfs, file) = sim_file(13, EXTENT);
+        let mut w = BlobWriter::new(file.clone(), BlobFileId(3), 0);
+        let v = vec![5u8; 40_000];
+        let mut page = 1024;
+        let mut ptrs = Vec::new();
+        for _ in 0..4 {
+            while w.needs_extent(v.len()) {
+                w.add_extent(ExtentRef {
+                    page,
+                    size_class: 0,
+                })
+                .unwrap();
+                page += 16;
+            }
+            ptrs.push(w.append(&v).unwrap());
+        }
+        let (extents, _) = w.finish().unwrap();
+        assert_eq!(extents.len(), 3);
+        // Damage the second extent's header.
+        let abs = extents[1].offset() + at as u64;
+        let mut b = [0u8];
+        file.read_at(&mut b, abs).unwrap();
+        b[0] ^= 0x40;
+        file.write_at(&b, abs).unwrap();
+        let r = BlobReader::new(
+            file,
+            BlobFileId(3),
+            extents,
+            Arc::new(BlockCache::new(1 << 20, 1)),
+        );
+        // 65,472-byte payloads, 40,016-byte records: record 0 lies in extent 0, records 1 and
+        // 3 span into extent 1, record 2 lies in it.
+        assert_eq!(&r.read(&ptrs[0]).unwrap()[..], &v[..], "byte {at}");
+        for p in &ptrs[1..] {
+            assert_corruption(&r.read(p).unwrap_err());
+        }
+        // A failed check is not remembered as passed.
+        assert_corruption(&r.read(&ptrs[2]).unwrap_err());
+    }
+    // A header naming the wrong extent position (swapped extents) is caught too.
+    let (_vfs, file) = sim_file(14, EXTENT);
+    let mut w = BlobWriter::new(file.clone(), BlobFileId(3), 0);
+    w.add_extent(ExtentRef {
+        page: 1024,
+        size_class: 0,
+    })
+    .unwrap();
+    w.add_extent(ExtentRef {
+        page: 1040,
+        size_class: 0,
+    })
+    .unwrap();
+    let p = w.append(&vec![1u8; 70_000]).unwrap();
+    let (mut extents, _) = w.finish().unwrap();
+    extents.swap(0, 1);
+    let r = BlobReader::new(
+        file,
+        BlobFileId(3),
+        extents,
+        Arc::new(BlockCache::new(1 << 20, 1)),
+    );
+    assert_corruption(&r.read(&p).unwrap_err());
+}
+
+/// Records above `min(1 MiB, capacity / 8)` are returned pinned but not cached.
+#[test]
+fn large_blob_records_bypass_the_cache() {
+    use pigeonhole_format::superblock::ExtentRef;
+    let (_vfs, file) = sim_file(15, EXTENT);
+    let mut w = BlobWriter::new(file.clone(), BlobFileId(1), 6);
+    w.add_extent(ExtentRef {
+        page: 1024,
+        size_class: 6,
+    })
+    .unwrap();
+    let small = w.append(&[1u8; 1000]).unwrap();
+    let big = w.append(&vec![2u8; 200_000]).unwrap();
+    let (extents, _) = w.finish().unwrap();
+    let cache = Arc::new(BlockCache::new(1 << 20, 1)); // limit: 128 KiB
+    let r = BlobReader::new(file, BlobFileId(1), extents, cache.clone());
+    assert_eq!(r.read(&big).unwrap().len(), 200_000);
+    assert_eq!(cache.usage(), 0);
+    assert_eq!(r.read(&small).unwrap().len(), 1000);
+    assert!(cache.usage() > 0);
+}
+
 /// Writes `m` with a crash after the `n`-th mutating operation of the build. Returns whether
 /// the build finished before the crash.
 fn build_with_crash(

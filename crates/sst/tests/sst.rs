@@ -135,18 +135,25 @@ proptest! {
             .collect();
         prop_assert_eq!(scan(&mut r.iter(filter.clone(), ReadOptions::default())), admitted.clone());
 
-        let mut it = r.iter(filter.clone(), ReadOptions::default());
-        let mut at = admitted.len();
-        for op in &ops {
-            match op {
-                Op::First => it.seek_to_first().unwrap(),
-                Op::Seek(t) => it.seek(t).unwrap(),
-                Op::Next => it.next().unwrap(),
-                Op::SkipRow => it.skip_row().unwrap(),
+        // Plain reads, and readahead into the cursor (no cache fill), where backward seeks
+        // must drop stale read-ahead blocks.
+        let mut readahead = ReadOptions::default();
+        readahead.readahead_blocks = 3;
+        readahead.fill_cache = false;
+        for opts in [ReadOptions::default(), readahead] {
+            let mut it = r.iter(filter.clone(), opts);
+            let mut at = admitted.len();
+            for op in &ops {
+                match op {
+                    Op::First => it.seek_to_first().unwrap(),
+                    Op::Seek(t) => it.seek(t).unwrap(),
+                    Op::Next => it.next().unwrap(),
+                    Op::SkipRow => it.skip_row().unwrap(),
+                }
+                at = model_step(&admitted, at, op);
+                let got = it.valid().then(|| (it.key().to_vec(), it.value().to_vec()));
+                prop_assert_eq!(got.as_ref(), admitted.get(at), "after {:?} with {:?}", op, opts);
             }
-            at = model_step(&admitted, at, op);
-            let got = it.valid().then(|| (it.key().to_vec(), it.value().to_vec()));
-            prop_assert_eq!(got.as_ref(), admitted.get(at), "after {:?}", op);
         }
     }
 
@@ -349,4 +356,63 @@ fn value_cells_outlive_everything() {
     drop((it, r));
     cache.erase_files(&[pigeonhole_sst::sst_cache_file(SstId(77))]);
     assert_eq!(&cell[..], b"\x00pinned");
+}
+
+/// A row spanning many 64-byte blocks: `skip_row` leaves the first block, finds the row
+/// continuing in the next one with no later row start there, and seeks past the row with
+/// `escaped row ++ 00 02` through the index.
+#[test]
+fn skip_row_seeks_past_a_row_spanning_many_blocks() {
+    let mut m = Model::new();
+    let mut put = |row: &[u8], q: u32| {
+        let mut k = Vec::new();
+        encode_key(&mut k, row, &q.to_be_bytes(), 1, 1, Kind::Put).unwrap();
+        m.insert(k, b"\x00value".to_vec());
+    };
+    put(b"a", 0);
+    for q in 0..20 {
+        put(b"wide", q);
+    }
+    // A later row that extends the wide row's bytes, so a sloppy "past the row" key would
+    // land inside or beyond it.
+    put(b"wide\x00", 0);
+    put(b"wide\x01", 0);
+    put(b"z", 0);
+    let l = Layout {
+        block_size: 64,
+        restart_interval: 2,
+        compression: pigeonhole_format::compress::Compression::None,
+        bloom_bits: 0,
+    };
+    let (_vfs, file) = sim_file(10, EXTENT);
+    let meta = write_sst(&file, EXTENT, &m, &l);
+    let r = open(&file, &meta);
+    assert!(
+        r.properties().data_blocks >= 20,
+        "{} blocks",
+        r.properties().data_blocks
+    );
+    let rows: Vec<Vec<u8>> = {
+        let mut v: Vec<Vec<u8>> = m.keys().map(|k| row_of(k).to_vec()).collect();
+        v.dedup();
+        v
+    };
+    let mut readahead = ReadOptions::default();
+    readahead.readahead_blocks = 4;
+    for opts in [ReadOptions::default(), readahead] {
+        let mut it = r.iter(ScanFilter::all(), opts);
+        it.seek_to_first().unwrap();
+        let mut seen = Vec::new();
+        while it.valid() {
+            seen.push(row_of(it.key()).to_vec());
+            it.skip_row().unwrap();
+        }
+        assert_eq!(seen, rows);
+        // From the middle of the wide row too.
+        let mut mid = Vec::new();
+        encode_key(&mut mid, b"wide", &10u32.to_be_bytes(), 1, 1, Kind::Put).unwrap();
+        it.seek(&mid).unwrap();
+        it.skip_row().unwrap();
+        assert_eq!(row_of(it.key()), &rows[2][..]);
+    }
 }

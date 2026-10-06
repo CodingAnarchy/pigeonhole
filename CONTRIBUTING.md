@@ -11,7 +11,7 @@ Pigeonhole is built by a mix of humans and coding agents. The rules below apply 
 ## Workspace rules
 - **Dependencies only point down.** No crate depends on a crate in its own layer or above; `pigeonhole-format` depends on no other workspace crate. Layers, bottom to top: `format` → `io` → (`pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, `sim`) → `sst` → `compaction` → `engine` → `pigeonhole` → (`arrow`, `cli`, `capi`, `bench`).
 - **Contracts first.** Public traits and types are written and reviewed before implementation. Every crate below the engine ships an in-memory or mock implementation for the layer above to test against.
-- **`unsafe` is fenced.** Only `pigeonhole-io`, `pigeonhole-cache` and `pigeonhole-memtable` may contain `unsafe`, and every block carries a `// SAFETY:` comment (enforced by `clippy::undocumented_unsafe_blocks`). Every other crate has `#![forbid(unsafe_code)]`.
+- **`unsafe` is fenced.** Only `pigeonhole-io`, `pigeonhole-cache` and `pigeonhole-memtable` may contain `unsafe`, and every block carries a `// SAFETY:` comment (enforced by `clippy::undocumented_unsafe_blocks`). Every other crate has `#![forbid(unsafe_code)]`. The one exception: any crate's test or bench binaries (`tests/`, `benches/`) may define a counting `GlobalAlloc` that forwards to `System`, to check that a path allocates nothing.
 - **Every crate runs under the simulator.** All file access goes through the `Vfs` trait so faults, time and scheduling can be controlled.
 - **Definition of done:** the crate's acceptance tests (see its brief) pass, the workspace simulation suite passes, and its public API has rustdoc with examples.
 - **License: MIT.** Dependencies must be MIT-compatible (`deny.toml`, checked in CI).

@@ -3,6 +3,7 @@
 //! `len u64, xxh3 u64, value` at a logical offset and may span extents.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pigeonhole_cache::{BlockCache, BlockData, BlockKey, Cell, Priority};
 use pigeonhole_format::blob::{
@@ -26,14 +27,15 @@ fn payload_len(size_class: u8) -> u64 {
     .saturating_sub(BLOB_EXTENT_HEADER_LEN as u64)
 }
 
-/// Calls `f(absolute file offset, range of bytes)` for each extent-contiguous piece of the
-/// logical range `[offset, offset + len)`. Fails if the range runs past the extents.
+/// Calls `f(extent index, absolute file offset, range of bytes)` for each extent-contiguous
+/// piece of the logical range `[offset, offset + len)`. Fails if the range runs past the
+/// extents.
 fn for_each_piece(
     extents: &[ExtentRef],
     payload: u64,
     offset: u64,
     len: usize,
-    mut f: impl FnMut(u64, std::ops::Range<usize>) -> Result<()>,
+    mut f: impl FnMut(usize, u64, std::ops::Range<usize>) -> Result<()>,
 ) -> Result<()> {
     let corrupt = || {
         Error::Format(FormatError::Corrupt {
@@ -50,10 +52,12 @@ fn for_each_piece(
     let mut done = 0;
     while done < len {
         let at = offset + done as u64;
-        let extent = extents[(at / payload) as usize];
+        let index = (at / payload) as usize;
+        let extent = extents[index];
         let within = at % payload;
         let n = ((payload - within) as usize).min(len - done);
         f(
+            index,
             extent.offset() + BLOB_EXTENT_HEADER_LEN as u64 + within,
             done..done + n,
         )?;
@@ -126,7 +130,7 @@ impl Writer {
         let offset = self.pos;
         let header = encode_record_header(value);
         for (at, bytes) in [(offset, &header[..]), (offset + header.len() as u64, value)] {
-            for_each_piece(&self.extents, self.payload, at, bytes.len(), |abs, r| {
+            for_each_piece(&self.extents, self.payload, at, bytes.len(), |_, abs, r| {
                 Ok(self.file.write_at(&bytes[r], abs)?)
             })?;
         }
@@ -149,7 +153,16 @@ pub(crate) struct Reader {
     extents: Vec<ExtentRef>,
     payload: u64,
     cache: Arc<BlockCache>,
+    /// Hands out unshared handles for records too large to cache.
+    uncached: BlockCache,
+    /// Records above this many bytes are not cached.
+    cache_limit: usize,
+    /// Per extent: whether its header has been verified.
+    verified: Vec<AtomicBool>,
 }
+
+/// Records larger than this are never cached (nor larger than an eighth of the cache).
+const MAX_CACHED_RECORD: usize = 1 << 20;
 
 impl std::fmt::Debug for Reader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -171,13 +184,39 @@ impl Reader {
         Self {
             file,
             blob_file,
+            verified: extents.iter().map(|_| AtomicBool::new(false)).collect(),
             extents,
             payload,
+            cache_limit: MAX_CACHED_RECORD.min(cache.capacity() / 8),
             cache,
+            uncached: BlockCache::disabled(),
         }
     }
 
-    /// Reads a record (header and value) into the cache, verified; hits skip verification.
+    /// Verifies extent `i`'s header (FORMAT §7: magic, version, checksum, blob file and
+    /// position) the first time a read touches it.
+    fn verify_extent(&self, i: usize) -> Result<()> {
+        if self.verified[i].load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let extent = self.extents[i];
+        let mut b = [0; BLOB_EXTENT_HEADER_LEN];
+        self.file.read_at(&mut b, extent.offset())?;
+        let h = BlobExtentHeader::decode(&b)?;
+        if h.blob_file != self.blob_file
+            || h.extent_index as usize != i
+            || extent.size_class != self.extents[0].size_class
+        {
+            return Err(Error::Format(FormatError::Corrupt {
+                what: "blob extent header",
+            }));
+        }
+        self.verified[i].store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reads a record (header and value), verified, into the cache unless it is large; hits skip
+    /// verification.
     pub(crate) fn read(&self, ptr: &BlobPointer) -> Result<Cell> {
         if ptr.blob_file != self.blob_file {
             return Err(Error::Format(FormatError::InvalidArgument {
@@ -201,21 +240,27 @@ impl Reader {
             return Ok(Cell::in_block(h, range));
         }
         let total = BLOB_RECORD_HEADER_LEN + ptr.len as usize;
-        // Bounds first, so a bad pointer never sizes a buffer past the blob file.
+        // Bounds and extent headers first, so a bad pointer never sizes a buffer past the
+        // blob file.
+        for_each_piece(&self.extents, self.payload, ptr.offset, total, |i, _, _| {
+            self.verify_extent(i)
+        })?;
+        let mut buf = IoBuf::zeroed(total);
         for_each_piece(
             &self.extents,
             self.payload,
             ptr.offset,
             total,
-            |_, _| Ok(()),
+            |_, abs, r| Ok(self.file.read_at(&mut buf[r], abs)?),
         )?;
-        let mut buf = IoBuf::zeroed(total);
-        for_each_piece(&self.extents, self.payload, ptr.offset, total, |abs, r| {
-            Ok(self.file.read_at(&mut buf[r], abs)?)
-        })?;
         let (header, value) = buf.split_at(BLOB_RECORD_HEADER_LEN);
         verify_record(header, value, ptr.len)?;
-        let h = self.cache.insert(key, BlockData::Io(buf), Priority::Low);
+        let cache = if total <= self.cache_limit {
+            &*self.cache
+        } else {
+            &self.uncached
+        };
+        let h = cache.insert(key, BlockData::Io(buf), Priority::Low);
         Ok(Cell::in_block(h, range))
     }
 }

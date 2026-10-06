@@ -25,7 +25,6 @@
 #![forbid(unsafe_code)]
 
 mod blob;
-mod block;
 mod iter;
 mod reader;
 mod writer;
@@ -48,13 +47,21 @@ use pigeonhole_io::FileRef;
 /// Tag bit separating blob-file cache namespaces from SST ones.
 const BLOB_NAMESPACE: u64 = 1 << 63;
 
-/// The block-cache `file` namespace of an SST's blocks.
+/// The block-cache `file` namespace of an SST's blocks. SST ids must stay below `2^63` (the
+/// top bit tags blob files); the engine's id counter never gets near it.
 pub fn sst_cache_file(id: SstId) -> u64 {
+    debug_assert!(
+        id.0 < BLOB_NAMESPACE,
+        "SST id {} collides with blob namespaces",
+        id.0
+    );
     id.0 & !BLOB_NAMESPACE
 }
 
-/// The block-cache `file` namespace of a blob file's records.
+/// The block-cache `file` namespace of a blob file's records (blob ids are `u32`, so always
+/// below `2^63`).
 pub fn blob_cache_file(id: BlobFileId) -> u64 {
+    const { assert!((u32::MAX as u64) < BLOB_NAMESPACE) };
     BLOB_NAMESPACE | u64::from(id.0)
 }
 
@@ -98,20 +105,24 @@ impl std::error::Error for Error {
 
 impl Error {
     /// Whether the error means stored bytes are bad (checksum, structure, truncation), as
-    /// opposed to an I/O failure or a caller mistake.
+    /// opposed to an I/O failure, a caller mistake or an unsupported feature.
     pub fn is_corruption(&self) -> bool {
         use pigeonhole_format::Error as F;
         matches!(
             self,
             Self::Format(
-                F::Truncated { .. }
-                    | F::BadMagic { .. }
-                    | F::Checksum { .. }
-                    | F::Corrupt { .. }
-                    | F::UnsupportedVersion { .. }
-                    | F::UnsupportedCompression(_)
-                    | F::KeyTooLarge
+                F::Truncated { .. } | F::BadMagic { .. } | F::Checksum { .. } | F::Corrupt { .. }
             )
+        )
+    }
+
+    /// Whether the bytes are intact but use a format version or codec this build does not
+    /// support.
+    pub fn is_unsupported(&self) -> bool {
+        use pigeonhole_format::Error as F;
+        matches!(
+            self,
+            Self::Format(F::UnsupportedVersion { .. } | F::UnsupportedCompression(_))
         )
     }
 }
@@ -305,7 +316,10 @@ pub struct SstReader {
 
 impl SstReader {
     /// Opens an SST: reads the footer, pins the top-level index and both filters, and reads
-    /// the properties. Verifies checksums.
+    /// the properties. Verifies their checksums, but not those of data blocks and index
+    /// partitions, which are verified when first read (a damaged one is a corruption error,
+    /// never wrong data). Reading the whole SST at open is unnecessary: nothing references an
+    /// SST before its manifest commit, whose root commit syncs it first.
     pub fn open(
         file: FileRef,
         meta: &SstMeta,

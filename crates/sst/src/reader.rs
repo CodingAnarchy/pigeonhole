@@ -5,7 +5,7 @@ use std::sync::Arc;
 use pigeonhole_cache::{BlockCache, BlockData, BlockHandle, BlockKey, Priority};
 use pigeonhole_format::Error as FormatError;
 use pigeonhole_format::SstId;
-use pigeonhole_format::block::{BlockAddr, BlockKind, TRAILER_LEN, verify};
+use pigeonhole_format::block::{Block, BlockAddr, BlockKind, TRAILER_LEN, verify};
 use pigeonhole_format::compress::{Compression, decompress};
 use pigeonhole_format::filter::Filter;
 use pigeonhole_format::manifest::SstMeta;
@@ -22,20 +22,29 @@ pub(crate) fn corrupt(what: &'static str) -> crate::Error {
 /// uncompressed block keeps its I/O buffer (trimmed of the trailer); a compressed one is
 /// decompressed into a heap buffer.
 pub(crate) fn decode_physical(mut buf: IoBuf, kind: BlockKind) -> Result<BlockData> {
-    let (trailer, payload) = verify(&buf)?;
+    match decode_slice(&buf, kind)? {
+        Some(data) => Ok(data),
+        None => {
+            let n = buf.len() - TRAILER_LEN;
+            buf.resize(n);
+            Ok(BlockData::Io(buf))
+        }
+    }
+}
+
+/// [`decode_physical`] over borrowed bytes: the decompressed block, or `None` if the block
+/// is stored uncompressed (its logical bytes are the payload, which the caller keeps).
+fn decode_slice(physical: &[u8], kind: BlockKind) -> Result<Option<BlockData>> {
+    let (trailer, payload) = verify(physical)?;
     if trailer.kind != kind {
         return Err(corrupt("block kind"));
     }
     match trailer.compression {
-        Compression::None => {
-            let n = payload.len();
-            buf.resize(n);
-            Ok(BlockData::Io(buf))
-        }
+        Compression::None => Ok(None),
         codec => {
             let mut out = vec![0; trailer.uncompressed_len as usize];
             decompress(codec, payload, &mut out)?;
-            Ok(BlockData::from(out))
+            Ok(Some(BlockData::from(out)))
         }
     }
 }
@@ -97,7 +106,8 @@ impl Reader {
             uncached: BlockCache::disabled(),
         };
         let top = blocks.read_block(footer.top_index, BlockKind::TopIndex, true, priority)?;
-        crate::block::BlockCursor::new().reset(top.clone())?;
+        // Checked once here, so every cursor can trust the top index's tables.
+        Block::new(top.clone())?.validate()?;
         let filter = |addr: BlockAddr| -> Result<Option<Filter<BlockHandle>>> {
             if addr.len == 0 {
                 return Ok(None);
@@ -202,9 +212,12 @@ impl Blocks {
             .iter()
             .map(|a| {
                 let at = (a.offset - start) as usize;
-                let mut one = IoBuf::zeroed(a.len as usize);
-                one.copy_from_slice(&buf[at..at + a.len as usize]);
-                decode_physical(one, kind)
+                let physical = &buf[at..at + a.len as usize];
+                // One copy per block: decompression, or the payload of a stored block.
+                Ok(match decode_slice(physical, kind)? {
+                    Some(data) => data,
+                    None => BlockData::from(physical[..physical.len() - TRAILER_LEN].to_vec()),
+                })
             })
             .collect()
     }

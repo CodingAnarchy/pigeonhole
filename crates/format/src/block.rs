@@ -340,6 +340,11 @@ impl BlockBuilder {
 /// A parsed logical block over any byte owner: `&[u8]`, a cache `BlockHandle`, a
 /// decompression buffer. Owning the bytes lets a cursor live beside whatever keeps them alive
 /// (an `Arc<SstReader>`, a pinned cache entry) without borrowing from it.
+///
+/// [`Block::new`] is O(1): it reads the table counts and checks the first restart. Offsets
+/// in the restart and row-start tables are checked as a cursor uses them, so a cursor never
+/// panics on bad bytes (it returns `Corrupt`); [`Block::validate`] checks both tables up
+/// front for paths that want the whole block vetted (verification, fuzzing).
 #[derive(Debug, Clone)]
 pub struct Block<B> {
     bytes: B,
@@ -356,46 +361,65 @@ struct Entry {
     value: std::ops::Range<usize>,
 }
 
+/// Reads the table counts at the end of a logical block and checks that the tables fit and
+/// the first restart is at offset 0. Returns `(data_end, restarts, row_starts)`.
+fn parse_tail(b: &[u8]) -> crate::Result<(usize, usize, usize)> {
+    let Some(tail) = b.len().checked_sub(8) else {
+        return Err(Error::Truncated { what: "block" });
+    };
+    let r = le_u32(b, tail) as usize;
+    let s = le_u32(b, tail + 4) as usize;
+    let tables = r.checked_add(s).and_then(|n| n.checked_mul(4));
+    let Some(data_end) = tables.and_then(|t| tail.checked_sub(t)) else {
+        return Err(Error::Corrupt {
+            what: "block tables",
+        });
+    };
+    let first_ok = if r == 0 {
+        data_end == 0
+    } else {
+        le_u32(b, data_end) == 0
+    };
+    if !first_ok {
+        return Err(Error::Corrupt {
+            what: "block tables",
+        });
+    }
+    Ok((data_end, r, s))
+}
+
 impl<B: Deref<Target = [u8]>> Block<B> {
-    /// Parses the restart and row-start tables. Never panics.
+    /// Parses the table counts: O(1), never panics. See [`Block::validate`].
     pub fn new(logical: B) -> crate::Result<Self> {
-        let b: &[u8] = &logical;
-        let Some(tail) = b.len().checked_sub(8) else {
-            return Err(Error::Truncated { what: "block" });
-        };
-        let r = le_u32(b, tail) as usize;
-        let s = le_u32(b, tail + 4) as usize;
-        let tables = r.checked_add(s).and_then(|n| n.checked_mul(4));
-        let Some(data_end) = tables.and_then(|t| tail.checked_sub(t)) else {
-            return Err(Error::Corrupt {
-                what: "block tables",
-            });
-        };
+        let (data_end, restart_count, row_start_count) = parse_tail(&logical)?;
+        Ok(Self {
+            data_end,
+            restart_count,
+            row_start_count,
+            bytes: logical,
+        })
+    }
+
+    /// Checks that both offset tables are strictly ascending and point inside the entries.
+    /// O(restarts + row starts).
+    pub fn validate(&self) -> crate::Result<()> {
+        let b: &[u8] = &self.bytes;
         let ascending = |start: usize, n: usize| {
             let mut prev = None;
             (0..n).all(|i| {
                 let v = le_u32(b, start + 4 * i) as usize;
-                let ok = v < data_end && prev.is_none_or(|p| v > p);
+                let ok = v < self.data_end && prev.is_none_or(|p| v > p);
                 prev = Some(v);
                 ok
             })
         };
-        let first_ok = if r == 0 {
-            data_end == 0
-        } else {
-            le_u32(b, data_end) == 0
-        };
-        if !first_ok || !ascending(data_end, r) || !ascending(data_end + 4 * r, s) {
+        let r = self.restart_count;
+        if !ascending(self.data_end, r) || !ascending(self.data_end + 4 * r, self.row_start_count) {
             return Err(Error::Corrupt {
                 what: "block tables",
             });
         }
-        Ok(Self {
-            data_end,
-            restart_count: r,
-            row_start_count: s,
-            bytes: logical,
-        })
+        Ok(())
     }
 
     /// Number of restart points.
@@ -417,17 +441,30 @@ impl<B: Deref<Target = [u8]>> Block<B> {
             cur: end,
             next: end,
             key: KeySrc::Block(0..0),
-            key_buf: Vec::new(),
+            key_buf: KeyBuf::new(),
             value: 0..0,
         }
     }
 
-    fn restart(&self, i: usize) -> usize {
-        le_u32(&self.bytes, self.data_end + 4 * i) as usize
+    /// Entry `i` of the table starting at `table`, checked to point inside the entries.
+    fn table(&self, table: usize, i: usize, what: &'static str) -> crate::Result<usize> {
+        let v = le_u32(&self.bytes, table + 4 * i) as usize;
+        if v >= self.data_end {
+            return Err(Error::Corrupt { what });
+        }
+        Ok(v)
     }
 
-    fn row_start(&self, i: usize) -> usize {
-        le_u32(&self.bytes, self.data_end + 4 * (self.restart_count + i)) as usize
+    fn restart(&self, i: usize) -> crate::Result<usize> {
+        self.table(self.data_end, i, "block restart offset")
+    }
+
+    fn row_start(&self, i: usize) -> crate::Result<usize> {
+        self.table(
+            self.data_end + 4 * self.restart_count,
+            i,
+            "block row-start offset",
+        )
     }
 
     fn entry(&self, offset: usize) -> crate::Result<Entry> {
@@ -465,9 +502,75 @@ enum KeySrc {
     Buf,
 }
 
+/// Keys up to this long are rebuilt inline, so a cursor allocates nothing for them, even
+/// when one is created per lookup.
+const INLINE_KEY: usize = 128;
+
+/// A key buffer that lives inline until a key outgrows it.
+#[derive(Debug, Clone)]
+struct KeyBuf {
+    inline: [u8; INLINE_KEY],
+    len: usize,
+    heap: Vec<u8>,
+    spilled: bool,
+}
+
+impl KeyBuf {
+    fn new() -> Self {
+        Self {
+            inline: [0; INLINE_KEY],
+            len: 0,
+            heap: Vec::new(),
+            spilled: false,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.spilled {
+            &self.heap
+        } else {
+            &self.inline[..self.len]
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.heap.clear();
+        self.spilled = false;
+    }
+
+    fn truncate(&mut self, n: usize) {
+        if self.spilled {
+            self.heap.truncate(n);
+        } else {
+            self.len = self.len.min(n);
+        }
+    }
+
+    fn extend_from_slice(&mut self, b: &[u8]) {
+        if !self.spilled {
+            if self.len + b.len() <= INLINE_KEY {
+                self.inline[self.len..self.len + b.len()].copy_from_slice(b);
+                self.len += b.len();
+                return;
+            }
+            self.heap.clear();
+            self.heap.extend_from_slice(&self.inline[..self.len]);
+            self.spilled = true;
+        }
+        self.heap.extend_from_slice(b);
+    }
+}
+
 /// A zero-copy cursor over one logical block that owns its byte owner `B`. Keys at restart
-/// points are borrowed from the block; other keys are rebuilt in a small reused buffer.
-#[derive(Debug)]
+/// points are borrowed from the block; other keys are rebuilt in a buffer that is inline for
+/// keys up to 128 bytes, so iterating allocates nothing for them. [`BlockIter::reset`] moves
+/// the cursor onto another block, keeping its buffer.
+#[derive(Debug, Clone)]
 pub struct BlockIter<B> {
     block: Block<B>,
     /// Offset of the current entry; `data_end` when not valid.
@@ -475,11 +578,54 @@ pub struct BlockIter<B> {
     /// Offset of the entry after the current one.
     next: usize,
     key: KeySrc,
-    key_buf: Vec<u8>,
+    key_buf: KeyBuf,
     value: std::ops::Range<usize>,
 }
 
 impl<B: Deref<Target = [u8]>> BlockIter<B> {
+    /// Moves the cursor onto another logical block, unpositioned, with the O(1) checks of
+    /// [`Block::new`]. On error the cursor holds `bytes` as an empty block (so it pins
+    /// nothing else) and is invalid.
+    ///
+    /// ```
+    /// use pigeonhole_format::Cursor;
+    /// use pigeonhole_format::block::{Block, BlockBuilder};
+    /// use pigeonhole_format::key::{Kind, encode_key};
+    ///
+    /// let mut blocks = Vec::new();
+    /// for row in [&b"a"[..], b"b"] {
+    ///     let mut b = BlockBuilder::data(16);
+    ///     let mut k = Vec::new();
+    ///     encode_key(&mut k, row, b"q", 1, 1, Kind::Put).unwrap();
+    ///     b.add(&k, b"\x00v").unwrap();
+    ///     blocks.push(b.finish().to_vec());
+    /// }
+    /// let mut it = Block::new(blocks[0].as_slice()).unwrap().into_cursor();
+    /// it.seek_to_first().unwrap();
+    /// assert!(it.key().starts_with(b"a\x00\x01"));
+    /// it.reset(blocks[1].as_slice()).unwrap();
+    /// assert!(!it.valid());
+    /// it.seek_to_first().unwrap();
+    /// assert!(it.key().starts_with(b"b\x00\x01"));
+    /// ```
+    pub fn reset(&mut self, bytes: B) -> crate::Result<()> {
+        let parsed = parse_tail(&bytes);
+        let (data_end, r, s) = *parsed.as_ref().unwrap_or(&(0, 0, 0));
+        self.block = Block {
+            bytes,
+            data_end,
+            restart_count: r,
+            row_start_count: s,
+        };
+        self.invalidate();
+        parsed.map(|_| ())
+    }
+
+    /// The block this cursor reads.
+    pub fn block(&self) -> &Block<B> {
+        &self.block
+    }
+
     /// Byte offset of the current entry within the block (for row-start lookups).
     pub fn entry_offset(&self) -> usize {
         self.cur
@@ -500,6 +646,14 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
         self.next = self.block.data_end;
         self.key = KeySrc::Block(0..0);
         self.value = 0..0;
+    }
+
+    /// Passes `r` through, invalidating the cursor if it is an error.
+    fn or_invalidate<T>(&mut self, r: crate::Result<T>) -> crate::Result<T> {
+        if r.is_err() {
+            self.invalidate();
+        }
+        r
     }
 
     /// Decodes the entry at `offset`, taking its shared prefix from the current key.
@@ -544,18 +698,46 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
 
     /// Positions on the restart entry at index `i` (its key is stored whole).
     fn load_restart(&mut self, i: usize) -> crate::Result<()> {
+        let at = self.block.restart(i);
+        let at = self.or_invalidate(at)?;
         self.key = KeySrc::Block(0..0);
-        self.load(self.block.restart(i))
+        self.load(at)
     }
 
     fn restart_key(&self, i: usize) -> crate::Result<&[u8]> {
-        let e = self.block.entry(self.block.restart(i))?;
+        let e = self.block.entry(self.block.restart(i)?)?;
         if e.shared != 0 {
             return Err(Error::Corrupt {
                 what: "block restart entry",
             });
         }
         Ok(&self.block.bytes[e.unshared])
+    }
+
+    /// The first row start after the current entry, if any.
+    fn next_row_start(&self) -> crate::Result<Option<usize>> {
+        let (mut lo, mut hi) = (0, self.block.row_start_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.block.row_start(mid)? <= self.cur {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == self.block.row_start_count {
+            return Ok(None);
+        }
+        let at = self.block.row_start(lo)?;
+        // The search only stops on an entry it saw above `cur`, so this cannot fire; it is
+        // kept so a future change to the search can never make `skip_row` move backwards
+        // (and loop) on an unsorted, corrupt table.
+        if at <= self.cur {
+            return Err(Error::Corrupt {
+                what: "block row-start table",
+            });
+        }
+        Ok(Some(at))
     }
 }
 
@@ -569,7 +751,7 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
     fn key(&self) -> &[u8] {
         match &self.key {
             KeySrc::Block(r) => &self.block.bytes[r.clone()],
-            KeySrc::Buf => &self.key_buf,
+            KeySrc::Buf => self.key_buf.as_slice(),
         }
     }
 
@@ -617,25 +799,20 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
         self.load(self.next)
     }
 
-    /// Uses the row-start table: one binary search, no cell decoding.
+    /// Uses the row-start table: one binary search, no cell decoding. Becomes invalid if no
+    /// later row starts in this block.
     fn skip_row(&mut self) -> crate::Result<()> {
         if !self.valid() {
             return Ok(());
         }
-        let (mut lo, mut hi) = (0, self.block.row_start_count);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.block.row_start(mid) <= self.cur {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        let next = self.next_row_start();
+        match self.or_invalidate(next)? {
+            None => {
+                self.invalidate();
+                Ok(())
             }
+            // The row start's shared prefix lies within the current key's row prefix.
+            Some(at) => self.load(at),
         }
-        if lo == self.block.row_start_count {
-            self.invalidate();
-            return Ok(());
-        }
-        // The row start's shared prefix lies within the current key's row prefix.
-        self.load(self.block.row_start(lo))
     }
 }

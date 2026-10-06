@@ -26,7 +26,8 @@ const EXTENT: ExtentRef = ExtentRef {
     size_class: 10,
 };
 
-/// Single-family rows of four columns (`meta:a`, `meta:b`, `v:0`, `v:1`), 64-byte values.
+/// Single-family rows of four columns (`meta:a`, `meta:b`, `v:0`, `v:1`), 64-byte
+/// incompressible values.
 type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 
 fn entries() -> Entries {
@@ -45,8 +46,16 @@ fn entries() -> Entries {
                 Kind::Put,
             )
             .unwrap();
+            // Pseudo-random bytes: LZ4 cannot shrink them, so throughput is not inflated
+            // by compression (the ratio is printed at startup).
+            let mut x = (u64::from(r) << 2 | c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
             let mut v = vec![0u8];
-            v.extend(format!("{r:08}-{c}-").bytes().cycle().take(63));
+            v.extend((0..63).map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            }));
             out.push((k, v));
         }
     }
@@ -84,6 +93,13 @@ fn setup() -> (FileRef, SstMeta, Entries) {
 fn bench(c: &mut Criterion) {
     let (file, meta, e) = setup();
     let bytes = raw_bytes(&e);
+    eprintln!(
+        "{} cells, {} raw bytes, SST {} bytes (ratio {:.2})",
+        e.len(),
+        bytes,
+        meta.len,
+        meta.len as f64 / bytes as f64
+    );
 
     let mut g = c.benchmark_group("build");
     g.throughput(Throughput::Bytes(bytes));

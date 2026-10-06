@@ -284,3 +284,86 @@ fn builder_rejects_misuse_and_resets() {
     it.seek(b"x").unwrap();
     assert!(!it.valid());
 }
+
+fn row_block(rows: &[&[u8]], qual_len: usize) -> Vec<u8> {
+    let mut b = BlockBuilder::data(2);
+    for row in rows {
+        for q in 0..3u8 {
+            let mut k = Vec::new();
+            let qual = vec![b'a' + q; qual_len];
+            pigeonhole_format::key::encode_key(
+                &mut k,
+                row,
+                &qual,
+                1,
+                1,
+                pigeonhole_format::Kind::Put,
+            )
+            .unwrap();
+            b.add(&k, b"\x00v").unwrap();
+        }
+    }
+    b.finish().to_vec()
+}
+
+#[test]
+fn reset_moves_between_blocks_and_keeps_long_keys() {
+    // 300-byte qualifiers spill the inline key buffer; the cursor must still rebuild them.
+    let first = row_block(&[b"a", b"b"], 300);
+    let second = row_block(&[b"c"], 3);
+    let mut it = Block::new(first.as_slice()).unwrap().into_cursor();
+    it.seek_to_first().unwrap();
+    let mut n = 0;
+    while it.valid() {
+        assert_eq!(
+            decode_key(it.key())
+                .unwrap()
+                .qualifier
+                .unwrap()
+                .as_escaped()
+                .len(),
+            300
+        );
+        n += 1;
+        it.next().unwrap();
+    }
+    assert_eq!(n, 6);
+    it.reset(second.as_slice()).unwrap();
+    assert!(!it.valid());
+    it.seek_to_first().unwrap();
+    it.next().unwrap(); // a non-restart key, rebuilt inline after the spill
+    assert!(it.key().starts_with(b"c\x00\x01bbb\x00\x01"));
+    // A bad block leaves the cursor empty and invalid.
+    assert!(it.reset(&[1, 2, 3][..]).is_err());
+    assert!(!it.valid());
+    it.seek_to_first().unwrap();
+    assert!(!it.valid());
+}
+
+#[test]
+fn validate_checks_tables_and_cursors_survive_unsorted_ones() {
+    let good = row_block(&[b"a", b"b", b"c"], 1);
+    assert!(Block::new(good.as_slice()).unwrap().validate().is_ok());
+    // Swap the last two row starts: `new` accepts (O(1)), `validate` refuses, and row
+    // skipping still only moves forward.
+    let mut bad = good.clone();
+    let n = bad.len();
+    let s = u32::from_le_bytes(bad[n - 4..].try_into().unwrap()) as usize;
+    assert_eq!(s, 3);
+    let rows = n - 8 - 4 * s;
+    let (x, y) = (rows + 4, rows + 8);
+    let tmp: [u8; 4] = bad[x..x + 4].try_into().unwrap();
+    bad.copy_within(y..y + 4, x);
+    bad[y..y + 4].copy_from_slice(&tmp);
+    let block = Block::new(bad.as_slice()).unwrap();
+    assert!(block.validate().is_err());
+    let mut it = block.into_cursor();
+    it.seek_to_first().unwrap();
+    it.skip_row().unwrap(); // row a -> row start c (the swapped entry)
+    assert!(it.key().starts_with(b"c\x00\x01"));
+    let mut steps = 0;
+    while it.valid() && it.skip_row().is_ok() {
+        steps += 1;
+        assert!(steps < 10, "skip_row looped");
+    }
+}
