@@ -100,6 +100,9 @@ pub enum ModelError {
     NoSuchFamily(String),
     /// `Incr` on a family without the `i64` add merge operator.
     NoMergeOperator(String),
+    /// A read had to fold merge operands onto a base put whose value is not an 8-byte `i64`
+    /// (decision D41); the family is named. Returned by the `try_` read methods.
+    MergeFailed(String),
 }
 
 impl fmt::Display for ModelError {
@@ -108,6 +111,7 @@ impl fmt::Display for ModelError {
             Self::NoSuchTable(t) => write!(f, "no such table {t:?}"),
             Self::NoSuchFamily(x) => write!(f, "no such family {x:?}"),
             Self::NoMergeOperator(x) => write!(f, "family {x:?} has no merge operator"),
+            Self::MergeFailed(x) => write!(f, "merge failed in family {x:?}: base is not an i64"),
         }
     }
 }
@@ -149,7 +153,7 @@ struct Entry {
 enum Kind {
     Put(Vec<u8>),
     Merge(i64),
-    /// A `CellDelete`: hides earlier-written versions with exactly this timestamp.
+    /// A `CellDelete`: hides every version with exactly this timestamp, any seqno (D38).
     CellDelete,
     /// A `ColumnDelete`: hides every version with `ts <=` this timestamp, any seqno.
     ColumnDelete,
@@ -158,12 +162,17 @@ enum Kind {
 /// `(family, qualifier)` within a row.
 type ColumnKey = (String, Vec<u8>);
 
+/// Scan results: each row with its cells.
+type Rows = Vec<(Vec<u8>, Vec<ModelCell>)>;
+
 /// `(ts, seqno)` of a family-in-row marker.
 type Marker = (Timestamp, Seqno);
 
 #[derive(Debug, Default)]
 struct Table {
     families: BTreeMap<String, ModelFamily>,
+    /// Family names in creation order (D39).
+    order: Vec<String>,
     /// Column entries, including cell and column delete markers.
     columns: BTreeMap<Vec<u8>, BTreeMap<ColumnKey, Vec<Entry>>>,
     /// Family-in-row delete markers.
@@ -189,17 +198,22 @@ struct Table {
 /// - `DeleteColumn` and `DeleteFamily` (and `DeleteRow`, one family marker per family) take
 ///   the commit timestamp `T` and hide every version in scope with timestamp `<= T`,
 ///   whatever its seqno, including a put in the same commit with timestamp `<= T` and a later
-///   put with an older timestamp. `DeleteCell` hides the versions at exactly its timestamp
-///   with an older seqno.
+///   put with an older timestamp. `DeleteCell` is timestamp-only too (D38): it hides every
+///   version at exactly its timestamp whatever its seqno, so a put at that timestamp in a
+///   later commit stays hidden (until compaction drops the marker, which it does only once
+///   nothing older can be under it).
 /// - TTL: a version is expired when `ts + ttl_micros <= now` (timestamps are microseconds).
 ///   Expired versions are dropped before merge operands are folded and versions counted.
 /// - `Incr` (only on `i64_add` families, else [`ModelError::NoMergeOperator`]) is a merge
 ///   operand at the commit timestamp. Going newest to oldest, a run of operands folds into
 ///   one cell at the newest operand's timestamp: its value is the wrapping sum of the
-///   operands plus the `i64` in the next older put, which the fold consumes (a put value
-///   that is not 8 bytes counts as 0). Without a base the sum is the value.
+///   operands plus the `i64` in the next older put, which the fold consumes. A base put
+///   whose value is not 8 bytes makes the read fail with [`ModelError::MergeFailed`] (D41);
+///   a put no operand folds onto is returned as written. Without a base the sum is the
+///   value. An expired base is dropped before folding, so the run then has no base.
 /// - `max_versions` keeps the newest N resolved versions (after deletes, TTL and folding).
-/// - Reads order cells by family name, then qualifier, then timestamp descending.
+/// - Reads order cells by family, then qualifier, then timestamp descending. Families come
+///   in creation order, or in the caller's order when the read lists families (D39).
 ///
 /// ```
 /// use pigeonhole_format::Durability;
@@ -234,7 +248,10 @@ impl Model {
     pub fn create_table(&mut self, name: &str, families: Vec<ModelFamily>) {
         let table = self.tables.entry(name.to_owned()).or_default();
         for f in families {
-            table.families.insert(f.name.clone(), f);
+            let name = f.name.clone();
+            if table.families.insert(name.clone(), f).is_none() {
+                table.order.push(name);
+            }
         }
     }
 
@@ -392,6 +409,9 @@ impl Model {
     }
 
     /// The newest visible version of a cell at `snapshot`, with TTL evaluated at `now`.
+    ///
+    /// # Panics
+    /// On [`ModelError::MergeFailed`]; use [`Model::try_get`] to get the error instead.
     pub fn get(
         &self,
         table: &str,
@@ -401,25 +421,49 @@ impl Model {
         snapshot: Seqno,
         now: Timestamp,
     ) -> Option<ModelCell> {
-        let t = self.tables.get(table)?;
-        let fam = t.families.get(family)?;
-        let entries = t
+        expect_read(self.try_get(table, row, family, qualifier, snapshot, now))
+    }
+
+    /// Like [`Model::get`], but a failed merge is a typed error.
+    pub fn try_get(
+        &self,
+        table: &str,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        snapshot: Seqno,
+        now: Timestamp,
+    ) -> Result<Option<ModelCell>, ModelError> {
+        let Some(t) = self.tables.get(table) else {
+            return Ok(None);
+        };
+        let Some(fam) = t.families.get(family) else {
+            return Ok(None);
+        };
+        let Some(entries) = t
             .columns
-            .get(row)?
-            .get(&(family.to_owned(), qualifier.to_vec()))?;
+            .get(row)
+            .and_then(|c| c.get(&(family.to_owned(), qualifier.to_vec())))
+        else {
+            return Ok(None);
+        };
         let markers = t.family_deletes.get(&(row.to_vec(), family.to_owned()));
-        let mut versions = resolve(fam, entries, markers, snapshot, now, 1);
-        let (ts, value) = versions.pop()?;
-        Some(ModelCell {
+        let mut versions = resolve(fam, entries, markers, snapshot, now, 1)?;
+        Ok(versions.pop().map(|(ts, value)| ModelCell {
             family: family.to_owned(),
             qualifier: qualifier.to_vec(),
             ts,
             value,
-        })
+        }))
     }
 
     /// Up to `versions` visible versions of every cell of `row` in `families` (all if empty).
-    /// `versions == 0` means every visible version.
+    /// `versions == 0` means every visible version. Families come in the order listed, or in
+    /// creation order when `families` is empty (D39); a name listed twice or not in the table
+    /// is skipped.
+    ///
+    /// # Panics
+    /// On [`ModelError::MergeFailed`]; use [`Model::try_read_row`] to get the error instead.
     pub fn read_row(
         &self,
         table: &str,
@@ -429,33 +473,61 @@ impl Model {
         snapshot: Seqno,
         now: Timestamp,
     ) -> Vec<ModelCell> {
+        expect_read(self.try_read_row(table, row, families, versions, snapshot, now))
+    }
+
+    /// Like [`Model::read_row`], but a failed merge is a typed error.
+    pub fn try_read_row(
+        &self,
+        table: &str,
+        row: &[u8],
+        families: &[&str],
+        versions: u32,
+        snapshot: Seqno,
+        now: Timestamp,
+    ) -> Result<Vec<ModelCell>, ModelError> {
         let Some(t) = self.tables.get(table) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(columns) = t.columns.get(row) else {
-            return Vec::new();
+            return Ok(Vec::new());
+        };
+        let order: Vec<&str> = if families.is_empty() {
+            t.order.iter().map(String::as_str).collect()
+        } else {
+            families.to_vec()
         };
         let mut out = Vec::new();
-        for ((family, qualifier), entries) in columns {
-            if !families.is_empty() && !families.contains(&family.as_str()) {
+        for (i, &family) in order.iter().enumerate() {
+            let Some(fam) = t.families.get(family) else {
+                continue;
+            };
+            if order[..i].contains(&family) {
                 continue;
             }
-            let fam = &t.families[family];
-            let markers = t.family_deletes.get(&(row.to_vec(), family.clone()));
-            for (ts, value) in resolve(fam, entries, markers, snapshot, now, versions) {
-                out.push(ModelCell {
-                    family: family.clone(),
-                    qualifier: qualifier.clone(),
-                    ts,
-                    value,
-                });
+            let markers = t.family_deletes.get(&(row.to_vec(), family.to_owned()));
+            let in_family = columns
+                .range((family.to_owned(), Vec::new())..)
+                .take_while(|((f, _), _)| f == family);
+            for ((_, qualifier), entries) in in_family {
+                for (ts, value) in resolve(fam, entries, markers, snapshot, now, versions)? {
+                    out.push(ModelCell {
+                        family: family.to_owned(),
+                        qualifier: qualifier.clone(),
+                        ts,
+                        value,
+                    });
+                }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Rows in `[start, end)` with their latest visible cells, in order. Rows with no visible
-    /// cell are omitted.
+    /// cell are omitted. Cells within a row are ordered as by [`Model::read_row`].
+    ///
+    /// # Panics
+    /// On [`ModelError::MergeFailed`]; use [`Model::try_scan`] to get the error instead.
     pub fn scan(
         &self,
         table: &str,
@@ -465,8 +537,21 @@ impl Model {
         snapshot: Seqno,
         now: Timestamp,
     ) -> Vec<(Vec<u8>, Vec<ModelCell>)> {
+        expect_read(self.try_scan(table, start, end, families, snapshot, now))
+    }
+
+    /// Like [`Model::scan`], but a failed merge is a typed error.
+    pub fn try_scan(
+        &self,
+        table: &str,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        families: &[&str],
+        snapshot: Seqno,
+        now: Timestamp,
+    ) -> Result<Rows, ModelError> {
         let Some(t) = self.tables.get(table) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let to_owned = |b: Bound<&[u8]>| match b {
             Bound::Included(k) => Bound::Included(k.to_vec()),
@@ -482,15 +567,16 @@ impl Model {
             _ => false,
         };
         if inverted {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        t.columns
-            .range((start, end))
-            .filter_map(|(row, _)| {
-                let cells = self.read_row(table, row, families, 1, snapshot, now);
-                (!cells.is_empty()).then(|| (row.clone(), cells))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for row in t.columns.range((start, end)).map(|(row, _)| row) {
+            let cells = self.try_read_row(table, row, families, 1, snapshot, now)?;
+            if !cells.is_empty() {
+                out.push((row.clone(), cells));
+            }
+        }
+        Ok(out)
     }
 
     /// What a crash of `kind` may lose, given each commit's acknowledged durability.
@@ -545,7 +631,13 @@ impl Model {
     }
 }
 
+/// Unwraps a read for the panicking read methods.
+fn expect_read<T>(r: Result<T, ModelError>) -> T {
+    r.unwrap_or_else(|e| panic!("model read failed: {e}"))
+}
+
 /// Resolves one column to its visible versions, newest first, at most `limit` (0 = all).
+/// Fails if a version within the limit folds operands onto a base that is not an `i64`.
 fn resolve(
     family: &ModelFamily,
     entries: &[Entry],
@@ -553,7 +645,7 @@ fn resolve(
     snapshot: Seqno,
     now: Timestamp,
     limit: u32,
-) -> Vec<(Timestamp, Vec<u8>)> {
+) -> Result<Vec<(Timestamp, Vec<u8>)>, ModelError> {
     let visible = |seqno: Seqno| seqno <= snapshot;
     // Highest timestamp a visible column or family delete covers.
     let covered = entries
@@ -580,9 +672,7 @@ fn resolve(
             visible(e.seqno)
                 && matches!(e.kind, Kind::Put(_) | Kind::Merge(_))
                 && covered.is_none_or(|c| e.ts > c)
-                && !cell_deletes
-                    .iter()
-                    .any(|d| d.ts == e.ts && d.seqno > e.seqno)
+                && !cell_deletes.iter().any(|d| d.ts == e.ts)
                 && (family.ttl_micros == 0 || e.ts.saturating_add(family.ttl_micros) > now)
         })
         .collect();
@@ -595,7 +685,8 @@ fn resolve(
     // a pending run; the run folds onto the first older timestamp that has a put (whose
     // newer-than-base operands join the sum), and the version carries the timestamp of the
     // run's newest operand.
-    let mut out: Vec<(Timestamp, Vec<u8>)> = Vec::new();
+    // A version whose fold failed is `None`; it is an error only if it is returned.
+    let mut out: Vec<(Timestamp, Option<Vec<u8>>)> = Vec::new();
     let mut run: Option<(Timestamp, i64)> = None;
     let mut i = 0;
     while i < live.len() {
@@ -615,12 +706,13 @@ fn resolve(
             });
         match base.map(|b| &group[b].kind) {
             Some(Kind::Put(value)) if run.is_none() && base == Some(0) => {
-                out.push((ts, value.clone()));
+                out.push((ts, Some(value.clone())));
             }
             Some(Kind::Put(value)) => {
                 let (run_ts, run_sum) = run.take().unwrap_or((ts, 0));
-                let total = run_sum.wrapping_add(operands).wrapping_add(as_i64(value));
-                out.push((run_ts, total.to_le_bytes().to_vec()));
+                let total =
+                    as_i64(value).map(|base| run_sum.wrapping_add(operands).wrapping_add(base));
+                out.push((run_ts, total.map(|t| t.to_le_bytes().to_vec())));
             }
             _ => {
                 run = Some(match run {
@@ -631,7 +723,7 @@ fn resolve(
         }
     }
     if let Some((run_ts, sum)) = run {
-        out.push((run_ts, sum.to_le_bytes().to_vec()));
+        out.push((run_ts, Some(sum.to_le_bytes().to_vec())));
     }
     let mut cap = if family.max_versions == 0 {
         usize::MAX
@@ -642,7 +734,13 @@ fn resolve(
         cap = cap.min(limit as usize);
     }
     out.truncate(cap);
-    out
+    out.into_iter()
+        .map(|(ts, value)| {
+            value
+                .map(|v| (ts, v))
+                .ok_or_else(|| ModelError::MergeFailed(family.name.clone()))
+        })
+        .collect()
 }
 
 /// `(row, family, qualifier, ts)` of a column-level mutation, borrowed.
@@ -685,8 +783,9 @@ fn column_key(op: &ModelOp, commit_ts: Timestamp) -> Option<CollapseKey<'_>> {
     .map(|(t, r, f, q, ts)| (t.as_str(), r.as_slice(), f.as_str(), q.as_slice(), ts))
 }
 
-fn as_i64(bytes: &[u8]) -> i64 {
-    <[u8; 8]>::try_from(bytes).map_or(0, i64::from_le_bytes)
+/// A merge base as an `i64`, or `None` if it is not 8 bytes.
+fn as_i64(bytes: &[u8]) -> Option<i64> {
+    <[u8; 8]>::try_from(bytes).ok().map(i64::from_le_bytes)
 }
 
 #[cfg(test)]
@@ -813,12 +912,65 @@ mod tests {
         m.commit(&[del], 11, Durability::Sync);
         assert_eq!(values(&m, "r", 0, 2, 100), [(5, "a".into())]);
         assert_eq!(values(&m, "r", 0, 1, 100).len(), 2);
-        // A later put at the deleted timestamp is visible again.
+        // Timestamp-only (D38): a later put at the deleted timestamp stays hidden...
         m.commit(&[put("r", "q", Some(6), "c")], 12, Durability::Sync);
+        assert_eq!(values(&m, "r", 0, 3, 100), [(5, "a".into())]);
+        // ...while one at another timestamp is visible, and a snapshot from before the
+        // delete still sees the original version.
+        m.commit(&[put("r", "q", Some(7), "d")], 13, Durability::Sync);
         assert_eq!(
-            values(&m, "r", 0, 3, 100),
-            [(6, "c".into()), (5, "a".into())]
+            values(&m, "r", 0, 4, 100),
+            [(7, "d".into()), (5, "a".into())]
         );
+        assert_eq!(values(&m, "r", 0, 1, 100)[0], (6, "b".into()));
+    }
+
+    #[test]
+    fn cell_delete_hides_operands_at_its_timestamp() {
+        let mut m = model();
+        let del = ModelOp::DeleteCell {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "c".into(),
+            qualifier: b"n".to_vec(),
+            ts: 20,
+        };
+        m.commit(&[incr("r", 1)], 10, Durability::Sync);
+        m.commit(&[del], 15, Durability::Sync);
+        m.commit(&[incr("r", 5)], 20, Durability::Sync);
+        let v = m.get("t", b"r", "c", b"n", 3, 100).unwrap();
+        assert_eq!((v.ts, v.value), (10, 1i64.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn families_in_creation_or_requested_order() {
+        let mut m = Model::new();
+        m.create_table("t", vec![fam("z", 0, 0, false), fam("a", 0, 0, false)]);
+        m.create_table("t", vec![fam("m", 0, 0, false), fam("z", 0, 0, false)]);
+        let p = |family: &str, q: &str| ModelOp::Put {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: family.into(),
+            qualifier: q.into(),
+            ts: None,
+            value: b"v".to_vec(),
+        };
+        m.commit(
+            &[p("a", "2"), p("a", "1"), p("m", "x"), p("z", "y")],
+            10,
+            Durability::Sync,
+        );
+        let order = |families: &[&str]| {
+            m.read_row("t", b"r", families, 0, 1, 100)
+                .into_iter()
+                .map(|c| format!("{}:{}", c.family, String::from_utf8(c.qualifier).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&[]), ["z:y", "a:1", "a:2", "m:x"]);
+        assert_eq!(order(&["m", "a", "m", "nope"]), ["m:x", "a:1", "a:2"]);
+        let scanned = m.scan("t", Bound::Unbounded, Bound::Unbounded, &["a", "z"], 1, 100);
+        let fams: Vec<_> = scanned[0].1.iter().map(|c| c.family.as_str()).collect();
+        assert_eq!(fams, ["a", "a", "z"]);
     }
 
     #[test]
@@ -900,6 +1052,64 @@ mod tests {
         w.commit(&[incr("r", 1)], 2, Durability::Sync);
         let v = w.get("t", b"r", "c", b"n", 2, 2).unwrap().value;
         assert_eq!(i64::from_le_bytes(v.try_into().unwrap()), i64::MIN);
+    }
+
+    #[test]
+    fn merge_onto_a_non_i64_base_fails() {
+        let mut m = model();
+        let base = ModelOp::Put {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "c".into(),
+            qualifier: b"n".to_vec(),
+            ts: None,
+            value: b"abc".to_vec(),
+        };
+        m.commit(&[base], 10, Durability::Sync);
+        // No operand on top: the put is returned as written.
+        assert_eq!(m.get("t", b"r", "c", b"n", 1, 100).unwrap().value, b"abc");
+        m.commit(&[incr("r", 1)], 20, Durability::Sync);
+        let failed = Err(ModelError::MergeFailed("c".into()));
+        assert_eq!(m.try_get("t", b"r", "c", b"n", 2, 100), failed);
+        assert_eq!(
+            m.try_read_row("t", b"r", &[], 0, 2, 100).map(|_| ()),
+            Err(ModelError::MergeFailed("c".into()))
+        );
+        assert_eq!(
+            m.try_scan("t", Bound::Unbounded, Bound::Unbounded, &[], 2, 100)
+                .map(|_| ()),
+            Err(ModelError::MergeFailed("c".into()))
+        );
+        // A newer plain put shadows the fold when only the newest version is read.
+        m.commit(&[put_c(30, 7)], 30, Durability::Sync);
+        let v = m.try_get("t", b"r", "c", b"n", 3, 100).unwrap().unwrap();
+        assert_eq!((v.ts, v.value), (30, 7i64.to_le_bytes().to_vec()));
+        assert!(m.try_read_row("t", b"r", &[], 0, 3, 100).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "merge failed")]
+    fn panicking_read_reports_a_failed_merge() {
+        let mut m = model();
+        m.commit(&[put_c(10, 0)], 10, Durability::Sync);
+        let mut bad = put_c(10, 0);
+        if let ModelOp::Put { value, .. } = &mut bad {
+            value.truncate(3);
+        }
+        m.commit(&[bad], 11, Durability::Sync);
+        m.commit(&[incr("r", 1)], 20, Durability::Sync);
+        let _ = m.get("t", b"r", "c", b"n", 3, 100);
+    }
+
+    fn put_c(ts: u64, v: i64) -> ModelOp {
+        ModelOp::Put {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "c".into(),
+            qualifier: b"n".to_vec(),
+            ts: Some(ts),
+            value: v.to_le_bytes().to_vec(),
+        }
     }
 
     #[test]
