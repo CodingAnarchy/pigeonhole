@@ -1,4 +1,8 @@
-use std::marker::PhantomData;
+use std::borrow::Cow;
+use std::ops::Range;
+use std::sync::Arc;
+
+use pigeonhole_engine::{CellData, FamilyId, TableInfo, ValueRef};
 
 /// A typed view of a value.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,66 +17,139 @@ pub enum Value<'a> {
     Varint(i64),
 }
 
+/// The value bytes of a stored value: everything after the tag byte.
+fn payload(data: &CellData) -> &[u8] {
+    data.stored().get(1..).unwrap_or_default()
+}
+
+fn typed(data: &CellData) -> Value<'_> {
+    match data.value() {
+        ValueRef::Bytes(b) => Value::Bytes(b),
+        ValueRef::I64(v) => Value::I64(v),
+        ValueRef::F64(v) => Value::F64(v),
+        ValueRef::Varint(v) => Value::Varint(v),
+        // The engine resolves blob pointers on read; never reached.
+        ValueRef::Blob(_) => Value::Bytes(&[]),
+    }
+}
+
+fn as_i64(data: &CellData) -> Option<i64> {
+    match data.value() {
+        ValueRef::I64(v) | ValueRef::Varint(v) => Some(v),
+        _ => None,
+    }
+}
+
 /// A borrowed cell version, tied to the table handle that read it. Reading it allocates
 /// nothing; the bytes stay pinned until it drops. [`CellRef::to_owned`] keeps them longer.
+///
+/// ```
+/// use pigeonhole::{Family, Options, Pigeonhole, Value};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-cellref", std::process::id()));
+/// # std::fs::create_dir_all(&dir).unwrap();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+/// t.mutate(b"row").put("f", b"name", b"Ada").put_i64("f", b"age", 36).commit()?;
+///
+/// let name = t.get(b"row", "f", b"name")?.unwrap();
+/// assert_eq!(name.value(), b"Ada");
+/// assert_eq!(name.typed(), Value::Bytes(b"Ada"));
+/// let age = t.get(b"row", "f", b"age")?.unwrap();
+/// assert_eq!(age.as_i64(), Some(36));
+/// assert_eq!(age.value(), 36i64.to_le_bytes());
+///
+/// // Keep a cell past the borrow of the table.
+/// let owned = name.to_owned();
+/// drop(t);
+/// assert_eq!(owned.value(), b"Ada");
+/// # db.close()?;
+/// # std::fs::remove_dir_all(&dir).unwrap();
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct CellRef<'a> {
-    _priv: PhantomData<&'a ()>,
+    data: Cow<'a, CellData>,
 }
 
 impl<'a> CellRef<'a> {
+    pub(crate) fn owned(data: CellData) -> Self {
+        Self {
+            data: Cow::Owned(data),
+        }
+    }
+
+    pub(crate) fn borrowed(data: &'a CellData) -> Self {
+        Self {
+            data: Cow::Borrowed(data),
+        }
+    }
+
     /// The value bytes (for typed values, their encoding without the tag).
     pub fn value(&self) -> &[u8] {
-        todo!()
+        payload(&self.data)
     }
 
     /// The typed value.
     pub fn typed(&self) -> Value<'_> {
-        todo!()
+        typed(&self.data)
     }
 
     /// The value as an `i64`, if it is one.
     pub fn as_i64(&self) -> Option<i64> {
-        todo!()
+        as_i64(&self.data)
     }
 
     /// The version's timestamp (microseconds since the Unix epoch by default).
     pub fn timestamp(&self) -> u64 {
-        todo!()
+        self.data.timestamp()
     }
 
     /// An owned handle that can outlive the table borrow (no copy of the value).
     pub fn to_owned(&self) -> Cell {
-        todo!()
+        Cell {
+            data: CellData::clone(&self.data),
+        }
     }
 }
 
 /// An owned cell version: a cheap ref-counted handle that pins its cache block. `Send`,
 /// `Sync`, `'static`; safe to hold across `.await`.
+///
+/// ```
+/// # fn assert_owned<T: Send + Sync + 'static>() {}
+/// assert_owned::<pigeonhole::Cell>();
+/// ```
 #[derive(Debug, Clone)]
 pub struct Cell {
-    _priv: (),
+    data: CellData,
 }
 
 impl Cell {
+    pub(crate) fn from_data(data: CellData) -> Self {
+        Self { data }
+    }
+
     /// The value bytes.
     pub fn value(&self) -> &[u8] {
-        todo!()
+        payload(&self.data)
     }
 
     /// The typed value.
     pub fn typed(&self) -> Value<'_> {
-        todo!()
+        typed(&self.data)
     }
 
     /// The value as an `i64`, if it is one.
     pub fn as_i64(&self) -> Option<i64> {
-        todo!()
+        as_i64(&self.data)
     }
 
     /// The version's timestamp.
     pub fn timestamp(&self) -> u64 {
-        todo!()
+        self.data.timestamp()
     }
 }
 
@@ -87,83 +164,235 @@ pub struct CellEntry<'a> {
     pub cell: CellRef<'a>,
 }
 
+/// One cell of a row: its family, its qualifier as a range of the row's qualifier buffer,
+/// and the version.
+#[derive(Debug, Clone)]
+pub(crate) struct RowCell {
+    pub(crate) family: FamilyId,
+    pub(crate) qualifier: Range<u32>,
+    pub(crate) cell: Cell,
+}
+
+/// The storage behind [`Row`] and [`RowRef`]: a few buffers per row, none per cell.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RowBuf {
+    /// Names the families (a catalog entry that includes every family read).
+    pub(crate) info: Option<Arc<TableInfo>>,
+    pub(crate) key: Vec<u8>,
+    /// Every qualifier of the row, concatenated.
+    pub(crate) qualifiers: Vec<u8>,
+    pub(crate) cells: Vec<RowCell>,
+}
+
+impl RowBuf {
+    /// Empties the buffers, keeping their capacity.
+    pub(crate) fn clear(&mut self) {
+        self.key.clear();
+        self.qualifiers.clear();
+        self.cells.clear();
+    }
+
+    /// Appends a cell whose qualifier was just appended to `qualifiers` at `start`.
+    pub(crate) fn push_appended(&mut self, family: FamilyId, start: usize, data: CellData) {
+        self.cells.push(RowCell {
+            family,
+            qualifier: start as u32..self.qualifiers.len() as u32,
+            cell: Cell { data },
+        });
+    }
+
+    fn family_name(&self, id: FamilyId) -> &str {
+        self.info
+            .as_deref()
+            .and_then(|info| info.families.iter().find(|f| f.id == id))
+            .map_or("", |f| f.name.as_str())
+    }
+
+    fn qualifier(&self, cell: &RowCell) -> &[u8] {
+        &self.qualifiers[cell.qualifier.start as usize..cell.qualifier.end as usize]
+    }
+
+    fn entry(&self, i: usize) -> Option<(&str, &[u8], &Cell)> {
+        let c = self.cells.get(i)?;
+        Some((self.family_name(c.family), self.qualifier(c), &c.cell))
+    }
+
+    /// The newest version of one column: the first cell of it, since versions come newest
+    /// first.
+    fn get(&self, family: &str, qualifier: &[u8]) -> Option<&Cell> {
+        let id = self.info.as_deref()?.family(family)?.id;
+        self.cells
+            .iter()
+            .find(|c| c.family == id && self.qualifier(c) == qualifier)
+            .map(|c| &c.cell)
+    }
+}
+
+/// Where a [`RowRef`] gets its cells.
+#[derive(Debug, Clone)]
+enum RowSrc<'a> {
+    Owned(Arc<RowBuf>),
+    Borrowed(&'a RowBuf),
+}
+
 /// A borrowed row: its key and its cells ordered by family, qualifier, newest version first.
+///
+/// ```
+/// use pigeonhole::{Family, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-rowref", std::process::id()));
+/// # std::fs::create_dir_all(&dir).unwrap();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let t = db
+///     .table("t")?
+///     .family("a", Family::default())
+///     .family("b", Family::default())
+///     .create_if_missing()?;
+/// t.mutate(b"row").put("b", b"x", b"1").put("a", b"z", b"2").put("a", b"y", b"3").commit()?;
+///
+/// let row = t.row(b"row").read()?.unwrap();
+/// assert_eq!(row.key(), b"row");
+/// let cells: Vec<(&str, &[u8])> = row.iter().map(|e| (e.family, e.qualifier)).collect();
+/// assert_eq!(cells, [("a", &b"y"[..]), ("a", b"z"), ("b", b"x")]);
+/// assert_eq!(row.get("a", b"z").unwrap().value(), b"2");
+/// # db.close()?;
+/// # std::fs::remove_dir_all(&dir).unwrap();
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct RowRef<'a> {
-    _priv: PhantomData<&'a ()>,
+    src: RowSrc<'a>,
 }
 
 impl<'a> RowRef<'a> {
+    pub(crate) fn owned(buf: RowBuf) -> Self {
+        Self {
+            src: RowSrc::Owned(Arc::new(buf)),
+        }
+    }
+
+    pub(crate) fn borrowed(buf: &'a RowBuf) -> Self {
+        Self {
+            src: RowSrc::Borrowed(buf),
+        }
+    }
+
+    fn buf(&self) -> &RowBuf {
+        match &self.src {
+            RowSrc::Owned(b) => b,
+            RowSrc::Borrowed(b) => b,
+        }
+    }
+
     /// The row key.
     pub fn key(&self) -> &[u8] {
-        todo!()
+        &self.buf().key
     }
 
     /// Number of cells.
     pub fn len(&self) -> usize {
-        todo!()
+        self.buf().cells.len()
     }
 
     /// Whether the row has no cells.
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.len() == 0
     }
 
     /// The `i`th cell.
     pub fn entry(&self, i: usize) -> Option<CellEntry<'_>> {
-        todo!()
+        let (family, qualifier, cell) = self.buf().entry(i)?;
+        Some(CellEntry {
+            family,
+            qualifier,
+            cell: CellRef::borrowed(&cell.data),
+        })
     }
 
     /// Iterates the cells.
     pub fn iter(&self) -> impl Iterator<Item = CellEntry<'_>> + '_ {
-        std::iter::empty()
+        (0..self.len()).filter_map(move |i| self.entry(i))
     }
 
     /// The newest version of one column.
     pub fn get(&self, family: &str, qualifier: &[u8]) -> Option<CellRef<'_>> {
-        todo!()
+        self.buf()
+            .get(family, qualifier)
+            .map(|c| CellRef::borrowed(&c.data))
     }
 
     /// An owned copy of the row's structure; values stay pinned, not copied.
     pub fn to_owned(&self) -> Row {
-        todo!()
+        let buf = match &self.src {
+            RowSrc::Owned(b) => Arc::clone(b),
+            RowSrc::Borrowed(b) => Arc::new(RowBuf::clone(b)),
+        };
+        Row { buf }
     }
 }
 
 /// An owned row. Cheap to clone.
+///
+/// ```
+/// use pigeonhole::{Family, Options, Pigeonhole, Row};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = std::env::temp_dir().join(format!("pigeonhole-doc-{}-row", std::process::id()));
+/// # std::fs::create_dir_all(&dir).unwrap();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+/// t.mutate(b"a").put("f", b"q", b"1").commit()?;
+/// t.mutate(b"b").put("f", b"q", b"2").commit()?;
+///
+/// let rows: Vec<Row> = t.scan_prefix(b"").iter()?.collect::<pigeonhole::Result<_>>()?;
+/// assert_eq!(rows.len(), 2);
+/// let (family, qualifier, cell) = rows[1].entry(0).unwrap();
+/// assert_eq!((family, qualifier, cell.value()), ("f", &b"q"[..], &b"2"[..]));
+/// assert_eq!(rows[0].get("f", b"q").unwrap().value(), b"1");
+/// # db.close()?;
+/// # std::fs::remove_dir_all(&dir).unwrap();
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Row {
-    _priv: (),
+    buf: Arc<RowBuf>,
 }
 
 impl Row {
+    pub(crate) fn new(buf: RowBuf) -> Self {
+        Self { buf: Arc::new(buf) }
+    }
+
     /// The row key.
     pub fn key(&self) -> &[u8] {
-        todo!()
+        &self.buf.key
     }
 
     /// Number of cells.
     pub fn len(&self) -> usize {
-        todo!()
+        self.buf.cells.len()
     }
 
     /// Whether the row has no cells.
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.len() == 0
     }
 
     /// The `i`th cell: family name, qualifier and version.
     pub fn entry(&self, i: usize) -> Option<(&str, &[u8], &Cell)> {
-        todo!()
+        self.buf.entry(i)
     }
 
     /// The newest version of one column.
     pub fn get(&self, family: &str, qualifier: &[u8]) -> Option<&Cell> {
-        todo!()
+        self.buf.get(family, qualifier)
     }
 
     /// A borrowed view.
     pub fn view(&self) -> RowRef<'_> {
-        todo!()
+        RowRef::borrowed(&self.buf)
     }
 }
