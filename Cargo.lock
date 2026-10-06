@@ -574,7 +574,10 @@ dependencies = [
 name = "pigeonhole-runtime"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "pigeonhole-io",
+ "pigeonhole-sim",
+ "proptest",
 ]
 
 [[package]]
