@@ -577,7 +577,14 @@ impl Run {
     }
 
     /// Crashes (unless a fault plan already did), reopens, and checks what survived.
+    ///
+    /// While a power loss is armed, any crash is that power loss: the scheduled crash fires
+    /// on the n-th mutating operation, which may be the WAL write of a commit that is then
+    /// acknowledged, or the engine's background spare-segment preparation, so it can have
+    /// fired with no error seen. Checking against a process crash's floor would demand
+    /// `Buffered` commits the power loss was allowed to drop (issue #56).
     fn crash_and_recover(&mut self, kind: CrashKind, already: bool) -> Result<(), String> {
+        let kind = if self.armed { CrashKind::Power } else { kind };
         self.stats.crashes += 1;
         self.trace.push(format!(
             "CRASH {kind:?}{}",
@@ -882,6 +889,37 @@ fn every_durability_level_under_crashes() {
         cfg.mid_commit_crash_ppm = 60_000;
         check(&cfg);
     }
+}
+
+#[test]
+fn a_crash_while_a_power_loss_is_armed_is_that_power_loss() {
+    // Issue #56: the scheduled power loss fired after an acknowledged `Buffered` commit's
+    // WAL write (no error seen), then a random process crash was checked at the process
+    // floor and demanded the dropped commit. Fire the power loss directly so the test does
+    // not depend on which mutating operation the scheduled one would land on.
+    let seed = seeds()[0];
+    let mut cfg = Config::crashing(0);
+    cfg.faults = FaultPlan::none();
+    (cfg.crash_ppm, cfg.mid_commit_crash_ppm, cfg.reopen_ppm) = (0, 0, 0);
+    let mut run = Run::new(seed, cfg).expect("open");
+    let mut rng = Rng::new(seed);
+    for op in Workload::new(seed, "t", run.cfg.spec.clone()).take(40) {
+        let Op::Commit(ops, _) = op else { continue };
+        run.step(Op::Commit(ops, Durability::Buffered), &mut rng)
+            .expect("commit");
+    }
+    assert!(
+        run.log.iter().any(|c| c.acked),
+        "seed {seed}: nothing committed"
+    );
+    run.armed = true;
+    run.vfs.crash(CrashKind::Power);
+    let result = run.crash_and_recover(CrashKind::Process, false);
+    assert!(
+        run.trace.iter().any(|t| t == "CRASH Power"),
+        "seed {seed}: the armed power loss was checked as a process crash"
+    );
+    result.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
 }
 
 #[test]
