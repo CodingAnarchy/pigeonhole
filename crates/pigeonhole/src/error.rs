@@ -144,6 +144,11 @@ impl From<pigeonhole_engine::Error> for Error {
             // mapping test lists every current variant.
             _ => ErrorCode::Io,
         };
-        Self::new(code, e.to_string())
+        let message = match &e {
+            // Built from the fields: the message does not depend on the operator's `Display`.
+            E::Merge(m) => format!("merge operator {:?} failed: {}", m.operator, m.message),
+            _ => e.to_string(),
+        };
+        Self::new(code, message)
     }
 }
