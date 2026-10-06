@@ -215,10 +215,18 @@ fn check_compaction(seed: u64, commits: usize) {
     }
     assert_disjoint(&out);
 
-    let mut points = snapshots.clone();
+    // Under Miri, latest only (each read point costs seconds there).
+    let mut points = if cfg!(miri) {
+        Vec::new()
+    } else {
+        snapshots.clone()
+    };
     points.push(max);
     for &s in &points {
-        for now in [gc_now, gc_now + 500] {
+        for now in [gc_now, gc_now + 500]
+            .into_iter()
+            .take(if cfg!(miri) { 1 } else { 2 })
+        {
             let what = format!(
                 "seed {seed}: choice {choice}, snapshots {snapshots:?}, gc_now {gc_now}, read at {s}/{now}"
             );
@@ -238,7 +246,8 @@ fn check_compaction(seed: u64, commits: usize) {
     flush.sort();
     after.push(db.sst(&family, &flush).1);
     let now = gc_now.max(h.last_ts) + rng.below(100);
-    for s in snapshots.iter().copied().chain([max, h.model.snapshot()]) {
+    let old_points = if cfg!(miri) { &[][..] } else { &snapshots[..] };
+    for s in old_points.iter().copied().chain([max, h.model.snapshot()]) {
         let what = format!("seed {seed}: choice {choice}, later writes, read at {s}/{now}");
         let expected = model_reads(&h, s, now);
         let a = resolver_reads(&h, s, now, |o| sst_resolver(&after, o));
@@ -321,6 +330,7 @@ fn kinds(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Timestamp, Seqno, Kind)> {
 /// Done-when (3): expired and deleted data is gone after a bottommost compaction with no
 /// snapshot needing it, and kept while a snapshot can still see it.
 #[test]
+#[cfg_attr(miri, ignore = "each SimVfs pager costs ~25 s under Miri; covered natively")]
 fn ttl_and_tombstones_are_reclaimed_at_the_bottom() {
     let mut db = Db::new(3);
     let mut family = FamilyOptions::default();
@@ -393,6 +403,7 @@ fn ttl_and_tombstones_are_reclaimed_at_the_bottom() {
 
 /// #25: a cell delete at `T` keeps a later put at `T` hidden through compactions.
 #[test]
+#[cfg_attr(miri, ignore = "each SimVfs pager costs ~25 s under Miri; covered natively")]
 fn cell_delete_hides_a_later_put_through_compaction() {
     let mut db = Db::new(4);
     let family = FamilyOptions::default();
@@ -438,6 +449,7 @@ fn cell_delete_hides_a_later_put_through_compaction() {
 
 /// #21: a bad base is never folded into a zero; the read keeps failing after compaction.
 #[test]
+#[cfg_attr(miri, ignore = "each SimVfs pager costs ~25 s under Miri; covered natively")]
 fn a_bad_merge_base_stays_a_merge_failure() {
     let mut db = Db::new(5);
     let family = FamilyOptions::default();
@@ -466,6 +478,7 @@ fn a_bad_merge_base_stays_a_merge_failure() {
 
 /// Operands at one timestamp and stripe combine into one operand.
 #[test]
+#[cfg_attr(miri, ignore = "each SimVfs pager costs ~25 s under Miri; covered natively")]
 fn operands_combine_within_a_timestamp() {
     let mut db = Db::new(6);
     let family = FamilyOptions::default();
@@ -612,6 +625,7 @@ fn crash_mid_job_leaves_inputs_intact() {
 
 /// `TrivialMove` and `Drop` tasks need no I/O.
 #[test]
+#[cfg_attr(miri, ignore = "each SimVfs pager costs ~25 s under Miri; covered natively")]
 fn non_rewrite_tasks_finish_empty() {
     let mut db = Db::new(10);
     let (family, inputs) = inputs_for_interrupt(&mut db);
@@ -629,6 +643,7 @@ fn non_rewrite_tasks_finish_empty() {
 
 /// The cursor stays within the task's subranges.
 #[test]
+#[cfg_attr(miri, ignore = "each SimVfs pager costs ~25 s under Miri; covered natively")]
 fn subranges_bound_the_inputs() {
     let mut db = Db::new(11);
     let family = FamilyOptions::default();
@@ -678,6 +693,7 @@ fn subranges_bound_the_inputs() {
 
 /// A put at one timestamp shadows older entries at that timestamp in its stripe.
 #[test]
+#[cfg_attr(miri, ignore = "each SimVfs pager costs ~25 s under Miri; covered natively")]
 fn same_timestamp_puts_shadow_older_ones() {
     let mut db = Db::new(12);
     let family = FamilyOptions::default();

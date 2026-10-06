@@ -30,7 +30,7 @@ pub fn cases(default: u32) -> u32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default);
-    if cfg!(miri) { base.min(2) } else { base }
+    if cfg!(miri) { base.min(1) } else { base }
 }
 
 /// One stored entry: internal key, stored value, seqno.
@@ -693,5 +693,5 @@ where
 
 /// History length, scaled down under Miri.
 pub fn commits(n: usize) -> usize {
-    if cfg!(miri) { n.min(8) } else { n }
+    if cfg!(miri) { n.min(5) } else { n }
 }
