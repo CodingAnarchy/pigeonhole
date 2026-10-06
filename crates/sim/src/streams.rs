@@ -7,6 +7,8 @@
 //! There is no global prefix across streams, so [`Model::crash_window`] only describes the
 //! single-stream case.
 
+use std::collections::BTreeSet;
+
 use pigeonhole_format::{Durability, Timestamp};
 use pigeonhole_io::sim::CrashKind;
 
@@ -41,19 +43,52 @@ pub struct StreamCommit {
     pub streams: CommitStreams,
 }
 
-/// The records `commit` appends, as the streams they go to, in append order.
-fn record_streams(commit: &StreamCommit) -> Vec<usize> {
-    match &commit.streams {
-        CommitStreams::Single(s) => vec![*s],
-        CommitStreams::Cross {
-            participants,
-            coordinator,
-        } => participants
-            .iter()
-            .copied()
-            .chain(std::iter::once(*coordinator))
-            .collect(),
+/// One record in a WAL stream, naming the commit it belongs to by index.
+///
+/// A cross-shard commit's PREPAREs and COMMIT need not be adjacent in their streams: the
+/// engine logs the COMMIT only once every participant's PREPARE is durable, so other commits'
+/// records may land in between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamRecord {
+    /// A single-shard commit's only record.
+    Single(usize),
+    /// A participant's PREPARE of cross-shard commit `.0`.
+    Prepare(usize),
+    /// The coordinator's COMMIT of a cross-shard commit.
+    Commit {
+        /// The commit.
+        commit: usize,
+        /// Streams that must hold its PREPARE (the COMMIT record names its participants).
+        participants: Vec<usize>,
+    },
+}
+
+/// Lays `commits` out as per-stream record lists, each commit's records appended in turn
+/// (so a cross-shard commit's records are adjacent on a stream that holds several of them).
+/// Callers with overlapping commits build the lists themselves in append order.
+///
+/// # Panics
+/// If a commit names a stream `>= streams`.
+pub fn commit_records(commits: &[StreamCommit], streams: usize) -> Vec<Vec<StreamRecord>> {
+    let mut out = vec![Vec::new(); streams];
+    for (i, c) in commits.iter().enumerate() {
+        match &c.streams {
+            CommitStreams::Single(s) => out[*s].push(StreamRecord::Single(i)),
+            CommitStreams::Cross {
+                participants,
+                coordinator,
+            } => {
+                for p in participants {
+                    out[*p].push(StreamRecord::Prepare(i));
+                }
+                out[*coordinator].push(StreamRecord::Commit {
+                    commit: i,
+                    participants: participants.clone(),
+                });
+            }
+        }
     }
+    out
 }
 
 /// How many records each of `streams` streams holds once every commit is written; the
@@ -62,13 +97,10 @@ fn record_streams(commit: &StreamCommit) -> Vec<usize> {
 /// # Panics
 /// If a commit names a stream `>= streams`.
 pub fn stream_lengths(commits: &[StreamCommit], streams: usize) -> Vec<usize> {
-    let mut len = vec![0; streams];
-    for c in commits {
-        for s in record_streams(c) {
-            len[s] += 1;
-        }
-    }
-    len
+    commit_records(commits, streams)
+        .iter()
+        .map(Vec::len)
+        .collect()
 }
 
 /// The commits recovered when stream `s` keeps its first `survivors[s]` records: indices into
@@ -95,19 +127,61 @@ pub fn stream_lengths(commits: &[StreamCommit], streams: usize) -> Vec<usize> {
 /// # Panics
 /// If a commit names a stream `>= survivors.len()`.
 pub fn recovered_commits(commits: &[StreamCommit], survivors: &[usize]) -> Vec<usize> {
-    let mut next = vec![0usize; survivors.len()];
-    let mut out = Vec::new();
-    for (i, c) in commits.iter().enumerate() {
-        let mut all = true;
-        for s in record_streams(c) {
-            all &= next[s] < survivors[s];
-            next[s] += 1;
-        }
-        if all {
-            out.push(i);
-        }
-    }
-    out
+    recovered_from_records(&commit_records(commits, survivors.len()), survivors)
+}
+
+/// The commits recovered when stream `s` keeps its first `survivors[s]` of `streams[s]`, its
+/// records in append order: commit indices, ascending. A single-shard commit survives iff its
+/// record does; a cross-shard commit iff its COMMIT survives and every participant it names
+/// still holds its PREPARE (D83). A commit whose COMMIT was never appended is lost. A
+/// `survivors` entry past the end of its stream keeps the whole stream.
+///
+/// ```
+/// use pigeonhole_sim::{StreamRecord::*, recovered_from_records};
+///
+/// // Commit 0 is cross-shard over streams 0 and 1, coordinated by stream 0; commit 1 is a
+/// // single-shard commit that landed on stream 0 between 0's PREPARE and COMMIT.
+/// let streams = [
+///     vec![Prepare(0), Single(1), Commit { commit: 0, participants: vec![0, 1] }],
+///     vec![Prepare(0)],
+/// ];
+/// assert_eq!(recovered_from_records(&streams, &[3, 1]), vec![0, 1]);
+/// // The COMMIT is lost but commit 1 sits before it: only commit 1 survives.
+/// assert_eq!(recovered_from_records(&streams, &[2, 1]), vec![1]);
+/// // Stream 1 lost its PREPARE: commit 0 is lost whole although its COMMIT survived.
+/// assert_eq!(recovered_from_records(&streams, &[3, 0]), vec![1]);
+/// ```
+pub fn recovered_from_records(streams: &[Vec<StreamRecord>], survivors: &[usize]) -> Vec<usize> {
+    let kept = || {
+        streams
+            .iter()
+            .zip(survivors)
+            .enumerate()
+            .flat_map(|(s, (recs, n))| recs.iter().take(*n).map(move |r| (s, r)))
+    };
+    let prepared: BTreeSet<(usize, usize)> = kept()
+        .filter_map(|(s, r)| match r {
+            StreamRecord::Prepare(c) => Some((*c, s)),
+            _ => None,
+        })
+        .collect();
+    kept()
+        .filter_map(|(_, r)| match r {
+            StreamRecord::Single(c) => Some(*c),
+            StreamRecord::Commit {
+                commit,
+                participants,
+            } if participants
+                .iter()
+                .all(|p| prepared.contains(&(*commit, *p))) =>
+            {
+                Some(*commit)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Checks that every commit acknowledged at the floor level of `kind` or stronger (`Buffered`
@@ -292,7 +366,12 @@ mod tests {
         ) {
             let n = commits
                 .iter()
-                .flat_map(record_streams)
+                .flat_map(|c| match &c.streams {
+                    CommitStreams::Single(s) => vec![*s],
+                    CommitStreams::Cross { participants, coordinator } => {
+                        participants.iter().copied().chain([*coordinator]).collect()
+                    }
+                })
                 .max()
                 .map_or(1, |m| m + 1);
             let full = stream_lengths(&commits, n);
@@ -317,6 +396,157 @@ mod tests {
                 prop_assert!(on_s.windows(2).all(|w| w[0] || !w[1]));
             }
         }
+    }
+
+    /// Ground truth for a commit that may be cross-shard: its participants (empty for a
+    /// single-shard commit), its coordinator or only stream, and its records' append order.
+    type Truth = (Vec<usize>, usize);
+
+    /// Random commits over `n` streams whose records are merged in a random order that keeps
+    /// each commit's own order (PREPAREs, then COMMIT), so records of different commits
+    /// interleave freely. Some commits are cut short, as when a crash caught them in flight:
+    /// `cut` of their records were appended (the COMMIT only if all were).
+    fn arb_interleaved() -> impl Strategy<Value = (Vec<Truth>, Vec<Vec<StreamRecord>>, Vec<usize>)>
+    {
+        (1usize..=8).prop_flat_map(|n| {
+            let truth = prop_oneof![
+                (0..n).prop_map(|s| (Vec::new(), s)),
+                (proptest::collection::btree_set(0..n, 1..=n), 0..n)
+                    .prop_map(|(p, c)| (p.into_iter().collect::<Vec<_>>(), c)),
+            ];
+            (
+                proptest::collection::vec((truth, any::<bool>()), 0..30),
+                proptest::collection::vec(any::<u16>(), 200),
+                proptest::collection::vec(any::<u16>(), n),
+            )
+                .prop_map(move |(commits, picks, draws)| {
+                    let mut queues: Vec<std::collections::VecDeque<(usize, StreamRecord)>> =
+                        commits
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ((p, c), in_flight))| {
+                                let mut q: std::collections::VecDeque<_> = if p.is_empty() {
+                                    [(*c, StreamRecord::Single(i))].into()
+                                } else {
+                                    p.iter().map(|s| (*s, StreamRecord::Prepare(i))).collect()
+                                };
+                                if !p.is_empty() {
+                                    q.push_back((
+                                        *c,
+                                        StreamRecord::Commit {
+                                            commit: i,
+                                            participants: p.clone(),
+                                        },
+                                    ));
+                                }
+                                if *in_flight {
+                                    q.pop_back();
+                                }
+                                q
+                            })
+                            .collect();
+                    let mut streams = vec![Vec::new(); n];
+                    let mut picks = picks.into_iter().cycle();
+                    loop {
+                        let live: Vec<usize> = (0..queues.len())
+                            .filter(|&i| !queues[i].is_empty())
+                            .collect();
+                        if live.is_empty() {
+                            break;
+                        }
+                        let i = live[usize::from(picks.next().unwrap()) % live.len()];
+                        let (s, r) = queues[i].pop_front().unwrap();
+                        streams[s].push(r);
+                    }
+                    let survivors = draws
+                        .iter()
+                        .zip(&streams)
+                        .map(|(d, l): (_, &Vec<_>)| usize::from(*d) % (l.len() + 1))
+                        .collect();
+                    (
+                        commits.into_iter().map(|(t, _)| t).collect(),
+                        streams,
+                        survivors,
+                    )
+                })
+        })
+    }
+
+    proptest! {
+        /// Brute force against the ground truth, not the record kinds: a commit survives iff
+        /// each of its PREPAREs (or its single record) and its COMMIT are in a kept prefix.
+        #[test]
+        fn interleaved_records_match_brute_force(
+            (truth, streams, survivors) in arb_interleaved(),
+        ) {
+            let kept: Vec<Vec<&StreamRecord>> = streams
+                .iter()
+                .zip(&survivors)
+                .map(|(l, n)| l.iter().take(*n).collect())
+                .collect();
+            let has = |s: usize, r: &StreamRecord| kept[s].contains(&r);
+            let expect: Vec<usize> = truth
+                .iter()
+                .enumerate()
+                .filter(|(i, (p, c))| {
+                    if p.is_empty() {
+                        has(*c, &StreamRecord::Single(*i))
+                    } else {
+                        p.iter().all(|s| has(*s, &StreamRecord::Prepare(*i)))
+                            && has(*c, &StreamRecord::Commit { commit: *i, participants: p.clone() })
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+            prop_assert_eq!(recovered_from_records(&streams, &survivors), expect);
+        }
+
+        /// Survivors per stream are a record prefix, so keeping more never loses a commit.
+        #[test]
+        fn longer_prefixes_recover_more((_, streams, survivors) in arb_interleaved()) {
+            let base = recovered_from_records(&streams, &survivors);
+            for s in 0..survivors.len() {
+                let mut more = survivors.clone();
+                more[s] += 1;
+                let rec = recovered_from_records(&streams, &more);
+                prop_assert!(base.iter().all(|c| rec.contains(c)));
+            }
+        }
+    }
+
+    #[test]
+    fn commit_level_is_the_record_level_in_commit_order() {
+        let commits = [
+            commit(
+                Durability::Sync,
+                CommitStreams::Cross {
+                    participants: vec![0, 1],
+                    coordinator: 0,
+                },
+            ),
+            commit(Durability::Sync, CommitStreams::Single(0)),
+        ];
+        let recs = commit_records(&commits, 2);
+        assert_eq!(recs[0].len(), 3);
+        assert_eq!(stream_lengths(&commits, 2), vec![3, 1]);
+        for a in 0..=3 {
+            for b in 0..=1 {
+                assert_eq!(
+                    recovered_commits(&commits, &[a, b]),
+                    recovered_from_records(&recs, &[a, b])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_commit_never_logged_is_lost() {
+        // Only PREPAREs were appended before the crash.
+        let streams = [
+            vec![StreamRecord::Prepare(0)],
+            vec![StreamRecord::Prepare(0)],
+        ];
+        assert!(recovered_from_records(&streams, &[1, 1]).is_empty());
     }
 
     #[test]

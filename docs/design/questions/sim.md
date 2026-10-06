@@ -1,0 +1,4 @@
+## Proposed decision: the recovery oracle also works on record lists (extends D93, #59)
+`pigeonhole-sim` offers `recovered_from_records(streams, survivors)`: the caller passes each stream's records in append order as `StreamRecord::{Single, Prepare, Commit { commit, participants }}` plus the surviving prefix length per stream. A single-shard commit survives iff its record does; a cross-shard commit iff its COMMIT survives and every participant the COMMIT names still holds its PREPARE (D83). A commit whose COMMIT was never appended is lost. PREPARE and COMMIT need not be adjacent. `recovered_commits` is now `recovered_from_records` over `commit_records`, so the commit-level API is unchanged.
+
+**Interim behavior:** as described; suites with overlapping commits (engine, pigeonhole) call the record-level helper. Adoption is tracked by #48.
