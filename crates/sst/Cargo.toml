@@ -16,5 +16,13 @@ pigeonhole-format = { workspace = true }
 pigeonhole-io = { workspace = true }
 pigeonhole-cache = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "sst"
+harness = false
+
 [lints]
 workspace = true
