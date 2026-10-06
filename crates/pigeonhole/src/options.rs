@@ -37,6 +37,11 @@ impl Options {
     }
 
     /// Dedicate `k` extra pinned threads to flush and compaction.
+    ///
+    /// Engine-owned mode only. [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
+    /// starts no threads, so it fails with
+    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when `k > 0`
+    /// (decision D40); flush and compaction then run on the shards you drive.
     pub fn compaction_cores(self, k: usize) -> Self {
         todo!()
     }
