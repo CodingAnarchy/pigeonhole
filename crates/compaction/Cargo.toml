@@ -18,5 +18,14 @@ pigeonhole-format = { workspace = true }
 pigeonhole-cache = { workspace = true }
 pigeonhole-io = { workspace = true }
 
+[dev-dependencies]
+pigeonhole-sim = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "compaction"
+harness = false
+
 [lints]
 workspace = true

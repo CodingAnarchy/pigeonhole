@@ -116,6 +116,7 @@ let hits = pages.get(b"com.example/a", "meta", b"hits")?.and_then(|c| c.as_i64()
 - The built-in `pigeonhole.i64_add` is the default operator. A missing counter counts as 0; overflow wraps.
 - Write a counter column **only** with `incr` (and `put_i64` to set or reset a base). Mixing arbitrary `put` bytes into a counter column can make resolution fail with `ErrorCode::MergeFailed`.
 - Counters are for totals. For per-period counts, use one column per period (`2026-10-05`) and `incr` each.
+- Until Phase 2, compaction does not fold a counter's increments into one value: each `incr` stays a separate operand, and a read adds them all up (about 30 ns per operand: ~3 µs for 100 increments, ~0.3 ms for 10,000). For a counter incremented millions of times, spread the count over time-bucketed columns so each column holds a bounded number of operands. Phase 2 folds operands in compaction ([#34](https://github.com/CodingAnarchy/pigeonhole/issues/34)).
 - Do not use `time_range` to window a counter; operands are never dropped by pushdown (see [Scans and filters](scans-and-filters.md)).
 - **Phase 2:** custom operators. Implement `pigeonhole::MergeOperator` (an associative fold: `merge(acc, older)` then `finish(base, acc)`), register it with `Options::merge_operator(Arc::new(op))`, and name it on the family with `Family::merge_operator("name")`, then write operands with `RowMutation::merge`. The operator's name is stored in the file; opening without it registered fails with `ErrorCode::UnknownMergeOperator` unless you set `Options::allow_unregistered_merge_operators(true)` (read-only, compaction off). Operators must be associative; non-associative operators are not supported.
 
@@ -127,6 +128,8 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 - **Limit retention** with `max_versions(n)` (0 keeps all) and `ttl`.
 - **Read history** with `.versions(n)`, `.time_range(a..b)`.
 - **Deleting:** `delete_cell(family, qualifier, ts)` removes the version at `ts`, and a put at that same `ts` committed later stays hidden too (decision D38); write the replacement at another timestamp. `delete_column` removes every version, and a later put with a timestamp at or before the delete's timestamp stays hidden (decision D9). A put with a **newer** timestamp is visible again.
+
+**Deletes and version limits are not permanent for writes with older timestamps** (HBase semantics). Until compaction purges them, a delete keeps hiding any later write at or below its timestamp, and `max_versions` only limits what reads return. Once a compaction at the bottom of the tree has run with no open snapshot that still needs them, the delete markers and the versions beyond `max_versions` are gone for good. After that, a write with an older explicit timestamp (`put_at`, `delete_cell`) behaves as if they never existed: a `put_at` below a purged delete becomes visible, and deleting the newest version does not bring back a purged older one. Writes with default timestamps are never affected, because their timestamps are newer than anything a purge removes. If you rewrite history with explicit timestamps, write the replacement at a timestamp newer than the delete instead of relying on the delete to keep hiding it.
 
 ## Anti-patterns
 | Don't | Why | Instead |

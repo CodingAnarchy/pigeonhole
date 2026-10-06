@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 
 use pigeonhole_format::{Durability, Seqno, Timestamp};
 use pigeonhole_io::sim::CrashKind;
@@ -200,8 +200,8 @@ struct Table {
 ///   whatever its seqno, including a put in the same commit with timestamp `<= T` and a later
 ///   put with an older timestamp. `DeleteCell` is timestamp-only too (D38): it hides every
 ///   version at exactly its timestamp whatever its seqno, so a put at that timestamp in a
-///   later commit stays hidden (until compaction drops the marker, which it does only once
-///   nothing older can be under it).
+///   later commit stays hidden (until compaction purges the marker; [`Model::purge`] applies
+///   the same purge, HBase semantics).
 /// - TTL: a version is expired when `ts + ttl_micros <= now` (timestamps are microseconds).
 ///   Expired versions are dropped before merge operands are folded and versions counted.
 /// - `Incr` (only on `i64_add` families, else [`ModelError::NoMergeOperator`]) is a merge
@@ -629,6 +629,234 @@ impl Model {
             self.commits.fill(Durability::Sync);
         }
     }
+
+    /// Applies what a bottommost compaction may purge from one family (the owner's HBase
+    /// rule), so the model keeps matching the store after later writes with older explicit
+    /// timestamps. Reads at the live snapshots are unchanged; afterwards a later write that
+    /// a purged marker or version limit would have hidden becomes visible, as in the store.
+    ///
+    /// Only *input* entries (`seqno <= max_seqno`, rows in `rows`) are touched, and only
+    /// timestamps below `min_ts_above`. In order:
+    /// 1. A delete (cell, column or family) visible at every read point (`seqno <=` the
+    ///    oldest snapshot, or any seqno with no snapshot) is removed, with every put and
+    ///    operand it covers, and every delete it makes redundant: one of narrower scope at
+    ///    or below its timestamp, or of the same scope and timestamp with a lower seqno.
+    /// 2. If the family has `max_versions`, in each column whose input entries are all
+    ///    below `min_ts_above`, every put and operand that contributes to none of the newest
+    ///    `max_versions` versions at any read point (live snapshots and latest, input
+    ///    entries only, TTL at `now`) is removed.
+    pub fn purge(&mut self, p: &ModelPurge) {
+        let Some(t) = self.tables.get_mut(&p.table) else {
+            return;
+        };
+        let Some(fam) = t.families.get(&p.family).cloned() else {
+            return;
+        };
+        let first = p.snapshots.iter().copied().min().unwrap_or(Seqno::MAX);
+        let mut points: Vec<Seqno> = p.snapshots.clone();
+        points.push(Seqno::MAX);
+        let input = |seqno: Seqno| seqno <= p.max_seqno;
+        let purgeable =
+            |ts: Timestamp, seqno: Seqno| input(seqno) && seqno <= first && ts < p.min_ts_above;
+        let in_range = |row: &Vec<u8>| p.rows.contains(row);
+        let rows: Vec<Vec<u8>> = t
+            .columns
+            .keys()
+            .chain(t.family_deletes.keys().map(|(r, _)| r))
+            .filter(|r| in_range(r))
+            .cloned()
+            .collect();
+        for row in rows {
+            let mkey = (row.clone(), p.family.clone());
+            let markers = t.family_deletes.get(&mkey).cloned().unwrap_or_default();
+            let purged_markers: Vec<Marker> = markers
+                .iter()
+                .copied()
+                .filter(|m| purgeable(m.0, m.1))
+                .collect();
+            // Markers: purged, or redundant (an earlier purged marker at or above).
+            let marker_dropped = |m: &Marker| {
+                purgeable(m.0, m.1)
+                    || (input(m.1)
+                        && purged_markers
+                            .iter()
+                            .any(|d| d.0 > m.0 || (d.0 == m.0 && d.1 > m.1)))
+            };
+            let kept_markers: Vec<Marker> = markers
+                .iter()
+                .copied()
+                .filter(|m| !marker_dropped(m))
+                .collect();
+            if kept_markers.is_empty() {
+                t.family_deletes.remove(&mkey);
+            } else {
+                t.family_deletes.insert(mkey.clone(), kept_markers.clone());
+            }
+            let marker_ts = purged_markers.iter().map(|m| m.0).max();
+            let Some(cols) = t.columns.get_mut(&row) else {
+                continue;
+            };
+            for ((family, _), entries) in cols.iter_mut() {
+                if *family != p.family {
+                    continue;
+                }
+                // Step 1: purged deletes and what they cover.
+                let col_dels: Vec<(Timestamp, Seqno)> = entries
+                    .iter()
+                    .filter(|e| matches!(e.kind, Kind::ColumnDelete) && purgeable(e.ts, e.seqno))
+                    .map(|e| (e.ts, e.seqno))
+                    .collect();
+                let cell_dels: Vec<(Timestamp, Seqno)> = entries
+                    .iter()
+                    .filter(|e| matches!(e.kind, Kind::CellDelete) && purgeable(e.ts, e.seqno))
+                    .map(|e| (e.ts, e.seqno))
+                    .collect();
+                let by_marker = |ts: Timestamp| marker_ts.is_some_and(|m| ts <= m);
+                entries.retain(|e| {
+                    if !input(e.seqno) {
+                        return true;
+                    }
+                    let dropped = match e.kind {
+                        Kind::Put(_) | Kind::Merge(_) => {
+                            by_marker(e.ts)
+                                || col_dels.iter().any(|d| e.ts <= d.0)
+                                || cell_dels.iter().any(|d| e.ts == d.0)
+                        }
+                        Kind::ColumnDelete => {
+                            purgeable(e.ts, e.seqno)
+                                || by_marker(e.ts)
+                                || col_dels
+                                    .iter()
+                                    .any(|d| d.0 > e.ts || (d.0 == e.ts && d.1 > e.seqno))
+                        }
+                        Kind::CellDelete => {
+                            purgeable(e.ts, e.seqno)
+                                || by_marker(e.ts)
+                                || col_dels.iter().any(|d| d.0 >= e.ts)
+                                || cell_dels.iter().any(|d| d.0 == e.ts && d.1 > e.seqno)
+                        }
+                    };
+                    !dropped
+                });
+                // Step 2: versions beyond the limit at every read point.
+                if fam.max_versions == 0
+                    || entries
+                        .iter()
+                        .any(|e| input(e.seqno) && e.ts >= p.min_ts_above)
+                {
+                    continue;
+                }
+                let inputs: Vec<Entry> =
+                    entries.iter().filter(|e| input(e.seqno)).cloned().collect();
+                let input_markers: Vec<Marker> = kept_markers
+                    .iter()
+                    .copied()
+                    .filter(|m| input(m.1))
+                    .collect();
+                let mut needed = vec![false; inputs.len()];
+                for &point in &points {
+                    let versions = contributors(&fam, &inputs, &input_markers, point, p.now);
+                    for v in versions.iter().take(fam.max_versions as usize) {
+                        for &i in v {
+                            needed[i] = true;
+                        }
+                    }
+                }
+                let mut i = 0;
+                entries.retain(|e| {
+                    if !input(e.seqno) {
+                        return true;
+                    }
+                    let keep = needed[i] || !matches!(e.kind, Kind::Put(_) | Kind::Merge(_));
+                    i += 1;
+                    keep
+                });
+            }
+            cols.retain(|_, entries| !entries.is_empty());
+            if cols.is_empty() {
+                t.columns.remove(&row);
+            }
+        }
+    }
+}
+
+/// What [`Model::purge`] removes: the bottommost-compaction purge of one family's input
+/// entries (owner decision on purges vs later writes, HBase semantics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPurge {
+    /// Table name.
+    pub table: String,
+    /// Family name.
+    pub family: String,
+    /// Rows the compaction covered.
+    pub rows: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+    /// Live snapshot seqnos (the compaction's `GcPolicy::snapshots`).
+    pub snapshots: Vec<Seqno>,
+    /// The compaction's `now` (TTL).
+    pub now: Timestamp,
+    /// The compaction's `GcPolicy::min_ts_above`: nothing at or above it is purged.
+    pub min_ts_above: Timestamp,
+    /// The newest seqno among the compaction's inputs; newer entries are above them.
+    pub max_seqno: Seqno,
+}
+
+/// Indices into `entries` of the entries each visible version is made of (base and the
+/// operands folded onto it), newest version first: the same grouping as [`resolve`].
+fn contributors(
+    family: &ModelFamily,
+    entries: &[Entry],
+    family_markers: &[Marker],
+    snapshot: Seqno,
+    now: Timestamp,
+) -> Vec<Vec<usize>> {
+    let visible = |seqno: Seqno| seqno <= snapshot;
+    let covered = entries
+        .iter()
+        .filter(|e| visible(e.seqno) && matches!(e.kind, Kind::ColumnDelete))
+        .map(|e| e.ts)
+        .chain(family_markers.iter().filter(|m| visible(m.1)).map(|m| m.0))
+        .max();
+    let cell_deleted = |ts: Timestamp| {
+        entries
+            .iter()
+            .any(|d| visible(d.seqno) && matches!(d.kind, Kind::CellDelete) && d.ts == ts)
+    };
+    let mut live: Vec<usize> = (0..entries.len())
+        .filter(|&i| {
+            let e = &entries[i];
+            visible(e.seqno)
+                && matches!(e.kind, Kind::Put(_) | Kind::Merge(_))
+                && covered.is_none_or(|c| e.ts > c)
+                && !cell_deleted(e.ts)
+                && (family.ttl_micros == 0 || e.ts.saturating_add(family.ttl_micros) > now)
+        })
+        .collect();
+    live.sort_by_key(|&i| std::cmp::Reverse((entries[i].ts, entries[i].seqno)));
+    let mut out = Vec::new();
+    let mut run: Option<Vec<usize>> = None;
+    let mut i = 0;
+    while i < live.len() {
+        let ts = entries[live[i]].ts;
+        let end = live[i..]
+            .iter()
+            .position(|&j| entries[j].ts != ts)
+            .map_or(live.len(), |n| i + n);
+        let group = &live[i..end];
+        i = end;
+        match group
+            .iter()
+            .position(|&j| matches!(entries[j].kind, Kind::Put(_)))
+        {
+            Some(b) => {
+                let mut v = run.take().unwrap_or_default();
+                v.extend_from_slice(&group[..=b]);
+                out.push(v);
+            }
+            None => run.get_or_insert_with(Vec::new).extend_from_slice(group),
+        }
+    }
+    out.extend(run);
+    out
 }
 
 /// Unwraps a read for the panicking read methods.
@@ -840,6 +1068,68 @@ mod tests {
             .into_iter()
             .map(|c| (c.ts, String::from_utf8(c.value).unwrap()))
             .collect()
+    }
+
+    fn purge_all(m: &mut Model, family: &str, snapshots: Vec<Seqno>) {
+        let now = 1_000;
+        m.purge(&ModelPurge {
+            table: "t".into(),
+            family: family.into(),
+            rows: (Bound::Unbounded, Bound::Unbounded),
+            snapshots,
+            now,
+            min_ts_above: u64::MAX,
+            max_seqno: m.snapshot(),
+        });
+    }
+
+    #[test]
+    fn purge_follows_hbase_semantics() {
+        // A cell delete hides a later put at its timestamp until it is purged.
+        let mut m = model();
+        m.commit(&[put("r", "q", Some(5), "a")], 10, Durability::Sync);
+        let del = ModelOp::DeleteCell {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "f".into(),
+            qualifier: b"q".to_vec(),
+            ts: 5,
+        };
+        m.commit(std::slice::from_ref(&del), 20, Durability::Sync);
+        // A snapshot that still sees the put keeps the delete.
+        purge_all(&mut m, "f", vec![1]);
+        assert_eq!(values(&m, "r", 0, 1, 100), [(5, "a".into())]);
+        assert!(values(&m, "r", 0, 2, 100).is_empty());
+        // With no snapshot, the delete and the put it hides go; a later put at 5 shows.
+        purge_all(&mut m, "f", vec![]);
+        m.commit(&[put("r", "q", Some(5), "later")], 30, Durability::Sync);
+        assert_eq!(values(&m, "r", 0, 3, 100), [(5, "later".into())]);
+
+        // Versions beyond max_versions go, so deleting the newest leaves nothing.
+        m.commit(&[put("r", "v", Some(1), "x")], 40, Durability::Sync);
+        let g = |m: &Model, s| m.read_row("t", b"r", &["g"], 0, s, 100);
+        let gput = |ts, v: &str| ModelOp::Put {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "g".into(),
+            qualifier: b"q".to_vec(),
+            ts: Some(ts),
+            value: v.into(),
+        };
+        for (i, ts) in [10, 20, 30].into_iter().enumerate() {
+            m.commit(&[gput(ts, "v")], 50 + i as u64, Durability::Sync);
+        }
+        purge_all(&mut m, "g", vec![]);
+        let del = ModelOp::DeleteCell {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "g".into(),
+            qualifier: b"q".to_vec(),
+            ts: 30,
+        };
+        m.commit(&[del], 60, Durability::Sync);
+        let s = m.snapshot();
+        assert_eq!(g(&m, s).iter().map(|c| c.ts).collect::<Vec<_>>(), [20]);
     }
 
     #[test]
