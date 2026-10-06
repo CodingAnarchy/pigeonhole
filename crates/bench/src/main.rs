@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! phdb-bench <workload|all|scaling> [options]
-//! phdb-bench compare <baseline.json> <candidate.json> [--tolerance 0.15]
+//! phdb-bench compare <baseline.json> <candidate.json> [--tolerance 0.20]
 //! ```
 //!
 //! See `docs/bench.md` or `phdb-bench --help`.
@@ -49,7 +49,7 @@ OPTIONS:
     --json PATH            write results as JSON
     --markdown PATH        write the markdown summary
     --tolerance T          compare: relative tolerance for throughput and p50; p99
-                           gets 2T [default: 0.15]
+                           gets 2T [default: 0.20]
 ";
 
 #[derive(Debug, Default)]

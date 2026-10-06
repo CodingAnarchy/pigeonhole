@@ -424,7 +424,7 @@ impl Suite {
 }
 
 /// How far a candidate run may drift from a baseline and still count as the same
-/// result. Relative: 0.15 allows ±15%.
+/// result. Relative: 0.20 allows ±20%.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tolerance {
     /// Throughput.
@@ -436,10 +436,10 @@ pub struct Tolerance {
 }
 
 impl Default for Tolerance {
-    /// The documented reproducibility tolerance (docs/bench.md): ±15% throughput and
-    /// p50, ±30% p99. p99.9 and max are reported but not checked.
+    /// The documented reproducibility tolerance (docs/bench.md): ±20% throughput and
+    /// p50, ±40% p99. p99.9 and max are reported but not checked.
     fn default() -> Self {
-        Self::uniform(0.15)
+        Self::uniform(0.20)
     }
 }
 
@@ -681,9 +681,9 @@ mod tests {
     fn each_checked_metric_can_fail() {
         let a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
         for b in [
-            rec("ycsb-a", 0.8e5, 1000, 5000),
-            rec("ycsb-a", 1e5, 1200, 5000),
-            rec("ycsb-a", 1e5, 1000, 7000),
+            rec("ycsb-a", 0.75e5, 1000, 5000),
+            rec("ycsb-a", 1e5, 1250, 5000),
+            rec("ycsb-a", 1e5, 1000, 7500),
         ] {
             let cmp = compare(&a, &suite(vec![b]), Tolerance::default());
             assert!(!cmp.passes());
