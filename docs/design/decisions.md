@@ -191,5 +191,8 @@ The pager tracks allocated versus retired, not which extents the manifest names,
 ## D61 — `reclaim` is clamped to the durable root (approved; pager question)
 `reclaim(oldest_live)` frees nothing newer than the manifest version of the last *completed* root commit, because until the root that drops an extent is durable a crash recovers to a root that still references it; `truncate_tail` releases nothing while a commit is in flight. Callers may retire and reclaim right after submitting a commit; the extents are freed by a later `reclaim` once it completes ([#23](https://github.com/CodingAnarchy/pigeonhole/issues/23)).
 
+## D62 — each phase gate includes an empty phase milestone (approved; owner)
+Deferred work is a GitHub issue labeled with its crate and `phase-N`, and assigned to the matching milestone ("Phase 1 — Core engine" … "Phase 4 — Hardening and 1.0"). A phase's gate passes only when its measurable gate is met **and** its milestone has no open issues (`scripts/phase-gate.sh N`). Work found after a gate passes goes to a later milestone, never back into a closed one.
+
 ## Open questions
 _None._

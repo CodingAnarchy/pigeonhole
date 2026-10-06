@@ -24,6 +24,9 @@ Pigeonhole is built by a mix of humans and coding agents. The rules below apply 
 - A task is done when its brief's acceptance tests and the workspace simulation suite pass in CI. **Nothing merges on red.**
 - When the spec is silent or contradictory, stop and record the question and your interim behavior in `docs/design/questions/<crate>.md` (see its [README](docs/design/questions/README.md)) instead of guessing; the coordinator turns it into a numbered decision.
 
+## Deferred work
+Anything left for later is a GitHub issue titled `[crate] summary`, labeled with the crate and `phase-N`, and assigned to the matching **Phase N** milestone. A phase's gate requires its milestone to be empty (D62; `scripts/phase-gate.sh N`). Never leave deferred work only in a doc, a code comment or a PR description.
+
 ## Workflow
 1. Work on a branch (`crate/<name>-<topic>`), ideally in its own git worktree.
 2. Before pushing, run locally:

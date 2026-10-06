@@ -11,15 +11,17 @@ Live progress against the [build plan](design/spec.md#build-plan). Updated by th
 | 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | `engine` milestone A in progress (parallel with `sst`) |
 
 ## Phases
-| Phase | Gate | State |
-|---|---|---|
-| 1. Core engine | Fault-injection suite green | in progress |
-| 2. Wide-column model | Sparse-wide bench beats SQLite EAV and hand-keyed RocksDB | not started |
-| 3. Latency engine | Goals-table p50/p99 met; within 1.5× of RocksDB | not started |
-| 4. Hardening and 1.0 | File format frozen | not started |
+Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
+
+| Phase | Gate | Milestone | State |
+|---|---|---|---|
+| 1. Core engine | Fault-injection suite green | [Phase 1](https://github.com/CodingAnarchy/pigeonhole/milestone/1) | in progress |
+| 2. Wide-column model | Sparse-wide bench beats SQLite EAV and hand-keyed RocksDB | [Phase 2](https://github.com/CodingAnarchy/pigeonhole/milestone/2) | not started |
+| 3. Latency engine | Goals-table p50/p99 met; within 1.5× of RocksDB | [Phase 3](https://github.com/CodingAnarchy/pigeonhole/milestone/3) | not started |
+| 4. Hardening and 1.0 | File format frozen | [Phase 4](https://github.com/CodingAnarchy/pigeonhole/milestone/4) | not started |
 
 ## Tracked follow-ups
-Deferred work from the [decisions audit](design/decisions.md), one GitHub issue each (labels: phase, crate).
+Deferred work from the [decisions audit](design/decisions.md), one GitHub issue each (labels: phase, crate; milestone: the phase).
 
 | Issue | Crate | Phase | Decision | Summary |
 |---|---|---|---|---|
