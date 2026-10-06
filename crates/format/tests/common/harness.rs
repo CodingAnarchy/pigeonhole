@@ -16,7 +16,8 @@ use pigeonhole_format::key::{self, Escaped};
 use pigeonhole_format::manifest::{Edit, decode_block};
 use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use pigeonhole_format::wal::{
-    BatchRef, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, SegmentHeader, StreamList, WalRecord,
+    BatchRef, Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, SegmentHeader, StreamList,
+    WalRecord,
 };
 use pigeonhole_format::{blob, shm, sst, superblock, value, varint};
 
@@ -166,12 +167,15 @@ fn decode_frames(frame: &[u8], epoch: u32) {
     let mut dec = FrameDecoder::new(epoch, FRAME_SIZE as u64);
     // The same frame twice: as frame 1 and as frame 2.
     for _ in 0..2 {
-        for _ in 0..FRAME_SIZE {
+        // Every record is at least a fragment header long, so this bounds the loop.
+        for _ in 0..FRAME_SIZE / FRAGMENT_HEADER_LEN + 1 {
             match dec.decode(frame) {
-                Ok(Some(_)) => {
+                Ok(Some(Decoded::Record { .. })) => {
                     let _ = WalRecord::decode(dec.record());
                 }
-                _ => break,
+                // `Stop` is sticky: once the data stops, nothing more will decode.
+                Ok(Some(Decoded::Stop { .. })) => return,
+                Ok(None) | Err(_) => break,
             }
         }
     }

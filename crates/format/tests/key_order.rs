@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Cell, cell, config, num, part};
+use common::{Cell, cell, config, num, part, sized};
 use pigeonhole_format::key::{
     Kind, column_prefix_len, decode_key, encode_column_prefix, encode_key, encode_marker_prefix,
     encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
@@ -15,7 +15,7 @@ proptest! {
 
     /// Byte order of encoded keys equals the logical order, pairwise.
     #[test]
-    fn byte_order_is_logical_order(cells in vec(cell(), 2..24)) {
+    fn byte_order_is_logical_order(cells in vec(cell(), 2..sized(24, 4))) {
         let encoded: Vec<Vec<u8>> = cells.iter().map(Cell::encode).collect();
         for (a, ea) in cells.iter().zip(&encoded) {
             for (b, eb) in cells.iter().zip(&encoded) {

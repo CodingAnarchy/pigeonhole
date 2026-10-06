@@ -21,21 +21,36 @@ pub fn crc32c_append(crc: u32, bytes: &[u8]) -> u32 {
     }
 }
 
-/// Bitwise CRC32C, used under Miri (and checked against the crate in tests).
+/// Table-driven CRC32C (reflected polynomial `0x82F63B78`), used under Miri and checked
+/// against the crate in tests.
 fn crc32c_soft(crc: u32, bytes: &[u8]) -> u32 {
     let mut crc = !crc;
     for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
+        crc = CRC32C_TABLE[((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+/// CRC32C of each byte value, computed at compile time.
+const CRC32C_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 1 != 0 {
                 (crc >> 1) ^ 0x82F6_3B78
             } else {
                 crc >> 1
             };
+            bit += 1;
         }
+        table[i] = crc;
+        i += 1;
     }
-    !crc
-}
+    table
+};
 
 /// xxh3-64 (seed 0) of `bytes`. Used by blocks, the SST footer, superblocks, manifest blocks,
 /// blob records and filter hashing.

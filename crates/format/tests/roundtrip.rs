@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{bytes, config, edit, extent};
+use common::{bytes, config, edit, extent, sized};
 use pigeonhole_format::blob::{BlobExtentHeader, encode_record_header, verify_record};
 use pigeonhole_format::block::BlockAddr;
 use pigeonhole_format::filter::{Filter, FilterBuilder};
@@ -88,7 +88,7 @@ proptest! {
     #![proptest_config(config(500))]
 
     #[test]
-    fn varints(v in any::<u64>(), b in bytes(300)) {
+    fn varints(v in any::<u64>(), b in bytes(sized(300, 40))) {
         let mut out = Vec::new();
         varint::put_u64(&mut out, v);
         prop_assert!(out.len() <= varint::MAX_VARINT_LEN);
@@ -140,7 +140,7 @@ proptest! {
     }
 
     #[test]
-    fn filter_has_no_false_negatives(hashes in vec(any::<u64>(), 0..400), bpk in 0u8..30) {
+    fn filter_has_no_false_negatives(hashes in vec(any::<u64>(), 0..sized(400, 40)), bpk in 0u8..30) {
         let mut b = FilterBuilder::new(bpk);
         for &h in &hashes {
             b.add_hash(h);
@@ -177,7 +177,7 @@ proptest! {
     }
 
     #[test]
-    fn manifest_edits_and_blocks(edits in vec(edit(), 0..20), version in any::<u64>(), snapshot in any::<bool>()) {
+    fn manifest_edits_and_blocks(edits in vec(edit(), 0..sized(20, 4)), version in any::<u64>(), snapshot in any::<bool>()) {
         for e in &edits {
             let mut out = Vec::new();
             e.encode(&mut out);
@@ -207,12 +207,13 @@ proptest! {
         };
         let mut frame = Box::new([0xEEu8; FRAME_SIZE]);
         h.encode(&mut frame);
-        prop_assert!(frame[60..].iter().all(|&b| b == 0));
+        // (Under Miri, spot-check the zeroed tail instead of scanning 32 KiB.)
+        prop_assert!(frame[60..sized(FRAME_SIZE, 256)].iter().all(|&b| b == 0));
         prop_assert_eq!(SegmentHeader::decode(&frame[..]).unwrap(), h);
     }
 
     #[test]
-    fn wal_records(muts in vec(mutation(), 0..10), seqno in any::<u64>(), ts in any::<u64>(), coord in any::<u32>(), streams in vec(any::<u32>(), 0..8)) {
+    fn wal_records(muts in vec(mutation(), 0..sized(10, 3)), seqno in any::<u64>(), ts in any::<u64>(), coord in any::<u32>(), streams in vec(any::<u32>(), 0..8)) {
         let b = batch(&muts);
         prop_assert_eq!(b.len(), muts.len());
         let decoded: Vec<_> = b.batch().iter().map(Result::unwrap).collect();

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{cell, config, edit, harness};
+use common::{cell, config, edit, harness, sized};
 use pigeonhole_format::block::{BlockBuilder, BlockKind, seal};
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::manifest::{ManifestBlockKind, ManifestHeader, encode_block};
@@ -14,10 +14,10 @@ use proptest::prelude::*;
 /// Arbitrary bytes, biased towards the special values decoders branch on.
 fn input() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
-        vec(any::<u8>(), 0..600),
+        vec(any::<u8>(), 0..sized(600, 64)),
         vec(
             prop_oneof![Just(0u8), Just(1), Just(0x80), Just(0xFF), any::<u8>()],
-            0..600
+            0..sized(600, 64)
         ),
     ]
 }
@@ -43,7 +43,7 @@ proptest! {
 
     #[test]
     fn damaged_keys_and_blocks(
-        cells in vec(cell(), 1..40),
+        cells in vec(cell(), 1..sized(40, 4)),
         edits in vec((any::<prop::sample::Index>(), any::<u8>()), 1..4),
         interval in 1usize..8,
     ) {
@@ -66,7 +66,7 @@ proptest! {
 
     #[test]
     fn damaged_manifest_and_wal(
-        edits_in in vec(edit(), 0..10),
+        edits_in in vec(edit(), 0..sized(10, 3)),
         edits in vec((any::<prop::sample::Index>(), any::<u8>()), 1..4),
     ) {
         let header = ManifestHeader { version: FormatVersion::CURRENT, kind: ManifestBlockKind::Snapshot, manifest_version: 1, edit_count: 0, body_len: 0 };

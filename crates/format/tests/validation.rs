@@ -29,7 +29,11 @@ fn block_uncompressed_len_is_bounded() {
         Err(Error::Corrupt { .. })
     ));
     assert!(verify(&physical(&[0; 10], 1, 2550)).is_ok());
-    // Even a large payload cannot claim more than the 128 MiB block cap.
+    // Even a large payload cannot claim more than the 128 MiB block cap. (Hashing 1 MiB is
+    // too slow under Miri, which only needs the small cases above.)
+    if cfg!(miri) {
+        return;
+    }
     let big = vec![0; 1 << 20];
     assert!(matches!(
         verify(&physical(&big, 1, (128 << 20) + 1)),
@@ -164,8 +168,10 @@ fn stream_list_refuses_too_many_streams() {
     let err = StreamList::encode(&vec![StreamId(0); 65536], &mut out).unwrap_err();
     assert!(matches!(err, Error::InvalidArgument { .. }));
     assert!(out.is_empty(), "nothing written on failure");
-    StreamList::encode(&vec![StreamId(0); 65535], &mut out).unwrap();
-    assert_eq!(out.len(), 2 + 4 * 65535);
+    if !cfg!(miri) {
+        StreamList::encode(&vec![StreamId(0); 65535], &mut out).unwrap();
+        assert_eq!(out.len(), 2 + 4 * 65535);
+    }
 }
 
 #[test]

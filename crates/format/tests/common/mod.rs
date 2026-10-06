@@ -36,14 +36,29 @@ pub fn config(cases: u32) -> Config {
             h.finish()
         });
     println!("proptest seed {seed}; replay with PROPTEST_RNG_SEED={seed}");
-    // Miri is ~1000x slower; a handful of cases still checks the code paths for UB.
-    let cases = if cfg!(miri) { cases.min(1) } else { cases };
+    // `PROPTEST_CASES` wins when set (CI's Miri job sets it). Otherwise Miri, which is about
+    // 1000x slower, runs a handful of cases: enough to check the code paths for UB, while
+    // inputs are also shrunk with `sized`.
+    let cases = match std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) => n,
+        None if cfg!(miri) => cases.min(4),
+        None => cases,
+    };
     Config {
         cases,
         rng_seed: RngSeed::Fixed(seed),
         failure_persistence: None,
         ..Config::default()
     }
+}
+
+/// `normal` in ordinary runs, `miri` under Miri: input sizes are shrunk there so the
+/// interpreter finishes in minutes, while normal runs keep full coverage.
+pub const fn sized(normal: usize, miri: usize) -> usize {
+    if cfg!(miri) { miri } else { normal }
 }
 
 /// A row key or qualifier: usually short strings over {00, 01, FF, 'a'} so escapes and prefix

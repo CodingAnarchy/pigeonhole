@@ -6,7 +6,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use common::{Cell, cell, config};
+use common::{Cell, cell, config, sized};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::block::{Block, BlockBuilder, BlockKind, seal, verify};
 use pigeonhole_format::compress::{Compression, decompress};
@@ -30,7 +30,7 @@ fn entries() -> impl Strategy<Value = BTreeMap<Vec<u8>, Vec<u8>>> {
     btree_map(
         cell().prop_map(|c: Cell| c.encode()),
         vec(any::<u8>(), 0..20),
-        0..80,
+        0..sized(80, 6),
     )
 }
 
@@ -52,7 +52,7 @@ proptest! {
     fn data_block_matches_model(
         model in entries(),
         interval in 1usize..20,
-        targets in vec(cell().prop_map(|c| c.encode()), 0..10),
+        targets in vec(cell().prop_map(|c| c.encode()), 0..sized(10, 3)),
     ) {
         let bytes = build_data(&model, interval);
         let block = Block::new(bytes.as_slice()).unwrap();
@@ -104,7 +104,7 @@ proptest! {
     }
 
     #[test]
-    fn index_block_matches_model(model in btree_map(vec(any::<u8>(), 0..12), vec(any::<u8>(), 0..10), 0..60), targets in vec(vec(any::<u8>(), 0..12), 0..10)) {
+    fn index_block_matches_model(model in btree_map(vec(any::<u8>(), 0..12), vec(any::<u8>(), 0..10), 0..sized(60, 10)), targets in vec(vec(any::<u8>(), 0..12), 0..sized(10, 3))) {
         let mut b = BlockBuilder::index();
         for (k, v) in &model {
             b.add(k, v).unwrap();

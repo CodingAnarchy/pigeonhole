@@ -3,21 +3,22 @@
 
 mod common;
 
-use common::config;
+use common::{config, sized};
 use pigeonhole_format::wal::{
     Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, FrameEncoder,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-const FRAMES: usize = 8;
+/// Frames per test segment (fewer under Miri; records spanning frames are still covered).
+const FRAMES: usize = sized(8, 3);
 
 /// Records of sizes that fit in a frame, straddle one, or span several.
 fn record() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         4 => vec(any::<u8>(), 0..64),
         1 => (FRAME_SIZE - 40..FRAME_SIZE + 40).prop_map(|n| vec![0x5A; n]),
-        1 => (1usize..3 * FRAME_SIZE).prop_map(|n| (0..n).map(|i| i as u8).collect()),
+        1 => (1usize..sized(3 * FRAME_SIZE, FRAME_SIZE + 100)).prop_map(|n| (0..n).map(|i| i as u8).collect()),
     ]
 }
 
@@ -87,7 +88,7 @@ proptest! {
     #![proptest_config(config(300))]
 
     #[test]
-    fn records_roundtrip(records in vec(record(), 0..12), epoch in 1u32.., start in start_offset()) {
+    fn records_roundtrip(records in vec(record(), 0..sized(12, 4)), epoch in 1u32.., start in start_offset()) {
         let (seg, spans) = write(epoch, start, &records, 0);
         let (got, stop) = read(&seg, epoch, start);
         prop_assert_eq!(got.len(), spans.len());
@@ -105,7 +106,7 @@ proptest! {
     /// records and a stop at the end of the last complete one.
     #[test]
     fn torn_tail_stops_at_last_complete_record(
-        records in vec(record(), 1..10),
+        records in vec(record(), 1..sized(10, 4)),
         epoch in 2u32..,
         start in start_offset(),
         cut in any::<prop::sample::Index>(),
@@ -115,10 +116,12 @@ proptest! {
         let end = spans.last().map_or(start, |s| s.1) as usize;
         let cut = start as usize + cut.index(end - start as usize + 1);
         // What lies past the cut: zeros, or a valid-looking log from the previous epoch.
-        let (old, _) = write(epoch - 1, FRAME_SIZE as u64, &[vec![7; 5000], vec![8; 50_000], vec![9; 10]], 0);
+        let (old, _) = write(epoch - 1, FRAME_SIZE as u64, &[vec![7; sized(5000, 500)], vec![8; sized(50_000, FRAME_SIZE + 100)], vec![9; 10]], 0);
         let mut torn = seg.clone();
-        for i in cut..torn.len() {
-            torn[i] = if stale { old[i] } else { 0 };
+        if stale {
+            torn[cut..].copy_from_slice(&old[cut..]);
+        } else {
+            torn[cut..].fill(0);
         }
         let (got, stop) = read(&torn, epoch, start);
         // A record is complete if its bytes survived: usually it ended before the cut, but the
@@ -138,7 +141,7 @@ proptest! {
 
     /// A flipped bit inside any fragment stops replay at or before that record.
     #[test]
-    fn corruption_is_detected(records in vec(vec(any::<u8>(), 1..3000), 1..20), bit in any::<prop::sample::Index>()) {
+    fn corruption_is_detected(records in vec(vec(any::<u8>(), 1..sized(3000, 300)), 1..sized(20, 4)), bit in any::<prop::sample::Index>()) {
         let start = FRAME_SIZE as u64;
         let (mut seg, spans) = write(1, start, &records, 0);
         let end = spans.last().unwrap().1 as usize;
