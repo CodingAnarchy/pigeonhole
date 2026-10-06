@@ -31,6 +31,20 @@ pub trait Cursor {
     /// Advances past every remaining entry of the current row. Sources with a row-start table
     /// override this to skip without decoding; the default steps with [`Cursor::next`].
     fn skip_row(&mut self) -> Result<(), Self::Error> {
-        todo!()
+        if !self.valid() {
+            return Ok(());
+        }
+        let Ok(n) = crate::key::row_prefix_len(self.key()) else {
+            return self.next();
+        };
+        // The row prefix ends with a terminator that never occurs inside an escaped row, so
+        // a key starting with it belongs to the same row.
+        let row = self.key()[..n].to_vec();
+        loop {
+            self.next()?;
+            if !self.valid() || !self.key().starts_with(&row) {
+                return Ok(());
+            }
+        }
     }
 }

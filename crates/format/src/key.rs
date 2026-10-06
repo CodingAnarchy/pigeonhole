@@ -16,7 +16,7 @@
 //! so a later put with an older timestamp stays hidden. A `CellDelete` hides exactly the
 //! versions with its timestamp. Seqnos decide only snapshot visibility.
 
-use crate::{Seqno, Timestamp};
+use crate::{Error, Seqno, Timestamp};
 
 /// Maximum length, in unescaped bytes, of a row key or a qualifier (64 KiB).
 pub const MAX_KEY_PART: usize = 64 * 1024;
@@ -50,20 +50,61 @@ pub enum Kind {
 impl Kind {
     /// Parses a kind byte.
     pub fn from_u8(b: u8) -> crate::Result<Self> {
-        todo!()
+        match b {
+            0x01 => Ok(Self::Put),
+            0x02 => Ok(Self::Merge),
+            0x03 => Ok(Self::CellDelete),
+            0x04 => Ok(Self::ColumnDelete),
+            0x05 => Ok(Self::FamilyDelete),
+            _ => Err(Error::Corrupt { what: "key kind" }),
+        }
     }
 
     /// Whether this kind is a deletion of any granularity.
     pub fn is_delete(self) -> bool {
-        todo!()
+        matches!(
+            self,
+            Self::CellDelete | Self::ColumnDelete | Self::FamilyDelete
+        )
     }
 }
 
 /// Byte placed in the kind position of a seek key; sorts before every real [`Kind`].
 pub const SEEK_KIND: u8 = 0x00;
 
+fn check_part(part: &[u8]) -> crate::Result<()> {
+    if part.len() > MAX_KEY_PART {
+        Err(Error::KeyTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn put_suffix(out: &mut Vec<u8>, ts: Timestamp, seqno: Seqno, kind: u8) {
+    out.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
+    out.extend_from_slice(&(u64::MAX - seqno).to_be_bytes());
+    out.push(kind);
+}
+
 /// Appends the internal key for one cell to `out`. `out` is not cleared, so callers can
 /// reuse one buffer per thread and stay allocation-free.
+///
+/// [`Kind::FamilyDelete`] is rejected here (it is only valid on a marker key; use
+/// [`encode_marker_key`]).
+///
+/// ```
+/// use pigeonhole_format::key::{Kind, decode_key, encode_key};
+///
+/// let mut older = Vec::new();
+/// encode_key(&mut older, b"row", b"q", 10, 1, Kind::Put).unwrap();
+/// let mut newer = Vec::new();
+/// encode_key(&mut newer, b"row", b"q", 20, 2, Kind::Put).unwrap();
+/// assert!(newer < older); // newer timestamps sort first
+///
+/// let parts = decode_key(&older).unwrap();
+/// assert!(parts.row.eq_raw(b"row"));
+/// assert_eq!((parts.ts, parts.seqno, parts.kind), (10, 1, Kind::Put));
+/// ```
 pub fn encode_key(
     out: &mut Vec<u8>,
     row: &[u8],
@@ -72,7 +113,14 @@ pub fn encode_key(
     seqno: Seqno,
     kind: Kind,
 ) -> crate::Result<()> {
-    todo!()
+    if kind == Kind::FamilyDelete {
+        return Err(Error::InvalidArgument {
+            what: "FamilyDelete needs encode_marker_key",
+        });
+    }
+    encode_column_prefix(out, row, qualifier)?;
+    put_suffix(out, ts, seqno, kind as u8);
+    Ok(())
 }
 
 /// Appends a family-in-row marker key ([`Kind::FamilyDelete`]) for `row`.
@@ -82,24 +130,35 @@ pub fn encode_marker_key(
     ts: Timestamp,
     seqno: Seqno,
 ) -> crate::Result<()> {
-    todo!()
+    encode_marker_prefix(out, row)?;
+    put_suffix(out, ts, seqno, Kind::FamilyDelete as u8);
+    Ok(())
 }
 
 /// Appends the marker prefix of `row` (escaped row, terminator, `00 00`): every family marker
 /// of the row starts with it. A point get seeks here before seeking to the column.
 pub fn encode_marker_prefix(out: &mut Vec<u8>, row: &[u8]) -> crate::Result<()> {
-    todo!()
+    encode_row_prefix(out, row)?;
+    out.extend_from_slice(&MARKER_QUALIFIER);
+    Ok(())
 }
 
 /// Appends the escaped row and its terminator: a prefix shared by every key of `row`.
 pub fn encode_row_prefix(out: &mut Vec<u8>, row: &[u8]) -> crate::Result<()> {
-    todo!()
+    check_part(row)?;
+    escape_into(out, row);
+    out.extend_from_slice(&TERMINATOR);
+    Ok(())
 }
 
 /// Appends the escaped row, escaped qualifier and both terminators: a prefix shared by every
 /// version of one column.
 pub fn encode_column_prefix(out: &mut Vec<u8>, row: &[u8], qualifier: &[u8]) -> crate::Result<()> {
-    todo!()
+    check_part(qualifier)?;
+    encode_row_prefix(out, row)?;
+    escape_into(out, qualifier);
+    out.extend_from_slice(&TERMINATOR);
+    Ok(())
 }
 
 /// Appends a key that sorts immediately before the newest version of `(row, qualifier)`
@@ -112,12 +171,20 @@ pub fn encode_seek_key(
     ts: Timestamp,
     seqno: Seqno,
 ) -> crate::Result<()> {
-    todo!()
+    encode_column_prefix(out, row, qualifier)?;
+    put_suffix(out, ts, seqno, SEEK_KIND);
+    Ok(())
 }
 
 /// Appends the escaped form of `part` (no terminator).
 pub fn escape_into(out: &mut Vec<u8>, part: &[u8]) {
-    todo!()
+    let mut rest = part;
+    while let Some(i) = rest.iter().position(|&b| b == 0) {
+        out.extend_from_slice(&rest[..=i]);
+        out.push(0xFF);
+        rest = &rest[i + 1..];
+    }
+    out.extend_from_slice(rest);
 }
 
 /// A decoded internal key. Borrows the escaped parts from the input; nothing is copied.
@@ -135,29 +202,121 @@ pub struct KeyParts<'a> {
     pub kind: Kind,
 }
 
+/// Scans one escaped string from the front of `b`. Returns its escaped length (the
+/// terminator follows it) and its unescaped length, or `Corrupt` if a `0x00` is followed by
+/// anything other than `0xFF` or the terminator.
+fn scan_escaped(b: &[u8]) -> crate::Result<(usize, usize)> {
+    let mut i = 0;
+    let mut raw = 0;
+    loop {
+        let Some(z) = b[i..].iter().position(|&c| c == 0) else {
+            return Err(Error::Corrupt {
+                what: "key: missing terminator",
+            });
+        };
+        raw += z;
+        i += z;
+        match b.get(i + 1) {
+            Some(0xFF) => {
+                raw += 1;
+                i += 2;
+            }
+            Some(0x01) => return Ok((i, raw)),
+            _ => {
+                return Err(Error::Corrupt {
+                    what: "key: bad escape",
+                });
+            }
+        }
+    }
+}
+
 /// Decodes an internal key. Never panics, whatever the input.
 pub fn decode_key(key: &[u8]) -> crate::Result<KeyParts<'_>> {
-    todo!()
+    let (body, ts, seqno, kind) = split_suffix(key)?;
+    let (row_len, row_raw) = scan_escaped(body)?;
+    let rest = &body[row_len + 2..];
+    let qualifier = if rest == MARKER_QUALIFIER {
+        None
+    } else {
+        let (q_len, q_raw) = scan_escaped(rest)?;
+        if q_len + 2 != rest.len() {
+            return Err(Error::Corrupt {
+                what: "key: trailing bytes",
+            });
+        }
+        if q_raw > MAX_KEY_PART {
+            return Err(Error::KeyTooLarge);
+        }
+        Some(Escaped(&rest[..q_len]))
+    };
+    if row_raw > MAX_KEY_PART {
+        return Err(Error::KeyTooLarge);
+    }
+    if qualifier.is_none() != (kind == Kind::FamilyDelete) {
+        return Err(Error::Corrupt {
+            what: "key: marker kind",
+        });
+    }
+    Ok(KeyParts {
+        row: Escaped(&body[..row_len]),
+        qualifier,
+        ts,
+        seqno,
+        kind,
+    })
 }
 
 /// Splits the fixed 17-byte suffix off `key` without parsing the variable part.
 pub fn split_suffix(key: &[u8]) -> crate::Result<(&[u8], Timestamp, Seqno, Kind)> {
-    todo!()
+    let Some(split) = key.len().checked_sub(SUFFIX_LEN) else {
+        return Err(Error::Truncated {
+            what: "internal key",
+        });
+    };
+    let (body, suffix) = key.split_at(split);
+    let mut ts = [0; 8];
+    ts.copy_from_slice(&suffix[..8]);
+    let mut seqno = [0; 8];
+    seqno.copy_from_slice(&suffix[8..16]);
+    let kind = Kind::from_u8(suffix[16])?;
+    Ok((
+        body,
+        u64::MAX - u64::from_be_bytes(ts),
+        u64::MAX - u64::from_be_bytes(seqno),
+        kind,
+    ))
 }
 
 /// Length of the row prefix of `key` (escaped row plus terminator), found by scanning for the
 /// first unescaped terminator. Two keys belong to the same row iff these prefixes are equal.
 pub fn row_prefix_len(key: &[u8]) -> crate::Result<usize> {
-    todo!()
+    Ok(scan_escaped(key)?.0 + TERMINATOR.len())
 }
 
 /// Length of the column prefix of `key` (row prefix, escaped qualifier and its terminator,
 /// or the marker bytes). Two keys address the same column iff these prefixes are equal.
 pub fn column_prefix_len(key: &[u8]) -> crate::Result<usize> {
-    todo!()
+    let row = row_prefix_len(key)?;
+    let rest = &key[row..];
+    if rest.starts_with(&MARKER_QUALIFIER) {
+        return Ok(row + MARKER_QUALIFIER.len());
+    }
+    Ok(row + scan_escaped(rest)?.0 + TERMINATOR.len())
 }
 
 /// An escaped byte string borrowed from an internal key.
+///
+/// ```
+/// use pigeonhole_format::key::Escaped;
+///
+/// let e = Escaped::new(b"a\x00\xFFb");
+/// assert!(!e.is_verbatim());
+/// assert!(e.eq_raw(b"a\x00b"));
+/// let mut raw = Vec::new();
+/// e.unescape_into(&mut raw);
+/// assert_eq!(raw, b"a\x00b");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Escaped<'a>(&'a [u8]);
 
@@ -174,16 +333,40 @@ impl<'a> Escaped<'a> {
 
     /// Whether the escaped form contains no escape sequences, so it equals the raw bytes.
     pub fn is_verbatim(&self) -> bool {
-        todo!()
+        !self.0.contains(&0)
     }
 
     /// Appends the unescaped bytes to `out`.
     pub fn unescape_into(&self, out: &mut Vec<u8>) {
-        todo!()
+        out.extend(self.raw_bytes());
     }
 
     /// Compares with raw (unescaped) bytes without allocating.
     pub fn eq_raw(&self, raw: &[u8]) -> bool {
-        todo!()
+        self.raw_bytes().eq(raw.iter().copied())
+    }
+
+    /// Orders the unescaped bytes against `raw` without allocating.
+    pub(crate) fn cmp_raw(&self, raw: &[u8]) -> std::cmp::Ordering {
+        self.raw_bytes().cmp(raw.iter().copied())
+    }
+
+    /// Whether the unescaped bytes start with `raw`, without allocating.
+    pub(crate) fn starts_with_raw(&self, raw: &[u8]) -> bool {
+        let mut it = self.raw_bytes();
+        raw.iter().all(|&b| it.next() == Some(b))
+    }
+
+    /// The unescaped bytes. Tolerates malformed input: a `0x00` not followed by `0xFF` is
+    /// taken as is.
+    fn raw_bytes(&self) -> impl Iterator<Item = u8> + 'a {
+        let mut it = self.0.iter().copied().peekable();
+        std::iter::from_fn(move || {
+            let b = it.next()?;
+            if b == 0 {
+                it.next_if_eq(&0xFF);
+            }
+            Some(b)
+        })
     }
 }

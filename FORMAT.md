@@ -92,7 +92,7 @@ Trailer (16 bytes, at the end of the physical block):
 | 4 | 4 | `uncompressed_len` u32 |
 | 8 | 8 | `checksum` u64: xxh3-64 of `payload ++ trailer[0..8]` |
 
-The checksum is verified on every read from disk and skipped on cache hits. A writer stores a block uncompressed when compression saves less than 1/8 of its size.
+The checksum is verified on every read from disk and skipped on cache hits. A logical block is at most 128 MiB (twice the largest extent); a reader rejects a larger `uncompressed_len`, and an LZ4 one above 255 times the payload length. A writer stores a block uncompressed when compression saves less than 1/8 of its size.
 
 ### 4.2 Logical data and index block
 
@@ -291,7 +291,7 @@ Stream `N` of database `data.phdb` is the file `data.phdb-wal-N` (decimal `N`). 
 An **LSN** is `(epoch << 32) | offset_within_segment`. LSNs increase monotonically within a stream. The manifest records each stream's checkpoint LSN.
 
 **Chaining** (decision D25). Each segment header names its predecessor: `prev_epoch` and `prev_end`, the offset where the predecessor's valid data ends. Rules for the writer:
-1. When a segment fills, write nothing more to it, **sync it**, and only then write the next segment's header with `prev_end` = the full segment's end offset.
+1. When a segment fills, write nothing more to it, **sync it**, and only then write the next segment's header with `prev_end` = the offset where the full segment's last record ends (its stop offset, §10.2; the zero tail after it is not part of `prev_end`).
 2. After recovery, **never append to the last replayed segment**: start a new segment (epoch = max seen + 1) with `prev_epoch`/`prev_end` = where replay ended.
 
 Replay starts at the segment whose epoch is the checkpoint's, at the checkpoint's offset, and reads until the segment's data stops (§10.2). It then looks for the segment whose header has `prev_epoch` = this epoch:
@@ -328,9 +328,9 @@ Frames 1.. hold **fragments**. Fragment header (12 bytes):
 | 10 | 1 | `type`: 1 Full, 2 First, 3 Middle, 4 Last (0 = unused space) |
 | 11 | 1 | reserved |
 
-A record that fits in the rest of the current frame is one Full fragment; otherwise it is split into First, Middle..., Last fragments across frames. Fragments never span frames. If fewer than 12 bytes remain in a frame, the reader skips them whatever they contain and the next fragment starts at the next frame. A record never spans segments: if it does not fit, the writer moves to a new segment. A record larger than a segment's payload fails with `RecordTooLarge`.
+A record that fits in the rest of the current frame is one Full fragment; otherwise it is split into First, Middle..., Last fragments across frames. Fragments never span frames. If 12 bytes or fewer remain in a frame (no room for a header and any payload), the writer zero-pads them, the reader skips them whatever they contain, and the next fragment starts at the next frame. So every fragment carries payload except the Full fragment of an empty record. A record never spans segments: if it does not fit, the writer moves to a new segment. A record larger than a segment's payload fails with `RecordTooLarge`.
 
-**Where a segment's data stops.** Replay of a segment stops at the first fragment header (read only where at least 12 bytes remain in the frame) that has type 0, an epoch different from the segment's (stale data from a previous use of the slot), a bad CRC, or a First/Middle whose Last never arrives before the segment ends. Whether that stop is the end of the segment or the end of the log is decided by chaining (§10.1), never by the stop condition itself. Data after the end of the log is never read again: the next segment starts fresh.
+**Where a segment's data stops.** The stop offset is always the end of the last complete record (the starting offset if there is none), never a position after a skipped frame tail; a writer whose segment fills records exactly this offset (where its last record ended) as the successor's `prev_end`. Replay of a segment stops at the first fragment header (read only where more than 12 bytes remain in the frame) that has type 0, an epoch different from the segment's (stale data from a previous use of the slot), a bad CRC, or a First/Middle whose Last never arrives before the segment ends. Whether that stop is the end of the segment or the end of the log is decided by chaining (§10.1), never by the stop condition itself. Data after the end of the log is never read again: the next segment starts fresh.
 
 ### 10.3 Records
 

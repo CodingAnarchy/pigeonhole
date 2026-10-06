@@ -1,4 +1,17 @@
 //! Block compression codecs. The codec byte is stored in every block trailer.
+//!
+//! ```
+//! use pigeonhole_format::compress::{Compression, compress, decompress};
+//!
+//! let input = vec![7u8; 4096];
+//! let mut packed = Vec::new();
+//! assert_eq!(compress(Compression::Lz4, &input, &mut packed).unwrap(), Compression::Lz4);
+//! let mut back = vec![0; input.len()];
+//! decompress(Compression::Lz4, &packed, &mut back).unwrap();
+//! assert_eq!(back, input);
+//! ```
+
+use crate::Error;
 
 /// A block compression codec. Numbers are frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -16,17 +29,60 @@ pub enum Compression {
 impl Compression {
     /// Parses a codec byte.
     pub fn from_u8(b: u8) -> crate::Result<Self> {
-        todo!()
+        match b {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Lz4),
+            2 => Ok(Self::Zstd),
+            _ => Err(Error::UnsupportedCompression(b)),
+        }
     }
 }
 
 /// Compresses `input` with `codec`, appending to `out`. Returns the codec actually used:
 /// [`Compression::None`] when compression would not save at least 1/8 of the size.
 pub fn compress(codec: Compression, input: &[u8], out: &mut Vec<u8>) -> crate::Result<Compression> {
-    todo!()
+    match codec {
+        Compression::None => {}
+        Compression::Lz4 => {
+            let start = out.len();
+            out.resize(
+                start + lz4_flex::block::get_maximum_output_size(input.len()),
+                0,
+            );
+            let n = lz4_flex::block::compress_into(input, &mut out[start..]).map_err(|_| {
+                Error::Corrupt {
+                    what: "lz4 compress",
+                }
+            })?;
+            out.truncate(start + n);
+            // Keep the compressed form only if it saves at least 1/8 of the input.
+            if n < input.len() && (input.len() - n) * 8 >= input.len() {
+                return Ok(Compression::Lz4);
+            }
+            out.truncate(start);
+        }
+        Compression::Zstd => return Err(Error::UnsupportedCompression(codec as u8)),
+    }
+    out.extend_from_slice(input);
+    Ok(Compression::None)
 }
 
 /// Decompresses `input` into `out`, which must be exactly `uncompressed_len` bytes long.
 pub fn decompress(codec: Compression, input: &[u8], out: &mut [u8]) -> crate::Result<()> {
-    todo!()
+    match codec {
+        Compression::None => {
+            if input.len() != out.len() {
+                return Err(Error::Corrupt {
+                    what: "uncompressed block length",
+                });
+            }
+            out.copy_from_slice(input);
+            Ok(())
+        }
+        Compression::Lz4 => match lz4_flex::block::decompress_into(input, out) {
+            Ok(n) if n == out.len() => Ok(()),
+            _ => Err(Error::Corrupt { what: "lz4 block" }),
+        },
+        Compression::Zstd => Err(Error::UnsupportedCompression(codec as u8)),
+    }
 }

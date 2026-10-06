@@ -16,5 +16,13 @@ crc32c = { workspace = true }
 twox-hash = { workspace = true }
 lz4_flex = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "format"
+harness = false
+
 [lints]
 workspace = true

@@ -1,0 +1,45 @@
+[package]
+name = "pigeonhole-format-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a member of the main workspace: build with `cargo +nightly fuzz run <target>` from
+# crates/format.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pigeonhole-format = { path = ".." }
+
+[[bin]]
+name = "key"
+path = "fuzz_targets/key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block"
+path = "fuzz_targets/block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal"
+path = "fuzz_targets/wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
