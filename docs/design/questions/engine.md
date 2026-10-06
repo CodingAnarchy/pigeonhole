@@ -136,3 +136,37 @@ and nothing measurable under contention.
 
 **Interim behavior:** D29 stands as written (128-byte threshold, guard on `get_latest`); the
 coordinator may record these numbers in D29.
+
+## Resolutions from the Milestone A review (coordinator, 2026-10-06; to be numbered)
+- **All-or-nothing 2PC recovery: confirmed**, plus: a flush may not persist a share of a
+  cross-shard commit until every PREPARE and the COMMIT are durable (in #37's checklist).
+- **Cross-shard durability: confirmed**; D42 is amended to "per stream" by the coordinator.
+  The engine's checker verifies the per-stream prefix for single-shard commits and the
+  per-commit promise for the rest.
+- **Failed sync leaves data visible: confirmed**; documented on `Engine::commit` next to
+  `Durability::None`.
+- **No splits: deferred** (#38). **No checkpoints: Milestone B** (#37).
+- **Per-shard timestamp floor: confirmed**, seeded from every replayed commit timestamp at
+  open (D11).
+- **Reader pins: changed.** A reader re-pins at its next snapshot once its live-snapshot
+  count drops to zero, so a long-lived reader never blocks reclamation for ever (#39 keeps
+  the oldest-live-snapshot refinement).
+- **Application-owned close: confirmed**; documented that `PendingCommit::wait` on the
+  thread that drives the commit's shard deadlocks (poll the future from the event loop).
+- **`From<format::Error>` wildcard → `Corruption`: confirmed.** **`merge_operators` unused
+  until compaction: confirmed.**
+- **`Snapshot::at_seqno`: kept out of the public API** behind the non-default `test-hooks`
+  cargo feature, enabled only by the crate's own tests.
+- **Conditional-write deferral: changed.** A conditional member's written rows, read keys
+  and predicate row are all checked against the group's earlier writers (it then runs in
+  the next group) and against prepared, undecided shares (a single member waits for the
+  decision; a PREPARE aborts with `Conflict` rather than wait on another commit's decision).
+  Every shard owning a row a transaction read is a two-phase-commit participant with an
+  empty PREPARE that validates it (no cross-shard write skew). Arena room is reserved per
+  group and per prepared share, and a participant's apply error reaches the coordinator, so
+  a half-applied commit is never acknowledged.
+- **D29 numbers: confirmed**, folded into D29 by the coordinator.
+- **Resolver:** Milestone B replaces `resolve.rs` with `pigeonhole-compaction`'s shared
+  resolver; where they differ, compaction's behavior wins (a time range on a family with a
+  merge operator applies to resolved versions per D82, an unknown operator is an error, value
+  predicates per D77). The engine's resolver already follows D82, D75, D76 and D77.

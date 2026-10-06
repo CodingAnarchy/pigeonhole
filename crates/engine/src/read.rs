@@ -131,7 +131,13 @@ impl ReadSpec {
         opts.value = self.value.clone();
         opts.merge = meta.merge;
         opts.filter.qualifiers = self.qualifiers.clone();
-        opts.filter.time_range = self.time_range;
+        // D82: on a family with a merge operator the time range applies to resolved
+        // versions (pushing it to puts could drop a counter's base but keep its operands).
+        if meta.merge == crate::catalog::MergeKind::None {
+            opts.filter.time_range = self.time_range;
+        } else {
+            opts.resolved_time_range = self.time_range;
+        }
         opts
     }
 }
@@ -324,7 +330,7 @@ impl ScanCursor {
             let Some(meta) = view.catalog.family(family) else {
                 continue;
             };
-            let sources = sources_for(view, tablet.id, family);
+            let sources = sources_for(view, tablet.shard, tablet.id, family);
             let opts = self
                 .spec
                 .read
@@ -478,13 +484,14 @@ impl ScanCursor {
     }
 }
 
-/// The sources of `(tablet, family)` in `view`, newest first.
+/// The sources of `(tablet, family)` on `shard` in `view`, newest first.
 pub(crate) fn sources_for(
     view: &View,
+    shard: pigeonhole_runtime::ShardId,
     tablet: pigeonhole_format::TabletId,
     family: FamilyId,
 ) -> Vec<SourceCursor> {
-    match view.memtables(tablet, family) {
+    match view.memtables(shard, tablet, family) {
         Some(set) => set
             .readers
             .iter()
@@ -519,7 +526,7 @@ pub(crate) fn read_row(
     now: Timestamp,
 ) -> Result<Option<RowData>> {
     let view = &snapshot.view;
-    let Some((tablet, _)) = view.tablets().route(table, row) else {
+    let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
     };
     let mut prefix = Vec::new();
@@ -532,7 +539,7 @@ pub(crate) fn read_row(
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
-        let sources = sources_for(view, tablet, family);
+        let sources = sources_for(view, shard, tablet, family);
         if sources.is_empty() {
             continue;
         }

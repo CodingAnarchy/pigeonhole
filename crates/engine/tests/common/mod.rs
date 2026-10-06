@@ -25,12 +25,13 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, EngineShard, Error, FamilyId, FamilyOptions, PendingCommit, ScanSpec,
-    Snapshot, TableInfo, ValueRef, WriteBatch,
+    Engine, EngineOptions, EngineShard, Error, FamilyId, FamilyOptions, PendingCommit, Predicate,
+    ScanSpec, Snapshot, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, Seqno, StreamId, Timestamp};
@@ -147,6 +148,13 @@ pub struct Config {
     pub crash_at: Option<u64>,
     /// How often (ppm) a scan is followed by a full-state comparison.
     pub dump_ppm: u32,
+    /// Concurrent plain commits submitted together (real groups on the shards).
+    pub tasks: usize,
+    /// How often (ppm) a commit runs as a `check_and_mutate` / a transaction.
+    pub cas_ppm: u32,
+    pub txn_ppm: u32,
+    /// `final_dump` only: a process crash and reopen every this many ops.
+    pub crash_every: Option<usize>,
 }
 
 impl Config {
@@ -172,6 +180,10 @@ impl Config {
             durability: None,
             crash_at: None,
             dump_ppm: 100_000,
+            tasks: 4,
+            cas_ppm: 80_000,
+            txn_ppm: 80_000,
+            crash_every: None,
         }
     }
 
@@ -188,8 +200,13 @@ impl Config {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
     pub ops: usize,
+    pub submitted: usize,
     pub commits: usize,
     pub cross_shard: usize,
+    pub batched: usize,
+    pub cas_refused: usize,
+    pub conflicts: usize,
+    pub io_errors: usize,
     pub crashes: usize,
     pub mid_commit_crashes: usize,
     pub busy: usize,
@@ -574,8 +591,17 @@ pub fn model_dump(
 // WAL survivors
 // ---------------------------------------------------------------------------------------
 
-/// Surviving commits by seqno, and each stream's record seqnos in log order.
-pub type Survivors = (BTreeMap<Seqno, Survivor>, BTreeMap<StreamId, Vec<Seqno>>);
+/// What the WAL holds after a crash.
+#[derive(Debug, Default)]
+pub struct Survivors {
+    /// Commits recovery must apply, by seqno.
+    pub commits: BTreeMap<Seqno, Survivor>,
+    /// Each stream's record seqnos (Batch records and applied Prepares), sorted.
+    pub order: BTreeMap<StreamId, Vec<Seqno>>,
+    /// Decided cross-shard commits (COMMIT present) with at least one PREPARE missing:
+    /// recovery must apply nothing of them.
+    pub ambiguous: Vec<Seqno>,
+}
 
 /// A surviving commit as the WAL holds it.
 #[derive(Debug, Clone)]
@@ -654,6 +680,13 @@ pub fn wal_survivors(vfs: &Arc<SimVfs>, db: &Path) -> Result<Survivors, String> 
     // All or nothing: a decided commit counts only if every listed participant holds its
     // PREPARE (the engine's recovery rule).
     let prepared: BTreeSet<(StreamId, Seqno)> = prepares.iter().map(|p| (p.0, p.1)).collect();
+    let mut ambiguous: Vec<Seqno> = commits
+        .iter()
+        .filter(|((_, seqno), ps)| !ps.iter().all(|p| prepared.contains(&(*p, *seqno))))
+        .map(|((_, seqno), _)| *seqno)
+        .collect();
+    ambiguous.sort_unstable();
+    ambiguous.dedup();
     for (stream, seqno, commit_ts, coordinator, bytes) in prepares {
         let decided = commits
             .get(&(coordinator, seqno))
@@ -673,30 +706,108 @@ pub fn wal_survivors(vfs: &Arc<SimVfs>, db: &Path) -> Result<Survivors, String> 
     for list in order.values_mut() {
         list.sort_unstable();
     }
-    Ok((survivors, order))
+    Ok(Survivors {
+        commits: survivors,
+        order,
+        ambiguous,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
 // The world
 // ---------------------------------------------------------------------------------------
 
+/// A conditional-write predicate on one column, as the model evaluates it.
+#[derive(Debug, Clone, PartialEq)]
+enum CasPred {
+    Exists,
+    Absent,
+    Equals(Vec<u8>),
+}
+
+/// How the client submitted a commit.
+#[derive(Debug, Clone)]
+enum Kind {
+    Plain,
+    /// `check_and_mutate` on `(table, row)` with a predicate on `(family, qualifier)`.
+    Cas {
+        table: String,
+        row: Vec<u8>,
+        family: String,
+        qualifier: Vec<u8>,
+        pred: CasPred,
+        /// What the model said when the predicate was evaluated (nothing in flight).
+        expected: bool,
+    },
+    /// A transaction: reads at the engine snapshot, then the batch.
+    Txn {
+        snapshot: Seqno,
+        reads: Vec<(String, Vec<u8>, String)>,
+    },
+}
+
 /// One acknowledged (or in-flight) commit.
 #[derive(Debug, Clone)]
 struct Committed {
     seqno: Option<Seqno>,
     ops: Vec<ModelOp>,
-    commit_ts: Timestamp,
+    commit_ts: Option<Timestamp>,
     durability: Durability,
     /// The shards its rows route to.
     shards: Vec<u16>,
     acked: bool,
+    kind: Kind,
+}
+
+impl Committed {
+    /// A `(table, row, family)` the commit writes.
+    fn touches(&self, table: &str, row: &[u8], family: &str) -> bool {
+        self.ops.iter().any(|op| {
+            op_table(op) == table
+                && op_row(op) == row
+                && match op {
+                    ModelOp::DeleteRow { .. } => true,
+                    ModelOp::Put { family: f, .. }
+                    | ModelOp::Incr { family: f, .. }
+                    | ModelOp::DeleteCell { family: f, .. }
+                    | ModelOp::DeleteColumn { family: f, .. }
+                    | ModelOp::DeleteFamily { family: f, .. } => f == family,
+                }
+        })
+    }
+}
+
+/// The result of a blocking engine call run on a helper thread.
+enum Outcome {
+    Commit(Result<pigeonhole_engine::CommitInfo, Error>),
+    Cas(Result<(bool, Option<pigeonhole_engine::CommitInfo>), Error>),
+}
+
+enum Pending {
+    Poll(PendingCommit),
+    Thread(mpsc::Receiver<Outcome>),
 }
 
 struct InFlight {
-    pending: PendingCommit,
+    pending: Pending,
     commit: Committed,
     armed: bool,
+    /// Whether the commit was submitted alone (its timestamp is then the clock); a batched
+    /// commit is logged (never `Durability::None`), so its timestamp is read from the WAL.
+    alone: bool,
 }
+
+/// A mutation as both the engine and the model see it, for matching unacknowledged commits
+/// against WAL records.
+type MutationKey = (
+    String,
+    String,
+    u8,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Timestamp>,
+    Vec<u8>,
+);
 
 struct World {
     seed: u64,
@@ -709,7 +820,14 @@ struct World {
     engine_seqnos: Vec<Seqno>,
     /// Every commit since the last recovery, by engine seqno.
     history: BTreeMap<Seqno, Committed>,
-    in_flight: Option<InFlight>,
+    /// Commits that returned an error (or were in flight at a crash): maybe landed.
+    unacked: Vec<Committed>,
+    in_flight: Vec<InFlight>,
+    /// A shard reported a poisoned stream: reopen once nothing is in flight.
+    need_reopen: bool,
+    /// Microseconds to move the clock once the current batch has completed, past the
+    /// default timestamps its group assigned.
+    pending_advance: u64,
     base: u64,
     snaps: Vec<Snapshot>,
     trace: Vec<String>,
@@ -718,8 +836,9 @@ struct World {
     failure: Option<Failure>,
     reopens: usize,
     done: bool,
-    /// Operations handed to the client so far (for `crash_at` sweeps).
     workload: Option<std::iter::Take<Workload>>,
+    /// Ops taken from the workload but not yet run (lookahead for batching).
+    queued: std::collections::VecDeque<Op>,
 }
 
 impl World {
@@ -754,6 +873,10 @@ impl World {
         out
     }
 
+    fn trace_on(&self) -> bool {
+        std::env::var("PIGEONHOLE_TRACE").is_ok()
+    }
+
     fn compare_dump(&self, snap: &Snapshot, class: FailureClass) -> Result<(), Fail> {
         let now = self.now();
         let engine = match self.store().dump(snap) {
@@ -785,6 +908,145 @@ impl World {
         }
     }
 
+    /// The mutations of `ops` as the engine logs them (row deletes expanded per family).
+    fn mutation_keys(ops: &[ModelOp]) -> BTreeSet<MutationKey> {
+        let mut out = BTreeSet::new();
+        for op in ops {
+            let t = op_table(op).to_owned();
+            match op {
+                ModelOp::Put {
+                    row,
+                    family,
+                    qualifier,
+                    ts,
+                    value,
+                    ..
+                } => {
+                    out.insert((
+                        t,
+                        family.clone(),
+                        1,
+                        row.clone(),
+                        qualifier.clone(),
+                        *ts,
+                        value.clone(),
+                    ));
+                }
+                ModelOp::Incr {
+                    row,
+                    family,
+                    qualifier,
+                    delta,
+                    ..
+                } => {
+                    out.insert((
+                        t,
+                        family.clone(),
+                        2,
+                        row.clone(),
+                        qualifier.clone(),
+                        None,
+                        delta.to_le_bytes().to_vec(),
+                    ));
+                }
+                ModelOp::DeleteCell {
+                    row,
+                    family,
+                    qualifier,
+                    ts,
+                    ..
+                } => {
+                    out.insert((
+                        t,
+                        family.clone(),
+                        3,
+                        row.clone(),
+                        qualifier.clone(),
+                        Some(*ts),
+                        Vec::new(),
+                    ));
+                }
+                ModelOp::DeleteColumn {
+                    row,
+                    family,
+                    qualifier,
+                    ..
+                } => {
+                    out.insert((
+                        t,
+                        family.clone(),
+                        4,
+                        row.clone(),
+                        qualifier.clone(),
+                        None,
+                        Vec::new(),
+                    ));
+                }
+                ModelOp::DeleteFamily { row, family, .. } => {
+                    out.insert((
+                        t,
+                        family.clone(),
+                        5,
+                        row.clone(),
+                        Vec::new(),
+                        None,
+                        Vec::new(),
+                    ));
+                }
+                ModelOp::DeleteRow { row, .. } => {
+                    for f in families() {
+                        out.insert((
+                            t.clone(),
+                            f.name,
+                            5,
+                            row.clone(),
+                            Vec::new(),
+                            None,
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The mutations of a surviving record set, decoded.
+    fn survivor_keys(&self, s: &Survivor) -> BTreeSet<MutationKey> {
+        let store = self.store();
+        let table_names: HashMap<pigeonhole_engine::TableId, String> = store
+            .tables
+            .iter()
+            .map(|(n, t)| (t.id, n.clone()))
+            .collect();
+        let mut out = BTreeSet::new();
+        for bytes in &s.batches {
+            let Ok(batch) = pigeonhole_format::wal::BatchRef::new(bytes) else {
+                continue;
+            };
+            for m in batch.iter().flatten() {
+                let payload = match pigeonhole_format::value::decode_value(m.value) {
+                    Ok(v) => value_bytes(v),
+                    Err(_) => m.value.to_vec(),
+                };
+                out.insert((
+                    table_names.get(&m.table).cloned().unwrap_or_default(),
+                    store
+                        .family_names
+                        .get(&m.family)
+                        .cloned()
+                        .unwrap_or_default(),
+                    m.kind as u8,
+                    m.row.to_vec(),
+                    m.qualifier.to_vec(),
+                    m.ts,
+                    payload,
+                ));
+            }
+        }
+        out
+    }
+
     /// Crashes (or notes the fault plan already did), checks the WAL against the promises,
     /// rebuilds the model from the survivors and reopens.
     fn crash_and_recover(
@@ -794,7 +1056,7 @@ impl World {
         rng: &mut Rng,
     ) -> Result<(), Fail> {
         self.stats.crashes += 1;
-        if std::env::var("PIGEONHOLE_TRACE").is_ok() {
+        if self.trace_on() {
             eprintln!("crash {kind:?} already={already}");
         }
         if !already {
@@ -804,51 +1066,68 @@ impl World {
             "CRASH {kind:?}{}",
             if already { " mid-commit" } else { "" }
         ));
-        // The in-flight commit, if any, is unacknowledged: it may or may not have landed.
-        if let Some(inf) = self.in_flight.take() {
-            drop(inf.pending);
+        // Whatever was in flight is unacknowledged: it may or may not have landed.
+        for inf in self.in_flight.drain(..) {
             let mut c = inf.commit;
             c.acked = false;
-            self.history.insert(u64::MAX, c);
+            self.unacked.push(c);
         }
+        self.need_reopen = false;
+        self.pending_advance = 0;
         self.store = None;
         self.snaps.clear();
-        self.vfs.set_faults(self.cfg.faults.clone());
+        self.vfs.set_faults(FaultPlan::none());
 
-        let (survivors, order) = match wal_survivors(&self.vfs, Path::new(DB)) {
+        let survivors = match wal_survivors(&self.vfs, Path::new(DB)) {
             Ok(s) => s,
             Err(e) => return fail(FailureClass::Protocol, format!("reading the WAL: {e}")),
         };
-        // One commit at most is in flight, so a surviving seqno the client never saw is it.
-        let unacked = self.history.remove(&u64::MAX);
-        let mut matched_unacked: Option<Seqno> = None;
-        if unacked.is_some() {
-            matched_unacked = survivors
-                .keys()
-                .copied()
-                .find(|s| !self.history.contains_key(s));
-        }
-        // Promises per stream: survivors are a prefix of what was acknowledged there, and
-        // reach at least the last commit at the floor level.
         let floor = match kind {
             CrashKind::Process => Durability::Buffered,
             CrashKind::Power => Durability::GroupSync,
         };
-        let mut known: Vec<Seqno> = survivors.keys().copied().collect();
-        known.retain(|s| !self.history.contains_key(s) && Some(*s) != matched_unacked);
-        if !known.is_empty() {
-            return fail(
-                FailureClass::RecoveredFromTheFuture,
-                format!("the WAL holds commits the client never made: {known:?}"),
-            );
+
+        // The reopened engine is needed to decode survivors (ids to names).
+        let shards = self.next_shards();
+        self.reopens += 1;
+        let budget = self.cfg.memtable_budget;
+        let store = match Store::open(&self.vfs, shards, budget, &families()) {
+            Ok(s) => s,
+            Err(e) => return fail(FailureClass::Protocol, format!("recovery failed: {e}")),
+        };
+        self.store = Some(store);
+        self.vfs.set_faults(self.cfg.faults.clone());
+
+        // Unknown seqnos must match unacknowledged commits, by their mutations.
+        let mut unacked = std::mem::take(&mut self.unacked);
+        let mut matched: BTreeMap<Seqno, Committed> = BTreeMap::new();
+        for (seqno, s) in &survivors.commits {
+            if self.history.contains_key(seqno) {
+                continue;
+            }
+            let keys = self.survivor_keys(s);
+            match unacked
+                .iter()
+                .position(|c| Self::mutation_keys(&c.ops) == keys)
+            {
+                Some(i) => {
+                    let mut c = unacked.remove(i);
+                    c.seqno = Some(*seqno);
+                    c.commit_ts = Some(s.commit_ts);
+                    matched.insert(*seqno, c);
+                }
+                None => {
+                    return fail(
+                        FailureClass::RecoveredFromTheFuture,
+                        format!("the WAL holds commit {seqno}, which the client never made"),
+                    );
+                }
+            }
         }
-        // The promise: every commit acknowledged at the floor level or stronger survives
-        // (weaker ones may or may not; with one stream per shard there is no cross-shard
-        // prefix to check).
-        let _ = &order;
+        // The promise: every commit acknowledged at the floor level or stronger survives.
         for c in self.history.values() {
             let Some(seqno) = c.seqno else { continue };
-            if c.acked && c.durability >= floor && !survivors.contains_key(&seqno) {
+            if c.acked && c.durability >= floor && !survivors.commits.contains_key(&seqno) {
                 return fail(
                     FailureClass::LostAckedCommit,
                     format!(
@@ -858,53 +1137,86 @@ impl World {
                 );
             }
         }
-        // Rebuild the model from the survivors, in seqno order.
-        let mut kept: Vec<(Seqno, Vec<ModelOp>, Timestamp, Durability)> = Vec::new();
-        for (seqno, c) in &self.history {
-            if survivors.contains_key(seqno) {
-                kept.push((*seqno, c.ops.clone(), c.commit_ts, c.durability));
+        // Per stream, a single-shard commit's record precedes every later single-shard
+        // commit of that stream in the log, so everything below the stream's last synced
+        // commit must be there (a sync covers every earlier append).
+        let mut by_shard: BTreeMap<u16, Vec<&Committed>> = BTreeMap::new();
+        for c in self.history.values() {
+            if c.acked && c.shards.len() == 1 && c.durability != Durability::None {
+                by_shard.entry(c.shards[0]).or_default().push(c);
             }
         }
-        if let (Some(c), Some(seqno)) = (&unacked, matched_unacked) {
-            kept.push((
-                seqno,
-                c.ops.clone(),
-                survivors[&seqno].commit_ts,
-                c.durability,
-            ));
+        for (shard, commits) in &by_shard {
+            let last_strong = commits
+                .iter()
+                .filter(|c| c.durability >= floor)
+                .filter_map(|c| c.seqno)
+                .max();
+            for c in commits {
+                let Some(seqno) = c.seqno else { continue };
+                if last_strong.is_some_and(|l| seqno < l) && !survivors.commits.contains_key(&seqno)
+                {
+                    return fail(
+                        FailureClass::LostAckedCommit,
+                        format!(
+                            "stream {shard} lost commit {seqno} ({:?}) although its later commit {} was synced",
+                            c.durability,
+                            last_strong.unwrap()
+                        ),
+                    );
+                }
+            }
         }
-        kept.sort_by_key(|k| k.0);
+        // All or nothing, checked against the WAL directly: a decided commit with a missing
+        // PREPARE was never acknowledged at the floor level or stronger (those prepares were
+        // durable before the COMMIT), and the engine applies none of it (checked below
+        // through the model, which excludes it).
+        for a in &survivors.ambiguous {
+            if let Some(c) = self.history.get(a)
+                && c.acked
+                && c.durability >= floor
+            {
+                return fail(
+                    FailureClass::LostAckedCommit,
+                    format!(
+                        "commit {a} ({:?}) was acknowledged but a participant's PREPARE is gone",
+                        c.durability
+                    ),
+                );
+            }
+        }
+        // Rebuild the model from the survivors, in seqno order.
+        let mut kept: Vec<Committed> = Vec::new();
+        for (seqno, c) in &self.history {
+            if survivors.commits.contains_key(seqno) {
+                kept.push(c.clone());
+            }
+        }
+        kept.extend(matched.into_values());
+        kept.sort_by_key(|c| c.seqno);
         let mut model = new_model();
         self.history.clear();
         self.engine_seqnos.clear();
-        for (seqno, ops, ts, durability) in kept {
-            if let Err(e) = model.try_commit(&ops, ts, Durability::Sync) {
+        for mut c in kept {
+            let seqno = c.seqno.expect("kept commits have a seqno");
+            let ts = c.commit_ts.expect("kept commits have a timestamp");
+            if let Err(e) = model.try_commit(&c.ops, ts, Durability::Sync) {
                 return fail(FailureClass::Protocol, format!("model rebuild: {e}"));
             }
             self.engine_seqnos.push(seqno);
-            self.history.insert(
-                seqno,
-                Committed {
-                    seqno: Some(seqno),
-                    ops,
-                    commit_ts: ts,
-                    durability,
-                    shards: Vec::new(),
-                    acked: true,
-                },
-            );
+            c.acked = true;
+            c.shards = Vec::new();
+            self.history.insert(seqno, c);
         }
         self.model = model;
+        // Routing under the new shard count, for the next crash's per-stream check.
+        let keys: Vec<Seqno> = self.history.keys().copied().collect();
+        for k in keys {
+            let ops = self.history[&k].ops.clone();
+            let shards = self.shards_of(&ops);
+            self.history.get_mut(&k).unwrap().shards = shards;
+        }
 
-        // Reopen (possibly with another shard count) and compare.
-        let shards = self.next_shards();
-        self.reopens += 1;
-        let budget = self.cfg.memtable_budget;
-        let store = match Store::open(&self.vfs, shards, budget, &families()) {
-            Ok(s) => s,
-            Err(e) => return fail(FailureClass::Protocol, format!("recovery failed: {e}")),
-        };
-        self.store = Some(store);
         let snap = match self.store().engine.snapshot() {
             Ok(s) => s,
             Err(e) => {
@@ -917,9 +1229,9 @@ impl World {
         let recovered = snap.seqno();
         let last_kept = self.engine_seqnos.last().copied().unwrap_or(0);
         self.trace.push(format!(
-            "RECOVERED with {} shards: engine seqno {recovered}, {} commits kept (last {last_kept})",
-            shards,
-            self.engine_seqnos.len()
+            "RECOVERED with {shards} shards: engine seqno {recovered}, {} commits kept (last {last_kept}), {} ambiguous",
+            self.engine_seqnos.len(),
+            survivors.ambiguous.len()
         ));
         if recovered < last_kept {
             return fail(
@@ -928,12 +1240,9 @@ impl World {
             );
         }
         self.compare_dump(&snap, FailureClass::RecoveredStateMismatch)?;
-        // An older snapshot of the recovered store must agree too.
         if recovered > 0 {
             let s = 1 + rng.below(recovered);
-            let older = Snapshot::clone(&snap);
-            let older = older_at(older, s);
-            self.compare_dump(&older, FailureClass::RecoveredStateMismatch)?;
+            self.compare_dump(&snap.at_seqno(s), FailureClass::RecoveredStateMismatch)?;
         }
         Ok(())
     }
@@ -950,108 +1259,607 @@ impl World {
         Ok(())
     }
 
-    /// Finishes the in-flight commit if it resolved. Returns whether the client may proceed.
+    /// The commit timestamps the engine assigned, read from the WAL records (batched
+    /// commits are always logged).
+    fn logged_timestamps(&self) -> Result<BTreeMap<Seqno, Timestamp>, Fail> {
+        self.vfs.set_faults(FaultPlan::none());
+        let survivors = wal_survivors(&self.vfs, Path::new(DB));
+        self.vfs.set_faults(self.cfg.faults.clone());
+        match survivors {
+            Ok(s) => Ok(s.commits.iter().map(|(k, v)| (*k, v.commit_ts)).collect()),
+            Err(e) => fail(
+                FailureClass::Protocol,
+                format!("reading the WAL for timestamps: {e}"),
+            ),
+        }
+    }
+
+    /// Settles every in-flight commit that resolved. Returns whether the client may go on
+    /// (nothing left in flight).
     fn poll_in_flight(&mut self, rng: &mut Rng) -> Result<bool, Fail> {
-        if self.in_flight.is_none() {
+        if self.in_flight.is_empty() {
+            if self.need_reopen {
+                self.crash_and_recover(CrashKind::Process, false, rng)?;
+            }
             return Ok(true);
         }
         if !self.alive() {
-            if self.in_flight.as_ref().unwrap().armed {
+            if self.in_flight.iter().any(|i| i.armed) {
                 self.stats.mid_commit_crashes += 1;
             }
             self.crash_and_recover(CrashKind::Power, true, rng)?;
             return Ok(true);
         }
-        let inf = self.in_flight.as_mut().unwrap();
-        match poll_commit(&mut inf.pending) {
-            Poll::Pending => Ok(false),
-            Poll::Ready(result) => {
-                let inf = self.in_flight.take().unwrap();
-                let mut c = inf.commit;
-                match result {
-                    Ok(info) => {
-                        let m = match self.model.try_commit(&c.ops, c.commit_ts, c.durability) {
-                            Ok(m) => m,
-                            Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
-                        };
-                        let expected = self.engine_seqnos.len() as Seqno + 1;
-                        if m != expected {
-                            return fail(
-                                FailureClass::Protocol,
-                                format!(
-                                    "engine seqno {} maps to model {expected}, model assigned {m}",
-                                    info.seqno
-                                ),
-                            );
-                        }
-                        if self.engine_seqnos.last().is_some_and(|l| *l >= info.seqno) {
-                            return fail(
-                                FailureClass::Protocol,
-                                format!(
-                                    "engine seqno {} is not above the previous {:?}",
-                                    info.seqno,
-                                    self.engine_seqnos.last()
-                                ),
-                            );
-                        }
-                        if info.durability != c.durability {
-                            return fail(
-                                FailureClass::Protocol,
-                                format!("durability {:?} != {:?}", info.durability, c.durability),
-                            );
-                        }
-                        self.engine_seqnos.push(info.seqno);
-                        c.seqno = Some(info.seqno);
-                        c.acked = true;
-                        self.stats.commits += 1;
-                        if c.shards.len() > 1 {
-                            self.stats.cross_shard += 1;
-                        }
-                        self.history.insert(info.seqno, c);
-                        // Read-your-writes: the commit is visible now.
-                        let snap = self.store().engine.snapshot().map_err(|e| Fail {
-                            class: FailureClass::Protocol,
-                            message: e.to_string(),
-                        })?;
-                        if snap.seqno() < info.seqno {
-                            return fail(
-                                FailureClass::Protocol,
-                                format!("snapshot {} after commit {}", snap.seqno(), info.seqno),
-                            );
-                        }
-                        if inf.armed {
-                            self.vfs.set_faults(self.cfg.faults.clone());
+        let mut resolved: Vec<(InFlight, Outcome)> = Vec::new();
+        let mut still = Vec::new();
+        for mut inf in self.in_flight.drain(..) {
+            let outcome = match &mut inf.pending {
+                Pending::Poll(pc) => match poll_commit(pc) {
+                    Poll::Ready(r) => Some(Outcome::Commit(r)),
+                    Poll::Pending => None,
+                },
+                Pending::Thread(rx) => rx.recv_timeout(Duration::from_millis(1)).ok(),
+            };
+            match outcome {
+                Some(o) => resolved.push((inf, o)),
+                None => still.push(inf),
+            }
+        }
+        self.in_flight = still;
+        if resolved.is_empty() {
+            return Ok(false);
+        }
+        // Successful commits are applied to the model in seqno order.
+        let mut successes: Vec<(Seqno, InFlight, Option<pigeonhole_engine::CommitInfo>)> =
+            Vec::new();
+        for (inf, outcome) in resolved {
+            let armed = inf.armed;
+            match outcome {
+                Outcome::Commit(Ok(info)) => successes.push((info.seqno, inf, Some(info))),
+                Outcome::Cas(Ok((applied, info))) => {
+                    let Kind::Cas { expected, .. } = &inf.commit.kind else {
+                        unreachable!()
+                    };
+                    if applied != *expected {
+                        return fail(
+                            FailureClass::LiveReadMismatch,
+                            format!(
+                                "check_and_mutate applied={applied} but the model's predicate said {expected}"
+                            ),
+                        );
+                    }
+                    match info {
+                        Some(info) => successes.push((info.seqno, inf, Some(info))),
+                        None => {
+                            self.stats.cas_refused += 1;
+                            self.trace.push("  -> predicate false, not applied".into());
                         }
                     }
-                    Err(Error::Busy) => {
-                        self.stats.busy += 1;
-                        self.trace.push("  -> busy (arena full)".into());
-                        if inf.armed {
-                            self.vfs.set_faults(self.cfg.faults.clone());
-                        }
-                    }
-                    Err(e) if !self.alive() || is_crashed(&e) => {
-                        c.acked = false;
-                        self.history.insert(u64::MAX, c);
-                        if inf.armed {
-                            self.stats.mid_commit_crashes += 1;
-                        }
-                        self.crash_and_recover(CrashKind::Power, true, rng)?;
-                    }
-                    Err(e) => {
+                }
+                Outcome::Commit(Err(Error::Busy)) | Outcome::Cas(Err(Error::Busy)) => {
+                    self.stats.busy += 1;
+                    self.trace.push("  -> busy (arena full)".into());
+                }
+                Outcome::Commit(Err(Error::Conflict)) => {
+                    let Kind::Txn { snapshot, reads } = &inf.commit.kind else {
+                        return fail(FailureClass::Protocol, "conflict on a plain commit".into());
+                    };
+                    // A real conflict: some commit above the snapshot touched a read key.
+                    let real = self.history.values().any(|c| {
+                        c.seqno.is_some_and(|s| s > *snapshot)
+                            && reads.iter().any(|(t, r, f)| c.touches(t, r, f))
+                    });
+                    if !real {
                         return fail(
                             FailureClass::Protocol,
-                            format!("unexpected commit error: {e}"),
+                            format!(
+                                "spurious conflict: nothing above snapshot {snapshot} touched {reads:?}"
+                            ),
+                        );
+                    }
+                    self.stats.conflicts += 1;
+                    self.trace.push("  -> conflict".into());
+                }
+                Outcome::Commit(Err(e)) | Outcome::Cas(Err(e))
+                    if !self.alive() || is_crashed(&e) =>
+                {
+                    let mut c = inf.commit;
+                    c.acked = false;
+                    self.unacked.push(c);
+                    if armed {
+                        self.stats.mid_commit_crashes += 1;
+                    }
+                    for other in self.in_flight.drain(..) {
+                        let mut c = other.commit;
+                        c.acked = false;
+                        self.unacked.push(c);
+                    }
+                    self.crash_and_recover(CrashKind::Power, true, rng)?;
+                    return Ok(true);
+                }
+                Outcome::Commit(Err(Error::Io(e))) | Outcome::Cas(Err(Error::Io(e))) => {
+                    // A failed write or sync poisoned a stream: the commit may have landed
+                    // (a sync failure after apply), so it is unacknowledged, and the engine
+                    // must be reopened once everything in flight has settled.
+                    self.stats.io_errors += 1;
+                    self.trace
+                        .push(format!("  -> I/O error ({e}); reopen pending"));
+                    let mut c = inf.commit;
+                    c.acked = false;
+                    self.unacked.push(c);
+                    self.need_reopen = true;
+                }
+                Outcome::Commit(Err(e)) | Outcome::Cas(Err(e)) => {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!("unexpected commit error: {e}"),
+                    );
+                }
+            }
+            if armed {
+                self.vfs.set_faults(self.cfg.faults.clone());
+            }
+        }
+        successes.sort_by_key(|(s, ..)| *s);
+        let mut logged: Option<BTreeMap<Seqno, Timestamp>> = None;
+        for (seqno, inf, info) in successes {
+            let info = info.expect("successes carry info");
+            let mut c = inf.commit;
+            if self.engine_seqnos.last().is_some_and(|l| *l >= seqno) {
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "engine seqno {seqno} is not above the previous {:?}",
+                        self.engine_seqnos.last()
+                    ),
+                );
+            }
+            if info.durability != c.durability {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("durability {:?} != {:?}", info.durability, c.durability),
+                );
+            }
+            // The commit timestamp: the clock when the commit ran alone, else the record's.
+            let ts = if inf.alone {
+                c.commit_ts.expect("alone commits know their timestamp")
+            } else {
+                if logged.is_none() {
+                    logged = Some(self.logged_timestamps()?);
+                }
+                match logged.as_ref().and_then(|m| m.get(&seqno)) {
+                    Some(ts) => *ts,
+                    None => {
+                        return fail(
+                            FailureClass::Protocol,
+                            format!(
+                                "acknowledged commit {seqno} ({:?}) has no WAL record",
+                                c.durability
+                            ),
                         );
                     }
                 }
-                Ok(true)
+            };
+            if let Kind::Txn { snapshot, reads } = &c.kind {
+                // Validation must have seen every commit between the snapshot and this one.
+                if let Some(bad) = self.history.values().find(|h| {
+                    h.seqno.is_some_and(|s| s > *snapshot && s < seqno)
+                        && reads.iter().any(|(t, r, f)| h.touches(t, r, f))
+                }) {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!(
+                            "transaction {seqno} committed although commit {:?} touched its reads after snapshot {snapshot}",
+                            bad.seqno
+                        ),
+                    );
+                }
+            }
+            let m = match self.model.try_commit(&c.ops, ts, c.durability) {
+                Ok(m) => m,
+                Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
+            };
+            if m != self.engine_seqnos.len() as Seqno + 1 {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("model seqno {m} out of step"),
+                );
+            }
+            self.engine_seqnos.push(seqno);
+            c.seqno = Some(seqno);
+            c.commit_ts = Some(ts);
+            c.acked = true;
+            self.stats.commits += 1;
+            if c.shards.len() > 1 {
+                self.stats.cross_shard += 1;
+            }
+            self.history.insert(seqno, c);
+        }
+        // Read-your-writes: everything acknowledged is visible now.
+        let snap = self.store().engine.snapshot().map_err(|e| Fail {
+            class: FailureClass::Protocol,
+            message: e.to_string(),
+        })?;
+        if let Some(last) = self.engine_seqnos.last()
+            && snap.seqno() < *last
+        {
+            return fail(
+                FailureClass::Protocol,
+                format!("snapshot {} after commit {last}", snap.seqno()),
+            );
+        }
+        if self.in_flight.is_empty() {
+            if self.pending_advance > 0 {
+                self.vfs.advance(1_000 * self.pending_advance);
+                self.pending_advance = 0;
+            }
+            if self.need_reopen {
+                self.crash_and_recover(CrashKind::Process, false, rng)?;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Takes the next op from the workload (or the lookahead queue).
+    fn next_op(&mut self) -> Option<Op> {
+        if let Some(op) = self.queued.pop_front() {
+            return Some(op);
+        }
+        self.workload.as_mut().and_then(|w| w.next())
+    }
+
+    fn arm(&mut self, rng: &mut Rng) -> bool {
+        if rng.chance(self.cfg.mid_commit_crash_ppm) {
+            let mut plan = self.cfg.faults.clone();
+            plan.crash_after_ops = Some(self.vfs.mutating_ops() + 1 + rng.below(6));
+            self.vfs.set_faults(plan);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prepare_ops(&self, ops: &mut [ModelOp]) {
+        for o in ops.iter_mut() {
+            place(o);
+            match o {
+                ModelOp::Put { ts: Some(t), .. } | ModelOp::DeleteCell { ts: t, .. } => {
+                    *t += self.base;
+                }
+                _ => {}
             }
         }
     }
 
+    /// Submits one plain commit. Returns false when the engine crashed instead.
+    fn submit_plain(
+        &mut self,
+        ops: Vec<ModelOp>,
+        durability: Durability,
+        alone: bool,
+        rng: &mut Rng,
+    ) -> Result<bool, Fail> {
+        let now = self.now();
+        let armed = self.arm(rng);
+        let shards = self.shards_of(&ops);
+        self.stats.submitted += 1;
+        self.trace.push(format!(
+            "commit {durability:?} ts={now} shards={shards:?}{} [{}]{}",
+            if alone { "" } else { " (batched)" },
+            ops.iter().map(show).collect::<Vec<_>>().join("; "),
+            if armed { " (crash armed)" } else { "" }
+        ));
+        let batch = match self.store().batch(&ops) {
+            Ok(b) => b,
+            Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
+        };
+        let commit = Committed {
+            seqno: None,
+            ops,
+            commit_ts: alone.then_some(now),
+            durability,
+            shards,
+            acked: false,
+            kind: Kind::Plain,
+        };
+        match self.store().engine.submit(batch, Some(durability)) {
+            Ok(pc) => {
+                self.in_flight.push(InFlight {
+                    pending: Pending::Poll(pc),
+                    commit,
+                    armed,
+                    alone,
+                });
+                Ok(true)
+            }
+            Err(e) if is_crashed(&e) => {
+                let mut c = commit;
+                c.acked = false;
+                self.unacked.push(c);
+                self.crash_and_recover(CrashKind::Power, true, rng)?;
+                Ok(false)
+            }
+            Err(e) => fail(FailureClass::Protocol, format!("submit: {e}")),
+        }
+    }
+
+    /// Submits a `check_and_mutate` (alone) on a helper thread.
+    fn submit_cas(
+        &mut self,
+        ops: Vec<ModelOp>,
+        durability: Durability,
+        rng: &mut Rng,
+    ) -> Result<(), Fail> {
+        let now = self.now();
+        let (table, row) = (op_table(&ops[0]).to_owned(), op_row(&ops[0]).to_vec());
+        let ops: Vec<ModelOp> = ops
+            .into_iter()
+            .filter(|o| op_table(o) == table && op_row(o) == row)
+            .collect();
+        let fams = families();
+        let family = fams[rng.below(fams.len() as u64) as usize].name.clone();
+        let qualifier = format!("q{}", rng.below(self.cfg.spec.qualifiers)).into_bytes();
+        let current = self
+            .model
+            .try_get(
+                &table,
+                &row,
+                &family,
+                &qualifier,
+                self.model.snapshot(),
+                now,
+            )
+            .ok()
+            .flatten();
+        let pred = match rng.below(4) {
+            0 => CasPred::Exists,
+            1 => CasPred::Absent,
+            2 => CasPred::Equals(
+                current
+                    .as_ref()
+                    .map_or_else(|| b"none".to_vec(), |c| c.value.clone()),
+            ),
+            _ => CasPred::Equals(b"never".to_vec()),
+        };
+        let expected = match &pred {
+            CasPred::Exists => current.is_some(),
+            CasPred::Absent => current.is_none(),
+            CasPred::Equals(v) => current.as_ref().is_some_and(|c| &c.value == v),
+        };
+        let armed = self.arm(rng);
+        let shards = self.shards_of(&ops);
+        self.stats.submitted += 1;
+        let fam_id = self.store().family_ids[&(table.clone(), family.clone())];
+        let engine = Arc::clone(&self.store().engine);
+        let table_id = self.store().tables[&table].id;
+        let engine_pred = match &pred {
+            CasPred::Exists => Predicate::Exists {
+                family: fam_id,
+                qualifier: qualifier.clone(),
+            },
+            CasPred::Absent => Predicate::Absent {
+                family: fam_id,
+                qualifier: qualifier.clone(),
+            },
+            CasPred::Equals(v) => Predicate::Value {
+                family: fam_id,
+                qualifier: qualifier.clone(),
+                predicate: pigeonhole_engine::ValuePredicate::Equals(v.clone()),
+            },
+        };
+        self.trace.push(format!(
+            "cas {durability:?} ts={now} {}/{family}:{} {pred:?} (model says {expected}) [{}]{}",
+            text(&row),
+            text(&qualifier),
+            ops.iter().map(show).collect::<Vec<_>>().join("; "),
+            if armed { " (crash armed)" } else { "" }
+        ));
+        let batch = match self.store().batch(&ops) {
+            Ok(b) => b,
+            Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
+        };
+        let (tx, rx) = mpsc::channel();
+        let row2 = row.clone();
+        std::thread::spawn(move || {
+            let r = engine.check_and_mutate(table_id, &row2, &engine_pred, batch, Some(durability));
+            let _ = tx.send(Outcome::Cas(r));
+        });
+        self.in_flight.push(InFlight {
+            pending: Pending::Thread(rx),
+            commit: Committed {
+                seqno: None,
+                ops,
+                commit_ts: Some(now),
+                durability,
+                shards,
+                acked: false,
+                kind: Kind::Cas {
+                    table,
+                    row,
+                    family,
+                    qualifier,
+                    pred,
+                    expected,
+                },
+            },
+            armed,
+            alone: true,
+        });
+        Ok(())
+    }
+
+    /// Begins a transaction, reads a few columns (checked against the model), and commits
+    /// it on a helper thread.
+    fn submit_txn(
+        &mut self,
+        ops: Vec<ModelOp>,
+        durability: Durability,
+        rng: &mut Rng,
+    ) -> Result<(), Fail> {
+        let now = self.now();
+        let armed = self.arm(rng);
+        let shards = self.shards_of(&ops);
+        self.stats.submitted += 1;
+        let store = self.store.as_ref().expect("store open");
+        let mut txn = match store.engine.begin() {
+            Ok(t) => t,
+            Err(e) => return fail(FailureClass::Protocol, format!("begin: {e}")),
+        };
+        let snapshot = txn.snapshot().seqno();
+        let fams = families();
+        let mut reads = Vec::new();
+        for i in 0..1 + rng.below(2) {
+            // Read a row the batch writes (likely conflicts) or a random one.
+            let (table, row) = if i == 0 {
+                (op_table(&ops[0]).to_owned(), op_row(&ops[0]).to_vec())
+            } else {
+                let row = format!("row{:06}", rng.below(self.cfg.spec.rows)).into_bytes();
+                (table_of(&row).to_owned(), row)
+            };
+            let family = fams[rng.below(fams.len() as u64) as usize].name.clone();
+            let qualifier = format!("q{}", rng.below(self.cfg.spec.qualifiers)).into_bytes();
+            let fam_id = store.family_ids[&(table.clone(), family.clone())];
+            let got = txn
+                .get(store.tables[&table].id, fam_id, &row, &qualifier)
+                .map(|c| c.map(|c| (c.timestamp(), value_bytes(c.value()))));
+            let want = self
+                .model
+                .try_get(
+                    &table,
+                    &row,
+                    &family,
+                    &qualifier,
+                    self.model_seqno(snapshot),
+                    now,
+                )
+                .map(|c| c.map(|c| (c.ts, c.value)));
+            match (got, want) {
+                (Ok(g), Ok(w)) if g == w => {}
+                (Err(Error::Merge(_)), Err(_)) => {}
+                (g, w) => {
+                    return fail(
+                        FailureClass::LiveReadMismatch,
+                        format!(
+                            "txn read {}/{family}:{}: engine {g:?} vs model {w:?}",
+                            text(&row),
+                            text(&qualifier)
+                        ),
+                    );
+                }
+            }
+            reads.push((table, row, family));
+        }
+        let batch = match store.batch(&ops) {
+            Ok(b) => b,
+            Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
+        };
+        *txn.batch() = batch;
+        // Half the time another writer touches a read key between the reads and the
+        // commit, so validation must abort the transaction.
+        let interfere = rng.chance(500_000);
+        if interfere {
+            let (t, r, f) = reads[0].clone();
+            let op = ModelOp::Put {
+                table: t,
+                row: r,
+                family: f,
+                qualifier: b"q0".to_vec(),
+                ts: None,
+                value: b"interferer".to_vec(),
+            };
+            self.vfs.advance(1_000);
+            self.run_alone_now(vec![op], Durability::Buffered)?;
+        }
+        self.trace.push(format!(
+            "txn {durability:?} ts={now} snapshot={snapshot} reads={}{} [{}]{}",
+            reads
+                .iter()
+                .map(|(t, r, f)| format!("{t}/{}/{f}", text(r)))
+                .collect::<Vec<_>>()
+                .join(","),
+            if interfere { " (interfered)" } else { "" },
+            ops.iter().map(show).collect::<Vec<_>>().join("; "),
+            if armed { " (crash armed)" } else { "" }
+        ));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Outcome::Commit(txn.commit(Some(durability))));
+        });
+        self.in_flight.push(InFlight {
+            pending: Pending::Thread(rx),
+            commit: Committed {
+                seqno: None,
+                ops,
+                commit_ts: Some(now),
+                durability,
+                shards,
+                acked: false,
+                kind: Kind::Txn { snapshot, reads },
+            },
+            armed,
+            alone: true,
+        });
+        Ok(())
+    }
+
+    /// Commits `ops` right now, driving the shards until it resolves (used for interference
+    /// inside a client step), and applies it to the model.
+    fn run_alone_now(&mut self, ops: Vec<ModelOp>, durability: Durability) -> Result<(), Fail> {
+        let now = self.now();
+        let shards = self.shards_of(&ops);
+        let batch = match self.store().batch(&ops) {
+            Ok(b) => b,
+            Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
+        };
+        let mut pc = match self.store().engine.submit(batch, Some(durability)) {
+            Ok(pc) => pc,
+            Err(e) => return fail(FailureClass::Protocol, format!("submit: {e}")),
+        };
+        let store = self.store.as_mut().expect("store open");
+        let info = loop {
+            match poll_commit(&mut pc) {
+                Poll::Ready(Ok(info)) => break info,
+                Poll::Ready(Err(e)) => {
+                    return fail(FailureClass::Protocol, format!("interferer: {e}"));
+                }
+                Poll::Pending => store.step_shards(self.vfs.monotonic_nanos()),
+            }
+        };
+        self.trace.push(format!(
+            "interferer {durability:?} ts={now} seqno={} [{}]",
+            info.seqno,
+            ops.iter().map(show).collect::<Vec<_>>().join("; ")
+        ));
+        let m = match self.model.try_commit(&ops, now, durability) {
+            Ok(m) => m,
+            Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
+        };
+        if m != self.engine_seqnos.len() as Seqno + 1 {
+            return fail(
+                FailureClass::Protocol,
+                format!("model seqno {m} out of step"),
+            );
+        }
+        self.engine_seqnos.push(info.seqno);
+        self.stats.commits += 1;
+        self.history.insert(
+            info.seqno,
+            Committed {
+                seqno: Some(info.seqno),
+                ops,
+                commit_ts: Some(now),
+                durability,
+                shards,
+                acked: true,
+                kind: Kind::Plain,
+            },
+        );
+        Ok(())
+    }
+
     fn step(&mut self, op: Op, rng: &mut Rng) -> Result<(), Fail> {
-        if std::env::var("PIGEONHOLE_TRACE").is_ok() {
+        if self.trace_on() {
             eprintln!("op #{} {op:?}", self.op_index);
         }
         self.vfs.advance(1_000);
@@ -1059,61 +1867,57 @@ impl World {
         match op {
             Op::Commit(mut ops, durability) => {
                 let durability = self.cfg.durability.unwrap_or(durability);
-                for o in &mut ops {
-                    place(o);
-                    match o {
-                        ModelOp::Put { ts: Some(t), .. } | ModelOp::DeleteCell { ts: t, .. } => {
-                            *t += self.base;
+                self.prepare_ops(&mut ops);
+                if rng.chance(self.cfg.cas_ppm) {
+                    return self.submit_cas(ops, durability, rng);
+                }
+                if rng.chance(self.cfg.txn_ppm) {
+                    return self.submit_txn(ops, durability, rng);
+                }
+                // A batch of concurrent commits: this one plus following logged commits of
+                // the workload (a `None` commit leaves no record to read its timestamp from).
+                let want = if durability != Durability::None {
+                    1 + rng.below(self.cfg.tasks.max(1) as u64) as usize
+                } else {
+                    1
+                };
+                let mut batch: Vec<(Vec<ModelOp>, Durability)> = vec![(ops, durability)];
+                while batch.len() < want {
+                    match self.next_op() {
+                        Some(Op::Commit(mut more, d)) => {
+                            // Raw ops go back to the queue; only accepted ones are prepared
+                            // (the base offset must be added exactly once).
+                            let d = self.cfg.durability.unwrap_or(d);
+                            if d == Durability::None {
+                                self.queued.push_front(Op::Commit(more, d));
+                                break;
+                            }
+                            self.prepare_ops(&mut more);
+                            batch.push((more, d));
                         }
-                        _ => {}
+                        Some(other) => {
+                            self.queued.push_front(other);
+                            break;
+                        }
+                        None => break,
                     }
                 }
-                let armed = rng.chance(self.cfg.mid_commit_crash_ppm);
-                if armed {
-                    let mut plan = self.cfg.faults.clone();
-                    plan.crash_after_ops = Some(self.vfs.mutating_ops() + 1 + rng.below(6));
-                    self.vfs.set_faults(plan);
-                }
-                let shards = self.shards_of(&ops);
-                self.trace.push(format!(
-                    "commit {durability:?} ts={now} shards={shards:?} [{}]{}",
-                    ops.iter().map(show).collect::<Vec<_>>().join("; "),
-                    if armed { " (crash armed)" } else { "" }
-                ));
-                let batch = match self.store().batch(&ops) {
-                    Ok(b) => b,
-                    Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
-                };
-                let pending = match self.store().engine.submit(batch, Some(durability)) {
-                    Ok(p) => p,
-                    Err(e) if is_crashed(&e) => {
-                        self.history.insert(
-                            u64::MAX,
-                            Committed {
-                                seqno: None,
-                                ops,
-                                commit_ts: now,
-                                durability,
-                                shards,
-                                acked: false,
-                            },
-                        );
-                        return self.crash_and_recover(CrashKind::Power, true, rng);
+                if batch.len() > 1 {
+                    let n = batch.len();
+                    self.stats.batched += n;
+                    for (ops, d) in batch {
+                        if !self.submit_plain(ops, d, false, rng)? {
+                            break;
+                        }
                     }
-                    Err(e) => return fail(FailureClass::Protocol, format!("submit: {e}")),
-                };
-                self.in_flight = Some(InFlight {
-                    pending,
-                    commit: Committed {
-                        seqno: None,
-                        ops,
-                        commit_ts: now,
-                        durability,
-                        shards,
-                        acked: false,
-                    },
-                    armed,
-                });
+                    // The groups assign up to `n` distinct default timestamps from the clock;
+                    // once they are done the clock moves past them, so the next lone
+                    // commit's timestamp is the clock again.
+                    self.pending_advance = n as u64;
+                } else {
+                    let (ops, d) = batch.pop().expect("one");
+                    self.submit_plain(ops, d, true, rng)?;
+                }
             }
             Op::Get {
                 row,
@@ -1216,7 +2020,7 @@ impl World {
                 }
             }
         }
-        if self.in_flight.is_none() {
+        if self.in_flight.is_empty() {
             self.maybe_crash(rng)?;
         }
         Ok(())
@@ -1240,11 +2044,6 @@ fn is_crashed(e: &Error) -> bool {
         Error::Closed => true,
         _ => false,
     }
-}
-
-/// A snapshot at an older seqno over the same view.
-fn older_at(snap: Snapshot, seqno: Seqno) -> Snapshot {
-    snap.at_seqno(seqno)
 }
 
 /// Runs one seeded model check.
@@ -1303,7 +2102,10 @@ fn run_with(
         model,
         engine_seqnos: Vec::new(),
         history: BTreeMap::new(),
-        in_flight: None,
+        unacked: Vec::new(),
+        in_flight: Vec::new(),
+        need_reopen: false,
+        pending_advance: 0,
         base,
         snaps: Vec::new(),
         trace: Vec::new(),
@@ -1313,6 +2115,7 @@ fn run_with(
         reopens,
         done: false,
         workload: Some(workload),
+        queued: std::collections::VecDeque::new(),
     }));
 
     // Shard drivers as scheduler tasks: whichever shard the scheduler picks runs one slice.
@@ -1353,7 +2156,7 @@ fn run_with(
                     if !w.poll_in_flight(rng)? {
                         return Ok(true);
                     }
-                    let Some(op) = w.workload.as_mut().and_then(|wl| wl.next()) else {
+                    let Some(op) = w.next_op() else {
                         return Ok(false);
                     };
                     w.op_index += 1;
@@ -1383,7 +2186,7 @@ fn run_with(
             }),
         );
     }
-    let budget = (cfg.ops as u64 + 10) * 2_000;
+    let budget = (cfg.ops as u64 + 10) * 4_000;
     let finished = sim.run_until(budget, &mut || world.borrow().done);
     let mut w = world.borrow_mut();
     if !finished && w.failure.is_none() {
@@ -1420,7 +2223,8 @@ fn run_with(
         Some(f) => Err(f),
         None => Ok(w.stats),
     };
-    // Tear down in order: shards first (they finish the close), then the engine.
+    // Tear down: close, then drive the shards so they finish the close.
+    w.in_flight.clear();
     if let Some(mut store) = w.store.take() {
         let _ = store.engine.close();
         for _ in 0..4 {
@@ -1430,16 +2234,32 @@ fn run_with(
     result
 }
 
-/// The final state of a run as a dump (for cross-shard-count equivalence tests).
+/// The final state of a run as a dump plus every read's result (for cross-shard-count
+/// equivalence tests), with optional process crashes and reopens at fixed points.
 pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
     let sim = Sim::with_faults(seed, cfg.faults.clone());
     let vfs = sim.vfs();
     let mut store = Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families()).expect("open");
     let base = vfs.now_micros();
     let mut results: Vec<String> = Vec::new();
-    for op in Workload::new(seed ^ 0x5eed, TABLE, cfg.spec.clone()).take(cfg.ops) {
+    for (i, op) in Workload::new(seed ^ 0x5eed, TABLE, cfg.spec.clone())
+        .take(cfg.ops)
+        .enumerate()
+    {
         vfs.advance(1_000);
-        let now = vfs.now_micros();
+        if let Some(every) = cfg.crash_every
+            && i > 0
+            && i % every == 0
+        {
+            vfs.crash(CrashKind::Process);
+            drop(store);
+            store =
+                Store::open(&vfs, cfg.shards, cfg.memtable_budget, &families()).expect("reopen");
+            results.push(format!(
+                "reopen at {i}: seqno {}",
+                store.engine.snapshot().unwrap().seqno()
+            ));
+        }
         match op {
             Op::Commit(mut ops, durability) => {
                 for o in &mut ops {
@@ -1479,12 +2299,11 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
                     let rows = store
                         .scan(&snap, t, Bound::Included(&start), Bound::Excluded(&end), 1)
                         .expect("scan");
-                    results.push(format!("scan {t} {:?}", rows));
+                    results.push(format!("scan {t} {rows:?}"));
                 }
             }
             Op::Snapshot => {}
         }
-        let _ = now;
     }
     let snap = store.engine.snapshot().unwrap();
     let mut dump = store.dump(&snap).expect("dump");

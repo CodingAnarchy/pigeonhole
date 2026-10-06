@@ -236,10 +236,18 @@ pub struct PendingCommit {
     pub(crate) waiter: Waiter<crate::Result<CommitInfo>>,
     /// For the visibility wait (decision D19).
     pub(crate) shm: ShmRegion,
+    /// The engine, for registering an async waker on the global watermark.
+    pub(crate) shared: Arc<crate::shard::Shared>,
+    /// Resolved by the shard; waiting for visibility (async polling).
+    pub(crate) resolved: Option<CommitInfo>,
 }
 
 impl PendingCommit {
     /// Blocks until the commit meets its durability level and is visible.
+    ///
+    /// In application-owned mode this must not be called on a thread that drives the
+    /// commit's shard (it would wait for work only that thread can do): poll the future
+    /// from the event loop instead, or wait on another thread.
     pub fn wait(self) -> crate::Result<CommitInfo> {
         let info = self.waiter.wait().unwrap_or(Err(Error::Closed))?;
         // The shard resolved the commit once its group was durable and its own watermark
@@ -263,23 +271,25 @@ impl Future for PendingCommit {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        match Pin::new(&mut this.waiter).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(Err(Error::Closed)),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Some(Ok(info))) => {
-                if this.shm.visible_seqno() >= info.seqno {
-                    Poll::Ready(Ok(info))
-                } else {
-                    // Visibility lags by at most another shard's group; poll again soon.
-                    // The waiter is already resolved, so re-polling it is cheap.
-                    let (tx, waiter) = pigeonhole_runtime::completion();
-                    tx.notify(Ok(info));
-                    this.waiter = waiter;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+        let info = match this.resolved {
+            Some(info) => info,
+            None => match Pin::new(&mut this.waiter).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Err(Error::Closed)),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(Some(Ok(info))) => {
+                    this.resolved = Some(info);
+                    info
                 }
-            }
+            },
+        };
+        // Durable and applied on its shard; another shard's in-flight group may still hold
+        // the global watermark below it (D19). The shards wake registered waiters when they
+        // publish a watermark, so this never spins.
+        if this.shared.wait_visible(info.seqno, cx.waker()) {
+            Poll::Ready(Ok(info))
+        } else {
+            Poll::Pending
         }
     }
 }

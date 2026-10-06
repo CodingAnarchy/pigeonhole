@@ -11,10 +11,11 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hasher;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Waker;
 
 use arc_swap::ArcSwap;
 use pigeonhole_format::key::{encode_key, encode_marker_key, encode_row_prefix, split_suffix};
-use pigeonhole_format::wal::{BatchBuilder, BatchRef, Mutation, StreamList, WalRecord};
+use pigeonhole_format::wal::{BatchBuilder, BatchRef, StreamList, WalRecord};
 use pigeonhole_format::{
     Cursor, Durability, FamilyId, Kind, Lsn, Seqno, StreamId, TableId, TabletId, Timestamp,
 };
@@ -28,7 +29,7 @@ use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
 use crate::manifest::ManifestWriter;
 use crate::resolve::{Merge, ResolveOpts, Resolver, SourceCursor};
-use crate::snapshot::{MemSet, TabletMap, View};
+use crate::snapshot::{MemSet, ShardMems, TabletMap, View};
 use crate::write::ReadKey;
 use crate::{CommitInfo, Error, Predicate, Result};
 
@@ -102,6 +103,20 @@ pub(crate) struct Locks {
 pub(crate) struct CloseState {
     pub remaining: AtomicUsize,
     pub done: Mutex<Option<Notifier<Result<()>>>>,
+    /// A shard's final WAL sync failed: the close is not clean.
+    pub failed: AtomicBool,
+}
+
+/// One cache line per shard, so shards never share a line through these counters.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub(crate) struct Padded(pub AtomicU64);
+
+/// Commits waiting for the global watermark to reach their seqno (async `PendingCommit`).
+#[derive(Debug, Default)]
+pub(crate) struct VisibilityWaiters {
+    pub count: AtomicUsize,
+    pub list: Mutex<Vec<(Seqno, Waker)>>,
 }
 
 /// Engine-wide state every shard and every caller shares.
@@ -123,7 +138,8 @@ pub(crate) struct Shared {
     pub close: CloseState,
     pub metrics: Vec<ShardMetrics>,
     /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits.
-    pub ts_floors: Vec<AtomicU64>,
+    pub ts_floors: Vec<Padded>,
+    pub waiters: VisibilityWaiters,
     pub memtable_freeze_bytes: u64,
     /// Where frozen memtables go.
     pub flush: crate::flush::FlushBackend,
@@ -145,6 +161,50 @@ impl std::fmt::Debug for Shared {
 impl Shared {
     pub(crate) fn submitter(&self, shard: ShardId) -> &Submitter<ShardMsg> {
         &self.submitters.get().expect("runtime started")[usize::from(shard.0)]
+    }
+
+    /// Registers an async waiter for `seqno` to become visible; returns true if it already is
+    /// (the caller then proceeds without waiting).
+    pub(crate) fn wait_visible(&self, seqno: Seqno, waker: &Waker) -> bool {
+        if self.shm.visible_seqno() >= seqno {
+            return true;
+        }
+        {
+            let mut list = self
+                .waiters
+                .list
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            list.push((seqno, waker.clone()));
+            self.waiters.count.store(list.len(), Ordering::Release);
+        }
+        // The shards check the count after each watermark publish; a publish between the
+        // first check and the registration is caught by this second look.
+        self.shm.visible_seqno() >= seqno
+    }
+
+    /// Wakes every registered waiter whose seqno is visible now. Called by shards after a
+    /// watermark publish, and only when someone is registered (one relaxed load otherwise).
+    pub(crate) fn wake_visible(&self) {
+        if self.waiters.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let visible = self.shm.visible_seqno();
+        let mut list = self
+            .waiters
+            .list
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut i = 0;
+        while i < list.len() {
+            if list[i].0 <= visible {
+                let (_, w) = list.swap_remove(i);
+                w.wake();
+            } else {
+                i += 1;
+            }
+        }
+        self.waiters.count.store(list.len(), Ordering::Release);
     }
 
     /// Publishes a new view built by `f` from the current one, in shared memory too. The
@@ -178,7 +238,14 @@ impl Shared {
     /// is the last process, removes the shared-memory region. WAL files stay until flushes
     /// exist (Milestone B), since the memtables they back have nowhere else to go.
     pub(crate) fn final_close(&self) -> Result<()> {
-        let clean = {
+        // A failed final sync means the close is not clean: the flag stays clear so the next
+        // open replays, and the caller learns about it.
+        let clean = if self.close.failed.load(Ordering::Acquire) {
+            Err(Error::Io(pigeonhole_io::Error::new(
+                ErrorKind::Other,
+                "a shard's final WAL sync failed; the close is not clean",
+            )))
+        } else {
             let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
             manifest.mark_clean()
         };
@@ -323,10 +390,14 @@ pub(crate) enum ShardMsg {
     Decide {
         seqno: Seqno,
         commit: bool,
+        coordinator: ShardId,
     },
     Applied {
         seqno: Seqno,
         from: ShardId,
+        /// The participant could not apply its share (the data may be half applied there;
+        /// the shard poisons itself) or had dropped it: the coordinator never acks `Ok`.
+        error: Option<PrepareError>,
     },
     /// A WAL sync covering groups up to `group` finished.
     SyncDone {
@@ -375,6 +446,8 @@ struct Member {
     ticket: Option<CommitTicket>,
     /// Failed before being logged (not applied, resolved with this error).
     failed: Option<Error>,
+    /// Arena bytes reserved for it until it is applied or dropped.
+    reserved: usize,
 }
 
 #[derive(Debug)]
@@ -409,6 +482,7 @@ impl Member {
             predicate: req.predicate,
             ticket: None,
             failed: None,
+            reserved: 0,
         }
     }
 
@@ -466,7 +540,10 @@ struct Coord {
 struct PreparedShare {
     bytes: Arc<BatchBuilder>,
     commit_ts: Timestamp,
-    coordinator: ShardId,
+    /// Arena bytes reserved until the decision.
+    reserved: usize,
+    /// Its rows are counted in `pending_rows` (from admission until the decision).
+    tracked: bool,
 }
 
 /// A memtable with the smallest user timestamp written to it: a compaction's
@@ -549,27 +626,73 @@ fn slot_of<'a>(
 }
 
 /// Same-commit collapse scratch (decision D34): the last mutation per
-/// `(table, family, row, qualifier, timestamp)` wins. Keyed by two independent 64-bit
-/// hashes, so a false collision needs a 128-bit coincidence.
+/// `(table, family, row, qualifier, timestamp)` wins. Mutations are compared exactly (by the
+/// bytes of their key parts, located by offset within the batch), with reusable buffers and
+/// no per-cell allocation.
 #[derive(Debug, Default)]
 struct Dedup {
-    hashes: Vec<(u64, u64)>,
-    last: HashMap<(u64, u64), u32>,
+    keys: Vec<MutKey>,
+    order: Vec<u32>,
+    loser: Vec<bool>,
+}
+
+/// Where a mutation's key parts lie within the batch bytes.
+#[derive(Debug, Clone, Copy)]
+struct MutKey {
+    table: u32,
+    family: u32,
+    marker: bool,
+    row: (u32, u32),
+    qualifier: (u32, u32),
+    ts: Timestamp,
 }
 
 impl Dedup {
-    /// Fills the tables for `batch`. Returns whether any duplicate exists.
-    fn scan(&mut self, batch: BatchRef<'_>, commit_ts: Timestamp) -> bool {
-        self.hashes.clear();
-        self.last.clear();
+    /// Fills the tables for `batch` (whose bytes are `bytes`). Returns whether any
+    /// duplicate exists.
+    fn scan(&mut self, batch: BatchRef<'_>, bytes: &[u8], commit_ts: Timestamp) -> bool {
+        self.keys.clear();
+        let base = bytes.as_ptr() as usize;
+        let span = |part: &[u8]| -> (u32, u32) {
+            let off = (part.as_ptr() as usize).wrapping_sub(base);
+            (off as u32, part.len() as u32)
+        };
+        for m in batch.iter().flatten() {
+            self.keys.push(MutKey {
+                table: m.table.0,
+                family: m.family.0,
+                marker: m.kind == Kind::FamilyDelete,
+                row: span(m.row),
+                qualifier: span(m.qualifier),
+                ts: m.ts.unwrap_or(commit_ts),
+            });
+        }
+        let n = self.keys.len();
+        self.loser.clear();
+        self.loser.resize(n, false);
+        if n < 2 {
+            return false;
+        }
+        self.order.clear();
+        self.order.extend(0..n as u32);
+        let keys = &self.keys;
+        let part = |(off, len): (u32, u32)| &bytes[off as usize..(off + len) as usize];
+        let cmp = |a: &MutKey, b: &MutKey| {
+            (a.table, a.family, a.marker)
+                .cmp(&(b.table, b.family, b.marker))
+                .then_with(|| part(a.row).cmp(part(b.row)))
+                .then_with(|| part(a.qualifier).cmp(part(b.qualifier)))
+                .then_with(|| a.ts.cmp(&b.ts))
+        };
+        self.order
+            .sort_unstable_by(|a, b| cmp(&keys[*a as usize], &keys[*b as usize]).then(a.cmp(b)));
         let mut dup = false;
-        for (i, m) in batch.iter().enumerate() {
-            let Ok(m) = m else {
-                continue;
-            };
-            let h = hash_mutation(&m, commit_ts);
-            self.hashes.push(h);
-            if self.last.insert(h, i as u32).is_some() {
+        let order = &self.order;
+        for w in order.windows(2) {
+            let (a, b) = (w[0] as usize, w[1] as usize);
+            if cmp(&keys[a], &keys[b]).is_eq() {
+                // Equal keys sort by index, so the earlier one loses to the later one.
+                self.loser[a] = true;
                 dup = true;
             }
         }
@@ -577,33 +700,8 @@ impl Dedup {
     }
 
     fn wins(&self, i: usize) -> bool {
-        self.hashes
-            .get(i)
-            .is_none_or(|h| self.last.get(h).copied() == Some(i as u32))
+        !self.loser.get(i).copied().unwrap_or(false)
     }
-}
-
-fn hash_mutation(m: &Mutation<'_>, commit_ts: Timestamp) -> (u64, u64) {
-    let ts = m.ts.unwrap_or(commit_ts);
-    // Markers live in their own key space and never collapse with column entries.
-    let marker = u8::from(m.kind == Kind::FamilyDelete);
-    let mut a = DefaultHasher::new();
-    a.write_u32(m.table.0);
-    a.write_u32(m.family.0);
-    a.write_u8(marker);
-    a.write(m.row);
-    a.write_u8(0xff);
-    a.write(m.qualifier);
-    a.write_u64(ts);
-    let mut b = Vec::with_capacity(m.row.len() + m.qualifier.len() + 24);
-    b.extend_from_slice(&m.table.0.to_le_bytes());
-    b.extend_from_slice(&m.family.0.to_le_bytes());
-    b.push(marker);
-    b.extend_from_slice(&(m.row.len() as u32).to_le_bytes());
-    b.extend_from_slice(m.row);
-    b.extend_from_slice(m.qualifier);
-    b.extend_from_slice(&ts.to_le_bytes());
-    (a.finish(), pigeonhole_format::checksum::xxh3_64(&b))
 }
 
 fn hash_row(table: TableId, row: &[u8]) -> u64 {
@@ -659,6 +757,12 @@ pub(crate) struct ShardState {
     held: BTreeSet<Seqno>,
     coord: HashMap<Seqno, Coord>,
     prepared: HashMap<Seqno, PreparedShare>,
+    /// Rows (hashed with their table) of prepared, undecided shares, with a count per row.
+    pending_rows: HashMap<u64, u32>,
+    /// Arena bytes reserved by admitted-but-unapplied members and undecided shares.
+    reserved: usize,
+    /// `(tablet, family)` slots whose active memtable crossed the freeze threshold.
+    to_freeze: Vec<(TabletId, FamilyId)>,
     /// Largest default timestamp assigned on this shard (D11).
     ts_floor: Timestamp,
     key_buf: Vec<u8>,
@@ -709,6 +813,9 @@ impl ShardState {
             held: BTreeSet::new(),
             coord: HashMap::new(),
             prepared: HashMap::new(),
+            pending_rows: HashMap::new(),
+            reserved: 0,
+            to_freeze: Vec::new(),
             ts_floor,
             key_buf: Vec::new(),
             dedup: Dedup::default(),
@@ -728,6 +835,11 @@ impl ShardState {
 
     pub(crate) fn raise_ts_floor(&mut self, ts: Timestamp) {
         self.ts_floor = self.ts_floor.max(ts);
+    }
+
+    /// The largest default timestamp known to this shard (seeded from replay, D11).
+    pub(crate) fn ts_floor(&self) -> Timestamp {
+        self.ts_floor
     }
 
     /// The memtable sets of this shard, for a view.
@@ -751,24 +863,25 @@ impl ShardState {
 
     // ---- memtables and views ----
 
-    /// Publishes this shard's memtable sets into a new view.
+    /// Publishes this shard's memtable sets into a new view: only this shard's piece is
+    /// rebuilt; the other shards' pieces are shared by reference.
     fn publish_memtables(&mut self) -> Result<()> {
         self.view_dirty = false;
-        let id = self.id;
-        let sets = self.mem_sets();
-        let mine: Vec<(TabletId, FamilyId)> = self.memtables.keys().copied().collect();
+        let piece = Arc::new(ShardMems {
+            map: self.mem_sets().into_iter().collect(),
+        });
+        let i = usize::from(self.id.0);
         self.shared.publish_view(|current, version| {
-            let mut memtables = current.memtables.clone();
-            memtables.retain(|k, set| set.shard != id || mine.contains(k));
-            for (k, set) in sets {
-                memtables.insert(k, set);
+            let mut mems = current.mems.clone();
+            if i < mems.len() {
+                mems[i] = piece;
             }
             View {
                 version,
                 manifest_version: current.manifest_version,
                 tablets: Arc::clone(&current.tablets),
                 catalog: Arc::clone(&current.catalog),
-                memtables,
+                mems,
             }
         })?;
         Ok(())
@@ -787,19 +900,38 @@ impl ShardState {
         2 * total + 2 * chunk
     }
 
-    fn has_room(&self, bytes: &[u8]) -> bool {
-        match BatchRef::new(bytes) {
-            Ok(batch) => self.arena.free_bytes() >= Self::arena_needed(batch, self.chunk_size),
-            Err(_) => true,
+    /// Reserves arena room for `bytes` (on top of everything already reserved by members of
+    /// this group and undecided shares) or returns `None` when it would not fit.
+    fn reserve_room(&mut self, bytes: &[u8]) -> Option<usize> {
+        let needed = match BatchRef::new(bytes) {
+            Ok(batch) => Self::arena_needed(batch, self.chunk_size),
+            Err(_) => 0,
+        };
+        if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+            return None;
         }
+        self.reserved += needed;
+        Some(needed)
     }
 
-    /// Freezes active memtables over the threshold (or every non-empty one when `all`).
+    fn release_room(&mut self, bytes: usize) {
+        self.reserved = self.reserved.saturating_sub(bytes);
+    }
+
+    /// Freezes the active memtables that crossed the threshold during `apply` (or every
+    /// non-empty one when `all`).
     fn freeze(&mut self, all: bool) -> Result<()> {
         let threshold = self.shared.memtable_freeze_bytes as usize;
-        let keys: Vec<(TabletId, FamilyId)> = self.memtables.keys().copied().collect();
+        let keys: Vec<(TabletId, FamilyId)> = if all {
+            self.to_freeze.clear();
+            self.memtables.keys().copied().collect()
+        } else {
+            std::mem::take(&mut self.to_freeze)
+        };
         for key in keys {
-            let slot = self.memtables.get_mut(&key).expect("key listed");
+            let Some(slot) = self.memtables.get_mut(&key) else {
+                continue;
+            };
             let big = slot.active.table.allocated_bytes() >= threshold;
             if slot.active.table.is_empty() || !(all || big) {
                 continue;
@@ -888,6 +1020,7 @@ impl ShardState {
         self.shared
             .shm
             .publish_pending(u32::from(self.id.0), self.watermark());
+        self.shared.wake_visible();
     }
 
     /// Reserves `n` seqnos per FORMAT §11.3: publish the lower bound, reserve, publish the
@@ -905,7 +1038,9 @@ impl ShardState {
         let now = self.shared.vfs.now_micros();
         let ts = now.max(self.ts_floor + 1);
         self.ts_floor = ts;
-        self.shared.ts_floors[usize::from(self.id.0)].store(ts, Ordering::Release);
+        self.shared.ts_floors[usize::from(self.id.0)]
+            .0
+            .store(ts, Ordering::Release);
         ts
     }
 
@@ -997,7 +1132,8 @@ impl ShardState {
     /// per `(column, timestamp)` (decision D34).
     fn apply(&mut self, bytes: &[u8], seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
         let batch = BatchRef::new(bytes)?;
-        let dups = self.dedup.scan(batch, commit_ts);
+        let dups = self.dedup.scan(batch, bytes, commit_ts);
+        let threshold = self.shared.memtable_freeze_bytes as usize;
         let tablets = Arc::clone(&self.tablets);
         let mut last_route: Option<(TableId, &[u8], TabletId)> = None;
         let mut key_buf = std::mem::take(&mut self.key_buf);
@@ -1056,6 +1192,11 @@ impl ShardState {
                 break;
             }
             slot.active.min_ts = slot.active.min_ts.min(ts);
+            if slot.active.table.allocated_bytes() >= threshold
+                && !self.to_freeze.contains(&(tablet, m.family))
+            {
+                self.to_freeze.push((tablet, m.family));
+            }
         }
         self.key_buf = key_buf;
         result
@@ -1087,8 +1228,15 @@ impl ShardState {
         // so conditions see the applied state and submission order holds per row.
         let mut admitted: Vec<Member> = Vec::with_capacity(members.len());
         self.touched.clear();
-        let mut iter = members.into_iter();
-        while let Some(mut m) = iter.next() {
+        // Once a conditional member is held back, every later plain commit waits with it
+        // (per-row submission order); two-phase-commit records never wait, since the share
+        // the member waits for may need them to be decided.
+        let mut cut = false;
+        for mut m in members {
+            if cut && matches!(m.kind, MemberKind::Single) {
+                self.pending.push(m);
+                continue;
+            }
             if self.closing && matches!(m.kind, MemberKind::Single) {
                 m.failed = Some(Error::Closed);
                 self.settle(m, Ok(()), ctx);
@@ -1099,18 +1247,30 @@ impl ShardState {
                 self.settle(m, Ok(()), ctx);
                 continue;
             }
-            let rows: Vec<u64> = match (&m.kind, BatchRef::new(m.bytes.as_slice())) {
-                (MemberKind::CommitRecord { .. }, _) | (_, Err(_)) => Vec::new(),
-                (_, Ok(batch)) => batch
-                    .iter()
-                    .flatten()
-                    .map(|mu| hash_row(mu.table, mu.row))
-                    .collect(),
-            };
-            if m.conditional() && rows.iter().any(|h| self.touched.contains(h)) {
-                self.pending.push(m);
-                self.pending.extend(iter);
-                break;
+            // A conditional member reads the applied state: its written rows, its read
+            // keys and its predicate row must not be touched by an earlier member of this
+            // group (it then waits for the next group, with everything after it, so per-row
+            // submission order holds) nor by a prepared, undecided share (a single member
+            // waits for the decision; a PREPARE aborts instead, since waiting on another
+            // commit's decision could deadlock two coordinators).
+            if m.conditional() {
+                let (same_group, pending_share) = self.conflicts_with_group(&m);
+                if same_group || (pending_share && matches!(m.kind, MemberKind::Single)) {
+                    if matches!(m.kind, MemberKind::Single) {
+                        cut = true;
+                        self.pending.push(m);
+                    } else {
+                        // A PREPARE that must wait aborts instead (deadlock avoidance).
+                        m.failed = Some(Error::Conflict);
+                        self.settle(m, Ok(()), ctx);
+                    }
+                    continue;
+                }
+                if pending_share {
+                    m.failed = Some(Error::Conflict);
+                    self.settle(m, Ok(()), ctx);
+                    continue;
+                }
             }
             if let Some((table, row, predicate)) = &m.predicate {
                 match self.evaluate(*table, row, predicate) {
@@ -1151,16 +1311,27 @@ impl ShardState {
                     continue;
                 }
             }
-            if !matches!(m.kind, MemberKind::CommitRecord { .. })
-                && !self.has_room(m.bytes.as_slice())
-            {
-                let metrics = &self.shared.metrics[usize::from(self.id.0)];
-                metrics.stalls.fetch_add(1, Ordering::Relaxed);
-                m.failed = Some(Error::Busy);
-                self.settle(m, Ok(()), ctx);
-                continue;
+            if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                match self.reserve_room(m.bytes.as_slice()) {
+                    Some(bytes) => m.reserved = bytes,
+                    None => {
+                        let metrics = &self.shared.metrics[usize::from(self.id.0)];
+                        metrics.stalls.fetch_add(1, Ordering::Relaxed);
+                        m.failed = Some(Error::Busy);
+                        self.settle(m, Ok(()), ctx);
+                        continue;
+                    }
+                }
             }
-            self.touched.extend(rows);
+            self.touch_rows(&m);
+            if let MemberKind::Prepare { .. } = m.kind
+                && let Some(share) = self.prepared.get_mut(&m.seqno)
+                && !share.tracked
+            {
+                share.tracked = true;
+                let bytes = Arc::clone(&share.bytes);
+                self.track_share_rows(bytes.batch().as_bytes(), true);
+            }
             admitted.push(m);
         }
         if !self.pending.is_empty() {
@@ -1281,11 +1452,23 @@ impl ShardState {
             if m.failed.is_some() {
                 continue;
             }
-            if let MemberKind::Single = m.kind
-                && let Err(e) = self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts)
-            {
-                self.poisoned = true;
-                m.failed = Some(e);
+            match m.kind {
+                MemberKind::Single => {
+                    if let Err(e) = self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts) {
+                        self.poisoned = true;
+                        m.failed = Some(e);
+                    }
+                    self.release_room(m.reserved);
+                    m.reserved = 0;
+                }
+                MemberKind::Prepare { .. } => {
+                    // The share keeps its reservation until the decision.
+                    if let Some(share) = self.prepared.get_mut(&m.seqno) {
+                        share.reserved = m.reserved;
+                        m.reserved = 0;
+                    }
+                }
+                MemberKind::CommitRecord { .. } => {}
             }
         }
         if self.view_dirty
@@ -1390,8 +1573,69 @@ impl ShardState {
         self.try_finish_close(ctx);
     }
 
+    /// Whether `m`'s rows (written, read, or its predicate row) overlap rows touched by an
+    /// earlier member of this group, and rows of prepared undecided shares.
+    fn conflicts_with_group(&self, m: &Member) -> (bool, bool) {
+        let mut same = false;
+        let mut pending = false;
+        let mut check = |h: u64| {
+            same |= self.touched.contains(&h);
+            pending |= self.pending_rows.contains_key(&h);
+        };
+        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+            for mu in batch.iter().flatten() {
+                check(hash_row(mu.table, mu.row));
+            }
+        }
+        if let Some((_, reads)) = &m.validate {
+            for r in reads {
+                check(hash_row(r.table, &r.row));
+            }
+        }
+        if let Some((table, row, _)) = &m.predicate {
+            check(hash_row(*table, row));
+        }
+        (same, pending)
+    }
+
+    /// Records `m`'s written rows as touched by this group.
+    fn touch_rows(&mut self, m: &Member) {
+        if matches!(m.kind, MemberKind::CommitRecord { .. }) {
+            return;
+        }
+        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+            for mu in batch.iter().flatten() {
+                self.touched.insert(hash_row(mu.table, mu.row));
+            }
+        }
+    }
+
+    /// Counts or releases the rows of a prepared share.
+    fn track_share_rows(&mut self, bytes: &[u8], add: bool) {
+        let Ok(batch) = BatchRef::new(bytes) else {
+            return;
+        };
+        for mu in batch.iter().flatten() {
+            let h = hash_row(mu.table, mu.row);
+            if add {
+                *self.pending_rows.entry(h).or_insert(0) += 1;
+            } else if let Some(n) = self.pending_rows.get_mut(&h) {
+                *n -= 1;
+                if *n == 0 {
+                    self.pending_rows.remove(&h);
+                }
+            }
+        }
+    }
+
     /// Delivers one member's outcome: a reply, a PREPARED, or the COMMIT decision.
     fn settle(&mut self, mut m: Member, outcome: Result<()>, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let never_logged = m.ticket.is_none() && m.durability != Durability::None;
+        if m.failed.is_some() {
+            // Not applied: its reservation is free again.
+            self.release_room(m.reserved);
+            m.reserved = 0;
+        }
         let result: Result<CommitInfo> = match (m.failed.take(), outcome) {
             (Some(e), _) => Err(e),
             (None, Err(e)) => Err(e),
@@ -1411,8 +1655,13 @@ impl ShardState {
             }
             MemberKind::Prepare { coordinator } => {
                 let error = result.as_ref().err().map(prepare_error_of);
-                if error.is_some() {
-                    self.prepared.remove(&m.seqno);
+                if error.is_some()
+                    && let Some(share) = self.prepared.remove(&m.seqno)
+                {
+                    if share.tracked {
+                        self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                    }
+                    self.release_room(share.reserved);
                 }
                 self.send(
                     coordinator,
@@ -1425,8 +1674,14 @@ impl ShardState {
                 );
             }
             MemberKind::CommitRecord { participants } => {
-                // The decision stands once the record is written; a failed sync only means
-                // the caller cannot be promised durability (the stream is poisoned).
+                // The decision stands once the record is written (a failed sync only means
+                // the caller cannot be promised durability); a record that was never logged
+                // decides abort, since recovery could never find it.
+                let commit = match (&result, never_logged) {
+                    (Ok(_), _) => true,
+                    (Err(_), true) => false,
+                    (Err(_), false) => true,
+                };
                 if let (Err(e), Some(c)) = (result, self.coord.get_mut(&m.seqno)) {
                     c.failed = Some(e);
                 }
@@ -1435,7 +1690,8 @@ impl ShardState {
                         p,
                         ShardMsg::Decide {
                             seqno: m.seqno,
-                            commit: true,
+                            commit,
+                            coordinator: self.id,
                         },
                         ctx,
                     );
@@ -1523,7 +1779,8 @@ impl ShardState {
             PreparedShare {
                 bytes: Arc::clone(&req.bytes),
                 commit_ts: req.commit_ts,
-                coordinator: req.coordinator,
+                reserved: 0,
+                tracked: false,
             },
         );
         self.pending.push(Member {
@@ -1540,6 +1797,7 @@ impl ShardState {
             predicate: None,
             ticket: None,
             failed: None,
+            reserved: 0,
         });
     }
 
@@ -1571,6 +1829,7 @@ impl ShardState {
                     ShardMsg::Decide {
                         seqno,
                         commit: false,
+                        coordinator: self.id,
                     },
                     ctx,
                 );
@@ -1588,6 +1847,7 @@ impl ShardState {
                     ShardMsg::Decide {
                         seqno,
                         commit: false,
+                        coordinator: self.id,
                     },
                     ctx,
                 );
@@ -1608,43 +1868,75 @@ impl ShardState {
             predicate: None,
             ticket: None,
             failed: None,
+            reserved: 0,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
 
-    fn on_decide(&mut self, seqno: Seqno, commit: bool, ctx: &mut ShardContext<'_, ShardMsg>) {
-        let Some(share) = self.prepared.remove(&seqno) else {
-            return;
-        };
-        if commit {
-            self.refresh_tablets();
-            if self
-                .apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts)
-                .is_err()
-            {
-                self.poisoned = true;
+    fn on_decide(
+        &mut self,
+        seqno: Seqno,
+        commit: bool,
+        coordinator: ShardId,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        // Every decision is answered, even for a share this shard never held or already
+        // dropped (a refused or failed PREPARE): the coordinator waits for every participant.
+        let mut error = None;
+        if let Some(share) = self.prepared.remove(&seqno) {
+            if share.tracked {
+                self.track_share_rows(share.bytes.batch().as_bytes(), false);
             }
-            if self.view_dirty && self.publish_memtables().is_err() {
-                self.poisoned = true;
+            self.release_room(share.reserved);
+            if commit {
+                self.refresh_tablets();
+                if let Err(e) = self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts) {
+                    // Possibly half applied: this shard extends nothing further.
+                    self.poisoned = true;
+                    error = Some(prepare_error_of(&e));
+                }
+                if self.view_dirty && self.publish_memtables().is_err() {
+                    self.poisoned = true;
+                    error = error.or(Some(PrepareError::Io));
+                }
+                if self.freeze(false).is_err() {
+                    self.poisoned = true;
+                }
             }
-            if self.freeze(false).is_err() {
-                self.poisoned = true;
+            // A conditional member deferred behind this share may run now.
+            if !self.pending.is_empty() {
+                let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
             }
+        } else if commit {
+            // Decided commit, share gone: it was never prepared here (refused) or failed.
+            error = Some(PrepareError::Io);
         }
         self.send(
-            share.coordinator,
+            coordinator,
             ShardMsg::Applied {
                 seqno,
                 from: self.id,
+                error,
             },
             ctx,
         );
     }
 
-    fn on_applied(&mut self, seqno: Seqno, _from: ShardId, ctx: &mut ShardContext<'_, ShardMsg>) {
+    fn on_applied(
+        &mut self,
+        seqno: Seqno,
+        _from: ShardId,
+        error: Option<PrepareError>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
+        if let Some(e) = error
+            && c.failed.is_none()
+        {
+            c.failed = Some(e.into());
+        }
         c.applied += 1;
         if c.applied < c.participants {
             return;
@@ -1683,12 +1975,21 @@ impl ShardState {
             return;
         }
         self.close_reported = true;
-        if let Some(wal) = self.wal.as_mut()
-            && !self.poisoned
-        {
-            let _ = wal.sync();
-        }
+        self.final_sync();
         self.shared.report_closed();
+    }
+
+    /// The final sync of the stream at close; a failure (or an earlier poisoning) makes the
+    /// close unclean.
+    fn final_sync(&mut self) {
+        let failed = match self.wal.as_mut() {
+            Some(wal) if !self.poisoned => wal.sync().is_err(),
+            Some(_) => true,
+            None => false,
+        };
+        if failed {
+            self.shared.close.failed.store(true, Ordering::Release);
+        }
     }
 
     /// Finishes a shard whose driver is dropped before the close handshake completed: the
@@ -1699,11 +2000,7 @@ impl ShardState {
         }
         self.closing = true;
         self.close_reported = true;
-        if let Some(wal) = self.wal.as_mut()
-            && !self.poisoned
-        {
-            let _ = wal.sync();
-        }
+        self.final_sync();
         if shared.close.remaining.load(Ordering::Acquire) > 0 {
             shared.report_closed();
         }
@@ -1728,8 +2025,12 @@ impl ShardState {
             ShardMsg::Coordinate(req) => self.start_coordination(req, ctx),
             ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
             ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
-            ShardMsg::Decide { seqno, commit } => self.on_decide(seqno, commit, ctx),
-            ShardMsg::Applied { seqno, from } => self.on_applied(seqno, from, ctx),
+            ShardMsg::Decide {
+                seqno,
+                commit,
+                coordinator,
+            } => self.on_decide(seqno, commit, coordinator, ctx),
+            ShardMsg::Applied { seqno, from, error } => self.on_applied(seqno, from, error, ctx),
             ShardMsg::SyncDone { group, result } => self.resolve_through(group, result, ctx),
             ShardMsg::Freeze { reply } => {
                 let r = self.freeze(true);

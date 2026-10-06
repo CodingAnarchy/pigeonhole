@@ -113,30 +113,72 @@ fn durability_matrix() {
 
 #[test]
 fn crash_at_every_write_point() {
-    // A short run whose batches span shards (rows spread over 4 shards, big batches), so the
-    // sweep crosses every step of two-phase commits: PREPARE writes, syncs, the COMMIT
-    // record, and the applies after it.
-    let mut cfg = Config::quiet(40);
+    // Short runs whose batches span shards (rows spread over 4 shards, big batches, groups
+    // of concurrent commits), so the sweep crosses every step of two-phase commits: PREPARE
+    // writes, syncs, the COMMIT record, and the applies after it. Every mutating operation
+    // of each run is a crash point.
+    let mut cfg = Config::quiet(30);
     cfg.shards = 4;
     cfg.spec.read_fraction = 0.2;
     cfg.spec.max_batch = 6;
     cfg.spec.rows = 12;
     cfg.faults.torn_writes = true;
-    let seed = seeds()[0];
-    let total = count_ops(seed, &cfg);
-    eprintln!("sweeping {total} crash points");
     let step: u64 = std::env::var("PIGEONHOLE_SWEEP_STEP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
-    let mut n = 1;
-    while n <= total {
-        let mut c = cfg.clone();
-        c.crash_at = Some(n);
-        if let Err(f) = run(seed, &c) {
-            panic!("crash after mutating op {n}: {f}");
+        .unwrap_or(1);
+    for seed in seeds() {
+        let total = count_ops(seed, &cfg);
+        eprintln!("seed {seed}: sweeping {total} crash points");
+        let mut n = 1;
+        while n <= total {
+            let mut c = cfg.clone();
+            c.crash_at = Some(n);
+            if let Err(f) = run(seed, &c) {
+                panic!("seed {seed}, crash after mutating op {n}: {f}");
+            }
+            n += step;
         }
-        n += step;
+    }
+}
+
+#[test]
+fn io_errors_poison_shards_and_recover_on_reopen() {
+    // Random read and write failures: a failed write or sync poisons the stream, commits
+    // on it fail until the reopen, and whatever was acknowledged survives.
+    let mut cfg = Config::standard(250);
+    cfg.faults.io_error_ppm = 3_000;
+    cfg.crash_ppm = 5_000;
+    cfg.mid_commit_crash_ppm = 5_000;
+    cfg.shards = 3;
+    for seed in seeds() {
+        let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+        eprintln!("seed {seed}: {stats:?}");
+        assert!(
+            stats.io_errors > 0 || stats.crashes > 1,
+            "seed {seed}: no I/O error was injected"
+        );
+    }
+}
+
+#[test]
+fn results_are_identical_across_shard_counts_under_faults() {
+    // Torn and reordered unsynced writes plus a process crash and reopen every 60 ops:
+    // everything written survives a process crash, so every shard count recovers the same
+    // commits and reads the same results.
+    for seed in seeds() {
+        let mut cfg = Config::standard(250);
+        cfg.crash_every = Some(60);
+        cfg.shards = 1;
+        let reference = final_dump(seed, &cfg);
+        for shards in [2, 3, 5, 8] {
+            cfg.shards = shards;
+            let dump = final_dump(seed, &cfg);
+            assert_eq!(
+                dump, reference,
+                "seed {seed}: {shards} shards differ from 1 shard"
+            );
+        }
     }
 }
 

@@ -99,6 +99,13 @@ pub(crate) struct MemSet {
     pub roots: Vec<u32>,
 }
 
+/// One shard's memtable sets, as a view holds them. A shard publishes a new piece when one
+/// of its memtables is created or frozen; the other shards' pieces are shared by reference.
+#[derive(Debug, Default)]
+pub(crate) struct ShardMems {
+    pub map: HashMap<(TabletId, FamilyId), Arc<MemSet>>,
+}
+
 /// One immutable, consistent picture of the database: the tablet map, every tablet's active
 /// and frozen memtables, and the SST set of one manifest version. Any change to any of these
 /// publishes a new view. A frozen memtable stays in every new view until its flushed SST is
@@ -109,7 +116,8 @@ pub struct View {
     pub(crate) manifest_version: ManifestVersion,
     pub(crate) tablets: Arc<TabletMap>,
     pub(crate) catalog: Arc<Catalog>,
-    pub(crate) memtables: HashMap<(TabletId, FamilyId), Arc<MemSet>>,
+    /// One piece per shard.
+    pub(crate) mems: Vec<Arc<ShardMems>>,
 }
 
 impl View {
@@ -128,17 +136,32 @@ impl View {
         &self.tablets
     }
 
-    pub(crate) fn memtables(&self, tablet: TabletId, family: FamilyId) -> Option<&Arc<MemSet>> {
-        self.memtables.get(&(tablet, family))
+    pub(crate) fn memtables(
+        &self,
+        shard: ShardId,
+        tablet: TabletId,
+        family: FamilyId,
+    ) -> Option<&Arc<MemSet>> {
+        self.mems
+            .get(usize::from(shard.0))?
+            .map
+            .get(&(tablet, family))
+    }
+
+    /// Every memtable set of every shard.
+    pub(crate) fn all_memtables(
+        &self,
+    ) -> impl Iterator<Item = (&(TabletId, FamilyId), &Arc<MemSet>)> {
+        self.mems.iter().flat_map(|m| m.map.iter())
     }
 
     /// The record published in shared memory for this view.
     pub(crate) fn to_record(&self) -> ViewRecord {
         let mut memtables = Vec::new();
-        let mut keys: Vec<&(TabletId, FamilyId)> = self.memtables.keys().collect();
-        keys.sort();
-        for key in keys {
-            let set = &self.memtables[key];
+        let mut entries: Vec<(&(TabletId, FamilyId), &Arc<MemSet>)> =
+            self.all_memtables().collect();
+        entries.sort_by_key(|(k, _)| **k);
+        for (key, set) in entries {
             for (age, root) in set.roots.iter().enumerate() {
                 memtables.push(ViewMemtable {
                     tablet: key.0,
@@ -158,6 +181,20 @@ impl View {
     }
 }
 
+/// Counts the live snapshots of a reader process: when it drops to zero the reader moves
+/// its slot pin forward at the next snapshot, so a long-lived reader never blocks
+/// reclamation for ever.
+#[derive(Debug)]
+pub(crate) struct LiveSnapshot {
+    pub count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for LiveSnapshot {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// A seqno plus the view current when it was taken. Reads through a snapshot ignore newer
 /// commits and use only its view. Holding it pins the view's memtables and SST extents
 /// (epoch-based; no locks). Cheap to clone.
@@ -165,6 +202,8 @@ impl View {
 pub struct Snapshot {
     pub(crate) seqno: Seqno,
     pub(crate) view: Arc<View>,
+    /// Reader processes only: counted while any clone of this snapshot lives (a drop guard).
+    pub(crate) _live: Option<Arc<LiveSnapshot>>,
 }
 
 impl Snapshot {
@@ -179,12 +218,14 @@ impl Snapshot {
     }
 
     /// The same view at an older seqno (a view covers every seqno at or below the one it was
-    /// taken with). A test hook for recovery checks; not part of the stable API.
-    #[doc(hidden)]
+    /// taken with). A test hook for recovery checks (the `test-hooks` feature); not part of
+    /// the stable API.
+    #[cfg(feature = "test-hooks")]
     pub fn at_seqno(&self, seqno: Seqno) -> Snapshot {
         Snapshot {
             seqno: seqno.min(self.seqno),
             view: Arc::clone(&self.view),
+            _live: self._live.clone(),
         }
     }
 }

@@ -23,10 +23,10 @@ use crate::manifest::{self, ManifestWriter};
 use crate::read::{self, sources_for};
 use crate::resolve::{Merge, Resolver};
 use crate::shard::{
-    CloseState, CommitReq, CoordinateReq, Locks, Reply, ShardMetrics, ShardMsg, ShardState, Shared,
-    bucket_floor,
+    CloseState, CommitReq, CoordinateReq, Locks, Padded, Reply, ShardMetrics, ShardMsg, ShardState,
+    Shared, VisibilityWaiters, bucket_floor,
 };
-use crate::snapshot::{MemSet, TabletEntry, TabletMap, View};
+use crate::snapshot::{LiveSnapshot, MemSet, ShardMems, TabletEntry, TabletMap, View};
 use crate::write::ReadKey;
 use crate::{
     CellData, EngineOptions, Error, PendingCommit, Predicate, ReadSpec, Result, RowData,
@@ -111,6 +111,8 @@ struct ReaderState {
     /// The last view built from the region, by view version.
     view: Mutex<Option<Arc<View>>>,
     shards: usize,
+    /// Snapshots of this process still alive; the pin moves forward when it drops to zero.
+    live: Arc<AtomicUsize>,
 }
 
 /// Everything behind an [`Engine`] (and the handle a [`Txn`] keeps).
@@ -307,7 +309,9 @@ impl Engine {
             manifest_version,
             tablets: Arc::new(TabletMap::default()),
             catalog: Arc::new(Catalog::default()),
-            memtables: HashMap::new(),
+            mems: (0..shards)
+                .map(|_| Arc::new(ShardMems::default()))
+                .collect(),
         });
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
@@ -326,11 +330,13 @@ impl Engine {
             close: CloseState {
                 remaining: AtomicUsize::new(shards),
                 done: Mutex::new(None),
+                failed: AtomicBool::new(false),
             },
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             ts_floors: (0..shards)
-                .map(|_| AtomicU64::new(catalog.counters.ts_floor))
+                .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
+            waiters: VisibilityWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             flush: FlushBackend::default(),
             submitters: std::sync::OnceLock::new(),
@@ -444,20 +450,27 @@ impl Engine {
             }
         }
 
-        // 6. The first view: tablets, recovered memtables, the manifest version.
-        let mut memtables = HashMap::new();
-        for s in &states {
-            for (k, set) in s.mem_sets() {
-                memtables.insert(k, set);
-            }
+        // The timestamp floor starts above every replayed commit (D11).
+        for (i, s) in states.iter().enumerate() {
+            shared.ts_floors[i].0.store(s.ts_floor(), Ordering::Release);
         }
+
+        // 6. The first view: tablets, recovered memtables, the manifest version.
+        let mems: Vec<Arc<ShardMems>> = states
+            .iter()
+            .map(|s| {
+                Arc::new(ShardMems {
+                    map: s.mem_sets().into_iter().collect(),
+                })
+            })
+            .collect();
         let catalog = Arc::new(catalog);
         let first_view = Arc::new(View {
             version: 1,
             manifest_version,
             tablets: Arc::clone(&tablets),
             catalog: Arc::clone(&catalog),
-            memtables,
+            mems,
         });
         shm.publish_view(&first_view.to_record())?;
         shm.set_manifest_version(manifest_version);
@@ -564,7 +577,9 @@ impl Engine {
             manifest_version,
             tablets: Arc::new(TabletMap::default()),
             catalog: Arc::new(Catalog::default()),
-            memtables: HashMap::new(),
+            mems: (0..shards)
+                .map(|_| Arc::new(ShardMems::default()))
+                .collect(),
         });
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
@@ -580,6 +595,7 @@ impl Engine {
             close: CloseState::default(),
             metrics: Vec::new(),
             ts_floors: Vec::new(),
+            waiters: VisibilityWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             flush: FlushBackend::default(),
             submitters: std::sync::OnceLock::new(),
@@ -593,6 +609,7 @@ impl Engine {
             catalog: Mutex::new((manifest_version, Arc::new(catalog))),
             view: Mutex::new(None),
             shards,
+            live: Arc::new(AtomicUsize::new(0)),
         };
         let inner = Arc::new(Inner {
             shared,
@@ -679,6 +696,12 @@ impl Engine {
     /// visible (`visible_seqno >= seqno`), so the caller reads its own write (D19). A
     /// cross-shard commit becomes visible only when every participant has applied, so its
     /// latency includes the slowest participant's group.
+    ///
+    /// A `Durability::None` commit writes no log record: it is visible at once and lost by
+    /// any crash. The same holds for a commit whose WAL sync fails after its records were
+    /// written and applied: the caller gets an `Io` error, the shard refuses further writes
+    /// until the database is reopened, and the data stays visible until then (it may or
+    /// may not survive the reopen).
     pub fn commit(&self, batch: WriteBatch, durability: Option<Durability>) -> Result<CommitInfo> {
         self.submit(batch, durability)?.wait()
     }
@@ -948,7 +971,7 @@ fn get_in(
     qualifier: &[u8],
     pin: impl FnOnce() -> Arc<View>,
 ) -> Result<Option<CellData>> {
-    let Some((tablet, _)) = view.tablets().route(table, row) else {
+    let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
     };
     let Some(meta) = view.catalog.family(family) else {
@@ -957,7 +980,7 @@ fn get_in(
     if meta.table != table {
         return Err(Error::FamilyNotFound(format!("family {}", family.0)));
     }
-    let sources = sources_for(view, tablet, family);
+    let sources = sources_for(view, shard, tablet, family);
     if sources.is_empty() {
         return Ok(None);
     }
@@ -1020,7 +1043,7 @@ impl Inner {
             .shared
             .ts_floors
             .iter()
-            .map(|f| f.load(Ordering::Acquire))
+            .map(|f| f.0.load(Ordering::Acquire))
             .max()
             .unwrap_or(0)
             .max(catalog.counters.ts_floor);
@@ -1039,14 +1062,31 @@ impl Inner {
         let tablets = catalog.tablets();
         let live: HashSet<TabletId> = tablets.iter().map(|t| t.id).collect();
         self.shared.publish_view(|cur, view_version| {
-            let mut memtables = cur.memtables.clone();
-            memtables.retain(|k, _| live.contains(&k.0));
+            // Pieces of shards that held a dropped tablet are rebuilt without it (rare).
+            let mems = cur
+                .mems
+                .iter()
+                .map(|piece| {
+                    if piece.map.keys().all(|k| live.contains(&k.0)) {
+                        Arc::clone(piece)
+                    } else {
+                        Arc::new(ShardMems {
+                            map: piece
+                                .map
+                                .iter()
+                                .filter(|(k, _)| live.contains(&k.0))
+                                .map(|(k, v)| (*k, Arc::clone(v)))
+                                .collect(),
+                        })
+                    }
+                })
+                .collect();
             View {
                 version: view_version,
                 manifest_version: version,
                 tablets: Arc::new(TabletMap::build(cur.tablets.version() + 1, &tablets)),
                 catalog: Arc::clone(&catalog),
-                memtables,
+                mems,
             }
         })
     }
@@ -1219,7 +1259,19 @@ impl Inner {
         }
         self.check_open()?;
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
-        let (builder, shards) = self.route(batch)?;
+        let (builder, mut shards) = self.route(batch)?;
+        // Every shard that owns a row the transaction read validates it at PREPARE, so two
+        // transactions cannot each read what the other writes (write skew).
+        if let Some((_, reads)) = &validate {
+            let view = self.shared.view.load();
+            for r in reads {
+                if let Some((_, shard)) = view.tablets().route(r.table, &r.row)
+                    && !shards.contains(&shard)
+                {
+                    shards.push(shard);
+                }
+            }
+        }
         let submitted_at = self.shared.vfs.monotonic_nanos();
         let (tx, waiter) = completion();
         let shm = self.shared.shm.clone();
@@ -1253,7 +1305,12 @@ impl Inner {
                     validate,
                 }))?;
         }
-        Ok(PendingCommit { waiter, shm })
+        Ok(PendingCommit {
+            waiter,
+            shm,
+            shared: Arc::clone(&self.shared),
+            resolved: None,
+        })
     }
 
     fn check_and_mutate(
@@ -1324,7 +1381,11 @@ impl Inner {
         }
         let seqno = self.shared.shm.visible_seqno();
         let view = self.shared.view.load_full();
-        Ok(Snapshot { seqno, view })
+        Ok(Snapshot {
+            seqno,
+            view,
+            _live: None,
+        })
     }
 
     pub(crate) fn get(
@@ -1455,15 +1516,21 @@ impl Inner {
             *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
         }
         let (shm, slot, pinned) = &mut *guard;
-        // One pin per attachment, kept at the first snapshot: it protects every later view.
+        // The pin protects the oldest live snapshot and every newer view. While snapshots
+        // of this process are alive it stays put; once none is left it moves forward to this
+        // one, so a long-lived reader never blocks reclamation for ever.
         let seqno = shm.visible_seqno();
-        let seqno = if *pinned {
+        let seqno = if *pinned && r.live.load(Ordering::Acquire) > 0 {
             seqno
         } else {
             let (s, _) = slot.pin(seqno, shm.view_version());
             *pinned = true;
             s
         };
+        r.live.fetch_add(1, Ordering::AcqRel);
+        let live = Some(Arc::new(LiveSnapshot {
+            count: Arc::clone(&r.live),
+        }));
         let record = shm.read_view()?;
         let shm = shm.clone();
         drop(guard);
@@ -1480,7 +1547,11 @@ impl Inner {
                 view
             }
         };
-        Ok(Snapshot { seqno, view })
+        Ok(Snapshot {
+            seqno,
+            view,
+            _live: live,
+        })
     }
 }
 
@@ -1516,28 +1587,32 @@ fn view_from_record(shm: &ShmRegion, record: &ViewRecord, catalog: Arc<Catalog>)
             .1
             .push((m.age, reader, m.root));
     }
-    let memtables = sets
-        .into_iter()
-        .map(|(k, (shard, mut list))| {
-            list.sort_by_key(|(age, ..)| *age);
-            let roots = list.iter().map(|(_, _, r)| *r).collect();
-            let readers = list.into_iter().map(|(_, r, _)| r).collect();
-            (
+    let mut pieces: Vec<HashMap<(TabletId, FamilyId), Arc<MemSet>>> =
+        (0..shm.shard_count()).map(|_| HashMap::new()).collect();
+    for (k, (shard, mut list)) in sets {
+        list.sort_by_key(|(age, ..)| *age);
+        let roots = list.iter().map(|(_, _, r)| *r).collect();
+        let readers = list.into_iter().map(|(_, r, _)| r).collect();
+        if let Some(piece) = pieces.get_mut(usize::from(shard.0)) {
+            piece.insert(
                 k,
                 Arc::new(MemSet {
                     shard,
                     readers,
                     roots,
                 }),
-            )
-        })
-        .collect();
+            );
+        }
+    }
     Ok(View {
         version: record.view_version,
         manifest_version: record.manifest_version,
         tablets: Arc::new(TabletMap::build(record.view_version, &tablets)),
         catalog,
-        memtables,
+        mems: pieces
+            .into_iter()
+            .map(|map| Arc::new(ShardMems { map }))
+            .collect(),
     })
 }
 
@@ -1649,6 +1724,8 @@ impl EngineShard {
         Ok(PendingCommit {
             waiter,
             shm: engine.shared.shm.clone(),
+            shared: Arc::clone(&engine.shared),
+            resolved: None,
         })
     }
 

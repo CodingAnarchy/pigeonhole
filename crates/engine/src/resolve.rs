@@ -213,6 +213,9 @@ pub(crate) struct ResolveOpts {
     pub merge: MergeKind,
     /// Entry-level filter (qualifier selection, time range on puts).
     pub filter: ScanFilter,
+    /// A time range applied to resolved versions instead of pushed down (families with a
+    /// merge operator, decision D82): a version is kept iff `min <= ts < max`.
+    pub resolved_time_range: Option<(Timestamp, Timestamp)>,
 }
 
 impl ResolveOpts {
@@ -227,7 +230,14 @@ impl ResolveOpts {
             value: None,
             merge: MergeKind::None,
             filter: ScanFilter::all(),
+            resolved_time_range: None,
         }
+    }
+
+    /// Whether a resolved version at `ts` is inside the resolved-version time range.
+    fn in_time_range(&self, ts: Timestamp) -> bool {
+        self.resolved_time_range
+            .is_none_or(|(min, max)| min <= ts && ts < max)
     }
 
     /// Versions returned per column (0 = unlimited).
@@ -608,6 +618,9 @@ impl<S: Source> Resolver<S> {
             return Ok(false);
         };
         if std::mem::take(&mut self.run_bad) {
+            if !self.opts.in_time_range(ts) {
+                return Ok(false);
+            }
             return Err(self.merge_failed());
         }
         self.emit_merged(ts, sum)
@@ -652,6 +665,9 @@ impl<S: Source> Resolver<S> {
                         let total = run_sum.wrapping_add(group.operands).wrapping_add(b);
                         self.emit_merged(run_ts, total)
                     }
+                    // A version outside the time range is not returned, so its failed
+                    // fold does not fail the read (D82).
+                    _ if !self.opts.in_time_range(run_ts) => Ok(false),
                     _ => Err(self.merge_failed()),
                 }
             }
@@ -677,9 +693,13 @@ impl<S: Source> Resolver<S> {
         Ok(self.accept())
     }
 
-    /// Applies the value predicate (newest version of the column only) and the version cap
-    /// to the staged cell. Returns whether it is emitted.
+    /// Applies the resolved-version time range, the value predicate (newest version of the
+    /// column only) and the version cap to the staged cell. Returns whether it is emitted.
     fn accept(&mut self) -> bool {
+        if !self.opts.in_time_range(self.out_ts) {
+            self.out_value = None;
+            return false;
+        }
         if self.versions_emitted == 0 {
             if let Some(p) = &self.opts.value {
                 let value = match &self.out_value {
