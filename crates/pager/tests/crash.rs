@@ -452,3 +452,29 @@ fn clean_close_is_recorded_and_cleared() {
             .clean_shutdown()
     );
 }
+
+/// Growing the file is durable before any commit can publish the new extent: root commits
+/// sync with `sync_data`, which (in `SimVfs`, as on some filesystems) does not persist a
+/// length change.
+#[test]
+fn a_committed_extent_in_a_grown_tail_survives_power_loss() {
+    let sim = SimVfs::new(1);
+    let vfs: VfsRef = sim.clone();
+    let pager = Pager::create(&vfs, Path::new(PATH)).unwrap();
+    let extent = pager.allocate(1).unwrap();
+    pager.write(extent, 0, b"published").unwrap();
+    let root = Root {
+        manifest_version: 1,
+        snapshot: Some(extent),
+        snapshot_len: 9,
+        ..Default::default()
+    };
+    pager.commit_root(root).unwrap();
+
+    sim.crash(CrashKind::Power);
+    let opened = Pager::open(&vfs, Path::new(PATH), false).unwrap();
+    assert_eq!(opened.root(), root);
+    let mut buf = [0u8; 9];
+    opened.file().read_at(&mut buf, extent.offset()).unwrap();
+    assert_eq!(&buf, b"published");
+}
