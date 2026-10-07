@@ -1192,6 +1192,10 @@ fn a_read_after_a_background_fired_crash_is_that_crash() {
     // recovers from it.
     let seed = seeds()[0];
     let (mut run, mut rng) = run_with_flushed_commits(seed);
+    // `step` rolls a client `flush()` (and `compact()`) after a commit; at some seeds that
+    // call, not the background flush, takes the armed crash on the commit's own step
+    // (issue #101). Leave the flushing to the shard.
+    (run.cfg.flush_ppm, run.cfg.compact_ppm) = (0, 0);
     let mut plan = run.cfg.faults.clone();
     plan.crash_after_ops = Some(run.vfs.mutating_ops() + 1);
     run.vfs.set_faults(plan);
