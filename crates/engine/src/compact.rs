@@ -11,6 +11,7 @@ use pigeonhole_compaction::{
 };
 use pigeonhole_format::key::encode_row_prefix;
 use pigeonhole_format::manifest::{Edit, SstMeta};
+use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId, Timestamp};
 use pigeonhole_runtime::{ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
 use pigeonhole_sst::SstReader;
@@ -441,19 +442,23 @@ impl CompactionWork {
         if catalog.tablet(self.task.tablet).is_none() {
             // The table was dropped while this ran (its SSTs went with it, retired at the
             // drop): nothing to publish. Free only what this job wrote.
-            if let Some(out) = output {
-                for (_, meta) in out.added {
-                    self.shared.pager.abandon(meta.extent);
-                }
-                for blob in out.new_blob_files {
-                    for e in blob.extents {
-                        self.shared.pager.abandon(e);
-                    }
-                }
+            for x in output.iter().flat_map(written_extents) {
+                self.shared.pager.abandon(x);
             }
             return Err(Error::TableNotFound("the table was dropped".to_owned()));
         }
-        let (edits, readers) = self.edits(&catalog, output)?;
+        // What this job wrote, freed if the edits cannot be built (an output SST that fails
+        // to open): nothing else ever names it (5-6 5.4).
+        let written: Vec<ExtentRef> = output.iter().flat_map(written_extents).collect();
+        let (edits, readers) = match self.edits(&catalog, output) {
+            Ok(e) => e,
+            Err(e) => {
+                for x in written {
+                    self.shared.pager.abandon(x);
+                }
+                return Err(e);
+            }
+        };
         let (tx, rx) = completion();
         let req = ManifestReq {
             kind: manifest::ReqKind::Edits(edits),
@@ -467,6 +472,19 @@ impl CompactionWork {
         manifest::submit(&self.shared, self.shard, req);
         Ok(rx)
     }
+}
+
+/// Every extent a compaction's output occupies: its SSTs and its new blob files.
+fn written_extents(out: &CompactionOutput) -> Vec<ExtentRef> {
+    out.added
+        .iter()
+        .map(|(_, meta)| meta.extent)
+        .chain(
+            out.new_blob_files
+                .iter()
+                .flat_map(|b| b.extents.iter().copied()),
+        )
+        .collect()
 }
 
 impl Task for CompactionWork {

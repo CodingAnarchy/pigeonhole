@@ -103,6 +103,9 @@ pub(crate) struct ShardMetrics {
     pub splits: AtomicU64,
     pub merges: AtomicU64,
     pub moves: AtomicU64,
+    /// Size of the shard's aborted-seqno set after its last batch (test hook).
+    #[cfg(feature = "test-hooks")]
+    pub aborted: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -119,6 +122,8 @@ impl Default for ShardMetrics {
             splits: AtomicU64::new(0),
             merges: AtomicU64::new(0),
             moves: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            aborted: AtomicU64::new(0),
         }
     }
 }
@@ -275,7 +280,8 @@ pub(crate) struct Shared {
     pub busy_ssts: Mutex<HashSet<SstId>>,
     /// Published view version -> manifest version, to map reader-slot pins to extents.
     pub view_versions: Mutex<BTreeMap<u64, ManifestVersion>>,
-    /// Every committed compaction (test hook).
+    /// Every committed compaction (test hook; never built otherwise, 5-6 6.2).
+    #[cfg(feature = "test-hooks")]
     pub compactions: Mutex<Vec<CompactionRecord>>,
     /// Every WAL record appended, in append order (test hook).
     #[cfg(feature = "test-hooks")]
@@ -3657,7 +3663,7 @@ impl ShardState {
                     }
                     self.release_room(share.reserved);
                     // A failed prepare's record (if any) is never needed.
-                    self.aborted.insert(m.seqno);
+                    self.mark_aborted(m.seqno);
                 }
                 self.send(
                     coordinator,
@@ -3682,7 +3688,7 @@ impl ShardState {
                     c.failed = Some(e);
                 }
                 if !commit {
-                    self.aborted.insert(m.seqno);
+                    self.mark_aborted(m.seqno);
                 }
                 for p in participants {
                     self.send(
@@ -3900,7 +3906,7 @@ impl ShardState {
         c.decided = true;
         if c.failed.is_some() || c.moved {
             let shards = c.shards.clone();
-            self.aborted.insert(seqno);
+            self.mark_aborted(seqno);
             for p in shards {
                 self.send(
                     p,
@@ -3919,7 +3925,7 @@ impl ShardState {
         let mut encoded = Vec::new();
         if let Err(e) = StreamList::encode(&streams, &mut encoded) {
             c.failed = Some(e.into());
-            self.aborted.insert(seqno);
+            self.mark_aborted(seqno);
             for p in shards {
                 self.send(
                     p,
@@ -4006,7 +4012,7 @@ impl ShardState {
                 }
                 self.spawn_flush(ctx);
             } else {
-                self.aborted.insert(seqno);
+                self.mark_aborted(seqno);
                 self.advance_checkpoint(ctx);
             }
             // A conditional member deferred behind this share may run now.
@@ -4567,8 +4573,10 @@ impl ShardState {
             .min(self.prepared_min_ts(key.1));
         let now = self.shared.vfs.now_micros();
         let gc = compact::gc_policy(&self.shared, fam, &task, mem_min_ts, now);
-        let record =
-            (task.kind == pigeonhole_compaction::TaskKind::Rewrite).then(|| CompactionRecord {
+        // A test hook's record: production builds keep none (5-6 6.2).
+        let record = (cfg!(feature = "test-hooks")
+            && task.kind == pigeonhole_compaction::TaskKind::Rewrite)
+            .then(|| CompactionRecord {
                 manifest_version: 0,
                 table: meta.table,
                 tablet: key.0,
@@ -4844,6 +4852,19 @@ impl ShardState {
         );
         if failed {
             self.shared.fail_close();
+        }
+    }
+
+    /// Records that cross-shard commit `seqno` aborted, so its PREPARE or COMMIT record in
+    /// `log` is never needed. A seqno with no record there (refused before it was logged,
+    /// or already passed by the checkpoint) is not kept: only the removal of its record
+    /// would ever drop it from the set (5-6 6.3). A PREPARE is logged before its shard
+    /// replies `Prepared`, and a decision follows every reply, so the record is there by
+    /// the time a decision names it.
+    fn mark_aborted(&mut self, seqno: Seqno) {
+        // Newest first: a decision usually follows its own record closely.
+        if self.log.iter().rev().any(|l| l.seqno == seqno) {
+            self.aborted.insert(seqno);
         }
     }
 
@@ -5128,6 +5149,10 @@ impl ShardHandler for ShardState {
         }
         self.retry_starved_freeze(ctx);
         self.try_finish_close(ctx);
+        #[cfg(feature = "test-hooks")]
+        self.shared.metrics[usize::from(self.id.0)]
+            .aborted
+            .store(self.aborted.len() as u64, Ordering::Relaxed);
     }
 }
 

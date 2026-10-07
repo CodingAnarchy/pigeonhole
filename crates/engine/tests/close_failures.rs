@@ -1,5 +1,6 @@
-//! Close and flush failures around cross-shard commits, `drop_table` and `shrink` (issue
-//! #136). Shards are application-owned and driven by hand, so every interleaving is fixed.
+//! Error-path and resource edges from the #90 review: close and flush failures around
+//! cross-shard commits, `drop_table` and `shrink` (issue #136), and leaks (issue #144).
+//! Shards are application-owned and driven by hand, so every interleaving is fixed.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -358,6 +359,8 @@ fn close_racing_drop_table_and_a_flush_is_clean() {
 /// While armed, holds the database file's `set_len` on the thread named `shrink`, or a
 /// write to another file on the thread named `backup`, until released: the tests close the
 /// engine while `shrink` is between its commit and its truncation, or `backup` is copying.
+/// While `fail_written` is set, reads of database-file ranges written since it was set
+/// fail.
 #[derive(Debug)]
 struct GateVfs {
     inner: Arc<SimVfs>,
@@ -369,6 +372,8 @@ struct Gate {
     armed: AtomicBool,
     entered: AtomicBool,
     released: AtomicBool,
+    fail_written: AtomicBool,
+    written: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 #[derive(Debug)]
@@ -380,6 +385,32 @@ struct GateFile {
 }
 
 impl GateFile {
+    fn check_read(&self, offset: u64, len: usize) -> pigeonhole_io::Result<()> {
+        let g = &self.gate;
+        if !self.db || !g.fail_written.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let end = offset + len as u64;
+        let written = g.written.lock().unwrap();
+        if written.iter().any(|&(a, b)| offset < b && a < end) {
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected read failure",
+            ));
+        }
+        Ok(())
+    }
+
+    fn note_write(&self, offset: u64, len: usize) {
+        if self.db && self.gate.fail_written.load(Ordering::Acquire) {
+            self.gate
+                .written
+                .lock()
+                .unwrap()
+                .push((offset, offset + len as u64));
+        }
+    }
+
     /// While armed, holds the first call on `thread` here until released (at most two
     /// seconds: a final close that wrongly runs meanwhile may wait for what this thread
     /// holds; the test then fails on its assertions rather than hanging).
@@ -450,21 +481,27 @@ impl Vfs for GateVfs {
 
 impl pigeonhole_io::File for GateFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.check_read(offset, buf.len())?;
         self.inner.read_at(buf, offset)
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
         if !self.db {
             self.hold("backup");
         }
+        self.note_write(offset, buf.len());
         self.inner.write_at(buf, offset)
     }
     fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
-        self.inner.submit_read(buf, offset)
+        match self.check_read(offset, buf.len()) {
+            Ok(()) => self.inner.submit_read(buf, offset),
+            Err(e) => pigeonhole_io::Completion::ready(Err(e)),
+        }
     }
     fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
         if !self.db {
             self.hold("backup");
         }
+        self.note_write(offset, buf.len());
         self.inner.submit_write(buf, offset)
     }
     fn sync_data(&self) -> pigeonhole_io::Result<()> {
@@ -737,4 +774,90 @@ fn close_stops_a_backup_in_flight() {
     drop(shards);
     drop(engine);
     assert!(clean_at_rest(&vfs));
+}
+
+#[test]
+fn compaction_outputs_that_fail_to_open_are_freed() {
+    // 5-6 5.4: a compaction whose new SSTs could not be opened (an EIO reading a footer)
+    // dropped them without abandoning their extents, which then stayed allocated until
+    // reopen; a slot that kept failing leaked one set of outputs per retry.
+    let (mut db, gate) = open_gated(60, |o| {
+        o.compaction.l0_trigger = u32::MAX;
+        o.compaction.level_base_bytes = u64::MAX;
+    });
+    let t = db.table_on(0, "t");
+    for _ in 0..2 {
+        db.fill(&t);
+        let pm = db.engine.flush_pending().unwrap();
+        db.wait(pm).unwrap();
+    }
+    assert_eq!(db.engine.unreferenced_bytes(), 0);
+    // What the compaction writes (its outputs) cannot be read back.
+    gate.fail_written.store(true, Ordering::Release);
+    let pm = db.engine.compact_pending(Some(t.id)).unwrap();
+    let r = db.wait(pm);
+    gate.fail_written.store(false, Ordering::Release);
+    assert!(
+        r.is_err(),
+        "the compaction failed to open its outputs: {r:?}"
+    );
+    db.settle();
+    assert_eq!(
+        db.engine.unreferenced_bytes(),
+        0,
+        "the failed compaction's outputs stay allocated"
+    );
+    // The inputs are intact, and a retry succeeds.
+    let pm = db.engine.compact_pending(Some(t.id)).unwrap();
+    db.wait(pm).unwrap();
+    assert_eq!(read(&db.engine, &t, b"r007"), Some(vec![7u8; 1000]));
+    let (_, engine) = db.close();
+    drop(engine);
+}
+
+#[test]
+fn refused_cross_shard_commits_leave_no_aborted_seqnos() {
+    // 5-6 6.3: a cross-shard commit refused before its records were logged (an optimistic
+    // transaction's conflict) kept its seqno in the shards' aborted sets until reopen.
+    let mut db = open(61);
+    let (a, b) = (Arc::clone(&db.tables[0]), Arc::clone(&db.tables[1]));
+    for i in 0..20u32 {
+        let mut txn = db.engine.begin().unwrap();
+        let _ = txn.get(a.id, a.families[0].id, b"x", b"q").unwrap();
+        let mut wb = WriteBatch::new();
+        db.put(&mut wb, 0, b"x", &i.to_be_bytes());
+        db.commit_on(wb, Durability::Buffered, &[0, 1]).unwrap();
+        for (t, row) in [(&a, b"x"), (&b, b"y")] {
+            txn.batch()
+                .put(
+                    t.id,
+                    t.families[0].id,
+                    row,
+                    b"q",
+                    None,
+                    ValueRef::Bytes(b"txn"),
+                )
+                .unwrap();
+        }
+        // `Txn::commit` blocks: it runs on a thread while this one drives the shards.
+        let h = std::thread::spawn(move || txn.commit(Some(Durability::Buffered)));
+        while !h.is_finished() {
+            db.step(0);
+            db.step(1);
+            std::thread::yield_now();
+        }
+        let r = h.join().unwrap();
+        assert!(
+            matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+            "{r:?}"
+        );
+    }
+    db.settle();
+    assert_eq!(
+        db.engine.aborted_seqnos(),
+        0,
+        "refused commits' seqnos are kept"
+    );
+    let (_, engine) = db.close();
+    drop(engine);
 }

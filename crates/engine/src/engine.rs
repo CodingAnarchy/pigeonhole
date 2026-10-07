@@ -605,6 +605,7 @@ impl Engine {
             flushed_roots: Mutex::new(HashSet::new()),
             busy_ssts: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "test-hooks")]
             compactions: Mutex::new(Vec::new()),
             #[cfg(feature = "test-hooks")]
             appended: Mutex::new(Vec::new()),
@@ -1074,6 +1075,7 @@ impl Engine {
             flushed_roots: Mutex::new(HashSet::new()),
             busy_ssts: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "test-hooks")]
             compactions: Mutex::new(Vec::new()),
             #[cfg(feature = "test-hooks")]
             appended: Mutex::new(Vec::new()),
@@ -1637,6 +1639,19 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// Seqnos the shards hold as aborted cross-shard commits, as of each shard's last
+    /// batch (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn aborted_seqnos(&self) -> u64 {
+        self.inner
+            .shared
+            .metrics
+            .iter()
+            .map(|m| m.aborted.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// The WAL records appended since the last call (or since open), in append order.
