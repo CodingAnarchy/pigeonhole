@@ -8,7 +8,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 
 | Phase | File | Range |
 |---|---|---|
-| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D152 |
+| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D154 |
 
 ## Index
 
@@ -140,7 +140,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119
 - [D127](phase-1.md#d127) — a model harness attributes an error to an armed power loss only once the crash has fired · harness, #62
 - [D128](phase-1.md#d128) — flush and compaction outputs are trimmed to their length before they are published · pager, compaction, #106
-- [D129](phase-1.md#d129) — tablet changes are off by default until hardened · tablets, #97
+- [D129](phase-1.md#d129) — tablet changes are off by default until hardened · tablets, #97 · **amended by D153**
 - [D130](phase-1.md#d130) — a tablet's owner is not persisted; owners are re-derived at open · tablets, #97; persisting placement is #104
 - [D131](phase-1.md#d131) — checkpoints compare slots against the catalog, not the shard · tablets, #97
 - [D132](phase-1.md#d132) — a commit routed through an older tablet map · tablets, #97 · **amended by D145**
@@ -157,13 +157,15 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D143](phase-1.md#d143) — Should commits pipelined on one row keep their order during a move · engine
 - [D144](phase-1.md#d144) — Who rewrites a cold child's inherited SST so that the balancer can merge it back · tablets, #95 · amends D134
 - [D145](phase-1.md#d145) — How long may a commit wait on a tablet change, and when is a PREPARE routed with an older tablet map refused · tablets, #102 · amends D132
-- [D146](phase-1.md#d146) — How does the balancer avoid thrashing, oversubscribing a shard's slots and growing the tablet count without… · tablets, #103 · amends D134
+- [D146](phase-1.md#d146) — How does the balancer avoid thrashing, oversubscribing a shard's slots and growing the tablet count without… · tablets, #103 · amends D134 · **amended by D154**
 - [D147](phase-1.md#d147) — Does a prepared, undecided cross-shard share count as above a compaction's inputs · engine, #132 · amends D70
 - [D148](phase-1.md#d148) — Reader snapshots from before a writer restart expire with `SnapshotExpired` · process, #140 F7-1
 - [D149](phase-1.md#d149) — A reader builds a view only from the catalog of the record's own manifest version · process, #140 F7-2
 - [D150](phase-1.md#d150) — Blocking on a shard-driving thread: refuse before submitting, `WouldDeadlock` after · engine, #135 · amends D88
 - [D151](phase-1.md#d151) — The application-owned close reports its outcome through `closed()` · engine, #135 · amends D88
 - [D152](phase-1.md#d152) — A panicked engine-owned shard thread fails the close instead of hanging · engine, #135
+- [D153](phase-1.md#d153) — Tablet changes are on by default · engine, #38, #168 · amends D129
+- [D154](phase-1.md#d154) — An idle shard's balancer backs off to 10 s · engine, #168 · amends D146
 
 ## Open questions
 _None._
