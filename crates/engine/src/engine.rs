@@ -673,6 +673,10 @@ impl Engine {
             },
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
+            wal_pin_bytes: match options.wal_pin_bytes {
+                0 => options.memtable_budget.saturating_mul(2),
+                n => n,
+            },
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
             identity,
@@ -1132,6 +1136,7 @@ impl Engine {
             drivers: Default::default(),
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
+            wal_pin_bytes: 0,
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
             identity,

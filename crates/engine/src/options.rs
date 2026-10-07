@@ -51,6 +51,12 @@ pub struct EngineOptions {
     pub reader_slots: u32,
     /// WAL segment configuration.
     pub wal: WalOptions,
+    /// Bytes a shard's WAL stream may hold past its oldest record that is not yet in SSTs
+    /// before the shard flushes the memtables that record (and the ones after it) wrote,
+    /// however small they are (#137). Without it one write to a slot that is never written
+    /// again would keep the stream's checkpoint, and so the WAL and the next open's replay,
+    /// growing for the life of the process. 0 (the default) means twice `memtable_budget`.
+    pub wal_pin_bytes: u64,
     /// Tablet split threshold in bytes of live data (default 256 MiB). A tablet whose SSTs
     /// hold at least this much splits in two; two adjacent cold tablets on one shard holding
     /// less than a quarter of it together merge. Only read when `tablet_changes` is on.
@@ -118,6 +124,7 @@ impl EngineOptions {
             shm_dir: None,
             reader_slots: 126,
             wal: WalOptions::default(),
+            wal_pin_bytes: 0,
             tablet_split_bytes: 256 << 20,
             tablet_changes: true,
             balance_interval_nanos: 100_000_000,
