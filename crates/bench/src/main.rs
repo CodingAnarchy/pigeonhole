@@ -50,6 +50,8 @@ OPTIONS:
     --cache B              every engine's read cache (SQLite: page cache gets
                            write buffer + cache) [default: 256 MiB]
     --sync                 fsync every commit on every engine [default: buffered]
+    --tablet-changes       Pigeonhole: let tablets split, merge and move between shards,
+                           so one table's writes spread over every shard [default: off]
     --dir DIR              where stores are created [default: system temp dir]
     --json PATH            write results as JSON
     --markdown PATH        write the markdown summary
@@ -73,6 +75,7 @@ struct Args {
     write_buffer: Option<u64>,
     cache: Option<u64>,
     sync: bool,
+    tablet_changes: bool,
     dir: Option<PathBuf>,
     json: Option<PathBuf>,
     markdown: Option<PathBuf>,
@@ -110,6 +113,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
             "--sync" => a.sync = true,
+            "--tablet-changes" => a.tablet_changes = true,
             "--dir" => a.dir = Some(parse(&arg, it.next())?),
             "--json" => a.json = Some(parse(&arg, it.next())?),
             "--markdown" => a.markdown = Some(parse(&arg, it.next())?),
@@ -166,7 +170,10 @@ fn memory(a: &Args) -> MemoryBudget {
 }
 
 fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
-    let mut r = PigeonholeRunner::default().sync(a.sync).memory(memory(a));
+    let mut r = PigeonholeRunner::default()
+        .sync(a.sync)
+        .memory(memory(a))
+        .tablet_changes(a.tablet_changes);
     if let Some(n) = shards.or(a.shards) {
         r = r.shards(n);
     }
@@ -354,6 +361,8 @@ mod tests {
         let c = config(&a, WorkloadKind::YcsbA).unwrap();
         assert_eq!((c.records, c.operations), (10, 20));
         assert!(a.sync);
+        assert!(!a.tablet_changes);
+        assert!(args("scaling --tablet-changes").tablet_changes);
         assert_eq!(args("all --engine all").engines.len(), 4);
         assert_eq!(args("").command, "help");
         assert!(parse_args(["--bogus".to_owned()]).is_err());
@@ -385,12 +394,18 @@ mod tests {
         assert_eq!(suite.results.len(), 1);
         assert!(suite.to_markdown().contains("| ycsb-c | pigeonhole |"));
         let a = args(&format!(
-            "scaling --scale smoke --shards 2 --write-buffer 16777216 --dir {}",
+            "scaling --scale smoke --shards 2 --tablet-changes --write-buffer 16777216 --dir {}",
             dir.display()
         ));
         let suite = bench(&a).unwrap();
         assert_eq!(suite.results.len(), 2);
         assert!(suite.scaling.is_some());
+        assert!(
+            suite
+                .results
+                .iter()
+                .all(|r| r.store_config.contains("tablets=on"))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

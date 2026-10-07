@@ -259,7 +259,7 @@ fn scaling(c: &mut Criterion) {
         }
         let tables: Vec<Arc<TableInfo>> = tables.into_iter().map(Option::unwrap).collect();
         group.throughput(Throughput::Elements(1));
-        group.bench_function(BenchmarkId::new("commits/s per thread", shards), |b| {
+        group.bench_function(BenchmarkId::new("commits/s, all threads", shards), |b| {
             b.iter_custom(|iters| {
                 let per = (iters / shards as u64 + 1).min(5_000);
                 let start = Instant::now();
@@ -280,7 +280,10 @@ fn scaling(c: &mut Criterion) {
                         });
                     }
                 });
-                (start.elapsed() / shards as u32)
+                // Time per commit across all threads, so the throughput reads as the
+                // aggregate commits/s of the N threads.
+                start
+                    .elapsed()
                     .mul_f64(iters as f64 / (per * shards as u64) as f64)
             })
         });
@@ -348,7 +351,7 @@ fn scaling_one_table(c: &mut Criterion) {
             next += shards as u64 * 2_000;
         }
         group.throughput(Throughput::Elements(1));
-        group.bench_function(BenchmarkId::new("commits/s per thread", shards), |b| {
+        group.bench_function(BenchmarkId::new("commits/s, all threads", shards), |b| {
             b.iter_custom(|iters| {
                 let per = (iters / shards as u64 + 1).min(5_000);
                 let base = next;
@@ -371,7 +374,10 @@ fn scaling_one_table(c: &mut Criterion) {
                         });
                     }
                 });
-                (start.elapsed() / shards as u32)
+                // Time per commit across all threads, so the throughput reads as the
+                // aggregate commits/s of the N threads.
+                start
+                    .elapsed()
                     .mul_f64(iters as f64 / (per * shards as u64) as f64)
             })
         });

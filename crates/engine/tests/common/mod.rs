@@ -215,6 +215,9 @@ impl Config {
         compaction.level_multiplier = 2;
         compaction.max_levels = 4;
         compaction.target_sst_bytes = 64 << 10;
+        // `PIGEONHOLE_TABLET_CHANGES=1` turns tablet changes on (with the fast balancer) in
+        // every suite built on this config.
+        let tablets_from_env = std::env::var("PIGEONHOLE_TABLET_CHANGES").is_ok_and(|v| v == "1");
         Config {
             ops,
             faults,
@@ -236,9 +239,9 @@ impl Config {
             compaction,
             flush_ppm: 30_000,
             compact_ppm: 15_000,
-            tablet_changes: false,
+            tablet_changes: tablets_from_env,
             tablet_ops_ppm: 0,
-            balance_fast: false,
+            balance_fast: tablets_from_env,
             tablet_every: None,
         }
     }

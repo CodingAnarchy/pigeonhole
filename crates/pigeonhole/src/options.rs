@@ -45,6 +45,8 @@ pub struct Options {
     allow_unregistered_merge_operators: bool,
     vfs: Option<VfsRef>,
     wal_segment_size: Option<u64>,
+    tablet_changes: bool,
+    tablet_balance: Option<(Duration, u64, u64)>,
 }
 
 impl Default for Options {
@@ -62,6 +64,8 @@ impl Default for Options {
             allow_unregistered_merge_operators: false,
             vfs: None,
             wal_segment_size: None,
+            tablet_changes: false,
+            tablet_balance: None,
         }
     }
 }
@@ -143,6 +147,29 @@ impl Options {
         self
     }
 
+    /// Let a table's tablets split, merge and move between shards (default off), so the
+    /// writes of one table spread over every shard. Off, each table is one tablet on one
+    /// shard: writes to a single table use one shard thread whatever [`shards`](Self::shards)
+    /// says, and only commits touching several tables run on several shards.
+    ///
+    /// On, each shard's balancer splits a tablet at 256 MiB of live data or under sustained
+    /// write skew, moves tablets to colder shards and merges small cold neighbours. Reads are
+    /// never blocked by a change. Known limits: tablet owners are not stored in the file, so
+    /// a reopen places the tablets again; and two commits on one row that are in flight
+    /// together may be applied in either order while that row's tablet moves (a commit
+    /// submitted after an earlier one returned is always applied after it).
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().shards(4).tablet_changes(true);
+    /// # let _ = options;
+    /// ```
+    pub fn tablet_changes(mut self, yes: bool) -> Self {
+        self.tablet_changes = yes;
+        self
+    }
+
     /// Run on a custom filesystem implementation. Used by the deterministic simulation
     /// suites; applications never need it.
     #[doc(hidden)]
@@ -157,6 +184,16 @@ impl Options {
     #[doc(hidden)]
     pub fn wal_segment_size(mut self, bytes: u64) -> Self {
         self.wal_segment_size = Some(bytes);
+        self
+    }
+
+    /// Balancer tuning, a test hook (ICR 0009): a pass every `interval`, write skew acted on
+    /// once a shard writes `min_writes` rows in one, and size splits at `split_bytes`. The
+    /// simulation suites use tiny values so tablets change during short runs. Only read with
+    /// [`tablet_changes`](Self::tablet_changes) on. Applications never need it.
+    #[doc(hidden)]
+    pub fn tablet_balance(mut self, interval: Duration, min_writes: u64, split_bytes: u64) -> Self {
+        self.tablet_balance = Some((interval, min_writes, split_bytes));
         self
     }
 }
@@ -364,6 +401,12 @@ impl Options {
         o.allow_unregistered_merge = self.allow_unregistered_merge_operators;
         if let Some(bytes) = self.wal_segment_size {
             o.wal.segment_size = bytes;
+        }
+        o.tablet_changes = self.tablet_changes;
+        if let Some((interval, min_writes, split_bytes)) = self.tablet_balance {
+            o.balance_interval_nanos = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+            o.balance_min_writes = min_writes;
+            o.tablet_split_bytes = split_bytes;
         }
         // Custom operators (`merge_operators`) are kept for Phase 2: the engine resolves only
         // the built-in `pigeonhole.i64_add` so far, and refuses a family naming any other.

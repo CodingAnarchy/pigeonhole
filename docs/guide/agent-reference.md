@@ -88,6 +88,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `create_if_missing(bool)` | Default true. |
 | `merge_operator(Arc<dyn MergeOperator>)` | P2. Register custom operator. |
 | `allow_unregistered_merge_operators(bool)` | Open read-only with compaction off if a family names an unregistered operator. |
+| `tablet_changes(bool)` | Let tablets split, merge and move between shards so one table's writes spread over every shard (default off: a table is one tablet on one shard). Tablet owners are not stored; a reopen places tablets again. |
 
 `ReaderOptions` (P4, early): `block_cache(usize)`, `shm_dir(..)`, `merge_operator(..)`.
 
@@ -199,7 +200,7 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 ## Not yet available
 | Feature | Phase |
 |---|---|
-| Tablet splits: one table stays on one shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)) | P1 |
+| Tablet splits on by default (today opt-in, `Options::tablet_changes(true)`; [#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)) | P1 |
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
 | zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |

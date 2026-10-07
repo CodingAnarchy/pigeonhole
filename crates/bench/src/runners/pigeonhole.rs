@@ -21,6 +21,7 @@ pub(crate) struct Settings {
     pub(crate) shards: Option<usize>,
     pub(crate) memory: MemoryBudget,
     pub(crate) sync: bool,
+    pub(crate) tablet_changes: bool,
 }
 
 #[derive(Debug)]
@@ -92,6 +93,21 @@ impl PigeonholeRunner {
         self.settings.sync = yes;
         self
     }
+
+    /// `true`: tablets split, merge and move between shards, so the bench table's writes
+    /// spread over every shard ([`Options::tablet_changes`]); `false` (default): the table is
+    /// one tablet on one shard.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().shards(4).tablet_changes(true);
+    /// assert!(r.describe().contains("tablets=on"));
+    /// ```
+    pub fn tablet_changes(mut self, yes: bool) -> Self {
+        self.settings.tablet_changes = yes;
+        self
+    }
 }
 
 impl Runner for PigeonholeRunner {
@@ -108,7 +124,8 @@ impl Runner for PigeonholeRunner {
                 Durability::Buffered
             })
             .memtable_budget(s.memory.write_buffer)
-            .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
+            .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX))
+            .tablet_changes(s.tablet_changes);
         if let Some(n) = s.shards {
             options = options.shards(n);
         }
@@ -170,10 +187,11 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
-            durability(s.sync)
+            durability(s.sync),
+            if s.tablet_changes { " tablets=on" } else { "" }
         )
     }
 }
