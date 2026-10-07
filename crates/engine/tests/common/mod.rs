@@ -2448,7 +2448,8 @@ impl World {
 
     /// The timestamp of commit `seqno` from the entries it left in the store, for a record
     /// a flush already checkpointed away: the timestamp of any entry an op with a default
-    /// timestamp produced (0 when every op carries its own).
+    /// timestamp produced, and no op with an explicit one could have (0 when every op
+    /// carries its own).
     fn raw_commit_ts(&self, seqno: Seqno, ops: &[ModelOp]) -> Result<Timestamp, Fail> {
         if !ops.iter().any(|op| match op {
             ModelOp::Put { ts, .. } => ts.is_none(),
@@ -2517,7 +2518,29 @@ impl World {
                         ModelOp::DeleteCell { .. } => false,
                     }
             });
-            if default_ts {
+            // An op on the same column with an explicit timestamp equal to this entry's may
+            // have written it instead (#163: a default and an explicit put on one column).
+            // Such an entry says nothing about the commit timestamp: look for another one.
+            let explicit_here = ops.iter().any(|op| {
+                op_table(op) == table
+                    && op_row(op) == row
+                    && match op {
+                        ModelOp::Put {
+                            family: f,
+                            qualifier: q,
+                            ts: Some(ts),
+                            ..
+                        }
+                        | ModelOp::DeleteCell {
+                            family: f,
+                            qualifier: q,
+                            ts,
+                            ..
+                        } => f == &family && q == &qualifier && *ts == parts.ts,
+                        _ => false,
+                    }
+            });
+            if default_ts && !explicit_here {
                 return Ok(parts.ts);
             }
         }

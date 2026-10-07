@@ -353,16 +353,9 @@ fn results_are_identical_across_shard_counts_under_faults() {
     }
 }
 
-#[test]
-fn a_read_after_a_background_fired_crash_recovers() {
-    // Issue #62: an armed power loss fires on a shard's background flush with nothing in
-    // flight; the next read step meets the dead store (its SSTs' handles died with the
-    // crash) and must recover from that crash, not report a read mismatch.
-    let mut cfg = Config::quiet(30);
-    // Nothing random between the steps: no explicit maintenance, one plain commit at a time.
-    (cfg.flush_ppm, cfg.compact_ppm) = (0, 0);
-    (cfg.cas_ppm, cfg.txn_ppm, cfg.tasks) = (0, 0, 1);
-    let reads: Vec<Op> = (0..cfg.spec.rows)
+/// A get of every row, then a scan: the steps that meet a crash fired in the background.
+fn reads_of_every_row(cfg: &Config) -> Vec<Op> {
+    (0..cfg.spec.rows)
         .map(|i| Op::Get {
             row: format!("row{i:06}").into_bytes(),
             family: "f".into(),
@@ -372,7 +365,37 @@ fn a_read_after_a_background_fired_crash_recovers() {
             start: b"row".to_vec(),
             end: b"rox".to_vec(),
         }])
-        .collect();
+        .collect()
+}
+
+#[test]
+fn a_checkpointed_commit_keeps_its_default_timestamp_beside_an_explicit_one() {
+    // #163: a `Durability::None` commit put one column twice, at its default timestamp and
+    // at an explicit one just above it. With tablet changes on, the checker reads such a
+    // commit's timestamp from its entries, and took the explicit entry's: the rebuilt model
+    // collapsed the default put onto it (D34) and lost a version the engine kept.
+    let mut cfg = Config::quiet(30);
+    (cfg.flush_ppm, cfg.compact_ppm) = (0, 0);
+    (cfg.cas_ppm, cfg.txn_ppm, cfg.tasks) = (0, 0, 1);
+    cfg.tablet_changes = true;
+    cfg.balance_fast = false;
+    for seed in [10, 84, 263] {
+        let stats = read_after_background_crash(seed, &cfg, &reads_of_every_row(&cfg))
+            .unwrap_or_else(|f| panic!("{f}"));
+        assert_eq!(stats.background_crashes, 1, "seed {seed}");
+    }
+}
+
+#[test]
+fn a_read_after_a_background_fired_crash_recovers() {
+    // Issue #62: an armed power loss fires on a shard's background flush with nothing in
+    // flight; the next read step meets the dead store (its SSTs' handles died with the
+    // crash) and must recover from that crash, not report a read mismatch.
+    let mut cfg = Config::quiet(30);
+    // Nothing random between the steps: no explicit maintenance, one plain commit at a time.
+    (cfg.flush_ppm, cfg.compact_ppm) = (0, 0);
+    (cfg.cas_ppm, cfg.txn_ppm, cfg.tasks) = (0, 0, 1);
+    let reads = reads_of_every_row(&cfg);
     for seed in seeds() {
         let stats =
             read_after_background_crash(seed, &cfg, &reads).unwrap_or_else(|f| panic!("{f}"));
