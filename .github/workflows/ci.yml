@@ -12,9 +12,11 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on PR branches only: every push to main runs to completion,
+# so a breakage introduced by a combination of merges is never hidden by a cancel.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'branch' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
