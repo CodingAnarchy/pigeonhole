@@ -341,6 +341,38 @@ fn io_errors_poison_shards_and_recover_on_reopen() {
 }
 
 #[test]
+fn undecided_prepares_pass_the_checkpoint() {
+    // Issue #181: a cross-shard commit whose stream failed before its coordinator logged a
+    // COMMIT is aborted, and a participant's checkpoint passes its PREPARE at once (D116)
+    // while the other participants' PREPAREs survive. The checker took that hole for a lost
+    // commit. No CAS or transaction runs on a thread here, so these seeds replay exactly
+    // (found by a seed search over 1..=3000).
+    for seed in [328, 422] {
+        let stats = run(seed, &undecided_prepares_config()).unwrap_or_else(|f| panic!("{f}"));
+        assert!(
+            stats.undecided_prepares_passed > 0,
+            "seed {seed} no longer reaches the case: {stats:?}"
+        );
+    }
+}
+
+/// I/O errors and crashes on three shards, every commit on the test's thread.
+fn undecided_prepares_config() -> Config {
+    let mut cfg = Config::standard(250);
+    cfg.faults.io_error_ppm = 8_000;
+    cfg.crash_ppm = 5_000;
+    cfg.mid_commit_crash_ppm = 5_000;
+    cfg.shards = 3;
+    cfg.cas_ppm = 0;
+    cfg.txn_ppm = 0;
+    // The pinned seeds reach the case with tablet changes off; a sweep's
+    // `PIGEONHOLE_TABLET_CHANGES=1` must not change their workload.
+    cfg.tablet_changes = false;
+    cfg.balance_fast = false;
+    cfg
+}
+
+#[test]
 fn an_injected_read_error_in_a_transaction_read_abandons_the_transaction() {
     // Issue #99: a transaction's read can hit an injected read error. That is an expected
     // `Io` error (nothing was submitted), not a divergence from the model. Many steps are
