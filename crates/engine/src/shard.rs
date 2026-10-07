@@ -307,6 +307,9 @@ pub(crate) struct Shared {
     pub view_capacity: usize,
     /// Bumped whenever a tablet change finishes or is given up (see `CoordinateReq::epoch`).
     pub tablet_epoch: AtomicU64,
+    /// Full compactions (`Engine::compact`) in progress: the balancer starts no change
+    /// meanwhile, so a tablet does not move past the shards' rounds (issue #94).
+    pub full_compactions: AtomicUsize,
     pub waiters: VisibilityWaiters,
     /// Shards with a freeze deferred until the watermark passes their memtable (kicked by
     /// whoever publishes a watermark).
@@ -4061,7 +4064,9 @@ impl ShardState {
                 let Some(tablet) = view.tablets.entry(key.0) else {
                     continue;
                 };
-                if let Some(t) = compact::plan_full(tablet, key.1, &fam.levels_meta(), last, &busy)
+                let rewrite = self.tablets_on();
+                if let Some(t) =
+                    compact::plan_full(tablet, key.1, &fam.levels_meta(), last, &busy, rewrite)
                 {
                     task = Some((key, t));
                     break;

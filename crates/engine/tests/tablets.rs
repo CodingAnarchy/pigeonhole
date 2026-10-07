@@ -121,9 +121,10 @@ fn results_are_identical_across_shard_counts_with_tablet_changes() {
 }
 
 #[test]
-#[ignore = "#94"]
 fn results_identical_across_shard_counts_regressions() {
-    // Seeds of the 1–300 sweep where a multi-shard run misses a cell the 1-shard run has.
+    // Seeds of the 1–300 sweep where a multi-shard run missed a cell the 1-shard run had
+    // (#94): the balancer moved a tablet past the shards' full-compaction rounds (13), and a
+    // lone SST was moved to the last level, keeping a delete a rewrite purged (106).
     for seed in [13, 106] {
         identical_across_shard_counts(seed);
     }
@@ -241,6 +242,10 @@ impl Db {
         let mut wb = WriteBatch::new();
         wb.put(self.table.id, f, row, b"q", None, ValueRef::Bytes(value))
             .unwrap();
+        self.commit(wb)
+    }
+
+    fn commit(&mut self, wb: WriteBatch) -> u64 {
         let mut pc = self
             .engine
             .submit(wb, Some(Durability::Buffered))
@@ -469,6 +474,34 @@ fn the_default_timestamp_floor_travels_with_a_tablet() {
     let (ts, v) = db.get(b"row").unwrap();
     assert_eq!(v, b"newest");
     assert!(ts > last, "{ts} <= {last}");
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_full_compaction_rewrites_a_lone_sst() {
+    // Issue #94: with tablet changes on, how many SSTs a slot holds depends on when splits
+    // and moves flushed it, so a full compaction rewrites a lone L0 SST rather than moving
+    // it to the last level, and purges the same deletes (D74) whatever the layout.
+    let mut db = open(1, |_| {});
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    db.put(b"row", b"old");
+    let (ts, _) = db.get(b"row").unwrap();
+    let mut wb = WriteBatch::new();
+    wb.delete_row(id, b"row", Some(ts + 10)).unwrap();
+    db.commit(wb);
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    let m = db.engine.compact_pending(None).unwrap();
+    db.drive(m).unwrap();
+    // The purged delete no longer hides a write below it (D74).
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"row", b"q", Some(ts + 5), ValueRef::Bytes(b"below"))
+        .unwrap();
+    db.commit(wb);
+    assert_eq!(db.get(b"row"), Some((ts + 5, b"below".to_vec())));
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();

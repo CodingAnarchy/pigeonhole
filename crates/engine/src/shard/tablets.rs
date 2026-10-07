@@ -813,7 +813,8 @@ impl ShardState {
             && !self.replaying
             && !self.poisoned
             && !self.shared.closing.load(Ordering::Acquire)
-            && !self.shared.pager_poisoned.load(Ordering::Acquire);
+            && !self.shared.pager_poisoned.load(Ordering::Acquire)
+            && self.shared.full_compactions.load(Ordering::Acquire) == 0;
         let decision = if idle {
             self.decide(now, mem, &mem_per)
         } else {

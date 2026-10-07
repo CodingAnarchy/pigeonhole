@@ -115,12 +115,18 @@ pub(crate) fn narrow(
 }
 
 /// A task compacting every level of a slot into the last level (`Engine::compact`).
+///
+/// With `rewrite` (tablet changes on), a lone SST above the last level is rewritten rather
+/// than moved, so the compaction purges what a bottommost compaction may (D74) whatever
+/// the slot's layout: splits and moves flush and share SSTs at points that depend on the
+/// shard count, and a move would keep deletes a rewrite of the same rows drops (issue #94).
 pub(crate) fn plan_full(
     tablet: &TabletEntry,
     family: FamilyId,
     levels: &Levels,
     last_level: u8,
     busy: &[SstId],
+    rewrite: bool,
 ) -> Option<CompactionTask> {
     let inputs: Vec<(u8, Vec<SstId>)> = levels
         .levels
@@ -153,7 +159,7 @@ pub(crate) fn plan_full(
             return None;
         }
     }
-    let kind = if total == 1 {
+    let kind = if total == 1 && !rewrite {
         TaskKind::TrivialMove
     } else {
         TaskKind::Rewrite

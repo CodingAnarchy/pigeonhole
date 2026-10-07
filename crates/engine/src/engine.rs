@@ -235,6 +235,7 @@ enum ReplayedRecordKind {
 #[doc(hidden)]
 pub struct PendingMaintenance {
     waiters: Vec<Waiter<Result<()>>>,
+    rounds: Option<CompactRounds>,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -245,6 +246,23 @@ impl std::future::Future for PendingMaintenance {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        loop {
+            match self.poll_round(cx) {
+                std::task::Poll::Ready(Ok(())) => {}
+                other => return other,
+            }
+            let this = &mut *self;
+            match this.rounds.as_mut().map(CompactRounds::again) {
+                Some(Some(round)) => this.waiters = round?,
+                _ => return std::task::Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl PendingMaintenance {
+    fn poll_round(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
         let mut failed = None;
         let mut i = 0;
         while i < self.waiters.len() {
@@ -272,6 +290,62 @@ impl std::future::Future for PendingMaintenance {
             std::task::Poll::Pending
         }
     }
+}
+
+/// The rounds of a full compaction with tablet changes on (issue #94). A tablet that moves
+/// during a round can leave a shard before its round reached it and reach one whose round
+/// is over, so a round during which a tablet change finished is followed by another; the
+/// balancer starts no change while one runs (`Shared::full_compactions`), so the rounds end
+/// once the changes in flight at the start have finished.
+#[derive(Debug)]
+struct CompactRounds {
+    shared: Arc<Shared>,
+    table: Option<TableId>,
+    /// `Shared::tablet_epoch` when the current round was sent.
+    epoch: u64,
+}
+
+impl CompactRounds {
+    fn new(shared: &Arc<Shared>, table: Option<TableId>) -> Option<Self> {
+        if !shared.balance.enabled {
+            return None;
+        }
+        shared.full_compactions.fetch_add(1, Ordering::AcqRel);
+        Some(Self {
+            shared: Arc::clone(shared),
+            table,
+            epoch: shared.tablet_epoch.load(Ordering::Acquire),
+        })
+    }
+
+    /// The next round's replies, if a tablet change finished during the last one.
+    fn again(&mut self) -> Option<Result<Vec<Waiter<Result<()>>>>> {
+        let epoch = self.shared.tablet_epoch.load(Ordering::Acquire);
+        if epoch == self.epoch {
+            return None;
+        }
+        self.epoch = epoch;
+        Some(compact_round(&self.shared, self.table))
+    }
+}
+
+impl Drop for CompactRounds {
+    fn drop(&mut self) {
+        self.shared.full_compactions.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Asks every shard to compact its slots (of `table`) into the last level.
+fn compact_round(shared: &Shared, table: Option<TableId>) -> Result<Vec<Waiter<Result<()>>>> {
+    let mut waiters = Vec::with_capacity(shared.shards);
+    for i in 0..shared.shards {
+        let (tx, rx) = completion();
+        shared
+            .submitter(ShardId(i as u16))
+            .submit(ShardMsg::CompactAll { table, reply: tx })?;
+        waiters.push(rx);
+    }
+    Ok(waiters)
 }
 
 /// One raw entry of a table (a test hook).
@@ -511,6 +585,7 @@ impl Engine {
             },
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
+            full_compactions: AtomicUsize::new(0),
             waiters: VisibilityWaiters::default(),
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
@@ -960,6 +1035,7 @@ impl Engine {
             balance: BalanceConfig::default(),
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
+            full_compactions: AtomicUsize::new(0),
             waiters: VisibilityWaiters::default(),
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
@@ -1408,7 +1484,10 @@ impl Engine {
                 .submit(ShardMsg::Balance { reply: Some(tx) })?;
             waiters.push(rx);
         }
-        Ok(PendingMaintenance { waiters })
+        Ok(PendingMaintenance {
+            waiters,
+            rounds: None,
+        })
     }
 
     /// The largest default-timestamp floor of any shard (including floors raised by shards
@@ -1697,19 +1776,26 @@ fn families_in_order(view: &View, table: TableId, listed: &[FamilyId]) -> Result
 #[derive(Debug)]
 pub(crate) struct PendingMaintenance {
     waiters: Vec<Waiter<Result<()>>>,
+    rounds: Option<CompactRounds>,
 }
 
 impl PendingMaintenance {
-    /// Blocks until every shard replied.
-    pub(crate) fn wait(self) -> Result<()> {
-        let mut result = Ok(());
-        for w in self.waiters {
-            match w.wait().unwrap_or(Err(Error::Closed)) {
-                Ok(()) => {}
-                Err(e) => result = Err(e),
+    /// Blocks until every shard replied (to every round of a full compaction).
+    pub(crate) fn wait(mut self) -> Result<()> {
+        loop {
+            let mut result = Ok(());
+            for w in std::mem::take(&mut self.waiters) {
+                match w.wait().unwrap_or(Err(Error::Closed)) {
+                    Ok(()) => {}
+                    Err(e) => result = Err(e),
+                }
+            }
+            result?;
+            match self.rounds.as_mut().and_then(CompactRounds::again) {
+                Some(round) => self.waiters = round?,
+                None => return Ok(()),
             }
         }
-        result
     }
 }
 
@@ -1741,7 +1827,10 @@ impl Inner {
             op,
             reply: Some(tx),
         })?;
-        Ok(PendingMaintenance { waiters: vec![rx] })
+        Ok(PendingMaintenance {
+            waiters: vec![rx],
+            rounds: None,
+        })
     }
 }
 
@@ -2124,7 +2213,10 @@ impl Inner {
                 .submit(ShardMsg::FlushAll { reply: tx })?;
             waiters.push(rx);
         }
-        Ok(PendingMaintenance { waiters })
+        Ok(PendingMaintenance {
+            waiters,
+            rounds: None,
+        })
     }
 
     fn compact_pending(&self, table: Option<TableId>) -> Result<PendingMaintenance> {
@@ -2132,15 +2224,9 @@ impl Inner {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
-        let mut waiters = Vec::with_capacity(self.shared.shards);
-        for i in 0..self.shared.shards {
-            let (tx, rx) = completion();
-            self.shared
-                .submitter(ShardId(i as u16))
-                .submit(ShardMsg::CompactAll { table, reply: tx })?;
-            waiters.push(rx);
-        }
-        Ok(PendingMaintenance { waiters })
+        let rounds = CompactRounds::new(&self.shared, table);
+        let waiters = compact_round(&self.shared, table)?;
+        Ok(PendingMaintenance { waiters, rounds })
     }
 
     // ---- close ----
