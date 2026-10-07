@@ -739,7 +739,9 @@ pub(crate) enum ShardMsg {
     Kick,
     /// A failed background compaction's backoff passed (on a moving clock): retry.
     RetryCompaction,
-    /// Split, merge or move tablets this shard owns (replies when done, if asked).
+    /// Split, merge or move tablets this shard owns (replies when done, if asked). Sent by
+    /// the test hooks only; the balancer starts its own changes.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     TabletOp {
         op: TabletOpKind,
         reply: Option<Notifier<Result<()>>>,
@@ -749,6 +751,7 @@ pub(crate) enum ShardMsg {
         result: Result<ManifestVersion>,
     },
     /// Run the balancer now (a test hook); replies once whatever it started is done.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     Balance {
         reply: Option<Notifier<Result<()>>>,
     },
