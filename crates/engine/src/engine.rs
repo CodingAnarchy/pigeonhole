@@ -1254,7 +1254,10 @@ impl Engine {
 
     // ---- maintenance ----
 
-    /// Freezes and flushes every memtable; returns when the SSTs are in the manifest.
+    /// Freezes and flushes every memtable; returns when the SSTs are in the manifest. A
+    /// memtable the arena has no chunk to replace (snapshots pin the retired ones) waits as
+    /// a write stall does, and the flush fails with [`Error::Busy`] when no chunk frees up
+    /// in time (D124, D126; issue #116).
     pub fn flush(&self) -> Result<()> {
         self.inner.flush_pending()?.wait()
     }

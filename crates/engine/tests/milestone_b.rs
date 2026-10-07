@@ -1771,3 +1771,145 @@ fn a_close_flushes_memtables_in_place_when_snapshots_hold_the_arena() {
     drop(snap);
     db.close().unwrap();
 }
+
+// ---- #116: flush and compact while snapshots hold the arena ----
+
+#[test]
+fn flush_and_compact_are_busy_at_once_on_a_frozen_clock_when_snapshots_hold_the_arena() {
+    starved_flush_and_compact(false);
+}
+
+#[test]
+fn flush_and_compact_are_busy_after_the_stall_timeout_when_snapshots_hold_the_arena() {
+    starved_flush_and_compact(true);
+}
+
+/// The arena of the #111 test: after the second round, four of the eight memtables can be
+/// replaced and four cannot while a snapshot pins the first round's memtables. `flush` and
+/// `compact` used to report success with those four still unflushed. While a second
+/// snapshot also pins the second round's memtables, nothing frees a chunk: both are refused
+/// with `Busy` (D124, D126), at once on the frozen `SimVfs` clock and after
+/// `write_stall_timeout_nanos` on a real one. Without it, the four flushed second-round
+/// memtables free the chunks the other four need: the freeze is tried again, and `flush`
+/// returns only once every family is flushed through its last commit.
+fn starved_flush_and_compact(moving_clock: bool) {
+    const TIMEOUT: u64 = 2_000_000;
+    let sim = SimVfs::new(116);
+    let vfs: VfsRef = if moving_clock {
+        Arc::new(FailReadsVfs::real(&sim, None))
+    } else {
+        sim.clone()
+    };
+    let mut o = common::options(Arc::clone(&sim), 1, 2 << 20);
+    o.vfs = Arc::clone(&vfs);
+    o.memtable_freeze_bytes = 1 << 20;
+    o.write_stall_timeout_nanos = TIMEOUT;
+    let rows = |round: u32, family: usize| match (round, family) {
+        (0, 0..4) => 190,
+        (0, _) => 170,
+        _ => 1,
+    };
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+    let mut run = || {
+        for _ in 0..100_000 {
+            let mut more = false;
+            for s in &mut shards {
+                more |= s.run_once(u64::MAX);
+            }
+            if !more {
+                return;
+            }
+        }
+        panic!("the shards never went idle");
+    };
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut wait = |mut m: pigeonhole_engine::PendingMaintenance, run: &mut dyn FnMut()| loop {
+        match std::pin::Pin::new(&mut m).poll(&mut cx) {
+            Poll::Ready(r) => break r,
+            Poll::Pending => run(),
+        }
+    };
+    let defs: Vec<(String, FamilyOptions)> = (0..8)
+        .map(|f| (format!("f{f}"), FamilyOptions::default()))
+        .collect();
+    let t = db.create_table("t", &defs).unwrap();
+    let mut last = Vec::new();
+    let mut snap = None;
+    for round in 0..2 {
+        last.clear();
+        for (fi, f) in t.families.iter().enumerate() {
+            let mut wb = WriteBatch::new();
+            for i in 0..rows(round, fi) {
+                let row = format!("r{round}-{i:03}");
+                let v = ValueRef::Bytes(&[7u8; 1000]);
+                wb.put(t.id, f.id, row.as_bytes(), b"q", None, v).unwrap();
+            }
+            let mut pc = db.submit(wb, Some(Durability::Buffered)).unwrap();
+            let info = loop {
+                match poll_commit(&mut pc) {
+                    Poll::Ready(r) => break r.unwrap(),
+                    Poll::Pending => run(),
+                }
+            };
+            last.push((f.id, info.seqno));
+        }
+        if round == 0 {
+            snap = Some(db.snapshot().unwrap());
+            wait(db.flush_pending().unwrap(), &mut run).unwrap();
+        }
+    }
+    let flushed_through = |family| {
+        let info = Engine::inspect_manifest(&vfs, Path::new(DB)).unwrap();
+        info.flushed
+            .iter()
+            .filter(|((_, f), _)| *f == family)
+            .map(|(_, s)| *s)
+            .max()
+            .unwrap_or(0)
+    };
+
+    let pin_round1 = db.snapshot().unwrap();
+    let start = vfs.monotonic_nanos();
+    let flushed = wait(db.flush_pending().unwrap(), &mut run);
+    assert!(matches!(flushed, Err(Error::Busy)), "{flushed:?}");
+    let waited = vfs.monotonic_nanos() - start;
+    if moving_clock {
+        assert!(
+            waited >= TIMEOUT,
+            "refused after {waited} ns, before the timeout"
+        );
+    } else {
+        assert_eq!(waited, 0, "the frozen clock moved");
+    }
+    let compacted = wait(db.compact_pending(None).unwrap(), &mut run);
+    assert!(matches!(compacted, Err(Error::Busy)), "{compacted:?}");
+    let behind = last
+        .iter()
+        .filter(|(f, seqno)| flushed_through(*f) < *seqno)
+        .count();
+    assert!(behind > 0, "every family flushed: the arena was not short");
+
+    drop(pin_round1);
+    wait(db.flush_pending().unwrap(), &mut run).unwrap();
+    for (f, seqno) in &last {
+        assert!(
+            flushed_through(*f) >= *seqno,
+            "family {f:?} not flushed through {seqno}"
+        );
+    }
+    wait(db.compact_pending(None).unwrap(), &mut run).unwrap();
+    drop(snap);
+    let snap = db.snapshot().unwrap();
+    for (fi, f) in t.families.iter().enumerate() {
+        for round in 0..2 {
+            for i in 0..rows(round, fi) {
+                let row = format!("r{round}-{i:03}");
+                let cell = db.get(&snap, t.id, f.id, row.as_bytes(), b"q").unwrap();
+                assert!(cell.is_some(), "{} {row}", f.name);
+            }
+        }
+    }
+    drop(snap);
+    db.close().unwrap();
+    run();
+}

@@ -261,6 +261,11 @@ impl Pigeonhole {
     /// the WAL behind the flushed data is checkpointed. Background flushes run on their own
     /// as memtables fill; call this to make everything so far durable in the file.
     ///
+    /// Each flushed memtable needs a fresh one from the memtable arena. When snapshots pin
+    /// the arena's memory, the flush waits as a stalled write does, and fails with
+    /// [`ErrorCode::Busy`](crate::ErrorCode::Busy) if no room frees up within the
+    /// write-stall timeout. Nothing is lost: drop old snapshots and retry.
+    ///
     /// ```
     /// use pigeonhole::{Durability, Family, Options, Pigeonhole};
     ///
@@ -289,7 +294,9 @@ impl Pigeonhole {
     /// Compacts every table fully: flushes, then merges every level into the last one.
     /// Versions beyond a family's `max_versions`, expired cells and tombstones that no
     /// snapshot can still need are dropped. Compaction otherwise runs in the background;
-    /// call this after a bulk load or delete to reclaim space and speed up reads.
+    /// call this after a bulk load or delete to reclaim space and speed up reads. Its flush
+    /// can fail with [`ErrorCode::Busy`](crate::ErrorCode::Busy) as
+    /// [`flush`](Self::flush) does.
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole};

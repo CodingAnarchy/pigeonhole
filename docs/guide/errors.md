@@ -51,7 +51,7 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | 21 | `Closed` | The database is closed. | A table or snapshot handle used after `close()`. | Reopen the database. |
 | 22 | `NoReaderSlot` | Every reader slot in the shared-memory region is taken. | Too many concurrent reader processes. | Close idle readers, then retry. |
 | 23 | `RecordTooLarge` | A commit is too large for one WAL record. | A very large `WriteBatch`. | Split it into smaller batches (each atomic on its own). |
-| 24 | `Busy` | Writes are stalled past the engine's write-stall timeout (30 s), or one batch cannot fit the memtable arena. | A write found the arena full and waited for a flush, which did not free room in time (a slow or full disk, ingest faster than flush and compaction can keep up, or snapshots pinning memtables), or a single batch is larger than the arena. | **A stall is transient: back off and retry**, and drop old snapshots. A batch that keeps failing is larger than the arena: split it, or raise `Options::memtable_budget`. |
+| 24 | `Busy` | Writes, a `flush` or a `compact` are stalled past the engine's write-stall timeout (30 s), or one batch cannot fit the memtable arena. | A write found the arena full and waited for a flush, or a flush had no room for the fresh memtables it needs, and nothing freed room in time (a slow or full disk, ingest faster than flush and compaction can keep up, or snapshots pinning memtables); or a single batch is larger than the arena. | **A stall is transient: back off and retry**, and drop old snapshots. A batch that keeps failing is larger than the arena: split it, or raise `Options::memtable_budget`. |
 
 ## Handling guide
 | Situation | Action |
