@@ -427,6 +427,33 @@ impl Catalog {
         }
     }
 
+    /// Places every tablet for `shards` shards keeping each shard within `max_slots`
+    /// `(tablet, family)` slots where it can (with tablet changes on; owners are not
+    /// persisted, D130). In tablet id order, a tablet goes to shard `tablet % shards` when
+    /// that fits, else to the shard holding the fewest slots. Returns the most slots any
+    /// shard ends up holding, above `max_slots` only when the tablets fit no other way.
+    pub(crate) fn place(&mut self, shards: usize, max_slots: usize) -> usize {
+        let shards = shards.max(1);
+        let mut slots = vec![0usize; shards];
+        let widths: HashMap<TableId, usize> = self
+            .tables
+            .values()
+            .map(|t| (t.id, t.families.len()))
+            .collect();
+        for t in self.tablets.values_mut() {
+            let width = widths.get(&t.table).copied().unwrap_or(0);
+            let preferred = usize::from(shard_for(t.id, shards).0);
+            let shard = if slots[preferred] + width <= max_slots {
+                preferred
+            } else {
+                (0..shards).min_by_key(|&s| slots[s]).unwrap_or(preferred)
+            };
+            slots[shard] += width;
+            t.shard = ShardId(shard as u16);
+        }
+        slots.into_iter().max().unwrap_or(0)
+    }
+
     pub(crate) fn alloc_table(&mut self) -> TableId {
         let id = TableId(self.counters.next_table.max(1));
         self.counters.next_table = id.0 + 1;

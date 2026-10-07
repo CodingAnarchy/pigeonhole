@@ -528,7 +528,7 @@ impl ShardState {
     /// chunks. Every slot written to takes a memtable chunk (and usually two before it
     /// freezes), and frozen memtables keep theirs until flushed and released.
     fn max_slots(&self) -> usize {
-        self.arena.region().len() / self.chunk_size.max(1) / 4
+        crate::engine::max_slots(self.arena.region().len(), self.chunk_size)
     }
 
     /// Whether `shard` can take `extra` more slots under [`ShardState::max_slots`].
@@ -868,6 +868,13 @@ impl ShardState {
         //    still shares SSTs with a sibling: their bytes would count twice).
         for t in &owned {
             let (bytes, shared) = live_bytes(&view, t, &refs);
+            if bytes >= cfg.split_bytes && !shared && !room_for(t) {
+                trace!(
+                    "shard {} balancer: tablet {} is due a size split but the shard holds \
+                     {slots} of its {max_slots} slots",
+                    self.id.0, t.id.0
+                );
+            }
             if bytes >= cfg.split_bytes
                 && !shared
                 && room_for(t)

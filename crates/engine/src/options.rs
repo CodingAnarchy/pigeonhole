@@ -62,10 +62,13 @@ pub struct EngineOptions {
     /// **Not safe to turn on yet:** splits, merges, moves and the balancer have open
     /// correctness and liveness bugs (#94, #95, #98, #102–#105). Known limits when on:
     /// - each shard holds at most a quarter of its arena's chunks in `(tablet, family)`
-    ///   slots (16 per shard for budgets up to 64 MiB); splits and moves that would pass it
-    ///   silently stop (#104);
-    /// - tablet owners are not persisted: a reopen puts every tablet back on shard
-    ///   `tablet % shards`, losing earlier moves (#104);
+    ///   slots; arenas are cut into at least 256 chunks when this is on, so every shard
+    ///   serves at least 64 slots, and splits and moves past that are refused (the balancer
+    ///   skips them);
+    /// - tablet owners are not persisted: a reopen places every tablet again (on shard
+    ///   `tablet % shards` when that keeps the shard within its slots, else on the shard
+    ///   holding the fewest), losing earlier moves, and cuts the arenas into smaller chunks
+    ///   when the tablets need more slots than that;
     /// - a shard's balancer runs only while that shard processes writes (#103).
     pub tablet_changes: bool,
     /// How often each shard's balancer looks at its tablets (nanoseconds, default 100 ms):

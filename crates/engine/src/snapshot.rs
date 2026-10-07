@@ -40,8 +40,8 @@ pub(crate) struct TabletEntry {
 /// An immutable routing table: for each table, its tablets' row ranges and owning shards.
 /// Swapped atomically as a whole; read without locks.
 ///
-/// At open every tablet goes to shard `tablet % shards`. With `EngineOptions::tablet_changes`
-/// on, splits, merges and the balancer's moves hand tablets to other shards while the
+/// At open every tablet goes to shard `tablet % shards` (with `EngineOptions::tablet_changes`
+/// on, unless that shard's arena would serve too many slots). With it on, splits, merges and the balancer's moves hand tablets to other shards while the
 /// database runs, and each change publishes a new map with a higher version. Which shard applies a row never changes the result.
 ///
 /// ```
