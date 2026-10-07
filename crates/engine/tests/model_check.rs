@@ -143,6 +143,14 @@ fn a_seed_replays_the_same_io_trace() {
     let mut cfg = Config::standard(250);
     cfg.shards = 3;
     (cfg.cas_ppm, cfg.txn_ppm) = (0, 0);
+    // Spares are prepared only once a stream is half way through the segment it opened in,
+    // and only where no checkpointed slot can be recycled (#143): one stream that grows
+    // without crashes or size-triggered flushes.
+    let mut spares = Config::standard(1000);
+    spares.shards = 1;
+    (spares.cas_ppm, spares.txn_ppm) = (0, 0);
+    (spares.crash_ppm, spares.mid_commit_crash_ppm) = (0, 0);
+    spares.memtable_freeze_bytes = spares.memtable_budget;
     // `SpareSegments::prepare`'s I/O: grow the file by a slot, zero-fill it (one write: the
     // harness's segments are 256 KiB), then `sync_all`, with nothing in between.
     let zeros = {
@@ -177,7 +185,10 @@ fn a_seed_replays_the_same_io_trace() {
             _ => false,
         })
     };
-    for seed in seeds() {
+    for (seed, cfg, spare) in seeds()
+        .into_iter()
+        .flat_map(|seed| [(seed, &cfg, false), (seed, &spares, true)])
+    {
         let traced = |cfg: &Config| {
             let (result, ops) = run_traced(seed, cfg);
             if let Err(f) = result {
@@ -185,9 +196,9 @@ fn a_seed_replays_the_same_io_trace() {
             }
             ops
         };
-        let reference = traced(&cfg);
+        let reference = traced(cfg);
         assert!(
-            prepared_a_spare(&reference),
+            !spare || prepared_a_spare(&reference),
             "seed {seed}: no WAL spare segment was zero-filled"
         );
         let same = |ops: &[SimOp], run: &str| {
@@ -202,9 +213,9 @@ fn a_seed_replays_the_same_io_trace() {
                 );
             }
         };
-        same(&traced(&cfg), "the second run");
+        same(&traced(cfg), "the second run");
         std::thread::scope(|scope| {
-            let runs: Vec<_> = (0..8).map(|_| scope.spawn(|| traced(&cfg))).collect();
+            let runs: Vec<_> = (0..8).map(|_| scope.spawn(|| traced(cfg))).collect();
             for (t, run) in runs.into_iter().enumerate() {
                 same(&run.join().unwrap(), &format!("parallel run {t}"));
             }

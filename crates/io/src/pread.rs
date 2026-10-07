@@ -494,6 +494,15 @@ impl File for PreadFile {
             .map_err(|e| Error::os("sync", e))
     }
 
+    fn submit_sync_all(&self) -> Completion<()> {
+        let (done, resolver) = Completion::pair();
+        let inner = Arc::clone(&self.inner);
+        self.inner.pool.submit(Box::new(move || {
+            resolver.resolve(inner.file().sync_all().map_err(|e| Error::os("sync", e)))
+        }));
+        done
+    }
+
     fn len(&self) -> Result<u64> {
         Ok(self
             .inner

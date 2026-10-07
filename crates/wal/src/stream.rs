@@ -277,11 +277,17 @@ impl Shared {
     /// completion resolves once the sync counts; no thread blocks meanwhile (the last older
     /// sync to finish resolves it).
     fn submit_durable_sync(self: &Arc<Self>, file: &FileRef) -> Completion<()> {
+        self.submit_durable(|| file.submit_sync_data())
+    }
+
+    /// [`Shared::submit_durable_sync`] for any submitted sync of the stream file (`submit`
+    /// issues it): the open-time segments' `sync_all` goes through here too.
+    fn submit_durable(self: &Arc<Self>, submit: impl FnOnce() -> Completion<()>) -> Completion<()> {
         let ticket = self.start_sync();
         let (done, resolver) = Completion::pair();
         let shared = Arc::clone(self);
         // The continuation's own completion is not needed: `resolver` reports the outcome.
-        let _chained = file.submit_sync_data().map(move |r| {
+        let _chained = submit().map(move |r| {
             let ready = {
                 let mut syncs = shared.syncs();
                 shared.end_sync(&mut syncs, ticket, r.is_err());
@@ -387,6 +393,11 @@ impl SpareSegments {
         self.target
     }
 
+    /// The stream's slot size in bytes.
+    pub fn segment_size(&self) -> u64 {
+        self.segment_size
+    }
+
     /// Prepared slots not yet taken by the stream.
     pub fn ready(&self) -> u32 {
         self.shared.pool().ready.len() as u32
@@ -464,8 +475,9 @@ impl SpareSegments {
 /// The successor goes into a slot whose epoch is below the latest checkpoint if there is one,
 /// else into a slot prepared by [`SpareSegments::prepare`] (zero-filled and synced, so its
 /// fdatasyncs update no metadata), and only otherwise into a slot allocated inline
-/// ([`WalStream::inline_grows`] counts those). [`WalStream::create`] zero-fills the first slot
-/// before writing to it.
+/// ([`WalStream::inline_grows`] counts those). [`WalStream::create`] starts the first segment
+/// in a slot added past the file's end, sparse and not zero-filled, so an open writes one
+/// frame rather than a segment (#143).
 ///
 /// **Poisoning.** A failed write or sync leaves the kernel's view of the file unknown: a later
 /// successful sync could acknowledge commits behind a hole that replay would drop. So the
@@ -554,16 +566,96 @@ pub(crate) enum SlotSource {
     Prepared,
     /// An allocated slot never zero-filled.
     Blank,
+    /// A slot the open-time segment added past the file's end: zeros, not yet allocated.
+    Extended,
 }
 
 impl WalStream {
     /// Creates stream `stream` for a new database, or after its recovery found nothing.
     ///
     /// An existing file at the stream's path is truncated first, so stale segments can never
-    /// be mistaken for new ones. The first slot is zero-filled, its segment (epoch 1) written
-    /// and synced, and the directory entry synced, before this returns. Spare slots are not
+    /// be mistaken for new ones. The first slot is added past the file's end (sparse, so it
+    /// reads as zeros and needs no zero-fill), its segment's header (epoch 1) written and
+    /// synced with the file's length, and the directory entry synced, before this returns. Spare slots are not
     /// prepared here: the engine runs [`SpareSegments::prepare`] on a background task.
     pub fn create(
+        vfs: &VfsRef,
+        db_path: &Path,
+        stream: StreamId,
+        db_id: [u8; 16],
+        opts: WalOptions,
+    ) -> Result<WalStream> {
+        let s = Self::create_file(vfs, db_path, stream, db_id, opts)?;
+        sync_parent(&s.vfs, &s.path)?;
+        Ok(s)
+    }
+
+    /// [`WalStream::create`] for several streams, one after the other, with one directory
+    /// sync for all of them at the end (an open creating a stream per shard pays one rather
+    /// than one per shard, #143).
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use pigeonhole_format::StreamId;
+    /// use pigeonhole_io::sim::SimVfs;
+    /// use pigeonhole_wal::{WalOptions, WalStream, discover_streams};
+    ///
+    /// # fn main() -> pigeonhole_wal::Result<()> {
+    /// let vfs: pigeonhole_io::VfsRef = SimVfs::new(1);
+    /// let db = Path::new("/db/data.phdb");
+    /// let mut opts = WalOptions::default();
+    /// opts.segment_size = 2 * 32 * 1024;
+    /// let streams = WalStream::create_all(&vfs, db, &[StreamId(0), StreamId(1)], [1; 16], opts)?;
+    /// assert_eq!(streams.len(), 2);
+    /// assert_eq!(discover_streams(&vfs, db)?, [StreamId(0), StreamId(1)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create_all(
+        vfs: &VfsRef,
+        db_path: &Path,
+        streams: &[StreamId],
+        db_id: [u8; 16],
+        opts: WalOptions,
+    ) -> Result<Vec<WalStream>> {
+        // Every header first, then every sync submitted before any is waited for: on a real
+        // filesystem they overlap.
+        let mut created = Vec::with_capacity(streams.len());
+        for &s in streams {
+            let mut w = Self::create_unsynced(vfs, db_path, s, db_id, opts)?;
+            let lsn = w.begin_open_segment(0, 0)?;
+            created.push((w, lsn));
+        }
+        let syncs: Vec<_> = created
+            .iter()
+            .map(|(w, _)| w.shared.submit_durable(|| w.file.submit_sync_all()))
+            .collect();
+        let mut out = Vec::with_capacity(created.len());
+        for ((w, lsn), sync) in created.into_iter().zip(syncs) {
+            w.finish_open_segment(lsn, sync.wait().map_err(Error::from))?;
+            out.push(w);
+        }
+        if let Some(s) = out.first() {
+            sync_parent(&s.vfs, &s.path)?;
+        }
+        Ok(out)
+    }
+
+    /// `create` without the directory sync.
+    fn create_file(
+        vfs: &VfsRef,
+        db_path: &Path,
+        stream: StreamId,
+        db_id: [u8; 16],
+        opts: WalOptions,
+    ) -> Result<WalStream> {
+        let mut s = Self::create_unsynced(vfs, db_path, stream, db_id, opts)?;
+        s.open_segment(0, 0)?;
+        Ok(s)
+    }
+
+    /// An empty stream file with no segment yet.
+    fn create_unsynced(
         vfs: &VfsRef,
         db_path: &Path,
         stream: StreamId,
@@ -574,7 +666,7 @@ impl WalStream {
         let path = stream_path(db_path, stream);
         let file = vfs.open(&path, OpenOptions::read_write_create())?;
         file.set_len(0)?;
-        let mut s = Self::blank(
+        Ok(Self::blank(
             Arc::clone(vfs),
             file,
             path,
@@ -582,10 +674,7 @@ impl WalStream {
             db_id,
             opts.segment_size,
             opts.spare_segments,
-        );
-        s.open_segment(0, 0)?;
-        sync_parent(&s.vfs, &s.path)?;
-        Ok(s)
+        ))
     }
 
     /// A stream over `file` with no current segment yet.
@@ -651,15 +740,35 @@ impl WalStream {
         self.publish_recyclable();
     }
 
-    /// Starts the first segment of a fresh or reopened stream at open time: zero-fills its
-    /// slot unless recycled, then writes and syncs the header.
+    /// Starts the first segment of a fresh or reopened stream at open time, then writes its
+    /// header and syncs data and length together.
+    ///
+    /// Only a blank slot is zero-filled first: it may hold frames of a segment whose header
+    /// write was torn, under the epoch the new segment takes. A recycled slot holds only
+    /// lower epochs, and a slot added past the file's end reads as zeros. That last one is
+    /// what every open after a clean close uses, so an open writes one frame per stream
+    /// instead of a segment (#143); the price is that the first segment's syncs also
+    /// allocate its blocks, as D35's spares avoid for every later one.
     pub(crate) fn open_segment(&mut self, prev_epoch: u32, prev_end: u32) -> Result<()> {
+        let lsn = self.begin_open_segment(prev_epoch, prev_end)?;
+        let synced = self.shared.durable_sync(|| self.file.sync_all());
+        self.finish_open_segment(lsn, synced)
+    }
+
+    /// `open_segment` up to its sync: returns the position the sync will make durable.
+    fn begin_open_segment(&mut self, prev_epoch: u32, prev_end: u32) -> Result<Lsn> {
         let source = self.start_segment(prev_epoch, prev_end, true)?;
-        if source != SlotSource::Recycled {
+        if source == SlotSource::Blank {
             let zeros = vec![0u8; ZERO_CHUNK.min(self.segment_size as usize)];
             zero_fill(&self.file, self.segment_size, self.slot, &zeros)?;
         }
-        self.sync()?;
+        self.write()
+    }
+
+    /// `open_segment` after its sync (`synced`, which covers data and length).
+    fn finish_open_segment(&self, lsn: Lsn, synced: Result<()>) -> Result<()> {
+        self.poison_on_err(synced)?;
+        self.shared.durable.fetch_max(lsn.0, Ordering::Release);
         Ok(())
     }
 
@@ -718,14 +827,21 @@ impl WalStream {
             } else {
                 let slot = pool.total;
                 pool.total += 1;
-                if !at_open {
-                    pool.inline_grows += 1;
-                }
                 drop(pool);
-                self.file
-                    .allocate(slot as u64 * self.segment_size, self.segment_size)?;
-                self.shared.side_sync(|| self.file.sync_all())?;
-                (slot, SlotSource::Blank)
+                let end = (slot as u64 + 1) * self.segment_size;
+                if at_open {
+                    // Sparse: `open_segment` syncs the length with the header.
+                    if self.file.len()? < end {
+                        self.file.set_len(end)?;
+                    }
+                    (slot, SlotSource::Extended)
+                } else {
+                    self.shared.pool().inline_grows += 1;
+                    self.file
+                        .allocate(slot as u64 * self.segment_size, self.segment_size)?;
+                    self.shared.side_sync(|| self.file.sync_all())?;
+                    (slot, SlotSource::Blank)
+                }
             }
         };
         if slot >= self.slots.len() {

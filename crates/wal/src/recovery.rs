@@ -297,8 +297,10 @@ impl Recovery {
     /// ended. The torn segment is never appended to; its slot is recycled after checkpoint.
     ///
     /// The new segment's header is written and synced before this returns, so a checkpoint
-    /// taken at the new position names a segment that exists; its slot is zero-filled first
-    /// unless it is a recycled one. `opts.segment_size` is used only if the file holds no
+    /// taken at the new position names a segment that exists. A recycled slot (lower epochs
+    /// only) or a slot added past the file's end (zeros) is used as is; a blank one is
+    /// zero-filled first, since frames of a segment whose header write was torn may carry
+    /// the epoch the new segment takes. `opts.segment_size` is used only if the file holds no
     /// segment at all; otherwise the file's slot size is kept. Spare slots are not prepared
     /// here: the engine runs [`SpareSegments::prepare`](crate::SpareSegments::prepare) on a
     /// background task.

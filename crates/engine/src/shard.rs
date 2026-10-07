@@ -1727,6 +1727,9 @@ pub(crate) struct ShardState {
     close_stage: CloseStage,
     spares: Option<SpareSegments>,
     spares_running: Arc<AtomicBool>,
+    /// The epoch of the segment the stream started at open: spares are prepared only once
+    /// the stream is past half of it (#143).
+    open_epoch: u32,
     /// A memtable was created or frozen since the last view publish.
     view_dirty: bool,
     /// Replaying the WAL at open: mutations at or below a slot's flushed seqno are skipped.
@@ -1920,6 +1923,7 @@ impl ShardState {
             close_stage: CloseStage::Open,
             spares: None,
             spares_running: Arc::new(AtomicBool::new(false)),
+            open_epoch: 0,
             view_dirty: false,
             replaying: true,
             flushed: HashMap::new(),
@@ -1987,6 +1991,7 @@ impl ShardState {
 
     pub(crate) fn set_wal(&mut self, wal: Box<dyn Wal>) {
         self.spares = wal.spares();
+        self.open_epoch = wal.written().epoch();
         self.wal = Some(wal);
     }
 
@@ -2055,6 +2060,47 @@ impl ShardState {
         self.raise_ts_floor(commit_ts);
         self.apply(bytes, seqno, commit_ts)?;
         Ok(self.touched_slots.clone())
+    }
+
+    /// Whether the arena has room to replay `bytes` without a flush: the rows this shard
+    /// owns, as `arena_needed` counts them, plus a chunk for every slot the record creates.
+    /// Replay cannot flush on its own; the caller spills every recovered memtable to SSTs
+    /// first when this is false (#143).
+    pub(crate) fn replay_fits(&self, bytes: &[u8]) -> bool {
+        let Ok(batch) = BatchRef::new(bytes) else {
+            return true;
+        };
+        let mut total = 0usize;
+        let mut new_slots: Vec<(TabletId, FamilyId)> = Vec::new();
+        for m in batch.iter().flatten() {
+            let Some((tablet, owner)) = self.tablets.route(m.table, m.row) else {
+                continue;
+            };
+            if owner != self.id {
+                continue;
+            }
+            let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
+            total += ENTRY_OVERHEAD + key + m.value.len();
+            if !self.memtables.contains_key(&(tablet, m.family))
+                && !new_slots.contains(&(tablet, m.family))
+            {
+                new_slots.push((tablet, m.family));
+            }
+        }
+        total == 0 || self.arena.free_bytes() >= 2 * total + (new_slots.len() + 2) * self.chunk_size
+    }
+
+    /// Whether any memtable holds recovered data.
+    pub(crate) fn has_recovered(&self) -> bool {
+        self.memtables
+            .values()
+            .any(|s| !s.active.table.is_empty() || !s.frozen.is_empty())
+    }
+
+    /// The memtables `take_memtables` returned are written out and their readers dropped:
+    /// give their chunks back to the arena.
+    pub(crate) fn release_taken(&mut self) {
+        self.refresh_free();
     }
 
     /// Records a replayed record of this stream for checkpointing: a single commit, an
@@ -3800,7 +3846,17 @@ impl ShardState {
         let Some(spares) = &self.spares else {
             return;
         };
-        if spares.ready() >= spares.target() || self.spares_running.swap(true, Ordering::AcqRel) {
+        // Not before the stream is half way through the segment it opened in: a small
+        // database never pays for spares, and a busy one has half a segment of writes to
+        // prepare them in before the first rollover needs one (#143).
+        let due = self.wal.as_ref().is_some_and(|w| {
+            let at = w.written();
+            at.epoch() != self.open_epoch || 2 * u64::from(at.offset()) >= spares.segment_size()
+        });
+        if !due
+            || spares.ready() >= spares.target()
+            || self.spares_running.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         ctx.spawn(Box::new(SpareTask {

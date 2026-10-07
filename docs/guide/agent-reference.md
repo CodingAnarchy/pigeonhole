@@ -25,7 +25,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Snapshots | Pin data. Drop promptly. |
 | Filesystem | Local only (`NetworkFilesystem`). |
 | Storage | Disk-backed: memtables flush into the file as they fill, so data size is bounded by the disk, not `memtable_budget` (per shard, default 64 MiB; also the shm arena size). A write that finds the arena full stalls while a flush frees room; `Busy` after the 30 s stall timeout is transient (back off, retry), `Busy` for a batch larger than the arena is not (split it). |
-| Reopen budget | Reopening with a `memtable_budget` too small to hold the WAL's unflushed data (after a crash) fails with `InvalidArgument`; reopen with a larger one. |
+| Reopen budget | Reopening after a crash with fewer shards or a smaller `memtable_budget` works: when the WAL's unflushed data does not fit the arenas, open writes it to SSTs as it replays (a slower open). Only a single commit larger than a shard's arena fails, with `InvalidArgument`. |
 | Files at rest | One file after a clean last `close`. While open, or after a crash: the file plus WAL sidecars and the shm region. Open replays the sidecars. |
 | `None` durability (D94) | A `None` commit buffers its WAL record. A later `GroupSync`/`Sync` commit on the same shard, a `flush`, or a clean close makes it durable; a crash before then loses it. |
 | Typed values | `incr` columns are `i64`. Write counters only with `incr` / `put_i64`: reading an `incr` on top of a base that is not an 8-byte `i64` fails with `MergeFailed` (D41). `merge` writes untyped operands (custom operators); the built-in `i64` add refuses them at read time. |

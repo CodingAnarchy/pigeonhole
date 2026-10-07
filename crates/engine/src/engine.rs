@@ -721,6 +721,8 @@ impl Engine {
         // `(coordinator stream, seqno) -> participant streams` of every COMMIT decision.
         let mut commits: HashMap<(StreamId, Seqno), Vec<StreamId>> = HashMap::new();
         let mut replayed: Vec<(StreamId, Vec<ReplayedRecord>)> = Vec::new();
+        // Recovered memtables written to SSTs mid-replay when an arena ran short (#143).
+        let mut spill = Spilled::default();
         let streams = discover_streams(&vfs, path)?;
         for &stream in &streams {
             let checkpoint = catalog
@@ -737,6 +739,7 @@ impl Engine {
                         commit_ts,
                         batch,
                     } => {
+                        make_room(&shared, &catalog, &mut states, batch.as_bytes(), &mut spill)?;
                         let mut slots = Vec::new();
                         for s in &mut states {
                             slots.extend(
@@ -813,6 +816,7 @@ impl Engine {
             if !complete(*coordinator, *seqno) {
                 continue;
             }
+            make_room(&shared, &catalog, &mut states, bytes, &mut spill)?;
             let mut per_shard = Vec::with_capacity(states.len());
             for s in &mut states {
                 per_shard.push(s.replay(bytes, *seqno, *commit_ts).map_err(replay_error)?);
@@ -826,10 +830,12 @@ impl Engine {
         }
 
         // 6. Streams. With the same layout as before, every stream's unflushed records are
-        // logged on its shard for checkpointing. Otherwise (D20) everything recovered is
-        // flushed now, every stream checkpointed to its end, and the extra streams removed.
-        let same_layout =
-            streams.len() == shards && streams.iter().enumerate().all(|(i, s)| s.0 as usize == i);
+        // logged on its shard for checkpointing. Otherwise (D20), or when replay already
+        // spilled recovered memtables to SSTs, everything recovered is flushed now, every
+        // stream checkpointed to its end, and the extra streams removed.
+        let same_layout = !spill.spilled
+            && streams.len() == shards
+            && streams.iter().enumerate().all(|(i, s)| s.0 as usize == i);
         let mut have_wal = vec![false; shards];
         if same_layout {
             for ((stream, records), (_, rec)) in replayed.into_iter().zip(&recoveries) {
@@ -889,7 +895,7 @@ impl Engine {
                 &mut states,
                 &recoveries,
                 shards,
-                &options,
+                spill,
             )?;
             let extra: Vec<StreamId> = streams
                 .iter()
@@ -922,11 +928,18 @@ impl Engine {
                 vfs.sync_dir(dir)?;
             }
         }
-        for (i, have) in have_wal.iter().enumerate() {
-            if !have {
-                let wal = WalStream::create(&vfs, path, StreamId(i as u32), db_id, options.wal)?;
-                states[i].set_wal(Box::new(wal));
-            }
+        let missing: Vec<StreamId> = (0..shards)
+            .filter(|&i| !have_wal[i])
+            .map(|i| StreamId(i as u32))
+            .collect();
+        for (stream, wal) in missing.iter().zip(WalStream::create_all(
+            &vfs,
+            path,
+            &missing,
+            db_id,
+            options.wal,
+        )?) {
+            states[stream.0 as usize].set_wal(Box::new(wal));
         }
         for s in &mut states {
             s.finish_replay();
@@ -1925,15 +1938,58 @@ impl Drop for Engine {
 /// streams' records no longer map to shards; decision D20): one SST per non-empty memtable,
 /// `SetFlushed` per slot, every stream checkpointed to its end (extra streams to zero, since
 /// they are removed afterwards).
-fn flush_recovered(
+/// Recovered memtables already written to SSTs at open, committed with the rest by
+/// `flush_recovered` (#143).
+#[derive(Default)]
+struct Spilled {
+    /// Replay ran short of arena room at least once.
+    spilled: bool,
+    /// `AddSst` edits of the SSTs written so far.
+    edits: Vec<Edit>,
+    /// The largest seqno written to SSTs per slot.
+    flushed: BTreeMap<(TabletId, FamilyId), Seqno>,
+}
+
+impl Spilled {
+    /// Gives back the extents of every SST written so far (the open failed).
+    fn abandon(&mut self, shared: &Shared) {
+        for e in self.edits.drain(..) {
+            if let Edit::AddSst { meta, .. } = e {
+                shared.pager.abandon(meta.extent);
+            }
+        }
+    }
+}
+
+/// Before replaying `bytes`: if some shard's arena may not hold its share, writes every
+/// recovered memtable to SSTs first. Replay cannot flush the way a running shard does (it
+/// may not move a checkpoint past records whose prepares are still being resolved), so it
+/// spills everything and finishes as a layout change does (D121): the edits commit with
+/// the flush of what is left, which checkpoints every stream to its end. Without this, a
+/// database reopened with fewer shards or a smaller budget than it crashed with could not
+/// open at all (#143).
+fn make_room(
     shared: &Shared,
-    catalog: &mut Catalog,
+    catalog: &Catalog,
     states: &mut [ShardState],
-    recoveries: &[(StreamId, Recovery)],
-    shards: usize,
-    options: &EngineOptions,
+    bytes: &[u8],
+    spill: &mut Spilled,
 ) -> Result<()> {
-    let mut edits = Vec::new();
+    if states.iter().all(|s| s.replay_fits(bytes)) || !states.iter().any(|s| s.has_recovered()) {
+        return Ok(());
+    }
+    crate::shard::trace!("replay: an arena is short, spilling recovered memtables");
+    spill.spilled = true;
+    spill_recovered(shared, catalog, states, spill).inspect_err(|_| spill.abandon(shared))
+}
+
+/// Writes every recovered memtable of `states` to L0 SSTs, adding to `spill`.
+fn spill_recovered(
+    shared: &Shared,
+    catalog: &Catalog,
+    states: &mut [ShardState],
+    spill: &mut Spilled,
+) -> Result<()> {
     let created = shared.vfs.now_micros();
     for state in states.iter_mut() {
         for ((tablet, family), reader, bytes, max_seqno) in state.take_memtables() {
@@ -1953,19 +2009,37 @@ fn flush_recovered(
                 return Err(e);
             }
             for meta in sink.outputs.drain(..) {
-                edits.push(Edit::AddSst {
+                spill.edits.push(Edit::AddSst {
                     tablet,
                     family,
                     level: 0,
                     meta,
                 });
             }
-            edits.push(Edit::SetFlushed {
-                tablet,
-                family,
-                seqno: max_seqno,
-            });
+            let f = spill.flushed.entry((tablet, family)).or_insert(max_seqno);
+            *f = (*f).max(max_seqno);
         }
+        state.release_taken();
+    }
+    Ok(())
+}
+
+fn flush_recovered(
+    shared: &Shared,
+    catalog: &mut Catalog,
+    states: &mut [ShardState],
+    recoveries: &[(StreamId, Recovery)],
+    shards: usize,
+    mut spill: Spilled,
+) -> Result<()> {
+    spill_recovered(shared, catalog, states, &mut spill).inspect_err(|_| spill.abandon(shared))?;
+    let mut edits = std::mem::take(&mut spill.edits);
+    for ((tablet, family), seqno) in spill.flushed {
+        edits.push(Edit::SetFlushed {
+            tablet,
+            family,
+            seqno,
+        });
     }
     for (stream, rec) in recoveries {
         let lsn = if (stream.0 as usize) < shards {
@@ -1980,7 +2054,6 @@ fn flush_recovered(
     }
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.seqno_ceiling = shared.shm.next_seqno();
-    let _ = options;
     edits.push(catalog.counters_edit());
     for e in &edits {
         catalog.apply(e, shards)?;
@@ -2017,8 +2090,8 @@ fn interrupted_create(path: &Path, file: &FileRef, e: pigeonhole_format::Error) 
 fn replay_error(e: Error) -> Error {
     match e {
         Error::Busy => Error::InvalidArgument(
-            "the memtable budget is too small to hold the WAL's unflushed data; reopen with a \
-             larger memtable_budget"
+            "a WAL record is larger than a shard's memtable arena; reopen with a larger \
+             memtable_budget"
                 .to_owned(),
         ),
         e => e,
