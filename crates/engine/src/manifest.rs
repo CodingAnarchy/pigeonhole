@@ -751,7 +751,7 @@ pub(crate) fn commit_held(shared: &Shared, kind: ReqKind) -> Result<ManifestVers
 
 /// Processes the queue on the calling (application) thread until it is empty, blocking on
 /// each root commit. Must hold the exclusion.
-fn drain_sync(shared: &Shared) {
+pub(crate) fn drain_sync(shared: &Shared) {
     while let Some(commit) = begin(shared) {
         let r = shared.pager.commit_root(commit.root()).map_err(pager_io);
         end(shared, commit, r);
@@ -885,6 +885,31 @@ impl ManifestPump {
             Ok(())
         }));
         self.inflight = Some((commit, slot));
+    }
+}
+
+impl Drop for ManifestPump {
+    /// A pump dropped with its commit in flight (an application-owned shard dropped before
+    /// the commit finished) still holds the exclusion. Finish the commit with its root
+    /// commit's outcome, or as failed if that has not arrived (the outcome is unknown, so
+    /// the pager is poisoned as for any failed commit), then release, which runs a pending
+    /// final close.
+    fn drop(&mut self) {
+        let Some((commit, slot)) = self.inflight.take() else {
+            return;
+        };
+        let result = slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| {
+                Err(pigeonhole_io::Error::new(
+                    pigeonhole_io::ErrorKind::Other,
+                    "the shard running the manifest commit was dropped",
+                ))
+            });
+        end(&self.shared, commit, result);
+        release(&self.shared);
     }
 }
 

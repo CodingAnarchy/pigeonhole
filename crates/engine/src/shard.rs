@@ -390,8 +390,9 @@ impl Shared {
             clean = self.forget_checkpoints();
         }
         if clean.is_ok() {
-            // Under the exclusion (see `try_final_close`): no commit is in flight, so the
-            // pager's root is the latest.
+            // Under the exclusion (see `try_final_close`): no commit is in flight, and the
+            // queue is drained first, so nothing commits after the clean mark and clears it.
+            manifest::drain_sync(self);
             let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
             clean = manifest.mark_clean();
         }
@@ -408,9 +409,14 @@ impl Shared {
     }
 
     /// Commits a manifest delta resetting every stream's checkpoint to the start. Called
-    /// with the manifest writer's exclusion held: the delta goes through the queue, behind
-    /// any commit still queued, and is computed against the catalog they leave.
+    /// with the manifest writer's exclusion held: the delta goes through the queue, after
+    /// every commit still queued, and is computed against the catalog they leave.
     fn forget_checkpoints(&self) -> Result<()> {
+        // What is queued may move checkpoints: commit it first, then look.
+        manifest::drain_sync(self);
+        if self.view.load().catalog.checkpoints.is_empty() {
+            return Ok(());
+        }
         let change = |catalog: &mut crate::catalog::Catalog| {
             Ok(catalog
                 .checkpoints

@@ -469,6 +469,71 @@ fn the_final_close_waits_for_a_background_manifest_commit() {
     db.close().unwrap();
 }
 
+#[test]
+fn dropping_application_owned_shards_mid_commit_still_closes_cleanly() {
+    // #78 review: in application-owned mode the shards report closed while a compaction's
+    // commit is parked on a pump, `run_once` returns false (a blocked task is no work) and
+    // the application drops the shards. The dropped pump must release the writer's
+    // exclusion so the final close runs.
+    let vfs = SimVfs::new(30);
+    let vfs_ref: VfsRef = vfs.clone();
+    let mut o = owned(Arc::clone(&vfs), 2);
+    o.compaction.l0_trigger = u32::MAX;
+    o.compaction.level_base_bytes = u64::MAX;
+    let db = Engine::open(Path::new(DB), o.clone()).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for round in 0..2u32 {
+        write_rows(
+            &db,
+            &t,
+            round * 100..round * 100 + 100,
+            Durability::GroupSync,
+        );
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+
+    o.compaction_threads = 0;
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o.clone()).unwrap();
+    let mut run = |until: &dyn Fn() -> bool| {
+        for _ in 0..100_000 {
+            let mut more = false;
+            for s in &mut shards {
+                more |= s.run_once(u64::MAX);
+            }
+            if until() || !more {
+                return;
+            }
+        }
+        panic!("the shards never went idle");
+    };
+    db.park_manifest_commits(true);
+    let _compaction = db.compact_pending(None).unwrap();
+    run(&|| db.manifest_commit_parked());
+    assert!(db.manifest_commit_parked());
+    db.close().unwrap();
+    run(&|| false);
+    assert!(
+        db.final_close_pending(),
+        "the final close waits for the commit"
+    );
+    let compacted = db.take_compactions();
+    assert_eq!(compacted.len(), 1);
+    drop(shards);
+    drop(db);
+
+    let info = Engine::inspect_manifest(&vfs_ref, Path::new(DB)).unwrap();
+    assert!(info.clean, "the final close ran when the pump was dropped");
+    assert!(info.version > compacted[0].manifest_version);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").unwrap();
+    assert_eq!(row_count(&db, &t), 200);
+    db.close().unwrap();
+}
+
 // ---- #23: shrink never relocates in-flight output; reclaim after commits ----
 
 #[test]
