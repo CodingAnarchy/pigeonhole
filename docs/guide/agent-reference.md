@@ -73,7 +73,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 
 `PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
 `Snapshot`: `seqno(&self) -> u64`.
-`Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains; background work waiting for a time does not count), `next_wakeup(&self) -> Option<Duration>` (time until that background work is due), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)` (fires when work arrives, not when background work falls due). `closed(&self) -> Option<Result<()>>` (the close's outcome once the whole close has finished). Loop: `run_once` until `false`, then sleep until the wakeup fires (work arrived or I/O completed) or `next_wakeup` passes. After `close()`, keep looping until `closed()` is `Some`, then drop the shard; `close()` on a thread that drives no shard (once every shard has been run) waits for this and returns the outcome; on a driving thread, or before every shard has run, it returns `Ok(())` at once and the outcome is only in `closed()`. On a thread that drives a shard (it last called `run_once`), `commit`, `check_and_mutate`, transaction commits, `flush` and `compact` fail with `InvalidArgument` before submitting anything; awaiting an already-submitted commit there blocking fails with `WouldDeadlock` (it will apply: poll it from the event loop). A thread holding a shard it never ran is not detected: run the shard first.
+`Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains; background work waiting for a time does not count), `next_wakeup(&self) -> Option<Duration>` (time until that background work is due; with `tablet_changes` on, the default, the balancer's next pass keeps it `Some`: at most 100 ms after a write, backing off to 10 s while idle), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)` (fires when work arrives, not when background work falls due). `closed(&self) -> Option<Result<()>>` (the close's outcome once the whole close has finished). Loop: `run_once` until `false`, then sleep until the wakeup fires (work arrived or I/O completed) or `next_wakeup` passes. After `close()`, keep looping until `closed()` is `Some`, then drop the shard; `close()` on a thread that drives no shard (once every shard has been run) waits for this and returns the outcome; on a driving thread, or before every shard has run, it returns `Ok(())` at once and the outcome is only in `closed()`. On a thread that drives a shard (it last called `run_once`), `commit`, `check_and_mutate`, transaction commits, `flush` and `compact` fail with `InvalidArgument` before submitting anything; awaiting an already-submitted commit there blocking fails with `WouldDeadlock` (it will apply: poll it from the event loop). A thread holding a shard it never ran is not detected: run the shard first.
 
 ## `Options` (all `self -> Self`; process-local, not stored in file)
 | Method | Meaning |
@@ -88,7 +88,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `create_if_missing(bool)` | Default true. |
 | `merge_operator(Arc<dyn MergeOperator>)` | P2. Register custom operator. |
 | `allow_unregistered_merge_operators(bool)` | Open read-only with compaction off if a family names an unregistered operator. |
-| `tablet_changes(bool)` | Let tablets split, merge and move between shards so one table's writes spread over every shard (default off: a table is one tablet on one shard). Tablet owners are not stored; a reopen places tablets again. |
+| `tablet_changes(bool)` | Let tablets split, merge and move between shards so one table's writes spread over every shard (default on; off keeps each table as one tablet on one shard). Tablet owners are not stored; a reopen places tablets again. Commits in flight together on one row may apply in either order while its tablet moves. |
 
 `ReaderOptions` (P4, early): `block_cache(usize)`, `shm_dir(..)`, `merge_operator(..)`.
 
@@ -200,7 +200,6 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 ## Not yet available
 | Feature | Phase |
 |---|---|
-| Tablet splits on by default (today opt-in, `Options::tablet_changes(true)`; [#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)) | P1 |
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
 | zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |

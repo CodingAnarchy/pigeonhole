@@ -14,7 +14,7 @@
 //! by a cooperative task per shard, WAL streams are checkpointed per decision D24 and
 //! removed at the last clean close (one file at rest), compaction runs as cooperative tasks
 //! (or on `compaction_threads`), and writes stall on L0 depth through a per-shard token
-//! bucket. With `EngineOptions::tablet_changes` on (off by default while it is hardened),
+//! bucket. With `EngineOptions::tablet_changes` on (the default),
 //! tablets split at a size threshold or under write skew, merge when small and cold, and
 //! move between shards when load is skewed; reads are never blocked by any of it.
 //!

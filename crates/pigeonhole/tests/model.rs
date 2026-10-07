@@ -27,8 +27,9 @@
 //! a compaction while a commit waits in a write stall (issue #70).
 //!
 //! Seeds: `PIGEONHOLE_SEED` (first seed, default 1) and `PIGEONHOLE_SEEDS` (count, default
-//! 1). A failure prints its seed and the operation trace. `PIGEONHOLE_TABLET_CHANGES=1` runs
-//! every test with tablet changes on (`Options::tablet_changes`, with a fast balancer).
+//! 1). A failure prints its seed and the operation trace. Tablet changes are on, as by
+//! default, with a fast balancer so tablets split, move and merge within a run;
+//! `PIGEONHOLE_TABLET_CHANGES=0` runs every test with them off.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -121,7 +122,7 @@ struct Config {
     /// Per-op probability (ppm) of an explicit `compact`.
     compact_ppm: u32,
     /// `Options::tablet_changes`, with a balancer tuned so tablets split, move and merge
-    /// within a run. Defaults to `PIGEONHOLE_TABLET_CHANGES` (`1` on, else off).
+    /// within a run. On unless `PIGEONHOLE_TABLET_CHANGES=0`.
     tablet_changes: bool,
 }
 
@@ -146,7 +147,7 @@ impl Config {
             block_cache: 1 << 20,
             flush_ppm: 20_000,
             compact_ppm: 20_000,
-            tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").is_ok_and(|v| v == "1"),
+            tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").as_deref() != Ok("0"),
         }
     }
 
@@ -1128,18 +1129,18 @@ fn crashes_and_reopens_match_a_durable_prefix() {
 }
 
 #[test]
-fn quiet_runs_with_tablet_changes_match_the_model() {
+fn quiet_runs_with_tablet_changes_off_match_the_model() {
     for shards in [1, 2, 4, 8] {
         let mut cfg = Config::quiet(1000, shards);
-        cfg.tablet_changes = true;
+        cfg.tablet_changes = false;
         check(&cfg);
     }
 }
 
 #[test]
-fn crashes_with_tablet_changes_match_a_durable_prefix() {
+fn crashes_with_tablet_changes_off_match_a_durable_prefix() {
     let mut cfg = Config::crashing(1000);
-    cfg.tablet_changes = true;
+    cfg.tablet_changes = false;
     check(&cfg);
 }
 

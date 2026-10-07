@@ -55,12 +55,11 @@ pub struct EngineOptions {
     /// hold at least this much splits in two; two adjacent cold tablets on one shard holding
     /// less than a quarter of it together merge. Only read when `tablet_changes` is on.
     pub tablet_split_bytes: u64,
-    /// Lets tablets split, merge and move (default off). Off, every table stays one tablet
+    /// Lets tablets split, merge and move (default on). Off, every table stays one tablet
     /// on shard `tablet % shards` and the balancer never runs (the engine's own tests can
     /// still request changes through `test-hooks`; they are refused with `Unsupported`).
     ///
-    /// **Not safe to turn on yet:** splits, merges, moves and the balancer have open
-    /// correctness and liveness bugs (#94, #95, #98, #102–#105). Known limits when on:
+    /// Known limits when on:
     /// - each shard holds at most a quarter of its arena's chunks in `(tablet, family)`
     ///   slots; arenas are cut into at least 256 chunks when this is on, so every shard
     ///   serves at least 64 slots, and splits and moves past that are refused (the balancer
@@ -118,7 +117,7 @@ impl EngineOptions {
             reader_slots: 126,
             wal: WalOptions::default(),
             tablet_split_bytes: 256 << 20,
-            tablet_changes: false,
+            tablet_changes: true,
             balance_interval_nanos: 100_000_000,
             balance_min_writes: 2_000,
             balance_skew: 1.25,
