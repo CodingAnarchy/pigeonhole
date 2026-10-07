@@ -1510,6 +1510,83 @@ fn a_moving_clock_paces_a_deep_l0_with_the_token_bucket() {
     assert!(m.stalls.0 > 0 && m.stalls.1 > 0, "{m:?}");
 }
 
+#[test]
+fn close_returns_after_a_room_wait_a_flush_ended_on_a_frozen_clock() {
+    // Issue #88: a wait for arena room that a flush ended, with no write after it, kept its
+    // timeout timer running into the close; on a frozen clock `run_once` spun on it and the
+    // shard never finished closing. Close must end the wait, and the driven shards must
+    // all report idle.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sim = SimVfs::new(88);
+        let vfs: VfsRef = Arc::new(FailReadsVfs::frozen(
+            &sim,
+            &Arc::new(AtomicBool::new(false)),
+        ));
+        let mut o = small_arena(vfs);
+        // No L0 stalls: every stall counted is a wait for arena room.
+        let mut c = PickerOptions::default();
+        c.l0_trigger = 1_000;
+        o.compaction = c;
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let t = engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        // A burst far larger than the arena (128 KiB): the later members wait for a flush to
+        // free room, then every commit goes through and no write follows.
+        let value = vec![5u8; 2048];
+        let mut pending: Vec<_> = (0..400u32)
+            .map(|i| {
+                let mut wb = WriteBatch::new();
+                put(&mut wb, &t, format!("row{i:05}").as_bytes(), b"q", &value);
+                engine.submit(wb, Some(Durability::None)).unwrap()
+            })
+            .collect();
+        for _ in 0..100_000 {
+            pending.retain_mut(|pc| match poll_commit(pc) {
+                Poll::Ready(r) => {
+                    r.unwrap();
+                    false
+                }
+                Poll::Pending => true,
+            });
+            if pending.is_empty() {
+                break;
+            }
+            let now = sim.monotonic_nanos();
+            for s in shards.iter_mut() {
+                s.run_once(now + 1_000);
+            }
+        }
+        assert!(pending.is_empty(), "the burst never committed");
+        let i = 400;
+        assert!(
+            engine.metrics().stalls.0 > 0,
+            "never waited for room: {:?}",
+            engine.metrics()
+        );
+        engine.close().unwrap();
+        let mut passes = 0u32;
+        loop {
+            let now = sim.monotonic_nanos();
+            let mut busy = false;
+            for s in shards.iter_mut() {
+                busy |= s.run_once(now + 1_000);
+            }
+            if !busy {
+                break;
+            }
+            passes += 1;
+            assert!(passes < 100_000, "the shards never finished closing");
+        }
+        tx.send(i).unwrap();
+    });
+    let rows = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("close never finished after a room wait (issue #88)");
+    assert!(rows > 0);
+}
+
 // ---- #66: the purge record counts entries an earlier compaction dropped as inputs ----
 
 /// Commits `ops` on an application-owned store, driving the shards; returns the seqno.

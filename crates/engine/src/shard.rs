@@ -1893,6 +1893,11 @@ impl ShardState {
             self.wait_room = false;
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
+        if self.pending.is_empty() {
+            // No group waits any more: the wait (and its timeout timer) ends here rather
+            // than at the next group, which may never come (issue #88).
+            self.end_room_wait(ctx.now_nanos());
+        }
         self.compaction_backoff = false;
         self.check_flush_waiters();
         self.spawn_flush(ctx);
@@ -3837,9 +3842,11 @@ impl ShardState {
         }
         if self.close_stage == CloseStage::Draining {
             self.close_stage = CloseStage::Flushing;
-            // Abandon the stall: nothing is admitted any more.
+            // Abandon the stalls: nothing is admitted any more (issue #88).
             self.stall.score = 0.0;
             self.stall.cancel_timer();
+            self.end_room_wait(ctx.now_nanos());
+            self.wait_room = false;
             if self.freeze(true).is_err() {
                 self.shared.close.failed.store(true, Ordering::Release);
             }

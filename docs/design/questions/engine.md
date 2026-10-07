@@ -1,6 +1,6 @@
 # Engine questions
 
-## Q: How do write stalls and failed background work behave when the clock moves only with the caller (issues #70, #79)?
+## Q: How do write stalls and failed background work behave when the clock moves only with the caller (issues #70, #79, #88)?
 D119 cancels the L0 stall's timer when a compaction commits and D124 times a wait for arena room out after `write_stall_timeout_nanos`, but both lean on a clock. Under `SimVfs` the clock moves only when the workload advances it, and the workload is blocked in the commit (or, in application-owned mode, in `run_once`, whose slice deadline never comes). Three things followed: a `StallTimer` polling the clock spun for ever; a failed background compaction with an L0 score `>= 1.0` was retried at once by `maintain`, redoing the merge in a loop against a dead (crashed or poisoned) device (#79); and a stall with nothing running in the background had nothing to end it.
 
 **Interim behavior** (proposed amendments; on a moving clock D119 and D124 are unchanged except where noted):
@@ -15,4 +15,4 @@ D119 cancels the L0 stall's timer when a compaction commits and D124 times a wai
 *Amendment to D124 (wait for arena room).*
 - Moving clock: unchanged. The wait ends with `Busy` once `write_stall_timeout_nanos` has passed, and a failed flush is retried on the next run of the waiting group.
 - Frozen clock: the timeout never comes, so the wait also ends with `Busy` after 4 failed flushes in a row, or at once when nothing the shard would hear of can free room. That is the **idle case**: no flush running or queued, no deferred freeze, no undecided cross-shard share, no unsynced group, and no retired memtable that a reader process still pins (pinned memtables stay in the retired list and may be released at any time). What remains is held by in-process snapshots, which only the blocked caller can drop. A poisoned pager still ends the wait at once with the poison error.
-- Both clocks: `reserve_room` reclaims retired memtables whose readers left before it reports no room, and refusing the waiting members no longer drops the members the same group admitted before the cut (the timeout path used to return without applying them).
+- Both clocks: `reserve_room` reclaims retired memtables whose readers left before it reports no room, and refusing the waiting members no longer drops the members the same group admitted before the cut (the timeout path used to return without applying them). A wait ends (and its timeout timer is cancelled) when a flush completes with no group left waiting, and at close (issue #88: a wait a flush had ended outlived the writers and kept its timer running into the close).
