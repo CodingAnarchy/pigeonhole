@@ -162,3 +162,69 @@ fn a_slot_that_keeps_failing_does_not_stop_the_others_compacting() {
     gate.fail_reads_containing(None);
     db.close().unwrap();
 }
+
+/// 1-2 F4 / 5-6 5.2: flushes keep failing (a write error that does not poison the pager)
+/// while a writer waits for arena room on a moving clock. They are retried on a backoff
+/// (10 ms doubling to 1 s), not back to back until the stall timeout; once the device
+/// recovers, the next retry frees room and the writer goes on.
+#[test]
+fn a_failing_flush_during_a_room_wait_backs_off() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    let (vfs, gate) = gate::vfs(1414);
+    let mut o = options(vfs);
+    o.memtable_budget = 256 << 10;
+    o.write_stall_timeout_nanos = 30_000_000_000;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let a = table(&db, "a");
+    gate.fail_writes_containing(Some(MARK));
+    let (stop, done) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU32::new(0)),
+    );
+    let writer = {
+        let (db, a, stop, done) = (
+            Arc::clone(&db),
+            Arc::clone(&a),
+            Arc::clone(&stop),
+            Arc::clone(&done),
+        );
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Acquire) {
+                write(&db, &a, i, true);
+                i += 1;
+                done.store(i, Ordering::Release);
+            }
+        })
+    };
+    // Wait until the writer stalls: no commit for 300 ms (no flush can free the arena).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = (u32::MAX, Instant::now());
+    while last.1.elapsed() < Duration::from_millis(300) {
+        assert!(Instant::now() < deadline, "the writer never stalled");
+        let n = done.load(Ordering::Acquire);
+        if n != last.0 {
+            last = (n, Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!gate.write_failures().is_empty(), "no flush failed");
+    let before = gate.write_failures().len();
+    std::thread::sleep(Duration::from_secs(1));
+    let retries = gate.write_failures().len() - before;
+    assert!(
+        retries <= 8,
+        "{retries} failed flushes in 1 s of a room wait: retried back to back"
+    );
+    // The device recovers: the next retry (at most a second away) frees room.
+    gate.fail_writes_containing(None);
+    let stalled_at = done.load(Ordering::Acquire);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while done.load(Ordering::Acquire) == stalled_at {
+        assert!(Instant::now() < deadline, "the writer never resumed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    db.close().unwrap();
+}

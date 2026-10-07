@@ -69,6 +69,16 @@ const ROOM_FLUSH_ATTEMPTS: u32 = 4;
 /// clock; the wait doubles with each failure in a row, up to `COMPACTION_BACKOFF_MAX_NANOS`.
 const COMPACTION_BACKOFF_NANOS: u64 = 1_000_000_000;
 const COMPACTION_BACKOFF_MAX_NANOS: u64 = 60_000_000_000;
+/// How long the shard first waits before retrying a failed flush; the wait doubles with
+/// each failure in a row, up to `FLUSH_BACKOFF_MAX_NANOS` (issue #141).
+const FLUSH_BACKOFF_NANOS: u64 = 10_000_000;
+const FLUSH_BACKOFF_MAX_NANOS: u64 = 1_000_000_000;
+
+/// The wait before retrying a flush after `failures` failed flushes in a row (at least one).
+fn flush_backoff_nanos(failures: u32) -> u64 {
+    let doublings = failures.saturating_sub(1).min(32);
+    (FLUSH_BACKOFF_NANOS << doublings).min(FLUSH_BACKOFF_MAX_NANOS)
+}
 
 /// The wait before retrying after `failures` failed compactions in a row (at least one).
 /// Attempts of a cross-shard commit refused with `Moved` before it fails with `Busy`
@@ -1032,6 +1042,8 @@ pub(crate) enum ShardMsg {
     RetryCompaction,
     /// A refused checkpoint's backoff passed (on a moving clock): retry.
     RetryCheckpoint,
+    /// A failed flush's backoff passed: retry (issue #141).
+    RetryFlush,
     /// Split, merge or move tablets this shard owns (replies when done, if asked). Sent by
     /// the test hooks only; the balancer starts its own changes.
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
@@ -1776,6 +1788,12 @@ pub(crate) struct ShardState {
     /// A flush failed while closing: the close gives up on flushing (the WAL keeps the data)
     /// and is not clean.
     flush_failed: bool,
+    /// Flushes failed in a row (reset by one that succeeds).
+    flush_failures: u32,
+    /// After a failed flush, none starts until this timer fires (`RetryFlush`), so a device
+    /// that keeps failing is not rewritten back to back (issue #141). On a frozen clock the
+    /// timer gives up and the next trigger retries.
+    flush_retry: Option<Arc<TimerState>>,
     /// Tablets dropped since open: their records need no flush before a checkpoint.
     dropped: HashSet<TabletId>,
 
@@ -1956,6 +1974,8 @@ impl ShardState {
             starved_all: false,
             starve_wait: None,
             flush_failed: false,
+            flush_failures: 0,
+            flush_retry: None,
             dropped: HashSet::new(),
             log: VecDeque::new(),
             log_bytes: 0,
@@ -2540,6 +2560,10 @@ impl ShardState {
         if self.flush_running || self.flush_queue.is_empty() {
             return;
         }
+        // A failed flush waits out its backoff (the timer's `RetryFlush` comes back here).
+        if self.flush_retry.as_ref().is_some_and(|t| !t.finished()) {
+            return;
+        }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
             for w in self.flush_waiters.drain(..) {
                 w.notify(Err(ManifestWriter::poisoned_error()));
@@ -2677,6 +2701,10 @@ impl ShardState {
         self.flushing.clear();
         match result {
             Ok(_) => {
+                self.flush_failures = 0;
+                if let Some(t) = self.flush_retry.take() {
+                    t.cancel();
+                }
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
                 metrics.flushes.fetch_add(1, Ordering::Relaxed);
                 metrics.flush_nanos.fetch_add(nanos, Ordering::Relaxed);
@@ -2718,11 +2746,29 @@ impl ShardState {
                 self.advance_checkpoint(ctx);
             }
             Err(e) => {
-                // The frozen memtables stay (the WAL keeps their data); they are queued again
-                // at the next flush trigger, never in a tight loop. A poisoned pager stops
-                // flushing until reopen; a failure while closing makes the close unclean.
+                // The frozen memtables stay (the WAL keeps their data) and are queued again;
+                // no flush starts until a backoff (10 ms doubling to 1 s) passes, so a
+                // device that keeps failing is not rewritten back to back, even while a
+                // writer waits for room (issue #141). A poisoned pager stops flushing until
+                // reopen; a failure while closing makes the close unclean.
                 trace!("shard {} flush failed: {e}", self.id.0);
                 self.requeue_frozen();
+                if !self.closing {
+                    self.flush_failures = self.flush_failures.saturating_add(1);
+                    if let Some(t) = self.flush_retry.take() {
+                        t.cancel();
+                    }
+                    let state = TimerState::new();
+                    self.flush_retry = Some(Arc::clone(&state));
+                    ctx.spawn(Box::new(ClockTimer::new(
+                        &self.shared.vfs,
+                        ctx.now_nanos()
+                            .saturating_add(flush_backoff_nanos(self.flush_failures)),
+                        state,
+                        ctx.submitter(self.id).clone(),
+                        ShardMsg::RetryFlush,
+                    )));
+                }
                 // A tablet change waiting for this flush gives up (its tablets stay put).
                 self.abort_op(crate::error::relay("flush", &e), ctx);
                 // Whoever asked for this flush hears about the failure now rather than
@@ -5232,6 +5278,10 @@ impl ShardState {
             if let Some(t) = self.checkpoint_timer.take() {
                 t.cancel();
             }
+            // The close's flush goes at once; one that fails gives up flushing.
+            if let Some(t) = self.flush_retry.take() {
+                t.cancel();
+            }
             if self.freeze(true).is_err() {
                 self.shared.fail_close();
             }
@@ -5533,6 +5583,13 @@ impl ShardState {
                 self.maintain(ctx);
             }
             ShardMsg::Kick => {}
+            ShardMsg::RetryFlush => {
+                // Only the current backoff timer's firing ends the backoff.
+                if self.flush_retry.as_ref().is_some_and(|t| t.fired()) {
+                    self.flush_retry = None;
+                    self.spawn_flush(ctx);
+                }
+            }
             ShardMsg::RetryCompaction => {
                 // Only the current backoff timer's firing ends the backoff.
                 if self.backoff_timer.as_ref().is_some_and(|(t, _)| t.fired()) {

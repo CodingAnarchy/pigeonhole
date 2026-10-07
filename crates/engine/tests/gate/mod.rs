@@ -32,6 +32,11 @@ pub struct Gate {
     read_marker: Mutex<Option<Vec<u8>>>,
     /// When each injected read failure happened.
     read_failures: Mutex<Vec<Instant>>,
+    /// Writes to the main `.phdb` file whose bytes contain this marker fail (one table's
+    /// SST blocks; WAL records go to other files).
+    write_marker: Mutex<Option<Vec<u8>>>,
+    /// When each injected write failure happened.
+    write_failures: Mutex<Vec<Instant>>,
 }
 
 impl Gate {
@@ -58,6 +63,16 @@ impl Gate {
     /// When each injected read failure happened.
     pub fn read_failures(&self) -> Vec<Instant> {
         self.read_failures.lock().unwrap().clone()
+    }
+
+    /// Fails every later write to the main file whose bytes contain `marker`, or none.
+    pub fn fail_writes_containing(&self, marker: Option<&[u8]>) {
+        *self.write_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// When each injected write failure happened.
+    pub fn write_failures(&self) -> Vec<Instant> {
+        self.write_failures.lock().unwrap().clone()
     }
 
     /// Paths with a sync held now.
@@ -124,6 +139,25 @@ struct GateFile {
 impl GateFile {
     fn failing(&self) -> bool {
         self.gate.rules.lock().unwrap().fail.contains(&self.path)
+    }
+
+    /// Whether a write of `buf` to this file must fail.
+    fn write_fails(&self, buf: &[u8]) -> bool {
+        if !self.path.to_string_lossy().ends_with(".phdb") {
+            return false;
+        }
+        let failing = match &*self.gate.write_marker.lock().unwrap() {
+            Some(marker) => buf.windows(marker.len()).any(|w| w == &marker[..]),
+            None => false,
+        };
+        if failing {
+            self.gate
+                .write_failures
+                .lock()
+                .unwrap()
+                .push(Instant::now());
+        }
+        failing
     }
 
     fn injected() -> pigeonhole_io::Error {
@@ -196,6 +230,12 @@ impl pigeonhole_io::File for GateFile {
         Ok(())
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        if self.write_fails(buf) {
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected write failure",
+            ));
+        }
         self.inner.write_at(buf, offset)
     }
     fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> Completion {
