@@ -1308,6 +1308,53 @@ fn a_stall_on_a_frozen_clock_ends_when_compaction_fails_or_completes() {
     assert!(rows > 600);
 }
 
+#[test]
+fn a_room_wait_pinned_by_a_snapshot_is_refused_on_a_frozen_clock() {
+    // Issue #70: snapshots hold the memtables they read, so once flushes have emptied the
+    // arena of anything else, no event the shard hears of can free room and the clock
+    // never reaches the stall timeout. The commit is refused with `Busy` instead of
+    // waiting for ever, and goes through once the snapshots are released.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sim = SimVfs::new(71);
+        let vfs: VfsRef = Arc::new(FailReadsVfs {
+            inner: Arc::clone(&sim),
+            fail_reads: Arc::new(AtomicBool::new(false)),
+        });
+        let mut o = EngineOptions::new(vfs);
+        o.create_if_missing = true;
+        o.shards = 1;
+        o.pin_threads = false;
+        o.memtable_budget = 128 << 10;
+        o.memtable_freeze_bytes = 8 << 10;
+        o.wal.segment_size = 256 << 10;
+        o.wal.spare_segments = 1;
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let t = engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        // Every commit is followed by a snapshot, which holds the memtables of its view.
+        let mut snaps = Vec::new();
+        let mut i = 0;
+        let refused = loop {
+            assert!(i < 2_000, "never refused: {:?}", engine.metrics());
+            match commit_frozen(&engine, &mut shards, &sim, &t, i) {
+                Ok(()) => i += 1,
+                Err(Error::Busy) => break i,
+                Err(e) => panic!("commit {i}: {e}"),
+            }
+            snaps.push(engine.snapshot().unwrap());
+        };
+        drop(snaps);
+        commit_frozen(&engine, &mut shards, &sim, &t, refused).unwrap();
+        tx.send(refused).unwrap();
+    });
+    let refused = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("a commit waiting for arena room never resolved on a frozen clock (issue #70)");
+    assert!(refused > 0);
+}
+
 // ---- #66: the purge record counts entries an earlier compaction dropped as inputs ----
 
 /// Commits `ops` on an application-owned store, driving the shards; returns the seqno.

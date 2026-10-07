@@ -1581,6 +1581,8 @@ impl ShardState {
             Err(_) => 0,
         };
         if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+            // Memtables whose readers left since the last reclaim count too.
+            self.reclaim_retired();
             self.refresh_free();
         }
         trace!(
@@ -2412,6 +2414,7 @@ impl ShardState {
             self.wait_room = true;
             let now = ctx.now_nanos();
             let timeout = self.shared.write_stall_timeout_nanos;
+            let mut refuse = false;
             match &self.room_wait {
                 None => {
                     // The stall begins: count it, and arm the timeout.
@@ -2435,19 +2438,8 @@ impl ShardState {
                         || w.failed_flushes >= ROOM_FLUSH_ATTEMPTS =>
                 {
                     // Nothing freed room in time (or the flushes that would keep failing,
-                    // which a frozen clock never times out): refuse the waiting members.
-                    self.end_room_wait(now);
-                    self.wait_room = false;
-                    let waiting = std::mem::take(&mut self.pending);
-                    for mut m in waiting {
-                        if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                            self.pending.push(m);
-                            continue;
-                        }
-                        m.failed = Some(Error::Busy);
-                        self.settle(m, Ok(()), ctx);
-                    }
-                    return;
+                    // which a frozen clock never times out).
+                    refuse = true;
                 }
                 Some(w) => {
                     // A timer that gave up on a stopped clock is armed again.
@@ -2468,6 +2460,28 @@ impl ShardState {
             // A flush frees room (one that failed is tried again).
             let _ = self.freeze(true);
             self.spawn_flush(ctx);
+            // With no flush, deferred freeze, undecided share or unsynced group in flight,
+            // nothing the shard will hear of can free room (snapshots pin what is left):
+            // waiting would wait for the clock alone, which may never move (issue #70).
+            let idle = !self.flush_running
+                && self.flush_queue.is_empty()
+                && !self.freeze_deferred
+                && self.prepared.is_empty()
+                && self.unresolved.is_empty();
+            if refuse || idle {
+                // Refuse the waiting members; this group's admitted ones still apply.
+                self.end_room_wait(now);
+                self.wait_room = false;
+                let waiting = std::mem::take(&mut self.pending);
+                for mut m in waiting {
+                    if matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                        self.pending.push(m);
+                        continue;
+                    }
+                    m.failed = Some(Error::Busy);
+                    self.settle(m, Ok(()), ctx);
+                }
+            }
         } else {
             if let Some(w) = &self.room_wait
                 && !self.wait_room
