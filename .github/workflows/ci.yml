@@ -26,6 +26,7 @@ jobs:
   linux:
     name: linux (fmt, clippy, docs, test, deny, semver)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -64,6 +65,7 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     env:
       RUSTFLAGS: -D warnings
     steps:
