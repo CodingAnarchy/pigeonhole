@@ -799,12 +799,19 @@ impl ShardState {
         }
     }
 
-    /// Memtable bytes of this shard, and per tablet.
+    /// Memtable bytes of this shard, and per tablet (empty active memtables count 0).
     fn mem_bytes(&self) -> (u64, HashMap<TabletId, u64>) {
         let mut total = 0;
         let mut per = HashMap::new();
         for (key, slot) in &self.memtables {
-            let b = slot.active.table.allocated_bytes() as u64
+            // An empty active memtable holds no writes, whatever it has allocated: its tablet
+            // can still be cold (a slot now keeps its memtable after a flush).
+            let active = if slot.active.table.is_empty() {
+                0
+            } else {
+                slot.active.table.allocated_bytes() as u64
+            };
+            let b = active
                 + slot
                     .frozen
                     .iter()
@@ -852,10 +859,10 @@ impl ShardState {
             && !self.shared.closing.load(Ordering::Acquire)
             && !self.shared.pager_poisoned.load(Ordering::Acquire)
             && self.shared.full_compactions.load(Ordering::Acquire) == 0;
-        let decision = if idle {
+        let (decision, cleanups) = if idle {
             self.decide(now, mem, &mem_per)
         } else {
-            None
+            (None, Vec::new())
         };
         self.window_writes = 0;
         for l in self.loads.values_mut() {
@@ -875,11 +882,81 @@ impl ShardState {
                 }
             }
         }
+        if !cleanups.is_empty() {
+            for c in cleanups {
+                if !self.cleanups.contains(&c) {
+                    self.cleanups.push(c);
+                }
+            }
+            self.maintain(ctx);
+        }
+    }
+
+    /// Starts a rewrite of the first queued cleanup slot that still holds an SST sticking out
+    /// of its tablet (#95): the rewrite drops the sibling's rows, so a later balancer pass can
+    /// merge. Slots that no longer need one, or whose tablet left this shard or is being
+    /// changed, are dropped (the balancer queues them again while the merge is refused).
+    pub(super) fn start_cleanup(
+        &mut self,
+        view: &Arc<View>,
+        busy: &[SstId],
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let last = self.picker.options().max_levels.max(2) - 1;
+        while !self.cleanups.is_empty() {
+            let key = self.cleanups.remove(0);
+            let Some(tablet) = view.tablets.entry(key.0).filter(|t| t.shard == self.id) else {
+                continue;
+            };
+            if self.moving.contains(&key.0)
+                || view
+                    .catalog
+                    .family(key.1)
+                    .is_none_or(|m| m.merge == MergeKind::Unknown)
+            {
+                continue;
+            }
+            let Some(fam) = view.ssts.family(key.0, key.1) else {
+                continue;
+            };
+            let levels = fam.levels_meta();
+            if !sticks_out_of(tablet, &levels) {
+                continue;
+            }
+            let Some(task) = compact::plan_full(tablet, key.1, &levels, last, busy, true) else {
+                // Its inputs are busy: try again after the running work.
+                self.cleanups.insert(0, key);
+                return;
+            };
+            trace!("shard {} cleanup rewrite of {key:?}", self.id.0);
+            if let Err(e) = self.start_compaction(view, key, task, ctx) {
+                trace!("shard {} compaction start failed: {e}", self.id.0);
+                self.back_off_compaction(ctx);
+            }
+            return;
+        }
     }
 
     /// The balancer's choice for this interval, if any: a size split, a write-skew (or
-    /// memtable-skew) move or split, or a merge of two small, cold neighbours.
-    fn decide(&self, now: u64, mem: u64, mem_per: &HashMap<TabletId, u64>) -> Option<TabletOpKind> {
+    /// memtable-skew) move or split, or a merge of two small, cold neighbours. With no
+    /// choice, also the slots to rewrite so that a refused merge can go through later.
+    fn decide(
+        &self,
+        now: u64,
+        mem: u64,
+        mem_per: &HashMap<TabletId, u64>,
+    ) -> (Option<TabletOpKind>, Vec<(TabletId, FamilyId)>) {
+        let mut cleanups = Vec::new();
+        (self.choose(now, mem, mem_per, &mut cleanups), cleanups)
+    }
+
+    fn choose(
+        &self,
+        now: u64,
+        mem: u64,
+        mem_per: &HashMap<TabletId, u64>,
+        cleanups: &mut Vec<(TabletId, FamilyId)>,
+    ) -> Option<TabletOpKind> {
         let cfg = self.shared.balance;
         let view = self.shared.view.load_full();
         let owned: Vec<TabletEntry> = view
@@ -979,11 +1056,27 @@ impl ShardState {
             }
             let (lb, _) = live_bytes(&view, l, &refs);
             let (rb, _) = live_bytes(&view, r, &refs);
-            if lb + rb < cfg.split_bytes / 4 && merged_ssts(&view.catalog, l, r).is_ok() {
+            if lb + rb >= cfg.split_bytes / 4 {
+                continue;
+            }
+            if merged_ssts(&view.catalog, l, r).is_ok() {
                 return Some(TabletOpKind::Merge {
                     left: l.id,
                     right: r.id,
                 });
+            }
+            // Refused while a side still holds an SST inherited from the split, with its
+            // sibling's rows: nothing else rewrites a cold tablet's SSTs, so ask for it.
+            for t in [l, r] {
+                for f in view.catalog.family_ids_of(t.table) {
+                    if view
+                        .ssts
+                        .family(t.id, f)
+                        .is_some_and(|fam| sticks_out_of(t, &fam.levels_meta()))
+                    {
+                        cleanups.push((t.id, f));
+                    }
+                }
             }
         }
         None
@@ -1115,6 +1208,17 @@ fn quantiles(rows: &[&[u8]], parts: usize) -> Vec<Vec<u8>> {
 /// Whether `row` lies strictly inside `t` (a split there leaves both sides non-empty).
 fn inside(t: &TabletEntry, row: &[u8]) -> bool {
     row > t.start.as_slice() && t.end.as_ref().is_none_or(|e| row < e.as_slice())
+}
+
+/// Whether any SST of a slot of `t` holds rows outside `t`.
+fn sticks_out_of(t: &TabletEntry, levels: &pigeonhole_compaction::Levels) -> bool {
+    compact::tablet_range(t).is_ok_and(|range| {
+        levels
+            .levels
+            .iter()
+            .flatten()
+            .any(|m| compact::sticks_out(m, &range))
+    })
 }
 
 /// The unescaped row of an internal key.

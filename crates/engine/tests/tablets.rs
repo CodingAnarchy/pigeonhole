@@ -227,6 +227,21 @@ impl Db {
         }
     }
 
+    /// Steps until no shard has work left (queued messages or runnable background work).
+    fn settle(&mut self) {
+        for _ in 0..100_000 {
+            let now = pigeonhole_io::Vfs::monotonic_nanos(&*self.vfs);
+            let mut busy = false;
+            for s in &mut self.shards {
+                busy |= s.run_once(now + 1_000);
+            }
+            if !busy {
+                return;
+            }
+        }
+        panic!("the shards never went idle")
+    }
+
     fn drive(&mut self, mut m: PendingMaintenance) -> pigeonhole_engine::Result<()> {
         let mut cx = Context::from_waker(Waker::noop());
         for _ in 0..100_000 {
@@ -738,13 +753,14 @@ fn tablet_changes_are_refused_when_switched_off() {
 }
 
 #[test]
-#[ignore = "#95"]
 fn the_balancer_merges_cold_siblings_once_one_compacted_a_shared_sst() {
     // After a split, the left child compacts its copy of the shared SST and the right child
     // never reaches its L0 trigger: its inherited SST still holds the left child's rows, so
-    // the merge is refused (correctly) at every balancer pass, and nothing ever rewrites it.
+    // the merge is refused (correctly), and the balancer has to ask for a rewrite of the
+    // right child's SST before it can merge (#95). Every step waits for an event rather
+    // than counting on time or a fixed number of passes.
     let mut db = open(1, |o| {
-        o.balance_interval_nanos = u64::MAX;
+        o.balance_interval_nanos = u64::MAX; // only the explicit passes below
         o.tablet_split_bytes = 64 << 20;
         o.compaction.l0_trigger = 2;
     });
@@ -758,24 +774,57 @@ fn the_balancer_merges_cold_siblings_once_one_compacted_a_shared_sst() {
     db.drive(m).unwrap();
     let m = db.engine.split_tablet_pending(id, &rows[20]).unwrap();
     db.drive(m).unwrap();
+    let ranges = db.ranges();
+    assert_eq!(ranges.len(), 2, "{ranges:?}");
+    let (left, right) = (ranges[0].0, ranges[1].0);
+    // Only the left child reaches its L0 trigger and rewrites its copy of the shared SST.
+    db.engine.take_compactions();
     for r in &rows[..20] {
         db.put(r, b"new");
     }
     let m = db.engine.flush_pending().unwrap();
     db.drive(m).unwrap();
-    for _ in 0..1_000 {
+    let mut compacted = Vec::new();
+    for _ in 0..100_000 {
+        compacted.extend(db.engine.take_compactions());
+        if !compacted.is_empty() {
+            break;
+        }
         db.step();
     }
-    // Cold now: a few balancer passes with no writes.
-    for _ in 0..4 {
+    assert!(
+        !compacted.is_empty() && compacted.iter().all(|c| c.tablet == left),
+        "the left child never compacted on its own: {compacted:?}"
+    );
+    // Explicit balancer passes, each driven to completion, until the merge commits. The
+    // tablets turn cold after two passes without writes; then the balancer asks for the
+    // right child's rewrite (a background compaction, stepped to completion) and merges
+    // on a later pass.
+    let mut rewrote_right = false;
+    for pass in 0..32 {
         let m = db.engine.balance_pending().unwrap();
         db.drive(m).unwrap();
-        for _ in 0..1_000 {
-            db.step();
+        db.settle();
+        rewrote_right |= db
+            .engine
+            .take_compactions()
+            .iter()
+            .any(|c| c.tablet == right);
+        if db.ranges().len() == 1 {
+            eprintln!("merged after {} passes", pass + 1);
+            break;
         }
     }
-    assert_eq!(db.ranges().len(), 1, "{:?}", db.ranges());
+    assert!(
+        rewrote_right,
+        "the balancer never rewrote the right child's inherited SST"
+    );
+    assert_eq!(db.ranges().len(), 1, "never merged: {:?}", db.ranges());
     assert_eq!(db.scan_rows(), rows);
+    for (i, r) in rows.iter().enumerate() {
+        let want: &[u8] = if i < 20 { b"new" } else { b"old" };
+        assert_eq!(db.get(r).map(|(_, v)| v).as_deref(), Some(want), "row {i}");
+    }
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
@@ -1074,4 +1123,84 @@ fn idle_slots_do_not_churn_chunks_under_a_reader_pin() {
     eprintln!("commits before a stall: off {off}, on {on}");
     assert!(off > 50, "{off}");
     assert!(on + 2 >= off, "on {on}, off {off}");
+}
+
+#[test]
+fn a_busy_shard_still_rewrites_the_sst_blocking_a_cold_merge() {
+    // As above, but another table on the shard keeps reaching its L0 trigger: some slot is
+    // always due for compaction when the balancer asks for the rewrite. Cleanups alternate
+    // with due compactions, so the cold pair still merges.
+    let mut db = open(1, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.tablet_split_bytes = 64 << 20;
+        o.compaction.l0_trigger = 2;
+    });
+    let id = db.table.id;
+    let w = db
+        .engine
+        .create_table("w", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let mut rows: Vec<Vec<u8>> = (0..40).map(key).collect();
+    rows.sort();
+    for r in &rows {
+        db.put(r, b"old");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    let m = db.engine.split_tablet_pending(id, &rows[20]).unwrap();
+    db.drive(m).unwrap();
+    for r in &rows[..20] {
+        db.put(r, b"new");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    db.settle();
+    let mut n = 0u64;
+    for pass in 0..32 {
+        // Two flushes of `w` each pass: it is due again whenever the balancer runs.
+        for _ in 0..2 {
+            let mut wb = WriteBatch::new();
+            for _ in 0..8 {
+                wb.put(
+                    w.id,
+                    w.families[0].id,
+                    &key(n),
+                    b"q",
+                    None,
+                    ValueRef::Bytes(b"w"),
+                )
+                .unwrap();
+                n += 1;
+            }
+            let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+            step_until_done(&mut db, &mut pc);
+            let m = db.engine.flush_pending().unwrap();
+            db.drive(m).unwrap();
+        }
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+        db.settle();
+        if db.ranges().len() == 1 {
+            eprintln!("merged after {} passes", pass + 1);
+            break;
+        }
+    }
+    assert_eq!(db.ranges().len(), 1, "never merged: {:?}", db.ranges());
+    assert_eq!(db.scan_rows(), rows);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+fn step_until_done(db: &mut Db, pc: &mut pigeonhole_engine::PendingCommit) {
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..100_000 {
+        if let Poll::Ready(r) = Pin::new(&mut *pc).poll(&mut cx) {
+            r.expect("commit");
+            return;
+        }
+        db.step();
+    }
+    panic!("a commit never resolved");
 }

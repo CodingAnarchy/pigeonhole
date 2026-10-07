@@ -1583,6 +1583,12 @@ pub(crate) struct ShardState {
     lost_tablets: bool,
     /// Cross-shard commits to retry once the tablet map changes.
     retries: Vec<CoordinateReq>,
+    /// Slots whose SSTs, inherited from a split's parent, still hold a sibling's rows and so
+    /// block a merge the balancer wants: rewritten when no other compaction is due (#95).
+    cleanups: Vec<(TabletId, FamilyId)>,
+    /// The next background compaction goes to a queued cleanup (they alternate with due
+    /// compactions, so a busy shard never starves them).
+    cleanup_turn: bool,
     /// Writes per tablet in the current balancer interval.
     loads: HashMap<TabletId, TabletLoad>,
     window_writes: u64,
@@ -1682,6 +1688,8 @@ impl ShardState {
             parked_rows: HashSet::new(),
             lost_tablets: false,
             retries: Vec::new(),
+            cleanups: Vec::new(),
+            cleanup_turn: false,
             loads: HashMap::new(),
             window_writes: 0,
             next_balance: 0,
@@ -4256,7 +4264,8 @@ impl ShardState {
         // After a failure, nothing retries until the backoff timer fires, a flush completes
         // or a group is admitted, so a dead device does not loop (issues #70, #79). A
         // poisoned shard starts none: it is dead until reopen.
-        if due.is_empty() || self.compaction_backoff || self.poisoned {
+        if (due.is_empty() && self.cleanups.is_empty()) || self.compaction_backoff || self.poisoned
+        {
             return;
         }
         let busy: Vec<SstId> = self
@@ -4267,6 +4276,15 @@ impl ShardState {
             .iter()
             .copied()
             .collect();
+        // A queued cleanup takes every other compaction, so writes elsewhere on the shard
+        // never starve it (and the merge waiting on it); not while writers stall on L0.
+        if self.cleanup_turn && self.stall.since == 0 && !self.cleanups.is_empty() {
+            self.start_cleanup(&view, &busy, ctx);
+            if self.compaction.is_some() {
+                self.cleanup_turn = false;
+                return;
+            }
+        }
         let now = self.shared.vfs.now_micros();
         // The most urgent slot the picker finds work in (another one's inputs may be busy).
         for (_, key) in due {
@@ -4290,8 +4308,11 @@ impl ShardState {
                 trace!("shard {} compaction start failed: {e}", self.id.0);
                 self.back_off_compaction(ctx);
             }
+            self.cleanup_turn = true;
             return;
         }
+        // Nothing urgent: rewrite an inherited SST that blocks a merge (#95).
+        self.start_cleanup(&view, &busy, ctx);
     }
 
     /// A background compaction failed (or could not start): none starts until a flush
