@@ -121,11 +121,13 @@ impl Pigeonhole {
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) (decision D40).
     ///
     /// Every blocking call (`commit`, `flush`, `close`) waits for the shards to run, so make
-    /// sure each shard is being driven before calling one. A thread that drives a shard must
-    /// not block on shard work: there a blocking commit fails with
-    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) instead of
-    /// deadlocking (the commit still lands), and `flush` or `compact` would wait for ever.
-    /// Table creation and other catalog changes may be called from any thread.
+    /// sure each shard is being driven before calling one. A thread that drives a shard (it
+    /// last called [`Shard::run_once`]) must not block on shard work: there `commit`,
+    /// `check_and_mutate`, transaction commits, `flush` and `compact` fail with
+    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) before doing
+    /// anything, instead of deadlocking. A thread holding a shard it has never run is not
+    /// detected, so run each shard before committing from its thread. Table creation, other
+    /// catalog changes and `shrink` may be called from any thread.
     ///
     /// The loop for each shard: call [`Shard::run_once`] until it returns `false`, then sleep
     /// until the [`Shard::set_wakeup`] callback fires (work arrived or I/O completed) or
@@ -136,9 +138,11 @@ impl Pigeonhole {
     /// To close, call [`Pigeonhole::close`] and keep driving each shard the same way until
     /// [`Shard::closed`] returns `Some`, then drop it: the close's flush and syncs run on
     /// the shards, and `run_once` returns `false` while their I/O is in flight. Called on a
-    /// thread that drives no shard, `close` waits for this and returns the close's result;
-    /// on a thread that drives a shard it cannot wait, and the result comes from
-    /// [`Shard::closed`].
+    /// thread that drives no shard (once every shard has been run), `close` waits for this
+    /// and returns the close's result. Called on a thread that drives a shard, or before
+    /// every shard has been run, it cannot wait: it returns `Ok(())` once the shards are
+    /// told to close, and the close's result (a failed or unclean close) is then reported
+    /// only by [`Shard::closed`].
     ///
     /// ```
     /// use std::thread;

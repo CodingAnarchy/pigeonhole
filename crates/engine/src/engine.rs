@@ -460,12 +460,15 @@ impl Engine {
     /// checkpoint and sync their streams as part of the close, and `run_once` returns
     /// `false` while that I/O is in flight (the wakeup fires when it completes).
     ///
-    /// A thread that drives a shard must not block on shard work. Blocking commit waits
-    /// (`PendingCommit::wait`, `commit`, `check_and_mutate`) fail with `InvalidArgument` on
-    /// such a thread rather than deadlock (decision D88); `flush`, `compact` and `shrink`
-    /// wait for the shards, so call them from another thread. Catalog changes
-    /// (`create_table`, `add_family`, `drop_table`) only wait for the manifest writer and
-    /// may be called from any thread.
+    /// A thread that drives a shard (it last ran [`EngineShard::run_once`]) must not block
+    /// on shard work, and the engine refuses rather than deadlock (decision D88): `commit`,
+    /// `check_and_mutate`, `Txn::commit`, `flush` and `compact` fail there with
+    /// [`Error::InvalidArgument`] before submitting anything, and [`PendingCommit::wait`]
+    /// on an already-submitted commit fails with [`Error::WouldDeadlock`] (the commit will
+    /// apply; await its future from the event loop). A thread holding a shard it has never
+    /// run is not detected: run the shard before committing from that thread. Catalog
+    /// changes (`create_table`, `add_family`, `drop_table`) and `shrink` only wait for the
+    /// manifest writer and may be called from any thread.
     pub fn open_application_owned(
         path: &Path,
         options: EngineOptions,
@@ -659,6 +662,7 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             waiters: VisibilityWaiters::default(),
+            shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),
             drivers: if mode == Mode::ApplicationOwned {
                 crate::waker::Drivers::new(shards)
@@ -1119,6 +1123,7 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             waiters: VisibilityWaiters::default(),
+            shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),
             drivers: Default::default(),
             freeze_waiters: FreezeWaiters::default(),
@@ -1245,7 +1250,13 @@ impl Engine {
     /// A commit waits (inside the engine) while the memtable arena is full until a flush
     /// frees room, and while L0 is deep for the token bucket's next slot; it fails with
     /// [`Error::Busy`] only when no flush could ever make it fit.
+    ///
+    /// In application-owned mode, on a thread that drives a shard this fails with
+    /// [`Error::InvalidArgument`] before submitting anything, since waiting there could
+    /// deadlock (D88): use [`submit`](Engine::submit) and await the future from the event
+    /// loop.
     pub fn commit(&self, batch: WriteBatch, durability: Option<Durability>) -> Result<CommitInfo> {
+        self.inner.shared.refuse_blocking_on_driver("commit")?;
         self.submit(batch, durability)?.wait()
     }
 
@@ -1364,12 +1375,14 @@ impl Engine {
     /// a write stall does, and the flush fails with [`Error::Busy`] when no chunk frees up
     /// in time (D124, D126; issue #116).
     pub fn flush(&self) -> Result<()> {
+        self.inner.shared.refuse_blocking_on_driver("flush")?;
         self.inner.flush_pending()?.wait()
     }
 
     /// Compacts every family of `table` (or all tables) fully: flushes, then merges every
     /// level into the last one.
     pub fn compact(&self, table: Option<TableId>) -> Result<()> {
+        self.inner.shared.refuse_blocking_on_driver("compact")?;
         self.inner.compact_pending(table)?.wait()
     }
 
@@ -1443,9 +1456,12 @@ impl Engine {
     /// In application-owned mode the application keeps driving every shard as usual until
     /// [`EngineShard::closed`] returns `Some`, then drops it. Called on a thread that drives
     /// no shard, once every shard has been run, `close` waits for that and returns the final
-    /// result. Called on a thread that drives a shard (or before every shard has been run
-    /// once), it cannot wait: it returns `Ok(())` after telling the shards to close, and
-    /// the outcome comes from [`EngineShard::closed`].
+    /// result.
+    ///
+    /// Called on a thread that drives a shard, or before every shard has been run at least
+    /// once, `close` cannot wait: it returns `Ok(())` as soon as it has told the shards to
+    /// close. That `Ok` says nothing about the outcome: a failed or unclean close is then
+    /// reported **only** by [`EngineShard::closed`].
     pub fn close(&self) -> Result<()> {
         self.inner.close(true)
     }
@@ -2360,6 +2376,7 @@ impl Inner {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
+        self.shared.refuse_blocking_on_driver("check_and_mutate")?;
         for rd in &batch.row_deletes {
             if rd.table != table || rd.row != row {
                 return Err(Error::InvalidArgument(
@@ -2857,8 +2874,10 @@ impl EngineShard {
     /// wakeup fires when it completes.
     ///
     /// The calling thread counts as this shard's driver from now on (until another thread
-    /// runs it or it is dropped), so its blocking commit waits fail rather than deadlock
-    /// (see [`Engine::open_application_owned`]).
+    /// runs it or it is dropped), so its blocking calls fail rather than deadlock (see
+    /// [`Engine::open_application_owned`]). Until a thread first runs the shard, nobody
+    /// counts as its driver: a thread holding a shard it has not run yet is not protected,
+    /// and must not block on a commit (run the shard first).
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
         let Some(d) = self.driver.as_mut() else {
             return false;

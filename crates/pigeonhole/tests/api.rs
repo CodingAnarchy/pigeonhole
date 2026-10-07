@@ -267,6 +267,7 @@ fn error_codes_are_stable_numbers() {
         (ErrorCode::RecordTooLarge, 23),
         (ErrorCode::Busy, 24),
         (ErrorCode::SnapshotExpired, 25),
+        (ErrorCode::WouldDeadlock, 26),
     ];
     for (code, n) in codes {
         assert_eq!(code as u32, n, "{code:?}");
@@ -316,6 +317,7 @@ fn every_engine_error_maps_to_its_code() {
         (E::RecordTooLarge, ErrorCode::RecordTooLarge),
         (E::Busy, ErrorCode::Busy),
         (E::SnapshotExpired, ErrorCode::SnapshotExpired),
+        (E::WouldDeadlock, ErrorCode::WouldDeadlock),
     ];
     for (e, code) in cases {
         let what = format!("{e:?}");

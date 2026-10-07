@@ -64,6 +64,10 @@ pub enum ErrorCode {
     /// A reader process's snapshot was taken before a writer restart, which may have reused
     /// the space it reads. Take a new snapshot and redo the read.
     SnapshotExpired = 25,
+    /// A submitted commit's outcome was awaited on a thread that drives a shard
+    /// (application-owned mode), where blocking could deadlock. The commit was submitted
+    /// and will apply; poll its future from the event loop instead.
+    WouldDeadlock = 26,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
@@ -147,6 +151,7 @@ impl From<pigeonhole_engine::Error> for Error {
             E::RecordTooLarge => ErrorCode::RecordTooLarge,
             E::Busy => ErrorCode::Busy,
             E::SnapshotExpired => ErrorCode::SnapshotExpired,
+            E::WouldDeadlock => ErrorCode::WouldDeadlock,
             // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
             // here surfaces as `Io` (the message names it) until it gets its own code; the
             // mapping test lists every current variant.

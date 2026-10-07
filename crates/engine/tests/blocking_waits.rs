@@ -185,38 +185,39 @@ fn a_catalog_change_finishes_a_pump_commit_whose_shard_is_not_run() {
 
 /// Thread X drives shard B, which has a `Sync` group in flight (holding the global
 /// watermark). X commits to a table on shard A (driven by thread Y) and waits: only X can
-/// let B publish, so the wait used to spin for ever. It now fails at once (D88), and the
-/// commit still lands.
+/// let B publish, so the wait used to spin for ever. Now (amended D88) calls that would
+/// submit and block are refused before submitting anything (`InvalidArgument`), and
+/// waiting on an already-submitted commit fails with `WouldDeadlock` while the commit
+/// still applies.
 #[test]
 fn a_blocking_wait_on_a_thread_driving_another_shard_fails_instead_of_deadlocking() {
     let (vfs, gate) = gate::vfs(1352);
     let (db, shards) = Engine::open_application_owned(Path::new(DB), options(vfs, 2)).unwrap();
     let drivers: Vec<_> = shards.into_iter().map(driver).collect();
-    let a = table(&db, "a");
-    let b = table(&db, "b");
-    // Shard B is shard 1: `on_b` is the table it owns, `on_a` the other one's.
-    let (on_b, on_a) = match (shard_of(&db, &a), shard_of(&db, &b)) {
-        (0, 1) => (b, a),
-        (1, 0) => (a, b),
-        other => panic!("tables on shards {other:?}"),
-    };
-    let b_shard = 1;
+    let (on_a, on_b) = tables_on_0_and_1(&db);
     let x = &drivers[1];
-    gate.hold(&wal(b_shard));
+    gate.hold(&wal(1));
     let pending = db
         .submit(put(&on_b, "held"), Some(Durability::Sync))
         .unwrap();
-    gate.wait_held(&wal(b_shard));
+    gate.wait_held(&wal(1));
 
     let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
-    let waited = on_driver(x, move |_| {
-        db2.commit(put(&on_a2, "from-x"), Some(Durability::None))
-    });
-    let waited = waited.expect("the wait on the driving thread hung");
+    let refused = on_driver(x, move |_| {
+        db2.commit(put(&on_a2, "refused"), Some(Durability::None))
+    })
+    .expect("commit on the driving thread hung");
     assert!(
-        matches!(waited, Err(Error::InvalidArgument(ref m)) if m.contains("drives a shard")),
-        "{waited:?}"
+        matches!(refused, Err(Error::InvalidArgument(ref m)) if m.contains("nothing was submitted")),
+        "{refused:?}"
     );
+    let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
+    let waited = on_driver(x, move |_| {
+        db2.submit(put(&on_a2, "from-x"), Some(Durability::None))
+            .and_then(|p| p.wait())
+    })
+    .expect("the wait on the driving thread hung");
+    assert!(matches!(waited, Err(Error::WouldDeadlock)), "{waited:?}");
     let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
     let checked = on_driver(x, move |_| {
         db2.check_and_mutate(
@@ -235,19 +236,27 @@ fn a_blocking_wait_on_a_thread_driving_another_shard_fails_instead_of_deadlockin
         matches!(checked, Err(Error::InvalidArgument(_))),
         "{checked:?}"
     );
+    let db2 = Arc::clone(&db);
+    let flushed = on_driver(x, move |_| db2.flush()).expect("flush on the driving thread hung");
+    assert!(
+        matches!(flushed, Err(Error::InvalidArgument(_))),
+        "{flushed:?}"
+    );
 
-    // Off the driving threads, waits work, and both commits landed.
+    // Off the driving threads, waits work. The submitted commit applied; the refused ones
+    // did not.
     gate.release();
     pending.wait().unwrap();
-    // Both commits were submitted before this one: once it is visible, so are they.
+    // Everything above was submitted before this one: once it is visible, so is that.
     db.commit(put(&on_a, "barrier"), Some(Durability::None))
         .unwrap();
-    for row in [&b"from-x"[..], b"cas"] {
-        assert!(
+    for (row, landed) in [(&b"from-x"[..], true), (b"refused", false), (b"cas", false)] {
+        assert_eq!(
             db.get_latest(on_a.id, on_a.families[0].id, row, b"q")
                 .unwrap()
                 .is_some(),
-            "row {:?} missing",
+            landed,
+            "row {:?}",
             String::from_utf8_lossy(row)
         );
     }
@@ -255,6 +264,71 @@ fn a_blocking_wait_on_a_thread_driving_another_shard_fails_instead_of_deadlockin
     for (_, h) in drivers {
         h.join().unwrap().unwrap();
     }
+}
+
+/// Creates two tables and returns them ordered by owning shard (0, then 1). The shards
+/// must be running.
+fn tables_on_0_and_1(db: &Engine) -> (Arc<TableInfo>, Arc<TableInfo>) {
+    let a = table(db, "a");
+    let b = table(db, "b");
+    match (shard_of(db, &a), shard_of(db, &b)) {
+        (0, 1) => (a, b),
+        (1, 0) => (b, a),
+        other => panic!("tables on shards {other:?}"),
+    }
+}
+
+/// A commit waiting for visibility behind shard 1's in-flight group ends with `Closed`
+/// when shard 1 dies (its `EngineShard` is dropped mid-group), instead of parking for ever,
+/// and the close then ends (unclean) instead of waiting on the dead shard.
+#[test]
+fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
+    let (vfs, gate) = gate::vfs(1358);
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), options(vfs, 2)).unwrap();
+    let mut b = shards.pop().unwrap();
+    let a = driver(shards.pop().unwrap());
+    // This thread drives shard 1; helper threads commit.
+    let (db2, mut b) = (Arc::clone(&db), {
+        let me = thread::current();
+        b.set_wakeup(Box::new(move || me.unpark()));
+        b
+    });
+    let tables = thread::spawn(move || tables_on_0_and_1(&db2));
+    while !tables.is_finished() {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    let (on_a, on_b) = tables.join().unwrap();
+    gate.hold(&wal(1));
+    drop(
+        db.submit(put(&on_b, "held"), Some(Durability::Sync))
+            .unwrap(),
+    );
+    while gate.held().is_empty() {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    let (tx, rx) = mpsc::channel();
+    let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
+    thread::spawn(move || {
+        let _ = tx.send(db2.commit(put(&on_a2, "waits"), Some(Durability::None)));
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "visible while shard 1 held the watermark"
+    );
+    drop(b);
+    let ended = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the visibility wait outlived the shard holding it");
+    assert!(matches!(ended, Err(Error::Closed)), "{ended:?}");
+    gate.release();
+    // The close ends (it no longer waits on the dead shard) and is unclean.
+    assert!(db.close().is_err(), "a close with a dead shard reported Ok");
+    assert!(
+        a.1.join().unwrap().is_err(),
+        "a close with a dropped shard is unclean"
+    );
 }
 
 // ---- 3-4 3.1: the application-owned close ----

@@ -340,6 +340,8 @@ pub(crate) struct Shared {
     /// meanwhile, so a tablet does not move past the shards' rounds (issue #94).
     pub full_compactions: AtomicUsize,
     pub waiters: VisibilityWaiters,
+    /// A shard died (`Shared::shard_died`).
+    pub shard_died: AtomicBool,
     /// The manifest pump's root commit in flight, which a blocked thread may finish.
     pub manifest_flight: manifest::Flight,
     /// Which thread drives each application-owned shard (empty in engine-owned mode).
@@ -388,7 +390,8 @@ impl Shared {
     }
 
     /// Registers an async waiter for `seqno` to become visible; returns true if it already is
-    /// (the caller then proceeds without waiting).
+    /// (the caller then proceeds without waiting). A waker registered again for the same
+    /// seqno (a spurious wake) is not listed twice.
     pub(crate) fn wait_visible(&self, seqno: Seqno, waker: &Waker) -> bool {
         if self.shm.visible_seqno() >= seqno {
             return true;
@@ -399,12 +402,65 @@ impl Shared {
                 .list
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            list.push((seqno, waker.clone()));
+            if !list.iter().any(|(s, w)| *s == seqno && w.will_wake(waker)) {
+                list.push((seqno, waker.clone()));
+            }
             self.waiters.count.store(list.len(), Ordering::Release);
         }
-        // The shards check the count after each watermark publish; a publish between the
-        // first check and the registration is caught by this second look.
+        // The shards check the count after each watermark publish (behind a SeqCst fence,
+        // `FreezeWaiters::take_ready`); this fence orders our count store before the second
+        // look, so either the publisher sees us registered or we see its watermark.
+        std::sync::atomic::fence(Ordering::SeqCst);
         self.shm.visible_seqno() >= seqno
+    }
+
+    /// Whether visibility can no longer advance: the close finished, or a shard died (its
+    /// thread panicked, or its `EngineShard` was dropped, which also fails the close). A
+    /// visibility wait then ends with `Closed`.
+    pub(crate) fn visibility_ended(&self) -> bool {
+        self.closed.load(Ordering::SeqCst) || self.close.failed.load(Ordering::SeqCst)
+    }
+
+    /// Wakes every visibility waiter whatever its seqno, after `visibility_ended` became
+    /// true: each re-checks and ends.
+    pub(crate) fn wake_all_visible(&self) {
+        let woken = {
+            let mut list = self
+                .waiters
+                .list
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.waiters.count.store(0, Ordering::Release);
+            std::mem::take(&mut *list)
+        };
+        for (_, w) in woken {
+            w.wake();
+        }
+    }
+
+    /// A shard died (its thread panicked, or its `EngineShard` was dropped before it
+    /// closed): its pending watermark never moves again. The close becomes unclean, waits
+    /// for visibility end, and the other shards are kicked so a close in progress stops
+    /// waiting on it (they give up flushing).
+    pub(crate) fn shard_died(&self) {
+        self.shard_died.store(true, Ordering::SeqCst);
+        self.fail_close();
+        self.wake_all_visible();
+        // `fail_close` kicks only the first time the close fails: kick again, the death is news.
+        self.broadcast(|| ShardMsg::Kick);
+    }
+
+    /// In application-owned mode, refuses a call that submits work and blocks for it when
+    /// the calling thread drives a shard (it could deadlock): nothing is submitted (D88).
+    pub(crate) fn refuse_blocking_on_driver(&self, what: &str) -> Result<()> {
+        if self.drivers.current_drives() {
+            return Err(Error::InvalidArgument(format!(
+                "{what} blocks, and this thread drives a shard (application-owned mode), so \
+                 it could deadlock; nothing was submitted: submit and await the future from \
+                 the event loop, or call it from another thread"
+            )));
+        }
+        Ok(())
     }
 
     /// Wakes every registered waiter whose seqno is visible now. Called by shards after a
@@ -646,8 +702,10 @@ impl Shared {
             n.notify(result);
         }
         // Application-owned shards that finished their part are idle, and their drivers
-        // sleep until the wakeup: wake them to see `EngineShard::closed`.
+        // sleep until the wakeup: wake them to see `EngineShard::closed`. Visibility waits
+        // still pending now never complete: end them.
         self.broadcast(|| ShardMsg::Kick);
+        self.wake_all_visible();
     }
 }
 
@@ -4798,12 +4856,15 @@ impl ShardState {
         }
         if self.close_stage == CloseStage::Flushing
             && !self.flush_running
-            && (self.flush_failed || self.shared.pager_poisoned.load(Ordering::Acquire))
+            && (self.flush_failed
+                || self.shared.pager_poisoned.load(Ordering::Acquire)
+                || self.shared.shard_died.load(Ordering::Acquire))
         {
             self.flush_failed = true;
             self.shared.fail_close();
             // Give up on flushing: the WAL keeps everything, the next open replays it, and
-            // the close is reported unclean.
+            // the close is reported unclean. A dead shard (issue #135) pins the global
+            // watermark, so a deferred freeze would wait for it for ever.
             self.close_stage = CloseStage::Checkpointing;
             self.checkpoint_inflight = false;
         }
@@ -4908,7 +4969,7 @@ impl ShardState {
         self.closing = true;
         self.close_stage = CloseStage::Reported;
         self.final_sync();
-        shared.fail_close();
+        shared.shard_died();
         if shared.close.remaining.load(Ordering::Acquire) > 0 {
             shared.report_closed();
         }
@@ -4923,7 +4984,7 @@ impl ShardState {
         }
         self.closing = true;
         self.close_stage = CloseStage::Reported;
-        self.shared.close.failed.store(true, Ordering::Release);
+        self.shared.shard_died();
         if self.shared.close.remaining.load(Ordering::Acquire) > 0 {
             self.shared.report_closed();
         }

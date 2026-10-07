@@ -241,29 +241,20 @@ pub struct PendingCommit {
 
 impl PendingCommit {
     /// Blocks until the commit meets its durability level and is visible. The thread parks
-    /// while it waits.
+    /// while it waits. Fails with [`Error::Closed`] if the database closes, or a shard dies
+    /// (its thread panicked, or its `EngineShard` was dropped), before the commit is visible.
     ///
     /// In application-owned mode a thread that drives a shard must not block: the commit
     /// may need that shard to run (its own group, or any group holding the global
     /// watermark below it, decision D88). On such a thread this returns the result if the
     /// commit is already done and visible, and otherwise fails at once with
-    /// [`Error::InvalidArgument`] instead of deadlocking. The commit still lands; poll the
-    /// future from the event loop instead, or wait on another thread.
+    /// [`Error::WouldDeadlock`]: the commit was submitted and will apply, but its outcome
+    /// must be awaited from the event loop (poll this future there) or another thread.
     pub fn wait(mut self) -> crate::Result<CommitInfo> {
         let info = wait_reply(&self.shared, &mut self.waiter)?;
         wait_visible(&self.shared, info.seqno)?;
         Ok(info)
     }
-}
-
-/// The error for a blocking wait on a thread that drives a shard (D88, issue #135).
-pub(crate) fn driving_thread_error() -> Error {
-    Error::InvalidArgument(
-        "a blocking wait on a thread that drives a shard (application-owned mode) could \
-         deadlock; the request was submitted and completes as the shards run: await it from \
-         the event loop, or wait on another thread"
-            .to_owned(),
-    )
 }
 
 /// Blocks for a shard's reply, or (on a thread that drives a shard) takes it only if it is
@@ -277,7 +268,7 @@ pub(crate) fn wait_reply<T: Send>(
         return match Pin::new(waiter).poll(&mut cx) {
             Poll::Ready(Some(r)) => r,
             Poll::Ready(None) => Err(Error::Closed),
-            Poll::Pending => Err(driving_thread_error()),
+            Poll::Pending => Err(Error::WouldDeadlock),
         };
     }
     let waker = crate::waker::thread_waker();
@@ -292,7 +283,8 @@ pub(crate) fn wait_reply<T: Send>(
 }
 
 /// Blocks until `seqno` is visible (D19), parked on the shards' watermark publishes. Fails
-/// instead on a thread that drives a shard, which may be the one holding the watermark.
+/// instead on a thread that drives a shard, which may be the one holding the watermark, and
+/// with `Closed` once visibility can no longer advance (the close finished, or a shard died).
 pub(crate) fn wait_visible(
     shared: &crate::shard::Shared,
     seqno: pigeonhole_format::Seqno,
@@ -301,10 +293,13 @@ pub(crate) fn wait_visible(
         return Ok(());
     }
     if shared.drivers.current_drives() {
-        return Err(driving_thread_error());
+        return Err(Error::WouldDeadlock);
     }
     let waker = crate::waker::thread_waker();
     while !shared.wait_visible(seqno, &waker) {
+        if shared.visibility_ended() {
+            return Err(Error::Closed);
+        }
         std::thread::park();
     }
     Ok(())
@@ -332,6 +327,8 @@ impl Future for PendingCommit {
         // publish a watermark, so this never spins.
         if this.shared.wait_visible(info.seqno, cx.waker()) {
             Poll::Ready(Ok(info))
+        } else if this.shared.visibility_ended() {
+            Poll::Ready(Err(Error::Closed))
         } else {
             Poll::Pending
         }
@@ -396,6 +393,7 @@ impl Txn {
             reads,
             batch,
         } = self;
+        engine.shared.refuse_blocking_on_driver("Txn::commit")?;
         engine
             .submit(batch, durability, Some((snapshot.seqno, reads)), None)?
             .wait()

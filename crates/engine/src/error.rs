@@ -82,6 +82,10 @@ pub enum Error {
     /// A reader process's snapshot was taken before a writer restart: the new writer may
     /// have reused the space it names. Take a new snapshot.
     SnapshotExpired,
+    /// A submitted commit's outcome was awaited on a thread that drives a shard
+    /// (application-owned mode), where blocking could deadlock. The commit was submitted
+    /// and will apply; await its future from the event loop instead (D88).
+    WouldDeadlock,
 }
 
 impl fmt::Display for Error {
@@ -119,6 +123,11 @@ impl fmt::Display for Error {
             Error::RecordTooLarge => {
                 f.write_str("the commit's WAL record is larger than a segment can hold")
             }
+            Error::WouldDeadlock => f.write_str(
+                "the commit was submitted and will apply, but its outcome cannot be awaited \
+                 on a thread that drives a shard (it could deadlock): poll the PendingCommit \
+                 future from the event loop instead",
+            ),
             Error::Busy => f.write_str(
                 "writes stalled past the write-stall timeout (transient: retry later), or a \
                  batch larger than the arena (never fits: split it or raise memtable_budget)",
@@ -170,6 +179,8 @@ impl Error {
             Error::NoReaderSlot => Error::NoReaderSlot,
             Error::RecordTooLarge => Error::RecordTooLarge,
             Error::Busy => Error::Busy,
+            Error::WouldDeadlock => Error::WouldDeadlock,
+            Error::SnapshotExpired => Error::SnapshotExpired,
         }
     }
 }
