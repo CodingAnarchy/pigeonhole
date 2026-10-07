@@ -805,13 +805,17 @@ impl Run {
                     if armed { " (crash armed)" } else { "" }
                 ));
                 let mut result = self.commit(&ops, durability);
-                if matches!(&result, Err(e) if e.code() == ErrorCode::Busy) {
+                if matches!(&result, Err(e) if e.code() == ErrorCode::Busy)
+                    && !self.snaps.is_empty()
+                {
                     // The memtable arena is full of memtables this run's snapshots hold and
-                    // nothing is left to flush: the engine refuses the commit rather than
-                    // wait for a clock that only this thread moves (issue #70). A refused
-                    // commit is not applied; drop the snapshots and try again.
+                    // nothing is left to flush: on this frozen clock the engine refuses the
+                    // commit rather than wait for a timeout that never comes (issue #70). A
+                    // refused commit must not be applied: the store still matches the model
+                    // without it. Then drop the snapshots and try again.
                     self.stats.busy += 1;
                     self.trace.push("BUSY: snapshots dropped".into());
+                    self.compare_dump("after a commit refused with Busy")?;
                     self.snaps.clear();
                     result = self.commit(&ops, durability);
                 }
