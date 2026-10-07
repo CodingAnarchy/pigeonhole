@@ -39,4 +39,4 @@ Before this change, the only way to wait for a time was to return `Pending` on e
 - `crates/runtime`: `sched.rs` (scheduler, pool threads), `lib.rs` (shard loop, `ShardDriver`). `TaskPoll` is matched only inside the runtime, so adding a variant breaks no other crate. The crate is not published yet, so CI's semver check skips it.
 - `crates/engine/src/shard.rs`: `ClockTimer` probes the clock, then sleeps with `SleepUntil` once it has seen the clock move. A cancel wakes it at once.
 - `crates/engine/src/engine.rs`: `EngineShard::next_deadline`.
-- `crates/pigeonhole/src/db.rs`: the frozen public `Shard::run_once` keeps returning `true` while a background timer is pending, as it effectively did before. An application that waits only on `set_wakeup` therefore still runs it. A public `next_wakeup` would need its own ICR (issue #92).
+- `crates/pigeonhole/src/db.rs`: the frozen public `Shard::run_once` keeps returning `true` while a background timer is pending, as it effectively did before. An application that waits only on `set_wakeup` therefore still runs it. A public `next_wakeup` would need its own ICR (issue #92). Superseded for the public crate by ICR 0007.

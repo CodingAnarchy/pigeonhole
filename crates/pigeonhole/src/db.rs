@@ -121,28 +121,44 @@ impl Pigeonhole {
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) (decision D40).
     ///
     /// Every blocking call (`commit`, `flush`, table creation) waits for a shard to run, so
-    /// make sure each shard is being driven before calling one. After
-    /// [`Pigeonhole::close`], keep driving each shard until [`Shard::run_once`] returns
+    /// make sure each shard is being driven before calling one.
+    ///
+    /// The loop for each shard: call [`Shard::run_once`] until it returns `false`, then sleep
+    /// until the [`Shard::set_wakeup`] callback fires (work arrived) or
+    /// [`Shard::next_wakeup`] passes (background work is due), whichever comes first. An idle
+    /// shard then uses no CPU, even while a write stall or a failed compaction's retry is
+    /// pending. After [`Pigeonhole::close`], keep driving each shard until `run_once` returns
     /// `false`, then drop it.
     ///
     /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    /// use std::thread;
     /// use std::time::Duration;
     /// use pigeonhole::{Family, Options, Pigeonhole};
     ///
     /// # fn main() -> pigeonhole::Result<()> {
     /// # let dir = pigeonhole::doc_support::temp_dir();
     /// let (db, shards) = Pigeonhole::open_application_owned(dir.join("app.phdb"), Options::default().shards(2))?;
-    /// let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    /// let stop = Arc::new(AtomicBool::new(false));
     /// let threads: Vec<_> = shards
     ///     .into_iter()
     ///     .map(|mut shard| {
     ///         let stop = stop.clone();
-    ///         std::thread::spawn(move || {
-    ///             // Your event loop: run the shard, then do your own work.
-    ///             while shard.run_once(Duration::from_micros(200))
-    ///                 || !stop.load(std::sync::atomic::Ordering::Acquire)
-    ///             {
-    ///                 std::thread::yield_now();
+    ///         thread::spawn(move || {
+    ///             let me = thread::current();
+    ///             shard.set_wakeup(Box::new(move || me.unpark()));
+    ///             loop {
+    ///                 // Your event loop: run the shard until it is idle, do your own work...
+    ///                 while shard.run_once(Duration::from_micros(200)) {}
+    ///                 if stop.load(Ordering::Acquire) {
+    ///                     return;
+    ///                 }
+    ///                 // ...then sleep until work arrives or background work is due.
+    ///                 match shard.next_wakeup() {
+    ///                     Some(due) => thread::park_timeout(due),
+    ///                     None => thread::park(),
+    ///                 }
     ///             }
     ///         })
     ///     })
@@ -154,8 +170,9 @@ impl Pigeonhole {
     ///
     /// drop(t);
     /// db.close()?;
-    /// stop.store(true, std::sync::atomic::Ordering::Release);
+    /// stop.store(true, Ordering::Release);
     /// for thread in threads {
+    ///     thread.thread().unpark();
     ///     thread.join().unwrap();
     /// }
     /// # Ok(())
@@ -513,15 +530,52 @@ impl Shard {
 
     /// Runs queued writes, group commit and background work for up to `budget`. Returns
     /// whether work remains.
+    ///
+    /// Background work waiting for a time (a write stall's pacing, a wait for memtable room,
+    /// a failed compaction's retry) is not work that remains: with only that left it returns
+    /// `false`, and [`next_wakeup`](Shard::next_wakeup) says when to call it again. The
+    /// callback registered with [`set_wakeup`](Shard::set_wakeup) does not fire for it.
     pub fn run_once(&mut self, budget: std::time::Duration) -> bool {
         let budget = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
         let deadline = self.vfs.monotonic_nanos().saturating_add(budget);
-        // Background work waiting on a timer (a write stall, a compaction's backoff) is work
-        // that remains: the wakeup callback does not fire when it falls due.
-        self.inner.run_once(deadline) || self.inner.next_deadline().is_some()
+        self.inner.run_once(deadline)
     }
 
-    /// Registers a callback invoked (from any thread) when work arrives for this shard.
+    /// How long until background work on this shard is due (a write stall's pacing, a wait
+    /// for memtable room, a failed compaction's retry), or `None` when none is waiting for a
+    /// time. `Some(Duration::ZERO)` means it is due now.
+    ///
+    /// After [`run_once`](Shard::run_once) returns `false`, sleep until the
+    /// [`set_wakeup`](Shard::set_wakeup) callback fires or this much time passes, whichever
+    /// comes first, then call `run_once` again. See [`Pigeonhole::open_application_owned`]
+    /// for the loop.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::{Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let (db, mut shards) = Pigeonhole::open_application_owned(dir.join("w.phdb"), Options::default().shards(1))?;
+    /// let shard = &mut shards[0];
+    /// while shard.run_once(Duration::from_micros(200)) {}
+    /// // Nothing is waiting for a time: sleep until the wakeup callback fires.
+    /// assert_eq!(shard.next_wakeup(), None);
+    /// db.close()?;
+    /// while shard.run_once(Duration::from_micros(200)) {}
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn next_wakeup(&self) -> Option<std::time::Duration> {
+        let deadline = self.inner.next_deadline()?;
+        let now = self.vfs.monotonic_nanos();
+        Some(std::time::Duration::from_nanos(
+            deadline.saturating_sub(now),
+        ))
+    }
+
+    /// Registers a callback invoked (from any thread) when work arrives for this shard. It
+    /// does not fire when background work falls due: see [`next_wakeup`](Shard::next_wakeup).
     pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
         self.inner.set_wakeup(wake);
     }
