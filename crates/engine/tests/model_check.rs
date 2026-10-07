@@ -5,8 +5,9 @@
 
 mod common;
 
-use common::{Config, final_dump, run};
+use common::{Config, final_dump, read_after_background_crash, run};
 use pigeonhole_format::Durability;
+use pigeonhole_sim::Op;
 
 fn seeds() -> Vec<u64> {
     let n: u64 = std::env::var("PIGEONHOLE_SEEDS")
@@ -44,6 +45,21 @@ fn faults_and_crashes_for_every_shard_count() {
         let mut cfg = Config::standard(250);
         cfg.shards = shards;
         for seed in seeds() {
+            check(seed, &cfg);
+        }
+    }
+}
+
+#[test]
+fn harness_regressions_from_the_seed_sweep() {
+    // Seed 248: an armed crash fired on background I/O and the held snapshots' re-check
+    // after a commit found the store dead (issue #62's pattern). Seed 288: a surviving
+    // share fit two in-flight commits (a family delete inside another commit's row
+    // delete) and the greedy matcher gave it to the wrong one.
+    for shards in 1..=8 {
+        let mut cfg = Config::standard(250);
+        cfg.shards = shards;
+        for seed in [248, 288] {
             check(seed, &cfg);
         }
     }
@@ -213,5 +229,36 @@ fn results_are_identical_across_shard_counts_under_faults() {
                 "seed {seed}: {shards} shards differ from 1 shard"
             );
         }
+    }
+}
+
+#[test]
+fn a_read_after_a_background_fired_crash_recovers() {
+    // Issue #62: an armed power loss fires on a shard's background flush with nothing in
+    // flight; the next read step meets the dead store (its SSTs' handles died with the
+    // crash) and must recover from that crash, not report a read mismatch.
+    let mut cfg = Config::quiet(30);
+    // Nothing random between the steps: no explicit maintenance, one plain commit at a time.
+    (cfg.flush_ppm, cfg.compact_ppm) = (0, 0);
+    (cfg.cas_ppm, cfg.txn_ppm, cfg.tasks) = (0, 0, 1);
+    let reads: Vec<Op> = (0..cfg.spec.rows)
+        .map(|i| Op::Get {
+            row: format!("row{i:06}").into_bytes(),
+            family: "f".into(),
+            qualifier: b"q0".to_vec(),
+        })
+        .chain([Op::Scan {
+            start: b"row".to_vec(),
+            end: b"rox".to_vec(),
+        }])
+        .collect();
+    for seed in seeds() {
+        let stats =
+            read_after_background_crash(seed, &cfg, &reads).unwrap_or_else(|f| panic!("{f}"));
+        eprintln!("seed {seed}: {stats:?}");
+        assert_eq!(
+            stats.background_crashes, 1,
+            "seed {seed}: no read step met the background-fired crash"
+        );
     }
 }

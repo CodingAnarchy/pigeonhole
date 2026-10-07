@@ -11,25 +11,39 @@
 //! explicit timestamp is dropped on both sides: there is no typed `put_at`.
 //!
 //! **Crashes.** Process crashes and power losses between operations, and power losses in
-//! the middle of a commit (`FaultPlan::crash_after_ops`). Crash runs use one shard, so the
-//! survivors are a prefix of the commit log: recovery must reproduce exactly the model of
-//! some prefix that keeps every commit the durability levels promised
-//! (`Model::crash_window`). Multi-shard runs reopen cleanly instead.
+//! the middle of a commit (`FaultPlan::crash_after_ops`). Crash runs use one shard, so every
+//! commit is a single-shard record in one WAL stream (D84). The public API does not show
+//! how many records survived, so after every crash each possible surviving prefix of the
+//! stream, longest first, goes through `pigeonhole_sim`'s oracle: `recovered_from_records`
+//! names the surviving commits, `check_acknowledged_survive` rejects a prefix that drops a
+//! commit the durability levels promised (D42), and `Model::from_commits` rebuilds the
+//! model to compare with the reopened store. Recovery must match one allowed prefix.
+//! Multi-shard runs reopen cleanly instead.
+//!
+//! An armed power loss can fire on a shard's background I/O (a flush or a compaction)
+//! rather than on a commit. A later step that fails while one is armed and the liveness
+//! probe shows the crash fired is that power loss and recovers from it (issues #56, #62).
 //!
 //! Seeds: `PIGEONHOLE_SEED` (first seed, default 1) and `PIGEONHOLE_SEEDS` (count, default
 //! 3). A failure prints its seed and the operation trace.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use pigeonhole::{Durability, ErrorCode, Family, Options, Pigeonhole, Snapshot, Table};
-use pigeonhole_io::Vfs;
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
-use pigeonhole_sim::{Model, ModelCell, ModelFamily, ModelOp, Op, Rng, Workload, WorkloadSpec};
+use pigeonhole_io::{FileRef, OpenOptions, Vfs};
+use pigeonhole_sim::{
+    CommitStreams, Model, ModelCell, ModelFamily, ModelOp, Op, Rng, StreamCommit, StreamRecord,
+    Workload, WorkloadSpec, check_acknowledged_survive, recovered_from_records,
+};
 
 const DB: &str = "/db/model.phdb";
+/// A file whose handle dies with every other one at a crash: the liveness probe.
+const PROBE: &str = "/db/probe";
 
 /// Rows are spread over several tables (deterministically by row) so batches span shards.
 const TABLES: [&str; 4] = ["t0", "t1", "t2", "t3"];
@@ -69,11 +83,15 @@ fn public_family(f: &ModelFamily) -> Family {
     }
 }
 
-fn new_model() -> Model {
-    let mut m = Model::new();
+fn create_tables(m: &mut Model) {
     for t in TABLES {
         m.create_table(t, families());
     }
+}
+
+fn new_model() -> Model {
+    let mut m = Model::new();
+    create_tables(&mut m);
     m
 }
 
@@ -91,6 +109,10 @@ struct Config {
     reopen_ppm: u32,
     /// Every commit uses this level instead of the workload's.
     durability: Option<Durability>,
+    /// Memtable arena per shard (a memtable freezes and flushes at a quarter of it).
+    memtable_budget: u64,
+    /// Block cache capacity in bytes.
+    block_cache: usize,
 }
 
 impl Config {
@@ -110,6 +132,8 @@ impl Config {
             mid_commit_crash_ppm: 0,
             reopen_ppm: 10_000,
             durability: None,
+            memtable_budget: 4 << 20,
+            block_cache: 1 << 20,
         }
     }
 
@@ -146,6 +170,8 @@ struct Run {
     cfg: Config,
     vfs: Arc<SimVfs>,
     db: Option<(Pigeonhole, Vec<Table>)>,
+    /// Reopened with the store; its handle dies with the store's at a crash.
+    probe: Option<FileRef>,
     model: Model,
     log: Vec<Logged>,
     /// Saved snapshots with the model seqno each one corresponds to.
@@ -305,6 +331,7 @@ impl Run {
             cfg,
             vfs,
             db: None,
+            probe: None,
             model: new_model(),
             log: Vec::new(),
             snaps: Vec::new(),
@@ -322,9 +349,9 @@ impl Run {
         let options = Options::default()
             .vfs(Arc::clone(&self.vfs) as _)
             .shards(self.cfg.shards)
-            .memtable_budget(4 << 20)
+            .memtable_budget(self.cfg.memtable_budget)
             .wal_segment_size(256 << 10)
-            .block_cache(1 << 20);
+            .block_cache(self.cfg.block_cache);
         let db = Pigeonhole::open(DB, options).map_err(|e| format!("open: {e}"))?;
         let mut tables = Vec::new();
         for name in TABLES {
@@ -339,7 +366,30 @@ impl Run {
             );
         }
         self.db = Some((db, tables));
+        self.probe = Some(
+            self.vfs
+                .open(Path::new(PROBE), OpenOptions::read_write_create())
+                .map_err(|e| format!("probe: {e}"))?,
+        );
         Ok(())
+    }
+
+    /// Whether a crash killed the handles since the last open: with a power loss armed,
+    /// whether it has fired (on a commit or on a shard's background I/O). Only a dead probe
+    /// is evidence; with no probe open there is none.
+    fn fired(&self) -> bool {
+        self.probe.as_ref().is_some_and(|p| p.len().is_err())
+    }
+
+    /// A step failed with `e` while a power loss was armed and has fired: the failure is
+    /// that crash (it may have hit a background flush or compaction, so a read finds the
+    /// store dead), and the run recovers from it.
+    fn recover_fired(&mut self, e: &pigeonhole::Error) -> Result<(), String> {
+        self.trace.push(format!(
+            "  -> the armed power loss fired ({e}, {:?})",
+            e.code()
+        ));
+        self.crash_and_recover(CrashKind::Power, true)
     }
 
     fn db(&self) -> &Pigeonhole {
@@ -616,57 +666,66 @@ impl Run {
         out
     }
 
-    /// Rebuilds the model from the first `n` logged commits. Every commit has a WAL record:
-    /// a `Durability::None` commit's record sits in the stream's buffer until the next
-    /// stronger commit's write, a flush or a clean close carries it (decision #50), so it
-    /// survives exactly when the stream's prefix through it does.
-    fn rebuild(&self, n: usize) -> Result<Model, String> {
-        let mut m = new_model();
-        for c in self.log[..n].iter() {
-            m.try_commit(&c.ops, c.ts, Durability::Sync)
-                .map_err(|e| format!("model rebuild: {e}"))?;
-        }
-        Ok(m)
+    /// The logged commits as the sim oracle's commits: one shard, so each is a single record
+    /// in stream 0, in commit order. Every commit has a WAL record: a `Durability::None`
+    /// commit's record sits in the stream's buffer until the next stronger commit's write, a
+    /// flush or a clean close carries it (decision #50). An unacknowledged commit counts as
+    /// `Durability::None` (D42).
+    fn stream_commits(&self) -> Vec<StreamCommit> {
+        self.log
+            .iter()
+            .map(|c| StreamCommit {
+                ops: c.ops.clone(),
+                commit_ts: c.ts,
+                durability: if c.acked {
+                    c.durability
+                } else {
+                    Durability::None
+                },
+                streams: CommitStreams::Single(0),
+            })
+            .collect()
     }
 
-    /// Reopens and finds which commits survived: a prefix of the log (one shard, one stream)
-    /// that keeps every acknowledged commit at the crash's floor level or stronger. Without
-    /// a crash, every commit.
+    /// Reopens and finds which commits survived: after a crash, the longest prefix of the
+    /// stream whose recovered commits (`recovered_from_records`) keep every commit the
+    /// crash's floor promised (`check_acknowledged_survive`) and whose model
+    /// (`Model::from_commits`) matches the store. Without a crash, every commit.
     fn recover(&mut self, kind: Option<CrashKind>) -> Result<(), String> {
         self.snaps.clear();
         self.open()?;
-        let floor = match kind {
-            Some(CrashKind::Process) => Durability::Buffered,
-            Some(CrashKind::Power) => Durability::GroupSync,
-            None => Durability::None,
-        };
-        let hi = self.log.len();
-        let lo = match kind {
-            None => hi,
-            Some(_) => self
-                .log
-                .iter()
-                .rposition(|c| c.acked && c.durability >= floor)
-                .map_or(0, |i| i + 1),
-        };
+        let commits = self.stream_commits();
+        let hi = commits.len();
+        let stream = [(0..hi).map(StreamRecord::Single).collect::<Vec<_>>()];
         let now = self.now();
         let got = self.dump().map_err(|e| format!("dump after reopen: {e}"))?;
-        for n in (lo..=hi).rev() {
-            let m = self.rebuild(n)?;
-            if Self::model_dump(&m, now) == got {
-                self.trace
-                    .push(format!("RECOVERED {n} of {hi} commits (must keep {lo})"));
-                self.log.truncate(n);
+        let mut shortest = None;
+        for n in (0..=hi).rev() {
+            let survivors = recovered_from_records(&stream, &[n]);
+            let allowed = match kind {
+                None => n == hi,
+                Some(kind) => check_acknowledged_survive(&commits, &survivors, kind).is_ok(),
+            };
+            if !allowed {
+                // Shorter prefixes lose that commit too.
+                break;
+            }
+            let m = Model::from_commits(create_tables, survivors.iter().map(|&i| &commits[i]));
+            let want = Self::model_dump(&m, now);
+            if want == got {
+                self.trace.push(format!("RECOVERED {n} of {hi} commits"));
+                self.log = survivors.iter().map(|&i| self.log[i].clone()).collect();
                 for c in &mut self.log {
                     c.acked = true;
                 }
                 self.model = m;
                 return Ok(());
             }
+            shortest = Some((n, want));
         }
-        let want = Self::model_dump(&self.rebuild(lo)?, now);
+        let (n, want) = shortest.unwrap_or_default();
         Err(format!(
-            "recovered state matches no allowed prefix in [{lo}, {hi}] of the commit log; vs \
+            "recovered state matches no allowed prefix (from {hi} commits down to {n}); vs \
              the shortest: {}",
             first_diff(&got, &want).unwrap_or_default()
         ))
@@ -750,7 +809,7 @@ impl Run {
                             acked: true,
                         });
                     }
-                    Err(e) if armed && e.code() == ErrorCode::Io => {
+                    Err(e) if armed && self.fired() => {
                         // The power loss hit the commit: unacknowledged, it may have landed.
                         self.stats.mid_commit_crashes += 1;
                         self.log.push(Logged {
@@ -759,7 +818,7 @@ impl Run {
                             durability,
                             acked: false,
                         });
-                        return self.crash_and_recover(CrashKind::Power, true);
+                        return self.recover_fired(&e);
                     }
                     Err(e) => return Err(format!("commit failed: {e} ({:?})", e.code())),
                 }
@@ -793,10 +852,8 @@ impl Run {
                     (Ok(g), Ok(w)) if g == w => {}
                     (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
                         if e.code() == ErrorCode::MergeFailed => {}
-                    (Err(e), _) if self.armed && e.code() == ErrorCode::Io => {
-                        // The scheduled power loss hit a background write (a flush or a
-                        // compaction) rather than a commit: the read finds the store dead.
-                        return self.crash_and_recover(CrashKind::Power, true);
+                    (Err(e), _) if self.armed && self.fired() => {
+                        return self.recover_fired(&e);
                     }
                     (g, w) => {
                         return Err(format!(
@@ -820,8 +877,8 @@ impl Run {
                     (Ok(g), Ok(w)) if g == w => {}
                     (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
                         if e.code() == ErrorCode::MergeFailed => {}
-                    (Err(e), _) if self.armed && e.code() == ErrorCode::Io => {
-                        return self.crash_and_recover(CrashKind::Power, true);
+                    (Err(e), _) if self.armed && self.fired() => {
+                        return self.recover_fired(&e);
                     }
                     (g, w) => {
                         return Err(format!(
@@ -871,8 +928,8 @@ impl Run {
                                 return Err(format!("scan of {name} (model seqno {ms}): {d}"));
                             }
                         }
-                        (Err(e), _) if self.armed && e.code() == ErrorCode::Io => {
-                            return self.crash_and_recover(CrashKind::Power, true);
+                        (Err(e), _) if self.armed && self.fired() => {
+                            return self.recover_fired(&e);
                         }
                         (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
                             if e.code() == ErrorCode::MergeFailed => {}
@@ -887,7 +944,11 @@ impl Run {
                 }
             }
             Op::Snapshot => {
-                let s = self.db().snapshot().map_err(|e| format!("snapshot: {e}"))?;
+                let s = match self.db().snapshot() {
+                    Ok(s) => s,
+                    Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
+                    Err(e) => return Err(format!("snapshot: {e}")),
+                };
                 self.snaps.push((s, self.model.snapshot()));
                 if self.snaps.len() > 6 {
                     self.snaps.remove(0);
@@ -1050,4 +1111,100 @@ fn identical_results_across_shard_counts() {
         dumps.insert(shards, run.dump().expect("dump"));
     }
     assert_eq!(dumps[&1], dumps[&3], "seed {seed}");
+}
+
+/// A one-shard run whose commits a clean close and reopen persisted to SSTs, with the block
+/// cache off so reads reach the files and the shards idle (no background I/O pending).
+fn run_with_flushed_commits(seed: u64) -> (Run, Rng) {
+    let mut cfg = Config::crashing(0);
+    cfg.faults = FaultPlan::none();
+    (cfg.crash_ppm, cfg.mid_commit_crash_ppm, cfg.reopen_ppm) = (0, 0, 0);
+    cfg.memtable_budget = 256 << 10;
+    cfg.block_cache = 0;
+    let mut run = Run::new(seed, cfg).expect("open");
+    let mut rng = Rng::new(seed);
+    for op in Workload::new(seed, "t", run.cfg.spec.clone()).take(60) {
+        let Op::Commit(ops, _) = op else { continue };
+        run.step(Op::Commit(ops, Durability::Buffered), &mut rng)
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+    run.reopen().unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    (run, rng)
+}
+
+fn scan_all() -> Op {
+    Op::Scan {
+        start: Vec::new(),
+        end: vec![0xff],
+    }
+}
+
+#[test]
+fn a_read_after_a_background_fired_crash_is_that_crash() {
+    // Issue #62: a power loss is armed on the next mutating operation and a
+    // `Durability::None` commit (which writes nothing itself) fills the memtable, so a
+    // shard's background flush fires the crash with no client call in progress. The next
+    // read finds the SSTs' handles dead: the error is the armed power loss, and the run
+    // recovers from it.
+    let seed = seeds()[0];
+    let (mut run, mut rng) = run_with_flushed_commits(seed);
+    let mut plan = run.cfg.faults.clone();
+    plan.crash_after_ops = Some(run.vfs.mutating_ops() + 1);
+    run.vfs.set_faults(plan);
+    run.armed = true;
+    let big = ModelOp::Put {
+        table: "t".into(),
+        row: b"big".to_vec(),
+        family: "f".into(),
+        qualifier: b"q".to_vec(),
+        ts: None,
+        value: vec![7; 100 << 10],
+    };
+    run.step(Op::Commit(vec![big], Durability::None), &mut rng)
+        .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    assert!(
+        run.armed && run.log.last().is_some_and(|c| c.acked),
+        "seed {seed}: the crash fired on the commit itself: {:?}",
+        run.trace.iter().rev().take(4).collect::<Vec<_>>()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !run.fired() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "seed {seed}: the background flush never fired the armed crash"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    run.step(scan_all(), &mut rng)
+        .unwrap_or_else(|e| panic!("seed {seed}: {e}\n{}", run.trace.join("\n")));
+    assert!(
+        !run.armed && run.trace.iter().any(|t| t == "CRASH Power mid-commit"),
+        "seed {seed}: the read did not recover from the armed crash: {:?}",
+        run.trace.iter().rev().take(5).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_io_error_while_an_unfired_crash_is_armed_is_not_that_crash() {
+    // Issue #62's other half: armed alone is never sufficient. A power loss is armed far in
+    // the future (it does not fire) and every read fails with an injected I/O error: the
+    // scan's error is a real failure, not the crash, and the run must report it rather
+    // than recover as if the power had gone.
+    let seed = seeds()[0];
+    let (mut run, mut rng) = run_with_flushed_commits(seed);
+    let mut plan = run.cfg.faults.clone();
+    plan.crash_after_ops = Some(run.vfs.mutating_ops() + 1_000_000);
+    plan.io_error_ppm = 1_000_000;
+    run.vfs.set_faults(plan);
+    run.armed = true;
+    let crashes = run.stats.crashes;
+    let result = run.step(scan_all(), &mut rng);
+    run.vfs.set_faults(FaultPlan::none());
+    assert!(!run.fired(), "seed {seed}: the armed crash fired");
+    assert_eq!(
+        run.stats.crashes, crashes,
+        "seed {seed}: an I/O error with the crash unfired was taken for the crash"
+    );
+    let e = result.expect_err("the injected read error was not reported");
+    assert!(e.contains("scan of"), "seed {seed}: {e}");
 }
