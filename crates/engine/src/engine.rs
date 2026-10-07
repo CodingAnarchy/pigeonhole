@@ -578,6 +578,8 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             manifest_race_waiter: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
+            before_view_publish: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_parked: Mutex::new(None),
@@ -1043,6 +1045,8 @@ impl Engine {
             manifest_race: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_race_waiter: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            before_view_publish: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
@@ -1593,6 +1597,52 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// Takes the manifest writer's exclusion on this thread, as a commit in progress holds
+    /// it: shards' manifest requests queue up (their pumps find it held and leave) until
+    /// [`release_manifest`](Self::release_manifest). Returns whether it was free (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn hold_manifest(&self) -> bool {
+        manifest::claim(&self.inner.shared)
+    }
+
+    /// Commits every queued manifest request on this thread, which holds the exclusion
+    /// ([`hold_manifest`](Self::hold_manifest)) (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn drain_manifest(&self) {
+        manifest::drain_sync(&self.inner.shared);
+    }
+
+    /// Commits what is queued and releases the exclusion
+    /// [`hold_manifest`](Self::hold_manifest) took (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn release_manifest(&self) {
+        let shared = &self.inner.shared;
+        loop {
+            manifest::drain_sync(shared);
+            manifest::release(shared);
+            if shared.manifest_queue.is_empty() || !manifest::claim(shared) {
+                break;
+            }
+        }
+    }
+
+    /// Runs `f` once, at the start of the next view publish (a shard publishing its
+    /// memtables or a manifest commit), before that publish takes the publish lock: where
+    /// another thread's publish can land in between (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn before_next_view_publish(&self, f: Box<dyn FnOnce() + Send>) {
+        *self
+            .inner
+            .shared
+            .before_view_publish
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits
