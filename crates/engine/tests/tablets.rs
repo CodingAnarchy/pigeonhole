@@ -174,10 +174,11 @@ fn crash_at_every_write_point_of_tablet_changes() {
 }
 
 #[test]
-#[ignore = "#98"]
 fn crash_at_every_write_point_of_tablet_changes_regressions() {
-    // Not deterministic (CAS and transaction helper threads): fails in about half the runs
-    // under parallel load.
+    // #98: a transaction's helper thread reported its seqno after a compaction that took
+    // the commit as input was drained, and the model applied the purge without it. The
+    // race needs the helper thread to lag, so it is not deterministic: before the fix about
+    // a third of the sweeps failed under parallel load.
     for _ in 0..8 {
         crash_sweep(170);
     }
