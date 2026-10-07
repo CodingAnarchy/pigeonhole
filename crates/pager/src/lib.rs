@@ -341,8 +341,11 @@ struct CommitState {
     sequence: u64,
     /// Page of the current superblock; the next commit writes the other one.
     slot: u64,
-    /// A commit failed after its first sync started: the on-disk root is uncertain and an
-    /// fsync error may have dropped data, so no further commit is attempted.
+    /// A sync of the file failed: a commit's (the on-disk root is uncertain) or a growth's
+    /// or truncation's. An fsync error may have dropped written data, and on Linux it is
+    /// reported to one sync only, so a later sync succeeding proves nothing: no further
+    /// commit is attempted (decision D58). Set under the allocator lock when a growth or
+    /// truncation sync fails; see `Inner::check_syncs`.
     poisoned: bool,
 }
 
@@ -362,6 +365,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn class_for(bytes: u64) -> Result<u8> {
     let class = (0..=Extent::MAX_CLASS).find(|&c| UNIT_BYTES << c >= bytes);
     class.ok_or(Error::TooLarge)
+}
+
+fn poisoned_error() -> pigeonhole_io::Error {
+    pigeonhole_io::Error::new(
+        ErrorKind::Other,
+        "an earlier root commit failed, or a sync of the file did; reopen the database",
+    )
 }
 
 fn grow_error(e: pigeonhole_io::Error) -> Error {
@@ -424,10 +434,7 @@ impl Inner {
         if st.poisoned {
             drop(st);
             self.committing.store(false, Ordering::Release);
-            return Err(IoError::new(
-                ErrorKind::Other,
-                "an earlier root commit failed; reopen the database",
-            ));
+            return Err(poisoned_error());
         }
         let sequence = st.sequence + 1;
         let slot = st.slot ^ 1;
@@ -456,16 +463,35 @@ impl Inner {
         })
     }
 
+    /// Fails if a growth's or truncation's sync failed. A commit calls it after each of its
+    /// own syncs succeeded: that sync may have succeeded only because a concurrent one was
+    /// handed the error for the same pages. Those syncs run under the allocator lock and
+    /// poison before releasing it, so taking the lock waits for one in flight. That wait can
+    /// be a whole growth's `fallocate` and `sync_all` (up to 64 MiB), and for a submitted
+    /// commit it happens on the I/O backend's thread, which then serves no reads meanwhile
+    /// (bounded; issue #182).
+    fn check_syncs(&self) -> pigeonhole_io::Result<()> {
+        let _alloc = lock(&self.alloc);
+        if lock(&self.state).poisoned {
+            return Err(poisoned_error());
+        }
+        Ok(())
+    }
+
+    /// Writes the superblock once the first sync succeeded and no other sync failed.
     fn write_superblock(&self, p: &PendingCommit) -> pigeonhole_io::Result<()> {
+        self.check_syncs()?;
         self.file.write_at(&p.page[..], p.slot * PAGE_SIZE as u64)
     }
 
-    /// Ends a commit: on success the new root is current; on failure the pager is poisoned.
+    /// Ends a commit: on success the new root is current; on failure (or if another sync
+    /// failed meanwhile) the pager is poisoned.
     fn end(
         &self,
         p: PendingCommit,
         result: pigeonhole_io::Result<()>,
     ) -> pigeonhole_io::Result<()> {
+        let result = result.and_then(|()| self.check_syncs());
         let mut st = lock(&self.state);
         match &result {
             Ok(()) => {
@@ -625,7 +651,12 @@ impl Pager {
             .file
             .allocate(from, end * UNIT_BYTES - from)
             .map_err(grow_error)?;
-        self.inner.file.sync_all()?;
+        // A failed sync poisons (decision D58): it may have been handed the error for pages
+        // a flush wrote, which the next commit's sync would then not report.
+        if let Err(e) = self.inner.file.sync_all() {
+            lock(&self.inner.state).poisoned = true;
+            return Err(e.into());
+        }
         Ok(alloc.alloc_grown(class))
     }
 
@@ -705,8 +736,10 @@ impl Pager {
     /// main file. When this returns, a crash recovers to `root`; before it returns, to the
     /// previous root or `root`. Blocks; use [`Pager::submit_commit_root`] on a shard thread.
     ///
-    /// If a commit fails, the pager refuses every later commit (an fsync error may have
-    /// dropped written data, so retrying could publish a root over lost bytes); reopen.
+    /// If a commit fails, or any sync of the file failed before (a growth in
+    /// [`Pager::allocate`], a [`Pager::truncate_tail`]), the pager refuses every later commit
+    /// (an fsync error may have dropped written data, so retrying could publish a root over
+    /// lost bytes); reopen.
     pub fn commit_root(&self, root: Root) -> Result<()> {
         Ok(self.inner.commit(root, false)?)
     }
@@ -841,9 +874,14 @@ impl Pager {
             }
             self.inner.file.set_len(end * UNIT_BYTES)?;
             alloc.truncate(end);
+            // Synced under the allocator lock, poisoning on failure, as in `allocate`: every
+            // allocation (and a commit's `check_syncs`) waits for this sync meanwhile.
+            if let Err(e) = self.inner.file.sync_all() {
+                lock(&self.inner.state).poisoned = true;
+                return Err(e.into());
+            }
             (frontier - end) * UNIT_BYTES
         };
-        self.inner.file.sync_all()?;
         Ok(released)
     }
 

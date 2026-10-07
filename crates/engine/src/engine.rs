@@ -626,6 +626,8 @@ impl Engine {
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_parked: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            refuse_checkpoints: AtomicBool::new(false),
             picker: options.compaction.clone(),
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(Some(Locks {
@@ -1104,6 +1106,8 @@ impl Engine {
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_parked: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            refuse_checkpoints: AtomicBool::new(false),
             picker: options.compaction.clone(),
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(None),
@@ -1746,6 +1750,18 @@ impl Engine {
             .before_view_publish
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// While `refuse` is set, the manifest writer refuses every batch made only of WAL
+    /// checkpoints with `NoSpace`, through the path a snapshot rewrite that finds no space
+    /// takes (nothing written, the writer stays usable). Test hook.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn refuse_checkpoints(&self, refuse: bool) {
+        self.inner
+            .shared
+            .refuse_checkpoints
+            .store(refuse, Ordering::Release);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits
