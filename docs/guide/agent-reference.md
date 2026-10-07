@@ -24,7 +24,9 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Handles | `Pigeonhole`, `Table`, `Snapshot`, `Cell`, `Row` are cheap `Clone`. `Table`: `Send + Sync`. |
 | Snapshots | Pin data. Drop promptly. |
 | Filesystem | Local only (`NetworkFilesystem`). |
-| Memory bound (P1, until #37) | Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), everything written stays in the memtable arenas: total data ≤ `memtable_budget` × shards, and less in practice, since every version and delete marker counts and each table lives on one shard until tablets split. Beyond it, commits fail with `Busy`. Reopening with a `memtable_budget` too small for the data in the WAL fails with `InvalidArgument`. |
+| Storage | Disk-backed: memtables flush into the file as they fill, so data size is bounded by the disk, not `memtable_budget` (per shard, default 64 MiB; also the shm arena size). A write that finds the arena full stalls while a flush frees room; `Busy` after the 30 s stall timeout is transient (back off, retry), `Busy` for a batch larger than the arena is not (split it). |
+| Files at rest | One file after a clean last `close`. While open, or after a crash: the file plus WAL sidecars and the shm region. Open replays the sidecars. |
+| `None` durability (D94) | A `None` commit buffers its WAL record. A later `GroupSync`/`Sync` commit on the same shard, a `flush`, or a clean close makes it durable; a crash before then loses it. |
 | Typed values | `incr` columns are `i64`. Write counters only with `incr` / `put_i64`: reading an `incr` on top of a base that is not an 8-byte `i64` fails with `MergeFailed` (D41). `merge` writes untyped operands (custom operators); the built-in `i64` add refuses them at read time. |
 
 ## Types
@@ -62,10 +64,10 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `snapshot(&self) -> Result<Snapshot>` | Consistent view of everything committed. |
 | `default_durability(&self) -> Durability` | Writer default. |
 | `set_default_durability(&self, Durability)` | Applies to later commits. |
-| `flush(&self) -> Result<()>` | Flush all memtables. Today: freezes them only; data stays in the WAL. |
-| `compact(&self) -> Result<()>` | Compact all tables. Today: `Unsupported`. |
-| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent copy while writing. Today: `Unsupported`. |
-| `close(self) -> Result<()>` | Last handle out removes sidecars (today the WAL sidecars stay until SST flushes land). |
+| `flush(&self) -> Result<()>` | Write every memtable into the file; returns when the SSTs are in the manifest. Makes `None` commits durable. |
+| `compact(&self) -> Result<()>` | Flush, then merge every level of every table into the last (purges per `max_versions`, TTL and tombstones). |
+| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue. `dest` must not exist. The copy opens with no WAL replay and no sidecars. `Unsupported` if a family stores blob files (P2; not reachable today). |
+| `close(self) -> Result<()>` | Flushes memtables, checkpoints the WAL; the last handle out removes the sidecars and shm, leaving one file. |
 
 `PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
 `Snapshot`: `seqno(&self) -> u64`.
@@ -195,8 +197,9 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 ## Not yet available
 | Feature | Phase |
 |---|---|
-| Memtables written to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)): `flush` writing to the file, `compact`, `backup`, WAL checkpoints (sidecars removed at close), data beyond the memory bound (`Busy` today) | P1 (engine, in progress) |
-| `None` commits made durable by a later stronger commit on the same shard ([#50](https://github.com/CodingAnarchy/pigeonhole/issues/50)) | P1 (engine Milestone B) |
+| Tablet splits: one table stays on one shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)) | P1 |
+| Public `shrink` (the engine has it; nothing calls it, so freed space is reused but the file is not truncated) | P1 |
+| `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
 | zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
 

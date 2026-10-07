@@ -24,7 +24,7 @@ let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 - `open` creates the file if missing (`Options::create_if_missing`, default true) and takes the **writer lock**. A second writer, in this or any other process, fails with `ErrorCode::WriterLocked`.
 - `Options::default()` is a valid configuration. Options are process-local and not stored in the file, so reopening with different options changes them.
 - `Pigeonhole` is cheap to clone; every clone shares the same engine. Pass clones to threads.
-- Opening replays the WAL sidecar files; there is no full-file recovery scan. While the database is open you will see sidecar files next to it. When the last handle closes cleanly, only the one file remains (once SST flushes land; until then the WAL sidecars stay, see the last section).
+- Opening replays the WAL sidecar files; there is no full-file recovery scan. While the database is open you will see sidecar files next to it. When the last handle closes cleanly, only the one file remains: the close flushes every memtable into the file, checkpoints the WAL and removes the sidecars.
 - The database must be on a local filesystem. Network filesystems fail with `ErrorCode::NetworkFilesystem`.
 
 Common options:
@@ -224,21 +224,52 @@ A `WriteBatch` spans any rows and tables, is atomic across all of them, and has 
 db.close()?;
 # Ok::<(), pigeonhole::Error>(())
 ```
-If this is the last handle open anywhere, `close` checkpoints the WAL and removes the sidecar and shared-memory files, leaving one file (the current build keeps the WAL sidecars; see below). Dropping the last clone does the same but ignores errors, so call `close()` when you want to know about failures.
+If this is the last handle open anywhere, `close` checkpoints the WAL and removes the sidecar and shared-memory files, leaving one file. A crash instead leaves the sidecars, and the next open replays them. Dropping the last clone does the same but ignores errors, so call `close()` when you want to know about failures.
 
 ## Maintenance
-`db.flush()` writes every memtable to the file. `db.compact()` compacts every table fully. `db.backup(dest)` writes a consistent single-file copy while writes continue. In the current build only `flush` works, and only partly; see below.
+The database lives on disk: memtables are flushed into the file as they fill, and the size of your data is limited by the disk, not by memory. `Options::memtable_budget` (per shard, default 64 MiB) only sizes the in-memory write buffer. You rarely need to call anything below; background flushes and compactions run on their own.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta"])?;
+pages.mutate(b"row").put("meta", b"k", b"v").durability(Durability::None).commit()?;
+
+// Writes every memtable into the file and returns once the data is there.
+// Even a `None` commit survives a crash from here on.
+db.flush()?;
+
+// Merges every level of every table into the last one: drops versions beyond
+// `max_versions`, expired cells and covered tombstones (no snapshot can still see them).
+db.compact()?;
+
+// A consistent single-file copy of everything committed so far; writers keep running.
+// The copy opens on its own, with no sidecar files.
+db.backup(dir.join("guide-backup.phdb"))?;
+let copy = Pigeonhole::open(dir.join("guide-backup.phdb"), Options::default().create_if_missing(false))?;
+let pages_copy = copy.table("pages")?.open()?;
+assert_eq!(pages_copy.get(b"row", "meta", b"k")?.unwrap().value(), b"v");
+# drop(pages_copy);
+# copy.close()?;
+# Ok::<(), pigeonhole::Error>(())
+```
+
+- `flush()` and `compact()` return after the work is in the file; both fail with `ErrorCode::Closed` after `close`.
+- `backup(dest)` writes a new file at `dest`, which must not exist, from a snapshot taken when you call it, so it holds exactly the commits visible at that moment. Commits that land while it runs are not in it. A database whose families store blob files cannot be backed up yet (`ErrorCode::Unsupported`); in the current build values stay inline, so this does not occur.
+- The file does not shrink by itself: space freed by compaction is reused by later writes. There is no public `shrink` yet.
+
+## What happens when writes outrun the disk
+A write that finds the memtable arena full waits (a write stall) while a flush frees room. `ErrorCode::Busy` means the wait ran past the engine's stall timeout (30 s), or a single batch is larger than a shard's arena. The first is **transient**: back off and retry. The second never succeeds: split the batch or raise `Options::memtable_budget`. See [Errors](errors.md).
 
 ## What the current build does not do yet
-The storage engine writes memtables to SSTs in the file in the second half of Phase 1. Until then:
 
 | Feature | Current behavior |
 |---|---|
-| `db.flush()` | Freezes the memtables; nothing is written to the file. Data stays durable through the WAL. |
-| `db.compact()`, `db.backup(dest)` | Fail with `ErrorCode::Unsupported`. |
-| Clean close | Leaves the WAL sidecar files next to the database (the data has nowhere else to go); reopening replays them. |
-| `Durability::None` commits | Lost at the next close or crash, even when a later stronger commit returned; [#50](https://github.com/CodingAnarchy/pigeonhole/issues/50) makes a later stronger commit cover them (see [Durability](durability.md#mixed-levels)). |
-| Memory bound | Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), everything written stays in the memtable arenas: total data ≤ `memtable_budget` × shards, and less in practice, since every version and delete marker counts and each table lives on one shard until tablets split. Beyond it, commits fail with `Busy`. Reopening with a `memtable_budget` too small for the data in the WAL fails with `InvalidArgument`. Size `Options::memtable_budget` for your data. |
+| `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
+| `Compaction::Tiered`, `FifoByTime`, `zstd`, blob separation, custom merge operators | Phase 2. |
+| Tablet splits | A table stays on one shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)), so one table's writes do not spread across shards yet. |
+| `shrink` | The engine has it; the public crate does not expose it yet. |
 
 Later phases:
 

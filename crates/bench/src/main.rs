@@ -32,7 +32,8 @@ WORKLOADS:
 OPTIONS:
     --engine LIST          pigeonhole,rocksdb,sqlite,fjall or all [default: pigeonhole]
                            (comparison engines need the matching cargo feature)
-    --scale smoke|small    preset sizes [default: small]
+    --scale smoke|small|full
+                           preset sizes [default: small]; full is the spec's 1M rows
     --records N            rows loaded before measuring
     --ops N                operations measured
     --value-len N          bytes per value
@@ -41,7 +42,7 @@ OPTIONS:
     --warmup F             unrecorded warmup, as a fraction of --ops [default: 0.05]
     --shards N             Pigeonhole shards (scaling: N, default all cores)
     --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
-                           shard) [default: 256 MiB]
+                           shard) [default: 64 MiB]
     --cache B              every engine's read cache (SQLite: page cache gets
                            write buffer + cache) [default: 256 MiB]
     --sync                 fsync every commit on every engine [default: buffered]
@@ -132,7 +133,8 @@ fn config(a: &Args, kind: WorkloadKind) -> Result<WorkloadConfig, String> {
     let mut c = match a.scale.as_deref() {
         None | Some("small") => WorkloadConfig::small(kind),
         Some("smoke") => WorkloadConfig::smoke(kind),
-        Some(s) => return Err(format!("unknown scale {s:?} (smoke or small)")),
+        Some("full") => WorkloadConfig::full(kind),
+        Some(s) => return Err(format!("unknown scale {s:?} (smoke, small or full)")),
     };
     c.records = a.records.unwrap_or(c.records);
     c.operations = a.ops.unwrap_or(c.operations);
@@ -345,6 +347,9 @@ mod tests {
         assert!(parse_args(["--records".to_owned()]).is_err());
         let c = config(&args("x --scale smoke"), WorkloadKind::YcsbC).unwrap();
         assert_eq!(c, WorkloadConfig::smoke(WorkloadKind::YcsbC));
+        let c = config(&args("x --scale full"), WorkloadKind::SparseWide).unwrap();
+        assert_eq!((c.records, c.operations), (1_000_000, 1_000_000));
+        assert!(config(&args("x --scale huge"), WorkloadKind::YcsbC).is_err());
     }
 
     #[test]

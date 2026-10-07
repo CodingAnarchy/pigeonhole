@@ -1295,3 +1295,122 @@ fn days_saturates() {
     assert_eq!(days(2), Duration::from_secs(2 * 86_400));
     assert_eq!(days(u64::MAX), Duration::from_secs(u64::MAX));
 }
+
+#[test]
+fn data_beyond_the_memtable_budget_lives_in_one_file() {
+    let dir = TempDir::new("beyond-budget");
+    let path = dir.0.join("big.phdb");
+    let opts = || Options::default().shards(1).memtable_budget(2 << 20);
+    let cell = vec![7u8; 1000];
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let t = table(&db);
+    // About 8 MiB of cells through a 2 MiB arena: every commit succeeds because flushes
+    // free room as memtables fill.
+    for i in 0..8_000u32 {
+        t.mutate(&i.to_be_bytes())
+            .put("a", b"q", &cell)
+            .durability(Durability::Buffered)
+            .commit()
+            .unwrap();
+    }
+    db.compact().unwrap();
+    drop(t);
+    db.close().unwrap();
+    let names: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        names,
+        [std::ffi::OsString::from("big.phdb")],
+        "one file at rest"
+    );
+    assert!(std::fs::metadata(&path).unwrap().len() > 1 << 20);
+
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    assert_eq!(t.scan_prefix(b"").iter().unwrap().count(), 8_000);
+    assert_eq!(
+        value(&t, &7_999u32.to_be_bytes(), "a", b"q").as_deref(),
+        Some(&cell[..])
+    );
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn flush_compact_and_backup_through_the_public_api() {
+    let dir = TempDir::new("maintenance");
+    let path = dir.0.join("db.phdb");
+    let opts = || Options::default().shards(2).memtable_budget(4 << 20);
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let t = table(&db);
+    t.mutate(b"none")
+        .put("a", b"q", b"v1")
+        .durability(Durability::None)
+        .commit()
+        .unwrap();
+    // Versions beyond `max_versions(2)` on family `b` are compacted away.
+    for v in 0..5u8 {
+        t.mutate(b"ver").put("b", b"q", &[v]).commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(cells(&t, b"ver").len(), 2);
+
+    let copy_path = dir.0.join("copy.phdb");
+    db.backup(&copy_path).unwrap();
+    // The copy is a point in time: later commits are not in it.
+    t.mutate(b"none").put("a", b"q", b"v2").commit().unwrap();
+    t.mutate(b"later").put("a", b"q", b"x").commit().unwrap();
+    // A backup never overwrites.
+    assert!(db.backup(&copy_path).is_err());
+
+    let copy = Pigeonhole::open(&copy_path, opts().create_if_missing(false)).unwrap();
+    let ct = copy.table("t").unwrap().open().unwrap();
+    assert_eq!(value(&ct, b"none", "a", b"q").as_deref(), Some(&b"v1"[..]));
+    assert_eq!(value(&ct, b"later", "a", b"q"), None);
+    assert_eq!(cells(&ct, b"ver").len(), 2);
+    drop(ct);
+    copy.close().unwrap();
+
+    let handle = db.clone();
+    drop(t);
+    db.close().unwrap();
+    assert_eq!(handle.flush().unwrap_err().code(), ErrorCode::Closed);
+    assert_eq!(handle.compact().unwrap_err().code(), ErrorCode::Closed);
+    assert_eq!(
+        handle.backup(dir.0.join("late.phdb")).unwrap_err().code(),
+        ErrorCode::Closed
+    );
+}
+
+#[test]
+fn a_flush_makes_none_commits_survive_a_power_loss() {
+    let vfs = SimVfs::new(21);
+    let opts = || sim_options(&vfs).shards(1);
+    let db = Pigeonhole::open("/db/flush-crash.phdb", opts()).unwrap();
+    let t = table(&db);
+    t.mutate(b"flushed")
+        .put("a", b"q", b"v")
+        .durability(Durability::None)
+        .commit()
+        .unwrap();
+    db.flush().unwrap();
+    t.mutate(b"after")
+        .put("a", b"q", b"v")
+        .durability(Durability::None)
+        .commit()
+        .unwrap();
+    vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+    drop(t);
+    drop(db);
+
+    let db = Pigeonhole::open("/db/flush-crash.phdb", opts()).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    // Flushed: in the file, so it survives. The commit after it was only buffered.
+    assert_eq!(value(&t, b"flushed", "a", b"q").as_deref(), Some(&b"v"[..]));
+    assert_eq!(value(&t, b"after", "a", b"q"), None);
+    drop(t);
+    db.close().unwrap();
+}

@@ -5,7 +5,7 @@
 [![CI](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml/badge.svg)](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status: Phase 1 in progress: usable in-memory-bounded API; flush to disk arrives with engine Milestone B** ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)). The sync API below works and is crash-safe through the write-ahead log, but until memtables are flushed into the file all data must fit in the memtable budget (`Options::memtable_budget` per shard). See [`docs/status.md`](docs/status.md) for progress.
+> **Status: Phase 1 in progress: usable, disk-backed sync API.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; `flush`, `compact` and `backup` work, and a clean close leaves one file. Commits are crash-safe through the write-ahead log. Tablet splits (one table still lives on one shard) and the Phase 1 gate are still to come. See [`docs/status.md`](docs/status.md) for progress.
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
 
@@ -48,7 +48,7 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 | **Family** | Declared up front; its own physical LSM tree with its own policy (compression, bloom bits, versions, TTL, blob threshold, cache priority). |
 | **Qualifier** | Arbitrary bytes created on write, sorted within the family. Absent cells cost nothing. |
 | **Timestamp** | `u64`, newest first. Hybrid logical clock by default; user-supplied for event time. |
-| **Value** | Bytes. Phase 1 caps a value at the smaller of 64 MiB and half a shard's memtable arena; Phase 2 blob separation raises the cap to 4 GiB − 1. Optional typed merge operators. |
+| **Value** | Bytes. Phase 1 caps a value at the smaller of 64 MiB and half a shard's memtable arena (`memtable_budget`, default 64 MiB per shard); Phase 2 blob separation raises the cap to 4 GiB − 1. Optional typed merge operators. |
 
 ## Targets
 | Goal | Target (NVMe, hot cache) |

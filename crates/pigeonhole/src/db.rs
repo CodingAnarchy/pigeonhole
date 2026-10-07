@@ -239,33 +239,105 @@ impl Pigeonhole {
         self.db.engine.set_default_durability(durability);
     }
 
-    /// Flushes every memtable to the file.
+    /// Writes every memtable into the file and returns once the data is there (the SSTs are
+    /// in the manifest). Afterwards even [`Durability::None`] commits survive a crash, and
+    /// the WAL behind the flushed data is checkpointed. Background flushes run on their own
+    /// as memtables fill; call this to make everything so far durable in the file.
     ///
-    /// Until the engine writes SSTs (the rest of Phase 1), this freezes the memtables and
-    /// writes nothing to the file; the data stays durable through the WAL.
+    /// ```
+    /// use pigeonhole::{Durability, Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let path = dir.join("app.phdb");
+    /// let db = Pigeonhole::open(&path, Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"row").put("f", b"q", b"v").durability(Durability::None).commit()?;
+    /// db.flush()?; // now in the file, whatever the commit's durability level was
+    /// # drop(t);
+    /// db.close()?;
+    ///
+    /// let db = Pigeonhole::open(&path, Options::default().shards(1))?;
+    /// let t = db.table("t")?.open()?;
+    /// assert_eq!(t.get(b"row", "f", b"q")?.unwrap().value(), b"v");
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn flush(&self) -> Result<()> {
         Ok(self.db.engine.flush()?)
     }
 
-    /// Compacts every table fully. Fails with
-    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) until the engine writes SSTs.
+    /// Compacts every table fully: flushes, then merges every level into the last one.
+    /// Versions beyond a family's `max_versions`, expired cells and tombstones that no
+    /// snapshot can still need are dropped. Compaction otherwise runs in the background;
+    /// call this after a bulk load or delete to reclaim space and speed up reads.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db
+    ///     .table("t")?
+    ///     .family("f", Family::default().max_versions(1))
+    ///     .create_if_missing()?;
+    /// t.mutate(b"row").put("f", b"q", b"old").commit()?;
+    /// t.mutate(b"row").put("f", b"q", b"new").commit()?;
+    /// db.compact()?;
+    /// assert_eq!(t.get(b"row", "f", b"q")?.unwrap().value(), b"new");
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn compact(&self) -> Result<()> {
         Ok(self.db.engine.compact(None)?)
     }
 
-    /// Writes a consistent single-file copy to `dest` while writes continue. Fails with
-    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) until the engine writes SSTs.
+    /// Writes a consistent single-file copy to `dest`, which must not exist, while writes
+    /// continue. The copy holds exactly the commits visible when this is called and opens
+    /// on its own, without WAL replay or sidecar files. Fails with
+    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) for a database whose
+    /// families store blob files (Phase 2; values stay inline today).
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"row").put("f", b"q", b"v").commit()?;
+    ///
+    /// let copy_path = dir.join("backup.phdb");
+    /// db.backup(&copy_path)?;
+    /// t.mutate(b"row").put("f", b"q", b"later").commit()?; // not in the backup
+    ///
+    /// let copy = Pigeonhole::open(&copy_path, Options::default().shards(1).create_if_missing(false))?;
+    /// let ct = copy.table("t")?.open()?;
+    /// assert_eq!(ct.get(b"row", "f", b"q")?.unwrap().value(), b"v");
+    /// # drop(ct);
+    /// # copy.close()?;
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         Ok(self.db.engine.backup(dest.as_ref())?)
     }
 
-    /// Closes this handle's database. If this is the last process with it open, checkpoints
-    /// the WAL and removes the sidecar files and shared-memory region, leaving one file.
-    /// Dropping the last clone does the same, ignoring errors.
+    /// Closes this handle's database. Flushes every memtable and checkpoints the WAL; if
+    /// this is the last process with the database open, also removes the sidecar files and
+    /// shared-memory region, leaving one file. Dropping the last clone does the same,
+    /// ignoring errors.
     ///
-    /// Until the engine writes SSTs, the WAL sidecar files stay (the data has nowhere else to
-    /// go) and are replayed at the next open. Every handle derived from this database
-    /// (tables, batches) fails with [`ErrorCode::Closed`](crate::ErrorCode::Closed) afterwards.
+    /// A crash instead of a clean close leaves the sidecars; the next open replays them.
+    /// Every handle derived from this database (tables, batches) fails with
+    /// [`ErrorCode::Closed`](crate::ErrorCode::Closed) afterwards.
     pub fn close(self) -> Result<()> {
         self.db.closed.store(true, Ordering::Release);
         Ok(self.db.engine.close()?)

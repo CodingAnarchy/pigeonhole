@@ -27,16 +27,15 @@ pub const BLOOM_BITS: u8 = 10;
 /// | fjall | `max_memtable_size` | `cache_size` |
 /// | SQLite | — | page cache (`cache_size`) of `write_buffer + cache` |
 ///
-/// The default is 256 MiB of each: Pigeonhole's default block cache, and a write
-/// buffer raised from its 64 MiB default because all data stays in memtables until the
-/// engine flushes to SSTs (#37).
+/// The default is a 64 MiB write buffer (Pigeonhole's and RocksDB's default) and a 256 MiB
+/// read cache (Pigeonhole's default block cache).
 ///
 /// ```
 /// use pigeonhole_bench::MemoryBudget;
 ///
 /// let m = MemoryBudget::default();
-/// assert_eq!(m.write_buffer, 256 << 20);
-/// assert_eq!(m.to_string(), "write_buffer=256MiB cache=256MiB");
+/// assert_eq!(m.write_buffer, 64 << 20);
+/// assert_eq!(m.to_string(), "write_buffer=64MiB cache=256MiB");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBudget {
@@ -49,7 +48,7 @@ pub struct MemoryBudget {
 impl Default for MemoryBudget {
     fn default() -> Self {
         Self {
-            write_buffer: 256 << 20,
+            write_buffer: 64 << 20,
             cache: 256 << 20,
         }
     }

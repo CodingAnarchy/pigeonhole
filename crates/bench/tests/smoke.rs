@@ -60,8 +60,8 @@ fn pigeonhole_sync_durability() {
 
 #[test]
 fn pigeonhole_loads_more_than_the_memtable_budget() {
-    // The engine flushes to SSTs (#37): a data set many times the memtable budget loads
-    // and runs; sizing the presets for that is #52.
+    // The engine flushes to SSTs: a data set many times the memtable budget loads and
+    // runs (the `full` preset relies on it).
     let root = temp_dir("pigeonhole-bound");
     let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
     config.records = 20_000;
