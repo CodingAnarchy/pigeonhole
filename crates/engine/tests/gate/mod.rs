@@ -1,7 +1,11 @@
 //! A VFS that holds, fails or panics on chosen files' asynchronous syncs, so a test can keep
 //! I/O in flight across scheduling points (a WAL group unresolved, a manifest root commit
-//! blocked) and decide when it completes. Storage is `SimVfs` on a real clock.
+//! blocked) and decide when it completes. It also fails reads, and writes to the main
+//! file, whose bytes contain a marker (one table's SST blocks, stored uncompressed), so a
+//! test can make one table's flushes or compactions fail. Storage is `SimVfs` on a real
+//! clock.
 
+// Shared by several test binaries, each using a subset of it (as `tests/common` is).
 #![allow(dead_code)]
 
 use std::collections::HashSet;
