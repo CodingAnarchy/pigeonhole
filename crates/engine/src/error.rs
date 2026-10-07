@@ -131,6 +131,49 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// An equal error (same variant and message) for a second reader of one outcome (the
+    /// final close's, issue #135). The I/O source is carried as its kind and text.
+    pub(crate) fn duplicate(&self) -> Error {
+        match self {
+            Error::Io(e) => Error::Io(pigeonhole_io::Error {
+                kind: e.kind,
+                context: e.context,
+                source: e
+                    .source
+                    .as_ref()
+                    .map(|s| std::io::Error::new(s.kind(), s.to_string())),
+            }),
+            Error::Corruption(s) => Error::Corruption(s.clone()),
+            Error::WriterLocked => Error::WriterLocked,
+            Error::ShmVersionMismatch { found, expected } => Error::ShmVersionMismatch {
+                found: *found,
+                expected: *expected,
+            },
+            Error::ShmUnavailable => Error::ShmUnavailable,
+            Error::UnsupportedFormat(v) => Error::UnsupportedFormat(*v),
+            Error::NetworkFilesystem => Error::NetworkFilesystem,
+            Error::TableNotFound(s) => Error::TableNotFound(s.clone()),
+            Error::TableExists(s) => Error::TableExists(s.clone()),
+            Error::FamilyNotFound(s) => Error::FamilyNotFound(s.clone()),
+            Error::FamilyExists(s) => Error::FamilyExists(s.clone()),
+            Error::UnknownMergeOperator(s) => Error::UnknownMergeOperator(s.clone()),
+            Error::Merge(e) => Error::Merge(e.clone()),
+            Error::Conflict => Error::Conflict,
+            Error::ReadOnly => Error::ReadOnly,
+            Error::KeyTooLarge => Error::KeyTooLarge,
+            Error::ValueTooLarge => Error::ValueTooLarge,
+            Error::NoSpace => Error::NoSpace,
+            Error::InvalidArgument(s) => Error::InvalidArgument(s.clone()),
+            Error::Unsupported(s) => Error::Unsupported(s),
+            Error::Closed => Error::Closed,
+            Error::NoReaderSlot => Error::NoReaderSlot,
+            Error::RecordTooLarge => Error::RecordTooLarge,
+            Error::Busy => Error::Busy,
+        }
+    }
+}
+
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

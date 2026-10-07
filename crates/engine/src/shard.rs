@@ -171,6 +171,8 @@ pub(crate) struct CloseState {
     /// Every shard has reported: the final close runs once it holds the manifest writer's
     /// exclusion (whoever holds it then runs it when it releases).
     pub final_pending: AtomicBool,
+    /// The final close's outcome once it ran (`EngineShard::closed`).
+    pub outcome: Mutex<Option<Result<()>>>,
 }
 
 /// One cache line per shard, so shards never share a line through these counters.
@@ -338,6 +340,10 @@ pub(crate) struct Shared {
     /// meanwhile, so a tablet does not move past the shards' rounds (issue #94).
     pub full_compactions: AtomicUsize,
     pub waiters: VisibilityWaiters,
+    /// The manifest pump's root commit in flight, which a blocked thread may finish.
+    pub manifest_flight: manifest::Flight,
+    /// Which thread drives each application-owned shard (empty in engine-owned mode).
+    pub drivers: crate::waker::Drivers,
     /// Shards with a freeze deferred until the watermark passes their memtable (kicked by
     /// whoever publishes a watermark).
     pub freeze_waiters: FreezeWaiters,
@@ -622,6 +628,12 @@ impl Shared {
             return;
         }
         let result = self.final_close();
+        *self
+            .close
+            .outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(result.as_ref().copied().map_err(Error::duplicate));
         manifest::release(self);
         self.closed.store(true, Ordering::Release);
         if let Some(n) = self
@@ -632,6 +644,17 @@ impl Shared {
             .take()
         {
             n.notify(result);
+        }
+        // Application-owned shards that finished their part are idle, and their drivers
+        // sleep until the wakeup: wake them to see `EngineShard::closed`.
+        self.broadcast(|| ShardMsg::Kick);
+    }
+}
+
+impl Drop for ShardState {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.report_panicked();
         }
     }
 }
@@ -4888,6 +4911,21 @@ impl ShardState {
         shared.fail_close();
         if shared.close.remaining.load(Ordering::Acquire) > 0 {
             shared.report_closed();
+        }
+    }
+
+    /// The shard's thread is unwinding from a panic: report the shard closed (and the close
+    /// unclean), so a close waiting for every shard ends instead of hanging (issue #135). No
+    /// final sync: the shard's state is not trusted.
+    fn report_panicked(&mut self) {
+        if self.close_stage == CloseStage::Reported {
+            return;
+        }
+        self.closing = true;
+        self.close_stage = CloseStage::Reported;
+        self.shared.close.failed.store(true, Ordering::Release);
+        if self.shared.close.remaining.load(Ordering::Acquire) > 0 {
+            self.shared.report_closed();
         }
     }
 

@@ -837,13 +837,153 @@ pub(crate) fn claim(shared: &Shared) -> bool {
     !shared.manifest_busy.swap(true, Ordering::AcqRel)
 }
 
-/// Releases the exclusion, then runs the close's final step if it was waiting for it.
+/// Releases the exclusion, then runs the close's final step if it was waiting for it, and
+/// wakes the threads waiting to claim it.
 pub(crate) fn release(shared: &Shared) {
     shared.manifest_busy.store(false, Ordering::Release);
     // Pairs with the fence in `Shared::try_final_close`: either it claims the exclusion
     // released here, or this sees its pending flag.
     std::sync::atomic::fence(Ordering::SeqCst);
     shared.try_final_close();
+    shared.manifest_flight.wake_threads();
+}
+
+/// Outcome of a pump's root commit (`Pager::submit_commit_root`).
+type RootResult = std::result::Result<(), pigeonhole_io::Error>;
+
+/// The pump's commit in flight, held in `Shared` rather than by the pump, so that a thread
+/// blocked on the exclusion can finish it once its root commit completes. Otherwise the
+/// exclusion would stay held until the pump's shard runs again, which never happens when
+/// the blocked thread is the one that drives it (application-owned mode, issue #135).
+#[derive(Default)]
+pub(crate) struct Flight {
+    state: Mutex<FlightState>,
+    /// Threads blocked in [`commit_req_from_thread`] (woken by a root commit's completion
+    /// and by every release of the exclusion).
+    threads: Mutex<Vec<std::task::Waker>>,
+    thread_count: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Default)]
+struct FlightState {
+    /// Bumped per commit started, so a pump recognizes its own.
+    generation: u64,
+    commit: Option<Commit>,
+    result: Option<RootResult>,
+}
+
+/// Where a pump's commit is.
+enum Stage {
+    /// The root commit has not completed.
+    Pending,
+    /// It completed: the taker finishes it.
+    Done(Box<Commit>, RootResult),
+    /// Someone else finished it.
+    Gone,
+}
+
+impl std::fmt::Debug for Flight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Flight").finish_non_exhaustive()
+    }
+}
+
+impl Flight {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FlightState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records `commit` (whose root commit is about to be submitted); returns its generation.
+    fn start(&self, commit: Commit) -> u64 {
+        let mut st = self.lock();
+        debug_assert!(
+            st.commit.is_none(),
+            "one manifest commit in flight at a time"
+        );
+        st.generation += 1;
+        st.commit = Some(commit);
+        st.result = None;
+        st.generation
+    }
+
+    /// The root commit of `generation` completed.
+    fn complete(&self, generation: u64, result: RootResult) {
+        {
+            let mut st = self.lock();
+            if st.generation == generation && st.commit.is_some() {
+                st.result = Some(result);
+            }
+        }
+        self.wake_threads();
+    }
+
+    /// Takes the pump's commit `generation` if its root commit completed.
+    fn stage(&self, generation: u64) -> Stage {
+        let mut st = self.lock();
+        if st.generation != generation || st.commit.is_none() {
+            return Stage::Gone;
+        }
+        match st.result.take() {
+            Some(r) => Stage::Done(Box::new(st.commit.take().expect("checked")), r),
+            None => Stage::Pending,
+        }
+    }
+
+    /// Takes whatever commit is in flight if its root commit completed (a blocked thread
+    /// finishing it for a pump that has not run).
+    fn take_done(&self, shared: &Shared) -> Option<(Commit, RootResult)> {
+        let _ = shared;
+        let mut st = self.lock();
+        let commit = st.commit.as_ref()?;
+        st.result.as_ref()?;
+        #[cfg(feature = "test-hooks")]
+        if parks(shared, commit) {
+            return None;
+        }
+        let _ = commit;
+        Some((
+            st.commit.take().expect("checked"),
+            st.result.take().expect("checked"),
+        ))
+    }
+
+    /// Takes the pump's commit `generation` whatever its state (the pump is being dropped).
+    fn abandon(&self, generation: u64) -> Option<(Commit, Option<RootResult>)> {
+        let mut st = self.lock();
+        if st.generation != generation {
+            return None;
+        }
+        let commit = st.commit.take()?;
+        Some((commit, st.result.take()))
+    }
+
+    fn register(&self, waker: &std::task::Waker) {
+        let mut list = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+        if !list.iter().any(|w| w.will_wake(waker)) {
+            list.push(waker.clone());
+        }
+        self.thread_count.store(list.len(), Ordering::SeqCst);
+    }
+
+    fn wake_threads(&self) {
+        if self.thread_count.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let woken = {
+            let mut list = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+            self.thread_count.store(0, Ordering::SeqCst);
+            std::mem::take(&mut *list)
+        };
+        for w in woken {
+            w.wake();
+        }
+    }
+
+    /// Whether a completed commit waits to be finished.
+    fn ready(&self) -> bool {
+        let st = self.lock();
+        st.commit.is_some() && st.result.is_some()
+    }
 }
 
 /// Commits `kind` on a thread that already holds the exclusion: drains the queue (what is
@@ -884,13 +1024,19 @@ pub(crate) fn commit_from_thread(shared: &Shared, kind: ReqKind) -> Result<Manif
 }
 
 /// As [`commit_from_thread`], for a request built with [`ManifestReq::with_waiter`].
+///
+/// While another holds the exclusion the thread parks: it is woken when the holder
+/// releases, when a pump's root commit completes (the thread then finishes that commit
+/// itself, so a pump whose shard this thread drives never holds it up), and when its own
+/// request is answered.
 pub(crate) fn commit_req_from_thread(
     shared: &Shared,
     req: ManifestReq,
     mut waiter: Waiter<Result<ManifestVersion>>,
 ) -> Result<ManifestVersion> {
     shared.manifest_queue.push(req);
-    let mut spins = 0u32;
+    let waker = crate::waker::thread_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
     loop {
         if claim(shared) {
             // Release, then re-check: a request pushed after the last `begin` returned
@@ -904,20 +1050,25 @@ pub(crate) fn commit_req_from_thread(
                     break;
                 }
             }
+        } else if let Some((commit, result)) = shared.manifest_flight.take_done(shared) {
+            // A pump's root commit completed and its shard has not run since: finish it
+            // here (taking it hands its exclusion over), then look again.
+            end(shared, commit, result);
+            release(shared);
+            continue;
         }
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
         match std::pin::Pin::new(&mut waiter).poll(&mut cx) {
             Poll::Ready(Some(r)) => return r,
             Poll::Ready(None) => return Err(Error::Closed),
             Poll::Pending => {}
         }
-        spins += 1;
-        if spins < 64 {
-            std::thread::yield_now();
-        } else {
-            std::thread::sleep(std::time::Duration::from_micros(50));
+        shared.manifest_flight.register(&waker);
+        // A release or completion between the checks above and the registration is caught
+        // here; one after it unparks us.
+        if !shared.manifest_busy.load(Ordering::SeqCst) || shared.manifest_flight.ready() {
+            continue;
         }
+        std::thread::park();
     }
 }
 
@@ -940,22 +1091,28 @@ fn race_window(shared: &Shared) {
 /// changed, no memtable flushed) completed waits before `end` (the window in which a close
 /// once committed over it, issue #78).
 #[cfg(feature = "test-hooks")]
-fn parked(shared: &Shared, commit: &Commit, slot: &Slot, waker: &TaskWaker) -> bool {
-    if !shared.manifest_park.load(Ordering::Acquire)
-        || !commit.sst_changed
-        || !commit.flushed_roots.is_empty()
-        || slot
+fn parked(shared: &Shared, generation: u64, waker: &TaskWaker) -> bool {
+    let parks = {
+        let st = shared.manifest_flight.lock();
+        st.generation == generation
+            && st.result.is_some()
+            && st.commit.as_ref().is_some_and(|c| parks(shared, c))
+    };
+    if parks {
+        *shared
+            .manifest_parked
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_none()
-    {
-        return false;
+            .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
     }
-    *shared
-        .manifest_parked
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
-    true
+    parks
+}
+
+/// Whether the park hook holds `commit` (a compaction's: SSTs changed, nothing flushed).
+#[cfg(feature = "test-hooks")]
+fn parks(shared: &Shared, commit: &Commit) -> bool {
+    shared.manifest_park.load(Ordering::Acquire)
+        && commit.sst_changed
+        && commit.flushed_roots.is_empty()
 }
 
 /// Submits `req` from a shard or task: queues it and makes sure a pump runs on `shard`.
@@ -964,14 +1121,12 @@ pub(crate) fn submit(shared: &Shared, shard: pigeonhole_runtime::ShardId, req: M
     let _ = shared.submitter(shard).submit(ShardMsg::PumpManifest);
 }
 
-/// The outcome slot a pump's root commit resolves into.
-type Slot = Arc<Mutex<Option<std::result::Result<(), pigeonhole_io::Error>>>>;
-
 /// A cooperative task that processes the manifest queue: one commit at a time, blocked on
 /// the root commit's completion between slices.
 pub(crate) struct ManifestPump {
     shared: Arc<Shared>,
-    inflight: Option<(Commit, Slot)>,
+    /// The generation of this pump's commit in `Shared::manifest_flight`.
+    inflight: Option<u64>,
     waker: StdWaker,
 }
 
@@ -985,16 +1140,17 @@ impl ManifestPump {
     }
 
     fn start(&mut self, commit: Commit, task: &TaskWaker) {
-        let slot: Slot = Arc::new(Mutex::new(None));
-        let completion: Completion<()> = self.shared.pager.submit_commit_root(commit.root());
-        let (s, w) = (Arc::clone(&slot), task.clone());
+        let root = commit.root();
+        let generation = self.shared.manifest_flight.start(commit);
+        self.inflight = Some(generation);
+        let completion: Completion<()> = self.shared.pager.submit_commit_root(root);
+        let (s, w) = (Arc::clone(&self.shared), task.clone());
         let _ = self.waker.get(task);
         drop(completion.map(move |r| {
-            *s.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
+            s.manifest_flight.complete(generation, r);
             w.wake();
             Ok(())
         }));
-        self.inflight = Some((commit, slot));
     }
 }
 
@@ -1005,19 +1161,19 @@ impl Drop for ManifestPump {
     /// the pager is poisoned as for any failed commit), then release, which runs a pending
     /// final close.
     fn drop(&mut self) {
-        let Some((commit, slot)) = self.inflight.take() else {
+        let Some((commit, result)) = self
+            .inflight
+            .take()
+            .and_then(|g| self.shared.manifest_flight.abandon(g))
+        else {
             return;
         };
-        let result = slot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .unwrap_or_else(|| {
-                Err(pigeonhole_io::Error::new(
-                    pigeonhole_io::ErrorKind::Other,
-                    "the shard running the manifest commit was dropped",
-                ))
-            });
+        let result = result.unwrap_or_else(|| {
+            Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "the shard running the manifest commit was dropped",
+            ))
+        });
         end(&self.shared, commit, result);
         release(&self.shared);
     }
@@ -1026,18 +1182,21 @@ impl Drop for ManifestPump {
 impl Task for ManifestPump {
     fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
         loop {
-            if let Some((_commit, slot)) = &self.inflight {
+            if let Some(generation) = self.inflight {
                 #[cfg(feature = "test-hooks")]
-                if parked(&self.shared, _commit, slot, waker) {
+                if parked(&self.shared, generation, waker) {
                     return TaskPoll::Blocked;
                 }
-                let done = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
-                let Some(result) = done else {
-                    return TaskPoll::Blocked;
-                };
-                let (commit, _) = self.inflight.take().expect("checked");
-                end(&self.shared, commit, result);
-                release(&self.shared);
+                match self.shared.manifest_flight.stage(generation) {
+                    Stage::Pending => return TaskPoll::Blocked,
+                    Stage::Done(commit, result) => {
+                        self.inflight = None;
+                        end(&self.shared, *commit, result);
+                        release(&self.shared);
+                    }
+                    // A thread blocked on the exclusion finished it (and released).
+                    Stage::Gone => self.inflight = None,
+                }
                 if self.shared.manifest_queue.is_empty() {
                     return TaskPoll::Done;
                 }

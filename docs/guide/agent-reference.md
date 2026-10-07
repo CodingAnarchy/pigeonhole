@@ -73,7 +73,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 
 `PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
 `Snapshot`: `seqno(&self) -> u64`.
-`Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains; background work waiting for a time does not count), `next_wakeup(&self) -> Option<Duration>` (time until that background work is due), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)` (fires when work arrives, not when background work falls due). Loop: `run_once` until `false`, then sleep until the wakeup fires or `next_wakeup` passes.
+`Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains; background work waiting for a time does not count), `next_wakeup(&self) -> Option<Duration>` (time until that background work is due), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)` (fires when work arrives, not when background work falls due). `closed(&self) -> Option<Result<()>>` (the close's outcome once the whole close has finished). Loop: `run_once` until `false`, then sleep until the wakeup fires (work arrived or I/O completed) or `next_wakeup` passes. After `close()`, keep looping until `closed()` is `Some`, then drop the shard; `close()` on a thread that drives no shard waits for this and returns the outcome. On a thread that drives a shard, blocking commit waits fail with `InvalidArgument` instead of deadlocking (the commit still lands); `flush`/`compact` must not be called there.
 
 ## `Options` (all `self -> Self`; process-local, not stored in file)
 | Method | Meaning |

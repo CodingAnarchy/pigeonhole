@@ -455,13 +455,17 @@ impl Engine {
     /// threads at all, so a nonzero `options.compaction_threads` fails with
     /// `InvalidArgument` before anything is opened (decision D40).
     ///
-    /// After [`Engine::close`], keep driving each shard with [`EngineShard::run_once`] until
-    /// it returns `false`, then drop it: the shards finish their in-flight work, flush,
-    /// checkpoint and sync their streams as part of the close.
+    /// After [`Engine::close`], keep driving each shard until [`EngineShard::closed`]
+    /// returns `Some`, then drop it: the shards finish their in-flight work, flush,
+    /// checkpoint and sync their streams as part of the close, and `run_once` returns
+    /// `false` while that I/O is in flight (the wakeup fires when it completes).
     ///
-    /// Catalog changes (`create_table`, `add_family`, `drop_table`) and `flush`, `compact`
-    /// and `shrink` wait for a manifest commit; call them from a thread that does not drive
-    /// the shards, or they wait for ever.
+    /// A thread that drives a shard must not block on shard work. Blocking commit waits
+    /// (`PendingCommit::wait`, `commit`, `check_and_mutate`) fail with `InvalidArgument` on
+    /// such a thread rather than deadlock (decision D88); `flush`, `compact` and `shrink`
+    /// wait for the shards, so call them from another thread. Catalog changes
+    /// (`create_table`, `add_family`, `drop_table`) only wait for the manifest writer and
+    /// may be called from any thread.
     pub fn open_application_owned(
         path: &Path,
         options: EngineOptions,
@@ -635,6 +639,7 @@ impl Engine {
                 done: Mutex::new(None),
                 failed: AtomicBool::new(false),
                 final_pending: AtomicBool::new(false),
+                outcome: Mutex::new(None),
             },
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             ts_floors: (0..shards)
@@ -654,6 +659,12 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             waiters: VisibilityWaiters::default(),
+            manifest_flight: Default::default(),
+            drivers: if mode == Mode::ApplicationOwned {
+                crate::waker::Drivers::new(shards)
+            } else {
+                Default::default()
+            },
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
             submitters: std::sync::OnceLock::new(),
@@ -1108,6 +1119,8 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             waiters: VisibilityWaiters::default(),
+            manifest_flight: Default::default(),
+            drivers: Default::default(),
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             submitters: std::sync::OnceLock::new(),
@@ -1424,10 +1437,15 @@ impl Engine {
     /// clean close and, if no reader is attached, removes the WAL files and the
     /// shared-memory region, leaving one file at rest.
     ///
-    /// In engine-owned mode this waits for the shards and returns the final result. In
-    /// application-owned mode it returns at once after telling every shard to close: the
-    /// application keeps driving each [`EngineShard::run_once`] until it returns `false`
-    /// (the last shard to finish records the clean close), then drops the shards.
+    /// In engine-owned mode this waits for the shards and returns the final result (a shard
+    /// thread that panicked is reported as an error).
+    ///
+    /// In application-owned mode the application keeps driving every shard as usual until
+    /// [`EngineShard::closed`] returns `Some`, then drops it. Called on a thread that drives
+    /// no shard, once every shard has been run, `close` waits for that and returns the final
+    /// result. Called on a thread that drives a shard (or before every shard has been run
+    /// once), it cannot wait: it returns `Ok(())` after telling the shards to close, and
+    /// the outcome comes from [`EngineShard::closed`].
     pub fn close(&self) -> Result<()> {
         self.inner.close(true)
     }
@@ -2286,7 +2304,6 @@ impl Inner {
         }
         let submitted_at = self.shared.vfs.monotonic_nanos();
         let (tx, waiter) = completion();
-        let shm = self.shared.shm.clone();
         if shards.len() <= 1 {
             let shard = shards.first().copied().unwrap_or(ShardId(0));
             self.shared
@@ -2326,7 +2343,6 @@ impl Inner {
         }
         Ok(PendingCommit {
             waiter,
-            shm,
             shared: Arc::clone(&self.shared),
             resolved: None,
         })
@@ -2386,11 +2402,10 @@ impl Inner {
                 map_version: view.tablets().version(),
                 attempts: 0,
             }))?;
-        let (applied, info) = rx.wait().unwrap_or(Err(Error::Closed))?;
+        let mut rx = rx;
+        let (applied, info) = crate::write::wait_reply(&self.shared, &mut rx)?;
         if let Some(info) = info {
-            while self.shared.shm.visible_seqno() < info.seqno {
-                std::thread::yield_now();
-            }
+            crate::write::wait_visible(&self.shared, info.seqno)?;
         }
         Ok((applied, info))
     }
@@ -2475,14 +2490,37 @@ impl Inner {
             .done
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        // Every shard may have reported already (dropped, or its thread panicked) and the
+        // final close run before `done` was set: answer it here. The final close records
+        // its outcome before it takes `done`, so one of the two sides sees the other.
+        if let Some(outcome) = self
+            .shared
+            .close
+            .outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            && let Some(tx) = self
+                .shared
+                .close
+                .done
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        {
+            tx.notify(outcome.as_ref().copied().map_err(Error::duplicate));
+        }
         if let Some(submitters) = self.shared.submitters.get() {
             for s in submitters {
                 let _ = s.submit(ShardMsg::Close);
             }
         }
         // Application-owned shards are driven by the application's threads, possibly the
-        // caller's own, so the close never blocks there: the shards finish as they are run.
-        let result = if wait && !self.application_owned {
+        // caller's own: the close waits only when every shard is run by another thread (or
+        // already dropped); otherwise the shards finish as they are run and report the
+        // outcome through `EngineShard::closed`.
+        let result = if wait && (!self.application_owned || self.shared.drivers.driven_elsewhere())
+        {
             rx.wait().unwrap_or(Err(Error::Closed))
         } else {
             drop(rx);
@@ -2495,7 +2533,12 @@ impl Inner {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
             if let Some(rt) = rt {
-                rt.shutdown()?;
+                // A shard thread that panicked resumes its panic here: report it instead
+                // (this also runs from `Drop for Engine`).
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.shutdown())) {
+                    Ok(r) => drop(r?),
+                    Err(panic) => return Err(shard_panicked(&*panic)),
+                }
             }
         }
         result
@@ -2789,7 +2832,11 @@ fn check_merge_operator(
 /// // The application's event loop drives each shard from its own core thread.
 /// while shards[0].run_once(u64::MAX) {}
 /// db.close()?;
-/// while shards[0].run_once(u64::MAX) {}
+/// // This thread drives the shard, so `close` cannot wait: drive it until it has closed.
+/// while shards[0].closed().is_none() {
+///     shards[0].run_once(u64::MAX);
+/// }
+/// assert!(shards[0].closed().unwrap().is_ok());
 /// # Ok(())
 /// # }
 /// ```
@@ -2806,11 +2853,34 @@ impl EngineShard {
     }
 
     /// Runs queued writes, the group commit, and background work until `deadline_nanos`.
-    /// Returns whether work remains.
+    /// Returns whether work remains. Work blocked on I/O in flight does not count: the
+    /// wakeup fires when it completes.
+    ///
+    /// The calling thread counts as this shard's driver from now on (until another thread
+    /// runs it or it is dropped), so its blocking commit waits fail rather than deadlock
+    /// (see [`Engine::open_application_owned`]).
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
-        self.driver
-            .as_mut()
-            .is_some_and(|d| d.run_once(deadline_nanos))
+        let Some(d) = self.driver.as_mut() else {
+            return false;
+        };
+        self.engine.shared.drivers.enter(usize::from(d.shard().0));
+        d.run_once(deadline_nanos)
+    }
+
+    /// The outcome of the database's close once it has finished (every shard closed and
+    /// the last one recorded the clean close), or `None` before. After [`Engine::close`],
+    /// keep driving the shard until this is `Some`, then drop it. Every shard reports the
+    /// same outcome; an `Err` means the close was not clean or failed (the next open
+    /// replays the WAL).
+    pub fn closed(&self) -> Option<Result<()>> {
+        self.engine
+            .shared
+            .close
+            .outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|r| r.as_ref().copied().map_err(Error::duplicate))
     }
 
     /// The earliest deadline (VFS `monotonic_nanos`) of background work sleeping on this
@@ -2862,7 +2932,6 @@ impl EngineShard {
         });
         Ok(PendingCommit {
             waiter,
-            shm: engine.shared.shm.clone(),
             shared: Arc::clone(&engine.shared),
             resolved: None,
         })
@@ -2879,8 +2948,22 @@ impl EngineShard {
 impl Drop for EngineShard {
     fn drop(&mut self) {
         if let Some(driver) = self.driver.take() {
+            self.engine
+                .shared
+                .drivers
+                .dropped(usize::from(driver.shard().0));
             let mut state = driver.shutdown();
             state.abandon(&self.engine.shared);
         }
     }
+}
+
+/// The error for a shard thread that panicked (issue #135).
+fn shard_panicked(panic: &(dyn std::any::Any + Send)) -> Error {
+    let msg = panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_owned());
+    crate::error::io_other("shard thread panicked", msg)
 }

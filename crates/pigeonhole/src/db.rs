@@ -120,19 +120,27 @@ impl Pigeonhole {
     /// is started, [`Options::compaction_cores`] with `k > 0` is refused with
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) (decision D40).
     ///
-    /// Every blocking call (`commit`, `flush`, table creation) waits for a shard to run, so
-    /// make sure each shard is being driven before calling one.
+    /// Every blocking call (`commit`, `flush`, `close`) waits for the shards to run, so make
+    /// sure each shard is being driven before calling one. A thread that drives a shard must
+    /// not block on shard work: there a blocking commit fails with
+    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) instead of
+    /// deadlocking (the commit still lands), and `flush` or `compact` would wait for ever.
+    /// Table creation and other catalog changes may be called from any thread.
     ///
     /// The loop for each shard: call [`Shard::run_once`] until it returns `false`, then sleep
-    /// until the [`Shard::set_wakeup`] callback fires (work arrived) or
+    /// until the [`Shard::set_wakeup`] callback fires (work arrived or I/O completed) or
     /// [`Shard::next_wakeup`] passes (background work is due), whichever comes first. An idle
     /// shard then uses no CPU, even while a write stall or a failed compaction's retry is
-    /// pending. After [`Pigeonhole::close`], keep driving each shard until `run_once` returns
-    /// `false`, then drop it.
+    /// pending.
+    ///
+    /// To close, call [`Pigeonhole::close`] and keep driving each shard the same way until
+    /// [`Shard::closed`] returns `Some`, then drop it: the close's flush and syncs run on
+    /// the shards, and `run_once` returns `false` while their I/O is in flight. Called on a
+    /// thread that drives no shard, `close` waits for this and returns the close's result;
+    /// on a thread that drives a shard it cannot wait, and the result comes from
+    /// [`Shard::closed`].
     ///
     /// ```
-    /// use std::sync::Arc;
-    /// use std::sync::atomic::{AtomicBool, Ordering};
     /// use std::thread;
     /// use std::time::Duration;
     /// use pigeonhole::{Family, Options, Pigeonhole};
@@ -140,19 +148,18 @@ impl Pigeonhole {
     /// # fn main() -> pigeonhole::Result<()> {
     /// # let dir = pigeonhole::doc_support::temp_dir();
     /// let (db, shards) = Pigeonhole::open_application_owned(dir.join("app.phdb"), Options::default().shards(2))?;
-    /// let stop = Arc::new(AtomicBool::new(false));
     /// let threads: Vec<_> = shards
     ///     .into_iter()
     ///     .map(|mut shard| {
-    ///         let stop = stop.clone();
-    ///         thread::spawn(move || {
+    ///         thread::spawn(move || -> pigeonhole::Result<()> {
     ///             let me = thread::current();
     ///             shard.set_wakeup(Box::new(move || me.unpark()));
     ///             loop {
     ///                 // Your event loop: run the shard until it is idle, do your own work...
     ///                 while shard.run_once(Duration::from_micros(200)) {}
-    ///                 if stop.load(Ordering::Acquire) {
-    ///                     return;
+    ///                 // ...and stop once the database's close has finished on every shard.
+    ///                 if let Some(closed) = shard.closed() {
+    ///                     return closed;
     ///                 }
     ///                 // ...then sleep until work arrives or background work is due.
     ///                 match shard.next_wakeup() {
@@ -169,11 +176,10 @@ impl Pigeonhole {
     /// assert_eq!(t.get(b"row", "f", b"q")?.unwrap().value(), b"v");
     ///
     /// drop(t);
+    /// // Waits for the shard threads to finish the close, and returns its result.
     /// db.close()?;
-    /// stop.store(true, Ordering::Release);
     /// for thread in threads {
-    ///     thread.thread().unpark();
-    ///     thread.join().unwrap();
+    ///     thread.join().unwrap()?;
     /// }
     /// # Ok(())
     /// # }
@@ -569,7 +575,12 @@ impl Shard {
     /// // Nothing is waiting for a time: sleep until the wakeup callback fires.
     /// assert_eq!(shard.next_wakeup(), None);
     /// db.close()?;
-    /// while shard.run_once(Duration::from_micros(200)) {}
+    /// // This thread drives the shard, so `close` cannot wait: drive it until it has closed
+    /// // (a real loop sleeps between calls as above).
+    /// while shard.closed().is_none() {
+    ///     shard.run_once(Duration::from_micros(200));
+    /// }
+    /// shard.closed().unwrap()?;
     /// # Ok(())
     /// # }
     /// ```
@@ -579,6 +590,14 @@ impl Shard {
         Some(std::time::Duration::from_nanos(
             deadline.saturating_sub(now),
         ))
+    }
+
+    /// The database's close result once the close has finished (every shard closed, and the
+    /// clean close recorded), or `None` before (including before [`Pigeonhole::close`]).
+    /// After `close`, keep driving the shard until this is `Some`, then drop it. Every shard
+    /// reports the same result.
+    pub fn closed(&self) -> Option<Result<()>> {
+        self.inner.closed().map(|r| r.map_err(Into::into))
     }
 
     /// Registers a callback invoked (from any thread) when work arrives for this shard. It
