@@ -516,7 +516,9 @@ impl Shard {
     pub fn run_once(&mut self, budget: std::time::Duration) -> bool {
         let budget = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
         let deadline = self.vfs.monotonic_nanos().saturating_add(budget);
-        self.inner.run_once(deadline)
+        // Background work waiting on a timer (a write stall, a compaction's backoff) is work
+        // that remains: the wakeup callback does not fire when it falls due.
+        self.inner.run_once(deadline) || self.inner.next_deadline().is_some()
     }
 
     /// Registers a callback invoked (from any thread) when work arrives for this shard.

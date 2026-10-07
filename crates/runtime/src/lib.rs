@@ -344,6 +344,9 @@ struct ShardCore<H: ShardHandler> {
     spawner: Spawner,
     vfs: VfsRef,
     time_slice: u64,
+    /// The clock when the loop last went idle with sleeping tasks: if it reads the same at
+    /// the next pass, the clock is not moving on its own and sleepers run early to notice.
+    idle_at: Option<u64>,
 }
 
 impl<H: ShardHandler> ShardCore<H> {
@@ -409,6 +412,12 @@ impl<H: ShardHandler> ShardCore<H> {
         self.signal().awake();
         self.drain();
         self.spawner.local.collect_woken();
+        let start = self.vfs.monotonic_nanos();
+        if self.idle_at.take() == Some(start) {
+            // The clock has not moved since the loop went idle: sleepers check for themselves.
+            self.spawner.local.wake_sleepers();
+        }
+        self.spawner.local.wake_due(start);
         while self.spawner.local.has_runnable() {
             let now = self.vfs.monotonic_nanos();
             if now >= deadline {
@@ -420,11 +429,21 @@ impl<H: ShardHandler> ShardCore<H> {
             // Foreground first: whatever queued during the slice runs before the next one.
             self.drain();
             self.spawner.local.collect_woken();
+            self.spawner.local.wake_due(self.vfs.monotonic_nanos());
         }
         if self.spawner.local.has_runnable() {
             return true;
         }
-        self.check_before_sleep()
+        let more = self.check_before_sleep();
+        if !more && self.spawner.local.next_deadline().is_some() {
+            self.idle_at = Some(self.vfs.monotonic_nanos());
+        }
+        more
+    }
+
+    /// The earliest deadline of a sleeping background task on this shard.
+    fn next_deadline(&self) -> Option<u64> {
+        self.spawner.local.next_deadline()
     }
 
     /// Announces sleep, then re-checks for work. Returns whether work remains.
@@ -452,6 +471,7 @@ impl<H: ShardHandler> ShardCore<H> {
 /// Body of an engine-owned shard thread.
 fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
     let _shard = EnterShard::new(core.id);
+    let mut idle_park = sched::IdlePark::default();
     core.signal()
         .set_target(WakeTarget::Thread(thread::current()));
     loop {
@@ -462,7 +482,13 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
             return core.handler;
         }
         if !more {
-            thread::park();
+            // Until the next message, or the earliest sleeping task's deadline (re-checked
+            // sooner while the clock has not shown it keeps real time: a simulated clock
+            // moves without waking anyone).
+            match core.next_deadline() {
+                None => thread::park(),
+                Some(d) => idle_park.park(&*core.vfs, d),
+            }
         }
     }
 }
@@ -514,6 +540,7 @@ fn build<H: ShardHandler>(
             submitters: Arc::clone(&submitters),
             vfs: Arc::clone(&config.vfs),
             time_slice: config.slice_nanos(),
+            idle_at: None,
         })
         .collect();
     (submitters, cores)
@@ -805,8 +832,70 @@ impl<H: ShardHandler> ShardDriver<H> {
     ///
     /// Between task slices (each at most `time_slice` long) it drains the queue again, so
     /// foreground messages never wait behind more than one slice.
+    ///
+    /// Tasks sleeping until a deadline ([`TaskPoll::SleepUntil`]) are not work that remains:
+    /// with only those left it returns `false`, and the application should call it again
+    /// by [`next_deadline`](ShardDriver::next_deadline) even if no wakeup arrives.
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
         self.core.run_once(deadline_nanos)
+    }
+
+    /// The earliest deadline (VFS `monotonic_nanos`) of a background task sleeping on this
+    /// shard, or `None`. After [`run_once`](ShardDriver::run_once) returns `false`, the
+    /// application sleeps until the wakeup registered with
+    /// [`set_wakeup`](ShardDriver::set_wakeup) fires or this deadline passes, whichever
+    /// comes first.
+    ///
+    /// ```
+    /// use pigeonhole_io::Vfs;
+    /// use pigeonhole_io::sim::SimVfs;
+    /// use pigeonhole_runtime::{
+    ///     Runtime, RuntimeConfig, ShardContext, ShardHandler, Task, TaskPoll, TaskWaker,
+    /// };
+    ///
+    /// /// Fires once the clock reaches `at`.
+    /// struct Alarm {
+    ///     vfs: SimVfsRef,
+    ///     at: u64,
+    /// }
+    /// type SimVfsRef = std::sync::Arc<SimVfs>;
+    ///
+    /// impl Task for Alarm {
+    ///     fn run(&mut self, _deadline: u64, _waker: &TaskWaker) -> TaskPoll {
+    ///         if self.vfs.monotonic_nanos() >= self.at {
+    ///             TaskPoll::Done
+    ///         } else {
+    ///             TaskPoll::SleepUntil(self.at)
+    ///         }
+    ///     }
+    ///     fn name(&self) -> &'static str {
+    ///         "alarm"
+    ///     }
+    /// }
+    ///
+    /// struct Idle;
+    /// impl ShardHandler for Idle {
+    ///     type Msg = ();
+    ///     fn handle(&mut self, _ctx: &mut ShardContext<'_, ()>, _msg: ()) {}
+    ///     fn end_batch(&mut self, _ctx: &mut ShardContext<'_, ()>) {}
+    /// }
+    ///
+    /// let vfs = SimVfs::new(1);
+    /// let mut config = RuntimeConfig::new(vfs.clone());
+    /// config.shards = 1;
+    /// let mut drivers = Runtime::application_owned(config, vec![Idle])?;
+    /// let shard = &mut drivers[0];
+    /// let at = vfs.monotonic_nanos() + 5_000;
+    /// shard.with_handler(|_, ctx| ctx.spawn(Box::new(Alarm { vfs: vfs.clone(), at })));
+    /// assert!(!shard.run_once(u64::MAX)); // only a sleeping task: idle
+    /// assert_eq!(shard.next_deadline(), Some(at));
+    /// vfs.advance(5_000);
+    /// assert!(!shard.run_once(u64::MAX)); // due: it ran and finished
+    /// assert_eq!(shard.next_deadline(), None);
+    /// # Ok::<(), pigeonhole_runtime::Error>(())
+    /// ```
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.core.next_deadline()
     }
 
     /// Runs `f` on this shard's handler inline (the application's own writes on its own

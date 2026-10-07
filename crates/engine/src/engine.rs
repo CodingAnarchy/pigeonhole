@@ -2275,6 +2275,14 @@ impl EngineShard {
             .is_some_and(|d| d.run_once(deadline_nanos))
     }
 
+    /// The earliest deadline (VFS `monotonic_nanos`) of background work sleeping on this
+    /// shard (a write stall's refill, a wait for arena room's timeout, a failed compaction's
+    /// backoff), or `None`. After [`run_once`](EngineShard::run_once) returns `false`, call
+    /// it again when the wakeup fires or this deadline passes, whichever comes first.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.driver.as_ref().and_then(ShardDriver::next_deadline)
+    }
+
     /// Commits `batch` inline if every row belongs to this shard; otherwise submits it.
     pub fn commit_local(
         &mut self,

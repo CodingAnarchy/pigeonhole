@@ -3,15 +3,15 @@
 
 use std::future::Future;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-use pigeonhole_io::VfsRef;
 use pigeonhole_io::pread::PreadVfs;
 use pigeonhole_io::sim::SimVfs;
+use pigeonhole_io::{Vfs, VfsRef};
 use pigeonhole_runtime::{
     Error, Notifier, Runtime, RuntimeConfig, ShardContext, ShardDriver, ShardHandler, ShardId,
     Submitter, Task, TaskPoll, TaskWaker, completion,
@@ -63,7 +63,18 @@ impl<H: ShardHandler> Harness<H> {
                                     while d.run_once(u64::MAX) {}
                                     return d;
                                 }
-                                thread::park();
+                                // Until a wakeup, or the earliest sleeping task's deadline
+                                // (re-checked every 10 ms: the simulated clock moves without
+                                // waking anyone).
+                                match d.next_deadline() {
+                                    None => thread::park(),
+                                    Some(at) => thread::park_timeout(
+                                        Duration::from_nanos(
+                                            at.saturating_sub(vfs.monotonic_nanos()),
+                                        )
+                                        .min(Duration::from_millis(10)),
+                                    ),
+                                }
                             }
                         })
                     })
@@ -561,6 +572,92 @@ fn many_round_trips_no_lost_wakeup(mode: Mode) {
     h.finish(|_| ());
 }
 
+/// Sleeps until `at` on the VFS clock (returning to sleep if run early), counting its runs;
+/// reports the clock when it fired. Woken through its waker, it finishes at once.
+struct Alarm {
+    vfs: VfsRef,
+    at: u64,
+    runs: Arc<AtomicU32>,
+    waker_out: Option<Notifier<TaskWaker>>,
+    done: Option<Notifier<u64>>,
+}
+
+impl Task for Alarm {
+    fn run(&mut self, _deadline: u64, waker: &TaskWaker) -> TaskPoll {
+        let runs = self.runs.fetch_add(1, Ordering::Relaxed);
+        if let Some(out) = self.waker_out.take() {
+            out.notify(waker.clone());
+        } else if runs > 0 && self.at == u64::MAX {
+            // Woken early on purpose (the deadline never comes).
+            if let Some(d) = self.done.take() {
+                d.notify(self.vfs.monotonic_nanos());
+            }
+            return TaskPoll::Done;
+        }
+        let now = self.vfs.monotonic_nanos();
+        if now >= self.at {
+            if let Some(d) = self.done.take() {
+                d.notify(now);
+            }
+            return TaskPoll::Done;
+        }
+        TaskPoll::SleepUntil(self.at)
+    }
+
+    fn name(&self) -> &'static str {
+        "alarm"
+    }
+}
+
+/// On a real clock a sleeping task runs once its deadline passes, and not in between: the
+/// shard parks instead of polling (issue #89).
+fn sleeping_task_fires_on_time_real(mode: Mode) {
+    let vfs: VfsRef = PreadVfs::new(1);
+    let h = Harness::start(mode, config(1, Arc::clone(&vfs)), handlers(1));
+    let wait = Duration::from_millis(300);
+    let at = vfs.monotonic_nanos() + wait.as_nanos() as u64;
+    let runs = Arc::new(AtomicU32::new(0));
+    let (n, w) = completion();
+    let task = Alarm {
+        vfs: Arc::clone(&vfs),
+        at,
+        runs: Arc::clone(&runs),
+        waker_out: None,
+        done: Some(n),
+    };
+    h.submitter(0).submit(Msg::Spawn(Box::new(task))).unwrap();
+    let fired = w.wait().unwrap();
+    assert!(fired >= at, "fired before its deadline");
+    let late = Duration::from_nanos(fired - at);
+    assert!(late < Duration::from_millis(200), "fired {late:?} late");
+    // A polling timer runs millions of times in 300 ms; a parked one a handful (the 10 ms
+    // re-check runs it only while the clock has not moved).
+    let runs = runs.load(Ordering::Relaxed);
+    assert!(runs < 100, "the sleeping task ran {runs} times");
+    h.finish(|_| ());
+}
+
+/// A sleeping task's waker ends the sleep before its deadline.
+fn sleeping_task_is_woken_early(mode: Mode) {
+    let (cfg, sim) = sim_config(1);
+    let h = Harness::start(mode, cfg, handlers(1));
+    let (wn, ww) = completion();
+    let (dn, dw) = completion();
+    let task = Alarm {
+        vfs: sim.clone(),
+        at: u64::MAX,
+        runs: Arc::new(AtomicU32::new(0)),
+        waker_out: Some(wn),
+        done: Some(dn),
+    };
+    h.submitter(0).submit(Msg::Spawn(Box::new(task))).unwrap();
+    let waker = ww.wait().unwrap();
+    thread::sleep(Duration::from_millis(5)); // let it go to sleep
+    waker.wake();
+    assert!(dw.wait().is_some());
+    h.finish(|_| ());
+}
+
 macro_rules! both_modes {
     ($($name:ident),* $(,)?) => {
         mod engine_owned {
@@ -584,6 +681,8 @@ both_modes!(
     shutdown_handles_queued_then_refuses,
     dropped_notifier_resolves_none,
     many_round_trips_no_lost_wakeup,
+    sleeping_task_fires_on_time_real,
+    sleeping_task_is_woken_early,
 );
 
 // ---------------------------------------------------------------------------------------
@@ -821,4 +920,58 @@ fn run_once_unbounded_deadline_keeps_latency_bounded() {
         "only {} batches: foreground did not interleave",
         h.batches
     );
+}
+
+#[test]
+fn run_once_is_idle_with_only_sleeping_tasks() {
+    // Application-owned: a sleeping task is not work that remains; `next_deadline` reports
+    // it, and it runs once the clock reaches it.
+    let (mut drivers, sim) = app_drivers(1);
+    let d = &mut drivers[0];
+    let at = sim.monotonic_nanos() + 1_000_000;
+    let runs = Arc::new(AtomicU32::new(0));
+    let (n, w) = completion();
+    let task = Alarm {
+        vfs: sim.clone(),
+        at,
+        runs: Arc::clone(&runs),
+        waker_out: None,
+        done: Some(n),
+    };
+    d.with_handler(|_, ctx| ctx.spawn(Box::new(task)));
+    assert!(!d.run_once(u64::MAX));
+    assert_eq!(d.next_deadline(), Some(at));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    sim.advance(400_000);
+    assert!(!d.run_once(u64::MAX));
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "ran before its deadline");
+    sim.advance(600_000);
+    assert!(!d.run_once(u64::MAX));
+    assert_eq!(w.wait(), Some(at));
+    assert_eq!(d.next_deadline(), None);
+}
+
+#[test]
+fn a_clock_that_does_not_move_runs_sleepers_early() {
+    // A simulated clock nobody advances: the next `run_once` at the same reading runs the
+    // sleeping task early, so it can notice the clock is stuck (decision D126's timers).
+    let (mut drivers, sim) = app_drivers(1);
+    let d = &mut drivers[0];
+    let runs = Arc::new(AtomicU32::new(0));
+    let task = Alarm {
+        vfs: sim.clone(),
+        at: sim.monotonic_nanos() + 1_000_000,
+        runs: Arc::clone(&runs),
+        waker_out: None,
+        done: None,
+    };
+    d.with_handler(|_, ctx| ctx.spawn(Box::new(task)));
+    assert!(!d.run_once(u64::MAX));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert!(!d.run_once(u64::MAX));
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    // A moving clock does not: the task sleeps until its deadline.
+    sim.advance(1_000);
+    assert!(!d.run_once(u64::MAX));
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
 }
