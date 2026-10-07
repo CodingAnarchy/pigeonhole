@@ -1088,12 +1088,7 @@ fn check(cfg: &Config) {
 #[test]
 fn quiet_runs_match_the_model() {
     for shards in [1, 2, 4, 8] {
-        let mut cfg = Config::quiet(1000, shards);
-        if shards == 1 {
-            // Issue #111: a clean close after a compaction can hang with one shard.
-            cfg.compact_ppm = 0;
-        }
-        check(&cfg);
+        check(&Config::quiet(1000, shards));
     }
 }
 

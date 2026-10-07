@@ -1019,18 +1019,28 @@ struct MemSlot {
     active: MemEntry,
     /// Newest first.
     frozen: Vec<MemEntry>,
+    seal: Seal,
+}
+
+/// A closing shard flushes an active memtable in place when the arena has no chunk for its
+/// replacement (snapshots may pin every retired memtable until the close returns, issue
+/// #111): nothing writes to it any more, and the slot goes once its SST is in the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seal {
+    /// The active memtable takes writes (or is empty).
+    Open,
+    /// The active memtable is frozen and queued for flushing, or being flushed.
+    Flushing,
+    /// Its SST is in the manifest: no view lists it again, and the slot is dropped once
+    /// its older frozen memtables are flushed too.
+    Flushed,
 }
 
 impl MemSlot {
     fn set(&self, shard: ShardId, flushed: &HashSet<(u16, u32)>) -> Arc<MemSet> {
         let mut readers = Vec::with_capacity(1 + self.frozen.len());
         let mut roots = Vec::with_capacity(1 + self.frozen.len());
-        readers.push(self.active.table.reader());
-        roots.push(self.active.table.root());
-        for m in &self.frozen {
-            if flushed.contains(&(shard.0, m.table.root())) {
-                continue;
-            }
+        for m in self.unflushed(shard, flushed) {
             readers.push(m.table.reader());
             roots.push(m.table.root());
         }
@@ -1043,14 +1053,22 @@ impl MemSlot {
 
     /// The readers of the memtables not yet in SSTs, active first.
     fn readers(&self, shard: ShardId, flushed: &HashSet<(u16, u32)>) -> Vec<MemtableReader> {
-        std::iter::once(self.active.table.reader())
-            .chain(
-                self.frozen
-                    .iter()
-                    .filter(|m| !flushed.contains(&(shard.0, m.table.root())))
-                    .map(|m| m.table.reader()),
-            )
+        self.unflushed(shard, flushed)
+            .map(|m| m.table.reader())
             .collect()
+    }
+
+    /// The memtables not yet in SSTs, active first.
+    fn unflushed<'a>(
+        &'a self,
+        shard: ShardId,
+        flushed: &'a HashSet<(u16, u32)>,
+    ) -> impl Iterator<Item = &'a MemEntry> {
+        let active = (self.seal != Seal::Flushed).then_some(&self.active);
+        active
+            .into_iter()
+            .chain(&self.frozen)
+            .filter(move |m| !flushed.contains(&(shard.0, m.table.root())))
     }
 
     /// The smallest seqno in any of these memtables, `None` when all are empty.
@@ -1085,6 +1103,7 @@ fn slot_of<'a>(
             Ok(e.insert(MemSlot {
                 active,
                 frozen: Vec::new(),
+                seal: Seal::Open,
             }))
         }
     }
@@ -1999,6 +2018,9 @@ impl ShardState {
             let Some(slot) = self.memtables.get_mut(&key) else {
                 continue;
             };
+            if slot.seal != Seal::Open {
+                continue;
+            }
             let big = slot.active.table.allocated_bytes() >= threshold;
             trace!(
                 "shard {} freeze {:?}: all={all} big={big} empty={} max_seqno={} visible={visible}",
@@ -2022,6 +2044,17 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
+            let item = |m: &MemEntry| FlushItem {
+                table: meta.table,
+                tablet: key.0,
+                family: key.1,
+                root: m.table.root(),
+                reader: m.table.reader(),
+                bytes: m.table.allocated_bytes() as u64,
+                max_seqno: m.max_seqno(),
+                has_shares: m.has_shares,
+                options: meta.options.clone(),
+            };
             // The fresh active memtable takes a chunk: never one admitted commits reserved.
             if tablets_on
                 && self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size)
@@ -2030,36 +2063,37 @@ impl ShardState {
                 // As `refresh_free`: the arena accounts for memtables released since.
                 self.arena.reclaim(m.retire());
             }
-            if tablets_on && self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size)
-            {
+            let reserved = tablets_on
+                && self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size);
+            let fresh = if reserved {
                 trace!(
                     "shard {} freeze {:?}: the arena's free chunks are reserved",
                     self.id.0, key
                 );
-                continue;
-            }
-            let Ok(fresh) = Memtable::create(&mut self.arena) else {
-                // No chunk for a new active memtable: keep writing into this one; the
-                // arena-room check defers later commits until a flush frees space.
+                None
+            } else {
+                Memtable::create(&mut self.arena).ok()
+            };
+            let Some(fresh) = fresh else {
                 trace!(
                     "shard {} freeze {:?}: no chunk for a fresh memtable",
                     self.id.0, key
                 );
+                if self.close_stage == CloseStage::Flushing {
+                    // Nothing commits on a closing shard any more: flush this one in place
+                    // rather than wait for a chunk that live snapshots may hold until the
+                    // close returns (issue #111).
+                    slot.active.table.freeze();
+                    self.flush_queue.push(item(&slot.active));
+                    slot.seal = Seal::Flushing;
+                }
+                // Otherwise keep writing into this one; the arena-room check defers later
+                // commits until a flush frees space.
                 continue;
             };
             let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
             old.table.freeze();
-            self.flush_queue.push(FlushItem {
-                table: meta.table,
-                tablet: key.0,
-                family: key.1,
-                root: old.table.root(),
-                reader: old.table.reader(),
-                bytes: old.table.allocated_bytes() as u64,
-                max_seqno: old.max_seqno(),
-                has_shares: old.has_shares,
-                options: meta.options.clone(),
-            });
+            self.flush_queue.push(item(&old));
             slot.frozen.insert(0, old);
             self.view_dirty = true;
         }
@@ -2156,12 +2190,19 @@ impl ShardState {
                     let key = (item.tablet, item.family);
                     let e = self.flushed.entry(key).or_insert(0);
                     *e = (*e).max(item.max_seqno);
-                    if let Some(slot) = self.memtables.get_mut(&key)
-                        && let Some(pos) =
-                            slot.frozen.iter().position(|m| m.table.root() == item.root)
+                    let Some(slot) = self.memtables.get_mut(&key) else {
+                        continue;
+                    };
+                    if let Some(pos) = slot.frozen.iter().position(|m| m.table.root() == item.root)
                     {
                         let m = slot.frozen.remove(pos);
                         self.retired.push((version, m.table.retire()));
+                    } else if slot.seal == Seal::Flushing && slot.active.table.root() == item.root {
+                        slot.seal = Seal::Flushed;
+                    }
+                    if slot.seal == Seal::Flushed && slot.frozen.is_empty() {
+                        let slot = self.memtables.remove(&key).expect("present");
+                        self.retired.push((version, slot.active.table.retire()));
                     }
                 }
                 self.reclaim_retired();
