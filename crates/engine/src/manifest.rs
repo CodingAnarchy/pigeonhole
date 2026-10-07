@@ -319,7 +319,9 @@ pub(crate) struct ManifestReq {
     pub readers: Vec<(SstId, Arc<SstReader>)>,
     /// Memtables the edits flush, as `(shard, root)`: dropped from the published view.
     pub flushed_roots: Vec<(u16, u32)>,
-    /// A compaction to record (test hook; the version is filled in at commit).
+    /// A compaction to record (test hook; the version is filled in at commit). Always `None`
+    /// without the `test-hooks` feature, which records nothing (5-6 6.2).
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     pub compaction: Option<CompactionRecord>,
     /// Rewrite the manifest snapshot (shrink relocates the manifest extents).
     pub rewrite_snapshot: bool,
@@ -482,6 +484,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         .manifest
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    #[cfg(feature = "test-hooks")]
     let version = writer.next_version();
     let current = shared.view.load_full();
     let old = Arc::clone(&current.catalog);
