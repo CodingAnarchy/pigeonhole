@@ -310,6 +310,25 @@ fn io_errors_poison_shards_and_recover_on_reopen() {
 }
 
 #[test]
+fn an_injected_read_error_in_a_transaction_read_abandons_the_transaction() {
+    // Issue #99: a transaction's read can hit an injected read error. That is an expected
+    // `Io` error (nothing was submitted), not a divergence from the model. Many steps are
+    // transactions and reads fail often, so the sweep reaches it; no crash is armed, so
+    // D127's probe rule is not in play.
+    let mut cfg = Config::standard(250);
+    cfg.faults.io_error_ppm = 20_000;
+    cfg.txn_ppm = 600_000;
+    cfg.crash_ppm = 0;
+    cfg.mid_commit_crash_ppm = 0;
+    let mut io_errors = 0;
+    for seed in seeds() {
+        let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+        io_errors += stats.io_errors;
+    }
+    assert!(io_errors > 0, "no I/O error was injected");
+}
+
+#[test]
 fn results_are_identical_across_shard_counts_under_faults() {
     // Torn and reordered unsynced writes plus a process crash and reopen every 60 ops:
     // everything written survives a process crash, so every shard count recovers the same

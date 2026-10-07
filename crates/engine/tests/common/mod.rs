@@ -3098,6 +3098,20 @@ impl World {
             match (got, want) {
                 (Ok(g), Ok(w)) if g == w => {}
                 (Err(Error::Merge(_)), Err(_)) => {}
+                (Err(e), _) if !self.alive() => {
+                    // An armed power loss fired on background I/O (D127).
+                    drop(txn);
+                    return self.background_crash(e, rng);
+                }
+                (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 && self.faults_on() => {
+                    // An injected read failure (issue #99): nothing was submitted, so the
+                    // transaction is abandoned; a poisoned store is reopened.
+                    drop(txn);
+                    self.stats.io_errors += 1;
+                    self.trace.push(format!("  -> txn read I/O error ({e})"));
+                    self.need_reopen = true;
+                    return Ok(());
+                }
                 (g, w) => {
                     return fail(
                         FailureClass::LiveReadMismatch,
