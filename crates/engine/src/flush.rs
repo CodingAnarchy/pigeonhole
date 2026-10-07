@@ -107,7 +107,7 @@ impl SstSink {
         Ok(())
     }
 
-    /// Finishes the open SST, if any.
+    /// Finishes the open SST, if any, trimming its extent to its length.
     pub(crate) fn cut(&mut self) -> Result<()> {
         let Some((w, extent)) = self.open.take() else {
             return Ok(());
@@ -117,7 +117,9 @@ impl SstSink {
             return Ok(());
         }
         match w.finish() {
-            Ok(meta) => {
+            Ok(mut meta) => {
+                // The estimate is the memtable's size; give back what the SST did not use.
+                meta.extent = self.pager.trim(meta.extent, meta.len);
                 self.outputs.push(meta);
                 Ok(())
             }

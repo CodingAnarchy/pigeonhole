@@ -175,12 +175,21 @@ struct Open {
 }
 
 /// Where kept entries go: output SSTs cut near the target size, at row boundaries.
+///
+/// Each output's extent is sized to the input bytes not yet written out (GC only shrinks
+/// data), capped at the target, and trimmed to the output's length at finish, so a small
+/// compaction takes a small extent rather than a target-size one (#106). If the estimate
+/// runs out (a codec change can grow data), later outputs take the target size.
 #[derive(Debug)]
 struct Sink {
     pager: Arc<Pager>,
     sst_ids: Arc<AtomicU64>,
     options: SstWriterOptions,
     target: u64,
+    /// Total length of the inputs.
+    input_bytes: u64,
+    /// Total length of the outputs finished so far.
+    written: u64,
     open: Option<Open>,
     outputs: Vec<SstMeta>,
     last_row: Vec<u8>,
@@ -198,7 +207,7 @@ impl Sink {
         }
         if self.open.is_none() {
             let need = (key.len() + value.len()) as u64 * 2 + (64 << 10);
-            let extent = self.pager.allocate(self.target.max(need).min(MAX_EXTENT))?;
+            let extent = self.pager.allocate(self.extent_bytes(need))?;
             let id = SstId(self.sst_ids.fetch_add(1, Ordering::Relaxed));
             let file = self.pager.file().clone();
             self.open = Some(Open {
@@ -218,7 +227,19 @@ impl Sink {
         Ok(())
     }
 
-    /// Finishes the open SST, if any.
+    /// Bytes to allocate for the next output, at least `need` (room for the entry at hand).
+    fn extent_bytes(&self, need: u64) -> u64 {
+        let rest = self.input_bytes.saturating_sub(self.written);
+        // An eighth more covers the cut margin in `add`; past the estimate, take the target.
+        let estimate = if rest == 0 {
+            self.target
+        } else {
+            (rest + rest / 8 + (64 << 10)).min(self.target)
+        };
+        estimate.max(need).min(MAX_EXTENT)
+    }
+
+    /// Finishes the open SST, if any, trimming its extent to its length.
     fn cut(&mut self) -> Result<()> {
         let Some(o) = self.open.take() else {
             return Ok(());
@@ -228,7 +249,9 @@ impl Sink {
             return Ok(());
         }
         match o.writer.finish() {
-            Ok(meta) => {
+            Ok(mut meta) => {
+                meta.extent = self.pager.trim(meta.extent, meta.len);
+                self.written += meta.len;
                 self.outputs.push(meta);
                 Ok(())
             }
@@ -380,6 +403,8 @@ impl CompactionJob {
                 sst_ids: context.sst_ids,
                 options,
                 target: context.target_sst_bytes.max(1),
+                input_bytes: inputs.iter().map(|r| r.len_bytes()).sum(),
+                written: 0,
                 open: None,
                 outputs: Vec::new(),
                 last_row: Vec::new(),

@@ -290,6 +290,99 @@ fn allocation_sizes() {
 }
 
 #[test]
+fn trim_keeps_the_head_and_frees_the_tail() {
+    let pager = Pager::create(&sim(), path()).unwrap();
+    let e = pager.allocate(1 << 20).unwrap();
+    assert_eq!(e.size_class, 4);
+    let data = vec![7u8; 100 << 10];
+    pager.write(e, 0, &data).unwrap();
+    let before = pager.stats();
+    let t = pager.trim(e, data.len() as u64);
+    assert_eq!((t.page, t.size_class), (e.page, 1));
+    let mut back = vec![0u8; data.len()];
+    pager.read(t, 0, &mut back).unwrap();
+    assert_eq!(back, data);
+    let after = pager.stats();
+    assert_eq!(
+        after.allocated_bytes,
+        before.allocated_bytes - (1 << 20) + (128 << 10)
+    );
+    assert_eq!(after.file_bytes, before.file_bytes);
+    // Larger than the extent, or no smaller class: unchanged.
+    assert_eq!(pager.trim(t, 1 << 20), t);
+    assert_eq!(pager.trim(t, (64 << 10) + 1), t);
+    // The freed tail is reused before the file grows: one 512 KiB block is the alignment
+    // gap below `e`, the other is the tail of `e`.
+    let a = pager.allocate(512 << 10).unwrap();
+    let b = pager.allocate(512 << 10).unwrap();
+    assert!([a.page, b.page].contains(&(e.page + (512 << 10) / 4096)));
+    assert_eq!(pager.stats().file_bytes, before.file_bytes);
+    // The trimmed extent is an ordinary pending extent.
+    for x in [t, a, b] {
+        pager.abandon(x);
+    }
+    assert_eq!(pager.stats().allocated_bytes, 0);
+}
+
+/// A database whose committed root names a manifest log, reopened with one live data
+/// extent: both are known published.
+fn published() -> (Pager, Extent, Extent) {
+    let vfs = sim();
+    let pager = Pager::create(&vfs, path()).unwrap();
+    let data = pager.allocate(1 << 20).unwrap();
+    let log = pager.allocate(256 << 10).unwrap();
+    pager
+        .commit_root(Root {
+            log: Some(log),
+            ..root(1)
+        })
+        .unwrap();
+    drop(pager);
+    let pager = Pager::open(&vfs, path(), true)
+        .unwrap()
+        .finish([data, log])
+        .unwrap();
+    // A root committed in this session publishes the log it names.
+    let log2 = pager.allocate(256 << 10).unwrap();
+    pager
+        .commit_root(Root {
+            log: Some(log2),
+            ..root(2)
+        })
+        .unwrap();
+    (pager, data, log2)
+}
+
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "not pending output"))]
+fn trim_refuses_a_published_extent() {
+    let (pager, data, log) = published();
+    let before = pager.stats();
+    assert_eq!(pager.trim(data, 64 << 10), data);
+    assert_eq!(pager.trim(log, 64 << 10), log);
+    assert_eq!(pager.stats(), before);
+}
+
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "not pending output"))]
+fn abandon_refuses_a_published_extent() {
+    let (pager, data, log) = published();
+    let before = pager.stats();
+    pager.abandon(data);
+    pager.abandon(log);
+    assert_eq!(pager.stats(), before);
+}
+
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "not pending output"))]
+fn abandon_refuses_the_log_of_a_root_committed_in_this_session() {
+    let (pager, _, log) = published();
+    let before = pager.stats();
+    pager.abandon(log);
+    assert_eq!(pager.stats(), before);
+}
+
+#[test]
 fn finish_rejects_inconsistent_live_sets() {
     let vfs = sim();
     let pager = Pager::create(&vfs, path()).unwrap();

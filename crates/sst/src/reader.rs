@@ -75,7 +75,7 @@ impl std::fmt::Debug for Reader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SstReader")
             .field("id", &self.blocks.id)
-            .field("len", &(self.blocks.limit + FOOTER_LEN as u64))
+            .field("len", &self.len_bytes())
             .field("entries", &self.properties.entries)
             .field("filters", &self.row_filter.is_some())
             .finish()
@@ -126,6 +126,11 @@ impl Reader {
             column_filter,
             properties,
         })
+    }
+
+    /// The SST's length in bytes (`SstMeta::len`).
+    pub(crate) fn len_bytes(&self) -> u64 {
+        self.blocks.limit + FOOTER_LEN as u64
     }
 
     pub(crate) fn may_contain_row(&self, hash: u64) -> bool {

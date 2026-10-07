@@ -28,6 +28,11 @@ const CLASSES: usize = Extent::MAX_CLASS as usize + 1;
 struct Used {
     class: u8,
     retired: Option<ManifestVersion>,
+    /// Known to be referenced by a durable root: loaded at open, or named by a committed
+    /// root. A live extent that is not is *pending* (allocated in this session); only
+    /// pending extents may be abandoned or trimmed. An SST published in this session stays
+    /// pending here, since the pager never sees the manifest's contents.
+    published: bool,
 }
 
 /// Why a set of live extents cannot be loaded.
@@ -126,6 +131,7 @@ impl Alloc {
                 Used {
                     class,
                     retired: None,
+                    published: true,
                 },
             );
             a.used_units += units(class);
@@ -182,6 +188,7 @@ impl Alloc {
             Used {
                 class,
                 retired: None,
+                published: false,
             },
         );
         self.used_units += units(class);
@@ -223,16 +230,60 @@ impl Alloc {
         self.mark_used(unit, class)
     }
 
-    /// Frees a live extent at once. Returns false (and changes nothing) if `e` is not live.
+    /// Whether `e` is exactly a pending extent: live and not known to be published.
+    pub(crate) fn is_pending(&self, e: Extent) -> bool {
+        unit_of(e)
+            .and_then(|u| self.used.get(&u))
+            .is_some_and(|u| u.class == e.size_class && u.retired.is_none() && !u.published)
+    }
+
+    /// Records that a durable root references the live extent `e`. Returns false if `e` is
+    /// not live.
+    pub(crate) fn publish(&mut self, e: Extent) -> bool {
+        let Some(unit) = unit_of(e) else { return false };
+        match self.used.get_mut(&unit) {
+            Some(u) if u.class == e.size_class && u.retired.is_none() => {
+                u.published = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Frees a pending extent at once. Returns false (and changes nothing) if `e` is not
+    /// pending.
     pub(crate) fn release_live(&mut self, e: Extent) -> bool {
         let Some(unit) = unit_of(e) else { return false };
-        match self.used.get(&unit) {
-            Some(u) if u.class == e.size_class && u.retired.is_none() => {}
-            _ => return false,
+        if !self.is_pending(e) {
+            return false;
         }
         self.used.remove(&unit);
         self.used_units -= units(e.size_class);
         self.free_block(unit, e.size_class);
+        true
+    }
+
+    /// Shrinks a pending extent to `class` in place, freeing its upper halves at once.
+    /// Returns false (and changes nothing) if `e` is not pending or `class` is larger than
+    /// its class.
+    pub(crate) fn shrink_live(&mut self, e: Extent, class: u8) -> bool {
+        if class > e.size_class || !self.is_pending(e) {
+            return false;
+        }
+        let unit = unit_of(e).expect("pending extent is well formed");
+        self.used.insert(
+            unit,
+            Used {
+                class,
+                retired: None,
+                published: false,
+            },
+        );
+        self.used_units -= units(e.size_class) - units(class);
+        // Each upper half's buddy is the lower part, still used, so none coalesces.
+        for k in class..e.size_class {
+            self.free_block(unit + units(k), k);
+        }
         true
     }
 
@@ -408,6 +459,49 @@ mod tests {
         }
         a.check();
         assert_eq!(a.free[10].len(), 1, "units 1024..2048 whole again");
+    }
+
+    #[test]
+    fn shrink_live_frees_the_upper_halves() {
+        let mut a = Alloc::empty(1);
+        let x = a.alloc_grown(3);
+        assert_eq!(x, ext(8, 3));
+        assert!(!a.shrink_live(x, 4), "cannot grow");
+        assert!(a.shrink_live(x, 0));
+        a.check();
+        assert_eq!(a.used_units(), 1);
+        assert!(a.is_live(ext(8, 0)) && !a.is_live(x));
+        assert!(!a.shrink_live(x, 0), "no longer live at its old class");
+        // The freed halves (9, 10-11, 12-15) are free blocks, and coalesce once the rest goes.
+        assert!(a.free[0].contains(&9) && a.free[1].contains(&10) && a.free[2].contains(&12));
+        assert!(a.retire(ext(8, 0), 1));
+        assert!(
+            !a.shrink_live(ext(8, 0), 0),
+            "retired extents are not trimmed"
+        );
+        assert_eq!(a.reclaim(1), 1);
+        a.check();
+        assert_eq!(a.used_units(), 0);
+        assert!(a.free[3].contains(&8), "units 8..16 whole again");
+    }
+
+    #[test]
+    fn published_extents_are_neither_released_nor_shrunk() {
+        let mut a = Alloc::load(32, [ext(16, 4)]).unwrap();
+        let loaded = ext(16, 4);
+        assert!(a.is_live(loaded) && !a.is_pending(loaded));
+        assert!(!a.release_live(loaded), "loaded at open: published");
+        assert!(!a.shrink_live(loaded, 0));
+        let fresh = a.alloc_free(2).unwrap();
+        assert!(a.is_pending(fresh));
+        assert!(a.publish(fresh));
+        assert!(!a.release_live(fresh), "named by a committed root");
+        assert!(!a.shrink_live(fresh, 0));
+        // Published extents still retire and reclaim.
+        assert!(a.retire(fresh, 1) && a.retire(loaded, 1));
+        assert_eq!(a.reclaim(1), 2);
+        a.check();
+        assert_eq!(a.used_units(), 0);
     }
 
     #[test]
