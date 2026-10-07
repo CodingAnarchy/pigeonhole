@@ -198,7 +198,7 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 | Feature | Phase |
 |---|---|
 | Tablet splits: one table stays on one shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)) | P1 |
-| Public `shrink` (the engine has it; nothing calls it, so freed space is reused but the file is not truncated) | P1 |
+| Public `shrink` ([#71](https://github.com/CodingAnarchy/pigeonhole/issues/71); the engine has it; nothing calls it, so freed space is reused but the file is not truncated) | P1 |
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
 | zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |

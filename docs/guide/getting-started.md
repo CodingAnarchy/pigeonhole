@@ -269,7 +269,7 @@ A write that finds the memtable arena full waits (a write stall) while a flush f
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
 | `Compaction::Tiered`, `FifoByTime`, `zstd`, blob separation, custom merge operators | Phase 2. |
 | Tablet splits | A table stays on one shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)), so one table's writes do not spread across shards yet. |
-| `shrink` | The engine has it; the public crate does not expose it yet. |
+| `shrink` | The engine has it; the public crate does not expose it yet ([#71](https://github.com/CodingAnarchy/pigeonhole/issues/71)). |
 
 Later phases:
 

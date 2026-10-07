@@ -139,11 +139,32 @@ Run 1 started while the 15-minute load was still 12.3, the tail of another agent
 
 `compare` is symmetric: it flags any change beyond tolerance, faster or slower. An unexplained improvement is as suspect as a regression, and an intended one means it is time for a new baseline. It warns when the two runs come from different machines or build profiles, because the tolerance only means something on one machine. Close other heavy work while measuring. Laptops also throttle and switch between performance and efficiency cores.
 
-## First results (this Mac, non-reference)
+## Results with disk-backed storage (this Mac, non-reference)
+
+**Single run, n=1, commit `4bc304c`**, measured 2026-10-06: `phdb-bench all` (Pigeonhole only, release, `small` preset: 50,000 records, 200,000 measured operations after a 5% warmup, 100-byte values, seed `0x5EED`, 64 MiB write buffer, buffered commits). Memtables now flush to SSTs and compact during the run.
+
+**Environment:** Apple M5 (10 cores, 24 GiB), macOS 26.5.2 aarch64, APFS, **load 6.14** [non-reference (D5)]. The machine was shared with other agents' test suites, so this is *not* a quiet-machine run: the reproducibility rule above would flag it, and run-to-run drift is likely well beyond ±10%. Read these as order-of-magnitude, not as a regression or improvement against the older table (which ran at load 0.98 on a different engine build).
+
+| Workload | Store | Settings | Records | Ops | Threads | Ops/s | p50 µs | p99 µs | p99.9 µs |
+|---|---|---|--:|--:|--:|--:|--:|--:|--:|
+| ycsb-a | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 116.8K | 6.43 | 20.7 | 50.4 |
+| ycsb-b | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 293.1K | 2.46 | 14.6 | 26.4 |
+| ycsb-c | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 406.3K | 2.13 | 6.05 | 10.3 |
+| ycsb-d | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 436.5K | 1.09 | 17.5 | 29.8 |
+| ycsb-e | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 17.7K | 55.3 | 115 | 197 |
+| ycsb-f | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 124.0K | 6.27 | 23.9 | 36.9 |
+| sparse-wide | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 62.0K | 2.75 | 261 | 465 |
+| time-series-ttl | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 172.5K | 3.76 | 21.5 | 30.6 |
+| adjacency | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 54.5K | 10.8 | 78.8 | 103 |
+| skewed-multi-shard | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 4 | 234.8K | 14.5 | 34.0 | 532 |
+
+**Not measured:** the `full` preset (1M records) and the comparison engines at it. The machine was too loaded for the numbers to mean anything, so full-scale and four-engine comparisons are left to the weekly `bench.yml` workflow (`--scale full` is selectable there) and to reference hardware (D5). A 1M-row sparse-wide run on Pigeonhole alone did complete without `Busy` (22.4K ops/s at load 8.9, one run), which is the only full-scale evidence so far.
+
+## Comparison results before Milestone B (this Mac, non-reference)
 
 **Single run, n=1, commit `4b59eac`**, measured 2026-10-06: `phdb-bench all --engine all` (release, `small` preset: 50,000 records, 200,000 measured operations after a 5% warmup, 100-byte values, seed `0x5EED`). This is run 2 of the five calibration runs above, chosen because it started on the quietest machine (load 0.98). Single-run numbers carry the run-to-run drift described above: about ±10% on throughput and p50.
 
-These numbers are **not from reference hardware** (D5): a laptop with an APFS SSD, macOS, and no io_uring. Pigeonhole is memory-bound (#37), so every store's data is hot in memory. Every engine has the same memory budget (256 MiB write buffer, 256 MiB read cache, SQLite 512 MiB page cache) and its default options otherwise. No engine has been tuned. Treat this as a baseline to track, not a verdict.
+**These numbers predate engine Milestone B** (Pigeonhole ran memory-only with a 256 MiB write buffer; the other engines used the same budget). They are kept as the only four-engine comparison until it is re-run, and are not comparable with the table above. They are **not from reference hardware** (D5): a laptop with an APFS SSD, macOS, and no io_uring. Pigeonhole is memory-bound (#37), so every store's data is hot in memory. Every engine has the same memory budget (256 MiB write buffer, 256 MiB read cache, SQLite 512 MiB page cache) and its default options otherwise. No engine has been tuned. Treat this as a baseline to track, not a verdict.
 
 **Environment:** Apple M5 (10 cores, 24 GiB), macOS 26.5.2 aarch64, APFS, load 0.98 [non-reference (D5)]
 
