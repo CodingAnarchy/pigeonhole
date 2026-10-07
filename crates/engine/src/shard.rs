@@ -873,6 +873,10 @@ pub struct AppendedRecord {
     pub seqno: Seqno,
     pub kind: AppendedKind,
     pub durability: Durability,
+    /// The record's commit timestamp (0 for a COMMIT record): a harness reads a commit's
+    /// timestamp here when its record was checkpointed and compaction dropped every entry
+    /// it wrote.
+    pub commit_ts: Timestamp,
 }
 
 /// The kind of an [`AppendedRecord`].
@@ -3233,6 +3237,7 @@ impl ShardState {
                             MemberKind::CommitRecord { .. } => AppendedKind::Commit,
                         },
                         durability: m.durability,
+                        commit_ts: m.commit_ts,
                     });
             }
             match result {

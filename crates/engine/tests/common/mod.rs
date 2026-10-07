@@ -1054,6 +1054,9 @@ struct World {
     /// Per stream, parallel to `stream_records`: how many crashes had happened when each
     /// record was appended (a seqno may be reused only across a crash).
     stream_epochs: BTreeMap<u32, Vec<usize>>,
+    /// Commit timestamps of the batch records the engine appended, by seqno, with the crash
+    /// count when appended (seqnos are reused only across a crash).
+    appended_ts: HashMap<Seqno, (usize, Timestamp)>,
     /// Bottommost compactions applied to the model, by manifest version.
     purges: Vec<PurgeEvent>,
     /// Compactions reported by the engine whose manifest version is not published yet.
@@ -1105,6 +1108,7 @@ impl World {
             queued: std::collections::VecDeque::new(),
             stream_records: BTreeMap::new(),
             stream_epochs: BTreeMap::new(),
+            appended_ts: HashMap::new(),
             purges: Vec::new(),
             pending_purges: Vec::new(),
             compaction_floor: 0,
@@ -1185,6 +1189,10 @@ impl World {
                 AppendedKind::Prepare => RecKind::Prepare,
                 AppendedKind::Commit => RecKind::Commit,
             };
+            if kind == RecKind::Batch {
+                self.appended_ts
+                    .insert(r.seqno, (self.stats.crashes, r.commit_ts));
+            }
             self.stream_records
                 .entry(u32::from(r.stream))
                 .or_default()
@@ -2422,6 +2430,19 @@ impl World {
         Ok(logged_timestamps_of(&wal))
     }
 
+    /// The timestamp of logged commit `seqno` whose record a flush already checkpointed away:
+    /// from the engine's append record (test hook) when it was appended since the last
+    /// crash, else from the entries it left. A compaction may have dropped every entry
+    /// (a family delete purged with what it covers, expired TTL cells), so the append
+    /// record comes first.
+    fn checkpointed_commit_ts(&mut self, seqno: Seqno, ops: &[ModelOp]) -> Result<Timestamp, Fail> {
+        self.drain_appended();
+        match self.appended_ts.get(&seqno) {
+            Some(&(epoch, ts)) if epoch == self.stats.crashes => Ok(ts),
+            _ => self.raw_commit_ts(seqno, ops),
+        }
+    }
+
     /// The timestamp of commit `seqno` from the entries it left in the store, for a record
     /// a flush already checkpointed away: the timestamp of any entry an op with a default
     /// timestamp produced (0 when every op carries its own).
@@ -2786,8 +2807,9 @@ impl World {
                 }
                 match logged.as_ref().and_then(|m| m.get(&seqno)) {
                     Some(ts) => *ts,
-                    // Flushed and checkpointed before the client looked: the entries say.
-                    None => self.raw_commit_ts(seqno, &c.ops)?,
+                    // Flushed and checkpointed before the client looked: the engine's
+                    // append record says, else the entries.
+                    None => self.checkpointed_commit_ts(seqno, &c.ops)?,
                 }
             };
             if let Kind::Txn { snapshot, reads } = &c.kind {
@@ -3302,7 +3324,7 @@ impl World {
         let logged = self.logged_timestamps()?;
         let ts = match logged.get(&info.seqno) {
             Some(ts) => *ts,
-            None => self.raw_commit_ts(info.seqno, &ops)?,
+            None => self.checkpointed_commit_ts(info.seqno, &ops)?,
         };
         self.trace.push(format!(
             "interferer {durability:?} ts={ts} seqno={} [{}]",
