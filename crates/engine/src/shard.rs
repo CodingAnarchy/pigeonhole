@@ -125,6 +125,9 @@ pub(crate) struct CloseState {
     pub done: Mutex<Option<Notifier<Result<()>>>>,
     /// A shard's final WAL sync (or flush) failed: the close is not clean.
     pub failed: AtomicBool,
+    /// Every shard has reported: the final close runs once it holds the manifest writer's
+    /// exclusion (whoever holds it then runs it when it releases).
+    pub final_pending: AtomicBool,
 }
 
 /// One cache line per shard, so shards never share a line through these counters.
@@ -176,6 +179,11 @@ pub(crate) struct Shared {
     #[cfg(feature = "test-hooks")]
     pub manifest_race_waiter:
         Mutex<Option<pigeonhole_runtime::Waiter<Result<pigeonhole_format::ManifestVersion>>>>,
+    /// Test hook: park background manifest commits before `end` (see `manifest::parked`).
+    #[cfg(feature = "test-hooks")]
+    pub manifest_park: AtomicBool,
+    #[cfg(feature = "test-hooks")]
+    pub manifest_parked: Mutex<Option<pigeonhole_runtime::TaskWaker>>,
     pub picker: PickerOptions,
     /// How long a commit waits for arena room before `Busy`.
     pub write_stall_timeout_nanos: u64,
@@ -382,6 +390,9 @@ impl Shared {
             clean = self.forget_checkpoints();
         }
         if clean.is_ok() {
+            // Under the exclusion (see `try_final_close`): no commit is in flight, and the
+            // queue is drained first, so nothing commits after the clean mark and clears it.
+            manifest::drain_sync(self);
             let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
             clean = manifest.mark_clean();
         }
@@ -397,41 +408,62 @@ impl Shared {
         clean
     }
 
-    /// Commits a manifest delta resetting every stream's checkpoint to the start.
+    /// Commits a manifest delta resetting every stream's checkpoint to the start. Called
+    /// with the manifest writer's exclusion held: the delta goes through the queue, after
+    /// every commit still queued, and is computed against the catalog they leave.
     fn forget_checkpoints(&self) -> Result<()> {
-        let current = self.view.load_full();
-        let mut catalog = (*current.catalog).clone();
-        let edits: Vec<Edit> = catalog
-            .checkpoints
-            .keys()
-            .map(|stream| Edit::WalCheckpoint {
-                stream: *stream,
-                lsn: Lsn::default(),
-            })
-            .collect();
-        if edits.is_empty() {
+        // What is queued may move checkpoints: commit it first, then look.
+        manifest::drain_sync(self);
+        if self.view.load().catalog.checkpoints.is_empty() {
             return Ok(());
         }
-        for e in &edits {
-            catalog.apply(e, self.shards)?;
-        }
-        let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
-        manifest.commit(&catalog, &edits).map(|_| ())
+        let change = |catalog: &mut crate::catalog::Catalog| {
+            Ok(catalog
+                .checkpoints
+                .keys()
+                .map(|stream| Edit::WalCheckpoint {
+                    stream: *stream,
+                    lsn: Lsn::default(),
+                })
+                .collect())
+        };
+        manifest::commit_held(self, manifest::ReqKind::Catalog(Box::new(change))).map(|_| ())
     }
 
     fn report_closed(&self) {
         if self.close.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let result = self.final_close();
-            self.closed.store(true, Ordering::Release);
-            if let Some(n) = self
-                .close
-                .done
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-            {
-                n.notify(result);
-            }
+            self.close.final_pending.store(true, Ordering::SeqCst);
+            self.try_final_close();
+        }
+    }
+
+    /// Runs the final close if it is pending and the manifest writer's exclusion is free.
+    /// A background commit (a compaction's, say) may hold it with its root commit in
+    /// flight; the final close's own commits must not interleave with it, or both would be
+    /// prepared from the same writer state (issue #78). Its holder calls this again from
+    /// `manifest::release`. Never blocks, so it is safe on the shard thread that runs the
+    /// holder's pump.
+    pub(crate) fn try_final_close(&self) {
+        // Pairs with the fence in `manifest::release`.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !self.close.final_pending.load(Ordering::SeqCst) || !manifest::claim(self) {
+            return;
+        }
+        if !self.close.final_pending.swap(false, Ordering::SeqCst) {
+            manifest::release(self);
+            return;
+        }
+        let result = self.final_close();
+        manifest::release(self);
+        self.closed.store(true, Ordering::Release);
+        if let Some(n) = self
+            .close
+            .done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            n.notify(result);
         }
     }
 }

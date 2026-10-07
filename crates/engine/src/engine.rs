@@ -466,6 +466,10 @@ impl Engine {
             manifest_race: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_race_waiter: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            manifest_park: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            manifest_parked: Mutex::new(None),
             picker: options.compaction.clone(),
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(Some(Locks {
@@ -480,6 +484,7 @@ impl Engine {
                 remaining: AtomicUsize::new(shards),
                 done: Mutex::new(None),
                 failed: AtomicBool::new(false),
+                final_pending: AtomicBool::new(false),
             },
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             ts_floors: (0..shards)
@@ -908,6 +913,10 @@ impl Engine {
             manifest_race: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_race_waiter: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            manifest_park: AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            manifest_parked: Mutex::new(None),
             picker: options.compaction.clone(),
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             locks: Mutex::new(None),
@@ -1291,6 +1300,49 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// While `park` is set, a background manifest commit whose root commit completed waits
+    /// before it publishes and answers; clearing it wakes the parked commit (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn park_manifest_commits(&self, park: bool) {
+        let shared = &self.inner.shared;
+        shared.manifest_park.store(park, Ordering::Release);
+        if !park {
+            let parked = shared
+                .manifest_parked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(w) = parked {
+                w.wake();
+            }
+        }
+    }
+
+    /// Whether a background manifest commit is parked (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn manifest_commit_parked(&self) -> bool {
+        self.inner
+            .shared
+            .manifest_parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Whether every shard has closed and the final close waits for the manifest writer
+    /// (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn final_close_pending(&self) -> bool {
+        self.inner
+            .shared
+            .close
+            .final_pending
+            .load(Ordering::Acquire)
     }
 
     /// Commits an empty manifest delta from this thread while a second request lands in
