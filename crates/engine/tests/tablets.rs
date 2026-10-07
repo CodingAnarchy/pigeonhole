@@ -80,15 +80,27 @@ fn tablet_changes_under_faults_and_crashes() {
     assert!(totals.0 > 0 && totals.1 > 0 && totals.2 > 0, "{totals:?}");
 }
 
+/// Reopens with 1, 5, 2, 8 and 4 shards after starting on 3, tablet changes churning.
+fn changed_shard_count(seed: u64) {
+    let mut cfg = Config::standard(300);
+    churn(&mut cfg);
+    cfg.shards = 3;
+    cfg.reopen_shards = vec![1, 5, 2, 8, 4];
+    check(seed, &cfg);
+}
+
 #[test]
 fn tablet_changes_with_a_changed_shard_count() {
     for seed in seeds() {
-        let mut cfg = Config::standard(300);
-        churn(&mut cfg);
-        cfg.shards = 3;
-        cfg.reopen_shards = vec![1, 5, 2, 8, 4];
-        check(seed, &cfg);
+        changed_shard_count(seed);
     }
+}
+
+#[test]
+fn tablet_changes_with_a_changed_shard_count_regressions() {
+    // A participant compacted a slot while it held a prepared share with an explicit
+    // timestamp below a row delete in the inputs (#132).
+    changed_shard_count(183);
 }
 
 /// The final dump of `seed` matches the 1-shard run for 2..=8 shards, with tablet changes.
@@ -573,6 +585,75 @@ fn a_full_compaction_rewrites_a_lone_sst() {
         .unwrap();
     db.commit(wb);
     assert_eq!(db.get(b"row"), Some((ts + 5, b"below".to_vec())));
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_bottommost_compaction_counts_a_prepared_share_above_its_inputs() {
+    // Issue #132 (seed 183): a participant compacted a slot while it held a cross-shard
+    // share, prepared and undecided, with an explicit timestamp below a row delete in the
+    // inputs. `min_ts_above` saw only the memtables, so the delete was purged, and the share
+    // applied after it became visible. A prepared share is above the inputs (D70). Tablet
+    // changes off: two tables on two shards take the same two-phase path.
+    let mut db = open(2, |o| o.tablet_changes = false);
+    let owner = |db: &Db, table| db.engine.snapshot().unwrap().view().tablets().ranges(table)[0].1;
+    let participant = usize::from(owner(&db, db.table.id));
+    let other = (0..8)
+        .map(|i| {
+            db.engine
+                .create_table(&format!("u{i}"), &[("f".into(), FamilyOptions::default())])
+                .unwrap()
+        })
+        .find(|u| usize::from(owner(&db, u.id)) != participant)
+        .expect("a table on the other shard");
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    // Two L0 SSTs, so the full compaction rewrites them at the bottom (and may purge).
+    db.put(b"row", b"old");
+    let (ts, _) = db.get(b"row").unwrap();
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    let mut wb = WriteBatch::new();
+    wb.delete_row(id, b"row", Some(ts + 10)).unwrap();
+    db.commit(wb);
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+
+    // The other table's row first: its shard coordinates.
+    let mut wb = WriteBatch::new();
+    wb.put(
+        other.id,
+        other.families[0].id,
+        b"x",
+        b"q",
+        None,
+        ValueRef::Bytes(b"x"),
+    )
+    .unwrap();
+    wb.put(id, f, b"row", b"q", Some(ts + 5), ValueRef::Bytes(b"below"))
+        .unwrap();
+    let mut pc = db
+        .engine
+        .submit(wb, Some(Durability::Buffered))
+        .expect("submit");
+    let coordinator = 1 - participant;
+    let now = db.clock.monotonic_nanos();
+    db.shards[coordinator].run_once(now + 1_000);
+    // The participant prepares its share; the coordinator does not run, so no decision.
+    for _ in 0..8 {
+        db.shards[participant].run_once(now + 1_000);
+    }
+    let m = db.engine.compact_pending(None).unwrap();
+    for _ in 0..64 {
+        db.shards[participant].run_once(now + 1_000);
+    }
+    step_until_done(&mut db, &mut pc);
+    db.drive(m).unwrap();
+    db.settle();
+    // The delete was above the share's timestamp, so it was kept: the share stays hidden.
+    assert_eq!(db.get(b"row"), None);
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();

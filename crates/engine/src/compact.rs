@@ -219,7 +219,10 @@ pub(crate) fn gc_policy(
 /// oldest entry above them (the slot's other SSTs and memtables; `visible` when there is
 /// none): an output SST's seqno range covers only the entries it kept, so an entry an
 /// earlier compaction dropped (hidden by a delete at every read point) can be newer than
-/// every input, and the model must still count it as one (issue #66).
+/// every input, and the model must still count it as one (issue #66). Never above `visible`:
+/// a seqno past it may belong to a cross-shard commit not applied here yet (prepared and
+/// undecided, or its PREPARE still on the way), which lands in the memtables below their
+/// oldest entry (issue #132). Inputs never pass `visible` (a memtable freezes once it is).
 pub(crate) fn max_input_seqno(
     fam: &FamilySsts,
     task: &CompactionTask,
@@ -239,7 +242,8 @@ pub(crate) fn max_input_seqno(
         .map(|s| s.meta.seqno_range.0)
         .chain(mem_min_seqno)
         .min()
-        .map_or(visible, |m| m.saturating_sub(1));
+        .map_or(visible, |m| m.saturating_sub(1))
+        .min(visible);
     inputs.max(above)
 }
 
