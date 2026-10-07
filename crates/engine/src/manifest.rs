@@ -607,6 +607,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         }
                         flushed_roots.append(&mut req.flushed_roots);
                         rewrite |= req.rewrite_snapshot;
+                        #[cfg(feature = "test-hooks")]
                         if let Some(mut c) = req.compaction.take() {
                             c.manifest_version = version;
                             shared
