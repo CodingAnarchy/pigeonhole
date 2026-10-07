@@ -35,3 +35,8 @@ The spec gives the triggers (size, sustained write skew, small and cold) but no 
 
 ## Proposed decision: a split's children and the view buffer (D28)
 **Interim behavior:** a split whose estimated encoded view would not fit the shared-memory view buffer is refused before it starts (`Unsupported`), so the published view is never refused after the manifest commit (which would poison the pager). Children reference only the parent's SSTs that overlap their own range; scans clamp every tablet's sources to its range, since a shared SST also holds the sibling's rows.
+
+## Proposed decision: a write stall that nothing can end is refused at once
+D124 refuses a commit waiting for arena room with `Busy` after `write_stall_timeout_nanos`, or at once when the batch can never fit an empty arena. With many tablets per shard, every `(tablet, family)` slot takes memtable chunks, and memtables pinned by live snapshots stay allocated after their flush. A wait can then reach a state where nothing is frozen or flushing and nothing can freeze: only snapshots being released could make room.
+
+**Interim behavior:** in that state the waiting commits are refused with `Busy` at once instead of being held to the timeout. A wait that a flush, a deferred freeze or the group's own reservations can still end keeps waiting as before. Separately, the balancer and tablet-change validation keep each shard's slots to a quarter of its arena's chunks (`max_slots`), and empty slots release their memtables after a flush. This caps how many tablets of many-family tables a shard holds: with the default 64 MiB budget and 1 MiB chunks, 16 slots per shard. Smaller arena chunks for shards with many tablets are the longer-term fix.

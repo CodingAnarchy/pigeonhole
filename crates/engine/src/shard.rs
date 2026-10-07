@@ -2575,6 +2575,27 @@ impl ShardState {
                 // chunks. Once they are applied (below) their room is free again, so the
                 // waiting members try again then rather than wait for a flush that never comes.
                 let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+            } else if !self.flush_running
+                && !self.freeze_deferred
+                && !self.freeze_all_pending
+                && self.flush_queue.is_empty()
+                && self.memtables.values().all(|s| s.frozen.is_empty())
+            {
+                // Nothing is frozen or flushing and nothing could freeze: only snapshots
+                // releasing memtables they pin could make room, which no timer brings about.
+                // Refuse the waiting members now rather than hold them to the timeout.
+                trace!("shard {} room wait cannot progress: refusing", self.id.0);
+                self.end_room_wait(ctx.now_nanos());
+                self.wait_room = false;
+                let waiting = std::mem::take(&mut self.pending);
+                for mut m in waiting {
+                    if matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                        self.pending.push(m);
+                        continue;
+                    }
+                    m.failed = Some(Error::Busy);
+                    self.settle(m, Ok(()), ctx);
+                }
             }
         } else {
             if let Some(w) = &self.room_wait

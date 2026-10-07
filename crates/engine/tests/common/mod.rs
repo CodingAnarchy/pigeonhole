@@ -1746,6 +1746,24 @@ impl World {
                 // recover from it, and its commit is known through its other records.
                 continue;
             }
+            // PREPAREs of a cross-shard attempt whose coordinator never appended a COMMIT
+            // record to any stream (it aborted: a participant refused, or it never got that
+            // far) can never be recovered (D83). A commit refused by a shard moving a tablet
+            // is retried under a new seqno, so such an attempt must not be taken for an
+            // unacknowledged commit's seqno.
+            let prepares_only = wal
+                .streams
+                .values()
+                .flatten()
+                .all(|(s, kind)| *s != *seqno || *kind == RecKind::Prepare);
+            let committed_anywhere = self
+                .stream_records
+                .values()
+                .flatten()
+                .any(|(s, kind)| *s == *seqno && *kind == RecKind::Commit);
+            if prepares_only && !committed_anywhere {
+                continue;
+            }
             let exact = (0..unacked.len()).filter(|&i| unacked_keys[i] == keys);
             let within = (0..unacked.len())
                 .filter(|&i| unacked_keys[i] != keys && keys.is_subset(&unacked_keys[i]));
@@ -1770,18 +1788,6 @@ impl World {
                 .aborted
                 .iter()
                 .any(|c| keys.is_subset(&Self::mutation_keys(&c.ops)))
-            {
-                continue;
-            }
-            // An attempt a participant refused because it was splitting, merging or moving a
-            // tablet: the coordinator aborted it (no COMMIT record anywhere) and committed the
-            // same mutations again under a new seqno.
-            if !wal.commits.keys().any(|(_, s)| s == seqno)
-                && self
-                    .history
-                    .values()
-                    .chain(unacked.iter())
-                    .any(|c| keys.is_subset(&Self::mutation_keys(&c.ops)))
             {
                 continue;
             }
