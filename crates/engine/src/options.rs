@@ -69,7 +69,9 @@ pub struct EngineOptions {
     ///   `tablet % shards` when that keeps the shard within its slots, else on the shard
     ///   holding the fewest), losing earlier moves, and cuts the arenas into smaller chunks
     ///   when the tablets need more slots than that;
-    /// - a shard's balancer runs only while that shard processes writes (#103).
+    /// - a shard's balancer runs only while that shard processes writes (#103);
+    /// - commits in flight together on one row may be applied in either order during a
+    ///   move, even from one thread (see [`Engine::submit`](crate::Engine::submit)).
     pub tablet_changes: bool,
     /// How often each shard's balancer looks at its tablets (nanoseconds, default 100 ms):
     /// size splits, write-skew splits, moves to colder shards and merges of cold tablets.

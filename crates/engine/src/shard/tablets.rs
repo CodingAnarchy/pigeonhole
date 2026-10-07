@@ -140,6 +140,15 @@ impl ShardState {
         if matches!(m.kind, MemberKind::CommitRecord { .. }) {
             return Some(m);
         }
+        if self.below_floor(&m) {
+            // The coordinator's retry reads this shard's floor again.
+            let floor = self.ts_floor();
+            self.shared.ts_floors[usize::from(self.id.0)]
+                .0
+                .fetch_max(floor, Ordering::AcqRel);
+            self.refuse_prepare(m, PrepareError::BelowFloor, ctx);
+            return None;
+        }
         let single = matches!(m.kind, MemberKind::Single);
         if self.moving.is_empty() && !self.lost_tablets {
             return Some(m);
@@ -166,7 +175,7 @@ impl ShardState {
             }
             (Routing::Elsewhere, true) => self.forward(m, ctx),
             (_, false) => {
-                self.refuse_moved(m, ctx);
+                self.refuse_prepare(m, PrepareError::Moved, ctx);
                 None
             }
         }
@@ -206,9 +215,32 @@ impl ShardState {
         out
     }
 
-    /// A PREPARE for rows this shard is moving or no longer owns: refused without a record;
-    /// the coordinator aborts and retries the commit through the new tablet map.
-    fn refuse_moved(&mut self, m: Member, ctx: &mut ShardContext<'_, ShardMsg>) {
+    /// Whether `m` is a PREPARE writing rows at a commit timestamp below a default timestamp
+    /// this shard already assigned. The coordinator picked it above the floor it read, but
+    /// this shard may have assigned more since (to any of its tablets, a received one
+    /// included): applying it would put a write at a lower timestamp after a write at a
+    /// higher one, so a tablet's default timestamps would go backwards (D11, issue #105).
+    /// Ties are allowed: they never reorder.
+    fn below_floor(&self, m: &Member) -> bool {
+        if !self.tablets_on() || !matches!(m.kind, MemberKind::Prepare { .. }) {
+            return false;
+        }
+        let raised = self.shared.ts_raises[usize::from(self.id.0)]
+            .0
+            .load(Ordering::Acquire);
+        m.commit_ts < self.ts_floor().max(raised)
+            && BatchRef::new(m.bytes.as_slice()).is_ok_and(|b| b.iter().next().is_some())
+    }
+
+    /// A PREPARE refused without a record: for rows this shard is moving or no longer owns
+    /// (`Moved`: the coordinator retries through the new tablet map), or below its floor
+    /// (`BelowFloor`: the coordinator retries with a fresh timestamp).
+    fn refuse_prepare(
+        &mut self,
+        m: Member,
+        error: PrepareError,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
         let MemberKind::Prepare { coordinator } = m.kind else {
             return;
         };
@@ -224,7 +256,7 @@ impl ShardState {
             ShardMsg::Prepared {
                 seqno: m.seqno,
                 from: self.id,
-                error: Some(PrepareError::Moved),
+                error: Some(error),
             },
             ctx,
         );
@@ -324,45 +356,50 @@ impl ShardState {
                 .partition(|r| r.map_version < version || r.epoch < epoch);
         self.retries = wait;
         for r in ready {
-            let mut builder = BatchBuilder::new();
-            let mut failed = None;
-            for (_, part) in &r.parts {
-                for mu in part.batch().iter() {
-                    let pushed = mu.map_err(Error::from).and_then(|mu| {
-                        builder
-                            .push(
-                                mu.table,
-                                mu.family,
-                                mu.kind,
-                                mu.row,
-                                mu.qualifier,
-                                mu.ts,
-                                mu.value,
-                            )
-                            .map_err(Error::from)
-                    });
-                    if let Err(e) = pushed {
-                        failed = Some(e);
-                    }
+            self.retry(r, ctx);
+        }
+    }
+
+    /// Runs a refused cross-shard commit again through the current tablet map.
+    pub(super) fn retry(&mut self, r: CoordinateReq, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let mut builder = BatchBuilder::new();
+        let mut failed = None;
+        for (_, part) in &r.parts {
+            for mu in part.batch().iter() {
+                let pushed = mu.map_err(Error::from).and_then(|mu| {
+                    builder
+                        .push(
+                            mu.table,
+                            mu.family,
+                            mu.kind,
+                            mu.row,
+                            mu.qualifier,
+                            mu.ts,
+                            mu.value,
+                        )
+                        .map_err(Error::from)
+                });
+                if let Err(e) = pushed {
+                    failed = Some(e);
                 }
             }
-            if let Some(e) = failed {
-                r.reply.notify(Err(e));
-                continue;
-            }
-            let m = Member::single(CommitReq {
-                bytes: builder,
-                durability: r.durability,
-                reply: Reply::Commit(r.reply),
-                submitted_at: r.submitted_at,
-                validate: r.validate,
-                predicate: None,
-                commit_ts: r.commit_ts,
-            });
-            if let Some(m) = self.forward(m, ctx) {
-                self.pending.push(m);
-                let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
-            }
+        }
+        if let Some(e) = failed {
+            r.reply.notify(Err(e));
+            return;
+        }
+        let m = Member::single(CommitReq {
+            bytes: builder,
+            durability: r.durability,
+            reply: Reply::Commit(r.reply),
+            submitted_at: r.submitted_at,
+            validate: r.validate,
+            predicate: None,
+            commit_ts: r.commit_ts,
+        });
+        if let Some(m) = self.forward(m, ctx) {
+            self.pending.push(m);
+            let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
     }
 
