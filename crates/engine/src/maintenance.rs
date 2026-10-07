@@ -24,14 +24,18 @@ use pigeonhole_format::{Cursor, SstId};
 use pigeonhole_pager::Pager;
 use pigeonhole_sst::{SstReader, SstWriterOptions};
 
-use crate::Result;
 use crate::catalog::Catalog;
 use crate::flush::SstSink;
 use crate::manifest::{self, ManifestReq, ManifestWriter, ReqKind};
 use crate::shard::Shared;
 use crate::snapshot::{Snapshot, SstSet};
+use crate::{Error, Result};
 
-/// Writes a consistent copy of `snapshot` to `dest` (which must not exist).
+/// Entries `backup` copies between checks for a close.
+const CLOSE_CHECK_EVERY: u64 = 4096;
+
+/// Writes a consistent copy of `snapshot` to `dest` (which must not exist). Stops with
+/// `Closed` (removing the partial copy) once the engine is closing.
 pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Result<()> {
     let view = &snapshot.view;
     let seqno = snapshot.seqno;
@@ -71,9 +75,18 @@ pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Resul
     let last = shared.picker.max_levels.max(2) - 1;
     let created = shared.vfs.now_micros();
     let all = ScanFilter::all();
+    // `close` waits for this call (its maintenance guard): stop at the next check instead.
+    let closing = || {
+        if shared.closing.load(Ordering::Acquire) {
+            Err(Error::Closed)
+        } else {
+            Ok(())
+        }
+    };
     let result = (|| -> Result<()> {
         for t in source.tablets() {
             for f in source.family_ids_of(t.table) {
+                closing()?;
                 let Some(meta) = source.family(f) else {
                     continue;
                 };
@@ -91,7 +104,12 @@ pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Resul
                     options,
                     shared.picker.target_sst_bytes,
                 );
+                let mut n = 0u64;
                 while merged.valid() {
+                    n += 1;
+                    if n.is_multiple_of(CLOSE_CHECK_EVERY) {
+                        closing()?;
+                    }
                     let (_, _, s, _) = split_suffix(merged.key())?;
                     if s <= seqno {
                         sink.add(merged.key(), merged.value())?;
@@ -133,6 +151,7 @@ pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Resul
         for e in &edits {
             catalog.apply(e, 1)?;
         }
+        closing()?;
         let mut writer = ManifestWriter::new(Arc::clone(&pager));
         writer.commit(&catalog, &edits)?;
         writer.mark_clean()

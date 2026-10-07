@@ -1569,7 +1569,7 @@ pub(crate) struct ShardState {
     pub(crate) wal: Option<Box<dyn Wal>>,
     /// A write or sync failed: the stream is poisoned until reopen.
     poisoned: bool,
-    /// End of the newest PREPARE or COMMIT record appended since open. Other shards' flushes
+    /// End of the newest PREPARE or COMMIT record given a ticket since open. Other shards' flushes
     /// of cross-shard shares need the stream durable only through here, so a poisoned
     /// stream's barrier still holds for them once it is (5-6 5.1).
     cross_end: Lsn,
@@ -3340,6 +3340,12 @@ impl ShardState {
             match result {
                 Ok(t) => {
                     m.ticket = Some(t);
+                    // Every ticketed PREPARE or COMMIT counts, even one whose group fails
+                    // below (`fail_all`): a COMMIT with a ticket still decides commit, so
+                    // peers' barriers must wait for it to be durable.
+                    if !matches!(m.kind, MemberKind::Single) {
+                        self.cross_end = self.cross_end.max(t.end);
+                    }
                     if m.durability != Durability::None {
                         appended = true;
                         unsynced = true;
@@ -3433,7 +3439,6 @@ impl ShardState {
                     if let Some(t) = m.ticket {
                         let slots = self.slots_of(m.bytes.as_slice());
                         self.last_end = Some(t.end);
-                        self.cross_end = self.cross_end.max(t.end);
                         self.log.push_back(Logged {
                             end: t.end,
                             seqno: m.seqno,
@@ -3444,7 +3449,6 @@ impl ShardState {
                 MemberKind::CommitRecord { participants } => {
                     if let Some(t) = m.ticket {
                         self.last_end = Some(t.end);
-                        self.cross_end = self.cross_end.max(t.end);
                         self.share_reports.entry(m.seqno).or_insert((0, 0)).1 = participants.len();
                         self.log.push_back(Logged {
                             end: t.end,

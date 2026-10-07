@@ -79,12 +79,15 @@ impl Db {
         self.shards[i].run_once(now + 1_000)
     }
 
-    /// Runs every shard until none has work left.
+    /// Runs every shard until none has work left: two idle passes in a row, since shard 1's
+    /// turn may send shard 0 a message after shard 0's turn.
     fn settle(&mut self) {
+        let mut idle = 0;
         for _ in 0..10_000 {
             let a = self.step(0);
             let b = self.step(1);
-            if !a && !b {
+            idle = if a || b { 0 } else { idle + 1 };
+            if idle == 2 {
                 return;
             }
         }
@@ -352,9 +355,9 @@ fn close_racing_drop_table_and_a_flush_is_clean() {
     engine.close().unwrap();
 }
 
-/// Blocks the database file's `set_len` on the thread named `shrink` while armed, until
-/// released: the test closes the engine while `shrink` is between its commit and its
-/// truncation.
+/// While armed, holds the database file's `set_len` on the thread named `shrink`, or a
+/// write to another file on the thread named `backup`, until released: the tests close the
+/// engine while `shrink` is between its commit and its truncation, or `backup` is copying.
 #[derive(Debug)]
 struct GateVfs {
     inner: Arc<SimVfs>,
@@ -371,7 +374,27 @@ struct Gate {
 #[derive(Debug)]
 struct GateFile {
     inner: pigeonhole_io::FileRef,
-    gate: Option<Arc<Gate>>,
+    gate: Arc<Gate>,
+    /// The database file (else, say, a backup's destination).
+    db: bool,
+}
+
+impl GateFile {
+    /// While armed, holds the first call on `thread` here until released (at most two
+    /// seconds: a final close that wrongly runs meanwhile may wait for what this thread
+    /// holds; the test then fails on its assertions rather than hanging).
+    fn hold(&self, thread: &str) {
+        let g = &self.gate;
+        if std::thread::current().name() == Some(thread) && g.armed.swap(false, Ordering::AcqRel) {
+            g.entered.store(true, Ordering::Release);
+            let start = std::time::Instant::now();
+            while !g.released.load(Ordering::Acquire)
+                && start.elapsed() < std::time::Duration::from_secs(2)
+            {
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 impl Vfs for GateVfs {
@@ -383,7 +406,8 @@ impl Vfs for GateVfs {
         let inner = self.inner.open(path, opts)?;
         Ok(Arc::new(GateFile {
             inner,
-            gate: (path == Path::new(DB)).then(|| Arc::clone(&self.gate)),
+            gate: Arc::clone(&self.gate),
+            db: path == Path::new(DB),
         }))
     }
     fn remove(&self, path: &Path) -> pigeonhole_io::Result<()> {
@@ -429,12 +453,18 @@ impl pigeonhole_io::File for GateFile {
         self.inner.read_at(buf, offset)
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        if !self.db {
+            self.hold("backup");
+        }
         self.inner.write_at(buf, offset)
     }
     fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
         self.inner.submit_read(buf, offset)
     }
     fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        if !self.db {
+            self.hold("backup");
+        }
         self.inner.submit_write(buf, offset)
     }
     fn sync_data(&self) -> pigeonhole_io::Result<()> {
@@ -450,19 +480,8 @@ impl pigeonhole_io::File for GateFile {
         self.inner.len()
     }
     fn set_len(&self, len: u64) -> pigeonhole_io::Result<()> {
-        if let Some(g) = &self.gate
-            && std::thread::current().name() == Some("shrink")
-            && g.armed.swap(false, Ordering::AcqRel)
-        {
-            g.entered.store(true, Ordering::Release);
-            // Bounded: a final close that wrongly runs meanwhile may wait for the pager this
-            // thread holds; the test then fails on its assertions rather than hanging.
-            let start = std::time::Instant::now();
-            while !g.released.load(Ordering::Acquire)
-                && start.elapsed() < std::time::Duration::from_secs(2)
-            {
-                std::thread::yield_now();
-            }
+        if self.db {
+            self.hold("shrink");
         }
         self.inner.set_len(len)
     }
@@ -488,32 +507,8 @@ fn close_waits_for_a_shrink_in_flight() {
     // 7 F7-4: `shrink` checked for a close once, then kept relocating, committing roots and
     // truncating the file after the final close had marked it clean and released the
     // writer lock (another process could be the writer by then).
-    let sim = SimVfs::new(50);
-    let gate = Arc::new(Gate::default());
-    let vfs: VfsRef = Arc::new(GateVfs {
-        inner: Arc::clone(&sim),
-        gate: Arc::clone(&gate),
-    });
-    let mut o = options(&sim);
-    o.vfs = vfs;
-    let (engine, shards) = Engine::open_application_owned(Path::new(DB), o).expect("open");
-    let mut db = Db {
-        vfs: Arc::clone(&sim),
-        tables: [
-            Arc::clone(
-                &engine
-                    .create_table("x", &[("f".into(), FamilyOptions::default())])
-                    .unwrap(),
-            ),
-            Arc::clone(
-                &engine
-                    .create_table("y", &[("f".into(), FamilyOptions::default())])
-                    .unwrap(),
-            ),
-        ],
-        engine,
-        shards,
-    };
+    let (mut db, gate) = open_gated(50, |_| {});
+    let sim = Arc::clone(&db.vfs);
     // Interleaved SSTs of two tables; dropping the first leaves holes for the second's
     // tail extents.
     let gone = db.table_on(0, "gone");
@@ -575,4 +570,171 @@ fn close_waits_for_a_shrink_in_flight() {
     let keep = engine.table(&keep.name).unwrap();
     assert_eq!(read(&engine, &keep, b"r007"), Some(vec![7u8; 1000]));
     engine.close().unwrap();
+}
+
+#[test]
+fn a_commit_whose_write_failed_after_its_ticket_holds_peers_barriers() {
+    // Review of 5-6 5.1: a COMMIT record that got a ticket decides commit even when its
+    // group's write then fails, so it may never reach the disk. The poisoned coordinator's
+    // barrier must not let a participant flush (and checkpoint) its share of that commit:
+    // a power loss would keep the share and lose the COMMIT, a torn transaction (D83).
+    let mut db = open(70);
+    // The coordinator is the first shard of the commit: shard 0. Shard 1's share is large,
+    // so it freezes and flushes as soon as it is applied.
+    let value = vec![3u8; 1000];
+    let mut wb = WriteBatch::new();
+    db.put(&mut wb, 0, b"c0", b"coordinator");
+    for i in 0..150u32 {
+        db.put(&mut wb, 1, format!("c1-{i:03}").as_bytes(), &value);
+    }
+    let _ = db.engine.take_appended();
+    let mut pc = db.engine.submit(wb, Some(Durability::Sync)).unwrap();
+    // Run both shards until both PREPAREs are written, and no further.
+    let mut prepares = 0;
+    for _ in 0..1_000 {
+        prepares += db
+            .engine
+            .take_appended()
+            .iter()
+            .filter(|r| r.kind == pigeonhole_engine::AppendedKind::Prepare)
+            .count();
+        if prepares == 2 {
+            break;
+        }
+        db.step(1);
+        db.step(0);
+    }
+    assert_eq!(prepares, 2, "both shares prepared");
+    // The participant's sync completes and it replies `Prepared`.
+    for _ in 0..4 {
+        db.step(1);
+    }
+    // The coordinator appends its COMMIT (a ticket), then the group's write fails.
+    let mut faults = FaultPlan::none();
+    faults.io_error_ppm = 1_000_000;
+    db.vfs.set_faults(faults);
+    db.step(0);
+    db.vfs.set_faults(FaultPlan::none());
+    let appended = db.engine.take_appended();
+    assert!(
+        appended
+            .iter()
+            .any(|r| r.kind == pigeonhole_engine::AppendedKind::Commit),
+        "the COMMIT got a ticket: {appended:?}"
+    );
+    // The participant applies its share and tries to flush it.
+    for _ in 0..1_000 {
+        if ready(&mut pc).is_some() {
+            break;
+        }
+        db.step(1);
+        db.step(0);
+    }
+    db.settle();
+
+    // Power loss: only synced data survives.
+    db.vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+    let (vfs, tables) = (Arc::clone(&db.vfs), db.tables.clone());
+    drop(db);
+    let engine = Engine::open(Path::new(DB), threaded(&vfs)).unwrap();
+    let t = [
+        engine.table(&tables[0].name).unwrap(),
+        engine.table(&tables[1].name).unwrap(),
+    ];
+    let coordinator = read(&engine, &t[0], b"c0").is_some();
+    let participant = read(&engine, &t[1], b"c1-007").is_some();
+    assert_eq!(
+        coordinator, participant,
+        "a torn cross-shard commit: coordinator share {coordinator}, participant share {participant}"
+    );
+    engine.close().unwrap();
+}
+
+/// An application-owned engine on a `GateVfs` over a fresh `SimVfs` (its `tables` are
+/// placeholders; tests make their own with `table_on`).
+fn open_gated(seed: u64, tweak: impl FnOnce(&mut EngineOptions)) -> (Db, Arc<Gate>) {
+    let sim = SimVfs::new(seed);
+    let gate = Arc::new(Gate::default());
+    let mut o = options(&sim);
+    o.vfs = Arc::new(GateVfs {
+        inner: Arc::clone(&sim),
+        gate: Arc::clone(&gate),
+    });
+    tweak(&mut o);
+    let (engine, shards) = Engine::open_application_owned(Path::new(DB), o).expect("open");
+    let family = || vec![("f".into(), FamilyOptions::default())];
+    let tables = [
+        engine.create_table("x", &family()).unwrap(),
+        engine.create_table("y", &family()).unwrap(),
+    ];
+    let db = Db {
+        vfs: sim,
+        engine,
+        shards,
+        tables,
+    };
+    (db, gate)
+}
+
+#[test]
+fn close_stops_a_backup_in_flight() {
+    // Review of 7 F7-4: the final close waits for a backup (its maintenance guard), so a
+    // long copy must notice the close and stop rather than hold it up to the end.
+    let (mut db, gate) = open_gated(52, |_| {});
+    let t = db.table_on(0, "t");
+    db.fill(&t);
+    let pm = db.engine.flush_pending().unwrap();
+    db.wait(pm).unwrap();
+
+    gate.armed.store(true, Ordering::Release);
+    let engine = Arc::clone(&db.engine);
+    let backup = std::thread::Builder::new()
+        .name("backup".into())
+        .spawn(move || engine.backup(Path::new("/db/backup.phdb")))
+        .unwrap();
+    for _ in 0..1_000_000 {
+        if gate.entered.load(Ordering::Acquire) {
+            break;
+        }
+        db.step(0);
+        db.step(1);
+        std::thread::yield_now();
+    }
+    assert!(
+        gate.entered.load(Ordering::Acquire),
+        "the backup started copying"
+    );
+
+    db.engine.close().unwrap();
+    for _ in 0..1_000 {
+        db.step(0);
+        db.step(1);
+    }
+    assert!(
+        !db.engine.close_finished(),
+        "the final close ran while a backup was copying"
+    );
+    gate.released.store(true, Ordering::Release);
+    let r = backup.join().unwrap();
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Closed)),
+        "the backup stops at the close: {r:?}"
+    );
+    assert!(
+        db.engine.close_finished(),
+        "the backup's end ran the final close"
+    );
+    assert!(
+        !db.vfs.exists(Path::new("/db/backup.phdb")).unwrap(),
+        "the partial copy is removed"
+    );
+    let Db {
+        vfs,
+        engine,
+        shards,
+        ..
+    } = db;
+    drop(shards);
+    drop(engine);
+    assert!(clean_at_rest(&vfs));
 }

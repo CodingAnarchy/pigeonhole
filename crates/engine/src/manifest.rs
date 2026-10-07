@@ -22,7 +22,7 @@ use pigeonhole_format::manifest::{
     encode_block,
 };
 use pigeonhole_format::superblock::ExtentRef;
-use pigeonhole_format::{FormatVersion, ManifestVersion, SstId, TabletId};
+use pigeonhole_format::{FormatVersion, ManifestVersion, SstId, TableId, TabletId};
 use pigeonhole_io::{Completion, FileRef};
 use pigeonhole_pager::{Extent, OpenedPager, Pager, Root};
 use pigeonhole_runtime::{Notifier, ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
@@ -323,10 +323,10 @@ pub(crate) struct ManifestReq {
     pub compaction: Option<CompactionRecord>,
     /// Rewrite the manifest snapshot (shrink relocates the manifest extents).
     pub rewrite_snapshot: bool,
-    /// Drop the edits of tablets that no longer exist (a table dropped meanwhile) and
-    /// commit the rest, instead of refusing the whole request. For requests whose slots
-    /// are independent (a flush).
-    pub skip_orphans: bool,
+    /// The table of each tablet the edits touch, for a request whose slots are independent
+    /// (a flush): the edits of a tablet whose table was dropped meanwhile are skipped and
+    /// the rest commit, instead of the whole request being refused. Empty: refuse.
+    pub dropped_ok: Vec<(TabletId, TableId)>,
     /// Called with the outcome once the commit is durable (or failed).
     pub reply: Box<dyn FnOnce(Result<ManifestVersion>) + Send>,
 }
@@ -352,7 +352,7 @@ impl ManifestReq {
             flushed_roots: Vec::new(),
             compaction: None,
             rewrite_snapshot: false,
-            skip_orphans: false,
+            dropped_ok: Vec::new(),
             reply: Box::new(reply),
         }
     }
@@ -366,7 +366,7 @@ impl ManifestReq {
             flushed_roots: Vec::new(),
             compaction: None,
             rewrite_snapshot: false,
-            skip_orphans: false,
+            dropped_ok: Vec::new(),
             reply: Box::new(move |r| tx.notify(r)),
         };
         (req, rx)
@@ -512,13 +512,31 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             }),
         };
         let own = own.map(|own| {
-            if !req.skip_orphans {
+            if req.dropped_ok.is_empty() {
                 return own;
             }
             // A flush covers every slot of its shard: a table dropped while it ran loses
-            // its outputs only, and the other slots' commit goes ahead (F7-3).
-            let (gone, kept): (Vec<Edit>, Vec<Edit>) =
-                own.into_iter().partition(|e| orphaned(&catalog, e, &[]));
+            // its outputs only, and the other slots' commit goes ahead (F7-3). Only a
+            // dropped table's: a tablet a split or merge retired keeps its data in the
+            // flushed memtable, so its edits must not vanish while the checkpoint passes
+            // them (the request is refused below instead).
+            let table_gone = |e: &Edit| {
+                let tablet = match e {
+                    Edit::AddSst { tablet, .. } | Edit::SetFlushed { tablet, .. } => *tablet,
+                    _ => return false,
+                };
+                let gone = req
+                    .dropped_ok
+                    .iter()
+                    .find(|(t, _)| *t == tablet)
+                    .is_some_and(|(_, table)| catalog.table(*table).is_none());
+                debug_assert!(
+                    gone || !orphaned(&catalog, e, &[]),
+                    "a flush names tablet {tablet:?}, retired while its table lives"
+                );
+                gone && orphaned(&catalog, e, &[])
+            };
+            let (gone, kept): (Vec<Edit>, Vec<Edit>) = own.into_iter().partition(table_gone);
             if !gone.is_empty() {
                 let ids: Vec<SstId> = gone
                     .iter()

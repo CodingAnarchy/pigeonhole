@@ -461,7 +461,7 @@ impl CompactionWork {
             flushed_roots: Vec::new(),
             compaction: self.record.take(),
             rewrite_snapshot: false,
-            skip_orphans: false,
+            dropped_ok: Vec::new(),
             reply: Box::new(manifest::notify(tx)),
         };
         manifest::submit(&self.shared, self.shard, req);
