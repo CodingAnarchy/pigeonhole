@@ -1626,6 +1626,16 @@ pub(crate) struct ShardState {
     window_writes: u64,
     next_balance: u64,
     rng: u64,
+    /// Moving average of `window_writes` over balancer intervals (#103).
+    load_ewma: f64,
+    /// Balancer passes run so far.
+    balance_pass: u64,
+    /// The pass at which each owned tablet arrived on this shard (0: held at the first pass).
+    arrived: HashMap<TabletId, u64>,
+    /// The pass at which the balancer last started a move or a split over shards.
+    skew_pass: Option<u64>,
+    /// Wakes the shard for its next balancer pass (#103).
+    balance_timer: Option<Arc<TimerState>>,
 }
 
 impl std::fmt::Debug for ShardState {
@@ -1727,6 +1737,11 @@ impl ShardState {
             window_writes: 0,
             next_balance: 0,
             rng: 0x9E37_79B9_7F4A_7C15 ^ (u64::from(id.0) + 1),
+            load_ewma: 0.0,
+            balance_pass: 0,
+            arrived: HashMap::new(),
+            skew_pass: None,
+            balance_timer: None,
         }
     }
 
@@ -4881,6 +4896,7 @@ impl ShardState {
                         }
                     }
                     self.abort_op(Error::Closed, ctx);
+                    self.cancel_balance_timer();
                     self.run_retries(ctx);
                 }
                 self.try_finish_close(ctx);
