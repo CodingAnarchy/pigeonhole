@@ -109,6 +109,9 @@ pub(crate) struct ShardMetrics {
     /// Size of the shard's aborted-seqno set after its last batch (test hook).
     #[cfg(feature = "test-hooks")]
     pub aborted: AtomicU64,
+    /// WAL unpin passes (#137) and the memtables they froze below the size threshold.
+    pub unpin_passes: AtomicU64,
+    pub unpin_flushes: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -127,6 +130,8 @@ impl Default for ShardMetrics {
             moves: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             aborted: AtomicU64::new(0),
+            unpin_passes: AtomicU64::new(0),
+            unpin_flushes: AtomicU64::new(0),
         }
     }
 }
@@ -1772,8 +1777,9 @@ pub(crate) struct ShardState {
     /// to `unpin_at`.
     unpin_upto: u64,
     unpin_at: u64,
-    /// The largest `Unpin { through }` served.
-    unpin_through: Seqno,
+    /// The shards already sent `Unpin` for a needed record, by its seqno (pruned when the
+    /// record leaves `log`).
+    asked: HashMap<Seqno, Vec<ShardId>>,
     /// End of the newest record ever appended to the stream.
     last_end: Option<Lsn>,
     /// The checkpoint the manifest holds.
@@ -1934,7 +1940,7 @@ impl ShardState {
             unpin: BTreeSet::new(),
             unpin_upto: 0,
             unpin_at: 0,
-            unpin_through: 0,
+            asked: HashMap::new(),
             last_end: None,
             checkpoint: Lsn::default(),
             checkpoint_candidate: Lsn::default(),
@@ -2124,6 +2130,7 @@ impl ShardState {
             }
         }
         self.log.clear();
+        self.asked.clear();
         self.unreported.clear();
         self.share_reports.clear();
         self.aborted.clear();
@@ -2410,6 +2417,11 @@ impl ShardState {
                 starved = true;
                 continue;
             };
+            if !(all || big) && self.unpin.contains(&key) {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .unpin_flushes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
             old.table.freeze();
             self.flush_queue.push(item(&old));
@@ -3688,25 +3700,28 @@ impl ShardState {
         );
         self.unpin_upto = upto;
         self.unpin_at = self.log_bytes;
-        self.force_pinning(|l| l.pos < upto, ctx);
+        self.shared.metrics[usize::from(self.id.0)]
+            .unpin_passes
+            .fetch_add(1, Ordering::Relaxed);
+        self.force_pinning(|l| l.pos < upto, true, ctx);
     }
 
     /// Marks for flushing every unflushed slot of the needed records `which` selects, and
-    /// sends `Unpin` to the shards their cross-shard commits wait for.
+    /// sends `Unpin` to the shards their cross-shard commits wait for: always from this
+    /// shard's own pass (`origin`), and only to shards not yet asked about that record when
+    /// answering another shard's `Unpin`, so the requests between a coordinator and its
+    /// participants stop after one round.
     fn force_pinning(
         &mut self,
         which: impl Fn(&Logged) -> bool,
+        origin: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         let Ok(view) = self.checkpoint_view() else {
             return;
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
-        let mut asks: BTreeMap<ShardId, Seqno> = BTreeMap::new();
-        let mut ask = |shard: ShardId, seqno: Seqno| {
-            let s = asks.entry(shard).or_insert(seqno);
-            *s = (*s).max(seqno);
-        };
+        let mut wanted: Vec<(ShardId, Seqno)> = Vec::new();
         let mut slots = Vec::new();
         for l in self.log.iter().filter(|l| which(l)) {
             if !self.needed(catalog, l) {
@@ -3728,30 +3743,46 @@ impl ShardState {
                             .copied(),
                     );
                     // The coordinator's checkpoint must pass the COMMIT too.
-                    ask(*coordinator, l.seqno);
+                    wanted.push((*coordinator, l.seqno));
                 }
                 LoggedKind::Commit { participants } => {
-                    for &p in participants {
-                        ask(p, l.seqno);
-                    }
+                    wanted.extend(participants.iter().map(|&p| (p, l.seqno)));
                 }
             }
         }
         self.unpin.extend(slots);
-        for (shard, through) in asks {
-            if shard != self.id {
-                self.send(shard, ShardMsg::Unpin { through }, ctx);
+        let mut asks: BTreeMap<ShardId, Seqno> = BTreeMap::new();
+        for (shard, seqno) in wanted {
+            if shard == self.id {
+                continue;
             }
+            let sent = self.asked.entry(seqno).or_default();
+            if sent.contains(&shard) {
+                if !origin {
+                    continue;
+                }
+            } else {
+                sent.push(shard);
+            }
+            let through = asks.entry(shard).or_insert(seqno);
+            *through = (*through).max(seqno);
+        }
+        for (shard, through) in asks {
+            self.send(shard, ShardMsg::Unpin { through }, ctx);
         }
     }
 
-    /// Another shard's checkpoint waits for cross-shard commits up to `through`.
+    /// Another shard's checkpoint waits for cross-shard commits up to `through`. Every
+    /// request is served (requests carry no order: a commit decided later may have a lower
+    /// seqno), so the only dedupe is `force_pinning`'s per record and shard.
     fn on_unpin(&mut self, through: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
-        if through <= self.unpin_through || self.closing {
+        if self.closing {
             return;
         }
-        self.unpin_through = through;
-        self.force_pinning(|l| l.seqno <= through, ctx);
+        self.shared.metrics[usize::from(self.id.0)]
+            .unpin_passes
+            .fetch_add(1, Ordering::Relaxed);
+        self.force_pinning(|l| l.seqno <= through, false, ctx);
         let shares: Vec<(TabletId, FamilyId)> = self
             .unreported
             .iter()
@@ -4489,6 +4520,7 @@ impl ShardState {
             let l = self.log.pop_front().expect("checked");
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
             self.aborted.remove(&l.seqno);
+            self.asked.remove(&l.seqno);
             match l.kind {
                 LoggedKind::Commit { participants } => {
                     self.share_reports.remove(&l.seqno);

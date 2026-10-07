@@ -220,3 +220,104 @@ fn an_idle_participant_does_not_pin_the_coordinators_wal() {
     }
     db.close().unwrap();
 }
+
+/// Runs the shards whose index is in `which` until they go idle.
+fn run_only(shards: &mut [EngineShard], which: &[u16]) {
+    for _ in 0..100_000 {
+        let mut more = false;
+        for s in shards.iter_mut().filter(|s| which.contains(&s.index())) {
+            more |= s.run_once(u64::MAX);
+        }
+        if !more {
+            return;
+        }
+    }
+    panic!("the shards never went idle");
+}
+
+/// The WAL bytes of stream `stream`.
+fn stream_bytes(vfs: &SimVfs, stream: u32) -> u64 {
+    vfs.open(
+        Path::new(&format!("{DB}-wal-{stream}")),
+        OpenOptions::read(),
+    )
+    .unwrap()
+    .len()
+    .unwrap()
+}
+
+#[test]
+fn a_participant_serves_an_unpin_for_a_lower_seqno_decided_later() {
+    // Three shards: coordinator A (shard 0), coordinator B (shard 1), participant P
+    // (shard 2). Commit Y (B and P) takes its seqno first but is decided last; commit X
+    // (A and P) is decided first, and A's pass sends P `Unpin { through: X }`. Then B
+    // writes alone. Its pass sends P `Unpin { through: Y }` with Y < X: P must still flush
+    // its share of Y, or B's checkpoint stays behind Y's COMMIT for good.
+    let vfs = SimVfs::new(1372);
+    let mut o = options(&vfs, 3);
+    o.wal_pin_bytes = 1 << 20;
+    let db = Engine::open(Path::new(DB), o.clone()).unwrap();
+    let family = || vec![("f".into(), FamilyOptions::default())];
+    // Tablet n is on shard n % 3.
+    let b = db.create_table("b", &family()).unwrap();
+    let px = db.create_table("px", &family()).unwrap();
+    let a = db.create_table("a", &family()).unwrap();
+    let _filler = db.create_table("filler", &family()).unwrap();
+    let py = db.create_table("py", &family()).unwrap();
+    db.close().unwrap();
+    drop(db);
+
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+    let f = |t: &pigeonhole_engine::TableInfo| t.families[0].id.0;
+    // Y: B coordinates; P prepares; B never hears back yet.
+    let mut wb = WriteBatch::new();
+    put(&mut wb, b.id, f(&b), b"y", b"y-b");
+    put(&mut wb, py.id, f(&py), b"y", b"y-p");
+    let y = db.submit(wb, Some(Durability::GroupSync)).unwrap();
+    run_only(&mut shards, &[1]);
+    run_only(&mut shards, &[2]);
+    // X: A coordinates, P participates; decided while Y is not.
+    let mut wb = WriteBatch::new();
+    put(&mut wb, a.id, f(&a), b"x", b"x-a");
+    put(&mut wb, px.id, f(&px), b"x", b"x-p");
+    let x = db.submit(wb, Some(Durability::GroupSync)).unwrap();
+    run_only(&mut shards, &[0, 2]);
+    // A writes past its limit: its pass asks P to flush its share of X.
+    let v = vec![7u8; VALUE];
+    let mut held = Vec::new();
+    for i in 0..1500u32 {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, a.id, f(&a), &i.to_be_bytes(), &v);
+        held.push(db.submit(wb, Some(Durability::GroupSync)).unwrap());
+        run_only(&mut shards, &[0, 2]);
+    }
+    assert!(
+        db.metrics().unpin.0 >= 2,
+        "A's pass and P's answer: {:?}",
+        db.metrics()
+    );
+    // Now Y is decided, and B writes alone.
+    drive(&mut shards, y);
+    drive(&mut shards, x);
+    for p in held {
+        drive(&mut shards, p);
+    }
+    for i in 0..HOT_COMMITS {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, b.id, f(&b), &i.to_be_bytes(), &v);
+        drive(
+            &mut shards,
+            db.submit(wb, Some(Durability::GroupSync)).unwrap(),
+        );
+    }
+    let wal = stream_bytes(&vfs, 1);
+    let m = db.metrics();
+    eprintln!(
+        "B's WAL: {wal} bytes; unpin passes and forced flushes: {:?}",
+        m.unpin
+    );
+    assert!(
+        wal <= 4 << 20,
+        "P ignored B's Unpin for the lower seqno: B's WAL holds {wal} bytes"
+    );
+}

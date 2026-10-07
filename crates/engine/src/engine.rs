@@ -104,6 +104,11 @@ pub struct Metrics {
     pub stalls: (u64, u64),
     /// Block cache hits and misses (the cache does not count them yet: always zero).
     pub block_cache: (u64, u64),
+    /// Passes that flushed slots pinning a WAL checkpoint (a shard's own, past
+    /// `EngineOptions::wal_pin_bytes`, or at another shard's request), and the memtables
+    /// they froze below the size threshold (#137). Flushes per pass is the cost of the
+    /// bound: many small L0 SSTs per pass mean cold slots spread over many shards.
+    pub unpin: (u64, u64),
 }
 
 /// The lock-page byte range of the superblock-less file check (decision D59).
@@ -1450,6 +1455,8 @@ impl Engine {
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.stalls.0 += s.stalls.load(Ordering::Relaxed);
             m.stalls.1 += s.stall_nanos.load(Ordering::Relaxed);
+            m.unpin.0 += s.unpin_passes.load(Ordering::Relaxed);
+            m.unpin.1 += s.unpin_flushes.load(Ordering::Relaxed);
         }
         m
     }
