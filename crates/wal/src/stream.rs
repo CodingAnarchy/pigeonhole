@@ -132,6 +132,9 @@ struct Shared {
     /// Set by the first failed write or sync; every later append, write or sync is refused.
     poisoned: AtomicBool,
     pool: Mutex<Pool>,
+    /// Held across a sync no commit waits on (growing or preparing a slot) and the poisoning
+    /// its failure causes. See [`Shared::check_synced`].
+    side_sync: Mutex<()>,
 }
 
 /// Blank slots and the file's slot count. The file is `total * segment_size` bytes long (or
@@ -154,6 +157,45 @@ struct Pool {
 impl Shared {
     fn pool(&self) -> MutexGuard<'_, Pool> {
         self.pool.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Runs `sync`, a sync of the stream file no commit waits on, and poisons the stream if
+    /// it fails: on Linux an fsync error is reported to one sync only, so this one may have
+    /// been handed the error for appended records, and the next group sync would succeed
+    /// over their lost pages (decision D58).
+    fn side_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
+        let _held = self
+            .side_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        sync().map_err(|e| {
+            self.poisoned.store(true, Ordering::Release);
+            Error::from(e)
+        })
+    }
+
+    /// Called after a sync that makes records durable succeeded: fails if a side sync failed
+    /// meanwhile, since that one may have been handed this sync's error. Waits for a side
+    /// sync in flight.
+    fn check_synced(&self) -> Result<()> {
+        let _held = self
+            .side_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        Ok(())
+    }
+
+    /// [`Shared::check_synced`] for a sync completion.
+    fn check_synced_io(&self) -> pigeonhole_io::Result<()> {
+        self.check_synced().map_err(|_| {
+            pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "wal stream poisoned by a failed sync",
+            )
+        })
     }
 }
 
@@ -258,8 +300,9 @@ impl SpareSegments {
                     .allocate(slot as u64 * self.segment_size, self.segment_size)?;
                 zero_fill(&self.file, self.segment_size, slot, &zeros)?;
             }
-            self.file.sync_all()?;
-            Ok(())
+            // A failed allocation or write leaves the stream usable (the slots stay blank);
+            // a failed sync poisons it.
+            self.shared.side_sync(|| self.file.sync_all())
         })();
         let mut pool = self.shared.pool();
         match result {
@@ -460,6 +503,7 @@ impl WalStream {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
                 pool: Mutex::new(Pool::default()),
+                side_sync: Mutex::new(()),
             }),
         }
     }
@@ -559,7 +603,7 @@ impl WalStream {
                 drop(pool);
                 self.file
                     .allocate(slot as u64 * self.segment_size, self.segment_size)?;
-                self.file.sync_all()?;
+                self.shared.side_sync(|| self.file.sync_all())?;
                 (slot, SlotSource::Blank)
             }
         };
@@ -619,11 +663,13 @@ impl WalStream {
             // A failure surfaces from the next `write_buf`, whose caller poisons the stream.
             self.rollover_sync = Some(self.file.submit_sync_data().map(move |r| {
                 r?;
+                shared.check_synced_io()?;
                 shared.durable.fetch_max(end.0, Ordering::Release);
                 Ok(())
             }));
         } else {
             self.file.sync_data()?;
+            self.shared.check_synced()?;
             self.shared.durable.fetch_max(end.0, Ordering::Release);
             self.shared.pool().inline_rollover_syncs += 1;
         }
@@ -706,6 +752,7 @@ impl Wal for WalStream {
         let lsn = self.write()?;
         let r = self.file.sync_data().map_err(Error::from);
         self.poison_on_err(r)?;
+        self.shared.check_synced()?;
         self.shared.durable.fetch_max(lsn.0, Ordering::Release);
         Ok(lsn)
     }
@@ -718,6 +765,7 @@ impl Wal for WalStream {
                 shared.poisoned.store(true, Ordering::Release);
                 return Err(e);
             }
+            shared.check_synced_io()?;
             shared.durable.fetch_max(lsn.0, Ordering::Release);
             Ok(lsn)
         }))

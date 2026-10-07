@@ -123,8 +123,9 @@ pub(crate) struct ManifestWriter {
     root: Root,
     /// Length of the live snapshot block (for the "log outgrows the snapshot" rule).
     snapshot_len: u32,
-    /// Set once a root commit failed: the pager is poisoned (decision D58) and the engine
-    /// requires a reopen.
+    /// Set once a root commit or a manifest write failed: the pager is poisoned (decision
+    /// D58) and the engine requires a reopen. A snapshot rewrite that finds no space for its
+    /// extents writes nothing and leaves it clear.
     poisoned: bool,
 }
 
@@ -146,6 +147,14 @@ impl ManifestWriter {
         ))
     }
 
+    /// Whether the writer refuses every commit until reopen. A failed [`prepare`] that leaves
+    /// it clear wrote nothing: the batch is refused and the writer stays usable.
+    ///
+    /// [`prepare`]: ManifestWriter::prepare
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// The version the next commit gets.
     pub(crate) fn next_version(&self) -> ManifestVersion {
         self.root.manifest_version + 1
@@ -158,7 +167,10 @@ impl ManifestWriter {
 
     /// Writes `edits` as manifest version `current + 1` (a delta, or a new snapshot when the
     /// delta does not fit the log, outgrows the snapshot, or `rewrite` asks for one) and
-    /// returns the root to commit. `catalog` is the state *after* `edits`.
+    /// returns the root to commit. `catalog` is the state *after* `edits`. A failure poisons
+    /// the writer, except a snapshot rewrite that could not allocate its extents (a full
+    /// disk): nothing was written, so the caller refuses the batch and later commits may
+    /// succeed once space is freed.
     pub(crate) fn prepare(
         &mut self,
         catalog: &Catalog,
@@ -190,12 +202,12 @@ impl ManifestWriter {
                 }
                 _ => false,
             };
-        let result = if fits_log {
+        if fits_log {
             self.append_delta(&delta, version)
+                .inspect_err(|_| self.poisoned = true)
         } else {
             self.write_snapshot(catalog, version)
-        };
-        result.inspect_err(|_| self.poisoned = true)
+        }
     }
 
     fn append_delta(&mut self, delta: &[u8], version: ManifestVersion) -> Result<Prepared> {
@@ -225,15 +237,30 @@ impl ManifestWriter {
             &catalog.snapshot_edits(),
             &mut block,
         );
-        let snapshot = self.pager.allocate(block.len() as u64)?;
-        let log = match self.pager.allocate(LOG_EXTENT_LEN as u64) {
-            Ok(log) => log,
+        // Running out of space here leaves the writer usable; any other allocation failure
+        // (a failed growth sync poisoned the pager) or a failed write poisons it.
+        let allocated = self
+            .pager
+            .allocate(block.len() as u64)
+            .and_then(
+                |snapshot| match self.pager.allocate(LOG_EXTENT_LEN as u64) {
+                    Ok(log) => Ok((snapshot, log)),
+                    Err(e) => {
+                        self.pager.abandon(snapshot);
+                        Err(e)
+                    }
+                },
+            );
+        let (snapshot, log) = match allocated {
+            Ok(extents) => extents,
             Err(e) => {
-                self.pager.abandon(snapshot);
-                return Err(e.into());
+                let e = Error::from(e);
+                self.poisoned |= !matches!(e, Error::NoSpace);
+                return Err(e);
             }
         };
         if let Err(e) = self.pager.write(snapshot, 0, &block) {
+            self.poisoned = true;
             self.pager.abandon(snapshot);
             self.pager.abandon(log);
             return Err(e.into());
@@ -506,6 +533,11 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let mut sst_changed = false;
     let mut checkpoints_changed = false;
     let mut rewrite = false;
+    // What the accepted requests wrote (freed if the whole batch is refused), and the
+    // compactions they record (kept only once the batch is prepared).
+    let mut added = Vec::new();
+    #[cfg(feature = "test-hooks")]
+    let mut records = Vec::new();
     // Owners handed out by tablet changes, re-applied whenever the catalog is rebuilt.
     let mut retargets: Vec<(TabletId, ShardId)> = Vec::new();
     for mut req in reqs {
@@ -612,6 +644,9 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                             catalog.set_shard(*t, *shard);
                         }
                         retargets.extend(owners);
+                        if !is_tablets {
+                            added.extend(added_extents(&own));
+                        }
                         edits.extend(own);
                         for (id, r) in req.readers.drain(..) {
                             readers.insert(id, r);
@@ -621,11 +656,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         #[cfg(feature = "test-hooks")]
                         if let Some(mut c) = req.compaction.take() {
                             c.manifest_version = version;
-                            shared
-                                .compactions
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .push(c);
+                            records.push(c);
                         }
                         outcomes.push((req, Ok(())));
                     }
@@ -674,6 +705,12 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     match writer.prepare(&catalog, &edits, rewrite) {
         Ok(prepared) => {
             drop(writer);
+            #[cfg(feature = "test-hooks")]
+            shared
+                .compactions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(records);
             Some(Commit {
                 reqs: outcomes,
                 old,
@@ -688,13 +725,26 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             })
         }
         Err(e) => {
+            let poisoned = writer.is_poisoned();
             drop(writer);
-            shared.pager_poisoned.store(true, Ordering::Release);
+            if poisoned {
+                shared.pager_poisoned.store(true, Ordering::Release);
+            } else {
+                // Nothing was written (a snapshot rewrite found no space): refuse the batch
+                // as a whole and free what its requests wrote, as for a refused request.
+                // The writer stays usable, so a commit after space is freed succeeds.
+                for x in added {
+                    shared.pager.abandon(x);
+                }
+            }
             let msg = e.to_string();
             for (req, r) in outcomes {
-                (req.reply)(
-                    r.and_then(|()| Err(crate::error::io_other("manifest commit", msg.clone()))),
-                );
+                (req.reply)(r.and_then(|()| {
+                    Err(match e {
+                        Error::NoSpace => Error::NoSpace,
+                        _ => crate::error::io_other("manifest commit", msg.clone()),
+                    })
+                }));
             }
             None
         }

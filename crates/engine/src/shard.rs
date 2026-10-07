@@ -1328,6 +1328,8 @@ struct SpareTask {
 
 impl Task for SpareTask {
     fn run(&mut self, _deadline_nanos: u64, _waker: &TaskWaker) -> TaskPoll {
+        // A failed sync poisons the stream, and its next append or sync fails; a failed
+        // allocation or write leaves the slots blank for a later attempt.
         let _ = self.spares.prepare(self.spares.target());
         self.running.store(false, Ordering::Release);
         TaskPoll::Done
@@ -4289,6 +4291,7 @@ impl ShardState {
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         self.checkpoint_inflight = false;
+        let failed = result.is_err();
         match result {
             Ok(_) => {
                 self.checkpoint = self.checkpoint.max(lsn);
@@ -4314,7 +4317,9 @@ impl ShardState {
                 }
             }
         }
-        if self.checkpoint_dirty && !self.shared.pager_poisoned.load(Ordering::Acquire) {
+        // A refused checkpoint (a full disk) is not retried at once, which would spin while
+        // the disk stays full; the next checkpoint event retries it.
+        if self.checkpoint_dirty && !failed && !self.shared.pager_poisoned.load(Ordering::Acquire) {
             self.checkpoint_dirty = false;
             self.advance_checkpoint(ctx);
         }
