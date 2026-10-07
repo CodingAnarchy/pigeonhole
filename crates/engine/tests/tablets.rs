@@ -190,6 +190,8 @@ fn crash_at_every_write_point_of_tablet_changes_regressions() {
 
 struct Db {
     vfs: Arc<SimVfs>,
+    /// The engine's clock (`vfs`, or a wrapper of it).
+    clock: pigeonhole_io::VfsRef,
     engine: Arc<Engine>,
     shards: Vec<EngineShard>,
     table: Arc<TableInfo>,
@@ -206,6 +208,7 @@ fn open(shards: usize, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
     o.tablet_changes = true;
     o.balance_interval_nanos = 0;
     tweak(&mut o);
+    let clock = Arc::clone(&o.vfs);
     let (engine, shards) =
         Engine::open_application_owned(Path::new("/db/data.phdb"), o).expect("open");
     let table = engine
@@ -213,6 +216,7 @@ fn open(shards: usize, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
         .expect("table");
     Db {
         vfs,
+        clock,
         engine,
         shards,
         table,
@@ -221,7 +225,7 @@ fn open(shards: usize, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
 
 impl Db {
     fn step(&mut self) {
-        let now = pigeonhole_io::Vfs::monotonic_nanos(&*self.vfs);
+        let now = self.clock.monotonic_nanos();
         for s in &mut self.shards {
             s.run_once(now + 1_000);
         }
@@ -230,7 +234,7 @@ impl Db {
     /// Steps until no shard has work left (queued messages or runnable background work).
     fn settle(&mut self) {
         for _ in 0..100_000 {
-            let now = pigeonhole_io::Vfs::monotonic_nanos(&*self.vfs);
+            let now = self.clock.monotonic_nanos();
             let mut busy = false;
             for s in &mut self.shards {
                 busy |= s.run_once(now + 1_000);
@@ -909,6 +913,7 @@ fn open_wide(
     o.tablet_changes = true;
     o.balance_interval_nanos = 0;
     tweak(&mut o);
+    let clock = Arc::clone(&o.vfs);
     let (engine, shards) =
         Engine::open_application_owned(Path::new("/db/data.phdb"), o).expect("open");
     let table = engine.table("t").unwrap_or_else(|| {
@@ -919,6 +924,7 @@ fn open_wide(
     });
     Db {
         vfs: Arc::clone(vfs),
+        clock,
         engine,
         shards,
         table,
@@ -1203,4 +1209,385 @@ fn step_until_done(db: &mut Db, pc: &mut pigeonhole_engine::PendingCommit) {
         db.step();
     }
     panic!("a commit never resolved");
+}
+
+// ---- liveness of commits that meet a tablet change (#102) ----
+
+/// A VFS whose clock moves a nanosecond each time it is read, so timers see a moving
+/// clock (`SimVfs`'s only moves when the test advances it).
+#[derive(Debug)]
+struct Ticking {
+    inner: pigeonhole_io::VfsRef,
+    ticks: std::sync::atomic::AtomicU64,
+}
+
+impl Ticking {
+    fn tick(&self) -> u64 {
+        self.ticks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn ticking(o: &mut EngineOptions) {
+    o.vfs = Arc::new(Ticking {
+        inner: Arc::clone(&o.vfs),
+        ticks: std::sync::atomic::AtomicU64::new(0),
+    });
+}
+
+impl pigeonhole_io::Vfs for Ticking {
+    fn open(
+        &self,
+        path: &Path,
+        opts: pigeonhole_io::OpenOptions,
+    ) -> pigeonhole_io::Result<pigeonhole_io::FileRef> {
+        self.inner.open(path, opts)
+    }
+    fn remove(&self, path: &Path) -> pigeonhole_io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn exists(&self, path: &Path) -> pigeonhole_io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn list_dir(&self, dir: &Path) -> pigeonhole_io::Result<Vec<std::path::PathBuf>> {
+        self.inner.list_dir(dir)
+    }
+    fn sync_dir(&self, dir: &Path) -> pigeonhole_io::Result<()> {
+        self.inner.sync_dir(dir)
+    }
+    fn open_shared(
+        &self,
+        name: &str,
+        dir: Option<&Path>,
+        len: u64,
+        mode: pigeonhole_io::SharedOpen,
+    ) -> pigeonhole_io::Result<pigeonhole_io::SharedRegion> {
+        self.inner.open_shared(name, dir, len, mode)
+    }
+    fn remove_shared(&self, name: &str, dir: Option<&Path>) -> pigeonhole_io::Result<()> {
+        self.inner.remove_shared(name, dir)
+    }
+    fn now_micros(&self) -> u64 {
+        self.inner.now_micros() + self.tick() / 1_000
+    }
+    fn monotonic_nanos(&self) -> u64 {
+        self.inner.monotonic_nanos() + self.tick()
+    }
+    fn current_process(&self) -> pigeonhole_io::ProcessId {
+        self.inner.current_process()
+    }
+    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
+        self.inner.process_alive(process)
+    }
+}
+
+/// One shard holding `t`'s only tablet, with a compaction of it parked before its manifest
+/// commit: a change started now waits for that compaction, so it stays in its drain.
+fn hold_a_compaction(db: &mut Db) {
+    for i in 0..20 {
+        db.put(&key(i), b"v");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    db.engine.park_manifest_commits(true);
+    let _compact = db.engine.compact_pending(None).unwrap();
+    for _ in 0..1_000 {
+        if db.engine.manifest_commit_parked() {
+            return;
+        }
+        db.step();
+    }
+    panic!("the compaction never reached its manifest commit");
+}
+
+fn submit_put(db: &Db, table: &TableInfo, row: &[u8]) -> pigeonhole_engine::PendingCommit {
+    let mut wb = WriteBatch::new();
+    wb.put(
+        table.id,
+        table.families[0].id,
+        row,
+        b"q",
+        None,
+        ValueRef::Bytes(b"w"),
+    )
+    .unwrap();
+    db.engine.submit(wb, Some(Durability::Buffered)).unwrap()
+}
+
+fn poll_commit(
+    pc: &mut pigeonhole_engine::PendingCommit,
+) -> Option<pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>> {
+    let mut cx = Context::from_waker(Waker::noop());
+    match Pin::new(pc).poll(&mut cx) {
+        Poll::Ready(r) => Some(r),
+        Poll::Pending => None,
+    }
+}
+
+/// Steps with the clock moving `nanos` per step until `pc` resolves.
+fn step_until(
+    db: &mut Db,
+    pc: &mut pigeonhole_engine::PendingCommit,
+    nanos: u64,
+) -> pigeonhole_engine::Result<pigeonhole_engine::CommitInfo> {
+    for _ in 0..10_000 {
+        if let Some(r) = poll_commit(pc) {
+            return r;
+        }
+        db.vfs.advance(nanos);
+        db.step();
+    }
+    panic!("the commit never resolved");
+}
+
+fn close(mut db: Db) {
+    db.engine.park_manifest_commits(false);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_commit_parked_behind_a_change_fails_busy_after_the_write_stall_timeout() {
+    let mut db = open(1, |o| {
+        o.write_stall_timeout_nanos = 50_000_000;
+        ticking(o);
+    });
+    hold_a_compaction(&mut db);
+    let id = db.table.id;
+    let split = db.engine.split_tablet_pending(id, &key(3)).unwrap();
+    for _ in 0..50 {
+        db.vfs.advance(1_000);
+        db.step();
+    }
+    let table = Arc::clone(&db.table);
+    let mut pc = submit_put(&db, &table, &key(1));
+    for _ in 0..50 {
+        db.vfs.advance(1_000);
+        db.step();
+    }
+    assert!(
+        poll_commit(&mut pc).is_none(),
+        "the commit should be parked"
+    );
+    let r = step_until(&mut db, &mut pc, 1_000_000);
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Busy)), "{r:?}");
+    // The change itself goes through once the compaction commits.
+    db.engine.park_manifest_commits(false);
+    db.drive(split).unwrap();
+    assert_eq!(db.ranges().len(), 2);
+    db.put(&key(1), b"after");
+    assert_eq!(db.get(&key(1)).map(|(_, v)| v), Some(b"after".to_vec()));
+    close(db);
+}
+
+#[test]
+fn close_gives_up_a_draining_change_and_its_parked_commits() {
+    let mut db = open(1, |_| {});
+    hold_a_compaction(&mut db);
+    let id = db.table.id;
+    let mut split = db.engine.split_tablet_pending(id, &key(3)).unwrap();
+    for _ in 0..50 {
+        db.vfs.advance(1_000);
+        db.step();
+    }
+    let table = Arc::clone(&db.table);
+    let mut pc = submit_put(&db, &table, &key(1));
+    for _ in 0..50 {
+        db.vfs.advance(1_000);
+        db.step();
+    }
+    assert!(
+        poll_commit(&mut pc).is_none(),
+        "the commit should be parked"
+    );
+    db.engine.close().unwrap();
+    for _ in 0..50 {
+        db.vfs.advance(1_000);
+        db.step();
+    }
+    // Both resolve while the compaction is still parked: close waits on neither.
+    let r = poll_commit(&mut pc).expect("the parked commit resolved at close");
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Closed)), "{r:?}");
+    let mut cx = Context::from_waker(Waker::noop());
+    let Poll::Ready(r) = Pin::new(&mut split).poll(&mut cx) else {
+        panic!("the change is still running")
+    };
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Closed)), "{r:?}");
+    db.engine.park_manifest_commits(false);
+    for _ in 0..1_000 {
+        db.step();
+    }
+    assert_eq!(db.ranges().len(), 1);
+}
+
+#[test]
+fn the_balancer_leaves_a_compacting_tablet_alone() {
+    let mut db = open(1, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.tablet_split_bytes = 1;
+    });
+    hold_a_compaction(&mut db);
+    // Big enough to split by size, but compacting: the balancer waits.
+    let m = db.engine.balance_pending().unwrap();
+    db.drive(m).unwrap();
+    assert_eq!(db.engine.tablet_changes(), (0, 0, 0));
+    assert_eq!(db.ranges().len(), 1);
+    db.engine.park_manifest_commits(false);
+    for _ in 0..1_000 {
+        db.step();
+    }
+    let m = db.engine.balance_pending().unwrap();
+    db.drive(m).unwrap();
+    assert_eq!(db.engine.tablet_changes().0, 1);
+    close(db);
+}
+
+/// Two shards: `t` split with its right child on shard 1 and its left child on shard 0
+/// (which therefore lost a tablet), and table `u` on shard 1.
+fn two_shards_with_a_lost_tablet(db: &mut Db) -> Arc<TableInfo> {
+    let t = db.table.id;
+    let mut rows: Vec<Vec<u8>> = (0..20).map(key).collect();
+    rows.sort();
+    for r in &rows {
+        db.put(r, b"v");
+    }
+    if db.ranges()[0].1 != 0 {
+        let m = db.engine.move_tablet_pending(t, &rows[0], 0).unwrap();
+        db.drive(m).unwrap();
+    }
+    let m = db.engine.split_tablet_pending(t, &rows[10]).unwrap();
+    db.drive(m).unwrap();
+    let m = db.engine.move_tablet_pending(t, &rows[10], 1).unwrap();
+    db.drive(m).unwrap();
+    let u = db
+        .engine
+        .create_table("u", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let snap = db.engine.snapshot().unwrap();
+    let ushard = snap.view().tablets().ranges(u.id)[0].1;
+    drop(snap);
+    if ushard != 1 {
+        let m = db.engine.move_tablet_pending(u.id, b"x", 1).unwrap();
+        db.drive(m).unwrap();
+    }
+    u
+}
+
+#[test]
+fn a_prepare_routed_with_an_older_map_runs_when_none_of_its_rows_moved() {
+    let mut db = open(2, |_| {});
+    let u = two_shards_with_a_lost_tablet(&mut db);
+    let t = Arc::clone(&db.table);
+    // Coordinated by shard 1 (u's row first); shard 0's share is the left child of t. The
+    // tablet map changes between every step (a new table each time), so every PREPARE
+    // reaches shard 0 routed with an older map, though no row of the commit moved. Each one
+    // used to be refused with `Moved` and retried, for ever.
+    let mut wb = WriteBatch::new();
+    wb.put(
+        u.id,
+        u.families[0].id,
+        b"x",
+        b"q",
+        None,
+        ValueRef::Bytes(b"u"),
+    )
+    .unwrap();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        &key(0),
+        b"q",
+        None,
+        ValueRef::Bytes(b"t"),
+    )
+    .unwrap();
+    let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    let mut done = None;
+    for i in 0..200 {
+        db.engine
+            .create_table(
+                &format!("bump{i}"),
+                &[("f".into(), FamilyOptions::default())],
+            )
+            .unwrap();
+        if let Some(r) = poll_commit(&mut pc) {
+            done = Some(r);
+            break;
+        }
+        db.step();
+    }
+    let r = done.expect("the commit never finished");
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(db.get(&key(0)).map(|(_, v)| v), Some(b"t".to_vec()));
+    close(db);
+}
+
+#[test]
+fn a_commit_refused_while_a_change_waits_fails_busy_after_the_write_stall_timeout() {
+    // Shard 0 holds a split of t's left child in its drain (the child's compaction is
+    // parked). A cross-shard commit touching that child is refused with `Moved` and waits
+    // for the tablet map to change; it gives up with `Busy` once the write stall timeout
+    // has passed rather than waiting for ever.
+    let mut db = open(2, |o| {
+        o.write_stall_timeout_nanos = 50_000_000;
+        ticking(o);
+    });
+    let u = two_shards_with_a_lost_tablet(&mut db);
+    let t = Arc::clone(&db.table);
+    let mut rows: Vec<Vec<u8>> = (0..20).map(key).collect();
+    rows.sort();
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    db.engine.park_manifest_commits(true);
+    let _compact = db.engine.compact_pending(Some(t.id)).unwrap();
+    for _ in 0..1_000 {
+        if db.engine.manifest_commit_parked() {
+            break;
+        }
+        db.step();
+    }
+    assert!(db.engine.manifest_commit_parked());
+    let compacting = db.engine.take_compactions();
+    let left = db.ranges()[0].0;
+    assert!(compacting.iter().any(|c| c.tablet == left) || compacting.is_empty());
+    let split = db.engine.split_tablet_pending(t.id, &rows[5]).unwrap();
+    for _ in 0..50 {
+        db.vfs.advance(1_000);
+        db.step();
+    }
+    let mut wb = WriteBatch::new();
+    wb.put(
+        u.id,
+        u.families[0].id,
+        b"x",
+        b"q",
+        None,
+        ValueRef::Bytes(b"u"),
+    )
+    .unwrap();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        &rows[1],
+        b"q",
+        None,
+        ValueRef::Bytes(b"t"),
+    )
+    .unwrap();
+    let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    for _ in 0..50 {
+        db.vfs.advance(1_000);
+        db.step();
+    }
+    assert!(
+        poll_commit(&mut pc).is_none(),
+        "the commit should wait to retry"
+    );
+    let r = step_until(&mut db, &mut pc, 1_000_000);
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Busy)), "{r:?}");
+    db.engine.park_manifest_commits(false);
+    db.drive(split).unwrap();
+    close(db);
 }

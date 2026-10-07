@@ -68,6 +68,16 @@ const COMPACTION_BACKOFF_NANOS: u64 = 1_000_000_000;
 const COMPACTION_BACKOFF_MAX_NANOS: u64 = 60_000_000_000;
 
 /// The wait before retrying after `failures` failed compactions in a row (at least one).
+/// Attempts of a cross-shard commit refused with `Moved` before it fails with `Busy`
+/// (#102): a commit that keeps meeting tablet changes gives up rather than retrying for ever.
+pub(crate) const MOVED_RETRIES: u32 = 16;
+
+/// Whether a cross-shard commit refused with `Moved` for the `attempts`-th time, `waited`
+/// nanoseconds after it was submitted, fails with `Busy` instead of retrying.
+fn moved_gives_up(attempts: u32, waited: u64, timeout: u64) -> bool {
+    attempts >= MOVED_RETRIES || waited >= timeout
+}
+
 fn compaction_backoff_nanos(failures: u32) -> u64 {
     // 2^32 seconds is far past the cap and does not overflow.
     let doublings = failures.saturating_sub(1).min(32);
@@ -619,6 +629,12 @@ pub(crate) struct CommitReq {
     pub predicate: Option<(TableId, Vec<u8>, Predicate)>,
     /// A retried cross-shard commit's first timestamp, kept when still above the floor.
     pub commit_ts: Option<Preset>,
+    /// Version of the tablet map the commit was routed with (0: unknown): a shard that
+    /// handed a tablet away checks the routing of commits routed with an older map.
+    pub map_version: u64,
+    /// Times a participant refused this (cross-shard) commit with `Moved` so far: past
+    /// `MOVED_RETRIES` it fails with `Busy` (#102).
+    pub attempts: u32,
 }
 
 /// A refused commit's first timestamp, carried into its retry.
@@ -668,6 +684,8 @@ pub(crate) struct CoordinateReq {
     /// retried once a tablet change has finished since (it may have failed, leaving the map
     /// as it was).
     pub epoch: u64,
+    /// `CommitReq::attempts`.
+    pub attempts: u32,
 }
 
 /// A participant's share of a cross-shard commit.
@@ -681,6 +699,9 @@ pub(crate) struct PrepareReq {
     pub bytes: Arc<BatchBuilder>,
     pub durability: Durability,
     pub validate: Option<(Seqno, Vec<ReadKey>)>,
+    /// Every shard the commit was routed to: a share routed with an older tablet map runs
+    /// again only when one of its rows now lives outside them (#102).
+    pub participants: Vec<ShardId>,
 }
 
 /// Why a participant could not prepare.
@@ -885,6 +906,8 @@ struct Member {
     map_version: u64,
     /// A retried commit: the shards that may already hold its timestamp (`Preset::own`).
     preset_own: Vec<ShardId>,
+    /// `CommitReq::attempts`.
+    attempts: u32,
 }
 
 #[derive(Debug)]
@@ -912,6 +935,7 @@ impl Member {
             durability: req.durability,
             seqno: 0,
             commit_ts: req.commit_ts.as_ref().map_or(0, |p| p.ts),
+            attempts: req.attempts,
             preset_own: req.commit_ts.map(|p| p.own).unwrap_or_default(),
             bytes: Bytes::Own(req.bytes),
             reply: req.reply,
@@ -921,7 +945,7 @@ impl Member {
             ticket: None,
             failed: None,
             reserved: 0,
-            map_version: 0,
+            map_version: req.map_version,
         }
     }
 
@@ -983,6 +1007,8 @@ struct Coord {
     /// Shards that may hold `commit_ts` because of this commit (see `Preset::own`).
     own: Vec<ShardId>,
     epoch: u64,
+    /// `CommitReq::attempts`.
+    attempts: u32,
 }
 
 /// A share this shard prepared and holds until the decision.
@@ -994,6 +1020,8 @@ struct PreparedShare {
     reserved: usize,
     /// Its rows are counted in `pending_rows` (from admission until the decision).
     tracked: bool,
+    /// `PrepareReq::participants`.
+    participants: Vec<ShardId>,
 }
 
 /// A memtable with what flush and compaction need to know about it: the smallest user
@@ -1578,9 +1606,13 @@ pub(crate) struct ShardState {
     /// done and then routed again.
     parked: Vec<Member>,
     parked_rows: HashSet<u64>,
-    /// This shard has handed a tablet to another one: commits routed with an older map may
-    /// arrive for rows it no longer owns, so admission checks routing.
-    lost_tablets: bool,
+    /// Fires when the oldest parked commit or retry reaches `write_stall_timeout_nanos`
+    /// (its deadline, its state); both then fail with `Busy` (#102).
+    tablet_timer: Option<(u64, Arc<TimerState>)>,
+    /// The tablet map version as of the last change that handed a tablet to another shard
+    /// (0: none). Commits routed with an older map may arrive for rows this shard no longer
+    /// owns, so admission checks their routing; newer ones skip the check (#102).
+    lost_version: u64,
     /// Cross-shard commits to retry once the tablet map changes.
     retries: Vec<CoordinateReq>,
     /// Slots whose SSTs, inherited from a split's parent, still hold a sibling's rows and so
@@ -1686,7 +1718,8 @@ impl ShardState {
             op_queue: VecDeque::new(),
             parked: Vec::new(),
             parked_rows: HashSet::new(),
-            lost_tablets: false,
+            tablet_timer: None,
+            lost_version: 0,
             retries: Vec::new(),
             cleanups: Vec::new(),
             cleanup_turn: false,
@@ -3593,6 +3626,7 @@ impl ShardState {
                     .is_some_and(|p| preset_fits(p.ts, &p.own, *s, own_floor, raise));
             }
         }
+        let attempts = req.attempts;
         let (commit_ts, own) = match req.commit_ts {
             Some(p) if fits => {
                 self.raise_ts_floor(p.ts);
@@ -3636,6 +3670,7 @@ impl ShardState {
                 commit_ts,
                 own,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
+                attempts,
             },
         );
         for (shard, bytes) in req.parts {
@@ -3647,6 +3682,7 @@ impl ShardState {
                 bytes,
                 durability: req.durability,
                 validate: req.validate.clone(),
+                participants: shards.clone(),
             });
             if shard == self.id {
                 self.handle_msg(msg, ctx);
@@ -3681,6 +3717,7 @@ impl ShardState {
                 commit_ts: req.commit_ts,
                 reserved: 0,
                 tracked: false,
+                participants: req.participants,
             },
         );
         self.pending.push(Member {
@@ -3700,6 +3737,7 @@ impl ShardState {
             reserved: 0,
             map_version: req.map_version,
             preset_own: Vec::new(),
+            attempts: 0,
         });
     }
 
@@ -3789,6 +3827,7 @@ impl ShardState {
             reserved: 0,
             map_version: 0,
             preset_own: Vec::new(),
+            attempts: 0,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
@@ -3900,6 +3939,21 @@ impl ShardState {
             // A participant was splitting, merging or moving a tablet: the commit was
             // aborted everywhere and runs again once the tablet map has changed. One that
             // refused the timestamp as below its floor runs again at once, with a fresh one.
+            // Either gives up once it was refused too often or waited too long (#102).
+            let attempts = c.attempts.saturating_add(1);
+            if moved_gives_up(
+                attempts,
+                ctx.now_nanos().saturating_sub(c.submitted_at),
+                self.shared.write_stall_timeout_nanos,
+            ) {
+                trace!(
+                    "shard {} gives up on {seqno} after {attempts} attempts",
+                    self.id.0
+                );
+                reply.notify(Err(Error::Busy));
+                self.try_finish_close(ctx);
+                return;
+            }
             let req = CoordinateReq {
                 parts: std::mem::take(&mut c.parts),
                 durability: c.durability,
@@ -3912,6 +3966,7 @@ impl ShardState {
                     own: std::mem::take(&mut c.own),
                 }),
                 epoch: c.epoch,
+                attempts,
             };
             if c.below_floor {
                 self.retry(req, ctx);
@@ -4817,12 +4872,15 @@ impl ShardState {
                     self.closing = true;
                     self.close_stage = CloseStage::Draining;
                     self.shared.closing.store(true, Ordering::Release);
-                    // Queued tablet changes never start; the running one finishes.
+                    // Queued tablet changes never start; the running one finishes if it is
+                    // committing and is given up otherwise, so close never waits on the
+                    // drain of a change (or the commits parked behind it, #102).
                     for (_, reply) in self.op_queue.drain(..) {
                         if let Some(r) = reply {
                             r.notify(Err(Error::Closed));
                         }
                     }
+                    self.abort_op(Error::Closed, ctx);
                     self.run_retries(ctx);
                 }
                 self.try_finish_close(ctx);
@@ -4884,6 +4942,7 @@ impl ShardHandler for ShardState {
             self.progress_op(ctx);
         }
         self.run_retries(ctx);
+        self.expire_tablet_waits(ctx);
         self.maybe_balance(false, None, ctx);
         if (self.freeze_all_pending
             || (!self.to_freeze.is_empty() && self.freeze_deferred)
@@ -4975,6 +5034,15 @@ mod tests {
             }
             stop.store(1, Ordering::Release);
         });
+    }
+
+    #[test]
+    fn a_commit_refused_with_moved_gives_up_after_the_cap_or_the_timeout() {
+        let timeout = 30_000_000_000;
+        assert!(!moved_gives_up(1, 0, timeout));
+        assert!(!moved_gives_up(MOVED_RETRIES - 1, timeout - 1, timeout));
+        assert!(moved_gives_up(MOVED_RETRIES, 0, timeout));
+        assert!(moved_gives_up(1, timeout, timeout));
     }
 
     #[test]

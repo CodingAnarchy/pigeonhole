@@ -2123,6 +2123,8 @@ impl Inner {
                     validate,
                     predicate,
                     commit_ts: None,
+                    map_version: view.tablets().version(),
+                    attempts: 0,
                 }))?;
         } else {
             if predicate.is_some() {
@@ -2143,6 +2145,7 @@ impl Inner {
                     map_version: view.tablets.version(),
                     commit_ts: None,
                     epoch: 0,
+                    attempts: 0,
                 }))?;
         }
         Ok(PendingCommit {
@@ -2204,6 +2207,8 @@ impl Inner {
                 validate: None,
                 predicate: Some((table, row.to_vec(), predicate.clone())),
                 commit_ts: None,
+                map_version: view.tablets().version(),
+                attempts: 0,
             }))?;
         let (applied, info) = rx.wait().unwrap_or(Err(Error::Closed))?;
         if let Some(info) = info {
@@ -2612,6 +2617,8 @@ impl EngineShard {
                     validate: None,
                     predicate: None,
                     commit_ts: None,
+                    map_version: view.tablets().version(),
+                    attempts: 0,
                 },
                 ctx,
             )
