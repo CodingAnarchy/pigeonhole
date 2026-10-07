@@ -129,8 +129,8 @@ fn results_identical_across_shard_counts_regressions() {
     }
 }
 
-#[test]
-fn crash_at_every_write_point_of_tablet_changes() {
+/// Crashes `seed` after every `PIGEONHOLE_SWEEP_STEP`-th (default 2nd) mutating operation.
+fn crash_sweep(seed: u64) {
     // Short runs full of splits, merges and moves (requested and the balancer's) among
     // cross-shard batches, tiny memtables and frequent flushes: every mutating operation is a
     // crash point, so the sweep crosses every step of a change (the freeze and flush, the
@@ -149,21 +149,36 @@ fn crash_at_every_write_point_of_tablet_changes() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-    for seed in seeds() {
-        let base = run(seed, &cfg).unwrap_or_else(|f| panic!("seed {seed} without a crash: {f}"));
-        eprintln!(
-            "seed {seed}: sweeping {} crash points ({} tablet changes)",
-            base.mutating_ops, base.tablet_changes
-        );
-        let mut n = 1;
-        while n <= base.mutating_ops {
-            let mut c = cfg.clone();
-            c.crash_at = Some(n);
-            if let Err(f) = run(seed, &c) {
-                panic!("seed {seed}, crash after mutating op {n}: {f}");
-            }
-            n += step;
+    let base = run(seed, &cfg).unwrap_or_else(|f| panic!("seed {seed} without a crash: {f}"));
+    eprintln!(
+        "seed {seed}: sweeping {} crash points ({} tablet changes)",
+        base.mutating_ops, base.tablet_changes
+    );
+    let mut n = 1;
+    while n <= base.mutating_ops {
+        let mut c = cfg.clone();
+        c.crash_at = Some(n);
+        if let Err(f) = run(seed, &c) {
+            panic!("seed {seed}, crash after mutating op {n}: {f}");
         }
+        n += step;
+    }
+}
+
+#[test]
+fn crash_at_every_write_point_of_tablet_changes() {
+    for seed in seeds() {
+        crash_sweep(seed);
+    }
+}
+
+#[test]
+#[ignore = "#98"]
+fn crash_at_every_write_point_of_tablet_changes_regressions() {
+    // Not deterministic (CAS and transaction helper threads): fails in about half the runs
+    // under parallel load.
+    for _ in 0..8 {
+        crash_sweep(170);
     }
 }
 
