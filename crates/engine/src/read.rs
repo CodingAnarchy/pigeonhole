@@ -493,10 +493,11 @@ impl ScanCursor {
         // Clamp to the tablet: after a split, children share their parent's SSTs (D13), which
         // hold rows of the sibling too.
         let (start, end) = clamp_to_tablet(&tablet, start, end)?;
+        self.lanes.clear();
         if matches!((&start, &end), (Some(s), Some(e)) if s >= e) {
+            // No row of the scan is in this tablet: it opens with no lanes.
             return Ok(true);
         }
-        self.lanes.clear();
         for &family in &self.families {
             let Some(meta) = view.catalog.family(family) else {
                 continue;

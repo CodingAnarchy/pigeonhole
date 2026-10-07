@@ -3290,7 +3290,11 @@ impl World {
                 return Ok(());
             }
         }
-        if self.tablet_pending.is_none() && rng.chance(self.cfg.tablet_ops_ppm) {
+        // No draw at all without tablet changes, so every other seed runs as before.
+        if self.cfg.tablet_changes
+            && self.tablet_pending.is_none()
+            && rng.chance(self.cfg.tablet_ops_ppm)
+        {
             self.request_tablet_change(rng)?;
         }
         if rng.chance(self.cfg.flush_ppm) {
