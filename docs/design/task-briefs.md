@@ -3,7 +3,7 @@
 
 One brief per crate, in build order. Each agent gets its crate's brief plus [spec.md](spec.md); the brief says what to read there, what the crate owns, and when it is done.
 
-Project-level deviations from the original briefs are recorded in [decisions.md](decisions.md) and win over this file.
+Project-level deviations from the original briefs are recorded in [decisions](decisions/README.md) and win over this file.
 
 ## pigeonhole-format
 - **Goal:** Every on-disk and in-shared-memory byte layout, as pure encode and decode functions with no I/O.

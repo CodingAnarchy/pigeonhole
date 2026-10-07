@@ -21,7 +21,7 @@ Every gate also requires the phase's GitHub milestone to have no open issues (D6
 | 4. Hardening and 1.0 | File format frozen | [Phase 4](https://github.com/CodingAnarchy/pigeonhole/milestone/4) | not started |
 
 ## Tracked follow-ups
-Deferred work from the [decisions audit](design/decisions.md), one GitHub issue each (labels: phase, crate; milestone: the phase).
+Deferred work from the [decisions audit](design/decisions/README.md), one GitHub issue each (labels: phase, crate; milestone: the phase).
 
 | Issue | Crate | Phase | Decision | Summary |
 |---|---|---|---|---|
