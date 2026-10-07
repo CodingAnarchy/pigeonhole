@@ -13,7 +13,7 @@ on:
       scale:
         description: "Preset size"
         type: choice
-        options: [small, smoke, full]
+        options: [small, smoke, full, larger-than-ram]
         default: small
   schedule:
     - cron: "17 5 * * 1" # Mondays 05:17 UTC

@@ -32,8 +32,12 @@ WORKLOADS:
 OPTIONS:
     --engine LIST          pigeonhole,rocksdb,sqlite,fjall or all [default: pigeonhole]
                            (comparison engines need the matching cargo feature)
-    --scale smoke|small|full
-                           preset sizes [default: small]; full is the spec's 1M rows
+    --scale smoke|small|full|larger-than-ram
+                           preset sizes [default: small]; full is the spec's 1M rows;
+                           larger-than-ram is full with an 8 MiB write buffer and a
+                           16 MiB cache (unless --write-buffer/--cache say otherwise),
+                           so the data set is tens of times the memory budget, and the
+                           report splits gets into cold (first touch) and hot
     --records N            rows loaded before measuring
     --ops N                operations measured
     --value-len N          bytes per value
@@ -134,7 +138,12 @@ fn config(a: &Args, kind: WorkloadKind) -> Result<WorkloadConfig, String> {
         None | Some("small") => WorkloadConfig::small(kind),
         Some("smoke") => WorkloadConfig::smoke(kind),
         Some("full") => WorkloadConfig::full(kind),
-        Some(s) => return Err(format!("unknown scale {s:?} (smoke, small or full)")),
+        Some("larger-than-ram") => WorkloadConfig::larger_than_ram(kind),
+        Some(s) => {
+            return Err(format!(
+                "unknown scale {s:?} (smoke, small, full or larger-than-ram)"
+            ));
+        }
     };
     c.records = a.records.unwrap_or(c.records);
     c.operations = a.ops.unwrap_or(c.operations);
@@ -145,7 +154,11 @@ fn config(a: &Args, kind: WorkloadKind) -> Result<WorkloadConfig, String> {
 }
 
 fn memory(a: &Args) -> MemoryBudget {
-    let d = MemoryBudget::default();
+    let d = if a.scale.as_deref() == Some("larger-than-ram") {
+        MemoryBudget::larger_than_ram()
+    } else {
+        MemoryBudget::default()
+    };
     MemoryBudget {
         write_buffer: a.write_buffer.unwrap_or(d.write_buffer),
         cache: a.cache.unwrap_or(d.cache),
@@ -350,6 +363,15 @@ mod tests {
         let c = config(&args("x --scale full"), WorkloadKind::SparseWide).unwrap();
         assert_eq!((c.records, c.operations), (1_000_000, 1_000_000));
         assert!(config(&args("x --scale huge"), WorkloadKind::YcsbC).is_err());
+        // The larger-than-ram preset shrinks the memory budget unless flags override it.
+        let a = args("ycsb-c --scale larger-than-ram");
+        assert_eq!(memory(&a), MemoryBudget::larger_than_ram());
+        let c = config(&a, WorkloadKind::YcsbC).unwrap();
+        assert_eq!(c, WorkloadConfig::larger_than_ram(WorkloadKind::YcsbC));
+        let a = args("ycsb-c --scale larger-than-ram --cache 1048576");
+        assert_eq!(memory(&a).cache, 1 << 20);
+        assert_eq!(memory(&a).write_buffer, 8 << 20);
+        assert_eq!(memory(&args("ycsb-c")), MemoryBudget::default());
     }
 
     #[test]

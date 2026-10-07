@@ -45,6 +45,24 @@ pub struct MemoryBudget {
     pub cache: u64,
 }
 
+impl MemoryBudget {
+    /// The budget of the larger-than-memory preset: an 8 MiB write buffer and a 16 MiB
+    /// read cache. Small on purpose, so a laptop-sized data set is tens of times what the
+    /// engine may keep in memory.
+    ///
+    /// ```
+    /// use pigeonhole_bench::MemoryBudget;
+    ///
+    /// assert_eq!(MemoryBudget::larger_than_ram().to_string(), "write_buffer=8MiB cache=16MiB");
+    /// ```
+    pub fn larger_than_ram() -> Self {
+        Self {
+            write_buffer: 8 << 20,
+            cache: 16 << 20,
+        }
+    }
+}
+
 impl Default for MemoryBudget {
     fn default() -> Self {
         Self {

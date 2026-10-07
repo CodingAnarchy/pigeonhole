@@ -38,7 +38,8 @@ mod workload;
 
 pub use histogram::Histogram;
 pub use report::{
-    Comparison, Delta, Environment, RunRecord, SUITE_FORMAT, Scaling, Suite, Tolerance, compare,
+    Comparison, Delta, Environment, LatencyStats, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT,
+    Scaling, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -210,6 +211,29 @@ impl WorkloadConfig {
         };
         c
     }
+
+    /// The larger-than-memory preset (`--scale larger-than-ram`): the [`full`](Self::full)
+    /// sizes, meant to run with [`MemoryBudget::larger_than_ram`] so the data set is tens
+    /// of times the engine's write buffer plus block cache. Gets are split into cold
+    /// (first touch of a row) and hot (repeat) in the report ([`ReadSplit`]).
+    ///
+    /// The data set is made larger than the *memory budget*, not larger than the
+    /// machine's RAM: a bench that must run on a laptop and in CI bounds the engine's
+    /// memory instead of needing a machine-sized file. Cold reads therefore miss the
+    /// engine's cache but may still hit the OS page cache; see `docs/bench.md`.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{MemoryBudget, WorkloadConfig, WorkloadKind};
+    ///
+    /// let c = WorkloadConfig::larger_than_ram(WorkloadKind::YcsbC);
+    /// assert_eq!(c, WorkloadConfig::full(WorkloadKind::YcsbC));
+    /// // 1M rows x 10 fields x 100 bytes against 24 MiB of memory.
+    /// let m = MemoryBudget::larger_than_ram();
+    /// assert!(c.records * 10 * c.value_len as u64 > 30 * (m.write_buffer + m.cache));
+    /// ```
+    pub fn larger_than_ram(kind: WorkloadKind) -> Self {
+        Self::full(kind)
+    }
 }
 
 /// One generated operation, store-neutral.
@@ -310,6 +334,12 @@ pub trait Runner {
 
     /// Flushes and closes.
     fn close(&mut self) -> Result<(), String>;
+
+    /// Writes retried after the store answered `Busy` (a write stall that outlasted its
+    /// timeout). Reported, not hidden; zero for stores that never refuse a write.
+    fn busy_retries(&self) -> u64 {
+        0
+    }
 
     /// A client for another thread, sharing the open store. `None` (the default) means
     /// the runner serves one client, and [`run`] uses one thread whatever
@@ -432,8 +462,9 @@ pub fn run_detailed(
     });
     runner.open(dir)?;
     let result = measure(runner, config, &mut workload, warmup);
+    let busy_retries = runner.busy_retries();
     let closed = runner.close();
-    let (load, elapsed, threads, hist) = result?;
+    let (load, elapsed, threads, hist, split) = result?;
     closed?;
     let ops = hist.count();
     Ok(RunRecord {
@@ -454,10 +485,95 @@ pub fn run_detailed(
         mean_ns: hist.mean().as_nanos() as u64,
         max_ns: hist.max().as_nanos() as u64,
         warmup_ops: warmup,
+        detail: RunDetail {
+            store_bytes: dir_bytes(dir),
+            busy_retries,
+            reads: split.into_split(),
+        },
     })
 }
 
-type Measured = (Duration, Duration, usize, Histogram);
+/// Bytes of every file under `dir`: the store's size on disk after the run.
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            match e.metadata() {
+                Ok(m) if m.is_dir() => stack.push(e.path()),
+                Ok(m) => total += m.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// Whether a measured operation is a get on a row the run has not read before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Other,
+    Cold,
+    Hot,
+}
+
+/// Latency of gets, cold (first touch of a row since the store opened) and hot (the row
+/// was read before).
+#[derive(Debug, Default)]
+struct Split {
+    cold: Histogram,
+    hot: Histogram,
+}
+
+impl Split {
+    fn record(&mut self, class: Class, latency: Duration) {
+        match class {
+            Class::Cold => self.cold.record(latency),
+            Class::Hot => self.hot.record(latency),
+            Class::Other => {}
+        }
+    }
+
+    fn merge(&mut self, other: &Split) {
+        self.cold.merge(&other.cold);
+        self.hot.merge(&other.hot);
+    }
+
+    fn into_split(self) -> Option<ReadSplit> {
+        (self.cold.count() + self.hot.count() > 0).then(|| ReadSplit {
+            cold: LatencyStats::of(&self.cold),
+            hot: LatencyStats::of(&self.hot),
+        })
+    }
+}
+
+/// Classifies each measured op; `seen` starts with the rows the warmup read.
+fn classify(ops: &[BenchOp], seen: &mut std::collections::HashSet<u64>) -> Vec<Class> {
+    ops.iter()
+        .map(|op| match op {
+            BenchOp::Get { row, .. } => {
+                if seen.insert(row_hash(row)) {
+                    Class::Cold
+                } else {
+                    Class::Hot
+                }
+            }
+            _ => Class::Other,
+        })
+        .collect()
+}
+
+fn row_hash(row: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    row.hash(&mut h);
+    h.finish()
+}
+
+type Measured = (Duration, Duration, usize, Histogram, Split);
 
 fn measure(
     runner: &mut dyn Runner,
@@ -472,10 +588,15 @@ fn measure(
     let load = load_start.elapsed();
 
     let mut ops = workload.run_ops();
+    let mut seen = std::collections::HashSet::new();
     for op in ops.by_ref().take(warmup as usize) {
+        if let BenchOp::Get { row, .. } = &op {
+            seen.insert(row_hash(row));
+        }
         runner.execute(&op).map_err(|e| format!("warmup: {e}"))?;
     }
     let ops: Vec<BenchOp> = ops.collect();
+    let classes = classify(&ops, &mut seen);
     let threads = config.threads.max(1);
     let clients: Vec<Box<dyn Client>> = if threads > 1 {
         (0..threads).map_while(|_| runner.client()).collect()
@@ -484,22 +605,25 @@ fn measure(
     };
     if clients.len() < 2 {
         let mut hist = Histogram::new();
+        let mut split = Split::default();
         let start = Instant::now();
-        for op in &ops {
+        for (op, class) in ops.iter().zip(&classes) {
             let t = Instant::now();
             runner.execute(op)?;
-            hist.record(t.elapsed());
+            let latency = t.elapsed();
+            hist.record(latency);
+            split.record(*class, latency);
         }
-        return Ok((load, start.elapsed(), 1, hist));
+        return Ok((load, start.elapsed(), 1, hist, split));
     }
 
     // Deal operations round-robin so each thread sees the workload's mix in order.
     let n = clients.len();
-    let mut shares: Vec<Vec<BenchOp>> = (0..n)
+    let mut shares: Vec<Vec<(BenchOp, Class)>> = (0..n)
         .map(|_| Vec::with_capacity(ops.len() / n + 1))
         .collect();
-    for (i, op) in ops.into_iter().enumerate() {
-        shares[i % n].push(op);
+    for (i, (op, class)) in ops.into_iter().zip(classes).enumerate() {
+        shares[i % n].push((op, class));
     }
     let barrier = Arc::new(Barrier::new(n + 1));
     std::thread::scope(|scope| {
@@ -508,25 +632,32 @@ fn measure(
             .zip(shares)
             .map(|(mut client, share)| {
                 let barrier = Arc::clone(&barrier);
-                scope.spawn(move || -> Result<Histogram, String> {
+                scope.spawn(move || -> Result<(Histogram, Split), String> {
                     let mut hist = Histogram::new();
+                    let mut split = Split::default();
                     barrier.wait();
-                    for op in &share {
+                    for (op, class) in &share {
                         let t = Instant::now();
                         client.execute(op)?;
-                        hist.record(t.elapsed());
+                        let latency = t.elapsed();
+                        hist.record(latency);
+                        split.record(*class, latency);
                     }
-                    Ok(hist)
+                    Ok((hist, split))
                 })
             })
             .collect();
         barrier.wait();
         let start = Instant::now();
         let mut hist = Histogram::new();
+        let mut split = Split::default();
         let mut first_err = None;
         for h in handles {
             match h.join() {
-                Ok(Ok(h)) => hist.merge(&h),
+                Ok(Ok((h, s))) => {
+                    hist.merge(&h);
+                    split.merge(&s);
+                }
                 Ok(Err(e)) => {
                     first_err.get_or_insert(e);
                 }
@@ -538,7 +669,7 @@ fn measure(
         let elapsed = start.elapsed();
         match first_err {
             Some(e) => Err(e),
-            None => Ok((load, elapsed, n, hist)),
+            None => Ok((load, elapsed, n, hist, split)),
         }
     })
 }
