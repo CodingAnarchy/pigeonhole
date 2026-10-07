@@ -266,7 +266,10 @@ pub(crate) struct Shared {
     pub live_views: Arc<LiveViews>,
     pub live_seqnos: Arc<LiveSeqnos>,
     /// Memtables `(shard, root)` whose SSTs are in the manifest, excluded from every view
-    /// until their shard retires them.
+    /// until their shard retires them. Extended only together with storing the view that
+    /// adds their SSTs (`publish_view`): a shard building its memtable piece (under
+    /// `view_lock`) or reading its memtables beside the view's SSTs (loading the view while
+    /// holding this lock) sees both or neither.
     pub flushed_roots: Mutex<HashSet<(u16, u32)>>,
     /// SSTs a running compaction or relocation reads or replaces.
     pub busy_ssts: Mutex<HashSet<SstId>>,
@@ -283,6 +286,10 @@ pub(crate) struct Shared {
     #[cfg(feature = "test-hooks")]
     pub manifest_race_waiter:
         Mutex<Option<pigeonhole_runtime::Waiter<Result<pigeonhole_format::ManifestVersion>>>>,
+    /// Test hook: runs once at the start of the next `publish_view`, before the publish
+    /// lock (`Engine::before_next_view_publish`).
+    #[cfg(feature = "test-hooks")]
+    pub before_view_publish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Test hook: park background manifest commits before `end` (see `manifest::parked`).
     #[cfg(feature = "test-hooks")]
     pub manifest_park: AtomicBool,
@@ -404,7 +411,27 @@ impl Shared {
 
     /// Publishes a new view built by `f` from the current one, in shared memory too. The
     /// view version is bumped under the publish lock.
-    pub(crate) fn publish_view(&self, f: impl FnOnce(&View, u64) -> View) -> Result<Arc<View>> {
+    ///
+    /// `flushed` names the memtables `(shard, root)` whose SSTs the new view adds: they join
+    /// `flushed_roots` under that lock and in the same step as the view is stored, so no
+    /// view, and no shard reading its own memtables beside the view's SSTs, ever sees a
+    /// memtable together with its SST (issue #131: a merge operand counted twice).
+    pub(crate) fn publish_view(
+        &self,
+        flushed: &[(u16, u32)],
+        f: impl FnOnce(&View, u64) -> View,
+    ) -> Result<Arc<View>> {
+        #[cfg(feature = "test-hooks")]
+        {
+            let hook = self
+                .before_view_publish
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut last = self
             .view_lock
             .lock()
@@ -432,7 +459,14 @@ impl Shared {
                 vv.insert(k, v);
             }
         }
-        self.view.store(Arc::clone(&view));
+        {
+            let mut roots = self
+                .flushed_roots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            roots.extend(flushed.iter().copied());
+            self.view.store(Arc::clone(&view));
+        }
         *last = version;
         Ok(view)
     }
@@ -1926,11 +1960,14 @@ impl ShardState {
     fn publish_memtables(&mut self) -> Result<()> {
         self.view_dirty = false;
         let i = usize::from(self.id.0);
-        let sets = self.mem_sets();
-        let piece = Arc::new(ShardMems {
-            map: sets.into_iter().collect(),
-        });
-        self.shared.publish_view(|current, version| {
+        let this = &*self;
+        this.shared.publish_view(&[], |current, version| {
+            // Built under the publish lock: built before it, the piece could miss a manifest
+            // commit that published the SST of one of these memtables in between, and put
+            // the memtable back beside its SST (issue #131).
+            let piece = Arc::new(ShardMems {
+                map: this.mem_sets().into_iter().collect(),
+            });
             let mut mems = current.mems.clone();
             if i < mems.len() {
                 mems[i] = piece;
@@ -1943,7 +1980,7 @@ impl ShardState {
                 mems,
                 ssts: Arc::clone(&current.ssts),
                 _pin: Some(crate::snapshot::ViewPin::new(
-                    &self.shared.live_views,
+                    &this.shared.live_views,
                     current.manifest_version,
                 )),
             }
@@ -2586,29 +2623,19 @@ impl ShardState {
 
     // ---- reads on the shard (predicates, validation) ----
 
-    /// The sources of `(tablet, family)` for a point read at the applied state: this
-    /// shard's memtables (not yet in SSTs) and the view's SSTs.
+    /// The sources of `(tablet, family)` for a point read at the applied state: `mems`
+    /// (this shard's memtables not yet in SSTs) and the view's SSTs.
     fn point_sources(
         &self,
         view: &View,
+        mems: &[MemtableReader],
         tablet: TabletId,
         family: FamilyId,
         row: &[u8],
         qualifier: &[u8],
     ) -> Result<Vec<Source>> {
         let mut out = Vec::new();
-        if let Some(slot) = self.memtables.get(&(tablet, family)) {
-            let flushed = self
-                .shared
-                .flushed_roots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            mem_sources_from(
-                &slot.readers(self.id, &flushed),
-                &ScanFilter::all(),
-                &mut out,
-            );
-        }
+        mem_sources_from(mems, &ScanFilter::all(), &mut out);
         let l = view.locate(self.id, tablet, family);
         if let Some(fam) = l.ssts
             && !fam.is_empty()
@@ -2627,14 +2654,31 @@ impl ShardState {
         row: &[u8],
         qualifier: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let view = self.shared.view.load();
+        // The view is loaded and the memtables picked while `flushed_roots` is held: a
+        // manifest commit adds a flushed memtable's root and stores the view with its SST
+        // under that lock (issue #131), so the two never both hold its data, nor both miss it.
+        let (view, mems) = {
+            let flushed = self
+                .shared
+                .flushed_roots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let view = self.shared.view.load_full();
+            let mems = view
+                .tablets()
+                .route(table, row)
+                .and_then(|(tablet, _)| self.memtables.get(&(tablet, family)))
+                .map(|slot| slot.readers(self.id, &flushed))
+                .unwrap_or_default();
+            (view, mems)
+        };
         let Some((tablet, _)) = view.tablets().route(table, row) else {
             return Ok(None);
         };
         let Some(meta) = view.catalog.family(family) else {
             return Ok(None);
         };
-        let sources = self.point_sources(&view, tablet, family, row, qualifier)?;
+        let sources = self.point_sources(&view, &mems, tablet, family, row, qualifier)?;
         if sources.is_empty() {
             return Ok(None);
         }

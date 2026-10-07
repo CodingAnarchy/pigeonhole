@@ -686,7 +686,11 @@ pub(crate) fn end(
     };
     let tablets = catalog.tablets();
     let live: std::collections::HashSet<_> = tablets.iter().map(|t| t.id).collect();
-    let published = shared.publish_view(|cur, view_version| {
+    // Memtables whose SSTs this commit adds leave this view and, through
+    // `Shared::flushed_roots`, every later one until their shards retire them. The roots join
+    // `flushed_roots` only with the view stored: a failed publish keeps the old view, which
+    // still needs them.
+    let published = shared.publish_view(&flushed_roots, |cur, view_version| {
         let mems = cur
             .mems
             .iter()
@@ -741,16 +745,6 @@ pub(crate) fn end(
             (req.reply)(r.and_then(|()| Err(Error::Corruption(msg.clone()))));
         }
         return;
-    }
-    // Memtables whose SSTs this commit adds leave every view from now on; their shards keep
-    // excluding them until they retire them (`Shared::flushed_roots`). Only once the view
-    // is published: a failed publish keeps the old view, which still needs them.
-    if !flushed_roots.is_empty() {
-        shared
-            .flushed_roots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(flushed_roots.iter().copied());
     }
     // Extents no tablet references any more are reclaimable once no view older than this
     // version lives (decision D61).
