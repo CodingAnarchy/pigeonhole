@@ -150,7 +150,7 @@ impl ShardState {
             return None;
         }
         let single = matches!(m.kind, MemberKind::Single);
-        if self.moving.is_empty() && !self.lost_tablets {
+        if self.moving.is_empty() && m.map_version >= self.lost_version {
             return Some(m);
         }
         let mut routing = self.routing_of(&m);
@@ -171,6 +171,7 @@ impl ShardState {
             (Routing::Moving, true) => {
                 self.parked_rows.extend(member_rows(&m));
                 self.parked.push(m);
+                self.arm_tablet_timer(ctx);
                 None
             }
             (Routing::Elsewhere, true) => self.forward(m, ctx),
@@ -185,15 +186,23 @@ impl ShardState {
         let prepare = matches!(m.kind, MemberKind::Prepare { .. });
         let mut out = Routing::Owned;
         // A share routed with an older tablet map may name rows this shard no longer owns,
-        // and miss rows it does (reads it should validate): run it again through the new map.
-        if prepare && m.map_version < self.tablets.version() {
-            out = Routing::Elsewhere;
-        }
+        // and its reads may now belong to a shard outside the commit (nobody would validate
+        // them): it runs again through the new map only then (#102). A read another
+        // participant owns now is validated there, under that shard's current map.
+        let participants: Option<&[ShardId]> = (prepare && m.map_version < self.tablets.version())
+            .then(|| {
+                self.prepared
+                    .get(&m.seqno)
+                    .map_or(&[][..], |s| s.participants.as_slice())
+            });
         let mut look = |table: TableId, row: &[u8], read_by_others: bool| {
             if let Some((tablet, owner)) = self.tablets.route(table, row) {
                 if self.moving.contains(&tablet) {
                     out = Routing::Moving;
-                } else if owner != self.id && !read_by_others && out == Routing::Owned {
+                } else if owner != self.id
+                    && out == Routing::Owned
+                    && (!read_by_others || participants.is_some_and(|p| !p.contains(&owner)))
+                {
                     out = Routing::Elsewhere;
                 }
             }
@@ -292,7 +301,8 @@ impl ShardState {
             }
             [s] => {
                 let s = *s;
-                let req = member_req(m);
+                let mut req = member_req(m);
+                req.map_version = view.tablets.version();
                 if let Err(pigeonhole_runtime::Error::Closed) =
                     ctx.submitter(s).submit(ShardMsg::Commit(req))
                 {
@@ -325,6 +335,7 @@ impl ShardState {
                     map_version: view.tablets.version(),
                     commit_ts: req.commit_ts,
                     epoch: 0,
+                    attempts: req.attempts,
                 };
                 if shards[0] == self.id {
                     self.start_coordination(creq, ctx);
@@ -396,11 +407,89 @@ impl ShardState {
             validate: r.validate,
             predicate: None,
             commit_ts: r.commit_ts,
+            map_version: r.map_version,
+            attempts: r.attempts,
         });
         if let Some(m) = self.forward(m, ctx) {
             self.pending.push(m);
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
+    }
+
+    /// Fails with `Busy` every parked commit and every waiting retry that was submitted
+    /// `write_stall_timeout_nanos` ago (#102): a change can wait on a long compaction or a
+    /// slow flush, and a commit that keeps meeting changes must not wait for ever.
+    pub(super) fn expire_tablet_waits(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.parked.is_empty() && self.retries.is_empty() {
+            if let Some((_, t)) = self.tablet_timer.take() {
+                t.cancel();
+            }
+            return;
+        }
+        let now = ctx.now_nanos();
+        let timeout = self.shared.write_stall_timeout_nanos;
+        let late = |submitted_at: u64| now.saturating_sub(submitted_at) >= timeout;
+        if self.parked.iter().any(|m| late(m.submitted_at)) {
+            let (expired, kept): (Vec<Member>, Vec<Member>) = std::mem::take(&mut self.parked)
+                .into_iter()
+                .partition(|m| late(m.submitted_at));
+            self.parked = kept;
+            self.parked_rows = self.parked.iter().flat_map(member_rows).collect();
+            for m in expired {
+                trace!("shard {} parked commit times out", self.id.0);
+                m.reply.resolve(Err(Error::Busy));
+            }
+        }
+        if self.retries.iter().any(|r| late(r.submitted_at)) {
+            let (expired, kept): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
+                std::mem::take(&mut self.retries)
+                    .into_iter()
+                    .partition(|r| late(r.submitted_at));
+            self.retries = kept;
+            for r in expired {
+                trace!("shard {} retried commit times out", self.id.0);
+                r.reply.notify(Err(Error::Busy));
+            }
+        }
+        self.arm_tablet_timer(ctx);
+        self.try_finish_close(ctx);
+    }
+
+    /// Arms (or re-arms) the timer that ends the oldest parked commit or retry.
+    pub(super) fn arm_tablet_timer(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let oldest = self
+            .parked
+            .iter()
+            .map(|m| m.submitted_at)
+            .chain(self.retries.iter().map(|r| r.submitted_at))
+            .min();
+        let Some(oldest) = oldest else {
+            if let Some((_, t)) = self.tablet_timer.take() {
+                t.cancel();
+            }
+            return;
+        };
+        let deadline = oldest.saturating_add(self.shared.write_stall_timeout_nanos);
+        // A timer that gave up on a clock still frozen is not armed again: the change's
+        // progress releases the commits instead.
+        if let Some((at, t)) = &self.tablet_timer
+            && ((*at <= deadline && !t.finished()) || t.frozen(ctx.now_nanos()))
+        {
+            return;
+        }
+        if let Some((_, t)) = self.tablet_timer.take() {
+            t.cancel();
+        }
+        trace!("shard {} tablet timer armed for {deadline}", self.id.0);
+        let state = TimerState::new();
+        ctx.spawn(Box::new(ClockTimer::new(
+            &self.shared.vfs,
+            deadline,
+            Arc::clone(&state),
+            ctx.submitter(self.id).clone(),
+            ShardMsg::Kick,
+        )));
+        self.tablet_timer = Some((deadline, state));
     }
 
     // ---- the change ----
@@ -708,7 +797,7 @@ impl ShardState {
                     self.loads.remove(t);
                 }
                 if !op.kind.targets(self.id).is_empty() {
-                    self.lost_tablets = true;
+                    self.lost_version = self.tablets.version();
                 }
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
                 match op.kind {
@@ -859,8 +948,15 @@ impl ShardState {
             && !self.shared.closing.load(Ordering::Acquire)
             && !self.shared.pager_poisoned.load(Ordering::Acquire)
             && self.shared.full_compactions.load(Ordering::Acquire) == 0;
+        // A change waits for a running compaction on its tablets: the balancer leaves a
+        // compacting tablet alone and decides again next interval (#102).
         let (decision, cleanups) = if idle {
-            self.decide(now, mem, &mem_per)
+            let (kind, cleanups) = self.decide(now, mem, &mem_per);
+            let kind = kind.filter(|kind| {
+                self.compaction
+                    .is_none_or(|(t, _)| !kind.tablets().contains(&t))
+            });
+            (kind, cleanups)
         } else {
             (None, Vec::new())
         };
@@ -1281,6 +1377,8 @@ fn member_req(m: Member) -> CommitReq {
             ts: m.commit_ts,
             own: m.preset_own,
         }),
+        map_version: m.map_version,
+        attempts: m.attempts,
     }
 }
 
