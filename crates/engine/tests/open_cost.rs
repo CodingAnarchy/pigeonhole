@@ -163,3 +163,61 @@ fn a_crashed_database_reopens_with_a_smaller_budget() {
     // The same layout, but every arena a quarter of the size it crashed with.
     crash_with_unflushed(1432, 2, 2_500_000, 2, 1 << 20);
 }
+
+#[test]
+fn an_open_that_fails_after_a_spill_leaves_the_database_openable() {
+    // Unflushed small rows past a 1 MiB arena (replay spills them), then one record no
+    // 1 MiB arena can hold: that open fails after the spill wrote SSTs it never committed.
+    // A later open with room recovers everything.
+    const ROWS: u32 = 1200;
+    let vfs = SimVfs::new(1433);
+    let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
+    // Segments big enough for the oversized record (the value limit includes the segment).
+    o.wal.segment_size = 4 << 20;
+    o.memtable_freeze_bytes = 16 << 20;
+    o.wal_pin_bytes = u64::MAX;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    let value = vec![9u8; 1000];
+    for r in 0..ROWS {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, t.id, f, &r.to_be_bytes(), &value);
+        db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    }
+    let big = vec![8u8; 3 << 20];
+    let mut wb = WriteBatch::new();
+    put(&mut wb, t.id, f, b"big", &big);
+    db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    assert_eq!(db.metrics().flushes, 0);
+    vfs.crash(CrashKind::Power);
+    drop(db);
+
+    let small = common::options(Arc::clone(&vfs), 1, 1 << 20);
+    let failed = Engine::open(Path::new(DB), small);
+    assert!(
+        failed.is_err(),
+        "the oversized record must fail the open: {failed:?}"
+    );
+    drop(failed);
+    let db = Engine::open(
+        Path::new(DB),
+        common::options(Arc::clone(&vfs), 1, 16 << 20),
+    )
+    .unwrap();
+    for r in 0..ROWS {
+        let got = db
+            .get_latest(t.id, f, &r.to_be_bytes(), b"q")
+            .unwrap()
+            .map(|c| common::value_bytes(c.value()));
+        assert_eq!(got.as_deref(), Some(&value[..]), "row {r}");
+    }
+    let got = db
+        .get_latest(t.id, f, b"big", b"q")
+        .unwrap()
+        .map(|c| common::value_bytes(c.value()));
+    assert_eq!(got.as_deref(), Some(&big[..]));
+    db.close().unwrap();
+}

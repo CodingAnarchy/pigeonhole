@@ -298,7 +298,7 @@ impl Recovery {
     ///
     /// The new segment's header is written and synced before this returns, so a checkpoint
     /// taken at the new position names a segment that exists. A recycled slot (lower epochs
-    /// only) or a slot added past the file's end (zeros) is used as is; a blank one is
+    /// only) or a slot allocated past the file's end (never written: zeros) is used as is; a blank one is
     /// zero-filled first, since frames of a segment whose header write was torn may carry
     /// the epoch the new segment takes. `opts.segment_size` is used only if the file holds no
     /// segment at all; otherwise the file's slot size is kept. Spare slots are not prepared

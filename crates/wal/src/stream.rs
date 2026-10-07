@@ -476,8 +476,8 @@ impl SpareSegments {
 /// else into a slot prepared by [`SpareSegments::prepare`] (zero-filled and synced, so its
 /// fdatasyncs update no metadata), and only otherwise into a slot allocated inline
 /// ([`WalStream::inline_grows`] counts those). [`WalStream::create`] starts the first segment
-/// in a slot added past the file's end, sparse and not zero-filled, so an open writes one
-/// frame rather than a segment (#143).
+/// in a slot allocated past the file's end, which reads as zeros and is not zero-filled, so
+/// an open writes one frame rather than a segment (#143).
 ///
 /// **Poisoning.** A failed write or sync leaves the kernel's view of the file unknown: a later
 /// successful sync could acknowledge commits behind a hole that replay would drop. So the
@@ -566,7 +566,8 @@ pub(crate) enum SlotSource {
     Prepared,
     /// An allocated slot never zero-filled.
     Blank,
-    /// A slot the open-time segment added past the file's end: zeros, not yet allocated.
+    /// A slot the open-time segment added past the file's end: allocated, never written, so
+    /// it reads as zeros.
     Extended,
 }
 
@@ -574,9 +575,10 @@ impl WalStream {
     /// Creates stream `stream` for a new database, or after its recovery found nothing.
     ///
     /// An existing file at the stream's path is truncated first, so stale segments can never
-    /// be mistaken for new ones. The first slot is added past the file's end (sparse, so it
-    /// reads as zeros and needs no zero-fill), its segment's header (epoch 1) written and
-    /// synced with the file's length, and the directory entry synced, before this returns. Spare slots are not
+    /// be mistaken for new ones. The first slot is allocated past the file's end (never
+    /// written, so it reads as zeros and needs no zero-fill), its segment's header (epoch 1)
+    /// written and synced with the file's length, and the directory entry synced, before
+    /// this returns. Spare slots are not
     /// prepared here: the engine runs [`SpareSegments::prepare`] on a background task.
     pub fn create(
         vfs: &VfsRef,
@@ -745,10 +747,11 @@ impl WalStream {
     ///
     /// Only a blank slot is zero-filled first: it may hold frames of a segment whose header
     /// write was torn, under the epoch the new segment takes. A recycled slot holds only
-    /// lower epochs, and a slot added past the file's end reads as zeros. That last one is
-    /// what every open after a clean close uses, so an open writes one frame per stream
-    /// instead of a segment (#143); the price is that the first segment's syncs also
-    /// allocate its blocks, as D35's spares avoid for every later one.
+    /// lower epochs, and a slot allocated past the file's end was never written, so it reads
+    /// as zeros. That last one is what every open after a clean close uses, so an open writes
+    /// one frame per stream instead of a segment (#143). The price is that the first
+    /// segment's syncs also mark its blocks written (an unwritten-extent conversion), which
+    /// D35's zero-filled spares avoid for every later segment.
     pub(crate) fn open_segment(&mut self, prev_epoch: u32, prev_end: u32) -> Result<()> {
         let lsn = self.begin_open_segment(prev_epoch, prev_end)?;
         let synced = self.shared.durable_sync(|| self.file.sync_all());
@@ -830,11 +833,16 @@ impl WalStream {
                 drop(pool);
                 let end = (slot as u64 + 1) * self.segment_size;
                 if at_open {
-                    // Sparse: `open_segment` syncs the length with the header.
-                    if self.file.len()? < end {
-                        self.file.set_len(end)?;
+                    if self.file.len()? >= end {
+                        // Bytes past the slots the stream knows of (a preparation that
+                        // failed after growing the file): treat them as stale.
+                        (slot, SlotSource::Blank)
+                    } else {
+                        // Never written, so it reads as zeros and needs no zero-fill.
+                        // `open_segment` syncs the length with the header.
+                        self.extend_at_open(slot)?;
+                        (slot, SlotSource::Extended)
                     }
-                    (slot, SlotSource::Extended)
                 } else {
                     self.shared.pool().inline_grows += 1;
                     self.file
@@ -848,6 +856,28 @@ impl WalStream {
             self.slots.resize(slot + 1, POOLED);
         }
         Ok((slot, source))
+    }
+
+    /// Adds slot `slot` past the file's end for the open-time segment, without writing it.
+    ///
+    /// On Linux the slot is allocated (`fallocate`: unwritten extents, a metadata update), so
+    /// its space is reserved and a full disk fails the open rather than a later append. That
+    /// also keeps the zero-read guarantee on filesystems that could otherwise expose stale
+    /// freed blocks in a delayed-allocation hole after a crash (ext4 `data=writeback`, some
+    /// FUSE filesystems). Elsewhere it is extended sparsely: APFS has no unwritten extents, so
+    /// preallocating there writes the whole slot (64 MiB per shard per open, measured), and
+    /// its holes read as zeros by design. `SimVfs` records the same operation either way.
+    fn extend_at_open(&self, slot: usize) -> Result<()> {
+        let (start, end) = (
+            slot as u64 * self.segment_size,
+            (slot as u64 + 1) * self.segment_size,
+        );
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            self.file.allocate(start, self.segment_size)?;
+        } else {
+            self.file.set_len(end)?;
+        }
+        Ok(())
     }
 
     /// Starts a new segment (epoch one above every epoch seen) in a free slot, buffering its

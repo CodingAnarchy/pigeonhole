@@ -722,7 +722,7 @@ impl Engine {
         let mut commits: HashMap<(StreamId, Seqno), Vec<StreamId>> = HashMap::new();
         let mut replayed: Vec<(StreamId, Vec<ReplayedRecord>)> = Vec::new();
         // Recovered memtables written to SSTs mid-replay when an arena ran short (#143).
-        let mut spill = Spilled::default();
+        let mut spill = Spilled::new(Arc::clone(&pager));
         let streams = discover_streams(&vfs, path)?;
         for &stream in &streams {
             let checkpoint = catalog
@@ -1939,23 +1939,35 @@ impl Drop for Engine {
 /// `SetFlushed` per slot, every stream checkpointed to its end (extra streams to zero, since
 /// they are removed afterwards).
 /// Recovered memtables already written to SSTs at open, committed with the rest by
-/// `flush_recovered` (#143).
-#[derive(Default)]
+/// `flush_recovered` (#143). Until that commit succeeds the SSTs' extents are pending
+/// output: dropping this (the open failed anywhere after a spill) gives them back.
 struct Spilled {
+    pager: Arc<Pager>,
     /// Replay ran short of arena room at least once.
     spilled: bool,
-    /// `AddSst` edits of the SSTs written so far.
+    /// The edits to commit: the `AddSst` of every SST written so far, then (in
+    /// `flush_recovered`) the rest of the open-time flush.
     edits: Vec<Edit>,
     /// The largest seqno written to SSTs per slot.
     flushed: BTreeMap<(TabletId, FamilyId), Seqno>,
 }
 
 impl Spilled {
-    /// Gives back the extents of every SST written so far (the open failed).
-    fn abandon(&mut self, shared: &Shared) {
+    fn new(pager: Arc<Pager>) -> Self {
+        Self {
+            pager,
+            spilled: false,
+            edits: Vec::new(),
+            flushed: BTreeMap::new(),
+        }
+    }
+}
+
+impl Drop for Spilled {
+    fn drop(&mut self) {
         for e in self.edits.drain(..) {
             if let Edit::AddSst { meta, .. } = e {
-                shared.pager.abandon(meta.extent);
+                self.pager.abandon(meta.extent);
             }
         }
     }
@@ -1980,7 +1992,7 @@ fn make_room(
     }
     crate::shard::trace!("replay: an arena is short, spilling recovered memtables");
     spill.spilled = true;
-    spill_recovered(shared, catalog, states, spill).inspect_err(|_| spill.abandon(shared))
+    spill_recovered(shared, catalog, states, spill)
 }
 
 /// Writes every recovered memtable of `states` to L0 SSTs, adding to `spill`.
@@ -2032,9 +2044,11 @@ fn flush_recovered(
     shards: usize,
     mut spill: Spilled,
 ) -> Result<()> {
-    spill_recovered(shared, catalog, states, &mut spill).inspect_err(|_| spill.abandon(shared))?;
-    let mut edits = std::mem::take(&mut spill.edits);
-    for ((tablet, family), seqno) in spill.flushed {
+    // On any error below, dropping `spill` gives back every SST's extent.
+    spill_recovered(shared, catalog, states, &mut spill)?;
+    let flushed = std::mem::take(&mut spill.flushed);
+    let edits = &mut spill.edits;
+    for ((tablet, family), seqno) in flushed {
         edits.push(Edit::SetFlushed {
             tablet,
             family,
@@ -2055,20 +2069,16 @@ fn flush_recovered(
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.seqno_ceiling = shared.shm.next_seqno();
     edits.push(catalog.counters_edit());
-    for e in &edits {
+    for e in edits.iter() {
         catalog.apply(e, shards)?;
     }
     let mut writer = shared
         .manifest
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    writer.commit(catalog, &edits).inspect_err(|_| {
-        for e in &edits {
-            if let Edit::AddSst { meta, .. } = e {
-                shared.pager.abandon(meta.extent);
-            }
-        }
-    })?;
+    writer.commit(catalog, edits)?;
+    // Published: nothing to give back.
+    edits.clear();
     Ok(())
 }
 
