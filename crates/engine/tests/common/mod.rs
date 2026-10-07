@@ -184,6 +184,14 @@ pub struct Config {
     /// Per-op probability (ppm) of an explicit `flush` / `compact`.
     pub flush_ppm: u32,
     pub compact_ppm: u32,
+    /// Per-op probability (ppm) of requesting a random tablet split, merge or move; it runs
+    /// while the workload goes on (interleaved with commits, two-phase commits and crashes).
+    pub tablet_ops_ppm: u32,
+    /// Run the balancer every few operations with tiny thresholds, so splits, moves and
+    /// merges also happen on their own.
+    pub balance_fast: bool,
+    /// `final_dump` only: a deterministic split, move or merge every this many ops.
+    pub tablet_every: Option<usize>,
 }
 
 impl Config {
@@ -224,6 +232,9 @@ impl Config {
             compaction,
             flush_ppm: 30_000,
             compact_ppm: 15_000,
+            tablet_ops_ppm: 0,
+            balance_fast: false,
+            tablet_every: None,
         }
     }
 
@@ -265,6 +276,11 @@ pub struct Stats {
     /// Mutating VFS operations the run made before its final crash: the crash points a
     /// sweep of the same seed and config must cover.
     pub mutating_ops: u64,
+    /// Tablet changes requested by the workload that completed, and refused ones.
+    pub tablet_changes: usize,
+    pub tablet_refused: usize,
+    /// Splits, merges and moves the engines performed (requested or the balancer's).
+    pub engine_tablet_changes: (u64, u64, u64),
 }
 
 /// What kind of divergence the checker saw.
@@ -309,8 +325,11 @@ impl fmt::Display for Failure {
             "checker failure ({:?}): seed={} at op #{}: {}",
             self.class, self.seed, self.op_index, self.message
         )?;
-        const SHOWN: usize = 40;
-        let skip = self.trace.len().saturating_sub(SHOWN);
+        let shown: usize = std::env::var("PIGEONHOLE_TRACE_LINES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let skip = self.trace.len().saturating_sub(shown);
         if skip > 0 {
             writeln!(
                 f,
@@ -447,6 +466,12 @@ pub fn options_for(vfs: Arc<SimVfs>, shards: usize, cfg: &Config) -> EngineOptio
     let mut o = options(vfs, shards, cfg.memtable_budget);
     o.memtable_freeze_bytes = cfg.memtable_freeze_bytes;
     o.compaction = cfg.compaction.clone();
+    if cfg.balance_fast {
+        // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
+        o.balance_interval_nanos = 15_000;
+        o.balance_min_writes = 3;
+        o.tablet_split_bytes = 24 << 10;
+    }
     o
 }
 
@@ -1024,6 +1049,8 @@ struct World {
     compaction_floor: Seqno,
     /// Whether the configured fault plan is active (off while recovery checks the files).
     faults_active: bool,
+    /// A tablet change requested by the workload, still running.
+    tablet_pending: Option<(PendingMaintenance, String)>,
 }
 
 impl World {
@@ -1068,6 +1095,7 @@ impl World {
             pending_purges: Vec::new(),
             compaction_floor: 0,
             faults_active: true,
+            tablet_pending: None,
         }
     }
 
@@ -1649,6 +1677,8 @@ impl World {
         }
         self.stash_compactions();
         self.drain_appended();
+        self.tablet_pending = None;
+        self.count_tablet_changes();
         self.store = None;
         self.snaps.clear();
         self.vfs.set_faults(FaultPlan::none());
@@ -1740,6 +1770,18 @@ impl World {
                 .aborted
                 .iter()
                 .any(|c| keys.is_subset(&Self::mutation_keys(&c.ops)))
+            {
+                continue;
+            }
+            // An attempt a participant refused because it was splitting, merging or moving a
+            // tablet: the coordinator aborted it (no COMMIT record anywhere) and committed the
+            // same mutations again under a new seqno.
+            if !wal.commits.keys().any(|(_, s)| s == seqno)
+                && self
+                    .history
+                    .values()
+                    .chain(unacked.iter())
+                    .any(|c| keys.is_subset(&Self::mutation_keys(&c.ops)))
             {
                 continue;
             }
@@ -1874,11 +1916,18 @@ impl World {
             .iter()
             .map(|(n, t)| (n.clone(), t.id))
             .collect();
-        let tablet_of: HashMap<TableId, pigeonhole_format::TabletId> = manifest
-            .tablets
-            .iter()
-            .map(|(tablet, table)| (*table, *tablet))
-            .collect();
+        // The tablet holding a row, by the manifest's row ranges (tablets split and merge).
+        let tablet_of = |table: TableId, row: &[u8]| -> Option<pigeonhole_format::TabletId> {
+            manifest
+                .tablet_ranges
+                .iter()
+                .find(|(_, t, start, end)| {
+                    *t == table
+                        && start.as_slice() <= row
+                        && end.as_ref().is_none_or(|e| row < e.as_slice())
+                })
+                .map(|(id, ..)| *id)
+        };
         let fully_flushed = |c: &Committed| -> bool {
             let Some(seqno) = c.seqno else { return false };
             c.ops.iter().all(|op| {
@@ -1895,11 +1944,11 @@ impl World {
                     let Some(tid) = flushed_table_ids.get(table) else {
                         return false;
                     };
-                    let Some(tablet) = tablet_of.get(tid) else {
+                    let Some(tablet) = tablet_of(*tid, op_row(op)) else {
                         return false;
                     };
                     let fid = self.store().family_ids[&(table.to_owned(), f.clone())];
-                    manifest.flushed.get(&(*tablet, fid)).copied().unwrap_or(0) >= seqno
+                    manifest.flushed.get(&(tablet, fid)).copied().unwrap_or(0) >= seqno
                 })
             })
         };
@@ -2421,7 +2470,104 @@ impl World {
 
     /// Settles every in-flight commit that resolved. Returns whether the client may go on
     /// (nothing left in flight).
+    /// Moves the clock past every shard's default-timestamp floor.
+    fn clock_past_floors(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let floor = store.engine.max_ts_floor();
+        let now = self.now();
+        if floor >= now {
+            self.vfs.advance(1_000 * (floor - now + 1));
+        }
+    }
+
+    /// Adds the open engine's split, merge and move counts to the stats.
+    fn count_tablet_changes(&mut self) {
+        if let Some(store) = &self.store {
+            let (s, m, v) = store.engine.tablet_changes();
+            self.stats.engine_tablet_changes.0 += s;
+            self.stats.engine_tablet_changes.1 += m;
+            self.stats.engine_tablet_changes.2 += v;
+        }
+    }
+
+    /// Requests a random split, merge or move (it runs while the workload goes on).
+    fn request_tablet_change(&mut self, rng: &mut Rng) -> Result<(), Fail> {
+        let table = TABLES[rng.below(TABLES.len() as u64) as usize];
+        let row = format!("row{:06}", rng.below(self.cfg.spec.rows.max(1))).into_bytes();
+        let shards = self.store().shards.len().max(1) as u64;
+        let kind = rng.below(3);
+        let to = rng.below(shards) as u16;
+        let store = self.store();
+        let tid = store.tables[table].id;
+        let (what, pending) = match kind {
+            0 => ("split", store.engine.split_tablet_pending(tid, &row)),
+            1 => ("merge", store.engine.merge_tablets_pending(tid, &row)),
+            _ => ("move", store.engine.move_tablet_pending(tid, &row, to)),
+        };
+        let label = format!("tablet {what} {table} at {} (to {to})", text(&row));
+        self.trace.push(label.clone());
+        match pending {
+            Ok(p) => self.tablet_pending = Some((p, label)),
+            Err(e) => {
+                if !self.tablet_change_refused(&e) {
+                    return fail(FailureClass::Protocol, format!("{label}: {e}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a tablet change's error is an acceptable refusal (a stale or invalid request,
+    /// a crash or an injected I/O error, which the commits around it notice).
+    fn tablet_change_refused(&mut self, e: &Error) -> bool {
+        let ok = matches!(
+            e,
+            Error::InvalidArgument(_)
+                | Error::TableNotFound(_)
+                | Error::Unsupported(_)
+                | Error::Closed
+                | Error::Io(_)
+        );
+        if ok {
+            self.stats.tablet_refused += 1;
+            self.trace.push(format!("  -> tablet change refused: {e}"));
+        }
+        ok
+    }
+
+    /// Polls the running tablet change, if any.
+    fn poll_tablet_change(&mut self) -> Result<(), Fail> {
+        let Some((p, _)) = self.tablet_pending.as_mut() else {
+            return Ok(());
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(r) = Pin::new(p).poll(&mut cx) else {
+            return Ok(());
+        };
+        let (_, label) = self.tablet_pending.take().expect("checked");
+        if !self.alive() {
+            // Crashed meanwhile: the next commit notices and recovers.
+            return Ok(());
+        }
+        match r {
+            Ok(()) => {
+                self.stats.tablet_changes += 1;
+                self.trace.push(format!("  {label}: done"));
+            }
+            Err(e) => {
+                if !self.tablet_change_refused(&e) {
+                    return fail(FailureClass::Protocol, format!("{label}: {e}"));
+                }
+            }
+        }
+        self.drain_compactions()?;
+        self.check_held_snapshots()
+    }
+
     fn poll_in_flight(&mut self, rng: &mut Rng) -> Result<bool, Fail> {
+        self.poll_tablet_change()?;
         if self.in_flight.is_empty() {
             if self.need_reopen {
                 self.crash_and_recover(CrashKind::Process, false, rng)?;
@@ -2650,6 +2796,9 @@ impl World {
                 self.vfs.advance(1_000 * self.pending_advance);
                 self.pending_advance = 0;
             }
+            // A commit refused by a shard moving a tablet is retried, sometimes with a new
+            // default timestamp: past every floor as well.
+            self.clock_past_floors();
             if self.need_reopen {
                 self.crash_and_recover(CrashKind::Process, false, rng)?;
             }
@@ -3117,6 +3266,16 @@ impl World {
             eprintln!("op #{} {op:?}", self.op_index);
         }
         self.vfs.advance(1_000);
+        if !self.alive() {
+            // A background tablet change hit a crash point: recover before going on.
+            self.crash_and_recover(CrashKind::Power, true, rng)?;
+            if self.store.is_none() {
+                return Ok(());
+            }
+        }
+        if self.tablet_pending.is_none() && rng.chance(self.cfg.tablet_ops_ppm) {
+            self.request_tablet_change(rng)?;
+        }
         if rng.chance(self.cfg.flush_ppm) {
             self.maintenance(false, rng)?;
             if self.store.is_none() {
@@ -3656,10 +3815,33 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
             vfs.crash(CrashKind::Process);
             drop(store);
             store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("reopen");
-            results.push(format!(
-                "reopen at {i}: seqno {}",
-                store.engine.snapshot().unwrap().seqno()
-            ));
+            // Seqnos are not compared: a commit refused by a shard moving a tablet is
+            // retried under a new seqno, so numbering depends on the shard count.
+            results.push(format!("reopen at {i}"));
+        }
+        if let Some(every) = cfg.tablet_every
+            && i > 0
+            && i % every == 0
+        {
+            // Every table: split at a row that moves with `i`, move the tablet holding it,
+            // or merge it with its right neighbour (refusals are fine and the same for every
+            // shard count only in effect, never in the results).
+            let k = i / every;
+            let row = format!("row{:06}", (k * 7) % cfg.spec.rows.max(1) as usize).into_bytes();
+            for t in TABLES {
+                let tid = store.tables[t].id;
+                let shards = store.shards.len();
+                let p = match k % 3 {
+                    0 => store.engine.split_tablet_pending(tid, &row),
+                    1 => store
+                        .engine
+                        .move_tablet_pending(tid, &row, (k % shards) as u16),
+                    _ => store.engine.merge_tablets_pending(tid, &row),
+                };
+                if let Ok(p) = p {
+                    let _ = store.drive(&vfs, p, || true);
+                }
+            }
         }
         if let Some(every) = cfg.compact_every
             && i > 0
@@ -3692,7 +3874,8 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
                         Poll::Pending => store.step_shards(vfs.monotonic_nanos()),
                     }
                 };
-                results.push(format!("commit {}", info.seqno));
+                let _ = info;
+                results.push(format!("commit {i}"));
             }
             Op::Get {
                 row,

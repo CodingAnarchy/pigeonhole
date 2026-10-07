@@ -14,7 +14,8 @@
 //! by a cooperative task per shard, WAL streams are checkpointed per decision D24 and
 //! removed at the last clean close (one file at rest), compaction runs as cooperative tasks
 //! (or on `compaction_threads`), and writes stall on L0 depth through a per-shard token
-//! bucket.
+//! bucket. Tablets split at a size threshold or under write skew, merge when small and
+//! cold, and move between shards when load is skewed; reads are never blocked by any of it.
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
@@ -38,12 +39,14 @@ mod write;
 pub use compact::CompactionRecord;
 pub use engine::{CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, TableInfo};
 #[cfg(feature = "test-hooks")]
-pub use engine::{ManifestInfo, PendingMaintenance, RawEntry};
+pub use engine::{ManifestInfo, PendingMaintenance, RawEntry, TabletRange};
 pub use error::{Error, Result};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, ScanCell, ScanCursor, ScanSpec};
 #[cfg(feature = "test-hooks")]
 pub use shard::{AppendedKind, AppendedRecord};
+#[cfg(feature = "test-hooks")]
+pub use snapshot::TabletOwner;
 pub use snapshot::{Snapshot, TabletMap, View};
 pub use write::{PendingCommit, Predicate, Txn, WriteBatch};
 

@@ -35,7 +35,12 @@ use pigeonhole_runtime::{
 use pigeonhole_shm::{Presence, ShmRegion, WriterLock};
 use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
-use crate::catalog::MergeKind;
+mod tablets;
+
+use tablets::{ActiveOp, TabletLoad};
+pub(crate) use tablets::{BalanceConfig, LoadSlot, TabletOpKind, split_by_shard};
+
+use crate::catalog::{Catalog, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
 use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
@@ -68,6 +73,9 @@ pub(crate) struct ShardMetrics {
     pub flush_nanos: AtomicU64,
     pub compactions: AtomicU64,
     pub compaction_nanos: AtomicU64,
+    pub splits: AtomicU64,
+    pub merges: AtomicU64,
+    pub moves: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -81,6 +89,9 @@ impl Default for ShardMetrics {
             flush_nanos: AtomicU64::new(0),
             compactions: AtomicU64::new(0),
             compaction_nanos: AtomicU64::new(0),
+            splits: AtomicU64::new(0),
+            merges: AtomicU64::new(0),
+            moves: AtomicU64::new(0),
         }
     }
 }
@@ -189,8 +200,19 @@ pub(crate) struct Shared {
     pub pager_poisoned: AtomicBool,
     pub close: CloseState,
     pub metrics: Vec<ShardMetrics>,
-    /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits.
+    /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits
+    /// and by coordinators choosing a cross-shard commit timestamp.
     pub ts_floors: Vec<Padded>,
+    /// Per-shard floor raises from shards handing it tablets (D11: the floor travels with
+    /// the tablet); the shard's next default timestamp is above it.
+    pub ts_raises: Vec<Padded>,
+    /// Per-shard load as of its last balancer interval.
+    pub loads: Vec<LoadSlot>,
+    pub balance: BalanceConfig,
+    /// Bytes of a shared-memory view buffer (a split that would outgrow it is refused, D28).
+    pub view_capacity: usize,
+    /// Bumped whenever a tablet change finishes or is given up (see `CoordinateReq::epoch`).
+    pub tablet_epoch: AtomicU64,
     pub waiters: VisibilityWaiters,
     /// Shards with a freeze deferred until the watermark passes their memtable (kicked by
     /// whoever publishes a watermark).
@@ -484,6 +506,8 @@ pub(crate) struct CommitReq {
     pub validate: Option<(Seqno, Vec<ReadKey>)>,
     /// `check_and_mutate`: the row and predicate to test first.
     pub predicate: Option<(TableId, Vec<u8>, Predicate)>,
+    /// A retried cross-shard commit's first timestamp, kept when still above the floor.
+    pub commit_ts: Option<Timestamp>,
 }
 
 /// A cross-shard commit request, sent to the coordinator (the shard owning the first row).
@@ -494,11 +518,23 @@ pub(crate) struct CoordinateReq {
     pub reply: Notifier<Result<CommitInfo>>,
     pub submitted_at: u64,
     pub validate: Option<(Seqno, Vec<ReadKey>)>,
+    /// Version of the tablet map the parts were routed with: a commit a participant refused
+    /// because it is moving a tablet is retried once the map is newer.
+    pub map_version: u64,
+    /// A retry's first commit timestamp, kept when it is still above every participant's
+    /// floor (the refused attempt then leaves no trace).
+    pub commit_ts: Option<Timestamp>,
+    /// `Shared::tablet_epoch` when the commit was coordinated: a refused commit is also
+    /// retried once a tablet change has finished since (it may have failed, leaving the map
+    /// as it was).
+    pub epoch: u64,
 }
 
 /// A participant's share of a cross-shard commit.
 #[derive(Debug)]
 pub(crate) struct PrepareReq {
+    /// Version of the tablet map the share was routed with.
+    pub map_version: u64,
     pub seqno: Seqno,
     pub commit_ts: Timestamp,
     pub coordinator: ShardId,
@@ -511,6 +547,9 @@ pub(crate) struct PrepareReq {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrepareError {
     Conflict,
+    /// A row's tablet is being split, merged or moved, or now lives on another shard: the
+    /// coordinator retries through the new tablet map.
+    Moved,
     Busy,
     Closed,
     TooLarge,
@@ -521,7 +560,7 @@ impl From<PrepareError> for Error {
     fn from(e: PrepareError) -> Self {
         match e {
             PrepareError::Conflict => Error::Conflict,
-            PrepareError::Busy => Error::Busy,
+            PrepareError::Moved | PrepareError::Busy => Error::Busy,
             PrepareError::Closed => Error::Closed,
             PrepareError::TooLarge => Error::RecordTooLarge,
             PrepareError::Io => poisoned_error(),
@@ -627,6 +666,19 @@ pub(crate) enum ShardMsg {
     Start,
     /// Nothing: forces a drain so deferred members form a group.
     Kick,
+    /// Split, merge or move tablets this shard owns (replies when done, if asked).
+    TabletOp {
+        op: TabletOpKind,
+        reply: Option<Notifier<Result<()>>>,
+    },
+    /// A tablet change's manifest commit finished.
+    TabletOpDone {
+        result: Result<ManifestVersion>,
+    },
+    /// Run the balancer now (a test hook); replies once whatever it started is done.
+    Balance {
+        reply: Option<Notifier<Result<()>>>,
+    },
     /// Stop accepting writes, finish in-flight work, flush, checkpoint, sync, report.
     Close,
 }
@@ -681,6 +733,8 @@ struct Member {
     failed: Option<Error>,
     /// Arena bytes reserved for it until it is applied or dropped.
     reserved: usize,
+    /// A PREPARE: the tablet map version its share was routed with (0 otherwise).
+    map_version: u64,
 }
 
 #[derive(Debug)]
@@ -707,7 +761,7 @@ impl Member {
             kind: MemberKind::Single,
             durability: req.durability,
             seqno: 0,
-            commit_ts: 0,
+            commit_ts: req.commit_ts.unwrap_or(0),
             bytes: Bytes::Own(req.bytes),
             reply: req.reply,
             submitted_at: req.submitted_at,
@@ -716,6 +770,7 @@ impl Member {
             ticket: None,
             failed: None,
             reserved: 0,
+            map_version: 0,
         }
     }
 
@@ -766,6 +821,13 @@ struct Coord {
     failed: Option<Error>,
     decided: bool,
     shards: Vec<ShardId>,
+    /// The request, kept for a retry when a participant refused with `Moved`.
+    parts: Vec<(ShardId, Arc<BatchBuilder>)>,
+    validate: Option<(Seqno, Vec<ReadKey>)>,
+    map_version: u64,
+    moved: bool,
+    commit_ts: Timestamp,
+    epoch: u64,
 }
 
 /// A share this shard prepared and holds until the decision.
@@ -1163,8 +1225,6 @@ pub(crate) struct ShardState {
     /// A flush failed while closing: the close gives up on flushing (the WAL keeps the data)
     /// and is not clean.
     flush_failed: bool,
-    /// Tablets dropped since open: their records need no flush before a checkpoint.
-    dropped: HashSet<TabletId>,
 
     // ---- checkpoints ----
     /// Records the checkpoint cannot pass, in log order.
@@ -1200,6 +1260,26 @@ pub(crate) struct ShardState {
     /// A background compaction failed: none starts until a flush or new writes happen.
     compaction_backoff: bool,
     stall: Stall,
+
+    // ---- tablet changes and the balancer ----
+    /// Tablets the running change splits, merges or moves.
+    moving: HashSet<TabletId>,
+    op: Option<ActiveOp>,
+    op_queue: VecDeque<(TabletOpKind, Option<Notifier<Result<()>>>)>,
+    /// Single-shard commits touching `moving` tablets, held (unlogged) until the change is
+    /// done and then routed again.
+    parked: Vec<Member>,
+    parked_rows: HashSet<u64>,
+    /// This shard has handed a tablet to another one: commits routed with an older map may
+    /// arrive for rows it no longer owns, so admission checks routing.
+    lost_tablets: bool,
+    /// Cross-shard commits to retry once the tablet map changes.
+    retries: Vec<CoordinateReq>,
+    /// Writes per tablet in the current balancer interval.
+    loads: HashMap<TabletId, TabletLoad>,
+    window_writes: u64,
+    next_balance: u64,
+    rng: u64,
 }
 
 impl std::fmt::Debug for ShardState {
@@ -1265,7 +1345,6 @@ impl ShardState {
             freeze_deferred: false,
             freeze_all_pending: false,
             flush_failed: false,
-            dropped: HashSet::new(),
             log: VecDeque::new(),
             last_end: None,
             checkpoint: Lsn::default(),
@@ -1283,6 +1362,17 @@ impl ShardState {
             compaction_error: None,
             compaction_backoff: false,
             stall: Stall::default(),
+            moving: HashSet::new(),
+            op: None,
+            op_queue: VecDeque::new(),
+            parked: Vec::new(),
+            parked_rows: HashSet::new(),
+            lost_tablets: false,
+            retries: Vec::new(),
+            loads: HashMap::new(),
+            window_writes: 0,
+            next_balance: 0,
+            rng: 0x9E37_79B9_7F4A_7C15 ^ (u64::from(id.0) + 1),
         }
     }
 
@@ -1311,7 +1401,12 @@ impl ShardState {
 
     pub(crate) fn raise_ts_floor(&mut self, ts: Timestamp) {
         trace!("shard {} raise floor {} -> {ts}", self.id.0, self.ts_floor);
-        self.ts_floor = self.ts_floor.max(ts);
+        if ts > self.ts_floor {
+            self.ts_floor = ts;
+            if let Some(f) = self.shared.ts_floors.get(usize::from(self.id.0)) {
+                f.0.store(ts, Ordering::Release);
+            }
+        }
     }
 
     /// The largest default timestamp known to this shard (seeded from replay, D11).
@@ -1476,15 +1571,57 @@ impl ShardState {
 
     /// Worst-case arena bytes `batch` needs, so a commit is refused (`Busy`) before its
     /// record is logged rather than half-applied.
-    fn arena_needed(batch: BatchRef<'_>, chunk: usize) -> usize {
+    fn arena_needed(&self, batch: BatchRef<'_>) -> usize {
         let mut total = 0usize;
+        // `(tablet, family)` slots the batch would create, each a memtable with a chunk of
+        // its own (a table split into many tablets has many slots).
+        let mut new_slots: Vec<(TabletId, FamilyId)> = Vec::new();
         for m in batch.iter().flatten() {
             let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
             total += ENTRY_OVERHEAD + key + m.value.len();
+            if let Some((tablet, owner)) = self.tablets.route(m.table, m.row)
+                && owner == self.id
+                && !self.memtables.contains_key(&(tablet, m.family))
+                && !new_slots.contains(&(tablet, m.family))
+            {
+                new_slots.push((tablet, m.family));
+            }
         }
-        // Each allocation may waste the tail of the previous run (less than the entry), and a
-        // new memtable needs a chunk of its own.
-        2 * total + 2 * chunk
+        // Each allocation may waste the tail of the previous run (less than the entry), a
+        // new memtable needs a chunk of its own, and a freeze needs one more.
+        2 * total + (new_slots.len() + 2) * self.chunk_size
+    }
+
+    /// Retires the memtables of slots that hold nothing (an empty active memtable, nothing
+    /// frozen): each pins a whole arena chunk, and a shard with many tablets would otherwise
+    /// fill its arena with empty memtables. A later write creates the slot again.
+    fn retire_idle_slots(&mut self) -> Result<()> {
+        let idle: Vec<(TabletId, FamilyId)> = self
+            .memtables
+            .iter()
+            .filter(|(k, slot)| {
+                slot.active.table.is_empty()
+                    && slot.frozen.is_empty()
+                    && !self.to_freeze.contains(k)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        if idle.is_empty() {
+            return Ok(());
+        }
+        let mut retired = Vec::with_capacity(idle.len());
+        for key in idle {
+            if let Some(slot) = self.memtables.remove(&key) {
+                retired.push(slot.active.table.retire());
+            }
+        }
+        self.view_dirty = true;
+        self.publish_memtables()?;
+        let version = self.shared.view.load().version;
+        self.retired
+            .extend(retired.into_iter().map(|r| (version, r)));
+        self.reclaim_retired();
+        Ok(())
     }
 
     /// Forces the arena to account for retired memtables whose last in-process handle has
@@ -1499,7 +1636,7 @@ impl ShardState {
     /// this group and undecided shares) or returns `None` when it would not fit.
     fn reserve_room(&mut self, bytes: &[u8]) -> std::result::Result<usize, Room> {
         let needed = match BatchRef::new(bytes) {
-            Ok(batch) => Self::arena_needed(batch, self.chunk_size),
+            Ok(batch) => self.arena_needed(batch),
             Err(_) => 0,
         };
         if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
@@ -1550,7 +1687,14 @@ impl ShardState {
             self.to_freeze.clear();
             self.memtables.keys().copied().collect()
         } else {
-            std::mem::take(&mut self.to_freeze)
+            let mut keys = std::mem::take(&mut self.to_freeze);
+            // A tablet being split, merged or moved freezes whatever it holds.
+            for key in self.memtables.keys() {
+                if self.moving.contains(&key.0) && !keys.contains(key) {
+                    keys.push(*key);
+                }
+            }
+            keys
         };
         let visible = self.shared.shm.visible_seqno();
         let view = self.shared.view.load();
@@ -1567,7 +1711,8 @@ impl ShardState {
                 slot.active.table.is_empty(),
                 slot.active.max_seqno()
             );
-            if slot.active.table.is_empty() || !(all || big) {
+            let forced = self.moving.contains(&key.0);
+            if slot.active.table.is_empty() || !(all || big || forced) {
                 continue;
             }
             if slot.active.max_seqno() > visible {
@@ -1701,6 +1846,9 @@ impl ShardState {
                     }
                 }
                 self.reclaim_retired();
+                if self.retire_idle_slots().is_err() {
+                    self.poisoned = true;
+                }
                 self.report_shares_flushed(ctx);
                 self.advance_checkpoint(ctx);
             }
@@ -1710,6 +1858,8 @@ impl ShardState {
                 // flushing until reopen; a failure while closing makes the close unclean.
                 trace!("shard {} flush failed: {e}", self.id.0);
                 self.requeue_frozen();
+                // A tablet change waiting for this flush gives up (its tablets stay put).
+                self.abort_op(crate::error::io_other("flush", e.to_string()), ctx);
                 // Whoever asked for this flush hears about the failure now rather than
                 // waiting for a retry that may never come (a dead device).
                 let msg = e.to_string();
@@ -1741,6 +1891,7 @@ impl ShardState {
         self.check_flush_waiters();
         self.spawn_flush(ctx);
         self.maintain(ctx);
+        self.progress_op(ctx);
         self.try_finish_close(ctx);
     }
 
@@ -1797,7 +1948,6 @@ impl ShardState {
             .collect();
         self.flushed.retain(|k, _| !tablets.contains(&k.0));
         self.flush_queue.retain(|i| !tablets.contains(&i.tablet));
-        self.dropped.extend(tablets.iter().copied());
         if keys.is_empty() {
             return Ok(());
         }
@@ -1854,8 +2004,26 @@ impl ShardState {
         first
     }
 
+    /// `preset` (a retried commit's first timestamp) when it is still at or above this
+    /// shard's floor, else a fresh default timestamp.
+    fn default_ts_or(&mut self, preset: Timestamp) -> Timestamp {
+        let raised = self.shared.ts_raises[usize::from(self.id.0)]
+            .0
+            .load(Ordering::Acquire);
+        if preset != 0 && preset >= self.ts_floor.max(raised) {
+            self.raise_ts_floor(preset);
+            return preset;
+        }
+        self.default_ts()
+    }
+
     fn default_ts(&mut self) -> Timestamp {
         let now = self.shared.vfs.now_micros();
+        // A shard that handed us a tablet raised our floor to its own (D11).
+        let raised = self.shared.ts_raises[usize::from(self.id.0)]
+            .0
+            .load(Ordering::Acquire);
+        self.ts_floor = self.ts_floor.max(raised);
         let ts = now.max(self.ts_floor + 1);
         trace!(
             "shard {} default_ts now={now} floor={} -> {ts}",
@@ -2030,6 +2198,7 @@ impl ShardState {
         let mut key_buf = std::mem::take(&mut self.key_buf);
         let mut result = Ok(());
         self.touched_slots.clear();
+        let track = !self.replaying && self.shared.balance.interval_nanos > 0;
         for (i, m) in batch.iter().enumerate() {
             let m = match m {
                 Ok(m) => m,
@@ -2053,6 +2222,9 @@ impl ShardState {
                         continue;
                     }
                     last_route = Some((m.table, m.row, id));
+                    if track {
+                        self.note_write(id, m.row);
+                    }
                     id
                 }
             };
@@ -2182,6 +2354,12 @@ impl ShardState {
         if self.pending.is_empty() {
             return;
         }
+        trace!(
+            "shard {} run_group pending={} stall={}",
+            self.id.0,
+            self.pending.len(),
+            self.stall.score
+        );
         if self.stalled(ctx) {
             return;
         }
@@ -2214,6 +2392,11 @@ impl ShardState {
                 self.settle(m, Ok(()), ctx);
                 continue;
             }
+            // Rows in a tablet being split, merged or moved wait for the change (a PREPARE is
+            // refused and retried); rows another shard owns now go there.
+            let Some(mut m) = self.route_member(m, ctx) else {
+                continue;
+            };
             // A conditional member reads the applied state: its written rows, its read
             // keys and its predicate row must not be touched by an earlier member of this
             // group (it then waits for the next group, with everything after it, so per-row
@@ -2353,7 +2536,10 @@ impl ShardState {
                 }
                 Some(_) => {}
             }
-            // A flush frees room (one that failed is tried again).
+            // A flush frees room (one that failed is tried again), and so do empty slots.
+            if self.retire_idle_slots().is_err() {
+                self.poisoned = true;
+            }
             let _ = self.freeze(true);
             self.spawn_flush(ctx);
         } else {
@@ -2384,7 +2570,7 @@ impl ShardState {
                 MemberKind::Single => {
                     m.seqno = next;
                     next += 1;
-                    m.commit_ts = self.default_ts();
+                    m.commit_ts = self.default_ts_or(m.commit_ts);
                 }
                 MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
                     self.raise_ts_floor(m.commit_ts);
@@ -2823,8 +3009,29 @@ impl ShardState {
         let seqno = self.reserve(1);
         self.held.insert(seqno);
         self.publish_watermark();
-        let commit_ts = self.default_ts();
         let shards: Vec<ShardId> = req.parts.iter().map(|(s, _)| *s).collect();
+        trace!(
+            "shard {} coordinates {seqno} over {shards:?} routed with map v{}",
+            self.id.0, req.map_version
+        );
+        // Above every participant's floor too: a tablet's default timestamps never go
+        // backwards whichever shard coordinates a commit touching it (D11).
+        let mut floor = 0;
+        for s in &shards {
+            if let Some(f) = self.shared.ts_floors.get(usize::from(s.0)) {
+                floor = floor.max(f.0.load(Ordering::Acquire));
+            }
+        }
+        let commit_ts = match req.commit_ts {
+            Some(ts) if ts >= floor => {
+                self.raise_ts_floor(ts);
+                ts
+            }
+            _ => {
+                self.ts_floor = self.ts_floor.max(floor);
+                self.default_ts()
+            }
+        };
         self.coord.insert(
             seqno,
             Coord {
@@ -2837,10 +3044,17 @@ impl ShardState {
                 failed: None,
                 decided: false,
                 shards: shards.clone(),
+                parts: req.parts.clone(),
+                validate: req.validate.clone(),
+                map_version: req.map_version,
+                moved: false,
+                commit_ts,
+                epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
             },
         );
         for (shard, bytes) in req.parts {
             let msg = ShardMsg::Prepare(PrepareReq {
+                map_version: req.map_version,
                 seqno,
                 commit_ts,
                 coordinator: self.id,
@@ -2898,6 +3112,7 @@ impl ShardState {
             ticket: None,
             failed: None,
             reserved: 0,
+            map_version: req.map_version,
         });
     }
 
@@ -2908,20 +3123,24 @@ impl ShardState {
         error: Option<PrepareError>,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        trace!(
+            "shard {} on_prepared {seqno} from {} {error:?}",
+            self.id.0, _from.0
+        );
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
-        if let Some(e) = error
-            && c.failed.is_none()
-        {
-            c.failed = Some(e.into());
+        match error {
+            Some(PrepareError::Moved) => c.moved = true,
+            Some(e) if c.failed.is_none() => c.failed = Some(e.into()),
+            _ => {}
         }
         c.prepared += 1;
         if c.prepared < c.participants || c.decided {
             return;
         }
         c.decided = true;
-        if c.failed.is_some() {
+        if c.failed.is_some() || c.moved {
             let shards = c.shards.clone();
             self.aborted.insert(seqno);
             for p in shards {
@@ -2971,6 +3190,7 @@ impl ShardState {
             ticket: None,
             failed: None,
             reserved: 0,
+            map_version: 0,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
@@ -3033,6 +3253,7 @@ impl ShardState {
             if !self.pending.is_empty() {
                 let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
             }
+            self.progress_op(ctx);
         } else if commit {
             // Decided commit, share gone: it was never prepared here (refused) or failed.
             error = Some(PrepareError::Io);
@@ -3064,12 +3285,36 @@ impl ShardState {
             c.failed = Some(e.into());
         }
         c.applied += 1;
+        trace!(
+            "shard {} on_applied {seqno}: {}/{} moved={}",
+            self.id.0, c.applied, c.participants, c.moved
+        );
         if c.applied < c.participants {
             return;
         }
         let mut c = self.coord.remove(&seqno).expect("present");
         self.held.remove(&seqno);
         self.publish_watermark();
+        if c.moved
+            && c.failed.is_none()
+            && let Some(reply) = c.reply.take()
+        {
+            // A participant was splitting, merging or moving a tablet: the commit was
+            // aborted everywhere and runs again once the tablet map has changed.
+            self.retries.push(CoordinateReq {
+                parts: std::mem::take(&mut c.parts),
+                durability: c.durability,
+                reply,
+                submitted_at: c.submitted_at,
+                validate: c.validate.take(),
+                map_version: c.map_version,
+                commit_ts: Some(c.commit_ts),
+                epoch: c.epoch,
+            });
+            self.run_retries(ctx);
+            self.try_finish_close(ctx);
+            return;
+        }
         let outcome = match c.failed.take() {
             Some(e) => Err(e),
             None => {
@@ -3090,13 +3335,18 @@ impl ShardState {
 
     // ---- checkpoints ----
 
-    /// Whether the checkpoint may not pass `l` yet.
-    fn needed(&self, l: &Logged) -> bool {
+    /// Whether the checkpoint may not pass `l` yet. Slots are checked against the catalog's
+    /// flushed seqnos, not this shard's: after a move or a reopen a slot's records may sit
+    /// in this stream while another shard owns and flushes it. A slot whose tablet is gone
+    /// (its table dropped, or retired by a split or merge once everything in it was flushed)
+    /// needs nothing.
+    fn needed(&self, catalog: &Catalog, l: &Logged) -> bool {
         let unflushed = |slots: &[(TabletId, FamilyId)]| {
-            slots
-                .iter()
-                .filter(|s| !self.dropped.contains(&s.0))
-                .any(|s| self.flushed.get(s).copied().unwrap_or(0) < l.seqno)
+            slots.iter().any(|s| {
+                catalog
+                    .flushed_through(s.0, s.1)
+                    .is_some_and(|f| f < l.seqno)
+            })
         };
         // A COMMIT this shard coordinates is unneeded once every participant's share is in
         // SSTs (decision D24); its own PREPARE (logged before it) goes with it.
@@ -3118,6 +3368,10 @@ impl ShardState {
 
     /// Tells coordinators about applied shares whose slots are all in SSTs now.
     fn report_shares_flushed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let view = self.shared.view.load_full();
+        if view.version == 0 {
+            return;
+        }
         trace!(
             "shard {} report shares: flushed={:?} unreported={:?}",
             self.id.0, self.flushed, self.unreported
@@ -3126,7 +3380,9 @@ impl ShardState {
         while i < self.unreported.len() {
             let u = &self.unreported[i];
             let done = u.slots.iter().all(|s| {
-                self.dropped.contains(&s.0) || self.flushed.get(s).copied().unwrap_or(0) >= u.seqno
+                view.catalog
+                    .flushed_through(s.0, s.1)
+                    .is_none_or(|f| f >= u.seqno)
             });
             if done {
                 let u = self.unreported.swap_remove(i);
@@ -3144,8 +3400,13 @@ impl ShardState {
     /// Pops every unneeded record from the front of the log and, if the checkpoint moved,
     /// submits a `WalCheckpoint` edit (one in flight at a time).
     fn advance_checkpoint(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let view = self.shared.view.load_full();
+        if view.version == 0 {
+            // Still opening: the catalog is not published yet.
+            return;
+        }
         while let Some(front) = self.log.front() {
-            if self.needed(front) {
+            if self.needed(&view.catalog, front) {
                 break;
             }
             let l = self.log.pop_front().expect("checked");
@@ -3246,7 +3507,8 @@ impl ShardState {
     fn owned_slots(&self, view: &View) -> Vec<(TabletId, FamilyId)> {
         let mut out = Vec::new();
         for t in view.tablets.iter() {
-            if t.shard != self.id {
+            // A tablet being split, merged or moved starts no compaction.
+            if t.shard != self.id || self.moving.contains(&t.id) {
                 continue;
             }
             for f in view.catalog.family_ids_of(t.table) {
@@ -3523,9 +3785,17 @@ impl ShardState {
                     None => self.compaction_error = Some(e),
                 }
                 self.compaction_backoff = true;
+                // No retry from here: against a dead device it would spin without end.
+                // The next flush or manifest change (`Maintain`) tries again; a waiting full
+                // compaction is served now.
+                if self.compact_all.is_empty() {
+                    self.progress_op(ctx);
+                    return;
+                }
             }
         }
         self.maintain(ctx);
+        self.progress_op(ctx);
     }
 
     // ---- close ----
@@ -3563,13 +3833,14 @@ impl ShardState {
             self.aborted,
         );
         if tracing() {
+            let view = self.shared.view.load_full();
             for l in &self.log {
                 eprintln!(
                     "  shard {} log: seqno {} {:?} needed={}",
                     self.id.0,
                     l.seqno,
                     l.kind,
-                    self.needed(l)
+                    self.needed(&view.catalog, l)
                 );
             }
         }
@@ -3577,6 +3848,9 @@ impl ShardState {
             || !self.coord.is_empty()
             || !self.prepared.is_empty()
             || !self.pending.is_empty()
+            || self.op.is_some()
+            || !self.parked.is_empty()
+            || !self.retries.is_empty()
         {
             return;
         }
@@ -3782,6 +4056,15 @@ impl ShardState {
                     self.spawn_flush(ctx);
                 }
                 self.reclaim_retired();
+                if !self.replaying {
+                    // Another shard's flush may cover slots logged in this stream (moved
+                    // tablets, a reopen), and the tablet map may have changed.
+                    self.report_shares_flushed(ctx);
+                    self.advance_checkpoint(ctx);
+                    self.progress_op(ctx);
+                    self.run_retries(ctx);
+                }
+                self.try_finish_close(ctx);
             }
             ShardMsg::CompactionDone {
                 inputs,
@@ -3819,11 +4102,21 @@ impl ShardState {
                 self.maintain(ctx);
             }
             ShardMsg::Kick => {}
+            ShardMsg::TabletOp { op, reply } => self.request_tablet_op(op, reply, ctx),
+            ShardMsg::TabletOpDone { result } => self.on_tablet_op_done(result, ctx),
+            ShardMsg::Balance { reply } => self.maybe_balance(true, reply, ctx),
             ShardMsg::Close => {
                 if !self.closing {
                     self.closing = true;
                     self.close_stage = CloseStage::Draining;
                     self.shared.closing.store(true, Ordering::Release);
+                    // Queued tablet changes never start; the running one finishes.
+                    for (_, reply) in self.op_queue.drain(..) {
+                        if let Some(r) = reply {
+                            r.notify(Err(Error::Closed));
+                        }
+                    }
+                    self.run_retries(ctx);
                 }
                 self.try_finish_close(ctx);
             }
@@ -3880,6 +4173,11 @@ impl ShardHandler for ShardState {
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
         self.run_group(ctx);
+        if self.op.is_some() {
+            self.progress_op(ctx);
+        }
+        self.run_retries(ctx);
+        self.maybe_balance(false, None, ctx);
         if (self.freeze_all_pending
             || (!self.to_freeze.is_empty() && self.freeze_deferred)
             || self.wait_room)
