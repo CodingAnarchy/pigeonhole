@@ -478,3 +478,45 @@ fn a_committed_extent_in_a_grown_tail_survives_power_loss() {
     opened.file().read_at(&mut buf, extent.offset()).unwrap();
     assert_eq!(&buf, b"published");
 }
+
+/// A process killed between a growth's `fallocate` and its `sync_all` leaves the longer
+/// length in the page cache but not on disk. The restarted writer sizes its allocator from
+/// that length, so it must make it durable before handing out the tail: its root commits
+/// sync only with `sync_data` (issue #72).
+#[test]
+fn a_tail_grown_before_a_process_crash_survives_a_later_power_loss() {
+    let sim = SimVfs::new(1);
+    let vfs: VfsRef = sim.clone();
+    let pager = Pager::create(&vfs, Path::new(PATH)).unwrap();
+    // The interrupted growth: `Pager::allocate` extends the file, then the process dies
+    // before its `sync_all`.
+    let len = pager.file().len().unwrap();
+    pager.file().allocate(len, len).unwrap();
+    drop(pager);
+    sim.crash(CrashKind::Process);
+
+    let opened = Pager::open(&vfs, Path::new(PATH), true).unwrap();
+    let pager = opened.finish([]).unwrap();
+    let extent = pager.allocate(1).unwrap();
+    assert!(
+        extent.offset() >= len,
+        "the extent lies in the inherited tail"
+    );
+    pager.write(extent, 0, b"published").unwrap();
+    let root = Root {
+        manifest_version: 1,
+        snapshot: Some(extent),
+        snapshot_len: 9,
+        ..Default::default()
+    };
+    pager.commit_root(root).unwrap();
+    drop(pager);
+
+    sim.crash(CrashKind::Power);
+    let opened = Pager::open(&vfs, Path::new(PATH), true).unwrap();
+    assert_eq!(opened.root(), root);
+    let pager = opened.finish(root.snapshot).unwrap();
+    let mut buf = [0u8; 9];
+    pager.read(extent, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"published");
+}

@@ -10,7 +10,7 @@ use common::*;
 use pigeonhole_format::wal::FRAME_SIZE;
 use pigeonhole_format::{Durability, Lsn};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
-use pigeonhole_io::{ErrorKind, VfsRef};
+use pigeonhole_io::{ErrorKind, OpenOptions, VfsRef};
 use pigeonhole_wal::{CommitTicket, Error, Wal, WalOptions, WalStream};
 
 /// SplitMix64, so the workload is reproducible from its seed.
@@ -390,4 +390,41 @@ fn buffered_may_be_lost_to_power_loss_but_never_out_of_order() {
         lost_something |= got.records.len() < appended;
     }
     assert!(lost_something, "no seed lost an unsynced record");
+}
+
+/// A process killed between a slot's `allocate` and its `sync_all` leaves the slot in the
+/// page cache but not on disk. Recovery adopts it as blank, so it must make the length
+/// durable before the new stream writes there: appends sync with `sync_data` (issue #72).
+#[test]
+fn a_slot_grown_before_a_process_crash_survives_a_later_power_loss() {
+    let sim = SimVfs::new(1);
+    let vfs: VfsRef = sim.clone();
+    let opts = opts(4, 0);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    let t1 = wal
+        .append(&batch(1, 100).record(), Durability::GroupSync)
+        .unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+    // The interrupted growth.
+    let mut rw = OpenOptions::read();
+    rw.write = true;
+    let file = vfs.open(&path(), rw).unwrap();
+    file.allocate(opts.segment_size, opts.segment_size).unwrap();
+    drop(file);
+    sim.crash(CrashKind::Process);
+
+    let (_, r) = replay(&vfs, Lsn::default()).unwrap();
+    let mut wal = r.into_stream(opts).unwrap();
+    let t2 = wal
+        .append(&batch(2, 100).record(), Durability::GroupSync)
+        .unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+
+    sim.crash(CrashKind::Power);
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), [1, 2]);
+    assert_eq!(got.end, t2.end);
+    assert!(t2.end > t1.end);
 }

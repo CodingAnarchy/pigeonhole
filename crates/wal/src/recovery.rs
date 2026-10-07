@@ -123,6 +123,10 @@ impl Recovery {
     ) -> Result<Recovery> {
         let path = stream_path(db_path, stream);
         let file = vfs.open(&path, open_existing())?;
+        // A process that died between a slot's `allocate` and its `sync_all` left the page
+        // cache's length longer than the disk's. The grid (and the blank slots the stream
+        // adopts) come from that length, and appends sync with `sync_data`: make it durable.
+        file.sync_all()?;
         let grid = Grid::read(&file, stream, db_id)?;
         let start = match &grid {
             Some(g) if checkpoint.epoch() == 0 => g
