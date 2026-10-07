@@ -47,5 +47,7 @@ Deletes write markers: one cell version (`delete_cell`), a whole column (`delete
 ## Multi-process readers (Phase 4; available now)
 One writer process and any number of reader processes on the same host can open the same `.phdb` file; readers see each commit as soon as the writer publishes it. A reader's handle (`Pigeonhole::open_reader`) has no write methods, but the reader process still opens the file **read-write** and writes nothing to it: the processes coordinate with byte-range locks on the file, and some of those locks are exclusive, which POSIX grants only on a writable file descriptor. This is the same requirement SQLite has in WAL mode. So every reader process needs write permission on the database file, and a database on read-only media cannot be opened by readers.
 
+A reader's snapshot survives the writer closing. Once a new writer opens, though, reads through snapshots taken before the restart fail with `SnapshotExpired`, because the new writer may reuse the space those snapshots read. Take a new snapshot and redo the read. Snapshots taken after the restart read normally.
+
 ## Where next
 [Getting started](getting-started.md) · [Data modeling](data-modeling.md) · [Agent reference](agent-reference.md)

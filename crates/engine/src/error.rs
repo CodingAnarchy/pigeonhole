@@ -79,6 +79,9 @@ pub enum Error {
     /// Writes are stalled (L0 too deep, or the memtable arena full) and the caller asked not
     /// to wait.
     Busy,
+    /// A reader process's snapshot was taken before a writer restart: the new writer may
+    /// have reused the space it names. Take a new snapshot.
+    SnapshotExpired,
 }
 
 impl fmt::Display for Error {
@@ -119,6 +122,10 @@ impl fmt::Display for Error {
             Error::Busy => f.write_str(
                 "writes stalled past the write-stall timeout (transient: retry later), or a \
                  batch larger than the arena (never fits: split it or raise memtable_budget)",
+            ),
+            Error::SnapshotExpired => f.write_str(
+                "the snapshot was taken before a writer restart and can no longer be read; \
+                 take a new snapshot",
             ),
         }
     }

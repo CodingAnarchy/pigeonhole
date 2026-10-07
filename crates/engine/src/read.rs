@@ -565,7 +565,14 @@ impl ScanCursor {
     }
 
     /// Advances to the next row with at least one visible cell. Returns `false` at the end.
+    /// In a reader process, fails with [`Error::SnapshotExpired`] once a writer restarted
+    /// after the snapshot was taken.
     pub fn next_row(&mut self) -> Result<bool> {
+        let advanced = self.advance_row();
+        self.snapshot.checked(advanced)
+    }
+
+    fn advance_row(&mut self) -> Result<bool> {
         if self.done {
             return Ok(false);
         }
@@ -634,7 +641,8 @@ impl ScanCursor {
             return Ok(None);
         }
         if let Some(i) = self.last_lane.take() {
-            self.lanes[i].fetch()?;
+            let fetched = self.lanes[i].fetch();
+            self.snapshot.checked(fetched)?;
         }
         while self.lane_idx < self.lanes.len() {
             let i = self.lane_idx;

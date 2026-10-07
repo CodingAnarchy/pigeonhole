@@ -15,10 +15,11 @@ use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, SstId, TableId, Tablet
 use pigeonhole_io::FileRef;
 use pigeonhole_memtable::MemtableReader;
 use pigeonhole_runtime::ShardId;
+use pigeonhole_shm::ShmRegion;
 use pigeonhole_sst::SstReader;
 
-use crate::Result;
 use crate::catalog::Catalog;
+use crate::{Error, Result};
 
 /// A tablet, its owning shard and its row range `[start, end)` (a test hook).
 #[cfg(feature = "test-hooks")]
@@ -591,6 +592,25 @@ impl View {
 #[derive(Debug)]
 pub(crate) struct LiveSnapshot {
     pub count: Arc<AtomicUsize>,
+    /// The region generation the snapshot was taken in: its pin lives there.
+    pub shm: ShmRegion,
+}
+
+impl LiveSnapshot {
+    /// Fails with [`Error::SnapshotExpired`] once a new writer generation exists. The pin
+    /// lives in the abandoned region, so the new writer may have freed and reused the
+    /// extents the snapshot names (issue #140). A read through the snapshot checks this
+    /// **after** it read, seqlock style: a writer marks the old region abandoned and
+    /// publishes its generation before it allocates anything, so a read that finished before
+    /// either is visible read what the snapshot names.
+    pub(crate) fn check_current(&self) -> Result<()> {
+        // Orders the read's loads (shared-memory arenas included) before the state load.
+        std::sync::atomic::fence(Ordering::Acquire);
+        if self.shm.is_stale() {
+            return Err(Error::SnapshotExpired);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for LiveSnapshot {
@@ -622,6 +642,20 @@ impl Snapshot {
     /// The pinned view.
     pub fn view(&self) -> &Arc<View> {
         &self.view
+    }
+
+    /// Reader processes: [`Error::SnapshotExpired`] if a writer restarted since the snapshot
+    /// was taken; call after a read through it (see `LiveSnapshot::check_current`). Always
+    /// `Ok` in the writer process.
+    pub(crate) fn check_current(&self) -> Result<()> {
+        self._live.as_ref().map_or(Ok(()), |l| l.check_current())
+    }
+
+    /// `result` of a read through this snapshot, or [`Error::SnapshotExpired`] in its place
+    /// when the snapshot expired during the read (whatever the read returned).
+    pub(crate) fn checked<T>(&self, result: Result<T>) -> Result<T> {
+        self.check_current()?;
+        result
     }
 
     /// The same view at an older seqno (a view covers every seqno at or below the one it was
