@@ -654,6 +654,39 @@ fn deletes_follow_the_timestamp_rules() {
     assert_eq!(value(&t, b"s", "a", b"q").as_deref(), Some(&b"2"[..]));
 }
 
+/// D74 (HBase semantics), the behavior behind issues #67 and #68: a put with an older explicit
+/// timestamp stays hidden by a column or family delete until a bottommost compaction purges
+/// the delete; after that it shows. The engine also compacts in the background (after a
+/// reopen, say), so the model suite leaves such writes out.
+#[test]
+fn a_compaction_purge_uncovers_later_puts_at_older_timestamps() {
+    let db = db();
+    let t = table(&db);
+    t.mutate(b"c").put("a", b"q", b"v").commit().unwrap();
+    t.mutate(b"c").delete_column("a", b"q").commit().unwrap();
+    t.mutate(b"f").put("a", b"q", b"v").commit().unwrap();
+    t.mutate(b"f").delete_family("a").commit().unwrap();
+    // Two SSTs, so the compaction below rewrites them (one would only move down a level).
+    db.flush().unwrap();
+    for row in [&b"c"[..], b"f"] {
+        t.mutate(row)
+            .put_at("a", b"q", 1, b"before")
+            .commit()
+            .unwrap();
+        assert_eq!(value(&t, row, "a", b"q"), None, "hidden by the delete");
+    }
+    db.compact().unwrap();
+    for row in [&b"c"[..], b"f"] {
+        // The put hidden before the purge was dropped with the delete.
+        assert_eq!(value(&t, row, "a", b"q"), None);
+        t.mutate(row)
+            .put_at("a", b"q", 2, b"after")
+            .commit()
+            .unwrap();
+        assert_eq!(value(&t, row, "a", b"q").as_deref(), Some(&b"after"[..]));
+    }
+}
+
 #[test]
 fn counters_and_typed_values() {
     let db = db();

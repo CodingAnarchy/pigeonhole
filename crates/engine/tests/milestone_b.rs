@@ -911,7 +911,9 @@ fn a_purge_record_covers_entries_dropped_by_an_earlier_compaction() {
         .filter(|r| r.family == family)
         .collect();
     assert!(
-        records.iter().any(|r| !r.bottommost && r.max_seqno >= hidden),
+        records
+            .iter()
+            .any(|r| !r.bottommost && r.max_seqno >= hidden),
         "no middle-level compaction took the put: {records:?}"
     );
     maintain(&mut store, true);
