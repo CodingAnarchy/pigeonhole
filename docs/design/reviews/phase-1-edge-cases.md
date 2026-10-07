@@ -1,6 +1,6 @@
 # Phase 1 edge-case review (#90)
 
-Five read-only reviewers covered the nine #90 areas on main at `6756c2c`. Their raw findings follow, one section per reviewer. Finding IDs (for example `5-6 5.1`) are referenced from the issues below.
+Five read-only reviewers covered the nine #90 areas on main at `6756c2c`. Their raw findings follow, one section per reviewer. Finding IDs (for example `5-6 5.1`) are referenced from the issues below. The throwaway probe tests that reproduced the findings are not kept in the tree; they are in commit e49a287a78eb (`git fetch origin pull/152/head`, then `git show e49a287a78eb:docs/design/reviews/phase-1-probes/<file>`), and each fix PR turns its probe into a real regression test.
 
 ## Issues filed
 
@@ -292,7 +292,7 @@ cannot be caught by the sim suites.
 ## Issue #90 edge-case review: areas 3 (embedding modes) and 4 (platform differences)
 
 Reviewed `main` at 6756c2c (read-only). I ran the experiments in a `git archive` copy at
-a scratch copy (probe: `phase-1-probes/zz_review_appowned.rs`) on macOS (APFS, Rust 1.98.1).
+a scratch copy (probe: `docs/design/reviews/phase-1-probes/zz_review_appowned.rs` at commit e49a287a78eb) on macOS (APFS, Rust 1.98.1).
 
 Severity key: **B** = blocker for the Phase 1 gate, **S** = should-fix in Phase 1, **D(n)** = defer to Phase n.
 
@@ -468,7 +468,7 @@ In engine-owned mode the same loop busy-yields for the whole duration of another
 ## Issue #90 review: areas 5 (error paths) and 6 (unbounded resources)
 
 Reviewed: `main` at 6756c2c (read-only). The repro tests ran in a `git archive` copy at
-`phase-1-probes/review56.rs` (copy into `crates/engine/tests/` to run), built with `cargo test -p pigeonhole-engine --release --test review56`.
+`docs/design/reviews/phase-1-probes/review56.rs` at commit e49a287a78eb (copy into `crates/engine/tests/` to run), built with `cargo test -p pigeonhole-engine --release --test review56`.
 Line numbers refer to `main`.
 
 Severity key: **B** = blocker for the Phase 1 gate, **S** = should-fix (Phase 1 unless noted), **D** = defer (phase given).
@@ -567,7 +567,7 @@ Severity key: **B** = blocker for the Phase 1 gate, **S** = should-fix (Phase 1 
 ## Issue #90, area 7: concurrency edges
 
 Reviewed `main` at 6756c2c. Probes are in the scratch copy at
-`phase-1-probes/area7_probes.rs` (copy into `crates/engine/tests/`). Run them with
+`docs/design/reviews/phase-1-probes/area7_probes.rs` at commit e49a287a78eb (copy into `crates/engine/tests/`). Run them with
 `cargo test -p pigeonhole-engine --test area7_probes -- --nocapture --test-threads=1`.
 P4 also needs two env-gated sleeps added to the scratch copy's `engine.rs` and `shard.rs`
 (`PROBE_READER_DELAY`, `PROBE_WRITER_DELAY`). The sleeps only widen windows that already exist.
@@ -696,7 +696,7 @@ The doc says backup runs "while writers run" with no such caveat.
 ## Issue #90 review: areas 8 (defaults) and 9 (error and doc truthfulness)
 
 Reviewed main at 6756c2c. Probes ran against a `git archive` copy at
-a scratch copy, with new examples in `phase-1-probes/example_*.rs` (copy into `crates/pigeonhole/examples/`).
+a scratch copy, with new examples in `docs/design/reviews/phase-1-probes/example_*.rs` at commit e49a287a78eb (copy into `crates/pigeonhole/examples/`).
 They ran on macOS (10 CPUs, APFS) in release mode. Findings marked "by inspection" were not executed.
 
 ### Defaults table (as found)
