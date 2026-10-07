@@ -41,8 +41,10 @@ fn options(vfs: pigeonhole_io::VfsRef) -> EngineOptions {
 }
 
 fn table(db: &Engine, name: &str) -> Arc<TableInfo> {
-    let mut f = FamilyOptions::default();
-    f.compression = Compression::None;
+    let f = FamilyOptions {
+        compression: Compression::None,
+        ..FamilyOptions::default()
+    };
     db.create_table(name, &[("f".into(), f)]).unwrap()
 }
 
