@@ -31,5 +31,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install libclang (bindgen for librocksdb-sys)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev clang
       - run: cargo clippy -p pigeonhole-bench --all-targets --all-features -- -D warnings
       - run: cargo test -p pigeonhole-bench --all-features
