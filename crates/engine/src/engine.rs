@@ -203,6 +203,24 @@ fn chunk_size(budget: u64) -> usize {
     chunk & !63
 }
 
+/// Most `(tablet, family)` slots an arena of `arena_len` bytes in `chunk` chunks serves: a
+/// quarter of its chunks (every slot written to takes a chunk, usually two before it
+/// freezes, and frozen memtables keep theirs until flushed).
+pub(crate) fn max_slots(arena_len: usize, chunk: usize) -> usize {
+    arena_len / chunk.max(1) / 4
+}
+
+/// The arena chunk size with tablet changes on (D136, #104): at least 256 chunks per arena,
+/// so every shard serves 64 slots whatever the budget, and smaller still when the tablets
+/// placed at open need more (a reopen with fewer shards after splits). Never below 1 KiB.
+fn tablet_chunk_size(arena_len: usize, placed_slots: usize) -> usize {
+    let mut chunk = (arena_len / 256).clamp(1024, ShardArena::DEFAULT_CHUNK);
+    if max_slots(arena_len, chunk) < placed_slots {
+        chunk = arena_len / (4 * placed_slots);
+    }
+    chunk.max(1024) & !63
+}
+
 fn block_cache(bytes: usize, shards: usize) -> Arc<BlockCache> {
     Arc::new(if bytes == 0 {
         BlockCache::disabled()
@@ -407,6 +425,7 @@ impl Engine {
         let _clean = opened.clean_shutdown();
         let (mut catalog, manifest_extents) =
             manifest::load(&opened, shards, Arc::clone(&registry))?;
+        // With tablet changes on, owners are placed within the arenas' slot budgets below.
         catalog.reassign(shards);
         let mut live = manifest_extents;
         live.extend(catalog.data_extents());
@@ -430,14 +449,23 @@ impl Engine {
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?;
         let presence = Presence::acquire(&file)?;
 
-        // 4. Shard states over the arenas.
+        // 4. Shard states over the arenas. With tablet changes on, every tablet is placed so
+        //    no shard holds more slots than its arena serves where the tablets allow, and the
+        //    chunk size shrinks when they do not (#104).
+        let chunk = if options.tablet_changes {
+            let arena_len = shm.arena(0).2;
+            let base = tablet_chunk_size(arena_len, 0);
+            let placed = catalog.place(shards, max_slots(arena_len, base));
+            tablet_chunk_size(arena_len, placed)
+        } else {
+            chunk_size(options.memtable_budget)
+        };
         let tablets = Arc::new(TabletMap::build(1, &catalog.tablets()));
         let manifest_version = pager.root().manifest_version;
         let cache = block_cache(options.block_cache_bytes, shards);
         let live_views = Arc::new(LiveViews::default());
         // A memtable's allocation grows a chunk at a time: a threshold at or below one chunk
         // would freeze it at its first insert.
-        let chunk = chunk_size(options.memtable_budget);
         let freeze_bytes = options.memtable_freeze_bytes.max(2 * chunk as u64);
         let empty_view = Arc::new(View {
             version: 0,

@@ -712,3 +712,236 @@ fn probe_cross_shard_commit_ts_after_move() {
         db.step();
     }
 }
+
+/// Opens `/db/data.phdb` on `vfs` (application-owned, tablet changes on, no balancer) and
+/// table `t` with `families` families, creating it if missing.
+fn open_wide(
+    vfs: &Arc<SimVfs>,
+    shards: usize,
+    families: usize,
+    tweak: impl FnOnce(&mut EngineOptions),
+) -> Db {
+    let mut o = EngineOptions::new(vfs.clone());
+    o.create_if_missing = true;
+    o.shards = shards;
+    o.pin_threads = false;
+    o.memtable_budget = 4 << 20;
+    o.reader_slots = 4;
+    o.tablet_changes = true;
+    o.balance_interval_nanos = 0;
+    tweak(&mut o);
+    let (engine, shards) =
+        Engine::open_application_owned(Path::new("/db/data.phdb"), o).expect("open");
+    let table = engine.table("t").unwrap_or_else(|| {
+        let fams: Vec<(String, FamilyOptions)> = (0..families)
+            .map(|i| (format!("f{i:02}"), FamilyOptions::default()))
+            .collect();
+        engine.create_table("t", &fams).expect("table")
+    });
+    Db {
+        vfs: Arc::clone(vfs),
+        engine,
+        shards,
+        table,
+    }
+}
+
+impl Db {
+    fn close(mut self) {
+        self.engine.close().unwrap();
+        for _ in 0..8 {
+            self.step();
+        }
+    }
+
+    fn flush(&mut self) {
+        let m = self.engine.flush_pending().unwrap();
+        self.drive(m).unwrap();
+    }
+
+    /// One commit writing `value` to `rows` in every family of the table.
+    fn put_wide(&mut self, rows: &[Vec<u8>], value: &[u8]) -> pigeonhole_engine::Result<()> {
+        let mut wb = WriteBatch::new();
+        for f in &self.table.families {
+            for row in rows {
+                wb.put(self.table.id, f.id, row, b"q", None, ValueRef::Bytes(value))
+                    .unwrap();
+            }
+        }
+        let mut pc = self.engine.submit(wb, Some(Durability::Buffered))?;
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..1_000_000 {
+            if let Poll::Ready(r) = Pin::new(&mut pc).poll(&mut cx) {
+                return r.map(|_| ());
+            }
+            self.step();
+        }
+        panic!("a wide commit never resolved")
+    }
+
+    fn get_in(&self, family: usize, row: &[u8]) -> Option<Vec<u8>> {
+        let f = self.table.families[family].id;
+        self.engine
+            .get_latest(self.table.id, f, row, b"q")
+            .expect("get")
+            .map(|c| {
+                let ValueRef::Bytes(v) = c.value() else {
+                    panic!("bytes")
+                };
+                v.to_vec()
+            })
+    }
+
+    fn assert_wide(&self, rows: &[Vec<u8>], value: &[u8]) {
+        for (i, _) in self.table.families.iter().enumerate() {
+            for row in rows {
+                assert_eq!(self.get_in(i, row).as_deref(), Some(value), "family {i}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_reopen_with_fewer_shards_after_splits_keeps_writes_flowing() {
+    // Issue #104: a 20-family table split into four tablets, one per shard, is 80
+    // `(tablet, family)` slots. Owners are not persisted (D130), so a reopen on one shard
+    // puts all 80 on it: more slots than its arena had chunks, so a commit writing them all
+    // was refused with `Busy` for ever. The arena's chunks now shrink to serve the slots
+    // placed at open, and a reopen on two shards spreads the tablets within each arena.
+    let vfs = SimVfs::new(104);
+    let mut db = open_wide(&vfs, 4, 20, |_| {});
+    let mut rows: Vec<Vec<u8>> = (0..64).map(key).collect();
+    rows.sort();
+    db.put_wide(&rows, b"a").unwrap();
+    // A shard holding more than 16 families splits (it used to be capped at a quarter of
+    // 64 chunks for budgets up to 16 MiB).
+    let id = db.table.id;
+    let home = db.ranges()[0].1;
+    let others: Vec<u16> = (0..4).filter(|s| *s != home).collect();
+    for (at, to) in [(32, others[0]), (16, others[1]), (48, others[2])] {
+        let m = db.engine.split_tablet_pending(id, &rows[at]).unwrap();
+        db.drive(m).unwrap();
+        let m = db.engine.move_tablet_pending(id, &rows[at], to).unwrap();
+        db.drive(m).unwrap();
+    }
+    let owners: std::collections::BTreeSet<u16> = db.ranges().iter().map(|r| r.1).collect();
+    assert_eq!(owners.len(), 4, "{:?}", db.ranges());
+    db.put_wide(&rows, b"b").unwrap();
+    db.flush();
+    db.close();
+
+    // One shard: all 80 slots. Wide commits and flushes of every slot keep working.
+    let mut db = open_wide(&vfs, 1, 20, |_| {});
+    assert_eq!(db.ranges().len(), 4);
+    db.assert_wide(&rows, b"b");
+    for v in [b"c", b"d", b"e"] {
+        db.put_wide(&rows, v).unwrap();
+        db.flush();
+    }
+    db.assert_wide(&rows, b"e");
+    db.close();
+
+    // Two shards: 40 slots each, both take writes.
+    let mut db = open_wide(&vfs, 2, 20, |_| {});
+    let owners: Vec<u16> = db.ranges().iter().map(|r| r.1).collect();
+    assert_eq!(owners.iter().filter(|s| **s == 0).count(), 2, "{owners:?}");
+    db.put_wide(&rows, b"f").unwrap();
+    db.flush();
+    db.assert_wide(&rows, b"f");
+    db.close();
+}
+
+/// Commits (one row in family 0, then a flush) until one waits for arena room, with a
+/// reader process pinning its first view the whole time (so every retired chunk stays).
+fn cycles_until_a_stall_under_a_reader_pin(tablet_changes: bool) -> u32 {
+    use pigeonhole_io::ProcessId;
+    let writer = ProcessId {
+        pid: 1,
+        start_time: 1,
+    };
+    let reader = ProcessId {
+        pid: 2,
+        start_time: 1,
+    };
+    let options = |vfs: &Arc<SimVfs>| {
+        let mut o = EngineOptions::new(vfs.clone());
+        o.create_if_missing = true;
+        o.shards = 1;
+        o.pin_threads = false;
+        // A 512 KiB budget in a 2 MiB arena: 8 KiB chunks with tablet changes on or off.
+        o.memtable_budget = 512 << 10;
+        o.reader_slots = 4;
+        o.tablet_changes = tablet_changes;
+        o.balance_interval_nanos = 0;
+        o
+    };
+    let vfs = SimVfs::new(96);
+    vfs.enter_process(writer);
+    let mut db = open_wide(&vfs, 1, 4, |o| *o = options(&vfs));
+    db.put_wide(&[b"r".to_vec()], b"v").unwrap();
+    db.flush();
+    vfs.enter_process(reader);
+    let r = Engine::open_reader(Path::new("/db/data.phdb"), options(&vfs)).unwrap();
+    let pin = r.snapshot().unwrap();
+    vfs.enter_process(writer);
+    let f = db.table.families[0].id;
+    let mut cycles = 0;
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut pc = loop {
+        assert!(cycles < 10_000, "never stalled");
+        let mut wb = WriteBatch::new();
+        let row = format!("r{cycles:05}");
+        wb.put(
+            db.table.id,
+            f,
+            row.as_bytes(),
+            b"q",
+            None,
+            ValueRef::Bytes(b"v"),
+        )
+        .unwrap();
+        let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+        let mut done = false;
+        for _ in 0..1_000 {
+            if let Poll::Ready(r) = Pin::new(&mut pc).poll(&mut cx) {
+                r.unwrap();
+                done = true;
+                break;
+            }
+            db.step();
+        }
+        if !done {
+            assert!(db.engine.metrics().stalls.0 > 0, "cycle {cycles} hangs");
+            break pc;
+        }
+        cycles += 1;
+        db.flush();
+    };
+    // Releasing the pin frees the room the stalled commit waits for.
+    vfs.enter_process(reader);
+    drop(pin);
+    r.close().unwrap();
+    vfs.enter_process(writer);
+    for _ in 0..100_000 {
+        if let Poll::Ready(r) = Pin::new(&mut pc).poll(&mut cx) {
+            r.unwrap();
+            break;
+        }
+        db.step();
+    }
+    db.close();
+    cycles
+}
+
+#[test]
+fn idle_slots_do_not_churn_chunks_under_a_reader_pin() {
+    // Issue #104: retiring every idle slot after each flush gave a slot written once per
+    // flush a fresh memtable each cycle, and a reader process's pin keeps every retired
+    // chunk: the arena filled twice as fast as with tablet changes off. Idle slots now
+    // retire only when a commit waits for arena room.
+    let off = cycles_until_a_stall_under_a_reader_pin(false);
+    let on = cycles_until_a_stall_under_a_reader_pin(true);
+    eprintln!("commits before a stall: off {off}, on {on}");
+    assert!(off > 50, "{off}");
+    assert!(on + 2 >= off, "on {on}, off {off}");
+}

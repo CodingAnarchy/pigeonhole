@@ -1882,7 +1882,8 @@ impl ShardState {
 
     /// Retires the memtables of slots that hold nothing (an empty active memtable, nothing
     /// frozen): each pins a whole arena chunk, and a shard with many tablets would otherwise
-    /// fill its arena with empty memtables. A later write creates the slot again.
+    /// fill its arena with empty memtables. A later write creates the slot again. Called only
+    /// when a commit waits for arena room (#104).
     fn retire_idle_slots(&mut self) -> Result<()> {
         if !self.tablets_on() {
             return Ok(());
@@ -2164,10 +2165,10 @@ impl ShardState {
                         self.retired.push((version, m.table.retire()));
                     }
                 }
+                // Idle slots keep their memtables here: retiring them after every flush
+                // would churn a fresh chunk per slot each cycle, and a reader process's pin
+                // keeps every retired chunk (#104). They retire under arena pressure only.
                 self.reclaim_retired();
-                if self.retire_idle_slots().is_err() {
-                    self.poisoned = true;
-                }
                 self.report_shares_flushed(ctx);
                 self.advance_checkpoint(ctx);
             }
