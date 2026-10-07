@@ -251,8 +251,15 @@ impl OpenedPager {
     /// Marks `live` extents allocated (everything else is free) and returns a usable pager.
     /// `live` must include the manifest snapshot and log extents, every SST and every blob
     /// extent. Exact duplicates are accepted (tablets may share an SST after a split);
-    /// overlapping, misaligned or out-of-file extents fail with [`Error::Format`].
+    /// overlapping, misaligned or out-of-file extents fail with [`Error::Format`]. A writable
+    /// pager first makes the file's current length durable (`sync_all`).
     pub fn finish(self, live: impl IntoIterator<Item = Extent>) -> Result<Pager> {
+        // The allocator is sized from the length the page cache shows, which a process that
+        // died between a growth's `fallocate` and its `sync_all` left longer than the disk's.
+        // Make it durable before handing out that tail: root commits sync with `sync_data`.
+        if self.writable {
+            self.file.sync_all()?;
+        }
         let frontier = self.file.len()?.div_ceil(UNIT_BYTES);
         let alloc = Alloc::load(frontier, live).map_err(|e| {
             let what = match e {
