@@ -64,9 +64,9 @@
 
 mod alloc;
 
-use std::collections::hash_map::RandomState;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::hash::{BuildHasher, Hasher};
+use std::hash::Hasher;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -371,16 +371,14 @@ fn grow_error(e: pigeonhole_io::Error) -> Error {
     }
 }
 
-/// A fresh database id. There is no randomness source in the `Vfs`, so this mixes the
-/// standard library's per-process random hash keys with the clocks and the path.
+/// A fresh database id: [`Vfs::random_u64`](pigeonhole_io::Vfs::random_u64) mixed with the
+/// path, so a simulated `Vfs` replays the same id from its seed.
 fn random_db_id(vfs: &VfsRef, path: &Path) -> [u8; 16] {
     let mut id = [0u8; 16];
     let (halves, _) = id.as_chunks_mut::<8>();
     for (i, half) in halves.iter_mut().enumerate() {
-        let mut h = RandomState::new().build_hasher();
-        h.write_u64(vfs.now_micros());
-        h.write_u64(vfs.monotonic_nanos());
-        h.write_u32(vfs.current_process().pid);
+        let mut h = DefaultHasher::new();
+        h.write_u64(vfs.random_u64());
         h.write(path.as_os_str().as_encoded_bytes());
         h.write_usize(i);
         *half = h.finish().to_le_bytes();
