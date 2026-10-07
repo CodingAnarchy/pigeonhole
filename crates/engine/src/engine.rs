@@ -1154,6 +1154,13 @@ impl Engine {
 
     /// Submits a batch: routes each row to its shard (inline if called on the owning shard),
     /// single-shard fast path or two-phase commit. `None` uses the writer default.
+    ///
+    /// **Order.** A commit submitted after an earlier one was acknowledged is applied after
+    /// it. Commits still in flight together have no order between them, even from one
+    /// thread: with `EngineOptions::tablet_changes` on, a commit that reached a tablet's old
+    /// owner during a move is applied after a later one that reached the new owner directly
+    /// (D132). To order two writes to one row, wait for the first before submitting the
+    /// second.
     pub fn submit(
         &self,
         batch: WriteBatch,
@@ -1534,6 +1541,17 @@ impl Engine {
             .map(|f| f.0.load(Ordering::Acquire))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Publishes `ts` as `shard`'s default-timestamp floor, whatever the shard assigned: what
+    /// a coordinator reads when it loads the floor just before the shard publishes a higher
+    /// one (a race between threads, issue #105). The shard's own floor is unchanged.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn publish_stale_ts_floor(&self, shard: u16, ts: pigeonhole_format::Timestamp) {
+        self.inner.shared.ts_floors[usize::from(shard)]
+            .0
+            .store(ts, Ordering::Release);
     }
 
     /// Splits, merges and moves completed since open, summed over shards.

@@ -453,6 +453,57 @@ fn reads_are_never_blocked_by_a_move() {
 }
 
 #[test]
+fn commit_order_across_a_move() {
+    // Issue #105, the guarantee `Engine::submit` documents: a commit submitted after an
+    // earlier one was acknowledged is applied after it, also when the earlier one waited
+    // (parked) on a tablet's old owner during a move. Commits in flight together are all
+    // applied, in either order (D132).
+    let mut db = open(2, |_| {});
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    db.put(b"row", b"before");
+    let to = 1 - db.ranges()[0].1;
+    let submit = |db: &Db, v: &[u8]| {
+        let mut wb = WriteBatch::new();
+        wb.put(id, f, b"row", b"q", None, ValueRef::Bytes(v))
+            .unwrap();
+        db.engine.submit(wb, Some(Durability::Buffered)).unwrap()
+    };
+    let wait = |db: &mut Db, mut pc: pigeonhole_engine::PendingCommit| {
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(r) = Pin::new(&mut pc).poll(&mut cx) {
+                return r.expect("commit").seqno;
+            }
+            db.step();
+        }
+    };
+    // Acknowledged, then the next: the order holds across the move.
+    let m = db.engine.move_tablet_pending(id, b"row", to).unwrap();
+    db.step();
+    let parked = submit(&db, b"parked");
+    db.drive(m).unwrap();
+    assert_eq!(db.ranges()[0].1, to);
+    let first = wait(&mut db, parked);
+    let second = db.put(b"row", b"after");
+    assert!(second > first);
+    assert_eq!(db.get(b"row").map(|(_, v)| v), Some(b"after".to_vec()));
+    // In flight together across a move back: both are applied, in some order.
+    let m = db.engine.move_tablet_pending(id, b"row", 1 - to).unwrap();
+    db.step();
+    let a = submit(&db, b"a");
+    db.drive(m).unwrap();
+    let b = submit(&db, b"b");
+    let (a, b) = (wait(&mut db, a), wait(&mut db, b));
+    assert_ne!(a, b);
+    let newest = if a > b { b"a".to_vec() } else { b"b".to_vec() };
+    assert_eq!(db.get(b"row").map(|(_, v)| v), Some(newest));
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
 fn the_default_timestamp_floor_travels_with_a_tablet() {
     // The clock never moves: every default timestamp comes from the floor (D11).
     let mut db = open(2, |_| {});
@@ -503,6 +554,51 @@ fn a_full_compaction_rewrites_a_lone_sst() {
         .unwrap();
     db.commit(wb);
     assert_eq!(db.get(b"row"), Some((ts + 5, b"below".to_vec())));
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
+    // Issue #105: a coordinator picks a cross-shard commit's timestamp above the floors it
+    // reads, but a participant may assign higher default timestamps before the PREPARE
+    // arrives (another thread published its floor just after the coordinator read it; the
+    // hook replays that read). The participant refuses, and the retry takes a fresh
+    // timestamp above everything it assigned, so its tablet's timestamps never go back.
+    let mut db = open(2, |_| {});
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    // The frozen clock: each default timestamp is the shard's floor plus one.
+    let mut last = 0;
+    for i in 0..10u8 {
+        db.put(b"z", &[i]);
+        last = db.get(b"z").unwrap().0;
+    }
+    assert!(db.get(b"a").is_none());
+    db.engine.publish_stale_ts_floor(high, 0);
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"low"))
+        .unwrap();
+    wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"both"))
+        .unwrap();
+    db.commit(wb);
+    let (ts, v) = db.get(b"z").unwrap();
+    assert_eq!(v, b"both");
+    assert!(
+        ts > last,
+        "{ts} <= {last}: the commit went below the participant's floor"
+    );
+    assert_eq!(db.get(b"a").unwrap().0, ts);
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();

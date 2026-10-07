@@ -690,6 +690,9 @@ pub(crate) enum PrepareError {
     /// A row's tablet is being split, merged or moved, or now lives on another shard: the
     /// coordinator retries through the new tablet map.
     Moved,
+    /// The commit timestamp is below a default timestamp this shard already assigned (D11,
+    /// issue #105): the coordinator retries at once with a fresh timestamp.
+    BelowFloor,
     Busy,
     Closed,
     TooLarge,
@@ -700,7 +703,7 @@ impl From<PrepareError> for Error {
     fn from(e: PrepareError) -> Self {
         match e {
             PrepareError::Conflict => Error::Conflict,
-            PrepareError::Moved | PrepareError::Busy => Error::Busy,
+            PrepareError::Moved | PrepareError::BelowFloor | PrepareError::Busy => Error::Busy,
             PrepareError::Closed => Error::Closed,
             PrepareError::TooLarge => Error::RecordTooLarge,
             PrepareError::Io => poisoned_error(),
@@ -974,6 +977,8 @@ struct Coord {
     validate: Option<(Seqno, Vec<ReadKey>)>,
     map_version: u64,
     moved: bool,
+    /// A participant refused `commit_ts` as below its floor: the retry takes a fresh one.
+    below_floor: bool,
     commit_ts: Timestamp,
     /// Shards that may hold `commit_ts` because of this commit (see `Preset::own`).
     own: Vec<ShardId>,
@@ -3619,6 +3624,7 @@ impl ShardState {
                 },
                 map_version: req.map_version,
                 moved: false,
+                below_floor: false,
                 commit_ts,
                 own,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
@@ -3705,6 +3711,10 @@ impl ShardState {
         };
         match error {
             Some(PrepareError::Moved) => c.moved = true,
+            Some(PrepareError::BelowFloor) => {
+                c.moved = true;
+                c.below_floor = true;
+            }
             Some(e) if c.failed.is_none() => c.failed = Some(e.into()),
             Some(_) => {}
             // It raised its floor to the commit timestamp.
@@ -3880,21 +3890,27 @@ impl ShardState {
             && let Some(reply) = c.reply.take()
         {
             // A participant was splitting, merging or moving a tablet: the commit was
-            // aborted everywhere and runs again once the tablet map has changed.
-            self.retries.push(CoordinateReq {
+            // aborted everywhere and runs again once the tablet map has changed. One that
+            // refused the timestamp as below its floor runs again at once, with a fresh one.
+            let req = CoordinateReq {
                 parts: std::mem::take(&mut c.parts),
                 durability: c.durability,
                 reply,
                 submitted_at: c.submitted_at,
                 validate: c.validate.take(),
                 map_version: c.map_version,
-                commit_ts: Some(Preset {
+                commit_ts: (!c.below_floor).then(|| Preset {
                     ts: c.commit_ts,
                     own: std::mem::take(&mut c.own),
                 }),
                 epoch: c.epoch,
-            });
-            self.run_retries(ctx);
+            };
+            if c.below_floor {
+                self.retry(req, ctx);
+            } else {
+                self.retries.push(req);
+                self.run_retries(ctx);
+            }
             self.try_finish_close(ctx);
             return;
         }
