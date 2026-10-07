@@ -62,7 +62,6 @@ fn open_and_close_of_a_small_database_write_little() {
     }
     db.close().unwrap();
     let total = written(&vfs);
-    eprintln!("open wrote {at_open} bytes; open, 100 commits and close wrote {total}");
     // Before #143: 128 MiB at open (a zero-filled segment per stream) and 384 MiB more in
     // the background (two spares each).
     assert!(at_open <= 1 << 20, "open wrote {at_open} bytes");
