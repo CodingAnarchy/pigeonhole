@@ -363,6 +363,10 @@ fn text(b: &[u8]) -> String {
 }
 
 fn show(op: &ModelOp) -> String {
+    format!("{}:{}", op_table(op), show_in_table(op))
+}
+
+fn show_in_table(op: &ModelOp) -> String {
     match op {
         ModelOp::Put {
             row,
@@ -1301,6 +1305,20 @@ impl World {
     /// Takes the compactions the engine committed; applies the purge of every durable
     /// bottommost one to the model and re-checks the held snapshots.
     fn drain_compactions(&mut self) -> Result<(), Fail> {
+        // A commit still in flight may hold a seqno a compaction already took as input: its
+        // purge waits until that commit is in the model (issue #98).
+        let upto = if self.in_flight.is_empty() {
+            Seqno::MAX
+        } else {
+            self.engine_seqnos.last().copied().unwrap_or(0)
+        };
+        self.drain_compactions_upto(upto)
+    }
+
+    /// Applies the purges of committed compactions whose inputs hold no seqno above `upto`
+    /// (`max_seqno <= upto`); the others stay pending. The model then takes every purge
+    /// between the commits it orders by seqno, as the engine did.
+    fn drain_compactions_upto(&mut self, upto: Seqno) -> Result<(), Fail> {
         let store = self.store.as_ref().expect("store open");
         let mut records = store.engine.take_compactions();
         records.append(&mut self.pending_purges);
@@ -1319,7 +1337,7 @@ impl World {
         let family_names = store.family_names.clone();
         let mut applied = false;
         for r in records {
-            if r.manifest_version > published {
+            if r.manifest_version > published || r.max_seqno > upto {
                 self.pending_purges.push(r);
                 continue;
             }
@@ -2787,6 +2805,8 @@ impl World {
                     );
                 }
             }
+            // Compactions whose inputs ended below this commit come before it.
+            self.drain_compactions_upto(seqno - 1)?;
             let m = match self.model.try_commit(&c.ops, ts, c.durability) {
                 Ok(m) => m,
                 Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
@@ -3289,6 +3309,7 @@ impl World {
             info.seqno,
             ops.iter().map(show).collect::<Vec<_>>().join("; ")
         ));
+        self.drain_compactions_upto(info.seqno - 1)?;
         let m = match self.model.try_commit(&ops, ts, durability) {
             Ok(m) => m,
             Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
