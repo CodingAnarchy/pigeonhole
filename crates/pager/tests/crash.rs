@@ -144,6 +144,8 @@ struct Progress {
     appends: u64,
     rollovers: u64,
     relocations: u64,
+    /// Data extents placed in the freed tail of a trimmed output.
+    tail_reuses: u64,
 }
 
 /// The workload state carried across steps.
@@ -198,13 +200,20 @@ fn step(st: &mut State, rng: &mut Rng, progress: &mut Progress) -> pigeonhole_pa
         write_data(pager, d)?;
         next.push(d);
     }
-    // An output trimmed before it is published: written into an oversized extent, whose
-    // tail is freed at once and may be reused before the commit (issue #106).
-    if version.is_multiple_of(4) {
-        let big = pager.allocate(256 << 10)?;
+    // Outputs trimmed before they are published (issue #106), written into an oversized
+    // extent whose tail is freed at once: to the smallest class on even versions, from
+    // 1 MiB to an intermediate 256 KiB on odd ones. Data allocated next may land in the
+    // freed tail and is published in the same root as the trimmed head.
+    if version.is_multiple_of(2) {
+        let (alloc_bytes, keep_class) = if version.is_multiple_of(4) {
+            (256 << 10, 0)
+        } else {
+            (1 << 20, 2)
+        };
+        let big = pager.allocate(alloc_bytes)?;
         let tag = rng_free_tag(version);
         let small = Extent {
-            size_class: 0,
+            size_class: keep_class,
             ..big
         };
         // Written through `big` (the extent allocated); the stamps land where `small` has them.
@@ -213,6 +222,20 @@ fn step(st: &mut State, rng: &mut Rng, progress: &mut Progress) -> pigeonhole_pa
         let extent = pager.trim(big, small.len());
         assert_eq!(extent, small);
         next.push(Data { extent, tag });
+        // Allocate tail-sized data until one lands in the freed tail (a lower free block of
+        // that size is taken first), and publish all of it.
+        for i in 0..4 {
+            let d = Data {
+                extent: pager.allocate(small.len())?,
+                tag: rng_free_tag(version ^ ((i + 1) << 32)),
+            };
+            write_data(pager, d)?;
+            next.push(d);
+            if overlaps(d.extent, big) {
+                progress.tail_reuses += 1;
+                break;
+            }
+        }
     }
     // An abandoned output: allocated, written, never published.
     if rng.below(4) == 0 {
@@ -339,6 +362,7 @@ fn recover(vfs: &VfsRef, progress: &Progress, seed: u64) -> u64 {
 
 fn sweep(name: &str, plan: FaultPlan, seeds: &[u64]) {
     let mut relocations = 0;
+    let mut tail_reuses = 0;
     for &seed in seeds {
         // A clean run sizes the sweep.
         let clean = SimVfs::new(seed);
@@ -346,14 +370,15 @@ fn sweep(name: &str, plan: FaultPlan, seeds: &[u64]) {
         let mut coverage = Progress::default();
         workload(&clean_ref, seed, &mut coverage).unwrap();
         println!(
-            "{name} seed {seed}: {} appends, {} rollovers, {} relocations",
-            coverage.appends, coverage.rollovers, coverage.relocations
+            "{name} seed {seed}: {} appends, {} rollovers, {} relocations, {} tail reuses",
+            coverage.appends, coverage.rollovers, coverage.relocations, coverage.tail_reuses
         );
         assert!(
             coverage.appends > 0 && coverage.rollovers >= 2,
             "{coverage:?}"
         );
         relocations += coverage.relocations;
+        tail_reuses += coverage.tail_reuses;
         let total = clean.mutating_ops();
         let mut recovered_versions = std::collections::BTreeSet::new();
         // Under Miri, crash at a handful of evenly spaced points instead of every one.
@@ -393,6 +418,7 @@ fn sweep(name: &str, plan: FaultPlan, seeds: &[u64]) {
         );
     }
     assert!(relocations > 0, "{name}: no seed relocated anything");
+    assert!(tail_reuses > 0, "{name}: no seed reused a trimmed tail");
 }
 
 /// Two fresh seeds plus a fixed one whose workload is known to relocate (relocation needs

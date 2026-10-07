@@ -478,6 +478,13 @@ impl Inner {
             Err(_) => st.poisoned = true,
         }
         drop(st);
+        if result.is_ok() {
+            // The manifest extents the durable root names may no longer be abandoned.
+            let mut alloc = lock(&self.alloc);
+            for e in p.root.snapshot.into_iter().chain(p.root.log) {
+                alloc.publish(e);
+            }
+        }
         self.committing.store(false, Ordering::Release);
         result
     }
@@ -626,9 +633,19 @@ impl Pager {
 
     /// Returns an extent that was allocated but never published in a root (an abandoned
     /// flush or compaction output). Freed immediately.
+    ///
+    /// Never call it on a published extent: retire that instead. The pager refuses (and
+    /// debug-asserts on) every extent it knows a durable root references — those loaded at
+    /// open and the manifest snapshot and log of each committed root — and retired or
+    /// unallocated ones. It cannot tell an SST or blob extent published in this session
+    /// from pending output (it never reads the manifest), so that part is the caller's
+    /// contract.
     pub fn abandon(&self, extent: Extent) {
         let freed = lock(&self.inner.alloc).release_live(extent);
-        debug_assert!(freed, "abandon of an extent that is not live: {extent:?}");
+        debug_assert!(
+            freed,
+            "abandon of an extent that is not pending output: {extent:?}"
+        );
     }
 
     /// Shrinks an extent that was allocated but never published in a root to the smallest
@@ -638,7 +655,9 @@ impl Pager {
     /// length before it is published. Unpublished space is never referenced by a durable
     /// root, so this needs no retirement (D8).
     ///
-    /// Returns `extent` unchanged if `bytes` exceeds it or it is not live.
+    /// Returns `extent` unchanged if `bytes` exceeds it. Never call it on a published
+    /// extent; as with [`Pager::abandon`], the pager refuses (returns `extent` unchanged,
+    /// and debug-asserts) any extent it knows is published, retired or unallocated.
     pub fn trim(&self, extent: Extent, bytes: u64) -> Extent {
         let Ok(class) = class_for(bytes) else {
             return extent;
@@ -647,7 +666,10 @@ impl Pager {
             return extent;
         }
         let trimmed = lock(&self.inner.alloc).shrink_live(extent, class);
-        debug_assert!(trimmed, "trim of an extent that is not live: {extent:?}");
+        debug_assert!(
+            trimmed,
+            "trim of an extent that is not pending output: {extent:?}"
+        );
         if !trimmed {
             return extent;
         }
