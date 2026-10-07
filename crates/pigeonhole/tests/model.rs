@@ -124,6 +124,9 @@ struct Config {
     /// `Options::tablet_changes`, with a balancer tuned so tablets split, move and merge
     /// within a run. On unless `PIGEONHOLE_TABLET_CHANGES=0`.
     tablet_changes: bool,
+    /// With `tablet_changes`, tune the balancer so tablets change within a short run (else
+    /// the engine's defaults, under which nothing changes in these runs).
+    fast_balancer: bool,
 }
 
 impl Config {
@@ -148,6 +151,7 @@ impl Config {
             flush_ppm: 20_000,
             compact_ppm: 20_000,
             tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").as_deref() != Ok("0"),
+            fast_balancer: true,
         }
     }
 
@@ -365,15 +369,17 @@ impl Run {
     }
 
     fn open(&mut self) -> Result<(), String> {
-        let options = Options::default()
+        let mut options = Options::default()
             .vfs(Arc::clone(&self.vfs) as _)
             .shards(self.cfg.shards)
             .memtable_budget(self.cfg.memtable_budget)
             .wal_segment_size(256 << 10)
             .block_cache(self.cfg.block_cache)
-            .tablet_changes(self.cfg.tablet_changes)
+            .tablet_changes(self.cfg.tablet_changes);
+        if self.cfg.fast_balancer {
             // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
-            .tablet_balance(Duration::from_micros(15), 3, 8 << 10);
+            options = options.tablet_balance(Duration::from_micros(15), 3, 8 << 10);
+        }
         let db = Pigeonhole::open(DB, options).map_err(|e| format!("open: {e}"))?;
         let mut tables = Vec::new();
         for name in TABLES {
@@ -1217,6 +1223,10 @@ fn run_with_flushed_commits(seed: u64) -> (Run, Rng) {
     (cfg.crash_ppm, cfg.mid_commit_crash_ppm, cfg.reopen_ppm) = (0, 0, 0);
     cfg.memtable_budget = 256 << 10;
     cfg.block_cache = 0;
+    // The background I/O these runs arm a power loss for must be a flush alone: with the
+    // fast balancer a size split started beside it, and its manifest commit could take the
+    // crash before the commit under test was acknowledged (seed 51 on CI, PR #168).
+    cfg.fast_balancer = false;
     let mut run = Run::new(seed, cfg).expect("open");
     let mut rng = Rng::new(seed);
     for op in Workload::new(seed, "t", run.cfg.spec.clone()).take(60) {

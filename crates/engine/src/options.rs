@@ -73,7 +73,9 @@ pub struct EngineOptions {
     pub tablet_changes: bool,
     /// How often each shard's balancer looks at its tablets (nanoseconds, default 100 ms):
     /// size splits, write-skew splits, moves to colder shards and merges of cold tablets.
-    /// 0 turns the balancer off (tablets then change only through explicit requests). Only
+    /// An idle shard backs off: a pass that finds nothing to do, with no writes and no tablet
+    /// change since the last one, doubles the interval up to 10 s (never below this one);
+    /// the next write or tablet change returns it to this interval. 0 turns the balancer off (tablets then change only through explicit requests). Only
     /// read when `tablet_changes` is on.
     pub balance_interval_nanos: u64,
     /// Rows a shard must write in one balancer interval before write skew moves or splits

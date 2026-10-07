@@ -7,10 +7,14 @@ D129 kept `EngineOptions::tablet_changes` off until splits, merges, moves and th
 
 **Interim behavior (this PR):** both default to `true`. `false` turns them off, and `phdb-bench --no-tablet-changes` does the same for the bench. The engine harness (`Config::standard`) and the public model suite follow the default; `PIGEONHOLE_TABLET_CHANGES=0` runs them off, and `=1` adds the fast balancer to the engine harness (the public suite always uses it). New tests keep the off path covered: `model_check::runs_with_tablet_changes_off_match_the_model`, and the public suite's `quiet_runs_with_tablet_changes_off_match_the_model` and `crashes_with_tablet_changes_off_match_a_durable_prefix`.
 
-## Q: Should an idle application-owned shard wake every 100 ms for the balancer?
-D146 has each shard arm a clock timer for its next balancer pass, so the balancer runs without messages and idle shards merge cold tablets. With tablet changes on by default, `Shard::next_wakeup` is never `None`: an idle application-owned shard is woken every `balance_interval_nanos` (100 ms), and an engine-owned one runs a short pass on the same schedule. The `idle_cpu` tests still pass.
+## Proposed decision: an idle shard's balancer backs off (amends D146)
+D146 has each shard arm a clock timer for its next balancer pass, so idle shards still merge cold tablets. With tablet changes on by default, that is every user's cost: 10 wakeups a second per shard, for ever, on an idle database.
 
-**Interim behavior:** unchanged. `Shard::next_wakeup` documents the pass, and its doc example checks for at most 100 ms instead of `None`. Alternatives: stop arming the timer once a pass finds nothing to do and no writes arrived since the last one (re-arm on the next write), or back off the interval while idle.
+**Decision (this PR):** a pass that finds nothing to do (no change started, no cleanup queued, no change running or queued) after no writes and no tablet change on any shard since the last pass (`Shared::tablet_epoch` unchanged) doubles the shard's interval, up to 10 s (`BALANCE_IDLE_CAP_NANOS`; never below `balance_interval_nanos`). A write, a queued or running change, or a moved `tablet_epoch` returns it to `balance_interval_nanos` and pulls the next pass forward to one base interval from then. `Shard::next_wakeup` is bounded by the current interval: 100 ms after activity, up to 10 s while idle. Test: `tablets::an_idle_shard_backs_off_its_balancer_and_a_write_resets_it`.
+
+Proposed amendment to D146, "Idle shards": add "…and backs off while idle: each pass that finds nothing to do after no writes and no tablet change doubles the interval, up to 10 s; a write or a tablet change returns it to `balance_interval_nanos`."
+
+Consequence: an idle shard notices skew published by other shards, or cold tablets to consolidate, up to 10 s later. Merges of cold tablets wait for idle passes anyway, so they finish later on an idle database, which costs nothing.
 
 ## Q: Two milestone_b tests pin the arena layout without tablet changes
 `flush_and_compact_are_busy_*_when_snapshots_hold_the_arena` (#116, D138) starve an arena of 64 chunks of 32 KiB through chunk rounding. With tablet changes on, D140 cuts the arena into 256 chunks of 8 KiB, and the same rows leave room, so `flush` succeeds. The scenario tests D138's `flush`/`compact` semantics, which do not depend on tablets.

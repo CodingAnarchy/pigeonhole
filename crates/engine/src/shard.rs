@@ -1812,6 +1812,12 @@ pub(crate) struct ShardState {
     skew_pass: Option<u64>,
     /// Wakes the shard for its next balancer pass (#103).
     balance_timer: Option<Arc<TimerState>>,
+    /// The current balancer interval: the base `balance_interval_nanos`, doubled after each
+    /// idle pass up to 10 s (0 before the first pass).
+    balance_interval: u64,
+    /// `Shared::tablet_epoch` at the last balancer pass: a change since then ends the
+    /// idle backoff.
+    balance_epoch: u64,
 }
 
 impl std::fmt::Debug for ShardState {
@@ -1920,6 +1926,8 @@ impl ShardState {
             arrived: HashMap::new(),
             skew_pass: None,
             balance_timer: None,
+            balance_interval: 0,
+            balance_epoch: 0,
         }
     }
 
