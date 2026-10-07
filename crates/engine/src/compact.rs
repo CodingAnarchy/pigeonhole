@@ -400,6 +400,21 @@ impl CompactionWork {
         output: Option<CompactionOutput>,
     ) -> Result<Waiter<Result<ManifestVersion>>> {
         let catalog = Arc::clone(&self.shared.view.load().catalog);
+        if catalog.tablet(self.task.tablet).is_none() {
+            // The table was dropped while this ran (its SSTs went with it, retired at the
+            // drop): nothing to publish. Free only what this job wrote.
+            if let Some(out) = output {
+                for (_, meta) in out.added {
+                    self.shared.pager.abandon(meta.extent);
+                }
+                for blob in out.new_blob_files {
+                    for e in blob.extents {
+                        self.shared.pager.abandon(e);
+                    }
+                }
+            }
+            return Err(Error::TableNotFound("the table was dropped".to_owned()));
+        }
         let (edits, readers) = self.edits(&catalog, output)?;
         let (tx, rx) = completion();
         let req = ManifestReq {

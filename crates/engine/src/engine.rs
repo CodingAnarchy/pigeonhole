@@ -1274,8 +1274,9 @@ impl Engine {
         Ok(out)
     }
 
-    /// Bytes the pager holds allocated (not retired) that neither the catalog nor the
-    /// manifest root references: output in flight, or leaked. Zero when idle (test hook).
+    /// Bytes the pager holds (allocated or retired) that neither the catalog nor the
+    /// manifest root references: output in flight, extents awaiting reclamation, or leaked.
+    /// Zero once idle and reclaimed (test hook).
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn unreferenced_bytes(&self) -> u64 {
@@ -1291,11 +1292,8 @@ impl Engine {
         live.sort();
         live.dedup();
         let referenced: u64 = live.iter().map(|e| e.len()).sum();
-        shared
-            .pager
-            .stats()
-            .allocated_bytes
-            .saturating_sub(referenced)
+        let stats = shared.pager.stats();
+        (stats.allocated_bytes + stats.retired_bytes).saturating_sub(referenced)
     }
 
     /// The compactions committed since the last call (or since open).

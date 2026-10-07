@@ -534,23 +534,26 @@ fn dropping_application_owned_shards_mid_commit_still_closes_cleanly() {
     db.close().unwrap();
 }
 
-fn file_len(vfs: &Arc<SimVfs>) -> u64 {
-    vfs.open(Path::new(DB), pigeonhole_io::OpenOptions::read())
-        .unwrap()
-        .len()
-        .unwrap()
-}
-
 #[test]
 fn compact_after_drop_table_reclaims_the_dropped_table() {
-    // #83: a compaction of a table that is dropped while it runs is refused at commit
-    // (`TableNotFound`). That error used to fail the waiting `compact()` (or the next one,
-    // for a background compaction), and the refused output was never freed, so `shrink`
-    // could not release it.
-    let vfs = SimVfs::new(31);
+    // One SST: the full compaction is a trivial move, which looked the moved SST up after
+    // the drop and failed with `Corruption("moved SST .. is gone")`.
+    drop_table_during_compaction(31, 1);
+    // Two SSTs: a rewrite, refused at commit with `TableNotFound`, which failed the waiting
+    // `compact()` (or the next one, for a background compaction); its output was never
+    // freed, so `shrink` could not release it.
+    drop_table_during_compaction(32, 2);
+}
+
+/// #83: drops a table while a full compaction of it (planned from `gone_ssts` L0 SSTs) has
+/// started but not committed.
+fn drop_table_during_compaction(seed: u64, gone_ssts: u32) {
+    let vfs = SimVfs::new(seed);
     let mut o = owned(Arc::clone(&vfs), 2);
     o.compaction.l0_trigger = u32::MAX;
     o.compaction.level_base_bytes = u64::MAX;
+    // Only explicit flushes, so the SST count (and the compaction's kind) is fixed.
+    o.memtable_freeze_bytes = 512 << 10;
     let db = Engine::open(Path::new(DB), o.clone()).unwrap();
     let family = || vec![("f".into(), FamilyOptions::default())];
     let keep = db.create_table("keep", &family()).unwrap();
@@ -558,8 +561,10 @@ fn compact_after_drop_table_reclaims_the_dropped_table() {
     // The dropped table's SSTs land after the kept table's, at the file's tail.
     write_rows(&db, &keep, 0..200, Durability::GroupSync);
     db.flush().unwrap();
-    write_rows(&db, &gone, 0..200, Durability::GroupSync);
-    db.flush().unwrap();
+    for i in 0..gone_ssts {
+        write_rows(&db, &gone, i * 100..i * 100 + 100, Durability::GroupSync);
+        db.flush().unwrap();
+    }
     db.close().unwrap();
     drop(db);
 
@@ -567,7 +572,6 @@ fn compact_after_drop_table_reclaims_the_dropped_table() {
     // dropped, then the compaction runs and commits.
     o.compaction_threads = 0;
     let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o.clone()).unwrap();
-    let before = file_len(&vfs);
     let mut compaction = db.compact_pending(Some(gone.id)).unwrap();
     for s in &mut shards {
         // A deadline already passed: handle the message (start the compaction task), but
@@ -596,14 +600,17 @@ fn compact_after_drop_table_reclaims_the_dropped_table() {
         }
     };
     result.unwrap();
-    assert_eq!(db.unreferenced_bytes(), 0, "the refused output was freed");
 
-    // The dropped table's SSTs were retired and the refused output abandoned: the file
-    // shrinks below its length before the compaction.
+    // The dropped table's SSTs were retired at the drop and the refused output abandoned:
+    // once `shrink` has reclaimed, the pager holds nothing no root references, and the space
+    // went back to the filesystem.
     let released = db.shrink().unwrap();
     assert!(released > 0);
-    let after = file_len(&vfs);
-    assert!(after < before, "{after} >= {before}");
+    assert_eq!(
+        db.unreferenced_bytes(),
+        0,
+        "everything unreferenced was freed"
+    );
     db.close().unwrap();
     while shards.iter_mut().any(|s| s.run_once(u64::MAX)) {}
     drop(shards);
