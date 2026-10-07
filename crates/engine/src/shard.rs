@@ -3484,8 +3484,9 @@ impl ShardState {
             return;
         };
         // After a failure, nothing retries until a flush or new writes clear the backoff
-        // (a stall then retries it), so a dead device does not loop.
-        if self.compaction_backoff {
+        // (a stall then retries it), so a dead device does not loop (issues #70, #79). A
+        // poisoned shard starts none: it is dead until reopen.
+        if self.compaction_backoff || self.poisoned {
             return;
         }
         let Some(fam) = view.ssts.family(key.0, key.1) else {
