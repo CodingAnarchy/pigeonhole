@@ -822,6 +822,7 @@ impl ShardState {
             flushed_roots: Vec::new(),
             compaction: None,
             rewrite_snapshot: false,
+            dropped_ok: Vec::new(),
             reply: Box::new(move |result| {
                 let _ = submitter.submit(ShardMsg::TabletOpDone { result });
             }),
