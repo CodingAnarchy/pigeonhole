@@ -489,3 +489,72 @@ fn a_panicked_shard_thread_does_not_hang_close() {
         "{closed:?}"
     );
 }
+
+/// Shard 1 is poisoned while its `Sync` group is unresolved (the group's sync fails). A
+/// commit on shard 0 waiting for visibility behind that group does not park for ever: the
+/// failed sync resolves the group (its members get the poison error) and releases the
+/// watermark, so the waiter sees its own commit. A cross-shard commit that then reaches
+/// the poisoned participant fails without pinning the watermark either.
+#[test]
+fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
+    let (vfs, gate) = gate::vfs(1359);
+    let db = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
+    let (on_a, on_b) = tables_on_0_and_1(&db);
+    gate.fail(&wal(1));
+    gate.hold(&wal(1));
+    let doomed = db
+        .submit(put(&on_b, "doomed"), Some(Durability::Sync))
+        .unwrap();
+    gate.wait_held(&wal(1));
+    let (tx, rx) = mpsc::channel();
+    let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
+    thread::spawn(move || {
+        let _ = tx.send(db2.commit(put(&on_a2, "waits"), Some(Durability::None)));
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "visible while shard 1's group was unresolved"
+    );
+    // The held sync completes with its (injected) failure: shard 1 is poisoned.
+    gate.release();
+    let waited = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the visibility wait outlived the poisoned shard's group");
+    waited.unwrap();
+    let doomed = gate::within(10, move || doomed.wait()).expect("the poisoned commit hung");
+    assert!(matches!(doomed, Err(Error::Io(_))), "{doomed:?}");
+
+    // A cross-shard commit with the poisoned participant fails, and leaves nothing held.
+    let mut both = put(&on_a, "both");
+    both.put(
+        on_b.id,
+        on_b.families[0].id,
+        b"both",
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    let db2 = Arc::clone(&db);
+    let crossed = gate::within(10, move || db2.commit(both, Some(Durability::Sync)))
+        .expect("a cross-shard commit with a poisoned participant hung");
+    assert!(
+        crossed.is_err(),
+        "a commit through a poisoned shard succeeded"
+    );
+    let db2 = Arc::clone(&db);
+    let (on_a2, on_a3) = (Arc::clone(&on_a), Arc::clone(&on_a));
+    let after = gate::within(10, move || {
+        db2.commit(put(&on_a2, "after"), Some(Durability::None))
+    })
+    .expect("a later commit's visibility wait hung behind the poisoned shard");
+    after.unwrap();
+    assert!(
+        db.get_latest(on_a3.id, on_a3.families[0].id, b"after", b"q")
+            .unwrap()
+            .is_some()
+    );
+    let db2 = Arc::clone(&db);
+    let closed = gate::within(10, move || db2.close()).expect("close hung");
+    assert!(closed.is_err(), "a close with a poisoned shard reported Ok");
+}
