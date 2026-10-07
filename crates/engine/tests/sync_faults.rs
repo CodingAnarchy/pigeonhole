@@ -1,7 +1,8 @@
 //! Engine-level reproducers for issue #139. A failed sync outside a root commit or a group
 //! sync (a page-file growth, a WAL spare-slot preparation) poisons, so no later commit
 //! publishes over pages the failed sync may have lost (decision D58). A full disk during a
-//! manifest snapshot rewrite refuses that commit but needs no reopen once space is freed.
+//! manifest snapshot rewrite refuses that commit but needs no reopen once space is freed,
+//! and a refused checkpoint is retried on a timer.
 
 mod common;
 
@@ -22,6 +23,18 @@ use pigeonhole_io::{
 
 const DB: &str = "/db/data.phdb";
 
+/// Takes one from `n` if it is positive (an armed fault fires once per unit).
+fn take_one(n: &AtomicU32) -> bool {
+    let mut cur = n.load(Ordering::Acquire);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
+}
+
 /// Fails the next `fail_sync_all` calls of `sync_all`; fails the `sync_all` after the next
 /// growth of at least `fail_growth_sync` bytes (once; 0 is off); and fails `allocate` with
 /// `NoSpace` while `no_space` is set.
@@ -40,6 +53,8 @@ struct FaultVfs {
     inner: Arc<SimVfs>,
     faults: Arc<Faults>,
     target: PathBuf,
+    /// When set, the clock is real time from this instant (it moves on its own).
+    real_clock: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -68,11 +83,9 @@ impl File for FaultFile {
         self.inner.submit_sync_data()
     }
     fn sync_all(&self) -> Result<()> {
-        let armed =
-            self.faults
-                .fail_sync_all
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-        if armed.is_ok() || self.faults.growth_armed.swap(false, Ordering::AcqRel) {
+        if take_one(&self.faults.fail_sync_all)
+            || self.faults.growth_armed.swap(false, Ordering::AcqRel)
+        {
             return Err(pigeonhole_io::Error::new(
                 ErrorKind::Other,
                 "injected sync_all failure",
@@ -90,10 +103,11 @@ impl File for FaultFile {
         if self.faults.no_space.load(Ordering::Acquire) {
             return Err(pigeonhole_io::Error::new(ErrorKind::NoSpace, "allocate"));
         }
+        let grows = offset + len > self.inner.len()?;
         let at_least = self.faults.fail_growth_sync.load(Ordering::Acquire);
         if at_least > 0
             && len >= at_least
-            && offset + len > self.inner.len()?
+            && grows
             && self
                 .faults
                 .fail_growth_sync
@@ -154,10 +168,16 @@ impl Vfs for FaultVfs {
         self.inner.remove_shared(name, dir)
     }
     fn now_micros(&self) -> u64 {
-        self.inner.now_micros()
+        match self.real_clock {
+            Some(start) => self.inner.now_micros() + start.elapsed().as_micros() as u64,
+            None => self.inner.now_micros(),
+        }
     }
     fn monotonic_nanos(&self) -> u64 {
-        self.inner.monotonic_nanos()
+        match self.real_clock {
+            Some(start) => self.inner.monotonic_nanos() + start.elapsed().as_nanos() as u64,
+            None => self.inner.monotonic_nanos(),
+        }
     }
     fn current_process(&self) -> ProcessId {
         self.inner.current_process()
@@ -182,10 +202,20 @@ fn options(vfs: VfsRef) -> EngineOptions {
 
 /// An engine whose file at `target` (the database file, or a WAL stream) takes faults.
 fn open(sim: &Arc<SimVfs>, faults: &Arc<Faults>, target: PathBuf) -> Arc<Engine> {
+    open_with_clock(sim, faults, target, None)
+}
+
+fn open_with_clock(
+    sim: &Arc<SimVfs>,
+    faults: &Arc<Faults>,
+    target: PathBuf,
+    real_clock: Option<Instant>,
+) -> Arc<Engine> {
     let vfs: VfsRef = Arc::new(FaultVfs {
         inner: Arc::clone(sim),
         faults: Arc::clone(faults),
         target,
+        real_clock,
     });
     Engine::open(Path::new(DB), options(vfs)).unwrap()
 }
@@ -330,12 +360,18 @@ fn a_full_disk_during_a_manifest_rewrite_needs_no_reopen() {
         matches!(refused, Some(Error::NoSpace)),
         "a manifest rewrite was refused for space: {refused:?}"
     );
+    // A flush that cannot grow the file reports the full disk as such.
+    db.commit(batch(&t, 16, 16), Some(Durability::GroupSync))
+        .unwrap();
+    let flushed = db.flush();
+    assert!(
+        matches!(flushed, Err(Error::NoSpace)),
+        "a flush on a full disk: {flushed:?}"
+    );
     // The user frees space: writes, flushes and catalog changes work without a reopen.
     faults.no_space.store(false, Ordering::Release);
     drop(pin);
     db.create_table("after", &family()).unwrap();
-    db.commit(batch(&t, 16, 16), Some(Durability::GroupSync))
-        .unwrap();
     db.flush().unwrap();
     for i in 0..32 {
         assert_eq!(get(&db, &t, i), Some(vec![i as u8; 2048]), "row {i}");
@@ -347,6 +383,45 @@ fn a_full_disk_during_a_manifest_rewrite_needs_no_reopen() {
     let t = db.table("t").unwrap();
     for i in 0..32 {
         assert_eq!(get(&db, &t, i), Some(vec![i as u8; 2048]), "row {i}");
+    }
+    db.close().unwrap();
+}
+
+fn checkpoint(sim: &Arc<SimVfs>) -> pigeonhole_format::Lsn {
+    let vfs: VfsRef = Arc::clone(sim) as VfsRef;
+    Engine::inspect_manifest(&vfs, Path::new(DB))
+        .unwrap()
+        .checkpoints
+        .get(&StreamId(0))
+        .copied()
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_refused_checkpoint_is_retried_on_an_idle_shard_once_space_is_freed() {
+    let sim = SimVfs::new(1398);
+    let faults = Arc::new(Faults::default());
+    // A real clock: it moves on its own, so a backoff timer can fire.
+    let db = open_with_clock(&sim, &faults, PathBuf::from(DB), Some(Instant::now()));
+    let t = db.create_table("t", &family()).unwrap();
+    // The manifest finds no space for checkpoints: a flush commits, its checkpoint is
+    // refused (as a snapshot rewrite that cannot allocate is).
+    db.refuse_checkpoints(true);
+    db.commit(batch(&t, 0, 32), Some(Durability::GroupSync))
+        .unwrap();
+    let before = checkpoint(&sim);
+    db.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(checkpoint(&sim), before, "the checkpoint was refused");
+    // Space is freed. Nothing else happens on the shard: the backoff timer retries.
+    db.refuse_checkpoints(false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while checkpoint(&sim) == before {
+        assert!(
+            Instant::now() < deadline,
+            "an idle shard never retried its refused checkpoint"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
     db.close().unwrap();
 }

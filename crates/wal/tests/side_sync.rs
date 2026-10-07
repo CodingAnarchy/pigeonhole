@@ -2,8 +2,9 @@
 //! spare-slot preparation's and an inline growth's `sync_all`. On Linux an fsync error is
 //! reported to one sync only, so such a sync may have been handed the error for appended
 //! records, and the next group sync would succeed over their lost pages. Such a failure
-//! poisons the stream, and a group sync that succeeded while one failed does not count. A
-//! failed allocation (a full disk) syncs nothing and leaves the stream usable.
+//! poisons the stream, and a group sync that succeeded while one failed does not count. The
+//! same holds between durable syncs: two group syncs in flight, or a group sync and a
+//! rollover's. A failed allocation (a full disk) syncs nothing and leaves the stream usable.
 
 mod common;
 
@@ -21,6 +22,18 @@ use pigeonhole_io::{
 };
 use pigeonhole_wal::{Error, Wal, WalStream};
 
+/// Takes one from `n` if it is positive (an armed fault fires once per unit).
+fn take_one(n: &AtomicU32) -> bool {
+    let mut cur = n.load(Ordering::Acquire);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
+}
+
 /// Fails the next `fail_sync_all` calls of `sync_all`, fails `allocate` with `NoSpace` while
 /// `no_space` is set, and holds submitted syncs while `hold` is set.
 #[derive(Debug, Default)]
@@ -36,6 +49,20 @@ impl Faults {
     fn release_one(&self) {
         let (file, resolver) = self.held.lock().unwrap().pop_front().expect("a held sync");
         resolver.resolve(file.sync_data());
+    }
+
+    /// Resolves the `i`-th held sync (oldest first): it runs and succeeds, or fails with
+    /// an injected error without running.
+    fn release(&self, i: usize, ok: bool) {
+        let (file, resolver) = self.held.lock().unwrap().remove(i).expect("a held sync");
+        resolver.resolve(if ok {
+            file.sync_data()
+        } else {
+            Err(pigeonhole_io::Error::new(
+                ErrorKind::Other,
+                "injected sync failure",
+            ))
+        });
     }
 
     fn held(&self) -> usize {
@@ -84,11 +111,7 @@ impl File for FaultFile {
         done
     }
     fn sync_all(&self) -> Result<()> {
-        let armed =
-            self.faults
-                .fail_sync_all
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-        if armed.is_ok() {
+        if take_one(&self.faults.fail_sync_all) {
             return Err(pigeonhole_io::Error::new(
                 ErrorKind::Other,
                 "injected sync_all failure",
@@ -259,4 +282,71 @@ fn a_spare_allocation_without_space_leaves_the_stream_usable() {
     assert!(wal.satisfies(&t1));
     // The space is back: preparation succeeds.
     assert!(spares.prepare(spares.target() + 2).unwrap() > 0);
+}
+
+#[test]
+fn a_group_sync_overlapping_a_failed_one_does_not_count() {
+    let (faults, mut wal) = setup(1395);
+    let t1 = wal
+        .append(&batch(1, 100).record(), Durability::Sync)
+        .unwrap();
+    faults.hold.store(true, Ordering::Release);
+    let g1 = wal.submit_sync().unwrap();
+    let t2 = wal
+        .append(&batch(2, 100).record(), Durability::Sync)
+        .unwrap();
+    let g2 = wal.submit_sync().unwrap();
+    assert_eq!(faults.held(), 2);
+    // G2's sync succeeds first, possibly only because G1 is about to be handed the error
+    // for record 1's pages: it must not count until G1 finished.
+    faults.release(1, true);
+    assert!(
+        !g2.is_ready(),
+        "a sync counted while an older one was in flight"
+    );
+    assert!(!wal.satisfies(&t2));
+    faults.release(0, false);
+    assert!(g1.wait().is_err());
+    assert!(g2.wait().is_err(), "G2 overlapped a failed sync");
+    assert!(!wal.satisfies(&t1) && !wal.satisfies(&t2));
+    faults.hold.store(false, Ordering::Release);
+    assert!(matches!(wal.sync(), Err(Error::Poisoned)));
+}
+
+#[test]
+fn a_group_sync_overlapping_a_failed_rollover_sync_does_not_count() {
+    let (faults, mut wal) = setup(1396);
+    // A slot ready, so the next rollover's sync is submitted rather than run inline.
+    let spares = wal.spares();
+    spares.prepare(spares.target()).unwrap();
+    let t1 = wal
+        .append(&batch(1, 100).record(), Durability::GroupSync)
+        .unwrap();
+    faults.hold.store(true, Ordering::Release);
+    let g1 = wal.submit_sync().unwrap();
+    // Fill the segment until it rolls over: the rollover's sync is submitted and held.
+    let mut i = 2;
+    while faults.held() < 2 {
+        wal.append(&batch(i, 30_000).record(), Durability::Buffered)
+            .unwrap();
+        i += 1;
+        assert!(i < 64, "no rollover");
+    }
+    // The group's sync succeeds; the rollover's, issued after it, fails (it may have been
+    // handed the error for the group's pages).
+    faults.release(0, true);
+    assert!(
+        !g1.is_ready(),
+        "a sync counted while a later one was in flight"
+    );
+    faults.release(0, false);
+    assert!(
+        g1.wait().is_err(),
+        "the group overlapped a failed rollover sync"
+    );
+    assert!(!wal.satisfies(&t1));
+    faults.hold.store(false, Ordering::Release);
+    // The rollover's own failure is reported first, then the poison.
+    assert!(matches!(wal.sync(), Err(Error::Io(_))));
+    assert!(matches!(wal.sync(), Err(Error::Poisoned)));
 }

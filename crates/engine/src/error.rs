@@ -13,6 +13,16 @@ pub(crate) fn io_other(context: &'static str, message: impl Into<String>) -> Err
     ))
 }
 
+/// `e` reported to another caller (a background failure fanned out to every waiter). A full
+/// disk keeps its code, so the user can tell it apart and free space; anything else becomes
+/// an `Io` error carrying the message.
+pub(crate) fn relay(context: &'static str, e: &Error) -> Error {
+    match e {
+        Error::NoSpace => Error::NoSpace,
+        _ => io_other(context, e.to_string()),
+    }
+}
+
 /// Engine errors. Each variant maps to exactly one public `ErrorCode`.
 ///
 /// ```

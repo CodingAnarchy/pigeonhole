@@ -301,6 +301,10 @@ pub(crate) struct Shared {
     pub manifest_park: AtomicBool,
     #[cfg(feature = "test-hooks")]
     pub manifest_parked: Mutex<Option<pigeonhole_runtime::TaskWaker>>,
+    /// Test hook: refuse batches of only `WalCheckpoint` edits as `NoSpace`, as a snapshot
+    /// rewrite that finds no space does (`Engine::refuse_checkpoints`).
+    #[cfg(feature = "test-hooks")]
+    pub refuse_checkpoints: AtomicBool,
     pub picker: PickerOptions,
     /// How long a commit waits for arena room before `Busy`.
     pub write_stall_timeout_nanos: u64,
@@ -917,6 +921,8 @@ pub(crate) enum ShardMsg {
     Kick,
     /// A failed background compaction's backoff passed (on a moving clock): retry.
     RetryCompaction,
+    /// A refused checkpoint's backoff passed (on a moving clock): retry.
+    RetryCheckpoint,
     /// Split, merge or move tablets this shard owns (replies when done, if asked). Sent by
     /// the test hooks only; the balancer starts its own changes.
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
@@ -1692,6 +1698,10 @@ pub(crate) struct ShardState {
     backoff_timer: Option<Arc<TimerState>>,
     /// Background compactions failed in a row (reset by one that succeeds).
     compaction_failures: u32,
+    /// Checkpoints refused in a row (a full disk), and the timer that retries the last one
+    /// on a moving clock (an idle shard has no other event to retry it on).
+    checkpoint_failures: u32,
+    checkpoint_timer: Option<Arc<TimerState>>,
     stall: Stall,
 
     // ---- tablet changes and the balancer ----
@@ -1821,6 +1831,8 @@ impl ShardState {
             compaction_backoff: false,
             backoff_timer: None,
             compaction_failures: 0,
+            checkpoint_failures: 0,
+            checkpoint_timer: None,
             stall: Stall::default(),
             moving: HashSet::new(),
             op: None,
@@ -2492,16 +2504,15 @@ impl ShardState {
                 trace!("shard {} flush failed: {e}", self.id.0);
                 self.requeue_frozen();
                 // A tablet change waiting for this flush gives up (its tablets stay put).
-                self.abort_op(crate::error::io_other("flush", e.to_string()), ctx);
+                self.abort_op(crate::error::relay("flush", &e), ctx);
                 // Whoever asked for this flush hears about the failure now rather than
                 // waiting for a retry that may never come (a dead device).
-                let msg = e.to_string();
                 for w in self.flush_waiters.drain(..) {
-                    w.notify(Err(crate::error::io_other("flush", msg.clone())));
+                    w.notify(Err(crate::error::relay("flush", &e)));
                 }
                 // A full compaction starts with a flush: it fails with it.
                 for (_, w) in self.compact_all.drain(..) {
-                    w.notify(Err(crate::error::io_other("flush", msg.clone())));
+                    w.notify(Err(crate::error::relay("flush", &e)));
                 }
                 if self.closing {
                     self.flush_failed = true;
@@ -4294,6 +4305,10 @@ impl ShardState {
         let failed = result.is_err();
         match result {
             Ok(_) => {
+                self.checkpoint_failures = 0;
+                if let Some(t) = self.checkpoint_timer.take() {
+                    t.cancel();
+                }
                 self.checkpoint = self.checkpoint.max(lsn);
                 if let Some(wal) = self.wal.as_mut()
                     && !self.poisoned
@@ -4308,22 +4323,45 @@ impl ShardState {
                 }
             }
             Err(e) => {
-                // Retry at the next checkpoint event; the commits passed stay queued.
+                // Retry at the next checkpoint event, or once a backoff passes; the commits
+                // passed stay queued.
                 trace!("shard {} checkpoint failed: {e}", self.id.0);
                 self.passed_commits.extend(commits);
                 self.checkpoint_dirty = true;
                 if self.closing {
                     self.shared.fail_close();
+                } else if !self.shared.pager_poisoned.load(Ordering::Acquire) {
+                    self.back_off_checkpoint(ctx);
                 }
             }
         }
         // A refused checkpoint (a full disk) is not retried at once, which would spin while
-        // the disk stays full; the next checkpoint event retries it.
+        // the disk stays full; the next checkpoint event or the backoff timer retries it.
         if self.checkpoint_dirty && !failed && !self.shared.pager_poisoned.load(Ordering::Acquire) {
             self.checkpoint_dirty = false;
             self.advance_checkpoint(ctx);
         }
         self.try_finish_close(ctx);
+    }
+
+    /// A checkpoint was refused (the manifest found no space): retry after the compaction
+    /// backoff for as many refusals in a row (1 s doubling to 60 s), so an idle shard
+    /// recycles its WAL segments once space is freed, without spinning while it is not.
+    fn back_off_checkpoint(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.checkpoint_failures = self.checkpoint_failures.saturating_add(1);
+        if let Some(t) = self.checkpoint_timer.take() {
+            t.cancel();
+        }
+        let state = TimerState::new();
+        self.checkpoint_timer = Some(Arc::clone(&state));
+        ctx.spawn(Box::new(ClockTimer::new(
+            &self.shared.vfs,
+            ctx.now_nanos()
+                .saturating_add(compaction_backoff_nanos(self.checkpoint_failures)),
+            state,
+            ctx.submitter(self.id).clone(),
+            ShardMsg::RetryCheckpoint,
+        )));
     }
 
     // ---- compaction ----
@@ -4773,6 +4811,10 @@ impl ShardState {
             if let Some(t) = self.backoff_timer.take() {
                 t.cancel();
             }
+            // Close's own flush advances the checkpoint; a refused one makes it unclean.
+            if let Some(t) = self.checkpoint_timer.take() {
+                t.cancel();
+            }
             if self.freeze(true).is_err() {
                 self.shared.fail_close();
             }
@@ -5061,6 +5103,13 @@ impl ShardState {
                     self.backoff_timer = None;
                     self.compaction_backoff = false;
                     self.maintain(ctx);
+                }
+            }
+            ShardMsg::RetryCheckpoint => {
+                // Only the current timer's firing retries.
+                if self.checkpoint_timer.as_ref().is_some_and(|t| t.fired()) {
+                    self.checkpoint_timer = None;
+                    self.advance_checkpoint(ctx);
                 }
             }
             ShardMsg::TabletOp { op, reply } => self.request_tablet_op(op, reply, ctx),

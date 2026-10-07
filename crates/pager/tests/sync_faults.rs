@@ -32,6 +32,18 @@ fn root(version: u64) -> Root {
     }
 }
 
+/// Takes one from `n` if it is positive (an armed fault fires once per unit).
+fn take_one(n: &AtomicU32) -> bool {
+    let mut cur = n.load(Ordering::Acquire);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
+}
+
 /// Fails the next `fail_sync_all` calls of `sync_all`, fails `allocate` with `NoSpace` while
 /// `no_space` is set, and holds submitted syncs while `hold` is set.
 #[derive(Debug, Default)]
@@ -95,11 +107,7 @@ impl File for FaultFile {
         done
     }
     fn sync_all(&self) -> Result<()> {
-        let armed =
-            self.faults
-                .fail_sync_all
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-        if armed.is_ok() {
+        if take_one(&self.faults.fail_sync_all) {
             return Err(pigeonhole_io::Error::new(
                 ErrorKind::Other,
                 "injected sync_all failure",

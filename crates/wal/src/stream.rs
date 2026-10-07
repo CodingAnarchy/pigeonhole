@@ -1,10 +1,11 @@
 //! The sidecar-file stream: one file per stream, made of preallocated slots that are recycled
 //! after checkpoint.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use pigeonhole_format::wal::{
     FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameEncoder, SegmentHeader, WalRecord,
@@ -132,9 +133,51 @@ struct Shared {
     /// Set by the first failed write or sync; every later append, write or sync is refused.
     poisoned: AtomicBool,
     pool: Mutex<Pool>,
-    /// Held across a sync no commit waits on (growing or preparing a slot) and the poisoning
-    /// its failure causes. See [`Shared::check_synced`].
-    side_sync: Mutex<()>,
+    /// Every sync of the stream file in flight (see [`Syncs`]).
+    syncs: Mutex<Syncs>,
+    /// Signalled whenever a sync finishes.
+    sync_done: Condvar,
+}
+
+/// Told, once a durable sync settles, whether the stream is still unpoisoned.
+type Settle = Box<dyn FnOnce(bool) + Send>;
+
+/// The syncs of a stream file in flight. On Linux an fsync error is reported to one sync
+/// only: a sync that overlapped a failing one may succeed although pages it covered were
+/// lost (decision D58). So every sync of the file (a group sync, a rollover's, or a side
+/// sync preparing or growing a slot) takes a ticket before it is issued and poisons the
+/// stream if it fails, and a successful sync that makes records durable counts only once
+/// every sync started before it finished has finished too, and none failed.
+#[derive(Default)]
+struct Syncs {
+    /// The ticket the next sync gets.
+    next: u64,
+    /// Tickets of the syncs issued and not finished.
+    running: BTreeSet<u64>,
+    /// Durable syncs that succeeded, with the ticket every older sync is below, waiting for
+    /// those to finish. Each is told whether the stream is still unpoisoned then.
+    settling: Vec<(u64, Settle)>,
+}
+
+impl Syncs {
+    /// Whether every sync with a ticket below `barrier` has finished.
+    fn drained(&self, barrier: u64) -> bool {
+        self.running.first().is_none_or(|&t| t >= barrier)
+    }
+
+    /// Takes the settling syncs whose older syncs have all finished.
+    fn settled(&mut self) -> Vec<Settle> {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < self.settling.len() {
+            if self.drained(self.settling[i].0) {
+                ready.push(self.settling.swap_remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    }
 }
 
 /// Blank slots and the file's slot count. The file is `total * segment_size` bytes long (or
@@ -159,44 +202,121 @@ impl Shared {
         self.pool.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Runs `sync`, a sync of the stream file no commit waits on, and poisons the stream if
-    /// it fails: on Linux an fsync error is reported to one sync only, so this one may have
-    /// been handed the error for appended records, and the next group sync would succeed
-    /// over their lost pages (decision D58).
-    fn side_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
-        let _held = self
-            .side_sync
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        sync().map_err(|e| {
-            self.poisoned.store(true, Ordering::Release);
-            Error::from(e)
-        })
+    fn syncs(&self) -> MutexGuard<'_, Syncs> {
+        self.syncs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Called after a sync that makes records durable succeeded: fails if a side sync failed
-    /// meanwhile, since that one may have been handed this sync's error. Waits for a side
-    /// sync in flight.
-    fn check_synced(&self) -> Result<()> {
-        let _held = self
-            .side_sync
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+    /// Registers a sync about to be issued.
+    fn start_sync(&self) -> u64 {
+        let mut syncs = self.syncs();
+        let ticket = syncs.next;
+        syncs.next += 1;
+        syncs.running.insert(ticket);
+        ticket
+    }
+
+    /// Records that sync `ticket` finished, poisoning the stream if it failed.
+    fn end_sync(&self, syncs: &mut Syncs, ticket: u64, failed: bool) {
+        syncs.running.remove(&ticket);
+        if failed {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+
+    /// Tells settled syncs whether the stream is unpoisoned and wakes blocked waiters. Called
+    /// without the lock held.
+    fn tell(&self, ready: Vec<Settle>) {
+        self.sync_done.notify_all();
+        let ok = !self.poisoned.load(Ordering::Acquire);
+        for f in ready {
+            f(ok);
+        }
+    }
+
+    /// Runs `sync`, a sync of the stream file no commit waits on (growing or preparing a
+    /// slot): a failure poisons the stream.
+    fn side_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
+        let ticket = self.start_sync();
+        let r = sync();
+        let ready = {
+            let mut syncs = self.syncs();
+            self.end_sync(&mut syncs, ticket, r.is_err());
+            syncs.settled()
+        };
+        self.tell(ready);
+        Ok(r?)
+    }
+
+    /// Runs `sync`, a blocking sync that makes records durable, and returns once it counts:
+    /// after every sync started before it finished, and only if none failed.
+    fn durable_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
+        let ticket = self.start_sync();
+        let r = sync();
+        let (ready, barrier) = {
+            let mut syncs = self.syncs();
+            self.end_sync(&mut syncs, ticket, r.is_err());
+            (syncs.settled(), syncs.next)
+        };
+        self.tell(ready);
+        r?;
+        let mut syncs = self.syncs();
+        while !syncs.drained(barrier) {
+            syncs = self
+                .sync_done
+                .wait(syncs)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(syncs);
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
         }
         Ok(())
     }
 
-    /// [`Shared::check_synced`] for a sync completion.
-    fn check_synced_io(&self) -> pigeonhole_io::Result<()> {
-        self.check_synced().map_err(|_| {
-            pigeonhole_io::Error::new(
-                pigeonhole_io::ErrorKind::Other,
-                "wal stream poisoned by a failed sync",
-            )
-        })
+    /// [`Shared::durable_sync`] with the sync submitted to the I/O backend. The returned
+    /// completion resolves once the sync counts; no thread blocks meanwhile (the last older
+    /// sync to finish resolves it).
+    fn submit_durable_sync(self: &Arc<Self>, file: &FileRef) -> Completion<()> {
+        let ticket = self.start_sync();
+        let (done, resolver) = Completion::pair();
+        let shared = Arc::clone(self);
+        // The continuation's own completion is not needed: `resolver` reports the outcome.
+        let _chained = file.submit_sync_data().map(move |r| {
+            let ready = {
+                let mut syncs = shared.syncs();
+                shared.end_sync(&mut syncs, ticket, r.is_err());
+                match r {
+                    Err(e) => {
+                        let ready = syncs.settled();
+                        drop(syncs);
+                        shared.tell(ready);
+                        resolver.resolve(Err(e));
+                        return Ok(());
+                    }
+                    Ok(()) => {
+                        let barrier = syncs.next;
+                        syncs.settling.push((
+                            barrier,
+                            Box::new(move |ok| {
+                                resolver.resolve(if ok { Ok(()) } else { Err(poisoned_io()) });
+                            }),
+                        ));
+                        syncs.settled()
+                    }
+                }
+            };
+            shared.tell(ready);
+            Ok(())
+        });
+        done
     }
+}
+
+fn poisoned_io() -> pigeonhole_io::Error {
+    pigeonhole_io::Error::new(
+        pigeonhole_io::ErrorKind::Other,
+        "wal stream poisoned by a failed sync",
+    )
 }
 
 /// Zero-fills slot `slot` of a stream file.
@@ -503,7 +623,8 @@ impl WalStream {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
                 pool: Mutex::new(Pool::default()),
-                side_sync: Mutex::new(()),
+                syncs: Mutex::new(Syncs::default()),
+                sync_done: Condvar::new(),
             }),
         }
     }
@@ -660,16 +781,14 @@ impl WalStream {
         let end = Lsn::new(self.epoch, self.written_off as u32);
         if self.spare_ready() {
             let shared = Arc::clone(&self.shared);
-            // A failure surfaces from the next `write_buf`, whose caller poisons the stream.
-            self.rollover_sync = Some(self.file.submit_sync_data().map(move |r| {
+            // A failure poisons the stream at once and surfaces from the next `write_buf`.
+            self.rollover_sync = Some(self.shared.submit_durable_sync(&self.file).map(move |r| {
                 r?;
-                shared.check_synced_io()?;
                 shared.durable.fetch_max(end.0, Ordering::Release);
                 Ok(())
             }));
         } else {
-            self.file.sync_data()?;
-            self.shared.check_synced()?;
+            self.shared.durable_sync(|| self.file.sync_data())?;
             self.shared.durable.fetch_max(end.0, Ordering::Release);
             self.shared.pool().inline_rollover_syncs += 1;
         }
@@ -681,8 +800,13 @@ impl WalStream {
         self.written_off + self.buf.len() as u64
     }
 
-    fn check_poisoned(&self) -> Result<()> {
+    /// Refuses work on a poisoned stream. A rollover sync whose failure poisoned it reports
+    /// its own error first (its caller learns why, e.g. `Crashed`).
+    fn check_poisoned(&mut self) -> Result<()> {
         if self.shared.poisoned.load(Ordering::Acquire) {
+            if let Some(synced) = self.rollover_sync.take() {
+                synced.wait()?;
+            }
             return Err(Error::Poisoned);
         }
         Ok(())
@@ -750,9 +874,8 @@ impl Wal for WalStream {
 
     fn sync(&mut self) -> Result<Lsn> {
         let lsn = self.write()?;
-        let r = self.file.sync_data().map_err(Error::from);
+        let r = self.shared.durable_sync(|| self.file.sync_data());
         self.poison_on_err(r)?;
-        self.shared.check_synced()?;
         self.shared.durable.fetch_max(lsn.0, Ordering::Release);
         Ok(lsn)
     }
@@ -760,12 +883,8 @@ impl Wal for WalStream {
     fn submit_sync(&mut self) -> Result<Completion<Lsn>> {
         let lsn = self.write()?;
         let shared = Arc::clone(&self.shared);
-        Ok(self.file.submit_sync_data().map(move |r| {
-            if let Err(e) = r {
-                shared.poisoned.store(true, Ordering::Release);
-                return Err(e);
-            }
-            shared.check_synced_io()?;
+        Ok(self.shared.submit_durable_sync(&self.file).map(move |r| {
+            r?;
             shared.durable.fetch_max(lsn.0, Ordering::Release);
             Ok(lsn)
         }))

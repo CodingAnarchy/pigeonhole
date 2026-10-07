@@ -702,7 +702,19 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);
-    match writer.prepare(&catalog, &edits, rewrite) {
+    #[cfg(feature = "test-hooks")]
+    let refused = shared.refuse_checkpoints.load(Ordering::Acquire)
+        && edits
+            .iter()
+            .all(|e| matches!(e, Edit::WalCheckpoint { .. } | Edit::Counters { .. }));
+    #[cfg(not(feature = "test-hooks"))]
+    let refused = false;
+    let prepared = if refused {
+        Err(Error::NoSpace)
+    } else {
+        writer.prepare(&catalog, &edits, rewrite)
+    };
+    match prepared {
         Ok(prepared) => {
             drop(writer);
             #[cfg(feature = "test-hooks")]
@@ -737,14 +749,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                     shared.pager.abandon(x);
                 }
             }
-            let msg = e.to_string();
             for (req, r) in outcomes {
-                (req.reply)(r.and_then(|()| {
-                    Err(match e {
-                        Error::NoSpace => Error::NoSpace,
-                        _ => crate::error::io_other("manifest commit", msg.clone()),
-                    })
-                }));
+                (req.reply)(r.and_then(|()| Err(crate::error::relay("manifest commit", &e))));
             }
             None
         }

@@ -466,7 +466,10 @@ impl Inner {
     /// Fails if a growth's or truncation's sync failed. A commit calls it after each of its
     /// own syncs succeeded: that sync may have succeeded only because a concurrent one was
     /// handed the error for the same pages. Those syncs run under the allocator lock and
-    /// poison before releasing it, so taking the lock waits for one in flight.
+    /// poison before releasing it, so taking the lock waits for one in flight. That wait can
+    /// be a whole growth's `fallocate` and `sync_all` (up to 64 MiB), and for a submitted
+    /// commit it happens on the I/O backend's thread, which then serves no reads meanwhile
+    /// (bounded; issue #182).
     fn check_syncs(&self) -> pigeonhole_io::Result<()> {
         let _alloc = lock(&self.alloc);
         if lock(&self.state).poisoned {
@@ -871,7 +874,8 @@ impl Pager {
             }
             self.inner.file.set_len(end * UNIT_BYTES)?;
             alloc.truncate(end);
-            // Synced under the allocator lock, poisoning on failure, as in `allocate`.
+            // Synced under the allocator lock, poisoning on failure, as in `allocate`: every
+            // allocation (and a commit's `check_syncs`) waits for this sync meanwhile.
             if let Err(e) = self.inner.file.sync_all() {
                 lock(&self.inner.state).poisoned = true;
                 return Err(e.into());
