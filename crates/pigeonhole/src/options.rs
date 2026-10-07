@@ -124,8 +124,9 @@ impl Options {
 
     /// Memtable arena per shard, in bytes (default 64 MiB): the in-memory write buffer, also
     /// the size of the shared-memory arena. Data beyond it is flushed into the file, so it
-    /// does not bound the database size; it bounds the largest value and batch (a batch
-    /// larger than the arena fails with `Busy`).
+    /// does not bound the database size; it bounds the largest value and batch. A batch
+    /// whose cells need more than about half of it fails with
+    /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge).
     ///
     /// The shared-memory region holds every shard's arena (each rounded up to 2 MiB) plus
     /// about 10 MiB of views and reader slots, 266 MiB for the default budget on 4 CPUs: on

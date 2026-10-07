@@ -86,9 +86,12 @@ pub enum Error {
     NoReaderSlot,
     /// A commit's WAL record is larger than a WAL segment can hold.
     RecordTooLarge,
-    /// Writes are stalled (L0 too deep, or the memtable arena full) and the caller asked not
-    /// to wait.
+    /// Writes are stalled (L0 too deep, or the memtable arena full) and stayed stalled past
+    /// the write-stall timeout. Transient: retry later.
     Busy,
+    /// A batch can never fit a shard's memtable arena, even an empty one (about half of
+    /// `memtable_budget` per shard). Not transient: split the batch or raise the budget.
+    BatchTooLarge,
     /// A reader process's snapshot was taken before a writer restart: the new writer may
     /// have reused the space it names. Take a new snapshot.
     SnapshotExpired,
@@ -139,8 +142,12 @@ impl fmt::Display for Error {
                  future from the event loop instead",
             ),
             Error::Busy => f.write_str(
-                "writes stalled past the write-stall timeout (transient: retry later), or a \
-                 batch larger than the arena (never fits: split it or raise memtable_budget)",
+                "writes, a flush or a compaction stalled past the write-stall timeout \
+                 (transient: retry later)",
+            ),
+            Error::BatchTooLarge => f.write_str(
+                "the batch can never fit the shard's memtable arena (about half of \
+                 memtable_budget): split it or raise memtable_budget",
             ),
             Error::SnapshotExpired => f.write_str(
                 "the snapshot was taken before a writer restart and can no longer be read; \
@@ -190,6 +197,7 @@ impl Error {
             Error::RecordTooLarge => Error::RecordTooLarge,
             Error::Busy => Error::Busy,
             Error::WouldDeadlock => Error::WouldDeadlock,
+            Error::BatchTooLarge => Error::BatchTooLarge,
             Error::SnapshotExpired => Error::SnapshotExpired,
         }
     }

@@ -646,6 +646,41 @@ fn catalog_changes_persist_and_tables_can_be_dropped() {
 }
 
 #[test]
+fn a_value_at_the_documented_limit_fits_the_arena() {
+    // Issue #141 (8-9 F3): D16 allows a value up to half a shard's arena, but the arena
+    // accounting charged every entry twice, so such a value (or a batch of a few large
+    // values adding up to it) was refused as if it could never fit. One large entry wastes
+    // at most a chunk, not its own size.
+    for (budget, seed) in [(1u64 << 20, 31), (8 << 20, 32), (64 << 20, 33)] {
+        let vfs = SimVfs::new(seed);
+        let mut o = owned(Arc::clone(&vfs), 1);
+        o.memtable_budget = budget;
+        o.wal.segment_size = (2 * budget).max(4 << 20);
+        let db = Engine::open(Path::new(DB), o).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let half = (budget / 2) as usize;
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &t, "f", b"half", b"q", &vec![3u8; half]);
+        db.commit(wb, Some(Durability::None))
+            .unwrap_or_else(|e| panic!("budget {budget}: a value of half the arena: {e}"));
+        // A batch of four quarter-arena-sized values adds up to the same and fits too.
+        let mut wb = WriteBatch::new();
+        for i in 0..4u8 {
+            put(&mut wb, &t, "f", &[b'b', i], b"q", &vec![i; half / 4]);
+        }
+        db.commit(wb, Some(Durability::None))
+            .unwrap_or_else(|e| panic!("budget {budget}: four eighths of the arena: {e}"));
+        assert_eq!(
+            get_bytes(&db, &t, "f", b"half", b"q").map(|v| v.len()),
+            Some(half)
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
 fn value_limits_arena_pressure_and_closed_handles() {
     let vfs = SimVfs::new(12);
     let mut o = owned(Arc::clone(&vfs), 1);
@@ -684,11 +719,18 @@ fn value_limits_arena_pressure_and_closed_handles() {
             &vec![1u8; 4096],
         );
     }
+    // Not a stall (issue #141): its own non-retryable error, and no stall is counted (this
+    // test's writes flush long before the arena fills; the refusal used to be counted).
+    let stalls = db.metrics().stalls.0;
     assert!(matches!(
         db.commit(wb, Some(Durability::None)),
-        Err(Error::Busy)
+        Err(Error::BatchTooLarge)
     ));
-    assert!(db.metrics().stalls.0 >= 1);
+    assert_eq!(
+        db.metrics().stalls.0,
+        stalls,
+        "a never-fits refusal is no stall"
+    );
     // Everything written is readable, from memtables and SSTs alike.
     let snap = db.snapshot().unwrap();
     let mut cursor = db

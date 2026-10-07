@@ -268,6 +268,7 @@ fn error_codes_are_stable_numbers() {
         (ErrorCode::Busy, 24),
         (ErrorCode::SnapshotExpired, 25),
         (ErrorCode::WouldDeadlock, 26),
+        (ErrorCode::BatchTooLarge, 27),
     ];
     for (code, n) in codes {
         assert_eq!(code as u32, n, "{code:?}");
@@ -316,6 +317,7 @@ fn every_engine_error_maps_to_its_code() {
         (E::NoReaderSlot, ErrorCode::NoReaderSlot),
         (E::RecordTooLarge, ErrorCode::RecordTooLarge),
         (E::Busy, ErrorCode::Busy),
+        (E::BatchTooLarge, ErrorCode::BatchTooLarge),
         (E::SnapshotExpired, ErrorCode::SnapshotExpired),
         (E::WouldDeadlock, ErrorCode::WouldDeadlock),
     ];
@@ -323,9 +325,11 @@ fn every_engine_error_maps_to_its_code() {
         let what = format!("{e:?}");
         let message = match &e {
             E::Merge(_) => "merge operator \"op\" failed: bad".to_owned(),
-            E::Busy => "memtable arena full: a flush did not free room within the write-stall \
-                        timeout, or one batch is larger than the arena; retry, or raise \
-                        Options::memtable_budget"
+            E::Busy => "stalled: a flush or compaction did not free room within the write-stall \
+                        timeout (30 s); back off and retry, and drop old snapshots"
+                .to_owned(),
+            E::BatchTooLarge => "the batch can never fit a shard's memtable arena (about half \
+                                 of Options::memtable_budget); split it or raise the budget"
                 .to_owned(),
             _ => e.to_string(),
         };
@@ -1158,7 +1162,8 @@ fn a_full_memtable_arena_is_busy_with_a_precise_message() {
     let db = Pigeonhole::open("/db/busy.phdb", opts(1 << 20)).unwrap();
     let t = table(&db);
     // Engine Milestone B: a full arena waits for a flush, so steady writes never see
-    // `Busy`; a batch that can never fit the arena is refused at once.
+    // `Busy`; a batch that can never fit the arena is refused at once, with its own
+    // non-retryable code (issue #141).
     let cell = vec![1u8; 1000];
     for i in 0..3_000u32 {
         t.mutate(&i.to_be_bytes())
@@ -1174,7 +1179,7 @@ fn a_full_memtable_arena_is_busy_with_a_precise_message() {
     let err = wb
         .commit()
         .expect_err("a batch larger than the arena is refused");
-    assert_eq!(err.code(), ErrorCode::Busy);
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
     assert!(err.message().contains("memtable_budget"), "{err}");
     drop(t);
     db.close().unwrap();

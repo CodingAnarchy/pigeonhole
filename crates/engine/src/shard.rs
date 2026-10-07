@@ -906,6 +906,8 @@ pub(crate) enum PrepareError {
     Busy,
     Closed,
     TooLarge,
+    /// The share can never fit the participant's arena (issue #141).
+    NeverFits,
     Io,
 }
 
@@ -916,6 +918,7 @@ impl From<PrepareError> for Error {
             PrepareError::Moved | PrepareError::BelowFloor | PrepareError::Busy => Error::Busy,
             PrepareError::Closed => Error::Closed,
             PrepareError::TooLarge => Error::RecordTooLarge,
+            PrepareError::NeverFits => Error::BatchTooLarge,
             PrepareError::Io => poisoned_error(),
         }
     }
@@ -934,6 +937,7 @@ fn prepare_error_of(e: &Error) -> PrepareError {
         Error::Busy => PrepareError::Busy,
         Error::Closed => PrepareError::Closed,
         Error::RecordTooLarge => PrepareError::TooLarge,
+        Error::BatchTooLarge => PrepareError::NeverFits,
         _ => PrepareError::Io,
     }
 }
@@ -2248,16 +2252,26 @@ impl ShardState {
         Ok(())
     }
 
-    /// Worst-case arena bytes `batch` needs, so a commit is refused (`Busy`) before its
-    /// record is logged rather than half-applied.
+    /// Worst-case arena bytes `batch` needs, so a commit waits for room (or is refused with
+    /// `BatchTooLarge` when it could never fit) before its record is logged rather than
+    /// half-applied.
+    ///
+    /// A memtable bump-allocates entries in runs of whole chunks. An entry that does not fit
+    /// the rest of the current run takes a new run, rounded up to whole chunks, and the
+    /// rest of the old run is lost. That lost tail is shorter than both the entry that did
+    /// not fit and one chunk. So every entry costs at most its size plus `min(size,
+    /// chunk)`, and a single large value costs about its size, not twice it (issue #141).
     fn arena_needed(&self, batch: BatchRef<'_>) -> usize {
         let mut total = 0usize;
+        let mut waste = 0usize;
         // `(tablet, family)` slots the batch would create, each a memtable with a chunk of
         // its own (a table split into many tablets has many slots).
         let mut new_slots: Vec<(TabletId, FamilyId)> = Vec::new();
         for m in batch.iter().flatten() {
             let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
-            total += ENTRY_OVERHEAD + key + m.value.len();
+            let entry = ENTRY_OVERHEAD + key + m.value.len();
+            total += entry;
+            waste += entry.min(self.chunk_size);
             if self.tablets_on()
                 && let Some((tablet, owner)) = self.tablets.route(m.table, m.row)
                 && owner == self.id
@@ -2267,10 +2281,9 @@ impl ShardState {
                 new_slots.push((tablet, m.family));
             }
         }
-        // Each allocation may waste the tail of the previous run (less than the entry), and a
-        // new memtable needs a chunk of its own. With tablet changes on, every slot the batch
-        // creates needs one too, and a freeze needs one more.
-        2 * total + (new_slots.len() + 2) * self.chunk_size
+        // A new memtable needs a chunk of its own. With tablet changes on, every slot the
+        // batch creates needs one too, and a freeze needs one more.
+        total + waste + (new_slots.len() + 2) * self.chunk_size
     }
 
     /// Retires the memtables of slots that hold nothing (an empty active memtable, nothing
@@ -3353,9 +3366,9 @@ impl ShardState {
                 match self.reserve_room(m.bytes.as_slice()) {
                     Ok(bytes) => m.reserved = bytes,
                     Err(Room::Never) => {
-                        let metrics = &self.shared.metrics[usize::from(self.id.0)];
-                        metrics.stalls.fetch_add(1, Ordering::Relaxed);
-                        m.failed = Some(Error::Busy);
+                        // Not a stall: no flush could ever make room. The caller must split
+                        // the batch or raise `memtable_budget` (issue #141).
+                        m.failed = Some(Error::BatchTooLarge);
                         self.settle(m, Ok(()), ctx);
                         continue;
                     }

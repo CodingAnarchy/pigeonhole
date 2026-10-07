@@ -125,8 +125,9 @@ fn cross_shard_write_skew_is_prevented() {
 
 #[test]
 fn aborts_from_busy_poison_and_close_all_resolve() {
-    // Busy: a participant whose share can never fit its arena (even empty) refuses its
-    // PREPARE; the whole commit aborts. A merely full arena waits for a flush instead.
+    // BatchTooLarge: a participant whose share can never fit its arena (even empty) refuses
+    // its PREPARE; the whole commit aborts with that non-retryable error (issue #141). A
+    // merely full arena waits for a flush instead.
     {
         let vfs = SimVfs::new(12);
         let mut o = owned(Arc::clone(&vfs), 2);
@@ -170,7 +171,7 @@ fn aborts_from_busy_poison_and_close_all_resolve() {
         let r = within("cross-shard commit with a busy participant", move || {
             db2.commit(wb, None)
         });
-        assert!(matches!(r, Err(Error::Busy)), "{r:?}");
+        assert!(matches!(r, Err(Error::BatchTooLarge)), "{r:?}");
         assert_eq!(
             get(&db, &a, b"x"),
             None,
