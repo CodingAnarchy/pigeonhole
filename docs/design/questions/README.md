@@ -1,6 +1,6 @@
 # Per-crate open questions
 
-When the spec is silent or contradictory while you work on a crate, do not guess silently and do not edit [`decisions.md`](../decisions.md) yourself. Record the question in this directory, in `<crate>.md` (for example `pager.md`), one `##` section per question:
+When the spec is silent or contradictory while you work on a crate, do not guess silently and do not edit [`decisions/`](../decisions/README.md) yourself. Record the question in this directory, in `<crate>.md` (for example `pager.md`), one `##` section per question:
 
 ```markdown
 ## Q: <the question in one line>
@@ -13,7 +13,7 @@ Then build to the interim behavior, and mention the file in your PR.
 
 The coordinator audits these files after component merges. Each question becomes one of:
 
-- a numbered, approved decision in [`decisions.md`](../decisions.md) (the question confirmed or changed),
+- a numbered, approved decision in [`decisions/`](../decisions/README.md) (the question confirmed or changed),
 - a GitHub issue labeled with the phase (`phase-1`, `phase-3`, …) and the crate, linked from that decision, when work is deferred,
 - or a question for the owner when it is a product decision.
 

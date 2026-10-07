@@ -1,0 +1,166 @@
+# Decisions
+
+Project-level decisions that refine or deviate from [spec.md](../spec.md) and [task-briefs.md](../task-briefs.md). A decision wins over those files. Every decision is numbered and approved; numbers are permanent and global, and code and docs cite them as `Dn`.
+
+**Reading them:** don't read every file. Read this index, then open the decisions that touch your crate or topic, for example `grep -n -A30 '^## D83 ' docs/design/decisions/*.md`. When a decision is amended, read the amendment too ("amended by" below).
+
+**Adding them:** agents never write here. Record open questions and interim behavior in `docs/design/questions/<crate>.md` (see [questions/README.md](../questions/README.md)); the coordinator folds them into the current phase's file with the next free number and adds a line to this index. Deferred work is a GitHub issue ([status](../../status.md#tracked-follow-ups)).
+
+| Phase | File | Range |
+|---|---|---|
+| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D149 |
+
+## Index
+
+- [D1](phase-1.md#d1) — `pigeonhole-sim` does not depend on `pigeonhole`
+- [D2](phase-1.md#d2) — the simulated VFS lives in `pigeonhole-io`
+- [D3](phase-1.md#d3) — writer lock is a byte-range lock on the lock page
+- [D4](phase-1.md#d4) — interface-freeze gate
+- [D5](phase-1.md#d5) — reference hardware
+- [D6](phase-1.md#d6) — dependency policy
+- [D7](phase-1.md#d7) — manifest is a snapshot block plus a delta log · revised after review
+- [D8](phase-1.md#d8) — the free-space bitmap is not persisted
+- [D9](phase-1.md#d9) — family-in-row deletes use a marker key; BigTable delete rule · revised after review · **amended by D74, D78**
+- [D10](phase-1.md#d10) — a whole-row delete is one family marker per family
+- [D11](phase-1.md#d11) — timestamps are microseconds; default timestamps never go backwards · revised after review
+- [D12](phase-1.md#d12) — `WriteBatch::commit()` uses the writer default
+- [D13](phase-1.md#d13) — family ids are unique per database; SSTs belong to a (tablet, family)
+- [D14](phase-1.md#d14) — extra downward dependencies
+- [D15](phase-1.md#d15) — shared vocabulary types live in `format`
+- [D16](phase-1.md#d16) — value size limits · revised after review
+- [D17](phase-1.md#d17) — the `async` feature is off by default until Phase 3
+- [D18](phase-1.md#d18) — filters are cache-line-blocked bloom filters in Phase 1
+- [D19](phase-1.md#d19) — read-your-writes: commits return once visible · revised after review
+- [D20](phase-1.md#d20) — a changed shard count flushes recovered data before dropping streams
+- [D21](phase-1.md#d21) — lock page byte assignments
+- [D22](phase-1.md#d22) — filter pushdown semantics, uniform across sources · revised after review · **amended by D82**
+- [D23](phase-1.md#d23) — one shared-memory view record carries the tablet map and memtables
+- [D24](phase-1.md#d24) — WAL checkpoints never strand a prepared commit
+- [D25](phase-1.md#d25) — WAL segments are chained; recovery never appends to a torn segment
+- [D26](phase-1.md#d26) — a cross-shard commit's id is its seqno
+- [D27](phase-1.md#d27) — a shared-memory directory plus generation-named regions
+- [D28](phase-1.md#d28) — an oversized view is refused, never truncated
+- [D29](phase-1.md#d29) — small memtable values are copied; one-shot gets avoid view refcounts
+- [D30](phase-1.md#d30) — no fsync on a shard's foreground loop
+- [D31](phase-1.md#d31) — merge operators are associative folds
+- [D32](phase-1.md#d32) — cursors own what they read
+- [D33](phase-1.md#d33) — configuration structs are non-exhaustive
+- [D34](phase-1.md#d34) — a commit holds one entry per (column, timestamp); last write wins
+- [D35](phase-1.md#d35) — WAL spare segments are zero-filled off the shard thread
+- [D36](phase-1.md#d36) — reader processes open the database file read-write · owner decision U1
+- [D37](phase-1.md#d37) — Windows lock upgrades are not atomic; the writer opens shared memory before taking `Presence` · audit C1, K10
+- [D38](phase-1.md#d38) — a cell delete is timestamp-only · owner decision U2; purge behavior in D74
+- [D39](phase-1.md#d39) — a row read returns families in creation order, or in the caller's order · owner decision U3
+- [D40](phase-1.md#d40) — `compaction_cores(k)` is refused in application-owned mode · owner decision U4
+- [D41](phase-1.md#d41) — merge folding across timestamps; a non-`i64` base fails · audit K14, K15, C2 · **amended by D96**
+- [D42](phase-1.md#d42) — the reference model's crash windows, per WAL stream · audit K11 · **amended by D84**
+- [D43](phase-1.md#d43) — WAL segments are at most 4 GiB − 32 KiB · audit K13, C6
+- [D44](phase-1.md#d44) — shared-memory region names are at most 30 bytes · audit K16, C7
+- [D45](phase-1.md#d45) — "no other process attached" for a layout-version rebuild is decided by the presence byte · audit K17
+- [D46](phase-1.md#d46) — only `active` reader slots are reclaimed · audit K18
+- [D47](phase-1.md#d47) — the writer removes the old generation's name after switching · audit K20
+- [D48](phase-1.md#d48) — `read_view` before the first publish returns an empty view 0 · audit K21
+- [D49](phase-1.md#d49) — runtime shutdown, pinning and handler counts · audit K22
+- [D50](phase-1.md#d50) — pinned cache blocks may hold a shard over capacity; `erase_file` drops unpinned blocks only · audit K23
+- [D51](phase-1.md#d51) — a checkpoint may name a WAL segment that never reached the disk · audit K24
+- [D52](phase-1.md#d52) — memtable accounting and misuse · audit K25
+- [D53](phase-1.md#d53) — `Vfs` edge cases · audit K26
+- [D54](phase-1.md#d54) — `format` keeps a minimal decoder surface · audit K27
+- [D55](phase-1.md#d55) — `sync_data` does not make a length change durable · audit C3
+- [D56](phase-1.md#d56) — shared memory is little-endian only · audit C4, C5
+- [D57](phase-1.md#d57) — the pager's clean-close flag outlives the open that read it · pager question
+- [D58](phase-1.md#d58) — a failed root commit poisons the pager · pager question
+- [D59](phase-1.md#d59) — an interrupted `Pager::create` is refused, never deleted · owner decision
+- [D60](phase-1.md#d60) — `shrink_plan` cannot tell published extents from in-flight output · pager question
+- [D61](phase-1.md#d61) — `reclaim` is clamped to the durable root · pager question
+- [D62](phase-1.md#d62) — each phase gate includes an empty phase milestone · owner
+- [D63](phase-1.md#d63) — `SstWriterOptions::created_micros` · sst
+- [D64](phase-1.md#d64) — block-cache namespaces for SSTs and blob files · sst
+- [D65](phase-1.md#d65) — sst error classification · sst
+- [D66](phase-1.md#d66) — what `SstReader::open` promises about an interrupted build · sst
+- [D67](phase-1.md#d67) — one block decoder · sst, ICR 0004
+- [D68](phase-1.md#d68) — index partitions and readahead · sst
+- [D69](phase-1.md#d69) — blob record caching and logical length · sst
+- [D70](phase-1.md#d70) — `GcPolicy::min_ts_above` bounds bottommost purges · compaction · **amended by D147**
+- [D71](phase-1.md#d71) — additive `JobContext` fields `target_sst_bytes` and `clock` · compaction
+- [D72](phase-1.md#d72) — other additive public API · compaction
+- [D73](phase-1.md#d73) — counter operands are not folded across timestamps in Phase 1 · Phase 2 folding tracked in #34
+- [D74](phase-1.md#d74) — purges follow HBase semantics · owner decision · amends D9
+- [D75](phase-1.md#d75) — `I64Add` accepts only `ValueTag::I64` values · compaction
+- [D76](phase-1.md#d76) — `ResolveOptions::versions` and the family's `max_versions` · compaction
+- [D77](phase-1.md#d77) — value predicates on typed and blob values · compaction
+- [D78](phase-1.md#d78) — rows split across SSTs of one level move together; point gets consult every overlapping SST of a level · compaction · amends D9
+- [D79](phase-1.md#d79) — what the engine does with picker tasks · compaction
+- [D80](phase-1.md#d80) — blob accounting in Phase 1 · compaction
+- [D81](phase-1.md#d81) — point gets copy small values · compaction
+- [D82](phase-1.md#d82) — time ranges on merge families apply to resolved versions · coordinator · amends D22
+- [D83](phase-1.md#d83) — a cross-shard commit is recovered all or nothing · engine
+- [D84](phase-1.md#d84) — durability promises are per WAL stream · engine · amends D42
+- [D85](phase-1.md#d85) — a failed WAL sync after a group was applied leaves its data visible · engine
+- [D86](phase-1.md#d86) — default timestamps use a per-shard floor seeded at replay · engine
+- [D87](phase-1.md#d87) — reader processes re-pin when idle · engine; changed in review
+- [D88](phase-1.md#d88) — application-owned close does not block · engine
+- [D89](phase-1.md#d89) — `From<format::Error>` maps unknown variants to `Corruption` · engine
+- [D90](phase-1.md#d90) — `Snapshot::at_seqno` is a test hook behind `test-hooks` · engine
+- [D91](phase-1.md#d91) — conditional writes, OCC and prepared shares · changed in review
+- [D92](phase-1.md#d92) — one resolver for reads and compaction · coordinator
+- [D93](phase-1.md#d93) — the per-stream recovery oracle lives in `pigeonhole-sim` · sim, #40; extended by D114
+- [D94](phase-1.md#d94) — a later stronger commit makes earlier `None` commits durable · owner decision; implemented by #50
+- [D95](phase-1.md#d95) — Phase 2 family settings are refused at creation · pigeonhole
+- [D96](phase-1.md#d96) — every family has the `i64` add operator unless told otherwise · pigeonhole · amends D41
+- [D97](phase-1.md#d97) — `Scan::limit(0)` returns no rows · pigeonhole
+- [D98](phase-1.md#d98) — `TableBuilder::open` adds declared families that are missing · pigeonhole
+- [D99](phase-1.md#d99) — table handles resolve families added through other handles · pigeonhole
+- [D100](phase-1.md#d100) — `Error`'s `Display` is the message; unknown engine variants map to `Io` · pigeonhole
+- [D101](phase-1.md#d101) — a hidden `Options::wal_segment_size` test hook · pigeonhole; ICR 0005
+- [D102](phase-1.md#d102) — registered custom merge operators are not passed to the engine yet · Phase 2 work tracked in #43
+- [D103](phase-1.md#d103) — features available ahead of their phase · pigeonhole
+- [D104](phase-1.md#d104) — what crosses the future C ABI · pigeonhole
+- [D105](phase-1.md#d105) — `Runner` gains two provided methods, `client` and `describe` · bench
+- [D106](phase-1.md#d106) — The scaling gate cannot pass until tablets split or tables spread across shards · bench; tracked in #51
+- [D107](phase-1.md#d107) — Sparse-wide: what does "1M rows × 0 to 10K qualifiers, Zipfian" mean · bench; sizes grow in #52
+- [D108](phase-1.md#d108) — comparison durability is "written to the OS, not fsynced" unless `--sync` · bench
+- [D109](phase-1.md#d109) — reproducibility tolerance · bench
+- [D110](phase-1.md#d110) — license exceptions for fjall's dependencies · bench
+- [D111](phase-1.md#d111) — CI builds the bench crate without the `rocksdb` feature · bench
+- [D112](phase-1.md#d112) — YCSB fidelity limits imposed by `BenchOp` · deferred to #54 (Phase 2)
+- [D113](phase-1.md#d113) — Time series: TTL never expires during a run · deferred to #54 (Phase 2)
+- [D114](phase-1.md#d114) — the recovery oracle also works on record lists · sim, #59; extends D93
+- [D115](phase-1.md#d115) — Which WAL streams must a flush sync before its SSTs become visible · engine Milestone B
+- [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B
+- [D117](phase-1.md#d117) — Is `SetFlushed` the memtable's max seqno, or the shard's visible seqno · engine Milestone B
+- [D118](phase-1.md#d118) — How conservative is `GcPolicy` about reader-process snapshots · engine Milestone B; precise per-slot pinning is #39
+- [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126**
+- [D120](phase-1.md#d120) — What does `backup` write for an engine with memtables and many levels · engine Milestone B; blob extents are #58
+- [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B
+- [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
+- [D123](phase-1.md#d123) — Does the sim's recovery helper cover a coordinator that is also a participant · superseded for new code by D114; engine adoption in #48 · **amended by D125**
+- [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D138**
+- [D125](phase-1.md#d125) — the model suites use the sim's record-level oracle on every crash · harness, #48 · amends D123
+- [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119
+- [D127](phase-1.md#d127) — a model harness attributes an error to an armed power loss only once the crash has fired · harness, #62
+- [D128](phase-1.md#d128) — flush and compaction outputs are trimmed to their length before they are published · pager, compaction, #106
+- [D129](phase-1.md#d129) — tablet changes are off by default until hardened · tablets, #97
+- [D130](phase-1.md#d130) — a tablet's owner is not persisted; owners are re-derived at open · tablets, #97; persisting placement is #104
+- [D131](phase-1.md#d131) — checkpoints compare slots against the catalog, not the shard · tablets, #97
+- [D132](phase-1.md#d132) — a commit routed through an older tablet map · tablets, #97 · **amended by D145**
+- [D133](phase-1.md#d133) — the default-timestamp floor of a moved tablet · tablets, #97
+- [D134](phase-1.md#d134) — what the balancer does, and its options · tablets, #97; stability work in #103 · **amended by D144, D146**
+- [D135](phase-1.md#d135) — a split's children and the view buffer (D28) · tablets, #97
+- [D136](phase-1.md#d136) — arena room for many tablet slots · tablets, #97; refinement in #104
+- [D137](phase-1.md#d137) — What does `Engine::compact` guarantee while tablets split, merge and move · engine
+- [D138](phase-1.md#d138) — What do `flush` and `compact` do when the arena has no chunk for the fresh memtables they need · engine, #116 · amends D124
+- [D139](phase-1.md#d139) — Where do tablets go at open, now that owners are not persisted (D130) · engine
+- [D140](phase-1.md#d140) — How large is the slot budget, and what happens when the tablets need more · engine
+- [D141](phase-1.md#d141) — When do empty slots give back their memtables · engine
+- [D142](phase-1.md#d142) — Must a participant check a cross-shard commit's timestamp against its own floor · engine
+- [D143](phase-1.md#d143) — Should commits pipelined on one row keep their order during a move · engine
+- [D144](phase-1.md#d144) — Who rewrites a cold child's inherited SST so that the balancer can merge it back · tablets, #95 · amends D134
+- [D145](phase-1.md#d145) — How long may a commit wait on a tablet change, and when is a PREPARE routed with an older tablet map refused · tablets, #102 · amends D132
+- [D146](phase-1.md#d146) — How does the balancer avoid thrashing, oversubscribing a shard's slots and growing the tablet count without… · tablets, #103 · amends D134
+- [D147](phase-1.md#d147) — Does a prepared, undecided cross-shard share count as above a compaction's inputs · engine, #132 · amends D70
+- [D148](phase-1.md#d148) — Reader snapshots from before a writer restart expire with `SnapshotExpired` · process, #140 F7-1
+- [D149](phase-1.md#d149) — A reader builds a view only from the catalog of the record's own manifest version · process, #140 F7-2
+
+## Open questions
+_None._
