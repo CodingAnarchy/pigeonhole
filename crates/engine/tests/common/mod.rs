@@ -3530,6 +3530,12 @@ fn is_crashed(e: &Error) -> bool {
 
 /// Runs one seeded model check.
 pub fn run(seed: u64, cfg: &Config) -> Result<Stats, Failure> {
+    let mut cfg2 = cfg.clone();
+    if std::env::var("DBG_NOTHREADS").is_ok() {
+        cfg2.cas_ppm = 0;
+        cfg2.txn_ppm = 0;
+    }
+    let cfg = &cfg2;
     let sim = Sim::with_faults(seed, cfg.faults.clone());
     let vfs = sim.vfs();
     if let Some(n) = cfg.crash_at {

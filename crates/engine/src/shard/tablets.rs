@@ -466,6 +466,19 @@ impl ShardState {
                     + t.start.len()
                     + t.end.as_ref().map_or(0, Vec::len)
                     + 16;
+                // Each shard keeps its slots within its arena's chunks.
+                let fits = owners.iter().all(|o| {
+                    let children = owners.iter().filter(|x| *x == o).count();
+                    // The parent's slots leave this shard as its children arrive.
+                    let extra = families * children;
+                    let freed = if *o == self.id { families } else { 0 };
+                    self.slots_fit(&view, *o, extra.saturating_sub(freed))
+                });
+                if !fits {
+                    return Err(Error::Unsupported(
+                        "a shard would hold more tablets than its memtable arena serves",
+                    ));
+                }
                 if view.to_record().encoded_len() + grow > self.shared.view_capacity {
                     return Err(Error::Unsupported(
                         "the tablet map would not fit the shared-memory view buffer (D28)",
@@ -491,9 +504,33 @@ impl ShardState {
                         tablet.0, to.0
                     )));
                 }
+                let families = view.catalog.family_ids_of(t.table).len();
+                if !self.slots_fit(&view, *to, families) {
+                    return Err(Error::Unsupported(
+                        "a shard would hold more tablets than its memtable arena serves",
+                    ));
+                }
                 Ok(vec![t])
             }
         }
+    }
+
+    /// The most `(tablet, family)` slots a shard should hold: a quarter of its arena's
+    /// chunks. Every slot written to takes a memtable chunk (and usually two before it
+    /// freezes), and frozen memtables keep theirs until flushed and released.
+    fn max_slots(&self) -> usize {
+        self.arena.region().len() / self.chunk_size.max(1) / 4
+    }
+
+    /// Whether `shard` can take `extra` more slots under [`ShardState::max_slots`].
+    fn slots_fit(&self, view: &View, shard: ShardId, extra: usize) -> bool {
+        let slots: usize = view
+            .tablets
+            .iter()
+            .filter(|t| t.shard == shard)
+            .map(|t| view.catalog.family_ids_of(t.table).len())
+            .sum();
+        slots + extra <= self.max_slots()
     }
 
     /// Moves the running change on: commits it once its tablets are drained.
@@ -531,6 +568,10 @@ impl ShardState {
         if !busy && self.shares_touch_moving() {
             busy = true;
         }
+        trace!(
+            "shard {} tablet change waits: busy={busy} refreeze={refreeze} deferred={} flush_running={}",
+            self.id.0, self.freeze_deferred, self.flush_running
+        );
         if refreeze {
             if self.freeze(false).is_err() {
                 self.poisoned = true;
@@ -785,12 +826,22 @@ impl ShardState {
             return None;
         }
         let refs = view.catalog.sst_refs();
+        // Every `(tablet, family)` slot written to takes memtable chunks: a shard keeps its
+        // slots within `max_slots`, so splits never starve writers of memtables.
+        let slots: usize = owned
+            .iter()
+            .map(|t| view.catalog.family_ids_of(t.table).len())
+            .sum();
+        let max_slots = self.max_slots();
+        let room_for =
+            |t: &TabletEntry| slots + view.catalog.family_ids_of(t.table).len() <= max_slots;
         // 1. Size: a tablet holding `tablet_split_bytes` of SSTs splits in two (not while it
         //    still shares SSTs with a sibling: their bytes would count twice).
         for t in &owned {
             let (bytes, shared) = live_bytes(&view, t, &refs);
             if bytes >= cfg.split_bytes
                 && !shared
+                && room_for(t)
                 && let Some(key) = self.size_split_key(&view, t)
             {
                 return Some(TabletOpKind::Split {
@@ -819,11 +870,21 @@ impl ShardState {
                 .iter()
                 .map(|t| (t.id, self.loads.get(&t.id).map_or(0, |l| l.writes)))
                 .collect();
-            if let Some(op) = self.skew_op(&owned, &writes, &tablet_writes, cfg.min_writes) {
+            let splits_ok = |op: &TabletOpKind| match op {
+                TabletOpKind::Split { tablet, .. } => {
+                    owned.iter().find(|t| t.id == *tablet).is_some_and(room_for)
+                }
+                _ => true,
+            };
+            if let Some(op) = self.skew_op(&owned, &writes, &tablet_writes, cfg.min_writes)
+                && splits_ok(&op)
+            {
                 return Some(op);
             }
             let min_mem = self.shared.memtable_freeze_bytes;
-            if let Some(op) = self.skew_op(&owned, &mems, mem_per, min_mem) {
+            if let Some(op) = self.skew_op(&owned, &mems, mem_per, min_mem)
+                && splits_ok(&op)
+            {
                 return Some(op);
             }
         }

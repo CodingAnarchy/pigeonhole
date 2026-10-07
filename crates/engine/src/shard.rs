@@ -273,13 +273,15 @@ impl Shared {
     /// watermark publish, and only when someone is registered (one relaxed load otherwise).
     pub(crate) fn wake_visible(&self) {
         if self.freeze_waiting.load(Ordering::Acquire) != 0 {
-            let shards: Vec<u16> = std::mem::take(
-                &mut *self
+            let shards: Vec<u16> = {
+                let mut list = self
                     .freeze_waiters
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
-            self.freeze_waiting.store(0, Ordering::Release);
+                    .unwrap_or_else(PoisonError::into_inner);
+                // Reset under the lock, so a registration racing this take is never lost.
+                self.freeze_waiting.store(0, Ordering::Release);
+                std::mem::take(&mut *list)
+            };
             for s in shards {
                 let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
             }
@@ -1725,6 +1727,20 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
+            // The fresh active memtable takes a chunk: never one admitted commits reserved.
+            if self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size)
+                && let Ok(m) = Memtable::create(&mut self.arena)
+            {
+                // As `refresh_free`: the arena accounts for memtables released since.
+                self.arena.reclaim(m.retire());
+            }
+            if self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size) {
+                trace!(
+                    "shard {} freeze {:?}: the arena's free chunks are reserved",
+                    self.id.0, key
+                );
+                continue;
+            }
             let Ok(fresh) = Memtable::create(&mut self.arena) else {
                 // No chunk for a new active memtable: keep writing into this one; the
                 // arena-room check defers later commits until a flush frees space.
@@ -1751,15 +1767,22 @@ impl ShardState {
             self.view_dirty = true;
         }
         self.freeze_all_pending = all && deferred;
-        if deferred && !self.freeze_deferred {
+        if deferred {
+            // Register for the watermark kick whenever not registered: an earlier kick took
+            // this shard off the list even though its flag is still set, and a freeze that
+            // defers again must be woken again (a tablet change waits on it with every write
+            // to the tablet parked, so nothing else would wake it).
             self.freeze_deferred = true;
-            self.shared
+            let mut waiters = self
+                .shared
                 .freeze_waiters
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(self.id.0);
-            self.shared.freeze_waiting.fetch_add(1, Ordering::AcqRel);
-        } else if !deferred {
+                .unwrap_or_else(PoisonError::into_inner);
+            if !waiters.contains(&self.id.0) {
+                waiters.push(self.id.0);
+                self.shared.freeze_waiting.fetch_add(1, Ordering::AcqRel);
+            }
+        } else {
             self.freeze_deferred = false;
         }
         if self.view_dirty {
@@ -2352,6 +2375,11 @@ impl ShardState {
     /// Runs the group commit over everything drained since the last one.
     fn run_group(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.pending.is_empty() {
+            // Nothing waits for room any more (the waiting commits were parked or
+            // forwarded by a tablet change): the stall is over and its timer goes.
+            if self.room_wait.is_some() && !self.wait_room {
+                self.end_room_wait(ctx.now_nanos());
+            }
             return;
         }
         trace!(
@@ -2542,6 +2570,12 @@ impl ShardState {
             }
             let _ = self.freeze(true);
             self.spawn_flush(ctx);
+            if !self.flush_running && self.reserved > 0 {
+                // Nothing could freeze: this group's own admitted members hold the free
+                // chunks. Once they are applied (below) their room is free again, so the
+                // waiting members try again then rather than wait for a flush that never comes.
+                let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+            }
         } else {
             if let Some(w) = &self.room_wait
                 && !self.wait_room
@@ -4173,6 +4207,16 @@ impl ShardHandler for ShardState {
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
         self.run_group(ctx);
+        // The L0 stall's timer only kicks waiting writers: with none left (they were parked
+        // or forwarded by a tablet change) or the stall over, it goes.
+        if self.stall.timer.is_some()
+            && (self.pending.is_empty()
+                || self.stall.score < 1.0
+                || self.compaction_backoff
+                || self.poisoned)
+        {
+            self.stall.cancel_timer();
+        }
         if self.op.is_some() {
             self.progress_op(ctx);
         }
