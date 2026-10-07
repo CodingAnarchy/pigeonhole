@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::future::Future;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
@@ -1674,4 +1675,99 @@ fn a_purge_record_covers_entries_dropped_by_an_earlier_compaction() {
     );
     let snap = store.engine.snapshot().unwrap();
     assert_eq!(store.get(&snap, &row, "g", b"q2").unwrap(), None);
+}
+
+// ---- #111: a close whose memtables get no fresh replacement ----
+
+#[test]
+fn a_close_flushes_memtables_in_place_when_snapshots_hold_the_arena() {
+    // One shard, a 2 MiB arena (64 chunks of 32 KiB) and eight families. A snapshot pins
+    // the first round's memtables (seven chunks each in four families, six in the others)
+    // after their flush, which leaves four free chunks; the second round writes one row
+    // per family into the fresh memtables. The close then has eight memtables to freeze
+    // and room for four replacements. Those that got none used to stay active: nothing
+    // flushed them, and the shard waited for ever on the log records they held.
+    let vfs = SimVfs::new(111);
+    let vfs_ref: VfsRef = vfs.clone();
+    let mut o = common::options(Arc::clone(&vfs), 1, 2 << 20);
+    o.memtable_freeze_bytes = 1 << 20;
+    let rows = |round: u32, family: usize| match (round, family) {
+        (0, 0..4) => 190,
+        (0, _) => 170,
+        _ => 1,
+    };
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o.clone()).unwrap();
+    let mut run = || {
+        for _ in 0..100_000 {
+            let mut more = false;
+            for s in &mut shards {
+                more |= s.run_once(u64::MAX);
+            }
+            if !more {
+                return;
+            }
+        }
+        panic!("the shards never went idle");
+    };
+    let defs: Vec<(String, FamilyOptions)> = (0..8)
+        .map(|f| (format!("f{f}"), FamilyOptions::default()))
+        .collect();
+    let t = db.create_table("t", &defs).unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut snap = None;
+    for round in 0..2 {
+        for (fi, f) in t.families.iter().enumerate() {
+            let mut wb = WriteBatch::new();
+            for i in 0..rows(round, fi) {
+                let row = format!("r{round}-{i:03}");
+                let v = ValueRef::Bytes(&[7u8; 1000]);
+                wb.put(t.id, f.id, row.as_bytes(), b"q", None, v).unwrap();
+            }
+            let mut pc = db.submit(wb, Some(Durability::Buffered)).unwrap();
+            loop {
+                match poll_commit(&mut pc) {
+                    Poll::Ready(r) => break r.map(|_| ()).unwrap(),
+                    Poll::Pending => run(),
+                }
+            }
+        }
+        if round == 0 {
+            snap = Some(db.snapshot().unwrap());
+            let mut flush = db.flush_pending().unwrap();
+            loop {
+                match std::pin::Pin::new(&mut flush).poll(&mut cx) {
+                    Poll::Ready(r) => break r.unwrap(),
+                    Poll::Pending => run(),
+                }
+            }
+        }
+    }
+    db.close().unwrap();
+    run();
+    // The snapshot is still alive: the close finished without its memtables' chunks.
+    assert!(snap.is_some());
+    assert!(!db.final_close_pending());
+    let info = Engine::inspect_manifest(&vfs_ref, Path::new(DB)).unwrap();
+    assert!(info.clean, "the close finished");
+    drop((snap, shards, db));
+    assert_eq!(
+        sidecars(&vfs),
+        Vec::<String>::new(),
+        "checkpointed and removed"
+    );
+
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db.table("t").unwrap();
+    let snap = db.snapshot().unwrap();
+    for (fi, f) in t.families.iter().enumerate() {
+        for round in 0..2 {
+            for i in 0..rows(round, fi) {
+                let row = format!("r{round}-{i:03}");
+                let cell = db.get(&snap, t.id, f.id, row.as_bytes(), b"q").unwrap();
+                assert!(cell.is_some(), "{} {row}", f.name);
+            }
+        }
+    }
+    drop(snap);
+    db.close().unwrap();
 }
