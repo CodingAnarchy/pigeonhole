@@ -601,7 +601,7 @@ After a move, or a reopen that re-derives owners, a stream can hold records for 
 
 **Interim behavior (with `tablet_changes` on):** `needed` and `report_shares_flushed` read the flushed seqnos of the current view's catalog. A slot whose tablet no longer exists needs nothing: its table was dropped, or a split or merge retired it after every write to it reached SSTs. Replayed PREPAREs record the slots of every shard they were applied on. Every manifest commit that adds SSTs broadcasts `Maintain`, which then also advances checkpoints and share reports. Off, the shard's own flushed seqnos and its `dropped` set decide, as before.
 
-## D132 — a commit routed through an older tablet map (approved; tablets, #97)
+## D132 — a commit routed through an older tablet map (approved; tablets, #97; amended by the #102 decision)
 A router can pick a shard just before that shard splits, merges or moves the tablet.
 
 **Decision:**
@@ -614,7 +614,7 @@ D11 wants a per-tablet floor that travels with the tablet; D86 keeps it per shar
 
 **Decision:** the shard floor stays the only floor kept; it is an upper bound on every default timestamp the shard assigned to any of its tablets. Before a change commits, the shard raises the floor of every shard receiving a tablet to its own (`Shared::ts_raises`, read by the receiver's next default timestamp), so the moved tablet's timestamps never go backwards. A coordinator also picks a cross-shard commit timestamp above every participant's published floor and raise. A commit refused with `Moved` keeps its first timestamp on retry only where nothing else reached it: above every participant's floor and raise, or equal to one only where the shards that reached it are the commit's own (its coordinator and the participants that prepared it, and raises those shards made). Otherwise it takes a fresh timestamp, so a retry never ties a write another commit made. No per-mutation bookkeeping is added.
 
-## D134 — what the balancer does, and its options (approved; tablets, #97; stability work in #103)
+## D134 — what the balancer does, and its options (approved; tablets, #97; stability work in #103; amended by the #95 and #103 decisions)
 The spec gives the triggers (size, sustained write skew, small and cold) but no policy.
 
 **Decision:** each shard runs its balancer every `EngineOptions::balance_interval_nanos` (default 100 ms; 0 disables it) and changes at most one thing at a time, in this order:
@@ -692,6 +692,46 @@ D132 parks a commit on a tablet's old owner during a move and forwards it once t
 Proposed design if the stronger order is wanted: before the move's manifest commit, the old owner sends each receiving shard an `Incoming` message naming the moving ranges. The receiver parks single-shard commits on those rows and refuses PREPAREs on them with `Moved`. Once the change is done (or has failed), the old owner sends `HandoffDone` carrying the parked commits that now route to the receiver. The receiver runs those first, then its own parked commits, and bumps `tablet_epoch` so that refused PREPAREs retry. The message order (A's `Incoming` happens before the view is published, and so before any client routes to the new owner) puts `Incoming` ahead of every new-owner submit. A parked commit that turns cross-shard after the change could still reorder; that would need its own rule.
 
 **Coordinator:** no stronger order. D132's guarantee stands: a commit submitted after an earlier one was acknowledged is applied after it; commits in flight together have no order. The public API's commits are synchronous, so one client's writes stay ordered. The `Incoming`/`HandoffDone` design is not built.
+
+## D144 — Who rewrites a cold child's inherited SST so that the balancer can merge it back (approved; tablets, #95; amends D134)
+D134 refuses a merge while a sibling still has to compact its copy of an SST the two shared after a split (D13): once one child has rewritten its copy, the other's copy still holds the first child's rows, and the merged tablet would read them twice. A cold child never reaches its L0 trigger, so nothing ever rewrote its copy, and every balancer pass refused the same merge (issue #95). D134 says nothing about how such a merge gets unblocked.
+
+**Decision (with `tablet_changes` on):** when the balancer finds two adjacent cold tablets small enough to merge and `merged_ssts` refuses them, it queues every slot of the pair that holds an SST sticking out of its tablet's range (`ShardState::cleanups`). `maintain` serves that queue after full compactions, alternating with due compactions (a queued cleanup takes every other background compaction, except while writers stall on L0), so writes elsewhere on the shard never starve it: it compacts the slot into the last level (`compact::plan_full`; a single sticking-out SST becomes a rewrite, D79), which drops the sibling's rows. A later pass then merges. Slots that no longer stick out, whose tablet left the shard or is being changed, are dropped; a slot whose inputs are busy waits for the next `maintain`. Compaction backoff and a poisoned shard stop cleanups like any other background compaction. Off, the balancer never runs, so the queue stays empty.
+
+Proposed amendment to D134, item 3: "…A merge is refused while a sibling still has to compact its copy of a shared SST, since the merged tablet would see those rows twice; the balancer then asks for a rewrite of the slots holding such an SST, at the lowest compaction priority, and merges on a later pass."
+
+The balancer's coldness test also ignores an empty active memtable: since slots keep their memtable after a flush (#116/#120), an empty one still has chunks allocated, which used to keep its tablet from ever counting as cold.
+
+**Coordinator:** confirmed.
+
+## D145 — How long may a commit wait on a tablet change, and when is a PREPARE routed with an older tablet map refused (approved; tablets, #102; amends D132)
+D132 parks single-shard commits behind a change and refuses PREPAREs touching a changing tablet, or routed with an older map, with `Moved`; the coordinator retries. It sets no bound: parked commits sat before the arena-room wait (so D124's timeout never applied), a change waits for a running compaction on its tablets, retries had no cap, and a shard that once handed a tablet away refused every PREPARE routed with an older map, even when none of its rows changed owner, so under balancer churn a cross-shard commit could retry for ever. Close also waited for a draining change and everything parked behind it.
+
+**Decision (with `tablet_changes` on; off, none of this is reached):**
+- **Parked commits** fail with `Busy` once `write_stall_timeout_nanos` has passed since they were submitted. A clock timer fires at the oldest deadline; like D126's timers it is not armed again while the clock is frozen, where parked commits wait for the change as before.
+- **Retries** of a commit refused with `Moved` fail with `Busy` after `MOVED_RETRIES` (16) refusals, or once `write_stall_timeout_nanos` has passed since the commit was submitted (also for a retry still waiting for the map to change). The attempt count travels with the commit (`CommitReq::attempts`, `CoordinateReq::attempts`), through forwarding and both retry paths: a refusal for a moved tablet, and one for a timestamp below a participant's floor (#121).
+- **Refusals:** a PREPARE routed with an older map is refused only when, under the participant's current map, a row its share writes belongs to another shard, or a row the commit reads belongs to a shard outside the commit (`PrepareReq::participants`); a read another participant now owns is validated there. Rows in a tablet being changed are still refused.
+- **Routing checks after a loss:** the sticky `lost_tablets` flag is replaced by `lost_version`, the map version as of the last change that handed a tablet away. Commits routed with that map or a newer one skip the check; single-shard commits now carry the version they were routed with (`CommitReq::map_version`; forwarded ones take the map that forwarded them).
+- **Balancer:** it does not start a change on a tablet that is compacting (it decides again next interval). An explicit change still waits for the compaction.
+- **Close** gives up a change that has not reached its manifest commit (`abort_op` with `Closed`), so its parked commits are routed again and fail with `Closed`; a committing change still finishes.
+
+Proposed amendment to D132: add "A parked commit, or a refused cross-shard commit, fails with `Busy` after `write_stall_timeout_nanos` (and a refused commit after 16 attempts). A PREPARE routed with an older map is refused only when one of its rows now routes outside the commit. Close gives up a change that has not started its manifest commit."
+
+**Coordinator:** confirmed.
+
+## D146 — How does the balancer avoid thrashing, oversubscribing a shard's slots and growing the tablet count without bound (approved; tablets, #103; amends D134)
+D134 decides on one interval's snapshot: per-interval write counts, and memtable bytes, which swing with every flush, so uniform load moved or split tablets every interval. Each shard checked a move's target against its own view of the slots, so two shards could move tablets onto one shard in the same interval and take it past `max_slots`. Merges needed both neighbours on one shard while skew splits put children on other shards, so the tablet count only grew. And a shard balanced only while it processed messages, so an idle shard never merged its cold tablets.
+
+**Decision (with `tablet_changes` on; off, the balancer never runs):**
+- **Smoothed load.** Each shard keeps a moving average of the rows it writes per interval (weight 0.5 on the newest), publishes that in `LoadSlot::writes`, and keeps one per tablet. Write skew compares these averages. The memtable-bytes trigger is dropped.
+- **Dwell.** After a shard starts a move or a split over shards, it starts no other one for 10 balancer passes. A tablet that arrived on a shard (by a move or a split) is not moved or split for write skew there for 10 passes; tablets a shard held at its first pass count as settled. Size splits and merges are not delayed.
+- **Slot reservations.** A change that hands tablets to shards reserves their slots (`LoadSlot::reserved`) when it starts, and releases them when it ends. Every check counts the slots in the view plus the reservations, so concurrent moves and splits never take a shard past `max_slots`; the losing change is refused with `Unsupported`. A skew move only targets a shard with room.
+- **Consolidation.** A settled, cold tablet whose left neighbour lives on another shard moves there when the two hold less than a quarter of `tablet_split_bytes` together and the neighbour's shard has room; that shard then merges them (D134 item 3). Only right to left, so two shards never swap tablets.
+- **Idle shards.** After each pass the shard arms a clock timer for its next pass, so the balancer runs without messages. As with D126's timers, a timer that gave up on a frozen clock is not armed again while the clock stays frozen. It is cancelled at close and never armed for an interval of 0 or `u64::MAX`.
+
+Proposed amendment to D134: replace "The same rule applies to memtable bytes…" with the smoothed-load rule and the dwell; add the reservations to item 2, consolidation as item 4, and "each shard wakes itself for its next pass".
+
+**Coordinator:** confirmed.
 
 ## Open questions
 _None._
