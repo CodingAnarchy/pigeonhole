@@ -12,14 +12,17 @@
 //! files hold: the manifest's per-stream checkpoints and per-slot flushed seqnos (read before
 //! the reopen), and every stream's surviving records after its checkpoint. Each stream keeps
 //! a prefix of its records (decision D84): a record survives if the WAL still holds it or
-//! its commit is in SSTs below the checkpoint. A single-shard commit survives iff its record
-//! does, a cross-shard commit iff every PREPARE and its COMMIT do (D83); the harness tracks
-//! the order records were appended to each stream, so the prefix rule is exact, and checks
-//! it against `pigeonhole_sim::recovered_commits` wherever that helper's commit-level view
-//! can represent the stream (see `sim_helper_agrees`). Commits only SSTs still hold are
-//! recognized by their raw entries (`Engine::raw_entries`). The model is rebuilt with
-//! `Model::from_commits`, the durability promise checked with `check_acknowledged_survive`,
-//! and the purges of every durable bottommost compaction re-applied (decision D74).
+//! its commit is in SSTs below the checkpoint. The harness tracks the order records were
+//! appended to each stream (`Engine::take_appended`), and on every crash hands those records
+//! and the surviving prefixes to `pigeonhole_sim::recovered_from_records` (D114): a
+//! single-shard commit survives iff its record does, a cross-shard commit iff every PREPARE
+//! and its COMMIT do (D83), however other commits' records interleave. Commits only SSTs
+//! still hold are recognized by their raw entries (`Engine::raw_entries`). The model is
+//! rebuilt with `Model::from_commits`, the durability promise checked with
+//! `check_acknowledged_survive`, and the purges of every durable bottommost compaction
+//! re-applied (decision D74). An armed power loss can fire on a shard's background I/O
+//! (a flush or compaction) with nothing in flight: the next step that sees an error while
+//! the liveness probe is dead recovers from that crash instead of failing (issue #62).
 //!
 //! **Flush and compaction.** Memtables are tiny, so flushes and compactions run throughout;
 //! the workload also calls `flush` and `compact` explicitly. Every compaction the engine
@@ -53,7 +56,8 @@ use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
     CommitStreams, Model, ModelCell, ModelFamily, ModelOp, ModelPurge, Op, Rng, Sim, Step,
-    StreamCommit, Workload, WorkloadSpec, check_acknowledged_survive, recovered_commits,
+    StreamCommit, StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive,
+    recovered_from_records,
 };
 
 pub const TABLE: &str = "t";
@@ -245,12 +249,12 @@ pub struct Stats {
     pub io_errors: usize,
     pub crashes: usize,
     pub mid_commit_crashes: usize,
+    /// Armed power losses that fired on background I/O and surfaced as a later step's error.
+    pub background_crashes: usize,
     pub busy: usize,
     pub flushes: u64,
     pub compactions: u64,
     pub purges: usize,
-    /// Recoveries where the sim helper's commit-level view could be checked.
-    pub helper_checked: usize,
     /// Commits recovered only from SSTs (their WAL records were checkpointed away).
     pub sst_only: usize,
     /// Mutating VFS operations the run made before its final crash: the crash points a
@@ -1015,12 +1019,66 @@ struct World {
 }
 
 impl World {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        seed: u64,
+        cfg: &Config,
+        vfs: &Arc<SimVfs>,
+        probe: FileRef,
+        model: Model,
+        store: Store,
+        reopens: usize,
+        workload: Option<std::iter::Take<Workload>>,
+    ) -> Self {
+        World {
+            seed,
+            cfg: cfg.clone(),
+            vfs: Arc::clone(vfs),
+            probe,
+            store: Some(store),
+            model,
+            engine_seqnos: Vec::new(),
+            history: BTreeMap::new(),
+            unacked: Vec::new(),
+            aborted: Vec::new(),
+            in_flight: Vec::new(),
+            need_reopen: false,
+            pending_advance: 0,
+            base: vfs.now_micros(),
+            snaps: Vec::new(),
+            trace: Vec::new(),
+            op_index: 0,
+            stats: Stats::default(),
+            failure: None,
+            reopens,
+            done: false,
+            workload,
+            queued: std::collections::VecDeque::new(),
+            stream_records: BTreeMap::new(),
+            purges: Vec::new(),
+            pending_purges: Vec::new(),
+            compaction_floor: 0,
+            faults_active: true,
+        }
+    }
+
     fn now(&self) -> u64 {
         self.vfs.now_micros()
     }
 
     fn alive(&self) -> bool {
         self.probe.len().is_ok()
+    }
+
+    /// A step saw an error with the liveness probe dead: an armed power loss fired on a
+    /// shard's background I/O (a flush or compaction) while nothing was in flight, and the
+    /// error is that crash, not a divergence (issue #62). Recovers from it.
+    fn background_crash(&mut self, e: &Error, rng: &mut Rng) -> Result<(), Fail> {
+        self.stats.background_crashes += 1;
+        self.trace.push(format!(
+            "  -> the armed power loss fired in the background ({e})"
+        ));
+        self.crash_and_recover(CrashKind::Power, true, rng)
     }
 
     fn model_seqno(&self, engine_seqno: Seqno) -> Seqno {
@@ -1878,23 +1936,17 @@ impl World {
                 }
             }
         }
-        // The prefix rule per record: a commit survives iff every one of its records does
-        // (a cross-shard commit all or nothing, D83). Commits whose records were never
-        // appended survive only through SSTs.
-        let recovered: Vec<usize> = all
-            .iter()
-            .enumerate()
-            .filter(|(i, c)| {
-                flushed[*i]
-                    || c.seqno.is_some_and(|seqno| {
-                        records_of(&c.streams).iter().all(|(s, kind)| {
-                            position(*s, seqno, *kind)
-                                .is_some_and(|p| p < survivors.get(s).copied().unwrap_or(0))
-                        })
-                    })
-            })
-            .map(|(i, _)| i)
+        // The sim's record-level rule (D83, D84, D114) over every stream's records in append
+        // order: a single-shard commit survives iff its record is in its stream's surviving
+        // prefix, a cross-shard commit iff its COMMIT is and every participant the COMMIT
+        // names still holds its PREPARE. Commits whose records were checkpointed away survive
+        // through SSTs.
+        let (records, counts) = self.sim_records(&all, &survivors);
+        let mut recovered: BTreeSet<usize> = recovered_from_records(&records, &counts)
+            .into_iter()
             .collect();
+        recovered.extend((0..all.len()).filter(|i| flushed[*i]));
+        let recovered: Vec<usize> = recovered.into_iter().collect();
         for &i in &recovered {
             if let Some(seqno) = all[i].seqno
                 && !raw_by_seqno.contains_key(&seqno)
@@ -1937,49 +1989,6 @@ impl World {
                 ),
             );
         }
-        // Where the sim helper's commit-level view can represent the streams, it must agree
-        // (over the commits whose records were all observed and not persisted by a flush).
-        if let Some((helper, considered)) = self.sim_helper_recovered(&all, &survivors) {
-            self.stats.helper_checked += 1;
-            let mut ours: Vec<usize> = recovered
-                .iter()
-                .copied()
-                .filter(|i| !flushed[*i] && considered.contains(i))
-                .collect();
-            let mut theirs: Vec<usize> = helper
-                .into_iter()
-                .filter(|i| !flushed[*i] && considered.contains(i))
-                .collect();
-            ours.sort_unstable();
-            theirs.sort_unstable();
-            if ours != theirs {
-                let detail: Vec<String> = ours
-                    .iter()
-                    .chain(&theirs)
-                    .filter(|i| !(ours.contains(i) && theirs.contains(i)))
-                    .map(|&i| {
-                        let c = &all[i];
-                        format!(
-                            "#{i} seqno {:?} streams {:?} positions {:?}",
-                            c.seqno,
-                            c.streams,
-                            records_of(&c.streams)
-                                .iter()
-                                .map(|(s, k)| (*s, *k, position(*s, c.seqno.unwrap_or(0), *k)))
-                                .collect::<Vec<_>>()
-                        )
-                    })
-                    .collect();
-                return fail(
-                    FailureClass::Protocol,
-                    format!(
-                        "the sim's recovered_commits disagrees with the record-level rule: {theirs:?} vs {ours:?}; differing: {detail:?}; survivors {survivors:?}; streams {:?}",
-                        self.stream_records
-                    ),
-                );
-            }
-        }
-
         // A commit lost here stays lost, but its appended records (a PREPARE without its
         // COMMIT) remain valid WAL records until a checkpoint passes them.
         for (i, c) in all.iter().enumerate() {
@@ -2087,129 +2096,56 @@ impl World {
         Ok(())
     }
 
-    /// `pigeonhole_sim::recovered_commits` over the commits in an order consistent with every
-    /// stream's append order, when one exists and each commit's records on one stream are
-    /// adjacent (the helper counts them so). Returns `None` when the streams cannot be
-    /// represented that way (a coordinator's COMMIT separated from its own PREPARE by other
-    /// records, or concurrent cross-shard commits prepared in opposite orders on two
-    /// shards).
-    fn sim_helper_recovered(
+    /// Every stream's records in append order as the sim's `StreamRecord`s, naming commits by
+    /// their index in `all`, and how many of them lie in the stream's surviving prefix.
+    /// Records of refused attempts belong to no commit and are left out; so are repeats of a
+    /// `(seqno, kind)` on one stream (a seqno reused after a crash), whose first record is the
+    /// one that counts.
+    fn sim_records(
         &self,
         all: &[Committed],
         survivors: &BTreeMap<u32, usize>,
-    ) -> Option<(Vec<usize>, Vec<usize>)> {
+    ) -> (Vec<Vec<StreamRecord>>, Vec<usize>) {
         let index: HashMap<Seqno, usize> = all
             .iter()
             .enumerate()
             .filter_map(|(i, c)| c.seqno.map(|s| (s, i)))
             .collect();
-        // Commits whose every record was observed: the only ones the helper can place.
-        let considered: Vec<usize> = all
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                c.seqno.is_some_and(|seqno| {
-                    records_of(&c.streams).iter().all(|(s, kind)| {
-                        self.stream_records
-                            .get(s)
-                            .is_some_and(|l| l.contains(&(seqno, *kind)))
-                    })
-                })
-            })
-            .map(|(i, _)| i)
-            .collect();
-        // The helper's streams hold only whole commits: one whose records were not all
-        // appended (a crash between its PREPAREs and its COMMIT) is left out everywhere,
-        // its appended records included.
-        let considered_set: BTreeSet<usize> = considered.iter().copied().collect();
-        let index: HashMap<Seqno, usize> = index
-            .into_iter()
-            .filter(|(_, i)| considered_set.contains(i))
-            .collect();
-        // Per stream, the sequence of commits (a commit's records collapsed to one entry;
-        // they must be adjacent).
-        let mut sequences: Vec<Vec<usize>> = Vec::new();
-        let streams = all
-            .iter()
-            .flat_map(|c| records_of(&c.streams).into_iter().map(|(s, _)| s))
-            .max()
-            .map_or(0, |m| m as usize + 1);
-        for stream in 0..streams as u32 {
-            let list = self
-                .stream_records
-                .get(&stream)
-                .cloned()
-                .unwrap_or_default();
-            let mut seq: Vec<usize> = Vec::new();
-            let mut last: Option<usize> = None;
-            for (seqno, _) in list {
-                // Records of refused attempts and of commits left out belong to no commit.
-                let Some(&i) = index.get(&seqno) else {
+        let streams = self
+            .stream_records
+            .keys()
+            .next_back()
+            .map_or(0, |s| *s as usize + 1);
+        let mut records = vec![Vec::new(); streams];
+        let mut counts = vec![0; streams];
+        for (stream, list) in &self.stream_records {
+            let s = *stream as usize;
+            let cut = survivors.get(stream).copied().unwrap_or(0);
+            let mut seen = BTreeSet::new();
+            for (pos, (seqno, kind)) in list.iter().enumerate() {
+                let Some(&i) = index.get(seqno) else {
                     continue;
                 };
-                if last == Some(i) {
+                if !seen.insert((*seqno, *kind)) {
                     continue;
                 }
-                if seq.contains(&i) {
-                    return None; // split records: not representable
-                }
-                seq.push(i);
-                last = Some(i);
-            }
-            sequences.push(seq);
-        }
-        // Topological order of the per-stream sequences (Kahn, smallest index first), over
-        // the considered commits only: the helper counts every record of every commit it
-        // is given, and the others left records it must not see (or none at all).
-        let n = all.len();
-        let mut indeg = vec![0usize; n];
-        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for seq in &sequences {
-            for w in seq.windows(2) {
-                succ[w[0]].push(w[1]);
-                indeg[w[1]] += 1;
-            }
-        }
-        let mut ready: BTreeSet<usize> = (0..n)
-            .filter(|i| indeg[*i] == 0 && considered_set.contains(i))
-            .collect();
-        let mut order = Vec::with_capacity(n);
-        while let Some(&i) = ready.iter().next() {
-            ready.remove(&i);
-            order.push(i);
-            for &j in &succ[i] {
-                indeg[j] -= 1;
-                if indeg[j] == 0 {
-                    ready.insert(j);
+                records[s].push(match kind {
+                    RecKind::Batch => StreamRecord::Single(i),
+                    RecKind::Prepare => StreamRecord::Prepare(i),
+                    RecKind::Commit => StreamRecord::Commit {
+                        commit: i,
+                        participants: match &all[i].streams {
+                            CommitStreams::Cross { participants, .. } => participants.clone(),
+                            CommitStreams::Single(_) => Vec::new(),
+                        },
+                    },
+                });
+                if pos < cut {
+                    counts[s] += 1;
                 }
             }
         }
-        if order.len() != considered.len() {
-            return None;
-        }
-        let commits: Vec<StreamCommit> = order
-            .iter()
-            .map(|&i| StreamCommit {
-                ops: Vec::new(),
-                commit_ts: 0,
-                durability: all[i].durability,
-                streams: all[i].streams.clone(),
-            })
-            .collect();
-        let counts: Vec<usize> = (0..streams as u32)
-            .map(|s| {
-                // Records surviving on this stream, counted as the helper counts (one per
-                // record, the records of one commit adjacent).
-                let list = self.stream_records.get(&s).cloned().unwrap_or_default();
-                let cut = survivors.get(&s).copied().unwrap_or(0).min(list.len());
-                list[..cut]
-                    .iter()
-                    .filter(|(seqno, _)| index.contains_key(seqno))
-                    .count()
-            })
-            .collect();
-        let rec = recovered_commits(&commits, &counts);
-        Some((rec.into_iter().map(|k| order[k]).collect(), considered))
+        (records, counts)
     }
 
     /// The entries `ops` leave in the store when committed at `commit_ts` (same-commit
@@ -2709,7 +2645,9 @@ impl World {
                 });
                 Ok(true)
             }
-            Err(e) if is_crashed(&e) => {
+            // A crash (possibly fired earlier on a shard's background I/O, which then fails
+            // the submit with whatever error the dead store reports first, issue #62).
+            Err(e) if is_crashed(&e) || !self.alive() => {
                 let mut c = commit;
                 c.acked = false;
                 self.unacked.push(c);
@@ -2999,7 +2937,7 @@ impl World {
         };
         let mut pc = match self.store().engine.submit(batch, Some(durability)) {
             Ok(pc) => pc,
-            Err(e) if is_crashed(&e) => {
+            Err(e) if is_crashed(&e) || !self.alive() => {
                 self.unacked.push(unacked);
                 self.crash_and_recover(CrashKind::Power, true, rng)?;
                 return Ok(false);
@@ -3162,7 +3100,13 @@ impl World {
                 family,
                 qualifier,
             } => {
-                let snap = self.pick_snapshot(rng)?;
+                let snap = match self.pick_snapshot(rng) {
+                    Ok(s) => s,
+                    Err(_) if !self.alive() => {
+                        return self.background_crash(&Error::Closed, rng);
+                    }
+                    Err(f) => return Err(f),
+                };
                 let ms = self.model_seqno(snap.seqno());
                 self.trace.push(format!(
                     "get {}/{family}:{} @engine {} (model {ms})",
@@ -3177,6 +3121,7 @@ impl World {
                 match (got, want) {
                     (Ok(g), Ok(w)) if g == w => {}
                     (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => {}
+                    (Err(e), _) if !self.alive() => return self.background_crash(&e, rng),
                     (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 => {
                         // An injected read failure: the read reports it, nothing else.
                         self.stats.io_errors += 1;
@@ -3198,7 +3143,13 @@ impl World {
                 }
             }
             Op::Scan { start, end } => {
-                let snap = self.pick_snapshot(rng)?;
+                let snap = match self.pick_snapshot(rng) {
+                    Ok(s) => s,
+                    Err(_) if !self.alive() => {
+                        return self.background_crash(&Error::Closed, rng);
+                    }
+                    Err(f) => return Err(f),
+                };
                 let ms = self.model_seqno(snap.seqno());
                 self.trace.push(format!(
                     "scan [{}, {}) @engine {} (model {ms})",
@@ -3233,6 +3184,7 @@ impl World {
                         }
                         (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => {
                         }
+                        (Err(e), _) if !self.alive() => return self.background_crash(&e, rng),
                         (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 => {
                             self.stats.io_errors += 1;
                             self.trace.push(format!("  -> read I/O error ({e})"));
@@ -3252,12 +3204,18 @@ impl World {
                 if rng.chance(self.cfg.dump_ppm) {
                     self.trace
                         .push(format!("full dump @engine {}", snap.seqno()));
-                    self.compare_dump(&snap, FailureClass::LiveReadMismatch)?;
+                    if let Err(f) = self.compare_dump(&snap, FailureClass::LiveReadMismatch) {
+                        if self.alive() {
+                            return Err(f);
+                        }
+                        return self.background_crash(&Error::Closed, rng);
+                    }
                 }
             }
             Op::Snapshot => {
                 let snap = match self.store().engine.snapshot() {
                     Ok(s) => s,
+                    Err(e) if !self.alive() => return self.background_crash(&e, rng),
                     Err(e) => return fail(FailureClass::Protocol, format!("snapshot: {e}")),
                 };
                 self.trace.push(format!("snapshot engine {}", snap.seqno()));
@@ -3350,38 +3308,17 @@ fn run_with(
     store: Store,
     reopens: usize,
 ) -> Result<Stats, Failure> {
-    let base = vfs.now_micros();
     let workload = Workload::new(seed ^ 0x5eed, TABLE, cfg.spec.clone()).take(cfg.ops);
-    let world = Rc::new(RefCell::new(World {
+    let world = Rc::new(RefCell::new(World::new(
         seed,
-        cfg: cfg.clone(),
-        vfs: Arc::clone(&vfs),
+        cfg,
+        &vfs,
         probe,
-        store: Some(store),
         model,
-        engine_seqnos: Vec::new(),
-        history: BTreeMap::new(),
-        unacked: Vec::new(),
-        aborted: Vec::new(),
-        in_flight: Vec::new(),
-        need_reopen: false,
-        pending_advance: 0,
-        base,
-        snaps: Vec::new(),
-        trace: Vec::new(),
-        op_index: 0,
-        stats: Stats::default(),
-        failure: None,
+        store,
         reopens,
-        done: false,
-        workload: Some(workload),
-        queued: std::collections::VecDeque::new(),
-        stream_records: BTreeMap::new(),
-        purges: Vec::new(),
-        pending_purges: Vec::new(),
-        compaction_floor: 0,
-        faults_active: true,
-    }));
+        Some(workload),
+    )));
 
     // Shard drivers as scheduler tasks: whichever shard the scheduler picks runs one slice.
     let max_shards = cfg
@@ -3491,6 +3428,89 @@ fn run_with(
     };
     // Tear down: close, then drive the shards so they finish the close.
     w.in_flight.clear();
+    if let Some(mut store) = w.store.take() {
+        let _ = store.engine.close();
+        for _ in 0..4 {
+            store.step_shards(vfs.monotonic_nanos());
+        }
+    }
+    result
+}
+
+/// Issue #62's scenario, deterministically: `cfg.ops` commits persisted to SSTs by a flush,
+/// as many again left in the memtables, then a power loss armed on the next mutating
+/// operation and fired by a shard's background flush with nothing in flight. Then `reads`
+/// run as client steps until one of them meets the dead store and recovers from the armed
+/// crash (`Stats::background_crashes`), which is checked like any other recovery. Use a
+/// config without random flushes, compactions, crashes or helper-thread commits.
+pub fn read_after_background_crash(
+    seed: u64,
+    cfg: &Config,
+    reads: &[Op],
+) -> Result<Stats, Failure> {
+    let sim = Sim::with_faults(seed, cfg.faults.clone());
+    let vfs = sim.vfs();
+    let probe = vfs
+        .open(Path::new("/db/probe"), OpenOptions::read_write_create())
+        .expect("probe");
+    let store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("open");
+    let mut w = World::new(seed, cfg, &vfs, probe, new_model(), store, 0, None);
+    let mut rng = Rng::new(seed);
+    let mut commits = Workload::new(seed ^ 0x5eed, TABLE, cfg.spec.clone())
+        .filter(|op| matches!(op, Op::Commit(..)))
+        .take(2 * cfg.ops);
+    let outcome = (|| -> Result<(), Fail> {
+        let mut commit_some = |w: &mut World, rng: &mut Rng, n: usize| -> Result<(), Fail> {
+            for op in commits.by_ref().take(n) {
+                w.step(op, rng)?;
+                while !w.poll_in_flight(rng)? {
+                    let now = w.vfs.monotonic_nanos();
+                    w.store.as_mut().expect("store open").step_shards(now);
+                }
+            }
+            Ok(())
+        };
+        commit_some(&mut w, &mut rng, cfg.ops)?;
+        w.maintenance(false, &mut rng)?;
+        commit_some(&mut w, &mut rng, cfg.ops)?;
+        // Arm the power loss and let a shard's background flush fire it.
+        let mut plan = cfg.faults.clone();
+        plan.crash_after_ops = Some(vfs.mutating_ops() + 1);
+        vfs.set_faults(plan);
+        w.trace.push("background flush (crash armed)".into());
+        let flush = w.store().engine.flush_pending();
+        for _ in 0..10_000 {
+            if !w.alive() {
+                break;
+            }
+            let now = vfs.monotonic_nanos();
+            w.store.as_mut().expect("store open").step_shards(now);
+        }
+        drop(flush);
+        if w.alive() {
+            return fail(
+                FailureClass::Protocol,
+                "the armed crash did not fire on the background flush".into(),
+            );
+        }
+        for op in reads {
+            w.step(op.clone(), &mut rng)?;
+            if w.stats.background_crashes > 0 {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    let result = match outcome {
+        Ok(()) => Ok(w.stats),
+        Err(f) => Err(Failure {
+            seed,
+            class: f.class,
+            op_index: w.op_index,
+            message: f.message,
+            trace: std::mem::take(&mut w.trace),
+        }),
+    };
     if let Some(mut store) = w.store.take() {
         let _ = store.engine.close();
         for _ in 0..4 {

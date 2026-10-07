@@ -5,8 +5,9 @@
 
 mod common;
 
-use common::{Config, final_dump, run};
+use common::{Config, final_dump, read_after_background_crash, run};
 use pigeonhole_format::Durability;
+use pigeonhole_sim::Op;
 
 fn seeds() -> Vec<u64> {
     let n: u64 = std::env::var("PIGEONHOLE_SEEDS")
@@ -213,5 +214,36 @@ fn results_are_identical_across_shard_counts_under_faults() {
                 "seed {seed}: {shards} shards differ from 1 shard"
             );
         }
+    }
+}
+
+#[test]
+fn a_read_after_a_background_fired_crash_recovers() {
+    // Issue #62: an armed power loss fires on a shard's background flush with nothing in
+    // flight; the next read step meets the dead store (its SSTs' handles died with the
+    // crash) and must recover from that crash, not report a read mismatch.
+    let mut cfg = Config::quiet(30);
+    // Nothing random between the steps: no explicit maintenance, one plain commit at a time.
+    (cfg.flush_ppm, cfg.compact_ppm) = (0, 0);
+    (cfg.cas_ppm, cfg.txn_ppm, cfg.tasks) = (0, 0, 1);
+    let reads: Vec<Op> = (0..cfg.spec.rows)
+        .map(|i| Op::Get {
+            row: format!("row{i:06}").into_bytes(),
+            family: "f".into(),
+            qualifier: b"q0".to_vec(),
+        })
+        .chain([Op::Scan {
+            start: b"row".to_vec(),
+            end: b"rox".to_vec(),
+        }])
+        .collect();
+    for seed in seeds() {
+        let stats =
+            read_after_background_crash(seed, &cfg, &reads).unwrap_or_else(|f| panic!("{f}"));
+        eprintln!("seed {seed}: {stats:?}");
+        assert_eq!(
+            stats.background_crashes, 1,
+            "seed {seed}: no read step met the background-fired crash"
+        );
     }
 }
