@@ -727,9 +727,26 @@ pub(crate) fn claim(shared: &Shared) -> bool {
     !shared.manifest_busy.swap(true, Ordering::AcqRel)
 }
 
-/// Releases the exclusion.
+/// Releases the exclusion, then runs the close's final step if it was waiting for it.
 pub(crate) fn release(shared: &Shared) {
     shared.manifest_busy.store(false, Ordering::Release);
+    // Pairs with the fence in `Shared::try_final_close`: either it claims the exclusion
+    // released here, or this sees its pending flag.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    shared.try_final_close();
+}
+
+/// Commits `kind` on a thread that already holds the exclusion: drains the queue (what is
+/// queued commits first, ahead of or with `kind`) and returns `kind`'s outcome.
+pub(crate) fn commit_held(shared: &Shared, kind: ReqKind) -> Result<ManifestVersion> {
+    let (req, mut waiter) = ManifestReq::with_waiter(kind);
+    shared.manifest_queue.push(req);
+    drain_sync(shared);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::pin::Pin::new(&mut waiter).poll(&mut cx) {
+        Poll::Ready(Some(r)) => r,
+        Poll::Ready(None) | Poll::Pending => Err(Error::Closed),
+    }
 }
 
 /// Processes the queue on the calling (application) thread until it is empty, blocking on
@@ -809,6 +826,28 @@ fn race_window(shared: &Shared) {
     }
 }
 
+/// Test hook: while `Shared::manifest_park` is set, a pump whose compaction commit (SSTs
+/// changed, no memtable flushed) completed waits before `end` (the window in which a close
+/// once committed over it, issue #78).
+#[cfg(feature = "test-hooks")]
+fn parked(shared: &Shared, commit: &Commit, slot: &Slot, waker: &TaskWaker) -> bool {
+    if !shared.manifest_park.load(Ordering::Acquire)
+        || !commit.sst_changed
+        || !commit.flushed_roots.is_empty()
+        || slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    {
+        return false;
+    }
+    *shared
+        .manifest_parked
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
+    true
+}
+
 /// Submits `req` from a shard or task: queues it and makes sure a pump runs on `shard`.
 pub(crate) fn submit(shared: &Shared, shard: pigeonhole_runtime::ShardId, req: ManifestReq) {
     shared.manifest_queue.push(req);
@@ -852,7 +891,11 @@ impl ManifestPump {
 impl Task for ManifestPump {
     fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
         loop {
-            if let Some((_, slot)) = &self.inflight {
+            if let Some((_commit, slot)) = &self.inflight {
+                #[cfg(feature = "test-hooks")]
+                if parked(&self.shared, _commit, slot, waker) {
+                    return TaskPoll::Blocked;
+                }
                 let done = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
                 let Some(result) = done else {
                     return TaskPoll::Blocked;

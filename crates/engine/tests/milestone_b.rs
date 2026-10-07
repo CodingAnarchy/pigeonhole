@@ -388,6 +388,87 @@ fn a_crash_during_close_recovers_every_acknowledged_commit() {
     assert!(crashed_closes > 0);
 }
 
+/// Waits (bounded) for `cond`.
+fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            start.elapsed().as_secs() < 30,
+            "timed out waiting for {what}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn the_final_close_waits_for_a_background_manifest_commit() {
+    // #78: the last shard closed while a compaction's root commit was durable but not yet
+    // finished (`end` pending on its pump). The close's own commits ran without the
+    // manifest writer's exclusion, were prepared from the same writer state, and the clean
+    // root left out the compaction (in debug builds the compaction's `end` then retired the
+    // old manifest extents a second time).
+    let vfs = SimVfs::new(29);
+    let vfs_ref: VfsRef = vfs.clone();
+    let mut o = owned(Arc::clone(&vfs), 2);
+    o.compaction.l0_trigger = u32::MAX;
+    o.compaction.level_base_bytes = u64::MAX;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for round in 0..2u32 {
+        write_rows(
+            &db,
+            &t,
+            round * 100..round * 100 + 100,
+            Durability::GroupSync,
+        );
+        db.flush().unwrap();
+    }
+    db.park_manifest_commits(true);
+    let compact = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.compact(None))
+    };
+    wait_for("the compaction's commit to park", || {
+        db.manifest_commit_parked()
+    });
+    let close = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.close())
+    };
+    // Every shard closes; the final close must wait for the parked commit.
+    wait_for("the final close", || {
+        db.final_close_pending() || close.is_finished()
+    });
+    assert!(
+        !close.is_finished(),
+        "the close committed over an unfinished commit"
+    );
+    db.park_manifest_commits(false);
+    // The close answers the compaction's waiter (`Closed`); its commit still completes.
+    let _ = compact.join().unwrap();
+    close.join().unwrap().unwrap();
+    let compacted = db.take_compactions();
+    assert_eq!(compacted.len(), 1);
+    drop(db);
+
+    // The clean root is the close's own commit, made after the compaction's.
+    let info = Engine::inspect_manifest(&vfs_ref, Path::new(DB)).unwrap();
+    assert!(info.clean);
+    assert!(
+        info.version > compacted[0].manifest_version,
+        "{} <= {}",
+        info.version,
+        compacted[0].manifest_version
+    );
+    assert!(info.checkpoints.values().all(|l| *l == Default::default()));
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").unwrap();
+    assert_eq!(row_count(&db, &t), 200);
+    db.close().unwrap();
+}
+
 // ---- #23: shrink never relocates in-flight output; reclaim after commits ----
 
 #[test]
