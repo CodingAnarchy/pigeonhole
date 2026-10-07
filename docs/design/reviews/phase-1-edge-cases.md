@@ -65,7 +65,7 @@ after *every* participant applied). Seqnos are global, so any lower seqno anywhe
    fsync on another shard (ms on SSD, tens of ms on HDD/cloud disks).
 3. Application-owned mode: a thread that drives shard B and calls `commit(..).wait()` for a commit routed to shard A
    (driven by another thread) livelocks at 100% CPU forever, because only it can advance B's group. The documented
-   restriction (`write.rs:248`, D-note at decisions.md:314) covers only the commit's *own* shard.
+   restriction (`write.rs:248`, D88 in decisions/phase-1.md) covers only the commit's *own* shard.
 
 Never seen in sim: SimVfs syncs complete inline (F6), so an `unresolved` group never outlives a message batch, and the
 harness uses the `Future` path.

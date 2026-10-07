@@ -1,4 +1,4 @@
-<!-- Exported from https://claude.ai/artifact/4zEQ4RyDCMoovUiUNVwrco on 2026-10-05; corrected since to match decisions.md, which wins on any conflict. -->
+<!-- Exported from https://claude.ai/artifact/4zEQ4RyDCMoovUiUNVwrco on 2026-10-05; corrected since to match the decisions (decisions/README.md), which wins on any conflict. -->
 # Pigeonhole: An Embedded Wide-Column Store in Rust
 
 2026-10-05 · 

@@ -5,7 +5,7 @@ Pigeonhole is built by a mix of humans and coding agents. The rules below apply 
 ## Read first
 - [`docs/design/spec.md`](docs/design/spec.md) — the design. Every crate's behavior is defined there.
 - [`docs/design/task-briefs.md`](docs/design/task-briefs.md) — one brief per crate: goal, what to read, what it owns, when it is done.
-- [`docs/design/decisions.md`](docs/design/decisions.md) — decisions that refine the spec. They win over the spec.
+- [`docs/design/decisions/`](docs/design/decisions/README.md) — numbered decisions that refine the spec; they win over it. Read the index, then the decisions that touch your work.
 - [`FORMAT.md`](FORMAT.md) — every on-disk and shared-memory byte (frozen at the interface freeze).
 
 ## Workspace rules

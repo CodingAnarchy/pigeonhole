@@ -1,6 +1,6 @@
 # Interfaces
 
-The frozen contracts between crates, from the interface freeze (build step 2). Component agents build against these. Byte layouts are in [`FORMAT.md`](../../FORMAT.md); decisions D7 onward in [decisions.md](decisions.md) explain the choices. Changing anything here takes an interface-change request (`docs/design/icr/`).
+The frozen contracts between crates, from the interface freeze (build step 2). Component agents build against these. Byte layouts are in [`FORMAT.md`](../../FORMAT.md); decisions D7 onward in [`decisions/`](decisions/README.md) explain the choices. Changing anything here takes an interface-change request (`docs/design/icr/`).
 
 Every public item has rustdoc; bodies are `todo!()`. Each stub crate carries `#![allow(unused_variables, clippy::ptr_arg)]` under an "Interface freeze" comment; remove it when implementing.
 
