@@ -8,7 +8,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 
 | Phase | File | Range |
 |---|---|---|
-| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D149 |
+| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D152 |
 
 ## Index
 
@@ -99,7 +99,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D85](phase-1.md#d85) — a failed WAL sync after a group was applied leaves its data visible · engine
 - [D86](phase-1.md#d86) — default timestamps use a per-shard floor seeded at replay · engine
 - [D87](phase-1.md#d87) — reader processes re-pin when idle · engine; changed in review
-- [D88](phase-1.md#d88) — application-owned close does not block · engine
+- [D88](phase-1.md#d88) — application-owned close does not block · engine · **amended by D150, D151**
 - [D89](phase-1.md#d89) — `From<format::Error>` maps unknown variants to `Corruption` · engine
 - [D90](phase-1.md#d90) — `Snapshot::at_seqno` is a test hook behind `test-hooks` · engine
 - [D91](phase-1.md#d91) — conditional writes, OCC and prepared shares · changed in review
@@ -161,6 +161,9 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D147](phase-1.md#d147) — Does a prepared, undecided cross-shard share count as above a compaction's inputs · engine, #132 · amends D70
 - [D148](phase-1.md#d148) — Reader snapshots from before a writer restart expire with `SnapshotExpired` · process, #140 F7-1
 - [D149](phase-1.md#d149) — A reader builds a view only from the catalog of the record's own manifest version · process, #140 F7-2
+- [D150](phase-1.md#d150) — Blocking on a shard-driving thread: refuse before submitting, `WouldDeadlock` after · engine, #135 · amends D88
+- [D151](phase-1.md#d151) — The application-owned close reports its outcome through `closed()` · engine, #135 · amends D88
+- [D152](phase-1.md#d152) — A panicked engine-owned shard thread fails the close instead of hanging · engine, #135
 
 ## Open questions
 _None._
