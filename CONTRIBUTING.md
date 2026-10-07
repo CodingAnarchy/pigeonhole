@@ -36,7 +36,8 @@ Anything left for later is a GitHub issue titled `[crate] summary`, labeled with
    cargo test --workspace --all-features
    ```
    Crates with `unsafe` also run `cargo +nightly miri test -p <crate>`; crates with concurrency run `RUSTFLAGS="--cfg loom" cargo test --release -p <crate> --lib loom`.
-3. Open a pull request against `main`. CI must be green before merge.
+3. Clean up before the PR is ready: remove temporary diagnostics, debug prints, commented-out code and probe tests from the diff; keep a test hook only if a committed test uses it; delete scratch files (logs, traces, copied binaries) you created outside `target/`; stop any background processes you started. Leave deferred work as a milestoned issue, not a TODO.
+4. Open a pull request against `main`. CI must be green before merge.
 
 ## Seed sweeps and local resources
 Several agents often build and test on one machine, so local runs stay small:
