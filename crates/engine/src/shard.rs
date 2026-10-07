@@ -1512,6 +1512,13 @@ pub(crate) struct ShardState {
     /// A freeze of every memtable (`flush`, `compact`, close) is still owed: some memtable
     /// held a seqno the watermark had not reached yet.
     freeze_all_pending: bool,
+    /// The last freeze of every memtable left a non-empty one active: the arena had no
+    /// chunk for its replacement (snapshots may pin the retired ones). `flush` and
+    /// `compact` callers wait for it, and the freeze is tried again (issue #116).
+    starved_all: bool,
+    /// The wait of `flush` and `compact` callers for a chunk (`starved_all`): when it
+    /// began and its timeout timer. It ends with `Busy` as a write stall does (D124, D126).
+    starve_wait: Option<RoomWait>,
     /// A flush failed while closing: the close gives up on flushing (the WAL keeps the data)
     /// and is not clean.
     flush_failed: bool,
@@ -1640,6 +1647,8 @@ impl ShardState {
             room_wait: None,
             freeze_deferred: false,
             freeze_all_pending: false,
+            starved_all: false,
+            starve_wait: None,
             flush_failed: false,
             dropped: HashSet::new(),
             log: VecDeque::new(),
@@ -2016,6 +2025,7 @@ impl ShardState {
         let visible = self.shared.shm.visible_seqno();
         let view = self.shared.view.load();
         let mut deferred = false;
+        let mut starved = false;
         // The seqno that must be visible before every deferred memtable can freeze.
         let mut needed: Seqno = 0;
         for key in keys {
@@ -2092,7 +2102,9 @@ impl ShardState {
                     slot.seal = Seal::Flushing;
                 }
                 // Otherwise keep writing into this one; the arena-room check defers later
-                // commits until a flush frees space.
+                // commits until a flush frees space, and a `flush` or `compact` caller
+                // waits until this one freezes too.
+                starved = true;
                 continue;
             };
             let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
@@ -2102,6 +2114,9 @@ impl ShardState {
             self.view_dirty = true;
         }
         self.freeze_all_pending = all && deferred;
+        if all {
+            self.starved_all = starved;
+        }
         if deferred {
             // Register for the watermark kick every time the freeze defers, with the seqno it
             // waits for: a publish wakes this shard only once that seqno is visible (main's
@@ -2154,12 +2169,103 @@ impl ShardState {
     }
 
     fn check_flush_waiters(&mut self) {
-        if self.freeze_all_pending || !self.to_freeze.is_empty() {
+        if self.freeze_all_pending || self.starved_all || !self.to_freeze.is_empty() {
             return;
         }
         if self.flush_idle() {
             for w in self.flush_waiters.drain(..) {
                 w.notify(Ok(()));
+            }
+        }
+    }
+
+    /// While a freeze of every memtable is starved of chunks and `flush` or `compact`
+    /// callers wait for it, tries it again (a flush or a reclaim may have freed one), and
+    /// refuses them with `Busy` once nothing frees one in time, as a write stall is (D124,
+    /// D126): after `write_stall_timeout_nanos` on a moving clock, and at once on a frozen
+    /// clock with nothing in flight that could free a chunk (in-process snapshots, which
+    /// only the waiting callers can drop, hold the rest; issue #116).
+    fn retry_starved_freeze(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let waiting = !self.flush_waiters.is_empty() || !self.compact_all.is_empty();
+        if !self.starved_all || !waiting || self.closing {
+            if let Some(w) = self.starve_wait.take() {
+                w.timer.cancel();
+            }
+            if !waiting {
+                self.starved_all = false;
+            }
+            return;
+        }
+        self.reclaim_retired();
+        if self.freeze(true).is_ok() {
+            self.spawn_flush(ctx);
+        }
+        if !self.starved_all {
+            if let Some(w) = self.starve_wait.take() {
+                w.timer.cancel();
+            }
+            self.check_flush_waiters();
+            return;
+        }
+        let now = ctx.now_nanos();
+        let timeout = self.shared.write_stall_timeout_nanos;
+        let arm = |since: u64, ctx: &mut ShardContext<'_, ShardMsg>| {
+            let state = TimerState::new();
+            ctx.spawn(Box::new(ClockTimer::new(
+                &self.shared.vfs,
+                since.saturating_add(timeout),
+                Arc::clone(&state),
+                ctx.submitter(self.id).clone(),
+                ShardMsg::Kick,
+            )));
+            state
+        };
+        let (since, frozen) = match &self.starve_wait {
+            None => {
+                let timer = arm(now, ctx);
+                self.starve_wait = Some(RoomWait {
+                    since: now,
+                    timer,
+                    failed_flushes: 0,
+                });
+                (now, false)
+            }
+            Some(w) => (w.since, w.timer.frozen(now)),
+        };
+        if let Some(w) = &self.starve_wait
+            && w.timer.finished()
+            && !frozen
+            && now.saturating_sub(since) < timeout
+        {
+            // A timer that gave up on a clock that has moved since is armed again.
+            let timer = arm(since, ctx);
+            if let Some(w) = &mut self.starve_wait {
+                w.timer = timer;
+            }
+        }
+        let idle = frozen
+            && !self.flush_running
+            && self.flush_queue.is_empty()
+            && !self.freeze_deferred
+            && self.retired.is_empty();
+        if now.saturating_sub(since) >= timeout || idle {
+            trace!(
+                "shard {} starved freeze: refusing {} flush and {} compact callers \
+                 (waited {} ns, frozen clock {frozen}, idle {idle})",
+                self.id.0,
+                self.flush_waiters.len(),
+                self.compact_all.len(),
+                now.saturating_sub(since)
+            );
+            if let Some(w) = self.starve_wait.take() {
+                w.timer.cancel();
+            }
+            self.starved_all = false;
+            for w in self.flush_waiters.drain(..) {
+                w.notify(Err(Error::Busy));
+            }
+            for (_, w) in self.compact_all.drain(..) {
+                w.notify(Err(Error::Busy));
             }
         }
     }
@@ -4078,7 +4184,7 @@ impl ShardState {
         }
         // Full compactions first (a caller waits), one slot at a time.
         while let Some((filter, _)) = self.compact_all.front() {
-            if !self.flush_idle() {
+            if !self.flush_idle() || self.freeze_all_pending || self.starved_all {
                 self.spawn_flush(ctx);
                 return;
             }
@@ -4750,6 +4856,7 @@ impl ShardHandler for ShardState {
             self.spawn_flush(ctx);
             self.check_flush_waiters();
         }
+        self.retry_starved_freeze(ctx);
         self.try_finish_close(ctx);
     }
 }

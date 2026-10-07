@@ -768,6 +768,20 @@ impl Run {
         self.recover(Some(kind))
     }
 
+    /// A `flush` or `compact` refused with `Busy` while this run's snapshots pin the
+    /// memtable arena (issue #116): no chunk is left for the fresh memtables the flush needs,
+    /// and on this frozen clock the engine refuses rather than wait for a timeout. Drops the
+    /// snapshots so the caller can try again.
+    fn busy_with_snapshots(&mut self, result: &pigeonhole::Result<()>) -> bool {
+        if !matches!(result, Err(e) if e.code() == ErrorCode::Busy) || self.snaps.is_empty() {
+            return false;
+        }
+        self.stats.busy += 1;
+        self.trace.push("BUSY: snapshots dropped".into());
+        self.snaps.clear();
+        true
+    }
+
     fn reopen(&mut self) -> Result<(), String> {
         self.stats.reopens += 1;
         self.trace.push("REOPEN".into());
@@ -986,7 +1000,11 @@ impl Run {
         if self.cfg.flush_ppm > 0 && rng.chance(self.cfg.flush_ppm) {
             self.stats.flushes += 1;
             self.trace.push("FLUSH".into());
-            match self.db().flush() {
+            let mut result = self.db().flush();
+            if self.busy_with_snapshots(&result) {
+                result = self.db().flush();
+            }
+            match result {
                 Ok(()) => {}
                 Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
                 Err(e) => return Err(format!("flush failed: {e} ({:?})", e.code())),
@@ -995,7 +1013,11 @@ impl Run {
         if self.cfg.compact_ppm > 0 && rng.chance(self.cfg.compact_ppm) {
             self.stats.compactions += 1;
             self.trace.push("COMPACT".into());
-            match self.db().compact() {
+            let mut result = self.db().compact();
+            if self.busy_with_snapshots(&result) {
+                result = self.db().compact();
+            }
+            match result {
                 Ok(()) => {}
                 Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
                 Err(e) => return Err(format!("compact failed: {e} ({:?})", e.code())),
