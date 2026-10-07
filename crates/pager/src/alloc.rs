@@ -236,6 +236,28 @@ impl Alloc {
         true
     }
 
+    /// Shrinks a live extent to `class` in place, freeing its upper halves at once. Returns
+    /// false (and changes nothing) if `e` is not live or `class` is larger than its class.
+    pub(crate) fn shrink_live(&mut self, e: Extent, class: u8) -> bool {
+        if class > e.size_class || !self.is_live(e) {
+            return false;
+        }
+        let unit = unit_of(e).expect("live extent is well formed");
+        self.used.insert(
+            unit,
+            Used {
+                class,
+                retired: None,
+            },
+        );
+        self.used_units -= units(e.size_class) - units(class);
+        // Each upper half's buddy is the lower part, still used, so none coalesces.
+        for k in class..e.size_class {
+            self.free_block(unit + units(k), k);
+        }
+        true
+    }
+
     /// Marks a live extent retired at `at`. Returns false if `e` is not live.
     pub(crate) fn retire(&mut self, e: Extent, at: ManifestVersion) -> bool {
         let Some(unit) = unit_of(e) else { return false };
@@ -408,6 +430,30 @@ mod tests {
         }
         a.check();
         assert_eq!(a.free[10].len(), 1, "units 1024..2048 whole again");
+    }
+
+    #[test]
+    fn shrink_live_frees_the_upper_halves() {
+        let mut a = Alloc::empty(1);
+        let x = a.alloc_grown(3);
+        assert_eq!(x, ext(8, 3));
+        assert!(!a.shrink_live(x, 4), "cannot grow");
+        assert!(a.shrink_live(x, 0));
+        a.check();
+        assert_eq!(a.used_units(), 1);
+        assert!(a.is_live(ext(8, 0)) && !a.is_live(x));
+        assert!(!a.shrink_live(x, 0), "no longer live at its old class");
+        // The freed halves (9, 10-11, 12-15) are free blocks, and coalesce once the rest goes.
+        assert!(a.free[0].contains(&9) && a.free[1].contains(&10) && a.free[2].contains(&12));
+        assert!(a.retire(ext(8, 0), 1));
+        assert!(
+            !a.shrink_live(ext(8, 0), 0),
+            "retired extents are not trimmed"
+        );
+        assert_eq!(a.reclaim(1), 1);
+        a.check();
+        assert_eq!(a.used_units(), 0);
+        assert!(a.free[3].contains(&8), "units 8..16 whole again");
     }
 
     #[test]

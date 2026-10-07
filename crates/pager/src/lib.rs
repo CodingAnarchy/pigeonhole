@@ -631,6 +631,32 @@ impl Pager {
         debug_assert!(freed, "abandon of an extent that is not live: {extent:?}");
     }
 
+    /// Shrinks an extent that was allocated but never published in a root to the smallest
+    /// one holding `bytes` (64 KiB minimum), and returns it: the same first page, a size
+    /// class no larger. The freed tail is reusable at once. Bytes already written below
+    /// `bytes` stay where they are, so a finished flush or compaction output trims to its
+    /// length before it is published. Unpublished space is never referenced by a durable
+    /// root, so this needs no retirement (D8).
+    ///
+    /// Returns `extent` unchanged if `bytes` exceeds it or it is not live.
+    pub fn trim(&self, extent: Extent, bytes: u64) -> Extent {
+        let Ok(class) = class_for(bytes) else {
+            return extent;
+        };
+        if class >= extent.size_class {
+            return extent;
+        }
+        let trimmed = lock(&self.inner.alloc).shrink_live(extent, class);
+        debug_assert!(trimmed, "trim of an extent that is not live: {extent:?}");
+        if !trimmed {
+            return extent;
+        }
+        Extent {
+            page: extent.page,
+            size_class: class,
+        }
+    }
+
     fn check_range(extent: Extent, offset: u64, len: usize) -> Result<u64> {
         match offset.checked_add(len as u64) {
             Some(end) if end <= extent.len() => Ok(extent.offset() + offset),

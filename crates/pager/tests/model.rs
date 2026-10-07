@@ -27,6 +27,8 @@ enum Op {
     Allocate(u64),
     /// Abandon the pending extent at this index (mod len).
     Abandon(usize),
+    /// Trim the pending extent at this index (mod len) to this many bytes (mod its length).
+    Trim(usize, u64),
     /// Commit a new root adding every pending extent and dropping the live extents whose
     /// index bit is set in the mask.
     Publish(u64),
@@ -49,6 +51,7 @@ fn op() -> impl Strategy<Value = Op> {
         8 => (0u64..=common::miri_scaled(300 << 10, 64 << 10)).prop_map(Op::Allocate),
         1 => (0u64..=common::miri_scaled(4 << 20, 256 << 10)).prop_map(Op::Allocate),
         2 => any::<usize>().prop_map(Op::Abandon),
+        2 => (any::<usize>(), any::<u64>()).prop_map(|(i, b)| Op::Trim(i, b)),
         4 => any::<u64>().prop_map(Op::Publish),
         2 => Just(Op::Pin),
         2 => any::<usize>().prop_map(Op::Unpin),
@@ -164,6 +167,24 @@ impl Harness {
                 if !self.m.pending.is_empty() {
                     let e = self.m.pending.swap_remove(i % self.m.pending.len());
                     self.pager.abandon(e);
+                }
+            }
+            Op::Trim(i, bytes) => {
+                if !self.m.pending.is_empty() {
+                    let i = i % self.m.pending.len();
+                    let e = self.m.pending[i];
+                    let bytes = bytes % (e.len() + 1);
+                    let t = self.pager.trim(e, bytes);
+                    assert_eq!(t.page, e.page, "trim keeps the first page");
+                    assert!(
+                        t.len() >= bytes.max(64 << 10),
+                        "{t:?} too small for {bytes}"
+                    );
+                    assert!(
+                        t.len() < bytes.max(64 << 10) * 2,
+                        "{t:?} not trimmed to {bytes}"
+                    );
+                    self.m.pending[i] = t;
                 }
             }
             Op::Publish(mask) => {

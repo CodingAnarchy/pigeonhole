@@ -336,6 +336,11 @@ impl SstReader {
         self.inner.blocks.id
     }
 
+    /// The SST's length in bytes (`SstMeta::len`).
+    pub fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
     /// The properties block.
     pub fn properties(&self) -> &Properties {
         &self.inner.properties

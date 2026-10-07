@@ -585,6 +585,63 @@ fn outputs_are_cut_near_the_target_between_rows() {
     }
 }
 
+/// A small compaction under a large target takes an extent sized to its output, not a
+/// target-size one, and leaves the file small (#106).
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn small_outputs_take_small_extents() {
+    let mut db = Db::new(106);
+    let family = FamilyOptions::default();
+    let mut inputs = Vec::new();
+    for ts in [10, 20] {
+        let e: Vec<_> = (0..50u32)
+            .map(|row| {
+                let k = key(format!("row{row:05}").as_bytes(), b"q", ts, ts, Kind::Put);
+                (k, stored(&[ts as u8; 100]))
+            })
+            .collect();
+        inputs.push(db.sst(&family, &e));
+    }
+    let before = db.pager.stats();
+    for round in 0..20 {
+        let mut ctx = db.context(family.clone(), policy(vec![], 100, true));
+        ctx.target_sst_bytes = 64 << 20;
+        let ids = inputs.iter().map(|s| s.0.id).collect();
+        let mut job = CompactionJob::new(
+            task(vec![(1, ids)], 2),
+            inputs.iter().map(|s| s.1.clone()).collect(),
+            ctx,
+        );
+        run_sliced(&db, &mut job);
+        let out = job.finish().unwrap();
+        assert_eq!(out.added.len(), 1, "round {round}");
+        let meta = &out.added[0].1;
+        assert_eq!(
+            meta.extent.size_class, 0,
+            "{meta:?} not trimmed to its length"
+        );
+        assert!(meta.len <= meta.extent.len());
+        // Both versions of each cell are kept.
+        assert_eq!(
+            sst_entries(&open_sst(&db.pager, &db.cache, meta)).len(),
+            100
+        );
+        // Nothing publishes the output; give it back as an aborted job would.
+        db.pager.abandon(meta.extent);
+    }
+    let after = db.pager.stats();
+    assert_eq!(after.allocated_bytes, before.allocated_bytes);
+    assert!(
+        after.file_bytes <= before.file_bytes + (1 << 20),
+        "file grew from {} to {}",
+        before.file_bytes,
+        after.file_bytes
+    );
+}
+
 /// Slices run before interrupting a job (each ends at the deadline after 64 groups).
 const SLICES: usize = if cfg!(miri) { 2 } else { 12 };
 

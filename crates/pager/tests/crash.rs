@@ -1,7 +1,8 @@
 //! Crash safety: a crash at every write point never yields an unopenable file and always
 //! recovers to the last committed root (or the one being committed when the crash hit).
 //!
-//! The workload mimics the engine: each step writes data extents, sometimes relocates
+//! The workload mimics the engine: each step writes data extents (some trimmed to their
+//! length before they are published), sometimes relocates
 //! published ones toward the start of the file (online shrink), then records the new live set
 //! as a manifest: appended as a delta past the live end of the delta log, or, when the log is
 //! full, written as a new snapshot with a fresh empty log (D7). It commits a root naming them,
@@ -197,6 +198,22 @@ fn step(st: &mut State, rng: &mut Rng, progress: &mut Progress) -> pigeonhole_pa
         write_data(pager, d)?;
         next.push(d);
     }
+    // An output trimmed before it is published: written into an oversized extent, whose
+    // tail is freed at once and may be reused before the commit (issue #106).
+    if version.is_multiple_of(4) {
+        let big = pager.allocate(256 << 10)?;
+        let tag = rng_free_tag(version);
+        let small = Extent {
+            size_class: 0,
+            ..big
+        };
+        // Written through `big` (the extent allocated); the stamps land where `small` has them.
+        pager.write(big, 0, &stamp(tag, false))?;
+        pager.write(big, small.len() - STAMP as u64, &stamp(tag, true))?;
+        let extent = pager.trim(big, small.len());
+        assert_eq!(extent, small);
+        next.push(Data { extent, tag });
+    }
     // An abandoned output: allocated, written, never published.
     if rng.below(4) == 0 {
         let e = pager.allocate(64 << 10)?;
@@ -253,6 +270,12 @@ fn step(st: &mut State, rng: &mut Rng, progress: &mut Progress) -> pigeonhole_pa
     st.live = next;
     st.root = root;
     Ok(())
+}
+
+/// A tag for the trimmed output, drawn without the step's `Rng` so the other choices (and the
+/// seed known to relocate) are unchanged.
+fn rng_free_tag(version: u64) -> u64 {
+    Rng(version ^ 0x7121_0106).next()
 }
 
 /// Runs the workload until it finishes or the first error (the injected crash).
