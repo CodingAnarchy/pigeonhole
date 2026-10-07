@@ -408,6 +408,9 @@ pub(crate) struct Commit {
     readers: HashMap<SstId, Arc<SstReader>>,
     flushed_roots: Vec<(u16, u32)>,
     tablets_changed: bool,
+    /// A split, merge or move (`ReqKind::Tablets`) committed: shards re-check what waited on
+    /// the tablet map.
+    tablet_change: bool,
     sst_changed: bool,
     checkpoints_changed: bool,
 }
@@ -482,6 +485,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let mut readers = HashMap::new();
     let mut flushed_roots = Vec::new();
     let mut tablets_changed = false;
+    let mut tablet_change = false;
     let mut sst_changed = false;
     let mut checkpoints_changed = false;
     let mut rewrite = false;
@@ -497,6 +501,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             ReqKind::Tablets(f) => f(&mut catalog).map(|(edits, o)| {
                 owners = o;
                 tablets_changed = true;
+                tablet_change = true;
                 edits
             }),
         };
@@ -618,6 +623,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 readers,
                 flushed_roots,
                 tablets_changed,
+                tablet_change,
                 sst_changed,
                 checkpoints_changed,
             })
@@ -653,6 +659,7 @@ pub(crate) fn end(
         mut readers,
         flushed_roots,
         tablets_changed,
+        tablet_change,
         sst_changed,
         checkpoints_changed,
     } = commit;
@@ -767,7 +774,7 @@ pub(crate) fn end(
     for (req, r) in reqs {
         (req.reply)(r.map(|()| version));
     }
-    if sst_changed || checkpoints_changed || tablets_changed {
+    if sst_changed || checkpoints_changed || tablet_change {
         shared.broadcast(|| ShardMsg::Maintain);
     }
 }

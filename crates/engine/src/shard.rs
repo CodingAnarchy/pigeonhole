@@ -170,35 +170,69 @@ pub(crate) struct VisibilityWaiters {
     pub list: Mutex<Vec<(Seqno, Waker)>>,
 }
 
-/// Shards waiting for the watermark to pass a deferred freeze. Registering is idempotent;
-/// `take` hands every registered shard to the publisher once.
-#[derive(Debug, Default)]
+/// Shards waiting for the watermark to pass a deferred freeze, each with the seqno its
+/// freeze needs visible. A publisher wakes (and forgets) only the shards whose seqno is
+/// visible, so a watermark that did not move far enough wakes nobody, and a shard that
+/// defers again registers again.
+#[derive(Debug)]
 pub(crate) struct FreezeWaiters {
-    /// Registrations not taken yet: lets `take` skip the lock when nobody waits.
-    waiting: AtomicUsize,
-    list: Mutex<Vec<u16>>,
+    /// The smallest seqno any registered shard waits for (`u64::MAX` when none): a publish
+    /// below it skips the lock.
+    min_needed: AtomicU64,
+    list: Mutex<Vec<(u16, Seqno)>>,
+}
+
+impl Default for FreezeWaiters {
+    fn default() -> Self {
+        Self {
+            min_needed: AtomicU64::new(u64::MAX),
+            list: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl FreezeWaiters {
-    /// Registers `shard` unless it is registered already. A shard whose freeze defers again
-    /// after a `take` must register again: its deferred flag outlives the registration.
-    pub(crate) fn register(&self, shard: u16) {
+    /// Registers `shard` as waiting until `needed` is visible (replacing an earlier
+    /// registration). The caller re-reads the visible seqno afterwards: a watermark
+    /// published before the registration landed may have missed it.
+    pub(crate) fn register(&self, shard: u16, needed: Seqno) {
         let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
-        if !list.contains(&shard) {
-            list.push(shard);
-            self.waiting.fetch_add(1, Ordering::AcqRel);
+        match list.iter_mut().find(|(s, _)| *s == shard) {
+            Some(entry) => entry.1 = needed,
+            None => list.push((shard, needed)),
         }
+        let min = list.iter().map(|(_, n)| *n).min().unwrap_or(u64::MAX);
+        self.min_needed.store(min, Ordering::SeqCst);
+        drop(list);
+        // Pairs with the fence in `take_ready`: either the publisher sees this registration
+        // or the caller's re-read sees the publisher's watermark.
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
-    /// Takes every registered shard (one load when there is none).
-    pub(crate) fn take(&self) -> Vec<u16> {
-        if self.waiting.load(Ordering::Acquire) == 0 {
+    /// Takes the shards whose needed seqno is at or below what `visible` reads (one load and
+    /// no lock when none is ready).
+    pub(crate) fn take_ready(&self, visible: impl Fn() -> Seqno) -> Vec<u16> {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let min = self.min_needed.load(Ordering::SeqCst);
+        if min == u64::MAX {
+            return Vec::new();
+        }
+        let visible = visible();
+        if visible < min {
             return Vec::new();
         }
         let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
-        // Reset under the lock, so a registration racing this take is never lost.
-        self.waiting.store(0, Ordering::Release);
-        std::mem::take(&mut *list)
+        let mut ready = Vec::new();
+        list.retain(|&(s, needed)| {
+            let keep = needed > visible;
+            if !keep {
+                ready.push(s);
+            }
+            keep
+        });
+        let min = list.iter().map(|(_, n)| *n).min().unwrap_or(u64::MAX);
+        self.min_needed.store(min, Ordering::SeqCst);
+        ready
     }
 }
 
@@ -263,6 +297,9 @@ pub(crate) struct Shared {
     /// Per-shard floor raises from shards handing it tablets (D11: the floor travels with
     /// the tablet); the shard's next default timestamp is above it.
     pub ts_raises: Vec<Padded>,
+    /// Per shard, the shards whose floor set its current raise (a bit per shard below 64),
+    /// with that raise: a retried commit may tie a raise only its own shards made.
+    pub ts_raisers: Vec<Mutex<(Timestamp, u64)>>,
     /// Per-shard load as of its last balancer interval.
     pub loads: Vec<LoadSlot>,
     pub balance: BalanceConfig,
@@ -328,7 +365,7 @@ impl Shared {
     /// Wakes every registered waiter whose seqno is visible now. Called by shards after a
     /// watermark publish, and only when someone is registered (one relaxed load otherwise).
     pub(crate) fn wake_visible(&self) {
-        for s in self.freeze_waiters.take() {
+        for s in self.freeze_waiters.take_ready(|| self.shm.visible_seqno()) {
             let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
         }
         if self.waiters.count.load(Ordering::Acquire) == 0 {
@@ -578,7 +615,36 @@ pub(crate) struct CommitReq {
     /// `check_and_mutate`: the row and predicate to test first.
     pub predicate: Option<(TableId, Vec<u8>, Predicate)>,
     /// A retried cross-shard commit's first timestamp, kept when still above the floor.
-    pub commit_ts: Option<Timestamp>,
+    pub commit_ts: Option<Preset>,
+}
+
+/// A refused commit's first timestamp, carried into its retry.
+#[derive(Debug, Clone)]
+pub(crate) struct Preset {
+    pub ts: Timestamp,
+    /// Shards whose floor may equal `ts` because of this commit itself (the coordinator that
+    /// assigned it and the participants that prepared it). Any other shard at `ts` made a
+    /// write of its own there, and the retry takes a new timestamp rather than tie with it.
+    pub own: Vec<ShardId>,
+}
+
+/// Whether a retried commit may keep timestamp `ts` on `shard`, whose floor is `floor` and
+/// whose raise is `raise`, set by the shards in the bit mask `raisers`: above both, or equal
+/// only where the shards that reached `ts` are the commit's own (`Preset::own`).
+fn preset_fits(
+    ts: Timestamp,
+    own: &[ShardId],
+    shard: ShardId,
+    floor: Timestamp,
+    (raise, raisers): (Timestamp, u64),
+) -> bool {
+    let own_mask = own
+        .iter()
+        .filter(|s| s.0 < 64)
+        .fold(0u64, |m, s| m | (1 << s.0));
+    let floor_ok = ts > floor || (ts == floor && own.contains(&shard));
+    let raise_ok = ts > raise || (ts == raise && raisers & !own_mask == 0);
+    floor_ok && raise_ok
 }
 
 /// A cross-shard commit request, sent to the coordinator (the shard owning the first row).
@@ -594,7 +660,7 @@ pub(crate) struct CoordinateReq {
     pub map_version: u64,
     /// A retry's first commit timestamp, kept when it is still above every participant's
     /// floor (the refused attempt then leaves no trace).
-    pub commit_ts: Option<Timestamp>,
+    pub commit_ts: Option<Preset>,
     /// `Shared::tablet_epoch` when the commit was coordinated: a refused commit is also
     /// retried once a tablet change has finished since (it may have failed, leaving the map
     /// as it was).
@@ -811,6 +877,8 @@ struct Member {
     reserved: usize,
     /// A PREPARE: the tablet map version its share was routed with (0 otherwise).
     map_version: u64,
+    /// A retried commit: the shards that may already hold its timestamp (`Preset::own`).
+    preset_own: Vec<ShardId>,
 }
 
 #[derive(Debug)]
@@ -837,7 +905,8 @@ impl Member {
             kind: MemberKind::Single,
             durability: req.durability,
             seqno: 0,
-            commit_ts: req.commit_ts.unwrap_or(0),
+            commit_ts: req.commit_ts.as_ref().map_or(0, |p| p.ts),
+            preset_own: req.commit_ts.map(|p| p.own).unwrap_or_default(),
             bytes: Bytes::Own(req.bytes),
             reply: req.reply,
             submitted_at: req.submitted_at,
@@ -903,6 +972,8 @@ struct Coord {
     map_version: u64,
     moved: bool,
     commit_ts: Timestamp,
+    /// Shards that may hold `commit_ts` because of this commit (see `Preset::own`).
+    own: Vec<ShardId>,
     epoch: u64,
 }
 
@@ -1921,6 +1992,8 @@ impl ShardState {
         let visible = self.shared.shm.visible_seqno();
         let view = self.shared.view.load();
         let mut deferred = false;
+        // The seqno that must be visible before every deferred memtable can freeze.
+        let mut needed: Seqno = 0;
         for key in keys {
             let Some(slot) = self.memtables.get_mut(&key) else {
                 continue;
@@ -1939,6 +2012,7 @@ impl ShardState {
             }
             if slot.active.max_seqno() > visible {
                 deferred = true;
+                needed = needed.max(slot.active.max_seqno());
                 if !self.to_freeze.contains(&key) {
                     self.to_freeze.push(key);
                 }
@@ -1990,12 +2064,19 @@ impl ShardState {
         }
         self.freeze_all_pending = all && deferred;
         if deferred {
-            // Register for the watermark kick whenever not registered: an earlier kick took
-            // this shard off the list even though its flag is still set, and a freeze that
-            // defers again must be woken again (a tablet change waits on it with every write
-            // to the tablet parked, so nothing else would wake it).
+            // Register for the watermark kick every time the freeze defers, with the seqno it
+            // waits for: a publish wakes this shard only once that seqno is visible (main's
+            // flag-guarded registration was lost after the first wake, and a tablet change
+            // waits on the freeze with every write to its tablet parked, so nothing else
+            // would wake it). A watermark published since `visible` was read may have missed
+            // the registration: look again.
             self.freeze_deferred = true;
-            self.shared.freeze_waiters.register(self.id.0);
+            self.shared.freeze_waiters.register(self.id.0, needed);
+            if self.shared.shm.visible_seqno() >= needed
+                && let Some(subs) = self.shared.submitters.get()
+            {
+                let _ = subs[usize::from(self.id.0)].submit(ShardMsg::Kick);
+            }
         } else {
             self.freeze_deferred = false;
         }
@@ -2251,13 +2332,16 @@ impl ShardState {
         first
     }
 
-    /// `preset` (a retried commit's first timestamp) when it is still at or above this
-    /// shard's floor, else a fresh default timestamp.
-    fn default_ts_or(&mut self, preset: Timestamp) -> Timestamp {
-        let raised = self.shared.ts_raises[usize::from(self.id.0)]
-            .0
-            .load(Ordering::Acquire);
-        if preset != 0 && preset >= self.ts_floor.max(raised) {
+    /// `preset` (a retried commit's first timestamp) when it still fits this shard's floor
+    /// (`preset_fits`), else a fresh default timestamp.
+    fn default_ts_or(&mut self, preset: Timestamp, own: &[ShardId]) -> Timestamp {
+        if preset == 0 {
+            return self.default_ts();
+        }
+        let raise = *self.shared.ts_raisers[usize::from(self.id.0)]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if preset_fits(preset, own, self.id, self.ts_floor, raise) {
             self.raise_ts_floor(preset);
             return preset;
         }
@@ -2878,7 +2962,7 @@ impl ShardState {
                 MemberKind::Single => {
                     m.seqno = next;
                     next += 1;
-                    m.commit_ts = self.default_ts_or(m.commit_ts);
+                    m.commit_ts = self.default_ts_or(m.commit_ts, &m.preset_own);
                 }
                 MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
                     self.raise_ts_floor(m.commit_ts);
@@ -3322,24 +3406,40 @@ impl ShardState {
             "shard {} coordinates {seqno} over {shards:?} routed with map v{}",
             self.id.0, req.map_version
         );
-        // Above every participant's floor too: a tablet's default timestamps never go
-        // backwards whichever shard coordinates a commit touching it (D11).
+        // Above every participant's floor too, including the floor a shard handing it a
+        // tablet raised it to (`ts_raises`): a tablet's default timestamps never go
+        // backwards whichever shard coordinates a commit touching it (D11). A retry keeps its
+        // first timestamp only when it is above every participant's floor, or equal to the
+        // floor of a shard that reached it through this very commit (`Preset::own`): any
+        // other tie would be a write that participant already made at that timestamp.
         let mut floor = 0;
+        let mut fits = req.commit_ts.is_some();
         if self.tablets_on() {
             for s in &shards {
-                if let Some(f) = self.shared.ts_floors.get(usize::from(s.0)) {
-                    floor = floor.max(f.0.load(Ordering::Acquire));
-                }
+                let i = usize::from(s.0);
+                let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
+                let raise = *self.shared.ts_raisers[i]
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                floor = floor.max(own_floor).max(raise.0);
+                fits &= req
+                    .commit_ts
+                    .as_ref()
+                    .is_some_and(|p| preset_fits(p.ts, &p.own, *s, own_floor, raise));
             }
         }
-        let commit_ts = match req.commit_ts {
-            Some(ts) if ts >= floor => {
-                self.raise_ts_floor(ts);
-                ts
+        let (commit_ts, own) = match req.commit_ts {
+            Some(p) if fits => {
+                self.raise_ts_floor(p.ts);
+                let mut own = p.own;
+                if !own.contains(&self.id) {
+                    own.push(self.id);
+                }
+                (p.ts, own)
             }
             _ => {
                 self.ts_floor = self.ts_floor.max(floor);
-                self.default_ts()
+                (self.default_ts(), vec![self.id])
             }
         };
         self.coord.insert(
@@ -3368,6 +3468,7 @@ impl ShardState {
                 map_version: req.map_version,
                 moved: false,
                 commit_ts,
+                own,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
             },
         );
@@ -3432,19 +3533,20 @@ impl ShardState {
             failed: None,
             reserved: 0,
             map_version: req.map_version,
+            preset_own: Vec::new(),
         });
     }
 
     fn on_prepared(
         &mut self,
         seqno: Seqno,
-        _from: ShardId,
+        from: ShardId,
         error: Option<PrepareError>,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         trace!(
             "shard {} on_prepared {seqno} from {} {error:?}",
-            self.id.0, _from.0
+            self.id.0, from.0
         );
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
@@ -3452,7 +3554,13 @@ impl ShardState {
         match error {
             Some(PrepareError::Moved) => c.moved = true,
             Some(e) if c.failed.is_none() => c.failed = Some(e.into()),
-            _ => {}
+            Some(_) => {}
+            // It raised its floor to the commit timestamp.
+            None => {
+                if !c.own.contains(&from) {
+                    c.own.push(from);
+                }
+            }
         }
         c.prepared += 1;
         if c.prepared < c.participants || c.decided {
@@ -3510,6 +3618,7 @@ impl ShardState {
             failed: None,
             reserved: 0,
             map_version: 0,
+            preset_own: Vec::new(),
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
@@ -3627,7 +3736,10 @@ impl ShardState {
                 submitted_at: c.submitted_at,
                 validate: c.validate.take(),
                 map_version: c.map_version,
-                commit_ts: Some(c.commit_ts),
+                commit_ts: Some(Preset {
+                    ts: c.commit_ts,
+                    own: std::mem::take(&mut c.own),
+                }),
                 epoch: c.epoch,
             });
             self.run_retries(ctx);
@@ -4599,24 +4711,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_freeze_waiter_registers_once_and_again_after_each_take() {
+    fn a_retry_keeps_its_timestamp_only_where_no_other_write_reached_it() {
+        let (a, b, c) = (ShardId(0), ShardId(1), ShardId(2));
+        let own = [a, b];
+        // Strictly above the floor and the raise: kept anywhere.
+        assert!(preset_fits(10, &own, c, 9, (9, 0b100)));
+        // Below either: never.
+        assert!(!preset_fits(10, &own, a, 11, (0, 0)));
+        assert!(!preset_fits(10, &own, a, 9, (11, 0b1)));
+        // A tie with the floor only on a shard that reached it through this commit.
+        assert!(preset_fits(10, &own, b, 10, (0, 0)));
+        assert!(!preset_fits(10, &own, c, 10, (0, 0)));
+        // A tie with a raise only when every shard that raised it is the commit's own.
+        assert!(preset_fits(10, &own, c, 9, (10, 0b011)));
+        assert!(!preset_fits(10, &own, c, 9, (10, 0b101)));
+    }
+
+    #[test]
+    fn a_freeze_waiter_wakes_only_once_its_seqno_is_visible() {
         let w = FreezeWaiters::default();
-        w.register(3);
-        w.register(3);
-        w.register(1);
-        assert_eq!(w.take(), [3, 1]);
-        assert!(w.take().is_empty());
-        // A freeze that defers again after the kick is woken again.
-        w.register(3);
-        assert_eq!(w.take(), [3]);
+        w.register(3, 10);
+        w.register(1, 5);
+        // A watermark that did not reach either seqno wakes nobody.
+        assert!(w.take_ready(|| 4).is_empty());
+        assert_eq!(w.take_ready(|| 7), [1]);
+        assert!(w.take_ready(|| 9).is_empty());
+        // Registering again replaces the seqno.
+        w.register(3, 12);
+        assert!(w.take_ready(|| 10).is_empty());
+        assert_eq!(w.take_ready(|| 12), [3]);
+        assert!(w.take_ready(|| u64::MAX - 1).is_empty());
+        // A shard that defers again after its wake is woken again.
+        w.register(3, 20);
+        assert_eq!(w.take_ready(|| 20), [3]);
     }
 
     #[test]
     fn a_freeze_waiter_registering_during_a_take_is_never_lost() {
-        // Resetting the count outside the lock lost a registration made between the list's
-        // take and the reset: the count read 0 with the shard still listed, so `take` skipped
-        // it until some other shard registered. Under the lock the count always equals the
-        // list's length; registrants and a taker race while a checker looks.
+        // Registrants race a taker while a checker looks: under the lock the published
+        // minimum always equals the list's smallest needed seqno, so a registration racing a
+        // take is never hidden from later publishers.
         const SHARDS: u16 = 4;
         let w = FreezeWaiters::default();
         let stop = AtomicUsize::new(0);
@@ -4624,22 +4758,27 @@ mod tests {
             for id in 0..SHARDS {
                 let (w, stop) = (&w, &stop);
                 s.spawn(move || {
+                    let mut n = 0u64;
                     while stop.load(Ordering::Acquire) == 0 {
-                        w.register(id);
+                        n += 1;
+                        w.register(id, n);
                     }
                 });
             }
             s.spawn(|| {
+                let mut v = 0u64;
                 while stop.load(Ordering::Acquire) == 0 {
-                    let _ = w.take();
+                    v += 1;
+                    let _ = w.take_ready(|| v);
                 }
             });
             for _ in 0..200_000 {
                 let list = w.list.lock().unwrap_or_else(PoisonError::into_inner);
-                let waiting = w.waiting.load(Ordering::Acquire);
-                if waiting != list.len() {
+                let min = w.min_needed.load(Ordering::SeqCst);
+                let want = list.iter().map(|(_, n)| *n).min().unwrap_or(u64::MAX);
+                if min != want {
                     stop.store(1, Ordering::Release);
-                    panic!("count {waiting} with {:?} registered", *list);
+                    panic!("published minimum {min} with {:?} registered", *list);
                 }
             }
             stop.store(1, Ordering::Release);

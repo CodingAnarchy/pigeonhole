@@ -651,3 +651,64 @@ fn the_balancer_merges_cold_siblings_once_one_compacted_a_shared_sst() {
         db.step();
     }
 }
+
+#[test]
+fn probe_cross_shard_commit_ts_after_move() {
+    // 3 shards; T's tablet moves A -> B; a cross-shard commit coordinated by C touches T.
+    let mut db = open(3, |_| {});
+    let t = db.table.id;
+    let ft = db.table.families[0].id;
+    let from = db.ranges()[0].1;
+    let u = db
+        .engine
+        .create_table("u", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let snap = db.engine.snapshot().unwrap();
+    let ushard = snap.view().tablets().ranges(u.id)[0].1;
+    drop(snap);
+    eprintln!("t on {from}, u on {ushard}");
+    let mut last = 0;
+    for i in 0..50u8 {
+        db.put(b"row", &[i]);
+        let (ts, _) = db.get(b"row").unwrap();
+        last = ts;
+    }
+    let to = (0..3u16)
+        .find(|s| *s != from && *s != ushard)
+        .unwrap_or((from + 1) % 3);
+    let m = db.engine.move_tablet_pending(t, b"row", to).unwrap();
+    db.drive(m).unwrap();
+    eprintln!("moved t to {to}; ranges {:?}", db.ranges());
+    // Cross-shard: first row on u (coordinator = u's shard), then t/row.
+    let mut wb = WriteBatch::new();
+    wb.put(
+        u.id,
+        u.families[0].id,
+        b"x",
+        b"q",
+        None,
+        ValueRef::Bytes(b"ux"),
+    )
+    .unwrap();
+    wb.put(t, ft, b"row", b"q", None, ValueRef::Bytes(b"newest"))
+        .unwrap();
+    let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(r) = Pin::new(&mut pc).poll(&mut cx) {
+            r.expect("commit");
+            break;
+        }
+        db.step();
+    }
+    let (ts, v) = db.get(b"row").unwrap();
+    eprintln!(
+        "last={last} now ts={ts} v={:?}",
+        String::from_utf8_lossy(&v)
+    );
+    assert_eq!(v, b"newest", "a newer commit is hidden: ts {ts} <= {last}");
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}

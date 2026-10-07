@@ -500,6 +500,7 @@ impl Engine {
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
             ts_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
+            ts_raisers: (0..shards).map(|_| Mutex::new((0, 0))).collect(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
             balance: BalanceConfig {
                 enabled: options.tablet_changes,
@@ -954,6 +955,7 @@ impl Engine {
             metrics: Vec::new(),
             ts_floors: Vec::new(),
             ts_raises: Vec::new(),
+            ts_raisers: Vec::new(),
             loads: Vec::new(),
             balance: BalanceConfig::default(),
             view_capacity: shm_config.view_buffer_bytes as usize,
@@ -1955,7 +1957,7 @@ impl Inner {
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
         // One tablet map for the whole routing: its version goes with a cross-shard commit,
         // which a participant moving a tablet refuses and the coordinator retries.
-        let view = self.shared.view.load_full();
+        let view = self.shared.view.load();
         let (builder, mut shards) = self.route(batch, &view)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
@@ -2041,7 +2043,7 @@ impl Inner {
             }
         }
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
-        let view = self.shared.view.load_full();
+        let view = self.shared.view.load();
         let (builder, shards) = self.route(batch, &view)?;
         let shard = match shards.as_slice() {
             [] => view
@@ -2451,7 +2453,7 @@ impl EngineShard {
         let engine = Arc::clone(&self.engine);
         engine.check_open()?;
         let durability = durability.unwrap_or_else(|| engine.shared.default_durability());
-        let view = engine.shared.view.load_full();
+        let view = engine.shared.view.load();
         let (builder, shards) = engine.route(batch, &view)?;
         let me = ShardId(self.index());
         let Some(driver) = self.driver.as_mut() else {

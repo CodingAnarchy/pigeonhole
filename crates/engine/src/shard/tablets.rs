@@ -452,9 +452,10 @@ impl ShardState {
                 {
                     return Err(Error::InvalidArgument("malformed split".to_owned()));
                 }
+                // Above the tablet's start, then above the previous key.
                 let mut prev: &[u8] = &t.start;
-                for (i, k) in keys.iter().enumerate() {
-                    if (i == 0 && k.as_slice() <= prev) || (i > 0 && k.as_slice() <= prev) {
+                for k in keys {
+                    if k.as_slice() <= prev {
                         return Err(Error::InvalidArgument(
                             "split keys must increase strictly inside the tablet".to_owned(),
                         ));
@@ -616,7 +617,17 @@ impl ShardState {
         // starts above every default timestamp this shard assigned (an upper bound on the
         // tablet's own floor).
         for s in kind.targets(self.id) {
-            self.shared.ts_raises[usize::from(s.0)]
+            let i = usize::from(s.0);
+            let mut raisers = self.shared.ts_raisers[i]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let me = if self.id.0 < 64 { 1u64 << self.id.0 } else { 0 };
+            if self.ts_floor > raisers.0 {
+                *raisers = (self.ts_floor, me);
+            } else if self.ts_floor == raisers.0 {
+                raisers.1 |= me;
+            }
+            self.shared.ts_raises[i]
                 .0
                 .fetch_max(self.ts_floor, Ordering::AcqRel);
         }
@@ -1117,7 +1128,10 @@ fn member_req(m: Member) -> CommitReq {
         submitted_at: m.submitted_at,
         validate: m.validate,
         predicate: m.predicate,
-        commit_ts: (m.commit_ts != 0).then_some(m.commit_ts),
+        commit_ts: (m.commit_ts != 0).then_some(Preset {
+            ts: m.commit_ts,
+            own: m.preset_own,
+        }),
     }
 }
 

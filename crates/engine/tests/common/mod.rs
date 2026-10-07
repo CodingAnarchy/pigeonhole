@@ -276,6 +276,10 @@ pub struct Stats {
     pub unowned_records: usize,
     /// Earlier copies of a `(seqno, kind)` whose seqno recovery reused after a crash.
     pub reused_records: usize,
+    /// Surviving seqnos with only PREPAREs and no COMMIT on any stream (an attempt a shard
+    /// changing a tablet refused, retried under a new seqno; D83 never recovers them), kept
+    /// out of the match with unacknowledged commits. Tablet changes only.
+    pub refused_attempts: usize,
     /// Commits recovered only from SSTs (their WAL records were checkpointed away).
     pub sst_only: usize,
     /// Mutating VFS operations the run made before its final crash: the crash points a
@@ -1768,6 +1772,9 @@ impl World {
                 .flatten()
                 .any(|(s, kind)| *s == *seqno && *kind == RecKind::Commit);
             if self.cfg.tablet_changes && prepares_only && !committed_anywhere {
+                self.stats.refused_attempts += 1;
+                self.trace
+                    .push(format!("  seqno {seqno}: PREPAREs of a refused attempt"));
                 continue;
             }
             let exact = (0..unacked.len()).filter(|&i| unacked_keys[i] == keys);
@@ -2735,7 +2742,26 @@ impl World {
             // The commit timestamp: the clock when the commit ran alone, else the record's.
             let ts = if c.durability == Durability::None {
                 // Never logged: it ran alone with the clock past every timestamp floor.
-                c.commit_ts.expect("alone commits know their timestamp")
+                let now = c.commit_ts.expect("alone commits know their timestamp");
+                if self.cfg.tablet_changes {
+                    // A commit a moving tablet refused (`Moved`) or parked runs again later,
+                    // above every floor its participants reached meanwhile (a retry keeps
+                    // its first timestamp only when strictly above them): read it from the
+                    // entries, which must never be older than the clock it ran at. Entries a
+                    // compaction already dropped leave the clock, as without tablet changes.
+                    match self.raw_commit_ts(seqno, &c.ops).unwrap_or(0) {
+                        0 => now,
+                        ts if ts >= now => ts,
+                        ts => {
+                            return fail(
+                                FailureClass::Protocol,
+                                format!("commit {seqno} at ts {ts}, below the clock {now}"),
+                            );
+                        }
+                    }
+                } else {
+                    now
+                }
             } else {
                 if logged.is_none() {
                     logged = Some(self.logged_timestamps()?);
