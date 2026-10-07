@@ -26,7 +26,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | Option | Meaning |
 |---|---|
 | `--engine LIST` | `pigeonhole` (default), `rocksdb`, `sqlite`, `fjall`, or `all` |
-| `--scale smoke\|small\|full` | Preset size; `small` is the default, `smoke` is what `cargo test` runs, `full` is the spec's scale |
+| `--scale smoke\|small\|full\|larger-than-ram` | Preset size; `small` is the default, `smoke` is what `cargo test` runs, `full` is the spec's scale, `larger-than-ram` is `full` with a tiny memory budget (below) |
 | `--records N`, `--ops N`, `--value-len N`, `--threads N`, `--seed N` | Override the preset |
 | `--warmup F` | Unrecorded warmup, as a fraction of `--ops` (default 0.05) |
 | `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
@@ -55,8 +55,21 @@ PR-gating CI builds and tests the bench crate with `sqlite,fjall` only, so it ne
 | `smoke` | 1,000 | 2,000 | What `cargo test` runs; seconds for the whole suite |
 | `small` (default) | 50,000 | 200,000 | A quick check, seconds per workload |
 | `full` | 1,000,000 (adjacency: 2,000,000 edges) | 1,000,000 (skewed-multi-shard: 2,000,000) | The spec's scale: 1M sparse-wide rows, YCSB with 1M records |
+| `larger-than-ram` | same as `full` | same as `full` | The data set is more than 100× the engine's memory budget; gets are split into cold and hot (below) |
 
-Memtables flush to SSTs, so no preset is bounded by memory. At `full` size the data set is several times the 64 MiB write buffer (the runner's default, equal to the engine's), so flushes and compactions run during the load and the measurement, and a run completes without `Busy`. Sparse-wide at `full` loads about 20M cells, YCSB about 10M, and takes minutes per engine. `full` is **not** larger than RAM on a typical workstation, so it does not measure the spec's cold-read target (one I/O on data larger than RAM). For that, raise `--records` until the file exceeds memory, and use `--cache` small; there is no preset for it yet. Tablets do not split yet (#38), so one table's writes use one shard whatever `--shards` is.
+Memtables flush to SSTs, so no preset is bounded by memory. At `full` size the data set is several times the 64 MiB write buffer (the runner's default, equal to the engine's), so flushes and compactions run during the load and the measurement, and a run completes without `Busy`. Sparse-wide at `full` loads about 20M cells, YCSB about 10M, and takes minutes per engine. `full` is **not** larger than RAM on a typical workstation, so by itself it does not measure the spec's cold-read target (one I/O per get on data larger than memory). `larger-than-ram` does the next best thing on a laptop.
+
+### The larger-than-RAM preset
+
+`--scale larger-than-ram` runs the `full` sizes with a default memory budget of an **8 MiB write buffer and a 16 MiB read cache** (24 MiB, against 320 MiB by default), unless `--write-buffer` or `--cache` say otherwise. One million YCSB rows are about 3 GiB on disk, so the data set is over 100× what the engine may hold in its memtable and block cache, and nearly every first read of a row has to leave the engine's cache. Each result prints its store size on disk beside the budget.
+
+**What this is not.** It bounds the *engine's* memory; it does not bound the machine's. The OS page cache (most of 24 GiB here) still holds the files, so a cold get usually costs a page-cache copy, not a device read. That makes the cold numbers a measure of the engine's miss path (index and filter lookup, block decode, a `pread`), not of NVMe latency. For a true device-bound number, raise `--records` until the store exceeds RAM, or run on reference hardware (D5). The preset exists so the miss path is exercised on any machine, and in CI, without a machine-sized file.
+
+**Cold and hot gets.** Whenever a workload has gets, the report adds a second table (and `detail.reads` in the JSON). A get is **cold** when it is the first get of its row in the run (the warmup counts as earlier), **hot** when the row was read before. The classification is by row, decided before the clock starts, and is the same for every engine. It is an approximation: a "hot" row can have been evicted since, a "cold" row can share a block with a row read earlier, and the OS page cache can serve either. Under Zipfian access a minority of gets are cold (about a fifth at 100K records and 100K gets); use a uniform workload or more records for more.
+
+**Stalls.** The engine stalls writers while a flush frees memtable room and answers `Busy` only when the stall outlasts its timeout (30 s). The Pigeonhole runner retries a write after `Busy` (up to 20 times) instead of failing the run, and the second table reports the retries. A run with zero retries completed without ever refusing a write. Stall time shows up in the latency tail (max, p99.9) and in throughput; the public API exposes no stall counter, so there is no separate stall figure.
+
+Tablets do not split yet (#38), so one table's writes use one shard whatever `--shards` is.
 
 ## Workloads
 

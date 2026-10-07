@@ -2,8 +2,11 @@
 
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use pigeonhole::{Durability, Family, Options, Pigeonhole, Table};
+use pigeonhole::{Durability, ErrorCode, Family, Options, Pigeonhole, Table};
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
@@ -24,6 +27,31 @@ pub(crate) struct Settings {
 pub(crate) struct Open {
     db: Pigeonhole,
     table: Table,
+    /// Writes retried after `Busy`, shared with every client.
+    busy: Arc<AtomicU64>,
+}
+
+/// How many times a write refused with `Busy` is retried (each after the engine's own
+/// stall timeout) before the run fails. The engine already stalls writers while a flush
+/// frees room; `Busy` means that wait outlasted its timeout, which a bench on a slow
+/// disk can hit. Retrying keeps the run going and the count is reported.
+const BUSY_RETRIES: u32 = 20;
+
+fn retry_busy<T>(
+    busy: &AtomicU64,
+    mut f: impl FnMut() -> Result<T, pigeonhole::Error>,
+) -> Result<T, String> {
+    let mut tries = 0;
+    loop {
+        match f() {
+            Err(e) if e.code() == ErrorCode::Busy && tries < BUSY_RETRIES => {
+                tries += 1;
+                busy.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            r => return r.map_err(err),
+        }
+    }
 }
 
 fn err(e: pigeonhole::Error) -> String {
@@ -64,13 +92,6 @@ impl PigeonholeRunner {
         self.settings.sync = yes;
         self
     }
-
-    fn table(&self) -> Result<&Table, String> {
-        self.open
-            .as_ref()
-            .map(|o| &o.table)
-            .ok_or_else(|| "pigeonhole runner is not open".to_owned())
-    }
 }
 
 impl Runner for PigeonholeRunner {
@@ -101,7 +122,11 @@ impl Runner for PigeonholeRunner {
             builder = builder.family(family, f);
         }
         let table = builder.create_if_missing().map_err(err)?;
-        self.open = Some(Open { db, table });
+        self.open = Some(Open {
+            db,
+            table,
+            busy: Arc::default(),
+        });
         Ok(())
     }
 
@@ -111,7 +136,7 @@ impl Runner for PigeonholeRunner {
 
     fn close(&mut self) -> Result<(), String> {
         match self.open.take() {
-            Some(Open { db, table }) => {
+            Some(Open { db, table, .. }) => {
                 drop(table);
                 db.close().map_err(err)
             }
@@ -119,9 +144,18 @@ impl Runner for PigeonholeRunner {
         }
     }
 
+    fn busy_retries(&self) -> u64 {
+        self.open
+            .as_ref()
+            .map_or(0, |o| o.busy.load(Ordering::Relaxed))
+    }
+
     fn client(&self) -> Option<Box<dyn Client>> {
-        let table = self.open.as_ref()?.table.clone();
-        Some(Box::new(PigeonholeClient { table }))
+        let open = self.open.as_ref()?;
+        Some(Box::new(PigeonholeClient {
+            table: open.table.clone(),
+            busy: Arc::clone(&open.busy),
+        }))
     }
 
     fn describe(&self) -> String {
@@ -146,21 +180,23 @@ impl Runner for PigeonholeRunner {
 
 impl Counted for PigeonholeRunner {
     fn execute_counted(&mut self, op: &BenchOp) -> Result<Touched, String> {
-        execute(self.table()?, op)
+        let o = self.open.as_ref().ok_or("pigeonhole runner is not open")?;
+        execute(&o.table, &o.busy, op)
     }
 }
 
 struct PigeonholeClient {
     table: Table,
+    busy: Arc<AtomicU64>,
 }
 
 impl Client for PigeonholeClient {
     fn execute(&mut self, op: &BenchOp) -> Result<(), String> {
-        execute(&self.table, op).map(drop)
+        execute(&self.table, &self.busy, op).map(drop)
     }
 }
 
-fn execute(table: &Table, op: &BenchOp) -> Result<Touched, String> {
+fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, String> {
     let mut t = Touched::default();
     match op {
         BenchOp::Get {
@@ -173,11 +209,13 @@ fn execute(table: &Table, op: &BenchOp) -> Result<Touched, String> {
             }
         }
         BenchOp::Put { row, family, cells } => {
-            let mut m = table.mutate(row);
-            for (q, v) in cells {
-                m = m.put(family, q, v);
-            }
-            m.commit().map_err(err)?;
+            retry_busy(busy, || {
+                let mut m = table.mutate(row);
+                for (q, v) in cells {
+                    m = m.put(family, q, v);
+                }
+                m.commit()
+            })?;
         }
         BenchOp::Scan { start, len } => {
             let mut it = table
@@ -198,11 +236,9 @@ fn execute(table: &Table, op: &BenchOp) -> Result<Touched, String> {
                 t.cell(cell.value());
             }
             drop(old);
-            table
-                .mutate(row)
-                .put(YCSB_FAMILY, qualifier, &new)
-                .commit()
-                .map_err(err)?;
+            retry_busy(busy, || {
+                table.mutate(row).put(YCSB_FAMILY, qualifier, &new).commit()
+            })?;
         }
     }
     Ok(t)

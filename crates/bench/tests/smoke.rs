@@ -155,3 +155,34 @@ fn describe_reports_memory_budget() {
             .contains("write_buffer=32MiB cache=8MiB")
     );
 }
+
+#[test]
+fn larger_than_ram_preset_splits_cold_and_hot_gets() {
+    use pigeonhole_bench::{MemoryBudget, RunOptions, run_detailed};
+
+    let root = temp_dir("cold");
+    let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbC);
+    config.records = 2_000;
+    config.operations = 4_000;
+    // The preset's budget is far below the data set even at this size when shrunk further.
+    let budget = MemoryBudget {
+        write_buffer: 1 << 20,
+        cache: 1 << 20,
+    };
+    assert!(MemoryBudget::larger_than_ram().cache < MemoryBudget::default().cache);
+    let mut r = PigeonholeRunner::default().shards(1).memory(budget);
+    let rec = run_detailed(&mut r, &config, &root, &RunOptions { warmup: 0.0 })
+        .unwrap_or_else(|e| panic!("seed {}: {e}", config.seed));
+    let reads = rec.detail.reads.expect("a read workload reports the split");
+    // Every measured op is a get: each is cold (first touch of its row) or hot.
+    assert_eq!(reads.cold.count + reads.hot.count, rec.operations);
+    assert!(reads.cold.count > 0 && reads.hot.count > 0, "{reads:?}");
+    assert!(reads.cold.count <= config.records);
+    assert!(rec.detail.store_bytes > 0);
+    assert_eq!(rec.detail.busy_retries, 0);
+    // A write-only workload has no gets to split.
+    let config = WorkloadConfig::smoke(WorkloadKind::SkewedMultiShard);
+    let rec = run_detailed(&mut r, &config, &root, &RunOptions::default()).unwrap();
+    assert!(rec.detail.reads.is_none());
+    std::fs::remove_dir_all(&root).ok();
+}

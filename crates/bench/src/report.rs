@@ -246,6 +246,59 @@ pub struct RunRecord {
     /// Unrecorded warmup operations run before the measured ones.
     #[serde(default)]
     pub warmup_ops: u64,
+    /// What the run measured beyond latency: store size, `Busy` retries, cold/hot gets.
+    #[serde(default)]
+    pub detail: RunDetail,
+}
+
+/// Percentiles of one class of operations, in nanoseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatencyStats {
+    /// Operations in the class.
+    pub count: u64,
+    /// Median.
+    pub p50_ns: u64,
+    /// 99th percentile.
+    pub p99_ns: u64,
+    /// 99.9th percentile.
+    pub p999_ns: u64,
+}
+
+impl LatencyStats {
+    pub(crate) fn of(h: &crate::Histogram) -> Self {
+        Self {
+            count: h.count(),
+            p50_ns: h.percentile(0.50).as_nanos() as u64,
+            p99_ns: h.percentile(0.99).as_nanos() as u64,
+            p999_ns: h.percentile(0.999).as_nanos() as u64,
+        }
+    }
+}
+
+/// Point gets of a run, split by whether the row had been read before in the run.
+///
+/// *Cold* is the first get of a row (the warmup counts as earlier), so the engine had no
+/// reason to have its block cached; with a data set far larger than the cache it is the
+/// closest a store-neutral bench gets to the spec's "one I/O per get". *Hot* is every
+/// later get of the same row. The OS page cache can still serve a cold get; see
+/// `docs/bench.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadSplit {
+    /// First touch of a row.
+    pub cold: LatencyStats,
+    /// Repeat touch.
+    pub hot: LatencyStats,
+}
+
+/// Extra facts about a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDetail {
+    /// Bytes of the store directory when the run ended (0 when not measured).
+    pub store_bytes: u64,
+    /// Writes retried after `Busy` (a stall that outlasted the engine's timeout).
+    pub busy_retries: u64,
+    /// Cold and hot gets; `None` when the workload has no gets.
+    pub reads: Option<ReadSplit>,
 }
 
 impl RunRecord {
@@ -329,6 +382,10 @@ fn us(ns: u64) -> String {
     }
 }
 
+fn mib(bytes: u64) -> String {
+    format!("{:.0} MiB", bytes as f64 / (1u64 << 20) as f64)
+}
+
 fn ops(t: f64) -> String {
     if t >= 1e6 {
         format!("{:.2}M", t / 1e6)
@@ -405,6 +462,37 @@ impl Suite {
                 us(r.p99_ns),
                 us(r.p999_ns)
             );
+        }
+        let split: Vec<&RunRecord> = self
+            .results
+            .iter()
+            .filter(|r| r.detail.reads.is_some() || r.detail.busy_retries > 0)
+            .collect();
+        if !split.is_empty() {
+            s.push_str(
+                "\n| Workload | Store | Store size | Busy retries | Cold gets | Cold p50 µs | Cold p99 µs | Cold p99.9 µs | Hot gets | Hot p50 µs | Hot p99 µs | Hot p99.9 µs |\n",
+            );
+            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
+            for r in split {
+                let d = &r.detail;
+                let reads = d.reads.unwrap_or_default();
+                let _ = writeln!(
+                    s,
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    r.workload,
+                    r.store,
+                    mib(d.store_bytes),
+                    d.busy_retries,
+                    reads.cold.count,
+                    us(reads.cold.p50_ns),
+                    us(reads.cold.p99_ns),
+                    us(reads.cold.p999_ns),
+                    reads.hot.count,
+                    us(reads.hot.p50_ns),
+                    us(reads.hot.p99_ns),
+                    us(reads.hot.p999_ns),
+                );
+            }
         }
         if let Some(sc) = &self.scaling {
             let _ = writeln!(
@@ -553,7 +641,7 @@ impl Comparison {
 ///     store: "pigeonhole".into(), store_config: String::new(), workload: "ycsb-c".into(),
 ///     seed: 1, records: 10, operations: 10, value_len: 8, threads: 1, load_secs: 0.0,
 ///     run_secs: 1.0, throughput: tput, p50_ns: 1000, p99_ns: 2000, p999_ns: 3000,
-///     mean_ns: 1100, max_ns: 5000, warmup_ops: 0,
+///     mean_ns: 1100, max_ns: 5000, warmup_ops: 0, detail: Default::default(),
 /// };
 /// let env = Environment::detect(&std::env::temp_dir());
 /// let mut a = Suite::new(env.clone());
@@ -648,6 +736,7 @@ mod tests {
             mean_ns: p50,
             max_ns: p99 * 3,
             warmup_ops: 0,
+            detail: RunDetail::default(),
         }
     }
 
