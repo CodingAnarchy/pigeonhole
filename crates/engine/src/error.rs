@@ -82,6 +82,10 @@ pub enum Error {
     /// A reader process's snapshot was taken before a writer restart: the new writer may
     /// have reused the space it names. Take a new snapshot.
     SnapshotExpired,
+    /// A submitted commit's outcome was awaited on a thread that drives a shard
+    /// (application-owned mode), where blocking could deadlock. The commit was submitted
+    /// and will apply; await its future from the event loop instead (D88).
+    WouldDeadlock,
 }
 
 impl fmt::Display for Error {
@@ -119,6 +123,11 @@ impl fmt::Display for Error {
             Error::RecordTooLarge => {
                 f.write_str("the commit's WAL record is larger than a segment can hold")
             }
+            Error::WouldDeadlock => f.write_str(
+                "the commit was submitted and will apply, but its outcome cannot be awaited \
+                 on a thread that drives a shard (it could deadlock): poll the PendingCommit \
+                 future from the event loop instead",
+            ),
             Error::Busy => f.write_str(
                 "writes stalled past the write-stall timeout (transient: retry later), or a \
                  batch larger than the arena (never fits: split it or raise memtable_budget)",
@@ -127,6 +136,51 @@ impl fmt::Display for Error {
                 "the snapshot was taken before a writer restart and can no longer be read; \
                  take a new snapshot",
             ),
+        }
+    }
+}
+
+impl Error {
+    /// An equal error (same variant and message) for a second reader of one outcome (the
+    /// final close's, issue #135). The I/O source is carried as its kind and text.
+    pub(crate) fn duplicate(&self) -> Error {
+        match self {
+            Error::Io(e) => Error::Io(pigeonhole_io::Error {
+                kind: e.kind,
+                context: e.context,
+                source: e
+                    .source
+                    .as_ref()
+                    .map(|s| std::io::Error::new(s.kind(), s.to_string())),
+            }),
+            Error::Corruption(s) => Error::Corruption(s.clone()),
+            Error::WriterLocked => Error::WriterLocked,
+            Error::ShmVersionMismatch { found, expected } => Error::ShmVersionMismatch {
+                found: *found,
+                expected: *expected,
+            },
+            Error::ShmUnavailable => Error::ShmUnavailable,
+            Error::UnsupportedFormat(v) => Error::UnsupportedFormat(*v),
+            Error::NetworkFilesystem => Error::NetworkFilesystem,
+            Error::TableNotFound(s) => Error::TableNotFound(s.clone()),
+            Error::TableExists(s) => Error::TableExists(s.clone()),
+            Error::FamilyNotFound(s) => Error::FamilyNotFound(s.clone()),
+            Error::FamilyExists(s) => Error::FamilyExists(s.clone()),
+            Error::UnknownMergeOperator(s) => Error::UnknownMergeOperator(s.clone()),
+            Error::Merge(e) => Error::Merge(e.clone()),
+            Error::Conflict => Error::Conflict,
+            Error::ReadOnly => Error::ReadOnly,
+            Error::KeyTooLarge => Error::KeyTooLarge,
+            Error::ValueTooLarge => Error::ValueTooLarge,
+            Error::NoSpace => Error::NoSpace,
+            Error::InvalidArgument(s) => Error::InvalidArgument(s.clone()),
+            Error::Unsupported(s) => Error::Unsupported(s),
+            Error::Closed => Error::Closed,
+            Error::NoReaderSlot => Error::NoReaderSlot,
+            Error::RecordTooLarge => Error::RecordTooLarge,
+            Error::Busy => Error::Busy,
+            Error::WouldDeadlock => Error::WouldDeadlock,
+            Error::SnapshotExpired => Error::SnapshotExpired,
         }
     }
 }
