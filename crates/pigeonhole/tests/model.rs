@@ -27,7 +27,8 @@
 //! a compaction while a commit waits in a write stall (issue #70).
 //!
 //! Seeds: `PIGEONHOLE_SEED` (first seed, default 1) and `PIGEONHOLE_SEEDS` (count, default
-//! 1). A failure prints its seed and the operation trace.
+//! 1). A failure prints its seed and the operation trace. `PIGEONHOLE_TABLET_CHANGES=1` runs
+//! every test with tablet changes on (`Options::tablet_changes`, with a fast balancer).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -119,6 +120,9 @@ struct Config {
     flush_ppm: u32,
     /// Per-op probability (ppm) of an explicit `compact`.
     compact_ppm: u32,
+    /// `Options::tablet_changes`, with a balancer tuned so tablets split, move and merge
+    /// within a run. Defaults to `PIGEONHOLE_TABLET_CHANGES` (`1` on, else off).
+    tablet_changes: bool,
 }
 
 impl Config {
@@ -142,6 +146,7 @@ impl Config {
             block_cache: 1 << 20,
             flush_ppm: 20_000,
             compact_ppm: 20_000,
+            tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").is_ok_and(|v| v == "1"),
         }
     }
 
@@ -364,7 +369,10 @@ impl Run {
             .shards(self.cfg.shards)
             .memtable_budget(self.cfg.memtable_budget)
             .wal_segment_size(256 << 10)
-            .block_cache(self.cfg.block_cache);
+            .block_cache(self.cfg.block_cache)
+            .tablet_changes(self.cfg.tablet_changes)
+            // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
+            .tablet_balance(Duration::from_micros(15), 3, 8 << 10);
         let db = Pigeonhole::open(DB, options).map_err(|e| format!("open: {e}"))?;
         let mut tables = Vec::new();
         for name in TABLES {
@@ -1117,6 +1125,22 @@ fn quiet_runs_match_the_model() {
 #[test]
 fn crashes_and_reopens_match_a_durable_prefix() {
     check(&Config::crashing(1000));
+}
+
+#[test]
+fn quiet_runs_with_tablet_changes_match_the_model() {
+    for shards in [1, 2, 4, 8] {
+        let mut cfg = Config::quiet(1000, shards);
+        cfg.tablet_changes = true;
+        check(&cfg);
+    }
+}
+
+#[test]
+fn crashes_with_tablet_changes_match_a_durable_prefix() {
+    let mut cfg = Config::crashing(1000);
+    cfg.tablet_changes = true;
+    check(&cfg);
 }
 
 #[test]
