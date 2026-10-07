@@ -61,6 +61,9 @@ pub enum ErrorCode {
     /// larger than a shard's arena, which never succeeds: split it or raise
     /// `Options::memtable_budget`.
     Busy = 24,
+    /// A reader process's snapshot was taken before a writer restart, which may have reused
+    /// the space it reads. Take a new snapshot and redo the read.
+    SnapshotExpired = 25,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
@@ -143,6 +146,7 @@ impl From<pigeonhole_engine::Error> for Error {
             E::NoReaderSlot => ErrorCode::NoReaderSlot,
             E::RecordTooLarge => ErrorCode::RecordTooLarge,
             E::Busy => ErrorCode::Busy,
+            E::SnapshotExpired => ErrorCode::SnapshotExpired,
             // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
             // here surfaces as `Io` (the message names it) until it gets its own code; the
             // mapping test lists every current variant.

@@ -113,15 +113,50 @@ const INTERRUPTED_CREATE_MAX: u64 = 64 * 1024;
 struct ReaderState {
     file: FileRef,
     presence: Mutex<Option<Presence>>,
-    shm: Mutex<(ShmRegion, ReaderSlot, bool)>,
+    shm: Mutex<Attachment>,
     /// `(manifest version, catalog, the file the manifest was read from)` as last loaded.
     catalog: Mutex<(ManifestVersion, Arc<Catalog>, FileRef)>,
     /// The last view built from the region, by view version.
     view: Mutex<Option<Arc<View>>>,
     shards: usize,
-    /// Snapshots of this process still alive; the pin moves forward when it drops to zero.
-    live: Arc<AtomicUsize>,
     registry: Arc<MergeRegistry>,
+    #[cfg(feature = "test-hooks")]
+    hooks: Mutex<ReaderHooks>,
+}
+
+/// A reader process's attachment to one region generation.
+struct Attachment {
+    shm: ShmRegion,
+    slot: ReaderSlot,
+    /// Whether the slot holds a pin.
+    pinned: bool,
+    /// Snapshots taken in this generation still alive; the pin moves forward when it drops
+    /// to zero.
+    live: Arc<AtomicUsize>,
+}
+
+/// Test hooks of a reader's snapshot; each runs once.
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct ReaderHooks {
+    /// Between reading the view record and loading the catalog of its manifest version.
+    after_record: Option<Box<dyn FnOnce() + Send>>,
+    /// After the durable root matched the record's manifest version, before the manifest
+    /// is read.
+    before_manifest_load: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl ReaderState {
+    fn run_hook(
+        &self,
+        which: impl FnOnce(&mut ReaderHooks) -> &mut Option<Box<dyn FnOnce() + Send>>,
+    ) {
+        let hook = which(&mut self.hooks.lock().unwrap_or_else(PoisonError::into_inner)).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// Everything behind an [`Engine`] (and the handle a [`Txn`] keeps).
@@ -1079,12 +1114,18 @@ impl Engine {
         let reader = ReaderState {
             file,
             presence: Mutex::new(Some(presence)),
-            shm: Mutex::new((shm, slot, false)),
+            shm: Mutex::new(Attachment {
+                shm,
+                slot,
+                pinned: false,
+                live: Arc::new(AtomicUsize::new(0)),
+            }),
             catalog: Mutex::new((manifest_version, Arc::new(catalog), manifest_file)),
             view: Mutex::new(None),
             shards,
-            live: Arc::new(AtomicUsize::new(0)),
             registry,
+            #[cfg(feature = "test-hooks")]
+            hooks: Mutex::new(ReaderHooks::default()),
         };
         let inner = Arc::new(Inner {
             shared,
@@ -1252,8 +1293,16 @@ impl Engine {
     ) -> Result<Option<CellData>> {
         let inner = &self.inner;
         if inner.role == Role::Reader {
-            let snapshot = inner.snapshot()?;
-            return inner.get(&snapshot, table, family, row, qualifier);
+            // The caller holds no snapshot, so one that a writer restart expired between
+            // taking it and reading is retried with a fresh one (re-attached).
+            let mut tries = 0;
+            loop {
+                let snapshot = inner.snapshot()?;
+                match inner.get(&snapshot, table, family, row, qualifier) {
+                    Err(Error::SnapshotExpired) if tries < READER_EXPIRED_RETRIES => tries += 1,
+                    other => return other,
+                }
+            }
         }
         // The seqno first, then the view: a seqno is only visible once the view holding its
         // memtables is published.
@@ -1275,7 +1324,7 @@ impl Engine {
     ) -> Result<Option<RowData>> {
         let families = families_in_order(&snapshot.view, table, &spec.families)?;
         let now = self.inner.shared.vfs.now_micros();
-        read::read_row(snapshot, table, row, &families, spec, now)
+        snapshot.checked(read::read_row(snapshot, table, row, &families, spec, now))
     }
 
     /// Starts an ordered scan.
@@ -1400,33 +1449,36 @@ impl Engine {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn raw_entries(&self, snapshot: &Snapshot) -> Result<Vec<RawEntry>> {
-        use pigeonhole_compaction::MergingCursor;
-        use pigeonhole_format::Cursor;
-        let view = &snapshot.view;
-        let mut out = Vec::new();
-        let all = pigeonhole_format::scan::ScanFilter::all();
-        for t in view.catalog.tablets() {
-            // Children of a split share SSTs holding their siblings' rows too.
-            let (start, end) = crate::read::clamp_to_tablet(&t, None, None)?;
-            for family in view.catalog.family_ids_of(t.table) {
-                let sources = view.scan_sources(t.shard, t.id, family, &all, None, None)?;
-                let mut merged = MergingCursor::new(sources);
-                match &start {
-                    Some(s) => merged.seek(s)?,
-                    None => merged.seek_to_first()?,
-                }
-                while merged.valid() && end.as_deref().is_none_or(|e| merged.key() < e) {
-                    out.push(RawEntry {
-                        table: t.table,
-                        family,
-                        key: merged.key().to_vec(),
-                        value: merged.value().to_vec(),
-                    });
-                    merged.next()?;
+        let read = || -> Result<Vec<RawEntry>> {
+            use pigeonhole_compaction::MergingCursor;
+            use pigeonhole_format::Cursor;
+            let view = &snapshot.view;
+            let mut out = Vec::new();
+            let all = pigeonhole_format::scan::ScanFilter::all();
+            for t in view.catalog.tablets() {
+                // Children of a split share SSTs holding their siblings' rows too.
+                let (start, end) = crate::read::clamp_to_tablet(&t, None, None)?;
+                for family in view.catalog.family_ids_of(t.table) {
+                    let sources = view.scan_sources(t.shard, t.id, family, &all, None, None)?;
+                    let mut merged = MergingCursor::new(sources);
+                    match &start {
+                        Some(s) => merged.seek(s)?,
+                        None => merged.seek_to_first()?,
+                    }
+                    while merged.valid() && end.as_deref().is_none_or(|e| merged.key() < e) {
+                        out.push(RawEntry {
+                            table: t.table,
+                            family,
+                            key: merged.key().to_vec(),
+                            value: merged.value().to_vec(),
+                        });
+                        merged.next()?;
+                    }
                 }
             }
-        }
-        Ok(out)
+            Ok(out)
+        };
+        snapshot.checked(read())
     }
 
     /// Bytes the pager holds (allocated or retired) that neither the catalog nor the
@@ -1662,6 +1714,41 @@ impl Engine {
                 w.wake();
             }
         }
+    }
+
+    /// Reader processes: runs `hook` once, in the next snapshot, between reading the view
+    /// record from shared memory and loading the catalog of its manifest version (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn on_reader_view_record(&self, hook: Box<dyn FnOnce() + Send>) {
+        if let Some(r) = &self.inner.reader {
+            r.hooks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .after_record = Some(hook);
+        }
+    }
+
+    /// Reader processes: runs `hook` once, when a snapshot found the durable root at the
+    /// view record's manifest version and is about to read that manifest (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn on_reader_manifest_load(&self, hook: Box<dyn FnOnce() + Send>) {
+        if let Some(r) = &self.inner.reader {
+            r.hooks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .before_manifest_load = Some(hook);
+        }
+    }
+
+    /// The oldest `(seqno, view version)` any reader slot of the current region generation
+    /// pins, and the view version the writer published last (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn reader_pin_and_view(&self) -> (Option<(Seqno, u64)>, u64) {
+        let shared = &self.inner.shared;
+        (shared.shm.oldest_reader_pin(), shared.view.load().version)
     }
 
     /// Whether a background manifest commit is parked (test hook).
@@ -1947,7 +2034,15 @@ impl Inner {
     /// The current catalog (the one the current view carries).
     fn catalog(&self) -> Arc<Catalog> {
         if let Some(r) = &self.reader {
-            let _ = self.reader_refresh();
+            // Table metadata only (no view is built from it): the newest version the
+            // region names is good enough, and the cached catalog when the root moved on.
+            let version = r
+                .shm
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .shm
+                .manifest_version();
+            let _ = self.reader_catalog(version);
             return Arc::clone(&r.catalog.lock().unwrap_or_else(PoisonError::into_inner).1);
         }
         Arc::clone(&self.shared.view.load().catalog)
@@ -2292,7 +2387,7 @@ impl Inner {
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
         let now = self.shared.vfs.now_micros();
-        get_in(
+        snapshot.checked(get_in(
             &snapshot.view,
             snapshot.seqno,
             now,
@@ -2301,7 +2396,7 @@ impl Inner {
             row,
             qualifier,
             || Arc::clone(&snapshot.view),
-        )
+        ))
     }
 
     fn flush_pending(&self) -> Result<PendingMaintenance> {
@@ -2384,7 +2479,7 @@ impl Inner {
         }
         {
             let shm = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
-            shm.1.unpin();
+            shm.slot.unpin();
         }
         let presence = r
             .presence
@@ -2419,89 +2514,150 @@ impl Inner {
 
     // ---- reader process ----
 
-    /// Reloads the manifest if the region names a newer version.
-    fn reader_refresh(&self) -> Result<()> {
+    /// The catalog of manifest `version` and the file it was read from: the cached one, or
+    /// the durable root's when that is `version`. `None` when the durable root is another
+    /// version: the writer committed a newer root and has not published its view yet (or
+    /// published one since the record was read). A view must pair a record with the catalog
+    /// of the record's own manifest version (issue #140): a memtable the record lists is in
+    /// a newer catalog as an SST too, and a newer record no longer lists a memtable whose
+    /// SST an older catalog lacks.
+    fn reader_catalog(&self, version: ManifestVersion) -> Result<Option<(Arc<Catalog>, FileRef)>> {
         let r = self.reader.as_ref().expect("reader");
-        let version = r
-            .shm
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .0
-            .manifest_version();
         let mut cached = r.catalog.lock().unwrap_or_else(PoisonError::into_inner);
-        if cached.0 == version {
-            return Ok(());
+        if cached.0 != version {
+            // The reader's own read-only pager: re-reads the superblocks, nothing more.
+            let pager = &self.shared.pager;
+            pager.reload_root()?;
+            let root = pager.root();
+            if root.manifest_version != version {
+                return Ok(None);
+            }
+            #[cfg(feature = "test-hooks")]
+            r.run_hook(|h| &mut h.before_manifest_load);
+            let (catalog, _) =
+                manifest::load_root(pager.file(), &root, r.shards, Arc::clone(&r.registry))?;
+            *cached = (version, Arc::new(catalog), pager.file().clone());
         }
-        let opened = Pager::open(&self.shared.vfs, &self.path, false)?;
-        let (catalog, _) = manifest::load(&opened, r.shards, Arc::clone(&r.registry))?;
-        *cached = (
-            opened.root().manifest_version,
-            Arc::new(catalog),
-            opened.file().clone(),
-        );
-        Ok(())
+        Ok(Some((Arc::clone(&cached.1), cached.2.clone())))
+    }
+
+    /// The view of the record currently published in `shm`, or `None` while the durable
+    /// root names another manifest version (see [`Inner::reader_catalog`]).
+    fn reader_view(&self, shm: &ShmRegion) -> Result<Option<Arc<View>>> {
+        let r = self.reader.as_ref().expect("reader");
+        let record = shm.read_view()?;
+        #[cfg(feature = "test-hooks")]
+        r.run_hook(|h| &mut h.after_record);
+        let Some((catalog, file)) = self.reader_catalog(record.manifest_version)? else {
+            return Ok(None);
+        };
+        let mut cached = r.view.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(v) = &*cached
+            && v.version == record.view_version
+            && Arc::ptr_eq(&v.catalog, &catalog)
+        {
+            return Ok(Some(Arc::clone(v)));
+        }
+        let prev = cached.as_ref().map(|v| Arc::clone(&v.ssts));
+        let view = Arc::new(view_from_record(
+            shm,
+            &record,
+            catalog,
+            prev.as_deref(),
+            file,
+            Arc::clone(&self.shared.cache),
+        )?);
+        *cached = Some(Arc::clone(&view));
+        Ok(Some(view))
     }
 
     fn reader_snapshot(&self) -> Result<Snapshot> {
         let r = self.reader.as_ref().expect("reader");
-        let mut guard = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.0.is_stale() {
-            let shm = guard.0.reattach(&self.shared.vfs, &r.file)?;
-            let slot = shm.claim_reader_slot(self.shared.vfs.current_process())?;
-            *guard = (shm, slot, false);
-            *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let deadline = std::time::Instant::now() + READER_VIEW_WAIT;
+        let mut waits = 0u32;
+        loop {
+            let mut guard = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
+            let a = &mut *guard;
+            if a.shm.is_stale() {
+                let shm = a.shm.reattach(&self.shared.vfs, &r.file)?;
+                let slot = shm.claim_reader_slot(self.shared.vfs.current_process())?;
+                // Snapshots of the old generation keep counting there: they can no longer be
+                // read, so they must not hold this generation's pin back.
+                *a = Attachment {
+                    shm,
+                    slot,
+                    pinned: false,
+                    live: Arc::new(AtomicUsize::new(0)),
+                };
+                *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                // Start the new generation from the new writer's root.
+                r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
+            }
+            // The pin protects the oldest live snapshot and every newer view. While snapshots
+            // of this generation are alive it stays put; once none is left it moves forward to
+            // this one, so a long-lived reader never blocks reclamation for ever.
+            let seqno = a.shm.visible_seqno();
+            let seqno = if a.pinned && a.live.load(Ordering::Acquire) > 0 {
+                seqno
+            } else {
+                let (s, _) = a.slot.pin(seqno, a.shm.view_version());
+                a.pinned = true;
+                s
+            };
+            a.live.fetch_add(1, Ordering::AcqRel);
+            let live = Arc::new(LiveSnapshot {
+                count: Arc::clone(&a.live),
+                shm: a.shm.clone(),
+            });
+            let shm = a.shm.clone();
+            drop(guard);
+            // The record is read after the pin, so the pin covers it.
+            match self.reader_view(&shm) {
+                // A writer restarted while the view was built (whatever the build read, a
+                // failure included): re-attach and start over.
+                Ok(Some(_)) | Err(_) if live.check_current().is_err() => continue,
+                Ok(Some(view)) => {
+                    return Ok(Snapshot {
+                        seqno,
+                        view,
+                        _live: Some(live),
+                        _pin: None,
+                    });
+                }
+                Err(e) => return Err(e),
+                Ok(None) => {
+                    // Dropping `live` releases this attempt's count; the pin stays valid for
+                    // the next attempt, which reads a newer record.
+                    drop(live);
+                    if std::time::Instant::now() >= deadline {
+                        // The durable root stayed ahead of the published view: the writer
+                        // died between its root commit and its publish, or is stalled there.
+                        // A new writer republishes.
+                        return Err(Error::Busy);
+                    }
+                    if waits < 16 {
+                        std::thread::yield_now();
+                    } else {
+                        // 50 µs doubling to 1.6 ms.
+                        let micros = 50u64 << (waits - 16).min(5);
+                        std::thread::sleep(std::time::Duration::from_micros(micros));
+                    }
+                    waits += 1;
+                }
+            }
         }
-        let (shm, slot, pinned) = &mut *guard;
-        // The pin protects the oldest live snapshot and every newer view. While snapshots
-        // of this process are alive it stays put; once none is left it moves forward to this
-        // one, so a long-lived reader never blocks reclamation for ever.
-        let seqno = shm.visible_seqno();
-        let seqno = if *pinned && r.live.load(Ordering::Acquire) > 0 {
-            seqno
-        } else {
-            let (s, _) = slot.pin(seqno, shm.view_version());
-            *pinned = true;
-            s
-        };
-        r.live.fetch_add(1, Ordering::AcqRel);
-        let live = Some(Arc::new(LiveSnapshot {
-            count: Arc::clone(&r.live),
-        }));
-        let record = shm.read_view()?;
-        let shm = shm.clone();
-        drop(guard);
-        self.reader_refresh()?;
-        let (catalog, file) = {
-            let c = r.catalog.lock().unwrap_or_else(PoisonError::into_inner);
-            (Arc::clone(&c.1), c.2.clone())
-        };
-        let mut cached = r.view.lock().unwrap_or_else(PoisonError::into_inner);
-        let view = match &*cached {
-            Some(v) if v.version == record.view_version && Arc::ptr_eq(&v.catalog, &catalog) => {
-                Arc::clone(v)
-            }
-            _ => {
-                let prev = cached.as_ref().map(|v| Arc::clone(&v.ssts));
-                let view = Arc::new(view_from_record(
-                    &shm,
-                    &record,
-                    catalog,
-                    prev.as_deref(),
-                    file,
-                    Arc::clone(&self.shared.cache),
-                )?);
-                *cached = Some(Arc::clone(&view));
-                view
-            }
-        };
-        Ok(Snapshot {
-            seqno,
-            view,
-            _live: live,
-            _pin: None,
-        })
     }
 }
+
+/// How long a reader waits for the writer to publish the view of a root it already
+/// committed before `snapshot()` gives up with [`Error::Busy`].
+const READER_VIEW_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often `get_latest` in a reader process retries a read a writer restart expired.
+const READER_EXPIRED_RETRIES: u32 = 8;
+
+/// Names no manifest version: a reader's catalog cache after a re-attach.
+const NO_MANIFEST_VERSION: ManifestVersion = ManifestVersion::MAX;
 
 /// Builds a reader's view from the record published in shared memory.
 fn view_from_record(
