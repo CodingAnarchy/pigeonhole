@@ -67,6 +67,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `set_default_durability(&self, Durability)` | Applies to later commits. |
 | `flush(&self) -> Result<()>` | Write every memtable into the file; returns when the SSTs are in the manifest. Makes `None` commits durable. |
 | `compact(&self) -> Result<()>` | Flush, then merge every level of every table into the last (purges per `max_versions`, TTL and tombstones). |
+| `shrink(&self) -> Result<u64>` | Relocate live data from the file's tail into free space and truncate; returns bytes released (`0` if none). Online; costs a rewrite of the tail data. Call after deletes + `compact`. Errors: `Closed`, `ReadOnly`, `NoSpace` (no free extent to move into), `Io`. |
 | `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue. `dest` must not exist. The copy opens with no WAL replay and no sidecars. `Unsupported` if a family stores blob files (P2; not reachable today). |
 | `close(self) -> Result<()>` | Flushes memtables, checkpoints the WAL; the last handle out removes the sidecars and shm, leaving one file. |
 
@@ -199,7 +200,6 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 | Feature | Phase |
 |---|---|
 | Tablet splits: one table stays on one shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)) | P1 |
-| Public `shrink` ([#71](https://github.com/CodingAnarchy/pigeonhole/issues/71); the engine has it; nothing calls it, so freed space is reused but the file is not truncated) | P1 |
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
 | zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |

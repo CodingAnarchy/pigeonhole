@@ -330,6 +330,62 @@ impl Pigeonhole {
         Ok(self.db.engine.backup(dest.as_ref())?)
     }
 
+    /// Returns free space at the end of the file to the filesystem and reports the bytes
+    /// released. The file never shrinks by itself: space freed by compaction or by deleting
+    /// rows is reused by later writes, but the file keeps its length. Call this after a
+    /// large delete followed by [`compact`](Self::compact) when you need
+    /// the disk space back (for example before copying the file, or on a small device).
+    ///
+    /// It moves the live data that sits past the point where the file could end into free
+    /// space nearer the start, then truncates. The cost is reading and rewriting that data
+    /// (at most the live bytes in the file's tail) and a manifest commit per round, so run
+    /// it rarely. It runs online: reads, writes, flushes and compactions continue on other
+    /// threads, and in-flight flush or compaction output is never moved. It returns `0`
+    /// when there is nothing to release, for example before `compact` has freed anything.
+    /// Space still held by an open snapshot or scan is not released until that handle is
+    /// dropped; call `shrink` again afterwards.
+    ///
+    /// Errors: [`ErrorCode::Closed`](crate::ErrorCode::Closed) after `close`;
+    /// [`ErrorCode::ReadOnly`](crate::ErrorCode::ReadOnly) if this handle cannot write;
+    /// [`ErrorCode::NoSpace`](crate::ErrorCode::NoSpace) when there is no free extent
+    /// below the one being moved (free space and retry); [`ErrorCode::Io`](crate::ErrorCode::Io)
+    /// on a disk failure. A failed shrink loses no data; if it fails while committing the
+    /// manifest, reopen the database.
+    ///
+    /// ```
+    /// use pigeonhole::{Durability, Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let path = dir.join("app.phdb");
+    /// let db = Pigeonhole::open(&path, Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"keep").put("f", b"q", b"v").commit()?;
+    /// let junk = db.table("junk")?.family("f", Family::default()).create_if_missing()?;
+    /// for i in 0..2_000u32 {
+    ///     junk.mutate(&i.to_be_bytes()).put("f", b"q", &[7u8; 512]).durability(Durability::None).commit()?;
+    /// }
+    /// db.flush()?;
+    /// for i in 0..2_000u32 {
+    ///     junk.mutate(&i.to_be_bytes()).delete_row().durability(Durability::None).commit()?;
+    /// }
+    /// # drop(junk);
+    /// db.compact()?;
+    ///
+    /// let before = std::fs::metadata(&path).unwrap().len();
+    /// let released = db.shrink()?;
+    /// let after = std::fs::metadata(&path).unwrap().len();
+    /// assert_eq!(before - after, released);
+    /// assert_eq!(t.get(b"keep", "f", b"q")?.unwrap().value(), b"v");
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn shrink(&self) -> Result<u64> {
+        Ok(self.db.engine.shrink()?)
+    }
+
     /// Closes this handle's database. Flushes every memtable and checkpoints the WAL; if
     /// this is the last process with the database open, also removes the sidecar files and
     /// shared-memory region, leaving one file. Dropping the last clone does the same,
