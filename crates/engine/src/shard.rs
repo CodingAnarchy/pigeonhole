@@ -1618,6 +1618,57 @@ struct RoomWait {
     /// The timeout timer.
     timer: Arc<TimerState>,
     failed_flushes: u32,
+    /// On a moving clock, kicks the shard to look for room again: room freed by a snapshot
+    /// dropped on another thread or a reader process's unpin is not announced (issue #141).
+    recheck: Option<Arc<TimerState>>,
+    /// The re-check timer's last interval (1 ms doubling to 100 ms).
+    recheck_nanos: u64,
+}
+
+/// First and longest interval of a room wait's re-check timer.
+const ROOM_RECHECK_NANOS: u64 = 1_000_000;
+const ROOM_RECHECK_MAX_NANOS: u64 = 100_000_000;
+
+impl RoomWait {
+    fn new(since: u64, timer: Arc<TimerState>) -> Self {
+        Self {
+            since,
+            timer,
+            failed_flushes: 0,
+            recheck: None,
+            recheck_nanos: 0,
+        }
+    }
+
+    /// Arms the re-check timer unless one is pending: it kicks the shard after 1 ms, then
+    /// twice as long each time up to 100 ms, so freed room is seen within about 100 ms.
+    fn arm_recheck(&mut self, vfs: &VfsRef, ctx: &mut ShardContext<'_, ShardMsg>, me: ShardId) {
+        if self.recheck.as_ref().is_some_and(|t| !t.finished()) {
+            return;
+        }
+        self.recheck_nanos = if self.recheck_nanos == 0 {
+            ROOM_RECHECK_NANOS
+        } else {
+            (self.recheck_nanos * 2).min(ROOM_RECHECK_MAX_NANOS)
+        };
+        let state = TimerState::new();
+        ctx.spawn(Box::new(ClockTimer::new(
+            vfs,
+            ctx.now_nanos().saturating_add(self.recheck_nanos),
+            Arc::clone(&state),
+            ctx.submitter(me).clone(),
+            ShardMsg::Kick,
+        )));
+        self.recheck = Some(state);
+    }
+
+    /// The wait is over: stops both timers.
+    fn cancel(&self) {
+        self.timer.cancel();
+        if let Some(t) = &self.recheck {
+            t.cancel();
+        }
+    }
 }
 
 /// A record of this stream the checkpoint cannot pass yet.
@@ -2390,7 +2441,7 @@ impl ShardState {
     /// The wait for arena room is over: account the stall and cancel its timer.
     fn end_room_wait(&mut self, now: u64) {
         if let Some(w) = self.room_wait.take() {
-            w.timer.cancel();
+            w.cancel();
             self.shared.metrics[usize::from(self.id.0)]
                 .stall_nanos
                 .fetch_add(now.saturating_sub(w.since), Ordering::Relaxed);
@@ -2608,7 +2659,7 @@ impl ShardState {
         let waiting = !self.flush_waiters.is_empty() || !self.compact_all.is_empty();
         if !self.starved_all || !waiting || self.closing {
             if let Some(w) = self.starve_wait.take() {
-                w.timer.cancel();
+                w.cancel();
             }
             if !waiting {
                 self.starved_all = false;
@@ -2621,7 +2672,7 @@ impl ShardState {
         }
         if !self.starved_all {
             if let Some(w) = self.starve_wait.take() {
-                w.timer.cancel();
+                w.cancel();
             }
             self.check_flush_waiters();
             return;
@@ -2642,11 +2693,7 @@ impl ShardState {
         let (since, frozen) = match &self.starve_wait {
             None => {
                 let timer = arm(now, ctx);
-                self.starve_wait = Some(RoomWait {
-                    since: now,
-                    timer,
-                    failed_flushes: 0,
-                });
+                self.starve_wait = Some(RoomWait::new(now, timer));
                 (now, false)
             }
             Some(w) => (w.since, w.timer.frozen(now)),
@@ -2667,6 +2714,10 @@ impl ShardState {
             && self.flush_queue.is_empty()
             && !self.freeze_deferred
             && self.retired.is_empty();
+        if !frozen && let Some(w) = &mut self.starve_wait {
+            // As for a room wait: freed chunks are announced to nobody (issue #141).
+            w.arm_recheck(&self.shared.vfs, ctx, self.id);
+        }
         if now.saturating_sub(since) >= timeout || idle {
             trace!(
                 "shard {} starved freeze: refusing {} flush and {} compact callers \
@@ -2677,7 +2728,7 @@ impl ShardState {
                 now.saturating_sub(since)
             );
             if let Some(w) = self.starve_wait.take() {
-                w.timer.cancel();
+                w.cancel();
             }
             self.starved_all = false;
             for w in self.flush_waiters.drain(..) {
@@ -3470,11 +3521,7 @@ impl ShardState {
                         ctx.submitter(self.id).clone(),
                         ShardMsg::Kick,
                     )));
-                    self.room_wait = Some(RoomWait {
-                        since: now,
-                        timer: state,
-                        failed_flushes: 0,
-                    });
+                    self.room_wait = Some(RoomWait::new(now, state));
                 }
                 Some(w)
                     if now.saturating_sub(w.since) >= timeout
@@ -3519,6 +3566,13 @@ impl ShardState {
                 && self.prepared.is_empty()
                 && self.unresolved.is_empty()
                 && self.retired.is_empty();
+            if !refuse && !idle && !frozen {
+                // Room freed by a snapshot dropped on another thread or a reader process's
+                // unpin is announced to nobody: look again soon (issue #141).
+                if let Some(w) = &mut self.room_wait {
+                    w.arm_recheck(&self.shared.vfs, ctx, self.id);
+                }
+            }
             if refuse || idle {
                 // Refuse the waiting members; this group's admitted ones still apply.
                 self.end_room_wait(now);

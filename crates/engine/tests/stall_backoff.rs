@@ -228,3 +228,71 @@ fn a_failing_flush_during_a_room_wait_backs_off() {
     writer.join().unwrap();
     db.close().unwrap();
 }
+
+/// 1-2 F3: a writer waits for arena room that snapshots pin; another thread drops the
+/// snapshots. Nothing announces the freed room, so the wait used to last until the stall
+/// timeout (30 s here); a re-check timer sees it within about 100 ms. (A starved freeze's
+/// wait arms the same re-check timer, `RoomWait::arm_recheck`.)
+#[test]
+fn room_freed_by_a_snapshot_drop_on_another_thread_ends_the_wait() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    let (vfs, _gate) = gate::vfs(1415);
+    let mut o = options(vfs);
+    o.memtable_budget = 256 << 10;
+    o.write_stall_timeout_nanos = 30_000_000_000;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let a = table(&db, "a");
+    let snaps = Arc::new(Mutex::new(Vec::new()));
+    let (stop, done) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU32::new(0)),
+    );
+    let writer = {
+        let (db, a, snaps, stop, done) = (
+            Arc::clone(&db),
+            Arc::clone(&a),
+            Arc::clone(&snaps),
+            Arc::clone(&stop),
+            Arc::clone(&done),
+        );
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Acquire) {
+                write(&db, &a, i, false);
+                i += 1;
+                done.store(i, Ordering::Release);
+                // Every commit is followed by a snapshot, which pins its view's memtables.
+                if let Ok(mut s) = snaps.lock()
+                    && !stop.load(Ordering::Acquire)
+                {
+                    s.push(db.snapshot().unwrap());
+                }
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = (u32::MAX, Instant::now());
+    while last.1.elapsed() < Duration::from_millis(300) {
+        assert!(Instant::now() < deadline, "the writer never stalled");
+        let n = done.load(Ordering::Acquire);
+        if n != last.0 {
+            last = (n, Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // This thread drops the snapshots; nothing else happens on the shard.
+    let stalled_at = done.load(Ordering::Acquire);
+    stop.store(true, Ordering::Release);
+    let dropped = Instant::now();
+    snaps.lock().unwrap().clear();
+    while done.load(Ordering::Acquire) == stalled_at {
+        assert!(
+            dropped.elapsed() < Duration::from_secs(5),
+            "the wait outlived the snapshots that pinned the arena"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    writer.join().unwrap();
+    db.close().unwrap();
+}
