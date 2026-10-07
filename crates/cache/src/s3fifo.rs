@@ -248,8 +248,10 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
 
     fn evict(&mut self) {
         // A pinned entry is rotated to its queue's tail; once a whole queue has been skipped
-        // without an eviction, stop using it. Everything else (aging, promotion, stale
-        // entries) is bounded, so this terminates.
+        // without any progress, stop using it. Progress is an eviction or anything else that
+        // changes what a later pass finds (aging, promotion, dropping a stale entry); each of
+        // those is bounded, so this terminates. Not resetting on aging would give up on a
+        // queue whose unpinned entries still hold hit counts.
         let mut skipped_small = 0;
         let mut skipped_main = 0;
         while self.usage > self.capacity {
@@ -273,7 +275,10 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
                 }
                 Step::Pinned if use_small => skipped_small += 1,
                 Step::Pinned => skipped_main += 1,
-                Step::Other => {}
+                Step::Other => {
+                    skipped_small = 0;
+                    skipped_main = 0;
+                }
             }
         }
     }
@@ -506,6 +511,21 @@ mod tests {
         drop(pins);
         put(&mut s, 99, 100, Priority::Normal);
         assert!(s.usage() <= 300);
+    }
+
+    /// Regression for #76: a pinned entry rotated through a queue must not exhaust the skip
+    /// budget while unpinned entries behind it still need aging.
+    #[test]
+    fn pinned_entry_does_not_stop_aging_of_unpinned_ones() {
+        let mut s = shard(300);
+        put(&mut s, 1, 100, Priority::High);
+        s.get(&1);
+        s.get(&1);
+        // Main is [1 (hits banked), 2 (pinned, just inserted)]; 1 must age out, not be kept.
+        let v = Arc::new(vec![0u8; 250]);
+        s.insert(2, Arc::clone(&v), 250, Priority::High);
+        assert!(s.usage() <= 300, "usage {}", s.usage());
+        assert!(s.peek(&1).is_none());
     }
 
     #[test]
