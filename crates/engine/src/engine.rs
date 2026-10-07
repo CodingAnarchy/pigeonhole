@@ -1274,6 +1274,30 @@ impl Engine {
         Ok(out)
     }
 
+    /// Bytes the pager holds allocated (not retired) that neither the catalog nor the
+    /// manifest root references: output in flight, or leaked. Zero when idle (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn unreferenced_bytes(&self) -> u64 {
+        let shared = &self.inner.shared;
+        let root = shared
+            .manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .root();
+        let mut live: Vec<_> = shared.view.load().catalog.data_extents();
+        live.extend(root.snapshot);
+        live.extend(root.log);
+        live.sort();
+        live.dedup();
+        let referenced: u64 = live.iter().map(|e| e.len()).sum();
+        shared
+            .pager
+            .stats()
+            .allocated_bytes
+            .saturating_sub(referenced)
+    }
+
     /// The compactions committed since the last call (or since open).
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]

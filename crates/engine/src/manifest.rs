@@ -475,6 +475,10 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         };
         let own = own.and_then(|own| {
             if own.iter().any(|e| orphaned(&catalog, e)) {
+                // Output for a dropped table is never published: free it now.
+                for x in added_extents(&own) {
+                    shared.pager.abandon(x);
+                }
                 return Err(Error::TableNotFound("the table was dropped".to_owned()));
             }
             Ok(own)

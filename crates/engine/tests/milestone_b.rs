@@ -534,6 +534,88 @@ fn dropping_application_owned_shards_mid_commit_still_closes_cleanly() {
     db.close().unwrap();
 }
 
+fn file_len(vfs: &Arc<SimVfs>) -> u64 {
+    vfs.open(Path::new(DB), pigeonhole_io::OpenOptions::read())
+        .unwrap()
+        .len()
+        .unwrap()
+}
+
+#[test]
+fn compact_after_drop_table_reclaims_the_dropped_table() {
+    // #83: a compaction of a table that is dropped while it runs is refused at commit
+    // (`TableNotFound`). That error used to fail the waiting `compact()` (or the next one,
+    // for a background compaction), and the refused output was never freed, so `shrink`
+    // could not release it.
+    let vfs = SimVfs::new(31);
+    let mut o = owned(Arc::clone(&vfs), 2);
+    o.compaction.l0_trigger = u32::MAX;
+    o.compaction.level_base_bytes = u64::MAX;
+    let db = Engine::open(Path::new(DB), o.clone()).unwrap();
+    let family = || vec![("f".into(), FamilyOptions::default())];
+    let keep = db.create_table("keep", &family()).unwrap();
+    let gone = db.create_table("gone", &family()).unwrap();
+    // The dropped table's SSTs land after the kept table's, at the file's tail.
+    write_rows(&db, &keep, 0..200, Durability::GroupSync);
+    db.flush().unwrap();
+    write_rows(&db, &gone, 0..200, Durability::GroupSync);
+    db.flush().unwrap();
+    db.close().unwrap();
+    drop(db);
+
+    // Application-owned, so the test orders the steps: the compaction starts, the table is
+    // dropped, then the compaction runs and commits.
+    o.compaction_threads = 0;
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o.clone()).unwrap();
+    let before = file_len(&vfs);
+    let mut compaction = db.compact_pending(Some(gone.id)).unwrap();
+    for s in &mut shards {
+        // A deadline already passed: handle the message (start the compaction task), but
+        // run no task slice.
+        s.run_once(0);
+    }
+    db.drop_table(gone.id).unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let result = loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut compaction).poll(&mut cx) {
+            break r;
+        }
+        for s in &mut shards {
+            s.run_once(u64::MAX);
+        }
+    };
+    result.unwrap();
+    // A full compaction of every live table succeeds too.
+    let mut all = db.compact_pending(None).unwrap();
+    let result = loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut all).poll(&mut cx) {
+            break r;
+        }
+        for s in &mut shards {
+            s.run_once(u64::MAX);
+        }
+    };
+    result.unwrap();
+    assert_eq!(db.unreferenced_bytes(), 0, "the refused output was freed");
+
+    // The dropped table's SSTs were retired and the refused output abandoned: the file
+    // shrinks below its length before the compaction.
+    let released = db.shrink().unwrap();
+    assert!(released > 0);
+    let after = file_len(&vfs);
+    assert!(after < before, "{after} >= {before}");
+    db.close().unwrap();
+    while shards.iter_mut().any(|s| s.run_once(u64::MAX)) {}
+    drop(shards);
+    drop(db);
+
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    assert!(db.table("gone").is_none());
+    let keep = db.table("keep").unwrap();
+    assert_eq!(row_count(&db, &keep), 200);
+    db.close().unwrap();
+}
+
 // ---- #23: shrink never relocates in-flight output; reclaim after commits ----
 
 #[test]

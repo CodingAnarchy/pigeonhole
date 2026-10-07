@@ -1509,3 +1509,54 @@ fn a_flush_makes_none_commits_survive_a_power_loss() {
     drop(t);
     db.close().unwrap();
 }
+
+#[test]
+fn compact_after_drop_table_covers_the_live_tables() {
+    // #83: `compact()` after `drop_table` failed with `TableNotFound` when a compaction of
+    // the dropped table was in flight (the engine test forces that interleaving).
+    let vfs = SimVfs::new(83);
+    let path = "/db/drop-compact.phdb";
+    let db = Pigeonhole::open(path, sim_options(&vfs)).unwrap();
+    let make = |name: &str| {
+        db.table(name)
+            .unwrap()
+            .family("a", Family::default())
+            .create_if_missing()
+            .unwrap()
+    };
+    let keep = make("keep");
+    let gone = make("gone");
+    for round in 0..4u32 {
+        for i in round * 100..round * 100 + 100 {
+            let row = format!("row{i:05}");
+            keep.mutate(row.as_bytes())
+                .put("a", b"q", &[7; 300])
+                .commit()
+                .unwrap();
+            gone.mutate(row.as_bytes())
+                .put("a", b"q", &[9; 300])
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    drop(gone);
+    db.drop_table("gone").unwrap();
+    db.compact().unwrap();
+    assert_eq!(keep.scan_prefix(b"").iter().unwrap().count(), 400);
+    // Compacting again (nothing left of the dropped table) succeeds too.
+    db.compact().unwrap();
+    drop(keep);
+    db.close().unwrap();
+
+    let db = Pigeonhole::open(path, sim_options(&vfs)).unwrap();
+    assert!(db.table("gone").unwrap().open().is_err());
+    let keep = db.table("keep").unwrap().open().unwrap();
+    assert_eq!(keep.scan_prefix(b"").iter().unwrap().count(), 400);
+    assert_eq!(
+        value(&keep, b"row00399", "a", b"q").as_deref(),
+        Some(&[7u8; 300][..])
+    );
+    drop(keep);
+    db.close().unwrap();
+}
