@@ -28,6 +28,10 @@ type Held = (PathBuf, Resolver<()>, pigeonhole_io::Result<()>);
 pub struct Gate {
     rules: Mutex<Rules>,
     held: Mutex<Vec<Held>>,
+    /// Reads whose bytes contain this marker fail (one table's SST blocks, say).
+    read_marker: Mutex<Option<Vec<u8>>>,
+    /// When each injected read failure happened.
+    read_failures: Mutex<Vec<Instant>>,
 }
 
 impl Gate {
@@ -44,6 +48,16 @@ impl Gate {
     /// Panics in the next asynchronous sync of `path` (on whatever thread submits it).
     pub fn panic(&self, path: &Path) {
         self.rules.lock().unwrap().panic.insert(path.to_path_buf());
+    }
+
+    /// Fails every later read (blocking) whose bytes contain `marker`, or none (`None`).
+    pub fn fail_reads_containing(&self, marker: Option<&[u8]>) {
+        *self.read_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// When each injected read failure happened.
+    pub fn read_failures(&self) -> Vec<Instant> {
+        self.read_failures.lock().unwrap().clone()
     }
 
     /// Paths with a sync held now.
@@ -169,7 +183,17 @@ impl Vfs for GateVfs {
 
 impl pigeonhole_io::File for GateFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
-        self.inner.read_at(buf, offset)
+        self.inner.read_at(buf, offset)?;
+        if let Some(marker) = &*self.gate.read_marker.lock().unwrap()
+            && buf.windows(marker.len()).any(|w| w == &marker[..])
+        {
+            self.gate.read_failures.lock().unwrap().push(Instant::now());
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected read failure",
+            ));
+        }
+        Ok(())
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
         self.inner.write_at(buf, offset)
