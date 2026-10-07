@@ -1419,6 +1419,68 @@ fn flush_compact_and_backup_through_the_public_api() {
 }
 
 #[test]
+fn shrink_releases_file_space_after_deletes_and_keeps_data() {
+    let dir = TempDir::new("shrink");
+    let path = dir.0.join("db.phdb");
+    let opts = || Options::default().shards(1).memtable_budget(4 << 20);
+    let len = || std::fs::metadata(&path).unwrap().len();
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let t = table(&db);
+    t.mutate(b"keep").put("a", b"q", b"kept").commit().unwrap();
+    let junk = db
+        .table("junk")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let big = [9u8; 1024];
+    for round in 0..4u32 {
+        for i in 0..2_000u32 {
+            let row = (round * 2_000 + i).to_be_bytes();
+            junk.mutate(&row)
+                .put("f", b"q", &big)
+                .durability(Durability::None)
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let grown = len();
+    for i in 0..8_000u32 {
+        junk.mutate(&i.to_be_bytes())
+            .delete_row()
+            .durability(Durability::None)
+            .commit()
+            .unwrap();
+    }
+    drop(junk);
+    db.compact().unwrap();
+    let before = len();
+    assert!(before >= grown);
+    let released = db.shrink().unwrap();
+    let after = len();
+    assert!(released > 0, "no space released");
+    // Not an exact `before - after == released`: a background compaction may allocate
+    // between the two measurements.
+    assert!(after < before, "{after} >= {before}");
+    assert_eq!(value(&t, b"keep", "a", b"q").as_deref(), Some(&b"kept"[..]));
+    // Writes after a shrink land and survive a reopen.
+    t.mutate(b"late").put("a", b"q", b"x").commit().unwrap();
+    db.shrink().unwrap();
+    drop(t);
+    db.close().unwrap();
+
+    let db = Pigeonhole::open(&path, opts().create_if_missing(false)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    assert_eq!(value(&t, b"keep", "a", b"q").as_deref(), Some(&b"kept"[..]));
+    assert_eq!(value(&t, b"late", "a", b"q").as_deref(), Some(&b"x"[..]));
+    let handle = db.clone();
+    drop(t);
+    db.close().unwrap();
+    assert_eq!(handle.shrink().unwrap_err().code(), ErrorCode::Closed);
+}
+
+#[test]
 fn a_flush_makes_none_commits_survive_a_power_loss() {
     let vfs = SimVfs::new(21);
     let opts = || sim_options(&vfs).shards(1);

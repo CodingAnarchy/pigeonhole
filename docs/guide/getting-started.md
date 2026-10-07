@@ -244,6 +244,11 @@ db.flush()?;
 // `max_versions`, expired cells and covered tombstones (no snapshot can still see them).
 db.compact()?;
 
+// Returns free space at the end of the file to the filesystem; the result is the
+// number of bytes released.
+let released = db.shrink()?;
+println!("released {released} bytes");
+
 // A consistent single-file copy of everything committed so far; writers keep running.
 // The copy opens on its own, with no sidecar files.
 db.backup(dir.join("guide-backup.phdb"))?;
@@ -257,7 +262,8 @@ assert_eq!(pages_copy.get(b"row", "meta", b"k")?.unwrap().value(), b"v");
 
 - `flush()` and `compact()` return after the work is in the file; both fail with `ErrorCode::Closed` after `close`.
 - `backup(dest)` writes a new file at `dest`, which must not exist, from a snapshot taken when you call it, so it holds exactly the commits visible at that moment. Commits that land while it runs are not in it. A database whose families store blob files cannot be backed up yet (`ErrorCode::Unsupported`); in the current build values stay inline, so this does not occur.
-- The file does not shrink by itself: space freed by compaction is reused by later writes. There is no public `shrink` yet.
+- The file does not shrink by itself: space freed by compaction is reused by later writes, but the file keeps its length. Call `compact()` and then `shrink()` to give space back to the filesystem.
+- `shrink()` returns the bytes released (`0` when nothing is free at the end of the file). It moves live data from the file's tail into free space nearer the start, then truncates, so it costs a read and rewrite of that data. It runs online: other threads keep reading and writing. Space still held by an open snapshot or scan is released on a later call after you drop it. It fails with `ErrorCode::Closed` after `close`, `ErrorCode::NoSpace` if there is no room to move data into, and `ErrorCode::Io` on a disk failure. Use it after a large delete, not routinely.
 
 ## What happens when writes outrun the disk
 Reopening after a crash with a `memtable_budget` too small for the WAL's unflushed data fails with `ErrorCode::InvalidArgument`; reopen with a larger one. A write that finds the memtable arena full waits (a write stall) while a flush frees room. `ErrorCode::Busy` means the wait ran past the engine's stall timeout (30 s), or a single batch is larger than a shard's arena. The first is **transient**: back off and retry. The second never succeeds: split the batch or raise `Options::memtable_budget`. See [Errors](errors.md).
@@ -269,7 +275,6 @@ Reopening after a crash with a `memtable_budget` too small for the WAL's unflush
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
 | `Compaction::Tiered`, `FifoByTime`, `zstd`, blob separation, custom merge operators | Phase 2. |
 | Tablet splits | A table stays on one shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)), so one table's writes do not spread across shards yet. |
-| `shrink` | The engine has it; the public crate does not expose it yet ([#71](https://github.com/CodingAnarchy/pigeonhole/issues/71)). |
 
 Later phases:
 
