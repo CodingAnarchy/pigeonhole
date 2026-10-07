@@ -3546,6 +3546,10 @@ impl ShardState {
                 metrics.compactions.fetch_add(1, Ordering::Relaxed);
                 metrics.compaction_nanos.fetch_add(nanos, Ordering::Relaxed);
             }
+            // The table was dropped while this compaction ran: its output was abandoned and
+            // its inputs are retired with the table. Nothing failed; a full compaction goes
+            // on with the remaining tables.
+            Err(Error::TableNotFound(_)) => {}
             Err(e) => {
                 // A full compaction reports the failure to its caller; a background one
                 // waits for the next trigger (a flush or new writes) rather than retrying

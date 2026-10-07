@@ -429,12 +429,21 @@ fn orphaned(catalog: &Catalog, edit: &Edit) -> bool {
     }
 }
 
-/// Extents of SSTs an edit list adds (to abandon if the request is refused).
+/// Extents of SSTs an edit list newly adds (to abandon if the request is refused). An SST
+/// the same list also removes is moved (a trivial move re-adds it at another level), not
+/// new: its extent is not this request's to free.
 fn added_extents(edits: &[Edit]) -> Vec<ExtentRef> {
+    let moved: Vec<SstId> = edits
+        .iter()
+        .filter_map(|e| match e {
+            Edit::RemoveSst { sst, .. } => Some(*sst),
+            _ => None,
+        })
+        .collect();
     edits
         .iter()
         .filter_map(|e| match e {
-            Edit::AddSst { meta, .. } => Some(meta.extent),
+            Edit::AddSst { meta, .. } if !moved.contains(&meta.id) => Some(meta.extent),
             _ => None,
         })
         .collect()
@@ -475,6 +484,10 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         };
         let own = own.and_then(|own| {
             if own.iter().any(|e| orphaned(&catalog, e)) {
+                // Output for a dropped table is never published: free it now.
+                for x in added_extents(&own) {
+                    shared.pager.abandon(x);
+                }
                 return Err(Error::TableNotFound("the table was dropped".to_owned()));
             }
             Ok(own)

@@ -1509,3 +1509,69 @@ fn a_flush_makes_none_commits_survive_a_power_loss() {
     drop(t);
     db.close().unwrap();
 }
+
+#[test]
+fn compact_after_drop_table_covers_the_live_tables() {
+    // #83: `compact()` after `drop_table` failed with `TableNotFound` (or `Corruption`)
+    // when a compaction of the dropped table was in flight (the engine test forces that
+    // interleaving), and the dropped table's space could not be released.
+    let vfs = SimVfs::new(83);
+    let path = "/db/drop-compact.phdb";
+    let file_len = || {
+        use pigeonhole_io::Vfs;
+        vfs.open(path.as_ref(), pigeonhole_io::OpenOptions::read())
+            .unwrap()
+            .len()
+            .unwrap()
+    };
+    let db = Pigeonhole::open(path, sim_options(&vfs)).unwrap();
+    let make = |name: &str| {
+        db.table(name)
+            .unwrap()
+            .family("a", Family::default())
+            .create_if_missing()
+            .unwrap()
+    };
+    let keep = make("keep");
+    let gone = make("gone");
+    // The dropped table holds almost all of the data.
+    for i in 0..400u32 {
+        let row = format!("row{i:05}");
+        keep.mutate(row.as_bytes())
+            .put("a", b"q", &[7; 300])
+            .commit()
+            .unwrap();
+        for j in 0..10u32 {
+            gone.mutate(format!("{row}-{j}").as_bytes())
+                .put("a", b"q", &[9; 1000])
+                .commit()
+                .unwrap();
+        }
+    }
+    db.flush().unwrap();
+    let before = file_len();
+    drop(gone);
+    db.drop_table("gone").unwrap();
+    db.compact().unwrap();
+    assert_eq!(keep.scan_prefix(b"").iter().unwrap().count(), 400);
+    // Compacting again (nothing left of the dropped table) succeeds too.
+    db.compact().unwrap();
+    // The dropped table's SSTs were retired and reclaimed: shrink gives their space back.
+    db.shrink().unwrap();
+    let after = file_len();
+    assert!(after < before / 2, "{after} vs {before}");
+    assert_eq!(keep.scan_prefix(b"").iter().unwrap().count(), 400);
+    drop(keep);
+    db.close().unwrap();
+
+    let db = Pigeonhole::open(path, sim_options(&vfs)).unwrap();
+    assert!(db.table("gone").unwrap().open().is_err());
+    let keep = db.table("keep").unwrap().open().unwrap();
+    assert_eq!(keep.scan_prefix(b"").iter().unwrap().count(), 400);
+    assert_eq!(
+        value(&keep, b"row00399", "a", b"q").as_deref(),
+        Some(&[7u8; 300][..])
+    );
+    drop(keep);
+    db.close().unwrap();
+}
