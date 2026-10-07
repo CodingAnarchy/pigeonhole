@@ -533,7 +533,7 @@ The spec targets `open()` under 5 ms; a manifest can name hundreds of SSTs whose
 
 **Decision:** `OpenSst` holds the metadata and an `OnceLock<Arc<SstReader>>`; the reader (footer, index, filter blocks) is opened on first use by a read or compaction, through the block cache. Open reads only the manifest.
 
-## D123 — Does the sim's recovery helper cover a coordinator that is also a participant? (approved; superseded for new code by D114; engine adoption in #48)
+## D123 — Does the sim's recovery helper cover a coordinator that is also a participant? (approved; superseded for new code by D114; engine adoption in #48; amended by D125)
 Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledged_survive`. The helper counts one record per stream per commit, so a coordinator's PREPARE and COMMIT on its own stream must be adjacent; the engine interleaves other commits' PREPAREs between them whenever commits overlap.
 
 **Decision:** the harness takes the engine's own append order (the `test-hooks` `AppendedRecord` stream), applies the record-level prefix rule itself, and cross-checks `recovered_commits` only over commits whose records are adjacent per stream and all appended (`sim_helper_recovered`), skipping the check when the streams cannot be represented. `check_acknowledged_survive` and `Model::from_commits` are used as is. A record-level helper in `pigeonhole-sim` (issue #59) will let the check run on every crash and the harness drop its own rule; the engine half of #48 waits for it.
@@ -542,6 +542,13 @@ Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledg
 `ShardArena` reports free bytes only through `reserve`; nothing signals the shard when `reclaim` returns memory.
 
 **Decision:** a group that finds no room waits (a write stall, counted in `Metrics::stalls` with its duration): the shard freezes and flushes, and a flush completion (`Flushed`), every `Maintain` message and the stall's timeout timer re-run `reserve_room` for the waiting group (`refresh_free`). A flush that fails is tried again on the next retry. The wait ends with `Busy` only after `EngineOptions::write_stall_timeout_nanos` (30 s by default) passed without room, or at once for a batch that can never fit an empty arena, or with the poison error when the pager is poisoned.
+
+## D125 — the model suites use the sim's record-level oracle on every crash (approved; harness, #48; amends D123)
+An armed power loss (`FaultPlan::crash_after_ops`) can fire on a shard's background I/O (a flush, a compaction or a manifest commit) with no client call in progress. Both harnesses keep a liveness probe, a file opened alongside the store whose handle dies with every other one at a crash. When a step (a read, a scan, a snapshot, a submit or a commit) fails and the probe is dead, the failure is that power loss and the harness recovers from it (`crash_and_recover(Power, already = true)`), whatever error the dead store reported first.
+
+**Armed alone is never sufficient — the probe must be dead.** An error while a crash is armed but has not fired is a real failure and fails the run; with no probe open there is no evidence that a crash fired.
+
+**Status:** implemented. Tests: `a_read_after_a_background_fired_crash_recovers` (engine), `a_read_after_a_background_fired_crash_is_that_crash` and `an_io_error_while_an_unfired_crash_is_armed_is_not_that_crash` (public; the last fails under the old "armed and `Io`" rule).
 
 ## Open questions
 _None._
