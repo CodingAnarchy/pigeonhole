@@ -1046,6 +1046,8 @@ struct TimerState {
     /// The clock reading at which the timer gave up because the clock stopped moving
     /// (`u64::MAX`: it did not give up).
     frozen_at: AtomicU64,
+    /// The timer task's waker while it sleeps, so a cancel ends the sleep at once.
+    waker: Mutex<Option<TaskWaker>>,
 }
 
 impl TimerState {
@@ -1054,11 +1056,20 @@ impl TimerState {
             cancel: AtomicBool::new(false),
             done: AtomicBool::new(false),
             frozen_at: AtomicU64::new(u64::MAX),
+            waker: Mutex::new(None),
         })
     }
 
     fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
+        let waker = self
+            .waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 
     /// The timer is no longer running.
@@ -1081,11 +1092,14 @@ impl TimerState {
 /// Sends its message to the shard once a deadline on the VFS clock passes (unless
 /// cancelled).
 ///
-/// The clock is polled, so on a clock that stops moving the timer would spin for ever (the
-/// shard loop never reaches its slice deadline on a frozen clock either). After
-/// `STALL_TIMER_FROZEN_POLLS` polls that see the clock unchanged the timer gives up, records
-/// the reading and kicks the shard, which then applies its frozen-clock fallback while the
-/// clock still reads the same (issue #70).
+/// The timer first polls the clock. Once it sees the clock move it sleeps until the deadline
+/// (`TaskPoll::SleepUntil`: the shard parks rather than spins, issue #89). The runtime runs a
+/// sleeping task early when the clock has not moved since the shard went idle, and the timer
+/// then polls again. After `STALL_TIMER_FROZEN_POLLS` polls in a row that see the clock
+/// unchanged it gives up, records the reading and kicks the shard, which then applies its
+/// frozen-clock fallback while the clock still reads the same (issue #70, D126): on a
+/// frozen clock a polling timer would spin for ever, since the shard loop never reaches its
+/// slice deadline either.
 struct ClockTimer {
     vfs: VfsRef,
     release_at: u64,
@@ -1118,16 +1132,29 @@ impl ClockTimer {
 }
 
 impl Task for ClockTimer {
-    fn run(&mut self, _deadline_nanos: u64, _waker: &TaskWaker) -> TaskPoll {
+    fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
         if self.state.cancel.load(Ordering::Acquire) {
             return TaskPoll::Done;
         }
         let now = self.vfs.monotonic_nanos();
         if now < self.release_at {
             if now != self.last_now {
+                let moved = self.last_now != u64::MAX;
                 self.last_now = now;
                 self.frozen_polls = 0;
-                return TaskPoll::Pending;
+                if !moved {
+                    return TaskPoll::Pending;
+                }
+                // The clock moves on its own: sleep until the deadline.
+                *self
+                    .state
+                    .waker
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
+                if self.state.cancel.load(Ordering::Acquire) {
+                    return TaskPoll::Done;
+                }
+                return TaskPoll::SleepUntil(self.release_at);
             }
             self.frozen_polls += 1;
             if self.frozen_polls < STALL_TIMER_FROZEN_POLLS {
@@ -3847,6 +3874,10 @@ impl ShardState {
             self.stall.cancel_timer();
             self.end_room_wait(ctx.now_nanos());
             self.wait_room = false;
+            // No compaction starts while closing: its backoff timer has nothing to retry.
+            if let Some(t) = self.backoff_timer.take() {
+                t.cancel();
+            }
             if self.freeze(true).is_err() {
                 self.shared.close.failed.store(true, Ordering::Release);
             }
