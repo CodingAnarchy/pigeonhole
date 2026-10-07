@@ -52,7 +52,7 @@ use pigeonhole_engine::{
 use pigeonhole_format::key::decode_key;
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, ManifestVersion, Seqno, StreamId, TableId, Timestamp};
-use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
+use pigeonhole_io::sim::{CrashKind, FaultPlan, SimOp, SimVfs};
 use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
     CommitStreams, Model, ModelCell, ModelFamily, ModelOp, ModelPurge, Op, Rng, Sim, Step,
@@ -3369,8 +3369,26 @@ fn is_crashed(e: &Error) -> bool {
 
 /// Runs one seeded model check.
 pub fn run(seed: u64, cfg: &Config) -> Result<Stats, Failure> {
+    run_recording(seed, cfg, false).0
+}
+
+/// Runs one seeded model check, also returning every mutating SimVfs operation it did (issue
+/// #61: a seed replays the same I/O, background work included).
+pub fn run_traced(seed: u64, cfg: &Config) -> (Result<Stats, Failure>, Vec<SimOp>) {
+    run_recording(seed, cfg, true)
+}
+
+fn run_recording(seed: u64, cfg: &Config, record: bool) -> (Result<Stats, Failure>, Vec<SimOp>) {
     let sim = Sim::with_faults(seed, cfg.faults.clone());
     let vfs = sim.vfs();
+    if record {
+        vfs.record_ops();
+    }
+    let result = run_on(seed, cfg, sim, Arc::clone(&vfs));
+    (result, vfs.recorded_ops())
+}
+
+fn run_on(seed: u64, cfg: &Config, sim: Sim, vfs: Arc<SimVfs>) -> Result<Stats, Failure> {
     if let Some(n) = cfg.crash_at {
         let mut plan = cfg.faults.clone();
         plan.crash_after_ops = Some(n);

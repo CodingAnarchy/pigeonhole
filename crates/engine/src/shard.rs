@@ -914,14 +914,14 @@ impl MemSlot {
 
 /// Finds or creates the slot of `(tablet, family)`; a split borrow so the arena stays usable.
 fn slot_of<'a>(
-    memtables: &'a mut HashMap<(TabletId, FamilyId), MemSlot>,
+    memtables: &'a mut BTreeMap<(TabletId, FamilyId), MemSlot>,
     arena: &mut ShardArena,
     view_dirty: &mut bool,
     key: (TabletId, FamilyId),
 ) -> Result<&'a mut MemSlot> {
     match memtables.entry(key) {
-        std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
-        std::collections::hash_map::Entry::Vacant(e) => {
+        std::collections::btree_map::Entry::Occupied(e) => Ok(e.into_mut()),
+        std::collections::btree_map::Entry::Vacant(e) => {
             let active = MemEntry::new(Memtable::create(arena)?);
             *view_dirty = true;
             Ok(e.insert(MemSlot {
@@ -1275,7 +1275,8 @@ pub(crate) struct ShardState {
     poisoned: bool,
     arena: ShardArena,
     chunk_size: usize,
-    memtables: HashMap<(TabletId, FamilyId), MemSlot>,
+    /// Ordered, so freezes and flushes visit slots in the same order on every run (#61).
+    memtables: BTreeMap<(TabletId, FamilyId), MemSlot>,
     /// Retired memtables waiting for reader processes to release their views:
     /// `(view version that dropped them, token)`.
     retired: Vec<(u64, Retired)>,
@@ -1407,7 +1408,7 @@ impl ShardState {
             poisoned: false,
             arena: ShardArena::new(region, chunk_size),
             chunk_size,
-            memtables: HashMap::new(),
+            memtables: BTreeMap::new(),
             retired: Vec::new(),
             tablets,
             pending: Vec::new(),

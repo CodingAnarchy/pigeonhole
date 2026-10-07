@@ -5,8 +5,13 @@
 
 mod common;
 
-use common::{Config, final_dump, read_after_background_crash, run};
+use std::path::Path;
+
+use common::{Config, final_dump, read_after_background_crash, run, run_traced};
+
 use pigeonhole_format::Durability;
+use pigeonhole_io::sim::{SimOp, SimVfs};
+use pigeonhole_io::{OpenOptions, Vfs};
 use pigeonhole_sim::Op;
 
 fn seeds() -> Vec<u64> {
@@ -93,6 +98,86 @@ fn sixty_four_shards_behind_env_var() {
     cfg.memtable_budget = 1 << 20;
     for seed in seeds() {
         check(seed, &cfg);
+    }
+}
+
+#[test]
+fn a_seed_replays_the_same_io_trace() {
+    // Issue #61: every mutating SimVfs operation, background work included (WAL spare
+    // preparation, flushes, compactions, the manifest pump), is scheduled by the simulator,
+    // so a seed replays the same I/O in the same order. Twice in a row, then on several
+    // threads at once (OS scheduling must not leak into a run). The harness runs
+    // `check_and_mutate` and transactions (blocking calls) on threads of its own, so those
+    // are off here.
+    let mut cfg = Config::standard(250);
+    cfg.shards = 3;
+    (cfg.cas_ppm, cfg.txn_ppm) = (0, 0);
+    // `SpareSegments::prepare`'s I/O: grow the file by a slot, zero-fill it (one write: the
+    // harness's segments are 256 KiB), then `sync_all`, with nothing in between.
+    let zeros = {
+        let vfs = SimVfs::new(0);
+        let f = vfs
+            .open(Path::new("/zeros"), OpenOptions::read_write_create())
+            .unwrap();
+        vfs.record_ops();
+        f.write_at(&[0; 8 * 32 * 1024], 0).unwrap();
+        vfs.recorded_ops().pop().expect("recorded")
+    };
+    let prepared_a_spare = |ops: &[SimOp]| {
+        ops.windows(3).any(|w| match (&w[0], &w[1], &w[2], &zeros) {
+            (
+                SimOp::SetLen { node, len },
+                SimOp::Write {
+                    node: n1,
+                    offset,
+                    len: l,
+                    digest,
+                },
+                SimOp::Sync {
+                    node: n2,
+                    metadata: true,
+                },
+                SimOp::Write {
+                    len: zl,
+                    digest: zd,
+                    ..
+                },
+            ) => node == n1 && node == n2 && offset + l == *len && (l, digest) == (zl, zd),
+            _ => false,
+        })
+    };
+    for seed in seeds() {
+        let traced = |cfg: &Config| {
+            let (result, ops) = run_traced(seed, cfg);
+            if let Err(f) = result {
+                panic!("{f}");
+            }
+            ops
+        };
+        let reference = traced(&cfg);
+        assert!(
+            prepared_a_spare(&reference),
+            "seed {seed}: no WAL spare segment was zero-filled"
+        );
+        let same = |ops: &[SimOp], run: &str| {
+            if let Some(i) =
+                (0..reference.len().max(ops.len())).find(|&i| reference.get(i) != ops.get(i))
+            {
+                panic!(
+                    "seed {seed}: {run} diverged at op {i} of {}: {:?} vs {:?}",
+                    reference.len(),
+                    reference.get(i),
+                    ops.get(i)
+                );
+            }
+        };
+        same(&traced(&cfg), "the second run");
+        std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..8).map(|_| scope.spawn(|| traced(&cfg))).collect();
+            for (t, run) in runs.into_iter().enumerate() {
+                same(&run.join().unwrap(), &format!("parallel run {t}"));
+            }
+        });
     }
 }
 

@@ -40,7 +40,9 @@
 //! - **Submitted I/O** completes before `submit_*` returns, so runs are deterministic.
 //!
 //! Every random decision draws from one seeded generator in a fixed order, so a seed and
-//! the same sequence of calls replay exactly.
+//! the same sequence of calls replay exactly. [`Vfs::random_u64`] is derived from the seed
+//! with a counter of its own, so asking for values never shifts the fault decisions.
+//! [`SimVfs::record_ops`] records every mutating operation, to check that a run replays.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -100,6 +102,49 @@ impl FaultPlan {
             crash_after_ops: None,
         }
     }
+}
+
+/// One mutating operation, as [`SimVfs::record_ops`] records it. Files are named by their
+/// simulated node number (assigned in creation order), and written bytes by a digest, so two
+/// runs that did the same I/O in the same order record equal traces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimOp {
+    /// `write_at` (or `submit_write`).
+    Write {
+        /// The file's node number.
+        node: u64,
+        /// Where the write started.
+        offset: u64,
+        /// Bytes written.
+        len: u64,
+        /// FNV-1a digest of the bytes written.
+        digest: u64,
+    },
+    /// `set_len`, or an `allocate` that grew the file.
+    SetLen {
+        /// The file's node number.
+        node: u64,
+        /// The new length.
+        len: u64,
+    },
+    /// `sync_data` (`metadata: false`) or `sync_all` (`metadata: true`).
+    Sync {
+        /// The file's node number.
+        node: u64,
+        /// Whether the length was made durable too.
+        metadata: bool,
+    },
+    /// [`Vfs::remove`].
+    Remove(PathBuf),
+    /// [`Vfs::sync_dir`].
+    SyncDir(PathBuf),
+}
+
+/// FNV-1a, for [`SimOp::Write`]'s digest.
+fn digest(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// What a crash loses.
@@ -176,6 +221,11 @@ struct SimState {
     next_handle: u64,
     bytes_written: u64,
     ops: u64,
+    /// Values handed out by `Vfs::random_u64`. A counter of its own, not `rng`, so asking
+    /// for one does not shift the fault decisions a seed makes.
+    random_draws: u64,
+    /// Mutating operations recorded since [`SimVfs::record_ops`], if recording.
+    trace: Option<Vec<SimOp>>,
     shm: BTreeMap<(Option<PathBuf>, String), SharedRegion>,
     killed: HashSet<ProcessId>,
     nanos: u64,
@@ -290,8 +340,12 @@ impl SimState {
         Ok(())
     }
 
-    /// Counts a completed mutating operation and fires a scheduled crash.
-    fn mutated(&mut self) {
+    /// Counts (and, if recording, records) a completed mutating operation and fires a
+    /// scheduled crash.
+    fn mutated(&mut self, op: impl FnOnce() -> SimOp) {
+        if let Some(trace) = &mut self.trace {
+            trace.push(op());
+        }
         self.ops += 1;
         if self.plan.crash_after_ops == Some(self.ops) {
             self.crash(CrashKind::Power);
@@ -382,6 +436,8 @@ impl SimVfs {
                 next_handle: 1,
                 bytes_written: 0,
                 ops: 0,
+                random_draws: 0,
+                trace: None,
                 shm: BTreeMap::new(),
                 killed: HashSet::new(),
                 nanos: 0,
@@ -444,6 +500,36 @@ impl SimVfs {
     /// Mutating operations performed so far (to size a crash-at-every-point sweep).
     pub fn mutating_ops(&self) -> u64 {
         self.state().ops
+    }
+
+    /// Starts recording every mutating operation (discarding anything recorded so far), to
+    /// check that a seed replays the same I/O: see [`SimVfs::recorded_ops`].
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use pigeonhole_io::{File, OpenOptions, Vfs};
+    /// use pigeonhole_io::sim::{SimOp, SimVfs};
+    ///
+    /// # fn main() -> pigeonhole_io::Result<()> {
+    /// let vfs = SimVfs::new(1);
+    /// vfs.record_ops();
+    /// let file = vfs.open(Path::new("/db/f"), OpenOptions::read_write_create())?;
+    /// file.write_at(b"x", 0)?;
+    /// file.sync_all()?;
+    /// let ops = vfs.recorded_ops();
+    /// assert_eq!(ops.len(), 2);
+    /// assert!(matches!(ops[1], SimOp::Sync { metadata: true, .. }));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn record_ops(&self) {
+        self.state().trace = Some(Vec::new());
+    }
+
+    /// The mutating operations recorded since [`SimVfs::record_ops`], in the order they
+    /// completed (empty if not recording). Recording continues.
+    pub fn recorded_ops(&self) -> Vec<SimOp> {
+        self.state().trace.clone().unwrap_or_default()
     }
 
     /// Marks a simulated process as dead for [`Vfs::process_alive`].
@@ -509,7 +595,10 @@ impl SimFile {
             let node = st.node(self.node);
             node.data.resize(len, 0);
             node.pending.push(Pending::SetLen(len));
-            st.mutated();
+            st.mutated(|| SimOp::SetLen {
+                node: self.node,
+                len: len as u64,
+            });
             Ok(())
         })
     }
@@ -524,7 +613,10 @@ impl SimFile {
             if metadata {
                 node.durable_len = node.durable.len();
             }
-            st.mutated();
+            st.mutated(|| SimOp::Sync {
+                node: self.node,
+                metadata,
+            });
             Ok(())
         })
     }
@@ -591,7 +683,12 @@ impl File for SimFile {
                 offset: start,
                 data: buf.to_vec(),
             });
-            st.mutated();
+            st.mutated(|| SimOp::Write {
+                node: self.node,
+                offset,
+                len,
+                digest: digest(buf),
+            });
             Ok(())
         })
     }
@@ -716,7 +813,7 @@ impl Vfs for SimVfs {
             return Err(Error::new(ErrorKind::NotFound, "remove"));
         }
         st.gc();
-        st.mutated();
+        st.mutated(|| SimOp::Remove(path.to_path_buf()));
         Ok(())
     }
 
@@ -745,7 +842,7 @@ impl Vfs for SimVfs {
             .collect();
         st.durable_names.extend(entries);
         st.gc();
-        st.mutated();
+        st.mutated(|| SimOp::SyncDir(dir.to_path_buf()));
         Ok(())
     }
 
@@ -807,5 +904,13 @@ impl Vfs for SimVfs {
 
     fn process_alive(&self, process: ProcessId) -> bool {
         !self.state().killed.contains(&process)
+    }
+
+    /// Derived from the seed and a counter of its own (not the fault generator), so a seed
+    /// replays the same values and asking for them never shifts its fault decisions.
+    fn random_u64(&self) -> u64 {
+        let mut st = self.state();
+        st.random_draws += 1;
+        Rng(self.seed ^ st.random_draws.wrapping_mul(0xA076_1D64_78BD_642F)).next()
     }
 }

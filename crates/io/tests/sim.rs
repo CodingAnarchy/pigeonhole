@@ -537,3 +537,56 @@ fn files_are_limited_to_four_gib() {
     );
     assert_eq!(f.len().unwrap(), 0, "failed calls change nothing");
 }
+
+#[test]
+fn random_values_replay_from_the_seed_without_shifting_faults() {
+    let draws = |seed| {
+        let vfs = SimVfs::new(seed);
+        [vfs.random_u64(), vfs.random_u64()]
+    };
+    let a = draws(5);
+    assert_eq!(a, draws(5), "seed 5: a seed replays its values");
+    assert_ne!(a[0], a[1], "seed 5: successive values differ");
+    assert_ne!(a, draws(6), "seeds 5 and 6 differ");
+
+    // Which writes an injected error fails is the same whether or not values were drawn.
+    let failures = |seed, draw: bool| {
+        let mut plan = FaultPlan::none();
+        plan.io_error_ppm = 200_000;
+        let vfs = SimVfs::with_faults(seed, plan);
+        let f = create_durable(&vfs, "f");
+        (0..64u64)
+            .map(|i| {
+                if draw {
+                    vfs.random_u64();
+                }
+                f.write_at(b"x", i).is_err()
+            })
+            .collect::<Vec<_>>()
+    };
+    for seed in 0..8 {
+        assert_eq!(failures(seed, false), failures(seed, true), "seed {seed}");
+    }
+}
+
+#[test]
+fn recorded_ops_replay_from_the_seed() {
+    let trace = |seed| {
+        let vfs = SimVfs::new(seed);
+        vfs.record_ops();
+        let f = create_durable(&vfs, "f");
+        f.write_at(&vfs.random_u64().to_le_bytes(), 0).unwrap();
+        f.set_len(4096).unwrap();
+        f.sync_data().unwrap();
+        vfs.remove(&path("f")).unwrap();
+        vfs.recorded_ops()
+    };
+    let ops = trace(9);
+    assert_eq!(ops.len(), 5, "seed 9: {ops:?}");
+    assert_eq!(
+        ops,
+        trace(9),
+        "seed 9: the same calls record the same trace"
+    );
+    assert_ne!(ops, trace(10), "seeds 9 and 10 wrote different bytes");
+}

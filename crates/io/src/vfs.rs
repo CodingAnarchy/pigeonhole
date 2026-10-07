@@ -1,4 +1,6 @@
+use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
+use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -68,6 +70,22 @@ pub trait Vfs: Send + Sync + Debug {
 
     /// Whether `process` is still running (pid present and start time unchanged).
     fn process_alive(&self, process: ProcessId) -> bool;
+
+    /// A random 64-bit value, for identifiers that must be unique (a new database's id).
+    ///
+    /// The default mixes the standard library's per-process random hash keys (`RandomState`,
+    /// seeded from the OS) with both clocks and the process id. It is not cryptographic:
+    /// expect values unique across databases and processes for identification, never
+    /// unpredictable to an adversary. Two calls in one process differ (each `RandomState`
+    /// gets fresh keys). A simulated `Vfs` overrides it to derive values from its seed, so a
+    /// run replays exactly (`SimVfs` does).
+    fn random_u64(&self) -> u64 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(self.now_micros());
+        h.write_u64(self.monotonic_nanos());
+        h.write_u32(self.current_process().pid);
+        h.finish()
+    }
 }
 
 /// A shared handle to a [`Vfs`].
