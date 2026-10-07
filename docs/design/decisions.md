@@ -513,7 +513,7 @@ D70 narrows purge by `min_ts_above`; D74 purge needs the set of live snapshot se
 
 **Decision:** `gc_policy` takes the writer's live snapshot seqnos (`LiveSeqnos`) plus the oldest reader pin's seqno (`oldest_reader_pin`): a reader's snapshots pin its own view, so the oldest pin bounds everything any reader can still read, and everything at or above it counts as reachable. This is conservative (a reader pinned at a version may hold no snapshot at all) and loses only purge work, never visibility. Precise per-slot pinning is issue #39's territory.
 
-## D119 — How should the L0 write stall behave with a frozen or coarse clock? (approved; engine Milestone B)
+## D119 — How should the L0 write stall behave with a frozen or coarse clock? (approved; engine Milestone B; amended by D126)
 The spec's token bucket refills with time. Under the simulator the clock advances only when the workload says so, so a stalled shard with nothing else running would wait forever.
 
 **Decision:** the stall engages only while the L0 score is `>= 1.0` and a compaction can run; it arms one `StallTimer` task with a cancel flag, cancelled the moment the score drops (a compaction committed) so a timer never spins on a frozen clock. A commit that cannot get room retries on the next `Kick`. A failed background compaction sets a backoff flag that a stall (score `>= 1.0`) clears, so a device that recovers is retried while a dead one does not loop.
@@ -538,7 +538,7 @@ Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledg
 
 **Decision:** the harness takes the engine's own append order (the `test-hooks` `AppendedRecord` stream), applies the record-level prefix rule itself, and cross-checks `recovered_commits` only over commits whose records are adjacent per stream and all appended (`sim_helper_recovered`), skipping the check when the streams cannot be represented. `check_acknowledged_survive` and `Model::from_commits` are used as is. A record-level helper in `pigeonhole-sim` (issue #59) will let the check run on every crash and the harness drop its own rule; the engine half of #48 waits for it.
 
-## D124 — How does a group waiting for arena room learn that a flush freed some? (approved; engine Milestone B)
+## D124 — How does a group waiting for arena room learn that a flush freed some? (approved; engine Milestone B; amended by D126)
 `ShardArena` reports free bytes only through `reserve`; nothing signals the shard when `reclaim` returns memory.
 
 **Decision:** a group that finds no room waits (a write stall, counted in `Metrics::stalls` with its duration): the shard freezes and flushes, and a flush completion (`Flushed`), every `Maintain` message and the stall's timeout timer re-run `reserve_room` for the waiting group (`refresh_free`). A flush that fails is tried again on the next retry. The wait ends with `Busy` only after `EngineOptions::write_stall_timeout_nanos` (30 s by default) passed without room, or at once for a batch that can never fit an empty arena, or with the poison error when the pager is poisoned.
@@ -549,6 +549,25 @@ An armed power loss (`FaultPlan::crash_after_ops`) can fire on a shard's backgro
 **Armed alone is never sufficient — the probe must be dead.** An error while a crash is armed but has not fired is a real failure and fails the run; with no probe open there is no evidence that a crash fired.
 
 **Status:** implemented. Tests: `a_read_after_a_background_fired_crash_recovers` (engine), `a_read_after_a_background_fired_crash_is_that_crash` and `an_io_error_while_an_unfired_crash_is_armed_is_not_that_crash` (public; the last fails under the old "armed and `Io`" rule).
+
+## D126 — write stalls and failed background work on a frozen or moving clock (approved; engine, #70 #79 #88; amends D119 and D124)
+D119 cancels the L0 stall's timer when a compaction commits and D124 times a wait for arena room out after `write_stall_timeout_nanos`, but both lean on a clock. Under `SimVfs` the clock moves only when the workload advances it, and the workload is blocked in the commit (or, in application-owned mode, in `run_once`, whose slice deadline never comes). Three things followed: a `StallTimer` polling the clock spun for ever; a failed background compaction with an L0 score `>= 1.0` was retried at once by `maintain`, redoing the merge in a loop against a dead (crashed or poisoned) device (#79); and a stall with nothing running in the background had nothing to end it.
+
+**Interim behavior** (proposed amendments; on a moving clock D119 and D124 are unchanged except where noted):
+
+*Detecting a frozen clock.* Every engine timer (`ClockTimer`: the L0 stall's refill timer, the arena-room timeout, the compaction backoff) polls the VFS clock. After 1024 polls in a row that see the same reading it gives up, records that reading and kicks the shard. The shard treats the clock as **frozen** only while its reading still equals the recorded one; any movement since makes it a moving clock again, and timers are armed as before. The fallbacks below apply only to a frozen clock.
+
+*Amendment to D119 (L0 stall).*
+- Moving clock: unchanged. The token bucket refills with time and paces writers whether or not a compaction runs or can start. A stall that finds no compaction running asks `maintain` to start one: it takes the most urgent slot the picker finds work in, falling back to the next slot when the picker returns nothing for the most urgent one; a compaction that fails to start sets the backoff.
+- Frozen clock: the bucket never refills, so a stall ends on compaction progress. Every compaction completion (success or failure) kicks a waiting group, and a successful one adds one token. When no compaction runs or can start, writers are admitted. A timer that gave up is not armed again while the clock stays frozen.
+- Failed compactions (D119's backoff, both clocks): after a failure, or a failure to start, no background compaction starts until a flush completes, a group is admitted, or, on a moving clock, a backoff timer fires: 1 s after the first failure, doubling with each failure in a row up to 60 s, and back to 1 s after a compaction succeeds (`compaction_backoff_nanos`). The timer's retry happens even with no new writes; on a frozen clock it gives up and only the event-tied retries remain. A dead device therefore never loops. A poisoned shard starts no background compaction until reopen, and a stalled writer on it is admitted and fails with the shard's error.
+
+*Amendment to D124 (wait for arena room).*
+- Moving clock: unchanged. The wait ends with `Busy` once `write_stall_timeout_nanos` has passed, and a failed flush is retried on the next run of the waiting group.
+- Frozen clock: the timeout never comes, so the wait also ends with `Busy` after 4 failed flushes in a row, or at once when nothing the shard would hear of can free room. That is the **idle case**: no flush running or queued, no deferred freeze, no undecided cross-shard share, no unsynced group, and no retired memtable that a reader process still pins (pinned memtables stay in the retired list and may be released at any time). What remains is held by in-process snapshots, which only the blocked caller can drop. A poisoned pager still ends the wait at once with the poison error.
+- Both clocks: `reserve_room` reclaims retired memtables whose readers left before it reports no room, and refusing the waiting members no longer drops the members the same group admitted before the cut (the timeout path used to return without applying them). A wait ends (and its timeout timer is cancelled) when a flush completes with no group left waiting, and at close (issue #88: a wait a flush had ended outlived the writers and kept its timer running into the close).
+
+The spin while a timer waits on a real clock is fixed by runtime timed wakeups (#89).
 
 ## Open questions
 _None._
