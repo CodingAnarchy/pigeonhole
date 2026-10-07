@@ -139,7 +139,6 @@ fn single_shard(cold: bool, seed: u64) -> u64 {
 fn a_cold_slot_does_not_pin_the_wal() {
     let without = single_shard(false, 137);
     let with = single_shard(true, 137);
-    eprintln!("WAL bytes: {without} without a cold write, {with} with one");
     // Before #137: ~24 MB with the cold write (every hot byte kept), ~1 MB without. The
     // limit is twice the memtable budget; allow a budget more for spares and the segment
     // in progress.
@@ -201,7 +200,6 @@ fn an_idle_participant_does_not_pin_the_coordinators_wal() {
         );
     }
     let wal = wal_bytes(&vfs);
-    eprintln!("WAL bytes over both streams: {wal}");
     assert!(
         wal <= 4 * BUDGET,
         "an idle participant pinned the coordinator's WAL: {wal} bytes"
@@ -311,13 +309,10 @@ fn a_participant_serves_an_unpin_for_a_lower_seqno_decided_later() {
         );
     }
     let wal = stream_bytes(&vfs, 1);
-    let m = db.metrics();
-    eprintln!(
-        "B's WAL: {wal} bytes; unpin passes and forced flushes: {:?}",
-        m.unpin
-    );
     assert!(
         wal <= 4 << 20,
-        "P ignored B's Unpin for the lower seqno: B's WAL holds {wal} bytes"
+        "P ignored B's Unpin for the lower seqno: B's WAL holds {wal} bytes (unpin passes \
+         and forced flushes: {:?})",
+        db.metrics().unpin
     );
 }
