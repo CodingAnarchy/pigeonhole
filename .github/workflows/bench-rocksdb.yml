@@ -20,6 +20,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   rocksdb:
     name: bench (all comparison runners, ubuntu)
