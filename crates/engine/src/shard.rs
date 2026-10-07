@@ -57,8 +57,17 @@ const STALL_TIMER_FROZEN_POLLS: u32 = 1024;
 /// Failed flushes in a row after which a wait for arena room ends with `Busy` on a frozen
 /// clock (a moving one waits for `write_stall_timeout_nanos`).
 const ROOM_FLUSH_ATTEMPTS: u32 = 4;
-/// How long a failed background compaction waits before it is retried on a moving clock.
+/// How long a failed background compaction first waits before it is retried on a moving
+/// clock; the wait doubles with each failure in a row, up to `COMPACTION_BACKOFF_MAX_NANOS`.
 const COMPACTION_BACKOFF_NANOS: u64 = 1_000_000_000;
+const COMPACTION_BACKOFF_MAX_NANOS: u64 = 60_000_000_000;
+
+/// The wait before retrying after `failures` failed compactions in a row (at least one).
+fn compaction_backoff_nanos(failures: u32) -> u64 {
+    // 2^32 seconds is far past the cap and does not overflow.
+    let doublings = failures.saturating_sub(1).min(32);
+    (COMPACTION_BACKOFF_NANOS << doublings).min(COMPACTION_BACKOFF_MAX_NANOS)
+}
 
 // ---------------------------------------------------------------------------------------
 // Engine-wide state shared with the shards
@@ -1336,6 +1345,8 @@ pub(crate) struct ShardState {
     /// (on a moving clock) `backoff_timer` fires.
     compaction_backoff: bool,
     backoff_timer: Option<Arc<TimerState>>,
+    /// Background compactions failed in a row (reset by one that succeeds).
+    compaction_failures: u32,
     stall: Stall,
 }
 
@@ -1420,6 +1431,7 @@ impl ShardState {
             compaction_error: None,
             compaction_backoff: false,
             backoff_timer: None,
+            compaction_failures: 0,
             stall: Stall::default(),
         }
     }
@@ -3597,10 +3609,11 @@ impl ShardState {
     }
 
     /// A background compaction failed (or could not start): none starts until a flush
-    /// completes, a group is admitted, or, on a moving clock, `COMPACTION_BACKOFF_NANOS`
+    /// completes, a group is admitted, or, on a moving clock, `compaction_backoff_nanos`
     /// pass (D119; issues #70, #79).
     fn back_off_compaction(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         self.compaction_backoff = true;
+        self.compaction_failures = self.compaction_failures.saturating_add(1);
         if let Some(t) = self.backoff_timer.take() {
             t.cancel();
         }
@@ -3608,7 +3621,8 @@ impl ShardState {
         self.backoff_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
             &self.shared.vfs,
-            ctx.now_nanos().saturating_add(COMPACTION_BACKOFF_NANOS),
+            ctx.now_nanos()
+                .saturating_add(compaction_backoff_nanos(self.compaction_failures)),
             state,
             ctx.submitter(self.id).clone(),
             ShardMsg::RetryCompaction,
@@ -3739,6 +3753,7 @@ impl ShardState {
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
                 metrics.compactions.fetch_add(1, Ordering::Relaxed);
                 metrics.compaction_nanos.fetch_add(nanos, Ordering::Relaxed);
+                self.compaction_failures = 0;
                 // On a frozen clock the bucket never refills: compaction progress paces a
                 // stall instead (issue #70).
                 let now = ctx.now_nanos();
@@ -4137,5 +4152,23 @@ impl ShardHandler for ShardState {
             self.check_flush_waiters();
         }
         self.try_finish_close(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_backoff_doubles_from_one_second_up_to_a_minute() {
+        let secs: Vec<u64> = (1..=9)
+            .map(|f| compaction_backoff_nanos(f) / 1_000_000_000)
+            .collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        // Never shorter than the first wait, never longer than the cap, at any count.
+        assert_eq!(compaction_backoff_nanos(0), COMPACTION_BACKOFF_NANOS);
+        for f in [64, 65, 1_000, u32::MAX] {
+            assert_eq!(compaction_backoff_nanos(f), COMPACTION_BACKOFF_MAX_NANOS);
+        }
     }
 }
