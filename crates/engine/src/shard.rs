@@ -51,6 +51,23 @@ const KEY_FIXED: usize = 2 + 2 + 17;
 /// Token-bucket capacity (groups) and refill rate at an L0 score of 1 (groups per second).
 const STALL_CAPACITY: f64 = 8.0;
 const STALL_RATE: f64 = 4000.0;
+/// Polls in a row that see the clock unchanged before a stall timer gives up: the clock is
+/// frozen (the simulator) or coarse, and the stall ends on a background event instead.
+const STALL_TIMER_FROZEN_POLLS: u32 = 1024;
+/// Failed flushes in a row after which a wait for arena room ends with `Busy` on a frozen
+/// clock (a moving one waits for `write_stall_timeout_nanos`).
+const ROOM_FLUSH_ATTEMPTS: u32 = 4;
+/// How long a failed background compaction first waits before it is retried on a moving
+/// clock; the wait doubles with each failure in a row, up to `COMPACTION_BACKOFF_MAX_NANOS`.
+const COMPACTION_BACKOFF_NANOS: u64 = 1_000_000_000;
+const COMPACTION_BACKOFF_MAX_NANOS: u64 = 60_000_000_000;
+
+/// The wait before retrying after `failures` failed compactions in a row (at least one).
+fn compaction_backoff_nanos(failures: u32) -> u64 {
+    // 2^32 seconds is far past the cap and does not overflow.
+    let doublings = failures.saturating_sub(1).min(32);
+    (COMPACTION_BACKOFF_NANOS << doublings).min(COMPACTION_BACKOFF_MAX_NANOS)
+}
 
 // ---------------------------------------------------------------------------------------
 // Engine-wide state shared with the shards
@@ -659,6 +676,8 @@ pub(crate) enum ShardMsg {
     Start,
     /// Nothing: forces a drain so deferred members form a group.
     Kick,
+    /// A failed background compaction's backoff passed (on a moving clock): retry.
+    RetryCompaction,
     /// Stop accepting writes, finish in-flight work, flush, checkpoint, sync, report.
     Close,
 }
@@ -1017,37 +1036,130 @@ impl Task for SpareTask {
     }
 }
 
-/// Kicks the shard once a write stall's wait has passed (or the stall was cancelled).
-struct StallTimer {
-    vfs: VfsRef,
-    release_at: u64,
-    cancel: Arc<AtomicBool>,
-    submitter: Submitter<ShardMsg>,
+/// A clock timer's state, shared between the shard and the timer task.
+#[derive(Debug)]
+struct TimerState {
+    /// Set by the shard to cancel the timer.
+    cancel: AtomicBool,
+    /// Set by the timer when it fired or gave up.
+    done: AtomicBool,
+    /// The clock reading at which the timer gave up because the clock stopped moving
+    /// (`u64::MAX`: it did not give up).
+    frozen_at: AtomicU64,
 }
 
-impl Task for StallTimer {
+impl TimerState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancel: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            frozen_at: AtomicU64::new(u64::MAX),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    /// The timer is no longer running.
+    fn finished(&self) -> bool {
+        self.done.load(Ordering::Acquire) || self.cancel.load(Ordering::Acquire)
+    }
+
+    /// The timer fired (its deadline passed).
+    fn fired(&self) -> bool {
+        self.done.load(Ordering::Acquire) && self.frozen_at.load(Ordering::Acquire) == u64::MAX
+    }
+
+    /// The timer gave up on a stopped clock and the clock still reads `now`: only events
+    /// can end the wait (the frozen-clock fallbacks of issue #70 apply).
+    fn frozen(&self, now: u64) -> bool {
+        self.frozen_at.load(Ordering::Acquire) == now
+    }
+}
+
+/// Sends its message to the shard once a deadline on the VFS clock passes (unless
+/// cancelled).
+///
+/// The clock is polled, so on a clock that stops moving the timer would spin for ever (the
+/// shard loop never reaches its slice deadline on a frozen clock either). After
+/// `STALL_TIMER_FROZEN_POLLS` polls that see the clock unchanged the timer gives up, records
+/// the reading and kicks the shard, which then applies its frozen-clock fallback while the
+/// clock still reads the same (issue #70).
+struct ClockTimer {
+    vfs: VfsRef,
+    release_at: u64,
+    state: Arc<TimerState>,
+    submitter: Submitter<ShardMsg>,
+    /// Sent when the deadline passes.
+    fire: Option<ShardMsg>,
+    last_now: u64,
+    frozen_polls: u32,
+}
+
+impl ClockTimer {
+    fn new(
+        vfs: &VfsRef,
+        release_at: u64,
+        state: Arc<TimerState>,
+        submitter: Submitter<ShardMsg>,
+        fire: ShardMsg,
+    ) -> Self {
+        Self {
+            vfs: Arc::clone(vfs),
+            release_at,
+            state,
+            submitter,
+            fire: Some(fire),
+            last_now: u64::MAX,
+            frozen_polls: 0,
+        }
+    }
+}
+
+impl Task for ClockTimer {
     fn run(&mut self, _deadline_nanos: u64, _waker: &TaskWaker) -> TaskPoll {
-        if self.cancel.load(Ordering::Acquire) {
+        if self.state.cancel.load(Ordering::Acquire) {
             return TaskPoll::Done;
         }
-        if self.vfs.monotonic_nanos() < self.release_at {
-            return TaskPoll::Pending;
+        let now = self.vfs.monotonic_nanos();
+        if now < self.release_at {
+            if now != self.last_now {
+                self.last_now = now;
+                self.frozen_polls = 0;
+                return TaskPoll::Pending;
+            }
+            self.frozen_polls += 1;
+            if self.frozen_polls < STALL_TIMER_FROZEN_POLLS {
+                return TaskPoll::Pending;
+            }
+            self.state.frozen_at.store(now, Ordering::Release);
+            self.state.done.store(true, Ordering::Release);
+            let _ = self.submitter.submit(ShardMsg::Kick);
+            return TaskPoll::Done;
         }
-        let _ = self.submitter.submit(ShardMsg::Kick);
+        self.state.done.store(true, Ordering::Release);
+        if let Some(msg) = self.fire.take() {
+            let _ = self.submitter.submit(msg);
+        }
         TaskPoll::Done
     }
 
     fn name(&self) -> &'static str {
-        "stall"
+        "timer"
     }
 }
 
 /// A group waiting for a flush to free memtable arena room (a write stall, counted in the
-/// metrics), refused with `Busy` once `write_stall_timeout_nanos` have passed.
+/// metrics), refused with `Busy` once `write_stall_timeout_nanos` have passed (D124). On a
+/// frozen clock it is also refused after `ROOM_FLUSH_ATTEMPTS` failed flushes in a row, or
+/// at once when nothing can free room (issue #70).
 #[derive(Debug)]
 struct RoomWait {
     since: u64,
-    timer: Arc<AtomicBool>,
+    /// The timeout timer.
+    timer: Arc<TimerState>,
+    failed_flushes: u32,
 }
 
 /// A record of this stream the checkpoint cannot pass yet.
@@ -1084,8 +1196,8 @@ struct Stall {
     score: f64,
     tokens: f64,
     last_refill: u64,
-    /// The running timer's cancel flag.
-    timer: Option<Arc<AtomicBool>>,
+    /// The timer that kicks the shard once a token is due.
+    timer: Option<Arc<TimerState>>,
     /// When the current stall started (0 = none).
     since: u64,
 }
@@ -1105,7 +1217,7 @@ impl Default for Stall {
 impl Stall {
     fn cancel_timer(&mut self) {
         if let Some(t) = self.timer.take() {
-            t.store(true, Ordering::Release);
+            t.cancel();
         }
     }
 }
@@ -1229,8 +1341,12 @@ pub(crate) struct ShardState {
     compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>)>,
     /// The last compaction error (reported to a `compact` caller).
     compaction_error: Option<Error>,
-    /// A background compaction failed: none starts until a flush or new writes happen.
+    /// A background compaction failed: none starts until a flush or new writes happen, or
+    /// (on a moving clock) `backoff_timer` fires.
     compaction_backoff: bool,
+    backoff_timer: Option<Arc<TimerState>>,
+    /// Background compactions failed in a row (reset by one that succeeds).
+    compaction_failures: u32,
     stall: Stall,
 }
 
@@ -1314,6 +1430,8 @@ impl ShardState {
             compact_all: VecDeque::new(),
             compaction_error: None,
             compaction_backoff: false,
+            backoff_timer: None,
+            compaction_failures: 0,
             stall: Stall::default(),
         }
     }
@@ -1535,6 +1653,8 @@ impl ShardState {
             Err(_) => 0,
         };
         if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+            // Memtables whose readers left since the last reclaim count too.
+            self.reclaim_retired();
             self.refresh_free();
         }
         trace!(
@@ -1559,7 +1679,7 @@ impl ShardState {
     /// The wait for arena room is over: account the stall and cancel its timer.
     fn end_room_wait(&mut self, now: u64) {
         if let Some(w) = self.room_wait.take() {
-            w.timer.store(true, Ordering::Release);
+            w.timer.cancel();
             self.shared.metrics[usize::from(self.id.0)]
                 .stall_nanos
                 .fetch_add(now.saturating_sub(w.since), Ordering::Relaxed);
@@ -1757,7 +1877,11 @@ impl ShardState {
                     self.shared.close.failed.store(true, Ordering::Release);
                 }
                 if self.wait_room && !self.closing {
-                    // The waiting members try the flush again (until their stall timeout).
+                    // The waiting members try the flush again (until their stall timeout or
+                    // `ROOM_FLUSH_ATTEMPTS` failures).
+                    if let Some(w) = &mut self.room_wait {
+                        w.failed_flushes += 1;
+                    }
                     self.wait_room = false;
                     let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
                 }
@@ -1768,6 +1892,11 @@ impl ShardState {
         if self.wait_room {
             self.wait_room = false;
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+        }
+        if self.pending.is_empty() {
+            // No group waits any more: the wait (and its timeout timer) ends here rather
+            // than at the next group, which may never come (issue #88).
+            self.end_room_wait(ctx.now_nanos());
         }
         self.compaction_backoff = false;
         self.check_flush_waiters();
@@ -2144,11 +2273,19 @@ impl ShardState {
     /// that re-kicks the shard once a token is due.
     fn stalled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) -> bool {
         let now = ctx.now_nanos();
+        let frozen = self.stall.timer.as_ref().is_some_and(|t| t.frozen(now));
         // A stall lets compaction catch up; when none can run (the last one failed, the
         // pager or this shard is poisoned) holding writers would hold them for ever.
-        let hopeless = self.compaction_backoff
+        let mut hopeless = self.compaction_backoff
             || self.poisoned
             || self.shared.pager_poisoned.load(Ordering::Acquire);
+        if !hopeless && self.stall.score >= 1.0 && self.compaction.is_none() {
+            self.maintain(ctx);
+            // On a frozen clock the bucket never refills: only a compaction's completion
+            // can end the stall, so with none running writers are admitted (issue #70). A
+            // moving clock keeps pacing them (D119).
+            hopeless = self.compaction_backoff || (frozen && self.compaction.is_none());
+        }
         if self.stall.score < 1.0 || hopeless {
             self.stall.cancel_timer();
             self.stall.tokens = STALL_CAPACITY;
@@ -2182,16 +2319,24 @@ impl ShardState {
                 .stalls
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if self.stall.timer.is_none() {
-            let cancel = Arc::new(AtomicBool::new(false));
-            self.stall.timer = Some(Arc::clone(&cancel));
+        // A timer that gave up on a clock that has not moved since is not armed again: the
+        // running compaction's completion kicks the shard.
+        if self
+            .stall
+            .timer
+            .as_ref()
+            .is_none_or(|t| t.finished() && !t.frozen(now))
+        {
+            let state = TimerState::new();
+            self.stall.timer = Some(Arc::clone(&state));
             let wait = ((1.0 - self.stall.tokens) / rate * 1e9) as u64;
-            ctx.spawn(Box::new(StallTimer {
-                vfs: Arc::clone(&self.shared.vfs),
-                release_at: now + wait.max(1_000),
-                cancel,
-                submitter: ctx.submitter(self.id).clone(),
-            }));
+            ctx.spawn(Box::new(ClockTimer::new(
+                &self.shared.vfs,
+                now + wait.max(1_000),
+                state,
+                ctx.submitter(self.id).clone(),
+                ShardMsg::Kick,
+            )));
         }
         true
     }
@@ -2351,43 +2496,81 @@ impl ShardState {
             self.wait_room = true;
             let now = ctx.now_nanos();
             let timeout = self.shared.write_stall_timeout_nanos;
+            let frozen = self.room_wait.as_ref().is_some_and(|w| w.timer.frozen(now));
+            let mut refuse = false;
             match &self.room_wait {
                 None => {
                     // The stall begins: count it, and arm the timeout.
                     let metrics = &self.shared.metrics[usize::from(self.id.0)];
                     metrics.stalls.fetch_add(1, Ordering::Relaxed);
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    ctx.spawn(Box::new(StallTimer {
-                        vfs: Arc::clone(&self.shared.vfs),
-                        release_at: now.saturating_add(timeout),
-                        cancel: Arc::clone(&cancel),
-                        submitter: ctx.submitter(self.id).clone(),
-                    }));
+                    let state = TimerState::new();
+                    ctx.spawn(Box::new(ClockTimer::new(
+                        &self.shared.vfs,
+                        now.saturating_add(timeout),
+                        Arc::clone(&state),
+                        ctx.submitter(self.id).clone(),
+                        ShardMsg::Kick,
+                    )));
                     self.room_wait = Some(RoomWait {
                         since: now,
-                        timer: cancel,
+                        timer: state,
+                        failed_flushes: 0,
                     });
                 }
-                Some(w) if now.saturating_sub(w.since) >= timeout => {
-                    // Nothing freed room in time: refuse the waiting members.
-                    self.end_room_wait(now);
-                    self.wait_room = false;
-                    let waiting = std::mem::take(&mut self.pending);
-                    for mut m in waiting {
-                        if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                            self.pending.push(m);
-                            continue;
-                        }
-                        m.failed = Some(Error::Busy);
-                        self.settle(m, Ok(()), ctx);
-                    }
-                    return;
+                Some(w)
+                    if now.saturating_sub(w.since) >= timeout
+                        || (frozen && w.failed_flushes >= ROOM_FLUSH_ATTEMPTS) =>
+                {
+                    // Nothing freed room in time (D124), or on a frozen clock, which never
+                    // reaches the timeout, the flushes keep failing (issue #70).
+                    refuse = true;
                 }
-                Some(_) => {}
+                Some(w) => {
+                    // A timer that gave up on a clock that has moved since is armed again.
+                    if w.timer.finished() && !frozen {
+                        let state = TimerState::new();
+                        ctx.spawn(Box::new(ClockTimer::new(
+                            &self.shared.vfs,
+                            w.since.saturating_add(timeout),
+                            Arc::clone(&state),
+                            ctx.submitter(self.id).clone(),
+                            ShardMsg::Kick,
+                        )));
+                        if let Some(w) = &mut self.room_wait {
+                            w.timer = state;
+                        }
+                    }
+                }
             }
             // A flush frees room (one that failed is tried again).
             let _ = self.freeze(true);
             self.spawn_flush(ctx);
+            // On a frozen clock, with no flush, deferred freeze, undecided share or unsynced
+            // group in flight and no retired memtable a reader process still pins, nothing
+            // the shard will hear of can free room (in-process snapshots hold what is left)
+            // and the timeout never comes: refuse now (issue #70). A moving clock waits for
+            // the timeout (D124), since a reader may release room meanwhile.
+            let idle = frozen
+                && !self.flush_running
+                && self.flush_queue.is_empty()
+                && !self.freeze_deferred
+                && self.prepared.is_empty()
+                && self.unresolved.is_empty()
+                && self.retired.is_empty();
+            if refuse || idle {
+                // Refuse the waiting members; this group's admitted ones still apply.
+                self.end_room_wait(now);
+                self.wait_room = false;
+                let waiting = std::mem::take(&mut self.pending);
+                for mut m in waiting {
+                    if matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                        self.pending.push(m);
+                        continue;
+                    }
+                    m.failed = Some(Error::Busy);
+                    self.settle(m, Ok(()), ctx);
+                }
+            }
         } else {
             if let Some(w) = &self.room_wait
                 && !self.wait_room
@@ -3296,7 +3479,8 @@ impl ShardState {
         }
         let view = self.shared.view.load_full();
         let mut score = 0.0f64;
-        let mut best: Option<(f64, (TabletId, FamilyId))> = None;
+        // Slots that need a compaction, most urgent first.
+        let mut due: Vec<(f64, (TabletId, FamilyId))> = Vec::new();
         for key in self.owned_slots(&view) {
             let Some(fam) = view.ssts.family(key.0, key.1) else {
                 continue;
@@ -3309,13 +3493,15 @@ impl ShardState {
             }
             let s = self.picker.score(&fam.levels_meta());
             score = score.max(s);
-            if s >= 1.0 && best.is_none_or(|(b, _)| s > b) {
-                best = Some((s, key));
+            if s >= 1.0 {
+                due.push((s, key));
             }
         }
+        due.sort_by(|a, b| b.0.total_cmp(&a.0));
         trace!(
-            "shard {} maintain: score={score:.2} best={best:?} compaction={:?} full_waiters={}",
+            "shard {} maintain: score={score:.2} best={:?} compaction={:?} full_waiters={}",
             self.id.0,
+            due.first(),
             self.compaction,
             self.compact_all.len()
         );
@@ -3386,19 +3572,12 @@ impl ShardState {
                 }
             }
         }
-        let Some((_, key)) = best else {
-            return;
-        };
-        // After a failure, only a stall (writers wait on this compaction) retries it.
-        if self.compaction_backoff && score < 1.0 {
+        // After a failure, nothing retries until the backoff timer fires, a flush completes
+        // or a group is admitted, so a dead device does not loop (issues #70, #79). A
+        // poisoned shard starts none: it is dead until reopen.
+        if due.is_empty() || self.compaction_backoff || self.poisoned {
             return;
         }
-        let Some(fam) = view.ssts.family(key.0, key.1) else {
-            return;
-        };
-        let Some(meta) = view.catalog.family(key.1) else {
-            return;
-        };
         let busy: Vec<SstId> = self
             .shared
             .busy_ssts
@@ -3408,17 +3587,51 @@ impl ShardState {
             .copied()
             .collect();
         let now = self.shared.vfs.now_micros();
-        let Some(task) = self.picker.pick(
-            key.0,
-            key.1,
-            &fam.levels_meta(),
-            &busy,
-            now,
-            meta.options.ttl_micros,
-        ) else {
+        // The most urgent slot the picker finds work in (another one's inputs may be busy).
+        for (_, key) in due {
+            let Some(fam) = view.ssts.family(key.0, key.1) else {
+                continue;
+            };
+            let Some(meta) = view.catalog.family(key.1) else {
+                continue;
+            };
+            let Some(task) = self.picker.pick(
+                key.0,
+                key.1,
+                &fam.levels_meta(),
+                &busy,
+                now,
+                meta.options.ttl_micros,
+            ) else {
+                continue;
+            };
+            if let Err(e) = self.start_compaction(&view, key, task, ctx) {
+                trace!("shard {} compaction start failed: {e}", self.id.0);
+                self.back_off_compaction(ctx);
+            }
             return;
-        };
-        let _ = self.start_compaction(&view, key, task, ctx);
+        }
+    }
+
+    /// A background compaction failed (or could not start): none starts until a flush
+    /// completes, a group is admitted, or, on a moving clock, `compaction_backoff_nanos`
+    /// pass (D119; issues #70, #79).
+    fn back_off_compaction(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.compaction_backoff = true;
+        self.compaction_failures = self.compaction_failures.saturating_add(1);
+        if let Some(t) = self.backoff_timer.take() {
+            t.cancel();
+        }
+        let state = TimerState::new();
+        self.backoff_timer = Some(Arc::clone(&state));
+        ctx.spawn(Box::new(ClockTimer::new(
+            &self.shared.vfs,
+            ctx.now_nanos()
+                .saturating_add(compaction_backoff_nanos(self.compaction_failures)),
+            state,
+            ctx.submitter(self.id).clone(),
+            ShardMsg::RetryCompaction,
+        )));
     }
 
     fn start_compaction(
@@ -3545,6 +3758,13 @@ impl ShardState {
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
                 metrics.compactions.fetch_add(1, Ordering::Relaxed);
                 metrics.compaction_nanos.fetch_add(nanos, Ordering::Relaxed);
+                self.compaction_failures = 0;
+                // On a frozen clock the bucket never refills: compaction progress paces a
+                // stall instead (issue #70).
+                let now = ctx.now_nanos();
+                if self.stall.timer.as_ref().is_some_and(|t| t.frozen(now)) {
+                    self.stall.tokens = (self.stall.tokens + 1.0).min(STALL_CAPACITY);
+                }
             }
             // The table was dropped while this compaction ran: its output was abandoned and
             // its inputs are retired with the table. Nothing failed; a full compaction goes
@@ -3558,8 +3778,12 @@ impl ShardState {
                     Some((_, reply)) => reply.notify(Err(e)),
                     None => self.compaction_error = Some(e),
                 }
-                self.compaction_backoff = true;
+                self.back_off_compaction(ctx);
             }
+        }
+        // A stalled group waits on this compaction: it runs again whatever the outcome.
+        if !self.pending.is_empty() {
+            let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
         self.maintain(ctx);
     }
@@ -3618,9 +3842,11 @@ impl ShardState {
         }
         if self.close_stage == CloseStage::Draining {
             self.close_stage = CloseStage::Flushing;
-            // Abandon the stall: nothing is admitted any more.
+            // Abandon the stalls: nothing is admitted any more (issue #88).
             self.stall.score = 0.0;
             self.stall.cancel_timer();
+            self.end_room_wait(ctx.now_nanos());
+            self.wait_room = false;
             if self.freeze(true).is_err() {
                 self.shared.close.failed.store(true, Ordering::Release);
             }
@@ -3855,6 +4081,14 @@ impl ShardState {
                 self.maintain(ctx);
             }
             ShardMsg::Kick => {}
+            ShardMsg::RetryCompaction => {
+                // Only the current backoff timer's firing ends the backoff.
+                if self.backoff_timer.as_ref().is_some_and(|t| t.fired()) {
+                    self.backoff_timer = None;
+                    self.compaction_backoff = false;
+                    self.maintain(ctx);
+                }
+            }
             ShardMsg::Close => {
                 if !self.closing {
                     self.closing = true;
@@ -3925,5 +4159,23 @@ impl ShardHandler for ShardState {
             self.check_flush_waiters();
         }
         self.try_finish_close(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_backoff_doubles_from_one_second_up_to_a_minute() {
+        let secs: Vec<u64> = (1..=9)
+            .map(|f| compaction_backoff_nanos(f) / 1_000_000_000)
+            .collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        // Never shorter than the first wait, never longer than the cap, at any count.
+        assert_eq!(compaction_backoff_nanos(0), COMPACTION_BACKOFF_NANOS);
+        for f in [64, 65, 1_000, u32::MAX] {
+            assert_eq!(compaction_backoff_nanos(f), COMPACTION_BACKOFF_MAX_NANOS);
+        }
     }
 }

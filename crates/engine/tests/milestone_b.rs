@@ -9,6 +9,7 @@ mod common;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 
 use common::{Store, families, poll_commit};
@@ -18,7 +19,7 @@ use pigeonhole_engine::{
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
-use pigeonhole_io::{Vfs, VfsRef};
+use pigeonhole_io::{ProcessId, Vfs, VfsRef};
 use pigeonhole_sim::{ModelOp, Sim};
 
 const DB: &str = "/db/data.phdb";
@@ -1078,6 +1079,512 @@ fn a_full_arena_stalls_writers_until_a_slow_flush_frees_it() {
     assert!(m.stalls.0 > 0, "writers were never stalled: {m:?}");
     assert_eq!(row_count(&db, &t), 4 * 60 * 32);
     db.close().unwrap();
+}
+
+// ---- #70: a stall on a frozen clock ends on background events ----
+
+/// A VFS whose main-file data-block reads fail while `fail_reads` is set: compactions
+/// (which read their inputs) fail, while flushes and commits (which only write) succeed.
+/// With `real_clock` its clock is real time (it moves on its own, unlike `SimVfs`'s), and
+/// `slow_reads` delays every data-block read.
+#[derive(Debug)]
+struct FailReadsVfs {
+    inner: Arc<SimVfs>,
+    fail_reads: Arc<AtomicBool>,
+    real_clock: Option<std::time::Instant>,
+    slow_reads: Option<std::time::Duration>,
+}
+
+impl FailReadsVfs {
+    fn frozen(inner: &Arc<SimVfs>, fail_reads: &Arc<AtomicBool>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            fail_reads: Arc::clone(fail_reads),
+            real_clock: None,
+            slow_reads: None,
+        }
+    }
+
+    fn real(inner: &Arc<SimVfs>, slow_reads: Option<std::time::Duration>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            fail_reads: Arc::new(AtomicBool::new(false)),
+            real_clock: Some(std::time::Instant::now()),
+            slow_reads,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FailReadsFile {
+    inner: pigeonhole_io::FileRef,
+    fail_reads: Option<Arc<AtomicBool>>,
+    slow_reads: Option<std::time::Duration>,
+}
+
+impl FailReadsFile {
+    fn check(&self, len: usize) -> pigeonhole_io::Result<()> {
+        if let Some(d) = self.slow_reads
+            && self.fail_reads.is_some()
+            && len >= 1024
+        {
+            std::thread::sleep(d);
+        }
+        match &self.fail_reads {
+            Some(f) if f.load(Ordering::Acquire) && len >= 1024 => Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected read failure",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Vfs for FailReadsVfs {
+    fn open(
+        &self,
+        path: &Path,
+        opts: pigeonhole_io::OpenOptions,
+    ) -> pigeonhole_io::Result<pigeonhole_io::FileRef> {
+        let inner = self.inner.open(path, opts)?;
+        Ok(Arc::new(FailReadsFile {
+            inner,
+            fail_reads: (path == Path::new(DB)).then(|| Arc::clone(&self.fail_reads)),
+            slow_reads: self.slow_reads,
+        }))
+    }
+    fn remove(&self, path: &Path) -> pigeonhole_io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn exists(&self, path: &Path) -> pigeonhole_io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn list_dir(&self, dir: &Path) -> pigeonhole_io::Result<Vec<std::path::PathBuf>> {
+        self.inner.list_dir(dir)
+    }
+    fn sync_dir(&self, dir: &Path) -> pigeonhole_io::Result<()> {
+        self.inner.sync_dir(dir)
+    }
+    fn open_shared(
+        &self,
+        name: &str,
+        dir: Option<&Path>,
+        len: u64,
+        mode: pigeonhole_io::SharedOpen,
+    ) -> pigeonhole_io::Result<pigeonhole_io::SharedRegion> {
+        self.inner.open_shared(name, dir, len, mode)
+    }
+    fn remove_shared(&self, name: &str, dir: Option<&Path>) -> pigeonhole_io::Result<()> {
+        self.inner.remove_shared(name, dir)
+    }
+    fn now_micros(&self) -> u64 {
+        match self.real_clock {
+            Some(start) => self.inner.now_micros() + start.elapsed().as_micros() as u64,
+            None => self.inner.now_micros(),
+        }
+    }
+    fn monotonic_nanos(&self) -> u64 {
+        match self.real_clock {
+            Some(start) => self.inner.monotonic_nanos() + start.elapsed().as_nanos() as u64,
+            None => self.inner.monotonic_nanos(),
+        }
+    }
+    fn current_process(&self) -> pigeonhole_io::ProcessId {
+        self.inner.current_process()
+    }
+    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
+        self.inner.process_alive(process)
+    }
+}
+
+impl pigeonhole_io::File for FailReadsFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.check(buf.len())?;
+        self.inner.read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.inner.write_at(buf, offset)
+    }
+    fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        match self.check(buf.len()) {
+            Ok(()) => self.inner.submit_read(buf, offset),
+            Err(e) => pigeonhole_io::Completion::ready(Err(e)),
+        }
+    }
+    fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        self.inner.submit_write(buf, offset)
+    }
+    fn sync_data(&self) -> pigeonhole_io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn submit_sync_data(&self) -> pigeonhole_io::Completion<()> {
+        self.inner.submit_sync_data()
+    }
+    fn sync_all(&self) -> pigeonhole_io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn len(&self) -> pigeonhole_io::Result<u64> {
+        self.inner.len()
+    }
+    fn set_len(&self, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn allocate(&self, offset: u64, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.allocate(offset, len)
+    }
+    fn lock(&self, byte: u64, mode: pigeonhole_io::LockMode) -> pigeonhole_io::Result<()> {
+        self.inner.lock(byte, mode)
+    }
+    fn unlock(&self, byte: u64) -> pigeonhole_io::Result<()> {
+        self.inner.unlock(byte)
+    }
+    fn identity(&self) -> pigeonhole_io::Result<pigeonhole_io::FileIdentity> {
+        self.inner.identity()
+    }
+    fn is_local(&self) -> pigeonhole_io::Result<bool> {
+        self.inner.is_local()
+    }
+}
+
+/// Commits row `i` (2 KiB) on application-owned shards, driving them with `clock`'s time
+/// (a `SimVfs` the test never advances, or a real clock).
+fn commit_frozen(
+    engine: &Engine,
+    shards: &mut [pigeonhole_engine::EngineShard],
+    clock: &dyn Vfs,
+    t: &pigeonhole_engine::TableInfo,
+    i: u32,
+) -> Result<(), Error> {
+    // Incompressible values: data blocks are the only large reads.
+    let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let value: Vec<u8> = (0..2048)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let mut wb = WriteBatch::new();
+    // Rows repeat, so every compaction rewrites (and reads) its inputs.
+    let row = format!("row{:05}", i % 97);
+    put(&mut wb, t, row.as_bytes(), b"q", &value);
+    let mut pc = engine.submit(wb, Some(Durability::None))?;
+    for _ in 0..10_000_000 {
+        if let Poll::Ready(r) = poll_commit(&mut pc) {
+            return r.map(|_| ());
+        }
+        // `run_once` itself must return: a task polling a frozen clock would keep it busy
+        // for ever, since its slice deadline never comes.
+        let now = clock.monotonic_nanos();
+        for s in shards.iter_mut() {
+            s.run_once(now + 1_000);
+        }
+    }
+    panic!("commit {i} never resolved")
+}
+
+#[test]
+fn a_stall_on_a_frozen_clock_ends_when_compaction_fails_or_completes() {
+    // Issue #70: the clock moves only with the caller (the simulator), and the caller is
+    // blocked in the commit, so neither the token bucket nor a timer ever moves. A stall
+    // must end on compaction progress, and on a compaction that fails and backs off.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sim = SimVfs::new(70);
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let vfs: VfsRef = Arc::new(FailReadsVfs::frozen(&sim, &fail_reads));
+        let mut o = EngineOptions::new(vfs);
+        o.create_if_missing = true;
+        o.shards = 1;
+        o.pin_threads = false;
+        o.memtable_budget = 128 << 10;
+        o.memtable_freeze_bytes = 8 << 10;
+        o.wal.segment_size = 256 << 10;
+        o.wal.spare_segments = 1;
+        // Compactions read their inputs from the file, never from the cache.
+        o.block_cache_bytes = 0;
+        let mut c = PickerOptions::default();
+        c.l0_trigger = 2;
+        c.level_base_bytes = 48 << 10;
+        c.level_multiplier = 2;
+        c.max_levels = 4;
+        c.target_sst_bytes = 64 << 10;
+        o.compaction = c;
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let t = engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let mut commit = |i| commit_frozen(&engine, &mut shards, &*sim, &t, i);
+        // Compactions that rewrite fail and back off; flushes keep deepening L0.
+        fail_reads.store(true, Ordering::Release);
+        let mut i = 0;
+        while i < 400 {
+            commit(i).unwrap();
+            i += 1;
+        }
+        let failing = engine.metrics();
+        // The device recovers: the next stall retries compaction.
+        fail_reads.store(false, Ordering::Release);
+        while i < 800 {
+            commit(i).unwrap();
+            i += 1;
+        }
+        let m = engine.metrics();
+        assert!(
+            m.compactions > failing.compactions,
+            "compaction was never retried: {m:?}"
+        );
+        tx.send(i).unwrap();
+    });
+    let rows = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("a stalled commit never resolved on a frozen clock (issue #70)");
+    assert!(rows > 600);
+}
+
+#[test]
+fn a_room_wait_pinned_by_a_snapshot_is_refused_on_a_frozen_clock() {
+    // Issue #70: snapshots hold the memtables they read, so once flushes have emptied the
+    // arena of anything else, no event the shard hears of can free room and the clock
+    // never reaches the stall timeout. The commit is refused with `Busy` instead of
+    // waiting for ever, and goes through once the snapshots are released.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sim = SimVfs::new(71);
+        let vfs: VfsRef = Arc::new(FailReadsVfs::frozen(
+            &sim,
+            &Arc::new(AtomicBool::new(false)),
+        ));
+        let mut o = EngineOptions::new(vfs);
+        o.create_if_missing = true;
+        o.shards = 1;
+        o.pin_threads = false;
+        o.memtable_budget = 128 << 10;
+        o.memtable_freeze_bytes = 8 << 10;
+        o.wal.segment_size = 256 << 10;
+        o.wal.spare_segments = 1;
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let t = engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        // Every commit is followed by a snapshot, which holds the memtables of its view.
+        let mut snaps = Vec::new();
+        let mut i = 0;
+        let refused = loop {
+            assert!(i < 2_000, "never refused: {:?}", engine.metrics());
+            match commit_frozen(&engine, &mut shards, &*sim, &t, i) {
+                Ok(()) => i += 1,
+                Err(Error::Busy) => break i,
+                Err(e) => panic!("commit {i}: {e}"),
+            }
+            snaps.push(engine.snapshot().unwrap());
+        };
+        drop(snaps);
+        commit_frozen(&engine, &mut shards, &*sim, &t, refused).unwrap();
+        tx.send(refused).unwrap();
+    });
+    let refused = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("a commit waiting for arena room never resolved on a frozen clock (issue #70)");
+    assert!(refused > 0);
+}
+
+/// Options for a one-shard application-owned engine on `vfs` whose arena fills quickly.
+fn small_arena(vfs: VfsRef) -> EngineOptions {
+    let mut o = EngineOptions::new(vfs);
+    o.create_if_missing = true;
+    o.shards = 1;
+    o.pin_threads = false;
+    o.memtable_budget = 128 << 10;
+    o.memtable_freeze_bytes = 8 << 10;
+    o.wal.segment_size = 256 << 10;
+    o.wal.spare_segments = 1;
+    o
+}
+
+#[test]
+fn a_reader_pin_waits_for_the_stall_timeout_on_a_moving_clock() {
+    // The frozen-clock refusal of issue #70 must not apply on a clock that moves: a reader
+    // process's snapshot pins retired memtables, which it may release at any time, so a
+    // commit waiting for arena room is refused only after `write_stall_timeout_nanos`
+    // (D124), never at once.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sim = SimVfs::new(72);
+        let vfs: VfsRef = Arc::new(FailReadsVfs::real(&sim, None));
+        let (writer, reader_process) = (
+            ProcessId {
+                pid: 1,
+                start_time: 1,
+            },
+            ProcessId {
+                pid: 2,
+                start_time: 1,
+            },
+        );
+        sim.enter_process(writer);
+        let timeout = std::time::Duration::from_millis(200);
+        let mut o = small_arena(Arc::clone(&vfs));
+        o.write_stall_timeout_nanos = timeout.as_nanos() as u64;
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let t = engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        for i in 0..8 {
+            commit_frozen(&engine, &mut shards, &*vfs, &t, i).unwrap();
+        }
+        sim.enter_process(reader_process);
+        let reader = Engine::open_reader(Path::new(DB), small_arena(Arc::clone(&vfs))).unwrap();
+        let pin = reader.snapshot().unwrap();
+        sim.enter_process(writer);
+        let mut i = 8;
+        loop {
+            assert!(i < 2_000, "never stalled: {:?}", engine.metrics());
+            let started = std::time::Instant::now();
+            match commit_frozen(&engine, &mut shards, &*vfs, &t, i) {
+                Ok(()) => i += 1,
+                Err(Error::Busy) => {
+                    let waited = started.elapsed();
+                    assert!(
+                        waited >= timeout,
+                        "refused after {waited:?}, before the timeout"
+                    );
+                    break;
+                }
+                Err(e) => panic!("commit {i}: {e}"),
+            }
+        }
+        sim.enter_process(reader_process);
+        drop(pin);
+        reader.close().unwrap();
+        tx.send(i).unwrap();
+    });
+    let rows = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("a commit waiting for arena room never resolved");
+    assert!(rows > 8);
+}
+
+#[test]
+fn a_moving_clock_paces_a_deep_l0_with_the_token_bucket() {
+    // D119 on a real clock: compactions are slow (every data-block read takes 1 ms), so L0
+    // outgrows them and writers are paced by the token bucket's time-based refill: they
+    // wait (stalled nanoseconds), and none is refused.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sim = SimVfs::new(73);
+        let vfs: VfsRef = Arc::new(FailReadsVfs::real(
+            &sim,
+            Some(std::time::Duration::from_millis(1)),
+        ));
+        let mut o = small_arena(Arc::clone(&vfs));
+        o.memtable_budget = 1 << 20;
+        o.block_cache_bytes = 0;
+        let mut c = PickerOptions::default();
+        c.l0_trigger = 2;
+        c.level_base_bytes = 48 << 10;
+        c.level_multiplier = 2;
+        c.max_levels = 4;
+        c.target_sst_bytes = 64 << 10;
+        o.compaction = c;
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let t = engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let mut i = 0;
+        while engine.metrics().stalls.1 == 0 {
+            assert!(
+                i < 20_000,
+                "writers were never paced: {:?}",
+                engine.metrics()
+            );
+            commit_frozen(&engine, &mut shards, &*vfs, &t, i).unwrap();
+            i += 1;
+        }
+        tx.send(engine.metrics()).unwrap();
+    });
+    let m = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("the paced writer never finished");
+    assert!(m.stalls.0 > 0 && m.stalls.1 > 0, "{m:?}");
+}
+
+#[test]
+fn close_returns_after_a_room_wait_a_flush_ended_on_a_frozen_clock() {
+    // Issue #88: a wait for arena room that a flush ended, with no write after it, kept its
+    // timeout timer running into the close; on a frozen clock `run_once` spun on it and the
+    // shard never finished closing. Close must end the wait, and the driven shards must
+    // all report idle.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sim = SimVfs::new(88);
+        let vfs: VfsRef = Arc::new(FailReadsVfs::frozen(
+            &sim,
+            &Arc::new(AtomicBool::new(false)),
+        ));
+        let mut o = small_arena(vfs);
+        // No L0 stalls: every stall counted is a wait for arena room.
+        let mut c = PickerOptions::default();
+        c.l0_trigger = 1_000;
+        o.compaction = c;
+        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+        let t = engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        // A burst far larger than the arena (128 KiB): the later members wait for a flush to
+        // free room, then every commit goes through and no write follows.
+        let value = vec![5u8; 2048];
+        let mut pending: Vec<_> = (0..400u32)
+            .map(|i| {
+                let mut wb = WriteBatch::new();
+                put(&mut wb, &t, format!("row{i:05}").as_bytes(), b"q", &value);
+                engine.submit(wb, Some(Durability::None)).unwrap()
+            })
+            .collect();
+        for _ in 0..100_000 {
+            pending.retain_mut(|pc| match poll_commit(pc) {
+                Poll::Ready(r) => {
+                    r.unwrap();
+                    false
+                }
+                Poll::Pending => true,
+            });
+            if pending.is_empty() {
+                break;
+            }
+            let now = sim.monotonic_nanos();
+            for s in shards.iter_mut() {
+                s.run_once(now + 1_000);
+            }
+        }
+        assert!(pending.is_empty(), "the burst never committed");
+        let i = 400;
+        assert!(
+            engine.metrics().stalls.0 > 0,
+            "never waited for room: {:?}",
+            engine.metrics()
+        );
+        engine.close().unwrap();
+        let mut passes = 0u32;
+        loop {
+            let now = sim.monotonic_nanos();
+            let mut busy = false;
+            for s in shards.iter_mut() {
+                busy |= s.run_once(now + 1_000);
+            }
+            if !busy {
+                break;
+            }
+            passes += 1;
+            assert!(passes < 100_000, "the shards never finished closing");
+        }
+        tx.send(i).unwrap();
+    });
+    let rows = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("close never finished after a room wait (issue #88)");
+    assert!(rows > 0);
 }
 
 // ---- #66: the purge record counts entries an earlier compaction dropped as inputs ----

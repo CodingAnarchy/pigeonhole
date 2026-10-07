@@ -23,6 +23,8 @@
 //! An armed power loss can fire on a shard's background I/O (a flush or a compaction)
 //! rather than on a commit. A later step that fails while one is armed and the liveness
 //! probe shows the crash fired is that power loss and recovers from it (issues #56, #62).
+//! Crash runs also `flush` between operations (2%), so a power loss can land in a flush or
+//! a compaction while a commit waits in a write stall (issue #70).
 //!
 //! Seeds: `PIGEONHOLE_SEED` (first seed, default 1) and `PIGEONHOLE_SEEDS` (count, default
 //! 3). A failure prints its seed and the operation trace.
@@ -113,6 +115,8 @@ struct Config {
     memtable_budget: u64,
     /// Block cache capacity in bytes.
     block_cache: usize,
+    /// Per-op probability (ppm) of an explicit `flush`.
+    flush_ppm: u32,
 }
 
 impl Config {
@@ -134,6 +138,7 @@ impl Config {
             durability: None,
             memtable_budget: 4 << 20,
             block_cache: 1 << 20,
+            flush_ppm: 0,
         }
     }
 
@@ -143,6 +148,7 @@ impl Config {
         c.faults.reorder_unsynced = true;
         c.crash_ppm = 15_000;
         c.mid_commit_crash_ppm = 25_000;
+        c.flush_ppm = 20_000;
         c
     }
 }
@@ -164,6 +170,8 @@ struct Stats {
     mid_commit_crashes: usize,
     reopens: usize,
     reads: usize,
+    flushes: usize,
+    busy: usize,
 }
 
 struct Run {
@@ -796,7 +804,22 @@ impl Run {
                     ops.iter().map(show).collect::<Vec<_>>().join("; "),
                     if armed { " (crash armed)" } else { "" }
                 ));
-                match self.commit(&ops, durability) {
+                let mut result = self.commit(&ops, durability);
+                if matches!(&result, Err(e) if e.code() == ErrorCode::Busy)
+                    && !self.snaps.is_empty()
+                {
+                    // The memtable arena is full of memtables this run's snapshots hold and
+                    // nothing is left to flush: on this frozen clock the engine refuses the
+                    // commit rather than wait for a timeout that never comes (issue #70). A
+                    // refused commit must not be applied: the store still matches the model
+                    // without it. Then drop the snapshots and try again.
+                    self.stats.busy += 1;
+                    self.trace.push("BUSY: snapshots dropped".into());
+                    self.compare_dump("after a commit refused with Busy")?;
+                    self.snaps.clear();
+                    result = self.commit(&ops, durability);
+                }
+                match result {
                     Ok(()) => {
                         self.stats.commits += 1;
                         self.model
@@ -953,6 +976,15 @@ impl Run {
                 if self.snaps.len() > 6 {
                     self.snaps.remove(0);
                 }
+            }
+        }
+        if self.cfg.flush_ppm > 0 && rng.chance(self.cfg.flush_ppm) {
+            self.stats.flushes += 1;
+            self.trace.push("FLUSH".into());
+            match self.db().flush() {
+                Ok(()) => {}
+                Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
+                Err(e) => return Err(format!("flush failed: {e} ({:?})", e.code())),
             }
         }
         if self.armed && rng.chance(self.cfg.reopen_ppm.max(self.cfg.crash_ppm)) {

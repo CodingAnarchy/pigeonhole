@@ -66,6 +66,23 @@ fn harness_regressions_from_the_seed_sweep() {
 }
 
 #[test]
+fn failed_compactions_back_off_after_a_crash() {
+    // Issue #79: after a power loss (seed 19) or an injected I/O error (seed 83) killed the
+    // file handles, a failed compaction was retried at once and for ever with the L0 score
+    // at 1.0; on the simulated clock `run_once` never returned, and the client never ran.
+    let mut cfg = Config::standard(400);
+    cfg.shards = 3;
+    cfg.reopen_shards = vec![1, 5, 2, 8, 4];
+    check(19, &cfg);
+    let mut cfg = Config::standard(250);
+    cfg.faults.io_error_ppm = 8_000;
+    cfg.crash_ppm = 5_000;
+    cfg.mid_commit_crash_ppm = 5_000;
+    cfg.shards = 3;
+    check(83, &cfg);
+}
+
+#[test]
 fn sixty_four_shards_behind_env_var() {
     if std::env::var("PIGEONHOLE_SHARDS_64").is_err() {
         eprintln!("skipped: set PIGEONHOLE_SHARDS_64=1");
