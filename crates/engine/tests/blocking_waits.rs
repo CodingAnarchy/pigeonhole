@@ -317,12 +317,23 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
         "visible while shard 1 held the watermark"
     );
+    // Dropping the shard syncs its stream, and that sync waits for every older sync of the
+    // stream to finish (#179), the held group sync included: release it from another
+    // thread once the drop is under way, as the I/O backend would complete it. Shard 1
+    // never runs again, so its group stays unresolved and keeps the watermark down.
+    let releaser = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            gate.release();
+        })
+    };
     drop(b);
+    releaser.join().unwrap();
     let ended = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the visibility wait outlived the shard holding it");
     assert!(matches!(ended, Err(Error::Closed)), "{ended:?}");
-    gate.release();
     // The close ends (it no longer waits on the dead shard) and is unclean.
     assert!(db.close().is_err(), "a close with a dead shard reported Ok");
     assert!(
