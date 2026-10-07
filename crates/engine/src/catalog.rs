@@ -99,7 +99,8 @@ impl Catalog {
         &self.registry
     }
 
-    /// Applies one edit. Shard assignment of tablets is `tablet % shards`.
+    /// Applies one edit. A tablet a `PutTablet` creates goes to shard `tablet % shards`
+    /// (a split or merge then places it with `set_shard`).
     pub(crate) fn apply(&mut self, edit: &Edit, shards: usize) -> Result<()> {
         match edit {
             Edit::CreateTable { table, name } => {
@@ -388,6 +389,35 @@ impl Catalog {
             .filter(|t| t.table == table)
             .map(|t| t.id)
             .collect()
+    }
+
+    /// Hands tablet `id` to `shard` (a move, or a split or merge placing its outputs). Not
+    /// persisted: the manifest has no owner field, so an open re-derives every owner from the
+    /// tablet id (see `docs/design/questions/engine.md`).
+    pub(crate) fn set_shard(&mut self, id: TabletId, shard: ShardId) {
+        if let Some(t) = self.tablets.get_mut(&id) {
+            t.shard = shard;
+        }
+    }
+
+    /// The flushed-through seqno of `(tablet, family)`, or `None` when the tablet no longer
+    /// exists (dropped with its table, or retired by a split or merge after every write to it
+    /// reached SSTs): nothing of it needs replaying.
+    pub(crate) fn flushed_through(&self, tablet: TabletId, family: FamilyId) -> Option<Seqno> {
+        self.tablets
+            .contains_key(&tablet)
+            .then(|| self.flushed.get(&(tablet, family)).copied().unwrap_or(0))
+    }
+
+    /// How many `(tablet, family)` lists name each SST (more than one after a split, D13).
+    pub(crate) fn sst_refs(&self) -> HashMap<SstId, usize> {
+        let mut refs = HashMap::new();
+        for list in self.ssts.values() {
+            for (_, m) in list {
+                *refs.entry(m.id).or_insert(0) += 1;
+            }
+        }
+        refs
     }
 
     /// Re-derives tablet ownership for `shards` shards (a reopen with another shard count).

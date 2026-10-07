@@ -20,6 +20,11 @@ use pigeonhole_sst::SstReader;
 use crate::Result;
 use crate::catalog::Catalog;
 
+/// A tablet, its owning shard and its row range `[start, end)` (a test hook).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub type TabletOwner = (TabletId, u16, Vec<u8>, Option<Vec<u8>>);
+
 /// One tablet of the routing table: a contiguous row range of one table and its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TabletEntry {
@@ -35,9 +40,29 @@ pub(crate) struct TabletEntry {
 /// An immutable routing table: for each table, its tablets' row ranges and owning shards.
 /// Swapped atomically as a whole; read without locks.
 ///
-/// Tablets are assigned to shards deterministically from their id (`tablet % shards`), so
-/// the same database opened with the same shard count routes the same way every time, and a
-/// different shard count only changes which shard applies a row, never the result.
+/// At open every tablet goes to shard `tablet % shards`; while the database runs, splits,
+/// merges and the balancer's moves hand tablets to other shards, and each change publishes a
+/// new map with a higher version. Which shard applies a row never changes the result.
+///
+/// ```
+/// use pigeonhole_engine::{Engine, EngineOptions, FamilyOptions};
+/// use pigeonhole_io::sim::SimVfs;
+///
+/// # fn main() -> pigeonhole_engine::Result<()> {
+/// let mut options = EngineOptions::new(SimVfs::new(1));
+/// options.create_if_missing = true;
+/// options.shards = 2;
+/// options.memtable_budget = 4 << 20;
+/// let db = Engine::open("/db/data.phdb".as_ref(), options)?;
+/// let t = db.create_table("t", &[("f".into(), FamilyOptions::default())])?;
+/// let snap = db.snapshot()?;
+/// // A new table is one tablet covering every row.
+/// let (tablet, shard) = snap.view().tablets().route(t.id, b"any row").unwrap();
+/// assert_eq!(snap.view().tablets().route(t.id, b""), Some((tablet, shard)));
+/// db.close()?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Default)]
 pub struct TabletMap {
     version: u64,
@@ -72,6 +97,16 @@ impl TabletMap {
             Some(end) if row >= end.as_slice() => None,
             _ => Some((t.id, t.shard)),
         }
+    }
+
+    /// The tablets of `table` in row order, as `(tablet, shard, start, end)` (a test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn ranges(&self, table: TableId) -> Vec<TabletOwner> {
+        self.tablets_of(table)
+            .iter()
+            .map(|t| (t.id, t.shard.0, t.start.clone(), t.end.clone()))
+            .collect()
     }
 
     /// The tablets of `table` in row order.

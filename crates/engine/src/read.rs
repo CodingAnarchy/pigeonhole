@@ -490,6 +490,12 @@ impl ScanCursor {
         };
         let view = Arc::clone(&self.snapshot.view);
         let (start, end) = self.bounds()?;
+        // Clamp to the tablet: after a split, children share their parent's SSTs (D13), which
+        // hold rows of the sibling too.
+        let (start, end) = clamp_to_tablet(&tablet, start, end)?;
+        if matches!((&start, &end), (Some(s), Some(e)) if s >= e) {
+            return Ok(true);
+        }
         self.lanes.clear();
         for &family in &self.families {
             let Some(meta) = view.catalog.family(family) else {
@@ -659,6 +665,36 @@ impl ScanCursor {
         let lane = &self.lanes[i];
         CellData::from_pinned(lane.ts, &lane.value, || Arc::clone(&self.snapshot.view))
     }
+}
+
+/// Narrows `[start, end)` (row prefixes, `None` = unbounded) to the rows of `tablet`.
+pub(crate) fn clamp_to_tablet(
+    tablet: &TabletEntry,
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+) -> Result<RowBounds> {
+    let start = if tablet.start.is_empty() {
+        start
+    } else {
+        let mut k = Vec::new();
+        encode_row_prefix(&mut k, &tablet.start)?;
+        Some(match start {
+            Some(s) if s > k => s,
+            _ => k,
+        })
+    };
+    let end = match &tablet.end {
+        None => end,
+        Some(e) => {
+            let mut k = Vec::new();
+            encode_row_prefix(&mut k, e)?;
+            Some(match end {
+                Some(x) if x < k => x,
+                _ => k,
+            })
+        }
+    };
+    Ok((start, end))
 }
 
 /// Reads one row through `view`: every family in `families` order.

@@ -4,6 +4,9 @@
 //! reading; single-shard commit latency per durability level on real files; group-commit
 //! throughput with many committers; and write scaling from one to N shards.
 //!
+//! Issue #38 adds write scaling on one table whose tablets the balancer spreads over the
+//! shards.
+//!
 //! Milestone B adds the LSM paths (issue #37): sustained writes with flushes and
 //! compactions running, point gets on flushed data with a hot and a cold block cache, and
 //! scan throughput over SSTs.
@@ -287,6 +290,97 @@ fn scaling(c: &mut Criterion) {
     group.finish();
 }
 
+/// Write scaling on one table (issue #38): N committer threads writing hashed rows of a
+/// single table. The balancer splits the table's one tablet over the shards and moves the
+/// pieces during a warmup; the measurement starts once every shard owns part of the table.
+fn scaling_one_table(c: &mut Criterion) {
+    let max = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let mut group = c.benchmark_group("scaling-one-table-buffered");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(4));
+    let mut shards = 1;
+    while shards <= max {
+        let vfs: VfsRef = PreadVfs::new(2);
+        let path = temp_db(&format!("scale-one-{shards}"));
+        let mut o = options(vfs, shards);
+        o.tablet_changes = true;
+        o.balance_interval_nanos = 20_000_000;
+        let db = Engine::open(&path, o).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let row = |i: u64| format!("{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).into_bytes();
+        // Warm up until the table's tablets cover every shard (or 10 s pass).
+        let started = Instant::now();
+        let mut next = 0u64;
+        loop {
+            let owners: std::collections::BTreeSet<u16> = db
+                .snapshot()
+                .unwrap()
+                .view()
+                .tablets()
+                .ranges(t.id)
+                .iter()
+                .map(|r| r.1)
+                .collect();
+            if owners.len() >= shards || started.elapsed() > Duration::from_secs(10) {
+                eprintln!(
+                    "{shards} shards: table spread over {} shards after {:?}",
+                    owners.len(),
+                    started.elapsed()
+                );
+                break;
+            }
+            std::thread::scope(|s| {
+                for k in 0..shards as u64 {
+                    let (db, t) = (&db, &t);
+                    s.spawn(move || {
+                        for j in 0..2_000u64 {
+                            let mut wb = WriteBatch::new();
+                            put(&mut wb, t, &row(next + k * 2_000 + j), b"warmup");
+                            db.commit(wb, Some(Durability::Buffered)).unwrap();
+                        }
+                    });
+                }
+            });
+            next += shards as u64 * 2_000;
+        }
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(BenchmarkId::new("commits/s per thread", shards), |b| {
+            b.iter_custom(|iters| {
+                let per = (iters / shards as u64 + 1).min(5_000);
+                let base = next;
+                next += per * shards as u64;
+                let start = Instant::now();
+                std::thread::scope(|s| {
+                    for k in 0..shards as u64 {
+                        let (db, t) = (&db, &t);
+                        s.spawn(move || {
+                            for j in 0..per {
+                                let mut wb = WriteBatch::new();
+                                put(
+                                    &mut wb,
+                                    t,
+                                    &row(base + k * per + j),
+                                    b"value-of-32-bytes-padding-......",
+                                );
+                                db.commit(wb, Some(Durability::Buffered)).unwrap();
+                            }
+                        });
+                    }
+                });
+                (start.elapsed() / shards as u32)
+                    .mul_f64(iters as f64 / (per * shards as u64) as f64)
+            })
+        });
+        db.close().unwrap();
+        shards *= 2;
+    }
+    group.finish();
+}
+
 /// Options for the LSM benchmarks: small memtables so flushes and compactions run during
 /// the measurement, and a block cache of `cache_bytes`.
 fn lsm_options(vfs: VfsRef, cache_bytes: usize) -> EngineOptions {
@@ -427,6 +521,7 @@ criterion_group!(
     gets,
     commits,
     scaling,
+    scaling_one_table,
     sustained_writes,
     flushed_gets,
     flushed_scans

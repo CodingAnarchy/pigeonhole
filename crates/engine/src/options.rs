@@ -51,8 +51,25 @@ pub struct EngineOptions {
     pub reader_slots: u32,
     /// WAL segment configuration.
     pub wal: WalOptions,
-    /// Tablet split threshold in bytes of live data (default 256 MiB).
+    /// Tablet split threshold in bytes of live data (default 256 MiB). A tablet whose SSTs
+    /// hold at least this much splits in two; two adjacent cold tablets on one shard holding
+    /// less than a quarter of it together merge.
     pub tablet_split_bytes: u64,
+    /// Lets tablets split, merge and move (default off). Off, every table stays one tablet
+    /// on one shard: the balancer never runs and explicit tablet changes are refused with
+    /// `Unsupported`. Splits, merges, moves and the balancer are still being hardened (#38).
+    pub tablet_changes: bool,
+    /// How often each shard's balancer looks at its tablets (nanoseconds, default 100 ms):
+    /// size splits, write-skew splits, moves to colder shards and merges of cold tablets.
+    /// 0 turns the balancer off (tablets then change only through explicit requests). Only
+    /// read when `tablet_changes` is on.
+    pub balance_interval_nanos: u64,
+    /// Rows a shard must write in one balancer interval before write skew moves or splits
+    /// its tablets (default 2,000), so an idle database never reshuffles.
+    pub balance_min_writes: u64,
+    /// A shard whose write load (or memtable bytes) exceeds this multiple of the mean over
+    /// all shards is skewed (default 1.25).
+    pub balance_skew: f64,
     /// Merge operators available to this process.
     pub merge_operators: MergeRegistry,
     /// Open even if a family names an unregistered merge operator: read-only, compaction
@@ -86,6 +103,10 @@ impl EngineOptions {
             reader_slots: 126,
             wal: WalOptions::default(),
             tablet_split_bytes: 256 << 20,
+            tablet_changes: false,
+            balance_interval_nanos: 100_000_000,
+            balance_min_writes: 2_000,
+            balance_skew: 1.25,
             merge_operators: MergeRegistry::default(),
             allow_unregistered_merge: false,
             compaction: PickerOptions::default(),
