@@ -4411,6 +4411,26 @@ impl ShardState {
         )));
     }
 
+    /// The smallest user timestamp `family` gets from the shares this shard prepared and
+    /// holds until the decision: a committed share lands in the memtables under its own,
+    /// possibly lower, seqno, so a compaction counts it as above its inputs (D70; issue
+    /// #132). Every tablet of the family counts, since routing may change before the
+    /// decision; `u64::MAX` when there is none.
+    fn prepared_min_ts(&self, family: FamilyId) -> Timestamp {
+        let mut min = u64::MAX;
+        for share in self.prepared.values() {
+            for m in share.bytes.batch().iter() {
+                // A share that does not decode fails its apply; it adds nothing.
+                if let Ok(m) = m
+                    && m.family == family
+                {
+                    min = min.min(m.ts.unwrap_or(share.commit_ts));
+                }
+            }
+        }
+        min
+    }
+
     fn start_compaction(
         &mut self,
         view: &Arc<View>,
@@ -4437,7 +4457,11 @@ impl ShardState {
             "shard {} compaction start {:?}: inputs {:?} -> level {} ({:?})",
             self.id.0, key, task.inputs, task.output_level, task.kind
         );
-        let mem_min_ts = self.memtables.get(&key).map_or(u64::MAX, MemSlot::min_ts);
+        let mem_min_ts = self
+            .memtables
+            .get(&key)
+            .map_or(u64::MAX, MemSlot::min_ts)
+            .min(self.prepared_min_ts(key.1));
         let now = self.shared.vfs.now_micros();
         let gc = compact::gc_policy(&self.shared, fam, &task, mem_min_ts, now);
         let record =
