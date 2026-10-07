@@ -274,7 +274,6 @@ Reopening after a crash with a `memtable_budget` too small for the WAL's unflush
 |---|---|
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
 | `Compaction::Tiered`, `FifoByTime`, `zstd`, blob separation, custom merge operators | Phase 2. |
-| Tablet splits | Off by default: a table stays on one shard, so one table's writes use one shard thread. `Options::tablet_changes(true)` lets tablets split, merge and move so they spread over every shard ([#38](https://github.com/CodingAnarchy/pigeonhole/issues/38)). |
 
 Later phases:
 

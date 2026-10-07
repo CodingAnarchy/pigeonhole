@@ -64,7 +64,7 @@ impl Default for Options {
             allow_unregistered_merge_operators: false,
             vfs: None,
             wal_segment_size: None,
-            tablet_changes: false,
+            tablet_changes: true,
             tablet_balance: None,
         }
     }
@@ -147,7 +147,7 @@ impl Options {
         self
     }
 
-    /// Let a table's tablets split, merge and move between shards (default off), so the
+    /// Let a table's tablets split, merge and move between shards (default on), so the
     /// writes of one table spread over every shard. Off, each table is one tablet on one
     /// shard: writes to a single table use one shard thread whatever [`shards`](Self::shards)
     /// says, and only commits touching several tables run on several shards.
@@ -162,7 +162,8 @@ impl Options {
     /// ```
     /// use pigeonhole::Options;
     ///
-    /// let options = Options::default().shards(4).tablet_changes(true);
+    /// // Keep every table on one shard.
+    /// let options = Options::default().shards(4).tablet_changes(false);
     /// # let _ = options;
     /// ```
     pub fn tablet_changes(mut self, yes: bool) -> Self {

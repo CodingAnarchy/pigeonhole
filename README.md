@@ -5,7 +5,7 @@
 [![CI](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml/badge.svg)](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status: Phase 1 in progress: usable, disk-backed sync API.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; `flush`, `compact` and `backup` work, and a clean close leaves one file. Commits are crash-safe through the write-ahead log. Tablet splits (one table still lives on one shard) and the Phase 1 gate are still to come. See [`docs/status.md`](docs/status.md) for progress.
+> **Status: Phase 1 in progress: usable, disk-backed sync API.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; `flush`, `compact` and `backup` work, and a clean close leaves one file. Commits are crash-safe through the write-ahead log. Tablets split and move between shards (on by default); the Phase 1 gate is still to come. See [`docs/status.md`](docs/status.md) for progress.
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
 

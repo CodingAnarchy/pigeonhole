@@ -40,6 +40,10 @@ const LOAD_ALPHA: f64 = 0.5;
 /// moving averages catch up with a change before the next one is decided.
 const DWELL_PASSES: u64 = 10;
 
+/// The longest balancer interval of an idle shard: passes that find nothing to do, with no
+/// writes and no tablet change since the last one, double the interval up to this (10 s).
+const BALANCE_IDLE_CAP_NANOS: u64 = 10_000_000_000;
+
 /// Slots reserved on shards receiving tablets (`LoadSlot::reserved`).
 type Reserved = Vec<(ShardId, usize)>;
 
@@ -990,10 +994,28 @@ impl ShardState {
             return;
         }
         let now = ctx.now_nanos();
+        let base = cfg.interval_nanos.max(1);
+        let epoch = self.shared.tablet_epoch.load(Ordering::Acquire);
+        // A write or a tablet change (here or on any shard) ends an idle backoff: the next
+        // pass is due one base interval from now.
+        let active = self.window_writes > 0
+            || self.op.is_some()
+            || !self.op_queue.is_empty()
+            || epoch != self.balance_epoch;
+        if active && self.balance_interval > base {
+            self.balance_interval = base;
+            let due = now.saturating_add(base);
+            if due < self.next_balance {
+                self.next_balance = due;
+                self.cancel_balance_timer();
+                self.arm_balance_timer(ctx);
+            }
+        }
         if !force && now < self.next_balance {
             return;
         }
-        self.next_balance = now.saturating_add(cfg.interval_nanos.max(1));
+        self.next_balance = now.saturating_add(base);
+        let wrote = self.window_writes > 0;
         self.balance_pass += 1;
         // Moving averages of the write load: a shard's (published for the other shards) and
         // each tablet's (#103). One interval's swing, or a flush, never decides a move.
@@ -1035,6 +1057,7 @@ impl ShardState {
             l.seen = 0;
             l.samples.clear();
         }
+        let decision_none = decision.is_none();
         match decision {
             Some(kind) => {
                 trace!("shard {} balancer: {kind:?}", self.id.0);
@@ -1053,6 +1076,25 @@ impl ShardState {
                 }
             }
         }
+        // Idle backoff: a pass that found nothing to do, after no writes and no tablet change,
+        // doubles the interval (up to `BALANCE_IDLE_CAP_NANOS`, never below the base), so an
+        // idle shard wakes rarely; anything else returns to the base interval.
+        let quiet = idle
+            && !wrote
+            && decision_none
+            && cleanups.is_empty()
+            && epoch == self.balance_epoch
+            && self.op.is_none();
+        let current = self.balance_interval.max(base);
+        self.balance_interval = if quiet {
+            current
+                .saturating_mul(2)
+                .min(BALANCE_IDLE_CAP_NANOS.max(base))
+        } else {
+            base
+        };
+        self.balance_epoch = self.shared.tablet_epoch.load(Ordering::Acquire);
+        self.next_balance = now.saturating_add(self.balance_interval);
         if !cleanups.is_empty() {
             for c in cleanups {
                 if !self.cleanups.contains(&c) {

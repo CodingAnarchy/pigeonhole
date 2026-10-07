@@ -1836,3 +1836,47 @@ fn an_idle_shard_still_merges_cold_tablets() {
     assert_eq!(db.scan_rows().len(), 40);
     close(db);
 }
+
+#[test]
+fn an_idle_shard_backs_off_its_balancer_and_a_write_resets_it() {
+    // With tablet changes on by default every idle shard wakes for its balancer pass: a pass
+    // that finds nothing to do after no writes doubles the interval, up to 10 s, and the next
+    // write brings it back to the base interval.
+    const BASE: u64 = 1_000_000;
+    const CAP: u64 = 10_000_000_000;
+    let mut db = open(1, |o| {
+        o.balance_interval_nanos = BASE;
+        ticking(o);
+    });
+    db.step();
+    let deadline = |db: &Db| {
+        db.shards[0]
+            .next_deadline()
+            .expect("a balancer pass is pending")
+    };
+    // Run each pass when it is due and record when the next one is due.
+    let mut due = vec![deadline(&db)];
+    for _ in 0..24 {
+        let now = db.clock.monotonic_nanos();
+        db.vfs.advance(due.last().unwrap().saturating_sub(now) + 1);
+        db.step();
+        due.push(deadline(&db));
+    }
+    let gaps: Vec<u64> = due.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps[0] <= 8 * BASE, "{gaps:?}");
+    assert!(
+        gaps.windows(2).all(|w| w[1] + BASE / 2 >= w[0]),
+        "the interval shrank while idle: {gaps:?}"
+    );
+    let last = *gaps.last().unwrap();
+    assert!(
+        (CAP..CAP + BASE).contains(&last),
+        "not capped at 10 s: {gaps:?}"
+    );
+    db.put(b"row", b"v");
+    db.step();
+    let now = db.clock.monotonic_nanos();
+    let gap = deadline(&db).saturating_sub(now);
+    assert!(gap <= BASE, "a write did not reset the interval: {gap}");
+    close(db);
+}

@@ -27,8 +27,9 @@
 //! a compaction while a commit waits in a write stall (issue #70).
 //!
 //! Seeds: `PIGEONHOLE_SEED` (first seed, default 1) and `PIGEONHOLE_SEEDS` (count, default
-//! 1). A failure prints its seed and the operation trace. `PIGEONHOLE_TABLET_CHANGES=1` runs
-//! every test with tablet changes on (`Options::tablet_changes`, with a fast balancer).
+//! 1). A failure prints its seed and the operation trace. Tablet changes are on, as by
+//! default, with a fast balancer so tablets split, move and merge within a run;
+//! `PIGEONHOLE_TABLET_CHANGES=0` runs every test with them off.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -121,8 +122,11 @@ struct Config {
     /// Per-op probability (ppm) of an explicit `compact`.
     compact_ppm: u32,
     /// `Options::tablet_changes`, with a balancer tuned so tablets split, move and merge
-    /// within a run. Defaults to `PIGEONHOLE_TABLET_CHANGES` (`1` on, else off).
+    /// within a run. On unless `PIGEONHOLE_TABLET_CHANGES=0`.
     tablet_changes: bool,
+    /// With `tablet_changes`, tune the balancer so tablets change within a short run (else
+    /// the engine's defaults, under which nothing changes in these runs).
+    fast_balancer: bool,
 }
 
 impl Config {
@@ -146,7 +150,8 @@ impl Config {
             block_cache: 1 << 20,
             flush_ppm: 20_000,
             compact_ppm: 20_000,
-            tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").is_ok_and(|v| v == "1"),
+            tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").as_deref() != Ok("0"),
+            fast_balancer: true,
         }
     }
 
@@ -364,15 +369,17 @@ impl Run {
     }
 
     fn open(&mut self) -> Result<(), String> {
-        let options = Options::default()
+        let mut options = Options::default()
             .vfs(Arc::clone(&self.vfs) as _)
             .shards(self.cfg.shards)
             .memtable_budget(self.cfg.memtable_budget)
             .wal_segment_size(256 << 10)
             .block_cache(self.cfg.block_cache)
-            .tablet_changes(self.cfg.tablet_changes)
+            .tablet_changes(self.cfg.tablet_changes);
+        if self.cfg.fast_balancer {
             // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
-            .tablet_balance(Duration::from_micros(15), 3, 8 << 10);
+            options = options.tablet_balance(Duration::from_micros(15), 3, 8 << 10);
+        }
         let db = Pigeonhole::open(DB, options).map_err(|e| format!("open: {e}"))?;
         let mut tables = Vec::new();
         for name in TABLES {
@@ -1128,18 +1135,18 @@ fn crashes_and_reopens_match_a_durable_prefix() {
 }
 
 #[test]
-fn quiet_runs_with_tablet_changes_match_the_model() {
+fn quiet_runs_with_tablet_changes_off_match_the_model() {
     for shards in [1, 2, 4, 8] {
         let mut cfg = Config::quiet(1000, shards);
-        cfg.tablet_changes = true;
+        cfg.tablet_changes = false;
         check(&cfg);
     }
 }
 
 #[test]
-fn crashes_with_tablet_changes_match_a_durable_prefix() {
+fn crashes_with_tablet_changes_off_match_a_durable_prefix() {
     let mut cfg = Config::crashing(1000);
-    cfg.tablet_changes = true;
+    cfg.tablet_changes = false;
     check(&cfg);
 }
 
@@ -1216,6 +1223,10 @@ fn run_with_flushed_commits(seed: u64) -> (Run, Rng) {
     (cfg.crash_ppm, cfg.mid_commit_crash_ppm, cfg.reopen_ppm) = (0, 0, 0);
     cfg.memtable_budget = 256 << 10;
     cfg.block_cache = 0;
+    // The background I/O these runs arm a power loss for must be a flush alone: with the
+    // fast balancer a size split started beside it, and its manifest commit could take the
+    // crash before the commit under test was acknowledged (seed 51 on CI, PR #168).
+    cfg.fast_balancer = false;
     let mut run = Run::new(seed, cfg).expect("open");
     let mut rng = Rng::new(seed);
     for op in Workload::new(seed, "t", run.cfg.spec.clone()).take(60) {

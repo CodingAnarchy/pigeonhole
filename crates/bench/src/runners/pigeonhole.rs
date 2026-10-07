@@ -21,7 +21,8 @@ pub(crate) struct Settings {
     pub(crate) shards: Option<usize>,
     pub(crate) memory: MemoryBudget,
     pub(crate) sync: bool,
-    pub(crate) tablet_changes: bool,
+    /// `None`: the library default (on).
+    pub(crate) tablet_changes: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -94,18 +95,19 @@ impl PigeonholeRunner {
         self
     }
 
-    /// `true`: tablets split, merge and move between shards, so the bench table's writes
-    /// spread over every shard ([`Options::tablet_changes`]); `false` (default): the table is
-    /// one tablet on one shard.
+    /// `true` (the library default): tablets split, merge and move between shards, so the
+    /// bench table's writes spread over every shard ([`Options::tablet_changes`]); `false`:
+    /// the table is one tablet on one shard.
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
     ///
-    /// let r = PigeonholeRunner::default().shards(4).tablet_changes(true);
-    /// assert!(r.describe().contains("tablets=on"));
+    /// assert!(PigeonholeRunner::default().describe().contains("tablets=on"));
+    /// let r = PigeonholeRunner::default().shards(4).tablet_changes(false);
+    /// assert!(!r.describe().contains("tablets=on"));
     /// ```
     pub fn tablet_changes(mut self, yes: bool) -> Self {
-        self.settings.tablet_changes = yes;
+        self.settings.tablet_changes = Some(yes);
         self
     }
 }
@@ -124,8 +126,10 @@ impl Runner for PigeonholeRunner {
                 Durability::Buffered
             })
             .memtable_budget(s.memory.write_buffer)
-            .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX))
-            .tablet_changes(s.tablet_changes);
+            .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
+        if let Some(yes) = s.tablet_changes {
+            options = options.tablet_changes(yes);
+        }
         if let Some(n) = s.shards {
             options = options.shards(n);
         }
@@ -191,7 +195,11 @@ impl Runner for PigeonholeRunner {
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             durability(s.sync),
-            if s.tablet_changes { " tablets=on" } else { "" }
+            if s.tablet_changes == Some(false) {
+                ""
+            } else {
+                " tablets=on"
+            }
         )
     }
 }

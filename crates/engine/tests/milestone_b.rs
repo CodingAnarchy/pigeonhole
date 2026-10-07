@@ -832,7 +832,11 @@ fn sim_run_closes_to_one_file_and_reopens_without_replay() {
 #[test]
 fn large_memtable_values_are_pinned_not_copied() {
     let vfs = SimVfs::new(29);
-    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    let mut o = owned(Arc::clone(&vfs), 1);
+    // Chunks of 16 KiB (arena / 256 with tablet changes on, D140): every value fits one, so
+    // nothing freezes and all of them stay memtable-resident.
+    o.memtable_budget = 4 << 20;
+    let db = Engine::open(Path::new(DB), o).unwrap();
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
@@ -1803,6 +1807,9 @@ fn starved_flush_and_compact(moving_clock: bool) {
     let mut o = common::options(Arc::clone(&sim), 1, 2 << 20);
     o.vfs = Arc::clone(&vfs);
     o.memtable_freeze_bytes = 1 << 20;
+    // The row counts starve an arena of 64 chunks of 32 KiB, the layout without tablet
+    // changes. With them on the arena has 256 chunks (D140), and these rows leave room.
+    o.tablet_changes = false;
     o.write_stall_timeout_nanos = TIMEOUT;
     let rows = |round: u32, family: usize| match (round, family) {
         (0, 0..4) => 190,

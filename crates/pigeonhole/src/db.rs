@@ -133,7 +133,8 @@ impl Pigeonhole {
     /// until the [`Shard::set_wakeup`] callback fires (work arrived or I/O completed) or
     /// [`Shard::next_wakeup`] passes (background work is due), whichever comes first. An idle
     /// shard then uses no CPU, even while a write stall or a failed compaction's retry is
-    /// pending.
+    /// pending, beyond a short tablet-balancer pass (with [`Options::tablet_changes`] on, the
+    /// default): every 100 ms after writes, backing off to one every 10 s while idle.
     ///
     /// To close, call [`Pigeonhole::close`] and keep driving each shard the same way until
     /// [`Shard::closed`] returns `Some`, then drop it: the close's flush and syncs run on
@@ -549,7 +550,7 @@ impl Shard {
     /// whether work remains.
     ///
     /// Background work waiting for a time (a write stall's pacing, a wait for memtable room,
-    /// a failed compaction's retry) is not work that remains: with only that left it returns
+    /// a failed compaction's retry, the tablet balancer's next pass) is not work that remains: with only that left it returns
     /// `false`, and [`next_wakeup`](Shard::next_wakeup) says when to call it again. The
     /// callback registered with [`set_wakeup`](Shard::set_wakeup) does not fire for it.
     pub fn run_once(&mut self, budget: std::time::Duration) -> bool {
@@ -559,8 +560,11 @@ impl Shard {
     }
 
     /// How long until background work on this shard is due (a write stall's pacing, a wait
-    /// for memtable room, a failed compaction's retry), or `None` when none is waiting for a
-    /// time. `Some(Duration::ZERO)` means it is due now.
+    /// for memtable room, a failed compaction's retry, the tablet balancer's next pass), or
+    /// `None` when none is waiting for a time. `Some(Duration::ZERO)` means it is due now.
+    /// With [`Options::tablet_changes`] on (the default) the balancer's next pass is always
+    /// pending, so this is never `None`; it is bounded by the balancer's current interval:
+    /// 100 ms after a write or a tablet change, doubling with each idle pass up to 10 s.
     ///
     /// After [`run_once`](Shard::run_once) returns `false`, sleep until the
     /// [`set_wakeup`](Shard::set_wakeup) callback fires or this much time passes, whichever
@@ -576,8 +580,8 @@ impl Shard {
     /// let (db, mut shards) = Pigeonhole::open_application_owned(dir.join("w.phdb"), Options::default().shards(1))?;
     /// let shard = &mut shards[0];
     /// while shard.run_once(Duration::from_micros(200)) {}
-    /// // Nothing is waiting for a time: sleep until the wakeup callback fires.
-    /// assert_eq!(shard.next_wakeup(), None);
+    /// // Idle: only the tablet balancer's next pass is waiting for a time (at most 10 s).
+    /// assert!(shard.next_wakeup().is_some_and(|d| d <= Duration::from_secs(10)));
     /// db.close()?;
     /// // This thread drives the shard, so `close` cannot wait: drive it until it has closed
     /// // (a real loop sleeps between calls as above).

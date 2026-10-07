@@ -56,6 +56,21 @@ fn faults_and_crashes_for_every_shard_count() {
 }
 
 #[test]
+fn runs_with_tablet_changes_off_match_the_model() {
+    // Tablet changes are on by default (D129 as amended); the off path keeps its coverage.
+    for shards in [1, 3] {
+        for mut cfg in [Config::quiet(300), Config::standard(250)] {
+            cfg.shards = shards;
+            cfg.tablet_changes = false;
+            cfg.balance_fast = false;
+            for seed in seeds() {
+                check(seed, &cfg);
+            }
+        }
+    }
+}
+
+#[test]
 fn harness_regressions_from_the_seed_sweep() {
     // Seed 248: an armed crash fired on background I/O and the held snapshots' re-check
     // after a commit found the store dead (issue #62's pattern). Seed 288: a surviving

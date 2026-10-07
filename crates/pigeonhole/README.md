@@ -8,7 +8,8 @@ SQLite's deployment model (one file, a library, no server).
 > crash-safe through the write-ahead log: memtables flush into the file and compact, so data
 > is bounded by the disk, not memory (`Options::memtable_budget` only sizes the per-shard
 > write buffer). `flush`, `compact` and `backup` work, and a clean close leaves one file.
-> One table still lives on one shard until tablet splits land. The async API arrives in
+> A table's tablets split and move between shards, so one table's writes spread over
+> them (`Options::tablet_changes`, on by default). The async API arrives in
 > Phase 3 behind the `async` feature.
 
 ## Quickstart

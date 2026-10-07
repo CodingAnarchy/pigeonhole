@@ -32,7 +32,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
 | `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |
-| `--tablet-changes` | Pigeonhole: tablets split, merge and move between shards (`Options::tablet_changes`), so one table's writes spread over every shard (default: off) |
+| `--no-tablet-changes` | Pigeonhole: keep each table one tablet on one shard (`Options::tablet_changes(false)`; by default tablets split, merge and move between shards, so one table's writes spread over every shard) |
 | `--json PATH`, `--markdown PATH` | Write results |
 | `--tolerance T` | `compare`: ±T on throughput and p50, ±2T on p99 (default 0.20) |
 
@@ -134,7 +134,7 @@ Each result row gives the workload, store, store settings, size, client threads,
 
 **The scaling gate has two halves, checked differently.** Each `scaling` run evaluates only the efficiency half and prints pass or fail. The other half, "no regression in single-shard p99", needs a baseline: compare this run's `scaling.json` against a stored one with `phdb-bench compare old/scaling.json new/scaling.json`, which checks the single-shard p99 within the p99 tolerance. The weekly `bench.yml` uploads `scaling.json` with every run, so each run leaves the baseline for the next.
 
-**Scaling needs tablet changes.** Without `--tablet-changes` a table is one tablet on one shard, so the skewed workload's writes all land on one shard whatever N is, and `scaling` fails by construction. Run `scaling --tablet-changes --shards N`: the balancer splits the table under write skew and spreads the pieces over the shards during the load phase. Tracked in [#51](https://github.com/CodingAnarchy/pigeonhole/issues/51).
+**Scaling needs tablet changes** (on by default). With `--no-tablet-changes` a table is one tablet on one shard, so the skewed workload's writes all land on one shard whatever N is, and `scaling` fails by construction. With them on, the balancer splits the table under write skew and spreads the pieces over the shards during the load phase. Tracked in [#51](https://github.com/CodingAnarchy/pigeonhole/issues/51).
 
 ### Reproducibility tolerance
 
