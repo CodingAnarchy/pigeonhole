@@ -1,7 +1,7 @@
 # Engine: tablet changes on by default (#38)
 
 ## Proposed decision: amend D129, tablet changes are on by default
-D129 kept `EngineOptions::tablet_changes` off until splits, merges, moves and the balancer were hardened. The bugs it named (#94, #95, #98, #102–#105) and the ones the first default-on seed sweep found (#131, #132) are fixed. The flip waits for #163, which the sweeps of this branch found; the sweep results go in the PR.
+D129 kept `EngineOptions::tablet_changes` off until splits, merges, moves and the balancer were hardened. The bugs it named (#94, #95, #98, #102–#105) and the ones the first default-on seed sweep found (#131, #132) are fixed. The sweeps of this branch then found #163, a model-harness oracle bug (fixed in the PR below this one in the stack); the sweep results are in the PR.
 
 **Proposed amendment to D129:** "`EngineOptions::tablet_changes` and `pigeonhole::Options::tablet_changes` default to `true`. Setting them to `false` keeps every table one tablet on shard `tablet % shards`, as before #38; everything D129 gates still runs only when they are on."
 
