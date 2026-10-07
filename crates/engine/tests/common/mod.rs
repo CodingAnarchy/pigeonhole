@@ -255,6 +255,11 @@ pub struct Stats {
     pub flushes: u64,
     pub compactions: u64,
     pub purges: usize,
+    /// Records naming a seqno no commit of the client holds (refused attempts, lost
+    /// commits), left out of the recovery oracle.
+    pub unowned_records: usize,
+    /// Earlier copies of a `(seqno, kind)` whose seqno recovery reused after a crash.
+    pub reused_records: usize,
     /// Commits recovered only from SSTs (their WAL records were checkpointed away).
     pub sst_only: usize,
     /// Mutating VFS operations the run made before its final crash: the crash points a
@@ -1007,6 +1012,9 @@ struct World {
     /// Per stream, the records appended to it in order, as observed in the WAL (plus
     /// `None` commits, placed when they resolve: their records wait in the buffer).
     stream_records: BTreeMap<u32, Vec<(Seqno, RecKind)>>,
+    /// Per stream, parallel to `stream_records`: how many crashes had happened when each
+    /// record was appended (a seqno may be reused only across a crash).
+    stream_epochs: BTreeMap<u32, Vec<usize>>,
     /// Bottommost compactions applied to the model, by manifest version.
     purges: Vec<PurgeEvent>,
     /// Compactions reported by the engine whose manifest version is not published yet.
@@ -1055,6 +1063,7 @@ impl World {
             workload,
             queued: std::collections::VecDeque::new(),
             stream_records: BTreeMap::new(),
+            stream_epochs: BTreeMap::new(),
             purges: Vec::new(),
             pending_purges: Vec::new(),
             compaction_floor: 0,
@@ -1073,12 +1082,26 @@ impl World {
     /// A step saw an error with the liveness probe dead: an armed power loss fired on a
     /// shard's background I/O (a flush or compaction) while nothing was in flight, and the
     /// error is that crash, not a divergence (issue #62). Recovers from it.
-    fn background_crash(&mut self, e: &Error, rng: &mut Rng) -> Result<(), Fail> {
+    fn background_crash(&mut self, e: impl fmt::Display, rng: &mut Rng) -> Result<(), Fail> {
         self.stats.background_crashes += 1;
         self.trace.push(format!(
             "  -> the armed power loss fired in the background ({e})"
         ));
         self.crash_and_recover(CrashKind::Power, true, rng)
+    }
+
+    /// The outcome of a check that reads the store (a dump, a held snapshot's re-check):
+    /// a failure with the liveness probe dead is an armed power loss that fired in the
+    /// background, so the run recovers from it instead. Returns whether it did.
+    fn recover_if_fired(&mut self, r: Result<(), Fail>, rng: &mut Rng) -> Result<bool, Fail> {
+        match r {
+            Ok(()) => Ok(false),
+            Err(f) if !self.alive() => {
+                self.background_crash(f.message, rng)?;
+                Ok(true)
+            }
+            Err(f) => Err(f),
+        }
     }
 
     fn model_seqno(&self, engine_seqno: Seqno) -> Seqno {
@@ -1124,6 +1147,10 @@ impl World {
                 .entry(u32::from(r.stream))
                 .or_default()
                 .push((r.seqno, kind));
+            self.stream_epochs
+                .entry(u32::from(r.stream))
+                .or_default()
+                .push(self.stats.crashes);
         }
     }
 
@@ -1406,8 +1433,10 @@ impl World {
             }
             Err(e) => return fail(FailureClass::Protocol, format!("maintenance: {e}")),
         }
-        self.drain_compactions()?;
-        self.check_held_snapshots()
+        let checked = self
+            .drain_compactions()
+            .and_then(|()| self.check_held_snapshots());
+        self.recover_if_fired(checked, rng).map(|_| ())
     }
 
     fn compare_dump(&self, snap: &Snapshot, class: FailureClass) -> Result<(), Fail> {
@@ -1665,65 +1694,75 @@ impl World {
         // Faults stay off until the recovered state has been checked: the checks read the
         // files directly and must not fail on an injected error.
 
-        // Unknown seqnos in the WAL must match unacknowledged commits, by their mutations.
+        // Unknown seqnos in the WAL must match unacknowledged commits, by their mutations. A
+        // cross-shard commit may have lost some shares, so a seqno's surviving records may
+        // hold a subset of its commit's mutations, and a share can fit several commits (a row
+        // delete covers a family delete of the same row). Each commit owns at most one seqno,
+        // so seqnos and commits are matched as a whole (a maximum matching, exact fits tried
+        // first), never greedily in seqno order.
         let mut unacked = std::mem::take(&mut self.unacked);
-        let mut matched: BTreeMap<Seqno, Committed> = BTreeMap::new();
+        let unacked_keys: Vec<BTreeSet<MutationKey>> = unacked
+            .iter()
+            .map(|c| Self::mutation_keys(&c.ops))
+            .collect();
+        let mut unknown: Vec<(Seqno, Timestamp, BTreeSet<MutationKey>, Vec<usize>)> = Vec::new();
         for (seqno, sv) in &wal.batches {
             if self.history.contains_key(seqno) {
                 continue;
             }
-            // A cross-shard commit may have lost some shares: the surviving records hold a
-            // subset of its mutations. An exact match wins over a superset.
             let keys = self.survivor_keys(sv);
             if keys.is_empty() {
                 // A read-only share (a transaction's reads on this shard): nothing to
                 // recover from it, and its commit is known through its other records.
                 continue;
             }
-            let found = unacked
-                .iter()
-                .position(|c| Self::mutation_keys(&c.ops) == keys)
-                .or_else(|| {
-                    unacked.iter().position(|c| {
-                        !keys.is_empty() && keys.is_subset(&Self::mutation_keys(&c.ops))
-                    })
-                });
-            match found {
-                Some(i) => {
-                    let mut c = unacked.remove(i);
-                    c.seqno = Some(*seqno);
-                    c.commit_ts = Some(sv.commit_ts);
-                    matched.insert(*seqno, c);
-                }
-                None => {
-                    // The PREPARE records of a refused attempt (never committed).
-                    if self
-                        .aborted
-                        .iter()
-                        .any(|c| !keys.is_empty() && keys.is_subset(&Self::mutation_keys(&c.ops)))
-                    {
-                        continue;
-                    }
-                    return fail(
-                        FailureClass::RecoveredFromTheFuture,
-                        format!(
-                            "the WAL holds commit {seqno}, which the client never made: {:?} (unacked: {:?}; history has {:?})",
-                            keys.iter()
-                                .map(|k| (
-                                    &k.0,
-                                    &k.1,
-                                    k.2,
-                                    String::from_utf8_lossy(&k.3).into_owned(),
-                                    k.5
-                                ))
-                                .collect::<Vec<_>>(),
-                            unacked.iter().map(|c| &c.ops).collect::<Vec<_>>(),
-                            self.history.keys().collect::<Vec<_>>()
-                        ),
-                    );
-                }
-            }
+            let exact = (0..unacked.len()).filter(|&i| unacked_keys[i] == keys);
+            let within = (0..unacked.len())
+                .filter(|&i| unacked_keys[i] != keys && keys.is_subset(&unacked_keys[i]));
+            let fits = exact.chain(within).collect();
+            unknown.push((*seqno, sv.commit_ts, keys, fits));
         }
+        let fits: Vec<&[usize]> = unknown.iter().map(|u| u.3.as_slice()).collect();
+        let owners = match_seqnos(&fits, unacked.len());
+        let mut matched: BTreeMap<Seqno, Committed> = BTreeMap::new();
+        let mut taken = vec![false; unacked.len()];
+        for ((seqno, commit_ts, keys, _), owner) in unknown.iter().zip(owners) {
+            if let Some(i) = owner {
+                let mut c = unacked[i].clone();
+                c.seqno = Some(*seqno);
+                c.commit_ts = Some(*commit_ts);
+                matched.insert(*seqno, c);
+                taken[i] = true;
+                continue;
+            }
+            // The PREPARE records of a refused attempt (never committed).
+            if self
+                .aborted
+                .iter()
+                .any(|c| keys.is_subset(&Self::mutation_keys(&c.ops)))
+            {
+                continue;
+            }
+            return fail(
+                FailureClass::RecoveredFromTheFuture,
+                format!(
+                    "the WAL holds commit {seqno}, which the client never made: {:?} (unacked: {:?}; history has {:?})",
+                    keys.iter()
+                        .map(|k| (
+                            &k.0,
+                            &k.1,
+                            k.2,
+                            String::from_utf8_lossy(&k.3).into_owned(),
+                            k.5
+                        ))
+                        .collect::<Vec<_>>(),
+                    unacked.iter().map(|c| &c.ops).collect::<Vec<_>>(),
+                    self.history.keys().collect::<Vec<_>>()
+                ),
+            );
+        }
+        let mut taken = taken.into_iter();
+        unacked.retain(|_| !taken.next().expect("one flag per commit"));
         // Commits whose records were checkpointed away survive in SSTs: the reopened
         // engine's raw entries name their seqnos.
         let raw = {
@@ -1941,7 +1980,7 @@ impl World {
         // prefix, a cross-shard commit iff its COMMIT is and every participant the COMMIT
         // names still holds its PREPARE. Commits whose records were checkpointed away survive
         // through SSTs.
-        let (records, counts) = self.sim_records(&all, &survivors);
+        let (records, counts) = self.sim_records(&all, &survivors)?;
         let mut recovered: BTreeSet<usize> = recovered_from_records(&records, &counts)
             .into_iter()
             .collect();
@@ -2038,6 +2077,9 @@ impl World {
                     .map_or(0, |i| i + 1)
             };
             list.truncate(keep);
+            if let Some(epochs) = self.stream_epochs.get_mut(stream) {
+                epochs.truncate(keep);
+            }
         }
         let purges: Vec<PurgeEvent> = self
             .purges
@@ -2098,14 +2140,21 @@ impl World {
 
     /// Every stream's records in append order as the sim's `StreamRecord`s, naming commits by
     /// their index in `all`, and how many of them lie in the stream's surviving prefix.
-    /// Records of refused attempts belong to no commit and are left out; so are repeats of a
-    /// `(seqno, kind)` on one stream (a seqno reused after a crash), whose first record is the
-    /// one that counts.
+    ///
+    /// Two kinds of record name no commit of `all` and are left out, each counted in
+    /// `Stats`. A record whose seqno no commit holds (`unowned_records`) is a refused
+    /// attempt's PREPARE, a lost cross-shard commit's PREPARE or COMMIT, or an
+    /// unacknowledged commit's record lost past the cut; a single-shard record inside the
+    /// surviving prefix would be a commit the client never made, and fails. A repeat of a
+    /// `(seqno, kind)` on one stream (`reused_records`) is legal only across a crash, when
+    /// recovery reused the seqno of a commit it lost: the latest copy belongs to the live
+    /// commit and the earlier ones to the lost one. Two copies appended between the same
+    /// two crashes fail.
     fn sim_records(
-        &self,
+        &mut self,
         all: &[Committed],
         survivors: &BTreeMap<u32, usize>,
-    ) -> (Vec<Vec<StreamRecord>>, Vec<usize>) {
+    ) -> Result<(Vec<Vec<StreamRecord>>, Vec<usize>), Fail> {
         let index: HashMap<Seqno, usize> = all
             .iter()
             .enumerate()
@@ -2118,15 +2167,44 @@ impl World {
             .map_or(0, |s| *s as usize + 1);
         let mut records = vec![Vec::new(); streams];
         let mut counts = vec![0; streams];
+        let (mut unowned, mut reused) = (0, 0);
         for (stream, list) in &self.stream_records {
             let s = *stream as usize;
+            // Records only come from `drain_appended`, which keeps the epochs alongside.
+            let epochs = self
+                .stream_epochs
+                .get(stream)
+                .map_or(&[][..], Vec::as_slice);
             let cut = survivors.get(stream).copied().unwrap_or(0);
-            let mut seen = BTreeSet::new();
+            // The latest copy of each (seqno, kind), and the epochs of all its copies.
+            let mut latest: BTreeMap<(Seqno, RecKind), usize> = BTreeMap::new();
+            for (pos, r) in list.iter().enumerate() {
+                if let Some(prev) = latest.insert(*r, pos)
+                    && epochs[prev] == epochs[pos]
+                {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!(
+                            "stream {stream}: {r:?} appended twice with no crash between (records {prev} and {pos}): {list:?}"
+                        ),
+                    );
+                }
+            }
             for (pos, (seqno, kind)) in list.iter().enumerate() {
                 let Some(&i) = index.get(seqno) else {
+                    if pos < cut && *kind == RecKind::Batch {
+                        return fail(
+                            FailureClass::RecoveredFromTheFuture,
+                            format!(
+                                "stream {stream} record {pos} (seqno {seqno}) survived but no commit of the client has that seqno"
+                            ),
+                        );
+                    }
+                    unowned += 1;
                     continue;
                 };
-                if !seen.insert((*seqno, *kind)) {
+                if latest[&(*seqno, *kind)] != pos {
+                    reused += 1;
                     continue;
                 }
                 records[s].push(match kind {
@@ -2145,7 +2223,9 @@ impl World {
                 }
             }
         }
-        (records, counts)
+        self.stats.unowned_records += unowned;
+        self.stats.reused_records += reused;
+        Ok((records, counts))
     }
 
     /// The entries `ops` leave in the store when committed at `commit_ts` (same-commit
@@ -2541,12 +2621,19 @@ impl World {
             self.drain_appended();
             self.history.insert(seqno, c);
         }
-        self.drain_compactions()?;
+        let drained = self.drain_compactions();
+        if self.recover_if_fired(drained, rng)? {
+            return Ok(true);
+        }
         // Read-your-writes: everything acknowledged is visible now.
-        let snap = self.store().engine.snapshot().map_err(|e| Fail {
-            class: FailureClass::Protocol,
-            message: e.to_string(),
-        })?;
+        let snap = match self.store().engine.snapshot() {
+            Ok(s) => s,
+            Err(e) if !self.alive() => {
+                self.background_crash(e, rng)?;
+                return Ok(true);
+            }
+            Err(e) => return fail(FailureClass::Protocol, e.to_string()),
+        };
         if let Some(last) = self.engine_seqnos.last()
             && snap.seqno() < *last
         {
@@ -3102,9 +3189,7 @@ impl World {
             } => {
                 let snap = match self.pick_snapshot(rng) {
                     Ok(s) => s,
-                    Err(_) if !self.alive() => {
-                        return self.background_crash(&Error::Closed, rng);
-                    }
+                    Err(f) if !self.alive() => return self.background_crash(f.message, rng),
                     Err(f) => return Err(f),
                 };
                 let ms = self.model_seqno(snap.seqno());
@@ -3121,7 +3206,7 @@ impl World {
                 match (got, want) {
                     (Ok(g), Ok(w)) if g == w => {}
                     (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => {}
-                    (Err(e), _) if !self.alive() => return self.background_crash(&e, rng),
+                    (Err(e), _) if !self.alive() => return self.background_crash(e, rng),
                     (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 => {
                         // An injected read failure: the read reports it, nothing else.
                         self.stats.io_errors += 1;
@@ -3145,9 +3230,7 @@ impl World {
             Op::Scan { start, end } => {
                 let snap = match self.pick_snapshot(rng) {
                     Ok(s) => s,
-                    Err(_) if !self.alive() => {
-                        return self.background_crash(&Error::Closed, rng);
-                    }
+                    Err(f) if !self.alive() => return self.background_crash(f.message, rng),
                     Err(f) => return Err(f),
                 };
                 let ms = self.model_seqno(snap.seqno());
@@ -3184,7 +3267,7 @@ impl World {
                         }
                         (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => {
                         }
-                        (Err(e), _) if !self.alive() => return self.background_crash(&e, rng),
+                        (Err(e), _) if !self.alive() => return self.background_crash(e, rng),
                         (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 => {
                             self.stats.io_errors += 1;
                             self.trace.push(format!("  -> read I/O error ({e})"));
@@ -3204,18 +3287,16 @@ impl World {
                 if rng.chance(self.cfg.dump_ppm) {
                     self.trace
                         .push(format!("full dump @engine {}", snap.seqno()));
-                    if let Err(f) = self.compare_dump(&snap, FailureClass::LiveReadMismatch) {
-                        if self.alive() {
-                            return Err(f);
-                        }
-                        return self.background_crash(&Error::Closed, rng);
+                    let dumped = self.compare_dump(&snap, FailureClass::LiveReadMismatch);
+                    if self.recover_if_fired(dumped, rng)? {
+                        return Ok(());
                     }
                 }
             }
             Op::Snapshot => {
                 let snap = match self.store().engine.snapshot() {
                     Ok(s) => s,
-                    Err(e) if !self.alive() => return self.background_crash(&e, rng),
+                    Err(e) if !self.alive() => return self.background_crash(e, rng),
                     Err(e) => return fail(FailureClass::Protocol, format!("snapshot: {e}")),
                 };
                 self.trace.push(format!("snapshot engine {}", snap.seqno()));
@@ -3241,6 +3322,41 @@ impl World {
             })
         }
     }
+}
+
+/// A maximum matching of WAL seqnos to unacknowledged commits (Kuhn's augmenting paths):
+/// `fits[s]` lists, in order of preference, the commits seqno `s` may belong to. Returns
+/// each seqno's commit; no commit gets two seqnos.
+fn match_seqnos(fits: &[&[usize]], commits: usize) -> Vec<Option<usize>> {
+    fn augment(
+        s: usize,
+        fits: &[&[usize]],
+        owner: &mut [Option<usize>],
+        seen: &mut [bool],
+    ) -> bool {
+        for &c in fits[s] {
+            if seen[c] {
+                continue;
+            }
+            seen[c] = true;
+            if owner[c].is_none_or(|t| augment(t, fits, owner, seen)) {
+                owner[c] = Some(s);
+                return true;
+            }
+        }
+        false
+    }
+    let mut owner: Vec<Option<usize>> = vec![None; commits];
+    for s in 0..fits.len() {
+        augment(s, fits, &mut owner, &mut vec![false; commits]);
+    }
+    let mut out = vec![None; fits.len()];
+    for (c, s) in owner.iter().enumerate() {
+        if let Some(s) = s {
+            out[*s] = Some(c);
+        }
+    }
+    out
 }
 
 fn is_crashed(e: &Error) -> bool {

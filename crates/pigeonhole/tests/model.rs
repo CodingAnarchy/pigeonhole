@@ -375,9 +375,10 @@ impl Run {
     }
 
     /// Whether a crash killed the handles since the last open: with a power loss armed,
-    /// whether it has fired (on a commit or on a shard's background I/O).
+    /// whether it has fired (on a commit or on a shard's background I/O). Only a dead probe
+    /// is evidence; with no probe open there is none.
     fn fired(&self) -> bool {
-        self.probe.as_ref().is_none_or(|p| p.len().is_err())
+        self.probe.as_ref().is_some_and(|p| p.len().is_err())
     }
 
     /// A step failed with `e` while a power loss was armed and has fired: the failure is
@@ -1112,19 +1113,13 @@ fn identical_results_across_shard_counts() {
     assert_eq!(dumps[&1], dumps[&3], "seed {seed}");
 }
 
-#[test]
-fn a_read_after_a_background_fired_crash_is_that_crash() {
-    // Issue #62: commits are flushed to SSTs, then a power loss is armed on the next
-    // mutating operation and a `Durability::None` commit (which writes nothing itself)
-    // fills the memtable, so a shard's background flush fires the crash with no client
-    // call in progress. The next read finds the SSTs' handles dead: that I/O error is the
-    // armed power loss, and the run recovers from it.
-    let seed = seeds()[0];
+/// A one-shard run whose commits a clean close and reopen persisted to SSTs, with the block
+/// cache off so reads reach the files and the shards idle (no background I/O pending).
+fn run_with_flushed_commits(seed: u64) -> (Run, Rng) {
     let mut cfg = Config::crashing(0);
     cfg.faults = FaultPlan::none();
     (cfg.crash_ppm, cfg.mid_commit_crash_ppm, cfg.reopen_ppm) = (0, 0, 0);
     cfg.memtable_budget = 256 << 10;
-    // Reads must reach the SST files, not blocks the reopen's check cached.
     cfg.block_cache = 0;
     let mut run = Run::new(seed, cfg).expect("open");
     let mut rng = Rng::new(seed);
@@ -1133,9 +1128,26 @@ fn a_read_after_a_background_fired_crash_is_that_crash() {
         run.step(Op::Commit(ops, Durability::Buffered), &mut rng)
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
     }
-    // A clean close flushes everything to SSTs and waits for the background work; the
-    // reopen leaves the shards idle.
     run.reopen().unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    (run, rng)
+}
+
+fn scan_all() -> Op {
+    Op::Scan {
+        start: Vec::new(),
+        end: vec![0xff],
+    }
+}
+
+#[test]
+fn a_read_after_a_background_fired_crash_is_that_crash() {
+    // Issue #62: a power loss is armed on the next mutating operation and a
+    // `Durability::None` commit (which writes nothing itself) fills the memtable, so a
+    // shard's background flush fires the crash with no client call in progress. The next
+    // read finds the SSTs' handles dead: the error is the armed power loss, and the run
+    // recovers from it.
+    let seed = seeds()[0];
+    let (mut run, mut rng) = run_with_flushed_commits(seed);
     let mut plan = run.cfg.faults.clone();
     plan.crash_after_ops = Some(run.vfs.mutating_ops() + 1);
     run.vfs.set_faults(plan);
@@ -1163,15 +1175,36 @@ fn a_read_after_a_background_fired_crash_is_that_crash() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    let scan = Op::Scan {
-        start: Vec::new(),
-        end: vec![0xff],
-    };
-    run.step(scan, &mut rng)
+    run.step(scan_all(), &mut rng)
         .unwrap_or_else(|e| panic!("seed {seed}: {e}\n{}", run.trace.join("\n")));
     assert!(
         !run.armed && run.trace.iter().any(|t| t == "CRASH Power mid-commit"),
         "seed {seed}: the read did not recover from the armed crash: {:?}",
         run.trace.iter().rev().take(5).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn an_io_error_while_an_unfired_crash_is_armed_is_not_that_crash() {
+    // Issue #62's other half: armed alone is never sufficient. A power loss is armed far in
+    // the future (it does not fire) and every read fails with an injected I/O error: the
+    // scan's error is a real failure, not the crash, and the run must report it rather
+    // than recover as if the power had gone.
+    let seed = seeds()[0];
+    let (mut run, mut rng) = run_with_flushed_commits(seed);
+    let mut plan = run.cfg.faults.clone();
+    plan.crash_after_ops = Some(run.vfs.mutating_ops() + 1_000_000);
+    plan.io_error_ppm = 1_000_000;
+    run.vfs.set_faults(plan);
+    run.armed = true;
+    let crashes = run.stats.crashes;
+    let result = run.step(scan_all(), &mut rng);
+    run.vfs.set_faults(FaultPlan::none());
+    assert!(!run.fired(), "seed {seed}: the armed crash fired");
+    assert_eq!(
+        run.stats.crashes, crashes,
+        "seed {seed}: an I/O error with the crash unfired was taken for the crash"
+    );
+    let e = result.expect_err("the injected read error was not reported");
+    assert!(e.contains("scan of"), "seed {seed}: {e}");
 }

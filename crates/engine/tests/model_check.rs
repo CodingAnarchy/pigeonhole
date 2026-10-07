@@ -51,6 +51,21 @@ fn faults_and_crashes_for_every_shard_count() {
 }
 
 #[test]
+fn harness_regressions_from_the_seed_sweep() {
+    // Seed 248: an armed crash fired on background I/O and the held snapshots' re-check
+    // after a commit found the store dead (issue #62's pattern). Seed 288: a surviving
+    // share fit two in-flight commits (a family delete inside another commit's row
+    // delete) and the greedy matcher gave it to the wrong one.
+    for shards in 1..=8 {
+        let mut cfg = Config::standard(250);
+        cfg.shards = shards;
+        for seed in [248, 288] {
+            check(seed, &cfg);
+        }
+    }
+}
+
+#[test]
 fn sixty_four_shards_behind_env_var() {
     if std::env::var("PIGEONHOLE_SHARDS_64").is_err() {
         eprintln!("skipped: set PIGEONHOLE_SHARDS_64=1");
