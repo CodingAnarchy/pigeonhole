@@ -3267,8 +3267,10 @@ impl World {
         }
         self.vfs.advance(1_000);
         if !self.alive() {
-            // A background tablet change hit a crash point: recover before going on.
-            self.crash_and_recover(CrashKind::Power, true, rng)?;
+            // An armed crash fired in the background (a flush, a compaction, or a tablet
+            // change running while the workload goes on): recover before going on, whatever
+            // this step would have done (a commit would see a poisoned pager instead).
+            self.background_crash("found before the step", rng)?;
             if self.store.is_none() {
                 return Ok(());
             }
