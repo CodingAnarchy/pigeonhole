@@ -6,7 +6,30 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      # Skip CI when every changed file is documentation no build or test reads.
+      # NOT listed (they are doctested via include_str!, so they must run CI):
+      # README.md, crates/pigeonhole/README.md and docs/guide/*.md.
+      - 'docs/design/**'
+      - 'docs/status.md'
+      - 'docs/bench.md'
+      - 'CONTRIBUTING.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'FORMAT.md'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
+    paths-ignore:  # same list as push
+      - 'docs/design/**'
+      - 'docs/status.md'
+      - 'docs/bench.md'
+      - 'CONTRIBUTING.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'FORMAT.md'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 permissions:
