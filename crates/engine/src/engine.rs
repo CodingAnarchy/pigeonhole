@@ -27,9 +27,9 @@ use crate::flush::{SstSink, write_memtable};
 use crate::manifest::{self, ManifestWriter, ReqKind};
 use crate::read::{self, get_in};
 use crate::shard::{
-    BalanceConfig, CloseState, CommitReq, CoordinateReq, FreezeWaiters, LoadSlot, Locks, Padded,
-    ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared, VisibilityWaiters,
-    bucket_floor, split_by_shard,
+    BalanceConfig, CloseState, CommitReq, CoordinateReq, FreezeWaiters, LoadSlot, Locks,
+    MaintenanceGuard, Padded, ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared,
+    VisibilityWaiters, bucket_floor, split_by_shard,
 };
 use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
@@ -592,6 +592,7 @@ impl Engine {
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            maintenance: AtomicUsize::new(0),
             pager_poisoned: AtomicBool::new(false),
             close: CloseState {
                 remaining: AtomicUsize::new(shards),
@@ -1057,6 +1058,7 @@ impl Engine {
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            maintenance: AtomicUsize::new(0),
             pager_poisoned: AtomicBool::new(false),
             close: CloseState::default(),
             metrics: Vec::new(),
@@ -1314,7 +1316,7 @@ impl Engine {
         if inner.role != Role::Writer {
             return Err(Error::ReadOnly);
         }
-        inner.check_open()?;
+        let _guard = inner.enter_maintenance()?;
         let snapshot = inner.snapshot()?;
         crate::maintenance::backup(&inner.shared, &snapshot, dest)
     }
@@ -1326,7 +1328,7 @@ impl Engine {
         if inner.role != Role::Writer {
             return Err(Error::ReadOnly);
         }
-        inner.check_open()?;
+        let _guard = inner.enter_maintenance()?;
         crate::maintenance::shrink(&inner.shared)
     }
 
@@ -1688,6 +1690,14 @@ impl Engine {
             .load(Ordering::Acquire)
     }
 
+    /// Whether the final close has run (test hook: application-owned shards finish the close
+    /// as they are driven).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn close_finished(&self) -> bool {
+        self.inner.shared.closed.load(Ordering::Acquire)
+    }
+
     /// Commits an empty manifest delta from this thread while a second request lands in
     /// the window between the drain's last `begin` and the release of the writer's
     /// exclusion (as a shard's submit would, whose pump then leaves). Returns whether that
@@ -1934,6 +1944,12 @@ impl Inner {
 }
 
 impl Inner {
+    /// Enters application-thread maintenance: refused once the engine is closing, and the
+    /// final close waits until the guard is dropped (7 F7-4).
+    fn enter_maintenance(&self) -> Result<MaintenanceGuard<'_>> {
+        MaintenanceGuard::enter(&self.shared, || self.check_open())
+    }
+
     fn check_open(&self) -> Result<()> {
         if self.closing.load(Ordering::Acquire) || self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
@@ -1963,7 +1979,7 @@ impl Inner {
         if self.role != Role::Writer {
             return Err(Error::ReadOnly);
         }
-        self.check_open()?;
+        let _guard = self.enter_maintenance()?;
         let version = manifest::commit_from_thread(&self.shared, ReqKind::Catalog(Box::new(f)))?;
         let view = self.shared.view.load_full();
         debug_assert!(view.manifest_version >= version);

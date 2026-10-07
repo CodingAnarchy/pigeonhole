@@ -303,6 +303,10 @@ pub(crate) struct Shared {
     pub closed: AtomicBool,
     /// `Engine::close` has started: background compaction stops.
     pub closing: AtomicBool,
+    /// Application threads inside `shrink`, `backup` or a catalog change. The final close
+    /// waits for them (the last one out runs it): it marks the file clean and releases the
+    /// writer lock, after which nothing may commit or truncate (7 F7-4).
+    pub maintenance: AtomicUsize,
     /// A manifest (root) commit failed: the pager is poisoned (decision D58) and every later
     /// write fails until the database is reopened.
     pub pager_poisoned: AtomicBool,
@@ -351,6 +355,15 @@ impl std::fmt::Debug for Shared {
 impl Shared {
     pub(crate) fn submitter(&self, shard: ShardId) -> &Submitter<ShardMsg> {
         &self.submitters.get().expect("runtime started")[usize::from(shard.0)]
+    }
+
+    /// Marks the close unclean. The first time, every shard is kicked: one waiting at close
+    /// for its peers' reports (`ShareFlushed`, `CommitCheckpointed`) stops waiting, since a
+    /// shard that gave up will never send them (5-6 5.1).
+    pub(crate) fn fail_close(&self) {
+        if !self.close.failed.swap(true, Ordering::AcqRel) {
+            self.broadcast(|| ShardMsg::Kick);
+        }
     }
 
     /// Sends `f()` to every shard (nothing before the runtime exists).
@@ -582,7 +595,8 @@ impl Shared {
         }
     }
 
-    /// Runs the final close if it is pending and the manifest writer's exclusion is free.
+    /// Runs the final close if it is pending, no application thread is inside maintenance
+    /// (`MaintenanceGuard`), and the manifest writer's exclusion is free.
     /// A background commit (a compaction's, say) may hold it with its root commit in
     /// flight; the final close's own commits must not interleave with it, or both would be
     /// prepared from the same writer state (issue #78). Its holder calls this again from
@@ -591,7 +605,10 @@ impl Shared {
     pub(crate) fn try_final_close(&self) {
         // Pairs with the fence in `manifest::release`.
         std::sync::atomic::fence(Ordering::SeqCst);
-        if !self.close.final_pending.load(Ordering::SeqCst) || !manifest::claim(self) {
+        if !self.close.final_pending.load(Ordering::SeqCst)
+            || self.maintenance.load(Ordering::SeqCst) > 0
+            || !manifest::claim(self)
+        {
             return;
         }
         if !self.close.final_pending.swap(false, Ordering::SeqCst) {
@@ -610,6 +627,34 @@ impl Shared {
         {
             n.notify(result);
         }
+    }
+}
+
+/// An application thread inside `shrink`, `backup` or a catalog change (`Shared::maintenance`).
+/// Dropping it runs the final close if that waited for it.
+pub(crate) struct MaintenanceGuard<'a>(&'a Shared);
+
+impl<'a> MaintenanceGuard<'a> {
+    /// Enters maintenance; `check_open` runs after the count is raised, so either it sees
+    /// the close or the final close sees the count.
+    pub(crate) fn enter(
+        shared: &'a Shared,
+        check_open: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        shared.maintenance.fetch_add(1, Ordering::SeqCst);
+        let guard = Self(shared);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        check_open()?;
+        Ok(guard)
+    }
+}
+
+impl Drop for MaintenanceGuard<'_> {
+    fn drop(&mut self) {
+        // Pairs with the fence in `Shared::try_final_close`: either it sees the count, or
+        // this sees its pending flag.
+        self.0.maintenance.fetch_sub(1, Ordering::SeqCst);
+        self.0.try_final_close();
     }
 }
 
@@ -1524,6 +1569,12 @@ pub(crate) struct ShardState {
     pub(crate) wal: Option<Box<dyn Wal>>,
     /// A write or sync failed: the stream is poisoned until reopen.
     poisoned: bool,
+    /// End of the newest PREPARE or COMMIT record appended since open. Other shards' flushes
+    /// of cross-shard shares need the stream durable only through here, so a poisoned
+    /// stream's barrier still holds for them once it is (5-6 5.1).
+    cross_end: Lsn,
+    /// After the close: whether the stream was durable through `cross_end` when dropped.
+    cross_durable_at_close: bool,
     arena: ShardArena,
     chunk_size: usize,
     /// Ordered, so freezes and flushes visit slots in the same order on every run (#61).
@@ -1704,6 +1755,8 @@ impl ShardState {
             shared,
             wal: None,
             poisoned: false,
+            cross_end: Lsn::default(),
+            cross_durable_at_close: false,
             arena: ShardArena::new(region, chunk_size),
             chunk_size,
             memtables: BTreeMap::new(),
@@ -2444,7 +2497,7 @@ impl ShardState {
                 }
                 if self.closing {
                     self.flush_failed = true;
-                    self.shared.close.failed.store(true, Ordering::Release);
+                    self.shared.fail_close();
                 }
                 if self.wait_room && !self.closing {
                     // The waiting members try the flush again (until their stall timeout or
@@ -3380,6 +3433,7 @@ impl ShardState {
                     if let Some(t) = m.ticket {
                         let slots = self.slots_of(m.bytes.as_slice());
                         self.last_end = Some(t.end);
+                        self.cross_end = self.cross_end.max(t.end);
                         self.log.push_back(Logged {
                             end: t.end,
                             seqno: m.seqno,
@@ -3390,6 +3444,7 @@ impl ShardState {
                 MemberKind::CommitRecord { participants } => {
                     if let Some(t) = m.ticket {
                         self.last_end = Some(t.end);
+                        self.cross_end = self.cross_end.max(t.end);
                         self.share_reports.entry(m.seqno).or_insert((0, 0)).1 = participants.len();
                         self.log.push_back(Logged {
                             end: t.end,
@@ -4245,7 +4300,7 @@ impl ShardState {
                 self.passed_commits.extend(commits);
                 self.checkpoint_dirty = true;
                 if self.closing {
-                    self.shared.close.failed.store(true, Ordering::Release);
+                    self.shared.fail_close();
                 }
             }
         }
@@ -4702,7 +4757,7 @@ impl ShardState {
                 t.cancel();
             }
             if self.freeze(true).is_err() {
-                self.shared.close.failed.store(true, Ordering::Release);
+                self.shared.fail_close();
             }
             self.spawn_flush(ctx);
         }
@@ -4711,7 +4766,7 @@ impl ShardState {
             && (self.flush_failed || self.shared.pager_poisoned.load(Ordering::Acquire))
         {
             self.flush_failed = true;
-            self.shared.close.failed.store(true, Ordering::Release);
+            self.shared.fail_close();
             // Give up on flushing: the WAL keeps everything, the next open replays it, and
             // the close is reported unclean.
             self.close_stage = CloseStage::Checkpointing;
@@ -4722,7 +4777,7 @@ impl ShardState {
                 // A freeze waited for visibility; try again (the watermark moves once the
                 // other shards finish their groups, and they kick us).
                 if self.freeze(true).is_err() {
-                    self.shared.close.failed.store(true, Ordering::Release);
+                    self.shared.fail_close();
                 }
                 self.spawn_flush(ctx);
             }
@@ -4739,9 +4794,17 @@ impl ShardState {
             }
             self.report_shares_flushed(ctx);
             self.advance_checkpoint(ctx);
-            if !self.log.is_empty() || self.checkpoint_inflight || self.checkpoint_dirty {
+            if self.checkpoint_inflight {
+                // Waiting for our own edit.
+                return;
+            }
+            if (!self.log.is_empty() || self.checkpoint_dirty)
+                && !self.shared.close.failed.load(Ordering::Acquire)
+            {
                 // Waiting for the other shards' flushes and checkpoints (ShareFlushed and
-                // CommitCheckpointed arrive as messages), or for our own edit.
+                // CommitCheckpointed arrive as messages). Once the close is unclean, a shard
+                // that gave up flushing never sends its reports: stop waiting (the WAL keeps
+                // whatever the checkpoint did not pass, and the next open replays it).
                 return;
             }
             self.close_stage = CloseStage::Checkpointing;
@@ -4766,13 +4829,25 @@ impl ShardState {
             Some(_) => true,
             None => false,
         };
+        self.cross_durable_at_close = if self.wal.is_some() {
+            self.cross_records_durable()
+        } else {
+            !self.poisoned
+        };
         trace!(
             "shard {} final sync failed={failed} poisoned={}",
             self.id.0, self.poisoned
         );
         if failed {
-            self.shared.close.failed.store(true, Ordering::Release);
+            self.shared.fail_close();
         }
+    }
+
+    /// Whether every PREPARE and COMMIT record appended since open is durable.
+    fn cross_records_durable(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(|w| w.durable() >= self.cross_end)
     }
 
     /// Finishes a shard whose driver is dropped before the close handshake completed: the
@@ -4785,7 +4860,7 @@ impl ShardState {
         self.closing = true;
         self.close_stage = CloseStage::Reported;
         self.final_sync();
-        shared.close.failed.store(true, Ordering::Release);
+        shared.fail_close();
         if shared.close.remaining.load(Ordering::Acquire) > 0 {
             shared.report_closed();
         }
@@ -4811,7 +4886,14 @@ impl ShardState {
             self.wal.is_some()
         );
         if self.poisoned {
-            reply.notify(Err(poisoned_error()));
+            // The barrier covers records other shards' shares depend on: this stream's
+            // PREPAREs and COMMITs. Durable ones keep holding after the failure, so one
+            // shard's WAL error does not fail every peer's flush (5-6 5.1).
+            if self.cross_records_durable() {
+                reply.notify(Ok(()));
+            } else {
+                reply.notify(Err(poisoned_error()));
+            }
             return;
         }
         match self.wal.as_mut() {
@@ -4827,10 +4909,9 @@ impl ShardState {
                     reply.notify(Err(e.into()));
                 }
             },
-            // Closed cleanly: the stream was synced before it was dropped.
-            None if self.close_stage == CloseStage::Reported
-                && !self.shared.close.failed.load(Ordering::Acquire) =>
-            {
+            // Closed: the stream was synced before it was dropped, or (after a failure) its
+            // cross-shard records were durable by then.
+            None if self.close_stage == CloseStage::Reported && self.cross_durable_at_close => {
                 reply.notify(Ok(()))
             }
             None => reply.notify(Err(Error::Unsupported("no WAL stream"))),

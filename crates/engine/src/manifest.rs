@@ -323,6 +323,10 @@ pub(crate) struct ManifestReq {
     pub compaction: Option<CompactionRecord>,
     /// Rewrite the manifest snapshot (shrink relocates the manifest extents).
     pub rewrite_snapshot: bool,
+    /// Drop the edits of tablets that no longer exist (a table dropped meanwhile) and
+    /// commit the rest, instead of refusing the whole request. For requests whose slots
+    /// are independent (a flush).
+    pub skip_orphans: bool,
     /// Called with the outcome once the commit is durable (or failed).
     pub reply: Box<dyn FnOnce(Result<ManifestVersion>) + Send>,
 }
@@ -348,6 +352,7 @@ impl ManifestReq {
             flushed_roots: Vec::new(),
             compaction: None,
             rewrite_snapshot: false,
+            skip_orphans: false,
             reply: Box::new(reply),
         }
     }
@@ -361,6 +366,7 @@ impl ManifestReq {
             flushed_roots: Vec::new(),
             compaction: None,
             rewrite_snapshot: false,
+            skip_orphans: false,
             reply: Box::new(move |r| tx.notify(r)),
         };
         (req, rx)
@@ -505,6 +511,29 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 edits
             }),
         };
+        let own = own.map(|own| {
+            if !req.skip_orphans {
+                return own;
+            }
+            // A flush covers every slot of its shard: a table dropped while it ran loses
+            // its outputs only, and the other slots' commit goes ahead (F7-3).
+            let (gone, kept): (Vec<Edit>, Vec<Edit>) =
+                own.into_iter().partition(|e| orphaned(&catalog, e, &[]));
+            if !gone.is_empty() {
+                let ids: Vec<SstId> = gone
+                    .iter()
+                    .filter_map(|e| match e {
+                        Edit::AddSst { meta, .. } => Some(meta.id),
+                        _ => None,
+                    })
+                    .collect();
+                req.readers.retain(|(id, _)| !ids.contains(id));
+                for x in added_extents(&gone) {
+                    shared.pager.abandon(x);
+                }
+            }
+            kept
+        });
         let own = own.and_then(|own| {
             // Tablets the request itself creates (a split's or merge's outputs) are not
             // orphans.

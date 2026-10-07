@@ -156,6 +156,10 @@ type SstRef = (
 pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     let mut released = 0;
     for _round in 0..8 {
+        if shared.closing.load(Ordering::Acquire) {
+            // The close waits for this call: stop between rounds.
+            break;
+        }
         // Retired extents no view uses any more are free space the relocations can move
         // into; without this the targets would be allocated past the end of the file.
         shared.reclaim();

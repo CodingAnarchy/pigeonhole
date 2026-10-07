@@ -371,6 +371,7 @@ impl FlushTask {
             flushed_roots: self.items.iter().map(|i| (self.shard.0, i.root)).collect(),
             compaction: None,
             rewrite_snapshot: false,
+            skip_orphans: true,
             reply: Box::new(manifest::notify(tx)),
         };
         manifest::submit(&self.shared, self.shard, req);
