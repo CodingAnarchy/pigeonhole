@@ -1591,3 +1591,167 @@ fn a_commit_refused_while_a_change_waits_fails_busy_after_the_write_stall_timeou
     db.drive(split).unwrap();
     close(db);
 }
+
+// ---- balancer stability (#103) ----
+
+/// `t` split at `keys` and its tablets handed to `owners` in order.
+fn lay_out(db: &mut Db, keys: &[&[u8]], owners: &[u16]) {
+    let id = db.table.id;
+    for k in keys {
+        let m = db.engine.split_tablet_pending(id, k).unwrap();
+        db.drive(m).unwrap();
+    }
+    for (i, owner) in owners.iter().enumerate() {
+        let r = db.ranges()[i].clone();
+        if r.1 != *owner {
+            let m = db.engine.move_tablet_pending(id, &r.2, *owner).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    let got: Vec<u16> = db.ranges().iter().map(|r| r.1).collect();
+    assert_eq!(got, owners);
+}
+
+fn changes(db: &Db) -> u64 {
+    let (s, m, v) = db.engine.tablet_changes();
+    s + m + v
+}
+
+#[test]
+fn the_balancer_goes_quiet_under_uniform_load() {
+    // Four shards, one tablet each over a quarter of a uniformly written key space. Every
+    // interval each shard writes about the same rows, give or take sampling noise, and
+    // memtables flush at different times. Nothing is skewed, so nothing should move.
+    let mut db = open(4, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+        o.memtable_freeze_bytes = 16 << 10;
+    });
+    lay_out(&mut db, &[b"k4", b"k8", b"kc"], &[0, 1, 2, 3]);
+    let before = changes(&db);
+    let value = vec![7u8; 200];
+    let mut written = 0u64;
+    for pass in 0..30 {
+        for _ in 0..200 {
+            db.put(&key(written), &value);
+            written += 1;
+        }
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+        eprintln!("pass {pass}: {} changes", changes(&db) - before);
+    }
+    assert_eq!(changes(&db), before, "{:?}", db.ranges());
+    assert_eq!(db.scan_rows().len() as u64, written);
+    close(db);
+}
+
+#[test]
+fn concurrent_moves_never_take_a_shard_past_its_slots() {
+    // A shard holds at most a quarter of its arena's chunks in `(tablet, family)` slots: 64
+    // here. With 21 families a tablet takes 21 slots, so shard 2 holding two tablets (42)
+    // has room for one more. Shards 0 and 1 each move a tablet to it at the same time:
+    // only one may land.
+    let vfs = SimVfs::new(7);
+    let mut db = open_wide(&vfs, 3, 21, |_| {});
+    let id = db.table.id;
+    if db.ranges()[0].1 != 0 {
+        let m = db.engine.move_tablet_pending(id, b"", 0).unwrap();
+        db.drive(m).unwrap();
+    }
+    let step = |db: &mut Db, at: &[u8], piece: &[u8], to: u16| {
+        let m = db.engine.split_tablet_pending(id, at).unwrap();
+        db.drive(m).unwrap();
+        let m = db.engine.move_tablet_pending(id, piece, to).unwrap();
+        db.drive(m).unwrap();
+    };
+    step(&mut db, b"k4", b"", 2);
+    step(&mut db, b"k8", b"k4", 2);
+    step(&mut db, b"kc", b"kc", 1);
+    let on = |db: &Db, s: u16| db.ranges().iter().filter(|r| r.1 == s).count();
+    assert_eq!(
+        (on(&db, 0), on(&db, 1), on(&db, 2)),
+        (1, 1, 2),
+        "{:?}",
+        db.ranges()
+    );
+    // Hold the manifest queue (a compaction's commit is parked), so both moves start, and
+    // check the slots, before either commits.
+    for i in 0..40 {
+        db.put(&key(i), b"v");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    db.engine.park_manifest_commits(true);
+    let _compact = db.engine.compact_pending(None).unwrap();
+    for _ in 0..1_000 {
+        if db.engine.manifest_commit_parked() {
+            break;
+        }
+        db.step();
+    }
+    assert!(db.engine.manifest_commit_parked());
+    let a = db.engine.move_tablet_pending(id, b"k8", 2).unwrap();
+    let b = db.engine.move_tablet_pending(id, b"kc", 2).unwrap();
+    for _ in 0..50 {
+        db.step();
+    }
+    db.engine.park_manifest_commits(false);
+    let ra = db.drive(a);
+    let rb = db.drive(b);
+    assert!(ra.is_ok() != rb.is_ok(), "{ra:?} {rb:?}");
+    for e in [ra, rb].into_iter().filter_map(Result::err) {
+        assert!(matches!(e, pigeonhole_engine::Error::Unsupported(_)), "{e}");
+    }
+    assert_eq!(on(&db, 2), 3, "{:?}", db.ranges());
+    close(db);
+}
+
+#[test]
+fn cold_tablets_spread_over_shards_consolidate_into_one() {
+    // A table left in four small tablets alternating between two shards: neighbours never
+    // share a shard, so merges alone never fire. Cold tablets move to their left
+    // neighbour's shard and merge, until one tablet remains.
+    let mut db = open(2, |o| o.balance_interval_nanos = u64::MAX);
+    for i in 0..40 {
+        db.put(&key(i), b"v");
+    }
+    lay_out(&mut db, &[b"k4", b"k8", b"kc"], &[0, 1, 0, 1]);
+    for pass in 0..40 {
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+        if db.ranges().len() == 1 {
+            eprintln!("one tablet after {pass} passes");
+            break;
+        }
+    }
+    assert_eq!(db.ranges().len(), 1, "{:?}", db.ranges());
+    assert_eq!(db.scan_rows().len(), 40);
+    close(db);
+}
+
+#[test]
+fn an_idle_shard_still_merges_cold_tablets() {
+    // No message reaches the shard after the split: its balancer's own wakeup runs the
+    // passes that merge the two cold halves.
+    let mut db = open(1, |o| {
+        o.balance_interval_nanos = 1_000_000;
+        ticking(o);
+    });
+    for i in 0..40 {
+        db.put(&key(i), b"v");
+    }
+    let id = db.table.id;
+    let m = db.engine.split_tablet_pending(id, b"k8").unwrap();
+    db.drive(m).unwrap();
+    assert_eq!(db.ranges().len(), 2);
+    for _ in 0..1_000 {
+        if db.ranges().len() == 1 {
+            break;
+        }
+        db.vfs.advance(100_000);
+        db.step();
+    }
+    assert_eq!(db.ranges().len(), 1, "{:?}", db.ranges());
+    assert_eq!(db.scan_rows().len(), 40);
+    close(db);
+}

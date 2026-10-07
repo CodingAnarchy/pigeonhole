@@ -1,0 +1,13 @@
+# Engine: tablets — balancer stability (#103)
+
+## Q: How does the balancer avoid thrashing, oversubscribing a shard's slots and growing the tablet count without bound?
+D134 decides on one interval's snapshot: per-interval write counts, and memtable bytes, which swing with every flush, so uniform load moved or split tablets every interval. Each shard checked a move's target against its own view of the slots, so two shards could move tablets onto one shard in the same interval and take it past `max_slots`. Merges needed both neighbours on one shard while skew splits put children on other shards, so the tablet count only grew. And a shard balanced only while it processed messages, so an idle shard never merged its cold tablets.
+
+**Interim behavior (with `tablet_changes` on; off, the balancer never runs):**
+- **Smoothed load.** Each shard keeps a moving average of the rows it writes per interval (weight 0.5 on the newest), publishes that in `LoadSlot::writes`, and keeps one per tablet. Write skew compares these averages. The memtable-bytes trigger is dropped.
+- **Dwell.** After a shard starts a move or a split over shards, it starts no other one for 10 balancer passes. A tablet that arrived on a shard (by a move or a split) is not moved or split for write skew there for 10 passes; tablets a shard held at its first pass count as settled. Size splits and merges are not delayed.
+- **Slot reservations.** A change that hands tablets to shards reserves their slots (`LoadSlot::reserved`) when it starts, and releases them when it ends. Every check counts the slots in the view plus the reservations, so concurrent moves and splits never take a shard past `max_slots`; the losing change is refused with `Unsupported`. A skew move only targets a shard with room.
+- **Consolidation.** A settled, cold tablet whose left neighbour lives on another shard moves there when the two hold less than a quarter of `tablet_split_bytes` together and the neighbour's shard has room; that shard then merges them (D134 item 3). Only right to left, so two shards never swap tablets.
+- **Idle shards.** After each pass the shard arms a clock timer for its next pass, so the balancer runs without messages. As with D126's timers, a timer that gave up on a frozen clock is not armed again while the clock stays frozen. It is cancelled at close and never armed for an interval of 0 or `u64::MAX`.
+
+Proposed amendment to D134: replace "The same rule applies to memtable bytes…" with the smoothed-load rule and the dwell; add the reservations to item 2, consolidation as item 4, and "each shard wakes itself for its next pass".

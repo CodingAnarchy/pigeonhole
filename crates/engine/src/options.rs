@@ -69,7 +69,6 @@ pub struct EngineOptions {
     ///   `tablet % shards` when that keeps the shard within its slots, else on the shard
     ///   holding the fewest), losing earlier moves, and cuts the arenas into smaller chunks
     ///   when the tablets need more slots than that;
-    /// - a shard's balancer runs only while that shard processes writes (#103);
     /// - commits in flight together on one row may be applied in either order during a
     ///   move, even from one thread (see [`Engine::submit`](crate::Engine::submit)).
     pub tablet_changes: bool,
@@ -82,8 +81,9 @@ pub struct EngineOptions {
     /// its tablets (default 2,000), so an idle database never reshuffles. Only read when
     /// `tablet_changes` is on.
     pub balance_min_writes: u64,
-    /// A shard whose write load (or memtable bytes) exceeds this multiple of the mean over
-    /// all shards is skewed (default 1.25). Only read when `tablet_changes` is on.
+    /// A shard whose write load (a moving average over intervals) exceeds this multiple of
+    /// the mean over all shards is skewed (default 1.25). Only read when `tablet_changes` is
+    /// on.
     pub balance_skew: f64,
     /// Merge operators available to this process.
     pub merge_operators: MergeRegistry,

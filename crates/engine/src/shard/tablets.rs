@@ -31,6 +31,18 @@ use crate::snapshot::TabletEntry;
 /// Row samples kept per tablet and balancer interval (split points for write skew).
 const SAMPLES: usize = 64;
 
+/// Weight of the newest interval in the moving averages of write load (#103): one interval's
+/// noise never decides a move on its own.
+const LOAD_ALPHA: f64 = 0.5;
+
+/// Balancer passes a shard waits after starting a move or a skew split, and a tablet stays
+/// put after it arrived on a shard, before write skew moves or splits again (#103): the
+/// moving averages catch up with a change before the next one is decided.
+const DWELL_PASSES: u64 = 10;
+
+/// Slots reserved on shards receiving tablets (`LoadSlot::reserved`).
+type Reserved = Vec<(ShardId, usize)>;
+
 /// A change to tablets this shard owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TabletOpKind {
@@ -82,6 +94,9 @@ pub(crate) struct ActiveOp {
     entries: Vec<TabletEntry>,
     /// The manifest request is in flight.
     committing: bool,
+    /// Slots reserved on each receiving shard (`LoadSlot::reserved`), released when the
+    /// change ends.
+    reserved: Reserved,
 }
 
 /// Writes to one tablet during the current balancer interval.
@@ -94,6 +109,8 @@ pub(crate) struct TabletLoad {
     seen: u64,
     /// A uniform sample of the rows written this interval.
     samples: Vec<Vec<u8>>,
+    /// Moving average of `writes` over intervals (`LOAD_ALPHA`).
+    ewma: f64,
 }
 
 /// The balancer settings, copied from `EngineOptions` at open.
@@ -111,8 +128,12 @@ pub(crate) struct BalanceConfig {
 #[derive(Debug, Default)]
 #[repr(align(64))]
 pub(crate) struct LoadSlot {
+    /// Moving average of the rows written per interval.
     pub writes: AtomicU64,
-    pub mem: AtomicU64,
+    /// `(tablet, family)` slots promised to changes in flight that will hand this shard
+    /// tablets: every change checks them with the slots in the view, so concurrent moves
+    /// never take a shard past `max_slots` (#103).
+    pub reserved: AtomicUsize,
     /// When it was published (monotonic nanoseconds; 0 = never).
     pub at: AtomicU64,
 }
@@ -530,7 +551,7 @@ impl ShardState {
                         r.notify(Err(e));
                     }
                 }
-                Ok(entries) => {
+                Ok((entries, reserved)) => {
                     trace!("shard {} tablet change {kind:?} starts", self.id.0);
                     self.moving = kind.tablets().into_iter().collect();
                     self.op = Some(ActiveOp {
@@ -538,6 +559,7 @@ impl ShardState {
                         reply,
                         entries,
                         committing: false,
+                        reserved,
                     });
                     if self.freeze(false).is_err() {
                         self.poisoned = true;
@@ -549,8 +571,9 @@ impl ShardState {
         }
     }
 
-    /// Checks a change against the current tablet map; returns the tablets it touches.
-    fn validate_op(&self, kind: &TabletOpKind) -> Result<Vec<TabletEntry>> {
+    /// Checks a change against the current tablet map; returns the tablets it touches and the
+    /// slots it reserved on the shards receiving tablets.
+    fn validate_op(&self, kind: &TabletOpKind) -> Result<(Vec<TabletEntry>, Reserved)> {
         if self.poisoned || self.shared.pager_poisoned.load(Ordering::Acquire) {
             return Err(poisoned_error());
         }
@@ -601,25 +624,24 @@ impl ShardState {
                     + t.start.len()
                     + t.end.as_ref().map_or(0, Vec::len)
                     + 16;
-                // Each shard keeps its slots within its arena's chunks.
-                let fits = owners.iter().all(|o| {
-                    let children = owners.iter().filter(|x| *x == o).count();
-                    // The parent's slots leave this shard as its children arrive.
-                    let extra = families * children;
-                    let freed = if *o == self.id { families } else { 0 };
-                    self.slots_fit(&view, *o, extra.saturating_sub(freed))
-                });
-                if !fits {
-                    return Err(Error::Unsupported(
-                        "a shard would hold more tablets than its memtable arena serves",
-                    ));
-                }
                 if view.to_record().encoded_len() + grow > self.shared.view_capacity {
                     return Err(Error::Unsupported(
                         "the tablet map would not fit the shared-memory view buffer (D28)",
                     ));
                 }
-                Ok(vec![t])
+                // Each shard keeps its slots within its arena's chunks.
+                let mut extra: Vec<(ShardId, usize)> = Vec::new();
+                for o in owners {
+                    if extra.iter().any(|(s, _)| s == o) {
+                        continue;
+                    }
+                    let children = owners.iter().filter(|x| *x == o).count();
+                    // The parent's slots leave this shard as its children arrive.
+                    let freed = if *o == self.id { families } else { 0 };
+                    extra.push((*o, (families * children).saturating_sub(freed)));
+                }
+                let reserved = self.reserve_slots(&view, &extra)?;
+                Ok((vec![t], reserved))
             }
             TabletOpKind::Merge { left, right } => {
                 let l = entry(*left)?;
@@ -629,7 +651,7 @@ impl ShardState {
                         "only adjacent tablets of one table merge".to_owned(),
                     ));
                 }
-                Ok(vec![l, r])
+                Ok((vec![l, r], Vec::new()))
             }
             TabletOpKind::Move { tablet, to } => {
                 let t = entry(*tablet)?;
@@ -640,12 +662,8 @@ impl ShardState {
                     )));
                 }
                 let families = view.catalog.family_ids_of(t.table).len();
-                if !self.slots_fit(&view, *to, families) {
-                    return Err(Error::Unsupported(
-                        "a shard would hold more tablets than its memtable arena serves",
-                    ));
-                }
-                Ok(vec![t])
+                let reserved = self.reserve_slots(&view, &[(*to, families)])?;
+                Ok((vec![t], reserved))
             }
         }
     }
@@ -657,15 +675,51 @@ impl ShardState {
         crate::engine::max_slots(self.arena.region().len(), self.chunk_size)
     }
 
-    /// Whether `shard` can take `extra` more slots under [`ShardState::max_slots`].
-    fn slots_fit(&self, view: &View, shard: ShardId, extra: usize) -> bool {
-        let slots: usize = view
-            .tablets
+    /// Slots `shard` holds in `view`.
+    fn slots_in(view: &View, shard: ShardId) -> usize {
+        view.tablets
             .iter()
             .filter(|t| t.shard == shard)
             .map(|t| view.catalog.family_ids_of(t.table).len())
-            .sum();
-        slots + extra <= self.max_slots()
+            .sum()
+    }
+
+    /// Whether `shard` can take `extra` more slots under [`ShardState::max_slots`], counting
+    /// the slots other changes reserved there.
+    fn slots_fit(&self, view: &View, shard: ShardId, extra: usize) -> bool {
+        let reserved = self.shared.loads[usize::from(shard.0)]
+            .reserved
+            .load(Ordering::Acquire);
+        Self::slots_in(view, shard) + reserved + extra <= self.max_slots()
+    }
+
+    /// Reserves `extra` slots on each shard (all or none), so a change running on another
+    /// shard sees them before this one commits (#103).
+    fn reserve_slots(&self, view: &View, extra: &[(ShardId, usize)]) -> Result<Reserved> {
+        let mut out: Reserved = Vec::new();
+        for &(shard, n) in extra {
+            if n == 0 {
+                continue;
+            }
+            let slot = &self.shared.loads[usize::from(shard.0)].reserved;
+            let before = slot.fetch_add(n, Ordering::AcqRel);
+            out.push((shard, n));
+            if Self::slots_in(view, shard) + before + n > self.max_slots() {
+                self.release_slots(&out);
+                return Err(Error::Unsupported(
+                    "a shard would hold more tablets than its memtable arena serves",
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    fn release_slots(&self, reserved: &[(ShardId, usize)]) {
+        for &(shard, n) in reserved {
+            self.shared.loads[usize::from(shard.0)]
+                .reserved
+                .fetch_sub(n, Ordering::AcqRel);
+        }
     }
 
     /// Moves the running change on: commits it once its tablets are drained.
@@ -786,6 +840,9 @@ impl ShardState {
         };
         self.finished_op();
         let moving: Vec<TabletId> = std::mem::take(&mut self.moving).into_iter().collect();
+        // The view now holds the slots (or the change failed): the reservation goes.
+        self.refresh_tablets();
+        self.release_slots(&op.reserved);
         match result {
             Ok(_) => {
                 trace!("shard {} tablet change {:?} done", self.id.0, op.kind);
@@ -833,6 +890,7 @@ impl ShardState {
         }
         let op = self.op.take().expect("checked");
         self.finished_op();
+        self.release_slots(&op.reserved);
         self.moving.clear();
         self.release_parked(ctx);
         if let Some(r) = op.reply {
@@ -935,10 +993,19 @@ impl ShardState {
             return;
         }
         self.next_balance = now.saturating_add(cfg.interval_nanos.max(1));
-        let (mem, mem_per) = self.mem_bytes();
+        self.balance_pass += 1;
+        // Moving averages of the write load: a shard's (published for the other shards) and
+        // each tablet's (#103). One interval's swing, or a flush, never decides a move.
+        self.load_ewma =
+            LOAD_ALPHA * self.window_writes as f64 + (1.0 - LOAD_ALPHA) * self.load_ewma;
+        for l in self.loads.values_mut() {
+            l.ewma = LOAD_ALPHA * l.writes as f64 + (1.0 - LOAD_ALPHA) * l.ewma;
+        }
+        self.note_arrivals();
+        let (_, mem_per) = self.mem_bytes();
         let slot = &self.shared.loads[usize::from(self.id.0)];
-        slot.writes.store(self.window_writes, Ordering::Relaxed);
-        slot.mem.store(mem, Ordering::Relaxed);
+        slot.writes
+            .store(self.load_ewma.round() as u64, Ordering::Relaxed);
         slot.at.store(now.max(1), Ordering::Release);
         let idle = self.op.is_none()
             && self.op_queue.is_empty()
@@ -951,7 +1018,7 @@ impl ShardState {
         // A change waits for a running compaction on its tablets: the balancer leaves a
         // compacting tablet alone and decides again next interval (#102).
         let (decision, cleanups) = if idle {
-            let (kind, cleanups) = self.decide(now, mem, &mem_per);
+            let (kind, cleanups) = self.decide(now, &mem_per);
             let kind = kind.filter(|kind| {
                 self.compaction
                     .is_none_or(|(t, _)| !kind.tablets().contains(&t))
@@ -970,6 +1037,13 @@ impl ShardState {
         match decision {
             Some(kind) => {
                 trace!("shard {} balancer: {kind:?}", self.id.0);
+                // Anything but a size split (a move, or a split over shards) starts the
+                // shard's dwell: the loads settle before write skew acts again.
+                let size_split = matches!(&kind, TabletOpKind::Split { owners, .. }
+                    if owners.iter().all(|o| *o == self.id));
+                if !size_split {
+                    self.skew_pass = Some(self.balance_pass);
+                }
                 self.request_tablet_op(kind, reply, ctx);
             }
             None => {
@@ -985,6 +1059,66 @@ impl ShardState {
                 }
             }
             self.maintain(ctx);
+        }
+        self.arm_balance_timer(ctx);
+    }
+
+    /// Records the balancer pass at which each tablet this shard owns first appeared here
+    /// (the tablets it held at its first pass count as settled).
+    fn note_arrivals(&mut self) {
+        let view = self.shared.view.load();
+        let first = self.balance_pass <= 1;
+        let pass = if first { 0 } else { self.balance_pass };
+        let owned: HashSet<TabletId> = view
+            .tablets
+            .iter()
+            .filter(|t| t.shard == self.id)
+            .map(|t| t.id)
+            .collect();
+        self.arrived.retain(|t, _| owned.contains(t));
+        for t in owned {
+            self.arrived.entry(t).or_insert(pass);
+        }
+    }
+
+    /// Whether write skew may move or split `t` this pass (it has dwelt here long enough).
+    fn settled(&self, t: TabletId) -> bool {
+        self.arrived
+            .get(&t)
+            .is_none_or(|p| *p == 0 || *p + DWELL_PASSES <= self.balance_pass)
+    }
+
+    /// Wakes the shard for its next balancer pass even when no message arrives (#103), so
+    /// an idle shard still merges cold tablets. Like the other clock timers (D126), one that
+    /// gave up on a frozen clock is not armed again while the clock stays frozen.
+    fn arm_balance_timer(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let interval = self.shared.balance.interval_nanos;
+        if interval == 0 || interval == u64::MAX || self.closing || self.next_balance == u64::MAX {
+            return;
+        }
+        let now = ctx.now_nanos();
+        if self
+            .balance_timer
+            .as_ref()
+            .is_some_and(|t| !t.finished() || t.frozen(now))
+        {
+            return;
+        }
+        let state = TimerState::new();
+        ctx.spawn(Box::new(ClockTimer::new(
+            &self.shared.vfs,
+            self.next_balance,
+            Arc::clone(&state),
+            ctx.submitter(self.id).clone(),
+            ShardMsg::Kick,
+        )));
+        self.balance_timer = Some(state);
+    }
+
+    /// Cancels the balancer's wakeup (close).
+    pub(super) fn cancel_balance_timer(&mut self) {
+        if let Some(t) = self.balance_timer.take() {
+            t.cancel();
         }
     }
 
@@ -1039,17 +1173,15 @@ impl ShardState {
     fn decide(
         &self,
         now: u64,
-        mem: u64,
         mem_per: &HashMap<TabletId, u64>,
     ) -> (Option<TabletOpKind>, Vec<(TabletId, FamilyId)>) {
         let mut cleanups = Vec::new();
-        (self.choose(now, mem, mem_per, &mut cleanups), cleanups)
+        (self.choose(now, mem_per, &mut cleanups), cleanups)
     }
 
     fn choose(
         &self,
         now: u64,
-        mem: u64,
         mem_per: &HashMap<TabletId, u64>,
         cleanups: &mut Vec<(TabletId, FamilyId)>,
     ) -> Option<TabletOpKind> {
@@ -1067,13 +1199,9 @@ impl ShardState {
         let refs = view.catalog.sst_refs();
         // Every `(tablet, family)` slot written to takes memtable chunks: a shard keeps its
         // slots within `max_slots`, so splits never starve writers of memtables.
-        let slots: usize = owned
-            .iter()
-            .map(|t| view.catalog.family_ids_of(t.table).len())
-            .sum();
-        let max_slots = self.max_slots();
-        let room_for =
-            |t: &TabletEntry| slots + view.catalog.family_ids_of(t.table).len() <= max_slots;
+        let room_for = |t: &TabletEntry| {
+            self.slots_fit(&view, self.id, view.catalog.family_ids_of(t.table).len())
+        };
         // 1. Size: a tablet holding `tablet_split_bytes` of SSTs splits in two (not while it
         //    still shares SSTs with a sibling: their bytes would count twice).
         for t in &owned {
@@ -1081,8 +1209,11 @@ impl ShardState {
             if bytes >= cfg.split_bytes && !shared && !room_for(t) {
                 trace!(
                     "shard {} balancer: tablet {} is due a size split but the shard holds \
-                     {slots} of its {max_slots} slots",
-                    self.id.0, t.id.0
+                     {} of its {} slots",
+                    self.id.0,
+                    t.id.0,
+                    Self::slots_in(&view, self.id),
+                    self.max_slots()
                 );
             }
             if bytes >= cfg.split_bytes
@@ -1097,24 +1228,33 @@ impl ShardState {
                 });
             }
         }
-        // 2. Skew across shards: write load first, then memtable bytes.
+        // 2. Skew across shards, on the moving averages of write load (#103; memtable bytes
+        //    swing with every flush and no longer count). Not during the shard's dwell after
+        //    its last move, and only for tablets that dwelt here long enough.
         let n = self.shared.shards;
-        if n > 1 {
+        let dwelling = self
+            .skew_pass
+            .is_some_and(|p| p + DWELL_PASSES > self.balance_pass);
+        if n > 1 && !dwelling {
             let stale = cfg.interval_nanos.saturating_mul(3).max(1);
             let mut writes = vec![0u64; n];
-            let mut mems = vec![0u64; n];
             for (i, slot) in self.shared.loads.iter().enumerate() {
                 let at = slot.at.load(Ordering::Acquire);
                 if at != 0 && now.saturating_sub(at) <= stale {
                     writes[i] = slot.writes.load(Ordering::Relaxed);
-                    mems[i] = slot.mem.load(Ordering::Relaxed);
                 }
             }
-            let me = usize::from(self.id.0);
-            mems[me] = mem;
-            let tablet_writes: HashMap<TabletId, u64> = owned
+            let settled: Vec<TabletEntry> = owned
                 .iter()
-                .map(|t| (t.id, self.loads.get(&t.id).map_or(0, |l| l.writes)))
+                .filter(|t| self.settled(t.id))
+                .cloned()
+                .collect();
+            let tablet_writes: HashMap<TabletId, u64> = settled
+                .iter()
+                .map(|t| {
+                    let w = self.loads.get(&t.id).map_or(0.0, |l| l.ewma);
+                    (t.id, w.round() as u64)
+                })
                 .collect();
             let splits_ok = |op: &TabletOpKind| match op {
                 TabletOpKind::Split { tablet, .. } => {
@@ -1122,13 +1262,7 @@ impl ShardState {
                 }
                 _ => true,
             };
-            if let Some(op) = self.skew_op(&owned, &writes, &tablet_writes, cfg.min_writes)
-                && splits_ok(&op)
-            {
-                return Some(op);
-            }
-            let min_mem = self.shared.memtable_freeze_bytes;
-            if let Some(op) = self.skew_op(&owned, &mems, mem_per, min_mem)
+            if let Some(op) = self.skew_op(&view, &settled, &writes, &tablet_writes, cfg.min_writes)
                 && splits_ok(&op)
             {
                 return Some(op);
@@ -1175,6 +1309,35 @@ impl ShardState {
                 }
             }
         }
+        // 4. Consolidate (#103): a cold tablet whose left neighbour lives on another shard
+        //    moves there when the two are small together, so that shard can merge them.
+        //    Only right to left, so two shards never swap tablets, and only tablets that
+        //    dwelt here (a split's child is cold until its first writes arrive).
+        for t in &owned {
+            if !cold(t.id) || t.start.is_empty() || !self.settled(t.id) {
+                continue;
+            }
+            let Some(left) = view
+                .tablets
+                .tablets_of(t.table)
+                .iter()
+                .find(|l| l.end.as_deref() == Some(t.start.as_slice()))
+            else {
+                continue;
+            };
+            if left.shard == self.id {
+                continue;
+            }
+            let (lb, _) = live_bytes(&view, left, &refs);
+            let (tb, _) = live_bytes(&view, t, &refs);
+            let families = view.catalog.family_ids_of(t.table).len();
+            if lb + tb < cfg.split_bytes / 4 && self.slots_fit(&view, left.shard, families) {
+                return Some(TabletOpKind::Move {
+                    tablet: t.id,
+                    to: left.shard,
+                });
+            }
+        }
         None
     }
 
@@ -1182,6 +1345,7 @@ impl ShardState {
     /// shares of it (`per_tablet`), when this shard is skewed past the threshold.
     fn skew_op(
         &self,
+        view: &View,
         owned: &[TabletEntry],
         loads: &[u64],
         per_tablet: &HashMap<TabletId, u64>,
@@ -1209,15 +1373,18 @@ impl ShardState {
             .collect();
         tablets.sort_by_key(|(id, w)| (std::cmp::Reverse(*w), *id));
         // A tablet carrying less than the gap moves: the one closest to half of it.
+        let to = ShardId(cold as u16);
+        let fits = |id: TabletId| {
+            owned.iter().find(|t| t.id == id).is_some_and(|t| {
+                self.slots_fit(view, to, view.catalog.family_ids_of(t.table).len())
+            })
+        };
         if let Some((t, _)) = tablets
             .iter()
-            .filter(|(_, w)| *w < gap && *w >= gap / 8)
+            .filter(|(id, w)| *w < gap && *w >= gap / 8 && fits(*id))
             .min_by_key(|(id, w)| ((gap / 2).abs_diff(*w), *id))
         {
-            return Some(TabletOpKind::Move {
-                tablet: *t,
-                to: ShardId(cold as u16),
-            });
+            return Some(TabletOpKind::Move { tablet: *t, to });
         }
         // One tablet dominates: split it over this shard and the shards below the mean.
         let (hot, _) = *tablets.first()?;
