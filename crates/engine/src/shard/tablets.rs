@@ -1217,6 +1217,15 @@ impl ShardState {
             }
             break;
         }
+        // A cleanup passed over for its slot's backoff runs when the backoff ends, even on
+        // a shard that is idle by then.
+        if let Some(until) = later
+            .iter()
+            .filter_map(|k| self.slot_backoff.get(k).map(|&(_, until)| until))
+            .min()
+        {
+            self.arm_compaction_retry(until, ctx);
+        }
         self.cleanups.extend(later);
     }
 

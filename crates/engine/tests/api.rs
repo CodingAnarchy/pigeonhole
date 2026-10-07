@@ -681,6 +681,79 @@ fn a_value_at_the_documented_limit_fits_the_arena() {
 }
 
 #[test]
+fn a_value_with_free_bytes_but_no_long_enough_run_waits_instead_of_poisoning() {
+    // Issue #141 review: free bytes scattered across the arena do not hold an entry larger
+    // than a chunk, which needs one contiguous run. With enough free bytes in total but no
+    // run long enough, the commit used to be admitted, failed to allocate at apply, and
+    // poisoned the shard. It now waits for room (here in vain: a stall) and the shard goes on.
+    let vfs = SimVfs::new(34);
+    let mut o = owned(Arc::clone(&vfs), 1);
+    o.memtable_budget = 1 << 20;
+    o.wal.segment_size = 4 << 20;
+    o.write_stall_timeout_nanos = 300_000_000;
+    // Without tablet changes the chunk is a fixed budget / 64.
+    o.tablet_changes = false;
+    let chunk = 16usize << 10;
+    // `x` freezes on its own once it holds 93 chunks.
+    o.memtable_freeze_bytes = (93 * chunk) as u64;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let table = |name: &str| {
+        db.create_table(name, &[("f".into(), FamilyOptions::default())])
+            .unwrap()
+    };
+    let (x, p1, p2) = (table("x"), table("p1"), table("p2"));
+    let commit = |t: &pigeonhole_engine::TableInfo, row: &[u8], len: usize| {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, t, "f", row, b"q", &vec![5u8; len]);
+        db.commit(wb, Some(Durability::None))
+    };
+    let allocated = || {
+        let (free, _, len) = db.arena_free(0);
+        (len - free) as usize / chunk
+    };
+    // `x` takes chunks from the bottom, one per 15 KiB row; `p1` and `p2` each take one
+    // chunk where `x` stopped, so they sit at chunks 31 and 63 as islands.
+    let mut row = 0u32;
+    let mut grow_x_to = |n: usize| {
+        while allocated() < n {
+            assert!(row < 200, "x never reached {n} chunks");
+            commit(&x, &row.to_be_bytes(), 15 << 10).unwrap();
+            row += 1;
+        }
+    };
+    grow_x_to(31);
+    commit(&p1, b"island", 1).unwrap();
+    grow_x_to(63);
+    commit(&p2, b"island", 1).unwrap();
+    // `x` freezes at 93 chunks (its fresh memtable is the third island) and its old chunks
+    // come back once flushed.
+    grow_x_to(95);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let half = 512usize << 10; // D16's limit: 33 chunks with its node and the prefix.
+    loop {
+        commit(&p1, b"tick", 1).unwrap();
+        let (free, run, len) = db.arena_free(0);
+        if (free as usize) > half * 3 / 2 && (run as usize) < half + chunk {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never built the fragmented arena: free {free}, largest run {run} of {len}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let r = commit(&x, b"half", half);
+    assert!(
+        matches!(r, Ok(_) | Err(Error::Busy)),
+        "a value that fits no run: {r:?}"
+    );
+    // The shard is not poisoned.
+    commit(&p2, b"after", 100).unwrap();
+    commit(&x, b"after", 100).unwrap();
+    db.close().unwrap();
+}
+
+#[test]
 fn value_limits_arena_pressure_and_closed_handles() {
     let vfs = SimVfs::new(12);
     let mut o = owned(Arc::clone(&vfs), 1);

@@ -113,6 +113,10 @@ pub(crate) struct ShardMetrics {
     pub flush_nanos: AtomicU64,
     pub compactions: AtomicU64,
     pub compaction_nanos: AtomicU64,
+    /// Flushes and background compactions that failed (issue #141: they are retried on a
+    /// backoff, and nothing else reports them).
+    pub flush_failures: AtomicU64,
+    pub compaction_failures: AtomicU64,
     pub splits: AtomicU64,
     pub merges: AtomicU64,
     pub moves: AtomicU64,
@@ -122,6 +126,14 @@ pub(crate) struct ShardMetrics {
     /// WAL unpin passes (#137) and the memtables they froze below the size threshold.
     pub unpin_passes: AtomicU64,
     pub unpin_flushes: AtomicU64,
+    /// The arena's free bytes, largest free run and size after the shard's last batch
+    /// (test hook: a test checks it built the fragmented arena it means to, issue #141).
+    #[cfg(feature = "test-hooks")]
+    pub arena_free: AtomicU64,
+    #[cfg(feature = "test-hooks")]
+    pub arena_run: AtomicU64,
+    #[cfg(feature = "test-hooks")]
+    pub arena_len: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -135,6 +147,8 @@ impl Default for ShardMetrics {
             flush_nanos: AtomicU64::new(0),
             compactions: AtomicU64::new(0),
             compaction_nanos: AtomicU64::new(0),
+            flush_failures: AtomicU64::new(0),
+            compaction_failures: AtomicU64::new(0),
             splits: AtomicU64::new(0),
             merges: AtomicU64::new(0),
             moves: AtomicU64::new(0),
@@ -142,6 +156,12 @@ impl Default for ShardMetrics {
             aborted: AtomicU64::new(0),
             unpin_passes: AtomicU64::new(0),
             unpin_flushes: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            arena_free: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            arena_run: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            arena_len: AtomicU64::new(0),
         }
     }
 }
@@ -1608,6 +1628,19 @@ impl Task for ClockTimer {
     }
 }
 
+/// Arena room a batch needs (`ShardState::arena_needed`).
+#[derive(Debug, Clone, Copy)]
+struct ArenaNeed {
+    /// Worst-case bytes of free chunks it uses.
+    bytes: usize,
+    /// Chunks its largest entry takes (contiguous).
+    run_chunks: usize,
+    /// Chunks its smallest entry larger than a chunk takes (0 without one).
+    min_large: usize,
+    /// Chunks its allocations can take in all.
+    alloc_chunks: usize,
+}
+
 /// A group waiting for a flush to free memtable arena room (a write stall, counted in the
 /// metrics), refused with `Busy` once `write_stall_timeout_nanos` have passed (D124). On a
 /// frozen clock it is also refused after `ROOM_FLUSH_ATTEMPTS` failed flushes in a row, or
@@ -1894,10 +1927,9 @@ pub(crate) struct ShardState {
     /// failure is that caller's. A background compaction's failure is nobody's: it backs
     /// off (issue #141).
     compaction_full: bool,
-    /// A compaction failed and no retry has happened since: a write stall does not wait for
-    /// compaction (D119). Ends when `backoff_timer` fires, a compaction succeeds, or, on a
-    /// frozen clock only, a flush completes or a group is admitted (issue #141).
-    compaction_backoff: bool,
+    /// Every slot due for a compaction is backing off after a failure, so no compaction can
+    /// relieve an L0 stall now (set by `maintain`; D119, issue #141).
+    due_backing_off: bool,
     /// Fires (`RetryCompaction`) at its deadline, the earliest end of a slot's backoff.
     backoff_timer: Option<(Arc<TimerState>, u64)>,
     /// Slots whose compaction failed: failures in a row and the time (VFS monotonic
@@ -2048,7 +2080,7 @@ impl ShardState {
             compaction: None,
             compact_all: VecDeque::new(),
             compaction_full: false,
-            compaction_backoff: false,
+            due_backing_off: false,
             backoff_timer: None,
             slot_backoff: HashMap::new(),
             checkpoint_failures: 0,
@@ -2338,29 +2370,59 @@ impl ShardState {
     /// rest of the old run is lost. That lost tail is shorter than both the entry that did
     /// not fit and one chunk. So every entry costs at most its size plus `min(size,
     /// chunk)`, and a single large value costs about its size, not twice it (issue #141).
-    fn arena_needed(&self, batch: BatchRef<'_>) -> usize {
+    /// Each memtable the batch writes to may also leave its last run's tail unused: one
+    /// chunk more per slot touched. The bound is checked by the memtable crate's property
+    /// test `a_batch_stays_within_the_engine_bound`.
+    ///
+    /// An entry larger than a chunk needs contiguous free chunks, which free bytes scattered
+    /// across the arena do not provide. So this also returns the largest and smallest such
+    /// entry's size in chunks, and how many chunks the batch's allocations can take in all
+    /// (each entry at most its own, each slot it creates one).
+    fn arena_needed(&self, batch: BatchRef<'_>) -> ArenaNeed {
         let mut total = 0usize;
         let mut waste = 0usize;
-        // `(tablet, family)` slots the batch would create, each a memtable with a chunk of
-        // its own (a table split into many tablets has many slots).
-        let mut new_slots: Vec<(TabletId, FamilyId)> = Vec::new();
+        let mut largest = 0usize;
+        let (mut alloc_chunks, mut min_large) = (0usize, usize::MAX);
+        // `(tablet, family)` slots the batch writes to, and those it would create (each a
+        // memtable with a chunk of its own; a table split into many tablets has many slots).
+        let mut touched: Vec<(TabletId, FamilyId)> = Vec::new();
+        let mut unrouted = 0usize;
+        let mut new_slots = 0usize;
         for m in batch.iter().flatten() {
             let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
             let entry = ENTRY_OVERHEAD + key + m.value.len();
             total += entry;
             waste += entry.min(self.chunk_size);
-            if self.tablets_on()
-                && let Some((tablet, owner)) = self.tablets.route(m.table, m.row)
-                && owner == self.id
-                && !self.memtables.contains_key(&(tablet, m.family))
-                && !new_slots.contains(&(tablet, m.family))
-            {
-                new_slots.push((tablet, m.family));
+            largest = largest.max(entry);
+            // The arena's first chunk loses a 64-byte prefix.
+            let chunks = (entry + 64).div_ceil(self.chunk_size);
+            alloc_chunks += chunks;
+            if chunks > 1 {
+                min_large = min_large.min(chunks);
+            }
+            match self.tablets.route(m.table, m.row) {
+                Some((tablet, _)) if !touched.contains(&(tablet, m.family)) => {
+                    touched.push((tablet, m.family));
+                    if self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family)) {
+                        new_slots += 1;
+                    }
+                }
+                Some(_) => {}
+                None => unrouted += 1,
             }
         }
-        // A new memtable needs a chunk of its own. With tablet changes on, every slot the
-        // batch creates needs one too, and a freeze needs one more.
-        total + waste + (new_slots.len() + 2) * self.chunk_size
+        // A new memtable needs a chunk of its own, and a freeze needs one more.
+        let chunks = touched.len() + unrouted + new_slots + 2;
+        ArenaNeed {
+            bytes: total + waste + chunks * self.chunk_size,
+            run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
+            min_large: if min_large == usize::MAX {
+                0
+            } else {
+                min_large
+            },
+            alloc_chunks: alloc_chunks + new_slots,
+        }
     }
 
     /// Retires the memtables of slots that hold nothing (an empty active memtable, nothing
@@ -2410,23 +2472,48 @@ impl ShardState {
     /// Reserves arena room for `bytes` (on top of everything already reserved by members of
     /// this group and undecided shares) or returns `None` when it would not fit.
     fn reserve_room(&mut self, bytes: &[u8]) -> std::result::Result<usize, Room> {
-        let needed = match BatchRef::new(bytes) {
+        let need = match BatchRef::new(bytes) {
             Ok(batch) => self.arena_needed(batch),
-            Err(_) => 0,
+            Err(_) => ArenaNeed {
+                bytes: 0,
+                run_chunks: 1,
+                min_large: 0,
+                alloc_chunks: 0,
+            },
         };
-        if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+        let needed = need.bytes;
+        // Entries within a chunk fit any free chunk. A larger entry must also find a long
+        // enough run (issue #141: a run too short for it, with enough free chunks elsewhere,
+        // used to poison the shard at apply). Before any large entry allocates, at most the
+        // batch's other allocations and those reserved for this group's earlier members have
+        // taken chunks: if a block of the largest entry's size is sure to be left after
+        // that many (`ShardArena::blocks_left`), every large entry finds a run.
+        let chunk = self.chunk_size;
+        let reserved = self.reserved;
+        let fits = |arena: &ShardArena| {
+            arena.free_bytes() >= reserved.saturating_add(needed)
+                && (need.run_chunks <= 1
+                    || arena.blocks_left(
+                        need.run_chunks,
+                        (need.alloc_chunks - need.min_large) + reserved.div_ceil(chunk),
+                    ) >= 1)
+        };
+        if !fits(&self.arena) {
             // Memtables whose readers left since the last reclaim count too.
             self.reclaim_retired();
             self.refresh_free();
         }
         trace!(
-            "shard {} reserve: needed={needed} free={} reserved={} total={}",
+            "shard {} reserve: needed={needed} run={} of {} chunks free={} largest={} reserved={} total={}",
             self.id.0,
+            need.run_chunks,
+            need.alloc_chunks,
             self.arena.free_bytes(),
+            self.arena.largest_free_run(),
             self.reserved,
             self.arena.region().len()
         );
-        if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+        if !fits(&self.arena) {
             let total = self.arena.region().len();
             return Err(if needed + 2 * self.chunk_size > total {
                 Room::Never
@@ -2611,14 +2698,14 @@ impl ShardState {
         if self.flush_running || self.flush_queue.is_empty() {
             return;
         }
-        // A failed flush waits out its backoff (the timer's `RetryFlush` comes back here).
-        if self.flush_retry.as_ref().is_some_and(|t| !t.finished()) {
-            return;
-        }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
             for w in self.flush_waiters.drain(..) {
                 w.notify(Err(ManifestWriter::poisoned_error()));
             }
+            return;
+        }
+        // A failed flush waits out its backoff (the timer's `RetryFlush` comes back here).
+        if self.flush_retry.as_ref().is_some_and(|t| !t.finished()) {
             return;
         }
         let items = std::mem::take(&mut self.flush_queue);
@@ -2803,6 +2890,9 @@ impl ShardState {
                 // writer waits for room (issue #141). A poisoned pager stops flushing until
                 // reopen; a failure while closing makes the close unclean.
                 trace!("shard {} flush failed: {e}", self.id.0);
+                self.shared.metrics[usize::from(self.id.0)]
+                    .flush_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 self.requeue_frozen();
                 if !self.closing {
                     self.flush_failures = self.flush_failures.saturating_add(1);
@@ -3270,7 +3360,7 @@ impl ShardState {
         let frozen = self.stall.timer.as_ref().is_some_and(|t| t.frozen(now));
         // A stall lets compaction catch up; when none can run (the last one failed, the
         // pager or this shard is poisoned) holding writers would hold them for ever.
-        let mut hopeless = self.compaction_backoff
+        let mut hopeless = self.due_backing_off
             || self.poisoned
             || self.shared.pager_poisoned.load(Ordering::Acquire);
         if !hopeless && self.stall.score >= 1.0 && self.compaction.is_none() {
@@ -3278,7 +3368,7 @@ impl ShardState {
             // On a frozen clock the bucket never refills: only a compaction's completion
             // can end the stall, so with none running writers are admitted (issue #70). A
             // moving clock keeps pacing them (D119).
-            hopeless = self.compaction_backoff || (frozen && self.compaction.is_none());
+            hopeless = self.due_backing_off || (frozen && self.compaction.is_none());
         }
         if self.stall.score < 1.0 || hopeless {
             self.stall.cancel_timer();
@@ -4867,6 +4957,23 @@ impl ShardState {
             }
         }
         due.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let now_nanos = ctx.now_nanos();
+        // Backoffs of slots this shard no longer has (a dropped table, a tablet merged away
+        // or moved off) go (issue #141).
+        if !self.slot_backoff.is_empty() {
+            let id = self.id;
+            self.slot_backoff.retain(|k, _| {
+                view.tablets.entry(k.0).is_some_and(|t| t.shard == id)
+                    && view.catalog.family(k.1).is_some()
+            });
+        }
+        // A stall waits for compaction only while some due slot may compact (D119).
+        self.due_backing_off = !due.is_empty()
+            && due.iter().all(|(_, k)| {
+                self.slot_backoff
+                    .get(k)
+                    .is_some_and(|&(_, until)| until > now_nanos)
+            });
         trace!(
             "shard {} maintain: score={score:.2} best={:?} compaction={:?} full_waiters={}",
             self.id.0,
@@ -4974,7 +5081,6 @@ impl ShardState {
             }
         }
         let now = self.shared.vfs.now_micros();
-        let now_nanos = ctx.now_nanos();
         // The earliest end of a quarantine that kept a due slot from being picked.
         let mut quarantined: Option<u64> = None;
         // The most urgent slot the picker finds work in (another one's inputs may be busy,
@@ -5049,9 +5155,9 @@ impl ShardState {
             .backoff_timer
             .as_ref()
             .is_some_and(|(t, _)| t.frozen(now));
-        if frozen || (self.compaction_backoff && self.backoff_timer.is_none()) {
-            self.compaction_backoff = false;
+        if frozen {
             self.slot_backoff.clear();
+            self.due_backing_off = false;
         }
     }
 
@@ -5064,7 +5170,9 @@ impl ShardState {
         key: (TabletId, FamilyId),
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
-        self.compaction_backoff = true;
+        self.shared.metrics[usize::from(self.id.0)]
+            .compaction_failures
+            .fetch_add(1, Ordering::Relaxed);
         let e = self.slot_backoff.entry(key).or_insert((0, 0));
         e.0 = e.0.saturating_add(1);
         e.1 = ctx
@@ -5228,7 +5336,6 @@ impl ShardState {
                 if let Some(key) = key {
                     self.slot_backoff.remove(&key);
                 }
-                self.compaction_backoff = false;
                 // On a frozen clock the bucket never refills: compaction progress paces a
                 // stall instead (issue #70).
                 let now = ctx.now_nanos();
@@ -5648,7 +5755,6 @@ impl ShardState {
                 // Only the current backoff timer's firing ends the backoff.
                 if self.backoff_timer.as_ref().is_some_and(|(t, _)| t.fired()) {
                     self.backoff_timer = None;
-                    self.compaction_backoff = false;
                     self.maintain(ctx);
                 }
             }
@@ -5751,9 +5857,17 @@ impl ShardHandler for ShardState {
         self.retry_starved_freeze(ctx);
         self.try_finish_close(ctx);
         #[cfg(feature = "test-hooks")]
-        self.shared.metrics[usize::from(self.id.0)]
-            .aborted
-            .store(self.aborted.len() as u64, Ordering::Relaxed);
+        {
+            let m = &self.shared.metrics[usize::from(self.id.0)];
+            m.aborted
+                .store(self.aborted.len() as u64, Ordering::Relaxed);
+            m.arena_free
+                .store(self.arena.free_bytes() as u64, Ordering::Relaxed);
+            m.arena_run
+                .store(self.arena.largest_free_run() as u64, Ordering::Relaxed);
+            m.arena_len
+                .store(self.arena.region().len() as u64, Ordering::Relaxed);
+        }
     }
 }
 

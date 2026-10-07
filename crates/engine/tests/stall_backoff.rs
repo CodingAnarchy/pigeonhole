@@ -122,6 +122,8 @@ fn steady_writes_do_not_cut_a_failing_compactions_backoff_short() {
          was cut short"
     );
     assert!(failures >= 2, "the backoff timer never retried");
+    // Each failed attempt is counted (nothing else reports a background failure).
+    assert_eq!(db.metrics().compaction_failures, failures as u64);
     gate.fail_reads_containing(None);
     db.close().unwrap();
 }
@@ -217,6 +219,10 @@ fn a_failing_flush_during_a_room_wait_backs_off() {
     assert!(
         retries <= 8,
         "{retries} failed flushes in 1 s of a room wait: retried back to back"
+    );
+    assert!(
+        db.metrics().flush_failures >= 1,
+        "failed flushes are counted"
     );
     // The device recovers: the next retry (at most a second away) frees room.
     gate.fail_writes_containing(None);

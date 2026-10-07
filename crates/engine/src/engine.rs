@@ -100,6 +100,10 @@ pub struct Metrics {
     pub flushes: u64,
     /// Compactions completed.
     pub compactions: u64,
+    /// Flushes that failed (retried on a backoff; the WAL keeps their data).
+    pub flush_failures: u64,
+    /// Compactions that failed or could not start (their slot backs off, then retries).
+    pub compaction_failures: u64,
     /// Write stalls (token-bucket waits and refused commits) and total stalled nanoseconds.
     pub stalls: (u64, u64),
     /// Block cache hits and misses (the cache does not count them yet: always zero).
@@ -1477,6 +1481,8 @@ impl Engine {
         for s in &shared.metrics {
             m.flushes += s.flushes.load(Ordering::Relaxed);
             m.compactions += s.compactions.load(Ordering::Relaxed);
+            m.flush_failures += s.flush_failures.load(Ordering::Relaxed);
+            m.compaction_failures += s.compaction_failures.load(Ordering::Relaxed);
             m.stalls.0 += s.stalls.load(Ordering::Relaxed);
             m.stalls.1 += s.stall_nanos.load(Ordering::Relaxed);
             m.unpin.0 += s.unpin_passes.load(Ordering::Relaxed);
@@ -1780,6 +1786,20 @@ impl Engine {
             .iter()
             .map(|m| m.aborted.load(Ordering::Relaxed))
             .sum()
+    }
+
+    /// Shard `shard`'s arena after its last batch: free bytes, the usable bytes of its
+    /// largest run of free chunks, and its size. A test builds a fragmented arena with it
+    /// (issue #141).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn arena_free(&self, shard: usize) -> (u64, u64, u64) {
+        let m = &self.inner.shared.metrics[shard];
+        (
+            m.arena_free.load(Ordering::Relaxed),
+            m.arena_run.load(Ordering::Relaxed),
+            m.arena_len.load(Ordering::Relaxed),
+        )
     }
 
     /// The WAL records appended since the last call (or since open), in append order.

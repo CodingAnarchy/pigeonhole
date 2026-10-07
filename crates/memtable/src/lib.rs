@@ -350,6 +350,72 @@ impl ShardArena {
         self.free_count * self.chunk_size
     }
 
+    /// Usable bytes of the largest run of contiguous free chunks: the largest entry an
+    /// allocation can place now. An entry larger than a chunk needs one such run, so free
+    /// bytes elsewhere do not help it.
+    pub fn largest_free_run(&self) -> usize {
+        let mut best = 0;
+        self.free_runs_each(|first, count| best = best.max(self.usable(first, count)));
+        best
+    }
+
+    /// How many blocks of `chunks` contiguous free chunks the free runs are sure to hold
+    /// after any `removed` chunks are allocated: `Σ ⌊run / chunks⌋` minus the most blocks
+    /// that many chunks could break.
+    ///
+    /// Every allocation takes its chunks from the start of a free run (the first one long
+    /// enough). Taking chunks from a run's start breaks its first block only once its spare
+    /// chunks (`run mod chunks`) are gone, and each further block costs `chunks` more, so
+    /// the most blocks `removed` chunks can break is found by spending them on the cheapest
+    /// breaks first. While at least one block is left, an allocation of up to `chunks`
+    /// chunks finds a run (issue #141).
+    pub fn blocks_left(&self, chunks: usize, removed: usize) -> usize {
+        let chunks = chunks.max(1);
+        let mut blocks = 0;
+        // The cost of breaking each run's first block; later ones cost `chunks` each.
+        let mut first_costs = Vec::new();
+        self.free_runs_each(|_, count| {
+            if count >= chunks {
+                blocks += count / chunks;
+                first_costs.push(count % chunks + 1);
+            }
+        });
+        first_costs.sort_unstable();
+        let (mut budget, mut broken) = (removed, 0);
+        for cost in first_costs {
+            if cost > budget {
+                break;
+            }
+            budget -= cost;
+            broken += 1;
+        }
+        broken += budget / chunks;
+        blocks.saturating_sub(broken)
+    }
+
+    /// The chunk size in bytes.
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Calls `f(first, count)` for each run of free chunks.
+    fn free_runs_each(&self, mut f: impl FnMut(usize, usize)) {
+        let n = self.free.len();
+        let mut first = 0;
+        while first < n {
+            if !self.free[first] {
+                first += 1;
+                continue;
+            }
+            let mut count = 1;
+            while first + count < n && self.free[first + count] {
+                count += 1;
+            }
+            f(first, count);
+            first += count;
+        }
+    }
+
     /// Returns a retired memtable's chunks to the free list. Call only once no reader slot
     /// pins a view that lists it (reader processes have no other protection). Handles in
     /// this process need no care: while any [`MemtableReader`], [`MemIter`] or

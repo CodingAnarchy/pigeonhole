@@ -651,3 +651,33 @@ fn reader_reports_link_cycles() {
     assert_eq!(result, Err(Error::Corrupt("link cycle")));
     assert_eq!(it.seek(&key(&[9], 9)), Err(Error::Corrupt("link cycle")));
 }
+
+#[test]
+fn largest_free_run_is_the_largest_contiguous_free_space() {
+    // 8 chunks of 1 KiB; the first loses the reserved 64-byte prefix.
+    let mut arena = ShardArena::new(ArenaRegion::heap(8 * 1024), 1024);
+    assert_eq!(arena.largest_free_run(), 8 * 1024 - 64);
+    let a = Memtable::create(&mut arena).unwrap(); // chunk 0
+    let mut b = Memtable::create(&mut arena).unwrap(); // chunk 1
+    // An entry of two chunks takes chunks 2-3.
+    b.insert(&mut arena, &key(b"r", 1), &[0u8; 1500]).unwrap();
+    assert_eq!(arena.largest_free_run(), 4 * 1024);
+    // Freeing chunk 0 leaves runs of 1 and 4 chunks.
+    arena.reclaim(a.retire());
+    assert_eq!(arena.free_bytes(), 5 * 1024);
+    assert_eq!(arena.largest_free_run(), 4 * 1024);
+    // Runs of 1 and 4 chunks: five 1-chunk blocks, two of 2, one of 3 or 4, none of 5.
+    assert_eq!(
+        (1..=5).map(|k| arena.blocks_left(k, 0)).collect::<Vec<_>>(),
+        [5, 2, 1, 1, 0]
+    );
+    // Blocks of 3: the 4-run holds one with a spare chunk, so taking two chunks from its
+    // start breaks it, and one does not.
+    assert_eq!(arena.blocks_left(3, 1), 1);
+    assert_eq!(arena.blocks_left(3, 2), 0);
+    // Blocks of 2: breaking the 4-run's first block costs 1, its second 2 more.
+    assert_eq!(
+        (0..5).map(|r| arena.blocks_left(2, r)).collect::<Vec<_>>(),
+        [2, 1, 1, 0, 0]
+    );
+}
