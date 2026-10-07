@@ -276,3 +276,132 @@ fn a_reader_view_never_mixes_a_record_with_another_versions_catalog() {
         .unwrap()
         .close();
 }
+
+/// Review of #140: a writer restart that reuses the manifest extents of the root a snapshot
+/// is loading made the load fail, and `snapshot()` returned that `Corruption` instead of
+/// re-attaching to the new generation.
+#[test]
+fn a_writer_restart_during_a_manifest_load_re_attaches() {
+    let vfs = SimVfs::new(12);
+    vfs.enter_process(WRITER);
+    let w = Arc::new(Mutex::new(Some(Writer::open(&vfs))));
+    let t = {
+        let mut g = w.lock().unwrap();
+        let w = g.as_mut().unwrap();
+        let t =
+            w.db.create_table("t", &[("f".into(), FamilyOptions::default())])
+                .unwrap();
+        write_rows(w, &t, "row", "old", 0..200);
+        t
+    };
+
+    vfs.enter_process(READER);
+    let reader =
+        Engine::open_reader(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20)).unwrap();
+    let rt = reader.table("t").unwrap();
+    drop(reader.snapshot().unwrap());
+
+    // A new manifest version the reader has not loaded yet.
+    vfs.enter_process(WRITER);
+    write_rows(
+        w.lock().unwrap().as_mut().unwrap(),
+        &t,
+        "row",
+        "old",
+        200..400,
+    );
+
+    // The reader found the durable root at the record's version; before it reads that
+    // manifest, the writer restarts and rewrites everything, reusing its extents.
+    let (hw, hv) = (Arc::clone(&w), Arc::clone(&vfs));
+    reader.on_reader_manifest_load(Box::new(move || {
+        hv.enter_process(WRITER);
+        let mut g = hw.lock().unwrap();
+        g.take().unwrap().close();
+        let mut nw = Writer::open(&hv);
+        let t = nw.db.table("t").unwrap();
+        nw.compact();
+        for round in 0..6u32 {
+            write_rows(&mut nw, &t, "zzz", "NEW", round * 200..round * 200 + 200);
+        }
+        nw.compact();
+        *g = Some(nw);
+        hv.enter_process(READER);
+    }));
+    vfs.enter_process(READER);
+    let snap = reader.snapshot().unwrap();
+    for i in [0u32, 150, 250, 399] {
+        assert_eq!(
+            get(&reader, &snap, &rt, &format!("row{i:05}")).unwrap(),
+            Some(value("old", i)),
+            "row{i:05}"
+        );
+    }
+    assert_eq!(
+        get(&reader, &snap, &rt, "zzz01199").unwrap(),
+        Some(value("NEW", 1199))
+    );
+    drop(snap);
+    reader.close().unwrap();
+    vfs.enter_process(WRITER);
+    w.lock().unwrap().take().unwrap().close();
+}
+
+/// Review of #140: an expired snapshot the application still holds kept the reader's live
+/// count above zero, so the pin in the new generation never moved forward and the writer
+/// could not reclaim what it compacted away. Live snapshots count per generation.
+#[test]
+fn an_expired_snapshot_does_not_hold_the_new_generations_pin() {
+    let vfs = SimVfs::new(13);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs);
+    let t =
+        w.db.create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+    write_rows(&mut w, &t, "row", "a", 0..200);
+
+    vfs.enter_process(READER);
+    let reader =
+        Engine::open_reader(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20)).unwrap();
+    let rt = reader.table("t").unwrap();
+    let expired = reader.snapshot().unwrap();
+
+    vfs.enter_process(WRITER);
+    w.close();
+    let mut w = Writer::open(&vfs);
+    let t = w.db.table("t").unwrap();
+
+    // The first snapshot of the new generation pins its current view, then drops.
+    vfs.enter_process(READER);
+    drop(reader.snapshot().unwrap());
+    assert!(matches!(
+        get(&reader, &expired, &rt, "row00001"),
+        Err(Error::SnapshotExpired)
+    ));
+
+    // The writer replaces every SST. No snapshot of this generation is alive, so the next
+    // one moves the pin forward to the current view (past the compaction).
+    vfs.enter_process(WRITER);
+    write_rows(&mut w, &t, "row", "b", 200..400);
+    w.compact();
+    let (_, current) = w.db.reader_pin_and_view();
+    vfs.enter_process(READER);
+    let snap = reader.snapshot().unwrap();
+    assert_eq!(
+        get(&reader, &snap, &rt, "row00399").unwrap(),
+        Some(value("b", 399))
+    );
+    vfs.enter_process(WRITER);
+    let (pin, _) = w.db.reader_pin_and_view();
+    assert_eq!(
+        pin.map(|(_, view)| view),
+        Some(current),
+        "the reader pin stayed behind the compaction"
+    );
+    drop(snap);
+    drop(expired);
+    vfs.enter_process(READER);
+    reader.close().unwrap();
+    vfs.enter_process(WRITER);
+    w.close();
+}

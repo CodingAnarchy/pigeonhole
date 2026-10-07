@@ -42,8 +42,16 @@ pub(crate) fn load(
     shards: usize,
     registry: Arc<pigeonhole_compaction::MergeRegistry>,
 ) -> Result<(Catalog, Vec<Extent>)> {
-    let root = opened.root();
-    let file = opened.file();
+    load_root(opened.file(), &opened.root(), shards, registry)
+}
+
+/// [`load`] from `root` read through `file` (a reader process's own pager handle).
+pub(crate) fn load_root(
+    file: &FileRef,
+    root: &Root,
+    shards: usize,
+    registry: Arc<pigeonhole_compaction::MergeRegistry>,
+) -> Result<(Catalog, Vec<Extent>)> {
     let mut catalog = Catalog::with_registry(registry);
     let mut live = Vec::new();
     if let Some(snapshot) = root.snapshot {
