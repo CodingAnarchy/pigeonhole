@@ -68,6 +68,22 @@ fn harness_regressions_from_the_seed_sweep() {
             check(seed, &cfg);
         }
     }
+    // Seeds 114 and 274 (issue #162): a refused attempt's PREPARE, settled at one recovery,
+    // was still in the WAL at the next, fit an unacknowledged commit made in between (a row
+    // delete of the same row) and took it from the commit whose share really survived.
+    for seed in [114, 274] {
+        check(seed, &read_error_txn_config());
+    }
+}
+
+/// Transactions under frequent injected read errors, no crash armed.
+fn read_error_txn_config() -> Config {
+    let mut cfg = Config::standard(250);
+    cfg.faults.io_error_ppm = 20_000;
+    cfg.txn_ppm = 600_000;
+    cfg.crash_ppm = 0;
+    cfg.mid_commit_crash_ppm = 0;
+    cfg
 }
 
 #[test]
@@ -315,11 +331,7 @@ fn an_injected_read_error_in_a_transaction_read_abandons_the_transaction() {
     // `Io` error (nothing was submitted), not a divergence from the model. Many steps are
     // transactions and reads fail often, so the sweep reaches it; no crash is armed, so
     // D127's probe rule is not in play.
-    let mut cfg = Config::standard(250);
-    cfg.faults.io_error_ppm = 20_000;
-    cfg.txn_ppm = 600_000;
-    cfg.crash_ppm = 0;
-    cfg.mid_commit_crash_ppm = 0;
+    let cfg = read_error_txn_config();
     let mut io_errors = 0;
     for seed in seeds() {
         let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));

@@ -1034,6 +1034,13 @@ struct World {
     /// Attempts the engine refused (a false predicate, a conflict, a full arena): a
     /// cross-shard one may have left PREPARE records under a seqno of its own.
     aborted: Vec<Committed>,
+    /// Seqnos of WAL survivors a recovery already settled as never committed: a refused
+    /// attempt's PREPAREs, or a commit the crash lost. Their records stay valid until a
+    /// checkpoint passes them, so a later recovery reads them again, and they must not be
+    /// matched to a commit submitted after the recovery that settled them (issue #162).
+    /// Only seqnos whose records the WAL holds at that recovery are settled, and the engine
+    /// never hands one out again: it starts above every seqno the WAL replays.
+    settled_seqnos: BTreeSet<Seqno>,
     in_flight: Vec<InFlight>,
     /// A shard reported a poisoned stream: reopen once nothing is in flight.
     need_reopen: bool,
@@ -1096,6 +1103,7 @@ impl World {
             history: BTreeMap::new(),
             unacked: Vec::new(),
             aborted: Vec::new(),
+            settled_seqnos: BTreeSet::new(),
             in_flight: Vec::new(),
             need_reopen: false,
             pending_advance: 0,
@@ -1776,7 +1784,7 @@ impl World {
             .collect();
         let mut unknown: Vec<(Seqno, Timestamp, BTreeSet<MutationKey>, Vec<usize>)> = Vec::new();
         for (seqno, sv) in &wal.batches {
-            if self.history.contains_key(seqno) {
+            if self.history.contains_key(seqno) || self.settled_seqnos.contains(seqno) {
                 continue;
             }
             let keys = self.survivor_keys(sv);
@@ -1801,6 +1809,7 @@ impl World {
                 .flatten()
                 .any(|(s, kind)| *s == *seqno && *kind == RecKind::Commit);
             if self.cfg.tablet_changes && prepares_only && !committed_anywhere {
+                self.settled_seqnos.insert(*seqno);
                 self.stats.refused_attempts += 1;
                 self.trace
                     .push(format!("  seqno {seqno}: PREPAREs of a refused attempt"));
@@ -1831,6 +1840,7 @@ impl World {
                 .iter()
                 .any(|c| keys.is_subset(&Self::mutation_keys(&c.ops)))
             {
+                self.settled_seqnos.insert(*seqno);
                 continue;
             }
             return fail(
@@ -2128,7 +2138,14 @@ impl World {
         // A commit lost here stays lost, but its appended records (a PREPARE without its
         // COMMIT) remain valid WAL records until a checkpoint passes them.
         for (i, c) in all.iter().enumerate() {
-            if !recovered.contains(&i) && c.seqno.is_some() {
+            if !recovered.contains(&i)
+                && let Some(seqno) = c.seqno
+            {
+                // Only records the WAL still holds come back; a lost commit with none left
+                // frees its seqno (the streams go on from the last kept record).
+                if wal.batches.contains_key(&seqno) {
+                    self.settled_seqnos.insert(seqno);
+                }
                 self.aborted.push(c.clone());
             }
         }
@@ -2874,6 +2891,7 @@ impl World {
                 self.stats.cross_shard += 1;
             }
             self.drain_appended();
+            self.check_fresh_seqno(seqno)?;
             self.history.insert(seqno, c);
         }
         let drained = self.drain_compactions();
@@ -3381,8 +3399,24 @@ impl World {
             kind: Kind::Plain,
         };
         self.drain_appended();
+        self.check_fresh_seqno(info.seqno)?;
         self.history.insert(info.seqno, c);
         Ok(true)
+    }
+
+    /// An acknowledged commit's seqno must be new: never one a recovery settled as not
+    /// committed (its records may still be in the WAL, so a reuse would make them
+    /// ambiguous).
+    fn check_fresh_seqno(&self, seqno: Seqno) -> Result<(), Fail> {
+        if self.settled_seqnos.contains(&seqno) {
+            return fail(
+                FailureClass::Protocol,
+                format!(
+                    "commit acknowledged under seqno {seqno}, which a recovery settled as never committed"
+                ),
+            );
+        }
+        Ok(())
     }
 
     fn step(&mut self, op: Op, rng: &mut Rng) -> Result<(), Fail> {
