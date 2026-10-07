@@ -55,17 +55,17 @@ PR-gating CI builds and tests the bench crate with `sqlite,fjall` only, so it ne
 | `smoke` | 1,000 | 2,000 | What `cargo test` runs; seconds for the whole suite |
 | `small` (default) | 50,000 | 200,000 | A quick check, seconds per workload |
 | `full` | 1,000,000 (adjacency: 2,000,000 edges) | 1,000,000 (skewed-multi-shard: 2,000,000) | The spec's scale: 1M sparse-wide rows, YCSB with 1M records |
-| `larger-than-ram` | same as `full` | same as `full` | The data set is more than 100× the engine's memory budget; gets are split into cold and hot (below) |
+| `larger-than-ram` | same as `full` | same as `full` | The data set is 75–85× the engine's memory budget; gets are split into cold and hot (below) |
 
 Memtables flush to SSTs, so no preset is bounded by memory. At `full` size the data set is several times the 64 MiB write buffer (the runner's default, equal to the engine's), so flushes and compactions run during the load and the measurement, and a run completes without `Busy`. Sparse-wide at `full` loads about 20M cells, YCSB about 10M, and takes minutes per engine. `full` is **not** larger than RAM on a typical workstation, so by itself it does not measure the spec's cold-read target (one I/O per get on data larger than memory). `larger-than-ram` does the next best thing on a laptop.
 
 ### The larger-than-RAM preset
 
-`--scale larger-than-ram` runs the `full` sizes with a default memory budget of an **8 MiB write buffer and a 16 MiB read cache** (24 MiB, against 320 MiB by default), unless `--write-buffer` or `--cache` say otherwise. One million YCSB rows are about 3 GiB on disk, so the data set is over 100× what the engine may hold in its memtable and block cache, and nearly every first read of a row has to leave the engine's cache. Each result prints its store size on disk beside the budget.
+`--scale larger-than-ram` runs the `full` sizes with a default memory budget of an **8 MiB write buffer and a 16 MiB read cache** (24 MiB, against 320 MiB by default), unless `--write-buffer` or `--cache` say otherwise. One million YCSB rows are about 1.8–2 GiB on disk, so the data set is 75–85× what the engine may hold in its memtable and block cache, and nearly every first read of a row has to leave the engine's cache. Each result prints its store size on disk beside the budget.
 
 **What this is not.** It bounds the *engine's* memory; it does not bound the machine's. The OS page cache (most of 24 GiB here) still holds the files, so a cold get usually costs a page-cache copy, not a device read. That makes the cold numbers a measure of the engine's miss path (index and filter lookup, block decode, a `pread`), not of NVMe latency. For a true device-bound number, raise `--records` until the store exceeds RAM, or run on reference hardware (D5). The preset exists so the miss path is exercised on any machine, and in CI, without a machine-sized file.
 
-**Cold and hot gets.** Whenever a workload has gets, the report adds a second table (and `detail.reads` in the JSON). A get is **cold** when it is the first get of its row in the run (the warmup counts as earlier), **hot** when the row was read before. The classification is by row, decided before the clock starts, and is the same for every engine. It is an approximation: a "hot" row can have been evicted since, a "cold" row can share a block with a row read earlier, and the OS page cache can serve either. Under Zipfian access a minority of gets are cold (about a fifth at 100K records and 100K gets); use a uniform workload or more records for more.
+**Cold and hot gets.** Whenever a workload has gets, the report adds a second table (and `detail.reads` in the JSON). A get is **cold** when it is the first get of its row in the run (the warmup counts as earlier), **hot** when the row was read before. The classification is by row, decided before the clock starts, and is the same for every engine. It is an approximation: a "hot" row can have been evicted since, a "cold" row can share a block with a row read earlier, and the OS page cache can serve either. Under Zipfian access a minority of gets are cold (16% of gets in the `ycsb-c` run below); use a uniform workload or more records for more.
 
 **Stalls.** The engine stalls writers while a flush frees memtable room and answers `Busy` only when the stall outlasts its timeout (30 s). The Pigeonhole runner retries a write after `Busy` (up to 20 times) instead of failing the run, and the second table reports the retries. A run with zero retries completed without ever refusing a write. Stall time shows up in the latency tail (max, p99.9) and in throughput; the public API exposes no stall counter, so there is no separate stall figure.
 
@@ -172,6 +172,24 @@ Run 1 started while the 15-minute load was still 12.3, the tail of another agent
 | skewed-multi-shard | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 4 | 234.8K | 14.5 | 34.0 | 532 |
 
 **Not measured:** the `full` preset (1M records) and the comparison engines at it. The machine was too loaded for the numbers to mean anything, so full-scale and four-engine comparisons are left to the weekly `bench.yml` workflow (`--scale full` is selectable there) and to reference hardware (D5). The only full-scale evidence so far is one run, n=1, of `sparse-wide --scale full` on Pigeonhole alone: 1,000,000 records and 1,000,000 operations completed without `Busy` at 22.4K ops/s (p50 6.17 µs, p99 786 µs), at machine load 8.9. It was built from `a007910` plus this branch's then-uncommitted `full` preset, so it names no branch commit; treat it as evidence that the size runs, not as a measurement.
+
+## Larger-than-RAM results (this Mac, non-reference)
+
+**Single runs, n=1, commit `ba5e996`**, measured 2026-10-06: `phdb-bench ycsb-c` and `phdb-bench ycsb-a` with `--scale larger-than-ram` (Pigeonhole only, release, 1,000,000 records and 1,000,000 operations, 5% warmup, 100-byte values, seed `0x5EED`, 8 MiB memtable, 16 MiB block cache, buffered commits).
+
+**Environment:** Apple M5 (10 cores, 24 GiB), macOS 26.5.2 aarch64, APFS, **load 6.22 (ycsb-c) and 7.98 (ycsb-a)** at the start of each run [non-reference (D5)]. The machine was shared with other agents' test suites and never dropped below a one-minute load of 6 while I waited, so neither run is a quiet-machine run. Read them as order-of-magnitude. The store was 1,792 MiB (ycsb-c) and 2,048 MiB (ycsb-a) on disk, 75–85× the 24 MiB budget, and fits in the OS page cache, so cold gets did not reach the device (see above).
+
+| Workload | Store | Settings | Records | Ops | Threads | Ops/s | p50 µs | p99 µs | p99.9 µs |
+|---|---|---|--:|--:|--:|--:|--:|--:|--:|
+| ycsb-c | pigeonhole | shards=default(10) memtable=8MiB cache=16MiB bloom=10 buffered | 1000000 | 1000000 | 1 | 130.9K | 7.10 | 26.5 | 167 |
+| ycsb-a | pigeonhole | shards=default(10) memtable=8MiB cache=16MiB bloom=10 buffered | 1000000 | 1000000 | 1 | 13.5K | 14.8 | 1335 | 2900 |
+
+| Workload | Store size | Busy retries | Cold gets | Cold p50 µs | Cold p99 µs | Cold p99.9 µs | Hot gets | Hot p50 µs | Hot p99 µs | Hot p99.9 µs |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| ycsb-c | 1792 MiB | 0 | 162686 | 7.68 | 158 | 196 | 837314 | 6.85 | 15.6 | 43.5 |
+| ycsb-a | 2048 MiB | 0 | 110500 | 16.6 | 2621 | 3768 | 389773 | 19.6 | 1286 | 2802 |
+
+Both runs completed with no `Busy` retries, so no write was ever refused. Loading took about 230 s each (1M rows × 10 fields under an 8 MiB write buffer). In `ycsb-c`, cold gets have a median close to hot ones (7.7 vs 6.9 µs) and a much worse p99 (158 vs 15.6 µs): the miss path costs a long tail, but a median read is dominated by the same OS-page-cache and engine overhead either way. In `ycsb-a` the tail belongs to the 50% updates running under flush and compaction pressure, which hits cold and hot gets alike (the p99 rows are close to each other). These do not measure the spec's one-I/O-per-get target; that needs a store larger than RAM, on reference hardware.
 
 ## Comparison results before Milestone B (this Mac, non-reference)
 
