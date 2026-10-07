@@ -73,7 +73,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 
 `PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
 `Snapshot`: `seqno(&self) -> u64`.
-`Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)`.
+`Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains; background work waiting for a time does not count), `next_wakeup(&self) -> Option<Duration>` (time until that background work is due), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)` (fires when work arrives, not when background work falls due). Loop: `run_once` until `false`, then sleep until the wakeup fires or `next_wakeup` passes.
 
 ## `Options` (all `self -> Self`; process-local, not stored in file)
 | Method | Meaning |
