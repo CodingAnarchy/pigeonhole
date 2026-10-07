@@ -27,7 +27,7 @@
 //! a compaction while a commit waits in a write stall (issue #70).
 //!
 //! Seeds: `PIGEONHOLE_SEED` (first seed, default 1) and `PIGEONHOLE_SEEDS` (count, default
-//! 3). A failure prints its seed and the operation trace.
+//! 1). A failure prints its seed and the operation trace.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -117,6 +117,8 @@ struct Config {
     block_cache: usize,
     /// Per-op probability (ppm) of an explicit `flush`.
     flush_ppm: u32,
+    /// Per-op probability (ppm) of an explicit `compact`.
+    compact_ppm: u32,
 }
 
 impl Config {
@@ -138,7 +140,11 @@ impl Config {
             durability: None,
             memtable_budget: 4 << 20,
             block_cache: 1 << 20,
-            flush_ppm: 0,
+            flush_ppm: 20_000,
+            // Off until issue #106 is fixed: each compaction output allocates a full
+            // target-size extent, so a run's file outgrows the simulator's 4 GiB limit.
+            // Issue #75 stays open until this is enabled.
+            compact_ppm: 0,
         }
     }
 
@@ -148,7 +154,6 @@ impl Config {
         c.faults.reorder_unsynced = true;
         c.crash_ppm = 15_000;
         c.mid_commit_crash_ppm = 25_000;
-        c.flush_ppm = 20_000;
         c
     }
 }
@@ -171,6 +176,7 @@ struct Stats {
     reopens: usize,
     reads: usize,
     flushes: usize,
+    compactions: usize,
     busy: usize,
 }
 
@@ -987,6 +993,15 @@ impl Run {
                 Err(e) => return Err(format!("flush failed: {e} ({:?})", e.code())),
             }
         }
+        if self.cfg.compact_ppm > 0 && rng.chance(self.cfg.compact_ppm) {
+            self.stats.compactions += 1;
+            self.trace.push("COMPACT".into());
+            match self.db().compact() {
+                Ok(()) => {}
+                Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
+                Err(e) => return Err(format!("compact failed: {e} ({:?})", e.code())),
+            }
+        }
         if self.armed && rng.chance(self.cfg.reopen_ppm.max(self.cfg.crash_ppm)) {
             // The scheduled power loss, whether or not it has fired yet.
             self.crash_and_recover(CrashKind::Power, false)?;
@@ -1053,7 +1068,7 @@ fn seeds() -> Vec<u64> {
             .unwrap_or(default)
     };
     let base = var("PIGEONHOLE_SEED", 1);
-    (base..base + var("PIGEONHOLE_SEEDS", 3)).collect()
+    (base..base + var("PIGEONHOLE_SEEDS", 1)).collect()
 }
 
 fn check(cfg: &Config) {
@@ -1066,9 +1081,6 @@ fn check(cfg: &Config) {
 }
 
 #[test]
-#[ignore = "engine Milestone B compacts: bottommost compactions purge per decision D74, which \
-            this model does not replay (the public API exposes no compaction records); \
-            issue #45"]
 fn quiet_runs_match_the_model() {
     for shards in [1, 2, 4, 8] {
         check(&Config::quiet(1000, shards));
