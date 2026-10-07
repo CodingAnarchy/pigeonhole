@@ -10,7 +10,7 @@ use pigeonhole_compaction::{
     Levels, TaskKind,
 };
 use pigeonhole_format::key::encode_row_prefix;
-use pigeonhole_format::manifest::Edit;
+use pigeonhole_format::manifest::{Edit, SstMeta};
 use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId, Timestamp};
 use pigeonhole_runtime::{ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
 use pigeonhole_sst::SstReader;
@@ -70,8 +70,22 @@ pub(crate) fn tablet_range(tablet: &TabletEntry) -> Result<KeyRange> {
     Ok(KeyRange { start, end })
 }
 
+/// Whether `meta` holds keys outside `range`: an SST a split's child inherited (D13), which
+/// still holds its sibling's rows even once the sibling no longer references it.
+pub(crate) fn sticks_out(meta: &SstMeta, range: &KeyRange) -> bool {
+    range
+        .start
+        .as_ref()
+        .is_some_and(|s| meta.smallest_key.as_slice() < s.as_slice())
+        || range
+            .end
+            .as_ref()
+            .is_some_and(|e| meta.largest_key.as_slice() >= e.as_slice())
+}
+
 /// Narrows a picker task to the tablet's rows and turns a `TrivialMove` of an SST shared
-/// with a sibling tablet into a `Rewrite` (decision D79).
+/// with a sibling tablet, or holding rows outside the tablet, into a `Rewrite` (decision
+/// D79): the rewrite drops the rows outside, so the SST stops blocking a merge.
 pub(crate) fn narrow(
     task: &mut CompactionTask,
     tablet: &TabletEntry,
@@ -88,7 +102,12 @@ pub(crate) fn narrow(
             .inputs
             .iter()
             .flat_map(|(_, ids)| ids.iter())
-            .any(|id| catalog.sst_shared(*id))
+            .any(|id| {
+                catalog.sst_shared(*id)
+                    || catalog
+                        .sst(tablet.id, task.family, *id)
+                        .is_some_and(|(_, m)| sticks_out(m, &task.range))
+            })
     {
         task.kind = TaskKind::Rewrite;
     }
@@ -97,7 +116,7 @@ pub(crate) fn narrow(
 
 /// A task compacting every level of a slot into the last level (`Engine::compact`).
 pub(crate) fn plan_full(
-    tablet: TabletId,
+    tablet: &TabletEntry,
     family: FamilyId,
     levels: &Levels,
     last_level: u8,
@@ -121,9 +140,18 @@ pub(crate) fn plan_full(
     {
         return None;
     }
-    // Already one run at the bottom: nothing to do.
+    // Already one run at the bottom: nothing to do, unless it holds rows outside the tablet
+    // (inherited from a split's parent), which a rewrite drops.
     if inputs.len() == 1 && inputs[0].0 == last_level {
-        return None;
+        let range = tablet_range(tablet).ok()?;
+        if !levels
+            .levels
+            .iter()
+            .flatten()
+            .any(|m| sticks_out(m, &range))
+        {
+            return None;
+        }
     }
     let kind = if total == 1 {
         TaskKind::TrivialMove
@@ -131,7 +159,7 @@ pub(crate) fn plan_full(
         TaskKind::Rewrite
     };
     Some(CompactionTask {
-        tablet,
+        tablet: tablet.id,
         family,
         range: KeyRange::all(),
         subranges: vec![KeyRange::all()],

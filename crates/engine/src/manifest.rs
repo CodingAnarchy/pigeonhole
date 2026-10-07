@@ -22,10 +22,10 @@ use pigeonhole_format::manifest::{
     encode_block,
 };
 use pigeonhole_format::superblock::ExtentRef;
-use pigeonhole_format::{FormatVersion, ManifestVersion, SstId};
+use pigeonhole_format::{FormatVersion, ManifestVersion, SstId, TabletId};
 use pigeonhole_io::{Completion, FileRef};
 use pigeonhole_pager::{Extent, OpenedPager, Pager, Root};
-use pigeonhole_runtime::{Notifier, Task, TaskPoll, TaskWaker, Waiter, completion};
+use pigeonhole_runtime::{Notifier, ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
 use pigeonhole_sst::SstReader;
 
 use crate::catalog::Catalog;
@@ -295,12 +295,21 @@ impl ManifestWriter {
 /// A catalog change computed against the current catalog under the writer's exclusion.
 pub(crate) type CatalogChange = Box<dyn FnOnce(&mut Catalog) -> Result<Vec<Edit>> + Send>;
 
+/// A tablet split, merge or move computed against the current catalog: its edits, then the
+/// owners to give tablets once the edits are applied (owners are not persisted).
+pub(crate) type TabletChange = Box<dyn FnOnce(&mut Catalog) -> Result<TabletEdits> + Send>;
+
+/// A tablet change's edits and the owners it hands out.
+pub(crate) type TabletEdits = (Vec<Edit>, Vec<(TabletId, ShardId)>);
+
 /// What a request changes.
 pub(crate) enum ReqKind {
     /// Edits computed by the caller (flush and compaction outputs, checkpoints).
     Edits(Vec<Edit>),
     /// A catalog change (table and family creation allocate ids).
     Catalog(CatalogChange),
+    /// A tablet split, merge or move: publishes a new tablet map.
+    Tablets(TabletChange),
 }
 
 /// One queued manifest change.
@@ -399,6 +408,9 @@ pub(crate) struct Commit {
     readers: HashMap<SstId, Arc<SstReader>>,
     flushed_roots: Vec<(u16, u32)>,
     tablets_changed: bool,
+    /// A split, merge or move (`ReqKind::Tablets`) committed: shards re-check what waited on
+    /// the tablet map.
+    tablet_change: bool,
     sst_changed: bool,
     checkpoints_changed: bool,
 }
@@ -420,10 +432,10 @@ impl Commit {
 
 /// Whether `edit` names a tablet that no longer exists (an output of a flush or compaction
 /// that raced a table drop).
-fn orphaned(catalog: &Catalog, edit: &Edit) -> bool {
+fn orphaned(catalog: &Catalog, edit: &Edit, created: &[TabletId]) -> bool {
     match edit {
         Edit::AddSst { tablet, .. } | Edit::SetFlushed { tablet, .. } => {
-            catalog.tablet(*tablet).is_none()
+            catalog.tablet(*tablet).is_none() && !created.contains(tablet)
         }
         _ => false,
     }
@@ -473,20 +485,43 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let mut readers = HashMap::new();
     let mut flushed_roots = Vec::new();
     let mut tablets_changed = false;
+    let mut tablet_change = false;
     let mut sst_changed = false;
     let mut checkpoints_changed = false;
     let mut rewrite = false;
+    // Owners handed out by tablet changes, re-applied whenever the catalog is rebuilt.
+    let mut retargets: Vec<(TabletId, ShardId)> = Vec::new();
     for mut req in reqs {
         let kind = std::mem::replace(&mut req.kind, ReqKind::Edits(Vec::new()));
+        let mut owners = Vec::new();
+        let is_tablets = matches!(kind, ReqKind::Tablets(_));
         let own: Result<Vec<Edit>> = match kind {
             ReqKind::Edits(e) => Ok(e),
             ReqKind::Catalog(f) => f(&mut catalog),
+            ReqKind::Tablets(f) => f(&mut catalog).map(|(edits, o)| {
+                owners = o;
+                tablets_changed = true;
+                tablet_change = true;
+                edits
+            }),
         };
         let own = own.and_then(|own| {
-            if own.iter().any(|e| orphaned(&catalog, e)) {
-                // Output for a dropped table is never published: free it now.
-                for x in added_extents(&own) {
-                    shared.pager.abandon(x);
+            // Tablets the request itself creates (a split's or merge's outputs) are not
+            // orphans.
+            let created: Vec<TabletId> = own
+                .iter()
+                .filter_map(|e| match e {
+                    Edit::PutTablet { tablet, .. } => Some(*tablet),
+                    _ => None,
+                })
+                .collect();
+            if own.iter().any(|e| orphaned(&catalog, e, &created)) {
+                // Output for a dropped table is never published: free it now. A tablet
+                // change only re-references SSTs it does not own, so it frees nothing.
+                if !is_tablets {
+                    for x in added_extents(&own) {
+                        shared.pager.abandon(x);
+                    }
                 }
                 return Err(Error::TableNotFound("the table was dropped".to_owned()));
             }
@@ -515,6 +550,10 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 }
                 match applied {
                     Ok(()) => {
+                        for (t, shard) in &owners {
+                            catalog.set_shard(*t, *shard);
+                        }
+                        retargets.extend(owners);
                         edits.extend(own);
                         for (id, r) in req.readers.drain(..) {
                             readers.insert(id, r);
@@ -539,6 +578,9 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         catalog = (*old).clone();
                         for e in &edits {
                             let _ = catalog.apply(e, shared.shards);
+                        }
+                        for (t, shard) in &retargets {
+                            catalog.set_shard(*t, *shard);
                         }
                         outcomes.push((req, Err(e)));
                     }
@@ -581,6 +623,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 readers,
                 flushed_roots,
                 tablets_changed,
+                tablet_change,
                 sst_changed,
                 checkpoints_changed,
             })
@@ -616,6 +659,7 @@ pub(crate) fn end(
         mut readers,
         flushed_roots,
         tablets_changed,
+        tablet_change,
         sst_changed,
         checkpoints_changed,
     } = commit;
@@ -730,7 +774,7 @@ pub(crate) fn end(
     for (req, r) in reqs {
         (req.reply)(r.map(|()| version));
     }
-    if sst_changed || checkpoints_changed {
+    if sst_changed || checkpoints_changed || tablet_change {
         shared.broadcast(|| ShardMsg::Maintain);
     }
 }

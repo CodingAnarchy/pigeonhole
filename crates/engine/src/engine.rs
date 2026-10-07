@@ -27,8 +27,9 @@ use crate::flush::{SstSink, write_memtable};
 use crate::manifest::{self, ManifestWriter, ReqKind};
 use crate::read::{self, get_in};
 use crate::shard::{
-    CloseState, CommitReq, CoordinateReq, Locks, Padded, ReplayedKind, Reply, ShardMetrics,
-    ShardMsg, ShardState, Shared, VisibilityWaiters, bucket_floor,
+    BalanceConfig, CloseState, CommitReq, CoordinateReq, FreezeWaiters, LoadSlot, Locks, Padded,
+    ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared, VisibilityWaiters,
+    bucket_floor, split_by_shard,
 };
 use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
@@ -288,6 +289,11 @@ pub struct RawEntry {
     pub value: Vec<u8>,
 }
 
+/// A tablet's id, table and row range `[start, end)` (a test hook).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub type TabletRange = (TabletId, TableId, Vec<u8>, Option<Vec<u8>>);
+
 /// What the manifest of a closed database records (a test hook).
 #[cfg(feature = "test-hooks")]
 #[derive(Debug, Clone, Default)]
@@ -301,6 +307,9 @@ pub struct ManifestInfo {
     pub flushed: BTreeMap<(TabletId, FamilyId), Seqno>,
     /// Tablets and their tables.
     pub tablets: Vec<(TabletId, TableId)>,
+    /// Tablets with their tables and row ranges `[start, end)` (empty start and `None` end
+    /// are unbounded).
+    pub tablet_ranges: Vec<TabletRange>,
     /// Whether the last close was clean.
     pub clean: bool,
 }
@@ -490,9 +499,20 @@ impl Engine {
             ts_floors: (0..shards)
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
+            ts_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
+            ts_raisers: (0..shards).map(|_| Mutex::new((0, 0))).collect(),
+            loads: (0..shards).map(|_| LoadSlot::default()).collect(),
+            balance: BalanceConfig {
+                enabled: options.tablet_changes,
+                interval_nanos: options.balance_interval_nanos,
+                min_writes: options.balance_min_writes,
+                skew: options.balance_skew,
+                split_bytes: options.tablet_split_bytes.max(1),
+            },
+            view_capacity: shm_config.view_buffer_bytes as usize,
+            tablet_epoch: AtomicU64::new(0),
             waiters: VisibilityWaiters::default(),
-            freeze_waiting: AtomicUsize::new(0),
-            freeze_waiters: Mutex::new(Vec::new()),
+            freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
@@ -661,10 +681,17 @@ impl Engine {
                     let kind = match r.kind {
                         ReplayedRecordKind::Single { slots } => ReplayedKind::Single { slots },
                         ReplayedRecordKind::Prepare { coordinator } => {
+                            // With tablet changes on, every shard's slots: tablets owned
+                            // elsewhere since a move are flushed by their owner, and the
+                            // checkpoint waits for that. Off, only this shard's.
                             let applied = applied_slots.get(&(stream, r.seqno));
-                            let slots = applied
-                                .map(|per| per.get(i).cloned().unwrap_or_default())
-                                .unwrap_or_default();
+                            let slots = if options.tablet_changes {
+                                applied.map(|per| per.concat()).unwrap_or_default()
+                            } else {
+                                applied
+                                    .map(|per| per.get(i).cloned().unwrap_or_default())
+                                    .unwrap_or_default()
+                            };
                             ReplayedKind::Prepare {
                                 slots,
                                 coordinator: ShardId(coordinator.0 as u16),
@@ -927,9 +954,14 @@ impl Engine {
             close: CloseState::default(),
             metrics: Vec::new(),
             ts_floors: Vec::new(),
+            ts_raises: Vec::new(),
+            ts_raisers: Vec::new(),
+            loads: Vec::new(),
+            balance: BalanceConfig::default(),
+            view_capacity: shm_config.view_buffer_bytes as usize,
+            tablet_epoch: AtomicU64::new(0),
             waiters: VisibilityWaiters::default(),
-            freeze_waiting: AtomicUsize::new(0),
-            freeze_waiters: Mutex::new(Vec::new()),
+            freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
@@ -1256,11 +1288,16 @@ impl Engine {
         let mut out = Vec::new();
         let all = pigeonhole_format::scan::ScanFilter::all();
         for t in view.catalog.tablets() {
+            // Children of a split share SSTs holding their siblings' rows too.
+            let (start, end) = crate::read::clamp_to_tablet(&t, None, None)?;
             for family in view.catalog.family_ids_of(t.table) {
                 let sources = view.scan_sources(t.shard, t.id, family, &all, None, None)?;
                 let mut merged = MergingCursor::new(sources);
-                merged.seek_to_first()?;
-                while merged.valid() {
+                match &start {
+                    Some(s) => merged.seek(s)?,
+                    None => merged.seek_to_first()?,
+                }
+                while merged.valid() && end.as_deref().is_none_or(|e| merged.key() < e) {
                     out.push(RawEntry {
                         table: t.table,
                         family,
@@ -1294,6 +1331,112 @@ impl Engine {
         let referenced: u64 = live.iter().map(|e| e.len()).sum();
         let stats = shared.pager.stats();
         (stats.allocated_bytes + stats.retired_bytes).saturating_sub(referenced)
+    }
+
+    /// Splits the tablet of `table` holding row `at` at `at`; both halves stay on its shard.
+    /// Fails with `InvalidArgument` when `at` is the tablet's first row.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn split_tablet_pending(&self, table: TableId, at: &[u8]) -> Result<PendingMaintenance> {
+        let (tablet, shard) = self.inner.tablet_at(table, at)?;
+        self.inner.tablet_op(
+            shard,
+            crate::shard::TabletOpKind::Split {
+                tablet,
+                keys: vec![at.to_vec()],
+                owners: vec![shard, shard],
+            },
+        )
+    }
+
+    /// Moves the tablet of `table` holding `row` to shard `to`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn move_tablet_pending(
+        &self,
+        table: TableId,
+        row: &[u8],
+        to: u16,
+    ) -> Result<PendingMaintenance> {
+        let (tablet, shard) = self.inner.tablet_at(table, row)?;
+        self.inner.tablet_op(
+            shard,
+            crate::shard::TabletOpKind::Move {
+                tablet,
+                to: ShardId(to),
+            },
+        )
+    }
+
+    /// Merges the tablet of `table` holding `row` with its right neighbour (both must be on
+    /// one shard).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn merge_tablets_pending(&self, table: TableId, row: &[u8]) -> Result<PendingMaintenance> {
+        let view = self.inner.shared.view.load_full();
+        let list = view.tablets.tablets_of(table);
+        let i = list
+            .iter()
+            .position(|t| {
+                t.start.as_slice() <= row && t.end.as_ref().is_none_or(|e| row < e.as_slice())
+            })
+            .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))?;
+        let (Some(l), Some(r)) = (list.get(i), list.get(i + 1)) else {
+            return Err(Error::InvalidArgument("no right neighbour".to_owned()));
+        };
+        self.inner.tablet_op(
+            l.shard,
+            crate::shard::TabletOpKind::Merge {
+                left: l.id,
+                right: r.id,
+            },
+        )
+    }
+
+    /// Runs every shard's balancer now (whatever interval is configured); resolves once the
+    /// splits, moves or merges it started are done.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn balance_pending(&self) -> Result<PendingMaintenance> {
+        self.inner.check_open()?;
+        let mut waiters = Vec::with_capacity(self.inner.shared.shards);
+        for i in 0..self.inner.shared.shards {
+            let (tx, rx) = completion();
+            self.inner
+                .shared
+                .submitter(ShardId(i as u16))
+                .submit(ShardMsg::Balance { reply: Some(tx) })?;
+            waiters.push(rx);
+        }
+        Ok(PendingMaintenance { waiters })
+    }
+
+    /// The largest default-timestamp floor of any shard (including floors raised by shards
+    /// handing over tablets): the next default timestamp anywhere is above it.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn max_ts_floor(&self) -> pigeonhole_format::Timestamp {
+        let shared = &self.inner.shared;
+        shared
+            .ts_floors
+            .iter()
+            .chain(&shared.ts_raises)
+            .map(|f| f.0.load(Ordering::Acquire))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Splits, merges and moves completed since open, summed over shards.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn tablet_changes(&self) -> (u64, u64, u64) {
+        let mut out = (0, 0, 0);
+        for m in &self.inner.shared.metrics {
+            out.0 += m.splits.load(Ordering::Relaxed);
+            out.1 += m.merges.load(Ordering::Relaxed);
+            out.2 += m.moves.load(Ordering::Relaxed);
+        }
+        out
     }
 
     /// The compactions committed since the last call (or since open).
@@ -1406,6 +1549,11 @@ impl Engine {
             checkpoints: catalog.checkpoints.clone(),
             flushed: catalog.flushed.clone(),
             tablets: catalog.tablets().iter().map(|t| (t.id, t.table)).collect(),
+            tablet_ranges: catalog
+                .tablets()
+                .into_iter()
+                .map(|t| (t.id, t.table, t.start, t.end))
+                .collect(),
             clean,
         })
     }
@@ -1565,6 +1713,38 @@ impl PendingMaintenance {
     }
 }
 
+#[cfg(feature = "test-hooks")]
+impl Inner {
+    /// The tablet of `table` holding `row` and its owner.
+    fn tablet_at(&self, table: TableId, row: &[u8]) -> Result<(TabletId, ShardId)> {
+        self.check_open()?;
+        self.shared
+            .view
+            .load()
+            .tablets()
+            .route(table, row)
+            .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))
+    }
+
+    /// Sends a tablet change to `shard`, the tablets' owner.
+    fn tablet_op(
+        &self,
+        shard: ShardId,
+        op: crate::shard::TabletOpKind,
+    ) -> Result<PendingMaintenance> {
+        if self.role != Role::Writer {
+            return Err(Error::ReadOnly);
+        }
+        self.check_open()?;
+        let (tx, rx) = completion();
+        self.shared.submitter(shard).submit(ShardMsg::TabletOp {
+            op,
+            reply: Some(tx),
+        })?;
+        Ok(PendingMaintenance { waiters: vec![rx] })
+    }
+}
+
 impl Inner {
     fn check_open(&self) -> Result<()> {
         if self.closing.load(Ordering::Acquire) || self.shared.closed.load(Ordering::Acquire) {
@@ -1710,8 +1890,7 @@ impl Inner {
     }
 
     /// Validates and routes a batch: per-shard parts in first-appearance order.
-    fn route(&self, mut batch: WriteBatch) -> Result<(BatchBuilder, Vec<ShardId>)> {
-        let view = self.shared.view.load();
+    fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Vec<ShardId>)> {
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
             let info = catalog
@@ -1776,11 +1955,13 @@ impl Inner {
         }
         self.check_open()?;
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
-        let (builder, mut shards) = self.route(batch)?;
+        // One tablet map for the whole routing: its version goes with a cross-shard commit,
+        // which a participant moving a tablet refuses and the coordinator retries.
+        let view = self.shared.view.load();
+        let (builder, mut shards) = self.route(batch, &view)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
         if let Some((_, reads)) = &validate {
-            let view = self.shared.view.load();
             for r in reads {
                 if let Some((_, shard)) = view.tablets().route(r.table, &r.row)
                     && !shards.contains(&shard)
@@ -1803,6 +1984,7 @@ impl Inner {
                     submitted_at,
                     validate,
                     predicate,
+                    commit_ts: None,
                 }))?;
         } else {
             if predicate.is_some() {
@@ -1810,7 +1992,7 @@ impl Inner {
                     "check_and_mutate touches one row".to_owned(),
                 ));
             }
-            let parts = split_by_shard(&self.shared.view.load(), &builder, &shards)?;
+            let parts = split_by_shard(&view, &builder, &shards)?;
             let coordinator = shards[0];
             self.shared
                 .submitter(coordinator)
@@ -1820,6 +2002,9 @@ impl Inner {
                     reply: tx,
                     submitted_at,
                     validate,
+                    map_version: view.tablets.version(),
+                    commit_ts: None,
+                    epoch: 0,
                 }))?;
         }
         Ok(PendingCommit {
@@ -1858,12 +2043,10 @@ impl Inner {
             }
         }
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
-        let (builder, shards) = self.route(batch)?;
+        let view = self.shared.view.load();
+        let (builder, shards) = self.route(batch, &view)?;
         let shard = match shards.as_slice() {
-            [] => self
-                .shared
-                .view
-                .load()
+            [] => view
                 .tablets()
                 .route(table, row)
                 .map(|(_, s)| s)
@@ -1882,6 +2065,7 @@ impl Inner {
                 submitted_at,
                 validate: None,
                 predicate: Some((table, row.to_vec(), predicate.clone())),
+                commit_ts: None,
             }))?;
         let (applied, info) = rx.wait().unwrap_or(Err(Error::Closed))?;
         if let Some(info) = info {
@@ -2214,29 +2398,6 @@ fn check_merge_operator(
     }
 }
 
-/// Splits a batch into one builder per shard, in `shards` order.
-fn split_by_shard(
-    view: &View,
-    builder: &BatchBuilder,
-    shards: &[ShardId],
-) -> Result<Vec<(ShardId, Arc<BatchBuilder>)>> {
-    let mut parts: Vec<(ShardId, BatchBuilder)> =
-        shards.iter().map(|s| (*s, BatchBuilder::new())).collect();
-    for m in builder.batch().iter() {
-        let m = m?;
-        let Some((_, shard)) = view.tablets().route(m.table, m.row) else {
-            return Err(Error::TableNotFound(format!("table {}", m.table.0)));
-        };
-        let part = parts
-            .iter_mut()
-            .find(|(s, _)| *s == shard)
-            .expect("routed while listing shards");
-        part.1
-            .push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
-    }
-    Ok(parts.into_iter().map(|(s, b)| (s, Arc::new(b))).collect())
-}
-
 /// One shard in application-owned mode. Move it to the thread that should run it.
 ///
 /// ```no_run
@@ -2292,7 +2453,8 @@ impl EngineShard {
         let engine = Arc::clone(&self.engine);
         engine.check_open()?;
         let durability = durability.unwrap_or_else(|| engine.shared.default_durability());
-        let (builder, shards) = engine.route(batch)?;
+        let view = engine.shared.view.load();
+        let (builder, shards) = engine.route(batch, &view)?;
         let me = ShardId(self.index());
         let Some(driver) = self.driver.as_mut() else {
             return Err(Error::Closed);
@@ -2314,6 +2476,7 @@ impl EngineShard {
                     submitted_at,
                     validate: None,
                     predicate: None,
+                    commit_ts: None,
                 },
                 ctx,
             )
