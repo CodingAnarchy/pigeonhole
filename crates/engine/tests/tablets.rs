@@ -91,27 +91,41 @@ fn tablet_changes_with_a_changed_shard_count() {
     }
 }
 
+/// The final dump of `seed` matches the 1-shard run for 2..=8 shards, with tablet changes.
+fn identical_across_shard_counts(seed: u64) {
+    let mut cfg = Config::quiet(250);
+    // Purges at fixed points (decision D74), as in the model_check equivalent.
+    cfg.compaction.l0_trigger = u32::MAX;
+    cfg.compaction.level_base_bytes = u64::MAX;
+    cfg.compact_every = Some(50);
+    cfg.tablet_changes = true;
+    cfg.tablet_every = Some(9);
+    cfg.balance_fast = true;
+    cfg.shards = 1;
+    let reference = final_dump(seed, &cfg);
+    for shards in 2..=8 {
+        cfg.shards = shards;
+        let dump = final_dump(seed, &cfg);
+        assert_eq!(
+            dump, reference,
+            "seed {seed}: {shards} shards differ from 1 shard"
+        );
+    }
+}
+
 #[test]
 fn results_are_identical_across_shard_counts_with_tablet_changes() {
     for seed in seeds() {
-        let mut cfg = Config::quiet(250);
-        // Purges at fixed points (decision D74), as in the model_check equivalent.
-        cfg.compaction.l0_trigger = u32::MAX;
-        cfg.compaction.level_base_bytes = u64::MAX;
-        cfg.compact_every = Some(50);
-        cfg.tablet_changes = true;
-        cfg.tablet_every = Some(9);
-        cfg.balance_fast = true;
-        cfg.shards = 1;
-        let reference = final_dump(seed, &cfg);
-        for shards in 2..=8 {
-            cfg.shards = shards;
-            let dump = final_dump(seed, &cfg);
-            assert_eq!(
-                dump, reference,
-                "seed {seed}: {shards} shards differ from 1 shard"
-            );
-        }
+        identical_across_shard_counts(seed);
+    }
+}
+
+#[test]
+#[ignore = "#94"]
+fn results_identical_across_shard_counts_regressions() {
+    // Seeds of the 1–300 sweep where a multi-shard run misses a cell the 1-shard run has.
+    for seed in [13, 106] {
+        identical_across_shard_counts(seed);
     }
 }
 
@@ -572,6 +586,51 @@ fn tablet_changes_are_refused_when_switched_off() {
     refused(db.drive(m));
     assert_eq!(db.ranges().len(), 1);
     assert_eq!(db.engine.tablet_changes(), (0, 0, 0));
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+#[ignore = "#95"]
+fn the_balancer_merges_cold_siblings_once_one_compacted_a_shared_sst() {
+    // After a split, the left child compacts its copy of the shared SST and the right child
+    // never reaches its L0 trigger: its inherited SST still holds the left child's rows, so
+    // the merge is refused (correctly) at every balancer pass, and nothing ever rewrites it.
+    let mut db = open(1, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.tablet_split_bytes = 64 << 20;
+        o.compaction.l0_trigger = 2;
+    });
+    let id = db.table.id;
+    let mut rows: Vec<Vec<u8>> = (0..40).map(key).collect();
+    rows.sort();
+    for r in &rows {
+        db.put(r, b"old");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    let m = db.engine.split_tablet_pending(id, &rows[20]).unwrap();
+    db.drive(m).unwrap();
+    for r in &rows[..20] {
+        db.put(r, b"new");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    for _ in 0..1_000 {
+        db.step();
+    }
+    // Cold now: a few balancer passes with no writes.
+    for _ in 0..4 {
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+        for _ in 0..1_000 {
+            db.step();
+        }
+    }
+    assert_eq!(db.ranges().len(), 1, "{:?}", db.ranges());
+    assert_eq!(db.scan_rows(), rows);
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
