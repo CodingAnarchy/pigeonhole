@@ -180,14 +180,33 @@ pub(crate) fn gc_policy(
     gc
 }
 
-/// The newest seqno among the task's inputs.
-pub(crate) fn max_input_seqno(fam: &FamilySsts, task: &CompactionTask) -> Seqno {
-    task.inputs
+/// `CompactionRecord::max_seqno`: a seqno at or below which every entry of the slot is an
+/// input or was already dropped. The newest seqno among the inputs, raised to just below the
+/// oldest entry above them (the slot's other SSTs and memtables; `visible` when there is
+/// none): an output SST's seqno range covers only the entries it kept, so an entry an
+/// earlier compaction dropped (hidden by a delete at every read point) can be newer than
+/// every input, and the model must still count it as one (issue #66).
+pub(crate) fn max_input_seqno(
+    fam: &FamilySsts,
+    task: &CompactionTask,
+    mem_min_seqno: Option<Seqno>,
+    visible: Seqno,
+) -> Seqno {
+    let is_input = |id: SstId| task.inputs.iter().any(|(_, ids)| ids.contains(&id));
+    let inputs = fam
         .iter()
-        .flat_map(|(_, ids)| ids.iter())
-        .filter_map(|id| fam.find(*id).map(|(_, s)| s.meta.seqno_range.1))
+        .filter(|s| is_input(s.meta.id))
+        .map(|s| s.meta.seqno_range.1)
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let above = fam
+        .iter()
+        .filter(|s| !is_input(s.meta.id))
+        .map(|s| s.meta.seqno_range.0)
+        .chain(mem_min_seqno)
+        .min()
+        .map_or(visible, |m| m.saturating_sub(1));
+    inputs.max(above)
 }
 
 /// Manifest edits plus the readers of the SSTs they add.

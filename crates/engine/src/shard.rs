@@ -844,6 +844,14 @@ impl MemSlot {
             .collect()
     }
 
+    /// The smallest seqno in any of these memtables, `None` when all are empty.
+    fn min_seqno(&self) -> Option<Seqno> {
+        std::iter::once(&self.active)
+            .chain(&self.frozen)
+            .filter_map(|m| m.table.seqno_range().map(|(min, _)| min))
+            .min()
+    }
+
     /// The smallest user timestamp in any of these memtables.
     fn min_ts(&self) -> Timestamp {
         self.frozen
@@ -3420,7 +3428,12 @@ impl ShardState {
                 snapshots: gc.snapshots.clone(),
                 now: gc.now,
                 min_ts_above: gc.min_ts_above,
-                max_seqno: compact::max_input_seqno(fam, &task),
+                max_seqno: compact::max_input_seqno(
+                    fam,
+                    &task,
+                    self.memtables.get(&key).and_then(MemSlot::min_seqno),
+                    self.shared.shm.visible_seqno(),
+                ),
                 rows: (
                     (!tablet.start.is_empty()).then(|| tablet.start.clone()),
                     tablet.end.clone(),

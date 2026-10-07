@@ -844,3 +844,90 @@ fn a_full_arena_stalls_writers_until_a_slow_flush_frees_it() {
     assert_eq!(row_count(&db, &t), 4 * 60 * 32);
     db.close().unwrap();
 }
+
+// ---- #66: the purge record counts entries an earlier compaction dropped as inputs ----
+
+/// Commits `ops` on an application-owned store, driving the shards; returns the seqno.
+fn commit_ops(store: &mut Store, vfs: &Arc<SimVfs>, ops: &[ModelOp]) -> u64 {
+    let batch = store.batch(ops).unwrap();
+    let mut pc = store.engine.submit(batch, Some(Durability::Sync)).unwrap();
+    loop {
+        match poll_commit(&mut pc) {
+            Poll::Ready(r) => return r.unwrap().seqno,
+            Poll::Pending => store.step_shards(vfs.monotonic_nanos()),
+        }
+    }
+}
+
+#[test]
+fn a_purge_record_covers_entries_dropped_by_an_earlier_compaction() {
+    // A put written after a row delete with an older timestamp is hidden at every read
+    // point, so a non-bottommost compaction drops it; the bottommost compaction that later
+    // purges the row delete must still report it as an input (`max_seqno`), or the model's
+    // purge (D74) brings it back while the engine has rightly dropped it.
+    let sim = Sim::new(66);
+    let vfs = sim.vfs();
+    let cfg = common::Config::quiet(0);
+    let mut store = Store::open_cfg(&vfs, 1, &cfg).unwrap();
+    let row = b"row000001".to_vec();
+    let table = common::table_of(&row).to_owned();
+    let put = |q: &[u8], ts: Option<u64>| ModelOp::Put {
+        table: table.clone(),
+        row: row.clone(),
+        family: "g".into(),
+        qualifier: q.to_vec(),
+        ts,
+        value: vec![7; 16],
+    };
+    let maintain = |store: &mut Store, compact: bool| {
+        let m = if compact {
+            store.engine.compact_pending(None)
+        } else {
+            store.engine.flush_pending()
+        };
+        store.drive(&vfs, m.unwrap(), || true).unwrap();
+        store.run_until_idle();
+    };
+    // The last level holds data, so the L0 compaction below is not bottommost.
+    commit_ops(&mut store, &vfs, &[put(b"q0", None)]);
+    maintain(&mut store, true);
+    let deleted = commit_ops(
+        &mut store,
+        &vfs,
+        &[ModelOp::DeleteRow {
+            table: table.clone(),
+            row: row.clone(),
+        }],
+    );
+    maintain(&mut store, false);
+    let hidden = commit_ops(&mut store, &vfs, &[put(b"q2", Some(1))]);
+    // A second L0 file: the picker compacts L0 into a middle level, dropping the put.
+    maintain(&mut store, false);
+    let (_, family) = store.ids(&table, "g");
+    let records: Vec<_> = store
+        .engine
+        .take_compactions()
+        .into_iter()
+        .filter(|r| r.family == family)
+        .collect();
+    assert!(
+        records.iter().any(|r| !r.bottommost && r.max_seqno >= hidden),
+        "no middle-level compaction took the put: {records:?}"
+    );
+    maintain(&mut store, true);
+    let full: Vec<_> = store
+        .engine
+        .take_compactions()
+        .into_iter()
+        .filter(|r| r.family == family)
+        .collect();
+    let last = full.last().expect("the full compaction's record");
+    assert!(last.bottommost, "{last:?}");
+    assert!(
+        last.max_seqno >= hidden,
+        "max_seqno {} leaves out the dropped put at seqno {hidden} (row delete at {deleted})",
+        last.max_seqno
+    );
+    let snap = store.engine.snapshot().unwrap();
+    assert_eq!(store.get(&snap, &row, "g", b"q2").unwrap(), None);
+}
