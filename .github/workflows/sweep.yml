@@ -1,0 +1,103 @@
+name: Sweep
+
+# Seed sweeps on runners instead of developer machines (CONTRIBUTING.md, "Seed sweeps").
+# Dispatch on a pushed branch:
+#
+#   gh workflow run sweep.yml --ref <branch> -f package=pigeonhole -f test=model \
+#     -f first=1 -f count=300 -f chunks=6 -f env="PIGEONHOLE_TABLET_CHANGES=1"
+#
+# Each chunk runs `cargo test --release` with PIGEONHOLE_SEED/PIGEONHOLE_SEEDS set to its
+# share of the range; a failing chunk's log names the seed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Cargo package (-p)
+        required: true
+        default: pigeonhole
+      test:
+        description: Integration test target (--test)
+        required: true
+        default: model
+      filter:
+        description: Test name filter (empty runs every test in the target)
+        default: ""
+      first:
+        description: First seed
+        default: "1"
+      count:
+        description: Number of seeds
+        default: "300"
+      chunks:
+        description: Parallel chunks (1-20)
+        default: "6"
+      env:
+        description: Extra environment, space-separated KEY=VALUE pairs
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+    steps:
+      - id: plan
+        env:
+          FIRST: ${{ inputs.first }}
+          COUNT: ${{ inputs.count }}
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          for v in "$FIRST" "$COUNT" "$CHUNKS"; do
+            [[ "$v" =~ ^[0-9]+$ ]] || { echo "not a number: $v"; exit 1; }
+          done
+          (( CHUNKS >= 1 && CHUNKS <= 20 && COUNT >= 1 )) || { echo "bad chunks/count"; exit 1; }
+          (( CHUNKS > COUNT )) && CHUNKS=$COUNT
+          per=$(( (COUNT + CHUNKS - 1) / CHUNKS ))
+          json="["; seed=$FIRST; end=$(( FIRST + COUNT ))
+          while (( seed < end )); do
+            n=$(( end - seed < per ? end - seed : per ))
+            json+="{\"seed\":$seed,\"seeds\":$n},"; seed=$(( seed + n ))
+          done
+          echo "chunks=${json%,}]" >> "$GITHUB_OUTPUT"
+
+  sweep:
+    needs: plan
+    name: seeds ${{ matrix.chunk.seed }}+${{ matrix.chunk.seeds }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sweep
+      - name: Extra environment
+        env:
+          EXTRA: ${{ inputs.env }}
+        run: |
+          for kv in $EXTRA; do
+            [[ "$kv" =~ ^[A-Z][A-Z0-9_]*=[A-Za-z0-9_.,:-]*$ ]] || { echo "bad env entry: $kv"; exit 1; }
+            echo "$kv" >> "$GITHUB_ENV"
+          done
+      - name: Sweep
+        env:
+          PACKAGE: ${{ inputs.package }}
+          TEST: ${{ inputs.test }}
+          FILTER: ${{ inputs.filter }}
+          PIGEONHOLE_SEED: ${{ matrix.chunk.seed }}
+          PIGEONHOLE_SEEDS: ${{ matrix.chunk.seeds }}
+        run: |
+          [[ "$PACKAGE$TEST" =~ ^[A-Za-z0-9_-]+$ && "$FILTER" =~ ^[A-Za-z0-9_:]*$ ]] \
+            || { echo "bad package, test or filter"; exit 1; }
+          cargo test --release --all-features -p "$PACKAGE" --test "$TEST" -- $FILTER

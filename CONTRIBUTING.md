@@ -38,5 +38,17 @@ Anything left for later is a GitHub issue titled `[crate] summary`, labeled with
    Crates with `unsafe` also run `cargo +nightly miri test -p <crate>`; crates with concurrency run `RUSTFLAGS="--cfg loom" cargo test --release -p <crate> --lib loom`.
 3. Open a pull request against `main`. CI must be green before merge.
 
+## Seed sweeps and local resources
+Several agents often build and test on one machine, so local runs stay small:
+- Run at most one `cargo` command at a time per worktree, and no seed sweep beyond about 20 seeds locally.
+- Larger sweeps run on CI runners with the `Sweep` workflow (`.github/workflows/sweep.yml`). Push the branch, then:
+  ```sh
+  gh workflow run sweep.yml --ref <branch> -f package=pigeonhole -f test=model \
+    -f first=1 -f count=300 -f chunks=6 -f env="PIGEONHOLE_TABLET_CHANGES=1"
+  gh run list --workflow sweep.yml --branch <branch> --limit 1   # then: gh run watch <id>
+  ```
+  Each chunk sets `PIGEONHOLE_SEED`/`PIGEONHOLE_SEEDS`; a failing chunk's log names the seed. Reproduce that one seed locally.
+- Agent worktrees carry an untracked `.cargo/config.toml` that caps build jobs and test threads; don't override it.
+
 ## Performance discipline
 Optimization, simplification and performance are maintained continuously, not bolted on: keep hot paths allocation-free where the spec says so, prefer the simplest structure that meets the brief, and add a criterion benchmark for any path with a latency target. Note measured numbers in the PR.
