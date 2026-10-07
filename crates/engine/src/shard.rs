@@ -170,6 +170,38 @@ pub(crate) struct VisibilityWaiters {
     pub list: Mutex<Vec<(Seqno, Waker)>>,
 }
 
+/// Shards waiting for the watermark to pass a deferred freeze. Registering is idempotent;
+/// `take` hands every registered shard to the publisher once.
+#[derive(Debug, Default)]
+pub(crate) struct FreezeWaiters {
+    /// Registrations not taken yet: lets `take` skip the lock when nobody waits.
+    waiting: AtomicUsize,
+    list: Mutex<Vec<u16>>,
+}
+
+impl FreezeWaiters {
+    /// Registers `shard` unless it is registered already. A shard whose freeze defers again
+    /// after a `take` must register again: its deferred flag outlives the registration.
+    pub(crate) fn register(&self, shard: u16) {
+        let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
+        if !list.contains(&shard) {
+            list.push(shard);
+            self.waiting.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Takes every registered shard (one load when there is none).
+    pub(crate) fn take(&self) -> Vec<u16> {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
+        // Reset under the lock, so a registration racing this take is never lost.
+        self.waiting.store(0, Ordering::Release);
+        std::mem::take(&mut *list)
+    }
+}
+
 /// Engine-wide state every shard and every caller shares.
 pub(crate) struct Shared {
     pub vfs: VfsRef,
@@ -241,8 +273,7 @@ pub(crate) struct Shared {
     pub waiters: VisibilityWaiters,
     /// Shards with a freeze deferred until the watermark passes their memtable (kicked by
     /// whoever publishes a watermark).
-    pub freeze_waiting: AtomicUsize,
-    pub freeze_waiters: Mutex<Vec<u16>>,
+    pub freeze_waiters: FreezeWaiters,
     pub memtable_freeze_bytes: u64,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
@@ -297,19 +328,8 @@ impl Shared {
     /// Wakes every registered waiter whose seqno is visible now. Called by shards after a
     /// watermark publish, and only when someone is registered (one relaxed load otherwise).
     pub(crate) fn wake_visible(&self) {
-        if self.freeze_waiting.load(Ordering::Acquire) != 0 {
-            let shards: Vec<u16> = {
-                let mut list = self
-                    .freeze_waiters
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                // Reset under the lock, so a registration racing this take is never lost.
-                self.freeze_waiting.store(0, Ordering::Release);
-                std::mem::take(&mut *list)
-            };
-            for s in shards {
-                let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
-            }
+        for s in self.freeze_waiters.take() {
+            let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
         }
         if self.waiters.count.load(Ordering::Acquire) == 0 {
             return;
@@ -1972,15 +1992,7 @@ impl ShardState {
             // defers again must be woken again (a tablet change waits on it with every write
             // to the tablet parked, so nothing else would wake it).
             self.freeze_deferred = true;
-            let mut waiters = self
-                .shared
-                .freeze_waiters
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !waiters.contains(&self.id.0) {
-                waiters.push(self.id.0);
-                self.shared.freeze_waiting.fetch_add(1, Ordering::AcqRel);
-            }
+            self.shared.freeze_waiters.register(self.id.0);
         } else {
             self.freeze_deferred = false;
         }
@@ -3339,8 +3351,17 @@ impl ShardState {
                 failed: None,
                 decided: false,
                 shards: shards.clone(),
-                parts: req.parts.clone(),
-                validate: req.validate.clone(),
+                // Kept for a retry only when a participant may refuse with `Moved`.
+                parts: if self.tablets_on() {
+                    req.parts.clone()
+                } else {
+                    Vec::new()
+                },
+                validate: if self.tablets_on() {
+                    req.validate.clone()
+                } else {
+                    None
+                },
                 map_version: req.map_version,
                 moved: false,
                 commit_ts,
@@ -3921,7 +3942,11 @@ impl ShardState {
                 if filter.is_some_and(|t| t != meta.table) || meta.merge == MergeKind::Unknown {
                     continue;
                 }
-                if let Some(t) = compact::plan_full(key.0, key.1, &fam.levels_meta(), last, &busy) {
+                let Some(tablet) = view.tablets.entry(key.0) else {
+                    continue;
+                };
+                if let Some(t) = compact::plan_full(tablet, key.1, &fam.levels_meta(), last, &busy)
+                {
                     task = Some((key, t));
                     break;
                 }
@@ -4569,6 +4594,54 @@ impl ShardHandler for ShardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_freeze_waiter_registers_once_and_again_after_each_take() {
+        let w = FreezeWaiters::default();
+        w.register(3);
+        w.register(3);
+        w.register(1);
+        assert_eq!(w.take(), [3, 1]);
+        assert!(w.take().is_empty());
+        // A freeze that defers again after the kick is woken again.
+        w.register(3);
+        assert_eq!(w.take(), [3]);
+    }
+
+    #[test]
+    fn a_freeze_waiter_registering_during_a_take_is_never_lost() {
+        // Resetting the count outside the lock lost a registration made between the list's
+        // take and the reset: the count read 0 with the shard still listed, so `take` skipped
+        // it until some other shard registered. Under the lock the count always equals the
+        // list's length; registrants and a taker race while a checker looks.
+        const SHARDS: u16 = 4;
+        let w = FreezeWaiters::default();
+        let stop = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for id in 0..SHARDS {
+                let (w, stop) = (&w, &stop);
+                s.spawn(move || {
+                    while stop.load(Ordering::Acquire) == 0 {
+                        w.register(id);
+                    }
+                });
+            }
+            s.spawn(|| {
+                while stop.load(Ordering::Acquire) == 0 {
+                    let _ = w.take();
+                }
+            });
+            for _ in 0..200_000 {
+                let list = w.list.lock().unwrap_or_else(PoisonError::into_inner);
+                let waiting = w.waiting.load(Ordering::Acquire);
+                if waiting != list.len() {
+                    stop.store(1, Ordering::Release);
+                    panic!("count {waiting} with {:?} registered", *list);
+                }
+            }
+            stop.store(1, Ordering::Release);
+        });
+    }
 
     #[test]
     fn compaction_backoff_doubles_from_one_second_up_to_a_minute() {

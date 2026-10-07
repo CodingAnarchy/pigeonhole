@@ -1,5 +1,10 @@
 # Engine questions (issue #38: tablet splits, merges and the balancer)
 
+## Proposed decision: tablet changes are off by default until hardened
+Splits, merges, moves and the balancer still have known stalls and hangs (tracked as `[engine] tablets: ...` issues under #38).
+
+**Interim behavior:** `EngineOptions::tablet_changes` (default `false`) turns them on. Off, the balancer never runs and explicit changes (the test hooks) are refused with `Unsupported`, so every table stays one tablet on shard `tablet % shards`, as before #38. Every piece of the tablet work that would change behavior is gated on the switch: per-new-slot arena accounting, idle-slot retirement, the freeze reservation guard, catalog-based checkpoints and share reports (and their extra `Maintain` work), the union of replayed PREPARE slots, the published shard floors and the coordinator's above-the-participants'-floors timestamp. What stays on is inert for a whole-table tablet: admission routing checks run only while a change is in flight, and scan clamping is a no-op for an unbounded tablet. The model harness has a matching `Config::tablet_changes`; its tablet-specific allowances apply only when it is on.
+
 ## Q: Where does the manifest record a tablet's owner?
 The spec says a move "records the new owner in the manifest", but `Edit::PutTablet` has no owner field and the `Edit` tags are frozen in `pigeonhole-format`. Adding an edit is a format change outside the engine.
 
@@ -8,7 +13,7 @@ The spec says a move "records the new owner in the manifest", but `Edit::PutTabl
 ## Proposed decision: checkpoints compare slots against the catalog, not the shard
 After a move, or a reopen that re-derives owners, a stream can hold records for slots another shard now owns and flushes. A shard's checkpoint used its own per-slot flushed seqnos, so it never passed such records (the WAL grew and a clean close waited for ever), and a replayed PREPARE applied on another shard was logged with no slots at all (its participant could checkpoint past it before the data reached an SST).
 
-**Interim behavior:** `needed` and `report_shares_flushed` read the flushed seqnos of the current view's catalog. A slot whose tablet no longer exists needs nothing: its table was dropped, or a split or merge retired it after every write to it reached SSTs. Replayed PREPAREs record the slots of every shard they were applied on. Every manifest commit that adds SSTs broadcasts `Maintain`, which now also advances checkpoints and share reports. This replaces the per-shard `dropped` set.
+**Interim behavior (with `tablet_changes` on):** `needed` and `report_shares_flushed` read the flushed seqnos of the current view's catalog. A slot whose tablet no longer exists needs nothing: its table was dropped, or a split or merge retired it after every write to it reached SSTs. Replayed PREPAREs record the slots of every shard they were applied on. Every manifest commit that adds SSTs broadcasts `Maintain`, which then also advances checkpoints and share reports. Off, the shard's own flushed seqnos and its `dropped` set decide, as before.
 
 ## Proposed decision: a commit routed through an older tablet map
 A router can pick a shard just before that shard splits, merges or moves the tablet.
@@ -36,7 +41,7 @@ The spec gives the triggers (size, sustained write skew, small and cold) but no 
 ## Proposed decision: a split's children and the view buffer (D28)
 **Interim behavior:** a split whose estimated encoded view would not fit the shared-memory view buffer is refused before it starts (`Unsupported`), so the published view is never refused after the manifest commit (which would poison the pager). Children reference only the parent's SSTs that overlap their own range; scans clamp every tablet's sources to its range, since a shared SST also holds the sibling's rows.
 
-## Proposed decision: a write stall that nothing can end is refused at once
-D124 refuses a commit waiting for arena room with `Busy` after `write_stall_timeout_nanos`, or at once when the batch can never fit an empty arena. With many tablets per shard, every `(tablet, family)` slot takes memtable chunks, and memtables pinned by live snapshots stay allocated after their flush. A wait can then reach a state where nothing is frozen or flushing and nothing can freeze: only snapshots being released could make room.
+## Proposed decision: arena room for many tablet slots
+With many tablets per shard, every `(tablet, family)` slot takes memtable chunks, and memtables pinned by live snapshots stay allocated after their flush.
 
-**Interim behavior:** in that state the waiting commits are refused with `Busy` at once instead of being held to the timeout. A wait that a flush, a deferred freeze or the group's own reservations can still end keeps waiting as before. Separately, the balancer and tablet-change validation keep each shard's slots to a quarter of its arena's chunks (`max_slots`), and empty slots release their memtables after a flush. This caps how many tablets of many-family tables a shard holds: with the default 64 MiB budget and 1 MiB chunks, 16 slots per shard. Smaller arena chunks for shards with many tablets are the longer-term fix.
+**Interim behavior (with `tablet_changes` on):** a batch reserves a chunk for each slot it would create; empty slots release their memtables after a flush and before a room wait; a freeze never takes a chunk admitted members reserved; the balancer and tablet-change validation keep each shard's slots to a quarter of its arena's chunks (`max_slots`: with the default 64 MiB budget and 1 MiB chunks, 16 slots per shard). A room wait that nothing can end follows D126 (#84). Smaller arena chunks for shards with many tablets are the longer-term fix.

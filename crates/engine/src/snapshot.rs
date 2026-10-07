@@ -40,9 +40,9 @@ pub(crate) struct TabletEntry {
 /// An immutable routing table: for each table, its tablets' row ranges and owning shards.
 /// Swapped atomically as a whole; read without locks.
 ///
-/// At open every tablet goes to shard `tablet % shards`; while the database runs, splits,
-/// merges and the balancer's moves hand tablets to other shards, and each change publishes a
-/// new map with a higher version. Which shard applies a row never changes the result.
+/// At open every tablet goes to shard `tablet % shards`. With `EngineOptions::tablet_changes`
+/// on, splits, merges and the balancer's moves hand tablets to other shards while the
+/// database runs, and each change publishes a new map with a higher version. Which shard applies a row never changes the result.
 ///
 /// ```
 /// use pigeonhole_engine::{Engine, EngineOptions, FamilyOptions};

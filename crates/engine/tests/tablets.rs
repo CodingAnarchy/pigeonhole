@@ -483,3 +483,97 @@ fn invalid_tablet_changes_are_refused() {
         db.step();
     }
 }
+
+#[test]
+fn a_merge_waits_until_both_siblings_compacted_a_shared_sst() {
+    // After a split both children reference the parent's SSTs (D13). Once one child has
+    // compacted its copy and the other has not, the other's SST still holds the first
+    // child's rows: a merged tablet would read them twice (and resurrect what the first
+    // child's compaction dropped), so the merge is refused until both compacted.
+    let mut db = open(1, |o| {
+        o.balance_interval_nanos = 0;
+        o.compaction.l0_trigger = 2;
+    });
+    let id = db.table.id;
+    let mut rows: Vec<Vec<u8>> = (0..40).map(key).collect();
+    rows.sort();
+    for r in &rows {
+        db.put(r, b"old");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    let mid = rows[20].clone();
+    let m = db.engine.split_tablet_pending(id, &mid).unwrap();
+    db.drive(m).unwrap();
+    let ranges = db.ranges();
+    assert_eq!(ranges.len(), 2, "{ranges:?}");
+    let left = ranges[0].0;
+    // Only the left child reaches the L0 trigger: it rewrites its copy of the shared SST.
+    db.engine.take_compactions();
+    for r in &rows[..20] {
+        db.put(r, b"new");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    let mut compacted = Vec::new();
+    for _ in 0..1_000 {
+        compacted.extend(db.engine.take_compactions());
+        if !compacted.is_empty() {
+            break;
+        }
+        db.step();
+    }
+    assert!(
+        !compacted.is_empty() && compacted.iter().all(|c| c.tablet == left),
+        "{compacted:?}"
+    );
+    let m = db.engine.merge_tablets_pending(id, &rows[0]).unwrap();
+    let e = db
+        .drive(m)
+        .expect_err("merged while a sibling still shares an SST");
+    assert!(e.to_string().contains("shared SST"), "{e}");
+    assert_eq!(db.ranges().len(), 2);
+    // Once both children compacted, the merge goes through and every row reads once.
+    let m = db.engine.compact_pending(None).unwrap();
+    db.drive(m).unwrap();
+    let m = db.engine.merge_tablets_pending(id, &rows[0]).unwrap();
+    db.drive(m).unwrap();
+    assert_eq!(db.ranges().len(), 1);
+    assert_eq!(db.scan_rows(), rows);
+    for (i, r) in rows.iter().enumerate() {
+        let want: &[u8] = if i < 20 { b"new" } else { b"old" };
+        assert_eq!(db.get(r).map(|(_, v)| v).as_deref(), Some(want), "row {i}");
+    }
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn tablet_changes_are_refused_when_switched_off() {
+    let mut db = open(2, |o| o.tablet_changes = false);
+    for i in 0..10 {
+        db.put(&key(i), b"v");
+    }
+    let id = db.table.id;
+    let refused = |r: pigeonhole_engine::Result<()>| {
+        assert!(
+            matches!(r, Err(pigeonhole_engine::Error::Unsupported(_))),
+            "{r:?}"
+        );
+    };
+    let m = db.engine.split_tablet_pending(id, &key(4)).unwrap();
+    refused(db.drive(m));
+    let to = 1 - db.ranges()[0].1;
+    let m = db.engine.move_tablet_pending(id, &key(4), to).unwrap();
+    refused(db.drive(m));
+    let m = db.engine.balance_pending().unwrap();
+    refused(db.drive(m));
+    assert_eq!(db.ranges().len(), 1);
+    assert_eq!(db.engine.tablet_changes(), (0, 0, 0));
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}

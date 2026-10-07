@@ -27,9 +27,9 @@ use crate::flush::{SstSink, write_memtable};
 use crate::manifest::{self, ManifestWriter, ReqKind};
 use crate::read::{self, get_in};
 use crate::shard::{
-    BalanceConfig, CloseState, CommitReq, CoordinateReq, LoadSlot, Locks, Padded, ReplayedKind,
-    Reply, ShardMetrics, ShardMsg, ShardState, Shared, VisibilityWaiters, bucket_floor,
-    split_by_shard,
+    BalanceConfig, CloseState, CommitReq, CoordinateReq, FreezeWaiters, LoadSlot, Locks, Padded,
+    ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared, VisibilityWaiters,
+    bucket_floor, split_by_shard,
 };
 use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
@@ -511,8 +511,7 @@ impl Engine {
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
             waiters: VisibilityWaiters::default(),
-            freeze_waiting: AtomicUsize::new(0),
-            freeze_waiters: Mutex::new(Vec::new()),
+            freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
@@ -960,8 +959,7 @@ impl Engine {
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
             waiters: VisibilityWaiters::default(),
-            freeze_waiting: AtomicUsize::new(0),
-            freeze_waiters: Mutex::new(Vec::new()),
+            freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
