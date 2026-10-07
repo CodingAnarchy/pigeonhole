@@ -19,7 +19,7 @@
 //! Seeds: `PIGEONHOLE_SEED` (first seed, default 1) and `PIGEONHOLE_SEEDS` (count, default
 //! 3). A failure prints its seed and the operation trace.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
@@ -156,7 +156,26 @@ struct Run {
     armed: bool,
     trace: Vec<String>,
     stats: Stats,
+    deletes: Deletes,
 }
+
+/// Every delete generated so far (lost ones too: dropping more is harmless), so `prepare`
+/// can leave out the explicit-timestamp writes whose result depends on whether a bottommost
+/// compaction has purged a delete or old versions yet (decision D74). The engine compacts in
+/// the background and the public API reports no purges to replay on the model (issue #45),
+/// so such a write would make a read depend on timing (issues #67, #68).
+#[derive(Default)]
+struct Deletes {
+    /// Newest `delete_column` timestamp per column.
+    columns: BTreeMap<ColumnId, u64>,
+    /// Newest family or row delete timestamp per `(table, row, family)`.
+    families: BTreeMap<(String, Vec<u8>, String), u64>,
+    /// `delete_cell` targets: column and timestamp.
+    cells: BTreeSet<(ColumnId, u64)>,
+}
+
+/// `(table, row, family, qualifier)`.
+type ColumnId = (String, Vec<u8>, String, Vec<u8>);
 
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
@@ -293,6 +312,7 @@ impl Run {
             armed: false,
             trace: Vec::new(),
             stats: Stats::default(),
+            deletes: Deletes::default(),
         };
         run.open()?;
         Ok(run)
@@ -440,9 +460,12 @@ impl Run {
         }
     }
 
-    /// Prepares a generated commit: tables by row, explicit timestamps after the base, and
-    /// no counter base at an explicit timestamp (there is no typed `put_at`).
-    fn prepare(&self, ops: Vec<ModelOp>) -> Vec<ModelOp> {
+    /// Prepares a generated commit: tables by row, explicit timestamps after the base, no
+    /// counter base at an explicit timestamp (there is no typed `put_at`), and none of the
+    /// writes a purge changes (see [`Deletes`]): a put at a timestamp an earlier delete
+    /// covers (a later write with an explicit older timestamp), or a `delete_cell` in a
+    /// family with `max_versions` (it may uncover an older version, or not once purged).
+    fn prepare(&mut self, ops: Vec<ModelOp>) -> Vec<ModelOp> {
         let mut ops: Vec<ModelOp> = ops
             .into_iter()
             .map(|mut op| {
@@ -467,6 +490,87 @@ impl Run {
         ops.retain(|op| {
             !matches!(op, ModelOp::Put { family, ts: Some(_), .. } if family.starts_with("counter"))
         });
+        // This commit's timestamp (the clock now, decision D11).
+        let now = self.now();
+        let d = &self.deletes;
+        ops.retain(|op| match op {
+            ModelOp::Put {
+                table,
+                row,
+                family,
+                qualifier,
+                ts,
+                ..
+            } => {
+                let ts = &ts.unwrap_or(now);
+                let col = (
+                    table.clone(),
+                    row.clone(),
+                    family.clone(),
+                    qualifier.clone(),
+                );
+                let fam = (table.clone(), row.clone(), family.clone());
+                !(d.columns.get(&col).is_some_and(|c| ts <= c)
+                    || d.families.get(&fam).is_some_and(|f| ts <= f)
+                    || d.cells.contains(&(col, *ts)))
+            }
+            ModelOp::DeleteCell { family, .. } => families()
+                .iter()
+                .any(|f| f.name == *family && f.max_versions == 0),
+            _ => true,
+        });
+        let d = &mut self.deletes;
+        for op in &ops {
+            match op {
+                ModelOp::DeleteCell {
+                    table,
+                    row,
+                    family,
+                    qualifier,
+                    ts,
+                } => {
+                    let col = (
+                        table.clone(),
+                        row.clone(),
+                        family.clone(),
+                        qualifier.clone(),
+                    );
+                    d.cells.insert((col, *ts));
+                }
+                ModelOp::DeleteColumn {
+                    table,
+                    row,
+                    family,
+                    qualifier,
+                } => {
+                    let key = (
+                        table.clone(),
+                        row.clone(),
+                        family.clone(),
+                        qualifier.clone(),
+                    );
+                    let e = d.columns.entry(key).or_insert(now);
+                    *e = (*e).max(now);
+                }
+                ModelOp::DeleteFamily { table, row, family } => {
+                    let e = d
+                        .families
+                        .entry((table.clone(), row.clone(), family.clone()))
+                        .or_insert(now);
+                    *e = (*e).max(now);
+                }
+                ModelOp::DeleteRow { table, row } => {
+                    for f in families() {
+                        let e = d
+                            .families
+                            .entry((table.clone(), row.clone(), f.name))
+                            .or_insert(now);
+                        *e = (*e).max(now);
+                    }
+                }
+                _ => {}
+            }
+        }
         ops
     }
 
