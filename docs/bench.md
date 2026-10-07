@@ -141,7 +141,7 @@ Run 1 started while the 15-minute load was still 12.3, the tail of another agent
 
 ## Results with disk-backed storage (this Mac, non-reference)
 
-**Single run, n=1, commit `4bc304c`**, measured 2026-10-06: `phdb-bench all` (Pigeonhole only, release, `small` preset: 50,000 records, 200,000 measured operations after a 5% warmup, 100-byte values, seed `0x5EED`, 64 MiB write buffer, buffered commits). Memtables now flush to SSTs and compact during the run.
+**Single run, n=1, commit `fa606ba`** (the build was made at `4bc304c`, the same code before this branch was rebased onto `main`), measured 2026-10-06: `phdb-bench all` (Pigeonhole only, release, `small` preset: 50,000 records, 200,000 measured operations after a 5% warmup, 100-byte values, seed `0x5EED`, 64 MiB write buffer, buffered commits). Memtables now flush to SSTs and compact during the run.
 
 **Environment:** Apple M5 (10 cores, 24 GiB), macOS 26.5.2 aarch64, APFS, **load 6.14** [non-reference (D5)]. The machine was shared with other agents' test suites, so this is *not* a quiet-machine run: the reproducibility rule above would flag it, and run-to-run drift is likely well beyond ±10%. Read these as order-of-magnitude, not as a regression or improvement against the older table (which ran at load 0.98 on a different engine build).
 
@@ -158,7 +158,7 @@ Run 1 started while the 15-minute load was still 12.3, the tail of another agent
 | adjacency | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 54.5K | 10.8 | 78.8 | 103 |
 | skewed-multi-shard | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 4 | 234.8K | 14.5 | 34.0 | 532 |
 
-**Not measured:** the `full` preset (1M records) and the comparison engines at it. The machine was too loaded for the numbers to mean anything, so full-scale and four-engine comparisons are left to the weekly `bench.yml` workflow (`--scale full` is selectable there) and to reference hardware (D5). A 1M-row sparse-wide run on Pigeonhole alone did complete without `Busy` (22.4K ops/s at load 8.9, one run), which is the only full-scale evidence so far.
+**Not measured:** the `full` preset (1M records) and the comparison engines at it. The machine was too loaded for the numbers to mean anything, so full-scale and four-engine comparisons are left to the weekly `bench.yml` workflow (`--scale full` is selectable there) and to reference hardware (D5). The only full-scale evidence so far is one run, n=1, of `sparse-wide --scale full` on Pigeonhole alone: 1,000,000 records and 1,000,000 operations completed without `Busy` at 22.4K ops/s (p50 6.17 µs, p99 786 µs), at machine load 8.9. It was built from `a007910` plus this branch's then-uncommitted `full` preset, so it names no branch commit; treat it as evidence that the size runs, not as a measurement.
 
 ## Comparison results before Milestone B (this Mac, non-reference)
 

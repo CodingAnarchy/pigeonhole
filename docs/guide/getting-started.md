@@ -260,7 +260,7 @@ assert_eq!(pages_copy.get(b"row", "meta", b"k")?.unwrap().value(), b"v");
 - The file does not shrink by itself: space freed by compaction is reused by later writes. There is no public `shrink` yet.
 
 ## What happens when writes outrun the disk
-A write that finds the memtable arena full waits (a write stall) while a flush frees room. `ErrorCode::Busy` means the wait ran past the engine's stall timeout (30 s), or a single batch is larger than a shard's arena. The first is **transient**: back off and retry. The second never succeeds: split the batch or raise `Options::memtable_budget`. See [Errors](errors.md).
+Reopening after a crash with a `memtable_budget` too small for the WAL's unflushed data fails with `ErrorCode::InvalidArgument`; reopen with a larger one. A write that finds the memtable arena full waits (a write stall) while a flush frees room. `ErrorCode::Busy` means the wait ran past the engine's stall timeout (30 s), or a single batch is larger than a shard's arena. The first is **transient**: back off and retry. The second never succeeds: split the batch or raise `Options::memtable_budget`. See [Errors](errors.md).
 
 ## What the current build does not do yet
 
