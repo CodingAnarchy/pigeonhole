@@ -150,7 +150,9 @@ fn a_seed_replays_the_same_io_trace() {
     spares.shards = 1;
     (spares.cas_ppm, spares.txn_ppm) = (0, 0);
     (spares.crash_ppm, spares.mid_commit_crash_ppm) = (0, 0);
-    spares.memtable_freeze_bytes = spares.memtable_budget;
+    (spares.flush_ppm, spares.compact_ppm) = (0, 0);
+    // The first freeze comes after half the arena of data, far past half a segment of WAL.
+    spares.memtable_freeze_bytes = spares.memtable_budget / 2;
     // `SpareSegments::prepare`'s I/O: grow the file by a slot, zero-fill it (one write: the
     // harness's segments are 256 KiB), then `sync_all`, with nothing in between.
     let zeros = {
