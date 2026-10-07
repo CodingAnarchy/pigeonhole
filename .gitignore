@@ -8,3 +8,4 @@
 /fuzz/artifacts
 proptest-regressions/
 /.claude/settings.local.json
+/scratch/
