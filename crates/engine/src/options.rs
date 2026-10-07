@@ -110,6 +110,17 @@ pub struct EngineOptions {
     /// with `Busy` (nanoseconds). A full arena stalls writers rather than refusing them; the
     /// wait is counted in `Metrics::stalls`.
     pub write_stall_timeout_nanos: u64,
+    /// How long a slot whose compaction failed waits before it is retried (nanoseconds,
+    /// default 1 s), doubling with each failure in a row up to 60 times this. A refused WAL
+    /// checkpoint retries on the same schedule. Mostly for tests, which shorten it.
+    pub compaction_backoff_nanos: u64,
+    /// How long the shard waits before retrying a failed flush (nanoseconds, default
+    /// 10 ms), doubling with each failure in a row up to 100 times this. Mostly for tests.
+    pub flush_backoff_nanos: u64,
+    /// How soon a wait for memtable arena room on a moving clock first looks again for room
+    /// that nothing announced (a snapshot dropped on another thread, a reader process's
+    /// unpin): nanoseconds, default 1 ms, doubling up to 100 times this. Mostly for tests.
+    pub room_recheck_nanos: u64,
 }
 
 impl EngineOptions {
@@ -140,6 +151,9 @@ impl EngineOptions {
             allow_unregistered_merge: false,
             compaction: PickerOptions::default(),
             write_stall_timeout_nanos: 30_000_000_000,
+            compaction_backoff_nanos: 1_000_000_000,
+            flush_backoff_nanos: 10_000_000,
+            room_recheck_nanos: 1_000_000,
         }
     }
 }

@@ -37,8 +37,18 @@ fn options(vfs: pigeonhole_io::VfsRef) -> EngineOptions {
     c.max_levels = 4;
     c.target_sst_bytes = 64 << 10;
     o.compaction = c;
+    // Short backoffs, so each test runs in well under a second: a failed compaction's slot
+    // waits 20 ms (doubling), a failed flush 2 ms (doubling to 200 ms).
+    o.compaction_backoff_nanos = BACKOFF.as_nanos() as u64;
+    o.flush_backoff_nanos = 2_000_000;
     o
 }
+
+/// The compaction backoff's base in these tests.
+const BACKOFF: Duration = Duration::from_millis(20);
+
+/// How long a writer makes no progress before a test takes it as stalled.
+const STALLED: Duration = Duration::from_millis(100);
 
 fn table(db: &Engine, name: &str) -> Arc<TableInfo> {
     let f = FamilyOptions {
@@ -101,7 +111,7 @@ fn compact_does_not_report_an_earlier_background_failure() {
 }
 
 /// 1-2 F5: under steady writes, a compaction that keeps failing is retried on its backoff
-/// timer (1 s, then 2 s), not after every admitted group or flush.
+/// timer (20 ms, 40 ms, 80 ms, ... here), not after every admitted group or flush.
 #[test]
 fn steady_writes_do_not_cut_a_failing_compactions_backoff_short() {
     let (vfs, gate) = gate::vfs(1412);
@@ -110,16 +120,18 @@ fn steady_writes_do_not_cut_a_failing_compactions_backoff_short() {
     gate.fail_reads_containing(Some(MARK));
     let mut i = until_a_compaction_fails(&db, &gate, &a);
     let first = gate.read_failures()[0];
-    // 2.5 s of writes after the first failure: the backoff allows one retry (at 1 s).
-    while first.elapsed() < Duration::from_millis(2_500) {
+    // Writes for 12.5 backoff bases after the first failure: the backoff allows three
+    // retries (after 1, 3 and 7 bases).
+    while first.elapsed() < BACKOFF * 25 / 2 {
         write(&db, &a, i, true);
         i += 1;
     }
     let failures = gate.read_failures().len();
     assert!(
         failures <= 4,
-        "{failures} failed compaction reads in 2.5 s of writes ({i} commits): the backoff \
-         was cut short"
+        "{failures} failed compaction reads in {:?} of writes ({i} commits): the backoff \
+         was cut short",
+        BACKOFF * 25 / 2
     );
     assert!(failures >= 2, "the backoff timer never retried");
     // Each failed attempt is counted (nothing else reports a background failure).
@@ -169,7 +181,7 @@ fn a_slot_that_keeps_failing_does_not_stop_the_others_compacting() {
 
 /// 1-2 F4 / 5-6 5.2: flushes keep failing (a write error that does not poison the pager)
 /// while a writer waits for arena room on a moving clock. They are retried on a backoff
-/// (10 ms doubling to 1 s), not back to back until the stall timeout; once the device
+/// (2 ms doubling to 200 ms here), not back to back until the stall timeout; once the device
 /// recovers, the next retry frees room and the writer goes on.
 #[test]
 fn a_failing_flush_during_a_room_wait_backs_off() {
@@ -201,10 +213,10 @@ fn a_failing_flush_during_a_room_wait_backs_off() {
             }
         })
     };
-    // Wait until the writer stalls: no commit for 300 ms (no flush can free the arena).
+    // Wait until the writer stalls: no commit for a while (no flush can free the arena).
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut last = (u32::MAX, Instant::now());
-    while last.1.elapsed() < Duration::from_millis(300) {
+    while last.1.elapsed() < STALLED {
         assert!(Instant::now() < deadline, "the writer never stalled");
         let n = done.load(Ordering::Acquire);
         if n != last.0 {
@@ -214,17 +226,18 @@ fn a_failing_flush_during_a_room_wait_backs_off() {
     }
     assert!(!gate.write_failures().is_empty(), "no flush failed");
     let before = gate.write_failures().len();
-    std::thread::sleep(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(200));
     let retries = gate.write_failures().len() - before;
+    // With a 2 ms base, at most about seven retries fit 200 ms (2, 4, ... 128 ms).
     assert!(
         retries <= 8,
-        "{retries} failed flushes in 1 s of a room wait: retried back to back"
+        "{retries} failed flushes in 200 ms of a room wait: retried back to back"
     );
     assert!(
         db.metrics().flush_failures >= 1,
         "failed flushes are counted"
     );
-    // The device recovers: the next retry (at most a second away) frees room.
+    // The device recovers: the next retry (at most 200 ms away) frees room.
     gate.fail_writes_containing(None);
     let stalled_at = done.load(Ordering::Acquire);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -281,7 +294,7 @@ fn room_freed_by_a_snapshot_drop_on_another_thread_ends_the_wait() {
     };
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut last = (u32::MAX, Instant::now());
-    while last.1.elapsed() < Duration::from_millis(300) {
+    while last.1.elapsed() < STALLED {
         assert!(Instant::now() < deadline, "the writer never stalled");
         let n = done.load(Ordering::Acquire);
         if n != last.0 {

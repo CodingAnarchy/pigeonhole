@@ -65,20 +65,22 @@ const STALL_TIMER_FROZEN_POLLS: u32 = 1024;
 /// Failed flushes in a row after which a wait for arena room ends with `Busy` on a frozen
 /// clock (a moving one waits for `write_stall_timeout_nanos`).
 const ROOM_FLUSH_ATTEMPTS: u32 = 4;
-/// How long a failed background compaction first waits before it is retried on a moving
-/// clock; the wait doubles with each failure in a row, up to `COMPACTION_BACKOFF_MAX_NANOS`.
-const COMPACTION_BACKOFF_NANOS: u64 = 1_000_000_000;
-const COMPACTION_BACKOFF_MAX_NANOS: u64 = 60_000_000_000;
-/// How long the shard first waits before retrying a failed flush; the wait doubles with
-/// each failure in a row, up to `FLUSH_BACKOFF_MAX_NANOS` (issue #141).
-const FLUSH_BACKOFF_NANOS: u64 = 10_000_000;
-const FLUSH_BACKOFF_MAX_NANOS: u64 = 1_000_000_000;
-
-/// The wait before retrying a flush after `failures` failed flushes in a row (at least one).
-fn flush_backoff_nanos(failures: u32) -> u64 {
+/// A backoff that starts at `base` and doubles with each failure in a row (`failures`, at
+/// least one), up to `cap` times `base`. The bases are `EngineOptions` fields: a failed
+/// compaction's (1 s, capped at 60 s), a failed flush's (10 ms, capped at 1 s) and a room
+/// wait's re-check (1 ms, capped at 100 ms).
+fn backoff_nanos(base: u64, cap: u64, failures: u32) -> u64 {
+    // 2^32 times the base is far past any cap; saturate rather than overflow.
     let doublings = failures.saturating_sub(1).min(32);
-    (FLUSH_BACKOFF_NANOS << doublings).min(FLUSH_BACKOFF_MAX_NANOS)
+    base.saturating_mul(1 << doublings)
+        .min(base.saturating_mul(cap))
+        .max(base)
 }
+
+/// Caps of the backoffs, as multiples of their bases.
+const COMPACTION_BACKOFF_CAP: u64 = 60;
+const FLUSH_BACKOFF_CAP: u64 = 100;
+const ROOM_RECHECK_CAP: u64 = 100;
 
 /// The wait before retrying after `failures` failed compactions in a row (at least one).
 /// Attempts of a cross-shard commit refused with `Moved` before it fails with `Busy`
@@ -89,12 +91,6 @@ pub(crate) const MOVED_RETRIES: u32 = 16;
 /// nanoseconds after it was submitted, fails with `Busy` instead of retrying.
 fn moved_gives_up(attempts: u32, waited: u64, timeout: u64) -> bool {
     attempts >= MOVED_RETRIES || waited >= timeout
-}
-
-fn compaction_backoff_nanos(failures: u32) -> u64 {
-    // 2^32 seconds is far past the cap and does not overflow.
-    let doublings = failures.saturating_sub(1).min(32);
-    (COMPACTION_BACKOFF_NANOS << doublings).min(COMPACTION_BACKOFF_MAX_NANOS)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -356,6 +352,10 @@ pub(crate) struct Shared {
     pub picker: PickerOptions,
     /// How long a commit waits for arena room before `Busy`.
     pub write_stall_timeout_nanos: u64,
+    /// Backoff bases (`EngineOptions`; issue #141).
+    pub compaction_backoff_nanos: u64,
+    pub flush_backoff_nanos: u64,
+    pub room_recheck_nanos: u64,
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
@@ -1654,13 +1654,9 @@ struct RoomWait {
     /// On a moving clock, kicks the shard to look for room again: room freed by a snapshot
     /// dropped on another thread or a reader process's unpin is not announced (issue #141).
     recheck: Option<Arc<TimerState>>,
-    /// The re-check timer's last interval (1 ms doubling to 100 ms).
+    /// The re-check timer's last interval (the base doubling up to 100 times it).
     recheck_nanos: u64,
 }
-
-/// First and longest interval of a room wait's re-check timer.
-const ROOM_RECHECK_NANOS: u64 = 1_000_000;
-const ROOM_RECHECK_MAX_NANOS: u64 = 100_000_000;
 
 impl RoomWait {
     fn new(since: u64, timer: Arc<TimerState>) -> Self {
@@ -1673,16 +1669,25 @@ impl RoomWait {
         }
     }
 
-    /// Arms the re-check timer unless one is pending: it kicks the shard after 1 ms, then
-    /// twice as long each time up to 100 ms, so freed room is seen within about 100 ms.
-    fn arm_recheck(&mut self, vfs: &VfsRef, ctx: &mut ShardContext<'_, ShardMsg>, me: ShardId) {
+    /// Arms the re-check timer unless one is pending: it kicks the shard after `base` (1 ms
+    /// by default), then twice as long each time up to 100 times `base`, so freed room is
+    /// seen within about 100 ms.
+    fn arm_recheck(
+        &mut self,
+        vfs: &VfsRef,
+        base: u64,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+        me: ShardId,
+    ) {
         if self.recheck.as_ref().is_some_and(|t| !t.finished()) {
             return;
         }
         self.recheck_nanos = if self.recheck_nanos == 0 {
-            ROOM_RECHECK_NANOS
+            base
         } else {
-            (self.recheck_nanos * 2).min(ROOM_RECHECK_MAX_NANOS)
+            self.recheck_nanos
+                .saturating_mul(2)
+                .min(base.saturating_mul(ROOM_RECHECK_CAP))
         };
         let state = TimerState::new();
         ctx.spawn(Box::new(ClockTimer::new(
@@ -2803,7 +2808,12 @@ impl ShardState {
             && self.retired.is_empty();
         if !frozen && let Some(w) = &mut self.starve_wait {
             // As for a room wait: freed chunks are announced to nobody (issue #141).
-            w.arm_recheck(&self.shared.vfs, ctx, self.id);
+            w.arm_recheck(
+                &self.shared.vfs,
+                self.shared.room_recheck_nanos,
+                ctx,
+                self.id,
+            );
         }
         if now.saturating_sub(since) >= timeout || idle {
             trace!(
@@ -2903,8 +2913,11 @@ impl ShardState {
                     self.flush_retry = Some(Arc::clone(&state));
                     ctx.spawn(Box::new(ClockTimer::new(
                         &self.shared.vfs,
-                        ctx.now_nanos()
-                            .saturating_add(flush_backoff_nanos(self.flush_failures)),
+                        ctx.now_nanos().saturating_add(backoff_nanos(
+                            self.shared.flush_backoff_nanos,
+                            FLUSH_BACKOFF_CAP,
+                            self.flush_failures,
+                        )),
                         state,
                         ctx.submitter(self.id).clone(),
                         ShardMsg::RetryFlush,
@@ -3660,7 +3673,12 @@ impl ShardState {
                 // Room freed by a snapshot dropped on another thread or a reader process's
                 // unpin is announced to nobody: look again soon (issue #141).
                 if let Some(w) = &mut self.room_wait {
-                    w.arm_recheck(&self.shared.vfs, ctx, self.id);
+                    w.arm_recheck(
+                        &self.shared.vfs,
+                        self.shared.room_recheck_nanos,
+                        ctx,
+                        self.id,
+                    );
                 }
             }
             if refuse || idle {
@@ -4905,8 +4923,11 @@ impl ShardState {
         self.checkpoint_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
             &self.shared.vfs,
-            ctx.now_nanos()
-                .saturating_add(compaction_backoff_nanos(self.checkpoint_failures)),
+            ctx.now_nanos().saturating_add(backoff_nanos(
+                self.shared.compaction_backoff_nanos,
+                COMPACTION_BACKOFF_CAP,
+                self.checkpoint_failures,
+            )),
             state,
             ctx.submitter(self.id).clone(),
             ShardMsg::RetryCheckpoint,
@@ -5175,9 +5196,11 @@ impl ShardState {
             .fetch_add(1, Ordering::Relaxed);
         let e = self.slot_backoff.entry(key).or_insert((0, 0));
         e.0 = e.0.saturating_add(1);
-        e.1 = ctx
-            .now_nanos()
-            .saturating_add(compaction_backoff_nanos(e.0));
+        e.1 = ctx.now_nanos().saturating_add(backoff_nanos(
+            self.shared.compaction_backoff_nanos,
+            COMPACTION_BACKOFF_CAP,
+            e.0,
+        ));
         let until = e.1;
         self.arm_compaction_retry(until, ctx);
     }
@@ -5961,14 +5984,19 @@ mod tests {
 
     #[test]
     fn compaction_backoff_doubles_from_one_second_up_to_a_minute() {
-        let secs: Vec<u64> = (1..=9)
-            .map(|f| compaction_backoff_nanos(f) / 1_000_000_000)
-            .collect();
+        let base = 1_000_000_000;
+        let backoff = |f| backoff_nanos(base, COMPACTION_BACKOFF_CAP, f);
+        let secs: Vec<u64> = (1..=9).map(|f| backoff(f) / base).collect();
         assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
         // Never shorter than the first wait, never longer than the cap, at any count.
-        assert_eq!(compaction_backoff_nanos(0), COMPACTION_BACKOFF_NANOS);
+        assert_eq!(backoff(0), base);
         for f in [64, 65, 1_000, u32::MAX] {
-            assert_eq!(compaction_backoff_nanos(f), COMPACTION_BACKOFF_MAX_NANOS);
+            assert_eq!(backoff(f), 60 * base);
         }
+        // A flush's: 10 ms doubling up to 1 s.
+        let ms: Vec<u64> = (1..=9)
+            .map(|f| backoff_nanos(10_000_000, FLUSH_BACKOFF_CAP, f) / 1_000_000)
+            .collect();
+        assert_eq!(ms, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
     }
 }
