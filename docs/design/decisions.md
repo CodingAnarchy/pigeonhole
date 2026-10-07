@@ -538,7 +538,7 @@ Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledg
 
 **Decision:** the harness takes the engine's own append order (the `test-hooks` `AppendedRecord` stream), applies the record-level prefix rule itself, and cross-checks `recovered_commits` only over commits whose records are adjacent per stream and all appended (`sim_helper_recovered`), skipping the check when the streams cannot be represented. `check_acknowledged_survive` and `Model::from_commits` are used as is. A record-level helper in `pigeonhole-sim` (issue #59) will let the check run on every crash and the harness drop its own rule; the engine half of #48 waits for it.
 
-## D124 — How does a group waiting for arena room learn that a flush freed some? (approved; engine Milestone B; amended by D126)
+## D124 — How does a group waiting for arena room learn that a flush freed some? (approved; engine Milestone B; amended by D126; flush/compact under arena pressure in the decision folded from #116)
 `ShardArena` reports free bytes only through `reserve`; nothing signals the shard when `reclaim` returns memory.
 
 **Decision:** a group that finds no room waits (a write stall, counted in `Metrics::stalls` with its duration): the shard freezes and flushes, and a flush completion (`Flushed`), every `Maintain` message and the stall's timeout timer re-run `reserve_room` for the waiting group (`refresh_free`). A flush that fails is tried again on the next retry. The wait ends with `Busy` only after `EngineOptions::write_stall_timeout_nanos` (30 s by default) passed without room, or at once for a batch that can never fit an empty arena, or with the poison error when the pager is poisoned.
@@ -553,7 +553,7 @@ D123 left the engine harness applying its own record-level prefix rule and cross
 
 **Status:** implemented.
 
-## D126 — write stalls and failed background work on a frozen or moving clock (approved; engine, #70 #79 #88; amends D119 and D124)
+## D126 — write stalls and failed background work on a frozen or moving clock (approved; engine, #70 #79 #88; amends D119 and D124; flush/compact under arena pressure in the decision folded from #116)
 D119 cancels the L0 stall's timer when a compaction commits and D124 times a wait for arena room out after `write_stall_timeout_nanos`, but both lean on a clock. Under `SimVfs` the clock moves only when the workload advances it, and the workload is blocked in the commit (or, in application-owned mode, in `run_once`, whose slice deadline never comes). Three things followed: a `StallTimer` polling the clock spun for ever; a failed background compaction with an L0 score `>= 1.0` was retried at once by `maintain`, redoing the merge in a loop against a dead (crashed or poisoned) device (#79); and a stall with nothing running in the background had nothing to end it.
 
 **Interim behavior** (proposed amendments; on a moving clock D119 and D124 are unchanged except where noted):
@@ -631,6 +631,67 @@ The spec gives the triggers (size, sustained write skew, small and cold) but no 
 With many tablets per shard, every `(tablet, family)` slot takes memtable chunks, and memtables pinned by live snapshots stay allocated after their flush.
 
 **Interim behavior (with `tablet_changes` on):** a batch reserves a chunk for each slot it would create; empty slots release their memtables after a flush and before a room wait; a freeze never takes a chunk admitted members reserved; the balancer and tablet-change validation keep each shard's slots to a quarter of its arena's chunks (`max_slots`: with the default 64 MiB budget and 1 MiB chunks, 16 slots per shard). A room wait that nothing can end follows D126 (#84). Smaller arena chunks for shards with many tablets are the longer-term fix.
+
+## D137 — What does `Engine::compact` guarantee while tablets split, merge and move (approved; engine)
+`Engine::compact` sends one `CompactAll` to every shard; each shard compacts the slots it owns and replies. With tablet changes on, the balancer kept moving and merging tablets meanwhile: a tablet could leave a shard before that shard's round reached it and arrive at a shard whose round was over, so it was never compacted (seed 13 of `results_are_identical_across_shard_counts_with_tablet_changes`). And a slot holding one SST above the last level was moved there without a rewrite, keeping deletes that a rewrite of the same rows purges (D74). How many SSTs a slot holds depends on when splits and moves flushed it, which depends on the shard count (seed 106).
+
+**Decision (tablet changes on only; off, nothing changes):**
+- While a full compaction runs, the balancer starts no change (`Shared::full_compactions`). A round during which a tablet change finished or was given up (`Shared::tablet_epoch` moved) is followed by another round, until one completes with no change. Changes requested explicitly (test hooks) still run; they only add rounds.
+- `plan_full` rewrites a lone SST above the last level instead of moving it, so every slot's full compaction purges what a bottommost compaction may.
+
+Proposed decision: a full compaction compacts every slot that exists when it is called, whatever tablets do meanwhile, and leaves each slot as one rewritten run at the last level. Whether the lone-SST rewrite should also apply with tablet changes off (it costs one rewrite per slot with a single L0 SST, and makes `compact` purge consistently) is for the coordinator; this PR keeps it gated, as D129 requires.
+
+**Coordinator:** confirmed. With tablet changes off, a lone SST above the last level is still trivially moved, not rewritten: the move is the cheaper equivalent and purge timing may vary (D74).
+
+## D138 — What do `flush` and `compact` do when the arena has no chunk for the fresh memtables they need (approved; engine, #116; amends D124 and D126)
+Every freeze replaces the active memtable with a fresh one from the shard's arena. When in-process snapshots pin the retired memtables, the arena can have fewer free chunks than memtables to freeze. The freeze then left those memtables active, and `flush` and `compact` still reported success with their data only in the WAL. D124 and D126 define how a commit waits for arena room; neither covers `flush` or `compact`. A closing shard flushes such memtables in place (#111, #117), since it admits no more commits. A running shard cannot: it needs an active memtable in every slot it writes.
+
+**Decision:** a freeze of every memtable that leaves one active for lack of a chunk sets `ShardState::starved_all`. `flush` and `compact` callers wait while it is set (`check_flush_waiters`, and the full-compaction loop in `maintain`). At the end of every message batch while they wait, the shard reclaims retired memtables and tries the freeze again (`retry_starved_freeze`), so a flush that freed chunks lets the rest freeze. The wait ends like a stalled write (D124, D126). On a moving clock, the callers get `Busy` once `write_stall_timeout_nanos` has passed. On a frozen clock they get it at once in the idle case: no flush running or queued, no deferred freeze, and no retired memtable a reader process still pins. In-process snapshots, which only the caller can drop, hold the rest. Nothing is lost: the data stays in memtables and the WAL. The public model suite drops its snapshots and retries, as it does for a `Busy` commit. Commits are not paused while the callers wait.
+
+Proposed decision: amend D124 and D126 so that `flush` and `compact` wait for arena room as a stalled write does, ending with `Busy` on the same terms, and never report success while a memtable they were asked to flush is still unflushed.
+
+**Coordinator:** confirmed; this amends D124 and D126: `flush` and `compact` wait for arena room as a stalled write does and end with `Busy` on the same terms, never `Ok` with data left unflushed.
+
+## D139 — Where do tablets go at open, now that owners are not persisted (D130) (approved; engine)
+D130 re-derives every owner as `tablet % shards`. After splits, a reopen with fewer shards can put more `(tablet, family)` slots on one shard than its arena has chunks: a 20-family table split into four tablets is 80 slots, all on shard 0 of a one-shard reopen, against 64 chunks at a 4 MiB budget. A commit writing all of them, or a freeze of all of them, then never finds room, and that shard can neither shed slots nor receive moves (D136's `max_slots` refuses both).
+
+Persisting owners (an `Edit::SetTabletOwner`, or an owner on `PutTablet`) needs a `format` change and an ICR, and a reopen with fewer shards still has to place the tablets of the missing shards somewhere. Placement at open is needed either way, so this change does only that.
+
+**Decision (with `tablet_changes` on):** at open, in tablet id order, a tablet goes to shard `tablet % shards` when that keeps the shard within its slot budget, else to the shard holding the fewest slots (`Catalog::place`). Owners are still not persisted: a reopen with the same shard count loses earlier moves, as D130 says, and the balancer moves tablets again if the load calls for it. With `tablet_changes` off, every tablet is on shard `tablet % shards`, as before.
+
+**Coordinator:** confirmed.
+
+## D140 — How large is the slot budget, and what happens when the tablets need more (approved; engine)
+D136 caps each shard at a quarter of its arena's chunks (`max_slots`). Chunks are `memtable_budget / 64` capped at 256 KiB, so at budgets up to 16 MiB every shard has 64 chunks and 16 slots. A shard holding a table with more than 16 families could never split by size or receive a move, and nothing reported it.
+
+**Decision (with `tablet_changes` on):** each arena is cut into at least 256 chunks (`arena / 256`, between 1 KiB and 256 KiB), so every shard serves at least 64 slots at any budget. The default 64 MiB budget already had 256 KiB chunks, so it does not change. When the tablets placed at open need more slots on a shard than that, the chunks shrink further (`arena / (4 × slots)`, never below 1 KiB). The chunk size is fixed for the life of the open, so splits and moves past the budget are still refused at run time: an explicit request fails with `Unsupported`, and the balancer passes over a size split it has no slots for. The balancer logs that skip under `PIGEONHOLE_TRACE`, but no metric counts it. Smaller chunks mean entries larger than a chunk take a run of contiguous chunks more often, which a fragmented arena may not have. With `tablet_changes` off, chunks are sized as before.
+
+Open for the coordinator: whether a refused split should be counted in `Metrics`, and whether chunks should shrink at run time (for example, rebuilding a shard's arena once every memtable is flushed) instead of only at open.
+
+**Coordinator:** confirmed. Refused splits get a metric (https://github.com/CodingAnarchy/pigeonhole/issues/122, Phase 2); shrinking chunks at run time is https://github.com/CodingAnarchy/pigeonhole/issues/123 (Phase 3).
+
+## D141 — When do empty slots give back their memtables (approved; engine)
+D136 retires every idle slot's memtable after every flush. A slot written once per flush cycle then gets a fresh memtable each cycle. A reader process's pin keeps every chunk retired after the view it pinned (D118), so the arena filled twice as fast as with tablet changes off.
+
+**Decision (with `tablet_changes` on):** idle slots retire only when a commit waits for arena room (the room-wait path of `run_group`), not after each flush. Pinned retired memtables (flushed ones and, under pressure, idle ones) still stay allocated until the pin moves, as with tablet changes off.
+
+**Coordinator:** confirmed.
+
+## D142 — Must a participant check a cross-shard commit's timestamp against its own floor (approved; engine)
+D133 has the coordinator pick a commit timestamp above every participant's published floor and raise. A participant publishes its floor after reserving the seqnos it assigns timestamps to, so a coordinator on another thread can reserve a later seqno and still read the older floor. Its commit then lands on that participant at a timestamp below one the participant assigned to an earlier seqno, and a tablet's default timestamps go backwards (D11).
+
+**Decision (tablet changes on only):** a participant refuses a PREPARE that writes rows at a commit timestamp strictly below its floor (its own floor, or the raise a shard handing it a tablet set) with an internal `BelowFloor`, and republishes its floor. The coordinator aborts the attempt everywhere, as for `Moved`, and retries it at once with a fresh timestamp rather than its first one. A tie is accepted: it never reorders, and a retry that kept its timestamp may meet the floor its own first attempt raised. Empty (validate-only) PREPAREs write nothing and are never refused. The check covers every tablet the participant owns, not only received ones, since the race is the same for all. Test hook: `Engine::publish_stale_ts_floor` replays the stale read deterministically.
+
+**Coordinator:** confirmed (strictly below is refused; ties allowed).
+
+## D143 — Should commits pipelined on one row keep their order during a move (approved; engine)
+D132 parks a commit on a tablet's old owner during a move and forwards it once the move commits, but a later commit from the same thread can reach the new owner first.
+
+**Decision:** unchanged, and now documented publicly on `Engine::submit` and in `EngineOptions::tablet_changes`'s known limits: a commit submitted after an earlier one was acknowledged is applied after it; commits in flight together have no order. Test: `commit_order_across_a_move`.
+
+Proposed design if the stronger order is wanted: before the move's manifest commit, the old owner sends each receiving shard an `Incoming` message naming the moving ranges. The receiver parks single-shard commits on those rows and refuses PREPAREs on them with `Moved`. Once the change is done (or has failed), the old owner sends `HandoffDone` carrying the parked commits that now route to the receiver. The receiver runs those first, then its own parked commits, and bumps `tablet_epoch` so that refused PREPAREs retry. The message order (A's `Incoming` happens before the view is published, and so before any client routes to the new owner) puts `Incoming` ahead of every new-owner submit. A parked commit that turns cross-shard after the change could still reorder; that would need its own rule.
+
+**Coordinator:** no stronger order. D132's guarantee stands: a commit submitted after an earlier one was acknowledged is applied after it; commits in flight together have no order. The public API's commits are synchronous, so one client's writes stay ordered. The `Incoming`/`HandoffDone` design is not built.
 
 ## Open questions
 _None._
