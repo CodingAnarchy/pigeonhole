@@ -342,6 +342,8 @@ durable. Implemented by engine Milestone B, issue #50; this crate changes nothin
 (`tests/model.rs`, `Logged::reaches_the_wal`) expects today's behavior and is updated with
 #50 and #45.
 
+_Superseded by D94 and D115: engine Milestone B (#63) implemented the rule; the public docs now state it._
+
 ## D95 — Phase 2 family settings are refused at creation (approved; pigeonhole)
 `Family::zstd`, `Compaction::Tiered` and `Compaction::FifoByTime` are in the frozen API but
 land in Phase 2. `TableBuilder::{create, create_if_missing, open}` refuse a declared family
@@ -382,6 +384,8 @@ variants cannot carry are filled in here: `KeyTooLarge` names the part and its s
 the 64 KiB limit, `ValueTooLarge` the value's size against the D16 limit computed from the
 open's options, and `Busy` (coordinator decision: a hard failure until engine Milestone B,
 #37) says the memtable arena is full and to raise `Options::memtable_budget`.
+
+_Superseded by D94 and D115 / D124: after Milestone B, `Busy` is a transient write stall or an oversize batch; the public message and the guide say so._
 
 ## D101 — a hidden `Options::wal_segment_size` test hook (approved; pigeonhole; ICR 0005)
 With the default 64 MiB WAL segments every open on `SimVfs` cost about 0.5 s in a debug

@@ -55,9 +55,11 @@ pub enum ErrorCode {
     NoReaderSlot = 22,
     /// A commit is too large for one WAL record.
     RecordTooLarge = 23,
-    /// Writes are stalled and the call asked not to wait. In Phase 1 this means the
-    /// memtable arena is full, which nothing frees until the engine flushes to SSTs: not
-    /// retryable; raise `Options::memtable_budget`.
+    /// Writes are stalled. A write that finds the memtable arena full waits while a flush
+    /// frees room; this code means the wait outlasted the engine's stall timeout (30 s by
+    /// default), a transient condition: back off and retry. It also means one batch is
+    /// larger than a shard's arena, which never succeeds: split it or raise
+    /// `Options::memtable_budget`.
     Busy = 24,
 }
 

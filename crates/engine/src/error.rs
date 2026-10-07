@@ -117,8 +117,8 @@ impl fmt::Display for Error {
                 f.write_str("the commit's WAL record is larger than a segment can hold")
             }
             Error::Busy => f.write_str(
-                "memtable arena full past the write-stall timeout, or a batch larger than the \
-                 arena: retry later, or raise memtable_budget",
+                "writes stalled past the write-stall timeout (transient: retry later), or a \
+                 batch larger than the arena (never fits: split it or raise memtable_budget)",
             ),
         }
     }

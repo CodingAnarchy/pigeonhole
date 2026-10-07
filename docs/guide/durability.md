@@ -1,6 +1,6 @@
 # Durability
 
-> **Status: Phase 1 sync API implemented.** Semantics here come from the spec and decisions D12 and D19. Async commit forms are Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status: Phase 1 sync API implemented, including flush to disk.** Semantics here come from the spec and decisions D12 and D19. Async commit forms are Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every commit says how durable it must be before it returns. The default is the strongest batched level, so a commit that returns is on disk unless you asked for less.
 
@@ -9,7 +9,7 @@ Every commit says how durable it must be before it returns. The default is the s
 
 | Level | What happened before `commit` returned | Survives | Doesn't survive | Typical use |
 |---|---|---|---|---|
-| `None` | Applied to the memtable only. No I/O. | Nothing past the last flush | Any crash | Rebuildable caches, derived data |
+| `None` | Applied to the memtable only. No I/O. | Nothing past the last flush or stronger commit | Any crash before then | Rebuildable caches, derived data |
 | `Buffered` | Handed to the kernel with `write()`, no fsync. | Process crash, panic, `kill -9` | OS crash, power loss | Ingest with an upstream source of truth |
 | `GroupSync` (default) | The WAL group containing it was fsynced; one fsync is shared by all committers in the group. | Power loss | Nothing, once returned | Systems of record |
 | `Sync` | A dedicated fsync, never batched. | Power loss | Nothing, once returned | Rare latency-isolated critical writes |
@@ -57,7 +57,7 @@ Commits at different levels share each shard's WAL stream, which is ordered.
 
 - A `GroupSync` or `Sync` commit also makes every **earlier** `Buffered` or `None` record in that stream durable.
 - A weaker commit never weakens a stronger one in the same group: the group is written to the strongest level any member requested.
-- A `None` commit followed by a `GroupSync` commit on the same shard is therefore durable after the second returns. The reverse is not true: a later `None` commit is not durable. **Arriving with engine Milestone B ([#50](https://github.com/CodingAnarchy/pigeonhole/issues/50)):** the current build writes no WAL record for a `None` commit, so today a `None` commit is lost at the next close or crash, even after a later stronger commit.
+- A `None` commit followed by a `GroupSync` commit on the same shard is therefore durable after the second returns. The reverse is not true: a later `None` commit is not durable. A `None` commit buffers its WAL record without writing it, so the next stronger commit on that shard writes it (decision D94). A `flush()`, a background flush or a clean close also makes it durable, because the data then lives in the file.
 - Each shard has its own stream. A `GroupSync` commit on one shard does not make an earlier `Buffered` commit on another shard durable; after a power loss, every commit acknowledged at `GroupSync` or `Sync` survives, and weaker ones may or may not.
 
 So you can run a mostly-`Buffered` ingest path and put a periodic `GroupSync` commit on it as a checkpoint for that shard.

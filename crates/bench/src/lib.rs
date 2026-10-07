@@ -164,11 +164,10 @@ impl WorkloadConfig {
         }
     }
 
-    /// The CLI default: sized to fit Pigeonhole's memtable-bound Phase 1 engine
-    /// (everything in memory until #37) with [`DEFAULT_MEMTABLE_BUDGET`]: 50,000
-    /// records, 200,000 operations, 100-byte values, one client thread (four for
-    /// [`WorkloadKind::SkewedMultiShard`]). Grow `records` and `operations` once the
-    /// engine flushes to SSTs.
+    /// The CLI default: 50,000 records, 200,000 operations, 100-byte values, one client
+    /// thread (four for [`WorkloadKind::SkewedMultiShard`]). Small enough to finish in
+    /// seconds per workload, so it is the quick check; [`WorkloadConfig::full`] is the
+    /// spec's scale.
     pub fn small(kind: WorkloadKind) -> Self {
         Self {
             kind,
@@ -182,6 +181,34 @@ impl WorkloadConfig {
                 1
             },
         }
+    }
+
+    /// The spec's scale (build plan: "1M rows" for sparse-wide), now that memtables flush
+    /// to SSTs: 1,000,000 records and 1,000,000 operations with 100-byte values; the
+    /// skewed workload does 2,000,000 writes from four client threads. The adjacency
+    /// workload loads 2,000,000 edges (50,000 vertices of mean out-degree 40). With the
+    /// default 64 MiB write buffer the data set is several times the memtable budget, so
+    /// flushes and compactions run during the measurement. It is not larger than RAM on a
+    /// typical workstation; raise `--records` for that.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{WorkloadConfig, WorkloadKind};
+    ///
+    /// let c = WorkloadConfig::full(WorkloadKind::SparseWide);
+    /// assert_eq!((c.records, c.operations), (1_000_000, 1_000_000));
+    /// assert_eq!(WorkloadConfig::smoke(WorkloadKind::SparseWide).records, 1_000);
+    /// ```
+    pub fn full(kind: WorkloadKind) -> Self {
+        let mut c = Self::small(kind);
+        c.records = match kind {
+            WorkloadKind::Adjacency => 2_000_000,
+            _ => 1_000_000,
+        };
+        c.operations = match kind {
+            WorkloadKind::SkewedMultiShard => 2_000_000,
+            _ => 1_000_000,
+        };
+        c
     }
 }
 

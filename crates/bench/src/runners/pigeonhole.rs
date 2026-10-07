@@ -9,10 +9,9 @@ use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
 use crate::{BenchOp, Client, PigeonholeRunner, Runner};
 
-/// Default per-shard memtable budget of the runner ([`MemoryBudget`]'s write buffer).
-/// Until the engine flushes to SSTs (#37) all data stays in memtables and one table
-/// lives on one shard, so this bounds the data set of a run.
-pub const DEFAULT_MEMTABLE_BUDGET: u64 = 256 << 20;
+/// Default per-shard memtable budget of the runner ([`MemoryBudget`]'s write buffer): the
+/// engine's own default.
+pub const DEFAULT_MEMTABLE_BUDGET: u64 = 64 << 20;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Settings {

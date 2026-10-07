@@ -47,18 +47,18 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | 17 | `ValueTooLarge` | A value exceeds the size limit. | Phase 1 limit: `min(WAL segment payload, 64 MiB, half the shard's memtable arena)`. Phase 2 blob separation lifts it. | Split the value across qualifiers, or store it outside the database and keep a reference. |
 | 18 | `NoSpace` | The device is full. | Disk full, quota. | Free space and retry. The commit did not apply. |
 | 19 | `InvalidArgument` | An argument is invalid. | For example a malformed option or table name, or `compaction_cores(k)` with `k > 0` passed to `open_application_owned`, which starts no threads. | Check `message()` and fix the call. |
-| 20 | `Unsupported` | The feature is not available in this build. | Calling a feature gated off or not yet implemented: Phase 2 family settings (`zstd`, `Compaction::Tiered` or `FifoByTime`) at table creation; `compact()` and `backup()` until the engine writes SSTs. | Enable the feature, or use the supported alternative. |
+| 20 | `Unsupported` | The feature is not available in this build. | Calling a feature gated off or not yet implemented: Phase 2 family settings (`zstd`, `Compaction::Tiered` or `FifoByTime`) at table creation; `backup()` of a database whose families store blob files (Phase 2; not reachable today). | Enable the feature, or use the supported alternative. |
 | 21 | `Closed` | The database is closed. | A table or snapshot handle used after `close()`. | Reopen the database. |
 | 22 | `NoReaderSlot` | Every reader slot in the shared-memory region is taken. | Too many concurrent reader processes. | Close idle readers, then retry. |
 | 23 | `RecordTooLarge` | A commit is too large for one WAL record. | A very large `WriteBatch`. | Split it into smaller batches (each atomic on its own). |
-| 24 | `Busy` | Writes are stalled past the engine's write-stall timeout, or one batch cannot fit the memtable arena. | The memtable arena is full and a flush did not free room within the timeout (a slow disk, or snapshots pinning memtables), or a single batch is larger than the arena. | **Transient: back off and retry.** A batch that keeps failing is larger than the arena: split it, or raise `Options::memtable_budget`. |
+| 24 | `Busy` | Writes are stalled past the engine's write-stall timeout (30 s), or one batch cannot fit the memtable arena. | A write found the arena full and waited for a flush, which did not free room in time (a slow or full disk, ingest faster than flush and compaction can keep up, or snapshots pinning memtables), or a single batch is larger than the arena. | **A stall is transient: back off and retry**, and drop old snapshots. A batch that keeps failing is larger than the arena: split it, or raise `Options::memtable_budget`. |
 
 ## Handling guide
 | Situation | Action |
 |---|---|
-| Retryable | `Conflict` (retry the whole transaction); `WriterLocked` (after the other writer exits); `NoSpace` and `Io` once the cause is fixed; `NoReaderSlot` (after a reader process closes). |
+| Retryable | `Busy` from a write stall (back off); `Conflict` (retry the whole transaction); `WriterLocked` (after the other writer exits); `NoSpace` and `Io` once the cause is fixed; `NoReaderSlot` (after a reader process closes). |
 | Programmer error | `FamilyNotFound`, `TableNotFound`, `TableExists`, `FamilyExists`, `KeyTooLarge`, `ValueTooLarge`, `RecordTooLarge` (split the batch), `MergeFailed` (bad operand or mixed counter data), `InvalidArgument`, `Unsupported`, `Closed`, `ReadOnly`. Fix the code or the data model. |
-| Configuration | `Busy` for a batch larger than the arena (see its row), `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
+| Configuration | `Busy` for a batch larger than the arena (see its row; a stall `Busy` is retryable), `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
 | Data integrity | `Corruption`. Do not retry; restore from backup. |
 
 If this table disagrees with `crates/pigeonhole/src/error.rs`, the source wins; please report it.

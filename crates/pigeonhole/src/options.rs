@@ -91,7 +91,10 @@ impl Options {
         self
     }
 
-    /// Memtable arena per shard, in bytes (default 64 MiB).
+    /// Memtable arena per shard, in bytes (default 64 MiB): the in-memory write buffer, also
+    /// the size of the shared-memory arena. Data beyond it is flushed into the file, so it
+    /// does not bound the database size; it bounds the largest value and batch (a batch
+    /// larger than the arena fails with `Busy`).
     pub fn memtable_budget(mut self, bytes: u64) -> Self {
         self.memtable_budget = bytes;
         self

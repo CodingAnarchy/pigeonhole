@@ -26,10 +26,10 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | Option | Meaning |
 |---|---|
 | `--engine LIST` | `pigeonhole` (default), `rocksdb`, `sqlite`, `fjall`, or `all` |
-| `--scale smoke\|small` | Preset size; `small` is the default, `smoke` is what `cargo test` runs |
+| `--scale smoke\|small\|full` | Preset size; `small` is the default, `smoke` is what `cargo test` runs, `full` is the spec's scale |
 | `--records N`, `--ops N`, `--value-len N`, `--threads N`, `--seed N` | Override the preset |
 | `--warmup F` | Unrecorded warmup, as a fraction of `--ops` (default 0.05) |
-| `--write-buffer B`, `--cache B` | Every engine's memory budget (default 256 MiB each; see below) |
+| `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
 | `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |
 | `--json PATH`, `--markdown PATH` | Write results |
@@ -48,9 +48,15 @@ export DYLD_FALLBACK_LIBRARY_PATH=$LIBCLANG_PATH
 
 PR-gating CI builds and tests the bench crate with `sqlite,fjall` only, so it never needs a C++ toolchain. A separate workflow, `bench-rocksdb.yml`, builds and tests every comparison runner, RocksDB included. It runs weekly, on pushes to `main` that touch `crates/bench/**`, and on demand, so the `rocksdb` feature cannot rot. Locally: `cargo test -p pigeonhole-bench --all-features`.
 
-### Size limits today
+### Presets
 
-Until the engine flushes memtables to SSTs ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), all Pigeonhole data stays in memory. A table also lives on one shard until tablets split, so one run's data must fit in one shard's memtable budget. The runner raises that budget to 256 MiB (`--write-buffer`). The `small` preset (50,000 records, 200,000 operations, 100-byte values) fits with room to spare. A run that outgrows the budget fails with `Busy` during load, so it never reports a bogus number. Once #37 lands, grow `--records` and `--ops`. The spec's sizes, such as 1M sparse-wide rows, are flags, not code changes ([#52](https://github.com/CodingAnarchy/pigeonhole/issues/52)).
+| Preset | Records | Operations | Use |
+|---|--:|--:|---|
+| `smoke` | 1,000 | 2,000 | What `cargo test` runs; seconds for the whole suite |
+| `small` (default) | 50,000 | 200,000 | A quick check, seconds per workload |
+| `full` | 1,000,000 (adjacency: 2,000,000 edges) | 1,000,000 (skewed-multi-shard: 2,000,000) | The spec's scale: 1M sparse-wide rows, YCSB with 1M records |
+
+Memtables flush to SSTs, so no preset is bounded by memory. At `full` size the data set is several times the 64 MiB write buffer (the runner's default, equal to the engine's), so flushes and compactions run during the load and the measurement, and a run completes without `Busy`. Sparse-wide at `full` loads about 20M cells, YCSB about 10M, and takes minutes per engine. `full` is **not** larger than RAM on a typical workstation, so it does not measure the spec's cold-read target (one I/O on data larger than RAM). For that, raise `--records` until the file exceeds memory, and use `--cache` small; there is no preset for it yet. Tablets do not split yet (#38), so one table's writes use one shard whatever `--shards` is.
 
 ## Workloads
 
@@ -78,12 +84,12 @@ Interpretation notes (details and rationale in [`design/questions/bench.md`](des
 
 | Store | Model | Memory (default budget) | Filter | Commit (default / `--sync`) |
 |---|---|---|---|---|
-| `pigeonhole` | Table `bench`, families `ycsb`, `attr`, `metric` (TTL), `edge`, each `max_versions(1)`; public API only | memtable 256 MiB per shard, block cache 256 MiB | bloom, 10 bits/key | `Buffered` / `Sync` |
-| `rocksdb` | Hand-written wide-column key: `escape(row) 00 01 <family> <qualifier>` (order-preserving), one key per cell; no compression codecs compiled in | `write_buffer_size` 256 MiB, LRU block cache 256 MiB | bloom, 10 bits/key | WAL, no fsync / `sync=true` |
-| `sqlite-eav` | `cells(row, family, qualifier, value)` `WITHOUT ROWID`, primary key `(row, family, qualifier)`, WAL journal | page cache 512 MiB (write buffer + cache) | none (B-tree) | `synchronous=NORMAL` / `FULL` |
-| `fjall` | Same key encoding as RocksDB, one keyspace | `max_memtable_size` 256 MiB, block cache 256 MiB | fjall's default bloom filters | `PersistMode::Buffer` / `SyncAll` |
+| `pigeonhole` | Table `bench`, families `ycsb`, `attr`, `metric` (TTL), `edge`, each `max_versions(1)`; public API only | memtable 64 MiB per shard, block cache 256 MiB | bloom, 10 bits/key | `Buffered` / `Sync` |
+| `rocksdb` | Hand-written wide-column key: `escape(row) 00 01 <family> <qualifier>` (order-preserving), one key per cell; no compression codecs compiled in | `write_buffer_size` 64 MiB, LRU block cache 256 MiB | bloom, 10 bits/key | WAL, no fsync / `sync=true` |
+| `sqlite-eav` | `cells(row, family, qualifier, value)` `WITHOUT ROWID`, primary key `(row, family, qualifier)`, WAL journal | page cache 320 MiB (write buffer + cache) | none (B-tree) | `synchronous=NORMAL` / `FULL` |
+| `fjall` | Same key encoding as RocksDB, one keyspace | `max_memtable_size` 64 MiB, block cache 256 MiB | fjall's default bloom filters | `PersistMode::Buffer` / `SyncAll` |
 
-**Memory budget.** Every engine gets the same `MemoryBudget`: a write buffer (`--write-buffer`) and a read cache (`--cache`), 256 MiB each by default. The read cache matches Pigeonhole's default block cache. The write buffer is raised from Pigeonhole's 64 MiB default, because all data stays in memtables until #37. SQLite has no separate write buffer, so its page cache gets the sum. A one-shard table uses one shard's memtable, so the comparison holds whatever `--shards` is. Every engine's other options are its defaults: no tuning on any side. Each result's `Settings` column prints the budget, filter and durability it ran with.
+**Memory budget.** Every engine gets the same `MemoryBudget`: a write buffer (`--write-buffer`, 64 MiB by default: Pigeonhole's and RocksDB's default) and a read cache (`--cache`, 256 MiB, Pigeonhole's default block cache). SQLite has no separate write buffer, so its page cache gets the sum. A one-shard table uses one shard's memtable, so the comparison holds whatever `--shards` is. Every engine's other options are its defaults: no tuning on any side. Each result's `Settings` column prints the budget, filter and durability it ran with.
 
 **Durability.** The default level, written to the OS but not fsynced, survives a process crash in every engine, so the engines compare like with like. Tests check that every comparison runner reads exactly the same cells and bytes as Pigeonhole, operation by operation, for every workload (`runners::agreement`).
 
@@ -133,11 +139,32 @@ Run 1 started while the 15-minute load was still 12.3, the tail of another agent
 
 `compare` is symmetric: it flags any change beyond tolerance, faster or slower. An unexplained improvement is as suspect as a regression, and an intended one means it is time for a new baseline. It warns when the two runs come from different machines or build profiles, because the tolerance only means something on one machine. Close other heavy work while measuring. Laptops also throttle and switch between performance and efficiency cores.
 
-## First results (this Mac, non-reference)
+## Results with disk-backed storage (this Mac, non-reference)
+
+**Single run, n=1, commit `fa606ba`** (the build was made at `4bc304c`, the same code before this branch was rebased onto `main`), measured 2026-10-06: `phdb-bench all` (Pigeonhole only, release, `small` preset: 50,000 records, 200,000 measured operations after a 5% warmup, 100-byte values, seed `0x5EED`, 64 MiB write buffer, buffered commits). Memtables now flush to SSTs and compact during the run.
+
+**Environment:** Apple M5 (10 cores, 24 GiB), macOS 26.5.2 aarch64, APFS, **load 6.14** [non-reference (D5)]. The machine was shared with other agents' test suites, so this is *not* a quiet-machine run: the reproducibility rule above would flag it, and run-to-run drift is likely well beyond ±10%. Read these as order-of-magnitude, not as a regression or improvement against the older table (which ran at load 0.98 on a different engine build).
+
+| Workload | Store | Settings | Records | Ops | Threads | Ops/s | p50 µs | p99 µs | p99.9 µs |
+|---|---|---|--:|--:|--:|--:|--:|--:|--:|
+| ycsb-a | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 116.8K | 6.43 | 20.7 | 50.4 |
+| ycsb-b | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 293.1K | 2.46 | 14.6 | 26.4 |
+| ycsb-c | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 406.3K | 2.13 | 6.05 | 10.3 |
+| ycsb-d | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 436.5K | 1.09 | 17.5 | 29.8 |
+| ycsb-e | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 17.7K | 55.3 | 115 | 197 |
+| ycsb-f | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 124.0K | 6.27 | 23.9 | 36.9 |
+| sparse-wide | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 62.0K | 2.75 | 261 | 465 |
+| time-series-ttl | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 172.5K | 3.76 | 21.5 | 30.6 |
+| adjacency | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 1 | 54.5K | 10.8 | 78.8 | 103 |
+| skewed-multi-shard | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 4 | 234.8K | 14.5 | 34.0 | 532 |
+
+**Not measured:** the `full` preset (1M records) and the comparison engines at it. The machine was too loaded for the numbers to mean anything, so full-scale and four-engine comparisons are left to the weekly `bench.yml` workflow (`--scale full` is selectable there) and to reference hardware (D5). The only full-scale evidence so far is one run, n=1, of `sparse-wide --scale full` on Pigeonhole alone: 1,000,000 records and 1,000,000 operations completed without `Busy` at 22.4K ops/s (p50 6.17 µs, p99 786 µs), at machine load 8.9. It was built from `a007910` plus this branch's then-uncommitted `full` preset, so it names no branch commit; treat it as evidence that the size runs, not as a measurement.
+
+## Comparison results before Milestone B (this Mac, non-reference)
 
 **Single run, n=1, commit `4b59eac`**, measured 2026-10-06: `phdb-bench all --engine all` (release, `small` preset: 50,000 records, 200,000 measured operations after a 5% warmup, 100-byte values, seed `0x5EED`). This is run 2 of the five calibration runs above, chosen because it started on the quietest machine (load 0.98). Single-run numbers carry the run-to-run drift described above: about ±10% on throughput and p50.
 
-These numbers are **not from reference hardware** (D5): a laptop with an APFS SSD, macOS, and no io_uring. Pigeonhole is memory-bound (#37), so every store's data is hot in memory. Every engine has the same memory budget (256 MiB write buffer, 256 MiB read cache, SQLite 512 MiB page cache) and its default options otherwise. No engine has been tuned. Treat this as a baseline to track, not a verdict.
+**These numbers predate engine Milestone B** (Pigeonhole ran memory-only with a 256 MiB write buffer; the other engines used the same budget). They are kept as the only four-engine comparison until it is re-run, and are not comparable with the table above. They are **not from reference hardware** (D5): a laptop with an APFS SSD, macOS, and no io_uring. Pigeonhole is memory-bound (#37), so every store's data is hot in memory. Every engine has the same memory budget (256 MiB write buffer, 256 MiB read cache, SQLite 512 MiB page cache) and its default options otherwise. No engine has been tuned. Treat this as a baseline to track, not a verdict.
 
 **Environment:** Apple M5 (10 cores, 24 GiB), macOS 26.5.2 aarch64, APFS, load 0.98 [non-reference (D5)]
 

@@ -4,11 +4,11 @@
 column families, sparse qualifiers, timestamped versions, TTLs, prefix and range scans) with
 SQLite's deployment model (one file, a library, no server).
 
-> **Status: Phase 1 in progress.** The blocking API is implemented and crash-safe through the
-> write-ahead log. Until the engine flushes memtables into the file
-> ([#37](https://github.com/CodingAnarchy/pigeonhole/issues/37)), all data must fit in the
-> memtable budget (`Options::memtable_budget` per shard; commits beyond it fail with
-> `ErrorCode::Busy`), and `compact` and `backup` are not available. The async API arrives in
+> **Status: Phase 1 in progress.** The blocking API is implemented, disk-backed and
+> crash-safe through the write-ahead log: memtables flush into the file and compact, so data
+> is bounded by the disk, not memory (`Options::memtable_budget` only sizes the per-shard
+> write buffer). `flush`, `compact` and `backup` work, and a clean close leaves one file.
+> One table still lives on one shard until tablet splits land. The async API arrives in
 > Phase 3 behind the `async` feature.
 
 ## Quickstart
