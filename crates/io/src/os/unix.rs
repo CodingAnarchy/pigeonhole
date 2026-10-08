@@ -251,11 +251,58 @@ pub(crate) fn open_region_file(path: &Path, len: u64, mode: SharedOpen) -> Resul
     let file = opts
         .open(path)
         .map_err(|e| Error::os("open shared region", e))?;
-    if mode == SharedOpen::CreateNew {
-        file.set_len(len)
-            .map_err(|e| Error::os("size shared region", e))?;
+    if mode == SharedOpen::CreateNew
+        && let Err(e) = reserve_region_file(&file, len)
+    {
+        let _ = fs::remove_file(path);
+        return Err(e);
     }
     Ok(file)
+}
+
+/// Sizes a new region file to `len` and reserves its storage up front where the filesystem
+/// can, so a full or too-small filesystem (Docker's 64 MiB `/dev/shm`) fails here with
+/// `NoSpace` instead of raising `SIGBUS` on a later store into the mapping. On tmpfs this
+/// commits the region's memory at open. A filesystem that cannot reserve gets a sparse file.
+fn reserve_region_file(file: &fs::File, len: u64) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    {
+        let size = off(len, "region too large")?;
+        loop {
+            // SAFETY: plain syscall on an fd we own; it reports its error as the return value.
+            match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, size) } {
+                0 => return Ok(()),
+                libc::EINTR => {}
+                libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS => break,
+                e => {
+                    return Err(Error::os(
+                        "reserve shared region",
+                        io::Error::from_raw_os_error(e),
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: off(len, "region too large")?,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: `store` is a valid `fstore_t` that outlives the call; the fd is ours.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENOSPC) {
+                return Err(Error::os("reserve shared region", e));
+            }
+            // Anything else (no support on this filesystem): fall back to a sparse file.
+        }
+    }
+    file.set_len(len)
+        .map_err(|e| Error::os("size shared region", e))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -305,6 +352,9 @@ pub(crate) fn open_default_shared(name: &str, len: u64, mode: SharedOpen) -> Res
         <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
     });
     let result = (|| {
+        // A POSIX shared-memory object here (macOS, the BSDs) is anonymous memory backed by
+        // swap, not a size-capped filesystem, so `ftruncate` is all it takes: there is no
+        // tmpfs to run out of later (and macOS offers no call to reserve one anyway).
         if mode == SharedOpen::CreateNew {
             let size = off(len, "region too large")?;
             // SAFETY: plain syscall on an fd we own.

@@ -26,6 +26,8 @@ let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 - `Pigeonhole` is cheap to clone; every clone shares the same engine. Pass clones to threads.
 - Opening replays the WAL sidecar files; there is no full-file recovery scan. While the database is open you will see sidecar files next to it. When the last handle closes cleanly, only the one file remains: the close flushes every memtable into the file, checkpoints the WAL and removes the sidecars.
 - The database must be on a local filesystem. Network filesystems fail with `ErrorCode::NetworkFilesystem`.
+- **Memory at open.** The writer reserves a shared-memory region of about `memtable_budget × shards` (64 MiB per shard by default, so 256 MiB on 4 CPUs) when it opens, and holds it until close. On Linux it lives in `/dev/shm`, which Docker and Kubernetes cap at 64 MiB by default. If the region does not fit, `open` fails with `ErrorCode::ShmUnavailable`, and the message says how much it needs and where. Then enlarge `/dev/shm` (`docker run --shm-size=1g`, or in Kubernetes an `emptyDir` with `medium: Memory` mounted at `/dev/shm`), point `Options::shm_dir` at a larger tmpfs, or lower `memtable_budget` or `shards`.
+- **Threads are not pinned** to CPUs by default, so several databases or containers on one host share the CPUs cleanly. On a host or cpuset dedicated to one database, `Options::pin_threads(true)` pins shard `i` to the `i`-th CPU the opening thread may run on.
 
 Common options:
 
@@ -37,6 +39,7 @@ let db = Pigeonhole::open(
     Options::default()
         .durability(Durability::Buffered) // writer default; see durability.md
         .shards(1)                        // shard threads; default is the CPUs available
+        .memtable_budget(16 << 20)        // write buffer per shard; shm = budget × shards
         .block_cache(256 << 20)           // bytes; 256 MiB is the default
         .row_cache(0),                    // bytes; 0 (default) disables
 )?;

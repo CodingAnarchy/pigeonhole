@@ -285,8 +285,13 @@ pub(crate) fn open_region_file(path: &Path, len: u64, mode: SharedOpen) -> Resul
         .open(path)
         .map_err(|e| Error::os("open shared region", e))?;
     if mode == SharedOpen::CreateNew {
-        file.set_len(len)
-            .map_err(|e| Error::os("size shared region", e))?;
+        // Not a sparse file: NTFS allocates the clusters here, so a full volume fails now
+        // rather than on a later store into the mapping.
+        if let Err(e) = file.set_len(len) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(Error::os("size shared region", e));
+        }
     }
     Ok(file)
 }
@@ -308,6 +313,8 @@ pub(crate) fn open_default_shared(name: &str, len: u64, mode: SharedOpen) -> Res
     }
     let mapping = match mode {
         SharedOpen::CreateNew => {
+            // Pagefile-backed sections are committed here (`SEC_COMMIT` is the default), so a
+            // region beyond the commit limit fails now, not on a later store.
             // SAFETY: `wide` is NUL-terminated; INVALID_HANDLE_VALUE requests pagefile backing.
             let h = unsafe {
                 CreateFileMappingW(

@@ -36,6 +36,7 @@ pub struct Options {
     durability: Durability,
     shards: usize,
     compaction_cores: usize,
+    pin_threads: bool,
     memtable_budget: u64,
     block_cache: Option<usize>,
     row_cache: usize,
@@ -55,6 +56,7 @@ impl Default for Options {
             durability: Durability::GroupSync,
             shards: 0,
             compaction_cores: 0,
+            pin_threads: false,
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: 0,
@@ -84,7 +86,8 @@ impl Options {
         self
     }
 
-    /// Dedicate `k` extra pinned threads to flush and compaction.
+    /// Dedicate `k` extra threads to flush and compaction (pinned when
+    /// [`pin_threads`](Options::pin_threads) is on).
     ///
     /// Engine-owned mode only. [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
     /// starts no shard or compaction threads, so it fails with
@@ -95,10 +98,39 @@ impl Options {
         self
     }
 
+    /// Pin each shard thread, and each [`compaction_cores`](Options::compaction_cores)
+    /// thread, to its own CPU (default off). Engine-owned mode only:
+    /// [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
+    /// runs shards on your threads and ignores it.
+    ///
+    /// Shard `i` goes to the `i`-th CPU (wrapping) of the set the opening thread may run on.
+    /// Turn it on only when this database owns those CPUs, typically one database per
+    /// process with `shards` equal to the CPUs it was given. Otherwise pinning stacks
+    /// threads on the same cores: two pinned databases in one process both put shard 0 on
+    /// the first CPU, containers limited by a CPU quota (not a cpuset) all pin to the host's
+    /// first CPUs, and an opener already pinned to one CPU puts every shard on it.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // A dedicated host: one shard per CPU, each pinned.
+    /// let options = Options::default().shards(8).pin_threads(true);
+    /// # let _ = options;
+    /// ```
+    pub fn pin_threads(mut self, yes: bool) -> Self {
+        self.pin_threads = yes;
+        self
+    }
+
     /// Memtable arena per shard, in bytes (default 64 MiB): the in-memory write buffer, also
     /// the size of the shared-memory arena. Data beyond it is flushed into the file, so it
     /// does not bound the database size; it bounds the largest value and batch (a batch
     /// larger than the arena fails with `Busy`).
+    ///
+    /// The shared-memory region holds every shard's arena, about `memtable_budget × shards`
+    /// (256 MiB for the default budget on 4 CPUs), and is reserved when the database opens:
+    /// on Linux it is memory in `/dev/shm` (or [`shm_dir`](Options::shm_dir)). If it does not
+    /// fit, opening fails with [`ErrorCode::ShmUnavailable`](crate::ErrorCode::ShmUnavailable).
     pub fn memtable_budget(mut self, bytes: u64) -> Self {
         self.memtable_budget = bytes;
         self
@@ -391,6 +423,7 @@ impl Options {
         o.create_if_missing = self.create_if_missing;
         o.shards = self.shards;
         o.compaction_threads = self.compaction_cores;
+        o.pin_threads = self.pin_threads;
         o.durability = self.durability;
         o.memtable_budget = self.memtable_budget;
         o.memtable_freeze_bytes = self.memtable_budget / 4;

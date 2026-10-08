@@ -151,10 +151,12 @@ impl Inner {
 /// Retries of the owner's `active -> free` transition while the writer probes the slot.
 const RELEASE_ATTEMPTS: u32 = 64 + 200;
 
-/// `Unavailable` for an allocation failure, `Io` for anything else.
+/// Maps a failure to create a region: `Unavailable` when it could not be allocated (no
+/// space, or no such directory: `/dev/shm` missing in a distroless or Lambda container, or a
+/// bad `shm_dir`), `Io` for anything else.
 fn unavailable(e: pigeonhole_io::Error) -> Error {
     match e.kind {
-        ErrorKind::NoSpace | ErrorKind::Other => Error::Unavailable,
+        ErrorKind::NoSpace | ErrorKind::NotFound | ErrorKind::Other => Error::Unavailable,
         _ => Error::Io(e),
     }
 }
@@ -959,6 +961,17 @@ mod tests {
         assert_eq!(off % (2 << 20), 0);
         assert!(off + len <= region.len());
         shm.bind_arena(1, 0).unwrap();
+    }
+
+    #[test]
+    fn create_failures_map_to_unavailable() {
+        use pigeonhole_io::Error as IoError;
+        for kind in [ErrorKind::NoSpace, ErrorKind::NotFound, ErrorKind::Other] {
+            let e = unavailable(IoError::new(kind, "reserve shared region"));
+            assert!(matches!(e, Error::Unavailable), "{kind:?} gave {e:?}");
+        }
+        let e = unavailable(IoError::new(ErrorKind::Crashed, "open shared region"));
+        assert!(matches!(e, Error::Io(_)), "{e:?}");
     }
 
     #[test]
