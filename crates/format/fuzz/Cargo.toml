@@ -8,6 +8,10 @@ license = "MIT"
 [package.metadata]
 cargo-fuzz = true
 
+# The targets reach pigeonhole-format through the shared harness (`#[path]`).
+[package.metadata.cargo-machete]
+ignored = ["pigeonhole-format"]
+
 # Not a member of the main workspace: build with `cargo +nightly fuzz run <target>` from
 # crates/format.
 [workspace]

@@ -13,7 +13,6 @@
 //! **Crashes in the middle of a commit** use `FaultPlan::crash_after_ops`, which the io
 //! simulator always treats as a power loss ([`CrashKind::Power`]); process crashes are
 //! injected between operations only.
-#![allow(dead_code)]
 
 pub mod toy;
 

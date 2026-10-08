@@ -1084,7 +1084,7 @@ impl MemIter {
             region: self.reader.region.clone(),
             offset: node.value_off,
             len: node.value_len,
-            pin: Arc::clone(&self.reader.pin),
+            _pin: Arc::clone(&self.reader.pin),
             #[cfg(loom)]
             bytes: self.value_buf.clone(),
         }
@@ -1132,8 +1132,7 @@ pub struct ArenaSlice {
     len: usize,
     /// Keeps the memtable's chunks from being reused while the slice lives (held for its
     /// drop).
-    #[allow(dead_code)]
-    pin: Arc<Pin>,
+    _pin: Arc<Pin>,
     #[cfg(loom)]
     bytes: Vec<u8>,
 }

@@ -3,6 +3,7 @@
 //!
 //! Checksummed structures are also fed with their checksum recomputed over the arbitrary
 //! bytes, so the parser behind the checksum gets exercised, not just the checksum check.
+// Shared by several test binaries and the fuzz targets, each using a subset of it.
 #![allow(dead_code)]
 
 use std::ops::Bound;

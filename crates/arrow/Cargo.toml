@@ -16,3 +16,7 @@ pigeonhole = { workspace = true }
 
 [lints]
 workspace = true
+
+# Phase 3/4 placeholder: builds on the public crate once implemented.
+[package.metadata.cargo-machete]
+ignored = ["pigeonhole"]

@@ -1,4 +1,5 @@
 //! Shared helpers: random cell data, building an SST on `SimVfs`, and a reference model.
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

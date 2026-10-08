@@ -1,5 +1,6 @@
 //! Helpers shared by the integration tests: a seeded generator of internal keys and stored
 //! values, and a full check of a reader against the entries it should hold.
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 use pigeonhole_format::{Cursor, Kind, encode_key};

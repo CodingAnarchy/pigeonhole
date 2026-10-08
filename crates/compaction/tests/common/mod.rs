@@ -1,5 +1,6 @@
 //! Shared test harness: random model histories, their stored entries, and read comparison
 //! between `pigeonhole_sim::Model` and `CellResolver`.
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

@@ -2,6 +2,7 @@
 //! follows the FORMAT §11.3 protocol (single-shard groups and cross-shard commits with the
 //! `min(held, ..)` rule) and records what it applied in the arenas, and a reader-side checker
 //! that verifies a snapshot is consistent with those records.
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
