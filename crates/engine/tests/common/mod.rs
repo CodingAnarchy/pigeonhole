@@ -305,6 +305,9 @@ pub struct Stats {
     pub engine_tablet_changes: (u64, u64, u64),
     /// Client steps that found submitted I/O still in flight (`Config::deferred_io`).
     pub io_in_flight_steps: usize,
+    /// Reads at a held snapshot checked against the model rebuilt for its view, because a
+    /// compaction published after it purged something (`World::model_at`).
+    pub reads_at_older_views: usize,
 }
 
 /// What kind of divergence the checker saw.
@@ -1076,6 +1079,8 @@ struct World {
     pending_advance: u64,
     base: u64,
     snaps: Vec<Snapshot>,
+    /// `Stats::reads_at_older_views`, counted by `&self` reads.
+    reads_at_older_views: std::cell::Cell<usize>,
     trace: Vec<String>,
     op_index: usize,
     stats: Stats,
@@ -1136,6 +1141,7 @@ impl World {
             pending_advance: 0,
             base: vfs.now_micros(),
             snaps: Vec::new(),
+            reads_at_older_views: std::cell::Cell::new(0),
             trace: Vec::new(),
             op_index: 0,
             stats: Stats::default(),
@@ -1200,7 +1206,12 @@ impl World {
         let store = self.store();
         let view = store.engine.snapshot().expect("snapshot").view().clone();
         let mut out = Vec::new();
-        for op in ops {
+        // In the engine's routing order: `Engine::route` moves row deletes after every other
+        // mutation, and the first shard coordinates a cross-shard commit.
+        let (rest, row_deletes): (Vec<&ModelOp>, Vec<&ModelOp>) = ops
+            .iter()
+            .partition(|op| !matches!(op, ModelOp::DeleteRow { .. }));
+        for op in rest.into_iter().chain(row_deletes) {
             let table = store.tables[op_table(op)].id;
             if let Some((_, shard)) = view.tablets().route(table, op_row(op))
                 && !out.contains(&shard.0)
@@ -1471,8 +1482,8 @@ impl World {
         self.faults_active
     }
 
-    fn apply_purge(&mut self, e: &PurgeEvent) {
-        let p = ModelPurge {
+    fn model_purge(&self, e: &PurgeEvent) -> ModelPurge {
+        ModelPurge {
             table: e.table.clone(),
             family: e.family.clone(),
             rows: e.rows.clone(),
@@ -1480,8 +1491,52 @@ impl World {
             now: e.now,
             min_ts_above: e.min_ts_above,
             max_seqno: self.model_seqno(e.max_seqno),
-        };
+        }
+    }
+
+    fn apply_purge(&mut self, e: &PurgeEvent) {
+        let p = self.model_purge(e);
         self.model.purge(&p);
+    }
+
+    /// The model a read at `snap` must match, when it is not `self.model`. A snapshot reads
+    /// the view it was taken in, which holds only the compactions published by then; the
+    /// model takes a purge at its `max_seqno`. Usually the same thing, but a commit applied
+    /// between a bottommost compaction's GC decision and its publication counts as a later
+    /// write (D74, D147), above `max_seqno`, while a snapshot taken in that window still
+    /// sees the deletes the compaction purged (issue #204). For such a snapshot this is the
+    /// model rebuilt from the commits and only the purges its view holds, as recovery
+    /// rebuilds it.
+    fn model_at(&self, snap: &Snapshot) -> Option<Model> {
+        let view = snap.view().manifest_version();
+        let newer = |p: &PurgeEvent| p.bottommost && p.manifest_version > view;
+        if !self.purges.iter().any(newer) {
+            return None;
+        }
+        self.reads_at_older_views
+            .set(self.reads_at_older_views.get() + 1);
+        let commits: Vec<StreamCommit> = self
+            .history
+            .values()
+            .map(|c| StreamCommit {
+                ops: c.ops.clone(),
+                commit_ts: c.commit_ts.expect("acknowledged commits have a timestamp"),
+                durability: Durability::Sync,
+                streams: c.streams.clone(),
+            })
+            .collect();
+        let mut model = Model::from_commits(
+            |m| {
+                for t in TABLES {
+                    m.create_table(t, families());
+                }
+            },
+            &commits,
+        );
+        for p in self.purges.iter().filter(|p| p.bottommost && !newer(p)) {
+            model.purge(&self.model_purge(p));
+        }
+        Some(model)
     }
 
     /// Every held snapshot still reads as the model says (at the current clock: TTL moves
@@ -1551,7 +1606,9 @@ impl World {
             }
             Err(e) => return fail(FailureClass::Protocol, format!("dump failed: {e}")),
         };
-        let model = match model_dump(&self.model, self.model_seqno(snap.seqno()), now) {
+        let rebuilt = self.model_at(snap);
+        let model = rebuilt.as_ref().unwrap_or(&self.model);
+        let model = match model_dump(model, self.model_seqno(snap.seqno()), now) {
             Ok(d) => d,
             Err(e) => return fail(FailureClass::Protocol, format!("model dump failed: {e}")),
         };
@@ -3575,9 +3632,15 @@ impl World {
                     snap.seqno()
                 ));
                 let got = self.store().get(&snap, &row, &family, &qualifier);
-                let want = self
-                    .model
-                    .try_get(table_of(&row), &row, &family, &qualifier, ms, now);
+                let rebuilt = self.model_at(&snap);
+                let want = rebuilt.as_ref().unwrap_or(&self.model).try_get(
+                    table_of(&row),
+                    &row,
+                    &family,
+                    &qualifier,
+                    ms,
+                    now,
+                );
                 match (got, want) {
                     (Ok(g), Ok(w)) if g == w => {}
                     (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => {}
@@ -3615,6 +3678,8 @@ impl World {
                     text(&end),
                     snap.seqno()
                 ));
+                let rebuilt = self.model_at(&snap);
+                let model = rebuilt.as_ref().unwrap_or(&self.model);
                 for t in TABLES {
                     let got = self.store().scan(
                         &snap,
@@ -3623,7 +3688,7 @@ impl World {
                         Bound::Excluded(&end),
                         1,
                     );
-                    let want = self.model.try_scan(
+                    let want = model.try_scan(
                         t,
                         Bound::Included(&start),
                         Bound::Excluded(&end),
@@ -3935,6 +4000,7 @@ fn run_with(
             });
         }
     }
+    w.stats.reads_at_older_views = w.reads_at_older_views.get();
     let result = match w.failure.take() {
         Some(f) => Err(f),
         None => Ok(w.stats),
