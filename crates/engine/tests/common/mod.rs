@@ -286,6 +286,10 @@ pub struct Stats {
     pub refused_attempts: usize,
     /// Commits recovered only from SSTs (their WAL records were checkpointed away).
     pub sst_only: usize,
+    /// PREPAREs of an unacknowledged cross-shard commit with no COMMIT on any stream that a
+    /// checkpoint passed: an aborted or undecided attempt's PREPARE passes at once (D116),
+    /// and such a commit is never recovered (D83, D114).
+    pub undecided_prepares_passed: usize,
     /// Mutating VFS operations the run made before its final crash: the crash points a
     /// sweep of the same seed and config must cover.
     pub mutating_ops: u64,
@@ -2046,6 +2050,13 @@ impl World {
         }
         // Every record below a stream's cut is recoverable (WAL or SSTs): a hole would
         // mean the engine lost a record in the middle of a stream.
+        let decided = |seqno: Seqno| {
+            self.stream_records
+                .values()
+                .flatten()
+                .any(|r| *r == (seqno, RecKind::Commit))
+        };
+        let mut undecided_passed = 0;
         for (stream, cut) in &survivors {
             let list = &self.stream_records[stream];
             let observed_from = wal
@@ -2064,9 +2075,26 @@ impl World {
                     .any(|(c, f)| *f && c.seqno == Some(*seqno));
                 if !ok {
                     let commit = all.iter().find(|c| c.seqno == Some(*seqno));
-                    if commit.is_none() {
+                    let Some(c) = commit else {
                         // A refused attempt's PREPARE (no commit to recover) or an
                         // unacknowledged commit that left nothing behind.
+                        continue;
+                    };
+                    // A cross-shard commit no coordinator appended a COMMIT for aborted or
+                    // was never decided: its PREPAREs pass the checkpoint at once (D116),
+                    // and it is lost as a whole (D83, D114; the record-level rule below
+                    // checks that). Its shares on other streams may survive and make it
+                    // known here (issue #181). An acknowledged one always has a COMMIT.
+                    if matches!(c.streams, CommitStreams::Cross { .. }) && !decided(*seqno) {
+                        if c.acked {
+                            return fail(
+                                FailureClass::Protocol,
+                                format!(
+                                    "cross-shard commit {seqno} was acknowledged, but no stream holds its COMMIT"
+                                ),
+                            );
+                        }
+                        undecided_passed += 1;
                         continue;
                     }
                     return fail(
@@ -2083,6 +2111,7 @@ impl World {
                 }
             }
         }
+        self.stats.undecided_prepares_passed += undecided_passed;
         // The sim's record-level rule (D83, D84, D114) over every stream's records in append
         // order: a single-shard commit survives iff its record is in its stream's surviving
         // prefix, a cross-shard commit iff its COMMIT is and every participant the COMMIT
