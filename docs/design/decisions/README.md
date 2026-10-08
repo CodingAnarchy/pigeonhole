@@ -175,7 +175,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126 · **amended by D171, D176**
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
-- [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220
+- [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220 · **amended by D178**
 - [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134 · **amended by D174**
 - [D165](phase-2.md#d165) — The tiered picker's runs, triggers and output levels; the engine picks per family · compaction, #31, #227 · **amended by D169**
 - [D166](phase-2.md#d166) — The write stall follows L0 depth only · compaction, engine, #227 · amends D119
@@ -189,6 +189,8 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D174](phase-2.md#d174) — Test-hook recording is opt-in, and the test-hooks wait matches production · engine, #148, #261 · refines D164
 - [D175](phase-2.md#d175) — The zstd codec, its library and its level · format, sst, pigeonhole, #44, #255 · amends D168
 - [D176](phase-2.md#d176) — The stopped-clock fallbacks apply only to a simulated clock · io, engine, runtime, #263, #267 · amends D126, refines D161, D171
+- [D177](phase-2.md#d177) — Backup releases its snapshot's memtables before the long merge · engine, #262, #268
+- [D178](phase-2.md#d178) — The bench metric family compacts FIFO in Pigeonhole and RocksDB · bench, #236, #270 · refines D163
 
 ## Open questions
 _None._
