@@ -20,6 +20,11 @@ Issue #33 asks to pick blob GC "from per-file live-byte ratios". The manifest do
 
 **Interim behavior:** a file is a candidate when it is at least half garbage and holds at least `target_sst_bytes / 16` garbage bytes (`pick_blob_gc`). A `TaskKind::BlobGc` task rewrites **every** SST of one `(tablet, family)` into the last level, copying the values still in its candidate files into new files. Each shard remembers in memory which slots it has emptied each candidate from and does not pick them again for that file (a slot that committed a blob GC holds no pointer into the file afterwards), so the work terminates even if some count were off; after a reopen, a merge or a move a slot may be rewritten once more for nothing. Recording each SST's referenced blob files, so that blob GC rewrites only the slots that point into a file and termination survives a reopen, is #240. Blob GC runs only when no other compaction is due. `Engine::compact` turns each full-compaction rewrite into a blob GC of every file of the family with any garbage, so `compact()` reclaims what it can. No knob yet; a public one can come with the Phase 2 options work.
 
+## Proposed decision: blob records are not compressed
+zstd block compression (#44, #255) compresses SST blocks with the family's codec.
+
+**Interim behavior:** blob records hold the stored value as is, whatever the family's codec. The SST blocks that hold the 16-byte pointers are compressed as usual, so nothing is compressed twice, and a read of a separated value needs no decompression (it is pinned straight from the block cache). Families with compressible large values can raise `blob_threshold` to keep them inline and compressed. Per-record compression would need a codec byte in the record header (a format change); not planned.
+
 ## Proposed decision: blob extents are at most 1 MiB unless a value needs more
 All extents of a blob file share one size class (FORMAT §7) and cannot be trimmed one by one, so the last extent's unused tail is wasted.
 
