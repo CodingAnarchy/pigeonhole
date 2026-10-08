@@ -19,6 +19,17 @@ SQLite's deployment model (one file, a library, no server).
 > them (`Options::tablet_changes`, on by default). The async API arrives in
 > Phase 3 behind the `async` feature.
 
+## Install
+
+```sh
+cargo add pigeonhole
+```
+
+or `pigeonhole = "0.1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on
+[docs.rs](https://docs.rs/pigeonhole). See the
+[changelog](https://github.com/CodingAnarchy/pigeonhole/blob/main/CHANGELOG.md) and the
+[0.1.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0).
+
 ## Quickstart
 
 ```rust

@@ -56,6 +56,15 @@
 //! # }
 //! ```
 //!
+//! # Install and status
+//!
+//! `cargo add pigeonhole`, or `pigeonhole = "0.1"` in `Cargo.toml`. This is an experimental
+//! 0.x release: the core engine (Phase 1) is complete and fault-tested in simulation, but the
+//! on-disk format and the API may change before 1.0, the wide-column model (Phase 2) and the
+//! latency work (Phase 3) are still to come, and it is not recommended for production use yet.
+//! See the [status page](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md)
+//! and the [changelog](https://github.com/CodingAnarchy/pigeonhole/blob/main/CHANGELOG.md).
+//!
 //! # API shape and the future C ABI
 //!
 //! Every zero-copy type ([`CellRef`], [`RowRef`]) has an owned, cheap, ref-counted
