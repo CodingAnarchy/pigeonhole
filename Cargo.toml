@@ -77,3 +77,9 @@ codegen-units = 1
 
 [profile.bench]
 inherits = "release"
+
+# The simulation suites (engine tablets/model_check, wal stream, ...) are CPU-bound; a
+# light optimisation level makes them several times faster. Debug assertions and
+# overflow checks stay on (they catch real bugs); only codegen is optimised.
+[profile.dev]
+opt-level = 1
