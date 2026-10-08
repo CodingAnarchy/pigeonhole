@@ -3169,12 +3169,12 @@ impl ShardState {
         opts.ttl_micros = meta.options.ttl_micros;
         opts.versions = 1;
         opts.merge = meta.merge_op.clone();
+        let resolver_blobs = crate::read::ResolverBlobs::attach(&mut opts, &view.ssts);
         let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
         resolver.seek_column(row, qualifier)?;
-        let Some(cell) = resolver
-            .next_cell()
-            .map_err(|e| crate::read::read_error(e, meta))?
-        else {
+        let next = resolver.next_cell();
+        crate::read::ResolverBlobs::check(resolver_blobs.as_ref())?;
+        let Some(cell) = next.map_err(|e| crate::read::read_error(e, meta))? else {
             return Ok(None);
         };
         // A separated value is compared as the value, not its pointer.

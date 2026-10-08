@@ -620,7 +620,7 @@ impl CompactionWork {
         } else {
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
                 let mut edits = edits;
-                edits.extend(blob_edits(catalog, blobs));
+                edits.extend(blob_edits(catalog, blobs)?);
                 Ok(edits)
             }))
         };
@@ -657,7 +657,11 @@ impl BlobChanges {
 /// `PutBlobFile` for each new file (all live), and for each older file the catalog still
 /// names its new live count, or a `DropBlobFile` once nothing references it. A file the
 /// catalog no longer names (its table was dropped) is left alone.
-pub(crate) fn blob_edits(catalog: &Catalog, changes: BlobChanges) -> Vec<Edit> {
+///
+/// A delta larger than a file's live count means the accounting undercounted: dropping the
+/// file would lose values some SST still points to. That is refused with `Corruption`
+/// (the request commits nothing and its outputs are freed), never clamped to zero.
+pub(crate) fn blob_edits(catalog: &Catalog, changes: BlobChanges) -> Result<Vec<Edit>> {
     let mut edits = Vec::new();
     for f in changes.new {
         edits.push(Edit::PutBlobFile {
@@ -672,13 +676,12 @@ pub(crate) fn blob_edits(catalog: &Catalog, changes: BlobChanges) -> Vec<Edit> {
         let Some(b) = catalog.blob_files.get(&blob_file) else {
             continue;
         };
-        debug_assert!(
-            delta >= 0 || b.live_bytes >= delta.unsigned_abs(),
-            "blob file {} would go below zero live bytes ({} {delta})",
-            blob_file.0,
-            b.live_bytes
-        );
-        let live_bytes = b.live_bytes.saturating_add_signed(delta);
+        let Some(live_bytes) = b.live_bytes.checked_add_signed(delta) else {
+            return Err(Error::Corruption(format!(
+                "blob file {} would go below zero live bytes ({} {delta})",
+                blob_file.0, b.live_bytes
+            )));
+        };
         if live_bytes == 0 {
             edits.push(Edit::DropBlobFile { blob_file });
         } else {
@@ -691,7 +694,7 @@ pub(crate) fn blob_edits(catalog: &Catalog, changes: BlobChanges) -> Vec<Edit> {
             });
         }
     }
-    edits
+    Ok(edits)
 }
 
 /// Every extent a compaction's output occupies: its SSTs and its new blob files.
@@ -759,5 +762,61 @@ impl Task for CompactionWork {
 
     fn name(&self) -> &'static str {
         "compaction"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pigeonhole_format::superblock::ExtentRef;
+
+    fn catalog_with_file(live_bytes: u64) -> Catalog {
+        let mut c = Catalog::default();
+        c.apply(
+            &Edit::PutBlobFile {
+                blob_file: BlobFileId(7),
+                family: FamilyId(1),
+                extents: vec![ExtentRef {
+                    page: 16,
+                    size_class: 0,
+                }],
+                total_bytes: 1000,
+                live_bytes,
+            },
+            1,
+        )
+        .unwrap();
+        c
+    }
+
+    fn changes(delta: i64) -> BlobChanges {
+        BlobChanges {
+            family: FamilyId(1),
+            new: Vec::new(),
+            delta: vec![(BlobFileId(7), delta)],
+        }
+    }
+
+    #[test]
+    fn a_file_is_dropped_exactly_at_zero_and_an_undercount_is_refused() {
+        let c = catalog_with_file(300);
+        assert!(matches!(
+            blob_edits(&c, changes(-100)).unwrap()[..],
+            [Edit::PutBlobFile {
+                live_bytes: 200,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            blob_edits(&c, changes(-300)).unwrap()[..],
+            [Edit::DropBlobFile {
+                blob_file: BlobFileId(7)
+            }]
+        ));
+        // More dropped than recorded live: refused, never clamped into a drop.
+        assert!(matches!(
+            blob_edits(&c, changes(-301)),
+            Err(Error::Corruption(_))
+        ));
     }
 }

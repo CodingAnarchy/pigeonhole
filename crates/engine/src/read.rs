@@ -17,7 +17,7 @@ use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
-use crate::catalog::{FamilyMeta, MergeKind};
+use crate::catalog::{FamilyMeta, I64_ADD, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
 use crate::source::{Pinned, Resolver, Source};
 use crate::{Error, Result};
@@ -224,20 +224,27 @@ impl ReadSpec {
     }
 }
 
-/// Reads separated values for a value predicate (`ResolveOptions::blobs`). The resolver
+/// Reads separated values for the resolver (`ResolveOptions::blobs`): a value predicate
+/// tests the value, and a merge operator folds onto the value, not its pointer. The resolver
 /// cannot fail through the hook, so the first error is kept here and the read reports it
-/// after each resolver step ([`PredicateBlobs::check`]).
+/// after each resolver step ([`ResolverBlobs::check`]).
 #[derive(Debug)]
-pub(crate) struct PredicateBlobs {
+pub(crate) struct ResolverBlobs {
     ssts: Arc<SstSet>,
     error: Mutex<Option<Error>>,
 }
 
-impl PredicateBlobs {
-    /// Sets `opts.blobs` when the options test values and `ssts` names blob files; returns
-    /// the handle to check after each resolver step.
+impl ResolverBlobs {
+    /// Sets `opts.blobs` when the resolver may need a separated value and `ssts` names blob
+    /// files; returns the handle to check after each resolver step. It may need one for a
+    /// value predicate, or to fold operands onto a separated base. The built-in `i64` add
+    /// is the exception: it rejects every base that is not a stored `i64`, with the same
+    /// error, and a separated value never is one (only `Bytes` are separated), so loading
+    /// the base could not change its result. Skipping it keeps a default family's reads
+    /// free of the hook.
     pub(crate) fn attach(opts: &mut ResolveOptions, ssts: &Arc<SstSet>) -> Option<Arc<Self>> {
-        if opts.value.is_none() || !ssts.has_blobs() {
+        let folds = opts.merge.as_ref().is_some_and(|m| m.name() != I64_ADD);
+        if !(opts.value.is_some() || folds) || !ssts.has_blobs() {
             return None;
         }
         let blobs = Arc::new(Self {
@@ -262,7 +269,7 @@ impl PredicateBlobs {
     }
 }
 
-impl BlobFetch for PredicateBlobs {
+impl BlobFetch for ResolverBlobs {
     fn fetch(&self, ptr: &BlobPointer) -> Option<pigeonhole_cache::Cell> {
         match self.ssts.read_pointer(ptr) {
             Ok(v) => Some(v),
@@ -426,8 +433,8 @@ struct Lane {
     resolver: Resolver,
     /// The view's SSTs and blob files, to read separated values.
     ssts: Arc<SstSet>,
-    /// The value predicate's blob reads, if it has any.
-    predicate_blobs: Option<Arc<PredicateBlobs>>,
+    /// The resolver's blob reads, if it may need any.
+    resolver_blobs: Option<Arc<ResolverBlobs>>,
     /// The held cell: column prefix, timestamp, value.
     col: Vec<u8>,
     ts: Timestamp,
@@ -455,7 +462,7 @@ impl Lane {
         }
         let (from_source, large) = {
             let next = self.resolver.next_cell();
-            PredicateBlobs::check(self.predicate_blobs.as_ref())?;
+            ResolverBlobs::check(self.resolver_blobs.as_ref())?;
             let Some(cell) = next.map_err(|e| read_error(e, &self.meta))? else {
                 self.done = true;
                 return Ok(());
@@ -601,7 +608,7 @@ impl ScanCursor {
                 self.spec
                     .read
                     .resolve_opts(meta, self.snapshot.seqno, self.now);
-            let predicate_blobs = PredicateBlobs::attach(&mut opts, &view.ssts);
+            let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
             let sources = view.scan_sources(
                 tablet.shard,
                 tablet.id,
@@ -621,7 +628,7 @@ impl ScanCursor {
                 meta: meta.clone(),
                 resolver,
                 ssts: Arc::clone(&view.ssts),
-                predicate_blobs,
+                resolver_blobs,
                 col: Vec::new(),
                 ts: 0,
                 value: LaneValue::Copied(Vec::new()),
@@ -830,7 +837,7 @@ pub(crate) fn read_row(
             continue;
         };
         let (mut opts, filter) = spec.resolve_opts(meta, snapshot.seqno, now);
-        let predicate_blobs = PredicateBlobs::attach(&mut opts, &view.ssts);
+        let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let sources = view.row_sources(shard, tablet, family, &filter, row, &prefix)?;
         if sources.is_empty() {
             continue;
@@ -841,7 +848,7 @@ pub(crate) fn read_row(
         loop {
             let (data, column) = {
                 let next = resolver.next_cell();
-                PredicateBlobs::check(predicate_blobs.as_ref())?;
+                ResolverBlobs::check(resolver_blobs.as_ref())?;
                 let Some(cell) = next.map_err(|e| read_error(e, meta))? else {
                     break;
                 };
@@ -903,11 +910,12 @@ pub(crate) fn get_in(
     if sources.is_empty() {
         return Ok(None);
     }
-    let (opts, _) = ReadSpec {
+    let (mut opts, _) = ReadSpec {
         versions: 1,
         ..ReadSpec::default()
     }
     .resolve_opts(meta, seqno, now);
+    let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
     let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
     resolver.seek_column(row, qualifier)?;
     // A value above the inline threshold is pinned, not copied (D29). The resolver copies
@@ -918,7 +926,9 @@ pub(crate) fn get_in(
     let mut key_vec: Vec<u8> = Vec::new();
     let mut key_len = 0;
     let (ts, refind) = {
-        let Some(cell) = resolver.next_cell().map_err(|e| read_error(e, meta))? else {
+        let next = resolver.next_cell();
+        ResolverBlobs::check(resolver_blobs.as_ref())?;
+        let Some(cell) = next.map_err(|e| read_error(e, meta))? else {
             return Ok(None);
         };
         if cell.value.len() <= CellData::INLINE_MAX {

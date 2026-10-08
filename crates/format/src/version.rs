@@ -7,6 +7,7 @@
 /// use pigeonhole_format::FormatVersion;
 ///
 /// assert!(FormatVersion::CURRENT.is_readable());
+/// assert!(FormatVersion(1).is_readable()); // 0.1.0 files
 /// assert!(!FormatVersion(99).is_readable());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -14,8 +15,10 @@
 pub struct FormatVersion(pub u32);
 
 impl FormatVersion {
-    /// The format this build writes.
-    pub const CURRENT: Self = Self(1);
+    /// The format this build writes. Version 2 adds blob files (FORMAT §7): a version 1
+    /// build (0.1.0) would read a blob pointer as an empty value, so it must refuse a file
+    /// this build has written.
+    pub const CURRENT: Self = Self(2);
     /// The oldest format this build reads.
     pub const MIN_READABLE: Self = Self(1);
 

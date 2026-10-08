@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, EngineShard, FamilyOptions, Predicate, ReadSpec, ScanSpec, TableInfo,
-    ValuePredicate, ValueRef, WriteBatch,
+    Engine, EngineOptions, EngineShard, FamilyOptions, MergeError, MergeOperator, Predicate,
+    ReadSpec, ScanSpec, TableInfo, ValuePredicate, ValueRef, WriteBatch,
 };
 use pigeonhole_format::{Durability, TableId};
 use pigeonhole_io::sim::SimVfs;
@@ -481,4 +481,134 @@ fn a_snapshot_reads_a_blob_file_that_blob_gc_dropped() {
     rig.db.shrink().unwrap();
     assert_eq!(rig.db.unreferenced_bytes(), 0);
     rig.close();
+}
+
+/// Appends `Bytes` payloads: the result is the base, then each operand oldest first.
+#[derive(Debug)]
+struct Append;
+
+impl Append {
+    fn bytes(stored: &[u8]) -> Result<&[u8], MergeError> {
+        match stored.split_first() {
+            Some((0, payload)) => Ok(payload),
+            _ => Err(MergeError {
+                operator: "test.append".into(),
+                message: "not bytes".into(),
+            }),
+        }
+    }
+}
+
+impl MergeOperator for Append {
+    fn name(&self) -> &str {
+        "test.append"
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        let mut out = vec![0u8];
+        out.extend_from_slice(Self::bytes(older)?);
+        out.extend_from_slice(Self::bytes(acc)?);
+        *acc = out;
+        Ok(())
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        let mut out = vec![0u8];
+        if let Some(b) = base {
+            out.extend_from_slice(Self::bytes(b)?);
+        }
+        out.extend_from_slice(Self::bytes(acc)?);
+        *acc = out;
+        Ok(())
+    }
+}
+
+#[test]
+fn operands_fold_onto_a_separated_base_on_every_read_path() {
+    let vfs = SimVfs::new(40);
+    let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
+    o.compaction.l0_trigger = u32::MAX;
+    o.compaction.level_base_bytes = u64::MAX;
+    o.merge_operators.register(Arc::new(Append));
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let appended = FamilyOptions {
+        merge_operator: "test.append".into(),
+        ..family()
+    };
+    let counter = FamilyOptions {
+        merge_operator: "pigeonhole.i64_add".into(),
+        ..family()
+    };
+    let t = db
+        .create_table("t", &[("a".into(), appended), ("c".into(), counter)])
+        .unwrap();
+    let (a, c) = (t.families[0].id, t.families[1].id);
+    let base = vec![b'b'; 500];
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, a, b"r", b"q", None, ValueRef::Bytes(&base))
+        .unwrap();
+    wb.put(t.id, c, b"r", b"n", None, ValueRef::Bytes(&base))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.blob_files().len(), 2, "both bases are separated");
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, a, b"r", b"q", ValueRef::Bytes(b"xy"))
+        .unwrap();
+    wb.merge(t.id, c, b"r", b"n", ValueRef::I64(1)).unwrap();
+    db.commit(wb, None).unwrap();
+    let mut want = base.clone();
+    want.extend_from_slice(b"xy");
+
+    let check = |what: &str| {
+        let snap = db.snapshot().unwrap();
+        let got = db.get(&snap, t.id, a, b"r", b"q").unwrap().unwrap();
+        assert_eq!(got.value(), ValueRef::Bytes(&want), "{what}: get");
+        let got = db.get_latest(t.id, a, b"r", b"q").unwrap().unwrap();
+        assert_eq!(got.value(), ValueRef::Bytes(&want), "{what}: get_latest");
+        let mut spec = ReadSpec::default();
+        spec.families = vec![a];
+        let row = db.read_row(&snap, t.id, b"r", &spec).unwrap().unwrap();
+        assert_eq!(
+            row.cells[0].data.value(),
+            ValueRef::Bytes(&want),
+            "{what}: read_row"
+        );
+        let mut scan = ScanSpec::new(Bound::Unbounded, Bound::Unbounded);
+        scan.read.families = vec![a];
+        let mut cursor = db.scan(&snap, t.id, scan).unwrap();
+        assert!(cursor.next_row().unwrap());
+        let cell = cursor.next_cell().unwrap().unwrap();
+        assert_eq!(&cell.stored[1..], &want[..], "{what}: scan");
+        // The built-in i64 add rejects a bytes base whether it is separated or not.
+        assert!(
+            matches!(
+                db.get(&snap, t.id, c, b"r", b"n"),
+                Err(pigeonhole_engine::Error::Merge(_))
+            ),
+            "{what}: i64 add over a bytes base"
+        );
+    };
+    check("operand in a memtable");
+    db.flush().unwrap();
+    check("operand in an SST");
+    db.compact(None).unwrap();
+    check("after a compaction");
+
+    let cas = |expected: &[u8]| {
+        let mut wb = WriteBatch::new();
+        wb.put(t.id, a, b"r", b"other", None, ValueRef::Bytes(b"x"))
+            .unwrap();
+        let predicate = Predicate::Value {
+            family: a,
+            qualifier: b"q".to_vec(),
+            predicate: ValuePredicate::Equals(expected.to_vec()),
+        };
+        db.check_and_mutate(t.id, b"r", &predicate, wb, None)
+            .unwrap()
+            .0
+    };
+    assert!(!cas(&base), "the folded value is not the base");
+    assert!(cas(&want), "check_and_mutate compares the folded value");
+    db.close().unwrap();
 }

@@ -10,15 +10,17 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 - Custom merge operators: `Options::merge_operator` / `ReaderOptions::merge_operator` register them and families name them with `Family::merge_operator(name)`; opening over a family whose operator is not registered needs `allow_unregistered_merge_operators(true)` and is then read-only (#43).
 - `Options::write_stall_timeout(Duration)`: how long a stalled write, `flush` or `compact` waits before `Busy` (default 30 s, as before) (#210).
 - zstd block compression: `Family::zstd(level)` is accepted at table creation and stores blocks as zstd frames at the family's level (#44).
+- Blob separation (#33): values above a family's `blob_threshold` (default 4096 bytes) move to blob files when flushed or compacted, and blob GC rewrites blob files once they are half garbage.
 
 ### Fixed
 - A database on NFS without working locks now fails to open with `NetworkFilesystem` instead of an I/O error about locks, and FUSE and GPFS mounts are refused as network filesystems (#147).
 
 ### Changed
 - The write stall follows L0 depth only; deeper levels and tiered space amplification no longer pace writers (D119).
+- On-disk format version 2 (FORMAT §12). This build reads 0.1.0 files, but a file it has written cannot be opened by 0.1.0.
 
 Planned for Phase 2 (the wide-column model), see [`docs/status.md`](docs/status.md):
-- Blob separation for large values (raising the Phase 1 value cap).
+- Raising the Phase 1 value cap now that blob files can span extents (#230).
 - A tighter file layout: the file at rest can be 2-4x live data because of power-of-two extents (#185).
 
 Planned for Phase 3 (latency): write throughput that scales with shard count (#154), open latency toward the 5 ms goal (#158), and the async API.

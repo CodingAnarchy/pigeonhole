@@ -25,7 +25,7 @@ Format version **1**, shared-memory layout version **1**. Nothing here is promis
 | Shared-memory directory | `PHDBSHMD` | offset 0 of the directory region |
 | Memtable header | `MEMT` (u32 `0x544D454D`) | offset 0 of each memtable header |
 
-- **Versions.** `FormatVersion` (u32, currently 1) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 1) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
+- **Versions.** `FormatVersion` (u32, currently 2; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 1) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
 
 ## 2. Internal key
 
@@ -497,6 +497,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 ## 12. Evolution
 
 - A reader rejects a `FormatVersion` above what it supports and refuses a `ShmLayoutVersion` that differs at all.
+- **Version 2** adds blob files (§7): separated values, `PutBlobFile`/`DropBlobFile` edits in use, and the `Blob` value tag in SSTs. A version 1 build (0.1.0) would read a blob pointer as an empty value, so every structure is now written with version 2 and a version 1 build refuses the file. This build still reads version 1 files; a file it writes to (any commit rewrites the superblock) is version 2 from then on.
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.
 - Golden files for every structure are frozen at 1.0 (format brief).
