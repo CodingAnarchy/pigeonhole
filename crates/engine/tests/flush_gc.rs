@@ -302,3 +302,43 @@ fn a_snapshot_pins_its_seqno_before_it_loads_the_view() {
         shard.run_once(u64::MAX);
     }
 }
+
+/// #301 put large values in blob files at commit time, so a memtable holds their pointers. A
+/// flush that drops such a pointer (a version purged under the guard, a put hidden by a delete
+/// in the same memtable) lowers its file's live bytes in the same commit: the accounting
+/// check passes after the flush, and the live bytes fell by exactly the dropped records.
+#[test]
+fn a_flush_that_drops_a_blob_pointer_lowers_its_live_bytes() {
+    let mut rig = Rig::open(2873, FlushGcMutation::None);
+    rig.db.set_inline_value_limit(200);
+    let (t, f) = (rig.t.id, rig.t.families[0].id);
+    let large = |b: u8| vec![b; 400];
+    rig.put(None, &large(b'1'));
+    rig.put(None, &large(b'2'));
+    // A large put at 7 and a cell delete of it: hidden at every read point.
+    let mut wb = WriteBatch::new();
+    wb.put(
+        t,
+        f,
+        b"row",
+        b"gone",
+        Some(7),
+        ValueRef::Bytes(&large(b'g')),
+    )
+    .unwrap();
+    rig.commit(wb);
+    let mut wb = WriteBatch::new();
+    wb.delete_cell(t, f, b"row", b"gone", 7).unwrap();
+    rig.commit(wb);
+    let live = |db: &Engine| db.blob_files().iter().map(|b| b.3).sum::<u64>();
+    let total = |db: &Engine| db.blob_files().iter().map(|b| b.2).sum::<u64>();
+    rig.db.check_blob_accounting().unwrap();
+    let before = live(&rig.db);
+    assert_eq!(before, total(&rig.db), "three large values, all live");
+    rig.flush();
+    rig.db.check_blob_accounting().unwrap();
+    // Two of the three records (all the same size) are no longer referenced.
+    assert_eq!(live(&rig.db) * 3, before);
+    assert_eq!(rig.get(&rig.db.snapshot().unwrap()), Some(large(b'2')));
+    rig.close();
+}
