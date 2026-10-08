@@ -172,7 +172,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D157](phase-1.md#d157) — An open writes one frame per stream; spares wait for use · wal, #143, #172 · amends D35
 - [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
 - [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
-- [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60
+- [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60 · **amended by D183**
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126 · **amended by D171, D176**
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220 · **amended by D178**
@@ -195,6 +195,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D180](phase-2.md#d180) — Blob separation and blob GC · compaction, engine, #33, #235 · amends D29, D77
 - [D181](phase-2.md#d181) — File format version 2 · engine, format, #235
 - [D182](phase-2.md#d182) — Backup copies the separated values the snapshot references · engine, #58, #238 · amends D120, refines D177
+- [D183](phase-2.md#d183) — Level outputs are cut into power-of-two pieces so a file at rest stays near its live size · compaction, pager, sst, #185, #276 · refines D160
 
 ## Open questions
 _None._
