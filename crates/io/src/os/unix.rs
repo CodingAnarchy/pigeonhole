@@ -48,6 +48,11 @@ pub(crate) fn is_local(file: &fs::File) -> Result<bool> {
         0x0BD0_0BD0, // Lustre
         0x0116_1970, // GFS2
         0x7461_636F, // OCFS2
+        // FUSE (sshfs, s3fs, gcsfuse, JuiceFS, rclone, ...): its byte-range locks are often
+        // local to one host, so two hosts could both be writers. Local FUSE filesystems
+        // (ntfs-3g) are refused too, until an opt-in exists (#147).
+        0x6573_5546,
+        0x4750_4653, // GPFS (IBM Spectrum Scale)
     ];
     // SAFETY: `statfs` is plain old data; all-zero is a valid value.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
