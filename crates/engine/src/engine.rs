@@ -422,14 +422,16 @@ impl Engine {
             }
         }
 
-        // 1. The lock handle: writer byte, then the local-filesystem check (D37 order).
+        // 1. The lock handle: the local-filesystem check, then the writer byte. The check
+        //    comes first (#147): it only reads (`fstatfs`), and on a network filesystem
+        //    without lock support taking the lock fails with a bare I/O error instead.
         let mut open_opts = OpenOptions::read();
         open_opts.write = true;
         let file = vfs.open(path, open_opts)?;
-        let writer_lock = WriterLock::acquire(&file)?;
         if !file.is_local()? {
             return Err(Error::NetworkFilesystem);
         }
+        let writer_lock = WriterLock::acquire(&file)?;
         let identity = file.identity()?;
 
         // 2. The page file and the manifest.
