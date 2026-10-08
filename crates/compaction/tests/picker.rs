@@ -74,20 +74,23 @@ fn apply(
     rng: &mut Rng,
 ) {
     assert_clean_cut(levels, inputs);
-    rewrite(levels, inputs, out, kind, target, id, rng);
+    rewrite(levels, inputs, out, kind, target, 90, id, rng);
 }
 
-/// Inputs out, their rows rewritten into target-sized SSTs at the output level, keeping the
-/// inputs' seqno range.
+/// Inputs out, their rows rewritten into target-sized SSTs at the output level (`kept_pct`
+/// percent of their bytes survive GC), keeping the inputs' seqno range; returns the bytes
+/// written.
+#[allow(clippy::too_many_arguments)]
 fn rewrite(
     levels: &mut Levels,
     inputs: &[(u8, Vec<SstId>)],
     out: u8,
     kind: &TaskKind,
     target: u64,
+    kept_pct: u64,
     id: &mut u64,
     rng: &mut Rng,
-) {
+) -> u64 {
     let mut taken = Vec::new();
     for (level, ids) in inputs {
         let l = &mut levels.levels[*level as usize];
@@ -104,6 +107,7 @@ fn rewrite(
         taken.iter().map(|s| s.seqno_range.0).min().unwrap(),
         taken.iter().map(|s| s.seqno_range.1).max().unwrap(),
     );
+    let mut written = 0;
     let new: Vec<Arc<SstMeta>> = if *kind == TaskKind::TrivialMove {
         taken
     } else {
@@ -113,7 +117,7 @@ fn rewrite(
             .min()
             .unwrap();
         let hi = taken.iter().map(|s| row_num(&s.largest_key)).max().unwrap();
-        let bytes: u64 = taken.iter().map(|s| s.len).sum::<u64>() * 9 / 10;
+        let bytes: u64 = taken.iter().map(|s| s.len).sum::<u64>() * kept_pct / 100;
         let n = bytes.div_ceil(target).clamp(1, hi - lo + 1);
         // Chunks sometimes share an edge row (a row too big for one SST is split).
         let mut start = (lo, &b"a"[..]);
@@ -128,6 +132,7 @@ fn rewrite(
                 };
                 let mut s = (*sst_cut(id, start, end, bytes / n)).clone();
                 s.seqno_range = seqnos;
+                written += s.len;
                 start = if shared {
                     (b + 1, &b"n"[..])
                 } else {
@@ -143,6 +148,7 @@ fn rewrite(
     for w in l.windows(2) {
         assert!(w[0].largest_key < w[1].smallest_key, "level {out} overlaps");
     }
+    written
 }
 
 /// First and last row of an SST.
@@ -295,10 +301,12 @@ fn check_tiered(seed: u64, flushes: usize) {
         .resize(options.max_levels as usize, Vec::new());
     let last = options.max_levels as usize - 1;
     let mut id = 0;
+    let (mut flushed, mut written) = (0u64, 0u64);
     for _ in 0..flushes {
         let lo = rng.below(ROWS);
         let hi = (lo + rng.below(ROWS / 2)).min(ROWS - 1);
         let len = (1 << 20) + rng.below(2 << 20);
+        flushed += len;
         let s = sst(&mut id, lo, hi, len);
         levels.levels[0].insert(0, s);
         let mut guard = 0;
@@ -306,9 +314,9 @@ fn check_tiered(seed: u64, flushes: usize) {
             let task = picker
                 .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
                 .unwrap_or_else(|| panic!("{what}: score >= 1 but no task"));
+            let before = runs(&levels);
             // Whole runs, newest first, and the output lies between the deepest input and
             // the first run left out.
-            let before = runs(&levels);
             let taken: Vec<usize> = task
                 .inputs
                 .iter()
@@ -332,12 +340,13 @@ fn check_tiered(seed: u64, flushes: usize) {
             } else {
                 assert_eq!(task.output_level as usize, last, "{what}: {task:?}");
             }
-            rewrite(
+            written += rewrite(
                 &mut levels,
                 &task.inputs,
                 task.output_level,
                 &task.kind,
                 options.target_sst_bytes,
+                100,
                 &mut id,
                 &mut rng,
             );
@@ -364,6 +373,20 @@ fn check_tiered(seed: u64, flushes: usize) {
             assert!(w[0].2.0 > w[1].2.1, "{what}: runs out of order: {r:?}");
         }
     }
+    // Write amplification (#228), with no GC shrinking the merges: an L0 merge lands just
+    // above the deepest run, so L1 is rewritten by a merge only once every level holds a
+    // run, and the size-ratio cascade then grows like a size-tiered scheme with
+    // `levels - 1` runs below L0. Bound it by `levels * batches^(1 / (levels - 2))`: a
+    // picker that rewrote a growing L1 into every L0 merge (about `batches / 2` per byte)
+    // breaks it from 4 levels up.
+    let batches = (flushes as f64 / f64::from(options.l0_trigger)).max(1.0);
+    let levels_n = f64::from(options.max_levels);
+    let bound = levels_n * batches.powf(1.0 / (levels_n - 2.0)) + 2.0;
+    let amp = written as f64 / flushed as f64;
+    assert!(
+        amp <= bound,
+        "{what}: write amplification {amp:.2} > {bound:.2}"
+    );
 }
 
 proptest! {
