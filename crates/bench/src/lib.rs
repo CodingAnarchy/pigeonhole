@@ -144,6 +144,12 @@ pub struct WorkloadConfig {
     pub value_len: usize,
     /// Client threads.
     pub threads: usize,
+    /// The workload's "now", in microseconds since the Unix epoch: the time-series
+    /// workload places event timestamps relative to it, so that part of the loaded points
+    /// is already older than [`TIME_SERIES_TTL`]. `0` (the default of every preset) means
+    /// the wall clock when the [`Workload`] is created; set it to make the generated
+    /// operations identical across runs.
+    pub epoch_micros: u64,
 }
 
 impl WorkloadConfig {
@@ -162,6 +168,7 @@ impl WorkloadConfig {
             } else {
                 1
             },
+            epoch_micros: 0,
         }
     }
 
@@ -181,6 +188,7 @@ impl WorkloadConfig {
             } else {
                 1
             },
+            epoch_micros: 0,
         }
     }
 
@@ -248,12 +256,32 @@ pub enum BenchOp {
         /// Qualifier.
         qualifier: Vec<u8>,
     },
-    /// Write cells of one row.
+    /// Read every cell of one row's family (YCSB `readallfields`, a sparse row read).
+    GetRow {
+        /// Row.
+        row: Vec<u8>,
+        /// Family.
+        family: &'static str,
+    },
+    /// Write cells of one row at the commit time.
     Put {
         /// Row.
         row: Vec<u8>,
         /// Family.
         family: &'static str,
+        /// Qualifier/value pairs.
+        cells: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Write cells of one row at an explicit event time. A cell older than its family's
+    /// TTL ([`TIME_SERIES_TTL`] for [`METRIC_FAMILY`]) is expired the moment it is written
+    /// and no read returns it.
+    PutAt {
+        /// Row.
+        row: Vec<u8>,
+        /// Family.
+        family: &'static str,
+        /// Event time, microseconds since the Unix epoch.
+        ts: u64,
         /// Qualifier/value pairs.
         cells: Vec<(Vec<u8>, Vec<u8>)>,
     },
@@ -286,7 +314,7 @@ pub enum BenchOp {
 /// assert_eq!(w.load_ops().count() as u64, config.records);
 /// let ops: Vec<BenchOp> = w.run_ops().collect();
 /// assert_eq!(ops.len() as u64, config.operations);
-/// assert!(ops.iter().all(|op| matches!(op, BenchOp::Get { .. })));
+/// assert!(ops.iter().all(|op| matches!(op, BenchOp::GetRow { .. })));
 /// // Same seed, same operations.
 /// assert_eq!(Workload::new(config).run_ops().collect::<Vec<_>>(), ops);
 /// ```
@@ -520,7 +548,7 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// Whether a measured operation is a get on a row the run has not read before.
+/// Whether a measured operation is a read of a row the run has not read before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     Other,
@@ -562,7 +590,7 @@ impl Split {
 fn classify(ops: &[BenchOp], seen: &mut std::collections::HashSet<u64>) -> Vec<Class> {
     ops.iter()
         .map(|op| match op {
-            BenchOp::Get { row, .. } => {
+            BenchOp::Get { row, .. } | BenchOp::GetRow { row, .. } => {
                 if seen.insert(row_hash(row)) {
                     Class::Cold
                 } else {
@@ -607,7 +635,7 @@ fn measure(
     let mut ops = workload.run_ops();
     let mut seen = std::collections::HashSet::new();
     for op in ops.by_ref().take(warmup as usize) {
-        if let BenchOp::Get { row, .. } = &op {
+        if let BenchOp::Get { row, .. } | BenchOp::GetRow { row, .. } = &op {
             seen.insert(row_hash(row));
         }
         runner.execute(&op).map_err(|e| format!("warmup: {e}"))?;

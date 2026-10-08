@@ -1,5 +1,6 @@
 //! RocksDB with a hand-written wide-column key encoding ([`super::keys`]): one column
-//! family, one key per cell, latest value only. Default RocksDB options except the
+//! family, one key per cell, latest value only, each value prefixed with the cell's timestamp; the
+//! TTL filter runs on read. Default RocksDB options except the
 //! [`MemoryBudget`] (write buffer, LRU block cache) and a 10-bit bloom filter; no
 //! compression codecs are compiled in.
 
@@ -11,7 +12,8 @@ use rocksdb::{
 };
 
 use super::{
-    BLOOM_BITS, Counted, MemoryBudget, Touched, durability, family_id, keys, modified, scan_rows,
+    BLOOM_BITS, Counted, MemoryBudget, Touched, durability, encode_value, family_id, keys,
+    live_value, modified, now_micros, read_family, scan_rows,
 };
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
@@ -127,6 +129,24 @@ impl Client for Handle {
 }
 
 impl Handle {
+    /// One atomic batch of cells of one row, all stamped `ts`.
+    fn put(
+        &self,
+        row: &[u8],
+        family: &str,
+        ts: u64,
+        cells: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), String> {
+        let f = family_id(family)?;
+        let mut batch = WriteBatch::default();
+        for (q, v) in cells {
+            batch.put(keys::cell(row, f, q), encode_value(ts, v));
+        }
+        self.db
+            .write_opt(batch, &self.write)
+            .map_err(|e| e.to_string())
+    }
+
     fn execute(&self, op: &BenchOp) -> Result<Touched, String> {
         let e = |e: rocksdb::Error| e.to_string();
         let mut t = Touched::default();
@@ -136,34 +156,51 @@ impl Handle {
                 family,
                 qualifier,
             } => {
-                let key = keys::cell(row, family_id(family)?, qualifier);
-                if let Some(v) = self.db.get_pinned(key).map_err(e)? {
-                    t.cell(&v);
+                let f = family_id(family)?;
+                let key = keys::cell(row, f, qualifier);
+                if let Some(v) = self.db.get_pinned(key).map_err(e)?
+                    && let Some(v) = live_value(f, &v, now_micros())?
+                {
+                    t.cell(v);
                 }
+            }
+            BenchOp::GetRow { row, family } => {
+                let mut prefix = keys::row_prefix(row);
+                prefix.push(family_id(family)?);
+                let iter = self
+                    .db
+                    .iterator(IteratorMode::From(&prefix, Direction::Forward));
+                t = read_family(iter, &prefix, now_micros())?;
             }
             BenchOp::Put { row, family, cells } => {
-                let f = family_id(family)?;
-                let mut batch = WriteBatch::default();
-                for (q, v) in cells {
-                    batch.put(keys::cell(row, f, q), v);
-                }
-                self.db.write_opt(batch, &self.write).map_err(e)?;
+                self.put(row, family, now_micros(), cells)?;
             }
+            BenchOp::PutAt {
+                row,
+                family,
+                ts,
+                cells,
+            } => self.put(row, family, *ts, cells)?,
             BenchOp::Scan { start, len } => {
                 let from = keys::row_prefix(start);
                 let iter = self
                     .db
                     .iterator(IteratorMode::From(&from, Direction::Forward));
-                t = scan_rows(iter, *len)?;
+                t = scan_rows(iter, *len, now_micros())?;
             }
             BenchOp::ReadModifyWrite { row, qualifier } => {
                 let key = keys::cell(row, family_id(YCSB_FAMILY)?, qualifier);
-                let old = self.db.get_pinned(&key).map_err(e)?;
-                if let Some(v) = &old {
+                let f = family_id(YCSB_FAMILY)?;
+                let stored = self.db.get_pinned(&key).map_err(e)?;
+                let old = match &stored {
+                    Some(v) => live_value(f, v, now_micros())?,
+                    None => None,
+                };
+                if let Some(v) = old {
                     t.cell(v);
                 }
-                let new = modified(old.as_deref());
-                drop(old);
+                let new = encode_value(now_micros(), &modified(old));
+                drop(stored);
                 self.db.put_opt(key, new, &self.write).map_err(e)?;
             }
         }

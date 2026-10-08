@@ -250,11 +250,32 @@ fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, Str
                 t.cell(cell.value());
             }
         }
+        BenchOp::GetRow { row, family } => {
+            if let Some(row) = table.row(row).family(family).read().map_err(err)? {
+                for entry in row.iter() {
+                    t.cell(entry.cell.value());
+                }
+            }
+        }
         BenchOp::Put { row, family, cells } => {
             retry_busy(busy, || {
                 let mut m = table.mutate(row);
                 for (q, v) in cells {
                     m = m.put(family, q, v);
+                }
+                m.commit()
+            })?;
+        }
+        BenchOp::PutAt {
+            row,
+            family,
+            ts,
+            cells,
+        } => {
+            retry_busy(busy, || {
+                let mut m = table.mutate(row);
+                for (q, v) in cells {
+                    m = m.put_at(family, q, *ts, v);
                 }
                 m.commit()
             })?;
@@ -284,4 +305,73 @@ fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, Str
         }
     }
     Ok(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Workload, WorkloadConfig, WorkloadKind};
+
+    fn opened(tag: &str) -> (PigeonholeRunner, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default()
+            .shards(1)
+            .memtable_budget(16 << 20);
+        r.open(&dir).unwrap();
+        (r, dir)
+    }
+
+    #[test]
+    fn cells_older_than_the_ttl_are_not_read() {
+        let (mut r, dir) = opened("ttl");
+        let mut w = Workload::new(WorkloadConfig::smoke(WorkloadKind::TimeSeriesTtl));
+        let (mut live, mut dead) = (0, 0);
+        for op in w.load_ops() {
+            r.execute(&op).unwrap();
+            let BenchOp::PutAt {
+                row, family, ts, ..
+            } = &op
+            else {
+                panic!("the time-series load is timestamped puts")
+            };
+            let get = BenchOp::Get {
+                row: row.clone(),
+                family,
+                qualifier: b"v".to_vec(),
+            };
+            let by_row = BenchOp::GetRow {
+                row: row.clone(),
+                family,
+            };
+            let got = r.execute_counted(&get).unwrap().cells;
+            assert_eq!(got, r.execute_counted(&by_row).unwrap().cells);
+            let now = crate::runners::now_micros();
+            assert_eq!(got == 0, ts + TIME_SERIES_TTL.as_micros() as u64 <= now);
+            if got == 0 { dead += 1 } else { live += 1 }
+        }
+        assert_eq!(dead * 3, live, "a quarter of the points are expired");
+        r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_row_read_returns_every_field() {
+        let (mut r, dir) = opened("row");
+        let mut w = Workload::new(WorkloadConfig::smoke(WorkloadKind::YcsbC));
+        let load: Vec<BenchOp> = w.load_ops().collect();
+        for op in &load {
+            r.execute(op).unwrap();
+        }
+        let BenchOp::Put { row, family, .. } = &load[0] else {
+            panic!("the YCSB load is puts")
+        };
+        let read = BenchOp::GetRow {
+            row: row.clone(),
+            family,
+        };
+        assert_eq!(r.execute_counted(&read).unwrap().cells, 10);
+        r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

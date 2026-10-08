@@ -84,23 +84,25 @@ Every workload is deterministic for a seed (default `0x5EED`, recorded in every 
 | `ycsb-d` | same | 95% read-latest, 5% insert |
 | `ycsb-e` | same | 95% scan of 1–100 rows (uniform), 5% insert |
 | `ycsb-f` | same | 50% read, 50% read-modify-write |
-| `sparse-wide` | `records` rows, 0–40 cells each (mean 20), qualifiers from a 10K vocabulary with Zipfian popularity | 60% point get (many miss, as in a sparse store), 20% put of 1–4 cells, 20% scan of 10 rows |
-| `time-series-ttl` | `records / 100` entities × 100 points; row `ts:<entity>:<reversed time>`, so a scan from the entity prefix returns the newest point first; family with a 1-day TTL | 40% append, 40% scan of the newest 10 points, 20% get of a recent point |
+| `sparse-wide` | `records` rows, 0–40 cells each (mean 20), qualifiers from a 10K vocabulary with Zipfian popularity | 40% point get (many miss, as in a sparse store), 20% read of a whole row's family, 20% put of 1–4 cells, 20% scan of 10 rows |
+| `time-series-ttl` | `records / 100` entities × 100 points; row `ts:<entity>:<reversed time>`, so a scan from the entity prefix returns the newest point first; family with a 1-day TTL; points carry event timestamps, and a quarter of the loaded ones are already older than the TTL | 40% timestamped append, 40% scan of the newest 10 points, 20% get of a recent point (a miss when expired) |
 | `adjacency` | about `records / 40` vertices; row `v:<id>`, qualifiers `edge:<dst>`, out-degree `1 + Zipf(256)` (mean ≈ 40), Zipfian destinations | 80% scan of one vertex's edges, 10% scan of 10 vertices, 10% add an edge |
 | `skewed-multi-shard` | `records` rows, one cell each | 100% Zipfian writes from `threads` client threads (default 4) |
 
 Interpretation notes (details and rationale in [`design/questions/bench.md`](design/questions/bench.md)):
-- A YCSB read fetches one field, not all ten, because a bench op reads one cell.
+- A YCSB read fetches all ten fields of the record (`readallfields=true`, `BenchOp::GetRow`); an update still writes one field, as in YCSB. Results measured before [#54](https://github.com/CodingAnarchy/pigeonhole/issues/54) read one field and are not comparable with newer ones.
 - Read-modify-write is a get and then a put in every engine, not an atomic operation. For that reason `ycsb-f` refuses `--threads` > 1: concurrent clients would race and lose updates. Every other workload accepts several threads. With more than one thread, operations are dealt round-robin, so a `ycsb-d` read can reach a key whose insert is still queued on another thread. That read is a miss, in every engine alike.
-- TTL never expires during a run (puts carry no timestamp), so reads pay the TTL check and nothing more.
+- Time-series cells expire. `BenchOp::PutAt` writes at an event time; the load places 100 points per entity `TTL/75` apart, ending just before "now" (`WorkloadConfig::epoch_micros`, default the wall clock when the workload is created), so the oldest 25 are older than the 1-day TTL and no read returns them. Every point is at least about 9.6 minutes from the boundary, so engines agree on what is live unless a run lasts longer than that. Appends during the run are stamped at "now" and stay live.
+- Every engine filters expired cells on read: Pigeonhole in its read path, the others by comparing the cell's timestamp (an 8-byte value prefix in RocksDB and fjall, a `ts` column in SQLite) with the clock. Only Pigeonhole removes them in compaction; see the questions file for what that does to comparisons. Agreement tests check that every engine reads the same cells, expired ones included.
+- Nothing reads or keeps more than the latest version of a cell (`max_versions(1)`). Phase 2's version support is not exercised yet.
 
 ### How each store is driven
 
 | Store | Model | Memory (default budget) | Filter | Commit (default / `--sync`) |
 |---|---|---|---|---|
 | `pigeonhole` | Table `bench`, families `ycsb`, `attr`, `metric` (TTL), `edge`, each `max_versions(1)`; public API only | memtable 64 MiB per shard, block cache 256 MiB | bloom, 10 bits/key | `Buffered` / `Sync` |
-| `rocksdb` | Hand-written wide-column key: `escape(row) 00 01 <family> <qualifier>` (order-preserving), one key per cell; no compression codecs compiled in | `write_buffer_size` 64 MiB, LRU block cache 256 MiB | bloom, 10 bits/key | WAL, no fsync / `sync=true` |
-| `sqlite-eav` | `cells(row, family, qualifier, value)` `WITHOUT ROWID`, primary key `(row, family, qualifier)`, WAL journal | page cache 320 MiB (write buffer + cache) | none (B-tree) | `synchronous=NORMAL` / `FULL` |
+| `rocksdb` | Hand-written wide-column key: `escape(row) 00 01 <family> <qualifier>` (order-preserving), one key per cell, value = 8-byte timestamp + bytes; no compression codecs compiled in | `write_buffer_size` 64 MiB, LRU block cache 256 MiB | bloom, 10 bits/key | WAL, no fsync / `sync=true` |
+| `sqlite-eav` | `cells(row, family, qualifier, ts, value)` `WITHOUT ROWID`, primary key `(row, family, qualifier)`, WAL journal | page cache 320 MiB (write buffer + cache) | none (B-tree) | `synchronous=NORMAL` / `FULL` |
 | `fjall` | Same key encoding as RocksDB, one keyspace | `max_memtable_size` 64 MiB, block cache 256 MiB | fjall's default bloom filters | `PersistMode::Buffer` / `SyncAll` |
 
 **Memory budget.** Every engine gets the same `MemoryBudget`: a write buffer (`--write-buffer`, 64 MiB by default: Pigeonhole's and RocksDB's default) and a read cache (`--cache`, 256 MiB, Pigeonhole's default block cache). SQLite has no separate write buffer, so its page cache gets the sum. A one-shard table uses one shard's memtable, so the comparison holds whatever `--shards` is. Every engine's other options are its defaults: no tuning on any side. Each result's `Settings` column prints the budget, filter and durability it ran with.

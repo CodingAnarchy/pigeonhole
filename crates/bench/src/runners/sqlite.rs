@@ -6,22 +6,38 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Counted, MemoryBudget, Touched, durability, modified};
-use crate::workload::YCSB_FAMILY;
+use super::{Counted, MemoryBudget, Touched, durability, modified, now_micros, ttl_micros};
+use crate::workload::{METRIC_FAMILY, YCSB_FAMILY};
 use crate::{BenchOp, Client, Runner};
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS cells (
     row BLOB NOT NULL,
     family TEXT NOT NULL,
     qualifier BLOB NOT NULL,
+    ts INTEGER NOT NULL,
     value BLOB NOT NULL,
     PRIMARY KEY (row, family, qualifier)
 ) WITHOUT ROWID";
 
-const GET: &str = "SELECT value FROM cells WHERE row = ?1 AND family = ?2 AND qualifier = ?3";
+// `?4` is the oldest live timestamp of the cell's family: `ts > ?4` is the TTL filter.
+const GET: &str =
+    "SELECT value FROM cells WHERE row = ?1 AND family = ?2 AND qualifier = ?3 AND ts > ?4";
+const GET_ROW: &str =
+    "SELECT value FROM cells WHERE row = ?1 AND family = ?2 AND ts > ?3 ORDER BY qualifier";
 const PUT: &str =
-    "INSERT OR REPLACE INTO cells (row, family, qualifier, value) VALUES (?1, ?2, ?3, ?4)";
-const SCAN: &str = "SELECT row, value FROM cells WHERE row >= ?1 ORDER BY row, family, qualifier";
+    "INSERT OR REPLACE INTO cells (row, family, qualifier, ts, value) VALUES (?1, ?2, ?3, ?4, ?5)";
+// `?2` is the metric family's oldest live timestamp; other families have no TTL.
+const SCAN: &str = "SELECT row, value FROM cells WHERE row >= ?1 AND (family <> ?3 OR ts > ?2) \
+    ORDER BY row, family, qualifier";
+
+/// The oldest timestamp of `family` that is still live at `now`: cells with `ts` above it
+/// are. Families without a TTL keep everything (timestamps are never negative).
+fn oldest_live(family: &str, now: u64) -> i64 {
+    match ttl_micros(family) {
+        0 => -1,
+        ttl => i64::try_from(now.saturating_sub(ttl)).unwrap_or(i64::MAX),
+    }
+}
 
 /// Runs SQLite as an EAV table (feature `sqlite`).
 ///
@@ -129,6 +145,26 @@ impl Client for Conn {
 }
 
 impl Conn {
+    /// One transaction of cells of one row, all stamped `ts`.
+    fn put(
+        &mut self,
+        row: &[u8],
+        family: &str,
+        ts: u64,
+        cells: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), String> {
+        let e = |e: rusqlite::Error| e.to_string();
+        let ts = i64::try_from(ts).unwrap_or(i64::MAX);
+        let tx = self.0.transaction().map_err(e)?;
+        {
+            let mut stmt = tx.prepare_cached(PUT).map_err(e)?;
+            for (q, v) in cells {
+                stmt.execute(params![row, family, q, ts, v]).map_err(e)?;
+            }
+        }
+        tx.commit().map_err(e)
+    }
+
     fn execute(&mut self, op: &BenchOp) -> Result<Touched, String> {
         let e = |e: rusqlite::Error| e.to_string();
         let mut t = Touched::default();
@@ -139,7 +175,10 @@ impl Conn {
                 qualifier,
             } => {
                 let mut stmt = self.0.prepare_cached(GET).map_err(e)?;
-                let mut rows = stmt.query(params![row, family, qualifier]).map_err(e)?;
+                let live = oldest_live(family, now_micros());
+                let mut rows = stmt
+                    .query(params![row, family, qualifier, live])
+                    .map_err(e)?;
                 if let Some(r) = rows.next().map_err(e)? {
                     t.cell(
                         r.get_ref(0)
@@ -149,19 +188,32 @@ impl Conn {
                     );
                 }
             }
-            BenchOp::Put { row, family, cells } => {
-                let tx = self.0.transaction().map_err(e)?;
-                {
-                    let mut stmt = tx.prepare_cached(PUT).map_err(e)?;
-                    for (q, v) in cells {
-                        stmt.execute(params![row, family, q, v]).map_err(e)?;
-                    }
+            BenchOp::GetRow { row, family } => {
+                let mut stmt = self.0.prepare_cached(GET_ROW).map_err(e)?;
+                let live = oldest_live(family, now_micros());
+                let mut rows = stmt.query(params![row, family, live]).map_err(e)?;
+                while let Some(r) = rows.next().map_err(e)? {
+                    t.cell(
+                        r.get_ref(0)
+                            .map_err(e)?
+                            .as_blob()
+                            .map_err(|e| e.to_string())?,
+                    );
                 }
-                tx.commit().map_err(e)?;
             }
+            BenchOp::Put { row, family, cells } => {
+                self.put(row, family, now_micros(), cells)?;
+            }
+            BenchOp::PutAt {
+                row,
+                family,
+                ts,
+                cells,
+            } => self.put(row, family, *ts, cells)?,
             BenchOp::Scan { start, len } => {
                 let mut stmt = self.0.prepare_cached(SCAN).map_err(e)?;
-                let mut rows = stmt.query(params![start]).map_err(e)?;
+                let live = oldest_live(METRIC_FAMILY, now_micros());
+                let mut rows = stmt.query(params![start, live, METRIC_FAMILY]).map_err(e)?;
                 let mut seen = 0u32;
                 let mut current: Option<Vec<u8>> = None;
                 while let Some(r) = rows.next().map_err(e)? {
@@ -190,7 +242,7 @@ impl Conn {
                 let old: Option<Vec<u8>> = tx
                     .prepare_cached(GET)
                     .map_err(e)?
-                    .query_row(params![row, YCSB_FAMILY, qualifier], |r| r.get(0))
+                    .query_row(params![row, YCSB_FAMILY, qualifier, -1], |r| r.get(0))
                     .optional()
                     .map_err(e)?;
                 if let Some(v) = &old {
@@ -199,7 +251,13 @@ impl Conn {
                 let new = modified(old.as_deref());
                 tx.prepare_cached(PUT)
                     .map_err(e)?
-                    .execute(params![row, YCSB_FAMILY, qualifier, new])
+                    .execute(params![
+                        row,
+                        YCSB_FAMILY,
+                        qualifier,
+                        i64::try_from(now_micros()).unwrap_or(i64::MAX),
+                        new
+                    ])
                     .map_err(e)?;
                 tx.commit().map_err(e)?;
             }
