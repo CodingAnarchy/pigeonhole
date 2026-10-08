@@ -28,7 +28,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D13](phase-1.md#d13) — family ids are unique per database; SSTs belong to a (tablet, family)
 - [D14](phase-1.md#d14) — extra downward dependencies
 - [D15](phase-1.md#d15) — shared vocabulary types live in `format`
-- [D16](phase-1.md#d16) — value size limits · revised after review · **amended by D162**
+- [D16](phase-1.md#d16) — value size limits · revised after review · **amended by D162, D188**
 - [D17](phase-1.md#d17) — the `async` feature is off by default until Phase 3
 - [D18](phase-1.md#d18) — filters are cache-line-blocked bloom filters in Phase 1
 - [D19](phase-1.md#d19) — read-your-writes: commits return once visible · revised after review
@@ -200,6 +200,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D185](phase-2.md#d185) — `shrink` relocates blob extents · engine, #231, #286 · amends D160
 - [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments · **refined by D187**
 - [D187](phase-2.md#d187) — Counter-family deletes purge at the bottom level by seqno · compaction, engine, #290, #298 · refines D70, D186
+- [D188](phase-2.md#d188) — Values above the inline limit are separated into blob files at commit time · engine, runtime, #230, #301 · amends D16
 
 ## Open questions
 _None._
