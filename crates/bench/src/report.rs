@@ -291,7 +291,7 @@ pub struct ReadSplit {
 }
 
 /// Extra facts about a run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDetail {
     /// Bytes of the store directory when the run ended (0 when not measured).
     pub store_bytes: u64,
@@ -299,6 +299,52 @@ pub struct RunDetail {
     pub busy_retries: u64,
     /// Cold and hot gets; `None` when the workload has no gets.
     pub reads: Option<ReadSplit>,
+    /// How the measured phase's work fell on each shard, indexed by shard; empty for
+    /// stores without shards.
+    #[serde(default)]
+    pub shards: Vec<ShardShare>,
+}
+
+/// One shard's share of a run's measured phase (Pigeonhole only): whether the scaling
+/// gate's writes really spread over the shards (issue #51).
+///
+/// ```
+/// use pigeonhole_bench::ShardShare;
+///
+/// let before = ShardShare { commits: 10, tablets_start: 1, tablets_end: 1, splits: 1, ..Default::default() };
+/// let after = ShardShare { commits: 25, tablets_start: 3, tablets_end: 3, splits: 2, ..Default::default() };
+/// let d = ShardShare::between(&before, &after);
+/// assert_eq!((d.commits, d.tablets_start, d.tablets_end, d.splits), (15, 1, 3, 1));
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardShare {
+    /// Commits the shard applied.
+    pub commits: u64,
+    /// Tablets the shard owned when the measured phase started, after the load and warmup.
+    pub tablets_start: u64,
+    /// Tablets the shard owned when it ended.
+    pub tablets_end: u64,
+    /// Tablet splits the shard completed.
+    pub splits: u64,
+    /// Tablet merges the shard completed.
+    pub merges: u64,
+    /// Tablet moves the shard completed.
+    pub moves: u64,
+}
+
+impl ShardShare {
+    /// The share between two cumulative readings of the same shard: counters subtract,
+    /// tablet counts are taken from each end.
+    pub fn between(before: &ShardShare, after: &ShardShare) -> ShardShare {
+        ShardShare {
+            commits: after.commits.saturating_sub(before.commits),
+            tablets_start: before.tablets_end,
+            tablets_end: after.tablets_end,
+            splits: after.splits.saturating_sub(before.splits),
+            merges: after.merges.saturating_sub(before.merges),
+            moves: after.moves.saturating_sub(before.moves),
+        }
+    }
 }
 
 impl RunRecord {
@@ -492,6 +538,34 @@ impl Suite {
                     us(reads.hot.p99_ns),
                     us(reads.hot.p999_ns),
                 );
+            }
+        }
+        let spread: Vec<&RunRecord> = self
+            .results
+            .iter()
+            .filter(|r| r.detail.shards.len() > 1)
+            .collect();
+        if !spread.is_empty() {
+            s.push_str("\n| Workload | Store | Settings | Shard | Commits | Share | Tablets (start → end) | Splits | Merges | Moves |\n");
+            s.push_str("|---|---|---|--:|--:|--:|--:|--:|--:|--:|\n");
+            for r in spread {
+                let total: u64 = r.detail.shards.iter().map(|d| d.commits).sum();
+                for (i, d) in r.detail.shards.iter().enumerate() {
+                    let _ = writeln!(
+                        s,
+                        "| {} | {} | {} | {i} | {} | {:.1}% | {} → {} | {} | {} | {} |",
+                        r.workload,
+                        r.store,
+                        r.store_config,
+                        d.commits,
+                        100.0 * d.commits as f64 / total.max(1) as f64,
+                        d.tablets_start,
+                        d.tablets_end,
+                        d.splits,
+                        d.merges,
+                        d.moves,
+                    );
+                }
             }
         }
         if let Some(sc) = &self.scaling {

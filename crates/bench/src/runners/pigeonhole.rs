@@ -10,7 +10,7 @@ use pigeonhole::{Durability, ErrorCode, Family, Options, Pigeonhole, Table};
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
-use crate::{BenchOp, Client, PigeonholeRunner, Runner};
+use crate::{BenchOp, Client, PigeonholeRunner, Runner, ShardShare};
 
 /// Default per-shard memtable budget of the runner ([`MemoryBudget`]'s write buffer): the
 /// engine's own default.
@@ -169,6 +169,22 @@ impl Runner for PigeonholeRunner {
         self.open
             .as_ref()
             .map_or(0, |o| o.busy.load(Ordering::Relaxed))
+    }
+
+    fn shard_shares(&self) -> Vec<ShardShare> {
+        self.open.as_ref().map_or_else(Vec::new, |o| {
+            o.db.shard_stats()
+                .into_iter()
+                .map(|s| ShardShare {
+                    commits: s.commits,
+                    tablets_start: s.tablets,
+                    tablets_end: s.tablets,
+                    splits: s.splits,
+                    merges: s.merges,
+                    moves: s.moves,
+                })
+                .collect()
+        })
     }
 
     fn client(&self) -> Option<Box<dyn Client>> {

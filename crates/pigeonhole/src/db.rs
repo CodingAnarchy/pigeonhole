@@ -262,6 +262,13 @@ impl Pigeonhole {
         self.db.snapshot()
     }
 
+    /// Per-shard commits, tablets and tablet changes since open, indexed by shard: a bench
+    /// hook (ICR 0010) that shows whether one table's writes spread over the shards.
+    #[doc(hidden)]
+    pub fn shard_stats(&self) -> Vec<crate::ShardStats> {
+        self.db.engine.shard_stats()
+    }
+
     /// The writer default durability.
     pub fn default_durability(&self) -> Durability {
         self.db.engine.default_durability()

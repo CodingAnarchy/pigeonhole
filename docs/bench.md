@@ -28,7 +28,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--engine LIST` | `pigeonhole` (default), `rocksdb`, `sqlite`, `fjall`, or `all` |
 | `--scale smoke\|small\|full\|larger-than-ram` | Preset size; `small` is the default, `smoke` is what `cargo test` runs, `full` is the spec's scale, `larger-than-ram` is `full` with a tiny memory budget (below) |
 | `--records N`, `--ops N`, `--value-len N`, `--threads N`, `--seed N` | Override the preset |
-| `--warmup F` | Unrecorded warmup, as a fraction of `--ops` (default 0.05) |
+| `--warmup F` | Unrecorded warmup, as a fraction of `--ops` (default 0.05; `scaling`: 1.0, see below) |
 | `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
 | `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |
@@ -134,7 +134,9 @@ Each result row gives the workload, store, store settings, size, client threads,
 
 **The scaling gate has two halves, checked differently.** Each `scaling` run evaluates only the efficiency half and prints pass or fail. The other half, "no regression in single-shard p99", needs a baseline: compare this run's `scaling.json` against a stored one with `phdb-bench compare old/scaling.json new/scaling.json`, which checks the single-shard p99 within the p99 tolerance. The weekly `bench.yml` uploads `scaling.json` with every run, so each run leaves the baseline for the next.
 
-**Scaling needs tablet changes** (on by default). With `--no-tablet-changes` a table is one tablet on one shard, so the skewed workload's writes all land on one shard whatever N is, and `scaling` fails by construction. With them on, the balancer splits the table under write skew and spreads the pieces over the shards during the load phase. Tracked in [#51](https://github.com/CodingAnarchy/pigeonhole/issues/51).
+**Scaling needs tablet changes** (on by default). With `--no-tablet-changes` a table is one tablet on one shard, so the skewed workload's writes all land on one shard whatever N is, and `scaling` fails by construction. With them on, the balancer splits the table under write skew and spreads the pieces over the shards. That takes about a second of writes on the machine below, longer than the `small` preset's load plus a 5% warmup, so `scaling` warms up as long as it measures (`--warmup 1.0`) unless `--warmup` says otherwise.
+
+**Where the writes went.** For Pigeonhole, each result also reports every shard's share of the measured phase: commits applied, tablets owned at its start and end, and splits, merges and moves completed. JSON has it in `detail.shards`; the markdown prints a `Shard | Commits | Share` table. A scaling run whose N-shard result shows one shard with all the commits measured one tablet, not N shards.
 
 ### Reproducibility tolerance
 
@@ -152,6 +154,43 @@ How the tolerance was chosen: five runs of `all --engine all` at commit `4b59eac
 Run 1 started while the 15-minute load was still 12.3, the tail of another agent's test suite. Its pairs drifted by up to 28% (throughput), 22% (p50) and 38% (p99), and `compare` fails all four of them. That is the intended outcome: a run that starts on a busy machine should not count as a reproduction. Earlier, runs taken while that suite was at 300% CPU disagreed by 20–90% on every engine at once. `compare` warns when a run started with a one-minute load of 2 or more. The load is recorded in every result's environment. On a macOS desktop the one-minute load rarely drops below 1 even when idle, so 2 is the practical bar for "quiet".
 
 `compare` is symmetric: it flags any change beyond tolerance, faster or slower. An unexplained improvement is as suspect as a regression, and an intended one means it is time for a new baseline. It warns when the two runs come from different machines or build profiles, because the tolerance only means something on one machine. Close other heavy work while measuring. Laptops also throttle and switch between performance and efficiency cores.
+
+## Scaling gate results (this Mac, non-reference)
+
+**Single runs, n=1, commit `87afe1f` plus this section's bench changes**, measured 2026-10-08: `phdb-bench scaling --shards N` at `--scale small` (50,000 records, 200,000 measured writes) and `--scale full` (1,000,000 records, 2,000,000 measured writes), release, `skewed-multi-shard`, N client threads, buffered commits, 64 MiB write buffer, tablet changes on, warmup equal to the measured ops (single-threaded, unrecorded).
+
+**Environment:** Apple M5 (10 cores, 24 GiB), macOS 26.5.2 aarch64, APFS [non-reference (D5)]. macOS ignores thread pinning. The one-minute load at the start of each run is in the table; the last `full` run started above the quiet bar of 2.
+
+| Scale | N | Load | 1 shard ops/s | N shards ops/s | Efficiency | 1-shard p99 µs | N-shard p99 µs |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| small | 2 | 1.98 | 172.4K | 197.8K | 0.57 | 14.8 | 14.8 |
+| small | 4 | 1.99 | 240.6K | 255.1K | 0.27 | 32.3 | 34.3 |
+| small | 8 | 1.91 | 281.3K | 250.6K | 0.11 | 504 | 58.1 |
+| full | 2 | 1.76 | 156.2K | 151.9K | 0.49 | 16.8 | 19.2 |
+| full | 4 | 1.80 | 193.4K | 185.3K | 0.24 | 49.4 | 155 |
+| full | 8 | 3.33 | 237.8K | 191.3K | 0.10 | 524 | 185 |
+
+The gate (efficiency ≥ 0.8) fails at every N. **The writes do spread.** Commits per shard in the N-shard runs, as a share of the measured phase, with tablets owned at its start:
+
+| Scale | N | Commits per shard (%) | Tablets per shard at start | Splits / moves during the phase |
+|---|--:|---|---|---|
+| small | 2 | 49.8, 50.2 | 1, 1 | 0 / 0 |
+| small | 4 | 17.4, 28.6, 27.7, 26.2 | 1, 1, 1, 1 | 0 / 0 |
+| small | 8 | 14.4, 13.1, 14.3, 11.1, 16.2, 8.1, 11.1, 11.8 | 1 on each | 3 / 1 |
+| full | 2 | 46.0, 54.0 | 2, 2 | 1 / 7 |
+| full | 4 | 23.9, 26.9, 24.8, 24.4 | 4, 2, 3, 2 | 0 / 8 |
+| full | 8 | 13.2, 12.8, 13.6, 12.5, 11.9, 12.7, 11.3, 11.9 | 6, 4, 3, 3, 5, 4, 2, 2 | 3 / 10 |
+
+With the old 5% warmup, `small` at 8 shards measured one tablet: all 200,000 commits on shard 1, no split completed in the run's ~1 s of writes (0.37 s load, 10,000 warmup ops, 0.62 s measured). A warmup of 50,000 ops put the first split inside the measured phase (53% of commits on one shard); 100,000 to 200,000 spread the table before it. At `full` the load phase alone is long enough.
+
+**Why spreading does not raise throughput.** A `sample` profile (macOS, 10 s each, `skewed-multi-shard --scale full --threads 8 --ops 8000000`) of one shard and of eight:
+
+- **One shard is CPU-bound.** Its thread was parked in about 1% of samples. About 40% of its time went to `resolve_group` waking the 8 client threads (`semaphore_signal_trap` through `ThreadWake`), about 10% to the WAL `pwrite`, and the rest to memtable inserts and the group path. Throughput 269K ops/s.
+- **Eight shards are mostly idle.** Each shard thread was parked in the runtime (`IdlePark::park`, `thread::park`) in 64–75% of samples, and spent 7–13% in `pwrite` and 5–8% waking clients. Commits were spread 11–14% per shard. Throughput 194K ops/s.
+- **The clients are latency-bound.** Each client thread was blocked in about 91% of samples: about 78% in `PendingCommit::wait` waiting for its shard's reply (`write.rs:254`), and about 14% waiting for the global visibility watermark (`wait_visible`, `write.rs:255`, D19), which waits for every shard's in-flight group below its seqno.
+- **Little lock contention.** `__psynch_mutexwait` was under 1.5% of a shard thread's samples. It comes from the global visibility-waiter list, which every shard locks in `publish_watermark` → `wake_visible` after each group and every client locks in `wait_visible`.
+
+With N closed-loop clients, throughput is about N divided by commit latency. At one shard, group commit puts the 8 clients' writes in one batch and one `pwrite`. At eight shards each shard has one client: every commit pays its own `pwrite`, two cross-thread wakes (submit, reply), and the cross-shard visibility wait, while the shard threads idle. With 32 clients at `small` (load 2.66), 8 shards reached 409.6K ops/s against 354.1K on one shard (efficiency 0.14). Changing the workload so it can saturate one shard, and cutting the per-commit handoff, is tracked in [#154](https://github.com/CodingAnarchy/pigeonhole/issues/154) and [#134](https://github.com/CodingAnarchy/pigeonhole/issues/134) (Phase 3).
 
 ## Results with disk-backed storage (this Mac, non-reference)
 

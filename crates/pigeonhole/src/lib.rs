@@ -116,5 +116,7 @@ pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use write::{CommitInfo, RowMutation, Transaction, WriteBatch};
 
+#[doc(hidden)]
+pub use pigeonhole_engine::ShardStats;
 pub use pigeonhole_engine::{MergeError, MergeOperator};
 pub use pigeonhole_format::Durability;
