@@ -42,6 +42,8 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, ScanCell, ScanCursor, ScanSpec};
+#[doc(hidden)]
+pub use shard::set_tracing;
 pub use snapshot::{Snapshot, TabletMap, View};
 pub use write::{PendingCommit, Predicate, Txn, WriteBatch};
 

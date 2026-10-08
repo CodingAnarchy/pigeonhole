@@ -36,10 +36,11 @@
 //! does not replay exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::time::{Duration, Instant};
 
 use pigeonhole::{Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, Snapshot, Table};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
@@ -1088,7 +1089,11 @@ impl Run {
     }
 }
 
-fn run(seed: u64, cfg: &Config) -> Result<Stats, String> {
+/// Runs `seed` under `cfg`, keeping `progress` at the step under way (for the watchdog in
+/// [`check`]).
+fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, String> {
+    let at = |what: String| *progress.lock().unwrap_or_else(PoisonError::into_inner) = what;
+    at("open".into());
     let mut run = Run::new(seed, cfg.clone())?;
     let mut rng = Rng::new(seed ^ 0xa11ce);
     let ops: Vec<Op> = Workload::new(seed, "t", cfg.spec.clone())
@@ -1096,17 +1101,21 @@ fn run(seed: u64, cfg: &Config) -> Result<Stats, String> {
         .collect();
     let mut result = Ok(());
     for (i, op) in ops.into_iter().enumerate() {
+        at(format!("op {i}: {op:?}"));
         if let Err(e) = run.step(op, &mut rng) {
             result = Err(format!("op {i}: {e}"));
             break;
         }
     }
     if result.is_ok() && run.armed {
+        at("final crash and recovery".into());
         result = run.crash_and_recover(CrashKind::Power, false);
     }
     if result.is_ok() {
+        at("final dump".into());
         result = run.compare_dump("at the end");
     }
+    at("final close".into());
     match result {
         Ok(()) => {
             if let Ok(f) = run
@@ -1144,12 +1153,67 @@ fn seeds() -> Vec<u64> {
     (base..base + var("PIGEONHOLE_SEEDS", 1)).collect()
 }
 
+/// How long one seed may run before [`check`] declares it hung: `PIGEONHOLE_SEED_TIMEOUT`
+/// seconds, 120 by default (a seed normally takes well under a second).
+fn seed_timeout() -> Duration {
+    let secs = std::env::var("PIGEONHOLE_SEED_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    Duration::from_secs(secs)
+}
+
+/// Runs every seed of `cfg`. Each runs on its own thread under a watchdog: a seed that
+/// outlives [`seed_timeout`] is reported with its test, configuration and the step it was
+/// on, and the process aborts, so a hang fails fast and names itself instead of eating the
+/// job's timeout (#244, #209).
 fn check(cfg: &Config) {
+    let test = std::thread::current().name().unwrap_or("?").to_owned();
+    let limit = seed_timeout();
     for seed in seeds() {
-        match run(seed, cfg) {
-            Ok(stats) => eprintln!("seed {seed}: {stats:?}"),
-            Err(e) => panic!("{e}"),
+        let started = Instant::now();
+        let progress = Arc::new(Mutex::new(String::new()));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let (cfg, progress) = (cfg.clone(), Arc::clone(&progress));
+            std::thread::Builder::new()
+                .name(format!("{test} seed {seed}"))
+                .spawn(move || {
+                    let _ = tx.send(run(seed, &cfg, &progress));
+                })
+                .expect("spawn a seed's thread")
+        };
+        match rx.recv_timeout(limit) {
+            Ok(Ok(stats)) => eprintln!("seed {seed}: {stats:?} in {:?}", started.elapsed()),
+            Ok(Err(e)) => panic!("{e}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let at = progress
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                // Straight to stderr: the test harness's capture would lose an `eprintln!`.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}) \
+                     did not finish in {limit:?}; it was at {at}",
+                    cfg.shards,
+                    cfg.tablet_changes,
+                    cfg.deferred_io
+                );
+                // What the shards do from here on, if anything (#244).
+                pigeonhole_engine::set_tracing(true);
+                std::thread::sleep(Duration::from_secs(5));
+                let _ = writeln!(std::io::stderr(), "HUNG: end of the trace after the hang");
+                std::process::abort();
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Err(panic) = worker.join() {
+                    std::panic::resume_unwind(panic);
+                }
+                unreachable!("a seed's thread ended without a result");
+            }
         }
+        let _ = worker.join();
     }
 }
 
