@@ -13,6 +13,7 @@ The next release is **0.2.0**: counters change in a breaking way (below), and ev
   - `incr_at(family, qualifier, ts, delta)` (new) adds to the bucket at `ts`, for hourly or daily totals; each bucket is a version. `put_i64` sets the counter and `put_i64_at` (new) a bucket; later increments add to them.
   - Only `i64` values are accepted: `put`, `put_at`, `put_f64` and untyped `merge` operands fail with `InvalidArgument`.
   - A delete hides only what was written before it, so an `incr` after `delete_column` or `delete_row` starts the counter from 0.
+  - Writes of one counter in one mutation or batch apply in order (D186, #295): `incr(c, 1).incr(c, 2)` adds 3 and `put_i64(c, 5).incr(c, 1)` leaves 6. Other families keep D34 (the last write of a cell in a commit wins).
   - A TTL expires each bucket; with a TTL the fixed timestamp would expire at once, so `incr` and `put_i64` without a timestamp fail with `InvalidArgument` there. `max_versions` limits reads; compaction keeps older buckets, so bound storage with a TTL.
 - `pigeonhole-engine`, `pigeonhole-format`, `pigeonhole-compaction` and `pigeonhole-sim`: `FamilyOptions::kind` (`FamilyKind::{Standard, Counter}`), `WriteBatch::merge_at`, `COUNTER_TS`, `ResolveOptions::counter`, `GcPolicy::other_sources`, and the model's `ModelFamily::counter`, `ModelOp::Incr::ts` and `ModelError::CounterWrite`.
 

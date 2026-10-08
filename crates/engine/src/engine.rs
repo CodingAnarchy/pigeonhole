@@ -11,10 +11,10 @@ use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::MergeRegistry;
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions};
 use pigeonhole_format::shm::ViewRecord;
-use pigeonhole_format::value::ValueTag;
+use pigeonhole_format::value::{ValueRef, ValueTag, encode_value};
 use pigeonhole_format::wal::{BatchBuilder, Mutation, WalRecord};
 use pigeonhole_format::{
-    Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, StreamId, TableId, TabletId,
+    Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, StreamId, TableId, TabletId, Timestamp,
 };
 use pigeonhole_io::{ErrorKind, FileRef, Locality, OpenOptions};
 use pigeonhole_memtable::{ArenaRegion, MemtableReader, ShardArena};
@@ -1831,8 +1831,10 @@ impl Inner {
             }
         }
         let mut shards: Vec<ShardId> = Vec::new();
-        // Whether a counter-family put or operand takes the fixed timestamp (D179).
+        // Whether a counter-family put or operand takes the fixed timestamp (D179), and how
+        // many counter puts and operands there are (two may combine, #295).
         let mut fixed_ts = false;
+        let mut counter_writes = 0usize;
         for m in batch.batch().iter() {
             let m = m?;
             let Some(meta) = catalog.family(m.family) else {
@@ -1846,6 +1848,7 @@ impl Inner {
             }
             if meta.options.kind == FamilyKind::Counter {
                 fixed_ts |= check_counter_write(&m, meta, catalog)?;
+                counter_writes += usize::from(matches!(m.kind, Kind::Put | Kind::Merge));
             } else if m.kind == Kind::Merge && m.ts.is_some() {
                 return Err(Error::InvalidArgument(format!(
                     "{} is not a counter family: only a counter family takes increments at a \
@@ -1879,8 +1882,8 @@ impl Inner {
                 shards.push(shard);
             }
         }
-        if fixed_ts {
-            return Ok((with_counter_timestamps(&batch.builder, catalog)?, shards));
+        if fixed_ts || counter_writes > 1 {
+            return Ok((prepare_counter_writes(&batch.builder, catalog)?, shards));
         }
         Ok((batch.builder, shards))
     }
@@ -2460,20 +2463,53 @@ fn family_name(catalog: &Catalog, table: TableId, family: FamilyId) -> String {
     }
 }
 
-/// `batch` with every put and operand of a counter family that has no timestamp moved to
-/// the fixed counter timestamp, [`COUNTER_TS`].
-fn with_counter_timestamps(batch: &BatchBuilder, catalog: &Catalog) -> Result<BatchBuilder> {
-    let mut out = BatchBuilder::new();
+/// `(table, family, row, qualifier, timestamp)` of a cell in a batch.
+type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
+
+/// `batch` with its counter-family writes prepared (D179, #295): a put or operand without a
+/// timestamp moves to the fixed counter timestamp, [`COUNTER_TS`], and an operand of a cell
+/// (column and timestamp) that an earlier put or operand of this batch wrote combines into
+/// that write: the put's value or the operand grows by it, in write order. Deletes do not
+/// stop a combination; D34 then collapses what is left of one cell to the last write.
+fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<BatchBuilder> {
+    struct Write<'a> {
+        m: Mutation<'a>,
+        /// The value of a combined write, replacing `m.value`.
+        value: Option<Vec<u8>>,
+    }
+    let mut writes: Vec<Write<'_>> = Vec::new();
+    // The latest counter put or operand of each cell.
+    let mut latest: HashMap<CellKey<'_>, usize> = HashMap::new();
     for m in batch.batch().iter() {
-        let m = m?;
+        let mut m = m?;
         let counter = catalog
             .family(m.family)
             .is_some_and(|f| f.options.kind == FamilyKind::Counter);
-        let ts = match (m.kind, m.ts) {
-            (Kind::Put | Kind::Merge, None) if counter => Some(COUNTER_TS),
-            (_, ts) => ts,
-        };
-        out.push(m.table, m.family, m.kind, m.row, m.qualifier, ts, m.value)?;
+        if !(counter && matches!(m.kind, Kind::Put | Kind::Merge)) {
+            writes.push(Write { m, value: None });
+            continue;
+        }
+        let ts = *m.ts.get_or_insert(COUNTER_TS);
+        let key = (m.table, m.family, m.row, m.qualifier, ts);
+        if m.kind == Kind::Merge
+            && let Some(&i) = latest.get(&key)
+        {
+            let w = &mut writes[i];
+            let sum = stored_i64(w.value.as_deref().unwrap_or(w.m.value))
+                .wrapping_add(stored_i64(m.value));
+            let mut v = Vec::with_capacity(9);
+            encode_value(&mut v, ValueRef::I64(sum));
+            w.value = Some(v);
+            continue;
+        }
+        latest.insert(key, writes.len());
+        writes.push(Write { m, value: None });
+    }
+    let mut out = BatchBuilder::new();
+    for w in &writes {
+        let m = &w.m;
+        let value = w.value.as_deref().unwrap_or(m.value);
+        out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, value)?;
     }
     Ok(out)
 }
@@ -2485,6 +2521,13 @@ fn check_local(file: &FileRef, allow_fuse: bool) -> Result<()> {
         Locality::Fuse if allow_fuse => Ok(()),
         _ => Err(Error::NetworkFilesystem),
     }
+}
+
+/// The `i64` in a stored counter value (`check_counter_write` admitted only those).
+fn stored_i64(v: &[u8]) -> i64 {
+    v.get(1..9)
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map_or(0, i64::from_le_bytes)
 }
 
 fn check_merge_operator(

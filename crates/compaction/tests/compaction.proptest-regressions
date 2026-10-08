@@ -6,3 +6,6 @@
 # everyone who runs the test benefits from these saved cases.
 cc f545471ac312841de80fc30e1f751acbe39c8a03f13bc42a0d174c26f2bdff3f # shrinks to seed = 1441807873888145, commits = 3
 cc c7989b48e6566e63b80371c5c5c45018604024de7eabd423136226679c3d8ea6 # shrinks to seed = 11187170588779056095, commits = 19
+cc 2a977b0dcb6cc581fcd601f6469de2ee03fc49982ea6ceb364b218e603d6edc3 # shrinks to seed = 2338992553344228631, commits = 5
+cc dd3e74aec06f9e5d89fbe22c482137bfbc76b03e0e14dcfd32d74a94e930b7f7 # shrinks to seed = 2785031272237028780, commits = 13
+cc 2784d3015abae889bc84d6df2c46fa1aa131468b6bb9c5cd04764d55b214dc30 # shrinks to seed = 890572610782042730, commits = 17

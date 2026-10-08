@@ -207,6 +207,9 @@ struct Table {
 ///   explicit or the commit timestamp; `Incr` and `DeleteColumn` use the commit timestamp;
 ///   `DeleteCell` its own). So after a commit no column holds two entries at one `(ts, seqno)`.
 ///   Family and row markers are separate keys and never collapse with column entries.
+///   In a counter family an `Incr` first combines into the latest earlier put or `Incr` of
+///   its cell in the commit ([`combine_counter_writes`], D186 / #295), so `incr(1).incr(2)`
+///   adds 3 and `put(5).incr(1)` writes 6.
 /// - **Same timestamp across commits.** At one timestamp the newest-seqno put is the
 ///   version's base; merge operands with a newer seqno fold onto it; every older entry at
 ///   that timestamp is shadowed. A timestamp with operands only folds them into the run
@@ -311,6 +314,8 @@ impl Model {
         for op in ops {
             self.validate(op)?;
         }
+        let combined = combine_counter_writes(ops, |table, family| self.is_counter(table, family));
+        let ops = combined.as_slice();
         self.commits.push(durability);
         let seqno = self.commits.len() as Seqno;
         // Keep only the last column-level mutation per (row, family, qualifier, ts).
@@ -1141,6 +1146,67 @@ fn resolve_counter(
                 .ok_or_else(|| ModelError::MergeFailed(family.name.clone()))
         })
         .collect()
+}
+
+/// `ops` with the writes of counter families combined as the store combines them within
+/// one commit (decision D186, #295): an `Incr` of a cell (table, row, family, qualifier and
+/// timestamp, [`COUNTER_TS`] when it has none) that an earlier put or `Incr` of `ops` wrote
+/// is added to that write (wrapping), in order, and dropped. Deletes do not stop a
+/// combination; D34 then collapses what is left of a cell to the last write. `counter`
+/// tells whether `(table, family)` is a counter family; other families' ops are unchanged.
+pub fn combine_counter_writes(
+    ops: &[ModelOp],
+    counter: impl Fn(&str, &str) -> bool,
+) -> Vec<ModelOp> {
+    let mut out: Vec<ModelOp> = Vec::with_capacity(ops.len());
+    let mut latest: BTreeMap<CollapseKey<'_>, usize> = BTreeMap::new();
+    for op in ops {
+        let (table, row, family, qualifier, ts) = match op {
+            ModelOp::Put {
+                table,
+                row,
+                family,
+                qualifier,
+                ts,
+                ..
+            }
+            | ModelOp::Incr {
+                table,
+                row,
+                family,
+                qualifier,
+                ts,
+                ..
+            } if counter(table, family) => (table, row, family, qualifier, ts),
+            _ => {
+                out.push(op.clone());
+                continue;
+            }
+        };
+        let key = (
+            table.as_str(),
+            row.as_slice(),
+            family.as_str(),
+            qualifier.as_slice(),
+            ts.unwrap_or(COUNTER_TS),
+        );
+        if let ModelOp::Incr { delta, .. } = op
+            && let Some(&i) = latest.get(&key)
+        {
+            match &mut out[i] {
+                ModelOp::Incr { delta: d, .. } => *d = d.wrapping_add(*delta),
+                ModelOp::Put { value, .. } => {
+                    let base = as_i64(value).unwrap_or(0);
+                    *value = base.wrapping_add(*delta).to_le_bytes().to_vec();
+                }
+                _ => unreachable!("only puts and increments are combined into"),
+            }
+            continue;
+        }
+        latest.insert(key, out.len());
+        out.push(op.clone());
+    }
+    out
 }
 
 /// `(row, family, qualifier, ts)` of a column-level mutation, borrowed.
@@ -2102,5 +2168,60 @@ mod tests {
             c.try_commit(&[at], 10, Durability::Sync),
             Err(ModelError::CounterWrite("c".into()))
         );
+    }
+
+    #[test]
+    fn counter_writes_in_one_commit_combine() {
+        let mut m = sum_model();
+        m.commit(
+            &[sum_incr("s", None, 1), sum_incr("s", None, 2)],
+            10,
+            Durability::Sync,
+        );
+        assert_eq!(sums(&m, "s", 1, 20), [(COUNTER_TS, 3)]);
+        let five = 5i64.to_le_bytes();
+        m.commit(
+            &[sum_put("s", None, &five), sum_incr("s", None, 1)],
+            20,
+            Durability::Sync,
+        );
+        assert_eq!(sums(&m, "s", 2, 30), [(COUNTER_TS, 6)]);
+        // A put after an increment sets the cell (D34: the last write of a cell wins).
+        m.commit(
+            &[sum_incr("s", None, 7), sum_put("s", None, &five)],
+            30,
+            Durability::Sync,
+        );
+        assert_eq!(sums(&m, "s", 3, 40), [(COUNTER_TS, 5)]);
+        // Buckets combine on their own; `None` and `Some(COUNTER_TS)` are one cell.
+        m.commit(
+            &[
+                sum_incr("s", Some(100), 1),
+                sum_incr("s", Some(COUNTER_TS), 2),
+                sum_incr("s", Some(100), 4),
+                sum_incr("s", None, 8),
+            ],
+            40,
+            Durability::Sync,
+        );
+        assert_eq!(sums(&m, "s", 4, 50), [(100, 5), (COUNTER_TS, 15)]);
+        // A delete in the commit does not split a combination, and hides only earlier
+        // commits (D186).
+        let del = ModelOp::DeleteColumn {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "s".into(),
+            qualifier: b"n".to_vec(),
+        };
+        m.commit(
+            &[sum_incr("s", None, 1), del, sum_incr("s", None, 2)],
+            50,
+            Durability::Sync,
+        );
+        assert_eq!(sums(&m, "s", 5, 60), [(100, 5), (COUNTER_TS, 3)]);
+        // Other families keep D34: the last write of a cell wins.
+        let mut c = model();
+        c.commit(&[incr("r", 1), incr("r", 2)], 10, Durability::Sync);
+        assert_eq!(counter(&c, "r", 1), [(10, 2)]);
     }
 }

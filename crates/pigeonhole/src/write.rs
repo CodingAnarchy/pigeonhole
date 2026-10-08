@@ -283,8 +283,9 @@ impl RowMutation<'_> {
 
     /// Atomically adds `delta` (wrapping) to the counter in a counter family
     /// ([`Family::counter`](crate::Family::counter)) without reading it. Increments of one
-    /// counter combine into one cell; two in the same mutation collapse to the last one
-    /// (decision D34). Other families fail with `InvalidArgument` at commit.
+    /// counter combine into one cell. Within one mutation (or batch) the writes of a counter
+    /// apply in order: `incr(c, 1).incr(c, 2)` adds 3, and `put_i64(c, 5).incr(c, 1)` sets
+    /// 6 (decision D186). Other families fail with `InvalidArgument` at commit.
     pub fn incr(self, family: &str, qualifier: &[u8], delta: i64) -> Self {
         self.op(family, qualifier, 8, |b, t, f, row| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))

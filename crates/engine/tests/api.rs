@@ -1254,3 +1254,62 @@ fn counter_family_write_rules() {
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     db.close().unwrap();
 }
+
+/// #295 (D186): writes of one counter cell in one commit apply in order: operands add up,
+/// and an operand after a put adds to it. Other families keep D34 (the last write wins).
+#[test]
+fn counter_writes_in_one_commit_combine() {
+    let vfs = SimVfs::new(295);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table(
+            "t",
+            &[
+                ("c".into(), counter_family(0)),
+                (
+                    "legacy".into(),
+                    FamilyOptions {
+                        merge_operator: "pigeonhole.i64_add".into(),
+                        ..FamilyOptions::default()
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+    let (c, legacy) = (t.family("c").unwrap().id, t.family("legacy").unwrap().id);
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, c, b"r", b"n", ValueRef::I64(1)).unwrap();
+    wb.merge(t.id, c, b"r", b"n", ValueRef::I64(2)).unwrap();
+    wb.put(t.id, c, b"s", b"n", None, ValueRef::I64(5)).unwrap();
+    wb.merge(t.id, c, b"s", b"n", ValueRef::I64(1)).unwrap();
+    wb.merge_at(t.id, c, b"s", b"n", 40, ValueRef::I64(3))
+        .unwrap();
+    wb.merge_at(t.id, c, b"s", b"n", 40, ValueRef::I64(4))
+        .unwrap();
+    wb.merge(t.id, legacy, b"r", b"n", ValueRef::I64(1))
+        .unwrap();
+    wb.merge(t.id, legacy, b"r", b"n", ValueRef::I64(2))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    assert_eq!(counter_versions(&db, &t, "c", b"r"), [(COUNTER_TS, 3)]);
+    assert_eq!(
+        counter_versions(&db, &t, "c", b"s"),
+        [(40, 7), (COUNTER_TS, 6)]
+    );
+    let legacy_sum: Vec<i64> = counter_versions(&db, &t, "legacy", b"r")
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(legacy_sum, [2], "D34 still collapses other families");
+    // A transaction's batch combines the same way.
+    let mut txn = db.begin().unwrap();
+    txn.batch()
+        .merge(t.id, c, b"r", b"n", ValueRef::I64(10))
+        .unwrap();
+    txn.batch()
+        .merge(t.id, c, b"r", b"n", ValueRef::I64(20))
+        .unwrap();
+    txn.commit(None).unwrap();
+    assert_eq!(counter_versions(&db, &t, "c", b"r"), [(COUNTER_TS, 33)]);
+    db.close().unwrap();
+}
