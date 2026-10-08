@@ -20,7 +20,9 @@ use pigeonhole_format::{
     BlobFileId, Cursor, Durability, FamilyId, Seqno, SstId, TableId, TabletId, Timestamp,
 };
 use pigeonhole_pager::Pager;
-use pigeonhole_sim::{COUNTER_TS, Model, ModelError, ModelFamily, ModelOp, Rng};
+use pigeonhole_sim::{
+    COUNTER_TS, Model, ModelError, ModelFamily, ModelOp, Rng, combine_counter_writes,
+};
 use pigeonhole_sst::{
     BlobReader, ReadOptions, ScanFilter, SstIter, SstReader, SstWriter, SstWriterOptions,
 };
@@ -220,6 +222,8 @@ fn commit_ops(
     counter: bool,
 ) -> Vec<Entry> {
     let seqno = model.commit(ops, commit_ts, Durability::Sync);
+    // Counter writes of one cell combine within a commit, as the store does them (#295).
+    let ops = &combine_counter_writes(ops, |_, _| counter);
     // Where a put or operand without a timestamp lands.
     let default_ts = if counter { COUNTER_TS } else { commit_ts };
     // The same commit as stored entries, collapsed like the model (D34).
