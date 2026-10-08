@@ -41,7 +41,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D26](phase-1.md#d26) — a cross-shard commit's id is its seqno
 - [D27](phase-1.md#d27) — a shared-memory directory plus generation-named regions
 - [D28](phase-1.md#d28) — an oversized view is refused, never truncated
-- [D29](phase-1.md#d29) — small memtable values are copied; one-shot gets avoid view refcounts
+- [D29](phase-1.md#d29) — small memtable values are copied; one-shot gets avoid view refcounts · **amended by D180**
 - [D30](phase-1.md#d30) — no fsync on a shard's foreground loop
 - [D31](phase-1.md#d31) — merge operators are associative folds
 - [D32](phase-1.md#d32) — cursors own what they read
@@ -89,7 +89,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D74](phase-1.md#d74) — purges follow HBase semantics · owner decision · amends D9
 - [D75](phase-1.md#d75) — `I64Add` accepts only `ValueTag::I64` values · compaction
 - [D76](phase-1.md#d76) — `ResolveOptions::versions` and the family's `max_versions` · compaction
-- [D77](phase-1.md#d77) — value predicates on typed and blob values · compaction
+- [D77](phase-1.md#d77) — value predicates on typed and blob values · compaction · **amended by D180**
 - [D78](phase-1.md#d78) — rows split across SSTs of one level move together; point gets consult every overlapping SST of a level · compaction · amends D9
 - [D79](phase-1.md#d79) — what the engine does with picker tasks · compaction
 - [D80](phase-1.md#d80) — blob accounting in Phase 1 · compaction
@@ -132,7 +132,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D117](phase-1.md#d117) — Is `SetFlushed` the memtable's max seqno, or the shard's visible seqno · engine Milestone B
 - [D118](phase-1.md#d118) — How conservative is `GcPolicy` about reader-process snapshots · engine Milestone B; precise per-slot pinning is #39
 - [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161, D166**
-- [D120](phase-1.md#d120) — What does `backup` write for an engine with memtables and many levels · engine Milestone B; blob extents are #58
+- [D120](phase-1.md#d120) — What does `backup` write for an engine with memtables and many levels · engine Milestone B; blob extents are #58 · **amended by D182**
 - [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B · **amended by D156**
 - [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
 - [D123](phase-1.md#d123) — Does the sim's recovery helper cover a coordinator that is also a participant · superseded for new code by D114; engine adoption in #48 · **amended by D125**
@@ -189,9 +189,12 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D174](phase-2.md#d174) — Test-hook recording is opt-in, and the test-hooks wait matches production · engine, #148, #261 · refines D164
 - [D175](phase-2.md#d175) — The zstd codec, its library and its level · format, sst, pigeonhole, #44, #255 · amends D168
 - [D176](phase-2.md#d176) — The stopped-clock fallbacks apply only to a simulated clock · io, engine, runtime, #263, #267 · amends D126, refines D161, D171
-- [D177](phase-2.md#d177) — Backup releases its snapshot's memtables before the long merge · engine, #262, #268
+- [D177](phase-2.md#d177) — Backup releases its snapshot's memtables before the long merge · engine, #262, #268 · **amended by D182**
 - [D178](phase-2.md#d178) — The bench metric family compacts FIFO in Pigeonhole and RocksDB · bench, #236, #270 · refines D163
 - [D179](phase-2.md#d179) — Counters are declared families, combined per timestamp like Bigtable aggregates · owner decision, #274 · supersedes the #233 cross-timestamp fold; amends D41, D73
+- [D180](phase-2.md#d180) — Blob separation and blob GC · compaction, engine, #33, #235 · amends D29, D77
+- [D181](phase-2.md#d181) — File format version 2 · engine, format, #235
+- [D182](phase-2.md#d182) — Backup copies the separated values the snapshot references · engine, #58, #238 · amends D120, refines D177
 
 ## Open questions
 _None._
