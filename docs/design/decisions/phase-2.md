@@ -249,3 +249,39 @@ D126's fallbacks for a clock that does not move (admit writers when no compactio
 - Regression test: `engine/tests/coarse_clock.rs` uses a real clock in 4 ms steps. A commit waiting for room that snapshots hold gets `Busy` only after the 300 ms stall timeout; with the old behavior it was refused after 1.6 ms.
 
 **Coordinator:** confirmed; ICR 0012 (`Vfs::clock_is_simulated`, an additive provided method) approved on #267.
+
+<a id="d177"></a>
+## D177 — Backup releases its snapshot's memtables before the long merge (approved; engine, #262, #268)
+`backup` held one snapshot, memtables included, for its whole run. A snapshot keeps its memtables' arena chunks allocated, so a backup of a large file (minutes) left writers to fill the rest of the arena and fail with `Busy` at the stall timeout (D124, D138). On a simulated clock the hopeless case was refused at once.
+
+The options weighed:
+- **Copy the memtables first, then keep only the SST view** (chosen). The snapshot point stays exactly the call time, as documented. The memtable copy is bounded by the arena: it reads memory, but it writes (and compresses, LZ4 or zstd per family) up to an arena's worth of SSTs to the new file while the memtables are pinned, so its length is that write's. The long part reads SSTs whose extents the kept view pins.
+- **`flush()` first, then back up an SST-only snapshot.** This is simpler, but the snapshot would still include memtables with writes that land between the flush and the snapshot. It also turns every backup into a forced flush of every slot (more L0 files, a compaction burst) and moves the point in time.
+
+**Interim behavior:**
+- **Phase 1.** For every slot, the snapshot's memtable entries at or below its seqno go into temporary SSTs in the new file.
+- **Release.** `backup` then builds a view with the same tablets, catalog and SST set but no memtables, registered (`ViewPin`) so its SSTs stay unreclaimed, and drops the snapshot. Its memtables' chunks are freed as soon as nothing else holds them. The seqno pin goes too: compactions may garbage-collect past the snapshot meanwhile, which is harmless since the backup reads the pinned old SST files.
+- **Phase 2.** Each slot merges its source SSTs with its temporary SSTs and writes the final last-level SSTs. The temporary extents are abandoned in the new file right after (the new file's bitmap is rebuilt from its manifest at open anyway, D8). Temporary SSTs are read through a private block cache, because the new file's SST ids start at 1 and would collide with the engine's cache keys.
+- **Cost.** The new file briefly holds up to one arena's worth of temporary SSTs. Their abandoned extents become free space that the phase-2 outputs reuse only in part (they are allocated in other size classes and order), so the copy can end up to about an arena larger than a freshly compacted file. It is still a valid file: free extents are not persisted, and its bitmap is rebuilt from the manifest at open (D8); `shrink` reclaims the tail. The old SSTs a compaction replaces during the backup stay allocated until it ends, as they did.
+- **Test hook.** `Engine::after_backup_releases_memtables` runs between the phases. No public seam can observe the release, and the test (`backup_releases_the_memtable_arena_before_its_long_merge`) checks that a flush there gives the arena back.
+
+**Coordinator:** confirmed. With blob separation (#235/#238), phase 1 writes values inline and only phase 2 separates (from the #268 review).
+
+<a id="d178"></a>
+## D178 — The bench `metric` family compacts FIFO in Pigeonhole and RocksDB; RocksDB scans merge column families only once `metric` is written (approved; bench, #236, #270; refines D163)
+D163 asked to switch Pigeonhole's `metric` family to `FifoByTime` once the picker existed, and to give RocksDB FIFO compaction with a TTL as the fair counterpart. RocksDB's FIFO is per column family, the runner kept every family in one, and `BenchOp::Scan` carries no family. So the question was how a scan finds `metric` cells without slowing the other workloads' scans, the sparse-wide gate's included.
+
+The options weighed:
+- **Route by key prefix** (`ts:` rows live only in `metric`). This is cheapest, but the runner's correctness would hang on the workload's key layout.
+- **A per-run workload hook** opening the default column family as FIFO for `time-series-ttl`. This needs an ICR on `Runner`, and it would compact `metric`'s neighbours FIFO in a mixed run.
+- **Merge both column families in every scan.** This is always correct, but adds a seek on an empty column family to every scan of every workload.
+- **Merge only once `metric` was written** (chosen).
+
+**Interim behavior:**
+- Pigeonhole's `metric` family is `ttl(1 day)` plus `Compaction::FifoByTime`.
+- RocksDB keeps `metric` cells in a `metric` column family with `DBCompactionStyle::Fifo`, `set_ttl(1 day)` and no size cap (`max_table_files_size = u64::MAX`, as Pigeonhole's FIFO has none). The other families stay in the default column family.
+- RocksDB routes Put, PutAt, Get and GetRow by family. A scan merges the two column families' iterators in key order (keys never collide, since the family byte is part of the key), but only once the runner has written a `metric` cell. A run that never writes one, every workload but `time-series-ttl`, scans exactly as before.
+- Caveat for comparisons: RocksDB's FIFO TTL counts from a file's creation, not from the cells' event times, so it drops the loaded back-dated points later than Pigeonhole does. Within one run (well under a day) it drops nothing. `docs/bench.md` says so next to the store-size note. SQLite and fjall have no FIFO and keep filtering on read.
+- The agreement tests (RocksDB, SQLite and fjall against Pigeonhole on every workload) pass: every engine reads the same cells.
+
+**Coordinator:** confirmed. The sparse-wide gate workload scans one RocksDB iterator, unchanged.
