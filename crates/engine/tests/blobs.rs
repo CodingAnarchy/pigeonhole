@@ -860,3 +860,130 @@ fn blob_gc_empties_files_of_ssts_written_without_references() {
     });
     rig.close();
 }
+
+/// The database `shrink_crash_points` shrinks: `t`'s blob files and SST sit above the space a
+/// dropped table (`junk`, as large) freed, so a shrink moves both kinds of extents (#231).
+fn behind_a_dropped_table(vfs: &Arc<SimVfs>) -> (Rig, TableInfo) {
+    let mut rig = Rig::open(vfs, false);
+    let junk = rig
+        .db
+        .create_table("junk", &[("f".into(), family())])
+        .unwrap();
+    let t = rig.db.create_table("t", &[("f".into(), family())]).unwrap();
+    for (table, generation) in [(&junk, 0u8), (&t, 1)] {
+        for i in 0..120u32 {
+            let mut wb = WriteBatch::new();
+            wb.put(
+                table.id,
+                table.families[0].id,
+                &row(i),
+                b"q",
+                None,
+                ValueRef::Bytes(&big_value(i, generation)),
+            )
+            .unwrap();
+            rig.commit(wb);
+        }
+        rig.flush();
+    }
+    rig.db.drop_table(junk.id).unwrap();
+    rig.idle();
+    (rig, (*t).clone())
+}
+
+fn big_value(i: u32, generation: u8) -> Vec<u8> {
+    let mut v = vec![b'a' + generation; 8 << 10];
+    v[..4].copy_from_slice(&i.to_le_bytes());
+    v
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "a full crash sweep; covered natively")]
+fn shrink_crash_points() {
+    // #288: a power loss at every write point of a shrink that relocates blob and SST
+    // extents (between the copies and the root commit that publishes them, and during it).
+    // After recovery the reads are the same, every extent the manifest names is intact and
+    // accounted for, and the copies a lost commit never published are free space. The
+    // seed picks which unsynced writes survive each crash (`PIGEONHOLE_SEED` and
+    // `PIGEONHOLE_SEEDS` sweep it; seed 288 alone by default).
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let first = env("PIGEONHOLE_SEED", 288);
+    for seed in first..first + env("PIGEONHOLE_SEEDS", 1) {
+        shrink_crash_sweep(seed);
+    }
+}
+
+fn shrink_crash_sweep(seed: u64) {
+    let mut crashed = 0;
+    for n in 1.. {
+        assert!(n < 5_000, "seed {seed}: runaway sweep");
+        let vfs = SimVfs::new(seed);
+        let (mut rig, t) = behind_a_dropped_table(&vfs);
+        let len = |vfs: &SimVfs| {
+            pigeonhole_io::Vfs::open(vfs, Path::new(DB), pigeonhole_io::OpenOptions::read())
+                .unwrap()
+                .len()
+                .unwrap()
+        };
+        let start = len(&vfs);
+        let mut plan = pigeonhole_io::sim::FaultPlan::none();
+        plan.torn_writes = true;
+        plan.reorder_unsynced = true;
+        let armed = vfs.mutating_ops() + n;
+        plan.crash_after_ops = Some(armed);
+        vfs.set_faults(plan);
+        let shrunk = rig.db.shrink();
+        // The crash fired if the shrink reached the armed write.
+        let alive = shrunk.is_ok() && vfs.mutating_ops() < armed;
+        vfs.set_faults(pigeonhole_io::sim::FaultPlan::none());
+        if alive {
+            // The uncrashed shrink moved `t`'s blob extents down: with them left at the tail
+            // the file could not end below three quarters of its length.
+            assert!(
+                len(&vfs) * 4 < start * 3,
+                "seed {seed}: the shrink only went from {start} to {} bytes",
+                len(&vfs)
+            );
+            rig.check();
+            rig.close();
+            break;
+        }
+        crashed += 1;
+        drop(rig);
+        let mut rig = Rig::open(&vfs, false);
+        rig.check();
+        assert!(
+            rig.db.table("junk").is_none(),
+            "seed {seed}, crash point {n}"
+        );
+        let snap = rig.db.snapshot().unwrap();
+        let f = t.families[0].id;
+        for i in [0u32, 1, 59, 119] {
+            let got = rig.db.get(&snap, t.id, f, &row(i), b"q").unwrap().unwrap();
+            assert_eq!(
+                got.value(),
+                ValueRef::Bytes(&big_value(i, 1)),
+                "seed {seed}, crash point {n}, row {i}"
+            );
+        }
+        drop(snap);
+        rig.db.shrink().unwrap();
+        rig.check();
+        assert_eq!(
+            rig.db.unreferenced_bytes(),
+            0,
+            "seed {seed}, crash point {n}"
+        );
+        rig.idle();
+        rig.close();
+    }
+    assert!(
+        crashed > 10,
+        "the sweep reached only {crashed} crash points"
+    );
+}
