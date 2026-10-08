@@ -1305,7 +1305,7 @@ impl Engine {
         }
         let _guard = inner.enter_maintenance()?;
         let snapshot = inner.snapshot()?;
-        crate::maintenance::backup(&inner.shared, &snapshot, dest)
+        crate::maintenance::backup(&inner.shared, snapshot, dest)
     }
 
     /// Truncates the free tail, relocates tail extents the manifest names and truncates the

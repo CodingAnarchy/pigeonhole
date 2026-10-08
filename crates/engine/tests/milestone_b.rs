@@ -739,6 +739,54 @@ fn backup_is_a_consistent_single_file_copy() {
     assert_eq!(sidecars(&vfs), Vec::<String>::new());
 }
 
+#[test]
+fn backup_releases_the_memtable_arena_before_its_long_merge() {
+    // #262: a backup held its snapshot, memtables included, for its whole run, so a long
+    // backup kept the arena allocated and writers stalled into `Busy`. Now it copies the
+    // memtables first and releases them: by the time it merges SSTs, a flush gives the
+    // arena back.
+    let vfs = SimVfs::new(262);
+    let mut o = owned(Arc::clone(&vfs), 1);
+    o.memtable_budget = 2 << 20;
+    o.memtable_freeze_bytes = 1 << 20;
+    o.tablet_changes = false;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    // About 600 KiB in the active memtable: the snapshot pins it.
+    write_rows(&db, &t, 0..2000, Durability::Buffered);
+    let (pinned_free, _, _) = db.arena_free(0);
+    let released = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (db, t, released) = (Arc::clone(&db), Arc::clone(&t), Arc::clone(&released));
+        db.clone()
+            .after_backup_releases_memtables(Box::new(move || {
+                db.flush().unwrap();
+                // One small commit refreshes the arena counters.
+                write_rows(&db, &t, 5000..5001, Durability::Buffered);
+                *released.lock().unwrap() = Some(db.arena_free(0).0);
+            }));
+    }
+    db.backup(Path::new("/db/copy.phdb")).unwrap();
+    let free = released.lock().unwrap().expect("the hook ran");
+    assert!(
+        free > pinned_free + (400 << 10),
+        "{free} bytes free after the flush, {pinned_free} before: the backup still pins the \
+         memtables"
+    );
+    db.close().unwrap();
+    // The copy holds every row written before the backup, and none after.
+    let copy = Engine::open(Path::new("/db/copy.phdb"), owned(Arc::clone(&vfs), 1)).unwrap();
+    let ct = copy.table("t").unwrap();
+    assert_eq!(row_count(&copy, &ct), 2000);
+    assert_eq!(
+        get_bytes(&copy, &ct, b"row01234", b"q").unwrap(),
+        vec![(1234 % 251) as u8; 300]
+    );
+    copy.close().unwrap();
+}
+
 // ---- stalls ----
 
 #[test]
