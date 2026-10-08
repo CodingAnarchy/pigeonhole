@@ -1132,12 +1132,15 @@ fn records_of(streams: &CommitStreams) -> Vec<(u32, RecKind)> {
     }
 }
 
-/// A bottommost compaction the engine committed, to replay on the model after a recovery.
+/// A compaction (or a flush that purged versions, #287) the engine committed, to replay on
+/// the model after a recovery.
 #[derive(Debug, Clone)]
 struct PurgeEvent {
     manifest_version: ManifestVersion,
     /// Only a bottommost compaction purges; the others still bound historical reads.
     bottommost: bool,
+    /// A flush's guarded version purge over exactly these engine seqnos (#287).
+    flush_inputs: Option<Vec<Seqno>>,
     table: String,
     family: String,
     /// Engine seqnos (mapped to model seqnos when applied).
@@ -1146,6 +1149,14 @@ struct PurgeEvent {
     min_ts_above: Timestamp,
     max_seqno: Seqno,
     rows: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+}
+
+impl PurgeEvent {
+    /// Whether the event purges anything (a bottommost compaction or a flush's version
+    /// purge); the others only bound historical reads.
+    fn purges(&self) -> bool {
+        self.bottommost || self.flush_inputs.is_some()
+    }
 }
 
 impl Committed {
@@ -1527,7 +1538,7 @@ impl World {
     /// between the commits it orders by seqno, as the engine did.
     fn drain_compactions_upto(&mut self, upto: Seqno) -> Result<(), Fail> {
         let store = self.store.as_ref().expect("store open");
-        let mut records = store.engine.take_compactions();
+        let mut records = store.engine.take_gc_records();
         records.append(&mut self.pending_purges);
         if records.is_empty() {
             return Ok(());
@@ -1548,7 +1559,9 @@ impl World {
                 self.pending_purges.push(r);
                 continue;
             }
-            self.stats.compactions += 1;
+            if !r.flush {
+                self.stats.compactions += 1;
+            }
             self.compaction_floor = self.compaction_floor.max(r.max_seqno);
             applied = true;
             let (Some(table), Some(family)) =
@@ -1559,6 +1572,7 @@ impl World {
             let event = PurgeEvent {
                 manifest_version: r.manifest_version,
                 bottommost: r.bottommost,
+                flush_inputs: r.input_seqnos.clone().filter(|_| r.versions_purge),
                 table: table.clone(),
                 family: family.clone(),
                 snapshots: r.snapshots.clone(),
@@ -1570,9 +1584,14 @@ impl World {
                     r.rows.1.clone().map_or(Bound::Unbounded, Bound::Excluded),
                 ),
             };
-            if event.bottommost {
+            if event.purges() {
                 self.trace.push(format!(
-                    "purge {}/{} at manifest {} (snapshots {:?}, min_ts_above {}, max_seqno {})",
+                    "purge{} {}/{} at manifest {} (snapshots {:?}, min_ts_above {}, max_seqno {})",
+                    if event.flush_inputs.is_some() {
+                        " (flush)"
+                    } else {
+                        ""
+                    },
                     event.table,
                     event.family,
                     event.manifest_version,
@@ -1598,7 +1617,7 @@ impl World {
             self.pending_purges.clear();
             return;
         };
-        let mut records = store.engine.take_compactions();
+        let mut records = store.engine.take_gc_records();
         records.append(&mut self.pending_purges);
         let table_names: HashMap<TableId, String> = store
             .tables
@@ -1614,6 +1633,7 @@ impl World {
             self.purges.push(PurgeEvent {
                 manifest_version: r.manifest_version,
                 bottommost: r.bottommost,
+                flush_inputs: r.input_seqnos.clone().filter(|_| r.versions_purge),
                 table: table.clone(),
                 family: family.clone(),
                 snapshots: r.snapshots.clone(),
@@ -1645,8 +1665,23 @@ impl World {
     }
 
     fn apply_purge(&mut self, e: &PurgeEvent) {
+        let mut model = std::mem::take(&mut self.model);
+        self.purge_on(&mut model, e);
+        self.model = model;
+    }
+
+    /// Applies `e`'s purge to `model`: a bottommost compaction's, or a flush's guarded
+    /// version purge over its input seqnos (mapped to model seqnos).
+    fn purge_on(&self, model: &mut Model, e: &PurgeEvent) {
         let p = self.model_purge(e);
-        self.model.purge(&p);
+        match &e.flush_inputs {
+            Some(inputs) => {
+                let inputs: Vec<Seqno> = inputs.iter().map(|s| self.model_seqno(*s)).collect();
+                model.purge_versions(&p, &inputs);
+            }
+            None if e.bottommost => model.purge(&p),
+            None => {}
+        }
     }
 
     /// The model a read at `snap` must match, when it is not `self.model`. A snapshot reads
@@ -1659,7 +1694,7 @@ impl World {
     /// rebuilds it.
     fn model_at(&self, snap: &Snapshot) -> Option<Model> {
         let view = snap.view().manifest_version();
-        let newer = |p: &PurgeEvent| p.bottommost && p.manifest_version > view;
+        let newer = |p: &PurgeEvent| p.purges() && p.manifest_version > view;
         if !self.purges.iter().any(newer) {
             return None;
         }
@@ -1683,8 +1718,8 @@ impl World {
             },
             &commits,
         );
-        for p in self.purges.iter().filter(|p| p.bottommost && !newer(p)) {
-            model.purge(&self.model_purge(p));
+        for p in self.purges.iter().filter(|p| p.purges() && !newer(p)) {
+            self.purge_on(&mut model, p);
         }
         Some(model)
     }
@@ -2499,7 +2534,7 @@ impl World {
             .collect();
         for p in &purges {
             self.compaction_floor = self.compaction_floor.max(p.max_seqno);
-            if p.bottommost {
+            if p.purges() {
                 self.apply_purge(p);
             }
         }

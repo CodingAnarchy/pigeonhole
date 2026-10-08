@@ -23,6 +23,7 @@ use pigeonhole_pager::Pager;
 use pigeonhole_runtime::{ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
 use pigeonhole_sst::{SstReader, SstWriter, SstWriterOptions};
 
+use crate::catalog::Catalog;
 use crate::manifest::{self, ManifestReq};
 use crate::shard::{ShardMsg, Shared};
 use crate::snapshot::SstSet;
@@ -49,6 +50,9 @@ pub(crate) struct FlushItem {
     /// Holds applied shares of cross-shard commits: every stream is synced before the
     /// manifest commit.
     pub has_shares: bool,
+    /// The flush GC guard held when the memtable was queued (#287): no other source of the
+    /// slot could hold a delete, so versions beyond `max_versions` may be purged.
+    pub no_outside_deletes: bool,
     pub options: FamilyOptions,
 }
 
@@ -276,6 +280,91 @@ pub(crate) fn write_memtable(sink: &mut SstSink, reader: &MemtableReader) -> Res
     sink.cut()
 }
 
+/// The GC a flush runs its memtable through (#287): compaction's rules for a
+/// non-bottommost job over the slot, with the same read points (live snapshots and the
+/// oldest reader pin), plus the guarded purge of versions beyond `max_versions` when the
+/// shard found no delete outside the memtable as it queued it.
+fn flush_gc(
+    shared: &Shared,
+    item: &FlushItem,
+) -> (
+    pigeonhole_compaction::StreamGc,
+    pigeonhole_compaction::GcPolicy,
+) {
+    let view = shared.view.load();
+    let now = shared.vfs.now_micros();
+    let mut policy =
+        pigeonhole_compaction::GcPolicy::new(crate::compact::gc_snapshots(shared), now, false);
+    policy.no_outside_deletes = item.no_outside_deletes;
+    // The record (test hook) describes the real GC, so a deliberate fault below shows up.
+    let real = policy.clone();
+    #[cfg(feature = "test-hooks")]
+    match shared
+        .hooks
+        .flush_gc_mutation
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        1 => policy.no_outside_deletes = true,
+        2 => policy.snapshots.clear(),
+        _ => {}
+    }
+    let merge = view
+        .catalog
+        .family(item.family)
+        .and_then(|m| m.merge_op.clone());
+    let gc = pigeonhole_compaction::StreamGc::new(&policy, &item.options, merge);
+    (gc, real)
+}
+
+/// The record of a flush (test hook, #287): its GC's read points and clock. Every flush
+/// records, since its GC drops history (entries hidden at every live read point) as a
+/// non-bottommost compaction does; one that ran the guarded version purge also records the
+/// exact seqnos its memtable held. `None` for a tablet gone from the view.
+#[cfg(feature = "test-hooks")]
+fn flush_record(
+    shared: &Shared,
+    item: &FlushItem,
+    policy: &pigeonhole_compaction::GcPolicy,
+) -> Result<Option<crate::compact::CompactionRecord>> {
+    use pigeonhole_format::manifest::FamilyKind;
+    let view = shared.view.load();
+    let Some(tablet) = view.tablets.entry(item.tablet) else {
+        return Ok(None);
+    };
+    let versions_purge = policy.no_outside_deletes
+        && item.options.max_versions != 0
+        && item.options.kind != FamilyKind::Counter;
+    let mut seqnos = std::collections::BTreeSet::new();
+    if versions_purge {
+        let mut it = item.reader.iter();
+        it.seek_to_first()?;
+        while it.valid() {
+            if let Ok((_, _, seqno, _)) = pigeonhole_format::key::split_suffix(it.key()) {
+                seqnos.insert(seqno);
+            }
+            it.next()?;
+        }
+    }
+    Ok(Some(crate::compact::CompactionRecord {
+        manifest_version: 0,
+        table: item.table,
+        tablet: item.tablet,
+        family: item.family,
+        bottommost: false,
+        snapshots: policy.snapshots.clone(),
+        now: policy.now,
+        min_ts_above: 0,
+        max_seqno: item.max_seqno,
+        rows: (
+            (!tablet.start.is_empty()).then(|| tablet.start.clone()),
+            tablet.end.clone(),
+        ),
+        flush: true,
+        versions_purge,
+        input_seqnos: versions_purge.then(|| seqnos.into_iter().collect()),
+    }))
+}
+
 enum Stage {
     Write,
     Barrier(Vec<Waiter<Result<()>>>),
@@ -291,6 +380,13 @@ pub(crate) struct FlushTask {
     idx: usize,
     iter: Option<MemIter>,
     sink: Option<SstSink>,
+    /// Compaction's GC over the memtable being written (#287).
+    gc: Option<pigeonhole_compaction::StreamGc>,
+    /// Per written item, the live-byte change of blob files whose pointers the GC dropped.
+    blob_deltas: Vec<crate::compact::BlobChanges>,
+    /// Records of the items that ran the guarded version purge (test hook).
+    #[cfg(feature = "test-hooks")]
+    records: Vec<crate::compact::CompactionRecord>,
     /// `(item index, sink outputs)` per flushed item.
     written: Vec<(usize, SstSink)>,
     stage: Stage,
@@ -308,6 +404,10 @@ impl FlushTask {
             idx: 0,
             iter: None,
             sink: None,
+            gc: None,
+            blob_deltas: Vec::new(),
+            #[cfg(feature = "test-hooks")]
+            records: Vec::new(),
             written: Vec::new(),
             stage: Stage::Write,
             waker: StdWaker::default(),
@@ -397,13 +497,26 @@ impl FlushTask {
                 let mut it = item.reader.iter();
                 it.seek_to_first()?;
                 self.iter = Some(it);
+                let (gc, _policy) = flush_gc(&self.shared, item);
+                #[cfg(feature = "test-hooks")]
+                if self
+                    .shared
+                    .hooks
+                    .record
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && let Some(r) = flush_record(&self.shared, item, &_policy)?
+                {
+                    self.records.push(r);
+                }
+                self.gc = Some(gc);
             }
-            let (Some(it), Some(sink)) = (self.iter.as_mut(), self.sink.as_mut()) else {
+            let (Some(it), Some(sink), Some(gc)) =
+                (self.iter.as_mut(), self.sink.as_mut(), self.gc.as_mut())
+            else {
                 unreachable!("set above");
             };
-            while it.valid() {
-                sink.add(it.key(), it.value())?;
-                it.next()?;
+            while gc.step(it)? {
+                gc.drain(|k, v| sink.add(k, v))?;
                 n += 1;
                 if n.is_multiple_of(CLOCK_EVERY)
                     && deadline != u64::MAX
@@ -416,6 +529,15 @@ impl FlushTask {
             sink.finish_blobs()?;
             let sink = self.sink.take().expect("open");
             self.iter = None;
+            if let Some(gc) = self.gc.take()
+                && !gc.blob_delta().is_empty()
+            {
+                self.blob_deltas.push(crate::compact::BlobChanges {
+                    family: self.items[self.idx].family,
+                    new: Vec::new(),
+                    delta: gc.blob_delta().to_vec(),
+                });
+            }
             self.written.push((self.idx, sink));
             self.idx += 1;
         }
@@ -486,12 +608,29 @@ impl FlushTask {
                 seqno: item.max_seqno,
             });
         }
+        // Blob pointers the GC dropped lower their files' live counts, computed against the
+        // catalog the commit applies to (as a compaction's are).
+        let deltas = std::mem::take(&mut self.blob_deltas);
+        let kind = if deltas.is_empty() {
+            manifest::ReqKind::Edits(edits)
+        } else {
+            manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
+                let mut edits = edits;
+                for changes in deltas {
+                    edits.extend(crate::compact::blob_edits(catalog, changes)?);
+                }
+                Ok(edits)
+            }))
+        };
         let (tx, rx) = completion();
         let req = ManifestReq {
-            kind: manifest::ReqKind::Edits(edits),
+            kind,
             readers,
             flushed_roots: self.items.iter().map(|i| (self.shard.0, i.root)).collect(),
-            compaction: None,
+            #[cfg(feature = "test-hooks")]
+            compactions: std::mem::take(&mut self.records),
+            #[cfg(not(feature = "test-hooks"))]
+            compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: self.items.iter().map(|i| (i.tablet, i.table)).collect(),
             reply: Box::new(manifest::notify(tx)),

@@ -74,6 +74,12 @@ pub struct GcPolicy {
     /// the `min_ts_above` rule purges. (Counter families never get a `max_versions` purge,
     /// whatever this holds.)
     pub other_sources: Option<Vec<OtherSource>>,
+    /// No source of the slot outside the job's input can hold a delete (every other SST
+    /// has none, nor do the other memtables or prepared shares). Then a version beyond
+    /// `max_versions` among the input's own versions of a column stays hidden whatever lies
+    /// outside, so it is purged at any level, not only the bottommost (#287; see
+    /// `docs/design/questions/engine.md`). Ignored for counter families (D186). Default false.
+    pub no_outside_deletes: bool,
 }
 
 /// A source of a compaction's slot outside its inputs, for [`GcPolicy::other_sources`]: an
@@ -96,7 +102,71 @@ impl GcPolicy {
             bottommost,
             min_ts_above: 0,
             other_sources: None,
+            no_outside_deletes: false,
         }
+    }
+}
+
+/// Compaction's GC over any ordered stream of internal entries, with exactly the rules a
+/// job with the same [`GcPolicy`] applies: a flush runs its memtable through one as a
+/// non-bottommost job (#287).
+#[derive(Debug)]
+pub struct StreamGc {
+    gc: Gc,
+    out: OutBuf,
+}
+
+impl StreamGc {
+    /// GC under `policy` for a family with `family`'s options and merge operator.
+    pub fn new(
+        policy: &GcPolicy,
+        family: &FamilyOptions,
+        merge: Option<Arc<dyn MergeOperator>>,
+    ) -> Self {
+        Self {
+            gc: Gc::new(GcConfig {
+                snapshots: policy.snapshots.clone(),
+                now: policy.now,
+                bottommost: policy.bottommost,
+                min_ts_above: policy.min_ts_above,
+                ttl_micros: family.ttl_micros,
+                max_versions: family.max_versions,
+                merge,
+                counter: family.kind == FamilyKind::Counter,
+                other_sources: policy.other_sources.clone(),
+                no_outside_deletes: policy.no_outside_deletes,
+            }),
+            out: OutBuf::default(),
+        }
+    }
+
+    /// Reads the next unit at `cursor` (a family marker or a whole `(column, timestamp)`
+    /// group) and buffers what it keeps. Returns false at the end of the cursor.
+    pub fn step<C: Cursor>(&mut self, cursor: &mut C) -> std::result::Result<bool, C::Error> {
+        self.gc.step(cursor, None, &mut self.out)
+    }
+
+    /// Hands every buffered entry to `f`, in order, and empties the buffer.
+    pub fn drain<E>(
+        &mut self,
+        mut f: impl FnMut(&[u8], &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for i in 0..self.out.len() {
+            let (k, v) = self.out.get(i);
+            f(k, v)?;
+        }
+        self.out.clear();
+        Ok(())
+    }
+
+    /// Live-byte change per blob file from dropped blob pointers.
+    pub fn blob_delta(&self) -> &[(BlobFileId, i64)] {
+        &self.gc.blob_delta
+    }
+
+    /// Entries read and kept so far.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.gc.read, self.gc.kept)
     }
 }
 
@@ -562,6 +632,7 @@ impl CompactionJob {
             merge: context.merge.clone(),
             counter: context.family.kind == FamilyKind::Counter,
             other_sources: context.gc.other_sources.clone(),
+            no_outside_deletes: context.gc.no_outside_deletes,
         });
         let mut options =
             SstWriterOptions::for_family(&context.family, context.table, task.family, task.tablet);

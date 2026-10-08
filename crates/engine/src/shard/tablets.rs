@@ -830,7 +830,7 @@ impl ShardState {
             kind: ReqKind::Tablets(change),
             readers: Vec::new(),
             flushed_roots: Vec::new(),
-            compaction: None,
+            compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
             reply: Box::new(move |result| {

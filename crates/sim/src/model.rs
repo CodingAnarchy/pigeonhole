@@ -735,6 +735,24 @@ impl Model {
     ///    `max_versions` versions at any read point (live snapshots and latest, input
     ///    entries only, TTL at `now`) is removed.
     pub fn purge(&mut self, p: &ModelPurge) {
+        self.purge_inner(p, None);
+    }
+
+    /// Applies what a flush may purge under the guard of #287: only step 2 of
+    /// [`Model::purge`], over the entries of `p.rows` and `p.family` whose seqno is in
+    /// `inputs` (the flushed memtable's commits), with no `min_ts_above` condition. No delete
+    /// is purged, and nothing at all unless the model agrees the guard held: no delete of
+    /// the family in those rows outside `inputs` with a seqno at or below the newest input,
+    /// unless expired at `p.now` (a newer one is a later write, D70). `p.min_ts_above` and
+    /// `p.max_seqno` are ignored.
+    pub fn purge_versions(&mut self, p: &ModelPurge, inputs: &[Seqno]) {
+        let mut inputs = inputs.to_vec();
+        inputs.sort_unstable();
+        self.purge_inner(p, Some(&inputs));
+    }
+
+    /// [`Model::purge`], or with `inputs` (sorted) [`Model::purge_versions`].
+    fn purge_inner(&mut self, p: &ModelPurge, inputs: Option<&[Seqno]>) {
         let Some(t) = self.tables.get_mut(&p.table) else {
             return;
         };
@@ -749,9 +767,20 @@ impl Model {
         let first = p.snapshots.iter().copied().min().unwrap_or(Seqno::MAX);
         let mut points: Vec<Seqno> = p.snapshots.clone();
         points.push(Seqno::MAX);
-        let input = |seqno: Seqno| seqno <= p.max_seqno;
-        let purgeable =
-            |ts: Timestamp, seqno: Seqno| input(seqno) && seqno <= first && ts < p.min_ts_above;
+        let versions_only = inputs.is_some();
+        if let Some(set) = inputs
+            && !Self::flush_guard_holds(t, &fam, p, set)
+        {
+            return;
+        }
+        let input = |seqno: Seqno| {
+            inputs.map_or(seqno <= p.max_seqno, |set| {
+                set.binary_search(&seqno).is_ok()
+            })
+        };
+        let purgeable = |ts: Timestamp, seqno: Seqno| {
+            !versions_only && input(seqno) && seqno <= first && ts < p.min_ts_above
+        };
         let in_range = |row: &Vec<u8>| p.rows.contains(row);
         let rows: Vec<Vec<u8>> = t
             .columns
@@ -834,9 +863,10 @@ impl Model {
                 });
                 // Step 2: versions beyond the limit at every read point.
                 if fam.max_versions == 0
-                    || entries
-                        .iter()
-                        .any(|e| input(e.seqno) && e.ts >= p.min_ts_above)
+                    || (!versions_only
+                        && entries
+                            .iter()
+                            .any(|e| input(e.seqno) && e.ts >= p.min_ts_above))
                 {
                     continue;
                 }
@@ -871,6 +901,37 @@ impl Model {
                 t.columns.remove(&row);
             }
         }
+    }
+}
+
+impl Model {
+    /// [`Model::purge_versions`]'s guard over table `t`.
+    fn flush_guard_holds(t: &Table, fam: &ModelFamily, p: &ModelPurge, inputs: &[Seqno]) -> bool {
+        let Some(&newest) = inputs.last() else {
+            return true;
+        };
+        let outside = |ts: Timestamp, seqno: Seqno| {
+            seqno <= newest
+                && inputs.binary_search(&seqno).is_err()
+                && !(fam.ttl_micros != 0 && ts.saturating_add(fam.ttl_micros) <= p.now)
+        };
+        let markers = t
+            .family_deletes
+            .iter()
+            .filter(|((row, f), _)| *f == p.family && p.rows.contains(row))
+            .flat_map(|(_, ms)| ms.iter())
+            .any(|m| outside(m.0, m.1));
+        let cells = t
+            .columns
+            .iter()
+            .filter(|(row, _)| p.rows.contains(*row))
+            .flat_map(|(_, cols)| cols.iter())
+            .filter(|((f, _), _)| *f == p.family)
+            .flat_map(|(_, entries)| entries.iter())
+            .any(|e| {
+                matches!(e.kind, Kind::CellDelete | Kind::ColumnDelete) && outside(e.ts, e.seqno)
+            });
+        !markers && !cells
     }
 }
 
@@ -1384,6 +1445,71 @@ mod tests {
         m.commit(&[del], 60, Durability::Sync);
         let s = m.snapshot();
         assert_eq!(g(&m, s).iter().map(|c| c.ts).collect::<Vec<_>>(), [20]);
+    }
+
+    /// #287: a flush's version purge runs only when no delete outside its input could hide
+    /// one of the versions it counts.
+    #[test]
+    fn purge_versions_respects_the_flush_guard() {
+        let gput = |ts, v: &str| ModelOp::Put {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "g".into(),
+            qualifier: b"q".to_vec(),
+            ts: Some(ts),
+            value: v.into(),
+        };
+        let gdel = |ts| ModelOp::DeleteCell {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "g".into(),
+            qualifier: b"q".to_vec(),
+            ts,
+        };
+        let flush = || ModelPurge {
+            table: "t".into(),
+            family: "g".into(),
+            rows: (Bound::Unbounded, Bound::Unbounded),
+            snapshots: vec![],
+            now: 1_000,
+            min_ts_above: 0,
+            max_seqno: 0,
+        };
+        let g = |m: &Model| -> Vec<u64> {
+            m.read_row("t", b"r", &["g"], 0, m.snapshot(), 1_000)
+                .iter()
+                .map(|c| c.ts)
+                .collect()
+        };
+
+        // An older cell delete at 30 (outside the flush) hides the put at 30: 20 and 10 are
+        // the two versions read. Counting the flushed puts alone would purge 10.
+        let mut m = model();
+        m.commit(&[gdel(30)], 10, Durability::Sync);
+        let inputs: Vec<Seqno> = [10, 20, 30]
+            .into_iter()
+            .enumerate()
+            .map(|(i, ts)| m.commit(&[gput(ts, "v")], 20 + i as u64, Durability::Sync))
+            .collect();
+        assert_eq!(g(&m), [20, 10]);
+        m.purge_versions(&flush(), &inputs);
+        assert_eq!(
+            g(&m),
+            [20, 10],
+            "the guard keeps the version the delete shows"
+        );
+
+        // Without it the flush purges 10; a later delete of 30 shows nothing older (D70).
+        let mut m = model();
+        let inputs: Vec<Seqno> = [10, 20, 30]
+            .into_iter()
+            .enumerate()
+            .map(|(i, ts)| m.commit(&[gput(ts, "v")], 20 + i as u64, Durability::Sync))
+            .collect();
+        m.purge_versions(&flush(), &inputs);
+        assert_eq!(g(&m), [30, 20]);
+        m.commit(&[gdel(30)], 40, Durability::Sync);
+        assert_eq!(g(&m), [20]);
     }
 
     #[test]

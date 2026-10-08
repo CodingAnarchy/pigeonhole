@@ -357,10 +357,11 @@ pub(crate) struct ManifestReq {
     pub readers: Vec<(SstId, Arc<SstReader>)>,
     /// Memtables the edits flush, as `(shard, root)`: dropped from the published view.
     pub flushed_roots: Vec<(u16, u32)>,
-    /// A compaction to record (test hook; the version is filled in at commit). Always `None`
-    /// without the `test-hooks` feature, which records nothing (5-6 6.2).
+    /// Compactions (and flushes that purged versions, #287) to record (test hook; the
+    /// version is filled in at commit). Always empty without the `test-hooks` feature, which
+    /// records nothing (5-6 6.2).
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
-    pub compaction: Option<CompactionRecord>,
+    pub compactions: Vec<CompactionRecord>,
     /// Rewrite the manifest snapshot (shrink relocates the manifest extents).
     pub rewrite_snapshot: bool,
     /// The table of each tablet the edits touch, for a request whose slots are independent
@@ -390,7 +391,7 @@ impl ManifestReq {
             kind: ReqKind::Edits(edits),
             readers: Vec::new(),
             flushed_roots: Vec::new(),
-            compaction: None,
+            compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
             reply: Box::new(reply),
@@ -404,7 +405,7 @@ impl ManifestReq {
             kind,
             readers: Vec::new(),
             flushed_roots: Vec::new(),
-            compaction: None,
+            compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
             reply: Box::new(move |r| tx.notify(r)),
@@ -738,7 +739,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         flushed_roots.append(&mut req.flushed_roots);
                         rewrite |= req.rewrite_snapshot;
                         #[cfg(feature = "test-hooks")]
-                        if let Some(mut c) = req.compaction.take() {
+                        for mut c in std::mem::take(&mut req.compactions) {
                             c.manifest_version = writer.next_version();
                             records.push(c);
                         }

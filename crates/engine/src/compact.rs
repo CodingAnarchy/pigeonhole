@@ -52,6 +52,15 @@ pub struct CompactionRecord {
     pub max_seqno: Seqno,
     /// The tablet's row range (unescaped; `None` is unbounded).
     pub rows: (Option<Vec<u8>>, Option<Vec<u8>>),
+    /// A flush's record, not a compaction's (#287: a flush's GC drops history too).
+    pub flush: bool,
+    /// A flush that ran the guarded purge of versions beyond `max_versions` (#287): no
+    /// delete purge, and versions counted within the flushed memtable only.
+    pub versions_purge: bool,
+    /// A flush's input: the seqnos of the commits its memtable held (the slot's other
+    /// sources can hold seqnos in the same range). `None` for a compaction, whose input is
+    /// every entry of the range at or below `max_seqno`.
+    pub input_seqnos: Option<Vec<Seqno>>,
 }
 
 /// The row prefix of an internal key (the whole key if it has none).
@@ -302,6 +311,21 @@ impl BlobGc {
     }
 }
 
+/// The read points GC must preserve (decision D70): every live snapshot of this process plus
+/// the oldest reader pin's seqno (a reader's snapshots pin its own view, so the oldest pin
+/// bounds everything a reader can still read), ascending.
+pub(crate) fn gc_snapshots(shared: &Shared) -> Vec<Seqno> {
+    let mut snapshots = shared.live_seqnos.list();
+    if let Some((seqno, _)) = shared.shm.oldest_reader_pin()
+        && seqno != 0
+    {
+        snapshots.push(seqno);
+    }
+    snapshots.sort_unstable();
+    snapshots.dedup();
+    snapshots
+}
+
 /// The GC policy of `task` over `fam` (decision D70): every live snapshot of this process
 /// plus the oldest reader pin's seqno (a reader's snapshots pin its own view, so the
 /// oldest pin bounds everything a reader can still read), whether the output is bottommost,
@@ -318,14 +342,7 @@ pub(crate) fn gc_policy(
     counter: bool,
     now: Timestamp,
 ) -> GcPolicy {
-    let mut snapshots = shared.live_seqnos.list();
-    if let Some((seqno, _)) = shared.shm.oldest_reader_pin()
-        && seqno != 0
-    {
-        snapshots.push(seqno);
-    }
-    snapshots.sort_unstable();
-    snapshots.dedup();
+    let snapshots = gc_snapshots(shared);
     let input_ids: Vec<SstId> = task
         .inputs
         .iter()
@@ -746,7 +763,7 @@ impl CompactionWork {
             kind,
             readers,
             flushed_roots: Vec::new(),
-            compaction: self.record.take(),
+            compactions: self.record.take().into_iter().collect(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
             reply: Box::new(manifest::notify(tx)),

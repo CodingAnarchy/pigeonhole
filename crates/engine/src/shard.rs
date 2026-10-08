@@ -1210,6 +1210,8 @@ struct MemEntry {
     table: Memtable,
     min_ts: Timestamp,
     has_shares: bool,
+    /// Holds a delete of any kind (the flush GC guard, #287).
+    deletes: bool,
 }
 
 impl MemEntry {
@@ -1218,12 +1220,46 @@ impl MemEntry {
             table,
             min_ts: u64::MAX,
             has_shares: false,
+            deletes: false,
         }
     }
 
     fn max_seqno(&self) -> Seqno {
         self.table.seqno_range().map_or(0, |(_, max)| max)
     }
+}
+
+/// The flush GC guard (#287, see `docs/design/questions/engine.md`): whether no source of
+/// slot `key` other than its memtable with root `root` can hold a delete, judged now on the
+/// shard thread as the memtable is queued. The slot's other memtables (the active one
+/// included: an applied cross-shard share can carry a seqno below the flushed memtable's),
+/// every prepared share writing `key`'s family (it lands later, possibly under a lower
+/// seqno; a share that does not decode counts), and every SST of the slot in `view`. Whatever
+/// commits here afterwards has a seqno above the visible watermark, so above every entry of
+/// the flushed memtable (it froze only once all of them were visible).
+fn flush_guard(
+    slot: &MemSlot,
+    root: u32,
+    prepared: &HashMap<Seqno, PreparedShare>,
+    view: &View,
+    key: (TabletId, FamilyId),
+) -> bool {
+    let mems = std::iter::once(&slot.active)
+        .chain(&slot.frozen)
+        .filter(|m| m.table.root() != root)
+        .all(|m| !m.deletes);
+    let shares = !prepared.values().any(|share| {
+        share
+            .bytes
+            .batch()
+            .iter()
+            .any(|m| m.is_err() || m.is_ok_and(|m| m.family == key.1))
+    });
+    let ssts = view
+        .ssts
+        .family(key.0, key.1)
+        .is_none_or(|fam| fam.iter().all(|s| s.meta.deletes == 0));
+    mems && shares && ssts
 }
 
 /// The memtables of one `(tablet, family)` on this shard.
@@ -2601,7 +2637,7 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let item = |m: &MemEntry| FlushItem {
+            let item = |m: &MemEntry, no_outside_deletes: bool| FlushItem {
                 table: meta.table,
                 tablet: key.0,
                 family: key.1,
@@ -2610,6 +2646,7 @@ impl ShardState {
                 bytes: m.table.allocated_bytes() as u64,
                 max_seqno: m.max_seqno(),
                 has_shares: m.has_shares,
+                no_outside_deletes,
                 options: meta.options.clone(),
             };
             // The fresh active memtable takes a chunk: never one admitted commits reserved.
@@ -2641,7 +2678,9 @@ impl ShardState {
                     // rather than wait for a chunk that live snapshots may hold until the
                     // close returns (issue #111).
                     slot.active.table.freeze();
-                    self.flush_queue.push(item(&slot.active));
+                    let guard =
+                        flush_guard(slot, slot.active.table.root(), &self.prepared, &view, key);
+                    self.flush_queue.push(item(&slot.active, guard));
                     slot.seal = Seal::Flushing;
                 }
                 // Otherwise keep writing into this one; the arena-room check defers later
@@ -2657,7 +2696,9 @@ impl ShardState {
             }
             let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
             old.table.freeze();
-            self.flush_queue.push(item(&old));
+            let guard =
+                !self.replaying && flush_guard(slot, old.table.root(), &self.prepared, &view, key);
+            self.flush_queue.push(item(&old, guard));
             slot.frozen.insert(0, old);
             self.view_dirty = true;
         }
@@ -2977,7 +3018,7 @@ impl ShardState {
     fn requeue_frozen(&mut self) {
         let view = self.shared.view.load();
         let mut items = Vec::new();
-        for (key, slot) in &self.memtables {
+        for (&key, slot) in &self.memtables {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
@@ -2994,6 +3035,8 @@ impl ShardState {
                     bytes: m.table.allocated_bytes() as u64,
                     max_seqno: m.max_seqno(),
                     has_shares: m.has_shares,
+                    no_outside_deletes: !self.replaying
+                        && flush_guard(slot, m.table.root(), &self.prepared, &view, key),
                     options: meta.options.clone(),
                 });
             }
@@ -3377,6 +3420,9 @@ impl ShardState {
                 break;
             }
             slot.active.min_ts = slot.active.min_ts.min(ts);
+            if !matches!(m.kind, Kind::Put | Kind::Merge) {
+                slot.active.deletes = true;
+            }
             if !self.touched_slots.contains(&(tablet, m.family)) {
                 self.touched_slots.push((tablet, m.family));
             }
@@ -5461,6 +5507,9 @@ impl ShardState {
                 (!tablet.start.is_empty()).then(|| tablet.start.clone()),
                 tablet.end.clone(),
             ),
+            flush: false,
+            versions_purge: false,
+            input_seqnos: None,
         });
         // Claim the inputs under one lock: a shrink may have claimed one since the plan
         // was made against the busy set (then this round is skipped; `maintain` retries).

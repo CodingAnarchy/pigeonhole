@@ -125,6 +125,8 @@ pub(crate) struct GcConfig {
     pub counter: bool,
     /// `GcPolicy::other_sources` (counter families only).
     pub other_sources: Option<Vec<OtherSource>>,
+    /// `GcPolicy::no_outside_deletes`.
+    pub no_outside_deletes: bool,
 }
 
 /// Streaming GC state over one ordered input.
@@ -140,6 +142,7 @@ pub(crate) struct Gc {
     merge: Option<Arc<dyn MergeOperator>>,
     counter: bool,
     other_sources: Option<Vec<OtherSource>>,
+    no_outside_deletes: bool,
 
     row: Vec<u8>,
     /// `(ts, stripe, seqno)` of the row's family markers, newest first.
@@ -199,6 +202,7 @@ impl Gc {
             merge: config.merge,
             counter: config.counter,
             other_sources: config.other_sources,
+            no_outside_deletes: config.no_outside_deletes,
             row: Vec::new(),
             markers: Vec::new(),
             row_guard: Vec::new(),
@@ -419,7 +423,9 @@ impl Gc {
 
         // Upper cell deletes can only hit timestamps >= min_ts_above, so if the whole column
         // is below it, versions counted here stay versions.
-        let versions_gc = self.max_versions > 0 && self.purgeable(self.col_newest);
+        // Or, with no delete outside the input, nothing can hide the versions counted here.
+        let versions_gc =
+            self.max_versions > 0 && (self.purgeable(self.col_newest) || self.no_outside_deletes);
         let purge_deletes = self.purgeable(ts);
         if versions_gc {
             for j in 0..n_points {
