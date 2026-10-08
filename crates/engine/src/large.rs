@@ -48,13 +48,15 @@ type MutKey<'a> = (
 /// Largest stored value a blob pointer can name (its length is a `u32`).
 const MAX_STORED: usize = u32::MAX as usize;
 
-/// Extents of about this size for a large value's blob file (the sink takes larger ones for
-/// a value more than `VALUE_EXTENTS` times as long).
-const EXTENT_BYTES: u64 = 1 << 20;
+/// The smallest extents (the sink rounds up to 64 KiB) for a large value's blob file: the
+/// sink takes larger ones for a value more than `VALUE_EXTENTS` times as long. Larger
+/// fixed extents trimmed to a short file would leave free runs too short for the next
+/// one, so every separation would grow the file.
+const EXTENT_BYTES: u64 = 64 << 10;
 
 /// Extents a large value may span: a multi-extent file's last extent keeps its unused tail
 /// (FORMAT §7: one size class per file), so this bounds the waste to one extent of at most
-/// about 2/256 of the value (or 1 MiB), not the up to half a sink's default four allow.
+/// about 2/256 of the value (or 64 KiB), not the up to half a sink's default four allow.
 const VALUE_EXTENTS: u32 = 256;
 
 /// The blob files a batch's large values went to, until the commit's outcome decides whether
@@ -352,13 +354,24 @@ pub(crate) fn separate(
             live_bytes: f.total_bytes,
         })
         .collect();
-    // A refused commit frees the files' extents (`manifest::begin`); a failed one poisons
-    // the pager, and the extents are free space at the next open (D8).
-    manifest::commit_from_thread(shared, ReqKind::Edits(edits))?;
+    // Pending before the commit publishes them: until a batch points into them, nothing
+    // may count on what points into them (`check_blob_accounting`).
     shared
         .large_pending
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .extend(ids.iter().copied());
+    // A refused commit frees the files' extents (`manifest::begin`); a failed one poisons
+    // the pager, and the extents are free space at the next open (D8).
+    if let Err(e) = manifest::commit_from_thread(shared, ReqKind::Edits(edits)) {
+        let mut pending = shared
+            .large_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for id in &ids {
+            pending.remove(id);
+        }
+        return Err(e);
+    }
     Ok((out, Some(LargeValues::new(shared, ids))))
 }

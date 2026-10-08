@@ -2944,8 +2944,16 @@ impl World {
                 }
             }
         }
-        self.drain_compactions()?;
-        self.check_held_snapshots()
+        let checked = self
+            .drain_compactions()
+            .and_then(|()| self.check_held_snapshots());
+        match checked {
+            // An armed power loss fired meanwhile on I/O no client waits for (a commit-time
+            // separation's manifest commit runs on the committing thread, #230): the next
+            // commit notices and recovers.
+            Err(_) if !self.alive() => Ok(()),
+            r => r,
+        }
     }
 
     /// Settles every in-flight commit that resolved. Returns whether the client may go on
