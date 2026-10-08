@@ -730,7 +730,10 @@ fn shrink_moves_blob_extents_down() {
     // extents: the file shrinks, reads (and a snapshot taken before) are unchanged.
     let vfs = SimVfs::new(42);
     let mut rig = Rig::open(&vfs, false);
-    let junk = rig.db.create_table("junk", &[("f".into(), family())]).unwrap();
+    let junk = rig
+        .db
+        .create_table("junk", &[("f".into(), family())])
+        .unwrap();
     write(&mut rig, &junk, 0..200, 0);
     rig.flush();
     let t = rig.db.create_table("t", &[("f".into(), family())]).unwrap();
@@ -773,8 +776,16 @@ fn shrink_moves_blob_extents_down() {
     assert_reads(&rig.db, &t, 200, |i| value(i, 1));
     let f = t.families[0].id;
     for i in [1u32, 99, 199] {
-        let v = rig.db.get(&before, t.id, f, &row(i), b"q").unwrap().unwrap();
-        assert_eq!(v.value(), ValueRef::Bytes(&value(i, 1)), "row {i} at the snapshot");
+        let v = rig
+            .db
+            .get(&before, t.id, f, &row(i), b"q")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v.value(),
+            ValueRef::Bytes(&value(i, 1)),
+            "row {i} at the snapshot"
+        );
     }
     drop(before);
     rig.db.shrink().unwrap();
