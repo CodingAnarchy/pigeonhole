@@ -51,5 +51,19 @@ Several agents often build and test on one machine, so local runs stay small:
   Each chunk sets `PIGEONHOLE_SEED`/`PIGEONHOLE_SEEDS`; a failing chunk's log names the seed. Reproduce that one seed locally.
 - Agent worktrees carry an untracked `.cargo/config.toml` that caps build jobs and test threads; don't override it.
 
+### Test environment variables
+These are the only `PIGEONHOLE_*` variables the code reads. All of them are for tests, and only `PIGEONHOLE_TRACE` is read by library code. Add a new one here or not at all.
+
+| Variable | Read by | Effect |
+|---|---|---|
+| `PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS` | seeded suites (engine `model_check`, `tablets`, `deferred_waits`; pigeonhole `model`; shm, memtable, pager) | First seed and number of seeds. The Sweep workflow sets both per chunk. |
+| `PIGEONHOLE_TABLET_CHANGES` | engine harness (`tests/common`), pigeonhole `model` | Engine: `1` adds the fast balancer so tablets change during a run, `0` turns tablet changes off. Pigeonhole: `0` turns them off. |
+| `PIGEONHOLE_DEFERRED_IO` | engine harness, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |
+| `PIGEONHOLE_SWEEP_STEP` | engine `tablets` and `model_check` crash sweeps | Crash after every Nth mutating operation instead of the default step. |
+| `PIGEONHOLE_SHARDS_64` | engine `model_check` | Runs the 64-shard case, which is skipped otherwise. |
+| `PIGEONHOLE_TRACE` | engine library and engine harness | The engine logs its close, checkpoint, manifest, flush and tablet-change steps to stderr (`shard::trace!`), and the harness logs each operation. |
+| `PIGEONHOLE_TRACE_LINES` | engine harness | Trace lines a checker failure prints (default 40). |
+| `PIGEONHOLE_SHM_CHILD`, `PIGEONHOLE_MEMTABLE_CHILD`, `PIGEONHOLE_IO_LOCK_PROBE`, `PIGEONHOLE_TEST_SMALL_SHM` | multi-process tests | Set by a test when it re-runs itself as a child process. Don't set them yourself. |
+
 ## Performance discipline
 Optimization, simplification and performance are maintained continuously, not bolted on: keep hot paths allocation-free where the spec says so, prefer the simplest structure that meets the brief, and add a criterion benchmark for any path with a latency target. Note measured numbers in the PR.
