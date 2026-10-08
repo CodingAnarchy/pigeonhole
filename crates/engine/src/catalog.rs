@@ -465,6 +465,18 @@ impl Catalog {
         }
     }
 
+    /// The most `(tablet, family)` slots any of `shards` shards holds with tablets where
+    /// `shard_for` puts them (tablet changes off).
+    pub(crate) fn max_slots_per_shard(&self, shards: usize) -> usize {
+        let shards = shards.max(1);
+        let mut slots = vec![0usize; shards];
+        for t in self.tablets.values() {
+            let width = self.tables.get(&t.table).map_or(0, |i| i.families.len());
+            slots[usize::from(shard_for(t.id, shards).0)] += width;
+        }
+        slots.into_iter().max().unwrap_or(0)
+    }
+
     /// Places every tablet for `shards` shards keeping each shard within `max_slots`
     /// `(tablet, family)` slots where it can (with tablet changes on; owners are not
     /// persisted, D130). In tablet id order, a tablet goes to shard `tablet % shards` when

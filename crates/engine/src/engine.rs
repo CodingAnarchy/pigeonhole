@@ -243,11 +243,6 @@ fn first_seqno(ceiling: Seqno, max_replayed: Seqno) -> Seqno {
     ceiling.max(max_replayed + 1).max(1)
 }
 
-fn chunk_size(budget: u64) -> usize {
-    let chunk = (budget / 64).clamp(1024, ShardArena::DEFAULT_CHUNK as u64) as usize;
-    chunk & !63
-}
-
 /// Most `(tablet, family)` slots an arena of `arena_len` bytes in `chunk` chunks serves: a
 /// quarter of its chunks (every slot written to takes a chunk, usually two before it
 /// freezes, and frozen memtables keep theirs until flushed).
@@ -255,10 +250,11 @@ pub(crate) fn max_slots(arena_len: usize, chunk: usize) -> usize {
     arena_len / chunk.max(1) / 4
 }
 
-/// The arena chunk size with tablet changes on (D136, #104): at least 256 chunks per arena,
-/// so every shard serves 64 slots whatever the budget, and smaller still when the tablets
-/// placed at open need more (a reopen with fewer shards after splits). Never below 1 KiB.
-fn tablet_chunk_size(arena_len: usize, placed_slots: usize) -> usize {
+/// The arena chunk size (D136, #104, #283): at least 256 chunks per arena, so every shard
+/// serves 64 slots whatever the budget, and smaller still when the tablets placed at open
+/// need more (a reopen with fewer shards after splits, or many tables and families with
+/// tablet changes off). Never below 1 KiB.
+fn arena_chunk_size(arena_len: usize, placed_slots: usize) -> usize {
     let mut chunk = (arena_len / 256).clamp(1024, ShardArena::DEFAULT_CHUNK);
     if max_slots(arena_len, chunk) < placed_slots {
         chunk = arena_len / (4 * placed_slots);
@@ -476,15 +472,17 @@ impl Engine {
 
         // 4. Shard states over the arenas. With tablet changes on, every tablet is placed so
         //    no shard holds more slots than its arena serves where the tablets allow, and the
-        //    chunk size shrinks when they do not (#104).
+        //    chunk size shrinks when they do not (#104). Off, tablets stay where `shard_for`
+        //    puts them, and the chunks are sized the same way for the slots that gives (#283).
+        let arena_len = shm.arena(0).2;
         let chunk = if options.tablet_changes {
-            let arena_len = shm.arena(0).2;
-            let base = tablet_chunk_size(arena_len, 0);
+            let base = arena_chunk_size(arena_len, 0);
             let placed = catalog.place(shards, max_slots(arena_len, base));
-            tablet_chunk_size(arena_len, placed)
+            arena_chunk_size(arena_len, placed)
         } else {
-            chunk_size(options.memtable_budget)
+            arena_chunk_size(arena_len, catalog.max_slots_per_shard(shards))
         };
+        let chunk = options.arena_chunk_bytes.unwrap_or(chunk);
         let tablets = Arc::new(TabletMap::build(1, &catalog.tablets()));
         let manifest_version = pager.root().manifest_version;
         let cache = block_cache(options.block_cache_bytes, shards);

@@ -115,6 +115,11 @@ pub struct EngineOptions {
     /// with `Busy` (nanoseconds). A full arena stalls writers rather than refusing them; the
     /// wait is counted in `Metrics::stalls`.
     pub write_stall_timeout_nanos: u64,
+    /// Overrides the memtable arena's chunk size (bytes; a multiple of 64, at least 1 KiB),
+    /// which is otherwise sized for the slots a shard holds (#283). For tests that need a
+    /// particular arena layout, such as one a flush can starve.
+    #[doc(hidden)]
+    pub arena_chunk_bytes: Option<usize>,
     /// How long a slot whose compaction failed waits before it is retried (nanoseconds,
     /// default 1 s), doubling with each failure in a row up to 60 times this. A refused WAL
     /// checkpoint retries on the same schedule. Mostly for tests, which shorten it.
@@ -157,6 +162,7 @@ impl EngineOptions {
             allow_fuse: false,
             compaction: PickerOptions::default(),
             write_stall_timeout_nanos: 30_000_000_000,
+            arena_chunk_bytes: None,
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,

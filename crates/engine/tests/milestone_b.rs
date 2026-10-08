@@ -1887,9 +1887,10 @@ fn starved_flush_and_compact(moving_clock: bool) {
     let mut o = common::options(Arc::clone(&sim), 1, 2 << 20);
     o.vfs = Arc::clone(&vfs);
     o.memtable_freeze_bytes = 1 << 20;
-    // The row counts starve an arena of 64 chunks of 32 KiB, the layout without tablet
-    // changes. With them on the arena has 256 chunks (D140), and these rows leave room.
+    // The row counts starve an arena of 64 chunks of 32 KiB. Arenas are sized for their
+    // slots now (D140, #283: 256 chunks here), and these rows would leave room.
     o.tablet_changes = false;
+    o.arena_chunk_bytes = Some(32 << 10);
     o.write_stall_timeout_nanos = TIMEOUT;
     let rows = |round: u32, family: usize| match (round, family) {
         (0, 0..4) => 190,
