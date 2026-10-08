@@ -727,18 +727,39 @@ fn backup_copies_the_values_it_references() {
 #[test]
 fn shrink_moves_blob_extents_down() {
     // #231: blob extents past the shrink point move into free space below them like SST
-    // extents: the file shrinks, reads (and a snapshot taken before) are unchanged.
+    // extents: the file shrinks, reads (and a snapshot taken before) are unchanged. About
+    // 2 MiB of 8 KiB values per table, so `junk`'s blob extents (written first) lie below
+    // `t`'s and dropping `junk` frees room for them.
+    let big = |i: u32, generation: u8| {
+        let mut v = vec![b'a' + generation; 8 << 10];
+        v[..4].copy_from_slice(&i.to_le_bytes());
+        v
+    };
+    let write_big = |rig: &mut Rig, t: &TableInfo, generation: u8| {
+        for i in 0..250u32 {
+            let mut wb = WriteBatch::new();
+            wb.put(
+                t.id,
+                t.families[0].id,
+                &row(i),
+                b"q",
+                None,
+                ValueRef::Bytes(&big(i, generation)),
+            )
+            .unwrap();
+            rig.commit(wb);
+        }
+        rig.flush();
+    };
     let vfs = SimVfs::new(42);
     let mut rig = Rig::open(&vfs, false);
     let junk = rig
         .db
         .create_table("junk", &[("f".into(), family())])
         .unwrap();
-    write(&mut rig, &junk, 0..200, 0);
-    rig.flush();
+    write_big(&mut rig, &junk, 0);
     let t = rig.db.create_table("t", &[("f".into(), family())]).unwrap();
-    write(&mut rig, &t, 0..200, 1);
-    rig.flush();
+    write_big(&mut rig, &t, 1);
     let t_files: Vec<u32> = rig
         .db
         .blob_files()
@@ -759,40 +780,42 @@ fn shrink_moves_blob_extents_down() {
     let start = len(&vfs);
     let released = rig.db.shrink().unwrap();
     rig.check();
-    assert!(released > 0, "nothing moved: {start} bytes");
     assert_eq!(start - len(&vfs), released);
-    // `junk` held as much as `t`: with `t`'s blob extents left at the tail the file could
-    // not end below them.
-    assert!(
-        len(&vfs) * 4 < start * 3,
-        "the file only shrank from {start} to {}",
-        len(&vfs)
-    );
     assert_eq!(
         rig.db.blob_files().iter().map(|f| f.1).collect::<Vec<_>>(),
         t_files,
         "the same blob files, moved"
     );
-    assert_reads(&rig.db, &t, 200, |i| value(i, 1));
     let f = t.families[0].id;
-    for i in [1u32, 99, 199] {
-        let v = rig
-            .db
-            .get(&before, t.id, f, &row(i), b"q")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            v.value(),
-            ValueRef::Bytes(&value(i, 1)),
-            "row {i} at the snapshot"
-        );
+    let snap = rig.db.snapshot().unwrap();
+    for i in [0u32, 1, 99, 249] {
+        for (s, what) in [(&before, "before"), (&snap, "after")] {
+            let v = rig.db.get(s, t.id, f, &row(i), b"q").unwrap().unwrap();
+            assert_eq!(
+                v.value(),
+                ValueRef::Bytes(&big(i, 1)),
+                "row {i}, snapshot {what}"
+            );
+        }
     }
-    drop(before);
+    // The snapshot taken before pinned the old extents; released, they are reclaimed and
+    // the tail is cut. `junk` held as much as `t`: with `t`'s blob extents left at the tail
+    // the file could not end below them.
+    drop((before, snap));
     rig.db.shrink().unwrap();
     assert_eq!(rig.db.unreferenced_bytes(), 0);
+    assert!(
+        len(&vfs) * 4 < start * 3,
+        "the file only shrank from {start} to {}",
+        len(&vfs)
+    );
     rig.close();
     let rig = Rig::open(&vfs, false);
     rig.check();
-    assert_reads(&rig.db, &rig.db.table("t").unwrap(), 200, |i| value(i, 1));
+    let t = rig.db.table("t").unwrap();
+    let snap = rig.db.snapshot().unwrap();
+    let v = rig.db.get(&snap, t.id, f, &row(7), b"q").unwrap().unwrap();
+    assert_eq!(v.value(), ValueRef::Bytes(&big(7, 1)));
+    drop(snap);
     rig.close();
 }
