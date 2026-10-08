@@ -645,9 +645,12 @@ impl FlushTask {
             self.items.iter().filter_map(|i| i.guard.clone()).collect();
         #[cfg(feature = "test-hooks")]
         let install_seqnos = std::mem::take(&mut self.install_seqnos);
+        let mut on_refusal = Vec::new();
         let kind = if deltas.is_empty() && guards.is_empty() {
             manifest::ReqKind::Edits(edits)
         } else {
+            // Freed by the writer if the closure refuses (a voided guard).
+            on_refusal = edits.clone();
             // Weak: a request still queued when the engine goes (a crash, deferred I/O) must
             // not keep it alive through its own manifest queue.
             #[cfg(feature = "test-hooks")]
@@ -693,6 +696,7 @@ impl FlushTask {
             compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: self.items.iter().map(|i| (i.tablet, i.table)).collect(),
+            on_refusal,
             reply: Box::new(manifest::notify(tx)),
         };
         manifest::submit(&self.shared, self.shard, req);

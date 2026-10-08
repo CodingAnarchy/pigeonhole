@@ -3622,6 +3622,8 @@ impl ShardState {
         // the member waits for may need them to be decided.
         let mut cut = false;
         let mut need_room = false;
+        // A member waits for a guarded flush's install: the shard wakes on its outcome.
+        let mut guard_wait = false;
         for mut m in members {
             if cut && matches!(m.kind, MemberKind::Single) {
                 self.pending.push(m);
@@ -3719,6 +3721,21 @@ impl ShardState {
                 if matches!(m.kind, MemberKind::Single) {
                     cut = true;
                 }
+                guard_wait = true;
+                self.pending.push(m);
+                continue;
+            }
+            #[cfg(feature = "test-hooks")]
+            if !admitted.is_empty()
+                && matches!(m.kind, MemberKind::Single)
+                && self
+                    .shared
+                    .hooks
+                    .room_wait_once
+                    .swap(false, Ordering::AcqRel)
+            {
+                cut = true;
+                need_room = true;
                 self.pending.push(m);
                 continue;
             }
@@ -3814,6 +3831,16 @@ impl ShardState {
                 self.poisoned = true;
             }
             let _ = self.freeze(true);
+            // That freeze may have queued guarded flushes after this group's members were
+            // admitted but before they are applied (below, into the fresh active memtables):
+            // their deletes void those guards now. Nothing claims a fresh guard before the
+            // flush task runs, after this call.
+            for m in &admitted {
+                if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                    let admitted_again = self.admit_against_guards(m.bytes.as_slice());
+                    debug_assert!(admitted_again, "a fresh guard is never installing");
+                }
+            }
             self.spawn_flush(ctx);
             // On a frozen clock, with no flush, deferred freeze, undecided share or unsynced
             // group in flight and no retired memtable a reader process still pins, nothing
@@ -3864,7 +3891,10 @@ impl ShardState {
                 let _ = w;
                 self.end_room_wait(ctx.now_nanos());
             }
-            if !self.pending.is_empty() {
+            // A member waiting for a guarded flush's install is woken by its outcome
+            // (`on_flushed`, then `end_batch`), not by kicking the shard round the loop for
+            // the whole commit.
+            if !self.pending.is_empty() && !guard_wait {
                 let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
             }
         }

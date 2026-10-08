@@ -76,6 +76,9 @@ pub(crate) struct Hooks {
     /// Runs at the start of the next `publish_view`, before the publish lock
     /// (`Engine::before_next_view_publish`).
     pub before_view_publish: Once,
+    /// Makes the next group's second member wait for arena room, as a full arena would
+    /// (`Engine::force_room_wait_once`, #315 review).
+    pub room_wait_once: AtomicBool,
     /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
     /// (`Engine::before_snapshot_view_load`, #315 review).
     pub before_snapshot_view_load: Once,
@@ -594,6 +597,18 @@ impl Engine {
     #[doc(hidden)]
     pub fn before_shrink_relocates(&self, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.before_shrink_relocates.set(f);
+    }
+
+    /// The next commit group's second member waits for room as if the arena were full: the
+    /// stall path freezes memtables after the group's first member was admitted (test hook,
+    /// #315 review).
+    #[doc(hidden)]
+    pub fn force_room_wait_once(&self) {
+        self.inner
+            .shared
+            .hooks
+            .room_wait_once
+            .store(true, Ordering::Release);
     }
 
     /// Runs `f` once, on the calling thread of the next writer `snapshot()`, after it pinned

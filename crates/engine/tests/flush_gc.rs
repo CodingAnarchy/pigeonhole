@@ -376,3 +376,50 @@ fn two_slots_dropping_pointers_into_one_blob_file_both_count() {
     assert_eq!(live(&rig.db) * 2, before);
     rig.close();
 }
+
+/// Review of #315: one group holds a delete and, after it, a member that must wait for arena
+/// room. The wait freezes the slot's active memtable (queueing a guarded flush) after the
+/// delete was admitted but before it is applied, into the fresh memtable. The delete must
+/// still void that guard, or the purge drops the version it shows. Also: the voided flush's
+/// outputs are freed (`unreferenced_bytes`). Returns the read after the flush.
+fn delete_before_a_room_wait(mutation: FlushGcMutation) -> Option<Vec<u8>> {
+    let mut rig = Rig::open(2875, mutation);
+    let (t, f) = (rig.t.id, rig.t.families[0].id);
+    rig.put(Some(10), b"ten");
+    rig.put(Some(20), b"twenty");
+    // One group: the delete, then a put that waits for room (forced).
+    rig.db.force_room_wait_once();
+    let mut wb = WriteBatch::new();
+    wb.delete_cell(t, f, b"row", b"q", 20).unwrap();
+    let del = rig.db.submit(wb, Some(Durability::Buffered)).unwrap();
+    let mut wb = WriteBatch::new();
+    wb.put(t, f, b"other", b"q", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    let put = rig.db.submit(wb, Some(Durability::Buffered)).unwrap();
+    rig.wait(del).unwrap();
+    rig.wait(put).unwrap();
+    rig.flush();
+    let read = rig.get(&rig.db.snapshot().unwrap());
+    if mutation == FlushGcMutation::None {
+        assert_eq!(
+            rig.db.unreferenced_bytes(),
+            0,
+            "a voided flush frees its outputs"
+        );
+    }
+    rig.close();
+    read
+}
+
+#[test]
+fn a_delete_admitted_before_a_room_wait_freeze_voids_the_guard() {
+    assert_eq!(
+        delete_before_a_room_wait(FlushGcMutation::None),
+        Some(b"ten".to_vec())
+    );
+    // Without the voids the purge installs over the delete.
+    assert_eq!(
+        delete_before_a_room_wait(FlushGcMutation::IgnoreVoids),
+        None
+    );
+}

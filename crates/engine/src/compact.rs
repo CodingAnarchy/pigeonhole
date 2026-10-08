@@ -774,9 +774,19 @@ impl CompactionWork {
         let (tx, rx) = completion();
         // Blob live counts change against the catalog at commit time: other compactions of
         // the family (other tablets after a split share its blob files) commit meanwhile.
+        let mut on_refusal = Vec::new();
         let kind = if blobs.is_empty() {
             manifest::ReqKind::Edits(edits)
         } else {
+            // Freed by the writer if `blob_edits` refuses (an undercounted file).
+            on_refusal = edits.clone();
+            on_refusal.extend(blobs.new.iter().map(|f| Edit::PutBlobFile {
+                blob_file: f.id,
+                family: blobs.family,
+                extents: f.extents.clone(),
+                total_bytes: f.total_bytes,
+                live_bytes: f.total_bytes,
+            }));
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
                 let mut edits = edits;
                 edits.extend(blob_edits(catalog, blobs)?);
@@ -790,6 +800,7 @@ impl CompactionWork {
             compactions: self.record.take().into_iter().collect(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
+            on_refusal,
             reply: Box::new(manifest::notify(tx)),
         };
         manifest::submit(&self.shared, self.shard, req);

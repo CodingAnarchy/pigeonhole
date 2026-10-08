@@ -368,6 +368,10 @@ pub(crate) struct ManifestReq {
     /// (a flush): the edits of a tablet whose table was dropped meanwhile are skipped and
     /// the rest commit, instead of the whole request being refused. Empty: refuse.
     pub dropped_ok: Vec<(TabletId, TableId)>,
+    /// The outputs a `ReqKind::Catalog` request adds (its `AddSst`s and new blob files'
+    /// `PutBlobFile`s), freed if its closure refuses: the writer never sees a refused
+    /// closure's edits, and the caller has handed the outputs over.
+    pub on_refusal: Vec<Edit>,
     /// Called with the outcome once the commit is durable (or failed).
     pub reply: Box<dyn FnOnce(Result<ManifestVersion>) + Send>,
 }
@@ -394,6 +398,7 @@ impl ManifestReq {
             compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
+            on_refusal: Vec::new(),
             reply: Box::new(reply),
         }
     }
@@ -408,6 +413,7 @@ impl ManifestReq {
             compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
+            on_refusal: Vec::new(),
             reply: Box::new(move |r| tx.notify(r)),
         };
         (req, rx)
@@ -762,6 +768,12 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 }
             }
             Err(e) => {
+                // A refused closure: free the outputs it would have added (readers first, so
+                // their cached blocks go too).
+                req.readers.clear();
+                let refused = std::mem::take(&mut req.on_refusal);
+                abandon_ssts(shared, &added_ssts(&refused));
+                abandon_blobs(shared, &added_blobs(&catalog, &refused));
                 outcomes.push((req, Err(e)));
             }
         }
