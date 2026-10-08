@@ -9,7 +9,7 @@ use pigeonhole_compaction::{
     BlobFetch, MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate,
 };
 use pigeonhole_format::key::{
-    Escaped, Kind, SUFFIX_LEN, decode_key, encode_row_prefix, row_prefix_len,
+    Escaped, Kind, SUFFIX_LEN, TERMINATOR, decode_key, encode_row_prefix, row_prefix_len,
 };
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
@@ -358,13 +358,6 @@ impl RowData {
 /// terminator).
 pub(crate) fn column_of(key: &[u8]) -> &[u8] {
     &key[..key.len().saturating_sub(SUFFIX_LEN)]
-}
-
-/// The escaped qualifier inside a column prefix.
-pub(crate) fn qualifier_of(column: &[u8]) -> Escaped<'_> {
-    let n = row_prefix_len(column).unwrap_or(column.len());
-    let end = column.len().saturating_sub(2).max(n);
-    Escaped::new(&column[n..end])
 }
 
 /// The escaped row inside a column prefix (without its terminator).
@@ -744,6 +737,25 @@ impl ScanCursor {
 
     /// The next cell of the current row, or `None` when the row is done.
     pub fn next_cell(&mut self) -> Result<Option<ScanCell<'_>>> {
+        let mut qual = std::mem::take(&mut self.qual_buf);
+        qual.clear();
+        let next = self.next_cell_into(&mut qual);
+        self.qual_buf = qual;
+        Ok(next?.map(|family| {
+            let lane = &self.lanes[self.last_lane.expect("set by next_cell_into")];
+            ScanCell {
+                family,
+                qualifier: &self.qual_buf,
+                ts: lane.ts,
+                stored: &lane.value,
+            }
+        }))
+    }
+
+    /// Like [`ScanCursor::next_cell`], but appends the cell's unescaped qualifier to
+    /// `qualifiers` (a caller's row buffer, saving a copy) and returns only its family;
+    /// [`ScanCursor::current_data`] has its version and value.
+    pub fn next_cell_into(&mut self, qualifiers: &mut Vec<u8>) -> Result<Option<FamilyId>> {
         if !self.in_row {
             return Ok(None);
         }
@@ -751,20 +763,21 @@ impl ScanCursor {
             let fetched = self.lanes[i].fetch();
             self.snapshot.checked(fetched)?;
         }
+        // A column of the current row starts with its escaped row and the terminator (which
+        // never occurs inside an escaped row).
+        let row_len = self.row_esc.len() + TERMINATOR.len();
         while self.lane_idx < self.lanes.len() {
             let i = self.lane_idx;
             let lane = &self.lanes[i];
-            if lane.pending && row_of(&lane.col) == self.row_esc {
+            if lane.pending
+                && lane.col.len() >= row_len
+                && lane.col.starts_with(&self.row_esc)
+                && lane.col[self.row_esc.len()..row_len] == TERMINATOR
+            {
                 self.last_lane = Some(i);
-                let lane = &self.lanes[i];
-                self.qual_buf.clear();
-                qualifier_of(&lane.col).unescape_into(&mut self.qual_buf);
-                return Ok(Some(ScanCell {
-                    family: lane.family,
-                    qualifier: &self.qual_buf,
-                    ts: lane.ts,
-                    stored: &lane.value,
-                }));
+                let end = lane.col.len().saturating_sub(2).max(row_len);
+                Escaped::new(&lane.col[row_len..end]).unescape_into(qualifiers);
+                return Ok(Some(lane.family));
             }
             self.lane_idx += 1;
         }
