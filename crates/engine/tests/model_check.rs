@@ -7,7 +7,10 @@ mod common;
 
 use std::path::Path;
 
-use common::{Config, final_dump, read_after_background_crash, run, run_traced};
+use common::{
+    Config, FailureClass, final_dump, read_after_background_crash, run, run_traced,
+    undecided_prepare_passes,
+};
 
 use pigeonhole_format::Durability;
 use pigeonhole_io::sim::{SimOp, SimVfs};
@@ -355,31 +358,41 @@ fn io_errors_poison_shards_and_recover_on_reopen() {
 
 #[test]
 fn undecided_prepares_pass_the_checkpoint() {
-    // Issue #181: a cross-shard commit whose stream failed before its coordinator logged a
+    // Issue #181: a cross-shard commit whose coordinator's stream failed before it logged a
     // COMMIT is aborted, and a participant's checkpoint passes its PREPARE at once (D116)
-    // while the other participants' PREPAREs survive. The checker took that hole for a lost
-    // commit. No CAS or transaction runs on a thread here, so these seeds replay exactly
-    // (found by a seed search over 1..=3000).
-    for seed in [328, 422] {
-        let stats = run(seed, &undecided_prepares_config()).unwrap_or_else(|f| panic!("{f}"));
+    // while the coordinator's PREPARE survives. The checker took that hole for a lost
+    // commit. The scenario is driven step by step, so it does not depend on seed luck.
+    let cfg = undecided_prepares_config();
+    for seed in seeds() {
+        let stats = undecided_prepare_passes(seed, &cfg, false).unwrap_or_else(|f| panic!("{f}"));
         assert!(
             stats.undecided_prepares_passed > 0,
-            "seed {seed} no longer reaches the case: {stats:?}"
+            "seed {seed}: the checker did not meet the passed PREPARE: {stats:?}"
         );
     }
 }
 
-/// I/O errors and crashes on three shards, every commit on the test's thread.
+#[test]
+fn an_acknowledged_commit_without_a_commit_record_is_a_protocol_failure() {
+    // The same shape, but the client was told the commit succeeded: an acknowledged
+    // cross-shard commit always has a COMMIT, so the checker must not excuse the hole.
+    let cfg = undecided_prepares_config();
+    for seed in seeds() {
+        match undecided_prepare_passes(seed, &cfg, true) {
+            Err(f) if f.class == FailureClass::Protocol && f.message.contains("acknowledged") => {}
+            other => panic!("seed {seed}: expected a protocol failure, got {other:?}"),
+        }
+    }
+}
+
+/// Two shards, one plain commit at a time, no random faults, crashes or maintenance.
+/// `io_error_ppm` only marks the scenario's injected write error as expected.
 fn undecided_prepares_config() -> Config {
-    let mut cfg = Config::standard(250);
-    cfg.faults.io_error_ppm = 8_000;
-    cfg.crash_ppm = 5_000;
-    cfg.mid_commit_crash_ppm = 5_000;
-    cfg.shards = 3;
-    cfg.cas_ppm = 0;
-    cfg.txn_ppm = 0;
-    // The pinned seeds reach the case with tablet changes off; a sweep's
-    // `PIGEONHOLE_TABLET_CHANGES=1` must not change their workload.
+    let mut cfg = Config::quiet(0);
+    cfg.faults.io_error_ppm = 1;
+    cfg.shards = 2;
+    (cfg.flush_ppm, cfg.compact_ppm) = (0, 0);
+    (cfg.cas_ppm, cfg.txn_ppm, cfg.tasks) = (0, 0, 1);
     cfg.tablet_changes = false;
     cfg.balance_fast = false;
     cfg
