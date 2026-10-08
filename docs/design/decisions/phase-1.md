@@ -1,4 +1,4 @@
-# Decisions made in Phase 1 (D1–D154)
+# Decisions made in Phase 1 (D1–D157)
 
 Indexed in [README.md](README.md). Numbers are permanent; code and docs cite them as `Dn`.
 
@@ -964,5 +964,50 @@ D146 has each shard arm a clock timer for its next balancer pass, so idle shards
 Proposed amendment to D146, "Idle shards": add "…and backs off while idle: each pass that finds nothing to do after no writes and no tablet change doubles the interval, up to 10 s; a write or a tablet change returns it to `balance_interval_nanos`."
 
 Consequence: an idle shard notices skew published by other shards, or cold tablets to consolidate, up to 10 s later. Merges of cold tablets wait for idle passes anyway, so they finish later on an idle database, which costs nothing.
+
+**Coordinator:** confirmed.
+
+<a id="d155"></a>
+## D155 — A stream's checkpoint may lag its end by at most `wal_pin_bytes` (approved; engine, #137, #171)
+The spec says "if checkpoints fall behind, new segments are allocated", but nothing ever made a checkpoint catch up: it passes only a flushed prefix of the log, and a slot freezes only past `memtable_freeze_bytes`, on `flush()`, at close, or when the arena is full. One write to a slot that is never written again (a config table, a rarely written family) kept the checkpoint where it was for the life of the process. The WAL, the shard's in-memory log and the next open's replay grew with every byte written after it (reproduced: 20,000 × 1 KB commits on a 4 MiB budget left 24.6 MB of WAL instead of 1.8 MB).
+
+**Decision:** like RocksDB's `max_total_wal_size`, each shard bounds the bytes logged past its oldest needed record. `EngineOptions::wal_pin_bytes` (0, the default, means twice `memtable_budget`: 128 MiB per shard at the defaults) is the limit, counted as record payload plus 64 bytes per record since open (records replayed at open count as none, so the limit applies to what this process writes). When a group pushes the span past the limit, the shard flushes every slot written by a needed record in the oldest half of the span, however small its memtable. A needed cross-shard record also sends `Unpin { through }` to the shards it waits for: the participants of a COMMIT it coordinates, or the coordinator of a PREPARE it holds. Each of those shards flushes its own records and unreported shares up to that seqno, and passes the request on for its own needed records. Every request is served: seqno order is not decide order, so a commit decided later can have a lower seqno than one already served. A request is forwarded once per record and shard (pruned when the record leaves the log), so a coordinator and its participants stop after one round. A shard runs its own pass once per limit's worth of new bytes, or sooner once the checkpoint has passed the last pass, so the work is bounded and deterministic. The cost is one small SST per cold slot per pass. `Metrics::unpin` counts passes and the memtables they froze below the size threshold. Cheaper passes are #175 (Phase 3).
+
+**Interim behavior:** as described. Regression tests: `crates/engine/tests/wal_pin.rs`.
+
+**Coordinator:** confirmed.
+
+<a id="d156"></a>
+## D156 — Replay spills recovered memtables to L0 when an arena runs short (approved; engine, #143, #172; extends D121)
+Replay applied every recovered record into the arenas and could not flush. A database that crashed with more unflushed data than its reopened shards' arenas hold failed to open with `InvalidArgument("the memtable budget is too small…")`. That happens when it reopens with fewer shards (the default shard count follows the CPUs, a cgroup quota or a container) or with a smaller `memtable_budget`, so "zero required config" did not hold.
+
+**Decision:** before each replayed record (a batch, or a decided PREPARE's share), if some shard's arena may not hold the rows it owns, `make_room` writes every recovered memtable to L0 SSTs and frees the arenas. Replay cannot move a checkpoint mid-way (PREPAREs are resolved only after every stream is read), so the SSTs are not committed yet. Once replay has spilled, open finishes as a layout change does (D121): what is left is flushed, and one manifest edit adds every SST, sets each slot's flushed seqno to the largest one written, and checkpoints every stream to its end. Two L0 SSTs of a slot may then hold interleaved seqnos (a PREPARE's share applied after later single-shard records). Reads and compaction merge sources by full key, so that is safe. A single record larger than an arena still fails as before.
+
+**Interim behavior:** as described. Regression tests: `crates/engine/tests/open_cost.rs` (four shards with 2.5 MB unflushed each reopened as one 4 MiB shard; the same layout reopened with a quarter of the budget).
+
+**Follow-up question (default shard count):** With tablet changes off (D129), a table is one tablet on one shard, so a one-table application uses one shard while the default (`shards = 0`, one per CPU) starts them all. Per shard, the cost used to be 192 MiB of WAL writes and about 45 ms of open time. After the WAL changes above it is a pinned thread, a sparse arena (no RSS until written), and a WAL stream whose creation overlaps the others'. Open time is flat (14 ms at 1, 4 and 10 shards on a 10-core Mac), and an idle shard writes about 40 KB per open and close.
+
+**Interim behavior:** the default is unchanged: one shard per CPU. Capping it (for example at 4 while tablet changes are off) would save little now. It would also limit multi-table write parallelism and the shard count tablets need once they are on. Revisit with the Phase 3 open-latency work: open is still about 14 ms against the spec's 5 ms goal, and the remainder is not per shard.
+
+**Coordinator on the shard count:** keep one shard per CPU. After D157 an extra shard costs a thread and a sparse arena, and open time is flat across shard counts; capping it would limit multi-table write parallelism. The remaining open latency is #158 (Phase 3).
+
+**Coordinator:** confirmed.
+
+<a id="d157"></a>
+## D157 — An open writes one frame per stream; spares wait for use (approved; wal, #143, #172; amends D35)
+D35 zero-filled the first slot of every stream at open, and the engine prepared `spare_segments` more right away. At the defaults (64 MiB segments, two spares) every open wrote 192 MiB per shard, with one shard per CPU, and the clean close deleted it all. Measured on a 10-core Mac: 454 ms and 2.5 GiB written per open and close of a tiny database (51 ms and 256 MiB with one shard).
+
+**Decision:**
+- `WalStream::create` and `Recovery::into_stream` start the first segment in a slot added past the file's end. The slot was never written, so it reads as zeros and is not zero-filled. The header is written and synced together with the new length (`sync_all`).
+  - On Linux the slot is allocated with `fallocate` (unwritten extents, metadata only). Its space is reserved, so a full disk fails the open rather than poisoning the stream at a later append. The zero-read guarantee also holds on filesystems that could otherwise expose stale freed blocks in a delayed-allocation hole.
+  - Elsewhere the slot is a sparse extension. APFS has no unwritten extents: `F_PREALLOCATE` plus the length change physically wrote the whole slot (measured: 64 MiB per shard per open, 156 ms to open 10 shards against 14 ms sparse), and APFS holes read as zeros by design. On a full disk such a stream can still fail at an append and poison, as an inline grow at rollover already could.
+- A recycled slot is used as is, as before. A *blank* slot is still zero-filled first: one found at recovery, or bytes past the stream's known slots (a failed spare preparation that grew the file). Frames of a segment whose header write was torn can carry the epoch the new segment takes.
+- Fragments carry only an epoch and a CRC, no database id or salt. A reopen after a clean close starts epoch-1 streams at the same offsets as the deleted previous session's files. A filesystem that could expose stale freed blocks in a never-written allocated range after a crash would break the zero-read assumption. Allocated, unwritten ranges read as zeros on the local filesystems Pigeonhole supports (D37 refuses network filesystems). A per-database salt in fragments would remove the assumption: #176 (Phase 4).
+- The price: the first segment's fdatasyncs also convert its unwritten blocks, which D35's zero-filled spares avoid for every later segment. A writer pays that only until its first rollover.
+- `WalStream::create_all` creates several streams, submits every stream's `sync_all` before waiting on any (new `File::submit_sync_all`: pread runs it on its pool, `SimVfs` inline), and syncs the directory once. Opening N shards then costs about one sync, not N.
+- The engine runs `SpareSegments::prepare` only once its stream is half way through the segment it opened in (or past it). A small database never zero-fills a spare. A busy one has half a segment of writes to prepare spares before its first rollover needs one.
+- Segment size stays 64 MiB: a smaller default would lower the D16 value limit, which is `min(segment payload, …)`.
+
+**Interim behavior:** as described. Measured after (same machine, same tiny database): open 14 ms median at 1, 4 and 10 shards; 0.11–0.39 MiB written per open and close; about 1 MiB of disk held while open.
 
 **Coordinator:** confirmed.
