@@ -6,7 +6,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 ### Added
-- Per-family compaction strategies: `Compaction::Tiered` (universal/size-tiered, for write-heavy families) and `Compaction::FifoByTime` (drops whole SSTs once their newest timestamp passes the TTL, with no rewrite) are accepted at table creation (#31, #32, #44).
+- Per-family compaction strategies: `Compaction::Tiered` (universal/size-tiered, for write-heavy families) and `Compaction::FifoByTime` (drops whole SSTs once their newest timestamp passes the TTL, with no rewrite) are accepted at table creation (#31, #32, #44). See [Compaction styles](docs/guide/concepts.md#compaction-styles) in the guide. `FifoByTime` expiry is noticed when the family flushes or compacts; a timer for idle families is still to come (#232).
 
 ### Changed
 - The write stall follows L0 depth only; deeper levels and tiered space amplification no longer pace writers (D119).
