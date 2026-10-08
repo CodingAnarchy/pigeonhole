@@ -179,9 +179,10 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134
 - [D165](phase-2.md#d165) — The tiered picker's runs, triggers and output levels; the engine picks per family · compaction, #31, #227 · **amended by D169**
 - [D166](phase-2.md#d166) — The write stall follows L0 depth only · compaction, engine, #227 · amends D119
-- [D167](phase-2.md#d167) — The FIFO-by-time picker: expiry drops, the size cap and intra-L0 merges · compaction, #32, #229
+- [D167](phase-2.md#d167) — The FIFO-by-time picker: expiry drops, the size cap and intra-L0 merges · compaction, #32, #229 · **amended by D170**
 - [D168](phase-2.md#d168) — Tiered and FifoByTime families are accepted by the public API · pigeonhole, #44, #241 · amends D95
 - [D169](phase-2.md#d169) — The tiered picker needs no extra write-amplification bound; the proptest guards it · compaction, #228, #245 · supersedes D165's write-amp follow-up
+- [D170](phase-2.md#d170) — FIFO-by-time expiry runs on a timer; a busy L0 file splits the merge windows · compaction, engine, #232, #246 · refines D167
 
 ## Open questions
 _None._
