@@ -24,7 +24,7 @@ let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 - `open` creates the file if missing (`Options::create_if_missing`, default true) and takes the **writer lock**. A second writer, in this or any other process, fails with `ErrorCode::WriterLocked`.
 - `Options::default()` is a valid configuration. Options are process-local and not stored in the file, so reopening with different options changes them.
 - `Pigeonhole` is cheap to clone; every clone shares the same engine. Pass clones to threads.
-- Opening replays the WAL sidecar files; there is no full-file recovery scan. While the database is open you will see sidecar files next to it. When the last handle closes cleanly, only the one file remains: the close flushes every memtable into the file, checkpoints the WAL and removes the sidecars.
+- Opening replays the WAL sidecar files; there is no full-file recovery scan. Opening is cheap: a small database opens in milliseconds and writes well under a megabyte, however many shards it has, and the amount of WAL to replay is bounded because each shard flushes data that would otherwise pin its log (twice `memtable_budget` of log at most). While the database is open you will see sidecar files next to it. When the last handle closes cleanly, only the one file remains: the close flushes every memtable into the file, checkpoints the WAL and removes the sidecars.
 - The database must be on a local filesystem. Network filesystems fail with `ErrorCode::NetworkFilesystem`.
 
 Common options:
