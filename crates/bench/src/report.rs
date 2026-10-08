@@ -290,6 +290,17 @@ pub struct ReadSplit {
     pub hot: LatencyStats,
 }
 
+/// Latency of one operation type in a run's measured phase.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpTypeStats {
+    /// The type ([`BenchOp::type_name`](crate::BenchOp::type_name)).
+    pub op: String,
+    /// Percentiles.
+    pub stats: LatencyStats,
+    /// Mean latency in nanoseconds.
+    pub mean_ns: u64,
+}
+
 /// Extra facts about a run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDetail {
@@ -299,6 +310,9 @@ pub struct RunDetail {
     pub busy_retries: u64,
     /// Cold and hot gets; `None` when the workload has no gets.
     pub reads: Option<ReadSplit>,
+    /// Latency per operation type, by type name; empty in results written before it existed.
+    #[serde(default)]
+    pub by_type: Vec<OpTypeStats>,
     /// How the measured phase's work fell on each shard, indexed by shard; empty for
     /// stores without shards.
     #[serde(default)]
@@ -538,6 +552,33 @@ impl Suite {
                     us(reads.hot.p99_ns),
                     us(reads.hot.p999_ns),
                 );
+            }
+        }
+        let typed: Vec<&RunRecord> = self
+            .results
+            .iter()
+            .filter(|r| r.detail.by_type.len() > 1)
+            .collect();
+        if !typed.is_empty() {
+            s.push_str(
+                "\n| Workload | Store | Op | Count | Mean µs | p50 µs | p99 µs | p99.9 µs |\n",
+            );
+            s.push_str("|---|---|---|--:|--:|--:|--:|--:|\n");
+            for r in typed {
+                for t in &r.detail.by_type {
+                    let _ = writeln!(
+                        s,
+                        "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                        r.workload,
+                        r.store,
+                        t.op,
+                        t.stats.count,
+                        us(t.mean_ns),
+                        us(t.stats.p50_ns),
+                        us(t.stats.p99_ns),
+                        us(t.stats.p999_ns),
+                    );
+                }
             }
         }
         let spread: Vec<&RunRecord> = self
