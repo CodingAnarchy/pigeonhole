@@ -109,6 +109,37 @@ pub trait File: Send + Sync + Debug {
 
     /// Whether the file lives on a local filesystem. Network filesystems are refused at open.
     fn is_local(&self) -> Result<bool>;
+
+    /// What kind of filesystem the file lives on: [`Locality::Fuse`] apart from other
+    /// non-local ones, so a caller can accept FUSE on request (decision D173, #299). The
+    /// default derives it from [`File::is_local`] (never `Fuse`).
+    fn locality(&self) -> Result<Locality> {
+        Ok(if self.is_local()? {
+            Locality::Local
+        } else {
+            Locality::Network
+        })
+    }
+}
+
+/// The kind of filesystem a file lives on ([`File::locality`]).
+///
+/// ```
+/// use pigeonhole_io::Locality;
+///
+/// assert_ne!(Locality::Fuse, Locality::Local);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Locality {
+    /// A local filesystem.
+    Local,
+    /// A FUSE filesystem. It may be local (ntfs-3g, gocryptfs) or network-backed (sshfs,
+    /// s3fs, gcsfuse): its byte-range locks may be local to one host, and a sync may not
+    /// reach stable storage.
+    Fuse,
+    /// A network or cluster filesystem (NFS, SMB, Ceph, GPFS, ...).
+    Network,
 }
 
 /// A shared handle to an open file.

@@ -26,8 +26,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    Completion, Error, ErrorKind, File, FileIdentity, FileRef, IoBuf, LockMode, OpenOptions,
-    ProcessId, Result, SharedOpen, SharedRegion, Vfs, os,
+    Completion, Error, ErrorKind, File, FileIdentity, FileRef, IoBuf, Locality, LockMode,
+    OpenOptions, ProcessId, Result, SharedOpen, SharedRegion, Vfs, os,
 };
 
 /// Real files with a fixed pool of threads serving submitted I/O.
@@ -553,7 +553,11 @@ impl File for PreadFile {
     }
 
     fn is_local(&self) -> Result<bool> {
-        os::is_local(self.inner.file())
+        Ok(self.locality()? == Locality::Local)
+    }
+
+    fn locality(&self) -> Result<Locality> {
+        os::locality(self.inner.file())
     }
 }
 

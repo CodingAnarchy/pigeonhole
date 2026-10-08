@@ -22,6 +22,7 @@ The next release is **0.2.0**: counters change in a breaking way (below), and ev
 - Per-period counters kept as one qualifier per period can stay as they are, or become buckets of one column with `incr_at`.
 
 ### Added
+- `Options::allow_fuse(true)` and `ReaderOptions::allow_fuse(true)` accept a database on a FUSE filesystem, for local FUSE mounts the user trusts (ntfs-3g, gocryptfs). FUSE is still refused by default, and network and cluster filesystems are refused either way (D173, #299). `pigeonhole-io` adds `File::locality` and `Locality`, which tell FUSE apart from other non-local filesystems.
 - Per-family compaction strategies: `Compaction::Tiered` (universal/size-tiered, for write-heavy families) and `Compaction::FifoByTime` (drops whole SSTs once their newest timestamp passes the TTL, with no rewrite) are accepted at table creation (#31, #32, #44). See [Compaction styles](docs/guide/concepts.md#compaction-styles) in the guide. `FifoByTime` expiry runs on a timer, so an idle family drops expired files on time (#232).
 - Custom merge operators: `Options::merge_operator` / `ReaderOptions::merge_operator` register them and families name them with `Family::merge_operator(name)`; opening over a family whose operator is not registered needs `allow_unregistered_merge_operators(true)` and is then read-only (#43).
 - `Options::write_stall_timeout(Duration)`: how long a stalled write, `flush` or `compact` waits before `Busy` (default 30 s, as before) (#210).

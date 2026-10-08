@@ -103,6 +103,11 @@ pub struct EngineOptions {
     /// Open even if a family names an unregistered merge operator: read-only, compaction
     /// off, and reads of affected cells fail with `UnknownMergeOperator`.
     pub allow_unregistered_merge: bool,
+    /// Accept a database on a FUSE filesystem (D173, #299): only for a local FUSE mount
+    /// the user trusts (ntfs-3g, an encrypted home directory). FUSE byte-range locks may be
+    /// local to one host, so two hosts could both open it as writers, and a sync may not
+    /// reach stable storage. Network and cluster filesystems stay refused. Default off.
+    pub allow_fuse: bool,
     /// Compaction tuning (L0 trigger, level sizes, output SST size). The L0 trigger also
     /// drives write stalls.
     pub compaction: PickerOptions,
@@ -149,6 +154,7 @@ impl EngineOptions {
             balance_skew: 1.25,
             merge_operators: MergeRegistry::default(),
             allow_unregistered_merge: false,
+            allow_fuse: false,
             compaction: PickerOptions::default(),
             write_stall_timeout_nanos: 30_000_000_000,
             compaction_backoff_nanos: 1_000_000_000,
