@@ -336,6 +336,12 @@ impl Workload {
         self.generator.load()
     }
 
+    /// Fails once the run has outlasted the time-series live margin; see
+    /// `Gen::check_epoch_age`.
+    pub(crate) fn check_epoch_age(&self) -> Result<(), String> {
+        self.generator.check_epoch_age()
+    }
+
     /// The measured operations. Each call yields the same sequence.
     pub fn run_ops(&mut self) -> impl Iterator<Item = BenchOp> + '_ {
         self.generator.run()
@@ -496,7 +502,8 @@ pub fn run_detailed(
         ..config.clone()
     });
     runner.open(dir)?;
-    let result = measure(runner, config, &mut workload, warmup);
+    let result = measure(runner, config, &mut workload, warmup)
+        .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
     let closed = runner.close();
     let (load, elapsed, threads, hist, split, shards) = result?;
