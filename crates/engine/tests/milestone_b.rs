@@ -1611,7 +1611,8 @@ fn a_purge_record_covers_entries_dropped_by_an_earlier_compaction() {
     // A put written after a row delete with an older timestamp is hidden at every read
     // point, so a non-bottommost compaction drops it; the bottommost compaction that later
     // purges the row delete must still report it as an input (`max_seqno`), or the model's
-    // purge (D74) brings it back while the engine has rightly dropped it.
+    // purge (D74) brings it back while the engine has rightly dropped it. Family `f`
+    // compacts leveled (`g` is tiered).
     let sim = Sim::new(66);
     let vfs = sim.vfs();
     let cfg = common::Config::quiet(0);
@@ -1621,7 +1622,7 @@ fn a_purge_record_covers_entries_dropped_by_an_earlier_compaction() {
     let put = |q: &[u8], ts: Option<u64>| ModelOp::Put {
         table: table.clone(),
         row: row.clone(),
-        family: "g".into(),
+        family: "f".into(),
         qualifier: q.to_vec(),
         ts,
         value: vec![7; 16],
@@ -1650,7 +1651,7 @@ fn a_purge_record_covers_entries_dropped_by_an_earlier_compaction() {
     let hidden = commit_ops(&mut store, &vfs, &[put(b"q2", Some(1))]);
     // A second L0 file: the picker compacts L0 into a middle level, dropping the put.
     maintain(&mut store, false);
-    let (_, family) = store.ids(&table, "g");
+    let (_, family) = store.ids(&table, "f");
     let records: Vec<_> = store
         .engine
         .take_compactions()
@@ -1678,7 +1679,7 @@ fn a_purge_record_covers_entries_dropped_by_an_earlier_compaction() {
         last.max_seqno
     );
     let snap = store.engine.snapshot().unwrap();
-    assert_eq!(store.get(&snap, &row, "g", b"q2").unwrap(), None);
+    assert_eq!(store.get(&snap, &row, "f", b"q2").unwrap(), None);
 }
 
 // ---- #111: a close whose memtables get no fresh replacement ----

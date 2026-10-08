@@ -435,6 +435,16 @@ fn tiered_merges_l0_with_runs_of_similar_size() {
         [0, 1, 4]
     );
     assert_eq!((output, kind), (4, TaskKind::Rewrite));
+    // Three equal L0 files under the default trigger of four: space amplification reaches
+    // its cap (200%) and makes a merge due, but the write stall follows L0 depth only.
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 4;
+    let p = CompactionPicker::new(CompactionStyle::Tiered, options);
+    let three = Levels {
+        levels: vec![(0..3).map(|i| sst(&mut id, i, i + 5, 100)).collect()],
+    };
+    assert!(p.score(&three) >= 1.0);
+    assert!((p.stall_score(&three) - 0.75).abs() < 1e-9);
     // A lone L0 file over an empty tree moves down whole.
     let mut options = PickerOptions::default();
     options.l0_trigger = 1;

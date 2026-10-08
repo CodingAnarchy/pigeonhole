@@ -179,8 +179,8 @@ fn overlaps(s: &SstMeta, lo: &[u8], hi: &[u8]) -> bool {
 /// runs above the oldest hold more than `tiered_max_space_amp_percent` of its bytes, every
 /// run merges into the last level. Outputs go just above the first run not taken, so runs
 /// stay ordered newest first down the levels, and whole runs move, so no row is split. The
-/// score is the larger of L0 depth over its trigger and space amplification over its cap,
-/// so the engine's L0 write stall works as with leveled.
+/// score is the larger of L0 depth over its trigger and space amplification over its cap;
+/// the write stall uses only the first ([`stall_score`](Self::stall_score)).
 ///
 /// ```
 /// use std::sync::Arc;
@@ -250,6 +250,13 @@ impl CompactionPicker {
         }
     }
 
+    /// The L0 write stall's score (D119): L0 depth over `l0_trigger`, whatever the style, so
+    /// writers are paced only while flushes outrun compaction (never for a deeper level or
+    /// for tiered space amplification, which only drive picking).
+    pub fn stall_score(&self, levels: &Levels) -> f64 {
+        self.level_score(levels, 0)
+    }
+
     /// Tiered: how far the runs above the oldest one exceed the space-amplification cap
     /// (`>= 1.0` once they hold more than `tiered_max_space_amp_percent` of its bytes). The
     /// runs are the L0 files and each non-empty deeper level; with fewer than two there is
@@ -278,7 +285,7 @@ impl CompactionPicker {
     }
 
     /// Urgency: `>= 1.0` means compaction is due. The engine services the highest score
-    /// first and throttles writes on L0 depth.
+    /// first; it throttles writes on [`stall_score`](Self::stall_score).
     pub fn score(&self, levels: &Levels) -> f64 {
         match self.style {
             CompactionStyle::Leveled => (0..self.last_level())
