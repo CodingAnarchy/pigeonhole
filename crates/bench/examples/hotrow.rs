@@ -1,0 +1,123 @@
+//! A read-path microbenchmark (#287): one hot row of about 3,500 cells whose hot qualifiers
+//! carry many overwritten versions, half flushed to SSTs and half still in the memtable,
+//! among 10,000 cold rows of 20 cells. Times row reads of the hot row and 10-row scans
+//! through it, in process, and prints p10/p50/p90. Far less noisy than a full
+//! `phdb-bench` run, so it suits changes worth a few percent.
+//!
+//! ```text
+//! cargo run --release -p pigeonhole-bench --example hotrow -- [ITERATIONS] [DIR]
+//! ```
+//!
+//! The store is created in a fresh subdirectory of `DIR` (default: the system temp
+//! directory) and removed at the end. `HOT_FLUSH=1` flushes the memtable before reading (all
+//! versions in L0 SSTs); `HOT_COMPACT=1` compacts fully (one version per column), the floor
+//! for the same cells.
+use std::ops::Bound;
+use std::time::Instant;
+
+use pigeonhole::{Durability, Family, Options, Pigeonhole};
+
+fn main() {
+    let iters: usize = std::env::args()
+        .nth(1)
+        .map_or(2000, |s| s.parse().expect("ITERATIONS"));
+    let base = std::env::args()
+        .nth(2)
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let dir = base.join(format!("phdb-hotrow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the store directory");
+    let db = Pigeonhole::open(
+        dir.join("hot.phdb"),
+        Options::default()
+            .durability(Durability::Buffered)
+            .memtable_budget(64 << 20)
+            .block_cache(256 << 20),
+    )
+    .expect("open");
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default().max_versions(1).bloom_bits(10))
+        .create_if_missing()
+        .unwrap();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let val = [7u8; 100];
+    // Neighbour rows of 20 cells, and the hot row h:5000.
+    for r in 0..10_000u32 {
+        let mut m = t.mutate(format!("h:{r:05}").as_bytes());
+        for q in 0..20u32 {
+            m = m.put(
+                "f",
+                format!("q{:05}", (r * 7 + q * 13) % 10_000).as_bytes(),
+                &val,
+            );
+        }
+        m.commit().unwrap();
+    }
+    let hot = b"h:05000";
+    let put_hot = |n: usize, rnd: &mut dyn FnMut() -> u64| {
+        for _ in 0..n {
+            let mut m = t.mutate(hot);
+            for _ in 0..2 {
+                // Skewed: half the writes go to 50 hot qualifiers.
+                let q = if rnd().is_multiple_of(2) {
+                    rnd() % 50
+                } else {
+                    rnd() % 3500
+                };
+                m = m.put("f", format!("q{q:05}").as_bytes(), &val);
+            }
+            m.commit().unwrap();
+        }
+    };
+    put_hot(10_000, &mut rnd);
+    db.flush().unwrap();
+    put_hot(10_000, &mut rnd);
+    if std::env::var_os("HOT_COMPACT").is_some() {
+        db.compact().unwrap();
+    }
+    if std::env::var_os("HOT_FLUSH").is_some() {
+        db.flush().unwrap();
+    }
+    eprintln!("setup done"); // `sample` the process from here to profile the reads.
+    let mut cells = 0;
+    let mut row_ns = Vec::with_capacity(iters);
+    let mut scan_ns = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let row = t.row(hot).family("f").read().unwrap().unwrap();
+        cells = row.iter().count();
+        row_ns.push(t0.elapsed().as_nanos() as u64);
+        let t0 = Instant::now();
+        let mut it = t
+            .scan_bounds(Bound::Included(&b"h:04995"[..]), Bound::Unbounded)
+            .limit(10)
+            .iter()
+            .unwrap();
+        while let Some(r) = it.next_ref().unwrap() {
+            std::hint::black_box(r.iter().count());
+        }
+        scan_ns.push(t0.elapsed().as_nanos() as u64);
+    }
+    row_ns.sort_unstable();
+    scan_ns.sort_unstable();
+    let p = |v: &[u64], q: f64| v[((v.len() - 1) as f64 * q) as usize] as f64 / 1000.0;
+    println!(
+        "cells {cells} | row read p10 {:.1} p50 {:.1} p90 {:.1} µs | scan p10 {:.1} p50 {:.1} p90 {:.1} µs",
+        p(&row_ns, 0.1),
+        p(&row_ns, 0.5),
+        p(&row_ns, 0.9),
+        p(&scan_ns, 0.1),
+        p(&scan_ns, 0.5),
+        p(&scan_ns, 0.9)
+    );
+    drop(t);
+    db.close().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
