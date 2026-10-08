@@ -321,3 +321,55 @@ fn counter_time_range_applies_to_resolved_versions() {
     r.seek(b"").unwrap();
     assert_eq!(r.next_cell().unwrap().unwrap().value, i64v(3));
 }
+
+/// #287: a column with many versions is passed with a seek once the resolver has stepped
+/// over a few of its skipped entries. Neighbouring columns whose qualifiers extend it (`a`,
+/// `a\0`, `ab`), the empty qualifier and the next row are all still returned, at every
+/// version limit.
+#[test]
+fn a_column_with_many_versions_is_skipped_by_seeking() {
+    let mut e = Vec::new();
+    for (row, q) in [
+        (&b"r"[..], &b""[..]),
+        (b"r", b"a"),
+        (b"r", b"a\0"),
+        (b"r", b"a\0b"),
+        (b"r", b"ab"),
+        (b"r\0", b"a"),
+        (b"s", b"a"),
+    ] {
+        for ts in 1..=50u64 {
+            let v = [row, b"/", q, b"/", ts.to_string().as_bytes()].concat();
+            e.push((key(row, q, ts, ts, Kind::Put), stored(&v)));
+        }
+    }
+    // A column delete under the skipped versions changes nothing above it.
+    e.push((key(b"r", b"ab", 10, 60, Kind::ColumnDelete), Vec::new()));
+    for versions in [1u32, 2, 8, 9, 20, 0] {
+        let mut o = ResolveOptions::new(100, 100);
+        o.versions = versions;
+        let got = resolve(e.clone(), o);
+        let mut want = Vec::new();
+        for (row, q) in [
+            (&b"r"[..], &b""[..]),
+            (b"r", b"a"),
+            (b"r", b"a\0"),
+            (b"r", b"a\0b"),
+            (b"r", b"ab"),
+            (b"r\0", b"a"),
+            (b"s", b"a"),
+        ] {
+            let floor = if q == b"ab" { 10 } else { 0 };
+            let n = if versions == 0 {
+                50
+            } else {
+                u64::from(versions)
+            };
+            for ts in (floor + 1..=50u64).rev().take(n as usize) {
+                let v = [row, b"/", q, b"/", ts.to_string().as_bytes()].concat();
+                want.push((ts, stored(&v)));
+            }
+        }
+        assert_eq!(got, want, "versions {versions}");
+    }
+}

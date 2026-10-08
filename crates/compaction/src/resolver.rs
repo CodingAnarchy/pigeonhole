@@ -261,8 +261,14 @@ pub struct CellResolver<C> {
     col_versions: u32,
     /// Skip the rest of the column (version limit reached or predicate failed).
     col_skip: bool,
+    /// Entries of the column stepped over while skipping it; past [`SKIP_STEPS`] the
+    /// resolver seeks past the column instead.
+    col_skipped: u32,
     /// After `seek_column`: stop at the end of `col`.
     column_bound: bool,
+    /// Every key of `col` is below `upper` (or there is none), so entries inside the column
+    /// skip the bound check.
+    col_below_upper: bool,
     /// Stop at keys `>= upper`.
     upper: Option<Vec<u8>>,
 
@@ -283,7 +289,14 @@ pub struct CellResolver<C> {
     base_val: Vec<u8>,
     out_key: Vec<u8>,
     out_val: Vec<u8>,
+    past_col: Vec<u8>,
 }
+
+/// Entries of a skipped column the resolver steps over before it seeks past the column. A
+/// column with many versions (a hot cell overwritten hundreds of times, all still in the
+/// memtable) is then passed with a forward seek of the sources inside it (usually one)
+/// instead of a step per version; a column with a few versions keeps the cheaper steps.
+const SKIP_STEPS: u32 = 8;
 
 /// `max(a, b)` over optional timestamps.
 fn raise(cover: &mut Option<Timestamp>, ts: Timestamp) {
@@ -306,7 +319,9 @@ where
             col_cover: None,
             col_versions: 0,
             col_skip: false,
+            col_skipped: 0,
             column_bound: false,
+            col_below_upper: false,
             upper: None,
             run: false,
             run_ts: 0,
@@ -320,6 +335,7 @@ where
             base_val: Vec::new(),
             out_key: Vec::new(),
             out_val: Vec::new(),
+            past_col: Vec::new(),
         }
     }
 
@@ -335,6 +351,17 @@ where
             }
             None => self.upper = None,
         }
+        self.col_below_upper = false;
+    }
+
+    /// Records whether every key of the column `col` sorts below `upper`. Exact unless
+    /// `upper` starts with `col` (a bound inside the column), which is then checked per entry:
+    /// otherwise a key `col + suffix` compares with `upper` as `col` does.
+    fn note_column_bound(&mut self) {
+        self.col_below_upper = match self.upper.as_deref() {
+            None => true,
+            Some(u) => !u.starts_with(&self.col) && self.col.as_slice() < u,
+        };
     }
 
     fn reset(&mut self) {
@@ -344,6 +371,7 @@ where
         self.reset_column();
         self.col.clear();
         self.column_bound = false;
+        self.col_below_upper = false;
         self.skip_group = None;
     }
 
@@ -351,6 +379,7 @@ where
         self.col_cover = None;
         self.col_versions = 0;
         self.col_skip = false;
+        self.col_skipped = 0;
         self.run = false;
         self.run_err = None;
     }
@@ -390,6 +419,7 @@ where
         escape_into(&mut self.col, qualifier);
         self.col.extend_from_slice(&TERMINATOR);
         self.column_bound = true;
+        self.note_column_bound();
         self.cursor.seek(&self.col)
     }
 
@@ -451,9 +481,14 @@ where
         !self.col.is_empty() && k.len() == self.col.len() + SUFFIX_LEN && k.starts_with(&self.col)
     }
 
-    fn past_bounds(&self) -> bool {
-        if self.column_bound && !self.in_column() {
+    /// Whether the cursor's entry is past the column bound or the upper bound; `in_col` is
+    /// [`Self::in_column`] for it.
+    fn past_bounds(&self, in_col: bool) -> bool {
+        if self.column_bound && !in_col {
             return true;
+        }
+        if in_col && self.col_below_upper {
+            return false;
         }
         self.upper
             .as_deref()
@@ -465,7 +500,8 @@ where
             self.skip_rest_of_group(ts)?;
         }
         loop {
-            if !self.cursor.valid() || self.past_bounds() {
+            let in_col = self.cursor.valid() && self.in_column();
+            if !self.cursor.valid() || self.past_bounds(in_col) {
                 if self.run {
                     if let Some(out) = self.flush_run()? {
                         return Ok(Some(out));
@@ -479,7 +515,7 @@ where
                 self.cursor.next()?;
                 continue;
             };
-            if !self.in_column() {
+            if !in_col {
                 // The column ends: a pending run is its last version.
                 if self.run {
                     if let Some(out) = self.flush_run()? {
@@ -511,6 +547,7 @@ where
                 self.col.clear();
                 self.col.extend_from_slice(&key[..body]);
                 self.reset_column();
+                self.note_column_bound();
                 let limit = self.opts.columns_per_row;
                 if limit != 0 && self.columns_in_row >= limit {
                     self.col.clear();
@@ -519,7 +556,21 @@ where
                 }
             }
             if self.col_skip {
-                self.cursor.next()?;
+                self.col_skipped += 1;
+                if self.col_skipped > SKIP_STEPS {
+                    // The column prefix ends with the terminator `00 01`: bumping its last
+                    // byte gives the smallest key past every version of the column, and
+                    // before the next column (whose qualifier continues past this one's
+                    // with a byte above `00 02`, or differs earlier).
+                    self.past_col.clear();
+                    self.past_col.extend_from_slice(&self.col);
+                    if let Some(last) = self.past_col.last_mut() {
+                        *last += 1;
+                    }
+                    self.cursor.seek_forward(&self.past_col)?;
+                } else {
+                    self.cursor.next()?;
+                }
                 continue;
             }
             if let Some(out) = self.group(ts)? {

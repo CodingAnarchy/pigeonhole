@@ -340,10 +340,12 @@ impl RowData {
         &self.qualifiers[cell.qualifier.start as usize..cell.qualifier.end as usize]
     }
 
-    /// Appends a resolved cell (its qualifier unescaped into the shared buffer).
-    fn push(&mut self, family: FamilyId, column: &[u8], data: CellData) {
+    /// Appends a resolved cell (its qualifier unescaped into the shared buffer). `column`
+    /// is the cell's column prefix and `row_len` the length of its row prefix.
+    fn push(&mut self, family: FamilyId, column: &[u8], row_len: usize, data: CellData) {
         let start = self.qualifiers.len() as u32;
-        qualifier_of(column).unescape_into(&mut self.qualifiers);
+        let end = column.len().saturating_sub(2).max(row_len);
+        Escaped::new(&column[row_len..end]).unescape_into(&mut self.qualifiers);
         self.cells.push(RowCell {
             family,
             qualifier: start..self.qualifiers.len() as u32,
@@ -832,6 +834,8 @@ pub(crate) fn read_row(
         row: row.to_vec(),
         ..RowData::default()
     };
+    // The current cell's column prefix, reused across cells.
+    let mut column = Vec::new();
     for &family in families {
         let Some(meta) = view.catalog.family(family) else {
             continue;
@@ -846,7 +850,7 @@ pub(crate) fn read_row(
         resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;
         loop {
-            let (data, column) = {
+            let data = {
                 let next = resolver.next_cell();
                 ResolverBlobs::check(resolver_blobs.as_ref())?;
                 let Some(cell) = next.map_err(|e| read_error(e, meta))? else {
@@ -855,14 +859,14 @@ pub(crate) fn read_row(
                 if !cell.key.starts_with(&prefix) {
                     break;
                 }
-                let column = column_of(cell.key).to_vec();
-                let data = if cell.from_source && cell.value.len() > CellData::INLINE_MAX {
+                column.clear();
+                column.extend_from_slice(column_of(cell.key));
+                if cell.from_source && cell.value.len() > CellData::INLINE_MAX {
                     // Pinned below, once the borrow of the resolver ends.
                     None
                 } else {
                     Some(CellData::resolved(&cell, &view.ssts, || Arc::clone(view))?)
-                };
-                (data, column)
+                }
             };
             let data = match data {
                 Some(d) => d,
@@ -879,7 +883,7 @@ pub(crate) fn read_row(
                     CellData::from_pinned(ts, &value, || Arc::clone(view))
                 }
             };
-            out.push(family, &column, data);
+            out.push(family, &column, prefix.len(), data);
         }
     }
     Ok((!out.cells.is_empty()).then_some(out))
