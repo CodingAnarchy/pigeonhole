@@ -46,9 +46,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use pigeonhole_engine::{
-    AppendedKind, CompactionRecord, Engine, EngineOptions, EngineShard, Error, FamilyId,
-    FamilyOptions, PendingCommit, PendingMaintenance, PickerOptions, Predicate, ScanSpec, Snapshot,
-    TableInfo, ValueRef, WriteBatch,
+    AppendedKind, CompactionRecord, Compression, Engine, EngineOptions, EngineShard, Error,
+    FamilyId, FamilyOptions, PendingCommit, PendingMaintenance, PickerOptions, Predicate, ScanSpec,
+    Snapshot, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::key::decode_key;
 use pigeonhole_format::manifest::CompactionStyle;
@@ -142,8 +142,8 @@ pub fn families() -> Vec<ModelFamily> {
 }
 
 /// The engine options of a model family. `g` compacts tiered (issue #31) and `ttl` FIFO by
-/// time (issue #32), so every suite runs every picker; the reference model does not depend
-/// on the style.
+/// time (issue #32), so every suite runs every picker, and `f` uses zstd (issue #44); the
+/// reference model depends on neither.
 fn family_options(f: &ModelFamily) -> FamilyOptions {
     let compaction = match f.name.as_str() {
         "g" => CompactionStyle::Tiered,
@@ -152,6 +152,12 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
     };
     FamilyOptions {
         compaction,
+        // `f` stores its blocks with zstd (#44), the others with LZ4.
+        compression: if f.name == "f" {
+            Compression::Zstd
+        } else {
+            Compression::Lz4
+        },
         max_versions: f.max_versions,
         ttl_micros: f.ttl_micros,
         merge_operator: if f.i64_add {

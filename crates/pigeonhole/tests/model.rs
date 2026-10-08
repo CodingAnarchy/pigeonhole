@@ -81,8 +81,8 @@ fn families() -> Vec<ModelFamily> {
     ]
 }
 
-/// `g` compacts tiered and `ttl` FIFO by time (#31, #32, #44); the model does not depend on
-/// the style.
+/// `g` compacts tiered and `ttl` FIFO by time (#31, #32), and `f` uses zstd (#44); the
+/// model depends on neither.
 fn public_family(f: &ModelFamily) -> Family {
     let compaction = match f.name.as_str() {
         "g" => Compaction::Tiered,
@@ -93,6 +93,12 @@ fn public_family(f: &ModelFamily) -> Family {
         .max_versions(f.max_versions)
         .ttl(Duration::from_micros(f.ttl_micros))
         .compaction(compaction);
+    // `f` stores its blocks with zstd (#44).
+    let family = if f.name == "f" {
+        family.zstd(3)
+    } else {
+        family
+    };
     if f.i64_add {
         family
     } else {

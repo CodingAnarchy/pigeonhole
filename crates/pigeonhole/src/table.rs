@@ -93,7 +93,7 @@ impl TableBuilder<'_> {
         let mut defs = Vec::with_capacity(self.families.len());
         for (name, family) in &self.families {
             if !defs.iter().any(|(n, _)| n == name) {
-                defs.push((name.clone(), family.to_engine(name)?));
+                defs.push((name.clone(), family.to_engine()));
             }
         }
         let mut info = match engine.table(&self.name) {

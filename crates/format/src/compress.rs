@@ -22,7 +22,7 @@ pub enum Compression {
     /// LZ4 block format (no frame), the default.
     #[default]
     Lz4 = 1,
-    /// zstd, optionally with the family's trained dictionary (Phase 2; not yet supported).
+    /// zstd frames (libzstd) at the family's level. Trained dictionaries are not used yet.
     Zstd = 2,
 }
 
@@ -38,9 +38,36 @@ impl Compression {
     }
 }
 
+/// The zstd level [`compress`] uses (libzstd's default).
+pub const DEFAULT_ZSTD_LEVEL: i8 = 3;
+
 /// Compresses `input` with `codec`, appending to `out`. Returns the codec actually used:
-/// [`Compression::None`] when compression would not save at least 1/8 of the size.
+/// [`Compression::None`] when compression would not save at least 1/8 of the size. zstd
+/// runs at [`DEFAULT_ZSTD_LEVEL`]; see [`compress_with_level`].
 pub fn compress(codec: Compression, input: &[u8], out: &mut Vec<u8>) -> crate::Result<Compression> {
+    compress_with_level(codec, DEFAULT_ZSTD_LEVEL, input, out)
+}
+
+/// [`compress`] with a zstd `level` (libzstd's: negative is faster, up to 22 smaller; 0 is
+/// its default; out-of-range levels are clamped). Other codecs ignore it.
+///
+/// ```
+/// use pigeonhole_format::compress::{Compression, compress_with_level, decompress};
+///
+/// let input: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+/// let mut packed = Vec::new();
+/// let used = compress_with_level(Compression::Zstd, 19, &input, &mut packed).unwrap();
+/// assert_eq!(used, Compression::Zstd);
+/// let mut back = vec![0; input.len()];
+/// decompress(Compression::Zstd, &packed, &mut back).unwrap();
+/// assert_eq!(back, input);
+/// ```
+pub fn compress_with_level(
+    codec: Compression,
+    level: i8,
+    input: &[u8],
+    out: &mut Vec<u8>,
+) -> crate::Result<Compression> {
     match codec {
         Compression::None => {}
         Compression::Lz4 => {
@@ -61,7 +88,19 @@ pub fn compress(codec: Compression, input: &[u8], out: &mut Vec<u8>) -> crate::R
             }
             out.truncate(start);
         }
-        Compression::Zstd => return Err(Error::UnsupportedCompression(codec as u8)),
+        Compression::Zstd => {
+            let start = out.len();
+            out.resize(start + zstd::zstd_safe::compress_bound(input.len()), 0);
+            let n = zstd::bulk::compress_to_buffer(input, &mut out[start..], i32::from(level))
+                .map_err(|_| Error::Corrupt {
+                    what: "zstd compress",
+                })?;
+            out.truncate(start + n);
+            if n < input.len() && (input.len() - n) * 8 >= input.len() {
+                return Ok(Compression::Zstd);
+            }
+            out.truncate(start);
+        }
     }
     out.extend_from_slice(input);
     Ok(Compression::None)
@@ -83,6 +122,11 @@ pub fn decompress(codec: Compression, input: &[u8], out: &mut [u8]) -> crate::Re
             Ok(n) if n == out.len() => Ok(()),
             _ => Err(Error::Corrupt { what: "lz4 block" }),
         },
-        Compression::Zstd => Err(Error::UnsupportedCompression(codec as u8)),
+        // Into a buffer of exactly the block's length: a frame that would decode to more
+        // fails instead of growing it.
+        Compression::Zstd => match zstd::bulk::decompress_to_buffer(input, out) {
+            Ok(n) if n == out.len() => Ok(()),
+            _ => Err(Error::Corrupt { what: "zstd block" }),
+        },
     }
 }

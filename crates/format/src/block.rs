@@ -149,12 +149,29 @@ pub fn seal(
     logical: &[u8],
     out: &mut Vec<u8>,
 ) -> crate::Result<BlockTrailer> {
+    seal_with_level(
+        kind,
+        codec,
+        crate::compress::DEFAULT_ZSTD_LEVEL,
+        logical,
+        out,
+    )
+}
+
+/// [`seal`] with a zstd compression level ([`crate::compress::compress_with_level`]).
+pub fn seal_with_level(
+    kind: BlockKind,
+    codec: Compression,
+    level: i8,
+    logical: &[u8],
+    out: &mut Vec<u8>,
+) -> crate::Result<BlockTrailer> {
     if logical.len() > MAX_BLOCK_LEN {
         return Err(Error::ValueTooLarge);
     }
     let uncompressed_len = logical.len() as u32;
     let start = out.len();
-    let compression = crate::compress::compress(codec, logical, out)?;
+    let compression = crate::compress::compress_with_level(codec, level, logical, out)?;
     out.extend_from_slice(&[kind as u8, compression as u8, 0, 0]);
     out.extend_from_slice(&uncompressed_len.to_le_bytes());
     let checksum = crate::checksum::xxh3_64(&out[start..]);
