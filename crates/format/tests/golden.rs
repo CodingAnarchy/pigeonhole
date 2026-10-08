@@ -386,6 +386,10 @@ fn all_edits() -> Vec<Edit> {
         Edit::DropBlobFile {
             blob_file: BlobFileId(4),
         },
+        Edit::SstBlobRefs {
+            sst: SstId(9),
+            refs: vec![(BlobFileId(4), 4_112), (BlobFileId(5), 70_016)],
+        },
         Edit::DropTablet {
             tablet: TabletId(2),
         },

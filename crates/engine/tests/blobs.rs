@@ -819,3 +819,44 @@ fn shrink_moves_blob_extents_down() {
     drop(snap);
     rig.close();
 }
+
+#[test]
+fn blob_gc_empties_files_of_ssts_written_without_references() {
+    // #240: a file written before tag 13 has no per-SST blob references. Blob GC must treat
+    // such SSTs as pointing anywhere and still empty a mostly-garbage file.
+    let vfs = SimVfs::new(43);
+    let mut rig = Rig::open(&vfs, false);
+    rig.db.omit_blob_refs(true);
+    let one_version = FamilyOptions {
+        max_versions: 1,
+        ..family()
+    };
+    let t = rig
+        .db
+        .create_table("t", &[("f".into(), one_version)])
+        .unwrap();
+    write(&mut rig, &t, 0..80, 0);
+    rig.flush();
+    let first: Vec<u32> = rig.db.blob_files().iter().map(|f| f.1).collect();
+    assert!(!first.is_empty());
+    rig.close();
+
+    // Reopened by this build: the SSTs carry no references. Overwriting three quarters of
+    // the rows and compacting makes the first files mostly garbage; blob GC empties them.
+    let mut rig = Rig::open(&vfs, false);
+    let t = rig.db.table("t").unwrap();
+    write(&mut rig, &t, 0..60, 1);
+    rig.flush();
+    rig.compact();
+    rig.check();
+    assert!(
+        rig.db.blob_files().iter().all(|f| !first.contains(&f.1)),
+        "blob GC left a file of unrecorded SSTs: {:?}",
+        rig.db.blob_files()
+    );
+    assert_reads(&rig.db, &t, 80, |i| match i {
+        0..60 => value(i, 1),
+        _ => value(i, 0),
+    });
+    rig.close();
+}

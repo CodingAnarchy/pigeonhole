@@ -79,6 +79,11 @@ pub struct Catalog {
     /// `(tablet, family) -> [(level, meta)]`, in manifest order.
     pub(crate) ssts: BTreeMap<(TabletId, FamilyId), SstList>,
     pub(crate) blob_files: BTreeMap<BlobFileId, BlobFile>,
+    /// Per SST, the blob files its puts point into and the bytes they reference
+    /// (`SstBlobRefs`, #240). An SST without an entry (written by an older build) may point
+    /// into any blob file of its family. Entries of SSTs no tablet references any more are
+    /// dropped by [`Catalog::prune_blob_refs`] after each batch of edits.
+    pub(crate) blob_refs: HashMap<SstId, Vec<(BlobFileId, u64)>>,
     /// Whether any family names a merge operator this process cannot run.
     pub(crate) has_unknown_merge: bool,
     /// The operators this process knows (`EngineOptions::merge_operators`).
@@ -252,6 +257,9 @@ impl Catalog {
             Edit::DropBlobFile { blob_file } => {
                 self.blob_files.remove(blob_file);
             }
+            Edit::SstBlobRefs { sst, refs } => {
+                self.blob_refs.insert(*sst, refs.clone());
+            }
             Edit::Counters {
                 next_table,
                 next_family,
@@ -335,7 +343,37 @@ impl Catalog {
                 live_bytes: b.live_bytes,
             });
         }
+        let mut refs: Vec<(&SstId, &Vec<(BlobFileId, u64)>)> = self.blob_refs.iter().collect();
+        refs.sort_by_key(|(id, _)| **id);
+        for (sst, refs) in refs {
+            edits.push(Edit::SstBlobRefs {
+                sst: *sst,
+                refs: refs.clone(),
+            });
+        }
         edits
+    }
+
+    /// Drops the blob references of SSTs no tablet references (call after a batch of edits:
+    /// a trivial move removes and re-adds an SST within one batch).
+    pub(crate) fn prune_blob_refs(&mut self) {
+        if self.blob_refs.is_empty() {
+            return;
+        }
+        let live: HashSet<SstId> = self
+            .ssts
+            .values()
+            .flat_map(|l| l.iter().map(|(_, m)| m.id))
+            .collect();
+        self.blob_refs.retain(|id, _| live.contains(id));
+    }
+
+    /// Whether SST `id` may hold a pointer into blob file `blob`: its references say so, or
+    /// it has none recorded.
+    pub(crate) fn may_reference(&self, id: SstId, blob: BlobFileId) -> bool {
+        self.blob_refs
+            .get(&id)
+            .is_none_or(|refs| refs.iter().any(|(b, _)| *b == blob))
     }
 
     pub(crate) fn counters_edit(&self) -> Edit {

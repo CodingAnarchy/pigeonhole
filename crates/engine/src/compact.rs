@@ -2,13 +2,13 @@
 //! commit, narrowing picker tasks to the tablet (decision D79), the GC policy (decision
 //! D70), and the cooperative task that runs a `CompactionJob` and commits its output.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::task::Poll;
 
 use pigeonhole_compaction::{
-    BlobFileStat, CompactionJob, CompactionOutput, CompactionTask, GcPolicy, JobContext, JobPoll,
-    KeyRange, Levels, NewBlobFile, TaskKind, pick_blob_gc,
+    BlobFileStat, BlobRefs, CompactionJob, CompactionOutput, CompactionTask, GcPolicy, JobContext,
+    JobPoll, KeyRange, Levels, NewBlobFile, TaskKind, pick_blob_gc,
 };
 use pigeonhole_format::key::encode_row_prefix;
 use pigeonhole_format::manifest::{Edit, SstMeta};
@@ -202,29 +202,24 @@ pub(crate) fn plan_full(
 /// A slot: one `(tablet, family)` tree.
 type Slot = (TabletId, FamilyId);
 
-/// One shard's blob GC planning (issue #33).
+/// Blob GC planning (issues #33, #240).
 ///
-/// A blob file is emptied by rewriting every slot whose SSTs may point into it: a
-/// `BlobGc` task over all of the slot's SSTs copies the values still live in the file into
-/// new ones, and the file is dropped once its live count reaches zero (`blob_edits`). The
-/// manifest does not record which SSTs point into which file, so each candidate file is
-/// rewritten out of every slot of its family once. After a slot's blob GC commits it holds
-/// no pointer into the file (its rows' values were copied, and nothing it compacts later
-/// can bring one back), so the slot is not picked for that file again. The record is
-/// in memory only: after a reopen, or for a tablet that a merge created or a move brought
-/// here, a slot may be rewritten once more for nothing.
+/// A blob file is emptied by rewriting every slot whose SSTs point into it: a `BlobGc`
+/// task over all of the slot's SSTs copies the values still live in the file into new
+/// ones, and the file is dropped once its live count reaches zero (`blob_edits`). The
+/// manifest records which blob files each SST points into (`SstBlobRefs`), so only those
+/// slots are rewritten, and a slot whose blob GC committed is not picked again for the
+/// file (its new SSTs hold no pointer into it), across reopens too. An SST without a
+/// record (written by an older build) counts as pointing into every file of its family.
 #[derive(Debug, Default)]
-pub(crate) struct BlobGc {
-    done: HashMap<BlobFileId, HashSet<Slot>>,
-    running: Option<(Slot, Vec<BlobFileId>)>,
-}
+pub(crate) struct BlobGc;
 
 impl BlobGc {
     /// The next blob GC task among `slots` (oldest candidate file first), or `None`.
     /// Candidates are files at least half garbage with at least `min_garbage` garbage
-    /// bytes (`pick_blob_gc`). Slots with no SSTs need no rewrite and are marked done.
+    /// bytes (`pick_blob_gc`); a slot is picked for the candidates its SSTs point into.
     pub(crate) fn plan(
-        &mut self,
+        &self,
         view: &View,
         slots: &[Slot],
         last_level: u8,
@@ -232,8 +227,6 @@ impl BlobGc {
         min_garbage: u64,
     ) -> Option<(Slot, CompactionTask)> {
         let catalog = &view.catalog;
-        self.done
-            .retain(|id, _| catalog.blob_files.contains_key(id));
         let mut candidates: HashMap<FamilyId, Vec<BlobFileId>> = HashMap::new();
         for (id, b) in &catalog.blob_files {
             let stat = BlobFileStat {
@@ -249,30 +242,24 @@ impl BlobGc {
             let Some(files) = candidates.get(&slot.1) else {
                 continue;
             };
+            let Some(fam) = view.ssts.family(slot.0, slot.1) else {
+                continue;
+            };
             let pending: Vec<BlobFileId> = files
                 .iter()
                 .copied()
-                .filter(|id| !self.done.get(id).is_some_and(|d| d.contains(&slot)))
+                .filter(|f| fam.iter().any(|s| catalog.may_reference(s.meta.id, *f)))
                 .collect();
             if pending.is_empty() {
                 continue;
             }
-            let inputs: Vec<(u8, Vec<SstId>)> = view
-                .ssts
-                .family(slot.0, slot.1)
-                .map(|fam| {
-                    fam.levels
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, l)| !l.is_empty())
-                        .map(|(n, l)| (n as u8, l.iter().map(|s| s.meta.id).collect()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if inputs.is_empty() {
-                self.mark_done(slot, &pending);
-                continue;
-            }
+            let inputs: Vec<(u8, Vec<SstId>)> = fam
+                .levels
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| !l.is_empty())
+                .map(|(n, l)| (n as u8, l.iter().map(|s| s.meta.id).collect()))
+                .collect();
             if inputs
                 .iter()
                 .flat_map(|(_, ids)| ids)
@@ -311,28 +298,6 @@ impl BlobGc {
             .collect();
         if !files.is_empty() {
             task.kind = TaskKind::BlobGc { blob_files: files };
-        }
-    }
-
-    /// A blob GC task started for `slot`.
-    pub(crate) fn started(&mut self, slot: Slot, task: &CompactionTask) {
-        if let TaskKind::BlobGc { blob_files } = &task.kind {
-            self.running = Some((slot, blob_files.clone()));
-        }
-    }
-
-    /// The running compaction finished; a blob GC that committed marks its slot done.
-    pub(crate) fn finished(&mut self, committed: bool) {
-        if let Some((slot, files)) = self.running.take()
-            && committed
-        {
-            self.mark_done(slot, &files);
-        }
-    }
-
-    fn mark_done(&mut self, slot: Slot, files: &[BlobFileId]) {
-        for id in files {
-            self.done.entry(*id).or_default().insert(slot);
         }
     }
 }
@@ -431,6 +396,8 @@ pub(crate) struct CompactionWork {
     view: Arc<View>,
     /// A `Drop`'s blob live-byte changes: the pointers its SSTs held (read before submit).
     drop_delta: Vec<(BlobFileId, i64)>,
+    /// The finished job's per-SST blob references (#240).
+    blob_refs: BlobRefs,
     meta: FamilyMeta,
     record: Option<CompactionRecord>,
     stage: Stage,
@@ -495,6 +462,7 @@ impl CompactionWork {
             job,
             view,
             drop_delta: Vec::new(),
+            blob_refs: Vec::new(),
             meta,
             record,
             stage: Stage::Run,
@@ -505,8 +473,9 @@ impl CompactionWork {
 
     /// For a `Drop`, which removes whole SSTs without a job: the live bytes the blob files
     /// lose, `16 + len` for every blob pointer a dropped SST holds within the tablet's rows
-    /// (the same accounting a job does for the puts it drops). Reads the SSTs only when the
-    /// family has blob files.
+    /// (the same accounting a job does for the puts it drops). Uses the SST's recorded
+    /// references when they cover only this tablet's rows, and reads the SST otherwise;
+    /// nothing when the family has no blob files.
     fn count_dropped_blobs(&mut self) -> Result<()> {
         use pigeonhole_compaction::{blob_pointer, record_bytes};
         use pigeonhole_format::Cursor;
@@ -538,6 +507,23 @@ impl CompactionWork {
             let (_, sst) = fam
                 .find(*id)
                 .ok_or_else(|| Error::Corruption(format!("dropped SST {} is gone", id.0)))?;
+            // Its recorded references (#240) count every row: usable unless the SST also
+            // holds rows outside this tablet (shared with a sibling, or inherited from a
+            // split's parent).
+            let catalog = &self.view.catalog;
+            if let Some(refs) = catalog.blob_refs.get(id)
+                && !catalog.sst_shared(*id)
+                && !sticks_out(&sst.meta, range)
+            {
+                for (blob_file, bytes) in refs {
+                    let bytes = *bytes as i64;
+                    match delta.iter_mut().find(|d| d.0 == *blob_file) {
+                        Some(d) => d.1 -= bytes,
+                        None => delta.push((*blob_file, -bytes)),
+                    }
+                }
+                continue;
+            }
             let mut it = sst
                 .reader(&self.view.ssts, priority)?
                 .iter(ScanFilter::all(), read);
@@ -603,7 +589,16 @@ impl CompactionWork {
         match (self.task.kind.clone(), output) {
             (TaskKind::Rewrite | TaskKind::BlobGc { .. }, Some(out)) => {
                 let priority = SstSet::priority(self.meta.options.cache_priority);
+                let mut blob_refs = self.blob_refs.clone();
                 for (level, meta) in out.added {
+                    let refs = blob_refs
+                        .iter()
+                        .position(|(id, _)| *id == meta.id)
+                        .map(|i| blob_refs.swap_remove(i).1);
+                    // The job reports every output's references; in release builds a
+                    // missing one only leaves the SST unrecorded (blob GC then treats it
+                    // as pointing anywhere).
+                    debug_assert!(refs.is_some(), "no blob references for SST {}", meta.id.0);
                     readers.push((
                         meta.id,
                         Arc::new(SstReader::open(
@@ -613,12 +608,16 @@ impl CompactionWork {
                             priority,
                         )?),
                     ));
+                    let sst = meta.id;
                     edits.push(Edit::AddSst {
                         tablet,
                         family,
                         level,
                         meta,
                     });
+                    if let Some(refs) = refs {
+                        edits.push(Edit::SstBlobRefs { sst, refs });
+                    }
                 }
                 for sst in out.removed {
                     edits.push(Edit::RemoveSst {
@@ -808,8 +807,11 @@ impl Task for CompactionWork {
                                 self.job = Some(job);
                                 return TaskPoll::Pending;
                             }
-                            Ok(JobPoll::Done) => match job.finish() {
-                                Ok(out) => Some(out),
+                            Ok(JobPoll::Done) => match job.finish_with_blob_refs() {
+                                Ok((out, refs)) => {
+                                    self.blob_refs = refs;
+                                    Some(out)
+                                }
                                 Err(e) => {
                                     self.report(Err(e.into()));
                                     return TaskPoll::Done;
@@ -913,5 +915,148 @@ mod tests {
             blob_edits(&c, changes(-301)),
             Err(Error::Corruption(_))
         ));
+    }
+
+    fn sst(id: u64, row: &[u8]) -> SstMeta {
+        let mut key = Vec::new();
+        encode_row_prefix(&mut key, row).unwrap();
+        SstMeta {
+            id: SstId(id),
+            extent: ExtentRef {
+                page: 16 * id,
+                size_class: 0,
+            },
+            len: 4096,
+            smallest_key: key.clone(),
+            largest_key: key,
+            seqno_range: (1, 1),
+            ts_range: (1, 1),
+            entries: 1,
+            deletes: 0,
+        }
+    }
+
+    /// #240: blob GC rewrites only the slots whose SSTs point into a candidate file (or
+    /// whose SSTs have no record, written by an older build).
+    #[test]
+    fn blob_gc_picks_only_slots_pointing_into_a_candidate() {
+        let (table, family, f1) = (TableId(1), FamilyId(2), BlobFileId(9));
+        let mut c = Catalog::default();
+        let mut edits = vec![
+            Edit::CreateTable {
+                table,
+                name: "t".into(),
+            },
+            Edit::PutFamily {
+                table,
+                family,
+                name: "f".into(),
+                options: pigeonhole_format::manifest::FamilyOptions::default(),
+            },
+            Edit::PutTablet {
+                tablet: TabletId(1),
+                table,
+                start: Vec::new(),
+                end: Some(b"m".to_vec()),
+            },
+            Edit::PutTablet {
+                tablet: TabletId(2),
+                table,
+                start: b"m".to_vec(),
+                end: None,
+            },
+            // Mostly garbage: a candidate.
+            Edit::PutBlobFile {
+                blob_file: f1,
+                family,
+                extents: vec![ExtentRef {
+                    page: 4096,
+                    size_class: 0,
+                }],
+                total_bytes: 1 << 20,
+                live_bytes: 1000,
+            },
+        ];
+        for (tablet, id, row) in [(1, 10, &b"a"[..]), (2, 20, b"x")] {
+            edits.push(Edit::AddSst {
+                tablet: TabletId(tablet),
+                family,
+                level: 1,
+                meta: sst(id, row),
+            });
+        }
+        // Tablet 1's SST points into the file; tablet 2's points into none.
+        edits.push(Edit::SstBlobRefs {
+            sst: SstId(10),
+            refs: vec![(f1, 1000)],
+        });
+        edits.push(Edit::SstBlobRefs {
+            sst: SstId(20),
+            refs: Vec::new(),
+        });
+        for e in &edits {
+            c.apply(e, 1).unwrap();
+        }
+        let view = |c: &Catalog| {
+            let vfs = pigeonhole_io::sim::SimVfs::new(1);
+            let file = pigeonhole_io::Vfs::open(
+                &*vfs,
+                "/f".as_ref(),
+                pigeonhole_io::OpenOptions::read_write_create(),
+            )
+            .unwrap();
+            let cache = Arc::new(pigeonhole_cache::BlockCache::new(1 << 20, 1));
+            let ssts = SstSet::build(c, None, &mut HashMap::new(), file, cache);
+            let tablets: Vec<TabletEntry> = c.tablets();
+            View {
+                version: 1,
+                manifest_version: 1,
+                tablets: Arc::new(crate::snapshot::TabletMap::build(1, &tablets)),
+                catalog: Arc::new(c.clone()),
+                mems: Vec::new(),
+                ssts: Arc::new(ssts),
+                _pin: None,
+            }
+        };
+        let slots = [(TabletId(1), family), (TabletId(2), family)];
+        let plan = |c: &Catalog| {
+            BlobGc
+                .plan(&view(c), &slots, 6, &[], 1)
+                .map(|(slot, task)| (slot, task.kind))
+        };
+        assert_eq!(
+            plan(&c),
+            Some((
+                (TabletId(1), family),
+                TaskKind::BlobGc {
+                    blob_files: vec![f1]
+                }
+            ))
+        );
+        // Once tablet 1's SSTs no longer point into it, nothing is left to rewrite.
+        c.apply(
+            &Edit::SstBlobRefs {
+                sst: SstId(10),
+                refs: Vec::new(),
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(plan(&c), None);
+        // An SST without a record may point anywhere.
+        c.blob_refs.remove(&SstId(20));
+        assert_eq!(plan(&c).map(|p| p.0), Some((TabletId(2), family)));
+        // Records of SSTs no tablet references go at the end of a batch.
+        c.apply(
+            &Edit::RemoveSst {
+                tablet: TabletId(1),
+                family,
+                sst: SstId(10),
+            },
+            1,
+        )
+        .unwrap();
+        c.prune_blob_refs();
+        assert!(!c.blob_refs.contains_key(&SstId(10)));
     }
 }

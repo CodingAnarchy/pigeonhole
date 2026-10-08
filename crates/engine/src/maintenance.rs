@@ -122,11 +122,11 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
                 let options = writer_options(&meta.options, t.table, f, t.id, created);
                 // Inline: blob files written here would be the copy's, and the temporary
                 // SSTs' extents are freed after phase 2 (#58).
-                let (outputs, _) = copy_at(
+                let (sink, _) = copy_at(
                     shared, &pager, &sst_ids, options, sources, seqno, None, &closing,
                 )?;
-                if !outputs.is_empty() {
-                    temps.insert((t.id, f), outputs);
+                if !sink.outputs.is_empty() {
+                    temps.insert((t.id, f), sink.outputs);
                 }
             }
         }
@@ -191,7 +191,7 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
                     threshold: meta.options.blob_threshold,
                     rows: (start, end),
                 };
-                let (outputs, blob_files) = copy_at(
+                let (mut outputs, blob_files) = copy_at(
                     shared,
                     &pager,
                     &sst_ids,
@@ -214,14 +214,7 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
                 for m in temp {
                     pager.abandon(m.extent);
                 }
-                for meta in outputs {
-                    edits.push(Edit::AddSst {
-                        tablet: t.id,
-                        family: f,
-                        level: last,
-                        meta,
-                    });
-                }
+                edits.extend(outputs.take_edits(t.id, f, last));
                 edits.push(Edit::SetFlushed {
                     tablet: t.id,
                     family: f,
@@ -285,7 +278,8 @@ struct Separate<'a> {
 }
 
 /// Merges `sources` in key order and writes every entry with a seqno at or below `seqno`
-/// into new SSTs of `pager`; returns them and the blob files written. Without `separate`,
+/// into new SSTs of `pager`; returns the sink holding them (and their blob references) and
+/// the blob files written. Without `separate`,
 /// every value is written as it is (phase 1: memtables hold no blob pointers).
 #[allow(clippy::too_many_arguments)]
 fn copy_at(
@@ -297,17 +291,17 @@ fn copy_at(
     seqno: pigeonhole_format::Seqno,
     separate: Option<Separate<'_>>,
     closing: &dyn Fn() -> Result<()>,
-) -> Result<(Vec<SstMeta>, Vec<NewBlobFile>)> {
-    if sources.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let mut merged = MergingCursor::new(sources);
+) -> Result<(SstSink, Vec<NewBlobFile>)> {
     let mut sink = SstSink::new(
         Arc::clone(pager),
         Arc::clone(sst_ids),
         options,
         shared.picker.target_sst_bytes,
     );
+    if sources.is_empty() {
+        return Ok((sink, Vec::new()));
+    }
+    let mut merged = MergingCursor::new(sources);
     let (start, end) = separate
         .as_ref()
         .map_or((None, None), |s| (s.rows.0.as_deref(), s.rows.1.as_deref()));
@@ -343,10 +337,8 @@ fn copy_at(
     }
     sink.cut()?;
     sink.finish_blobs()?;
-    Ok((
-        std::mem::take(&mut sink.outputs),
-        std::mem::take(&mut sink.blob_files),
-    ))
+    let blob_files = std::mem::take(&mut sink.blob_files);
+    Ok((sink, blob_files))
 }
 
 /// Relocates manifest-named extents past the shrink point and truncates the file. Returns
@@ -570,6 +562,13 @@ impl Moves {
                     family,
                     level,
                     meta: copy.clone(),
+                });
+            }
+            // The copy holds the same entries, so the same blob references.
+            if let Some(refs) = catalog.blob_refs.get(&old) {
+                edits.push(Edit::SstBlobRefs {
+                    sst: copy.id,
+                    refs: refs.clone(),
                 });
             }
         }

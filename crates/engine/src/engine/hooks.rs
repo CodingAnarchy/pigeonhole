@@ -92,6 +92,9 @@ pub(crate) struct Hooks {
     /// Refuses batches of only `WalCheckpoint` edits as `NoSpace`, as a snapshot rewrite
     /// that finds no space does (`Engine::refuse_checkpoints`).
     pub refuse_checkpoints: AtomicBool,
+    /// Commits no `SstBlobRefs` edit and keeps no blob references, as a build from before
+    /// tag 13 (#240) wrote (`Engine::omit_blob_refs`).
+    pub omit_blob_refs: AtomicBool,
 }
 
 /// A shard's test-hook counters (`ShardMetrics::hooks`), stored after each batch.
@@ -389,7 +392,8 @@ impl Engine {
     /// holds within its tablet's rows names a blob file of the catalog, of the same family,
     /// and each file's live bytes are exactly the bytes those pointers reference (16 plus
     /// the value's length each; an SST shared by several tablets counts once per tablet,
-    /// for its rows in that tablet). Describes the first mismatch.
+    /// for its rows in that tablet), and every SST's recorded blob references (#240) are
+    /// exactly the pointers it holds. Describes the first mismatch.
     #[doc(hidden)]
     pub fn check_blob_accounting(&self) -> std::result::Result<(), String> {
         use pigeonhole_compaction::{blob_pointer, record_bytes};
@@ -445,6 +449,34 @@ impl Engine {
                         }
                         it.next().map_err(|e| err(&e))?;
                     }
+                }
+            }
+        }
+        // Each SST's recorded references (#240) are exactly the pointers it holds.
+        let mut seen = std::collections::HashSet::new();
+        for fam in view.ssts.map.values() {
+            for sst in fam.iter() {
+                if !seen.insert(sst.meta.id) {
+                    continue;
+                }
+                let Some(recorded) = catalog.blob_refs.get(&sst.meta.id) else {
+                    continue;
+                };
+                let reader = sst
+                    .reader(&view.ssts, pigeonhole_cache::Priority::Low)
+                    .map_err(|e| err(&e))?;
+                let mut it = reader.iter(ScanFilter::all(), ReadOptions::default());
+                it.seek_to_first().map_err(|e| err(&e))?;
+                let mut actual = Vec::new();
+                while it.valid() {
+                    pigeonhole_compaction::note_blob_ref(&mut actual, it.key(), it.value());
+                    it.next().map_err(|e| err(&e))?;
+                }
+                if &actual != recorded {
+                    return Err(format!(
+                        "SST {} records blob references {recorded:?} but holds {actual:?}",
+                        sst.meta.id.0
+                    ));
                 }
             }
         }
@@ -717,6 +749,18 @@ impl Engine {
             .hooks
             .refuse_checkpoints
             .store(refuse, Ordering::Release);
+    }
+
+    /// While `omit` is set, manifest commits drop every `SstBlobRefs` edit and the catalog
+    /// keeps no blob references, so the file looks as one written before tag 13 (#240).
+    /// Test hook.
+    #[doc(hidden)]
+    pub fn omit_blob_refs(&self, omit: bool) {
+        self.inner
+            .shared
+            .hooks
+            .omit_blob_refs
+            .store(omit, Ordering::Release);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits
