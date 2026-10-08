@@ -87,12 +87,12 @@ Trailer (16 bytes, at the end of the physical block):
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 1 | `kind`: 1 Data, 2 Index, 3 TopIndex, 4 Filter, 5 Properties |
-| 1 | 1 | `compression`: 0 None, 1 LZ4 (block format, no frame), 2 zstd |
+| 1 | 1 | `compression`: 0 None, 1 LZ4 (block format, no frame), 2 zstd (one zstd frame, standard format, no dictionary) |
 | 2 | 2 | reserved |
 | 4 | 4 | `uncompressed_len` u32 |
 | 8 | 8 | `checksum` u64: xxh3-64 of `payload ++ trailer[0..8]` |
 
-The checksum is verified on every read from disk and skipped on cache hits. A logical block is at most 128 MiB (twice the largest extent); a reader rejects a larger `uncompressed_len`, and an LZ4 one above 255 times the payload length. A writer stores a block uncompressed when compression saves less than 1/8 of its size.
+The checksum is verified on every read from disk and skipped on cache hits. A logical block is at most 128 MiB (twice the largest extent); a reader rejects a larger `uncompressed_len`, and an LZ4 one above 255 times the payload length. A zstd block decodes into a buffer of exactly `uncompressed_len` bytes and is rejected if its frame holds more or less. The zstd level is a writer setting (the family's `compression_level`) and is not stored per block. A writer stores a block uncompressed when compression saves less than 1/8 of its size.
 
 ### 4.2 Logical data and index block
 

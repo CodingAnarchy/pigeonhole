@@ -87,6 +87,7 @@ pub struct Layout {
     pub block_size: usize,
     pub restart_interval: usize,
     pub compression: Compression,
+    pub compression_level: i8,
     pub bloom_bits: u8,
 }
 
@@ -94,14 +95,21 @@ pub fn layout() -> impl Strategy<Value = Layout> {
     (
         prop::sample::select(vec![64usize, 256, 1024, 16 * 1024]),
         prop::sample::select(vec![1usize, 2, 16]),
-        prop::sample::select(vec![Compression::None, Compression::Lz4]),
+        // zstd is libzstd behind FFI, which Miri cannot run.
+        prop::sample::select(if cfg!(miri) {
+            vec![Compression::None, Compression::Lz4]
+        } else {
+            vec![Compression::None, Compression::Lz4, Compression::Zstd]
+        }),
+        -3i8..20,
         prop::sample::select(vec![0u8, 4, 10]),
     )
         .prop_map(
-            |(block_size, restart_interval, compression, bloom_bits)| Layout {
+            |(block_size, restart_interval, compression, compression_level, bloom_bits)| Layout {
                 block_size,
                 restart_interval,
                 compression,
+                compression_level,
                 bloom_bits,
             },
         )
@@ -117,6 +125,7 @@ pub fn options(l: &Layout) -> SstWriterOptions {
     o.block_size = l.block_size;
     o.restart_interval = l.restart_interval;
     o.compression = l.compression;
+    o.compression_level = l.compression_level;
     o.bloom_bits = l.bloom_bits;
     o.merge_operator = "pigeonhole.i64_add".into();
     o.created_micros = 1_700_000_000_000_000;

@@ -83,6 +83,7 @@ const LAYOUT: Layout = Layout {
     block_size: 512,
     restart_interval: 4,
     compression: Compression::Lz4,
+    compression_level: 3,
     bloom_bits: 10,
 };
 

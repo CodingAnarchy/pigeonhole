@@ -149,6 +149,8 @@ pub struct SstWriterOptions {
     pub restart_interval: usize,
     /// Block codec.
     pub compression: Compression,
+    /// zstd level (ignored by the other codecs).
+    pub compression_level: i8,
     /// Bloom bits per key; 0 writes no filters.
     pub bloom_bits: u8,
     /// Table (recorded in properties).
@@ -176,6 +178,7 @@ impl SstWriterOptions {
             block_size: options.block_size as usize,
             restart_interval: pigeonhole_format::block::DEFAULT_RESTART_INTERVAL,
             compression: options.compression,
+            compression_level: options.compression_level,
             bloom_bits: options.bloom_bits,
             table,
             family,

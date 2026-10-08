@@ -141,17 +141,8 @@ fn drop_table_removes_it_and_its_data() {
 }
 
 #[test]
-fn later_phase_family_settings_are_refused() {
+fn family_settings_are_stored_and_unregistered_operators_refused() {
     let db = db();
-    // zstd is still refused (#44: Tiered and FifoByTime are accepted below).
-    let err = db
-        .table("t")
-        .unwrap()
-        .family("f", Family::default().zstd(3))
-        .create_if_missing()
-        .unwrap_err();
-    assert_eq!(err.code(), ErrorCode::Unsupported, "{err}");
-    assert!(db.tables().is_empty());
     // A custom merge operator is not registered in this process.
     let err = db
         .table("t")
@@ -180,7 +171,7 @@ fn later_phase_family_settings_are_refused() {
         .create()
         .unwrap();
     assert_eq!(t.families(), ["f"]);
-    // Tiered and FIFO-by-time compaction are accepted since their pickers landed (#44).
+    // Tiered and FIFO-by-time compaction and zstd are accepted since they landed (#44).
     let u = db
         .table("u")
         .unwrap()
@@ -191,9 +182,26 @@ fn later_phase_family_settings_are_refused() {
                 .ttl(days(1))
                 .compaction(Compaction::FifoByTime),
         )
+        .family("zstd", Family::default().zstd(19))
         .create()
         .unwrap();
-    assert_eq!(u.families(), ["tiered", "fifo"]);
+    assert_eq!(u.families(), ["tiered", "fifo", "zstd"]);
+    // zstd blocks round-trip through a flush and a compaction.
+    let value: Vec<u8> = (0..3000u32).map(|i| (i % 7) as u8).collect();
+    for row in 0..50u32 {
+        u.mutate(format!("r{row:03}").as_bytes())
+            .put("zstd", b"q", &value)
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    for row in 0..50u32 {
+        let cell = u
+            .get(format!("r{row:03}").as_bytes(), "zstd", b"q")
+            .unwrap();
+        assert_eq!(cell.map(|c| c.value().to_vec()), Some(value.clone()));
+    }
 }
 
 // ---- errors ----

@@ -8,7 +8,7 @@ use std::ops::Bound;
 
 use common::{Cell, cell, config, sized};
 use pigeonhole_format::Cursor;
-use pigeonhole_format::block::{Block, BlockBuilder, BlockKind, seal, verify};
+use pigeonhole_format::block::{Block, BlockBuilder, BlockKind, seal_with_level, verify};
 use pigeonhole_format::compress::{Compression, decompress};
 use pigeonhole_format::key::{decode_key, row_prefix_len};
 use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
@@ -124,11 +124,16 @@ proptest! {
     }
 
     #[test]
-    fn seal_verify_roundtrip(model in entries(), lz4 in any::<bool>()) {
+    fn seal_verify_roundtrip(model in entries(), codec in 0u8..3, level in -5i8..23) {
         let logical = build_data(&model, 16);
-        let codec = if lz4 { Compression::Lz4 } else { Compression::None };
+        // zstd is libzstd behind FFI, which Miri cannot run.
+        let codec = match codec {
+            2 if !cfg!(miri) => Compression::Zstd,
+            1 | 2 => Compression::Lz4,
+            _ => Compression::None,
+        };
         let mut physical = vec![0xAA; 3]; // seal appends
-        let trailer = seal(BlockKind::Data, codec, &logical, &mut physical).unwrap();
+        let trailer = seal_with_level(BlockKind::Data, codec, level, &logical, &mut physical).unwrap();
         let (t, payload) = verify(&physical[3..]).unwrap();
         prop_assert_eq!(t, trailer);
         prop_assert_eq!(t.uncompressed_len as usize, logical.len());

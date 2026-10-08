@@ -108,7 +108,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `bloom_bits(u8)` | Filter bits per key (0 off; default 10). |
 | `blob_threshold(u32)` | P2. Values above go to blobs (default 4096). Today: stored, values stay inline. |
 | `lz4()` | Default compression. |
-| `zstd(i8)` | P2. zstd at level. Today: table or family creation fails with `Unsupported`. |
+| `zstd(i8)` | zstd blocks at a libzstd level (1–22, higher smaller and slower; default 3). |
 | `uncompressed()` | No compression. |
 | `block_size(u32)` | Data block bytes (default 16 KiB). |
 | `merge_operator(&str)` | Name of a registered operator (unregistered: `UnknownMergeOperator`). `incr` needs none (`pigeonhole.i64_add` default). |
@@ -209,7 +209,7 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 | Feature | Phase |
 |---|---|
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
-| zstd, blob separation | P2 |
+| blob separation | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
 
 ## Recipes

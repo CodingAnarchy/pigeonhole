@@ -8,7 +8,7 @@ use pigeonhole_engine::{
 use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
 
-use crate::{ErrorCode, MergeOperator, Result};
+use crate::MergeOperator;
 
 /// Name of the built-in `i64` add operator, the default operator of every family.
 pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
@@ -334,7 +334,7 @@ pub enum Compaction {
 ///
 /// Because every family carries the `i64` add operator, a column holds either plain values or
 /// a counter: an `incr` on top of a base that is not an 8-byte `i64` fails at read with
-/// [`ErrorCode::MergeFailed`] (decision D41). Use `merge_operator("")` for a family without
+/// [`ErrorCode::MergeFailed`](crate::ErrorCode::MergeFailed) (decision D41). Use `merge_operator("")` for a family without
 /// one.
 ///
 /// ```
@@ -392,8 +392,9 @@ impl Family {
         self
     }
 
-    /// zstd block compression at `level` (Phase 2). Until then, creating a table or family
-    /// with it fails with [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported).
+    /// zstd block compression at `level` (libzstd's levels: 1 to 22, higher is smaller and
+    /// slower to write; negative levels are faster; 0 and the default are 3). Smaller files
+    /// than LZ4 for most data, at a higher CPU cost to write and read.
     pub fn zstd(mut self, level: i8) -> Self {
         self.options.compression = Compression::Zstd;
         self.options.compression_level = level;
@@ -495,21 +496,9 @@ impl ReaderOptions {
 }
 
 impl Family {
-    /// The persisted options, after refusing what this build cannot store safely: settings
-    /// whose implementation lands in a later phase would otherwise be written into the file
-    /// and fail (or be silently ignored) when flush and compaction meet them.
-    pub(crate) fn to_engine(&self, name: &str) -> Result<FamilyOptions> {
-        let o = &self.options;
-        let unsupported = |what: &str| {
-            Err(crate::Error::new(
-                ErrorCode::Unsupported,
-                format!("family {name:?}: {what} is not available yet (Phase 2)"),
-            ))
-        };
-        if o.compression == Compression::Zstd {
-            return unsupported("zstd compression");
-        }
-        Ok(o.clone())
+    /// The persisted options.
+    pub(crate) fn to_engine(&self) -> FamilyOptions {
+        self.options.clone()
     }
 }
 

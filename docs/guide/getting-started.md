@@ -77,7 +77,7 @@ On an existing table, a declared family that is not yet present is added (cheap)
 
 The returned `Table` is cheap to clone and `Send + Sync`. Also available: `db.tables()`, `db.drop_table(name)`, `table.name()`, `table.families()`.
 
-`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `lz4()` (default), `uncompressed()`, `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`. Phase 2: `zstd(level)` is refused with `ErrorCode::Unsupported` when the table or family is created; `blob_threshold(bytes)` is stored but values stay inline; `merge_operator(name)` names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`).
+`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `lz4()` (default), `uncompressed()`, `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`, `zstd(level)` (smaller blocks than LZ4, for more CPU), and `merge_operator(name)`, which names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`). Phase 2: `blob_threshold(bytes)` is stored but values stay inline.
 
 ## Write one row atomically
 ```rust
@@ -279,13 +279,13 @@ Reopening after a crash with fewer shards or a smaller `memtable_budget` than be
 | Feature | Current behavior |
 |---|---|
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
-| `zstd`, blob separation | Phase 2. |
+| Blob separation | Phase 2. |
 
 Later phases:
 
 | Feature | Phase |
 |---|---|
-| zstd, blob separation | 2 |
+| Blob separation | 2 |
 | `async` front door (`get_async`, `Scan::stream`, `commit_async`) | 3 |
 
 Available ahead of their phase: `RowMutation::commit_if` (P2), `Transaction` and reader processes (`open_reader`) (P4).

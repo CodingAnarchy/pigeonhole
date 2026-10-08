@@ -224,6 +224,7 @@ fn empty_sst_opens_and_is_empty() {
             block_size: 4096,
             restart_interval: 16,
             compression: Default::default(),
+            compression_level: 3,
             bloom_bits,
         };
         let meta = write_sst(&file, EXTENT, &Model::new(), &l);
@@ -247,6 +248,7 @@ fn rejects_out_of_order_and_malformed_keys() {
         block_size: 4096,
         restart_interval: 16,
         compression: Default::default(),
+        compression_level: 3,
         bloom_bits: 10,
     };
     let mut w = SstWriter::new(file.clone(), EXTENT, SstId(1), options(&l));
@@ -275,6 +277,7 @@ fn a_full_extent_is_refused() {
         block_size: 4096,
         restart_interval: 16,
         compression: pigeonhole_format::compress::Compression::None,
+        compression_level: 3,
         bloom_bits: 10,
     };
     let mut w = SstWriter::new(file, extent, SstId(1), options(&l));
@@ -315,6 +318,7 @@ fn long_keys_and_huge_values_round_trip() {
         block_size: 1024,
         restart_interval: 4,
         compression: Default::default(),
+        compression_level: 3,
         bloom_bits: 10,
     };
     let (_vfs, file) = sim_file(8, EXTENT);
@@ -345,6 +349,7 @@ fn value_cells_outlive_everything() {
         block_size: 4096,
         restart_interval: 16,
         compression: Default::default(),
+        compression_level: 3,
         bloom_bits: 10,
     };
     let meta = write_sst(&file, EXTENT, &m, &l);
@@ -382,6 +387,7 @@ fn skip_row_seeks_past_a_row_spanning_many_blocks() {
         block_size: 64,
         restart_interval: 2,
         compression: pigeonhole_format::compress::Compression::None,
+        compression_level: 3,
         bloom_bits: 0,
     };
     let (_vfs, file) = sim_file(10, EXTENT);

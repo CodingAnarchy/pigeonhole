@@ -1,7 +1,7 @@
 //! Building an SST (FORMAT §5): data blocks streamed to the extent as they fill, then index
 //! partitions, top index, filters, properties and, in a separate final write, the footer.
 
-use pigeonhole_format::block::{BlockAddr, BlockBuilder, BlockKind, TRAILER_LEN, seal};
+use pigeonhole_format::block::{BlockAddr, BlockBuilder, BlockKind, TRAILER_LEN, seal_with_level};
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::filter::{FilterBuilder, column_hash, row_hash};
 use pigeonhole_format::key::{SUFFIX_LEN, decode_key};
@@ -229,9 +229,10 @@ impl Writer {
     fn seal_data_block(&mut self) -> Result<()> {
         let offset = self.flushed + self.out.len() as u64;
         let start = self.out.len();
-        seal(
+        seal_with_level(
             BlockKind::Data,
             self.opts.compression,
+            self.opts.compression_level,
             self.data.finish(),
             &mut self.out,
         )?;
@@ -273,9 +274,10 @@ impl Writer {
 
     fn seal_partition(&mut self) -> Result<()> {
         let offset = self.index_out.len() as u64;
-        seal(
+        seal_with_level(
             BlockKind::Index,
             self.opts.compression,
+            self.opts.compression_level,
             self.index.finish(),
             &mut self.index_out,
         )?;
@@ -380,7 +382,13 @@ impl Writer {
         fill(&mut self.scratch);
         let offset = self.flushed + self.out.len() as u64;
         let start = self.out.len();
-        seal(kind, codec, &self.scratch, &mut self.out)?;
+        seal_with_level(
+            kind,
+            codec,
+            self.opts.compression_level,
+            &self.scratch,
+            &mut self.out,
+        )?;
         let len = (self.out.len() - start) as u32;
         self.check_room(offset + u64::from(len))?;
         Ok(BlockAddr { offset, len })
