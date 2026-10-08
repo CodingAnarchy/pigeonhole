@@ -30,6 +30,20 @@ Families are declared when a table is created (adding one later is cheap). Each 
 | compression | LZ4 by default; `uncompressed()`; zstd *(Phase 2)*. |
 | cache priority | How long the family's blocks stay cached. |
 
+### Compaction styles
+`Family::compaction(..)` picks how a family's files are merged. The default is right for most families.
+
+| Style | Pick it when | Trade-off |
+|---|---|---|
+| `Leveled` (default) | Reads matter most: point gets, short scans, mixed read/write. | Lowest read cost and space overhead; the most rewriting of data on the write path. |
+| `Tiered` | The family is write-heavy and read less often (ingest, logs, event capture). | Far less rewriting per byte written; reads may consult more files and the file can hold more stale data until runs merge (D165). |
+| `FifoByTime` | Append-only data written roughly in time order that you age out with a TTL. | Cheapest way to expire data (whole files are dropped, with no rewrite), but it never merges old data into big sorted runs, so reads of old data stay as fragmented as it arrived. |
+
+Notes:
+- **Tiered depth.** The depth of the tree is engine-wide (7 levels by default) and is not a per-family setting. Keep the default: write amplification of a tiered family grows only logarithmically with the amount of data there (about 4× after 1000 flushes and 6× after 4000, insert-only, in the decision's measurements), while a shallow tree of 3 levels grows it linearly with the data (D169). If you build the engine yourself with a shallow `max_levels`, prefer `Leveled`.
+- **`FifoByTime` expiry.** A file is dropped when its **newest** cell has expired (`ttl`), not cell by cell, so a file lives until its newest cell is older than the TTL. Until it is dropped, its expired cells are already hidden from reads. Expiry is noticed when the family's maintenance runs (after a flush or compaction); an idle family keeps its expired files until then, and a timer for that is tracked in [#232](https://github.com/CodingAnarchy/pigeonhole/issues/232). A family with no TTL never drops anything. `Engine::compact` (`Pigeonhole::compact`) merges a FIFO family into one run, which then expires only when its newest cell does.
+- **`FifoByTime` size cap.** The engine has an optional size cap that drops the oldest files even when they have not expired (`PickerOptions::fifo_max_bytes`, off by default). It is **lossy**, and the public `Options` do not expose it. With explicit timestamps it can resurrect an older version of a cell, uncover a value a dropped delete was hiding, or move a counter backwards (D167). Do not rely on it for correctness.
+
 Put data with different access patterns in different families: small hot metadata in one, large or TTL'd payloads in another.
 
 ## Qualifiers
