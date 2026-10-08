@@ -185,6 +185,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D170](phase-2.md#d170) — FIFO-by-time expiry runs on a timer; a busy L0 file splits the merge windows · compaction, engine, #232, #246 · refines D167
 - [D171](phase-2.md#d171) — A room wait's re-check timer can tell the clock stopped · engine, #244, #252 · refines D126, D161
 - [D172](phase-2.md#d172) — Registered merge operators reach the engine; unregistered ones make the handle read-only · pigeonhole, engine, #43, #253 · supersedes D102
+- [D173](phase-2.md#d173) — FUSE and GPFS count as network filesystems; the local check runs before the writer lock · io, engine, #147, #258 · refines D37
 
 ## Open questions
 _None._
