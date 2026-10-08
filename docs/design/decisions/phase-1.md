@@ -1,4 +1,4 @@
-# Decisions made in Phase 1 (D1–D157)
+# Decisions made in Phase 1 (D1–D159)
 
 Indexed in [README.md](README.md). Numbers are permanent; code and docs cite them as `Dn`.
 
@@ -1011,3 +1011,31 @@ D35 zero-filled the first slot of every stream at open, and the engine prepared 
 **Interim behavior:** as described. Measured after (same machine, same tiny database): open 14 ms median at 1, 4 and 10 shards; 0.11–0.39 MiB written per open and close; about 1 MiB of disk held while open.
 
 **Coordinator:** confirmed.
+
+<a id="d158"></a>
+## D158 — Shard and compaction threads are not pinned unless asked (approved; engine, #142; amends spec §Thread-per-core)
+The spec (§ Thread-per-core) says shard threads are "pinned with CPU affinity", and `EngineOptions::pin_threads` defaulted to on with no public way to turn it off. The pin is shard `i` → the `i`-th CPU (wrapping) of the affinity set the new thread inherits from the opener, so it goes wrong whenever the database does not own the whole machine (edge-case review 3-4 §3.2, 8-9 F6):
+- two engine-owned databases in one process both put shard 0 on the first CPU;
+- containers limited by a CPU quota (not a cpuset) see every host CPU, so each one pins to the host's first CPUs;
+- an opener already pinned to one CPU puts every shard, and the I/O pool, on that CPU.
+
+Detecting contention instead ("pin only when the affinity set covers the shards and is not narrowed") still fails the first two cases: neither another database in the process nor a neighbouring container is visible in the affinity set, and a cgroup quota is invisible to it too.
+
+**Interim behavior:** `pin_threads` defaults to **off** in both `EngineOptions` and `pigeonhole::Options`; `Options::pin_threads(true)` opts in, with the same mapping as before (the opener's affinity set, wrapping), documented as "only when this database owns those CPUs". Application-owned mode ignores it (shards run on the caller's threads). Unpinned shard threads keep their one-shard-per-thread ownership, so the lock-free write path is unchanged; only the OS scheduler may migrate them. The spec's "pinned with CPU affinity" becomes "one thread per shard, pinned on request".
+
+**Coordinator:** confirmed.
+
+<a id="d159"></a>
+## D159 — A new shared-memory region checks free space at open and stays sparse (approved; io, #142; owner decision)
+The spec (§ Location and size) says "opening fails up front if the region can't be allocated", but the region was sized with a sparse `set_len`/`ftruncate` and nothing else. On a small tmpfs, such as the 64 MiB `/dev/shm` Docker and Kubernetes give a container, opening succeeded and the first store into an unbacked page killed the process with `SIGBUS` (edge-case review 3-4 §4.1, 8-9 F5).
+
+**Owner decision (2026-10-07): a free-space check, not a reservation.** Reserving the region (`posix_fallocate`, `F_PREALLOCATE`) would commit `memtable_budget × shards` of RAM at open, which is 640 MiB at the defaults on 10 cores, even for a tiny database. Instead:
+- **Region files** (`/dev/shm` on Linux and Android, and any `shm_dir` file on Unix): after creating the file, `fstatvfs` it; if `f_bavail × f_frsize` is below the region length, remove the file and fail with `NoSpace`, which `pigeonhole-shm` maps to `Unavailable` (`ShmUnavailable`). Otherwise size it sparsely with `set_len`, so memory is used only as memtables fill.
+- **macOS and BSD `shm_open` objects**: no check (they are swap-backed anonymous memory, not a size-capped filesystem); `ftruncate` as before.
+- **Windows**: unchanged. A pagefile-backed mapping is committed at `CreateFileMappingW` (`SEC_COMMIT`). `set_len` on a `shm_dir` file allocates NTFS clusters, and a failure now removes the file.
+
+**Residual risk (documented in the guide's errors.md and getting-started):** the check does not hold the space. If another process fills the same tmpfs after the open, a store into a new region page can still raise `SIGBUS`.
+
+`pigeonhole-shm` also maps `NotFound` while creating a region (no `/dev/shm` in a distroless or Lambda image, or a missing `shm_dir`) to `Unavailable`. The public `ShmUnavailable` message names the exact region size (`budget × shards`, each arena rounded up to 2 MiB, plus about 10 MiB of views and reader slots, computed from the real layout), the location and the remedies (enlarge `/dev/shm`, `shm_dir`, lower `memtable_budget` or `shards`). `pigeonhole` builds it at open because the lower error types carry no detail, and changing them needs an ICR.
+
+**Coordinator:** confirmed (owner decision, 2026-10-07).

@@ -8,7 +8,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 
 | Phase | File | Range |
 |---|---|---|
-| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D157 |
+| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D159 |
 
 ## Index
 
@@ -169,6 +169,8 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D155](phase-1.md#d155) — A stream's checkpoint may lag its end by at most `wal_pin_bytes` · engine, #137, #171
 - [D156](phase-1.md#d156) — Replay spills recovered memtables to L0 when an arena runs short · engine, #143, #172 · extends D121
 - [D157](phase-1.md#d157) — An open writes one frame per stream; spares wait for use · wal, #143, #172 · amends D35
+- [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
+- [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
 
 ## Open questions
 _None._
