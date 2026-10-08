@@ -1757,3 +1757,48 @@ fn a_family_naming_an_unregistered_operator_is_refused_at_creation() {
     assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
     assert!(db.tables().is_empty());
 }
+
+// ---- #210: the write-stall timeout ----
+
+/// On a real clock, a writer waiting for arena room that snapshots hold gets `Busy` after
+/// `Options::write_stall_timeout`, not the 30 s default, and writes go on once the
+/// snapshots are released.
+#[test]
+fn the_write_stall_timeout_bounds_a_wait_for_room() {
+    let dir = TempDir::new("stall-timeout");
+    let timeout = Duration::from_millis(200);
+    let options = Options::default()
+        .shards(1)
+        .memtable_budget(4 << 20)
+        .tablet_changes(false)
+        .write_stall_timeout(timeout);
+    let db = Pigeonhole::open(dir.0.join("stall.phdb"), options).unwrap();
+    let t = table(&db);
+    let value = vec![7u8; 16 << 10];
+    let mut snaps = Vec::new();
+    let mut refused = None;
+    for i in 0..5_000u32 {
+        let started = std::time::Instant::now();
+        match t
+            .mutate(format!("r{i:05}").as_bytes())
+            .put("a", b"q", &value)
+            .commit()
+        {
+            Ok(_) => snaps.push(db.snapshot().unwrap()),
+            Err(e) => {
+                assert_eq!(e.code(), ErrorCode::Busy, "{e}");
+                refused = Some(started.elapsed());
+                break;
+            }
+        }
+    }
+    let waited = refused.expect("snapshots holding the arena never stalled a write");
+    assert!(
+        waited >= timeout && waited < Duration::from_secs(10),
+        "refused after {waited:?}, the timeout is {timeout:?}"
+    );
+    drop(snaps);
+    t.mutate(b"after").put("a", b"q", b"v").commit().unwrap();
+    drop(t);
+    db.close().unwrap();
+}
