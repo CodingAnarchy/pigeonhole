@@ -55,6 +55,9 @@ const ENTRY_OVERHEAD: usize = 12 + 4 * 16 + 8;
 const KEY_FIXED: usize = 2 + 2 + 17;
 /// Token-bucket capacity (groups) and refill rate at an L0 score of 1 (groups per second).
 const STALL_CAPACITY: f64 = 8.0;
+/// Bytes a logged record counts for on top of its payload (framing and record header),
+/// for the WAL pin limit (#137).
+const LOGGED_OVERHEAD: u64 = 64;
 const STALL_RATE: f64 = 4000.0;
 /// Polls in a row that see the clock unchanged before a stall timer gives up: the clock is
 /// frozen (the simulator) or coarse, and the stall ends on a background event instead.
@@ -106,6 +109,9 @@ pub(crate) struct ShardMetrics {
     /// Size of the shard's aborted-seqno set after its last batch (test hook).
     #[cfg(feature = "test-hooks")]
     pub aborted: AtomicU64,
+    /// WAL unpin passes (#137) and the memtables they froze below the size threshold.
+    pub unpin_passes: AtomicU64,
+    pub unpin_flushes: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -124,6 +130,8 @@ impl Default for ShardMetrics {
             moves: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             aborted: AtomicU64::new(0),
+            unpin_passes: AtomicU64::new(0),
+            unpin_flushes: AtomicU64::new(0),
         }
     }
 }
@@ -354,6 +362,9 @@ pub(crate) struct Shared {
     /// whoever publishes a watermark).
     pub freeze_waiters: FreezeWaiters,
     pub memtable_freeze_bytes: u64,
+    /// Bytes a stream may hold past its oldest needed record before the slots pinning it
+    /// are flushed (`EngineOptions::wal_pin_bytes`, resolved; #137).
+    pub wal_pin_bytes: u64,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
     pub shm_dir: Option<std::path::PathBuf>,
@@ -971,6 +982,11 @@ pub(crate) enum ShardMsg {
     CommitCheckpointed {
         seqno: Seqno,
     },
+    /// Another shard's checkpoint is pinned by cross-shard commits up to `through`: flush
+    /// whatever this shard holds of them (#137).
+    Unpin {
+        through: Seqno,
+    },
     /// A `WalCheckpoint` edit for this stream is durable (or failed).
     Checkpointed {
         lsn: Lsn,
@@ -1585,6 +1601,9 @@ struct RoomWait {
 struct Logged {
     /// Position just past the record.
     end: Lsn,
+    /// Bytes logged on this shard before the record (`ShardState::log_bytes` when it was
+    /// appended; records replayed at open count as none).
+    pos: u64,
     seqno: Seqno,
     kind: LoggedKind,
 }
@@ -1594,7 +1613,10 @@ enum LoggedKind {
     /// A single-shard commit writing to these slots.
     Single { slots: Vec<(TabletId, FamilyId)> },
     /// A participant's PREPARE writing to these slots.
-    Prepare { slots: Vec<(TabletId, FamilyId)> },
+    Prepare {
+        slots: Vec<(TabletId, FamilyId)>,
+        coordinator: ShardId,
+    },
     /// A coordinator's COMMIT decision.
     Commit { participants: Vec<ShardId> },
 }
@@ -1745,6 +1767,19 @@ pub(crate) struct ShardState {
     // ---- checkpoints ----
     /// Records the checkpoint cannot pass, in log order.
     log: VecDeque<Logged>,
+    /// Bytes logged since open (record payloads plus a fixed overhead each): positions for
+    /// the WAL pin limit (#137).
+    log_bytes: u64,
+    /// Slots flushed because their records pinned the checkpoint, whatever their size,
+    /// until their active memtable freezes.
+    unpin: BTreeSet<(TabletId, FamilyId)>,
+    /// The last unpin pass forced every record below this position, at `log_bytes` equal
+    /// to `unpin_at`.
+    unpin_upto: u64,
+    unpin_at: u64,
+    /// The shards already sent `Unpin` for a needed record, by its seqno (pruned when the
+    /// record leaves `log`).
+    asked: HashMap<Seqno, Vec<ShardId>>,
     /// End of the newest record ever appended to the stream.
     last_end: Option<Lsn>,
     /// The checkpoint the manifest holds.
@@ -1901,6 +1936,11 @@ impl ShardState {
             flush_failed: false,
             dropped: HashSet::new(),
             log: VecDeque::new(),
+            log_bytes: 0,
+            unpin: BTreeSet::new(),
+            unpin_upto: 0,
+            unpin_at: 0,
+            asked: HashMap::new(),
             last_end: None,
             checkpoint: Lsn::default(),
             checkpoint_candidate: Lsn::default(),
@@ -2025,6 +2065,7 @@ impl ShardState {
         match kind {
             ReplayedKind::Single { slots } => self.log.push_back(Logged {
                 end,
+                pos: self.log_bytes,
                 seqno,
                 kind: LoggedKind::Single { slots },
             }),
@@ -2044,8 +2085,9 @@ impl ShardState {
                 }
                 self.log.push_back(Logged {
                     end,
+                    pos: self.log_bytes,
                     seqno,
-                    kind: LoggedKind::Prepare { slots },
+                    kind: LoggedKind::Prepare { slots, coordinator },
                 });
             }
             ReplayedKind::Commit {
@@ -2058,6 +2100,7 @@ impl ShardState {
                 self.share_reports.entry(seqno).or_insert((0, 0)).1 = participants.len();
                 self.log.push_back(Logged {
                     end,
+                    pos: self.log_bytes,
                     seqno,
                     kind: LoggedKind::Commit { participants },
                 });
@@ -2087,6 +2130,7 @@ impl ShardState {
             }
         }
         self.log.clear();
+        self.asked.clear();
         self.unreported.clear();
         self.share_reports.clear();
         self.aborted.clear();
@@ -2277,9 +2321,11 @@ impl ShardState {
             self.memtables.keys().copied().collect()
         } else {
             let mut keys = std::mem::take(&mut self.to_freeze);
-            // A tablet being split, merged or moved freezes whatever it holds.
+            // A tablet being split, merged or moved freezes whatever it holds, and so does a
+            // slot pinning the WAL checkpoint (#137).
             for key in self.memtables.keys() {
-                if self.moving.contains(&key.0) && !keys.contains(key) {
+                if (self.moving.contains(&key.0) || self.unpin.contains(key)) && !keys.contains(key)
+                {
                     keys.push(*key);
                 }
             }
@@ -2307,7 +2353,7 @@ impl ShardState {
                 slot.active.table.is_empty(),
                 slot.active.max_seqno()
             );
-            let forced = self.moving.contains(&key.0);
+            let forced = self.moving.contains(&key.0) || self.unpin.contains(&key);
             if slot.active.table.is_empty() || !(all || big || forced) {
                 continue;
             }
@@ -2371,12 +2417,24 @@ impl ShardState {
                 starved = true;
                 continue;
             };
+            if !(all || big) && self.unpin.contains(&key) {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .unpin_flushes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
             old.table.freeze();
             self.flush_queue.push(item(&old));
             slot.frozen.insert(0, old);
             self.view_dirty = true;
         }
+        // A forced slot is done once its active memtable froze (or is empty, or gone).
+        let memtables = &self.memtables;
+        self.unpin.retain(|k| {
+            memtables
+                .get(k)
+                .is_some_and(|s| s.seal == Seal::Open && !s.active.table.is_empty())
+        });
         self.freeze_all_pending = all && deferred;
         if all {
             self.starved_all = starved;
@@ -3528,17 +3586,13 @@ impl ShardState {
                     self.release_room(m.reserved);
                     m.reserved = 0;
                     if let Some(t) = m.ticket {
-                        self.last_end = Some(t.end);
-                        self.log.push_back(Logged {
-                            end: t.end,
-                            seqno: m.seqno,
-                            kind: LoggedKind::Single {
-                                slots: self.touched_slots.clone(),
-                            },
-                        });
+                        let kind = LoggedKind::Single {
+                            slots: self.touched_slots.clone(),
+                        };
+                        self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                     }
                 }
-                MemberKind::Prepare { .. } => {
+                MemberKind::Prepare { coordinator } => {
                     // The share keeps its reservation until the decision.
                     if let Some(share) = self.prepared.get_mut(&m.seqno) {
                         share.reserved = m.reserved;
@@ -3546,25 +3600,20 @@ impl ShardState {
                     }
                     if let Some(t) = m.ticket {
                         let slots = self.slots_of(m.bytes.as_slice());
-                        self.last_end = Some(t.end);
-                        self.log.push_back(Logged {
-                            end: t.end,
-                            seqno: m.seqno,
-                            kind: LoggedKind::Prepare { slots },
-                        });
+                        let kind = LoggedKind::Prepare {
+                            slots,
+                            coordinator: *coordinator,
+                        };
+                        self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                     }
                 }
                 MemberKind::CommitRecord { participants } => {
                     if let Some(t) = m.ticket {
-                        self.last_end = Some(t.end);
                         self.share_reports.entry(m.seqno).or_insert((0, 0)).1 = participants.len();
-                        self.log.push_back(Logged {
-                            end: t.end,
-                            seqno: m.seqno,
-                            kind: LoggedKind::Commit {
-                                participants: participants.clone(),
-                            },
-                        });
+                        let kind = LoggedKind::Commit {
+                            participants: participants.clone(),
+                        };
+                        self.log_record(t.end, m.seqno, 0, kind);
                     }
                 }
             }
@@ -3579,6 +3628,7 @@ impl ShardState {
                 }
             }
         }
+        self.limit_wal_pin(ctx);
         if self.freeze(false).is_err() {
             self.poisoned = true;
         }
@@ -3608,6 +3658,142 @@ impl ShardState {
         }
         self.reclaim_retired();
         self.maybe_prepare_spares(ctx);
+    }
+
+    /// Appends a logged record of `len` payload bytes to `log`.
+    fn log_record(&mut self, end: Lsn, seqno: Seqno, len: usize, kind: LoggedKind) {
+        self.last_end = Some(end);
+        let pos = self.log_bytes;
+        self.log_bytes += len as u64 + LOGGED_OVERHEAD;
+        self.log.push_back(Logged {
+            end,
+            pos,
+            seqno,
+            kind,
+        });
+    }
+
+    /// Bounds the bytes the checkpoint cannot pass (#137). A slot written once and never
+    /// again neither reaches the freeze threshold nor, while other slots flush and free the
+    /// arena, gets frozen by a full arena, so its records would keep the checkpoint (and the
+    /// WAL, `log` and the next open's replay) growing for the life of the process. Once the
+    /// log holds more than `wal_pin_bytes` past its oldest needed record, every slot the
+    /// records in the oldest half of that span wrote is flushed whatever its size, and the
+    /// other shards holding shares of its cross-shard commits are asked to do the same. One
+    /// pass per limit's worth of new bytes, unless the checkpoint moves past the last pass.
+    fn limit_wal_pin(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let limit = self.shared.wal_pin_bytes;
+        let Some(front) = self.log.front() else {
+            return;
+        };
+        if limit == 0 || self.closing || self.log_bytes - front.pos <= limit {
+            return;
+        }
+        if front.pos < self.unpin_upto && self.log_bytes < self.unpin_at.saturating_add(limit) {
+            // The last pass is still flushing.
+            return;
+        }
+        let upto = self.log_bytes - limit / 2;
+        trace!(
+            "shard {} unpin: front at {} of {} bytes, forcing below {upto}",
+            self.id.0, front.pos, self.log_bytes
+        );
+        self.unpin_upto = upto;
+        self.unpin_at = self.log_bytes;
+        self.shared.metrics[usize::from(self.id.0)]
+            .unpin_passes
+            .fetch_add(1, Ordering::Relaxed);
+        self.force_pinning(|l| l.pos < upto, true, ctx);
+    }
+
+    /// Marks for flushing every unflushed slot of the needed records `which` selects, and
+    /// sends `Unpin` to the shards their cross-shard commits wait for: always from this
+    /// shard's own pass (`origin`), and only to shards not yet asked about that record when
+    /// answering another shard's `Unpin`, so the requests between a coordinator and its
+    /// participants stop after one round.
+    fn force_pinning(
+        &mut self,
+        which: impl Fn(&Logged) -> bool,
+        origin: bool,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let Ok(view) = self.checkpoint_view() else {
+            return;
+        };
+        let catalog = view.as_ref().map(|v| &*v.catalog);
+        let mut wanted: Vec<(ShardId, Seqno)> = Vec::new();
+        let mut slots = Vec::new();
+        for l in self.log.iter().filter(|l| which(l)) {
+            if !self.needed(catalog, l) {
+                continue;
+            }
+            match &l.kind {
+                LoggedKind::Single { slots: s } => slots.extend(
+                    s.iter()
+                        .filter(|s| !self.slot_flushed(catalog, s, l.seqno))
+                        .copied(),
+                ),
+                LoggedKind::Prepare {
+                    slots: s,
+                    coordinator,
+                } => {
+                    slots.extend(
+                        s.iter()
+                            .filter(|s| !self.slot_flushed(catalog, s, l.seqno))
+                            .copied(),
+                    );
+                    // The coordinator's checkpoint must pass the COMMIT too.
+                    wanted.push((*coordinator, l.seqno));
+                }
+                LoggedKind::Commit { participants } => {
+                    wanted.extend(participants.iter().map(|&p| (p, l.seqno)));
+                }
+            }
+        }
+        self.unpin.extend(slots);
+        let mut asks: BTreeMap<ShardId, Seqno> = BTreeMap::new();
+        for (shard, seqno) in wanted {
+            if shard == self.id {
+                continue;
+            }
+            let sent = self.asked.entry(seqno).or_default();
+            if sent.contains(&shard) {
+                if !origin {
+                    continue;
+                }
+            } else {
+                sent.push(shard);
+            }
+            let through = asks.entry(shard).or_insert(seqno);
+            *through = (*through).max(seqno);
+        }
+        for (shard, through) in asks {
+            self.send(shard, ShardMsg::Unpin { through }, ctx);
+        }
+    }
+
+    /// Another shard's checkpoint waits for cross-shard commits up to `through`. Every
+    /// request is served (requests carry no order: a commit decided later may have a lower
+    /// seqno), so the only dedupe is `force_pinning`'s per record and shard.
+    fn on_unpin(&mut self, through: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.closing {
+            return;
+        }
+        self.shared.metrics[usize::from(self.id.0)]
+            .unpin_passes
+            .fetch_add(1, Ordering::Relaxed);
+        self.force_pinning(|l| l.seqno <= through, false, ctx);
+        let shares: Vec<(TabletId, FamilyId)> = self
+            .unreported
+            .iter()
+            .filter(|u| u.seqno <= through)
+            .flat_map(|u| u.slots.iter().copied())
+            .collect();
+        self.unpin.extend(shares);
+        if self.freeze(false).is_err() {
+            self.poisoned = true;
+        }
+        self.spawn_flush(ctx);
     }
 
     fn maybe_prepare_spares(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
@@ -4248,7 +4434,7 @@ impl ShardState {
         };
         match &l.kind {
             LoggedKind::Single { slots } => unflushed(slots),
-            LoggedKind::Prepare { slots } => {
+            LoggedKind::Prepare { slots, .. } => {
                 !self.aborted.contains(&l.seqno)
                     && (unflushed(slots)
                         || !(self.commit_ckpt.contains(&l.seqno) || commit_done(l.seqno)))
@@ -4334,6 +4520,7 @@ impl ShardState {
             let l = self.log.pop_front().expect("checked");
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
             self.aborted.remove(&l.seqno);
+            self.asked.remove(&l.seqno);
             match l.kind {
                 LoggedKind::Commit { participants } => {
                     self.share_reports.remove(&l.seqno);
@@ -5143,6 +5330,7 @@ impl ShardState {
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
+            ShardMsg::Unpin { through } => self.on_unpin(through, ctx),
             ShardMsg::Checkpointed {
                 lsn,
                 commits,
