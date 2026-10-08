@@ -41,7 +41,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pigeonhole::{Durability, ErrorCode, Family, Options, Pigeonhole, Snapshot, Table};
+use pigeonhole::{Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, Snapshot, Table};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
@@ -80,10 +80,18 @@ fn families() -> Vec<ModelFamily> {
     ]
 }
 
+/// `g` compacts tiered and `ttl` FIFO by time (#31, #32, #44); the model does not depend on
+/// the style.
 fn public_family(f: &ModelFamily) -> Family {
+    let compaction = match f.name.as_str() {
+        "g" => Compaction::Tiered,
+        "ttl" => Compaction::FifoByTime,
+        _ => Compaction::Leveled,
+    };
     let family = Family::default()
         .max_versions(f.max_versions)
-        .ttl(Duration::from_micros(f.ttl_micros));
+        .ttl(Duration::from_micros(f.ttl_micros))
+        .compaction(compaction);
     if f.i64_add {
         family
     } else {

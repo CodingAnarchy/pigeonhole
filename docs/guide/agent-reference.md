@@ -45,7 +45,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `Snapshot` | Point-in-time view. |
 | `Options`, `ReaderOptions`, `Family` | Config builders (consume and return `Self`). |
 | `Priority` | `Low`, `Normal` (default), `High`. |
-| `Compaction` | `Leveled` (default), `Tiered` (P2), `FifoByTime` (P2); P2 ones are refused with `Unsupported` today. |
+| `Compaction` | `Leveled` (default; read-heavy), `Tiered` (write-heavy), `FifoByTime` (TTL'd time series: drops whole expired files). |
 | `Durability` | `None`, `Buffered`, `GroupSync` (default), `Sync`. |
 | `TableBuilder`, `Table`, `ReadTable` | Define/open a table; read-write handle; read-only handle (P4, early). |
 | `RowMutation`, `WriteBatch`, `Transaction` | Writes; `Transaction` is P4, early. |
@@ -112,7 +112,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `block_size(u32)` | Data block bytes (default 16 KiB). |
 | `merge_operator(&str)` | P2 for custom. Name of registered operator. `incr` needs none (`pigeonhole.i64_add` default). |
 | `cache_priority(Priority)` | Block cache priority. |
-| `compaction(Compaction)` | Strategy (`Tiered`, `FifoByTime` are P2 and refused with `Unsupported` today; the latter needs a TTL). |
+| `compaction(Compaction)` | Strategy. `FifoByTime` only drops data with a TTL set; without one nothing expires. |
 
 ## `TableBuilder` / `Table` / `ReadTable`
 | Signature | Semantics |
@@ -208,7 +208,7 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 | Feature | Phase |
 |---|---|
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
-| zstd, blob separation, `Tiered`/`FifoByTime`, custom merge operators | P2 |
+| zstd, blob separation, custom merge operators | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
 
 ## Recipes

@@ -143,21 +143,14 @@ fn drop_table_removes_it_and_its_data() {
 #[test]
 fn later_phase_family_settings_are_refused() {
     let db = db();
-    for family in [
-        Family::default().zstd(3),
-        Family::default().compaction(Compaction::Tiered),
-        Family::default()
-            .ttl(days(1))
-            .compaction(Compaction::FifoByTime),
-    ] {
-        let err = db
-            .table("t")
-            .unwrap()
-            .family("f", family)
-            .create_if_missing()
-            .unwrap_err();
-        assert_eq!(err.code(), ErrorCode::Unsupported, "{err}");
-    }
+    // zstd is still refused (#44: Tiered and FifoByTime are accepted below).
+    let err = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default().zstd(3))
+        .create_if_missing()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::Unsupported, "{err}");
     assert!(db.tables().is_empty());
     // A custom merge operator is not registered in this process.
     let err = db
@@ -187,6 +180,20 @@ fn later_phase_family_settings_are_refused() {
         .create()
         .unwrap();
     assert_eq!(t.families(), ["f"]);
+    // Tiered and FIFO-by-time compaction are accepted since their pickers landed (#44).
+    let u = db
+        .table("u")
+        .unwrap()
+        .family("tiered", Family::default().compaction(Compaction::Tiered))
+        .family(
+            "fifo",
+            Family::default()
+                .ttl(days(1))
+                .compaction(Compaction::FifoByTime),
+        )
+        .create()
+        .unwrap();
+    assert_eq!(u.families(), ["tiered", "fifo"]);
 }
 
 // ---- errors ----

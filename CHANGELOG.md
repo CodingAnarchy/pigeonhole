@@ -5,6 +5,12 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 > **Experimental 0.x.** Not recommended for production use yet. See [`docs/status.md`](docs/status.md).
 
 ## [Unreleased]
+### Added
+- Per-family compaction strategies: `Compaction::Tiered` (universal/size-tiered, for write-heavy families) and `Compaction::FifoByTime` (drops whole SSTs once their newest timestamp passes the TTL, with no rewrite) are accepted at table creation (#31, #32, #44).
+
+### Changed
+- The write stall follows L0 depth only; deeper levels and tiered space amplification no longer pace writers (D119).
+
 Planned for Phase 2 (the wide-column model), see [`docs/status.md`](docs/status.md):
 - Blob separation for large values (raising the Phase 1 value cap), zstd compression and custom merge operators.
 - A tighter file layout: the file at rest can be 2-4x live data because of power-of-two extents (#185).
