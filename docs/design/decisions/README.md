@@ -114,7 +114,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D99](phase-1.md#d99) — table handles resolve families added through other handles · pigeonhole
 - [D100](phase-1.md#d100) — `Error`'s `Display` is the message; unknown engine variants map to `Io` · pigeonhole
 - [D101](phase-1.md#d101) — a hidden `Options::wal_segment_size` test hook · pigeonhole; ICR 0005
-- [D102](phase-1.md#d102) — registered custom merge operators are not passed to the engine yet · Phase 2 work tracked in #43
+- [D102](phase-1.md#d102) — registered custom merge operators are not passed to the engine yet · Phase 2 work tracked in #43 · **amended by D172**
 - [D103](phase-1.md#d103) — features available ahead of their phase · pigeonhole
 - [D104](phase-1.md#d104) — what crosses the future C ABI · pigeonhole
 - [D105](phase-1.md#d105) — `Runner` gains two provided methods, `client` and `describe` · bench
@@ -184,6 +184,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D169](phase-2.md#d169) — The tiered picker needs no extra write-amplification bound; the proptest guards it · compaction, #228, #245 · supersedes D165's write-amp follow-up
 - [D170](phase-2.md#d170) — FIFO-by-time expiry runs on a timer; a busy L0 file splits the merge windows · compaction, engine, #232, #246 · refines D167
 - [D171](phase-2.md#d171) — A room wait's re-check timer can tell the clock stopped · engine, #244, #252 · refines D126, D161
+- [D172](phase-2.md#d172) — Registered merge operators reach the engine; unregistered ones make the handle read-only · pigeonhole, engine, #43, #253 · supersedes D102
 
 ## Open questions
 _None._
