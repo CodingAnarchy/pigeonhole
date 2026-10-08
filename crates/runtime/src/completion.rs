@@ -6,9 +6,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
+/// A callback that sees the outcome before the waiter does ([`Notifier::on_resolve`]).
+type Hook<T> = Box<dyn FnOnce(Option<&T>) + Send>;
+
 struct Slot<T> {
     state: Mutex<SlotState<T>>,
     cv: Condvar,
+    hook: Mutex<Option<Hook<T>>>,
 }
 
 struct SlotState<T> {
@@ -23,6 +27,14 @@ impl<T> Slot<T> {
     }
 
     fn resolve(&self, value: Option<T>) {
+        let hook = self
+            .hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook(value.as_ref());
+        }
         let waker = {
             let mut s = self.lock();
             s.value = value;
@@ -57,6 +69,7 @@ pub fn completion<T: Send>() -> (Notifier<T>, Waiter<T>) {
             waker: None,
         }),
         cv: Condvar::new(),
+        hook: Mutex::new(None),
     });
     (
         Notifier {
@@ -79,6 +92,30 @@ impl<T> fmt::Debug for Notifier<T> {
 }
 
 impl<T: Send> Notifier<T> {
+    /// Calls `hook` with the outcome when the completion resolves, before the waiter is
+    /// woken: `Some` with the value passed to [`notify`](Self::notify), or `None` if the
+    /// notifier is dropped unresolved. It runs on the resolving thread whether or not anyone
+    /// still waits, so it suits cleanup that must follow the outcome. A later call replaces
+    /// an earlier hook.
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// let failed = Arc::new(AtomicBool::new(false));
+    /// let (notifier, waiter) = pigeonhole_runtime::completion::<Result<u32, ()>>();
+    /// let seen = Arc::clone(&failed);
+    /// notifier.on_resolve(move |r| seen.store(!matches!(r, Some(Ok(_))), Ordering::Relaxed));
+    /// drop(waiter); // nobody waits; the hook still runs
+    /// notifier.notify(Err(()));
+    /// assert!(failed.load(Ordering::Relaxed));
+    /// ```
+    pub fn on_resolve(&self, hook: impl FnOnce(Option<&T>) + Send + 'static) {
+        if let Some(slot) = &self.slot {
+            *slot.hook.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        }
+    }
+
     /// Resolves the completion and wakes the waiter (thread unpark or task waker).
     pub fn notify(mut self, value: T) {
         if let Some(slot) = self.slot.take() {

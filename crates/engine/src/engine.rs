@@ -177,8 +177,10 @@ pub(crate) struct Inner {
     application_owned: bool,
     closing: AtomicBool,
     reader: Option<ReaderState>,
-    /// Largest value accepted at write time (decision D16).
-    max_value: usize,
+    /// Longest stored value a WAL record and a memtable entry carry (decision D16): a
+    /// longer put is separated into a blob file when it is routed (#230). Atomic so a test
+    /// can shrink it (`Engine::set_inline_value_limit`).
+    max_value: AtomicUsize,
 }
 
 impl std::fmt::Debug for Inner {
@@ -520,6 +522,7 @@ impl Engine {
             live_seqnos: Arc::new(LiveSeqnos::default()),
             flushed_roots: Mutex::new(HashSet::new()),
             busy_ssts: Mutex::new(HashSet::new()),
+            large_pending: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
@@ -837,6 +840,7 @@ impl Engine {
         for s in &mut states {
             s.finish_replay();
         }
+        sweep_unreferenced_blobs(&shared, &mut catalog, &states, shards)?;
 
         // The timestamp floor starts above every replayed commit (D11).
         for (i, s) in states.iter().enumerate() {
@@ -903,7 +907,7 @@ impl Engine {
             application_owned: mode == Mode::ApplicationOwned,
             closing: AtomicBool::new(false),
             reader: None,
-            max_value,
+            max_value: AtomicUsize::new(max_value),
         });
         let engine = Arc::new(Engine {
             inner: Arc::clone(&inner),
@@ -1007,6 +1011,7 @@ impl Engine {
             live_seqnos: Arc::new(LiveSeqnos::default()),
             flushed_roots: Mutex::new(HashSet::new()),
             busy_ssts: Mutex::new(HashSet::new()),
+            large_pending: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
@@ -1069,7 +1074,7 @@ impl Engine {
             application_owned: false,
             closing: AtomicBool::new(false),
             reader: Some(reader),
-            max_value: 0,
+            max_value: AtomicUsize::new(0),
         });
         Ok(Arc::new(Engine { inner }))
     }
@@ -1529,6 +1534,83 @@ fn spill_recovered(
     Ok(())
 }
 
+/// After replay (#230): drops every blob file that nothing points into, neither an SST's
+/// recorded references (#240), nor an SST of its family without a record, nor a recovered
+/// memtable entry. Flushes, compactions, blob GC and backups commit a blob file in the same
+/// manifest commit as the SSTs that point into it, so only a value separated at commit time
+/// can leave one: its commit never became durable, or was refused and its release did not
+/// run before the process ended.
+fn sweep_unreferenced_blobs(
+    shared: &Shared,
+    catalog: &mut Catalog,
+    states: &[ShardState],
+    shards: usize,
+) -> Result<()> {
+    if catalog.blob_files.is_empty() {
+        return Ok(());
+    }
+    use pigeonhole_format::superblock::ExtentRef;
+    use pigeonhole_format::{BlobFileId, Cursor};
+
+    let mut keep: HashSet<BlobFileId> = HashSet::new();
+    let mut unrecorded: HashSet<FamilyId> = HashSet::new();
+    for ((_, family), list) in &catalog.ssts {
+        for (_, meta) in list {
+            match catalog.blob_refs.get(&meta.id) {
+                Some(refs) => keep.extend(refs.iter().map(|(id, _)| *id)),
+                None => {
+                    unrecorded.insert(*family);
+                }
+            }
+        }
+    }
+    for state in states {
+        for (_, set) in state.mem_sets() {
+            for reader in &set.readers {
+                let mut it = reader.iter();
+                it.seek_to_first()?;
+                while it.valid() {
+                    if let Some(p) = pigeonhole_compaction::blob_pointer(it.value()) {
+                        keep.insert(p.blob_file);
+                    }
+                    it.next()?;
+                }
+            }
+        }
+    }
+    let dropped: Vec<(BlobFileId, Vec<ExtentRef>)> = catalog
+        .blob_files
+        .iter()
+        .filter(|(id, b)| !keep.contains(id) && !unrecorded.contains(&b.family))
+        .map(|(id, b)| (*id, b.extents.clone()))
+        .collect();
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    crate::shard::trace!(
+        "open: dropping blob files nothing points into: {:?}",
+        dropped.iter().map(|(id, _)| id.0).collect::<Vec<_>>()
+    );
+    let edits: Vec<Edit> = dropped
+        .iter()
+        .map(|(id, _)| Edit::DropBlobFile { blob_file: *id })
+        .collect();
+    for e in &edits {
+        catalog.apply(e, shards)?;
+    }
+    let version = shared
+        .manifest
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .commit(catalog, &edits)?;
+    for (_, extents) in dropped {
+        for e in extents {
+            shared.pager.retire(e, version);
+        }
+    }
+    Ok(())
+}
+
 fn flush_recovered(
     shared: &Shared,
     catalog: &mut Catalog,
@@ -1821,6 +1903,21 @@ impl Inner {
         Ok(())
     }
 
+    /// The longest stored value a batch carries inline (D16; longer puts are separated).
+    pub(crate) fn inline_limit(&self) -> usize {
+        self.max_value.load(Ordering::Relaxed) + 1
+    }
+
+    /// Separates the puts of `builder` above the inline limit into blob files (#230). Waits
+    /// for a manifest commit when there is one; the waiting thread drives that commit
+    /// itself (`manifest::commit_from_thread`, as `shrink` does), so it may drive a shard.
+    fn separate_large(
+        &self,
+        builder: BatchBuilder,
+    ) -> Result<(BatchBuilder, Option<crate::large::LargeValues>)> {
+        crate::large::separate(&self.shared, builder, self.inline_limit())
+    }
+
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Vec<ShardId>)> {
         let catalog = &view.catalog;
@@ -1873,9 +1970,6 @@ impl Inner {
                     MergeKind::I64Add | MergeKind::Registered => {}
                 }
             }
-            if m.value.len() > self.max_value + 1 {
-                return Err(Error::ValueTooLarge);
-            }
             let Some((_, shard)) = view.tablets().route(m.table, m.row) else {
                 return Err(Error::TableNotFound(format!("table {}", m.table.0)));
             };
@@ -1905,6 +1999,7 @@ impl Inner {
         // which a participant moving a tablet refuses and the coordinator retries.
         let view = self.shared.view.load();
         let (builder, mut shards) = self.route(batch, &view)?;
+        let (builder, large) = self.separate_large(builder)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
         if let Some((_, reads)) = &validate {
@@ -1918,6 +2013,9 @@ impl Inner {
         }
         let submitted_at = self.shared.vfs.monotonic_nanos();
         let (tx, waiter) = completion();
+        if let Some(large) = large {
+            large.settle_on(&tx, crate::large::commit_refused);
+        }
         if shards.len() <= 1 {
             let shard = shards.first().copied().unwrap_or(ShardId(0));
             self.shared
@@ -1993,6 +2091,7 @@ impl Inner {
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
         let view = self.shared.view.load();
         let (builder, shards) = self.route(batch, &view)?;
+        let (builder, large) = self.separate_large(builder)?;
         let shard = match shards.as_slice() {
             [] => view
                 .tablets()
@@ -2004,6 +2103,9 @@ impl Inner {
         };
         let submitted_at = self.shared.vfs.monotonic_nanos();
         let (tx, rx) = completion();
+        if let Some(large) = large {
+            large.settle_on(&tx, crate::large::check_refused);
+        }
         self.shared
             .submitter(shard)
             .submit(ShardMsg::Commit(CommitReq {
@@ -2597,8 +2699,12 @@ impl EngineShard {
             wb.builder = builder;
             return engine.submit(wb, Some(durability), None, None);
         }
+        let (builder, large) = engine.separate_large(builder)?;
         let submitted_at = engine.shared.vfs.monotonic_nanos();
         let (tx, waiter) = completion();
+        if let Some(large) = large {
+            large.settle_on(&tx, crate::large::commit_refused);
+        }
         driver.with_handler(|h, ctx| {
             h.commit_inline(
                 CommitReq {

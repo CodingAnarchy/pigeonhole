@@ -763,13 +763,20 @@ fn value_limits_arena_pressure_and_closed_handles() {
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
+    // Over half the arena (D16's inline limit): the put goes to a blob file at commit time
+    // (#230; a merge operand that long is refused, `large_values.rs`).
     let big = vec![7u8; 600 << 10];
     let mut wb = WriteBatch::new();
     put(&mut wb, &t, "f", b"r", b"q", &big);
-    assert!(
-        matches!(db.commit(wb, None), Err(Error::ValueTooLarge)),
-        "over half the arena (D16)"
-    );
+    db.commit(wb, None).unwrap();
+    assert_eq!(db.blob_files().len(), 1);
+    let snap = db.snapshot().unwrap();
+    let got = db
+        .get(&snap, t.id, t.families[0].id, b"r", b"q")
+        .unwrap()
+        .unwrap();
+    assert!(got.value() == ValueRef::Bytes(&big));
+    drop(snap);
     // Fill the arena several times over: a full arena waits for a flush, never refuses and
     // never applies a commit in part.
     let mut written = 0;
@@ -817,7 +824,7 @@ fn value_limits_arena_pressure_and_closed_handles() {
     while cursor.next_row().unwrap() {
         rows += 1;
     }
-    assert_eq!(rows, written);
+    assert_eq!(rows, written + 1, "every row written, and the large value's");
     db.flush().unwrap();
     db.close().unwrap();
     assert!(matches!(

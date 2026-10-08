@@ -26,6 +26,7 @@ mod compact;
 mod engine;
 mod error;
 mod flush;
+mod large;
 mod maintenance;
 mod manifest;
 mod options;

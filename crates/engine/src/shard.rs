@@ -306,6 +306,10 @@ pub(crate) struct Shared {
     pub flushed_roots: Mutex<HashSet<(u16, u32)>>,
     /// SSTs a running compaction or relocation reads or replaces.
     pub busy_ssts: Mutex<HashSet<SstId>>,
+    /// Blob files of values separated at commit time whose commit has not settled yet, or
+    /// whose release (`DropBlobFile`) has not committed yet (#230): published, but nothing
+    /// may point into them yet.
+    pub large_pending: Mutex<HashSet<pigeonhole_format::BlobFileId>>,
     /// Published view version -> manifest version, to map reader-slot pins to extents.
     pub view_versions: Mutex<BTreeMap<u64, ManifestVersion>>,
     /// Test hooks (`engine::hooks`); none of them is set or read unless a test asks.

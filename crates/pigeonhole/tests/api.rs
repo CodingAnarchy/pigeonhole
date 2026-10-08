@@ -1442,17 +1442,22 @@ fn size_errors_name_the_size_and_the_limit() {
             .message()
             .contains("row key of 70000 bytes")
     );
-    // 256 KiB segments: the limit is the segment payload, 256 KiB - 64 KiB.
-    let big = vec![0u8; 300_000];
-    let err = t.mutate(b"r").put("a", b"q", &big).commit().unwrap_err();
+    // 256 KiB segments: the inline limit is the segment payload, 256 KiB - 64 KiB. A longer
+    // put is separated into a blob file at commit time (#230); a longer merge operand is
+    // refused.
+    let big = vec![7u8; 300_000];
+    t.mutate(b"r").put("a", b"q", &big).commit().unwrap();
+    assert_eq!(
+        t.get(b"r", "a", b"q").unwrap().map(|c| c.value().to_vec()),
+        Some(big.clone())
+    );
+    let mut txn = db.transaction().unwrap();
+    txn.put(&t, b"r2", "a", b"q", &big);
+    txn.commit().unwrap();
+    let err = t.mutate(b"r").merge("a", b"n", &big).commit().unwrap_err();
     assert_eq!(err.code(), ErrorCode::ValueTooLarge);
     assert!(err.message().contains("value of 300000 bytes"), "{err}");
     assert!(err.message().contains(&(192 * 1024).to_string()), "{err}");
-    let mut txn = db.transaction().unwrap();
-    txn.put(&t, b"r", "a", b"q", &big);
-    let err = txn.commit().unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ValueTooLarge);
-    assert!(err.message().contains("value of 300000 bytes"), "{err}");
 }
 
 #[test]
