@@ -38,8 +38,8 @@ mod workload;
 
 pub use histogram::Histogram;
 pub use report::{
-    Comparison, Delta, Environment, LatencyStats, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT,
-    Scaling, ShardShare, Suite, Tolerance, compare,
+    Comparison, Delta, Environment, LatencyStats, OpTypeStats, ReadSplit, RunDetail, RunRecord,
+    SUITE_FORMAT, Scaling, ShardShare, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -301,6 +301,27 @@ pub enum BenchOp {
     },
 }
 
+impl BenchOp {
+    /// The operation's type, as the report's per-type latency table names it.
+    ///
+    /// ```
+    /// use pigeonhole_bench::BenchOp;
+    ///
+    /// let op = BenchOp::Scan { start: b"r".to_vec(), len: 10 };
+    /// assert_eq!(op.type_name(), "scan");
+    /// ```
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Get { .. } => "get",
+            Self::GetRow { .. } => "row read",
+            Self::Put { .. } => "put",
+            Self::PutAt { .. } => "put at",
+            Self::Scan { .. } => "scan",
+            Self::ReadModifyWrite { .. } => "read-modify-write",
+        }
+    }
+}
+
 /// Generates the operations of a workload, deterministically from the seed.
 ///
 /// The data model of each workload (rows, families, qualifiers, mixes) is documented
@@ -509,6 +530,7 @@ pub fn run_detailed(
     let (load, elapsed, threads, hist, split, shards) = result?;
     closed?;
     let ops = hist.count();
+    let (reads, by_type) = split.into_split();
     Ok(RunRecord {
         store: runner.name().to_owned(),
         store_config: runner.describe(),
@@ -530,7 +552,8 @@ pub fn run_detailed(
         detail: RunDetail {
             store_bytes: dir_bytes(dir),
             busy_retries,
-            reads: split.into_split(),
+            reads,
+            by_type,
             shards,
         },
     })
@@ -564,32 +587,50 @@ enum Class {
 }
 
 /// Latency of gets, cold (first touch of a row since the store opened) and hot (the row
-/// was read before).
+/// was read before), and of each operation type.
 #[derive(Debug, Default)]
 struct Split {
     cold: Histogram,
     hot: Histogram,
+    by_type: std::collections::BTreeMap<&'static str, Histogram>,
 }
 
 impl Split {
-    fn record(&mut self, class: Class, latency: Duration) {
+    fn record(&mut self, op: &BenchOp, class: Class, latency: Duration) {
         match class {
             Class::Cold => self.cold.record(latency),
             Class::Hot => self.hot.record(latency),
             Class::Other => {}
         }
+        self.by_type
+            .entry(op.type_name())
+            .or_default()
+            .record(latency);
     }
 
     fn merge(&mut self, other: &Split) {
         self.cold.merge(&other.cold);
         self.hot.merge(&other.hot);
+        for (name, h) in &other.by_type {
+            self.by_type.entry(name).or_default().merge(h);
+        }
     }
 
-    fn into_split(self) -> Option<ReadSplit> {
-        (self.cold.count() + self.hot.count() > 0).then(|| ReadSplit {
+    fn into_split(self) -> (Option<ReadSplit>, Vec<OpTypeStats>) {
+        let reads = (self.cold.count() + self.hot.count() > 0).then(|| ReadSplit {
             cold: LatencyStats::of(&self.cold),
             hot: LatencyStats::of(&self.hot),
-        })
+        });
+        let by_type = self
+            .by_type
+            .iter()
+            .map(|(name, h)| OpTypeStats {
+                op: (*name).to_owned(),
+                stats: LatencyStats::of(h),
+                mean_ns: h.mean().as_nanos() as u64,
+            })
+            .collect();
+        (reads, by_type)
     }
 }
 
@@ -665,7 +706,7 @@ fn measure(
             runner.execute(op)?;
             let latency = t.elapsed();
             hist.record(latency);
-            split.record(*class, latency);
+            split.record(op, *class, latency);
         }
         let elapsed = start.elapsed();
         let shards = shares_between(&before, &runner.shard_shares());
@@ -696,7 +737,7 @@ fn measure(
                         client.execute(op)?;
                         let latency = t.elapsed();
                         hist.record(latency);
-                        split.record(*class, latency);
+                        split.record(op, *class, latency);
                     }
                     Ok((hist, split))
                 })
