@@ -26,6 +26,8 @@ let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 - `Pigeonhole` is cheap to clone; every clone shares the same engine. Pass clones to threads.
 - Opening replays the WAL sidecar files; there is no full-file recovery scan. Opening is cheap: a small database opens in milliseconds and writes well under a megabyte, however many shards it has, and the amount of WAL to replay is bounded because each shard flushes data that would otherwise pin its log (twice `memtable_budget` of log at most). While the database is open you will see sidecar files next to it. When the last handle closes cleanly, only the one file remains: the close flushes every memtable into the file, checkpoints the WAL and removes the sidecars.
 - The database must be on a local filesystem. Network filesystems fail with `ErrorCode::NetworkFilesystem`.
+- **Shared memory.** The writer creates a shared-memory region of `memtable_budget × shards` plus about 10 MiB for views and reader slots (64 MiB per shard by default, so 266 MiB on 4 CPUs). It takes memory only as the memtables fill, up to that size, and is released at close. On Linux it lives in `/dev/shm`, which Docker and Kubernetes cap at 64 MiB by default. `open` checks that the region's filesystem has that much free space; if not, it fails with `ErrorCode::ShmUnavailable`, and the message says how much it needs and where. Then enlarge `/dev/shm` (`docker run --shm-size=1g`, or in Kubernetes an `emptyDir` with `medium: Memory` mounted at `/dev/shm`), point `Options::shm_dir` at a larger tmpfs, or lower `memtable_budget` or `shards`. The check does not hold the space: if another process fills that tmpfs after the open, a write that needs more of the region can crash the process with `SIGBUS`. Give the database a `/dev/shm` (or `shm_dir`) with room to spare.
+- **Threads are not pinned** to CPUs by default, so several databases or containers on one host share the CPUs cleanly. On a host or cpuset dedicated to one database, `Options::pin_threads(true)` pins shard `i` to the `i`-th CPU the opening thread may run on.
 
 Common options:
 
@@ -37,6 +39,7 @@ let db = Pigeonhole::open(
     Options::default()
         .durability(Durability::Buffered) // writer default; see durability.md
         .shards(1)                        // shard threads; default is the CPUs available
+        .memtable_budget(16 << 20)        // write buffer per shard; shm = budget × shards
         .block_cache(256 << 20)           // bytes; 256 MiB is the default
         .row_cache(0),                    // bytes; 0 (default) disables
 )?;

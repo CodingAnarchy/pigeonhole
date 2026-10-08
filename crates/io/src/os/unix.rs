@@ -251,11 +251,35 @@ pub(crate) fn open_region_file(path: &Path, len: u64, mode: SharedOpen) -> Resul
     let file = opts
         .open(path)
         .map_err(|e| Error::os("open shared region", e))?;
-    if mode == SharedOpen::CreateNew {
-        file.set_len(len)
-            .map_err(|e| Error::os("size shared region", e))?;
+    if mode == SharedOpen::CreateNew
+        && let Err(e) = size_region_file(&file, len)
+    {
+        let _ = fs::remove_file(path);
+        return Err(e);
     }
     Ok(file)
+}
+
+/// Sizes a new region file to `len`, sparsely: memory (on tmpfs) or disk is used only as the
+/// memtables touch it. First checks that the filesystem has `len` bytes free, so a region that
+/// cannot fit (Docker's 64 MiB `/dev/shm`) fails here with `NoSpace` instead of raising
+/// `SIGBUS` on a later store into the mapping. Space another process takes after this check
+/// can still cause that; reserving instead would commit the whole region's memory at open.
+fn size_region_file(file: &fs::File, len: u64) -> Result<()> {
+    // SAFETY: `statvfs` is plain old data, valid when zeroed.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: plain syscall on an fd we own, writing into `st`, which outlives the call.
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(last_error("statvfs shared region"));
+    }
+    if (st.f_bavail as u128) * (st.f_frsize as u128) < u128::from(len) {
+        return Err(Error::new(
+            ErrorKind::NoSpace,
+            "not enough free space for the shared region",
+        ));
+    }
+    file.set_len(len)
+        .map_err(|e| Error::os("size shared region", e))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -305,6 +329,9 @@ pub(crate) fn open_default_shared(name: &str, len: u64, mode: SharedOpen) -> Res
         <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
     });
     let result = (|| {
+        // A POSIX shared-memory object here (macOS, the BSDs) is anonymous memory backed by
+        // swap, not a size-capped filesystem, so there is no free space to check: `ftruncate`
+        // is all it takes.
         if mode == SharedOpen::CreateNew {
             let size = off(len, "region too large")?;
             // SAFETY: plain syscall on an fd we own.
