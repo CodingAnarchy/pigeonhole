@@ -60,8 +60,11 @@ impl<C: Cursor> MergingCursor<C> {
     }
 
     fn less(&self, a: usize, b: usize) -> bool {
-        let (ka, kb) = (self.sources[a].key(), self.sources[b].key());
-        ka < kb || (ka == kb && a < b)
+        match self.sources[a].key().cmp(self.sources[b].key()) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Equal => a < b,
+            std::cmp::Ordering::Greater => false,
+        }
     }
 
     fn sift_down(&mut self, mut i: usize) {
@@ -129,6 +132,22 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             s.seek(target)?;
         }
         self.rebuild();
+        Ok(())
+    }
+
+    /// Moves only the sources still behind `target`: past a column with many versions that
+    /// is usually the one source holding them (a memtable), not every SST of the read.
+    fn seek_forward(&mut self, target: &[u8]) -> Result<(), C::Error> {
+        let mut moved = false;
+        for &i in &self.heap {
+            if self.sources[i].key() < target {
+                self.sources[i].seek_forward(target)?;
+                moved = true;
+            }
+        }
+        if moved {
+            self.rebuild();
+        }
         Ok(())
     }
 

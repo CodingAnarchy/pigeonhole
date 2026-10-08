@@ -28,6 +28,13 @@ pub trait Cursor {
     /// Advances one entry.
     fn next(&mut self) -> Result<(), Self::Error>;
 
+    /// Positions on the first entry whose key is `>= target`, where `target` is at or past
+    /// the current key (a forward seek). The default seeks; a merging cursor overrides it to
+    /// move only its sources still behind `target`.
+    fn seek_forward(&mut self, target: &[u8]) -> Result<(), Self::Error> {
+        self.seek(target)
+    }
+
     /// Advances past every remaining entry of the current row. Sources with a row-start table
     /// override this to skip without decoding; the default steps with [`Cursor::next`].
     fn skip_row(&mut self) -> Result<(), Self::Error> {
