@@ -2035,8 +2035,26 @@ impl World {
             let fits = exact.chain(within).collect();
             unknown.push((*seqno, sv.commit_ts, keys, fits));
         }
-        let fits: Vec<&[usize]> = unknown.iter().map(|u| u.3.as_slice()).collect();
-        let owners = match_seqnos(&fits, unacked.len());
+        // A seqno an aborted attempt also explains (its PREPARE) is matched last: a refused
+        // attempt's records can share keys with an unacknowledged commit (a row delete's
+        // family markers carry no timestamp), and taking that commit for them would leave
+        // the commit's own records unexplained (#308). Augmenting paths never unmatch a
+        // seqno, so the others keep their commits.
+        let explained = |keys: &BTreeSet<MutationKey>| {
+            self.aborted
+                .iter()
+                .any(|c| keys.is_subset(&Self::mutation_keys(&c.ops)))
+        };
+        let order: Vec<usize> = {
+            let (optional, required): (Vec<usize>, Vec<usize>) =
+                (0..unknown.len()).partition(|&i| explained(&unknown[i].2));
+            required.into_iter().chain(optional).collect()
+        };
+        let fits: Vec<&[usize]> = order.iter().map(|&i| unknown[i].3.as_slice()).collect();
+        let mut owners = vec![None; unknown.len()];
+        for (&i, owner) in order.iter().zip(match_seqnos(&fits, unacked.len())) {
+            owners[i] = owner;
+        }
         let mut matched: BTreeMap<Seqno, Committed> = BTreeMap::new();
         let mut taken = vec![false; unacked.len()];
         for ((seqno, commit_ts, keys, _), owner) in unknown.iter().zip(owners) {
