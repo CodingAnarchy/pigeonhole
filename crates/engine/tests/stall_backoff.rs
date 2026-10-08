@@ -317,3 +317,55 @@ fn room_freed_by_a_snapshot_drop_on_another_thread_ends_the_wait() {
     writer.join().unwrap();
     db.close().unwrap();
 }
+
+/// On a frozen clock the flush backoff's timer gives up instead of firing (within
+/// microseconds when the shard is driven in a loop). A flush that keeps failing must then
+/// wait for the next flush trigger: retrying it each time the timer gives up looped inside
+/// `run_once` (whose slice never ends on a frozen clock), allocating as it went, until the
+/// model suite's runner ran out of memory (#141 review). Run under a watchdog: that loop
+/// never returns.
+#[test]
+fn a_failing_flush_is_not_retried_in_a_loop_on_a_frozen_clock() {
+    let retried = gate::within(10, || {
+        let (vfs, gate) = gate::frozen_vfs(1416);
+        let (db, mut shards) =
+            Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs))).unwrap();
+        let shard = &mut shards[0];
+        let a = table(&db, "a");
+        gate.fail_writes_containing(Some(MARK));
+        let mut i = 0u32;
+        while db.metrics().flush_failures == 0 {
+            assert!(i < 2_000, "no flush failed");
+            let mut wb = WriteBatch::new();
+            let mut value = MARK.to_vec();
+            value.extend_from_slice(&[i as u8; 1024]);
+            wb.put(
+                a.id,
+                a.families[0].id,
+                format!("row{i:05}").as_bytes(),
+                b"q",
+                None,
+                ValueRef::Bytes(&value),
+            )
+            .unwrap();
+            drop(db.submit(wb, Some(Durability::None)).unwrap());
+            while shard.run_once(u64::MAX) {}
+            i += 1;
+        }
+        let failed = db.metrics().flush_failures;
+        // Nothing new to flush and nothing waiting: drive the idle shard hard.
+        for _ in 0..5_000 {
+            shard.run_once(u64::MAX);
+        }
+        let retried = db.metrics().flush_failures - failed;
+        gate.fail_writes_containing(None);
+        drop(shards);
+        let _ = db.close();
+        retried
+    })
+    .expect("a failing flush was retried in a loop on a frozen clock (run_once never returned)");
+    assert!(
+        retried <= 2,
+        "{retried} flush retries while the shard idled on a frozen clock"
+    );
+}

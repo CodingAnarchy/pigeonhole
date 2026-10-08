@@ -118,16 +118,26 @@ impl Gate {
 #[derive(Debug)]
 pub struct GateVfs {
     inner: Arc<SimVfs>,
-    start: Instant,
+    /// `None`: the simulator's own clock, frozen unless the test advances it.
+    start: Option<Instant>,
     gate: Arc<Gate>,
 }
 
 /// A new gated VFS and its gate.
 pub fn vfs(seed: u64) -> (VfsRef, Arc<Gate>) {
+    gated(seed, Some(Instant::now()))
+}
+
+/// As [`vfs`], on the simulator's frozen clock.
+pub fn frozen_vfs(seed: u64) -> (VfsRef, Arc<Gate>) {
+    gated(seed, None)
+}
+
+fn gated(seed: u64, start: Option<Instant>) -> (VfsRef, Arc<Gate>) {
     let gate = Arc::new(Gate::default());
     let vfs = Arc::new(GateVfs {
         inner: SimVfs::new(seed),
-        start: Instant::now(),
+        start,
         gate: Arc::clone(&gate),
     });
     (vfs, gate)
@@ -206,10 +216,10 @@ impl Vfs for GateVfs {
         self.inner.remove_shared(name, dir)
     }
     fn now_micros(&self) -> u64 {
-        self.inner.now_micros() + self.start.elapsed().as_micros() as u64
+        self.inner.now_micros() + self.start.map_or(0, |s| s.elapsed().as_micros() as u64)
     }
     fn monotonic_nanos(&self) -> u64 {
-        self.inner.monotonic_nanos() + self.start.elapsed().as_nanos() as u64
+        self.inner.monotonic_nanos() + self.start.map_or(0, |s| s.elapsed().as_nanos() as u64)
     }
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()

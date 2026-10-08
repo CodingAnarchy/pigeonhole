@@ -1881,7 +1881,8 @@ pub(crate) struct ShardState {
     flush_failures: u32,
     /// After a failed flush, none starts until this timer fires (`RetryFlush`), so a device
     /// that keeps failing is not rewritten back to back (issue #141). On a frozen clock the
-    /// timer gives up and the next trigger retries.
+    /// timer gives up and the next flush trigger retries: retrying at once when it gives up
+    /// would loop (it gives up within microseconds when the shard is driven in a loop).
     flush_retry: Option<Arc<TimerState>>,
     /// Tablets dropped since open: their records need no flush before a checkpoint.
     dropped: HashSet<TabletId>,
@@ -5881,12 +5882,6 @@ impl ShardHandler for ShardState {
         {
             self.spawn_flush(ctx);
             self.check_flush_waiters();
-        }
-        // A flush backoff whose timer gave up on a frozen clock never sends `RetryFlush`:
-        // the flush is retried here instead.
-        if self.flush_retry.as_ref().is_some_and(|t| t.finished()) {
-            self.flush_retry = None;
-            self.spawn_flush(ctx);
         }
         self.retry_starved_freeze(ctx);
         self.try_finish_close(ctx);
