@@ -79,6 +79,9 @@ pub(crate) struct Hooks {
     /// Runs in the next shrink round, between its catalog read and its relocations
     /// (`Engine::before_shrink_relocates`).
     pub before_shrink_relocates: Once,
+    /// Runs once `backup` has released its snapshot's memtables, before its long merge
+    /// (`Engine::after_backup_releases_memtables`).
+    pub after_backup_releases_memtables: Once,
     /// Runs in the next shrink round that commits, after its copies are written and before
     /// the commit (`Engine::before_shrink_commits`).
     pub before_shrink_commits: Once,
@@ -365,6 +368,18 @@ impl Engine {
     #[doc(hidden)]
     pub fn before_shrink_relocates(&self, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.before_shrink_relocates.set(f);
+    }
+
+    /// Runs `f` once, on the calling thread of the next `backup`, right after it released its
+    /// snapshot's memtables and before it merges the SSTs: where a test writes past the
+    /// arena while the backup still runs (#262; test hook).
+    #[doc(hidden)]
+    pub fn after_backup_releases_memtables(&self, f: Box<dyn FnOnce() + Send>) {
+        self.inner
+            .shared
+            .hooks
+            .after_backup_releases_memtables
+            .set(f);
     }
 
     /// Runs `f` once, in the next `shrink` round that commits, after it has written its

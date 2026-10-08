@@ -6,6 +6,14 @@
 //! them as flushed through that seqno. The copy is exactly what a read at the snapshot sees,
 //! writers keep running meanwhile, and the result is one clean file.
 //!
+//! It runs in two phases so the snapshot's memtables (arena chunks writers need) are held
+//! only while they are copied (#262): first every memtable's entries are written into
+//! temporary SSTs in the new file (at most an arena's worth, compressed per family), then
+//! the snapshot is released except for its SST set and the long merge reads the temporary
+//! SSTs and the source SSTs. The temporary SSTs' extents are freed after the merge, which
+//! reuses them only in part: the copy can end up to about an arena larger than a freshly
+//! compacted file (still valid; free space is rebuilt from the manifest at open, D8).
+//!
 //! **Shrink** truncates the free tail, relocates the extents past the pager's shrink point
 //! that the manifest names (decision D60: never an in-flight flush or compaction output,
 //! which the manifest does not name yet, nor an SST a running compaction reads), publishes
@@ -17,30 +25,33 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pigeonhole_cache::{BlockCache, Priority};
 use pigeonhole_compaction::MergingCursor;
 use pigeonhole_format::key::split_suffix;
 use pigeonhole_format::manifest::{Edit, SstMeta};
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::{Cursor, FamilyId, SstId};
 use pigeonhole_pager::Pager;
-use pigeonhole_sst::{SstReader, SstWriterOptions};
+use pigeonhole_sst::{ReadOptions, SstReader, SstWriterOptions};
 
 use crate::catalog::Catalog;
 use crate::flush::SstSink;
 use crate::manifest::{self, ManifestReq, ManifestWriter, ReqKind};
 use crate::shard::Shared;
-use crate::snapshot::{Snapshot, SstSet};
+use crate::snapshot::{ShardMems, Snapshot, SstSet, View, ViewPin};
+use crate::source::{Source, mem_sources};
 use crate::{Error, Result};
 
 /// Entries `backup` copies between checks for a close.
 const CLOSE_CHECK_EVERY: u64 = 4096;
 
 /// Writes a consistent copy of `snapshot` to `dest` (which must not exist). Stops with
-/// `Closed` (removing the partial copy) once the engine is closing.
-pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Result<()> {
-    let view = &snapshot.view;
+/// `Closed` (removing the partial copy) once the engine is closing. The snapshot's memtables
+/// are released after the first phase; see the module docs.
+pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result<()> {
     let seqno = snapshot.seqno;
-    let source = &view.catalog;
+    let view = Arc::clone(&snapshot.view);
+    let source = Arc::clone(&view.catalog);
     if !source.blob_files.is_empty() {
         // The copy would hold dangling blob pointers (issue #58).
         return Err(crate::Error::Unsupported(
@@ -84,41 +95,86 @@ pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Resul
             Ok(())
         }
     };
+    // Reads of the new file's temporary SSTs: their ids start again at 1, so they must not
+    // share the engine's cache, which is keyed by SST id.
+    let temp_cache = Arc::new(BlockCache::new(4 << 20, 1));
+    let mut snapshot = Some(snapshot);
+    let mut view = Some(view);
     let result = (|| -> Result<()> {
+        // Phase 1: every slot's memtable entries at or below the snapshot into temporary
+        // SSTs (bounded by the memtable arena), while the snapshot pins the memtables.
+        let mut temps: HashMap<(pigeonhole_format::TabletId, FamilyId), Vec<SstMeta>> =
+            HashMap::new();
+        let full = view.as_ref().expect("held through phase 1");
+        for t in source.tablets() {
+            for f in source.family_ids_of(t.table) {
+                closing()?;
+                let (Some(meta), Some(set)) = (source.family(f), full.memtables(t.shard, t.id, f))
+                else {
+                    continue;
+                };
+                let mut sources = Vec::new();
+                mem_sources(set, &all, &mut sources);
+                let options = writer_options(&meta.options, t.table, f, t.id, created);
+                let outputs = copy_at(shared, &pager, &sst_ids, options, sources, seqno, &closing)?;
+                if !outputs.is_empty() {
+                    temps.insert((t.id, f), outputs);
+                }
+            }
+        }
+        // Release the memtables: keep only an SST view of the snapshot, pinned (its manifest
+        // version registered) so no SST it names is reclaimed while the merge reads it.
+        let full = view.take().expect("held through phase 1");
+        let ssts_only = Arc::new(View {
+            version: full.version,
+            manifest_version: full.manifest_version,
+            tablets: Arc::clone(&full.tablets),
+            catalog: Arc::clone(&full.catalog),
+            mems: (0..full.mems.len())
+                .map(|_| Arc::new(ShardMems::default()))
+                .collect(),
+            ssts: Arc::clone(&full.ssts),
+            _pin: Some(ViewPin::new(&shared.live_views, full.manifest_version)),
+        });
+        drop(full);
+        drop(snapshot.take());
+        #[cfg(feature = "test-hooks")]
+        shared.hooks.after_backup_releases_memtables.run();
+
+        // Phase 2: each slot's SSTs merged with its temporary SSTs into the copy.
         for t in source.tablets() {
             for f in source.family_ids_of(t.table) {
                 closing()?;
                 let Some(meta) = source.family(f) else {
                     continue;
                 };
-                let sources = view.scan_sources(t.shard, t.id, f, &all, None, None)?;
+                let mut sources = ssts_only.scan_sources(t.shard, t.id, f, &all, None, None)?;
+                let temp = temps.remove(&(t.id, f)).unwrap_or_default();
+                // The temporary SSTs (the snapshot's memtables, so the newest entries) go
+                // after the SST sources, against the usual newest-first order. The merge does
+                // not depend on source order: entries carry their seqnos, and nothing here
+                // resolves versions.
+                for m in &temp {
+                    let reader = Arc::new(SstReader::open(
+                        pager.file().clone(),
+                        m,
+                        Arc::clone(&temp_cache),
+                        Priority::Low,
+                    )?);
+                    sources.push(Source::Sst(
+                        reader.iter(all.clone(), ReadOptions::default()),
+                    ));
+                }
                 if sources.is_empty() {
                     continue;
                 }
-                let mut merged = MergingCursor::new(sources);
-                merged.seek_to_first()?;
-                let mut options = SstWriterOptions::for_family(&meta.options, t.table, f, t.id);
-                options.created_micros = created;
-                let mut sink = SstSink::new(
-                    Arc::clone(&pager),
-                    Arc::clone(&sst_ids),
-                    options,
-                    shared.picker.target_sst_bytes,
-                );
-                let mut n = 0u64;
-                while merged.valid() {
-                    n += 1;
-                    if n.is_multiple_of(CLOSE_CHECK_EVERY) {
-                        closing()?;
-                    }
-                    let (_, _, s, _) = split_suffix(merged.key())?;
-                    if s <= seqno {
-                        sink.add(merged.key(), merged.value())?;
-                    }
-                    merged.next()?;
+                let options = writer_options(&meta.options, t.table, f, t.id, created);
+                let outputs = copy_at(shared, &pager, &sst_ids, options, sources, seqno, &closing)?;
+                // The temporary SSTs are copied: their extents are free for the next slots.
+                for m in temp {
+                    pager.abandon(m.extent);
                 }
-                sink.cut()?;
-                for meta in sink.outputs.drain(..) {
+                for meta in outputs {
                     edits.push(Edit::AddSst {
                         tablet: t.id,
                         family: f,
@@ -163,6 +219,57 @@ pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Resul
         let _ = shared.vfs.remove(dest);
     }
     result
+}
+
+/// SST writer options for a backup's output of `(table, family, tablet)`.
+fn writer_options(
+    options: &pigeonhole_format::manifest::FamilyOptions,
+    table: pigeonhole_format::TableId,
+    family: FamilyId,
+    tablet: pigeonhole_format::TabletId,
+    created: u64,
+) -> SstWriterOptions {
+    let mut o = SstWriterOptions::for_family(options, table, family, tablet);
+    o.created_micros = created;
+    o
+}
+
+/// Merges `sources` in key order and writes every entry with a seqno at or below `seqno`
+/// into new SSTs of `pager`; returns them.
+fn copy_at(
+    shared: &Shared,
+    pager: &Arc<Pager>,
+    sst_ids: &Arc<AtomicU64>,
+    options: SstWriterOptions,
+    sources: Vec<Source>,
+    seqno: pigeonhole_format::Seqno,
+    closing: &dyn Fn() -> Result<()>,
+) -> Result<Vec<SstMeta>> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut merged = MergingCursor::new(sources);
+    merged.seek_to_first()?;
+    let mut sink = SstSink::new(
+        Arc::clone(pager),
+        Arc::clone(sst_ids),
+        options,
+        shared.picker.target_sst_bytes,
+    );
+    let mut n = 0u64;
+    while merged.valid() {
+        n += 1;
+        if n.is_multiple_of(CLOSE_CHECK_EVERY) {
+            closing()?;
+        }
+        let (_, _, s, _) = split_suffix(merged.key())?;
+        if s <= seqno {
+            sink.add(merged.key(), merged.value())?;
+        }
+        merged.next()?;
+    }
+    sink.cut()?;
+    Ok(std::mem::take(&mut sink.outputs))
 }
 
 /// Relocates manifest-named extents past the shrink point and truncates the file. Returns
