@@ -620,13 +620,14 @@ impl Shard {
     }
 }
 
-/// The largest value a commit may carry (decision D16), as `pigeonhole-engine` computes it at
-/// open: the WAL segment payload, 64 MiB, and half a shard's memtable arena.
 /// The shared-memory region a writer open creates, kept to explain `ShmUnavailable`: what it
 /// needed, where, and how to make it fit.
 struct ShmFootprint {
     shards: u64,
     budget: u64,
+    /// The whole region: every arena (each rounded up to 2 MiB) plus the header, the two view
+    /// buffers and the reader slots, laid out as the engine lays it out.
+    region_len: u64,
     dir: Option<std::path::PathBuf>,
 }
 
@@ -637,9 +638,21 @@ impl ShmFootprint {
             0 => pigeonhole_io::sys::available_cpus().max(1),
             n => n,
         };
+        let count = u32::try_from(shards).unwrap_or(u32::MAX);
+        let config = pigeonhole_shm::ShmConfig::new(count);
+        let layout = pigeonhole_format::shm::ShmHeader::layout(
+            [0; 16],
+            count,
+            o.reader_slots.max(1),
+            config.view_buffer_bytes,
+            o.memtable_budget,
+            0,
+            0,
+        );
         Self {
             shards: shards as u64,
             budget: o.memtable_budget,
+            region_len: layout.region_len,
             dir: o.shm_dir.clone(),
         }
     }
@@ -649,23 +662,33 @@ impl ShmFootprint {
         if !matches!(e, pigeonhole_engine::Error::ShmUnavailable) {
             return e.into();
         }
+        let arenas = self.shards.saturating_mul(self.budget);
         let need = format!(
-            "{} ({} shards × {} memtable_budget, plus a few pages)",
-            bytes(self.shards.saturating_mul(self.budget)),
+            "{} ({} shards × {} memtable_budget, plus {} for views and reader slots)",
+            bytes(self.region_len),
             self.shards,
             bytes(self.budget),
+            bytes(self.region_len.saturating_sub(arenas)),
         );
         let fix = "or lower Options::memtable_budget or Options::shards";
         let message = match &self.dir {
             Some(dir) => format!(
-                "the shared-memory region could not be created in {}: it needs {need}. The                  directory must exist and have that much free space; free some, point                  Options::shm_dir at a larger one, {fix}",
+                "the shared-memory region could not be created in {}: it needs {need}. The \
+                 directory must exist and have that much free space; free some, point \
+                 Options::shm_dir at a larger one, {fix}",
                 dir.display()
             ),
             None if cfg!(any(target_os = "linux", target_os = "android")) => format!(
-                "the shared-memory region could not be created in /dev/shm: it needs {need},                  and /dev/shm is too small or missing (Docker and Kubernetes default it to 64                  MiB). Enlarge it (docker run --shm-size; in Kubernetes, mount an emptyDir                  with medium: Memory at /dev/shm), point Options::shm_dir at a larger tmpfs,                  {fix}"
+                "the shared-memory region could not be created in /dev/shm: it needs {need}, \
+                 and /dev/shm is too small or missing (Docker and Kubernetes default it to 64 \
+                 MiB). Enlarge it (docker run --shm-size; in Kubernetes, mount an emptyDir \
+                 with medium: Memory at /dev/shm), point Options::shm_dir at a larger tmpfs, \
+                 {fix}"
             ),
             None => format!(
-                "the shared-memory region could not be created: it needs {need} of shared                  memory, more than the system would commit. Free memory, point                  Options::shm_dir at a directory with room, {fix}"
+                "the shared-memory region could not be created: it needs {need} of shared \
+                 memory, more than the system would commit. Free memory, point \
+                 Options::shm_dir at a directory with room, {fix}"
             ),
         };
         Error::new(ErrorCode::ShmUnavailable, message)
@@ -681,6 +704,8 @@ fn bytes(n: u64) -> String {
     }
 }
 
+/// The largest value a commit may carry (decision D16), as `pigeonhole-engine` computes it at
+/// open: the WAL segment payload, 64 MiB, and half a shard's memtable arena.
 fn max_value(o: &pigeonhole_engine::EngineOptions) -> usize {
     (o.wal.segment_size as usize)
         .saturating_sub(64 * 1024)
@@ -692,12 +717,12 @@ fn max_value(o: &pigeonhole_engine::EngineOptions) -> usize {
 mod tests {
     use super::*;
 
-    fn footprint(shards: u64, budget: u64, dir: Option<&str>) -> ShmFootprint {
-        ShmFootprint {
-            shards,
-            budget,
-            dir: dir.map(Into::into),
-        }
+    fn footprint(shards: usize, budget: u64, dir: Option<&str>) -> ShmFootprint {
+        let mut o = pigeonhole_engine::EngineOptions::new(pigeonhole_io::sim::SimVfs::new(1));
+        o.shards = shards;
+        o.memtable_budget = budget;
+        o.shm_dir = dir.map(Into::into);
+        ShmFootprint::of(&o)
     }
 
     #[test]
@@ -706,7 +731,7 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::ShmUnavailable);
         let m = e.message();
         assert!(
-            m.contains("256 MiB (4 shards × 64 MiB memtable_budget"),
+            m.contains("266 MiB (4 shards × 64 MiB memtable_budget, plus 10 MiB for views"),
             "{m}"
         );
         assert!(
@@ -723,7 +748,8 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::ShmUnavailable);
         let m = e.message();
         assert!(
-            m.contains("in /mnt/small: it needs 576 KiB (3 shards × 192 KiB"),
+            // Each arena rounds up to 2 MiB.
+            m.contains("in /mnt/small: it needs 16 MiB (3 shards × 192 KiB memtable_budget"),
             "{m}"
         );
     }

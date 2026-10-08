@@ -22,6 +22,7 @@ tokio = ["async"]
 pigeonhole-engine = { workspace = true }
 pigeonhole-format = { workspace = true }
 pigeonhole-io = { workspace = true }
+pigeonhole-shm = { workspace = true }
 
 [dev-dependencies]
 pigeonhole-sim = { workspace = true }

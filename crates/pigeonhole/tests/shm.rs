@@ -16,16 +16,19 @@ fn missing_shm_dir_fails_at_open() {
     assert_eq!(err.code(), ErrorCode::ShmUnavailable, "{err}");
     let m = err.message();
     assert!(m.contains(&shm.display().to_string()), "{m}");
-    assert!(m.contains("2 MiB (2 shards × 1 MiB memtable_budget"), "{m}");
+    assert!(
+        m.contains("14 MiB (2 shards × 1 MiB memtable_budget"),
+        "{m}"
+    );
 
     // The failed open left nothing locked: a good configuration opens the same file.
     let db = Pigeonhole::open(dir.join("db.phdb"), Options::default().shards(1)).unwrap();
     db.close().unwrap();
 }
 
-/// The tmpfs size the Linux test mounts, below the 16 MiB region it then asks for.
+/// The tmpfs size the Linux test mounts: room for a 12 MiB region, not for a 74 MiB one.
 #[cfg(target_os = "linux")]
-const SMALL_TMPFS: &str = "size=8m";
+const SMALL_TMPFS: &str = "size=32m";
 
 /// Set (to the small tmpfs mount point) in the child that runs inside its own mount namespace.
 #[cfg(target_os = "linux")]
@@ -138,14 +141,14 @@ fn small_shm_child(mount: &std::path::Path) {
     let path = dir.join("db.phdb");
     let big = Options::default()
         .shards(4)
-        .memtable_budget(4 << 20)
+        .memtable_budget(16 << 20)
         .shm_dir(mount);
     let err = Pigeonhole::open(&path, big).unwrap_err();
     assert_eq!(err.code(), ErrorCode::ShmUnavailable, "{err}");
     let m = err.message();
     assert!(m.contains(&mount.display().to_string()), "{m}");
     assert!(
-        m.contains("16 MiB (4 shards × 4 MiB memtable_budget"),
+        m.contains("74 MiB (4 shards × 16 MiB memtable_budget"),
         "{m}"
     );
 

@@ -127,8 +127,9 @@ impl Options {
     /// does not bound the database size; it bounds the largest value and batch (a batch
     /// larger than the arena fails with `Busy`).
     ///
-    /// The shared-memory region holds every shard's arena, about `memtable_budget × shards`
-    /// (256 MiB for the default budget on 4 CPUs): on Linux, memory in `/dev/shm` (or a file
+    /// The shared-memory region holds every shard's arena (each rounded up to 2 MiB) plus
+    /// about 10 MiB of views and reader slots, 266 MiB for the default budget on 4 CPUs: on
+    /// Linux, memory in `/dev/shm` (or a file
     /// in [`shm_dir`](Options::shm_dir)), used only as the memtables fill. Opening checks
     /// that the filesystem has that much free and fails with
     /// [`ErrorCode::ShmUnavailable`](crate::ErrorCode::ShmUnavailable) if it does not.
