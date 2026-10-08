@@ -148,7 +148,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D133](phase-1.md#d133) — the default-timestamp floor of a moved tablet · tablets, #97
 - [D134](phase-1.md#d134) — what the balancer does, and its options · tablets, #97; stability work in #103 · **amended by D144, D146**
 - [D135](phase-1.md#d135) — a split's children and the view buffer (D28) · tablets, #97
-- [D136](phase-1.md#d136) — arena room for many tablet slots · tablets, #97; refinement in #104
+- [D136](phase-1.md#d136) — arena room for many tablet slots · tablets, #97; refinement in #104 · **amended by D189**
 - [D137](phase-1.md#d137) — What does `Engine::compact` guarantee while tablets split, merge and move · engine
 - [D138](phase-1.md#d138) — What do `flush` and `compact` do when the arena has no chunk for the fresh memtables they need · engine, #116 · amends D124
 - [D139](phase-1.md#d139) — Where do tablets go at open, now that owners are not persisted (D130) · engine
@@ -201,6 +201,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments · **refined by D187**
 - [D187](phase-2.md#d187) — Counter-family deletes purge at the bottom level by seqno · compaction, engine, #290, #298 · refines D70, D186
 - [D188](phase-2.md#d188) — Values above the inline limit are separated into blob files at commit time · engine, runtime, #230, #301 · amends D16
+- [D189](phase-2.md#d189) — Arenas are sized for their slots with tablet changes off too · engine, #283, #307 · amends D136
 
 ## Open questions
 _None._
