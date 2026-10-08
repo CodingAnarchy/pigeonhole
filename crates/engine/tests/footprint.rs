@@ -32,8 +32,9 @@ fn wait<F: Future + Unpin>(shard: &mut EngineShard, mut f: F) -> F::Output {
 }
 
 /// Loads `mib` MiB of 1 KiB incompressible values, keeps one row in `100 / keep_pct`,
-/// compacts and shrinks; returns `(file length, live SST bytes, SSTs)`.
-fn at_rest(mib: u64, keep_pct: u64) -> (u64, u64, usize) {
+/// compacts and shrinks; returns `(file length, SST bytes, blob file bytes, SSTs)`. With
+/// `separate`, the family's `blob_threshold` moves every value into blob files.
+fn at_rest(mib: u64, keep_pct: u64, separate: bool) -> (u64, u64, u64, usize) {
     let vfs = SimVfs::new(185);
     let mut o = EngineOptions::new(vfs.clone());
     o.create_if_missing = true;
@@ -50,7 +51,16 @@ fn at_rest(mib: u64, keep_pct: u64) -> (u64, u64, usize) {
         wait(shard, pending).unwrap();
     };
     let t = db
-        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .create_table(
+            "t",
+            &[(
+                "f".into(),
+                FamilyOptions {
+                    blob_threshold: if separate { 512 } else { u32::MAX },
+                    ..FamilyOptions::default()
+                },
+            )],
+        )
         .unwrap();
     let rows = mib * 1024;
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
@@ -98,7 +108,8 @@ fn at_rest(mib: u64, keep_pct: u64) -> (u64, u64, usize) {
     while shard.run_once(u64::MAX) {}
     db.shrink().unwrap();
     let ssts = db.sst_lens();
-    let live: u64 = ssts.iter().map(|s| s.1).sum();
+    let sst_bytes: u64 = ssts.iter().map(|s| s.1).sum();
+    let blob_bytes: u64 = db.blob_files().iter().map(|b| b.2).sum();
     let len = vfs
         .open(Path::new(DB), OpenOptions::read())
         .unwrap()
@@ -108,14 +119,14 @@ fn at_rest(mib: u64, keep_pct: u64) -> (u64, u64, usize) {
     while shard.closed().is_none() {
         shard.run_once(u64::MAX);
     }
-    (len, live, ssts.len())
+    (len, sst_bytes, blob_bytes, ssts.len())
 }
 
 #[test]
 #[cfg_attr(miri, ignore = "loads tens of MiB")]
 fn a_compacted_and_shrunk_file_is_about_its_data() {
     for (mib, keep_pct) in [(5, 100), (20, 100), (50, 100), (50, 10), (50, 1)] {
-        let (len, live, ssts) = at_rest(mib, keep_pct);
+        let (len, live, _, ssts) = at_rest(mib, keep_pct, false);
         let ratio = len as f64 / live as f64;
         eprintln!(
             "load {mib} MiB, kept {keep_pct}%: file {len}, live {live} ({ratio:.2}x), {ssts} SSTs"
@@ -129,4 +140,22 @@ fn a_compacted_and_shrunk_file_is_about_its_data() {
             "load {mib} MiB, kept {keep_pct}%: the file is {ratio:.2}x its data ({len} for {live})"
         );
     }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "loads tens of MiB")]
+fn pieces_count_sst_bytes_not_the_blobs_they_point_to() {
+    // With every value separated, an SST holds only keys and pointers: the pieces are cut
+    // from those bytes (about 0.35 MiB for 20 MiB of values), not from the values' 20 MiB.
+    // Blob files take their own extents (64 KiB to 1 MiB). The file's size is not asserted:
+    // `shrink` does not move blob extents yet (#281).
+    let (len, sst_bytes, blob_bytes, ssts) = at_rest(20, 100, true);
+    eprintln!("load 20 MiB separated: file {len}, SSTs {sst_bytes} in {ssts}, blobs {blob_bytes}");
+    assert!(
+        blob_bytes >= 20 << 20,
+        "the values were separated: {blob_bytes}"
+    );
+    assert!(sst_bytes < 1 << 20, "the SSTs hold pointers: {sst_bytes}");
+    // 0.35 MiB in pieces of at most half the stream: 128 + 64 + 64 + 64 + 64 KiB.
+    assert!(ssts <= 6, "pieces sized from the SST bytes: {ssts} SSTs");
 }

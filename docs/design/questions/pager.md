@@ -10,6 +10,9 @@ The coordinator approved option 1' below (no format change), and it is built as 
 - **Remaining.** The input bytes not yet read, scaled by the ratio of output written to input consumed so far, once at least 1/64 of the input is read. The open SST's data bytes come from the new `SstWriter::data_len`.
 - **Cut.** Each output's extent is exactly its piece. The output is cut between rows (D78) once less than 1/32 of the extent is left: the index, filters and footer fit in that. If a later projection calls for a smaller piece, the output is cut once it holds that piece. At finish the extent is trimmed to the output's class.
 - **`Engine::compact`.** A full compaction re-cuts a lone SST larger than one piece, where it used to move it trivially (a flush output would otherwise stay whole). An SST holding a single row cannot be cut and is left alone.
+- **Blob separation (#33).** A separated value leaves only its pointer in the SST, and the sink sees the pointer. So pieces are sized from SST bytes (input and output lengths), never from blob bytes. Flushes separate too, so a compaction's inputs and outputs compare like for like. Blob files keep their own extents (64 KiB to 1 MiB, several per file).
+  - Measured: 20 MiB of separated 1 KiB values compacts into 5 SSTs holding 355 KB.
+  - The file at rest is still 1.60× its data, because `shrink` does not relocate blob extents (#281).
 - **Not done here.**
   - Backup copies (`copy_at`) still write through the flush sink, so a backup's last SST can be half empty.
   - The #200 `shrink` notes (reserve holes for the largest extents; release a skipped extent's claim at once).
