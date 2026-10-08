@@ -1454,7 +1454,13 @@ fn size_errors_name_the_size_and_the_limit() {
     let mut txn = db.transaction().unwrap();
     txn.put(&t, b"r2", "a", b"q", &big);
     txn.commit().unwrap();
-    let err = t.mutate(b"r").merge("a", b"n", &big).commit().unwrap_err();
+    let m = db
+        .table("m")
+        .unwrap()
+        .family("a", Family::default().merge_operator("pigeonhole.i64_add"))
+        .create_if_missing()
+        .unwrap();
+    let err = m.mutate(b"r").merge("a", b"n", &big).commit().unwrap_err();
     assert_eq!(err.code(), ErrorCode::ValueTooLarge);
     assert!(err.message().contains("value of 300000 bytes"), "{err}");
     assert!(err.message().contains(&(192 * 1024).to_string()), "{err}");
