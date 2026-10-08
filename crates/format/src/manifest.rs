@@ -461,16 +461,6 @@ pub enum Edit {
         /// Blob file.
         blob_file: BlobFileId,
     },
-    /// Tag 13. The blob files an SST's puts point into, with the bytes they reference in
-    /// each (`16 + len` per pointer, FORMAT §7). Written with every new SST (an empty list:
-    /// it points into none); an SST without one, written by an older build, may point into
-    /// any blob file of its family.
-    SstBlobRefs {
-        /// SST.
-        sst: SstId,
-        /// `(blob file, referenced bytes)`, by blob file id.
-        refs: Vec<(BlobFileId, u64)>,
-    },
     /// Tag 12. Id allocation counters and the seqno floor, so ids are never reused and the
     /// seqno counter restarts above anything persisted.
     Counters {
@@ -489,6 +479,16 @@ pub enum Edit {
         /// Every timestamp assigned by default is at most this; default timestamps after
         /// open are greater (decision D11).
         ts_floor: Timestamp,
+    },
+    /// Tag 13. The blob files an SST's puts point into, with the bytes they reference in
+    /// each (`16 + len` per pointer, FORMAT §7). Written with every new SST (an empty list:
+    /// it points into none); an SST without one, written by an older build, may point into
+    /// any blob file of its family.
+    SstBlobRefs {
+        /// SST.
+        sst: SstId,
+        /// `(blob file, referenced bytes)`, by blob file id.
+        refs: Vec<(BlobFileId, u64)>,
     },
 }
 
