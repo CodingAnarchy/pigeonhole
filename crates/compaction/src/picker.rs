@@ -126,7 +126,9 @@ pub struct CompactionTask {
     /// tablet after a split (D13) are read only within it, and outputs never leave it.
     pub range: KeyRange,
     /// Disjoint pieces of `range`, in order, that run as independent subcompactions; one
-    /// piece equal to `range` means no split.
+    /// piece equal to `range` means no split. Bounds (here and in `range`) must be encoded
+    /// row prefixes, so a row is never split between pieces: GC reads a row's markers and
+    /// columns together, and a counter family's bottommost purge (#290) relies on it.
     pub subranges: Vec<KeyRange>,
     /// Input SSTs by level.
     pub inputs: Vec<(u8, Vec<SstId>)>,

@@ -66,10 +66,13 @@ pub struct GcPolicy {
     pub min_ts_above: Timestamp,
     /// Counter families only (decision D179): the other sources of the slot (SSTs not in
     /// the task, memtables, prepared cross-shard shares) that may hold an entry with a seqno
-    /// at or below the newest input seqno. A delete there can hide one of two input
-    /// operands but not the other, so operands are not combined across its seqno range.
-    /// `None` (the default) means unknown: no counter operand is combined. (Counter
-    /// families never get a `max_versions` purge, whatever this holds.)
+    /// at or below the newest input seqno; every such source must be listed. A delete there
+    /// can hide one of two input operands but not the other, so operands are not combined
+    /// across its seqno range; and a bottommost delete is purged without the `min_ts_above`
+    /// rule only when no listed source overlapping its row starts at or below its seqno
+    /// (#290). `None` (the default) means unknown: no counter operand is combined and only
+    /// the `min_ts_above` rule purges. (Counter families never get a `max_versions` purge,
+    /// whatever this holds.)
     pub other_sources: Option<Vec<OtherSource>>,
 }
 

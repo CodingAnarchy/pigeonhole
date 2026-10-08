@@ -30,6 +30,13 @@
 //! reads (reads apply the limit; the TTL and deletes reclaim the space). Two
 //! operands are combined only if no other source of the slot can hold a delete with a seqno
 //! between theirs (`GcPolicy::other_sources`), which would hide one but not the other.
+//!
+//! A counter delete hides only entries with a lower seqno, so besides the `min_ts_above` rule
+//! (useless there: every source holding a counter has timestamp 0) a bottommost delete
+//! visible at every read point is purged when no other source that may hold keys of its row
+//! starts at or below its seqno: nothing outside the inputs is old enough for it to
+//! hide, and what it hides in the inputs is dropped with it. Sources the engine leaves out
+//! of `other_sources` start above the newest input seqno, so they never block it.
 
 use std::sync::Arc;
 
@@ -269,6 +276,13 @@ impl Gc {
         }
     }
 
+    /// Counter families: whether a bottommost delete at `ts` with `seqno`, visible at every
+    /// read point, may be purged: by the timestamp rule, or because no other source that
+    /// may hold keys of the row starts at or below its seqno (#290).
+    fn counter_purgeable(&self, ts: Timestamp, seqno: Seqno) -> bool {
+        self.purgeable(ts) || (self.bottommost && self.row_guard.iter().all(|&(lo, _)| lo > seqno))
+    }
+
     /// Counter families: whether a delete from another source could have a seqno in
     /// `(older, newer]`.
     fn guarded(&self, older: Seqno, newer: Seqno) -> bool {
@@ -311,7 +325,13 @@ impl Gc {
                 .markers
                 .iter()
                 .any(|m| m.1 <= stripe && (!self.counter || (m.1 == stripe && m.2 > seqno)));
-            let keep = !self.expired(ts) && !redundant && !(self.purgeable(ts) && stripe == 0);
+            let purge = stripe == 0
+                && if self.counter {
+                    self.counter_purgeable(ts, seqno)
+                } else {
+                    self.purgeable(ts)
+                };
+            let keep = !self.expired(ts) && !redundant && !purge;
             self.markers.push((ts, stripe, seqno));
             if keep {
                 out.push(key, cursor.value());
@@ -532,7 +552,6 @@ impl Gc {
         self.c_any.fill(0);
         self.c_col.fill(0);
         let mut put_min = NONE;
-        let purge_deletes = self.purgeable(ts);
         // A pending combined operand: its stripe and newest seqno.
         let mut pending: Option<(usize, Seqno)> = None;
         for idx in 0..self.group.len() {
@@ -550,14 +569,14 @@ impl Gc {
                 Kind::CellDelete => {
                     let redundant = covered;
                     self.c_any[i] = self.c_any[i].max(e.seqno);
-                    !redundant && !(purge_deletes && i == 0)
+                    !redundant && !(i == 0 && self.counter_purgeable(ts, e.seqno))
                 }
                 Kind::ColumnDelete => {
                     let redundant = self.c_cover[i].max(self.c_col[i]) > e.seqno;
                     self.c_any[i] = self.c_any[i].max(e.seqno);
                     self.c_col[i] = self.c_col[i].max(e.seqno);
                     self.col_del_seqno[i] = self.col_del_seqno[i].max(e.seqno);
-                    !redundant && !(purge_deletes && i == 0)
+                    !redundant && !(i == 0 && self.counter_purgeable(ts, e.seqno))
                 }
                 Kind::FamilyDelete => true,
             };
