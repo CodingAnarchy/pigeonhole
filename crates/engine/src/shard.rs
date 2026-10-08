@@ -5449,7 +5449,7 @@ impl ShardState {
         if tracing() {
             let view = self.checkpoint_view().ok().flatten();
             for l in &self.log {
-                eprintln!(
+                trace!(
                     "  shard {} log: seqno {} {:?} needed={}",
                     self.id.0,
                     l.seqno,
@@ -5841,6 +5841,8 @@ pub(crate) fn tracing() -> bool {
     *ON.get_or_init(|| std::env::var_os("PIGEONHOLE_TRACE").is_some())
 }
 
+/// Logs to stderr when `PIGEONHOLE_TRACE` is set (CONTRIBUTING.md, "Test environment variables"):
+/// the only output the engine library writes.
 macro_rules! trace {
     ($($arg:tt)*) => {
         if $crate::shard::tracing() {

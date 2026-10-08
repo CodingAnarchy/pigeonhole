@@ -345,14 +345,13 @@ fn a_tables_writes_spread_across_shards_after_splits() {
     });
     let mut written = 0u64;
     // One table, one hot tablet on one shard: the balancer splits it over the idle shards.
-    for round in 0..4 {
+    for _ in 0..4 {
         for _ in 0..300 {
             db.put(&key(written), b"v");
             written += 1;
         }
         let m = db.engine.balance_pending().unwrap();
         db.drive(m).unwrap();
-        eprintln!("round {round}: {:?}", db.ranges());
     }
     let owners: std::collections::BTreeSet<u16> = db.ranges().iter().map(|(_, s, ..)| *s).collect();
     assert_eq!(owners.len(), shards, "tablets on {owners:?}");
@@ -916,8 +915,10 @@ fn the_balancer_merges_cold_siblings_once_one_compacted_a_shared_sst() {
     }
 }
 
+/// A cross-shard commit that touches a tablet just moved to another shard gets a timestamp
+/// above the tablet's earlier writes, so it is the newest version.
 #[test]
-fn probe_cross_shard_commit_ts_after_move() {
+fn a_cross_shard_commit_after_a_move_is_the_newest_version() {
     // 3 shards; T's tablet moves A -> B; a cross-shard commit coordinated by C touches T.
     let mut db = open(3, |_| {});
     let t = db.table.id;
@@ -930,7 +931,6 @@ fn probe_cross_shard_commit_ts_after_move() {
     let snap = db.engine.snapshot().unwrap();
     let ushard = snap.view().tablets().ranges(u.id)[0].1;
     drop(snap);
-    eprintln!("t on {from}, u on {ushard}");
     let mut last = 0;
     for i in 0..50u8 {
         db.put(b"row", &[i]);
@@ -942,7 +942,6 @@ fn probe_cross_shard_commit_ts_after_move() {
         .unwrap_or((from + 1) % 3);
     let m = db.engine.move_tablet_pending(t, b"row", to).unwrap();
     db.drive(m).unwrap();
-    eprintln!("moved t to {to}; ranges {:?}", db.ranges());
     // Cross-shard: first row on u (coordinator = u's shard), then t/row.
     let mut wb = WriteBatch::new();
     wb.put(
@@ -966,10 +965,6 @@ fn probe_cross_shard_commit_ts_after_move() {
         db.step();
     }
     let (ts, v) = db.get(b"row").unwrap();
-    eprintln!(
-        "last={last} now ts={ts} v={:?}",
-        String::from_utf8_lossy(&v)
-    );
     assert_eq!(v, b"newest", "a newer commit is hidden: ts {ts} <= {last}");
     db.engine.close().unwrap();
     for _ in 0..8 {
