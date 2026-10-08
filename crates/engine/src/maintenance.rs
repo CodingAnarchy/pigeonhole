@@ -7,9 +7,12 @@
 //! writers keep running meanwhile, and the result is one clean file.
 //!
 //! It runs in two phases so the snapshot's memtables (arena chunks writers need) are held
-//! only briefly (#262): first every memtable's entries are copied into temporary SSTs in the
-//! new file (bounded by the arena, so quick), then the snapshot is released except for its
-//! SST set and the long merge reads the temporary SSTs and the source SSTs.
+//! only while they are copied (#262): first every memtable's entries are written into
+//! temporary SSTs in the new file (at most an arena's worth, compressed per family), then
+//! the snapshot is released except for its SST set and the long merge reads the temporary
+//! SSTs and the source SSTs. The temporary SSTs' extents are freed after the merge, which
+//! reuses them only in part: the copy can end up to about an arena larger than a freshly
+//! compacted file (still valid; free space is rebuilt from the manifest at open, D8).
 //!
 //! **Shrink** truncates the free tail, relocates the extents past the pager's shrink point
 //! that the manifest names (decision D60: never an in-flight flush or compaction output,
@@ -147,6 +150,10 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
                 };
                 let mut sources = ssts_only.scan_sources(t.shard, t.id, f, &all, None, None)?;
                 let temp = temps.remove(&(t.id, f)).unwrap_or_default();
+                // The temporary SSTs (the snapshot's memtables, so the newest entries) go
+                // after the SST sources, against the usual newest-first order. The merge does
+                // not depend on source order: entries carry their seqnos, and nothing here
+                // resolves versions.
                 for m in &temp {
                     let reader = Arc::new(SstReader::open(
                         pager.file().clone(),
