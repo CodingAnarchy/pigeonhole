@@ -948,7 +948,7 @@ const MOVES_BLOBS_AND_SSTS: Shape = Shape {
 const CLEARS_A_REGION: Shape = Shape {
     name: "region clearing",
     build: fragmented_below_a_large_sst,
-    shrunk: |_, end| end <= 3 << 20,
+    shrunk: |_, end| end < 4 << 20,
     rows: &[0, 1, 45, 89],
     value: big_row,
     dropped: "s0",
@@ -1034,20 +1034,17 @@ fn noise(t: u32, i: u32, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// #314's shape: every second of many one-SST tables dropped leaves single free units
-/// between small SSTs, and a table with one SST of 1 MiB sits past them, with no aligned
-/// hole of its class below it until `shrink` clears one.
+/// #314's shape: every second of 24 one-row tables dropped leaves single free units between
+/// small SSTs and blob extents, and a table with one SST of 1 MiB sits past them, with no
+/// aligned hole of its class below it until `shrink` clears one (of SSTs and blob extents).
 fn fragmented_below_a_large_sst(vfs: &Arc<SimVfs>) -> (Rig, TableInfo) {
     let mut rig = Rig::open(vfs, false);
-    let fam = || FamilyOptions {
-        blob_threshold: u32::MAX,
-        ..FamilyOptions::default()
-    };
     let mut small = Vec::new();
-    for n in 0..40u32 {
+    for n in 0..24u32 {
+        // Separated: a blob extent beside each SST, so the region cleared holds both kinds.
         let t = rig
             .db
-            .create_table(&format!("s{n}"), &[("f".into(), fam())])
+            .create_table(&format!("s{n}"), &[("f".into(), family())])
             .unwrap();
         let mut wb = WriteBatch::new();
         wb.put(
@@ -1067,7 +1064,12 @@ fn fragmented_below_a_large_sst(vfs: &Arc<SimVfs>) -> (Rig, TableInfo) {
         rig.db.drop_table(t.id).unwrap();
     }
     rig.idle();
-    let big = rig.db.create_table("big", &[("f".into(), fam())]).unwrap();
+    // Not separated: one 1 MiB SST.
+    let fam = FamilyOptions {
+        blob_threshold: u32::MAX,
+        ..FamilyOptions::default()
+    };
+    let big = rig.db.create_table("big", &[("f".into(), fam)]).unwrap();
     for i in 0..90u32 {
         let mut wb = WriteBatch::new();
         wb.put(
@@ -1102,12 +1104,12 @@ fn file_len(vfs: &SimVfs) -> u64 {
 fn shrink_clears_a_region_for_a_large_extent() {
     // #314: the 1 MiB SST has no free 16-aligned hole below it, only single units between
     // small SSTs. `shrink` moves the small SSTs (and the manifest) out of one region, then
-    // the large SST into it: 3 MiB, where leaving it in place ends the file at 4 MiB.
+    // the large SST into it: the file ends below the 4 MiB it ends at with it left there.
     let vfs = SimVfs::new(314);
     let (rig, big) = fragmented_below_a_large_sst(&vfs);
     assert!(file_len(&vfs) > 4 << 20);
     rig.db.shrink().unwrap();
-    assert!(file_len(&vfs) <= 3 << 20, "{} bytes", file_len(&vfs));
+    assert!(file_len(&vfs) < 4 << 20, "{} bytes", file_len(&vfs));
     rig.check();
     let snap = rig.db.snapshot().unwrap();
     for i in 0..90 {
@@ -1121,4 +1123,121 @@ fn shrink_clears_a_region_for_a_large_extent() {
     drop(snap);
     assert_eq!(rig.db.unreferenced_bytes(), 0);
     rig.close();
+}
+
+/// `fragmented_below_a_large_sst`'s layout on an engine that runs its own shard threads, so
+/// a test can flush while `shrink` runs.
+fn fragmented_on_threads(vfs: &Arc<SimVfs>) -> (Arc<Engine>, TableInfo) {
+    let db = Engine::open(Path::new(DB), options(Arc::clone(vfs), false)).unwrap();
+    let fam = || FamilyOptions {
+        blob_threshold: u32::MAX,
+        ..FamilyOptions::default()
+    };
+    let mut small = Vec::new();
+    for n in 0..40u32 {
+        let t = db
+            .create_table(&format!("s{n}"), &[("f".into(), fam())])
+            .unwrap();
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t.id,
+            t.families[0].id,
+            b"r",
+            b"q",
+            None,
+            ValueRef::Bytes(&noise(n, 0, 2_000)),
+        )
+        .unwrap();
+        db.commit(wb, None).unwrap();
+        db.flush().unwrap();
+        small.push(t);
+    }
+    for t in small.iter().step_by(2) {
+        db.drop_table(t.id).unwrap();
+    }
+    let big = db.create_table("big", &[("f".into(), fam())]).unwrap();
+    for i in 0..90u32 {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            big.id,
+            big.families[0].id,
+            &row(i),
+            b"q",
+            None,
+            ValueRef::Bytes(&big_row(i)),
+        )
+        .unwrap();
+        db.commit(wb, None).unwrap();
+    }
+    db.flush().unwrap();
+    (db, (*big).clone())
+}
+
+/// Where `table`'s one 1 MiB SST is (first page).
+fn large_sst(db: &Engine, table: TableId) -> u64 {
+    let found: Vec<u64> = db
+        .sst_extents()
+        .into_iter()
+        .filter(|&(t, _, class)| t == table && class == 4)
+        .map(|(_, page, _)| page)
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found[0]
+}
+
+#[test]
+fn flushes_between_shrink_rounds_leave_the_cleared_region_alone() {
+    // #314: round 1 clears a region for the 1 MiB SST; before round 2 moves it in (after
+    // the reclaim that frees the occupants' old extents), a new table flushes an SST that
+    // the freed region would be the best fit for. The region is held, so the SST goes
+    // elsewhere and the large SST still moves in round 2.
+    let vfs = SimVfs::new(3141);
+    let (db, big) = fragmented_on_threads(&vfs);
+    let start = large_sst(&db, big.id);
+    let at_round_3 = Arc::new(std::sync::Mutex::new(None));
+    let weak = Arc::downgrade(&db);
+    let seen = Arc::clone(&at_round_3);
+    db.before_shrink_relocates(Box::new(move || {
+        // Round 1: arm round 2.
+        let Some(db) = weak.upgrade() else { return };
+        let weak = Arc::downgrade(&db);
+        db.before_shrink_relocates(Box::new(move || {
+            // Round 2: flush a table of about 2.5 MiB (64 KiB SSTs here): more than the free
+            // units elsewhere below the large SST, so with the cleared region freed some
+            // would land in it. Then arm round 3.
+            let Some(db) = weak.upgrade() else { return };
+            let t = db
+                .create_table("w", &[("f".into(), FamilyOptions::default())])
+                .unwrap();
+            for i in 0..320u32 {
+                let mut wb = WriteBatch::new();
+                wb.put(
+                    t.id,
+                    t.families[0].id,
+                    &row(i),
+                    b"q",
+                    None,
+                    ValueRef::Bytes(&noise(500, i, 8 << 10)),
+                )
+                .unwrap();
+                db.commit(wb, None).unwrap();
+            }
+            db.flush().unwrap();
+            let weak = Arc::downgrade(&db);
+            db.before_shrink_relocates(Box::new(move || {
+                // Round 3: where the large SST is.
+                if let Some(db) = weak.upgrade() {
+                    *seen.lock().unwrap() = Some(large_sst(&db, big.id));
+                }
+            }));
+        }));
+    }));
+    db.shrink().unwrap();
+    let at_round_3 = at_round_3.lock().unwrap().expect("a third round ran");
+    assert!(
+        at_round_3 < start,
+        "the large SST did not move in round 2: at {at_round_3}, from {start}"
+    );
+    assert!(large_sst(&db, big.id) <= at_round_3);
+    db.close().unwrap();
 }

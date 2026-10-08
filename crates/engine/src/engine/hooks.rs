@@ -362,6 +362,24 @@ impl Engine {
             .collect()
     }
 
+    /// Every SST the current catalog names, as `(table, first page, size class)` of its
+    /// extent (test hook: where `shrink` put it, #314).
+    #[doc(hidden)]
+    pub fn sst_extents(&self) -> Vec<(TableId, u64, u8)> {
+        let catalog = Arc::clone(&self.inner.shared.view.load().catalog);
+        let mut out = Vec::new();
+        for ((tablet, _), list) in &catalog.ssts {
+            let Some(entry) = catalog.tablet(*tablet) else {
+                continue;
+            };
+            out.extend(
+                list.iter()
+                    .map(|(_, meta)| (entry.table, meta.extent.page, meta.extent.size_class)),
+            );
+        }
+        out
+    }
+
     /// Every SST the current catalog names, as `(table, level, sst id)` (test hook).
     #[doc(hidden)]
     pub fn sst_levels(&self) -> Vec<(TableId, u8, u64)> {
