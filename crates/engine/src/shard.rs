@@ -306,6 +306,10 @@ pub(crate) struct Shared {
     /// lock (`Engine::before_next_view_publish`).
     #[cfg(feature = "test-hooks")]
     pub before_view_publish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test hook: runs once in the next shrink round, between its catalog read and its
+    /// relocations (`Engine::before_shrink_relocates`).
+    #[cfg(feature = "test-hooks")]
+    pub before_shrink_relocates: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Test hook: park background manifest commits before `end` (see `manifest::parked`).
     #[cfg(feature = "test-hooks")]
     pub manifest_park: AtomicBool,

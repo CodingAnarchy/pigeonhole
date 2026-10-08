@@ -486,7 +486,8 @@ fn orphaned(catalog: &Catalog, edit: &Edit, created: &[TabletId]) -> bool {
 
 /// Extents of SSTs an edit list newly adds (to abandon if the request is refused). An SST
 /// the same list also removes is moved (a trivial move re-adds it at another level), not
-/// new: its extent is not this request's to free.
+/// new: its extent is not this request's to free. Each extent once, though an SST that
+/// tablets share (after a split) is added to each of them.
 fn added_extents(edits: &[Edit]) -> Vec<ExtentRef> {
     let moved: Vec<SstId> = edits
         .iter()
@@ -495,13 +496,16 @@ fn added_extents(edits: &[Edit]) -> Vec<ExtentRef> {
             _ => None,
         })
         .collect();
-    edits
-        .iter()
-        .filter_map(|e| match e {
-            Edit::AddSst { meta, .. } if !moved.contains(&meta.id) => Some(meta.extent),
-            _ => None,
-        })
-        .collect()
+    let mut added = Vec::new();
+    for e in edits {
+        if let Edit::AddSst { meta, .. } = e
+            && !moved.contains(&meta.id)
+            && !added.contains(&meta.extent)
+        {
+            added.push(meta.extent);
+        }
+    }
+    added
 }
 
 /// Takes the queued requests and prepares one commit for them. Returns `None` if the queue
