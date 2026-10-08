@@ -7,12 +7,13 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ## [Unreleased]
 ### Added
 - Per-family compaction strategies: `Compaction::Tiered` (universal/size-tiered, for write-heavy families) and `Compaction::FifoByTime` (drops whole SSTs once their newest timestamp passes the TTL, with no rewrite) are accepted at table creation (#31, #32, #44). See [Compaction styles](docs/guide/concepts.md#compaction-styles) in the guide. `FifoByTime` expiry runs on a timer, so an idle family drops expired files on time (#232).
+- Custom merge operators: `Options::merge_operator` / `ReaderOptions::merge_operator` register them and families name them with `Family::merge_operator(name)`; opening over a family whose operator is not registered needs `allow_unregistered_merge_operators(true)` and is then read-only (#43).
 
 ### Changed
 - The write stall follows L0 depth only; deeper levels and tiered space amplification no longer pace writers (D119).
 
 Planned for Phase 2 (the wide-column model), see [`docs/status.md`](docs/status.md):
-- Blob separation for large values (raising the Phase 1 value cap), zstd compression and custom merge operators.
+- Blob separation for large values (raising the Phase 1 value cap) and zstd compression.
 - A tighter file layout: the file at rest can be 2-4x live data because of power-of-two extents (#185).
 
 Planned for Phase 3 (latency): write throughput that scales with shard count (#154), open latency toward the 5 ms goal (#158), and the async API.

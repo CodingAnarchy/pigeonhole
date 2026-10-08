@@ -54,7 +54,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `ValueFilter`, `Condition` | Value predicate; `commit_if` condition (P2, early). |
 | `CellRef<'a>`, `Cell`, `Row`, `RowRef<'a>`, `CellEntry<'a>`, `Value<'a>` | Borrowed and owned results. |
 | `Error`, `ErrorCode`, `Result<T>` | Errors. |
-| `MergeOperator`, `MergeError` | Custom merge (P2; a family naming a custom operator fails with `UnknownMergeOperator` today). |
+| `MergeOperator`, `MergeError` | Custom merge operators: an associative fold over stored values (tag byte, then payload). |
 | `days(n: u64) -> Duration` | TTL helper. |
 
 ## `Pigeonhole`
@@ -93,7 +93,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `row_cache(usize)` | Row cache bytes (default 0 = off). |
 | `shm_dir(impl Into<PathBuf>)` | Shared-memory file directory (e.g. a tmpfs), instead of `/dev/shm` (Linux), `shm_open` (macOS/BSD) or the pagefile (Windows). Must exist. |
 | `create_if_missing(bool)` | Default true. |
-| `merge_operator(Arc<dyn MergeOperator>)` | P2. Register custom operator. |
+| `merge_operator(Arc<dyn MergeOperator>)` | Register a custom operator (families name it). |
 | `allow_unregistered_merge_operators(bool)` | Open read-only with compaction off if a family names an unregistered operator. |
 | `tablet_changes(bool)` | Let tablets split, merge and move between shards so one table's writes spread over every shard (default on; off keeps each table as one tablet on one shard). Tablet owners are not stored; a reopen places tablets again. Commits in flight together on one row may apply in either order while its tablet moves. |
 
@@ -110,7 +110,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `zstd(i8)` | P2. zstd at level. Today: table or family creation fails with `Unsupported`. |
 | `uncompressed()` | No compression. |
 | `block_size(u32)` | Data block bytes (default 16 KiB). |
-| `merge_operator(&str)` | P2 for custom. Name of registered operator. `incr` needs none (`pigeonhole.i64_add` default). |
+| `merge_operator(&str)` | Name of a registered operator (unregistered: `UnknownMergeOperator`). `incr` needs none (`pigeonhole.i64_add` default). |
 | `cache_priority(Priority)` | Block cache priority. |
 | `compaction(Compaction)` | Strategy. `Leveled`: reads. `Tiered`: write-heavy; keep the default engine depth (a shallow tree makes write amplification grow linearly, D169). `FifoByTime`: drops a file when its newest cell has expired, so it only drops data with a TTL set (without one nothing expires), dropped on a timer at the earliest expiry (D170). The engine's FIFO size cap is lossy (D167) and not exposed. |
 
@@ -158,7 +158,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `put_at(&Table, row, family, qualifier, ts, value)` | |
 | `put_i64(&Table, row, family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. |
 | `incr(&Table, row, family, qualifier, delta)` | |
-| `merge(&Table, row, family, qualifier, operand)` | Untyped operand (custom operators, P2). |
+| `merge(&Table, row, family, qualifier, operand)` | Untyped operand (for custom operators). |
 | `delete_cell(&Table, row, family, qualifier, ts)` | D38. |
 | `delete_column(&Table, row, family, qualifier)` | |
 | `delete_family(&Table, row, family)` | |
@@ -208,7 +208,7 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 | Feature | Phase |
 |---|---|
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
-| zstd, blob separation, custom merge operators | P2 |
+| zstd, blob separation | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
 
 ## Recipes
