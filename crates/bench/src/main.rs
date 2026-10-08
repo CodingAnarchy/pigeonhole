@@ -16,6 +16,11 @@ use pigeonhole_bench::{
     Tolerance, WorkloadConfig, WorkloadKind, compare, run_detailed,
 };
 
+/// Default warmup of `scaling`, as a fraction of the measured ops. The balancer needs about
+/// a second of writes to split the table over the shards (issue #51); the 5% default
+/// (10,000 ops at `small`) ends before the first split, so the run would measure one tablet.
+const SCALING_WARMUP: f64 = 1.0;
+
 const HELP: &str = "\
 phdb-bench: Pigeonhole benchmark suite
 
@@ -43,7 +48,8 @@ OPTIONS:
     --value-len N          bytes per value
     --threads N            client threads
     --seed N               RNG seed
-    --warmup F             unrecorded warmup, as a fraction of --ops [default: 0.05]
+    --warmup F             unrecorded warmup, as a fraction of --ops [default: 0.05;
+                           scaling: 1.0, so the balancer spreads the table first]
     --shards N             Pigeonhole shards (scaling: N, default all cores)
     --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
                            shard) [default: 64 MiB]
@@ -238,7 +244,11 @@ fn one(
         runner.describe()
     );
     let options = RunOptions {
-        warmup: a.warmup.unwrap_or(RunOptions::default().warmup),
+        warmup: a.warmup.unwrap_or(if a.command == "scaling" {
+            SCALING_WARMUP
+        } else {
+            RunOptions::default().warmup
+        }),
     };
     let result = run_detailed(runner, config, &dir, &options)
         .map_err(|e| format!("{} on {}: {e}", config.kind.name(), runner.name()));
@@ -409,6 +419,18 @@ mod tests {
                 .iter()
                 .all(|r| r.store_config.contains("tablets=on"))
         );
+        // Every measured put is one commit on one shard; the report shows where they went.
+        for (r, shards) in suite.results.iter().zip([1, 2]) {
+            assert_eq!(
+                r.warmup_ops, r.operations,
+                "scaling warms up as long as it measures"
+            );
+            assert_eq!(r.detail.shards.len(), shards);
+            let commits: u64 = r.detail.shards.iter().map(|s| s.commits).sum();
+            assert_eq!(commits, r.operations);
+            assert!(r.detail.shards.iter().map(|s| s.tablets_end).sum::<u64>() >= 1);
+        }
+        assert!(suite.to_markdown().contains("| Shard | Commits | Share |"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

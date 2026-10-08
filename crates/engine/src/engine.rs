@@ -115,6 +115,22 @@ pub struct Metrics {
     pub unpin: (u64, u64),
 }
 
+/// One shard's share of the work, for benchmarks that check writes spread over shards
+/// (issue #51). Counters are cumulative since open; take two and subtract for a phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardStats {
+    /// Commits the shard applied, summed over durability levels.
+    pub commits: u64,
+    /// Tablets the shard owns in the current view, over every table.
+    pub tablets: u64,
+    /// Splits, merges and moves the shard completed.
+    pub splits: u64,
+    /// See [`ShardStats::splits`].
+    pub merges: u64,
+    /// See [`ShardStats::splits`].
+    pub moves: u64,
+}
+
 /// The lock-page byte range of the superblock-less file check (decision D59).
 const INTERRUPTED_CREATE_MAX: u64 = 64 * 1024;
 
@@ -1455,6 +1471,30 @@ impl Engine {
         }
         let _guard = inner.enter_maintenance()?;
         crate::maintenance::shrink(&inner.shared)
+    }
+
+    /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,
+    /// issue #51).
+    #[doc(hidden)]
+    pub fn shard_stats(&self) -> Vec<ShardStats> {
+        let shared = &self.inner.shared;
+        let mut out: Vec<ShardStats> = shared
+            .metrics
+            .iter()
+            .map(|m| ShardStats {
+                commits: m.commits.iter().map(|c| c.load(Ordering::Relaxed)).sum(),
+                tablets: 0,
+                splits: m.splits.load(Ordering::Relaxed),
+                merges: m.merges.load(Ordering::Relaxed),
+                moves: m.moves.load(Ordering::Relaxed),
+            })
+            .collect();
+        for t in shared.view.load().tablets().iter() {
+            if let Some(s) = out.get_mut(usize::from(t.shard.0)) {
+                s.tablets += 1;
+            }
+        }
+        out
     }
 
     /// Current metrics.

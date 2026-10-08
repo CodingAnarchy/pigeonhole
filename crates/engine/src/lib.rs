@@ -38,7 +38,9 @@ mod write;
 
 #[cfg(feature = "test-hooks")]
 pub use compact::CompactionRecord;
-pub use engine::{CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, TableInfo};
+pub use engine::{
+    CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats, TableInfo,
+};
 #[cfg(feature = "test-hooks")]
 pub use engine::{ManifestInfo, PendingMaintenance, RawEntry, TabletRange};
 pub use error::{Error, Result};

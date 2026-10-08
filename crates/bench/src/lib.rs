@@ -39,7 +39,7 @@ mod workload;
 pub use histogram::Histogram;
 pub use report::{
     Comparison, Delta, Environment, LatencyStats, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT,
-    Scaling, Suite, Tolerance, compare,
+    Scaling, ShardShare, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -352,6 +352,13 @@ pub trait Runner {
     fn describe(&self) -> String {
         String::new()
     }
+
+    /// Cumulative per-shard counters since open, indexed by shard, with `tablets_start`
+    /// and `tablets_end` both the current tablet count; empty (the default) for stores
+    /// without shards. [`run_detailed`] reads it around the measured phase.
+    fn shard_shares(&self) -> Vec<ShardShare> {
+        Vec::new()
+    }
 }
 
 /// Runs Pigeonhole through its public API.
@@ -464,7 +471,7 @@ pub fn run_detailed(
     let result = measure(runner, config, &mut workload, warmup);
     let busy_retries = runner.busy_retries();
     let closed = runner.close();
-    let (load, elapsed, threads, hist, split) = result?;
+    let (load, elapsed, threads, hist, split, shards) = result?;
     closed?;
     let ops = hist.count();
     Ok(RunRecord {
@@ -489,6 +496,7 @@ pub fn run_detailed(
             store_bytes: dir_bytes(dir),
             busy_retries,
             reads: split.into_split(),
+            shards,
         },
     })
 }
@@ -573,7 +581,16 @@ fn row_hash(row: &[u8]) -> u64 {
     h.finish()
 }
 
-type Measured = (Duration, Duration, usize, Histogram, Split);
+type Measured = (Duration, Duration, usize, Histogram, Split, Vec<ShardShare>);
+
+/// Per-shard shares between two [`Runner::shard_shares`] readings.
+fn shares_between(before: &[ShardShare], after: &[ShardShare]) -> Vec<ShardShare> {
+    before
+        .iter()
+        .zip(after)
+        .map(|(b, a)| ShardShare::between(b, a))
+        .collect()
+}
 
 fn measure(
     runner: &mut dyn Runner,
@@ -606,6 +623,7 @@ fn measure(
     if clients.len() < 2 {
         let mut hist = Histogram::new();
         let mut split = Split::default();
+        let before = runner.shard_shares();
         let start = Instant::now();
         for (op, class) in ops.iter().zip(&classes) {
             let t = Instant::now();
@@ -614,7 +632,9 @@ fn measure(
             hist.record(latency);
             split.record(*class, latency);
         }
-        return Ok((load, start.elapsed(), 1, hist, split));
+        let elapsed = start.elapsed();
+        let shards = shares_between(&before, &runner.shard_shares());
+        return Ok((load, elapsed, 1, hist, split, shards));
     }
 
     // Deal operations round-robin so each thread sees the workload's mix in order.
@@ -647,6 +667,7 @@ fn measure(
                 })
             })
             .collect();
+        let before = runner.shard_shares();
         barrier.wait();
         let start = Instant::now();
         let mut hist = Histogram::new();
@@ -667,9 +688,10 @@ fn measure(
             }
         }
         let elapsed = start.elapsed();
+        let shards = shares_between(&before, &runner.shard_shares());
         match first_err {
             Some(e) => Err(e),
-            None => Ok((load, elapsed, n, hist, split)),
+            None => Ok((load, elapsed, n, hist, split, shards)),
         }
     })
 }
