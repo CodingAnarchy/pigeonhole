@@ -539,8 +539,6 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         .manifest
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    #[cfg(feature = "test-hooks")]
-    let version = writer.next_version();
     let current = shared.view.load_full();
     let old = Arc::clone(&current.catalog);
     let mut catalog = (*old).clone();
@@ -692,7 +690,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         rewrite |= req.rewrite_snapshot;
                         #[cfg(feature = "test-hooks")]
                         if let Some(mut c) = req.compaction.take() {
-                            c.manifest_version = version;
+                            c.manifest_version = writer.next_version();
                             records.push(c);
                         }
                         outcomes.push((req, Ok(())));
@@ -739,7 +737,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);
     #[cfg(feature = "test-hooks")]
-    let refused = shared.refuse_checkpoints.load(Ordering::Acquire)
+    let refused = shared.hooks.refuse_checkpoints.load(Ordering::Acquire)
         && edits
             .iter()
             .all(|e| matches!(e, Edit::WalCheckpoint { .. } | Edit::Counters { .. }));
@@ -755,6 +753,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             drop(writer);
             #[cfg(feature = "test-hooks")]
             shared
+                .hooks
                 .compactions
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1168,10 +1167,11 @@ pub(crate) fn commit_req_from_thread(
 /// whose pump then finds the exclusion held and leaves), and keeps its waiter.
 #[cfg(feature = "test-hooks")]
 fn race_window(shared: &Shared) {
-    if shared.manifest_race.swap(false, Ordering::AcqRel) {
+    if shared.hooks.manifest_race.swap(false, Ordering::AcqRel) {
         let (req, waiter) = ManifestReq::with_waiter(ReqKind::Edits(Vec::new()));
         shared.manifest_queue.push(req);
         *shared
+            .hooks
             .manifest_race_waiter
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(waiter);
@@ -1191,6 +1191,7 @@ fn parked(shared: &Shared, generation: u64, waker: &TaskWaker) -> bool {
     };
     if parks {
         *shared
+            .hooks
             .manifest_parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
@@ -1201,7 +1202,7 @@ fn parked(shared: &Shared, generation: u64, waker: &TaskWaker) -> bool {
 /// Whether the park hook holds `commit` (a compaction's: SSTs changed, nothing flushed).
 #[cfg(feature = "test-hooks")]
 fn parks(shared: &Shared, commit: &Commit) -> bool {
-    shared.manifest_park.load(Ordering::Acquire)
+    shared.hooks.manifest_park.load(Ordering::Acquire)
         && commit.sst_changed
         && commit.flushed_roots.is_empty()
 }

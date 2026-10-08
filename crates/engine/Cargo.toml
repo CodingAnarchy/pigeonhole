@@ -25,7 +25,8 @@ pigeonhole-compaction = { workspace = true }
 arc-swap = { workspace = true }
 
 [features]
-# Test-only hooks (`Snapshot::at_seqno`); never enabled by the public crate.
+# Test-only hooks (`src/engine/hooks.rs`), enabled by the dev-dependency below for the
+# engine's own tests and benches; never by the public crate.
 test-hooks = []
 
 [dev-dependencies]

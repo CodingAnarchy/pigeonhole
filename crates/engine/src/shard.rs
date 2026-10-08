@@ -116,24 +116,12 @@ pub(crate) struct ShardMetrics {
     pub splits: AtomicU64,
     pub merges: AtomicU64,
     pub moves: AtomicU64,
-    /// Size of the shard's aborted-seqno set after its last batch (test hook).
-    #[cfg(feature = "test-hooks")]
-    pub aborted: AtomicU64,
     /// WAL unpin passes (#137) and the memtables they froze below the size threshold.
     pub unpin_passes: AtomicU64,
     pub unpin_flushes: AtomicU64,
-    /// The arena's free bytes, largest free run and size after the shard's last batch
-    /// (test hook: a test checks it built the fragmented arena it means to, issue #141).
+    /// Test-hook counters (`engine::hooks::ShardCounters`).
     #[cfg(feature = "test-hooks")]
-    pub arena_free: AtomicU64,
-    #[cfg(feature = "test-hooks")]
-    pub arena_run: AtomicU64,
-    #[cfg(feature = "test-hooks")]
-    pub arena_len: AtomicU64,
-    /// Reservations that found enough free bytes but no run long enough for their largest
-    /// entry (test hook: a test checks it reached that case, issue #141).
-    #[cfg(feature = "test-hooks")]
-    pub run_waits: AtomicU64,
+    pub hooks: crate::engine::hooks::ShardCounters,
 }
 
 impl Default for ShardMetrics {
@@ -152,18 +140,10 @@ impl Default for ShardMetrics {
             splits: AtomicU64::new(0),
             merges: AtomicU64::new(0),
             moves: AtomicU64::new(0),
-            #[cfg(feature = "test-hooks")]
-            aborted: AtomicU64::new(0),
             unpin_passes: AtomicU64::new(0),
             unpin_flushes: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
-            arena_free: AtomicU64::new(0),
-            #[cfg(feature = "test-hooks")]
-            arena_run: AtomicU64::new(0),
-            #[cfg(feature = "test-hooks")]
-            arena_len: AtomicU64::new(0),
-            #[cfg(feature = "test-hooks")]
-            run_waits: AtomicU64::new(0),
+            hooks: Default::default(),
         }
     }
 }
@@ -322,39 +302,9 @@ pub(crate) struct Shared {
     pub busy_ssts: Mutex<HashSet<SstId>>,
     /// Published view version -> manifest version, to map reader-slot pins to extents.
     pub view_versions: Mutex<BTreeMap<u64, ManifestVersion>>,
-    /// Every committed compaction (test hook; never built otherwise, 5-6 6.2).
+    /// Test hooks (`engine::hooks`); none of them is set or read unless a test asks.
     #[cfg(feature = "test-hooks")]
-    pub compactions: Mutex<Vec<CompactionRecord>>,
-    /// Every WAL record appended, in append order (test hook).
-    #[cfg(feature = "test-hooks")]
-    pub appended: Mutex<Vec<AppendedRecord>>,
-    /// Test hook: arm the manifest queue's release window (see `manifest::race_window`).
-    #[cfg(feature = "test-hooks")]
-    pub manifest_race: AtomicBool,
-    #[cfg(feature = "test-hooks")]
-    pub manifest_race_waiter:
-        Mutex<Option<pigeonhole_runtime::Waiter<Result<pigeonhole_format::ManifestVersion>>>>,
-    /// Test hook: runs once at the start of the next `publish_view`, before the publish
-    /// lock (`Engine::before_next_view_publish`).
-    #[cfg(feature = "test-hooks")]
-    pub before_view_publish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Test hook: runs once in the next shrink round, between its catalog read and its
-    /// relocations (`Engine::before_shrink_relocates`).
-    #[cfg(feature = "test-hooks")]
-    pub before_shrink_relocates: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Test hook: runs once in the next shrink round that commits, after its copies are
-    /// written and before the commit (`Engine::before_shrink_commits`).
-    #[cfg(feature = "test-hooks")]
-    pub before_shrink_commits: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Test hook: park background manifest commits before `end` (see `manifest::parked`).
-    #[cfg(feature = "test-hooks")]
-    pub manifest_park: AtomicBool,
-    #[cfg(feature = "test-hooks")]
-    pub manifest_parked: Mutex<Option<pigeonhole_runtime::TaskWaker>>,
-    /// Test hook: refuse batches of only `WalCheckpoint` edits as `NoSpace`, as a snapshot
-    /// rewrite that finds no space does (`Engine::refuse_checkpoints`).
-    #[cfg(feature = "test-hooks")]
-    pub refuse_checkpoints: AtomicBool,
+    pub hooks: crate::engine::hooks::Hooks,
     pub picker: PickerOptions,
     /// How long a commit waits for arena room before `Busy`.
     pub write_stall_timeout_nanos: u64,
@@ -562,16 +512,7 @@ impl Shared {
         f: impl FnOnce(&View, u64) -> View,
     ) -> Result<Arc<View>> {
         #[cfg(feature = "test-hooks")]
-        {
-            let hook = self
-                .before_view_publish
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
+        self.hooks.before_view_publish.run();
         let mut last = self
             .view_lock
             .lock()
@@ -1099,32 +1040,6 @@ enum MemberKind {
     Single,
     Prepare { coordinator: ShardId },
     CommitRecord { participants: Vec<ShardId> },
-}
-
-/// A WAL record the engine appended to a stream (test hook): the per-stream append order,
-/// which decides what a crash keeps (a stream survives as a prefix).
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppendedRecord {
-    pub stream: u16,
-    pub seqno: Seqno,
-    pub kind: AppendedKind,
-    pub durability: Durability,
-    /// The record's commit timestamp (0 for a COMMIT record): a harness reads a commit's
-    /// timestamp here when its record was checkpointed and compaction dropped every entry
-    /// it wrote.
-    pub commit_ts: Timestamp,
-}
-
-/// The kind of an [`AppendedRecord`].
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppendedKind {
-    Batch,
-    Prepare,
-    Commit,
 }
 
 /// One record of a group: a commit, a participant's PREPARE, or a coordinator's COMMIT.
@@ -2530,6 +2445,7 @@ impl ShardState {
             #[cfg(feature = "test-hooks")]
             if bytes_fit(&self.arena) {
                 self.shared.metrics[usize::from(self.id.0)]
+                    .hooks
                     .run_waits
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -3789,7 +3705,9 @@ impl ShardState {
                 Err(pigeonhole_wal::Error::RecordTooLarge
                     | pigeonhole_wal::Error::InvalidArgument { .. })
             ) {
+                use crate::engine::hooks::{AppendedKind, AppendedRecord};
                 self.shared
+                    .hooks
                     .appended
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -5904,7 +5822,7 @@ impl ShardHandler for ShardState {
         self.try_finish_close(ctx);
         #[cfg(feature = "test-hooks")]
         {
-            let m = &self.shared.metrics[usize::from(self.id.0)];
+            let m = &self.shared.metrics[usize::from(self.id.0)].hooks;
             m.aborted
                 .store(self.aborted.len() as u64, Ordering::Relaxed);
             m.arena_free
