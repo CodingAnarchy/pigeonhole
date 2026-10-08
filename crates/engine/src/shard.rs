@@ -2709,8 +2709,13 @@ impl ShardState {
             }
             return;
         }
-        // A failed flush waits out its backoff (the timer's `RetryFlush` comes back here).
-        if self.flush_retry.as_ref().is_some_and(|t| !t.finished()) {
+        // A failed flush waits out its backoff (the timer's `RetryFlush` comes back here),
+        // unless a `flush` or `compact` caller waits for it: each failure answers those at
+        // once, so a call retries at most once and never loops.
+        if self.flush_waiters.is_empty()
+            && self.compact_all.is_empty()
+            && self.flush_retry.as_ref().is_some_and(|t| !t.finished())
+        {
             return;
         }
         let items = std::mem::take(&mut self.flush_queue);
@@ -5876,6 +5881,12 @@ impl ShardHandler for ShardState {
         {
             self.spawn_flush(ctx);
             self.check_flush_waiters();
+        }
+        // A flush backoff whose timer gave up on a frozen clock never sends `RetryFlush`:
+        // the flush is retried here instead.
+        if self.flush_retry.as_ref().is_some_and(|t| t.finished()) {
+            self.flush_retry = None;
+            self.spawn_flush(ctx);
         }
         self.retry_starved_freeze(ctx);
         self.try_finish_close(ctx);
