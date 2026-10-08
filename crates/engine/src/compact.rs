@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use pigeonhole_compaction::{
-    BlobFileStat, CompactionJob, CompactionOutput, CompactionTask, GcPolicy, JobContext, JobPoll,
-    KeyRange, Levels, NewBlobFile, TaskKind, pick_blob_gc,
+    BlobFileStat, BlobRefs, CompactionJob, CompactionOutput, CompactionTask, GcPolicy, JobContext,
+    JobPoll, KeyRange, Levels, NewBlobFile, TaskKind, pick_blob_gc,
 };
 use pigeonhole_format::key::encode_row_prefix;
 use pigeonhole_format::manifest::{Edit, SstMeta};
@@ -396,6 +396,8 @@ pub(crate) struct CompactionWork {
     view: Arc<View>,
     /// A `Drop`'s blob live-byte changes: the pointers its SSTs held (read before submit).
     drop_delta: Vec<(BlobFileId, i64)>,
+    /// The finished job's per-SST blob references (#240).
+    blob_refs: BlobRefs,
     meta: FamilyMeta,
     record: Option<CompactionRecord>,
     stage: Stage,
@@ -460,6 +462,7 @@ impl CompactionWork {
             job,
             view,
             drop_delta: Vec::new(),
+            blob_refs: Vec::new(),
             meta,
             record,
             stage: Stage::Run,
@@ -586,7 +589,7 @@ impl CompactionWork {
         match (self.task.kind.clone(), output) {
             (TaskKind::Rewrite | TaskKind::BlobGc { .. }, Some(out)) => {
                 let priority = SstSet::priority(self.meta.options.cache_priority);
-                let mut blob_refs = out.blob_refs;
+                let mut blob_refs = self.blob_refs.clone();
                 for (level, meta) in out.added {
                     let refs = blob_refs
                         .iter()
@@ -800,8 +803,11 @@ impl Task for CompactionWork {
                                 self.job = Some(job);
                                 return TaskPoll::Pending;
                             }
-                            Ok(JobPoll::Done) => match job.finish() {
-                                Ok(out) => Some(out),
+                            Ok(JobPoll::Done) => match job.finish_with_blob_refs() {
+                                Ok((out, refs)) => {
+                                    self.blob_refs = refs;
+                                    Some(out)
+                                }
                                 Err(e) => {
                                     self.report(Err(e.into()));
                                     return TaskPoll::Done;

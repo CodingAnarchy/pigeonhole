@@ -146,6 +146,10 @@ pub enum JobPoll {
     Done,
 }
 
+/// Per SST, the blob files its puts point into and the bytes they reference
+/// ([`CompactionJob::finish_with_blob_refs`]).
+pub type BlobRefs = Vec<(SstId, Vec<(BlobFileId, u64)>)>;
+
 /// A blob file a job created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewBlobFile {
@@ -168,10 +172,6 @@ pub struct CompactionOutput {
     pub new_blob_files: Vec<NewBlobFile>,
     /// Change in live bytes per existing blob file (negative: values dropped).
     pub blob_live_delta: Vec<(BlobFileId, i64)>,
-    /// Per added SST, the blob files its puts point into and the bytes they reference
-    /// (`Edit::SstBlobRefs`, #240), sorted by blob file; an empty list for an SST with no
-    /// pointer. Every SST of `added` has an entry.
-    pub blob_refs: Vec<(SstId, Vec<(BlobFileId, u64)>)>,
     /// Blob files with no live bytes left, to drop (`DropBlobFile`) and retire. Always empty:
     /// a job does not know a file's live bytes (other tablets may reference it after a
     /// split), so the engine drops a file once its live count, updated from
@@ -669,7 +669,15 @@ impl CompactionJob {
     /// completion).
     ///
     /// If the remaining work fails, the outputs written so far are returned to the pager.
-    pub fn finish(mut self) -> Result<CompactionOutput> {
+    pub fn finish(self) -> Result<CompactionOutput> {
+        self.finish_with_blob_refs().map(|(out, _)| out)
+    }
+
+    /// [`finish`](Self::finish), plus each added SST's blob references
+    /// (`Edit::SstBlobRefs`, #240): the blob files its puts point into and the bytes they
+    /// reference, sorted by blob file, an empty list for an SST with no pointer. Every SST
+    /// of `added` has an entry, in the same order.
+    pub fn finish_with_blob_refs(mut self) -> Result<(CompactionOutput, BlobRefs)> {
         if !self.done
             && let Err(e) = self.run(u64::MAX)
         {
@@ -677,7 +685,7 @@ impl CompactionJob {
             return Err(e);
         }
         if !rewrites(&self.task.kind) {
-            return Ok(CompactionOutput::default());
+            return Ok((CompactionOutput::default(), Vec::new()));
         }
         let new_blob_files = match self.sink.blobs.take().map(BlobSink::finish) {
             Some(Ok(files)) => files,
@@ -702,8 +710,7 @@ impl CompactionJob {
             .map(|m| m.id)
             .zip(self.sink.output_refs.drain(..))
             .collect();
-        Ok(CompactionOutput {
-            blob_refs,
+        let out = CompactionOutput {
             added: self.sink.outputs.drain(..).map(|m| (level, m)).collect(),
             removed: self
                 .task
@@ -714,7 +721,8 @@ impl CompactionJob {
             new_blob_files,
             blob_live_delta,
             dropped_blob_files: Vec::new(),
-        })
+        };
+        Ok((out, blob_refs))
     }
 
     /// Abandons the job, returning any output extents to the pager.
