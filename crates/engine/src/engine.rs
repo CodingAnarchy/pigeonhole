@@ -1321,6 +1321,22 @@ impl Engine {
         crate::maintenance::shrink(&inner.shared)
     }
 
+    /// Tablet changes refused for lack of room, summed over shards since open, as
+    /// `(slot budget, view size)`: splits and moves a shard's memtable slots could not take
+    /// (a size split the balancer found due but skipped counts once per balancer pass), and
+    /// splits refused because the tablet map would not fit the shared-memory view buffer
+    /// (D28). A rising first count means tablets that should split cannot: raise
+    /// `memtable_budget` (#122). A method rather than a [`Metrics`] field, which would
+    /// break struct literals.
+    pub fn tablet_refusals(&self) -> (u64, u64) {
+        self.inner.shared.metrics.iter().fold((0, 0), |(s, v), m| {
+            (
+                s + m.refused_slots.load(Ordering::Relaxed),
+                v + m.refused_view.load(Ordering::Relaxed),
+            )
+        })
+    }
+
     /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,
     /// issue #51).
     #[doc(hidden)]
