@@ -13,6 +13,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Version order | Newest timestamp first; the same timestamp is ordered by inverted seqno (later commit first). Multiple mutations to the same (row, family, qualifier, timestamp) **within one commit** collapse to the last one written (D34). |
 | Atomicity | One `RowMutation` = one row, all families, all-or-nothing. `WriteBatch` = any rows/tables, atomic, one durability point. |
 | Builder errors | Surface at `commit`/`read`/`iter`, not at the builder call. |
+| Purges (D74) | Delete markers and versions beyond `max_versions` are purged by a bottommost compaction with no snapshot that needs them. After that, a write with an **older explicit timestamp** behaves as if they never existed: a `put_at` below a purged delete becomes visible. Default timestamps are never affected. |
 | Delete rule (D9, D38) | `delete_column`/`delete_family` at ts `T` hides every version in scope with ts ≤ `T`, regardless of commit order. `delete_cell(ts)` hides every version at exactly `ts`, also regardless of commit order: a later `put_at(.., ts, ..)` at that timestamp stays hidden. To rewrite a deleted version, use another timestamp. |
 | `delete_row` (D10) | One family marker per family, same commit. |
 | Read-your-writes (D19) | `commit` returns after durable at level **and** visible. |
@@ -20,10 +21,13 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Writer | One writer per file; second open → `WriterLocked`. |
 | Reader processes (D36, P4, early) | `open_reader` opens the `.phdb` file **read-write** (it never writes): the coordination locks are exclusive byte-range locks, which need a writable handle, as in SQLite WAL mode. Readers need write permission on the file; read-only media are not supported. |
 | Family order (D39) | A row's cells come by family in **creation order**, or in the order you listed families (`family(..)` calls); then qualifier; then newest version first. |
-| Application-owned mode (D40) | Starts no threads: `open_application_owned` with `compaction_cores(k)`, `k > 0`, fails with `InvalidArgument`. |
+| Application-owned mode (D40) | Starts no shard or compaction threads: you drive each `Shard`, and `open_application_owned` with `compaction_cores(k)`, `k > 0`, fails with `InvalidArgument`. The default I/O backend (`PreadVfs`) still starts a pool of 2–16 I/O threads (the CPUs available, clamped) that run WAL syncs, root commits and reads; they inherit the opener's CPU affinity. A fully threadless mode is Phase 3. |
 | Handles | `Pigeonhole`, `Table`, `Snapshot`, `Cell`, `Row` are cheap `Clone`. `Table`: `Send + Sync`. |
 | Snapshots | Pin data. Drop promptly. |
 | Filesystem | Local only (`NetworkFilesystem`). |
+| macOS/BSD file access | Closing any descriptor of the `.phdb` inside the process drops its writer lock (`fcntl` semantics). Never open the file with `std::fs` while it is open here; use `backup` to copy it. See [Concepts](concepts.md#platform-and-process-notes). |
+| Reader liveness | By raw PID: writer and readers must share a PID namespace. |
+| Custom `Vfs` clock | `monotonic_nanos` must advance at least every 10 µs; coarser clocks are treated as frozen. |
 | Storage | Disk-backed: memtables flush into the file as they fill, so data size is bounded by the disk, not `memtable_budget` (per shard, default 64 MiB; also the shm arena size). A write that finds the arena full stalls while a flush frees room; `Busy` after the 30 s stall timeout is transient (back off, retry), `Busy` for a batch larger than the arena is not (split it). |
 | Reopen budget | Reopening after a crash with fewer shards or a smaller `memtable_budget` works: when the WAL's unflushed data does not fit the arenas, open writes it to SSTs as it replays (a slower open). Only a single commit larger than a shard's arena fails, with `InvalidArgument`. |
 | Files at rest | One file after a clean last `close`. While open, or after a crash: the file plus WAL sidecars and the shm region. Open replays the sidecars. |
@@ -56,7 +60,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 |---|---|
 | `open(path: impl AsRef<Path>, Options) -> Result<Pigeonhole>` | Open or create as writer; replays WAL. |
 | `open_reader(path, ReaderOptions) -> Result<PigeonholeReader>` | P4, early. Read-only, any number of processes. Needs write permission on the file (D36). |
-| `open_application_owned(path, Options) -> Result<(Pigeonhole, Vec<Shard>)>` | Writer with no threads; you drive each `Shard`. `compaction_cores(k > 0)` → `InvalidArgument` (D40). |
+| `open_application_owned(path, Options) -> Result<(Pigeonhole, Vec<Shard>)>` | Writer with no shard or compaction threads (the default I/O backend still runs 2–16 I/O threads); you drive each `Shard`. `compaction_cores(k > 0)` → `InvalidArgument` (D40). |
 | `table(&self, name: &str) -> Result<TableBuilder<'_>>` | Start define/open. |
 | `tables(&self) -> Vec<String>` | Table names. |
 | `drop_table(&self, name: &str) -> Result<()>` | Drop table and data. |
@@ -68,7 +72,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `flush(&self) -> Result<()>` | Write every memtable into the file; returns when the SSTs are in the manifest. Makes `None` commits durable. |
 | `compact(&self) -> Result<()>` | Flush, then merge every level of every table into the last (purges per `max_versions`, TTL and tombstones). |
 | `shrink(&self) -> Result<u64>` | Relocate live data from the file's tail into free space and truncate; returns bytes released (`0` if none). Online; costs a rewrite of the tail data. Call after deletes + `compact`. Errors: `Closed`, `ReadOnly`, `NoSpace` (no free extent to move into), `Io`. |
-| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue. `dest` must not exist. The copy opens with no WAL replay and no sidecars. `Unsupported` if a family stores blob files (P2; not reachable today). |
+| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue. `dest` must not exist. Holds its snapshot (memtables included) for the whole run, so a long backup under heavy writes can stall writers into `Busy`. The copy opens with no WAL replay and no sidecars. `Unsupported` if a family stores blob files (P2; not reachable today). |
 | `close(self) -> Result<()>` | Flushes memtables, checkpoints the WAL; the last handle out removes the sidecars and shm, leaving one file. |
 
 `PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
@@ -82,7 +86,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `shards(usize)` | Shard threads (default CPUs available). `1` is valid. |
 | `compaction_cores(usize)` | Extra pinned threads for flush/compaction. Engine-owned mode only (D40). |
 | `memtable_budget(u64)` | Arena bytes per shard (default 64 MiB). |
-| `block_cache(usize)` | Block cache bytes. |
+| `block_cache(usize)` | Block cache bytes (default 256 MiB; each reader process has its own). |
 | `row_cache(usize)` | Row cache bytes (default 0 = off). |
 | `shm_dir(impl Into<PathBuf>)` | Shared-memory file directory (e.g. tmpfs). |
 | `create_if_missing(bool)` | Default true. |
@@ -90,7 +94,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `allow_unregistered_merge_operators(bool)` | Open read-only with compaction off if a family names an unregistered operator. |
 | `tablet_changes(bool)` | Let tablets split, merge and move between shards so one table's writes spread over every shard (default on; off keeps each table as one tablet on one shard). Tablet owners are not stored; a reopen places tablets again. Commits in flight together on one row may apply in either order while its tablet moves. |
 
-`ReaderOptions` (P4, early): `block_cache(usize)`, `shm_dir(..)`, `merge_operator(..)`.
+`ReaderOptions` (P4, early): `block_cache(usize)` (default 256 MiB **per reader process**, on top of the writer's), `shm_dir(..)`, `merge_operator(..)`.
 
 ## `Family` (all `self -> Self`; stored in file)
 | Method | Meaning |

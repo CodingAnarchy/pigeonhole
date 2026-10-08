@@ -1,6 +1,6 @@
 [package]
 name = "pigeonhole"
-description = "Embedded, single-file, wide-column store: BigTable's data model with SQLite's deployment model."
+description = "Embedded, single-file, wide-column store: BigTable's data model with SQLite's deployment model. Experimental 0.x: format and API may change before 1.0."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

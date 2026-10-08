@@ -115,8 +115,10 @@ impl Pigeonhole {
         })
     }
 
-    /// Opens as the writer in application-owned mode: no threads are started; drive each
-    /// returned [`Shard`] from one of your own (typically pinned) threads. Because no thread
+    /// Opens as the writer in application-owned mode: no shard or compaction threads are
+    /// started; drive each returned [`Shard`] from one of your own (typically pinned)
+    /// threads. The default I/O backend still runs a pool of 2-16 I/O threads for WAL syncs
+    /// and reads; a threadless mode is planned for Phase 3. Because no compaction thread
     /// is started, [`Options::compaction_cores`] with `k > 0` is refused with
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) (decision D40).
     ///

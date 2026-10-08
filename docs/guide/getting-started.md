@@ -37,7 +37,7 @@ let db = Pigeonhole::open(
     Options::default()
         .durability(Durability::Buffered) // writer default; see durability.md
         .shards(1)                        // shard threads; default is the CPUs available
-        .block_cache(256 << 20)           // bytes
+        .block_cache(256 << 20)           // bytes; 256 MiB is the default
         .row_cache(0),                    // bytes; 0 (default) disables
 )?;
 # Ok::<(), pigeonhole::Error>(())
@@ -261,7 +261,7 @@ assert_eq!(pages_copy.get(b"row", "meta", b"k")?.unwrap().value(), b"v");
 ```
 
 - `flush()` and `compact()` return after the work is in the file; both fail with `ErrorCode::Closed` after `close`.
-- `backup(dest)` writes a new file at `dest`, which must not exist, from a snapshot taken when you call it, so it holds exactly the commits visible at that moment. Commits that land while it runs are not in it. A database whose families store blob files cannot be backed up yet (`ErrorCode::Unsupported`); in the current build values stay inline, so this does not occur.
+- `backup(dest)` writes a new file at `dest`, which must not exist, from a snapshot taken when you call it, so it holds exactly the commits visible at that moment. Commits that land while it runs are not in it. It holds that snapshot, memtables included, until it finishes, so on a large file under heavy writes the arena can fill and writers fail with `Busy` after the 30 s stall timeout; back up when load is light. A database whose families store blob files cannot be backed up yet (`ErrorCode::Unsupported`); in the current build values stay inline, so this does not occur.
 - The file does not shrink by itself: space freed by compaction is reused by later writes, but the file keeps its length. Call `compact()` and then `shrink()` to give space back to the filesystem.
 - `shrink()` returns the bytes released (`0` when nothing is free at the end of the file). It moves live data from the file's tail into free space nearer the start, then truncates, so it costs a read and rewrite of that data. It runs online: other threads keep reading and writing. Space still held by an open snapshot or scan is released on a later call after you drop it. It fails with `ErrorCode::Closed` after `close`, `ErrorCode::NoSpace` if there is no room to move data into, and `ErrorCode::Io` on a disk failure. Use it after a large delete, not routinely.
 

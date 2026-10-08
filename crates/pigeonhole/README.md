@@ -4,6 +4,13 @@
 column families, sparse qualifiers, timestamped versions, TTLs, prefix and range scans) with
 SQLite's deployment model (one file, a library, no server).
 
+> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in
+> simulation, but the on-disk format and the API may change before 1.0
+> ([`FORMAT.md`](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md)). The
+> wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Pigeonhole is
+> **not recommended for production use yet**. See the
+> [status and roadmap](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md).
+
 > **Status: Phase 1 in progress.** The blocking API is implemented, disk-backed and
 > crash-safe through the write-ahead log: memtables flush into the file and compact, so data
 > is bounded by the disk, not memory (`Options::memtable_budget` only sizes the per-shard
