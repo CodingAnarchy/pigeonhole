@@ -726,8 +726,14 @@ fn a_value_with_free_bytes_but_no_long_enough_run_waits_instead_of_poisoning() {
     grow_x_to(63);
     commit(&p2, b"island", 1).unwrap();
     // `x` freezes at 93 chunks (its fresh memtable is the third island) and its old chunks
-    // come back once flushed.
-    grow_x_to(95);
+    // come back once flushed. Write until that flush has happened: counting chunks would
+    // race it (the flush may free them before the count is read).
+    let flushed = db.metrics().flushes;
+    while db.metrics().flushes == flushed {
+        assert!(row < 200, "x never froze and flushed");
+        commit(&x, &row.to_be_bytes(), 15 << 10).unwrap();
+        row += 1;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let half = 512usize << 10; // D16's limit: 33 chunks with its node and the prefix.
     loop {
