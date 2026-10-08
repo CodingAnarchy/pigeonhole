@@ -108,9 +108,11 @@ fn a_coarse_real_clock_waits_for_the_stall_timeout() {
         match db.commit(wb, Some(Durability::Buffered)) {
             Ok(_) => snaps.push(db.snapshot().unwrap()),
             Err(Error::Busy) => {
+                // The stall's start is read from the coarse clock, which lags real time by up
+                // to one tick, so the timeout can end up to one tick early in real time.
                 let waited = started.elapsed();
                 assert!(
-                    waited >= timeout,
+                    waited + TICK >= timeout,
                     "refused after {waited:?} on a moving (coarse) clock: taken as stopped"
                 );
                 drop(snaps);
