@@ -176,7 +176,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126 · **amended by D171**
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220
-- [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134
+- [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134 · **amended by D174**
 - [D165](phase-2.md#d165) — The tiered picker's runs, triggers and output levels; the engine picks per family · compaction, #31, #227 · **amended by D169**
 - [D166](phase-2.md#d166) — The write stall follows L0 depth only · compaction, engine, #227 · amends D119
 - [D167](phase-2.md#d167) — The FIFO-by-time picker: expiry drops, the size cap and intra-L0 merges · compaction, #32, #229 · **amended by D170**
@@ -186,6 +186,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D171](phase-2.md#d171) — A room wait's re-check timer can tell the clock stopped · engine, #244, #252 · refines D126, D161
 - [D172](phase-2.md#d172) — Registered merge operators reach the engine; unregistered ones make the handle read-only · pigeonhole, engine, #43, #253 · supersedes D102
 - [D173](phase-2.md#d173) — FUSE and GPFS count as network filesystems; the local check runs before the writer lock · io, engine, #147, #258 · refines D37
+- [D174](phase-2.md#d174) — Test-hook recording is opt-in, and the test-hooks wait matches production · engine, #148, #261 · refines D164
 
 ## Open questions
 _None._
