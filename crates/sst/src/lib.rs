@@ -252,6 +252,12 @@ impl SstWriter {
         self.inner.add(key, value)
     }
 
+    /// Data bytes written so far: sealed blocks and the open one, without the index, filters
+    /// and footer still to come. A writer that cuts its outputs by size reads it.
+    pub fn data_len(&self) -> u64 {
+        self.inner.data_len()
+    }
+
     /// Entries added.
     pub fn entries(&self) -> u64 {
         self.inner.entries()

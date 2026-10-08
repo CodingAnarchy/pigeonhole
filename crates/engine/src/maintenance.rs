@@ -349,24 +349,26 @@ fn copy_at(
 }
 
 /// Relocates manifest-named extents past the shrink point and truncates the file. Returns
-/// the bytes the file shrank by.
+/// the bytes the file shrank by, net: a round's manifest commit can grow the file by what
+/// a later truncation gives back.
 ///
 /// Every round first gives back the free space already at the tail, so a file whose tail
 /// holds nothing live (everything there was deleted and compacted away) shrinks without
 /// moving anything. An extent with no free extent of its class below it is skipped, not an
 /// error (the file then ends after it), and the extents past it still move.
 pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
-    let mut released = 0;
+    let start = shared.pager.stats().file_bytes;
+    let shrunk = || start.saturating_sub(shared.pager.stats().file_bytes);
     for _round in 0..8 {
         if shared.closing.load(Ordering::Acquire) {
             // The close waits for this call: stop between rounds.
-            return Ok(released);
+            return Ok(shrunk());
         }
         // Retired extents no view uses any more are free space: at the tail they are cut
         // off now, below it the relocations can move into them (without this the targets
         // would be allocated past the end of the file).
         shared.reclaim();
-        released += shared.pager.truncate_tail()?;
+        shared.pager.truncate_tail()?;
         let plan = shared.pager.shrink_plan();
         if plan.is_empty() {
             break;
@@ -497,9 +499,9 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     if !shared.closing.load(Ordering::Acquire) {
         // What the last round's moves retired.
         shared.reclaim();
-        released += shared.pager.truncate_tail()?;
+        shared.pager.truncate_tail()?;
     }
-    Ok(released)
+    Ok(shrunk())
 }
 
 /// Shrink's relocated copies, `(old SST, its copy)`, until the commit turns them into edits.

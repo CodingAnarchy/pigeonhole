@@ -54,6 +54,11 @@ pub struct CompactionRecord {
     pub rows: (Option<Vec<u8>>, Option<Vec<u8>>),
 }
 
+/// The row prefix of an internal key (the whole key if it has none).
+fn row_of(key: &[u8]) -> &[u8] {
+    &key[..pigeonhole_format::key::row_prefix_len(key).unwrap_or(key.len())]
+}
+
 /// The tablet's row range as a key range of row prefixes.
 pub(crate) fn tablet_range(tablet: &TabletEntry) -> Result<KeyRange> {
     let start = if tablet.start.is_empty() {
@@ -120,6 +125,10 @@ pub(crate) fn narrow(
 
 /// A task compacting every level of a slot into the last level (`Engine::compact`).
 ///
+/// A lone SST is also rewritten, not moved, when it is larger than one output piece
+/// (`output_piece_bytes` at `target`): the rewrite cuts it into pieces that pack below one
+/// another, so a compacted and shrunk file is about as large as its data (#185).
+///
 /// With `rewrite` (tablet changes on), a lone SST above the last level is rewritten rather
 /// than moved, so the compaction purges what a bottommost compaction may (D74) whatever
 /// the slot's layout: splits and moves flush and share SSTs at points that depend on the
@@ -131,6 +140,7 @@ pub(crate) fn plan_full(
     last_level: u8,
     busy: &[SstId],
     rewrite: bool,
+    target: u64,
 ) -> Option<CompactionTask> {
     let inputs: Vec<(u8, Vec<SstId>)> = levels
         .levels
@@ -152,7 +162,17 @@ pub(crate) fn plan_full(
     }
     // Already one run at the bottom: nothing to do, unless it holds rows outside the tablet
     // (inherited from a split's parent), which a rewrite drops.
-    if inputs.len() == 1 && inputs[0].0 == last_level {
+    // A lone SST larger than one output piece is cut into pieces (#185), unless it holds a
+    // single row: outputs are cut only between rows, so its rewrite would be the same SST,
+    // and a full compaction, which runs until nothing is left to do, would never end.
+    let lone = (total == 1)
+        .then(|| levels.levels.iter().flatten().next())
+        .flatten();
+    let one_piece = lone.is_none_or(|s| {
+        pigeonhole_compaction::output_piece_bytes(s.len, target) >= s.len
+            || row_of(&s.smallest_key) == row_of(&s.largest_key)
+    });
+    if inputs.len() == 1 && inputs[0].0 == last_level && one_piece {
         let range = tablet_range(tablet).ok()?;
         if !levels
             .levels
@@ -163,7 +183,7 @@ pub(crate) fn plan_full(
             return None;
         }
     }
-    let kind = if total == 1 && !rewrite {
+    let kind = if total == 1 && !rewrite && one_piece {
         TaskKind::TrivialMove
     } else {
         TaskKind::Rewrite

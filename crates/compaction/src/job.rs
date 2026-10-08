@@ -181,20 +181,67 @@ struct Open {
     extent: ExtentRef,
 }
 
-/// Where kept entries go: output SSTs cut near the target size, at row boundaries.
+/// The size of the next output SST of a level (≥ 1) output stream with about `remaining`
+/// bytes left to write, the next one included (#185): a power of two that the SST fills,
+/// the target's class while more than the target remains, then at most half of what
+/// remains, so the pieces of a stream pack into a file about as large as the data (an
+/// extent is aligned to its size and unit 0 is the header, so a file is at least twice its
+/// largest extent). The smallest piece is 1 MiB, or 64 KiB for a stream under 2 MiB; the
+/// last piece of a stream is what is left, rounded up to a power of two.
 ///
-/// Each output's extent is sized to the input bytes not yet written out (GC only shrinks
-/// data), capped at the target, and trimmed to the output's length at finish, so a small
-/// compaction takes a small extent rather than a target-size one (#106). If the estimate
-/// runs out (a codec change can grow data), later outputs take the target size.
+/// ```
+/// use pigeonhole_compaction::output_piece_bytes;
+///
+/// let mib = 1 << 20;
+/// let target = 64 * mib;
+/// assert_eq!(output_piece_bytes(200 * mib, target), 64 * mib); // full target-size SSTs
+/// assert_eq!(output_piece_bytes(51 * mib, target), 16 * mib); // then at most half the rest
+/// assert_eq!(output_piece_bytes(3 * mib, target), mib);
+/// assert_eq!(output_piece_bytes(1536 << 10, target), 512 << 10); // a small stream
+/// assert_eq!(output_piece_bytes(48 << 10, target), 64 << 10); // the last piece
+/// ```
+pub fn output_piece_bytes(remaining: u64, target: u64) -> u64 {
+    const UNIT: u64 = 64 << 10;
+    let floor_pow2 = |n: u64| {
+        if n == 0 {
+            0
+        } else {
+            1u64 << (63 - n.leading_zeros())
+        }
+    };
+    let top = floor_pow2(target.clamp(UNIT, MAX_EXTENT));
+    if remaining > top {
+        return top;
+    }
+    let min = if remaining < 2 << 20 { UNIT } else { 1 << 20 };
+    if remaining <= min {
+        return remaining.max(1).next_power_of_two().max(UNIT);
+    }
+    floor_pow2(remaining / 2).max(min)
+}
+
+/// Where kept entries go: output SSTs cut at row boundaries, sized by [`output_piece_bytes`]
+/// for outputs below L0 (#185).
+///
+/// The remaining output is projected from the inputs: the bytes not yet read, scaled by the
+/// output-to-input ratio so far (GC only shrinks data), so a compaction that drops most of
+/// its input still cuts small pieces. Each output's extent is that piece's size (or the
+/// entry at hand, if larger). An output is cut between rows once less than a thirty-second
+/// of its extent is left, or early once it holds the smaller piece a later projection calls
+/// for; its extent is trimmed to its length at finish. An L0 output (a FIFO merge of L0 files) is one SST, sized to the input
+/// left, as every L0 file stays one SST (#106).
 #[derive(Debug)]
 struct Sink {
     pager: Arc<Pager>,
     sst_ids: Arc<AtomicU64>,
     options: SstWriterOptions,
     target: u64,
-    /// Total length of the inputs.
+    /// Whether outputs are cut into power-of-two pieces (outputs below L0).
+    pieces: bool,
+    /// Total length and entries of the inputs, and the entries read so far.
     input_bytes: u64,
+    input_entries: u64,
+    read: u64,
     /// Total length of the outputs finished so far.
     written: u64,
     open: Option<Open>,
@@ -258,9 +305,20 @@ impl Sink {
     fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let row_start = self.last_row.is_empty() || !key.starts_with(&self.last_row);
         if let Some(o) = &self.open {
-            // Prefer to cut between rows once less than an eighth of the extent is left.
-            let margin = (o.extent.len() / 8) as usize;
-            if (row_start && !o.writer.fits(0, margin)) || !o.writer.fits(key.len(), value.len()) {
+            // Prefer to cut between rows once less than an eighth of the extent is left (a
+            // thirty-second for pieces, which should fill their class: the index, filters
+            // and footer take a few KiB), or (pieces) once the output holds the piece the
+            // projection now calls for, if that is smaller than its extent.
+            let margin = (o.extent.len() / if self.pieces { 32 } else { 8 }) as usize;
+            let piece_full = self.pieces && row_start && {
+                let len = o.writer.data_len();
+                let piece = output_piece_bytes(len + self.projected_rest(), self.target);
+                piece < o.extent.len() && len >= piece - piece / 32
+            };
+            if (row_start && !o.writer.fits(0, margin))
+                || piece_full
+                || !o.writer.fits(key.len(), value.len())
+            {
                 self.cut()?;
             }
         }
@@ -286,8 +344,33 @@ impl Sink {
         Ok(())
     }
 
+    /// The output still to come after the open SST (#185): the input not yet read, scaled
+    /// by the output-to-input ratio so far once there is enough of it to go by.
+    fn projected_rest(&self) -> u64 {
+        let total = self.input_entries.max(1);
+        let read = self.read.min(total);
+        let unread =
+            (u128::from(self.input_bytes) * u128::from(total - read) / u128::from(total)) as u64;
+        let open = self.open.as_ref().map_or(0, |o| o.writer.data_len());
+        let out = self.written + open;
+        // Below a sixty-fourth of the input read, or before any output, the ratio says
+        // little: assume everything survives.
+        if read * 64 < total || out == 0 {
+            return unread;
+        }
+        let consumed = (u128::from(self.input_bytes) * u128::from(read) / u128::from(total)).max(1);
+        let ratio_out = u128::from(unread) * u128::from(out) / consumed;
+        ratio_out.min(u128::from(unread)) as u64
+    }
+
     /// Bytes to allocate for the next output, at least `need` (room for the entry at hand).
     fn extent_bytes(&self, need: u64) -> u64 {
+        if self.pieces {
+            // Exactly the piece: the output fills it, and is trimmed at finish if it ends
+            // smaller.
+            let piece = output_piece_bytes(self.projected_rest(), self.target);
+            return piece.max(need).min(MAX_EXTENT);
+        }
         let rest = self.input_bytes.saturating_sub(self.written);
         // An eighth more covers the cut margin in `add`; past the estimate, take the target.
         let estimate = if rest == 0 {
@@ -479,7 +562,10 @@ impl CompactionJob {
                 sst_ids: context.sst_ids,
                 options,
                 target: context.target_sst_bytes.max(1),
+                pieces: task.output_level > 0,
                 input_bytes: inputs.iter().map(|r| r.len_bytes()).sum(),
+                input_entries: inputs.iter().map(|r| r.properties().entries).sum(),
+                read: 0,
                 written: 0,
                 open: None,
                 outputs: Vec::new(),
@@ -534,6 +620,7 @@ impl CompactionJob {
             let more = self
                 .gc
                 .step(&mut self.cursor, self.sub_end.as_deref(), &mut self.out)?;
+            self.sink.read = self.gc.read;
             for i in 0..self.out.len() {
                 let (k, v) = self.out.get(i);
                 match self.sink.place(k, v)? {

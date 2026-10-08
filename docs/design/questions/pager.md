@@ -1,6 +1,37 @@
 # Pager questions (Phase 2)
 
-## Proposal (needs a direction decision): cut level outputs into power-of-two pieces, at most half the stream each (#185)
+## Built (#185): level outputs are cut into power-of-two pieces, at most half the stream each
+The coordinator approved option 1' below (no format change), and it is built as follows.
+
+- **Where.** In the compaction job's sink (`pigeonhole_compaction::job`), for outputs at levels ≥ 1, through `output_piece_bytes(remaining, target)`.
+  - While more than the target's class remains, a piece is that class (64 MiB SSTs by default).
+  - Otherwise a piece is the power of two at or below half the remaining stream, and at least 1 MiB. Once less than 2 MiB remains, the minimum drops to 64 KiB.
+  - L0 (flush, FIFO's L0 merges) still writes one SST per flush.
+- **Remaining.** The input bytes not yet read, scaled by the ratio of output written to input consumed so far, once at least 1/64 of the input is read. The open SST's data bytes come from the new `SstWriter::data_len`.
+- **Cut.** Each output's extent is exactly its piece. The output is cut between rows (D78) once less than 1/32 of the extent is left: the index, filters and footer fit in that. If a later projection calls for a smaller piece, the output is cut once it holds that piece. At finish the extent is trimmed to the output's class.
+- **`Engine::compact`.** A full compaction re-cuts a lone SST larger than one piece, where it used to move it trivially (a flush output would otherwise stay whole). An SST holding a single row cannot be cut and is left alone.
+- **Blob separation (#33).** A separated value leaves only its pointer in the SST, and the sink sees the pointer. So pieces are sized from SST bytes (input and output lengths), never from blob bytes. Flushes separate too, so a compaction's inputs and outputs compare like for like. Blob files keep their own extents (64 KiB to 1 MiB, several per file).
+  - Measured: 20 MiB of separated 1 KiB values compacts into 5 SSTs holding 355 KB.
+  - The file at rest is still 1.60× its data, because `shrink` does not relocate blob extents (#281).
+- **Not done here.**
+  - Backup copies (`copy_at`) still write through the flush sink, so a backup's last SST can be half empty.
+  - The #200 `shrink` notes (reserve holes for the largest extents; release a skipped extent's claim at once).
+
+### Built: measured (deterministic test `crates/engine/tests/footprint.rs`, file sizes only)
+The setup is the probe's (1 shard, 1 KiB incompressible values, delete to the kept fraction, then `compact` and `shrink`), on `SimVfs` and an application-owned shard. The test asserts file ≤ 1.2 × live + 384 KiB (1.3× under 1 MiB of data), where 384 KiB is the header unit, a manifest snapshot unit and the manifest log's 256 KiB extent.
+
+| Load, kept | Live | File | Ratio | SSTs (was) |
+|---|---|---|---|---|
+| 5 MiB, 100% | 5.2 MiB | 6 MiB | 1.16× | 11 (1) |
+| 20 MiB, 100% | 20.8 MiB | 22.25 MiB | 1.07× | 14 (1) |
+| 50 MiB, 100% | 51.9 MiB | 54.25 MiB | 1.05× | 15 (1) |
+| 50 MiB, 10% | 5.2 MiB | 6 MiB | 1.15× | 11 (1) |
+| 50 MiB, 1% | 0.5 MiB | 1 MiB | 1.91× | 5 (1) |
+
+- **Small files.** At 0.5 MiB of data the fixed metadata dominates: the SST extents total 576 KiB (1.05× the data), and the manifest log's 256 KiB extent sets the rest.
+- **SST counts.** A run's count grows with the log of its tail, about 2·log2(tail / 64 KiB). That is more than the model's 5–10 because the 64 KiB minimum applies to every stream's last 2 MiB.
+
+## Proposal (approved as option 1'; kept for the measurements): cut level outputs into power-of-two pieces, at most half the stream each (#185)
 A file at rest is 1.2–3.8× its live data. Extents are power-of-two sized and aligned to their size, unit 0 (the header) is never free, and an SST takes the class above its length. So a file is at least twice its largest extent, and the last SST of a compaction is often half empty.
 
 ### Measured (file sizes only)
@@ -36,4 +67,4 @@ The probe ran on a CI runner (Sweep workflow on the scratch branch `scratch/foot
   - The sparse-wide gate's data sizes put most bytes in full 64 MiB SSTs, so I expect no measurable read change; the coordinator's bench run would confirm.
 - **Also folded in**, from the #200 review notes: `shrink` reserves holes for the largest extents first (or retries them after the small moves of a round), and releases a skipped extent's `busy_ssts` claim at once.
 
-**Interim behavior:** unchanged until the direction is confirmed.
+**Interim behavior:** superseded; see "Built" above.

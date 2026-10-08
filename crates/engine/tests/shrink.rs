@@ -191,20 +191,20 @@ fn ssts_of(db: &Engine, t: TableId) -> Vec<(u8, u64)> {
 }
 
 /// A database where `t`'s SSTs sit past the shrink point: a table written first (`junk`,
-/// one SST of the same 2 MiB size class as each of `t`'s) was dropped, leaving a free extent
-/// of their class below them. Returns `t`.
-fn tail_behind_a_dropped_table(rig: &Rig, flushes: u32) -> Arc<TableInfo> {
+/// one SST of the same size class as each of `t`'s, 2 MiB at 1500 `rows`) was dropped,
+/// leaving a free extent of their class below them. Returns `t`.
+fn tail_behind_a_dropped_table(rig: &Rig, flushes: u32, rows: u32) -> Arc<TableInfo> {
     let db = &rig.db;
     let junk = db
         .create_table("junk", &[("f".into(), FamilyOptions::default())])
         .unwrap();
-    write_rows(rig, &junk, 0..1500);
+    write_rows(rig, &junk, 0..rows);
     rig.flush();
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
     for n in 0..flushes {
-        write_rows(rig, &t, n * 1500..(n + 1) * 1500);
+        write_rows(rig, &t, n * rows..(n + 1) * rows);
         rig.flush();
     }
     db.drop_table(junk.id).unwrap();
@@ -268,7 +268,7 @@ fn shrink_skips_an_sst_a_compaction_retired_under_it() {
     let vfs = SimVfs::new(1381);
     let rig = Rig::open(&vfs);
     let db = &rig.db;
-    let t = tail_behind_a_dropped_table(&rig, 2);
+    let t = tail_behind_a_dropped_table(&rig, 2, 1500);
     let old = ssts_of(db, t.id);
     assert_eq!(old.len(), 2, "{old:?}");
 
@@ -306,7 +306,8 @@ fn shrink_keeps_the_level_a_trivial_move_gave_an_sst() {
     let vfs = SimVfs::new(1382);
     let rig = Rig::open(&vfs);
     let db = &rig.db;
-    let t = tail_behind_a_dropped_table(&rig, 1);
+    // Small enough to be one output piece (#185): a larger lone SST is re-cut, not moved.
+    let t = tail_behind_a_dropped_table(&rig, 1, 40);
     let old = ssts_of(db, t.id);
     assert_eq!(old.len(), 1, "{old:?}");
     assert_eq!(old[0].0, 0, "flushed to L0");
@@ -325,7 +326,7 @@ fn shrink_keeps_the_level_a_trivial_move_gave_an_sst() {
         now[0].0, last,
         "the copy stays at the level the trivial move gave the SST"
     );
-    assert_eq!(row_count(db, &t), 1500);
+    assert_eq!(row_count(db, &t), 40);
     rig.close();
 }
 
@@ -336,7 +337,7 @@ fn shrink_abandons_the_copy_of_a_table_dropped_under_it() {
     let vfs = SimVfs::new(1383);
     let rig = Rig::open(&vfs);
     let db = &rig.db;
-    let t = tail_behind_a_dropped_table(&rig, 1);
+    let t = tail_behind_a_dropped_table(&rig, 1, 1500);
     assert_eq!(ssts_of(db, t.id).len(), 1);
 
     let (db2, id) = (Arc::clone(db), t.id);
@@ -363,7 +364,7 @@ fn shrink_erases_the_cached_blocks_of_a_copy_it_abandons() {
     let vfs = SimVfs::new(1384);
     let rig = Rig::open(&vfs);
     let db = &rig.db;
-    let t = tail_behind_a_dropped_table(&rig, 1);
+    let t = tail_behind_a_dropped_table(&rig, 1, 1500);
     assert_eq!(ssts_of(db, t.id).len(), 1);
     let cached = db.block_cache_usage();
 
