@@ -112,7 +112,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `block_size(u32)` | Data block bytes (default 16 KiB). |
 | `merge_operator(&str)` | P2 for custom. Name of registered operator. `incr` needs none (`pigeonhole.i64_add` default). |
 | `cache_priority(Priority)` | Block cache priority. |
-| `compaction(Compaction)` | Strategy. `Leveled`: reads. `Tiered`: write-heavy; keep the default engine depth (a shallow tree makes write amplification grow linearly, D169). `FifoByTime`: drops a file when its newest cell has expired, so it only drops data with a TTL set (without one nothing expires), noticed at flush/compaction time (idle timer: #232). The engine's FIFO size cap is lossy (D167) and not exposed. |
+| `compaction(Compaction)` | Strategy. `Leveled`: reads. `Tiered`: write-heavy; keep the default engine depth (a shallow tree makes write amplification grow linearly, D169). `FifoByTime`: drops a file when its newest cell has expired, so it only drops data with a TTL set (without one nothing expires), dropped on a timer at the earliest expiry (D170). The engine's FIFO size cap is lossy (D167) and not exposed. |
 
 ## `TableBuilder` / `Table` / `ReadTable`
 | Signature | Semantics |
