@@ -138,7 +138,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D123](phase-1.md#d123) — Does the sim's recovery helper cover a coordinator that is also a participant · superseded for new code by D114; engine adoption in #48 · **amended by D125**
 - [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D138, D161, D162**
 - [D125](phase-1.md#d125) — the model suites use the sim's record-level oracle on every crash · harness, #48 · amends D123
-- [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119, D124 · **amended by D138, D161**
+- [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119, D124 · **amended by D138, D161, D171**
 - [D127](phase-1.md#d127) — a model harness attributes an error to an armed power loss only once the crash has fired · harness, #62
 - [D128](phase-1.md#d128) — flush and compaction outputs are trimmed to their length before they are published · pager, compaction, #106
 - [D129](phase-1.md#d129) — tablet changes are gated on `tablet_changes`, on by default · tablets, #97 · **amended by D153**
@@ -173,7 +173,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
 - [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
 - [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60
-- [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126
+- [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126 · **amended by D171**
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220
 - [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134
@@ -183,6 +183,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D168](phase-2.md#d168) — Tiered and FifoByTime families are accepted by the public API · pigeonhole, #44, #241 · amends D95
 - [D169](phase-2.md#d169) — The tiered picker needs no extra write-amplification bound; the proptest guards it · compaction, #228, #245 · supersedes D165's write-amp follow-up
 - [D170](phase-2.md#d170) — FIFO-by-time expiry runs on a timer; a busy L0 file splits the merge windows · compaction, engine, #232, #246 · refines D167
+- [D171](phase-2.md#d171) — A room wait's re-check timer can tell the clock stopped · engine, #244, #252 · refines D126, D161
 
 ## Open questions
 _None._
