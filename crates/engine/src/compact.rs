@@ -595,6 +595,10 @@ impl CompactionWork {
                         .iter()
                         .position(|(id, _)| *id == meta.id)
                         .map(|i| blob_refs.swap_remove(i).1);
+                    // The job reports every output's references; in release builds a
+                    // missing one only leaves the SST unrecorded (blob GC then treats it
+                    // as pointing anywhere).
+                    debug_assert!(refs.is_some(), "no blob references for SST {}", meta.id.0);
                     readers.push((
                         meta.id,
                         Arc::new(SstReader::open(

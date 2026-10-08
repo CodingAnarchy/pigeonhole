@@ -786,6 +786,11 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     edits.push(counters);
     catalog.prune_blob_refs();
     #[cfg(feature = "test-hooks")]
+    if shared.hooks.omit_blob_refs.load(Ordering::Acquire) {
+        edits.retain(|e| !matches!(e, Edit::SstBlobRefs { .. }));
+        catalog.blob_refs.clear();
+    }
+    #[cfg(feature = "test-hooks")]
     let refused = shared.hooks.refuse_checkpoints.load(Ordering::Acquire)
         && edits
             .iter()

@@ -92,6 +92,9 @@ pub(crate) struct Hooks {
     /// Refuses batches of only `WalCheckpoint` edits as `NoSpace`, as a snapshot rewrite
     /// that finds no space does (`Engine::refuse_checkpoints`).
     pub refuse_checkpoints: AtomicBool,
+    /// Commits no `SstBlobRefs` edit and keeps no blob references, as a build from before
+    /// tag 13 (#240) wrote (`Engine::omit_blob_refs`).
+    pub omit_blob_refs: AtomicBool,
 }
 
 /// A shard's test-hook counters (`ShardMetrics::hooks`), stored after each batch.
@@ -746,6 +749,18 @@ impl Engine {
             .hooks
             .refuse_checkpoints
             .store(refuse, Ordering::Release);
+    }
+
+    /// While `omit` is set, manifest commits drop every `SstBlobRefs` edit and the catalog
+    /// keeps no blob references, so the file looks as one written before tag 13 (#240).
+    /// Test hook.
+    #[doc(hidden)]
+    pub fn omit_blob_refs(&self, omit: bool) {
+        self.inner
+            .shared
+            .hooks
+            .omit_blob_refs
+            .store(omit, Ordering::Release);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits
