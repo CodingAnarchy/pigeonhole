@@ -1,4 +1,4 @@
-//! The leveled picker under a random flush workload.
+//! The leveled and tiered pickers under a random flush workload.
 #![allow(clippy::field_reassign_with_default)]
 
 mod common;
@@ -74,6 +74,20 @@ fn apply(
     rng: &mut Rng,
 ) {
     assert_clean_cut(levels, inputs);
+    rewrite(levels, inputs, out, kind, target, id, rng);
+}
+
+/// Inputs out, their rows rewritten into target-sized SSTs at the output level, keeping the
+/// inputs' seqno range.
+fn rewrite(
+    levels: &mut Levels,
+    inputs: &[(u8, Vec<SstId>)],
+    out: u8,
+    kind: &TaskKind,
+    target: u64,
+    id: &mut u64,
+    rng: &mut Rng,
+) {
     let mut taken = Vec::new();
     for (level, ids) in inputs {
         let l = &mut levels.levels[*level as usize];
@@ -86,6 +100,10 @@ fn apply(
     if levels.levels.len() <= out {
         levels.levels.resize(out + 1, Vec::new());
     }
+    let seqnos = (
+        taken.iter().map(|s| s.seqno_range.0).min().unwrap(),
+        taken.iter().map(|s| s.seqno_range.1).max().unwrap(),
+    );
     let new: Vec<Arc<SstMeta>> = if *kind == TaskKind::TrivialMove {
         taken
     } else {
@@ -108,13 +126,14 @@ fn apply(
                 } else {
                     (b, &b"z"[..])
                 };
-                let s = sst_cut(id, start, end, bytes / n);
+                let mut s = (*sst_cut(id, start, end, bytes / n)).clone();
+                s.seqno_range = seqnos;
                 start = if shared {
                     (b + 1, &b"n"[..])
                 } else {
                     (b + 1, &b"a"[..])
                 };
-                s
+                Arc::new(s)
             })
             .collect()
     };
@@ -243,8 +262,194 @@ proptest! {
     }
 }
 
+/// The sorted runs, newest first: each L0 file, then each non-empty deeper level, as
+/// `(level, bytes, seqno range)`.
+fn runs(levels: &Levels) -> Vec<(usize, u64, (u64, u64))> {
+    let mut runs: Vec<_> = levels.levels[0]
+        .iter()
+        .map(|s| (0, s.len, s.seqno_range))
+        .collect();
+    for (n, files) in levels.levels.iter().enumerate().skip(1) {
+        if !files.is_empty() {
+            let lo = files.iter().map(|s| s.seqno_range.0).min().unwrap();
+            let hi = files.iter().map(|s| s.seqno_range.1).max().unwrap();
+            runs.push((n, levels.level_bytes(n), (lo, hi)));
+        }
+    }
+    runs
+}
+
+fn check_tiered(seed: u64, flushes: usize) {
+    let mut rng = Rng::new(seed);
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 2 + rng.below(4) as u32;
+    options.max_levels = 3 + rng.below(5) as u8;
+    options.target_sst_bytes = 2 << 20;
+    options.tiered_size_ratio_percent = rng.below(50) as u32;
+    options.tiered_max_space_amp_percent = 50 + rng.below(250) as u32;
+    let what = format!("seed {seed}: {options:?}");
+    let picker = CompactionPicker::new(CompactionStyle::Tiered, options.clone());
+    let mut levels = Levels::default();
+    levels
+        .levels
+        .resize(options.max_levels as usize, Vec::new());
+    let last = options.max_levels as usize - 1;
+    let mut id = 0;
+    for _ in 0..flushes {
+        let lo = rng.below(ROWS);
+        let hi = (lo + rng.below(ROWS / 2)).min(ROWS - 1);
+        let len = (1 << 20) + rng.below(2 << 20);
+        let s = sst(&mut id, lo, hi, len);
+        levels.levels[0].insert(0, s);
+        let mut guard = 0;
+        while picker.score(&levels) >= 1.0 {
+            let task = picker
+                .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
+                .unwrap_or_else(|| panic!("{what}: score >= 1 but no task"));
+            // Whole runs, newest first, and the output lies between the deepest input and
+            // the first run left out.
+            let before = runs(&levels);
+            let taken: Vec<usize> = task
+                .inputs
+                .iter()
+                .flat_map(|(l, ids)| {
+                    let files = &levels.levels[*l as usize];
+                    assert_eq!(ids.len(), files.len(), "{what}: level {l} not whole");
+                    let n = if *l == 0 { ids.len() } else { 1 };
+                    std::iter::repeat_n(*l as usize, n)
+                })
+                .collect();
+            let in_runs = taken.len();
+            assert_eq!(
+                taken,
+                before[..in_runs].iter().map(|r| r.0).collect::<Vec<_>>(),
+                "{what}: not the newest runs"
+            );
+            let deepest = task.inputs.last().unwrap().0;
+            assert!(task.output_level >= deepest.max(1), "{what}: {task:?}");
+            if let Some(next) = before.get(in_runs) {
+                assert_eq!(task.output_level as usize, next.0 - 1, "{what}: {task:?}");
+            } else {
+                assert_eq!(task.output_level as usize, last, "{what}: {task:?}");
+            }
+            rewrite(
+                &mut levels,
+                &task.inputs,
+                task.output_level,
+                &task.kind,
+                options.target_sst_bytes,
+                &mut id,
+                &mut rng,
+            );
+            guard += 1;
+            assert!(guard < 100, "{what}: compaction does not converge");
+        }
+        // Within bounds after every flush: L0 below its trigger, at most one run per deeper
+        // level, space amplification within its cap, and runs ordered newest first.
+        let r = runs(&levels);
+        assert!(
+            (levels.levels[0].len() as u32) < options.l0_trigger,
+            "{what}"
+        );
+        assert!(r.len() < options.l0_trigger as usize + last, "{what}");
+        if r.len() >= 2 {
+            let oldest = r.last().unwrap().1;
+            let above: u64 = r[..r.len() - 1].iter().map(|r| r.1).sum();
+            assert!(
+                above * 100 <= oldest * u64::from(options.tiered_max_space_amp_percent),
+                "{what}: space amplification {above}/{oldest}"
+            );
+        }
+        for w in r.windows(2) {
+            assert!(w[0].2.0 > w[1].2.1, "{what}: runs out of order: {r:?}");
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(cases(64)))]
+
+    /// Issue #31: the run count and space amplification stay within their bounds under
+    /// random flushes, and runs stay ordered newest first down the levels.
+    #[test]
+    fn tiered_picker_keeps_runs_and_space_amp_within_bounds(seed in any::<u64>()) {
+        check_tiered(seed, if cfg!(miri) { 20 } else { 300 });
+    }
+}
+
 #[test]
-fn busy_inputs_are_not_picked_and_other_styles_wait() {
+fn tiered_merges_l0_with_runs_of_similar_size() {
+    let mut id = 0;
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 2;
+    options.max_levels = 5;
+    options.tiered_size_ratio_percent = 10;
+    let picker = CompactionPicker::new(CompactionStyle::Tiered, options);
+    let pick = |levels: &Levels, busy: &[SstId]| {
+        picker
+            .pick(TabletId(1), FamilyId(1), levels, busy, 0, 0)
+            .map(|t| (t.inputs, t.output_level, t.kind))
+    };
+    // No levels yet: two L0 files go to the last level.
+    let mut levels = Levels {
+        levels: vec![vec![sst(&mut id, 0, 9, 100), sst(&mut id, 5, 20, 100)]],
+    };
+    assert!(picker.score(&levels) >= 1.0);
+    assert_eq!(
+        pick(&levels, &[]),
+        Some((vec![(0, vec![SstId(1), SstId(2)])], 4, TaskKind::Rewrite))
+    );
+    assert_eq!(pick(&levels, &[SstId(2)]), None);
+    // L0 (200 bytes) takes in L2 (210, within 10%) but not L4 (1000); the output goes just
+    // above L4.
+    levels.levels.resize(5, Vec::new());
+    levels.levels[2] = vec![sst(&mut id, 0, 50, 210)];
+    levels.levels[4] = vec![sst(&mut id, 0, 99, 1000)];
+    assert_eq!(
+        pick(&levels, &[]),
+        Some((
+            vec![(0, vec![SstId(1), SstId(2)]), (2, vec![SstId(3)])],
+            3,
+            TaskKind::Rewrite
+        ))
+    );
+    // A larger L2 stays: the merge goes to L1.
+    levels.levels[2] = vec![sst(&mut id, 0, 50, 230)];
+    assert_eq!(
+        pick(&levels, &[]),
+        Some((vec![(0, vec![SstId(1), SstId(2)])], 1, TaskKind::Rewrite))
+    );
+    // L1 is always taken: nothing can go above it.
+    levels.levels[1] = vec![sst(&mut id, 0, 50, 5000)];
+    assert_eq!(pick(&levels, &[]).unwrap().0[1].0, 1);
+    // One L0 file below its trigger, but the runs above the oldest hold more than twice
+    // its bytes: everything merges into the last level.
+    levels.levels[0] = vec![sst(&mut id, 0, 9, 10)];
+    levels.levels[1] = vec![sst(&mut id, 0, 50, 1500)];
+    levels.levels[2] = vec![];
+    levels.levels[4] = vec![sst(&mut id, 0, 99, 700)];
+    assert!(picker.score(&levels) >= 1.0);
+    let (inputs, output, kind) = pick(&levels, &[]).unwrap();
+    assert_eq!(
+        inputs.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        [0, 1, 4]
+    );
+    assert_eq!((output, kind), (4, TaskKind::Rewrite));
+    // A lone L0 file over an empty tree moves down whole.
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 1;
+    let picker = CompactionPicker::new(CompactionStyle::Tiered, options);
+    let levels = Levels {
+        levels: vec![vec![sst(&mut id, 0, 9, 100)]],
+    };
+    let task = picker
+        .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
+        .unwrap();
+    assert_eq!((task.output_level, task.kind), (6, TaskKind::TrivialMove));
+}
+
+#[test]
+fn busy_inputs_are_not_picked_and_fifo_waits() {
     let mut id = 0;
     let mut levels = Levels::default();
     levels.levels = vec![
@@ -263,14 +468,12 @@ fn busy_inputs_are_not_picked_and_other_styles_wait() {
             .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
             .is_some()
     );
-    for style in [CompactionStyle::Tiered, CompactionStyle::FifoByTime] {
-        let p = CompactionPicker::new(style, PickerOptions::default());
-        assert_eq!(p.score(&levels), 0.0);
-        assert!(
-            p.pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
-                .is_none()
-        );
-    }
+    let p = CompactionPicker::new(CompactionStyle::FifoByTime, PickerOptions::default());
+    assert_eq!(p.score(&levels), 0.0);
+    assert!(
+        p.pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
+            .is_none()
+    );
 }
 
 #[test]

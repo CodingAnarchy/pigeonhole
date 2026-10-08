@@ -51,6 +51,7 @@ use pigeonhole_engine::{
     TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::key::decode_key;
+use pigeonhole_format::manifest::CompactionStyle;
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, ManifestVersion, Seqno, StreamId, TableId, Timestamp};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimOp, SimVfs};
@@ -140,8 +141,15 @@ pub fn families() -> Vec<ModelFamily> {
     ]
 }
 
+/// The engine options of a model family. `g` compacts tiered (issue #31), so every suite
+/// runs both pickers; the reference model does not depend on the style.
 fn family_options(f: &ModelFamily) -> FamilyOptions {
+    let compaction = match f.name.as_str() {
+        "g" => CompactionStyle::Tiered,
+        _ => CompactionStyle::Leveled,
+    };
     FamilyOptions {
+        compaction,
         max_versions: f.max_versions,
         ttl_micros: f.ttl_micros,
         merge_operator: if f.i64_add {

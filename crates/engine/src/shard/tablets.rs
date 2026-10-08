@@ -1175,7 +1175,7 @@ impl ShardState {
         busy: &[SstId],
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
-        let last = self.picker.options().max_levels.max(2) - 1;
+        let last = self.shared.picker.max_levels.max(2) - 1;
         let now = ctx.now_nanos();
         // Slots waiting out a failed compaction's backoff stay queued (issue #141).
         let mut later = Vec::new();

@@ -1845,7 +1845,9 @@ pub(crate) struct ShardState {
     unreported: Vec<UnreportedShare>,
 
     // ---- compaction and stalls ----
-    picker: CompactionPicker,
+    /// One picker per `CompactionStyle`, indexed by its number: each family compacts by its
+    /// own style.
+    pickers: [CompactionPicker; 3],
     /// The slot a compaction task is running for.
     compaction: Option<(TabletId, FamilyId)>,
     /// `Engine::compact` callers: `(table filter, reply)`, served in order.
@@ -1938,7 +1940,12 @@ impl ShardState {
         tablets: Arc<TabletMap>,
         ts_floor: Timestamp,
     ) -> Self {
-        let picker = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
+        let pickers = [
+            CompactionStyle::Leveled,
+            CompactionStyle::Tiered,
+            CompactionStyle::FifoByTime,
+        ]
+        .map(|style| CompactionPicker::new(style, shared.picker.clone()));
         Self {
             id,
             shared,
@@ -2003,7 +2010,7 @@ impl ShardState {
             commit_ckpt: HashSet::new(),
             share_reports: HashMap::new(),
             unreported: Vec::new(),
-            picker,
+            pickers,
             compaction: None,
             compact_all: VecDeque::new(),
             compaction_full: false,
@@ -4890,6 +4897,11 @@ impl ShardState {
         out
     }
 
+    /// The picker for a family compacting by `style`.
+    fn picker(&self, style: CompactionStyle) -> &CompactionPicker {
+        &self.pickers[style as usize]
+    }
+
     /// Scores the shard's slots, refreshes the stall score and starts the most urgent
     /// compaction (or the next step of a full compaction) if none is running.
     fn maintain(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
@@ -4910,7 +4922,9 @@ impl ShardState {
             if meta.merge == MergeKind::Unknown {
                 continue;
             }
-            let s = self.picker.score(&fam.levels_meta());
+            let s = self
+                .picker(meta.options.compaction)
+                .score(&fam.levels_meta());
             score = score.max(s);
             if s >= 1.0 {
                 due.push((s, key));
@@ -4966,7 +4980,7 @@ impl ShardState {
                 return;
             }
             let filter = *filter;
-            let last = self.picker.options().max_levels.max(2) - 1;
+            let last = self.shared.picker.max_levels.max(2) - 1;
             let busy: Vec<SstId> = self
                 .shared
                 .busy_ssts
@@ -5058,7 +5072,7 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let Some(task) = self.picker.pick(
+            let Some(task) = self.picker(meta.options.compaction).pick(
                 key.0,
                 key.1,
                 &fam.levels_meta(),

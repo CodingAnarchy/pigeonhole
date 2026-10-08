@@ -1,4 +1,4 @@
-//! Choosing compaction work: levels, tasks and the leveled picker.
+//! Choosing compaction work: levels, tasks and the leveled and tiered pickers.
 
 use std::sync::Arc;
 
@@ -37,10 +37,17 @@ pub struct PickerOptions {
     pub max_levels: u8,
     /// Target output SST size.
     pub target_sst_bytes: u64,
+    /// Tiered: a merge of the L0 runs takes in the next level's run while that run is at
+    /// most this many percent larger than everything taken so far.
+    pub tiered_size_ratio_percent: u32,
+    /// Tiered: once the runs above the oldest one hold more than this many percent of its
+    /// bytes, every run is merged into the last level.
+    pub tiered_max_space_amp_percent: u32,
 }
 
 impl Default for PickerOptions {
-    /// 4 L0 files, 256 MiB at L1, ×10 per level, 7 levels, 64 MiB SSTs.
+    /// 4 L0 files, 256 MiB at L1, ×10 per level, 7 levels, 64 MiB SSTs; tiered merges take
+    /// in runs up to 1% larger and cap space amplification at 200%.
     fn default() -> Self {
         Self {
             l0_trigger: 4,
@@ -48,6 +55,8 @@ impl Default for PickerOptions {
             level_multiplier: 10,
             max_levels: 7,
             target_sst_bytes: 64 << 20,
+            tiered_size_ratio_percent: 1,
+            tiered_max_space_amp_percent: 200,
         }
     }
 }
@@ -140,6 +149,9 @@ pub enum TaskKind {
     },
 }
 
+/// A picked task: inputs by level, output level and kind.
+type Picked = (Vec<(u8, Vec<SstId>)>, u8, TaskKind);
+
 /// The row prefix of an internal key (the whole key if it has none).
 fn row_of(key: &[u8]) -> &[u8] {
     &key[..row_prefix_len(key).unwrap_or(key.len())]
@@ -150,9 +162,9 @@ fn overlaps(s: &SstMeta, lo: &[u8], hi: &[u8]) -> bool {
     row_of(&s.smallest_key) <= hi && lo <= row_of(&s.largest_key)
 }
 
-/// Picks compaction work for one `(tablet, family)`.
+/// Picks compaction work for one `(tablet, family)`, by the family's [`CompactionStyle`].
 ///
-/// Leveled (Phase 1): L0 compacts into L1 once it holds `l0_trigger` files; level `n >= 1`
+/// Leveled: L0 compacts into L1 once it holds `l0_trigger` files; level `n >= 1`
 /// compacts into `n + 1` once it outgrows `level_base_bytes × level_multiplier^(n-1)`,
 /// choosing the file whose rewrite costs least (fewest overlapping bytes below per byte
 /// moved). Inputs and overlaps are whole rows: an SST sharing an edge row with a neighbour
@@ -160,6 +172,15 @@ fn overlaps(s: &SstMeta, lo: &[u8], hi: &[u8]) -> bool {
 /// every row of a level moves down at once and GC always sees all of a row's data at and
 /// below the input level. The task's `range` stays [`KeyRange::all`], which covers that
 /// expansion; the engine narrows it only to the tablet's rows.
+///
+/// Tiered (universal): each L0 file and each non-empty deeper level is a sorted run, newest
+/// first. Once L0 holds `l0_trigger` files, all of them merge with the following runs while
+/// each is at most `tiered_size_ratio_percent` larger than what was taken so far; once the
+/// runs above the oldest hold more than `tiered_max_space_amp_percent` of its bytes, every
+/// run merges into the last level. Outputs go just above the first run not taken, so runs
+/// stay ordered newest first down the levels, and whole runs move, so no row is split. The
+/// score is the larger of L0 depth over its trigger and space amplification over its cap,
+/// so the engine's L0 write stall works as with leveled.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -203,8 +224,7 @@ pub struct CompactionPicker {
 }
 
 impl CompactionPicker {
-    /// A picker for `style`. Phase 1 implements `Leveled`; the others return no work until
-    /// Phase 2.
+    /// A picker for `style`. `FifoByTime` returns no work yet.
     pub fn new(style: CompactionStyle, options: PickerOptions) -> Self {
         Self { style, options }
     }
@@ -230,15 +250,45 @@ impl CompactionPicker {
         }
     }
 
+    /// Tiered: how far the runs above the oldest one exceed the space-amplification cap
+    /// (`>= 1.0` once they hold more than `tiered_max_space_amp_percent` of its bytes). The
+    /// runs are the L0 files and each non-empty deeper level; with fewer than two there is
+    /// nothing to merge.
+    fn space_amp_score(&self, levels: &Levels) -> f64 {
+        let mut runs = levels.levels.first().map_or(0, Vec::len);
+        let mut oldest = levels
+            .levels
+            .first()
+            .and_then(|l0| l0.last())
+            .map_or(0, |s| s.len);
+        let mut total = levels.level_bytes(0);
+        for n in 1..levels.levels.len() {
+            let bytes = levels.level_bytes(n);
+            if !levels.levels[n].is_empty() {
+                runs += 1;
+                oldest = bytes;
+                total += bytes;
+            }
+        }
+        if runs < 2 {
+            return 0.0;
+        }
+        let amp = (total - oldest) as f64 * 100.0 / oldest.max(1) as f64;
+        amp / f64::from(self.options.tiered_max_space_amp_percent.max(1))
+    }
+
     /// Urgency: `>= 1.0` means compaction is due. The engine services the highest score
     /// first and throttles writes on L0 depth.
     pub fn score(&self, levels: &Levels) -> f64 {
-        if self.style != CompactionStyle::Leveled {
-            return 0.0;
+        match self.style {
+            CompactionStyle::Leveled => (0..self.last_level())
+                .map(|n| self.level_score(levels, n))
+                .fold(0.0, f64::max),
+            CompactionStyle::Tiered => self
+                .level_score(levels, 0)
+                .max(self.space_amp_score(levels)),
+            CompactionStyle::FifoByTime => 0.0,
         }
-        (0..self.last_level())
-            .map(|n| self.level_score(levels, n))
-            .fold(0.0, f64::max)
     }
 
     /// The next task, or `None`. `busy` lists SSTs already in a running job. `now` drives
@@ -252,11 +302,26 @@ impl CompactionPicker {
         now: Timestamp,
         ttl_micros: u64,
     ) -> Option<CompactionTask> {
-        // FIFO-by-time (which uses `now` and the TTL) and tiered are Phase 2.
+        // FIFO-by-time (which uses `now` and the TTL) is not implemented yet.
         let _ = (now, ttl_micros);
-        if self.style != CompactionStyle::Leveled {
-            return None;
-        }
+        let (inputs, output_level, kind) = match self.style {
+            CompactionStyle::Leveled => self.pick_leveled(levels, busy)?,
+            CompactionStyle::Tiered => self.pick_tiered(levels, busy)?,
+            CompactionStyle::FifoByTime => return None,
+        };
+        Some(CompactionTask {
+            tablet,
+            family,
+            range: KeyRange::all(),
+            subranges: vec![KeyRange::all()],
+            inputs,
+            output_level,
+            kind,
+        })
+    }
+
+    /// Leveled: the most urgent level's best task.
+    fn pick_leveled(&self, levels: &Levels, busy: &[SstId]) -> Option<Picked> {
         let mut due: Vec<(f64, usize)> = (0..self.last_level())
             .map(|n| (self.level_score(levels, n), n))
             .filter(|&(s, _)| s >= 1.0)
@@ -272,16 +337,57 @@ impl CompactionPicker {
             if !below.is_empty() {
                 by_level.push((n as u8 + 1, below));
             }
-            Some(CompactionTask {
-                tablet,
-                family,
-                range: KeyRange::all(),
-                subranges: vec![KeyRange::all()],
-                inputs: by_level,
-                output_level: n as u8 + 1,
-                kind,
-            })
+            Some((by_level, n as u8 + 1, kind))
         })
+    }
+
+    /// Tiered: every L0 file, plus the following level runs while each is at most
+    /// `tiered_size_ratio_percent` larger than everything taken so far (level 1 always, so
+    /// the output has a level above the next run to go to), or every run once space
+    /// amplification passes its cap. The output goes just above the first run not taken, or
+    /// to the last level. Whole runs move, so rows are never split.
+    fn pick_tiered(&self, levels: &Levels, busy: &[SstId]) -> Option<Picked> {
+        let full = self.space_amp_score(levels) >= 1.0;
+        if !full && self.level_score(levels, 0) < 1.0 {
+            return None;
+        }
+        let ids = |files: &[Arc<SstMeta>]| files.iter().map(|s| s.id).collect::<Vec<_>>();
+        let mut inputs = Vec::new();
+        if let Some(l0) = levels.levels.first().filter(|l| !l.is_empty()) {
+            inputs.push((0u8, ids(l0)));
+        }
+        let ratio = u128::from(self.options.tiered_size_ratio_percent);
+        let mut taken = levels.level_bytes(0);
+        let mut next = None;
+        for (n, files) in levels.levels.iter().enumerate().skip(1) {
+            if files.is_empty() {
+                continue;
+            }
+            let bytes = levels.level_bytes(n);
+            if full || n == 1 || u128::from(bytes) * 100 <= u128::from(taken) * (100 + ratio) {
+                inputs.push((n as u8, ids(files)));
+                taken += bytes;
+            } else {
+                next = Some(n);
+                break;
+            }
+        }
+        if inputs
+            .iter()
+            .flat_map(|(_, ids)| ids)
+            .any(|id| busy.contains(id))
+        {
+            return None;
+        }
+        let deepest = usize::from(inputs.last()?.0);
+        let output = next.map_or(self.last_level().max(deepest), |n| n - 1);
+        let files: usize = inputs.iter().map(|(_, ids)| ids.len()).sum();
+        let kind = if files == 1 && deepest != output {
+            TaskKind::TrivialMove
+        } else {
+            TaskKind::Rewrite
+        };
+        Some((inputs, output as u8, kind))
     }
 
     /// Files of `level` holding rows in `[lo, hi]`, expanded to a clean cut (neighbours
