@@ -88,11 +88,15 @@ fn value_too_large(len: usize, max_value: usize) -> Error {
     Error::new(
         ErrorCode::ValueTooLarge,
         format!(
-            "value of {len} bytes exceeds the limit of {max_value} bytes (the smallest of the \
-             WAL segment payload, 64 MiB and half a shard's memtable arena; decision D16)"
+            "value of {len} bytes exceeds the limit: {MAX_PUT_VALUE} bytes for a put, \
+             {max_value} bytes for a merge operand (the smallest of the WAL segment payload, \
+             64 MiB and half a shard's memtable arena; decision D16)"
         ),
     )
 }
+
+/// The longest put value: a blob pointer's length is a `u32` and covers the tag byte too.
+const MAX_PUT_VALUE: usize = u32::MAX as usize - 1;
 
 /// An engine batch plus the first error met while building it (builders never fail; the
 /// error surfaces at commit).

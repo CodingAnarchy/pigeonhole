@@ -279,8 +279,9 @@ struct Separate<'a> {
 
 /// Merges `sources` in key order and writes every entry with a seqno at or below `seqno`
 /// into new SSTs of `pager`; returns the sink holding them (and their blob references) and
-/// the blob files written. Without `separate`,
-/// every value is written as it is (phase 1: memtables hold no blob pointers).
+/// the blob files written. Without `separate` (phase 1), every value is written as it is:
+/// a memtable pointer (a value separated at commit time, #230) still names the source's
+/// blob file, and phase 2's `separate` reads the value from there.
 #[allow(clippy::too_many_arguments)]
 fn copy_at(
     shared: &Shared,

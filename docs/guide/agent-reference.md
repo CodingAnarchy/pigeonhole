@@ -8,7 +8,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Item | Rule |
 |---|---|
 | Row key, qualifier | Arbitrary bytes, each ≤ 64 KiB, else `KeyTooLarge`. Sorted byte-wise. |
-| Value | ≤ `min(WAL segment payload, 64 MiB, ½ memtable arena)`, else `ValueTooLarge` (D16); values above the family's `blob_threshold` are stored in blob files. Ceiling 2³²−1 bytes. |
+| Value | ≤ 2³²−2 bytes. Above the inline limit `min(WAL segment payload, 64 MiB, ½ memtable arena)` (D16) a put is written to a blob file at commit (one extra manifest commit and file sync, even with `Durability::None`); a merge operand above it is `ValueTooLarge`. Values above the family's `blob_threshold` are stored in blob files. |
 | Timestamp | `u64` **microseconds** since the Unix epoch (D11). Default = `max(now, tablet floor + 1)`, never goes backwards. User timestamps are microseconds for TTL. |
 | Version order | Newest timestamp first; the same timestamp is ordered by inverted seqno (later commit first). Multiple mutations to the same (row, family, qualifier, timestamp) **within one commit** collapse to the last one written (D34), except that a counter family's increments of one cell add up in order (`incr(1).incr(2)` adds 3; `put_i64(5).incr(1)` gives 6; D186). |
 | Atomicity | One `RowMutation` = one row, all families, all-or-nothing. `WriteBatch` = any rows/tables, atomic, one durability point. |

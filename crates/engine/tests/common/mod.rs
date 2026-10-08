@@ -637,7 +637,14 @@ impl Store {
 
     /// Opens with the checker's options.
     pub fn open_cfg(vfs: &Arc<SimVfs>, shards: usize, cfg: &Config) -> Result<Self, Error> {
-        Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())
+        let store = Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())?;
+        // Values above 120 bytes (of up to 160) are separated at commit time (#230). Not
+        // with deferred I/O: the commit waits for a manifest commit on the thread that must
+        // also complete the in-flight I/O a background manifest commit holds.
+        if !cfg.deferred_io {
+            store.engine.set_inline_value_limit(LARGE_VALUE);
+        }
+        Ok(store)
     }
 
     fn open_with(
@@ -869,6 +876,23 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// The payload length above which `Store::open_cfg` separates values at commit time.
+const LARGE_VALUE: usize = 120;
+
+/// A put's value as the recovery oracle compares it: itself, or for a value above
+/// [`LARGE_VALUE`] (logged as a blob pointer when separated at commit time) its length.
+fn record_value(value: &[u8]) -> Vec<u8> {
+    if value.len() > LARGE_VALUE {
+        large_value_key(value.len())
+    } else {
+        value.to_vec()
+    }
+}
+
+fn large_value_key(len: usize) -> Vec<u8> {
+    format!("<large {len}>").into_bytes()
 }
 
 pub fn value_bytes(v: ValueRef<'_>) -> Vec<u8> {
@@ -1782,7 +1806,7 @@ impl World {
                         row.clone(),
                         qualifier.clone(),
                         ts,
-                        value.clone(),
+                        record_value(value),
                     ));
                 }
                 ModelOp::Incr {
@@ -1880,8 +1904,12 @@ impl World {
                 continue;
             };
             for m in batch.iter().flatten() {
+                // A value separated at commit time (#230) is logged as its blob pointer,
+                // which may name a file blob GC has dropped since: large values compare
+                // by length (`record_value`).
                 let payload = match pigeonhole_format::value::decode_value(m.value) {
-                    Ok(v) => value_bytes(v),
+                    Ok(ValueRef::Blob(p)) => large_value_key(p.len as usize - 1),
+                    Ok(v) => record_value(&value_bytes(v)),
                     Err(_) => m.value.to_vec(),
                 };
                 out.insert((
@@ -2935,8 +2963,16 @@ impl World {
                 }
             }
         }
-        self.drain_compactions()?;
-        self.check_held_snapshots()
+        let checked = self
+            .drain_compactions()
+            .and_then(|()| self.check_held_snapshots());
+        match checked {
+            // An armed power loss fired meanwhile on I/O no client waits for (a commit-time
+            // separation's manifest commit runs on the committing thread, #230): the next
+            // commit notices and recovers.
+            Err(_) if !self.alive() => Ok(()),
+            r => r,
+        }
     }
 
     /// Settles every in-flight commit that resolved. Returns whether the client may go on

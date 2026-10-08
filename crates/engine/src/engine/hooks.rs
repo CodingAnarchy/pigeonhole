@@ -95,6 +95,9 @@ pub(crate) struct Hooks {
     /// Commits no `SstBlobRefs` edit and keeps no blob references, as a build from before
     /// tag 13 (#240) wrote (`Engine::omit_blob_refs`).
     pub omit_blob_refs: AtomicBool,
+    /// Fails the next single-shard batch's apply with `Busy` after its WAL append, without
+    /// applying it, as an arena miscount would (`Engine::fail_next_apply`).
+    pub fail_next_apply: AtomicBool,
 }
 
 /// A shard's test-hook counters (`ShardMetrics::hooks`), stored after each batch.
@@ -376,6 +379,14 @@ impl Engine {
         out
     }
 
+    /// Sets the inline value limit (D16) to `payload_bytes`: a put whose value payload is
+    /// longer is separated into a blob file at commit time (#230). Lets tests reach that
+    /// path with small values (the real limit is tens of MiB). Test hook.
+    #[doc(hidden)]
+    pub fn set_inline_value_limit(&self, payload_bytes: usize) {
+        self.inner.max_value.store(payload_bytes, Ordering::Relaxed);
+    }
+
     /// Every blob file the current catalog names, as `(family, blob file id, total bytes,
     /// live bytes)` (test hook).
     #[doc(hidden)]
@@ -392,7 +403,8 @@ impl Engine {
     /// holds within its tablet's rows names a blob file of the catalog, of the same family,
     /// and each file's live bytes are exactly the bytes those pointers reference (16 plus
     /// the value's length each; an SST shared by several tablets counts once per tablet,
-    /// for its rows in that tablet), and every SST's recorded blob references (#240) are
+    /// for its rows in that tablet; memtable pointers count too), and every SST's recorded
+    /// blob references (#240) are
     /// exactly the pointers it holds. Describes the first mismatch.
     #[doc(hidden)]
     pub fn check_blob_accounting(&self) -> std::result::Result<(), String> {
@@ -452,6 +464,30 @@ impl Engine {
                 }
             }
         }
+        // Memtables hold the pointers of values separated at commit time (#230) until their
+        // flush; a frozen memtable never appears together with its SST.
+        for (_, set) in view.all_memtables() {
+            for reader in &set.readers {
+                let mut it = reader.iter();
+                it.seek_to_first().map_err(|e| err(&e))?;
+                while it.valid() {
+                    let (_, _, _, kind) = split_suffix(it.key()).map_err(|e| err(&e))?;
+                    if kind == Kind::Put
+                        && let Some(p) = blob_pointer(it.value())
+                    {
+                        if !catalog.blob_files.contains_key(&p.blob_file) {
+                            return Err(format!(
+                                "a memtable points into blob file {}, which the catalog \
+                                 does not name",
+                                p.blob_file.0
+                            ));
+                        }
+                        *refs.entry(p.blob_file.0).or_default() += record_bytes(p.len);
+                    }
+                    it.next().map_err(|e| err(&e))?;
+                }
+            }
+        }
         // Each SST's recorded references (#240) are exactly the pointers it holds.
         let mut seen = std::collections::HashSet::new();
         for fam in view.ssts.map.values() {
@@ -480,7 +516,19 @@ impl Engine {
                 }
             }
         }
+        // A large value's file whose commit has not settled (or whose release has not
+        // committed) may have nothing pointing into it yet (#230).
+        let pending = self
+            .inner
+            .shared
+            .large_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         for (id, b) in &catalog.blob_files {
+            if pending.contains(id) {
+                continue;
+            }
             let referenced = refs.get(&id.0).copied().unwrap_or(0);
             if referenced != b.live_bytes {
                 return Err(format!(
@@ -761,6 +809,18 @@ impl Engine {
             .hooks
             .omit_blob_refs
             .store(omit, Ordering::Release);
+    }
+
+    /// Fails the next single-shard batch after its WAL append: it is not applied, the shard
+    /// poisons itself and the commit returns `Busy`, as an arena miscount would (#230).
+    /// Test hook.
+    #[doc(hidden)]
+    pub fn fail_next_apply(&self) {
+        self.inner
+            .shared
+            .hooks
+            .fail_next_apply
+            .store(true, Ordering::Release);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits

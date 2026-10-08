@@ -718,8 +718,9 @@ fn bytes(n: u64) -> String {
     }
 }
 
-/// The largest value a commit may carry (decision D16), as `pigeonhole-engine` computes it at
-/// open: the WAL segment payload, 64 MiB, and half a shard's memtable arena.
+/// The largest value a commit carries inline (decision D16), as `pigeonhole-engine` computes
+/// it at open: the WAL segment payload, 64 MiB, and half a shard's memtable arena. A longer
+/// put is separated into a blob file at commit time; a longer merge operand is refused.
 fn max_value(o: &pigeonhole_engine::EngineOptions) -> usize {
     (o.wal.segment_size as usize)
         .saturating_sub(64 * 1024)
