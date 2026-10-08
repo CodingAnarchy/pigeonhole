@@ -61,7 +61,31 @@ pub struct CompactionRecord {
     /// sources can hold seqnos in the same range). `None` for a compaction, whose input is
     /// every entry of the range at or below `max_seqno`.
     pub input_seqnos: Option<Vec<Seqno>>,
+    /// A flush with `versions_purge`: the visible seqno when its commit installed the purge.
+    /// Every delete of the family at or below it was there before the install.
+    pub install_seqno: SeqnoCell,
 }
+
+/// A seqno filled in when a flush installs its purge (test hook, #287): the visible seqno at
+/// that moment. Compares by value.
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct SeqnoCell(pub Arc<std::sync::atomic::AtomicU64>);
+
+impl SeqnoCell {
+    /// The seqno (0 until set).
+    pub fn get(&self) -> Seqno {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl PartialEq for SeqnoCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for SeqnoCell {}
 
 /// The row prefix of an internal key (the whole key if it has none).
 fn row_of(key: &[u8]) -> &[u8] {

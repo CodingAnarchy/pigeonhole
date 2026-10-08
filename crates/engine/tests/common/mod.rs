@@ -1139,8 +1139,10 @@ struct PurgeEvent {
     manifest_version: ManifestVersion,
     /// Only a bottommost compaction purges; the others still bound historical reads.
     bottommost: bool,
-    /// A flush's guarded version purge over exactly these engine seqnos (#287).
+    /// A flush's guarded version purge over exactly these engine seqnos (#287), and the
+    /// visible seqno when it installed.
     flush_inputs: Option<Vec<Seqno>>,
+    flush_installed: Seqno,
     table: String,
     family: String,
     /// Engine seqnos (mapped to model seqnos when applied).
@@ -1555,7 +1557,8 @@ impl World {
         let family_names = store.family_names.clone();
         let mut applied = false;
         for r in records {
-            if r.manifest_version > published || r.max_seqno > upto {
+            // A flush's purge also waits for every commit before its install (#287).
+            if r.manifest_version > published || r.max_seqno.max(r.install_seqno.get()) > upto {
                 self.pending_purges.push(r);
                 continue;
             }
@@ -1573,6 +1576,7 @@ impl World {
                 manifest_version: r.manifest_version,
                 bottommost: r.bottommost,
                 flush_inputs: r.input_seqnos.clone().filter(|_| r.versions_purge),
+                flush_installed: r.install_seqno.get(),
                 table: table.clone(),
                 family: family.clone(),
                 snapshots: r.snapshots.clone(),
@@ -1634,6 +1638,7 @@ impl World {
                 manifest_version: r.manifest_version,
                 bottommost: r.bottommost,
                 flush_inputs: r.input_seqnos.clone().filter(|_| r.versions_purge),
+                flush_installed: r.install_seqno.get(),
                 table: table.clone(),
                 family: family.clone(),
                 snapshots: r.snapshots.clone(),
@@ -1677,7 +1682,7 @@ impl World {
         match &e.flush_inputs {
             Some(inputs) => {
                 let inputs: Vec<Seqno> = inputs.iter().map(|s| self.model_seqno(*s)).collect();
-                model.purge_versions(&p, &inputs);
+                model.purge_versions(&p, &inputs, self.model_seqno(e.flush_installed));
             }
             None if e.bottommost => model.purge(&p),
             None => {}

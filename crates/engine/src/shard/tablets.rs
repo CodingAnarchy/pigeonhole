@@ -269,7 +269,7 @@ impl ShardState {
     /// A PREPARE refused without a record: for rows this shard is moving or no longer owns
     /// (`Moved`: the coordinator retries through the new tablet map), or below its floor
     /// (`BelowFloor`: the coordinator retries with a fresh timestamp).
-    fn refuse_prepare(
+    pub(super) fn refuse_prepare(
         &mut self,
         m: Member,
         error: PrepareError,

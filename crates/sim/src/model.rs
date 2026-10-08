@@ -742,17 +742,19 @@ impl Model {
     /// [`Model::purge`], over the entries of `p.rows` and `p.family` whose seqno is in
     /// `inputs` (the flushed memtable's commits), with no `min_ts_above` condition. No delete
     /// is purged, and nothing at all unless the model agrees the guard held: no delete of
-    /// the family in those rows outside `inputs` with a seqno at or below the newest input,
-    /// unless expired at `p.now` (a newer one is a later write, D70). `p.min_ts_above` and
-    /// `p.max_seqno` are ignored.
-    pub fn purge_versions(&mut self, p: &ModelPurge, inputs: &[Seqno]) {
+    /// the family in those rows outside `inputs` with a seqno at or below `installed` (the
+    /// newest seqno committed before the purge was installed) or the newest input, unless
+    /// expired at `p.now`. A delete committed after the install is a later write (D74).
+    /// `p.min_ts_above` and `p.max_seqno` are ignored.
+    pub fn purge_versions(&mut self, p: &ModelPurge, inputs: &[Seqno], installed: Seqno) {
         let mut inputs = inputs.to_vec();
         inputs.sort_unstable();
-        self.purge_inner(p, Some(&inputs));
+        self.purge_inner(p, Some((&inputs, installed)));
     }
 
     /// [`Model::purge`], or with `inputs` (sorted) [`Model::purge_versions`].
-    fn purge_inner(&mut self, p: &ModelPurge, inputs: Option<&[Seqno]>) {
+    fn purge_inner(&mut self, p: &ModelPurge, flush: Option<(&[Seqno], Seqno)>) {
+        let inputs = flush.map(|f| f.0);
         let Some(t) = self.tables.get_mut(&p.table) else {
             return;
         };
@@ -768,8 +770,8 @@ impl Model {
         let mut points: Vec<Seqno> = p.snapshots.clone();
         points.push(Seqno::MAX);
         let versions_only = inputs.is_some();
-        if let Some(set) = inputs
-            && !Self::flush_guard_holds(t, &fam, p, set)
+        if let Some((set, installed)) = flush
+            && !Self::flush_guard_holds(t, &fam, p, set, installed)
         {
             return;
         }
@@ -906,12 +908,19 @@ impl Model {
 
 impl Model {
     /// [`Model::purge_versions`]'s guard over table `t`.
-    fn flush_guard_holds(t: &Table, fam: &ModelFamily, p: &ModelPurge, inputs: &[Seqno]) -> bool {
+    fn flush_guard_holds(
+        t: &Table,
+        fam: &ModelFamily,
+        p: &ModelPurge,
+        inputs: &[Seqno],
+        installed: Seqno,
+    ) -> bool {
         let Some(&newest) = inputs.last() else {
             return true;
         };
+        let before_install = newest.max(installed);
         let outside = |ts: Timestamp, seqno: Seqno| {
-            seqno <= newest
+            seqno <= before_install
                 && inputs.binary_search(&seqno).is_err()
                 && !(fam.ttl_micros != 0 && ts.saturating_add(fam.ttl_micros) <= p.now)
         };
@@ -1492,7 +1501,7 @@ mod tests {
             .map(|(i, ts)| m.commit(&[gput(ts, "v")], 20 + i as u64, Durability::Sync))
             .collect();
         assert_eq!(g(&m), [20, 10]);
-        m.purge_versions(&flush(), &inputs);
+        m.purge_versions(&flush(), &inputs, 0);
         assert_eq!(
             g(&m),
             [20, 10],
@@ -1506,7 +1515,7 @@ mod tests {
             .enumerate()
             .map(|(i, ts)| m.commit(&[gput(ts, "v")], 20 + i as u64, Durability::Sync))
             .collect();
-        m.purge_versions(&flush(), &inputs);
+        m.purge_versions(&flush(), &inputs, 0);
         assert_eq!(g(&m), [30, 20]);
         m.commit(&[gdel(30)], 40, Durability::Sync);
         assert_eq!(g(&m), [20]);

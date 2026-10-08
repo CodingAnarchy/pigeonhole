@@ -76,6 +76,9 @@ pub(crate) struct Hooks {
     /// Runs at the start of the next `publish_view`, before the publish lock
     /// (`Engine::before_next_view_publish`).
     pub before_view_publish: Once,
+    /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
+    /// (`Engine::before_snapshot_view_load`, #315 review).
+    pub before_snapshot_view_load: Once,
     /// Runs in the next shrink round, between its catalog read and its relocations
     /// (`Engine::before_shrink_relocates`).
     pub before_shrink_relocates: Once,
@@ -99,7 +102,8 @@ pub(crate) struct Hooks {
     /// applying it, as an arena miscount would (`Engine::fail_next_apply`).
     pub fail_next_apply: AtomicBool,
     /// A deliberate fault in the flush GC (`Engine::mutate_flush_gc`, #287): 1 treats the
-    /// guard as always holding, 2 drops the snapshot floor (no live read point is kept).
+    /// guard as always holding, 2 drops the snapshot floor (no live read point is kept), 3
+    /// lets deletes pass guarded flushes without voiding them.
     pub flush_gc_mutation: std::sync::atomic::AtomicU8,
 }
 
@@ -114,6 +118,8 @@ pub enum FlushGcMutation {
     DropGuard,
     /// Keep no live snapshot's versions (only the latest read point).
     DropSnapshotFloor,
+    /// A delete arriving while a guarded flush is in flight does not void it.
+    IgnoreVoids,
 }
 
 /// A shard's test-hook counters (`ShardMetrics::hooks`), stored after each batch.
@@ -590,6 +596,14 @@ impl Engine {
         self.inner.shared.hooks.before_shrink_relocates.set(f);
     }
 
+    /// Runs `f` once, on the calling thread of the next writer `snapshot()`, after it pinned
+    /// its seqno and before it loads the view: where a test publishes a flush in between
+    /// (#315 review; test hook).
+    #[doc(hidden)]
+    pub fn before_snapshot_view_load(&self, f: Box<dyn FnOnce() + Send>) {
+        self.inner.shared.hooks.before_snapshot_view_load.set(f);
+    }
+
     /// Runs `f` once, on the calling thread of the next `backup`, right after it released its
     /// snapshot's memtables and before it merges the SSTs: where a test writes past the
     /// arena while the backup still runs (#262; test hook).
@@ -720,6 +734,7 @@ impl Engine {
             FlushGcMutation::None => 0,
             FlushGcMutation::DropGuard => 1,
             FlushGcMutation::DropSnapshotFloor => 2,
+            FlushGcMutation::IgnoreVoids => 3,
         };
         self.inner
             .shared

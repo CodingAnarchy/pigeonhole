@@ -895,7 +895,8 @@ pub(crate) struct PrepareReq {
 pub(crate) enum PrepareError {
     Conflict,
     /// A row's tablet is being split, merged or moved, or now lives on another shard: the
-    /// coordinator retries through the new tablet map.
+    /// coordinator retries through the new tablet map. Also a share deleting in a family
+    /// whose guarded flush is installing (#287): the retry comes after the install.
     Moved,
     /// The commit timestamp is below a default timestamp this shard already assigned (D11,
     /// issue #105): the coordinator retries at once with a fresh timestamp.
@@ -1260,6 +1261,26 @@ fn flush_guard(
         .family(key.0, key.1)
         .is_none_or(|fam| fam.iter().all(|s| s.meta.deletes == 0));
     mems && shares && ssts
+}
+
+/// Guard states of a queued flush (#287): it may install its purge (`IN_FLIGHT`), a delete in
+/// its family arrived first (`VOIDED`: the commit is refused and the memtable flushed again
+/// without the guard), or its commit took the purge (`INSTALLING`: deletes in the family wait
+/// until the shard learns the outcome, so they become visible only after the install).
+pub(crate) const GUARD_IN_FLIGHT: u8 = 0;
+pub(crate) const GUARD_VOIDED: u8 = 1;
+pub(crate) const GUARD_INSTALLING: u8 = 2;
+
+/// A fresh guard state for the flush of memtable `root` of `family`, tracked in `guarded`.
+fn guard_state(
+    guarded: &mut Vec<(u32, FamilyId, Arc<AtomicU8>)>,
+    root: u32,
+    family: FamilyId,
+) -> Arc<AtomicU8> {
+    let state = Arc::new(AtomicU8::new(GUARD_IN_FLIGHT));
+    guarded.retain(|g| g.0 != root);
+    guarded.push((root, family, Arc::clone(&state)));
+    state
 }
 
 /// The memtables of one `(tablet, family)` on this shard.
@@ -1821,6 +1842,12 @@ pub(crate) struct ShardState {
     held: BTreeSet<Seqno>,
     coord: HashMap<Seqno, Coord>,
     prepared: HashMap<Seqno, PreparedShare>,
+    /// Queued or running flushes that may purge versions under the guard (#287), as
+    /// `(memtable root, family, state)`: a delete in the family voids one before it installs,
+    /// and waits while one installs.
+    guarded: Vec<(u32, FamilyId, Arc<AtomicU8>)>,
+    /// Roots whose guarded flush a delete voided: flushed again without the guard.
+    voided_roots: HashSet<u32>,
     /// Rows (hashed with their table) of prepared, undecided shares, with a count per row.
     pending_rows: HashMap<u64, u32>,
     /// Arena bytes reserved by admitted-but-unapplied members and undecided shares.
@@ -2041,6 +2068,8 @@ impl ShardState {
             held: BTreeSet::new(),
             coord: HashMap::new(),
             prepared: HashMap::new(),
+            guarded: Vec::new(),
+            voided_roots: HashSet::new(),
             pending_rows: HashMap::new(),
             reserved: 0,
             to_freeze: Vec::new(),
@@ -2637,7 +2666,7 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let item = |m: &MemEntry, no_outside_deletes: bool| FlushItem {
+            let item = |m: &MemEntry, guard: Option<Arc<AtomicU8>>| FlushItem {
                 table: meta.table,
                 tablet: key.0,
                 family: key.1,
@@ -2646,7 +2675,7 @@ impl ShardState {
                 bytes: m.table.allocated_bytes() as u64,
                 max_seqno: m.max_seqno(),
                 has_shares: m.has_shares,
-                no_outside_deletes,
+                guard,
                 options: meta.options.clone(),
             };
             // The fresh active memtable takes a chunk: never one admitted commits reserved.
@@ -2678,8 +2707,11 @@ impl ShardState {
                     // rather than wait for a chunk that live snapshots may hold until the
                     // close returns (issue #111).
                     slot.active.table.freeze();
-                    let guard =
-                        flush_guard(slot, slot.active.table.root(), &self.prepared, &view, key);
+                    let root = slot.active.table.root();
+                    let guard = (!self.replaying
+                        && !self.voided_roots.contains(&root)
+                        && flush_guard(slot, root, &self.prepared, &view, key))
+                    .then(|| guard_state(&mut self.guarded, root, key.1));
                     self.flush_queue.push(item(&slot.active, guard));
                     slot.seal = Seal::Flushing;
                 }
@@ -2696,8 +2728,11 @@ impl ShardState {
             }
             let mut old = std::mem::replace(&mut slot.active, MemEntry::new(fresh));
             old.table.freeze();
-            let guard =
-                !self.replaying && flush_guard(slot, old.table.root(), &self.prepared, &view, key);
+            let root = old.table.root();
+            let guard = (!self.replaying
+                && !self.voided_roots.contains(&root)
+                && flush_guard(slot, root, &self.prepared, &view, key))
+            .then(|| guard_state(&mut self.guarded, root, key.1));
             self.flush_queue.push(item(&old, guard));
             slot.frozen.insert(0, old);
             self.view_dirty = true;
@@ -2893,9 +2928,39 @@ impl ShardState {
     ) {
         self.flush_running = false;
         self.flushing.clear();
+        // The guarded flushes this one carried are settled either way (#287). One a delete
+        // voided was refused at its commit: flush those memtables again without the guard,
+        // at once (not a failure). Members that waited on an install run again at the end of
+        // this batch (`end_batch`).
+        let mut voided = false;
+        self.guarded.retain(|(root, _, state)| {
+            if !items.iter().any(|i| i.root == *root) {
+                return true;
+            }
+            if state.load(Ordering::Acquire) == GUARD_VOIDED {
+                voided = true;
+                self.voided_roots.insert(*root);
+            }
+            false
+        });
+        let result = match result {
+            Err(_) if voided => {
+                trace!(
+                    "shard {} guarded flush voided by a delete; flushing again",
+                    self.id.0
+                );
+                self.requeue_frozen();
+                self.spawn_flush(ctx);
+                return;
+            }
+            r => r,
+        };
         match result {
             Ok(_) => {
                 self.flush_failures = 0;
+                for item in &items {
+                    self.voided_roots.remove(&item.root);
+                }
                 if let Some(t) = self.flush_retry.take() {
                     t.cancel();
                 }
@@ -3035,8 +3100,10 @@ impl ShardState {
                     bytes: m.table.allocated_bytes() as u64,
                     max_seqno: m.max_seqno(),
                     has_shares: m.has_shares,
-                    no_outside_deletes: !self.replaying
-                        && flush_guard(slot, m.table.root(), &self.prepared, &view, key),
+                    guard: (!self.replaying
+                        && !self.voided_roots.contains(&m.table.root())
+                        && flush_guard(slot, m.table.root(), &self.prepared, &view, key))
+                    .then(|| guard_state(&mut self.guarded, m.table.root(), key.1)),
                     options: meta.options.clone(),
                 });
             }
@@ -3639,6 +3706,21 @@ impl ShardState {
                     self.settle(m, Ok(()), ctx);
                     continue;
                 }
+            }
+            // A delete in a family whose memtable is being flushed under the guard (#287)
+            // voids that flush's purge, or waits while its commit installs the purge.
+            if !self.guarded.is_empty()
+                && !matches!(m.kind, MemberKind::CommitRecord { .. })
+                && !self.admit_against_guards(m.bytes.as_slice())
+            {
+                if matches!(m.kind, MemberKind::Single) {
+                    cut = true;
+                    self.pending.push(m);
+                } else {
+                    // A PREPARE does not wait (deadlock avoidance): the coordinator retries.
+                    self.refuse_prepare(m, PrepareError::Moved, ctx);
+                }
+                continue;
             }
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
                 match self.reserve_room(m.bytes.as_slice()) {
@@ -4297,6 +4379,42 @@ impl ShardState {
     }
 
     /// Counts or releases the rows of a prepared share.
+    /// Checks a member's deletes against the guarded flushes (#287): voids every one of a
+    /// family it deletes in that has not started installing, and returns false (wait) if one
+    /// has. Its seqno is above every entry of those memtables, and it becomes visible only
+    /// after admission, so a delete either voids the purge or lands after the install.
+    fn admit_against_guards(&self, bytes: &[u8]) -> bool {
+        #[cfg(feature = "test-hooks")]
+        if self.shared.hooks.flush_gc_mutation.load(Ordering::Acquire) == 3 {
+            return true;
+        }
+        let Ok(batch) = BatchRef::new(bytes) else {
+            // An undecodable batch fails its apply; it deletes nothing.
+            return true;
+        };
+        let mut families: Vec<FamilyId> = Vec::new();
+        for mu in batch.iter().flatten() {
+            if !matches!(mu.kind, Kind::Put | Kind::Merge) && !families.contains(&mu.family) {
+                families.push(mu.family);
+            }
+        }
+        for (_, family, state) in &self.guarded {
+            if !families.contains(family) {
+                continue;
+            }
+            match state.compare_exchange(
+                GUARD_IN_FLIGHT,
+                GUARD_VOIDED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(GUARD_VOIDED) => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     fn track_share_rows(&mut self, bytes: &[u8], add: bool) {
         let Ok(batch) = BatchRef::new(bytes) else {
             return;
@@ -5510,6 +5628,7 @@ impl ShardState {
             flush: false,
             versions_purge: false,
             input_seqnos: None,
+            install_seqno: Default::default(),
         });
         // Claim the inputs under one lock: a shrink may have claimed one since the plan
         // was made against the busy set (then this round is skipped; `maintain` retries).

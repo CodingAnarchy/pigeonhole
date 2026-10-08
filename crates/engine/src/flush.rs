@@ -51,8 +51,10 @@ pub(crate) struct FlushItem {
     /// manifest commit.
     pub has_shares: bool,
     /// The flush GC guard held when the memtable was queued (#287): no other source of the
-    /// slot could hold a delete, so versions beyond `max_versions` may be purged.
-    pub no_outside_deletes: bool,
+    /// slot could hold a delete, so versions beyond `max_versions` may be purged. Its state
+    /// (`shard::GUARD_*`) is shared with the shard: the commit installs the purge only if no
+    /// delete in the family voided it meanwhile.
+    pub guard: Option<Arc<std::sync::atomic::AtomicU8>>,
     pub options: FamilyOptions,
 }
 
@@ -295,7 +297,7 @@ fn flush_gc(
     let now = shared.vfs.now_micros();
     let mut policy =
         pigeonhole_compaction::GcPolicy::new(crate::compact::gc_snapshots(shared), now, false);
-    policy.no_outside_deletes = item.no_outside_deletes;
+    policy.no_outside_deletes = item.guard.is_some();
     // The record (test hook) describes the real GC, so a deliberate fault below shows up.
     let real = policy.clone();
     #[cfg(feature = "test-hooks")]
@@ -362,6 +364,7 @@ fn flush_record(
         flush: true,
         versions_purge,
         input_seqnos: versions_purge.then(|| seqnos.into_iter().collect()),
+        install_seqno: Default::default(),
     }))
 }
 
@@ -384,9 +387,11 @@ pub(crate) struct FlushTask {
     gc: Option<pigeonhole_compaction::StreamGc>,
     /// Per written item, the live-byte change of blob files whose pointers the GC dropped.
     blob_deltas: Vec<crate::compact::BlobChanges>,
-    /// Records of the items that ran the guarded version purge (test hook).
+    /// Records of the flushed items (test hook), and the install seqnos the commit fills in.
     #[cfg(feature = "test-hooks")]
     records: Vec<crate::compact::CompactionRecord>,
+    #[cfg(feature = "test-hooks")]
+    install_seqnos: Vec<Arc<std::sync::atomic::AtomicU64>>,
     /// `(item index, sink outputs)` per flushed item.
     written: Vec<(usize, SstSink)>,
     stage: Stage,
@@ -408,6 +413,8 @@ impl FlushTask {
             blob_deltas: Vec::new(),
             #[cfg(feature = "test-hooks")]
             records: Vec::new(),
+            #[cfg(feature = "test-hooks")]
+            install_seqnos: Vec::new(),
             written: Vec::new(),
             stage: Stage::Write,
             waker: StdWaker::default(),
@@ -506,6 +513,9 @@ impl FlushTask {
                     .load(std::sync::atomic::Ordering::Acquire)
                     && let Some(r) = flush_record(&self.shared, item, &_policy)?
                 {
+                    if r.versions_purge {
+                        self.install_seqnos.push(Arc::clone(&r.install_seqno.0));
+                    }
                     self.records.push(r);
                 }
                 self.gc = Some(gc);
@@ -609,12 +619,40 @@ impl FlushTask {
             });
         }
         // Blob pointers the GC dropped lower their files' live counts, computed against the
-        // catalog the commit applies to (as a compaction's are).
+        // catalog the commit applies to (as a compaction's are). A purge under the guard
+        // installs only if no delete in its family voided it since the memtable was queued;
+        // from here on such deletes wait for this commit's outcome (#287).
         let deltas = std::mem::take(&mut self.blob_deltas);
-        let kind = if deltas.is_empty() {
+        let guards: Vec<Arc<std::sync::atomic::AtomicU8>> =
+            self.items.iter().filter_map(|i| i.guard.clone()).collect();
+        #[cfg(feature = "test-hooks")]
+        let install_seqnos = std::mem::take(&mut self.install_seqnos);
+        let kind = if deltas.is_empty() && guards.is_empty() {
             manifest::ReqKind::Edits(edits)
         } else {
+            let shared = Arc::clone(&self.shared);
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
+                use crate::shard::{GUARD_IN_FLIGHT, GUARD_INSTALLING};
+                use std::sync::atomic::Ordering;
+                for g in &guards {
+                    match g.compare_exchange(
+                        GUARD_IN_FLIGHT,
+                        GUARD_INSTALLING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        // A re-run of this closure finds its own claim.
+                        Ok(_) | Err(GUARD_INSTALLING) => {}
+                        Err(_) => {
+                            return Err(Error::Busy);
+                        }
+                    }
+                }
+                #[cfg(feature = "test-hooks")]
+                for s in &install_seqnos {
+                    s.store(shared.shm.visible_seqno(), Ordering::Release);
+                }
+                let _ = &shared;
                 let mut edits = edits;
                 for changes in deltas {
                     edits.extend(crate::compact::blob_edits(catalog, changes)?);
