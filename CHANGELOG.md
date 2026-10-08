@@ -9,6 +9,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 - Per-family compaction strategies: `Compaction::Tiered` (universal/size-tiered, for write-heavy families) and `Compaction::FifoByTime` (drops whole SSTs once their newest timestamp passes the TTL, with no rewrite) are accepted at table creation (#31, #32, #44).
 
 ### Changed
+- Compaction folds a counter's `incr` operands, and its base, into one value at the bottom level when the family has no TTL and no older snapshot sees them; see the guide for how later explicit-timestamp writes see a folded counter (#34).
 - The write stall follows L0 depth only; deeper levels and tiered space amplification no longer pace writers (D119).
 
 Planned for Phase 2 (the wide-column model), see [`docs/status.md`](docs/status.md):

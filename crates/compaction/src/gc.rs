@@ -20,14 +20,16 @@
 //!
 //! Consecutive kept operands of one group and stripe are combined into one operand.
 //!
-//! Operands are folded across timestamps (issue #34) only where no read point or later write
-//! can tell: at the bottommost level, in a family with a merge operator and no TTL, in a
-//! column whose input entries are all below `min_ts_above`, when every kept entry of the
-//! column is a put or operand visible at every read point (stripe 0) and the row keeps no
-//! family marker. Each run of operands then becomes one operand at the newest one's key, or,
-//! folded onto the put below it, one put there; a base the operator refuses stays unfolded
-//! (#21). Such a column is buffered until it ends. `pigeonhole_sim::Model::purge` applies the
-//! same rule, so the model oracle stays strict.
+//! Operands are folded across timestamps (issue #34) only where no read point can tell: at
+//! the bottommost level, in a family with a merge operator and no TTL, in a column whose
+//! input entries are all below `min_ts_above`, and only in the column's *plain prefix*: the
+//! kept entries, newest first, up to the first that is not a put or operand visible at every
+//! read point (stripe 0) and covered by no delete or marker at any of them. Each run of
+//! operands there becomes one operand at the newest one's key, or, folded onto the put right
+//! below it, one put there. A base the operator refuses or a blob base stays unfolded (#21),
+//! and an operand the operator refuses ends folding for the column, so a read that failed
+//! still fails. The run is streamed (one accumulator), never buffered.
+//! `pigeonhole_sim::Model::purge` applies the same rule, so the model oracle stays strict.
 
 use std::sync::Arc;
 
@@ -146,13 +148,15 @@ pub(crate) struct Gc {
     acc_key: Vec<u8>,
     scratch: Vec<u8>,
 
-    /// Kept markers of the current row.
-    markers_kept: usize,
-    /// The current column's kept entries while it may fold, and whether every one so far is
-    /// a put or operand in stripe 0.
-    colbuf: OutBuf,
-    buffering: bool,
-    foldable: bool,
+    /// Whether the current column is still in its plain prefix (may fold), the open run's
+    /// newest key and accumulator, and the last group's hiding stripe.
+    fold_col: bool,
+    fold_open: bool,
+    fold_key: Vec<u8>,
+    fold_acc: Vec<u8>,
+    group_hide: usize,
+    /// One group's kept entries, before folding.
+    gbuf: OutBuf,
 
     /// Live-byte change per blob file from dropped values.
     pub(crate) blob_delta: Vec<(BlobFileId, i64)>,
@@ -192,10 +196,12 @@ impl Gc {
             acc: Vec::new(),
             acc_key: Vec::new(),
             scratch: Vec::new(),
-            markers_kept: 0,
-            colbuf: OutBuf::default(),
-            buffering: false,
-            foldable: false,
+            fold_col: false,
+            fold_open: false,
+            fold_key: Vec::new(),
+            fold_acc: Vec::new(),
+            group_hide: NONE,
+            gbuf: OutBuf::default(),
             blob_delta: Vec::new(),
             read: 0,
             kept: 0,
@@ -206,78 +212,87 @@ impl Gc {
     pub(crate) fn reset(&mut self) {
         self.row.clear();
         self.markers.clear();
-        self.markers_kept = 0;
         self.col.clear();
     }
 
-    /// Ends the current column: writes what it buffered, folded if it may be.
-    fn end_column(&mut self, out: &mut OutBuf) {
-        if !self.buffering {
-            return;
+    /// Writes the open run's folded operand, if any.
+    fn flush_run(&mut self, out: &mut OutBuf) {
+        if self.fold_open {
+            out.push(&self.fold_key, &self.fold_acc);
+            self.fold_open = false;
         }
-        self.buffering = false;
-        let buf = std::mem::take(&mut self.colbuf);
-        match (&self.merge, self.foldable) {
-            (Some(op), true) => {
-                let op = Arc::clone(op);
-                self.fold(&*op, &buf, out);
-            }
-            _ => {
-                for i in 0..buf.len() {
-                    let (k, v) = buf.get(i);
-                    out.push(k, v);
-                }
-            }
-        }
-        self.colbuf = buf;
-        self.colbuf.clear();
     }
 
-    /// Folds each run of operands in `buf` (one column, newest first, every entry a put or
-    /// operand in stripe 0) into one operand at its newest key, or onto the put below it.
-    fn fold(&mut self, op: &dyn MergeOperator, buf: &OutBuf, out: &mut OutBuf) {
-        let is_merge = |k: &[u8]| k.last() == Some(&(Kind::Merge as u8));
-        let mut i = 0;
-        while i < buf.len() {
-            let (key, value) = buf.get(i);
-            if !is_merge(key) {
+    /// Ends the current column (or a stretch the fold must not cross).
+    fn end_column(&mut self, out: &mut OutBuf) {
+        self.flush_run(out);
+        self.fold_col = false;
+    }
+
+    /// Passes one group's kept entries (`gbuf`) to `out`, folding them into the open run
+    /// while the column is in its plain prefix.
+    fn fold_group(&mut self, out: &mut OutBuf) {
+        let gbuf = std::mem::take(&mut self.gbuf);
+        for i in 0..gbuf.len() {
+            let (key, value) = gbuf.get(i);
+            let Ok((_, _, seqno, kind)) = split_suffix(key) else {
+                self.end_column(out);
                 out.push(key, value);
-                i += 1;
+                continue;
+            };
+            let plain = self.fold_col
+                && self.group_hide == NONE
+                && self.stripe(seqno) == 0
+                && matches!(kind, Kind::Put | Kind::Merge);
+            let op = match (&self.merge, plain) {
+                (Some(op), true) => Arc::clone(op),
+                _ => {
+                    self.end_column(out);
+                    out.push(key, value);
+                    continue;
+                }
+            };
+            if kind == Kind::Merge {
+                if !self.fold_open {
+                    self.fold_open = true;
+                    self.fold_key.clear();
+                    self.fold_key.extend_from_slice(key);
+                    self.fold_acc.clear();
+                    self.fold_acc.extend_from_slice(value);
+                    continue;
+                }
+                self.scratch.clear();
+                self.scratch.extend_from_slice(&self.fold_acc);
+                if op.merge(&mut self.scratch, value).is_ok() {
+                    std::mem::swap(&mut self.fold_acc, &mut self.scratch);
+                    self.kept -= 1;
+                } else {
+                    // The read fails here: fold nothing below it, so it still does.
+                    self.end_column(out);
+                    out.push(key, value);
+                }
                 continue;
             }
-            self.acc.clear();
-            self.acc.extend_from_slice(value);
-            let mut j = i + 1;
-            while j < buf.len() && is_merge(buf.get(j).0) {
+            // A put: the open run's base, unless it is a blob or the operator refuses it.
+            let is_blob = value.first() == Some(&(ValueTag::Blob as u8));
+            if self.fold_open && !is_blob {
                 self.scratch.clear();
-                self.scratch.extend_from_slice(&self.acc);
-                if op.merge(&mut self.scratch, buf.get(j).1).is_err() {
-                    break;
-                }
-                std::mem::swap(&mut self.acc, &mut self.scratch);
-                j += 1;
-            }
-            // The put right below the run is its base (an operand the operator refused
-            // ends the run instead, so the next entry is then an operand).
-            if j < buf.len() && !is_merge(buf.get(j).0) {
-                self.scratch.clear();
-                self.scratch.extend_from_slice(&self.acc);
-                if op.finish(Some(buf.get(j).1), &mut self.scratch).is_ok() {
-                    self.acc_key.clear();
-                    self.acc_key.extend_from_slice(key);
-                    if let Some(kind) = self.acc_key.last_mut() {
-                        *kind = Kind::Put as u8;
+                self.scratch.extend_from_slice(&self.fold_acc);
+                if op.finish(Some(value), &mut self.scratch).is_ok() {
+                    if let Some(k) = self.fold_key.last_mut() {
+                        *k = Kind::Put as u8;
                     }
-                    out.push(&self.acc_key, &self.scratch);
-                    self.kept -= (j - i) as u64;
-                    i = j + 1;
+                    out.push(&self.fold_key, &self.scratch);
+                    self.fold_open = false;
+                    self.kept -= 1;
                     continue;
                 }
             }
-            out.push(key, &self.acc);
-            self.kept -= (j - i - 1) as u64;
-            i = j;
+            self.flush_run(out);
+            out.push(key, value);
         }
+        self.gbuf = gbuf;
+        self.gbuf.clear();
     }
 
     fn stripe(&self, seqno: Seqno) -> usize {
@@ -317,14 +332,14 @@ impl Gc {
         }
         let key = cursor.key();
         let Ok((body, ts, seqno, kind)) = split_suffix(key) else {
-            // A malformed key cannot be interpreted; keep it as is.
+            // A malformed key cannot be interpreted; keep it as is, after any open run.
+            self.end_column(out);
             out.push(key, cursor.value());
             cursor.next()?;
             return Ok(true);
         };
         if self.row.is_empty() || !key.starts_with(&self.row) {
             self.end_column(out);
-            self.markers_kept = 0;
             let n = row_prefix_len(key).unwrap_or(body.len());
             self.row.clear();
             self.row.extend_from_slice(&key[..n]);
@@ -340,18 +355,13 @@ impl Gc {
             if keep {
                 out.push(key, cursor.value());
                 self.kept += 1;
-                self.markers_kept += 1;
             }
             cursor.next()?;
             return Ok(true);
         }
         if body != self.col.as_slice() {
             self.end_column(out);
-            self.buffering = self.merge.is_some()
-                && self.ttl == 0
-                && self.purgeable(ts)
-                && self.markers_kept == 0;
-            self.foldable = true;
+            self.fold_col = self.merge.is_some() && self.ttl == 0 && self.purgeable(ts);
             self.col.clear();
             self.col.extend_from_slice(body);
             self.col_stripe = NONE;
@@ -360,17 +370,11 @@ impl Gc {
             self.run_open.fill(false);
         }
         self.read_group(cursor, ts)?;
-        if self.buffering {
-            let mut buf = std::mem::take(&mut self.colbuf);
-            let from = buf.len();
-            self.decide(ts, &mut buf);
-            for i in from..buf.len() {
-                let foldable = split_suffix(buf.get(i).0).is_ok_and(|(_, _, seqno, kind)| {
-                    matches!(kind, Kind::Put | Kind::Merge) && self.stripe(seqno) == 0
-                });
-                self.foldable &= foldable;
-            }
-            self.colbuf = buf;
+        if self.fold_col {
+            let mut gbuf = std::mem::take(&mut self.gbuf);
+            self.decide(ts, &mut gbuf);
+            self.gbuf = gbuf;
+            self.fold_group(out);
         } else {
             self.decide(ts, out);
         }
@@ -434,6 +438,7 @@ impl Gc {
             }
         }
         let hide = cover.min(cell_min).min(coldel_min);
+        self.group_hide = hide;
 
         // Upper cell deletes can only hit timestamps >= min_ts_above, so if the whole column
         // is below it, versions counted here stay versions.

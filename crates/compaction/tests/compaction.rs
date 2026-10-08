@@ -703,6 +703,61 @@ fn counter_operands_fold_across_timestamps_at_the_bottom() {
     }
 }
 
+/// Issue #34 review: folding stops at the first kept entry that is not plain (here a column
+/// delete only newer snapshots see), at an operand the operator refuses (the read must
+/// still fail), and never consumes a blob base.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn counter_folding_stops_where_a_read_could_tell() {
+    let mut db = Db::new(35);
+    let family = FamilyOptions::default();
+    let i64v = |v: i64| stored(&v.to_le_bytes());
+    let k = |ts, seqno, kind| key(b"r", b"n", ts, seqno, kind);
+    // A column delete at 35 that only the latest read point sees (seqno 9 > snapshot 8).
+    let e = vec![
+        (k(50, 5, Kind::Merge), i64v(1)),
+        (k(40, 4, Kind::Merge), i64v(2)),
+        (k(35, 9, Kind::ColumnDelete), Vec::new()),
+        (k(30, 3, Kind::Merge), i64v(4)),
+        (k(20, 2, Kind::Merge), i64v(8)),
+    ];
+    let input = db.sst(&family, &e);
+    let (_, kept) = compact(&db, &family, &[input], policy(vec![8], 100, true));
+    assert_eq!(
+        kept,
+        [
+            (k(50, 5, Kind::Merge), i64v(3)),
+            e[2].clone(),
+            e[3].clone(),
+            e[4].clone()
+        ]
+    );
+    // An untyped operand the `i64` operator refuses: nothing below it folds.
+    let e = vec![
+        (k(50, 5, Kind::Merge), i64v(1)),
+        (k(40, 4, Kind::Merge), stored(b"abc")),
+        (k(30, 3, Kind::Merge), i64v(4)),
+        (k(20, 2, Kind::Put), i64v(100)),
+    ];
+    let input = db.sst(&family, &e);
+    let (_, kept) = compact(&db, &family, &[input], policy(vec![], 100, true));
+    assert_eq!(kept, e);
+    // A blob base stays; the operands above it fold into one.
+    let mut blob = vec![pigeonhole_format::value::ValueTag::Blob as u8];
+    blob.extend_from_slice(&[0; 16]);
+    let e = vec![
+        (k(50, 5, Kind::Merge), i64v(1)),
+        (k(40, 4, Kind::Merge), i64v(2)),
+        (k(20, 2, Kind::Put), blob),
+    ];
+    let input = db.sst(&family, &e);
+    let (_, kept) = compact(&db, &family, &[input], policy(vec![], 100, true));
+    assert_eq!(kept, [(k(50, 5, Kind::Merge), i64v(3)), e[2].clone()]);
+}
+
 /// Operands at one timestamp and stripe combine into one operand.
 #[test]
 #[cfg_attr(

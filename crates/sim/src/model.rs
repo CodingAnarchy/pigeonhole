@@ -652,13 +652,16 @@ impl Model {
     ///    `max_versions` versions at any read point (live snapshots and latest, input
     ///    entries only, TTL at `now`) is removed.
     /// 3. Counter folding (issue #34): if the family has the `i64` operator and no TTL, in
-    ///    each column whose input entries are all puts and operands visible at every read
-    ///    point and below `min_ts_above`, in a row with no input family marker left, the
-    ///    input puts and operands that contribute to no version are removed, and each version
-    ///    of two or more becomes one entry at its newest one's `(ts, seqno)`: a put of the
-    ///    folded value when it has an `i64` base, otherwise one operand of the summed deltas
-    ///    (with a base that is not an `i64` kept below it). A later write with an explicit
-    ///    timestamp inside a folded run then sees one version, as in the store.
+    ///    each column whose input entries are all below `min_ts_above`, take the column's
+    ///    *plain prefix*: its input entries newest first (by timestamp, then seqno), skipping
+    ///    puts and operands that contribute to no version at any read point, up to the first
+    ///    that is a delete, or a put or operand not visible at every read point or covered
+    ///    by an input delete or marker. Within it, the skipped entries are removed and each
+    ///    version's part in the prefix, if two or more entries, becomes one entry at its
+    ///    newest `(ts, seqno)`: a put of the folded value when its `i64` base is in the
+    ///    prefix, otherwise one operand of the summed deltas (with a base that is not an
+    ///    `i64` kept below it). A later write with an explicit timestamp inside a folded run
+    ///    then sees one version, as in the store.
     pub fn purge(&mut self, p: &ModelPurge) {
         let Some(t) = self.tables.get_mut(&p.table) else {
             return;
@@ -759,13 +762,17 @@ impl Model {
                 {
                     continue;
                 }
-                let no_markers = !kept_markers.iter().any(|m| input(m.1));
                 if fam.max_versions != 0 {
                     purge_versions(&fam, entries, &kept_markers, &points, p);
                 }
                 // Step 3: fold counter runs.
-                if fam.i64_add && fam.ttl_micros == 0 && no_markers {
-                    fold_counters(entries, &input, first);
+                if fam.i64_add && fam.ttl_micros == 0 {
+                    let markers: Vec<Marker> = kept_markers
+                        .iter()
+                        .copied()
+                        .filter(|m| input(m.1))
+                        .collect();
+                    fold_counters(entries, &markers, &points, p, first);
                 }
             }
             cols.retain(|_, entries| !entries.is_empty());
@@ -812,15 +819,16 @@ fn purge_versions(
     });
 }
 
-/// [`Model::purge`] step 3 for one column: when every input entry is a put or operand
-/// visible at every read point (`seqno <= first`), folds each version of the inputs into one
-/// entry and drops the inputs no version uses.
-fn fold_counters(entries: &mut Vec<Entry>, input: &dyn Fn(Seqno) -> bool, first: Seqno) {
-    if entries.iter().any(|e| {
-        input(e.seqno) && (e.seqno > first || !matches!(e.kind, Kind::Put(_) | Kind::Merge(_)))
-    }) {
-        return;
-    }
+/// [`Model::purge`] step 3 for one column: folds the versions of its plain prefix (see
+/// there).
+fn fold_counters(
+    entries: &mut Vec<Entry>,
+    markers: &[Marker],
+    points: &[Seqno],
+    p: &ModelPurge,
+    first: Seqno,
+) {
+    let input = |seqno: Seqno| seqno <= p.max_seqno;
     let inputs: Vec<Entry> = entries.iter().filter(|e| input(e.seqno)).cloned().collect();
     let family = ModelFamily {
         name: String::new(),
@@ -828,41 +836,85 @@ fn fold_counters(entries: &mut Vec<Entry>, input: &dyn Fn(Seqno) -> bool, first:
         ttl_micros: 0,
         i64_add: true,
     };
-    let mut folded = Vec::new();
-    for v in contributors(&family, &inputs, &[], Seqno::MAX, 0) {
-        let newest = &inputs[v[0]];
-        let sum = v.iter().fold(0i64, |s, &i| match inputs[i].kind {
+    let mut contributes = vec![false; inputs.len()];
+    for &point in points {
+        for v in contributors(&family, &inputs, markers, point, 0) {
+            for i in v {
+                contributes[i] = true;
+            }
+        }
+    }
+    let covered = |e: &Entry| {
+        markers.iter().any(|m| m.0 >= e.ts)
+            || inputs.iter().any(|d| match d.kind {
+                Kind::ColumnDelete => d.ts >= e.ts,
+                Kind::CellDelete => d.ts == e.ts,
+                _ => false,
+            })
+    };
+    let mut order: Vec<usize> = (0..inputs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse((inputs[i].ts, inputs[i].seqno)));
+    // The plain prefix: `prefix[i]` for the inputs in it, `skipped[i]` for those dropped.
+    let mut prefix = vec![false; inputs.len()];
+    let mut skipped = vec![false; inputs.len()];
+    for &i in &order {
+        let e = &inputs[i];
+        let value = matches!(e.kind, Kind::Put(_) | Kind::Merge(_));
+        if value && !contributes[i] {
+            skipped[i] = true;
+            continue;
+        }
+        if !value || e.seqno > first || covered(e) {
+            break;
+        }
+        prefix[i] = true;
+    }
+    let mut out: Vec<Entry> = Vec::new();
+    let mut done = vec![false; inputs.len()];
+    for v in contributors(&family, &inputs, markers, Seqno::MAX, 0) {
+        let part: Vec<usize> = v.iter().copied().filter(|&i| prefix[i]).collect();
+        if part.len() < 2 {
+            continue;
+        }
+        for &i in &part {
+            done[i] = true;
+        }
+        let newest = &inputs[part[0]];
+        let sum = part.iter().fold(0i64, |s, &i| match inputs[i].kind {
             Kind::Merge(d) => s.wrapping_add(d),
             _ => s,
         });
-        let base = v.last().and_then(|&i| match &inputs[i].kind {
+        let base = part.last().and_then(|&i| match &inputs[i].kind {
             Kind::Put(value) => Some(value),
             _ => None,
         });
-        match base {
-            _ if v.len() == 1 => folded.push(newest.clone()),
-            Some(value) => match as_i64(value) {
-                Some(b) => folded.push(Entry {
-                    kind: Kind::Put(b.wrapping_add(sum).to_le_bytes().to_vec()),
+        match base.map(|b| as_i64(b)) {
+            Some(Some(b)) => out.push(Entry {
+                kind: Kind::Put(b.wrapping_add(sum).to_le_bytes().to_vec()),
+                ..newest.clone()
+            }),
+            // A bad base stays; the operands above it fold into one (D41, #21).
+            Some(None) => {
+                out.push(Entry {
+                    kind: Kind::Merge(sum),
                     ..newest.clone()
-                }),
-                // A bad base stays; the operands above it fold into one (D41, #21).
-                None => {
-                    folded.push(Entry {
-                        kind: Kind::Merge(sum),
-                        ..newest.clone()
-                    });
-                    folded.push(inputs[v[v.len() - 1]].clone());
-                }
-            },
-            None => folded.push(Entry {
+                });
+                out.push(inputs[part[part.len() - 1]].clone());
+            }
+            None => out.push(Entry {
                 kind: Kind::Merge(sum),
                 ..newest.clone()
             }),
         }
     }
+    out.extend(
+        (0..inputs.len())
+            // Skipped inputs lie in the prefix (the walk stopped at its end).
+            .filter(|&i| !done[i] && !skipped[i])
+            .map(|i| inputs[i].clone()),
+    );
     entries.retain(|e| !input(e.seqno));
-    entries.extend(folded);
+    entries.extend(out);
 }
 
 /// What [`Model::purge`] removes: the bottommost-compaction purge of one family's input
