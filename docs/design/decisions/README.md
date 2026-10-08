@@ -172,7 +172,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D157](phase-1.md#d157) — An open writes one frame per stream; spares wait for use · wal, #143, #172 · amends D35
 - [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
 - [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
-- [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60 · **amended by D183**
+- [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60 · **amended by D183, D185**
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126 · **amended by D171, D176**
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220 · **amended by D178**
@@ -192,10 +192,12 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D177](phase-2.md#d177) — Backup releases its snapshot's memtables before the long merge · engine, #262, #268 · **amended by D182**
 - [D178](phase-2.md#d178) — The bench metric family compacts FIFO in Pigeonhole and RocksDB · bench, #236, #270 · refines D163
 - [D179](phase-2.md#d179) — Counters are declared families, combined per timestamp like Bigtable aggregates · owner decision, #274 · supersedes the #233 cross-timestamp fold; amends D41, D73
-- [D180](phase-2.md#d180) — Blob separation and blob GC · compaction, engine, #33, #235 · amends D29, D77
+- [D180](phase-2.md#d180) — Blob separation and blob GC · compaction, engine, #33, #235 · amends D29, D77 · **refined by D184**
 - [D181](phase-2.md#d181) — File format version 2 · engine, format, #235
 - [D182](phase-2.md#d182) — Backup copies the separated values the snapshot references · engine, #58, #238 · amends D120, refines D177
 - [D183](phase-2.md#d183) — Level outputs are cut into power-of-two pieces so a file at rest stays near its live size · compaction, pager, sst, #185, #276 · refines D160
+- [D184](phase-2.md#d184) — Blob GC follows the blob references each SST records · compaction, engine, format, #240, #285 · refines D180
+- [D185](phase-2.md#d185) — `shrink` relocates blob extents · engine, #231, #286 · amends D160
 
 ## Open questions
 _None._
