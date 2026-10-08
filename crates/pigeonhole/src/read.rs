@@ -415,11 +415,11 @@ impl RowIter<'_> {
             return Ok(false);
         }
         self.buf.key.extend_from_slice(self.cursor.row());
-        while let Some(cell) = self.cursor.next_cell()? {
-            let family = cell.family;
+        loop {
             let start = self.buf.qualifiers.len();
-            self.buf.qualifiers.extend_from_slice(cell.qualifier);
-            // `cell` borrows the cursor; the pinned value is taken once it is released.
+            let Some(family) = self.cursor.next_cell_into(&mut self.buf.qualifiers)? else {
+                break;
+            };
             let data = self.cursor.current_data();
             let end = self.buf.qualifiers.len();
             self.buf.push(family, start..end, data);
