@@ -116,6 +116,12 @@ pub struct Metrics {
     /// they froze below the size threshold (#137). Flushes per pass is the cost of the
     /// bound: many small L0 SSTs per pass mean cold slots spread over many shards.
     pub unpin: (u64, u64),
+    /// Tablet changes refused for lack of room: splits and moves a shard's memtable slots
+    /// could not take (a size split the balancer found due but skipped counts once per
+    /// balancer pass), and splits refused because the tablet map would not fit the
+    /// shared-memory view buffer (D28). A rising first count means tablets that should
+    /// split cannot: raise `memtable_budget` (#122).
+    pub tablet_refusals: (u64, u64),
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -1381,6 +1387,8 @@ impl Engine {
             m.stalls.1 += s.stall_nanos.load(Ordering::Relaxed);
             m.unpin.0 += s.unpin_passes.load(Ordering::Relaxed);
             m.unpin.1 += s.unpin_flushes.load(Ordering::Relaxed);
+            m.tablet_refusals.0 += s.refused_slots.load(Ordering::Relaxed);
+            m.tablet_refusals.1 += s.refused_view.load(Ordering::Relaxed);
         }
         m
     }

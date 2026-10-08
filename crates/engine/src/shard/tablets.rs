@@ -629,6 +629,9 @@ impl ShardState {
                     + t.end.as_ref().map_or(0, Vec::len)
                     + 16;
                 if view.to_record().encoded_len() + grow > self.shared.view_capacity {
+                    self.shared.metrics[usize::from(self.id.0)]
+                        .refused_view
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(Error::Unsupported(
                         "the tablet map would not fit the shared-memory view buffer (D28)",
                     ));
@@ -710,6 +713,9 @@ impl ShardState {
             out.push((shard, n));
             if Self::slots_in(view, shard) + before + n > self.max_slots() {
                 self.release_slots(&out);
+                self.shared.metrics[usize::from(self.id.0)]
+                    .refused_slots
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(Error::Unsupported(
                     "a shard would hold more tablets than its memtable arena serves",
                 ));
@@ -1269,6 +1275,9 @@ impl ShardState {
         for t in &owned {
             let (bytes, shared) = live_bytes(&view, t, &refs);
             if bytes >= cfg.split_bytes && !shared && !room_for(t) {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .refused_slots
+                    .fetch_add(1, Ordering::Relaxed);
                 trace!(
                     "shard {} balancer: tablet {} is due a size split but the shard holds \
                      {} of its {} slots",

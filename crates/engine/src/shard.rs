@@ -119,6 +119,10 @@ pub(crate) struct ShardMetrics {
     /// WAL unpin passes (#137) and the memtables they froze below the size threshold.
     pub unpin_passes: AtomicU64,
     pub unpin_flushes: AtomicU64,
+    /// Tablet changes refused (or a due size split skipped) for lack of memtable slots, and
+    /// splits refused because the tablet map would outgrow the shared-memory view (D28).
+    pub refused_slots: AtomicU64,
+    pub refused_view: AtomicU64,
     /// Test-hook counters (`engine::hooks::ShardCounters`).
     #[cfg(feature = "test-hooks")]
     pub hooks: crate::engine::hooks::ShardCounters,
@@ -142,6 +146,8 @@ impl Default for ShardMetrics {
             moves: AtomicU64::new(0),
             unpin_passes: AtomicU64::new(0),
             unpin_flushes: AtomicU64::new(0),
+            refused_slots: AtomicU64::new(0),
+            refused_view: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
         }
