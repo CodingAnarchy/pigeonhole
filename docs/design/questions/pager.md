@@ -12,7 +12,7 @@ The probe ran on a CI runner (Sweep workflow on the scratch branch `scratch/foot
 | 20 MiB, 100% | 20.7 MiB | 64 MiB (3.08×) | 32 MiB (1.54×) | **22 MiB (1.06×)** | 20.8 MiB (1.00×) | 1 → 7 |
 | 50 MiB, 100% | 51.9 MiB | 128 MiB (2.47×) | 64 MiB (1.23×) | **53 MiB (1.02×)** | 51.9 MiB (1.00×) | 1 → 10 |
 | 50 MiB, 10% | 5.2 MiB | 16 MiB (3.08×) | 8 MiB (1.54×) | **6 MiB (1.16×)** | 5.3 MiB (1.02×) | 1 → 5 |
-| 50 MiB, 1% | 0.5 MiB | 2 MiB (3.84×) | 1 MiB (1.92×) | **0.6 MiB (1.2×)**, with a 64 KiB minimum for streams under 2 MiB | 0.6 MiB (1.20×) | 1 → 4 |
+| 50 MiB, 1% | 0.5 MiB | 2 MiB (3.84×) | 1 MiB (1.92×) | **0.6 MiB (1.2×)**, with a 64 KiB minimum for streams under 2 MiB | 0.6 MiB (1.20×) | 1 → 5 |
 | 200 MiB, 50% | 103.7 MiB | 192 MiB (1.85×) | 128 MiB (1.23×) | **105 MiB (1.01×)** | 103.8 MiB (1.00×) | 2 → 12 |
 | 500 MiB, 100% | 518.7 MiB | 640 MiB (1.23×) | 576 MiB (1.11×) | **520 MiB (1.00×)** | 518.8 MiB (1.00×) | 10 → 17 |
 
