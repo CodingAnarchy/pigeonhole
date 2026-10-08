@@ -29,9 +29,13 @@ struct Rig {
 
 impl Rig {
     fn open(seed: u64, mutation: FlushGcMutation) -> Self {
+        Self::open_with(seed, mutation, false)
+    }
+
+    fn open_with(seed: u64, mutation: FlushGcMutation, tablet_changes: bool) -> Self {
         let vfs = SimVfs::new(seed);
         let mut o = common::options(vfs, 1, 16 << 20);
-        o.tablet_changes = false;
+        o.tablet_changes = tablet_changes;
         // No compaction runs: what the reads see is the flush's doing.
         o.compaction.l0_trigger = u32::MAX;
         let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
@@ -340,5 +344,35 @@ fn a_flush_that_drops_a_blob_pointer_lowers_its_live_bytes() {
     // Two of the three records (all the same size) are no longer referenced.
     assert_eq!(live(&rig.db) * 3, before);
     assert_eq!(rig.get(&rig.db.snapshot().unwrap()), Some(large(b'2')));
+    rig.close();
+}
+
+/// Sweep regression (#315, tablets seed 8): one flush drops pointers into the same
+/// commit-time blob file from two slots (two tablets of one family, written by one batch).
+/// Each slot's drop must count: the file's live bytes are computed once, from both deltas.
+#[test]
+fn two_slots_dropping_pointers_into_one_blob_file_both_count() {
+    let mut rig = Rig::open_with(2874, FlushGcMutation::None, true);
+    rig.db.set_inline_value_limit(200);
+    let (t, f) = (rig.t.id, rig.t.families[0].id);
+    let split = rig.db.split_tablet_pending(t, b"m").unwrap();
+    rig.wait(split).unwrap();
+    let large = |b: u8| vec![b; 400];
+    // One batch per generation: each puts both rows' values in one blob file.
+    for g in *b"12" {
+        let mut wb = WriteBatch::new();
+        for row in [&b"a"[..], b"z"] {
+            wb.put(t, f, row, b"q", None, ValueRef::Bytes(&large(g)))
+                .unwrap();
+        }
+        rig.commit(wb);
+    }
+    let live = |db: &Engine| db.blob_files().iter().map(|b| b.3).sum::<u64>();
+    rig.db.check_blob_accounting().unwrap();
+    let before = live(&rig.db);
+    rig.flush();
+    // The first generation's file lost both its records (and is dropped).
+    rig.db.check_blob_accounting().unwrap();
+    assert_eq!(live(&rig.db) * 2, before);
     rig.close();
 }

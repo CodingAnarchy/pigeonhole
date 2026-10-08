@@ -542,11 +542,29 @@ impl FlushTask {
             if let Some(gc) = self.gc.take()
                 && !gc.blob_delta().is_empty()
             {
-                self.blob_deltas.push(crate::compact::BlobChanges {
-                    family: self.items[self.idx].family,
-                    new: Vec::new(),
-                    delta: gc.blob_delta().to_vec(),
-                });
+                // One change set per family, each file's deltas summed: `blob_edits` writes a
+                // file's new live count from the committing catalog, so two change sets naming
+                // one file (tablets of a family flushed together, pointing into one commit-time
+                // blob file) would each overwrite the other's decrement.
+                let family = self.items[self.idx].family;
+                let pos = match self.blob_deltas.iter().position(|c| c.family == family) {
+                    Some(pos) => pos,
+                    None => {
+                        self.blob_deltas.push(crate::compact::BlobChanges {
+                            family,
+                            new: Vec::new(),
+                            delta: Vec::new(),
+                        });
+                        self.blob_deltas.len() - 1
+                    }
+                };
+                let delta = &mut self.blob_deltas[pos].delta;
+                for &(file, d) in gc.blob_delta() {
+                    match delta.iter_mut().find(|x| x.0 == file) {
+                        Some(x) => x.1 += d,
+                        None => delta.push((file, d)),
+                    }
+                }
             }
             self.written.push((self.idx, sink));
             self.idx += 1;
@@ -630,7 +648,10 @@ impl FlushTask {
         let kind = if deltas.is_empty() && guards.is_empty() {
             manifest::ReqKind::Edits(edits)
         } else {
-            let shared = Arc::clone(&self.shared);
+            // Weak: a request still queued when the engine goes (a crash, deferred I/O) must
+            // not keep it alive through its own manifest queue.
+            #[cfg(feature = "test-hooks")]
+            let shared = Arc::downgrade(&self.shared);
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
                 use crate::shard::{GUARD_IN_FLIGHT, GUARD_INSTALLING};
                 use std::sync::atomic::Ordering;
@@ -650,9 +671,10 @@ impl FlushTask {
                 }
                 #[cfg(feature = "test-hooks")]
                 for s in &install_seqnos {
-                    s.store(shared.shm.visible_seqno(), Ordering::Release);
+                    if let Some(shared) = shared.upgrade() {
+                        s.store(shared.shm.visible_seqno(), Ordering::Release);
+                    }
                 }
-                let _ = &shared;
                 let mut edits = edits;
                 for changes in deltas {
                     edits.extend(crate::compact::blob_edits(catalog, changes)?);

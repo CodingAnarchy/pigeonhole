@@ -895,8 +895,7 @@ pub(crate) struct PrepareReq {
 pub(crate) enum PrepareError {
     Conflict,
     /// A row's tablet is being split, merged or moved, or now lives on another shard: the
-    /// coordinator retries through the new tablet map. Also a share deleting in a family
-    /// whose guarded flush is installing (#287): the retry comes after the install.
+    /// coordinator retries through the new tablet map.
     Moved,
     /// The commit timestamp is below a default timestamp this shard already assigned (D11,
     /// issue #105): the coordinator retries at once with a fresh timestamp.
@@ -3713,13 +3712,14 @@ impl ShardState {
                 && !matches!(m.kind, MemberKind::CommitRecord { .. })
                 && !self.admit_against_guards(m.bytes.as_slice())
             {
+                // It waits for the install's outcome (`on_flushed`), a PREPARE too: the
+                // install never waits on any commit's decision, so this cannot deadlock two
+                // coordinators the way waiting on another share could (and a refusal would
+                // park the coordinator until the tablet map changes).
                 if matches!(m.kind, MemberKind::Single) {
                     cut = true;
-                    self.pending.push(m);
-                } else {
-                    // A PREPARE does not wait (deadlock avoidance): the coordinator retries.
-                    self.refuse_prepare(m, PrepareError::Moved, ctx);
                 }
+                self.pending.push(m);
                 continue;
             }
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
