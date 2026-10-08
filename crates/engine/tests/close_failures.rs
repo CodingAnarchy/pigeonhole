@@ -626,26 +626,41 @@ fn a_commit_whose_write_failed_after_its_ticket_holds_peers_barriers() {
     }
     let _ = db.engine.take_appended();
     let mut pc = db.engine.submit(wb, Some(Durability::Sync)).unwrap();
-    // Run both shards until both PREPAREs are written, and no further.
+    // Run both shards until both PREPAREs are written, and no further: one step at a time,
+    // so the coordinator never gets the turn in which it would append the COMMIT.
     let mut prepares = 0;
-    for _ in 0..1_000 {
-        prepares += db
-            .engine
-            .take_appended()
-            .iter()
-            .filter(|r| r.kind == pigeonhole_engine::AppendedKind::Prepare)
-            .count();
-        if prepares == 2 {
-            break;
+    'prepare: for _ in 0..1_000 {
+        for shard in [1, 0] {
+            let appended = db.engine.take_appended();
+            assert!(
+                !appended
+                    .iter()
+                    .any(|r| r.kind == pigeonhole_engine::AppendedKind::Commit),
+                "the COMMIT was appended before the faults were armed"
+            );
+            prepares += appended
+                .iter()
+                .filter(|r| r.kind == pigeonhole_engine::AppendedKind::Prepare)
+                .count();
+            if prepares == 2 {
+                break 'prepare;
+            }
+            db.step(shard);
         }
-        db.step(1);
-        db.step(0);
     }
     assert_eq!(prepares, 2, "both shares prepared");
-    // The participant's sync completes and it replies `Prepared`.
-    for _ in 0..4 {
-        db.step(1);
+    // The participant's sync completes and it replies `Prepared`. It runs until it has
+    // nothing left (its share is applied only at the decision): a fixed count of steps
+    // would depend on its background work, such as preparing WAL spares once its stream is
+    // half way through a segment (#143).
+    let mut idle = false;
+    for _ in 0..100 {
+        if !db.step(1) {
+            idle = true;
+            break;
+        }
     }
+    assert!(idle, "the participant never went idle");
     // The coordinator appends its COMMIT (a ticket), then the group's write fails.
     let mut faults = FaultPlan::none();
     faults.io_error_ppm = 1_000_000;

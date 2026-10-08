@@ -74,6 +74,13 @@ pub trait File: Send + Sync + Debug {
     /// Makes data and metadata (size) durable.
     fn sync_all(&self) -> Result<()>;
 
+    /// Submits [`File::sync_all`] and returns at once. The pread backend runs it on its pool,
+    /// so syncs of several files overlap; the default runs it inline (as `SimVfs` does, which
+    /// keeps simulated runs deterministic).
+    fn submit_sync_all(&self) -> Completion<()> {
+        Completion::ready(self.sync_all())
+    }
+
     /// Current length.
     fn len(&self) -> Result<u64>;
 
