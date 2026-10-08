@@ -1,0 +1,10 @@
+# Engine questions (shrink clears a region for a large extent, #314)
+
+## Proposed decision (amends D160): `shrink` clears a region when a large extent has no hole
+D160's `shrink` moved each extent past its target into an existing free extent of its class below it, and left it in place when there was none. Small extents scattered through the lower file (one per aligned hole, with free units between them) could then keep a large extent at the tail even though the space below added up. #185's footprint shape (50 MiB loaded, 10% kept) ended at 1.35× its data under flush GC (#287) for that reason.
+
+**Interim behavior:**
+- When a round's extent cannot move, the pager looks for a region of its class and alignment below it whose occupants are all live, smaller and movable: SSTs no compaction holds, blob extents, and the manifest's snapshot and log (moved by a snapshot rewrite). Every occupant must also have a free extent outside the region and below the large one, which is checked on a copy of the free map. Of the first 16 such regions, the one with the fewest occupied units wins, the lowest on a tie (`Pager::clear_for`, additive).
+- The region's free blocks are reserved as pending extents, so nothing else is allocated there. The occupants move out in the same round (`Pager::relocate_below`, additive: below the large extent, not necessarily below themselves), committed like any other move. The reservation is abandoned after the commit. The next round, once the occupants' old extents are reclaimed, relocates the large extent into the region.
+- One region per round. The rounds are tried largest extent first, and an extent with no clearable region doesn't use up the round.
+- Crash safety is unchanged. The reserved extents are pending and never published, so they are free space at the next open (D8). The occupants' copies are ordinary relocations, published by the round's root commit or abandoned. `shrink_crash_points` now also sweeps every write point of a shrink that clears a region (moving SSTs and the manifest out of it, then the large SST in).
