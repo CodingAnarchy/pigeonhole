@@ -691,9 +691,11 @@ fn a_value_with_free_bytes_but_no_long_enough_run_waits_instead_of_poisoning() {
     o.memtable_budget = 1 << 20;
     o.wal.segment_size = 4 << 20;
     o.write_stall_timeout_nanos = 300_000_000;
-    // Without tablet changes the chunk is a fixed budget / 64.
+    // The layout this test builds islands in: 64 chunks of 16 KiB (arenas are otherwise
+    // sized for their slots, #283).
     o.tablet_changes = false;
     let chunk = 16usize << 10;
+    o.arena_chunk_bytes = Some(chunk);
     // `x` freezes on its own once it holds 93 chunks.
     o.memtable_freeze_bytes = (93 * chunk) as u64;
     let db = Engine::open(Path::new(DB), o).unwrap();
@@ -1311,5 +1313,59 @@ fn counter_writes_in_one_commit_combine() {
         .unwrap();
     txn.commit(None).unwrap();
     assert_eq!(counter_versions(&db, &t, "c", b"r"), [(COUNTER_TS, 33)]);
+    db.close().unwrap();
+}
+
+/// #283 with D16: with chunks sized for many slots (here 1 KiB-sized chunks in a 1 MiB arena
+/// with tablet changes off), an entry larger than a chunk still takes a contiguous run of
+/// them. Values just above a chunk, several chunks long, and as large as D16 allows are
+/// admitted, applied and read back, and the shard goes on writing (nothing is admitted that
+/// then fails to allocate at apply, which would poison it).
+#[test]
+fn values_larger_than_a_small_chunk_are_admitted_and_applied() {
+    let vfs = SimVfs::new(2831);
+    let mut o = owned(Arc::clone(&vfs), 1);
+    o.memtable_budget = 1 << 20;
+    o.wal.segment_size = 4 << 20;
+    o.tablet_changes = false;
+    o.write_stall_timeout_nanos = 300_000_000;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    // 64 tables of 4 families: 256 slots on the one shard, so a reopen sizes chunks for
+    // them (1 MiB / (4 x 256) = 1 KiB) instead of 4 KiB (1 MiB / 256).
+    let fams: Vec<(String, FamilyOptions)> = (0..4)
+        .map(|i| (format!("f{i}"), FamilyOptions::default()))
+        .collect();
+    for i in 0..64 {
+        db.create_table(&format!("t{i}"), &fams).unwrap();
+    }
+    db.close().unwrap();
+    let mut o = owned(Arc::clone(&vfs), 1);
+    o.memtable_budget = 1 << 20;
+    o.wal.segment_size = 4 << 20;
+    o.tablet_changes = false;
+    o.write_stall_timeout_nanos = 300_000_000;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db.table("t0").unwrap();
+    let chunk = 1024usize;
+    let half = 512usize << 10;
+    for (i, len) in [chunk + 1, 3 * chunk + 7, 64 * chunk, half - 4096]
+        .into_iter()
+        .enumerate()
+    {
+        let mut wb = WriteBatch::new();
+        let row = [b'v', i as u8];
+        put(&mut wb, &t, "f0", &row, b"q", &vec![i as u8; len]);
+        db.commit(wb, Some(Durability::None))
+            .unwrap_or_else(|e| panic!("a value of {len} bytes: {e}"));
+        assert_eq!(
+            get_bytes(&db, &t, "f0", &row, b"q").map(|v| v.len()),
+            Some(len)
+        );
+        db.flush().unwrap();
+    }
+    // The shard is not poisoned: a small write after them commits.
+    let mut wb = WriteBatch::new();
+    put(&mut wb, &t, "f1", b"after", b"q", b"ok");
+    db.commit(wb, None).unwrap();
     db.close().unwrap();
 }

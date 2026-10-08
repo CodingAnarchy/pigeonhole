@@ -128,7 +128,8 @@ pub fn new_model() -> Model {
 /// The families every model-check run uses. `counter` is a 0.1.0-style family with the
 /// `i64` add operator (operands at the commit timestamp, D41). The `counters` test target
 /// swaps `g` and `ttl` for the counter families `sum` and `sum_ttl` (D179; the workload
-/// writes buckets only in `sum_ttl`), keeping four families per table.
+/// writes buckets only in `sum_ttl`), keeping four families per table; the `slots` target
+/// has all six (#283).
 pub fn families() -> Vec<ModelFamily> {
     let f = |name: &str, max_versions, ttl_micros, i64_add| ModelFamily {
         name: name.into(),
@@ -137,7 +138,17 @@ pub fn families() -> Vec<ModelFamily> {
         i64_add,
         counter: is_sum(name),
     };
-    if env!("CARGO_CRATE_NAME") == "counters" {
+    if env!("CARGO_CRATE_NAME") == "slots" {
+        // Six families: 24 slots on a shard holding every table (#283).
+        vec![
+            f("f", 0, 0, false),
+            f("g", 2, 0, false),
+            f("ttl", 0, 40, false),
+            f("counter", 3, 0, true),
+            f("sum", 2, 0, false),
+            f("sum_ttl", 0, 40, false),
+        ]
+    } else if env!("CARGO_CRATE_NAME") == "counters" {
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),

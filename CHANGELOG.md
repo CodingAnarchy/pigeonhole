@@ -31,6 +31,7 @@ The next release is **0.2.0**: counters change in a breaking way (below), and ev
 - Blob separation (#33): values above a family's `blob_threshold` (default 4096 bytes) move to blob files when flushed or compacted, and blob GC rewrites blob files once they are half garbage.
 
 ### Fixed
+- With tablet changes off, a shard's memtable arena is sized for the table and family slots it holds, as with them on. A memtable budget under 16 MiB used to serve only 16 slots per shard, and more (for example 4 tables of 6 families on one shard) stalled writes until `Busy` (#283).
 - A database on NFS without working locks now fails to open with `NetworkFilesystem` instead of an I/O error about locks, and FUSE and GPFS mounts are refused as network filesystems (#147).
 
 ### Changed
