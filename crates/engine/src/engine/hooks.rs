@@ -1,7 +1,7 @@
 //! Test hooks: the `test-hooks` feature, which only the engine's own tests and benches
 //! enable (its dev-dependency on itself). Everything a test reaches into the engine with
 //! is here: the `#[doc(hidden)]` `Engine` methods, the types they return, and the state
-//! they keep in `Shared::hooks` and `ShardMetrics::hooks`.
+//! they keep in `Shared::hooks`, `ShardMetrics::hooks` and `ReaderState::hooks`.
 //!
 //! The rules:
 //! - Every hook is used by a committed test; delete one when its last test goes.
