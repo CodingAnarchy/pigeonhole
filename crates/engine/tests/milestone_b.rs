@@ -763,9 +763,21 @@ fn backup_releases_the_memtable_arena_before_its_long_merge() {
         db.clone()
             .after_backup_releases_memtables(Box::new(move || {
                 db.flush().unwrap();
-                // One small commit refreshes the arena counters.
-                write_rows(&db, &t, 5000..5001, Durability::Buffered);
-                *released.lock().unwrap() = Some(db.arena_free(0).0);
+                // The flushed memtable's chunks go back to the arena once the shard has
+                // retired it and no view lists it, which may be after `flush` returns, and
+                // the counters are refreshed by the next batch (#277). Commit one small row
+                // at a time until they show the release, or give up after 200 batches (the
+                // assertion below then reports the last reading).
+                let mut free = 0;
+                for i in 0..200 {
+                    write_rows(&db, &t, 5000 + i..5001 + i, Durability::Buffered);
+                    free = db.arena_free(0).0;
+                    if free > pinned_free + (400 << 10) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                *released.lock().unwrap() = Some(free);
             }));
     }
     db.backup(Path::new("/db/copy.phdb")).unwrap();
@@ -776,7 +788,8 @@ fn backup_releases_the_memtable_arena_before_its_long_merge() {
          memtables"
     );
     db.close().unwrap();
-    // The copy holds every row written before the backup, and none after.
+    // The copy holds every row written before the backup, and none of the rows the hook
+    // wrote after it.
     let copy = Engine::open(Path::new("/db/copy.phdb"), owned(Arc::clone(&vfs), 1)).unwrap();
     let ct = copy.table("t").unwrap();
     assert_eq!(row_count(&copy, &ct), 2000);
