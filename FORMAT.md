@@ -283,8 +283,9 @@ Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader 
 | 10 | `PutBlobFile` | `blob_file` u32, `family` u32, `count` u32, `count` x extent, `total_bytes` u64, `live_bytes` u64 |
 | 11 | `DropBlobFile` | `blob_file` u32 |
 | 12 | `Counters` | `next_table` u32, `next_family` u32, `next_tablet` u64, `next_sst` u64, `next_blob_file` u32, `seqno_ceiling` u64, `ts_floor` u64 |
+| 13 | `SstBlobRefs` | `sst` u64, `count` u32, `count` x (`blob_file` u32, `bytes` u64): the blob files the SST's puts point into, ascending, and the bytes (`16 + len` per pointer, §7) each references |
 
-Rules: family ids are unique across the database, so `(tablet, family)` names one tree. After a split both child tablets may reference the same SST; an SST's extent is retired when no tablet references it. A snapshot block contains `Counters`, every live table, family, tablet, SST, flushed seqno, blob file and stream checkpoint. The live extents at open are: the snapshot and log extents, every referenced SST extent, and every blob-file extent. `ts_floor` is at least every default timestamp assigned before the commit (decision D11).
+Rules: family ids are unique across the database, so `(tablet, family)` names one tree. After a split both child tablets may reference the same SST; an SST's extent is retired when no tablet references it. A snapshot block contains `Counters`, every live table, family, tablet, SST, flushed seqno, blob file, SST blob references and stream checkpoint. Every commit that adds a new SST (a flush, compaction, backup or shrink copy) adds its `SstBlobRefs`, with an empty list if it holds no pointer; an SST without one (written before tag 13 existed) may point into any blob file of its family. References of an SST no tablet references are dropped from the next snapshot. A build that does not know tag 13 skips it. The live extents at open are: the snapshot and log extents, every referenced SST extent, and every blob-file extent. `ts_floor` is at least every default timestamp assigned before the commit (decision D11).
 
 ## 10. WAL
 

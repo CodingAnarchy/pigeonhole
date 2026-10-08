@@ -76,6 +76,42 @@ pub fn encode_blob_stored(ptr: &BlobPointer) -> [u8; BLOB_STORED_LEN] {
     out
 }
 
+/// Counts the blob pointer of one SST entry into `refs` (kept sorted by blob file): a put
+/// whose stored value is a pointer adds [`record_bytes`] of its length to its file. Writers
+/// call it for every entry they add, so an SST's references (`Edit::SstBlobRefs`, #240)
+/// are exact.
+///
+/// ```
+/// use pigeonhole_compaction::{encode_blob_stored, note_blob_ref};
+/// use pigeonhole_format::BlobFileId;
+/// use pigeonhole_format::key::{Kind, encode_key};
+/// use pigeonhole_format::value::BlobPointer;
+///
+/// let mut key = Vec::new();
+/// encode_key(&mut key, b"r", b"q", 10, 1, Kind::Put).unwrap();
+/// let ptr = BlobPointer { blob_file: BlobFileId(3), len: 100, offset: 0 };
+/// let mut refs = Vec::new();
+/// note_blob_ref(&mut refs, &key, &encode_blob_stored(&ptr));
+/// note_blob_ref(&mut refs, &key, b"\x00inline");
+/// assert_eq!(refs, [(BlobFileId(3), 116)]);
+/// ```
+pub fn note_blob_ref(refs: &mut Vec<(BlobFileId, u64)>, key: &[u8], stored: &[u8]) {
+    if stored.first() != Some(&(ValueTag::Blob as u8)) {
+        return;
+    }
+    if !pigeonhole_format::key::split_suffix(key).is_ok_and(|(_, _, _, k)| k == Kind::Put) {
+        return;
+    }
+    let Some(ptr) = blob_pointer(stored) else {
+        return;
+    };
+    let bytes = record_bytes(ptr.len);
+    match refs.binary_search_by_key(&ptr.blob_file, |r| r.0) {
+        Ok(i) => refs[i].1 += bytes,
+        Err(i) => refs.insert(i, (ptr.blob_file, bytes)),
+    }
+}
+
 /// Bytes a value of `len` stored bytes takes in its blob file: the record header and the
 /// value (what `blob_live_delta` and `NewBlobFile::total_bytes` count, decision D80).
 pub fn record_bytes(len: u32) -> u64 {

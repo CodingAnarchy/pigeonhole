@@ -1884,7 +1884,7 @@ pub(crate) struct ShardState {
     /// failure is that caller's. A background compaction's failure is nobody's: it backs
     /// off (issue #141).
     compaction_full: bool,
-    /// Blob GC planning: which slots each candidate blob file was emptied from (issue #33).
+    /// Blob GC planning (issues #33, #240).
     blob_gc: compact::BlobGc,
     /// Every slot due for a compaction is backing off after a failure, so no compaction can
     /// relieve an L0 stall now (set by `maintain`; D119, issue #141).
@@ -2043,7 +2043,7 @@ impl ShardState {
             compaction: None,
             compact_all: VecDeque::new(),
             compaction_full: false,
-            blob_gc: compact::BlobGc::default(),
+            blob_gc: compact::BlobGc,
             due_backing_off: false,
             backoff_timer: None,
             slot_backoff: HashMap::new(),
@@ -5439,7 +5439,6 @@ impl ShardState {
             }
         };
         self.compaction = Some(key);
-        self.blob_gc.started(key, &work.task);
         ctx.spawn(Box::new(work));
         Ok(())
     }
@@ -5463,7 +5462,6 @@ impl ShardState {
         }
         let key = self.compaction.take();
         let full = std::mem::take(&mut self.compaction_full);
-        self.blob_gc.finished(result.is_ok());
         trace!(
             "shard {} compaction done: {:?} ({nanos} ns)",
             self.id.0,

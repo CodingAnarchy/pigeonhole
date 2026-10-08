@@ -92,6 +92,7 @@ pub(crate) fn load_root(
             "superblock names a manifest version without a snapshot".to_owned(),
         ));
     }
+    catalog.prune_blob_refs();
     Ok((catalog, live))
 }
 
@@ -783,6 +784,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);
+    catalog.prune_blob_refs();
     #[cfg(feature = "test-hooks")]
     let refused = shared.hooks.refuse_checkpoints.load(Ordering::Acquire)
         && edits

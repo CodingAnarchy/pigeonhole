@@ -10,11 +10,13 @@ use std::sync::atomic::Ordering;
 use std::task::Poll;
 
 use pigeonhole_cache::BlockCache;
-use pigeonhole_compaction::{BlobSink, NewBlobFile, encode_blob_stored, separates};
+use pigeonhole_compaction::{BlobSink, NewBlobFile, encode_blob_stored, note_blob_ref, separates};
 use pigeonhole_format::key::split_suffix;
 use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
-use pigeonhole_format::{Cursor, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId};
+use pigeonhole_format::{
+    BlobFileId, Cursor, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId,
+};
 use pigeonhole_io::FileRef;
 use pigeonhole_memtable::{MemIter, MemtableReader};
 use pigeonhole_pager::Pager;
@@ -76,6 +78,10 @@ pub(crate) struct SstSink {
     estimate: u64,
     open: Option<(SstWriter, ExtentRef)>,
     pub outputs: Vec<SstMeta>,
+    /// Each output's blob references (parallel to `outputs`; `Edit::SstBlobRefs`, #240).
+    pub refs: Vec<Vec<(BlobFileId, u64)>>,
+    /// The open SST's blob references.
+    open_refs: Vec<(BlobFileId, u64)>,
     sst_ids: Arc<std::sync::atomic::AtomicU64>,
     separation: Option<Separation>,
     /// Blob files finished by [`SstSink::finish_blobs`].
@@ -97,6 +103,8 @@ impl SstSink {
             estimate: estimate.clamp(64 << 10, MAX_EXTENT),
             open: None,
             outputs: Vec::new(),
+            refs: Vec::new(),
+            open_refs: Vec::new(),
             sst_ids,
             separation: None,
             blob_files: Vec::new(),
@@ -162,6 +170,7 @@ impl SstSink {
         }
         let (w, _) = self.open.as_mut().expect("opened above");
         w.add(key, value)?;
+        note_blob_ref(&mut self.open_refs, key, value);
         Ok(())
     }
 
@@ -170,6 +179,7 @@ impl SstSink {
         let Some((w, extent)) = self.open.take() else {
             return Ok(());
         };
+        let refs = std::mem::take(&mut self.open_refs);
         if w.entries() == 0 {
             self.pager.abandon(w.abandon());
             return Ok(());
@@ -179,6 +189,7 @@ impl SstSink {
                 // The estimate is the memtable's size; give back what the SST did not use.
                 meta.extent = self.pager.trim(meta.extent, meta.len);
                 self.outputs.push(meta);
+                self.refs.push(refs);
                 Ok(())
             }
             Err(e) => {
@@ -204,6 +215,30 @@ impl SstSink {
         for meta in self.outputs.drain(..) {
             self.pager.abandon(meta.extent);
         }
+        self.refs.clear();
+        self.open_refs.clear();
+    }
+
+    /// The `AddSst` and `SstBlobRefs` edits of the outputs (drained) for `(tablet, family)`
+    /// at `level`.
+    pub(crate) fn take_edits(
+        &mut self,
+        tablet: TabletId,
+        family: FamilyId,
+        level: u8,
+    ) -> Vec<Edit> {
+        let mut edits = Vec::new();
+        for (meta, refs) in self.outputs.drain(..).zip(self.refs.drain(..)) {
+            let sst = meta.id;
+            edits.push(Edit::AddSst {
+                tablet,
+                family,
+                level,
+                meta,
+            });
+            edits.push(Edit::SstBlobRefs { sst, refs });
+        }
+        edits
     }
 
     /// Opens readers for the outputs (so the manifest commit publishes them without I/O on
@@ -433,12 +468,16 @@ impl FlushTask {
                     live_bytes: f.total_bytes,
                 });
             }
-            for meta in &sink.outputs {
+            for (meta, refs) in sink.outputs.iter().zip(&sink.refs) {
                 edits.push(Edit::AddSst {
                     tablet: item.tablet,
                     family: item.family,
                     level: 0,
                     meta: meta.clone(),
+                });
+                edits.push(Edit::SstBlobRefs {
+                    sst: meta.id,
+                    refs: refs.clone(),
                 });
             }
             edits.push(Edit::SetFlushed {

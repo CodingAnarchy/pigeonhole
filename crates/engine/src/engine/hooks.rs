@@ -389,7 +389,8 @@ impl Engine {
     /// holds within its tablet's rows names a blob file of the catalog, of the same family,
     /// and each file's live bytes are exactly the bytes those pointers reference (16 plus
     /// the value's length each; an SST shared by several tablets counts once per tablet,
-    /// for its rows in that tablet). Describes the first mismatch.
+    /// for its rows in that tablet), and every SST's recorded blob references (#240) are
+    /// exactly the pointers it holds. Describes the first mismatch.
     #[doc(hidden)]
     pub fn check_blob_accounting(&self) -> std::result::Result<(), String> {
         use pigeonhole_compaction::{blob_pointer, record_bytes};
@@ -445,6 +446,34 @@ impl Engine {
                         }
                         it.next().map_err(|e| err(&e))?;
                     }
+                }
+            }
+        }
+        // Each SST's recorded references (#240) are exactly the pointers it holds.
+        let mut seen = std::collections::HashSet::new();
+        for fam in view.ssts.map.values() {
+            for sst in fam.iter() {
+                if !seen.insert(sst.meta.id) {
+                    continue;
+                }
+                let Some(recorded) = catalog.blob_refs.get(&sst.meta.id) else {
+                    continue;
+                };
+                let reader = sst
+                    .reader(&view.ssts, pigeonhole_cache::Priority::Low)
+                    .map_err(|e| err(&e))?;
+                let mut it = reader.iter(ScanFilter::all(), ReadOptions::default());
+                it.seek_to_first().map_err(|e| err(&e))?;
+                let mut actual = Vec::new();
+                while it.valid() {
+                    pigeonhole_compaction::note_blob_ref(&mut actual, it.key(), it.value());
+                    it.next().map_err(|e| err(&e))?;
+                }
+                if &actual != recorded {
+                    return Err(format!(
+                        "SST {} records blob references {recorded:?} but holds {actual:?}",
+                        sst.meta.id.0
+                    ));
                 }
             }
         }

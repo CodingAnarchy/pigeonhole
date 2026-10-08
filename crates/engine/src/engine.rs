@@ -1519,14 +1519,7 @@ fn spill_recovered(
                 sink.abandon();
                 return Err(e);
             }
-            for meta in sink.outputs.drain(..) {
-                spill.edits.push(Edit::AddSst {
-                    tablet,
-                    family,
-                    level: 0,
-                    meta,
-                });
-            }
+            spill.edits.extend(sink.take_edits(tablet, family, 0));
             let f = spill.flushed.entry((tablet, family)).or_insert(max_seqno);
             *f = (*f).max(max_seqno);
         }

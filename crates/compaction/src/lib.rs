@@ -34,7 +34,7 @@ use std::fmt;
 
 pub use blob::{
     BLOB_STORED_LEN, BlobFetch, BlobFileStat, BlobSink, blob_pointer, encode_blob_stored,
-    pick_blob_gc, record_bytes, separates,
+    note_blob_ref, pick_blob_gc, record_bytes, separates,
 };
 pub use cursor::{FilteredCursor, MergingCursor, VecCursor};
 pub use job::{

@@ -163,7 +163,7 @@ pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>, u
 const MIN_EDIT_BYTES: usize = 2;
 
 /// Tags this build decodes (FORMAT §9.3).
-const KNOWN_TAGS: std::ops::RangeInclusive<u8> = 1..=12;
+const KNOWN_TAGS: std::ops::RangeInclusive<u8> = 1..=13;
 
 /// Length of the edit at the front of `input`, whatever its tag.
 fn skip_edit(input: &[u8]) -> crate::Result<usize> {
@@ -461,6 +461,16 @@ pub enum Edit {
         /// Blob file.
         blob_file: BlobFileId,
     },
+    /// Tag 13. The blob files an SST's puts point into, with the bytes they reference in
+    /// each (`16 + len` per pointer, FORMAT §7). Written with every new SST (an empty list:
+    /// it points into none); an SST without one, written by an older build, may point into
+    /// any blob file of its family.
+    SstBlobRefs {
+        /// SST.
+        sst: SstId,
+        /// `(blob file, referenced bytes)`, by blob file id.
+        refs: Vec<(BlobFileId, u64)>,
+    },
     /// Tag 12. Id allocation counters and the seqno floor, so ids are never reused and the
     /// seqno counter restarts above anything persisted.
     Counters {
@@ -589,6 +599,15 @@ impl Edit {
                 b.extend_from_slice(&blob_file.0.to_le_bytes());
                 11
             }
+            Edit::SstBlobRefs { sst, refs } => {
+                b.extend_from_slice(&sst.0.to_le_bytes());
+                b.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+                for (blob_file, bytes) in refs {
+                    b.extend_from_slice(&blob_file.0.to_le_bytes());
+                    b.extend_from_slice(&bytes.to_le_bytes());
+                }
+                13
+            }
             Edit::Counters {
                 next_table,
                 next_family,
@@ -696,6 +715,20 @@ impl Edit {
             11 => Edit::DropBlobFile {
                 blob_file: BlobFileId(r.u32()?),
             },
+            13 => {
+                let sst = SstId(r.u64()?);
+                let count = r.u32()? as usize;
+                // Each reference is 12 bytes, which bounds the allocation.
+                if count > r.remaining() / 12 {
+                    return Err(Error::Truncated {
+                        what: "manifest edit",
+                    });
+                }
+                let refs = (0..count)
+                    .map(|_| Ok((BlobFileId(r.u32()?), r.u64()?)))
+                    .collect::<crate::Result<_>>()?;
+                Edit::SstBlobRefs { sst, refs }
+            }
             12 => Edit::Counters {
                 next_table: r.u32()?,
                 next_family: r.u32()?,

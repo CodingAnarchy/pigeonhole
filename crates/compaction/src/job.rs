@@ -15,7 +15,8 @@ use pigeonhole_sst::{
 };
 
 use crate::blob::{
-    BLOB_STORED_LEN, BlobSink, blob_pointer, encode_blob_stored, record_bytes, separates,
+    BLOB_STORED_LEN, BlobSink, blob_pointer, encode_blob_stored, note_blob_ref, record_bytes,
+    separates,
 };
 use crate::gc::{Gc, GcConfig, OutBuf};
 use crate::{CompactionTask, KeyRange, MergeOperator, MergingCursor, Result, TaskKind};
@@ -167,6 +168,10 @@ pub struct CompactionOutput {
     pub new_blob_files: Vec<NewBlobFile>,
     /// Change in live bytes per existing blob file (negative: values dropped).
     pub blob_live_delta: Vec<(BlobFileId, i64)>,
+    /// Per added SST, the blob files its puts point into and the bytes they reference
+    /// (`Edit::SstBlobRefs`, #240), sorted by blob file; an empty list for an SST with no
+    /// pointer. Every SST of `added` has an entry.
+    pub blob_refs: Vec<(SstId, Vec<(BlobFileId, u64)>)>,
     /// Blob files with no live bytes left, to drop (`DropBlobFile`) and retire. Always empty:
     /// a job does not know a file's live bytes (other tablets may reference it after a
     /// split), so the engine drops a file once its live count, updated from
@@ -246,6 +251,9 @@ struct Sink {
     written: u64,
     open: Option<Open>,
     outputs: Vec<SstMeta>,
+    /// The open SST's blob references, then each output's (parallel to `outputs`).
+    open_refs: Vec<(BlobFileId, u64)>,
+    output_refs: Vec<Vec<(BlobFileId, u64)>>,
     last_row: Vec<u8>,
     /// Separated values (created on first use).
     blobs: Option<BlobSink>,
@@ -336,6 +344,7 @@ impl Sink {
             unreachable!("opened above");
         };
         o.writer.add(key, value)?;
+        note_blob_ref(&mut self.open_refs, key, value);
         if row_start {
             self.last_row.clear();
             let n = row_prefix_len(key).unwrap_or(key.len());
@@ -386,6 +395,7 @@ impl Sink {
         let Some(o) = self.open.take() else {
             return Ok(());
         };
+        let refs = std::mem::take(&mut self.open_refs);
         if o.writer.entries() == 0 {
             self.pager.abandon(o.writer.abandon());
             return Ok(());
@@ -395,6 +405,7 @@ impl Sink {
                 meta.extent = self.pager.trim(meta.extent, meta.len);
                 self.written += meta.len;
                 self.outputs.push(meta);
+                self.output_refs.push(refs);
                 Ok(())
             }
             Err(e) => {
@@ -414,6 +425,8 @@ impl Sink {
         for meta in self.outputs.drain(..) {
             self.pager.abandon(meta.extent);
         }
+        self.output_refs.clear();
+        self.open_refs.clear();
     }
 }
 
@@ -569,6 +582,8 @@ impl CompactionJob {
                 written: 0,
                 open: None,
                 outputs: Vec::new(),
+                open_refs: Vec::new(),
+                output_refs: Vec::new(),
                 last_row: Vec::new(),
                 blobs: None,
                 blob_ids: context.blob_ids,
@@ -680,7 +695,15 @@ impl CompactionJob {
             }
         }
         let level = self.task.output_level;
+        let blob_refs = self
+            .sink
+            .outputs
+            .iter()
+            .map(|m| m.id)
+            .zip(self.sink.output_refs.drain(..))
+            .collect();
         Ok(CompactionOutput {
+            blob_refs,
             added: self.sink.outputs.drain(..).map(|m| (level, m)).collect(),
             removed: self
                 .task

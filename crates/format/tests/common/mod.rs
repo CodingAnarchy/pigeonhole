@@ -306,6 +306,12 @@ pub fn edit() -> impl Strategy<Value = Edit> {
         any::<u32>().prop_map(|b| Edit::DropBlobFile {
             blob_file: BlobFileId(b)
         }),
+        (any::<u64>(), vec((any::<u32>(), any::<u64>()), 0..5)).prop_map(|(s, refs)| {
+            Edit::SstBlobRefs {
+                sst: SstId(s),
+                refs: refs.into_iter().map(|(b, n)| (BlobFileId(b), n)).collect(),
+            }
+        }),
         (
             any::<u32>(),
             any::<u32>(),
