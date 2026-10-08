@@ -2392,13 +2392,29 @@ impl ShardState {
                 retired.push(slot.active.table.retire());
             }
         }
+        self.publish_retired(retired)
+    }
+
+    /// Publishes a view without memtables just removed from the slots, then hands their
+    /// chunks to `retired` until no reader can still see them. They are kept even when the
+    /// publish fails (the shard is then poisoned, and the still-current view names them
+    /// until reopen): dropping the tokens would leak the chunks for the rest of the run
+    /// (review 5-6 5.8, #148).
+    fn publish_retired(&mut self, retired: Vec<Retired>) -> Result<()> {
         self.view_dirty = true;
-        self.publish_memtables()?;
-        let version = self.shared.view.load().version;
+        let published = self.publish_memtables();
+        let current = self.shared.view.load().version;
+        // A failed publish leaves the old view current: the chunks free once readers move
+        // past it, to the version that would have dropped them.
+        let version = if published.is_ok() {
+            current
+        } else {
+            current + 1
+        };
         self.retired
             .extend(retired.into_iter().map(|r| (version, r)));
         self.reclaim_retired();
-        Ok(())
+        published
     }
 
     /// Forces the arena to account for retired memtables whose last in-process handle has
@@ -2973,6 +2989,12 @@ impl ShardState {
         self.flushed.retain(|k, _| !tablets.contains(&k.0));
         self.flush_queue.retain(|i| !tablets.contains(&i.tablet));
         self.dropped.extend(tablets.iter().copied());
+        // The balancer's samples and arrival passes of the dropped tablets go too (review
+        // 5-6 6.4, #148): nothing else removes them.
+        for t in tablets {
+            self.loads.remove(t);
+            self.arrived.remove(t);
+        }
         if keys.is_empty() {
             return Ok(());
         }
@@ -2982,13 +3004,7 @@ impl ShardState {
             retired.push(slot.active.table.retire());
             retired.extend(slot.frozen.into_iter().map(|m| m.table.retire()));
         }
-        self.view_dirty = true;
-        self.publish_memtables()?;
-        let version = self.shared.view.load().version;
-        self.retired
-            .extend(retired.into_iter().map(|r| (version, r)));
-        self.reclaim_retired();
-        Ok(())
+        self.publish_retired(retired)
     }
 
     fn refresh_tablets(&mut self) {
@@ -4784,10 +4800,13 @@ impl ShardState {
                 LoggedKind::Single { .. } => {}
             }
         }
-        if self.log.is_empty()
-            && let Some(end) = self.last_end
-        {
-            self.checkpoint_candidate = self.checkpoint_candidate.max(end);
+        if self.log.is_empty() {
+            // No record left names a dropped tablet (a table created again gets new ones):
+            // `dropped` has nothing more to answer (review 5-6 6.4, #148).
+            self.dropped.clear();
+            if let Some(end) = self.last_end {
+                self.checkpoint_candidate = self.checkpoint_candidate.max(end);
+            }
         }
         // Never name bytes the kernel has not seen (a `None` record still in the buffer).
         if let Some(wal) = self.wal.as_ref() {
