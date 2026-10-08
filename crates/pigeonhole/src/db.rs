@@ -348,7 +348,8 @@ impl Pigeonhole {
     /// continue. The copy holds exactly the commits visible when this is called and opens
     /// on its own, without WAL replay or sidecar files. Fails with
     /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) for a database whose
-    /// families store blob files (Phase 2; values stay inline today).
+    /// families store blob files (values above a family's `blob_threshold`;
+    /// [#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)).
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole};

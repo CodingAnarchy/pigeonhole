@@ -12,13 +12,17 @@
 //!
 //! Scheduling is not here: the engine decides when, the runtime decides where.
 //!
-//! **Scope.** Leveled, tiered and FIFO-by-time picking, no
-//! value separation into blob files and no blob GC (the output types carry them for
-//! Phase 2), and merge operands are combined only within one `(column, timestamp)`.
+//! - [`BlobSink`], [`BlobFetch`] and [`pick_blob_gc`] are blob separation and blob GC
+//!   (FORMAT §7): values above a family's `blob_threshold` move to blob files at the
+//!   compaction output, and blob files that are mostly garbage are emptied by rewriting.
+//!
+//! **Scope.** Leveled, tiered and FIFO-by-time picking, and merge operands are combined
+//! only within one `(column, timestamp)`.
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod blob;
 mod cursor;
 mod gc;
 mod job;
@@ -28,6 +32,10 @@ mod resolver;
 
 use std::fmt;
 
+pub use blob::{
+    BLOB_STORED_LEN, BlobFetch, BlobFileStat, BlobSink, blob_pointer, encode_blob_stored,
+    pick_blob_gc, record_bytes, separates,
+};
 pub use cursor::{FilteredCursor, MergingCursor, VecCursor};
 pub use job::{CompactionJob, CompactionOutput, GcPolicy, JobContext, JobPoll, NewBlobFile};
 pub use merge::{I64Add, MergeError, MergeOperator, MergeRegistry};

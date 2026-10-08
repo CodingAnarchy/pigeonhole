@@ -89,10 +89,19 @@ fn public_family(f: &ModelFamily) -> Family {
         "ttl" => Compaction::FifoByTime,
         _ => Compaction::Leveled,
     };
+    // Small blob thresholds (values are up to 160 bytes), so flushes and compactions
+    // separate many values and blob GC runs.
+    let blob_threshold = match f.name.as_str() {
+        "f" => 40,
+        "g" => 100,
+        "ttl" => 60,
+        _ => 4096,
+    };
     let family = Family::default()
         .max_versions(f.max_versions)
         .ttl(Duration::from_micros(f.ttl_micros))
-        .compaction(compaction);
+        .compaction(compaction)
+        .blob_threshold(blob_threshold);
     // `f` stores its blocks with zstd (#44).
     let family = if f.name == "f" {
         family.zstd(3)

@@ -2,17 +2,20 @@
 //! commit, narrowing picker tasks to the tablet (decision D79), the GC policy (decision
 //! D70), and the cooperative task that runs a `CompactionJob` and commits its output.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::task::Poll;
 
 use pigeonhole_compaction::{
-    CompactionJob, CompactionOutput, CompactionTask, GcPolicy, JobContext, JobPoll, KeyRange,
-    Levels, TaskKind,
+    BlobFileStat, CompactionJob, CompactionOutput, CompactionTask, GcPolicy, JobContext, JobPoll,
+    KeyRange, Levels, NewBlobFile, TaskKind, pick_blob_gc,
 };
 use pigeonhole_format::key::encode_row_prefix;
 use pigeonhole_format::manifest::{Edit, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
-use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId, Timestamp};
+use pigeonhole_format::{
+    BlobFileId, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId, Timestamp,
+};
 use pigeonhole_runtime::{ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
 use pigeonhole_sst::SstReader;
 
@@ -176,6 +179,144 @@ pub(crate) fn plan_full(
     })
 }
 
+/// A slot: one `(tablet, family)` tree.
+type Slot = (TabletId, FamilyId);
+
+/// One shard's blob GC planning (issue #33).
+///
+/// A blob file is emptied by rewriting every slot whose SSTs may point into it: a
+/// `BlobGc` task over all of the slot's SSTs copies the values still live in the file into
+/// new ones, and the file is dropped once its live count reaches zero (`blob_edits`). The
+/// manifest does not record which SSTs point into which file, so each candidate file is
+/// rewritten out of every slot of its family once. After a slot's blob GC commits it holds
+/// no pointer into the file (its rows' values were copied, and nothing it compacts later
+/// can bring one back), so the slot is not picked for that file again. The record is
+/// in memory only: after a reopen, or for a tablet that a merge created or a move brought
+/// here, a slot may be rewritten once more for nothing.
+#[derive(Debug, Default)]
+pub(crate) struct BlobGc {
+    done: HashMap<BlobFileId, HashSet<Slot>>,
+    running: Option<(Slot, Vec<BlobFileId>)>,
+}
+
+impl BlobGc {
+    /// The next blob GC task among `slots` (oldest candidate file first), or `None`.
+    /// Candidates are files at least half garbage with at least `min_garbage` garbage
+    /// bytes (`pick_blob_gc`). Slots with no SSTs need no rewrite and are marked done.
+    pub(crate) fn plan(
+        &mut self,
+        view: &View,
+        slots: &[Slot],
+        last_level: u8,
+        busy: &[SstId],
+        min_garbage: u64,
+    ) -> Option<(Slot, CompactionTask)> {
+        let catalog = &view.catalog;
+        self.done
+            .retain(|id, _| catalog.blob_files.contains_key(id));
+        let mut candidates: HashMap<FamilyId, Vec<BlobFileId>> = HashMap::new();
+        for (id, b) in &catalog.blob_files {
+            let stat = BlobFileStat {
+                id: *id,
+                total_bytes: b.total_bytes,
+                live_bytes: b.live_bytes,
+            };
+            if !pick_blob_gc(&[stat], min_garbage).is_empty() {
+                candidates.entry(b.family).or_default().push(*id);
+            }
+        }
+        for &slot in slots {
+            let Some(files) = candidates.get(&slot.1) else {
+                continue;
+            };
+            let pending: Vec<BlobFileId> = files
+                .iter()
+                .copied()
+                .filter(|id| !self.done.get(id).is_some_and(|d| d.contains(&slot)))
+                .collect();
+            if pending.is_empty() {
+                continue;
+            }
+            let inputs: Vec<(u8, Vec<SstId>)> = view
+                .ssts
+                .family(slot.0, slot.1)
+                .map(|fam| {
+                    fam.levels
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| !l.is_empty())
+                        .map(|(n, l)| (n as u8, l.iter().map(|s| s.meta.id).collect()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if inputs.is_empty() {
+                self.mark_done(slot, &pending);
+                continue;
+            }
+            if inputs
+                .iter()
+                .flat_map(|(_, ids)| ids)
+                .any(|id| busy.contains(id))
+            {
+                continue;
+            }
+            let task = CompactionTask {
+                tablet: slot.0,
+                family: slot.1,
+                range: KeyRange::all(),
+                subranges: vec![KeyRange::all()],
+                inputs,
+                output_level: last_level,
+                kind: TaskKind::BlobGc {
+                    blob_files: pending,
+                },
+            };
+            return Some((slot, task));
+        }
+        None
+    }
+
+    /// Turns a full compaction's rewrite of `slot` into a blob GC of every file of the family
+    /// with any garbage (the inputs are rewritten anyway; `Engine::compact` reclaims all it
+    /// can).
+    pub(crate) fn full(&self, catalog: &Catalog, task: &mut CompactionTask) {
+        if task.kind != TaskKind::Rewrite {
+            return;
+        }
+        let files: Vec<BlobFileId> = catalog
+            .blob_files
+            .iter()
+            .filter(|(_, b)| b.family == task.family && b.live_bytes < b.total_bytes)
+            .map(|(id, _)| *id)
+            .collect();
+        if !files.is_empty() {
+            task.kind = TaskKind::BlobGc { blob_files: files };
+        }
+    }
+
+    /// A blob GC task started for `slot`.
+    pub(crate) fn started(&mut self, slot: Slot, task: &CompactionTask) {
+        if let TaskKind::BlobGc { blob_files } = &task.kind {
+            self.running = Some((slot, blob_files.clone()));
+        }
+    }
+
+    /// The running compaction finished; a blob GC that committed marks its slot done.
+    pub(crate) fn finished(&mut self, committed: bool) {
+        if let Some((slot, files)) = self.running.take()
+            && committed
+        {
+            self.mark_done(slot, &files);
+        }
+    }
+
+    fn mark_done(&mut self, slot: Slot, files: &[BlobFileId]) {
+        for id in files {
+            self.done.entry(*id).or_default().insert(slot);
+        }
+    }
+}
+
 /// The GC policy of `task` over `fam` (decision D70): every live snapshot of this process
 /// plus the oldest reader pin's seqno (a reader's snapshots pin its own view, so the
 /// oldest pin bounds everything a reader can still read), whether the output is bottommost,
@@ -290,7 +431,7 @@ impl CompactionWork {
         record: Option<CompactionRecord>,
     ) -> Result<Self> {
         let started = shared.vfs.monotonic_nanos();
-        let job = if task.kind == TaskKind::Rewrite {
+        let job = if matches!(task.kind, TaskKind::Rewrite | TaskKind::BlobGc { .. }) {
             let priority = SstSet::priority(meta.options.cache_priority);
             let mut inputs: Vec<Arc<SstReader>> = Vec::new();
             for (_, ids) in &task.inputs {
@@ -311,6 +452,14 @@ impl CompactionWork {
                 gc,
             );
             ctx.merge = meta.merge_op.clone();
+            if let TaskKind::BlobGc { blob_files } = &task.kind {
+                for id in blob_files {
+                    let reader = view.ssts.blob_reader(*id).ok_or_else(|| {
+                        Error::Corruption(format!("blob GC input {} is gone", id.0))
+                    })?;
+                    ctx.blob_files.push((*id, reader));
+                }
+            }
             ctx.target_sst_bytes = shared.picker.target_sst_bytes;
             ctx.clock = Some(Arc::clone(&shared.vfs));
             Some(CompactionJob::new(task.clone(), inputs, ctx))
@@ -357,13 +506,20 @@ impl CompactionWork {
         self.stage = Stage::Done;
     }
 
-    /// The manifest edits of an output (a job's, or a move or drop computed here).
-    fn edits(&self, fam_catalog: &Catalog, output: Option<CompactionOutput>) -> Result<Outputs> {
+    /// The manifest edits of an output (a job's, or a move or drop computed here), and its
+    /// blob file changes, which [`blob_edits`] turns into edits against the catalog at
+    /// commit time.
+    fn edits(
+        &self,
+        fam_catalog: &Catalog,
+        output: Option<CompactionOutput>,
+    ) -> Result<(Outputs, BlobChanges)> {
         let (tablet, family) = (self.task.tablet, self.task.family);
         let mut edits = Vec::new();
         let mut readers = Vec::new();
+        let mut blobs = BlobChanges::default();
         match (self.task.kind.clone(), output) {
-            (TaskKind::Rewrite, Some(out)) => {
+            (TaskKind::Rewrite | TaskKind::BlobGc { .. }, Some(out)) => {
                 let priority = SstSet::priority(self.meta.options.cache_priority);
                 for (level, meta) in out.added {
                     readers.push((
@@ -389,17 +545,11 @@ impl CompactionWork {
                         sst,
                     });
                 }
-                for (blob_file, delta) in out.blob_live_delta {
-                    if let Some(b) = fam_catalog.blob_files.get(&blob_file) {
-                        edits.push(Edit::PutBlobFile {
-                            blob_file,
-                            family: b.family,
-                            extents: b.extents.clone(),
-                            total_bytes: b.total_bytes,
-                            live_bytes: b.live_bytes.saturating_add_signed(delta),
-                        });
-                    }
-                }
+                blobs = BlobChanges {
+                    family,
+                    new: out.new_blob_files,
+                    delta: out.blob_live_delta,
+                };
             }
             (TaskKind::TrivialMove, _) => {
                 for (_, ids) in &self.task.inputs {
@@ -432,9 +582,9 @@ impl CompactionWork {
                     }
                 }
             }
-            (TaskKind::Rewrite, None) | (TaskKind::BlobGc { .. }, _) => {}
+            (TaskKind::Rewrite | TaskKind::BlobGc { .. }, None) => {}
         }
-        Ok((edits, readers))
+        Ok(((edits, readers), blobs))
     }
 
     fn submit(
@@ -453,7 +603,7 @@ impl CompactionWork {
         // What this job wrote, freed if the edits cannot be built (an output SST that fails
         // to open): nothing else ever names it (5-6 5.4).
         let written: Vec<ExtentRef> = output.iter().flat_map(written_extents).collect();
-        let (edits, readers) = match self.edits(&catalog, output) {
+        let ((edits, readers), blobs) = match self.edits(&catalog, output) {
             Ok(e) => e,
             Err(e) => {
                 for x in written {
@@ -463,8 +613,19 @@ impl CompactionWork {
             }
         };
         let (tx, rx) = completion();
+        // Blob live counts change against the catalog at commit time: other compactions of
+        // the family (other tablets after a split share its blob files) commit meanwhile.
+        let kind = if blobs.is_empty() {
+            manifest::ReqKind::Edits(edits)
+        } else {
+            manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
+                let mut edits = edits;
+                edits.extend(blob_edits(catalog, blobs));
+                Ok(edits)
+            }))
+        };
         let req = ManifestReq {
-            kind: manifest::ReqKind::Edits(edits),
+            kind,
             readers,
             flushed_roots: Vec::new(),
             compaction: self.record.take(),
@@ -475,6 +636,62 @@ impl CompactionWork {
         manifest::submit(&self.shared, self.shard, req);
         Ok(rx)
     }
+}
+
+/// A compaction's blob file changes: the files it wrote and the live-byte change of older
+/// ones.
+#[derive(Debug, Default)]
+pub(crate) struct BlobChanges {
+    pub family: FamilyId,
+    pub new: Vec<NewBlobFile>,
+    pub delta: Vec<(BlobFileId, i64)>,
+}
+
+impl BlobChanges {
+    fn is_empty(&self) -> bool {
+        self.new.is_empty() && self.delta.is_empty()
+    }
+}
+
+/// The edits of `changes` against `catalog` (the one the commit applies to): a
+/// `PutBlobFile` for each new file (all live), and for each older file the catalog still
+/// names its new live count, or a `DropBlobFile` once nothing references it. A file the
+/// catalog no longer names (its table was dropped) is left alone.
+pub(crate) fn blob_edits(catalog: &Catalog, changes: BlobChanges) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    for f in changes.new {
+        edits.push(Edit::PutBlobFile {
+            blob_file: f.id,
+            family: changes.family,
+            extents: f.extents,
+            total_bytes: f.total_bytes,
+            live_bytes: f.total_bytes,
+        });
+    }
+    for (blob_file, delta) in changes.delta {
+        let Some(b) = catalog.blob_files.get(&blob_file) else {
+            continue;
+        };
+        debug_assert!(
+            delta >= 0 || b.live_bytes >= delta.unsigned_abs(),
+            "blob file {} would go below zero live bytes ({} {delta})",
+            blob_file.0,
+            b.live_bytes
+        );
+        let live_bytes = b.live_bytes.saturating_add_signed(delta);
+        if live_bytes == 0 {
+            edits.push(Edit::DropBlobFile { blob_file });
+        } else {
+            edits.push(Edit::PutBlobFile {
+                blob_file,
+                family: b.family,
+                extents: b.extents.clone(),
+                total_bytes: b.total_bytes,
+                live_bytes,
+            });
+        }
+    }
+    edits
 }
 
 /// Every extent a compaction's output occupies: its SSTs and its new blob files.

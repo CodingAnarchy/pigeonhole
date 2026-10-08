@@ -6,17 +6,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use pigeonhole_cache::{BlockCache, Priority};
-use pigeonhole_compaction::Levels;
+use pigeonhole_cache::{BlockCache, Cell, Priority};
+use pigeonhole_compaction::{Levels, blob_pointer};
 use pigeonhole_format::key::row_prefix_len;
 use pigeonhole_format::manifest::{CachePriority, SstMeta};
 use pigeonhole_format::shm::{ViewMemtable, ViewRecord, ViewTablet};
-use pigeonhole_format::{FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId};
+use pigeonhole_format::superblock::ExtentRef;
+use pigeonhole_format::value::BlobPointer;
+use pigeonhole_format::{BlobFileId, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId};
 use pigeonhole_io::FileRef;
 use pigeonhole_memtable::MemtableReader;
 use pigeonhole_runtime::ShardId;
 use pigeonhole_shm::ShmRegion;
-use pigeonhole_sst::SstReader;
+use pigeonhole_sst::{BlobReader, SstReader};
 
 use crate::catalog::Catalog;
 use crate::{Error, Result};
@@ -237,6 +239,38 @@ impl OpenSst {
     }
 }
 
+/// A blob file the manifest names, with its reader opened on first use. A file's extents
+/// never change once it is published, so versions share it by id.
+pub(crate) struct OpenBlob {
+    id: BlobFileId,
+    extents: Vec<ExtentRef>,
+    reader: OnceLock<Arc<BlobReader>>,
+}
+
+impl std::fmt::Debug for OpenBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenBlob")
+            .field("id", &self.id)
+            .field("open", &self.reader.get().is_some())
+            .finish()
+    }
+}
+
+impl OpenBlob {
+    /// The reader, opened through `set` if this is its first use (no I/O: extent headers are
+    /// verified by the first read that touches them).
+    pub(crate) fn reader(&self, set: &SstSet) -> Arc<BlobReader> {
+        Arc::clone(self.reader.get_or_init(|| {
+            Arc::new(BlobReader::new(
+                set.file.clone(),
+                self.id,
+                self.extents.clone(),
+                Arc::clone(&set.cache),
+            ))
+        }))
+    }
+}
+
 /// The row prefix of an internal key (the whole key if it has none).
 pub(crate) fn row_of(key: &[u8]) -> &[u8] {
     &key[..row_prefix_len(key).unwrap_or(key.len())]
@@ -285,6 +319,8 @@ pub(crate) struct SstSet {
     pub cache: Arc<BlockCache>,
     pub map: HashMap<(TabletId, FamilyId), Arc<FamilySsts>>,
     by_id: HashMap<SstId, Arc<OpenSst>>,
+    /// The blob files of this manifest version.
+    blobs: HashMap<BlobFileId, Arc<OpenBlob>>,
 }
 
 impl std::fmt::Debug for SstSet {
@@ -292,6 +328,7 @@ impl std::fmt::Debug for SstSet {
         f.debug_struct("SstSet")
             .field("families", &self.map.len())
             .field("ssts", &self.by_id.len())
+            .field("blob_files", &self.blobs.len())
             .finish()
     }
 }
@@ -304,6 +341,7 @@ impl SstSet {
             cache,
             map: HashMap::new(),
             by_id: HashMap::new(),
+            blobs: HashMap::new(),
         }
     }
 
@@ -353,12 +391,60 @@ impl SstSet {
             }
             map.insert(*key, Arc::new(FamilySsts { levels }));
         }
+        let blobs = catalog
+            .blob_files
+            .iter()
+            .map(|(id, b)| {
+                let open = prev
+                    .and_then(|p| p.blobs.get(id))
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| {
+                        Arc::new(OpenBlob {
+                            id: *id,
+                            extents: b.extents.clone(),
+                            reader: OnceLock::new(),
+                        })
+                    });
+                (*id, open)
+            })
+            .collect();
         Self {
             file,
             cache,
             map,
             by_id,
+            blobs,
         }
+    }
+
+    /// The reader of blob file `id`, if this version names it.
+    pub(crate) fn blob_reader(&self, id: BlobFileId) -> Option<Arc<BlobReader>> {
+        self.blobs.get(&id).map(|b| b.reader(self))
+    }
+
+    /// The stored value a separated value names, or `None` if `stored` is not a blob pointer.
+    /// A pointer into a blob file this version does not name is corruption.
+    pub(crate) fn read_blob(&self, stored: &[u8]) -> Result<Option<Cell>> {
+        match blob_pointer(stored) {
+            Some(ptr) => self.read_pointer(&ptr).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The stored value `ptr` names.
+    pub(crate) fn read_pointer(&self, ptr: &BlobPointer) -> Result<Cell> {
+        let reader = self.blob_reader(ptr.blob_file).ok_or_else(|| {
+            Error::Corruption(format!(
+                "a blob pointer names blob file {}, which the manifest does not list",
+                ptr.blob_file.0
+            ))
+        })?;
+        Ok(reader.read(ptr)?)
+    }
+
+    /// Whether this version names any blob file.
+    pub(crate) fn has_blobs(&self) -> bool {
+        !self.blobs.is_empty()
     }
 
     pub(crate) fn family(&self, tablet: TabletId, family: FamilyId) -> Option<&Arc<FamilySsts>> {

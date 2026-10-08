@@ -26,7 +26,7 @@ Families are declared when a table is created (adding one later is cheap). Each 
 | `max_versions(n)` | Keep at most *n* versions per column (0 keeps all). |
 | `ttl(d)` | Cells whose timestamp is older than *d* expire. |
 | `bloom_bits(b)` | Bloom filter bits per key, to skip files on misses. |
-| `blob_threshold(bytes)` | Values larger than this are stored separately and never rewritten by compaction *(Phase 2)*. |
+| `blob_threshold(bytes)` | Values larger than this (default 4096) move to blob files when they are flushed; the family's tree keeps a 16-byte pointer, so compaction and scans of other columns do not copy them. |
 | compression | LZ4 by default; `uncompressed()`; `zstd(level)`. |
 | cache priority | How long the family's blocks stay cached. |
 

@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use common::*;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::{
-    CompactionJob, CompactionOutput, CompactionPicker, CompactionTask, GcPolicy, I64Add,
-    JobContext, JobPoll, KeyRange, Levels, PickerOptions, TaskKind,
+    BlobFetch, CompactionJob, CompactionOutput, CompactionPicker, CompactionTask, GcPolicy, I64Add,
+    JobContext, JobPoll, KeyRange, Levels, PickerOptions, ResolveOptions, TaskKind, ValuePredicate,
+    blob_pointer, record_bytes, separates,
 };
 use pigeonhole_format::key::{Kind, encode_key, encode_marker_key, split_suffix};
 use pigeonhole_format::manifest::{CompactionStyle, FamilyOptions, SstMeta};
@@ -35,6 +36,8 @@ struct Db {
     /// Output SST ids: shared by every job, as the engine's counter is (the block cache is
     /// keyed by SST id).
     sst_ids: Arc<AtomicU64>,
+    /// Blob file ids, likewise shared.
+    blob_ids: Arc<AtomicU32>,
 }
 
 impl Db {
@@ -48,6 +51,7 @@ impl Db {
             cache: Arc::new(BlockCache::new(4 << 20, 2)),
             next_id: 1,
             sst_ids: Arc::new(AtomicU64::new(1000)),
+            blob_ids: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -69,7 +73,7 @@ impl Db {
             self.pager.clone(),
             self.cache.clone(),
             self.sst_ids.clone(),
-            Arc::new(AtomicU32::new(1)),
+            self.blob_ids.clone(),
             gc,
         );
         ctx.merge = Some(Arc::new(I64Add));
@@ -117,7 +121,9 @@ fn check_compaction(seed: u64, commits: usize, choose: Choose) {
     let mut h = random_history(seed, common::commits(commits));
     let mut rng = Rng::new(seed ^ 0xc0c0);
     let mut db = Db::new(seed);
-    let family = family_options(&h);
+    let mut family = family_options(&h);
+    // Separate nothing, the 5000-byte values, or every bytes value longer than two bytes.
+    family.blob_threshold = [u32::MAX, 4096, 2][(seed % 3) as usize];
     let max = h.model.snapshot();
 
     // Cut the history into seqno batches: the oldest goes to L2, the next to L1, the rest
@@ -239,6 +245,10 @@ fn check_compaction(seed: u64, commits: usize, choose: Choose) {
     run_sliced(&db, &mut job);
     let read = job.entries_read();
     let out = job.finish().unwrap();
+    check_blob_accounting(&db, &out, family.blob_threshold);
+    let mut blobs = Blobs::default();
+    blobs.add(&db.pager, &db.cache, &out.new_blob_files);
+    let blobs = Arc::new(blobs);
     let input_entries: usize = from
         .iter()
         .flat_map(|&l| &levels[l])
@@ -279,8 +289,9 @@ fn check_compaction(seed: u64, commits: usize, choose: Choose) {
             let expected = model_reads(&h, s, now);
             let b = resolver_reads(&h, s, now, |o| sst_resolver(&before, o));
             assert_same(&format!("before, {what}"), &expected, &b);
-            let a = resolver_reads(&h, s, now, |o| sst_resolver(&after, o));
+            let a = resolver_reads(&h, s, now, |o| blob_sst_resolver(&after, &blobs, o));
             assert_same(&format!("after, {what}"), &expected, &a);
+            check_blob_predicates(&h, &after, &blobs, s, now, &what);
         }
     }
 
@@ -292,7 +303,7 @@ fn check_compaction(seed: u64, commits: usize, choose: Choose) {
     for &s in &points {
         let what = format!("seed {seed}: choice {choice}, purged model, read at {s}/{gc_now}");
         let expected = model_reads(&h, s, gc_now);
-        let a = resolver_reads(&h, s, gc_now, |o| sst_resolver(&after, o));
+        let a = resolver_reads(&h, s, gc_now, |o| blob_sst_resolver(&after, &blobs, o));
         assert_same(&what, &expected, &a);
     }
 
@@ -309,8 +320,91 @@ fn check_compaction(seed: u64, commits: usize, choose: Choose) {
     for s in old_points.iter().copied().chain([max, h.model.snapshot()]) {
         let what = format!("seed {seed}: choice {choice}, later writes, read at {s}/{now}");
         let expected = model_reads(&h, s, now);
-        let a = resolver_reads(&h, s, now, |o| sst_resolver(&after, o));
+        let a = resolver_reads(&h, s, now, |o| blob_sst_resolver(&after, &blobs, o));
         assert_same(&what, &expected, &a);
+    }
+}
+
+/// Every separated value is above the threshold, every value above it is separated, and
+/// each new blob file's bytes are exactly what the outputs reference.
+fn check_blob_accounting(db: &Db, out: &CompactionOutput, threshold: u32) {
+    let mut refs: std::collections::HashMap<_, u64> = Default::default();
+    for (_, meta) in &out.added {
+        for (k, v) in sst_entries(&open_sst(&db.pager, &db.cache, meta)) {
+            let (_, _, _, kind) = split_suffix(&k).unwrap();
+            match blob_pointer(&v) {
+                Some(p) => *refs.entry(p.blob_file).or_default() += record_bytes(p.len),
+                None => assert!(
+                    !separates(kind, &v, threshold),
+                    "an inline value above {threshold}"
+                ),
+            }
+        }
+    }
+    for f in &out.new_blob_files {
+        assert_eq!(
+            refs.remove(&f.id),
+            Some(f.total_bytes),
+            "blob file {:?}",
+            f.id
+        );
+    }
+    assert!(refs.is_empty(), "pointers into unknown files: {refs:?}");
+    assert!(out.dropped_blob_files.is_empty());
+}
+
+/// A value predicate through `ResolveOptions::blobs` over raw pointers matches what it
+/// matches over the values themselves.
+fn check_blob_predicates(
+    h: &History,
+    ssts: &[Arc<SstReader>],
+    blobs: &Arc<Blobs>,
+    snapshot: Seqno,
+    now: Timestamp,
+    what: &str,
+) {
+    for pred in [
+        ValuePredicate::Prefix(b"L".to_vec()),
+        ValuePredicate::Range(Bound::Included(vec![0x40]), Bound::Unbounded),
+        ValuePredicate::Equals(b"abc".to_vec()),
+    ] {
+        let opts = |blobs: Option<Arc<dyn BlobFetch>>| {
+            let mut o: ResolveOptions = options(h, snapshot, now, 0);
+            o.value = Some(pred.clone());
+            o.blobs = blobs;
+            o
+        };
+        let want = drain_resolved(&mut blob_sst_resolver(ssts, blobs, opts(None)), blobs, what);
+        let fetch: Arc<dyn BlobFetch> = blobs.clone();
+        let got = drain_resolved(&mut sst_resolver(ssts, opts(Some(fetch))), blobs, what);
+        assert_eq!(
+            got, want,
+            "{what}: predicate {pred:?} through the blob hook"
+        );
+    }
+}
+
+/// Every cell of a scan, pointers read through `blobs`; empty on a merge failure.
+fn drain_resolved<C: pigeonhole_format::Cursor<Error = pigeonhole_compaction::Error>>(
+    r: &mut pigeonhole_compaction::CellResolver<C>,
+    blobs: &Blobs,
+    what: &str,
+) -> Vec<(Vec<u8>, Timestamp, Vec<u8>)> {
+    r.seek(b"").unwrap();
+    let mut out = Vec::new();
+    loop {
+        match r.next_cell() {
+            Ok(Some(c)) => {
+                let v = match blob_pointer(c.value) {
+                    Some(p) => blobs.read(&p).to_vec(),
+                    None => c.value.to_vec(),
+                };
+                out.push((c.key.to_vec(), c.ts, v));
+            }
+            Ok(None) => return out,
+            Err(pigeonhole_compaction::Error::Merge(_)) => return Vec::new(),
+            Err(e) => panic!("{what}: {e}"),
+        }
     }
 }
 
@@ -1217,4 +1311,166 @@ fn purges_match_the_model_purge_hook() {
         vec![],
         &[(vec![del_cell(20)], 30)],
     );
+}
+
+/// Blob separation then blob GC over random histories: reads stay those of the model at
+/// every live snapshot, the GC'd files end with no pointer into them, and their live
+/// bytes (total plus every delta) reach exactly zero.
+/// Returns the number of blob files emptied.
+fn check_blob_gc(seed: u64, commits: usize) -> usize {
+    let mut h = random_history(seed, common::commits(commits));
+    let mut rng = Rng::new(seed ^ 0xb10b);
+    let mut db = Db::new(seed);
+    let mut family = family_options(&h);
+    family.blob_threshold = 2;
+    let max = h.model.snapshot();
+    let mut entries: Vec<KeyValue> = h
+        .entries
+        .iter()
+        .map(|e| (e.0.clone(), e.1.clone()))
+        .collect();
+    entries.sort();
+    let input = db.sst(&family, &entries);
+    let mut snapshots: Vec<Seqno> = (0..rng.below(3)).map(|_| 1 + rng.below(max)).collect();
+    snapshots.sort_unstable();
+    snapshots.dedup();
+    let now = h.last_ts + rng.below(300);
+
+    // Separation: one L0 SST to L1, nothing below (bottommost) and nothing above.
+    let (first, _) = compact(
+        &db,
+        &family,
+        std::slice::from_ref(&input),
+        policy(snapshots.clone(), now, true),
+    );
+    check_blob_accounting(&db, &first, family.blob_threshold);
+    h.model.purge(&ModelPurge {
+        table: TABLE.into(),
+        family: FAMILY.into(),
+        rows: (Bound::Unbounded, Bound::Unbounded),
+        snapshots: snapshots.clone(),
+        now,
+        min_ts_above: u64::MAX,
+        max_seqno: max,
+    });
+    let mut blobs = Blobs::default();
+    blobs.add(&db.pager, &db.cache, &first.new_blob_files);
+    let old: Vec<_> = first
+        .new_blob_files
+        .iter()
+        .map(|f| (f.id, f.total_bytes))
+        .collect();
+
+    // Blob GC of every file the first job wrote, over its outputs.
+    let ssts: Vec<(SstMeta, Arc<SstReader>)> = first
+        .added
+        .iter()
+        .map(|(_, m)| (m.clone(), open_sst(&db.pager, &db.cache, m)))
+        .collect();
+    let mut t = task(vec![(2, ssts.iter().map(|s| s.0.id).collect())], 2);
+    t.kind = TaskKind::BlobGc {
+        blob_files: old.iter().map(|f| f.0).collect(),
+    };
+    let mut ctx = db.context(family.clone(), policy(snapshots.clone(), now, true));
+    ctx.blob_files = blobs.0.clone();
+    let mut job = CompactionJob::new(t, ssts.iter().map(|s| s.1.clone()).collect(), ctx);
+    run_sliced(&db, &mut job);
+    let second = job.finish().unwrap();
+    let mut refs: std::collections::HashMap<_, u64> = Default::default();
+    for (_, meta) in &second.added {
+        for (_, v) in sst_entries(&open_sst(&db.pager, &db.cache, meta)) {
+            if let Some(p) = blob_pointer(&v) {
+                assert!(
+                    !old.iter().any(|f| f.0 == p.blob_file),
+                    "seed {seed}: a pointer into a GC'd file"
+                );
+                *refs.entry(p.blob_file).or_default() += record_bytes(p.len);
+            }
+        }
+    }
+    for f in &second.new_blob_files {
+        assert_eq!(refs.remove(&f.id), Some(f.total_bytes), "seed {seed}");
+    }
+    assert!(refs.is_empty());
+    for (id, total) in &old {
+        let delta: i64 = second
+            .blob_live_delta
+            .iter()
+            .filter(|d| d.0 == *id)
+            .map(|d| d.1)
+            .sum();
+        assert_eq!(
+            *total as i64 + delta,
+            0,
+            "seed {seed}: blob file {id:?} keeps live bytes"
+        );
+    }
+    blobs.add(&db.pager, &db.cache, &second.new_blob_files);
+    let blobs = Arc::new(blobs);
+    let after: Vec<Arc<SstReader>> = second
+        .added
+        .iter()
+        .map(|(_, m)| open_sst(&db.pager, &db.cache, m))
+        .collect();
+    for &s in snapshots.iter().chain([&max]) {
+        let what = format!("seed {seed}: blob GC, read at {s}/{now}");
+        let expected = model_reads(&h, s, now);
+        let a = resolver_reads(&h, s, now, |o| blob_sst_resolver(&after, &blobs, o));
+        assert_same(&what, &expected, &a);
+    }
+    old.len()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(cases(64)))]
+
+    /// Blob GC never changes a read and empties the files it names.
+    #[test]
+    fn blob_gc_preserves_reads_and_empties_files(seed in any::<u64>(), commits in 1usize..40) {
+        check_blob_gc(seed, commits);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn blob_gc_fixed_seeds() {
+    let emptied: usize = (0..24).map(|seed| check_blob_gc(seed, 35)).sum();
+    assert!(emptied > 0, "no seed separated anything");
+}
+
+/// Values above the threshold go to a blob file; typed values and operands stay inline.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn large_puts_are_separated_at_the_output() {
+    let mut db = Db::new(12);
+    let mut family = FamilyOptions::default();
+    family.blob_threshold = 100;
+    let big = stored(&[b'x'; 300]);
+    let e = vec![
+        (key(b"r", b"big", 10, 1, Kind::Put), big.clone()),
+        (
+            key(b"r", b"n", 10, 2, Kind::Merge),
+            stored(&5i64.to_le_bytes()),
+        ),
+        (key(b"r", b"small", 10, 3, Kind::Put), stored(b"tiny")),
+    ];
+    let input = db.sst(&family, &e);
+    let (out, kept) = compact(&db, &family, &[input], policy(vec![], 100, true));
+    assert_eq!(out.new_blob_files.len(), 1);
+    assert_eq!(
+        out.new_blob_files[0].total_bytes,
+        record_bytes(big.len() as u32)
+    );
+    let ptr = blob_pointer(&kept[0].1).expect("separated");
+    let mut blobs = Blobs::default();
+    blobs.add(&db.pager, &db.cache, &out.new_blob_files);
+    assert_eq!(&blobs.read(&ptr)[..], &big[..]);
+    assert_eq!(kept[1].1, e[1].1);
+    assert_eq!(kept[2].1, e[2].1);
 }

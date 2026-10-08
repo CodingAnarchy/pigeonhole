@@ -8,7 +8,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Item | Rule |
 |---|---|
 | Row key, qualifier | Arbitrary bytes, each ≤ 64 KiB, else `KeyTooLarge`. Sorted byte-wise. |
-| Value | P1: ≤ `min(WAL segment payload, 64 MiB, ½ memtable arena)`, else `ValueTooLarge` (D16). P2 blobs lift it; ceiling 2³²−1 bytes. |
+| Value | ≤ `min(WAL segment payload, 64 MiB, ½ memtable arena)`, else `ValueTooLarge` (D16); values above the family's `blob_threshold` are stored in blob files. Ceiling 2³²−1 bytes. |
 | Timestamp | `u64` **microseconds** since the Unix epoch (D11). Default = `max(now, tablet floor + 1)`, never goes backwards. User timestamps are microseconds for TTL. |
 | Version order | Newest timestamp first; the same timestamp is ordered by inverted seqno (later commit first). Multiple mutations to the same (row, family, qualifier, timestamp) **within one commit** collapse to the last one written (D34). |
 | Atomicity | One `RowMutation` = one row, all families, all-or-nothing. `WriteBatch` = any rows/tables, atomic, one durability point. |
@@ -74,7 +74,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `flush(&self) -> Result<()>` | Write every memtable into the file; returns when the SSTs are in the manifest. Makes `None` commits durable. Fails with `Busy` if the flush finds no room for its fresh memtables past the stall timeout, and with the flush's own error (`Io`, `NoSpace`) if it fails. |
 | `compact(&self) -> Result<()>` | Flush, then merge every level of every table into the last (purges per `max_versions`, TTL and tombstones). Reports only a failure of the compaction it started for this call, at once. A failed background compaction backs off (1 s, doubling to 60 s per table-and-family) and is never handed to a later `compact()`. |
 | `shrink(&self) -> Result<u64>` | Truncate free space at the end of the file, relocate live data from the tail into free space and truncate again; returns bytes released (`0` if none). Online; costs a rewrite of the tail data. Call after deletes + `compact`. The floor is the live extents packed (power-of-two sizes aligned to their size after a 64 KiB header: one 64 MiB SST means a 128 MiB file); data with nowhere lower to go stays, not an error. Errors: `Closed`, `ReadOnly`, `NoSpace` (disk full while moving the manifest), `Io`. |
-| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue. `dest` must not exist. Holds its snapshot's memtables only while it copies them (at most one arena's worth written to the copy); the long SST copy that follows pins file extents, not memtable space, so writers are not stalled by it. The copy opens with no WAL replay and no sidecars. `Unsupported` if a family stores blob files (P2; not reachable today). |
+| `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue. `dest` must not exist. Holds its snapshot's memtables only while it copies them (at most one arena's worth written to the copy); the long SST copy that follows pins file extents, not memtable space, so writers are not stalled by it. The copy opens with no WAL replay and no sidecars. `Unsupported` if a family stores blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)). |
 | `close(self) -> Result<()>` | Flushes memtables, checkpoints the WAL; the last handle out removes the sidecars and shm, leaving one file. |
 
 `PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`. No write methods.
@@ -106,7 +106,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `max_versions(u32)` | Keep ≤ n versions per column (0 = all). |
 | `ttl(Duration)` | Expire cells older than this by timestamp. |
 | `bloom_bits(u8)` | Filter bits per key (0 off; default 10). |
-| `blob_threshold(u32)` | P2. Values above go to blobs (default 4096). Today: stored, values stay inline. |
+| `blob_threshold(u32)` | Values longer than this go to blob files at flush (default 4096; `u32::MAX` never). Blob GC rewrites files that are half garbage; `compact()` empties every file with garbage. |
 | `lz4()` | Default compression. |
 | `zstd(i8)` | zstd blocks at a libzstd level (1–22, higher smaller and slower; default 3). |
 | `uncompressed()` | No compression. |
@@ -209,7 +209,6 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 | Feature | Phase |
 |---|---|
 | `backup` of databases with blob files ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)) | P2 |
-| blob separation | P2 |
 | `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
 
 ## Recipes

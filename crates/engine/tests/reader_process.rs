@@ -405,3 +405,62 @@ fn an_expired_snapshot_does_not_hold_the_new_generations_pin() {
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// Issue #33: a reader process reads separated values through its own view's blob files,
+/// and a snapshot it holds keeps reading them while the writer overwrites and compacts.
+#[test]
+fn a_reader_reads_separated_values_and_keeps_them_while_it_holds_a_snapshot() {
+    let vfs = SimVfs::new(13);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs);
+    let family = FamilyOptions {
+        blob_threshold: 100,
+        max_versions: 1,
+        ..FamilyOptions::default()
+    };
+    let t = w.db.create_table("t", &[("f".into(), family)]).unwrap();
+    write_rows(&mut w, &t, "row", "old", 0..100);
+    assert!(
+        !w.db.blob_files().is_empty(),
+        "the flush separated the values"
+    );
+
+    vfs.enter_process(READER);
+    let reader =
+        Engine::open_reader(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20)).unwrap();
+    let rt = reader.table("t").unwrap();
+    let snap = reader.snapshot().unwrap();
+    assert_eq!(
+        get(&reader, &snap, &rt, "row00042").unwrap(),
+        Some(value("old", 42))
+    );
+
+    // The writer overwrites everything and compacts: the reader's pin keeps the versions
+    // (and the values) its snapshot reads (D118).
+    vfs.enter_process(WRITER);
+    write_rows(&mut w, &t, "row", "new", 0..100);
+    w.compact();
+    w.db.check_blob_accounting().unwrap();
+
+    vfs.enter_process(READER);
+    for i in [0u32, 42, 99] {
+        assert_eq!(
+            get(&reader, &snap, &rt, &format!("row{i:05}")).unwrap(),
+            Some(value("old", i)),
+            "row {i} at the reader's old snapshot"
+        );
+    }
+    drop(snap);
+    let snap = reader.snapshot().unwrap();
+    for i in [0u32, 42, 99] {
+        assert_eq!(
+            get(&reader, &snap, &rt, &format!("row{i:05}")).unwrap(),
+            Some(value("new", i)),
+            "row {i} at a new snapshot"
+        );
+    }
+    drop(snap);
+    drop(reader);
+    vfs.enter_process(WRITER);
+    w.close();
+}

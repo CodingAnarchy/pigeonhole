@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pigeonhole_cache::BlockCache;
-use pigeonhole_format::key::row_prefix_len;
+use pigeonhole_format::key::{row_prefix_len, split_suffix};
 use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{BlobFileId, Cursor, Seqno, SstId, TableId, Timestamp};
@@ -14,6 +14,9 @@ use pigeonhole_sst::{
     BlobReader, ReadOptions, ScanFilter, SstIter, SstReader, SstWriter, SstWriterOptions,
 };
 
+use crate::blob::{
+    BLOB_STORED_LEN, BlobSink, blob_pointer, encode_blob_stored, record_bytes, separates,
+};
 use crate::gc::{Gc, GcConfig, OutBuf};
 use crate::{CompactionTask, KeyRange, MergeOperator, MergingCursor, Result, TaskKind};
 
@@ -92,7 +95,8 @@ pub struct JobContext {
     pub sst_ids: Arc<AtomicU64>,
     /// Allocator for new blob file ids (likewise).
     pub blob_ids: Arc<AtomicU32>,
-    /// Open readers for the family's blob files (to copy live values during blob GC).
+    /// Open readers for the family's blob files (to copy live values during blob GC). A
+    /// [`TaskKind::BlobGc`] job needs one for every blob file it empties.
     pub blob_files: Vec<(BlobFileId, Arc<BlobReader>)>,
     /// GC rules.
     pub gc: GcPolicy,
@@ -163,7 +167,10 @@ pub struct CompactionOutput {
     pub new_blob_files: Vec<NewBlobFile>,
     /// Change in live bytes per existing blob file (negative: values dropped).
     pub blob_live_delta: Vec<(BlobFileId, i64)>,
-    /// Blob files with no live bytes left, to drop (`DropBlobFile`) and retire.
+    /// Blob files with no live bytes left, to drop (`DropBlobFile`) and retire. Always empty:
+    /// a job does not know a file's live bytes (other tablets may reference it after a
+    /// split), so the engine drops a file once its live count, updated from
+    /// `blob_live_delta`, reaches zero.
     pub dropped_blob_files: Vec<BlobFileId>,
 }
 
@@ -193,9 +200,61 @@ struct Sink {
     open: Option<Open>,
     outputs: Vec<SstMeta>,
     last_row: Vec<u8>,
+    /// Separated values (created on first use).
+    blobs: Option<BlobSink>,
+    blob_ids: Arc<AtomicU32>,
+    /// Puts whose payload is longer than this are separated (`u32::MAX`: never).
+    blob_threshold: u32,
+    /// Blob files a blob GC job empties: values in them are copied to new files.
+    gc_files: Vec<(BlobFileId, Arc<BlobReader>)>,
+    /// Live bytes moved out of `gc_files`, per file (negative).
+    copied: Vec<(BlobFileId, i64)>,
 }
 
 impl Sink {
+    /// Separates or copies `value` into a blob file when the entry needs it (a put above the
+    /// threshold, or a pointer into a file being emptied); returns the stored value to
+    /// write.
+    fn place(&mut self, key: &[u8], value: &[u8]) -> Result<Option<[u8; BLOB_STORED_LEN]>> {
+        let Ok((_, _, _, kind)) = split_suffix(key) else {
+            return Ok(None);
+        };
+        if let Some(ptr) = blob_pointer(value) {
+            if kind != pigeonhole_format::key::Kind::Put {
+                return Ok(None);
+            }
+            let Some((_, reader)) = self.gc_files.iter().find(|(id, _)| *id == ptr.blob_file)
+            else {
+                return Ok(None);
+            };
+            let cell = Arc::clone(reader).read(&ptr)?;
+            let bytes = record_bytes(ptr.len) as i64;
+            match self.copied.iter_mut().find(|d| d.0 == ptr.blob_file) {
+                Some(d) => d.1 -= bytes,
+                None => self.copied.push((ptr.blob_file, -bytes)),
+            }
+            let new = self.blob_sink().append(&cell)?;
+            return Ok(Some(encode_blob_stored(&new)));
+        }
+        if separates(kind, value, self.blob_threshold) {
+            let new = self.blob_sink().append(value)?;
+            return Ok(Some(encode_blob_stored(&new)));
+        }
+        Ok(None)
+    }
+
+    fn blob_sink(&mut self) -> &mut BlobSink {
+        let (input, target) = (self.input_bytes, self.target);
+        self.blobs.get_or_insert_with(|| {
+            BlobSink::new(
+                Arc::clone(&self.pager),
+                Arc::clone(&self.blob_ids),
+                input / 2,
+                target.saturating_mul(4),
+            )
+        })
+    }
+
     fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let row_start = self.last_row.is_empty() || !key.starts_with(&self.last_row);
         if let Some(o) = &self.open {
@@ -263,6 +322,9 @@ impl Sink {
     }
 
     fn abandon(&mut self) {
+        if let Some(mut b) = self.blobs.take() {
+            b.abandon();
+        }
         if let Some(o) = self.open.take() {
             self.pager.abandon(o.writer.abandon());
         }
@@ -280,8 +342,13 @@ impl Sink {
 /// returned [`CompactionOutput`]: until the engine commits it, the inputs are untouched and
 /// an aborted or crashed job leaves nothing behind but space the next open reclaims (D8).
 /// `TrivialMove` and `Drop` need no I/O: the engine applies them from the task and its
-/// `SstMeta`s, and a job given one finishes at once with an empty output. Blob GC is Phase 2;
-/// such a job also finishes empty.
+/// `SstMeta`s, and a job given one finishes at once with an empty output.
+///
+/// Every kept put whose payload is longer than the family's `blob_threshold` is separated
+/// into a new blob file (FORMAT §7) and the output stores its pointer; values that are
+/// already pointers pass through. A `BlobGc` job is a `Rewrite` that also copies the values
+/// still referenced in its blob files into new ones. The output lists the new files and the
+/// live-byte change of every older file it stopped referencing (`blob_live_delta`).
 ///
 /// After `run` fails, call [`CompactionJob::abort`].
 ///
@@ -396,7 +463,16 @@ impl CompactionJob {
             }),
             "task range and subrange bounds must be encoded row prefixes"
         );
-        let done = task.kind != TaskKind::Rewrite;
+        let gc_files = match &task.kind {
+            TaskKind::BlobGc { blob_files } => context
+                .blob_files
+                .iter()
+                .filter(|(id, _)| blob_files.contains(id))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let done = !rewrites(&task.kind);
         Self {
             sink: Sink {
                 pager: context.pager,
@@ -408,6 +484,11 @@ impl CompactionJob {
                 open: None,
                 outputs: Vec::new(),
                 last_row: Vec::new(),
+                blobs: None,
+                blob_ids: context.blob_ids,
+                blob_threshold: context.family.blob_threshold,
+                gc_files,
+                copied: Vec::new(),
             },
             clock: context.clock,
             task,
@@ -455,7 +536,10 @@ impl CompactionJob {
                 .step(&mut self.cursor, self.sub_end.as_deref(), &mut self.out)?;
             for i in 0..self.out.len() {
                 let (k, v) = self.out.get(i);
-                self.sink.add(k, v)?;
+                match self.sink.place(k, v)? {
+                    Some(stored) => self.sink.add(k, &stored)?,
+                    None => self.sink.add(k, v)?,
+                }
             }
             self.out.clear();
             if !more {
@@ -490,8 +574,23 @@ impl CompactionJob {
             self.sink.abandon();
             return Err(e);
         }
-        if self.task.kind != TaskKind::Rewrite {
+        if !rewrites(&self.task.kind) {
             return Ok(CompactionOutput::default());
+        }
+        let new_blob_files = match self.sink.blobs.take().map(BlobSink::finish) {
+            Some(Ok(files)) => files,
+            Some(Err(e)) => {
+                self.sink.abandon();
+                return Err(e);
+            }
+            None => Vec::new(),
+        };
+        let mut blob_live_delta = std::mem::take(&mut self.gc.blob_delta);
+        for (id, d) in self.sink.copied.drain(..) {
+            match blob_live_delta.iter_mut().find(|x| x.0 == id) {
+                Some(x) => x.1 += d,
+                None => blob_live_delta.push((id, d)),
+            }
         }
         let level = self.task.output_level;
         Ok(CompactionOutput {
@@ -502,8 +601,8 @@ impl CompactionJob {
                 .iter()
                 .flat_map(|(_, ids)| ids.iter().copied())
                 .collect(),
-            new_blob_files: Vec::new(),
-            blob_live_delta: std::mem::take(&mut self.gc.blob_delta),
+            new_blob_files,
+            blob_live_delta,
             dropped_blob_files: Vec::new(),
         })
     }
@@ -512,4 +611,9 @@ impl CompactionJob {
     pub fn abort(mut self) {
         self.sink.abandon();
     }
+}
+
+/// Whether a task kind rewrites its inputs (and so runs as a job).
+fn rewrites(kind: &TaskKind) -> bool {
+    matches!(kind, TaskKind::Rewrite | TaskKind::BlobGc { .. })
 }
