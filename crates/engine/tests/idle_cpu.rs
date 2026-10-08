@@ -226,6 +226,27 @@ fn a_shard_in_compaction_backoff_parks_and_retries_on_time() {
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
     let f = t.families[0].id;
+    // #232: a FIFO-by-time family whose one SST expires in an hour arms the shard's retry
+    // timer for then. The backoff retries below must still fire on time (the timer keeps the
+    // earliest deadline), and the parked shard must not wake for the expiry.
+    let fifo = FamilyOptions {
+        compaction: pigeonhole_format::manifest::CompactionStyle::FifoByTime,
+        ttl_micros: 3_600_000_000,
+        ..FamilyOptions::default()
+    };
+    let ft = db.create_table("fifo", &[("f".into(), fifo)]).unwrap();
+    let mut wb = WriteBatch::new();
+    wb.put(
+        ft.id,
+        ft.families[0].id,
+        b"r",
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    db.commit(wb, Some(Durability::None)).unwrap();
+    db.flush().unwrap();
     fail.store(true, Ordering::Release);
     // Repeating rows with incompressible values: every compaction past the first rewrites
     // (and reads) its inputs, and fails.
