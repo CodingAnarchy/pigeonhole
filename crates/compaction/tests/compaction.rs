@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -15,7 +16,7 @@ use pigeonhole_compaction::{
     JobContext, JobPoll, KeyRange, Levels, OtherSource, PickerOptions, ResolveOptions, TaskKind,
     ValuePredicate, blob_pointer, record_bytes, separates,
 };
-use pigeonhole_format::key::{Kind, encode_key, encode_marker_key, split_suffix};
+use pigeonhole_format::key::{Kind, encode_key, encode_marker_key, row_prefix_len, split_suffix};
 use pigeonhole_format::manifest::{CompactionStyle, FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::{FamilyId, Seqno, SstId, TableId, TabletId, Timestamp};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
@@ -429,6 +430,111 @@ fn drain_resolved<C: pigeonhole_format::Cursor<Error = pigeonhole_compaction::Er
     }
 }
 
+/// Counter families (D179, #290): a compaction of some columns and row markers, while the
+/// rest of the same rows lives in another source with interleaved seqnos (a row split
+/// across files), keeps every read at every live snapshot and after later writes. With the
+/// other source listed, bottommost deletes purge by the seqno rule; unlisted (`None`), they
+/// purge only by the timestamp rule.
+fn check_counter_purge(seed: u64, commits: usize) {
+    let mut h = counter_history(seed, common::commits(commits));
+    let mut rng = Rng::new(seed ^ 0x290);
+    let mut db = Db::new(seed);
+    let family = family_options(&h);
+    let max = h.model.snapshot();
+
+    // Each column, and each row's markers, goes whole to the inputs or to the other source.
+    let mut outside: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
+    let (mut inputs, mut other): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+    for (k, v, _) in &h.entries {
+        let (body, _, _, kind) = split_suffix(k).unwrap();
+        let unit = if kind == Kind::FamilyDelete {
+            body[..row_prefix_len(k).unwrap()].to_vec()
+        } else {
+            body.to_vec()
+        };
+        let out = *outside.entry(unit).or_insert_with(|| rng.chance(350_000));
+        if out { &mut other } else { &mut inputs }.push((k.clone(), v.clone()));
+    }
+    inputs.sort();
+    other.sort();
+    if inputs.is_empty() {
+        return;
+    }
+    let mut input_ssts = Vec::new();
+    let cut = rng.below(inputs.len() as u64 + 1) as usize;
+    for part in [&inputs[..cut], &inputs[cut..]] {
+        if !part.is_empty() {
+            input_ssts.push(db.sst(&family, part));
+        }
+    }
+    let other_sst = (!other.is_empty()).then(|| db.sst(&family, &other));
+
+    let mut snapshots: Vec<Seqno> = (0..rng.below(4)).map(|_| 1 + rng.below(max)).collect();
+    snapshots.sort_unstable();
+    snapshots.dedup();
+    let gc_now = h.last_ts + rng.below(300);
+    let mut gc = GcPolicy::new(snapshots.clone(), gc_now, true);
+    gc.min_ts_above = other_sst.as_ref().map_or(u64::MAX, |s| s.0.ts_range.0);
+    if rng.below(4) == 0 {
+        gc.min_ts_above = 0;
+    }
+    let inputs_max = input_ssts
+        .iter()
+        .map(|s| s.0.seqno_range.1)
+        .max()
+        .unwrap_or(0);
+    let listed = rng.below(6) != 0;
+    gc.other_sources = listed.then(|| {
+        other_sst
+            .iter()
+            .filter(|s| s.0.seqno_range.0 <= inputs_max)
+            .map(|s| OtherSource {
+                keys: Some((s.0.smallest_key.clone(), s.0.largest_key.clone())),
+                seqnos: s.0.seqno_range,
+            })
+            .collect()
+    });
+    let ids = input_ssts.iter().map(|s| s.0.id).collect();
+    let mut job = CompactionJob::new(
+        task(vec![(1, ids)], 2),
+        input_ssts.iter().map(|s| s.1.clone()).collect(),
+        db.context(family.clone(), gc),
+    );
+    run_sliced(&db, &mut job);
+    let out = job.finish().unwrap();
+    assert_disjoint(&out);
+    let mut after: Vec<Arc<SstReader>> = out
+        .added
+        .iter()
+        .map(|(_, m)| open_sst(&db.pager, &db.cache, m))
+        .collect();
+    after.extend(other_sst.as_ref().map(|s| s.1.clone()));
+
+    let what = |phase: &str, s: Seqno, now: Timestamp| {
+        format!("seed {seed}: {phase}, listed {listed}, snapshots {snapshots:?}, read at {s}/{now}")
+    };
+    let mut points = snapshots.clone();
+    points.push(max);
+    for &s in &points {
+        let expected = model_reads(&h, s, gc_now);
+        let a = resolver_reads(&h, s, gc_now, |o| sst_resolver(&after, o));
+        assert_same(&what("after", s, gc_now), &expected, &a);
+    }
+    // Later writes on top read as in the model at the old snapshots and the new latest one
+    // (purges never change a counter family's reads).
+    let n_later = 1 + rng.below(8) as usize;
+    let later = extend_history(&mut h, &mut rng, n_later, false);
+    let mut flush: Vec<_> = later.iter().map(|e| (e.0.clone(), e.1.clone())).collect();
+    flush.sort();
+    after.push(db.sst(&family, &flush).1);
+    let now = gc_now.max(h.last_ts) + rng.below(100);
+    for s in snapshots.iter().copied().chain([max, h.model.snapshot()]) {
+        let expected = model_reads(&h, s, now);
+        let a = resolver_reads(&h, s, now, |o| sst_resolver(&after, o));
+        assert_same(&what("later writes", s, now), &expected, &a);
+    }
+}
+
 /// Output SSTs are sorted and disjoint.
 fn assert_disjoint(out: &CompactionOutput) {
     for w in out.added.windows(2) {
@@ -443,6 +549,12 @@ proptest! {
     #[test]
     fn compaction_preserves_reads_at_live_snapshots(seed in any::<u64>(), commits in 1usize..40) {
         check_compaction(seed, commits, Choose::Random);
+    }
+
+    /// #290: counter-family purges with rows split across the inputs and another source.
+    #[test]
+    fn counter_purges_preserve_reads_with_other_sources(seed in any::<u64>(), commits in 1usize..40) {
+        check_counter_purge(seed, commits);
     }
 
     /// Issue #31: the same for the tiered picker's compactions.
@@ -868,6 +980,65 @@ fn counter_operands_combine_and_deletes_hide_older_ones() {
     gc.bottommost = true;
     let (_, kept) = compact(&db, &family, &[input], gc);
     assert_eq!(kept, [(key(b"r", b"n", 0, 5, Kind::Merge), i64v(6))]);
+}
+
+/// #290: a counter delete purges at the bottom even with a timestamp-0 counter above the
+/// inputs (`min_ts_above` 0), unless another source overlapping its row starts at or below
+/// its seqno, or the other sources are unknown.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn counter_deletes_purge_at_the_bottom_by_seqno() {
+    let mut db = Db::new(9);
+    let family = FamilyOptions {
+        merge_operator: "pigeonhole.i64_add".into(),
+        kind: FamilyKind::Counter,
+        ..FamilyOptions::default()
+    };
+    let i64v = |v: i64| stored(&v.to_le_bytes());
+    let mut marker = Vec::new();
+    encode_marker_key(&mut marker, b"r", 60, 4).unwrap();
+    let e = vec![
+        (marker.clone(), Vec::new()),
+        (key(b"r", b"n", 50, 3, Kind::ColumnDelete), Vec::new()),
+        (key(b"r", b"n", 0, 5, Kind::Merge), i64v(4)),
+        (key(b"r", b"n", 0, 2, Kind::Merge), i64v(100)),
+    ];
+    let input = db.sst(&family, &e);
+    let source = |keys: &[u8], seqnos| OtherSource {
+        keys: Some((keys.to_vec(), keys.to_vec())),
+        seqnos,
+    };
+    let row_key = key(b"r", b"m", 0, 1, Kind::Merge);
+    let mut gc = GcPolicy::new(vec![], 100, true);
+    gc.min_ts_above = 0;
+    for (others, purged) in [
+        (Some(vec![]), true),
+        // Above both deletes, or on another row: no entry there is old enough to hide.
+        (Some(vec![source(&row_key, (5, 9))]), true),
+        (
+            Some(vec![source(&key(b"s", b"n", 0, 1, Kind::Merge), (1, 1))]),
+            true,
+        ),
+        // At or below the marker's seqno on this row: the marker stays.
+        (Some(vec![source(&row_key, (3, 9))]), false),
+        (None, false),
+    ] {
+        gc.other_sources = others.clone();
+        let (_, kept) = compact(&db, &family, std::slice::from_ref(&input), gc.clone());
+        let want = if purged {
+            vec![(key(b"r", b"n", 0, 5, Kind::Merge), i64v(4))]
+        } else {
+            // (The column delete goes either way: the newer marker covers it.)
+            vec![
+                (marker.clone(), Vec::new()),
+                (key(b"r", b"n", 0, 5, Kind::Merge), i64v(4)),
+            ]
+        };
+        assert_eq!(kept, want, "{others:?}");
+    }
 }
 
 /// A counter family's operands are not combined across the seqno range of another source

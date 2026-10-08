@@ -76,14 +76,27 @@ fn pick<'a, T: ?Sized>(rng: &mut Rng, xs: &[&'a T]) -> &'a T {
 
 /// A random history of `commits` commits on one family.
 pub fn random_history(seed: u64, commits: usize) -> History {
+    history_of(seed, commits, None)
+}
+
+/// A random history of a counter family (decision D179).
+pub fn counter_history(seed: u64, commits: usize) -> History {
+    history_of(seed, commits, Some(true))
+}
+
+/// A random history; `counter` forces the family kind (else half are counter families).
+fn history_of(seed: u64, commits: usize, counter: Option<bool>) -> History {
     let mut rng = Rng::new(seed);
     let family = ModelFamily {
         name: FAMILY.into(),
         max_versions: [0, 0, 1, 2, 3][rng.below(5) as usize],
         ttl_micros: [0, 0, 120, 300][rng.below(4) as usize],
         i64_add: true,
-        // Half the histories are counter families (decision D179).
         counter: rng.below(2) == 0,
+    };
+    let family = ModelFamily {
+        counter: counter.unwrap_or(family.counter),
+        ..family
     };
     let mut model = Model::new();
     model.create_table(TABLE, vec![family.clone()]);
