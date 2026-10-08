@@ -59,7 +59,7 @@ use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
     COUNTER_TS, CommitStreams, Model, ModelCell, ModelFamily, ModelOp, ModelPurge, Op, Rng, Sim,
     Step, StreamCommit, StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive,
-    recovered_from_records,
+    combine_counter_writes, recovered_from_records,
 };
 
 pub const TABLE: &str = "t";
@@ -1761,7 +1761,8 @@ impl World {
     /// The mutations of `ops` as the engine logs them (row deletes expanded per family).
     fn mutation_keys(ops: &[ModelOp]) -> BTreeSet<MutationKey> {
         let mut out = BTreeSet::new();
-        for op in ops {
+        // Counter writes of one cell combine before they are logged (#295).
+        for op in &combine_counter_writes(ops, |_, f| is_sum(f)) {
             let t = op_table(op).to_owned();
             match op {
                 ModelOp::Put {
@@ -2586,7 +2587,7 @@ impl World {
         #[allow(clippy::type_complexity)]
         let mut last: BTreeMap<(String, String, Vec<u8>, Vec<u8>, Timestamp), MutationKey> =
             BTreeMap::new();
-        for op in ops {
+        for op in &combine_counter_writes(ops, |_, f| is_sum(f)) {
             let t = op_table(op).to_owned();
             let mut push = |family: String,
                             kind: u8,

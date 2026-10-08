@@ -750,23 +750,38 @@ fn counters_and_typed_values() {
     assert_eq!(count(&t, b"r", b"hits"), Some(13));
     // One cell at the fixed timestamp, however many increments.
     assert_eq!(buckets(&t, b"r", b"hits"), [(0, 13)]);
-    // A put and an increment of the same counter in one commit share its timestamp, so the
-    // last one written wins (D34): reset and add in separate commits.
+    // Writes of one counter in one mutation apply in order (D186, #295): a put then an
+    // increment add up, two increments add both, and a put after an increment resets.
     t.mutate(b"r")
         .put_i64("c", b"hits", 100)
         .incr("c", b"hits", 7)
         .commit()
         .unwrap();
-    assert_eq!(count(&t, b"r", b"hits"), Some(20));
-    t.mutate(b"r").put_i64("c", b"hits", 100).commit().unwrap();
+    assert_eq!(count(&t, b"r", b"hits"), Some(107));
+    t.mutate(b"r")
+        .incr("c", b"hits", 1)
+        .incr("c", b"hits", 2)
+        .commit()
+        .unwrap();
+    assert_eq!(count(&t, b"r", b"hits"), Some(110));
+    t.mutate(b"r")
+        .incr("c", b"hits", 50)
+        .put_i64("c", b"hits", 100)
+        .commit()
+        .unwrap();
+    assert_eq!(count(&t, b"r", b"hits"), Some(100));
     t.mutate(b"r").incr("c", b"hits", 1).commit().unwrap();
     assert_eq!(count(&t, b"r", b"hits"), Some(101));
+    // A batch over rows on different shards combines per cell too.
     let mut wb = db.write_batch();
     wb.incr(&t, b"r", "c", b"hits", 1)
-        .incr(&t, b"s", "c", b"hits", 1);
+        .incr(&t, b"s", "c", b"hits", 1)
+        .incr(&t, b"s", "c", b"hits", 1)
+        .incr_at(&t, b"s", "c", b"hits", 9, 4)
+        .incr_at(&t, b"s", "c", b"hits", 9, 5);
     wb.commit().unwrap();
     assert_eq!(count(&t, b"r", b"hits"), Some(102));
-    assert_eq!(count(&t, b"s", b"hits"), Some(1));
+    assert_eq!(buckets(&t, b"s", b"hits"), [(9, 9), (0, 2)]);
     // Overflow wraps.
     t.mutate(b"w")
         .put_i64("c", b"n", i64::MAX)
