@@ -343,6 +343,19 @@ impl Engine {
         (stats.allocated_bytes + stats.retired_bytes).saturating_sub(referenced)
     }
 
+    /// Every SST the current catalog names, as `(level, length, size class)` (test hook:
+    /// the footprint test reads the live bytes and the SST count per run, #185).
+    #[doc(hidden)]
+    pub fn sst_lens(&self) -> Vec<(u8, u64, u8)> {
+        let catalog = Arc::clone(&self.inner.shared.view.load().catalog);
+        catalog
+            .ssts
+            .values()
+            .flatten()
+            .map(|(level, meta)| (*level, meta.len, meta.extent.size_class))
+            .collect()
+    }
+
     /// Every SST the current catalog names, as `(table, level, sst id)` (test hook).
     #[doc(hidden)]
     pub fn sst_levels(&self) -> Vec<(TableId, u8, u64)> {

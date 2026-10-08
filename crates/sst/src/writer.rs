@@ -153,6 +153,12 @@ impl Writer {
         (data + index + top + filters + props + FOOTER_LEN) as u64
     }
 
+    /// Data bytes written so far (blocks sealed and the open one), without the index,
+    /// filters and footer still to come.
+    pub(crate) fn data_len(&self) -> u64 {
+        self.flushed + self.out.len() as u64 + self.data.estimated_len() as u64
+    }
+
     pub(crate) fn fits(&self, key_len: usize, value_len: usize) -> bool {
         self.bound_with(key_len, value_len) <= self.extent.len()
     }

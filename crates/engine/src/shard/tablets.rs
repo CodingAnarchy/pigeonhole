@@ -1211,7 +1211,15 @@ impl ShardState {
             if !sticks_out_of(tablet, &levels) {
                 continue;
             }
-            let Some(task) = compact::plan_full(tablet, key.1, &levels, last, busy, true) else {
+            let Some(task) = compact::plan_full(
+                tablet,
+                key.1,
+                &levels,
+                last,
+                busy,
+                true,
+                self.shared.picker.target_sst_bytes,
+            ) else {
                 // Its inputs are busy: try again after the running work.
                 self.cleanups.insert(0, key);
                 break;

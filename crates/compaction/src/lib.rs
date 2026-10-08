@@ -37,7 +37,9 @@ pub use blob::{
     pick_blob_gc, record_bytes, separates,
 };
 pub use cursor::{FilteredCursor, MergingCursor, VecCursor};
-pub use job::{CompactionJob, CompactionOutput, GcPolicy, JobContext, JobPoll, NewBlobFile};
+pub use job::{
+    CompactionJob, CompactionOutput, GcPolicy, JobContext, JobPoll, NewBlobFile, output_piece_bytes,
+};
 pub use merge::{I64Add, MergeError, MergeOperator, MergeRegistry};
 pub use picker::{CompactionPicker, CompactionTask, KeyRange, Levels, PickerOptions, TaskKind};
 pub use resolver::{CellResolver, ResolveOptions, ResolvedCell, ValuePredicate};

@@ -5109,9 +5109,15 @@ impl ShardState {
                     continue;
                 };
                 let rewrite = self.tablets_on();
-                if let Some(mut t) =
-                    compact::plan_full(tablet, key.1, &fam.levels_meta(), last, &busy, rewrite)
-                {
+                if let Some(mut t) = compact::plan_full(
+                    tablet,
+                    key.1,
+                    &fam.levels_meta(),
+                    last,
+                    &busy,
+                    rewrite,
+                    self.shared.picker.target_sst_bytes,
+                ) {
                     self.blob_gc.full(&view.catalog, &mut t);
                     task = Some((key, t));
                     break;
