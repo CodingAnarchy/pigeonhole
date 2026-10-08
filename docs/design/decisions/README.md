@@ -191,6 +191,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D176](phase-2.md#d176) — The stopped-clock fallbacks apply only to a simulated clock · io, engine, runtime, #263, #267 · amends D126, refines D161, D171
 - [D177](phase-2.md#d177) — Backup releases its snapshot's memtables before the long merge · engine, #262, #268
 - [D178](phase-2.md#d178) — The bench metric family compacts FIFO in Pigeonhole and RocksDB · bench, #236, #270 · refines D163
+- [D179](phase-2.md#d179) — Counters are declared families, combined per timestamp like Bigtable aggregates · owner decision, #274 · supersedes the #233 cross-timestamp fold; amends D41, D73
 
 ## Open questions
 _None._

@@ -285,3 +285,15 @@ The options weighed:
 - The agreement tests (RocksDB, SQLite and fjall against Pigeonhole on every workload) pass: every engine reads the same cells.
 
 **Coordinator:** confirmed. The sparse-wide gate workload scans one RocksDB iterator, unchanged.
+
+<a id="d179"></a>
+## D179 — Counters are declared families, combined per timestamp like Bigtable aggregates (approved; owner decision 2026-10-08; pigeonhole, engine, compaction, #274; supersedes the cross-timestamp fold proposed in #233/#34)
+Counters used to be any column written with `incr`: every family defaulted to the `pigeonhole.i64_add` operator, and each increment carried its commit timestamp. Operands combine only within one (column, timestamp) (D73), so a counter kept one operand per increment for ever. #233 proposed folding operands across timestamps at bottommost compactions; that changes what later explicit-timestamp writes (`put_at`, `delete_cell`) mean, and a write-time guard could not be scoped, because every family was a merge family.
+
+**Decision (owner):** follow Bigtable's aggregate column families.
+- A family is **declared** a counter family (Sum over i64 first; Min, Max and HyperLogLog may follow). Ordinary families have no merge operator by default, and `incr` on them fails with `InvalidArgument`. Families naming a custom operator (D172) are unchanged.
+- In a counter family `incr` writes its operand at a **fixed timestamp** (0); `incr_at` writes at a caller-chosen bucket timestamp (for hourly or daily totals). Operands at the same (column, timestamp) combine at read time and in compaction under D73, so a counter column holds one cell per bucket, and no compaction ever changes the meaning of a later write.
+- `put_i64` sets a bucket (later increments add to it); deletes work as for any cell; non-i64 puts into a counter family are refused. `max_versions` and TTL apply per bucket.
+- Families written by 0.1.0 (which store `pigeonhole.i64_add` and may hold operands at commit timestamps) keep opening and reading correctly; their classification and a migration note are part of #274.
+
+**Coordinator:** recorded from the owner's decision; #233 closed, #34 superseded.
