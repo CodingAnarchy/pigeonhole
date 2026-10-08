@@ -30,6 +30,10 @@
 //! 1). A failure prints its seed and the operation trace. Tablet changes are on, as by
 //! default, with a fast balancer so tablets split, move and merge within a run;
 //! `PIGEONHOLE_TABLET_CHANGES=0` runs every test with them off.
+//! `PIGEONHOLE_DEFERRED_IO=1` defers submitted I/O (`SimVfs::set_deferred_io`): a device
+//! thread completes it in an order the seed picks, so WAL group syncs and root commits stay
+//! in flight while the shard threads go on. The OS schedules those threads, so such a run
+//! does not replay exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -127,6 +131,8 @@ struct Config {
     /// With `tablet_changes`, tune the balancer so tablets change within a short run (else
     /// the engine's defaults, under which nothing changes in these runs).
     fast_balancer: bool,
+    /// Defer submitted I/O to a device thread. Defaults to `PIGEONHOLE_DEFERRED_IO`.
+    deferred_io: bool,
 }
 
 impl Config {
@@ -152,6 +158,7 @@ impl Config {
             compact_ppm: 20_000,
             tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").as_deref() != Ok("0"),
             fast_balancer: true,
+            deferred_io: std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1"),
         }
     }
 
@@ -349,6 +356,11 @@ fn first_diff(got: &Rows, want: &Rows) -> Option<String> {
 impl Run {
     fn new(seed: u64, cfg: Config) -> Result<Self, String> {
         let vfs = SimVfs::new(seed);
+        if cfg.deferred_io {
+            vfs.set_deferred_io(true);
+            // Ends with the `SimVfs`.
+            drop(vfs.complete_io_in_background());
+        }
         let base = vfs.now_micros();
         let mut run = Run {
             cfg,

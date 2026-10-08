@@ -38,9 +38,16 @@ enum Inner<T> {
 
 type Then<T> = Box<dyn FnOnce(Result<T>) + Send>;
 
+/// Runs a deferred operation's I/O when a thread blocks on its completion (the simulator's
+/// deferred mode, where nothing else may ever complete it). Calling it when the operation
+/// already ran does nothing.
+pub(crate) type Drive = Arc<dyn Fn() + Send + Sync>;
+
 struct Shared<T> {
     state: Mutex<State<T>>,
     cond: Condvar,
+    /// Set for the simulator's deferred operations and every completion mapped from one.
+    drive: Option<Drive>,
 }
 
 enum State<T> {
@@ -74,12 +81,18 @@ impl<T: Send + 'static> Completion<T> {
     /// A completion and the handle that resolves it, for layers that build their own
     /// asynchronous operations (WAL group sync, root commit) on top of the backend.
     pub fn pair() -> (Self, Resolver<T>) {
+        Self::driven_pair(None)
+    }
+
+    /// A pair whose blocking [`Completion::wait`] calls `drive` first (see [`Drive`]).
+    pub(crate) fn driven_pair(drive: Option<Drive>) -> (Self, Resolver<T>) {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::Pending {
                 waker: None,
                 then: None,
             }),
             cond: Condvar::new(),
+            drive,
         });
         (
             Self {
@@ -107,7 +120,7 @@ impl<T: Send + 'static> Completion<T> {
                 Completion::ready(f(result))
             }
             State::Pending { .. } => {
-                let (next, resolver) = Completion::pair();
+                let (next, resolver) = Completion::driven_pair(shared.drive.clone());
                 *state = State::Pending {
                     waker: None,
                     then: Some(Box::new(move |result| resolver.resolve(f(result)))),
@@ -125,11 +138,18 @@ impl<T: Send + 'static> Completion<T> {
             Inner::Pending(shared) => shared,
         };
         let mut state = shared.lock();
+        let mut drive = shared.drive.as_ref();
         loop {
             match std::mem::replace(&mut *state, State::Taken) {
                 State::Done(result) => return result,
                 pending @ State::Pending { .. } => {
                     *state = pending;
+                    if let Some(run) = drive.take() {
+                        drop(state);
+                        run();
+                        state = shared.lock();
+                        continue;
+                    }
                     state = shared
                         .cond
                         .wait(state)

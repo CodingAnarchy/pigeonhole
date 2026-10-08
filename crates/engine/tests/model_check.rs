@@ -228,6 +228,33 @@ fn a_seed_replays_the_same_io_trace() {
     }
 }
 
+#[test]
+fn deferred_io_stays_in_flight_and_a_seed_replays() {
+    // Issue #145: with deferred I/O, WAL group syncs and root commits stay in flight across
+    // shard slices and client steps until the scheduler completes them, in an order the
+    // seed picks, and a seed still replays the same I/O. No helper-thread commits (they
+    // would let the OS order a run, see above).
+    let mut cfg = Config::quiet(200);
+    cfg.shards = 3;
+    (cfg.cas_ppm, cfg.txn_ppm) = (0, 0);
+    cfg.deferred_io = true;
+    for seed in seeds() {
+        let (result, ops) = run_traced(seed, &cfg);
+        let stats = result.unwrap_or_else(|f| panic!("{f}"));
+        eprintln!("seed {seed}: {stats:?}");
+        assert!(
+            stats.io_in_flight_steps > 0,
+            "seed {seed}: no client step saw I/O in flight"
+        );
+        let (again, replayed) = run_traced(seed, &cfg);
+        again.unwrap_or_else(|f| panic!("{f}"));
+        assert!(
+            ops == replayed,
+            "seed {seed}: the second run's I/O diverged"
+        );
+    }
+}
+
 /// Background compaction off and a full compaction at fixed points: a bottommost compaction
 /// may purge deletes (decision D74), after which a write with an older explicit timestamp
 /// reads differently, so purges must happen at the same points for every shard count.

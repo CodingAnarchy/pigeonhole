@@ -590,3 +590,176 @@ fn recorded_ops_replay_from_the_seed() {
     );
     assert_ne!(ops, trace(10), "seeds 9 and 10 wrote different bytes");
 }
+
+fn buf(bytes: &[u8]) -> IoBuf {
+    let mut b = IoBuf::zeroed(bytes.len());
+    b.copy_from_slice(bytes);
+    b
+}
+
+#[test]
+fn deferred_io_runs_only_when_completed() {
+    let vfs = SimVfs::new(3);
+    vfs.set_deferred_io(true);
+    let f = create_durable(&vfs, "f");
+    vfs.record_ops();
+    let write = f.submit_write(buf(b"abcd"), 0);
+    let sync = f.submit_sync_data();
+    let read = f.submit_read(IoBuf::zeroed(2), 1);
+    assert_eq!(vfs.io_in_flight(), 3);
+    assert!(!write.is_ready() && !sync.is_ready() && !read.is_ready());
+    assert_eq!(f.len().unwrap(), 0, "nothing ran yet");
+    assert!(vfs.recorded_ops().is_empty(), "no crash point passed yet");
+    // The read runs whenever it completes: after the write, or past the end of the file.
+    while vfs.io_in_flight() > 0 {
+        assert!(vfs.complete_io());
+    }
+    assert!(!vfs.complete_io(), "nothing left in flight");
+    write.wait().unwrap();
+    sync.wait().unwrap();
+    match read.wait() {
+        Ok(b) => assert_eq!(&b[..], b"bc"),
+        Err(e) => assert_eq!(e.kind, ErrorKind::UnexpectedEof),
+    }
+    assert_eq!(contents(&vfs, "f"), b"abcd");
+    assert_eq!(vfs.recorded_ops().len(), 2, "the write and the sync");
+    // Off again: submitted I/O completes inline.
+    vfs.set_deferred_io(false);
+    assert!(f.submit_sync_data().is_ready());
+}
+
+/// The order in which `seed` completes eight deferred writes to distinct offsets.
+fn completion_order(seed: u64) -> Vec<u64> {
+    let vfs = SimVfs::new(seed);
+    vfs.set_deferred_io(true);
+    let f = create_durable(&vfs, "f");
+    vfs.record_ops();
+    let pending: Vec<_> = (0..8).map(|i| f.submit_write(buf(b"x"), i)).collect();
+    vfs.complete_all_io();
+    assert!(pending.iter().all(|c| c.is_ready()), "seed {seed}");
+    vfs.recorded_ops()
+        .iter()
+        .map(|op| match op {
+            pigeonhole_io::sim::SimOp::Write { offset, .. } => *offset,
+            other => panic!("seed {seed}: unexpected {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn deferred_completion_order_replays_from_the_seed() {
+    let order = completion_order(5);
+    assert_eq!(order, completion_order(5), "seed 5 replays");
+    assert!(
+        (0..20).any(|s| completion_order(s) != order),
+        "the order varies across seeds"
+    );
+    assert!(
+        (0..20).any(|s| completion_order(s) != (0..8).collect::<Vec<_>>()),
+        "some seed completes out of submission order"
+    );
+}
+
+#[test]
+fn deferring_io_does_not_shift_fault_decisions() {
+    // The same calls with and without deferral inject the same failures.
+    let failures = |seed: u64, deferred: bool| {
+        let vfs = SimVfs::with_faults(seed, plan(|p| p.io_error_ppm = 200_000));
+        vfs.set_deferred_io(deferred);
+        let f = vfs
+            .open(&path("f"), OpenOptions::read_write_create())
+            .unwrap();
+        (0..64)
+            .map(|i| f.submit_write(buf(b"x"), i).wait().is_err())
+            .collect::<Vec<_>>()
+    };
+    for seed in 0..8 {
+        assert_eq!(failures(seed, false), failures(seed, true), "seed {seed}");
+    }
+}
+
+#[test]
+fn blocking_on_deferred_io_runs_it() {
+    let vfs = SimVfs::new(4);
+    vfs.set_deferred_io(true);
+    let f = create_durable(&vfs, "f");
+    f.set_len(4).unwrap();
+    f.sync_all().unwrap();
+    let other = f.submit_write(buf(b"zz"), 2);
+    f.write_at(b"abcd", 0).unwrap();
+    // A mapped completion runs its operation too, and only that one.
+    let synced = f.submit_sync_data().map(|r| r.map(|()| 7));
+    assert_eq!(synced.wait().unwrap(), 7);
+    assert_eq!(vfs.io_in_flight(), 1, "the other write is still in flight");
+    vfs.crash(CrashKind::Power);
+    assert_eq!(
+        contents(&vfs, "f"),
+        b"abcd",
+        "the sync ran, the write did not"
+    );
+    // An operation completed after a crash never happened.
+    assert!(vfs.complete_io());
+    assert_eq!(other.wait().unwrap_err().kind, ErrorKind::Crashed);
+    assert_eq!(contents(&vfs, "f"), b"abcd");
+}
+
+#[test]
+fn a_crash_point_passes_when_deferred_io_completes() {
+    let vfs = SimVfs::new(6);
+    let f = create_durable(&vfs, "f");
+    vfs.set_faults(plan(|p| p.crash_after_ops = Some(vfs.mutating_ops() + 2)));
+    vfs.set_deferred_io(true);
+    let first = f.submit_write(buf(b"ab"), 0);
+    let second = f.submit_write(buf(b"cd"), 2);
+    let third = f.submit_write(buf(b"ef"), 4);
+    assert_eq!(f.len().unwrap(), 0, "no crash yet");
+    vfs.complete_all_io();
+    let results = [first.wait(), second.wait(), third.wait()];
+    let crashed = results.iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        crashed, 1,
+        "seed 6: the third completed write meets the crash"
+    );
+    assert_eq!(f.len().unwrap_err().kind, ErrorKind::Crashed);
+}
+
+#[test]
+fn a_handle_dropped_with_io_in_flight_stays_open_until_it_completes() {
+    let vfs = SimVfs::new(8);
+    vfs.set_deferred_io(true);
+    let f = create_durable(&vfs, "f");
+    f.write_at(b"data", 0).unwrap();
+    f.sync_all().unwrap();
+    f.lock(0, LockMode::Exclusive).unwrap();
+    f.write_at(b"more", 4).unwrap();
+    let sync = f.submit_sync_data();
+    drop(f);
+    // The lock went with the handle; the sync still runs on it.
+    let g = vfs
+        .open(&path("f"), OpenOptions::read_write_create())
+        .unwrap();
+    g.lock(0, LockMode::Exclusive).unwrap();
+    drop(g);
+    vfs.remove(&path("f")).unwrap();
+    vfs.complete_all_io();
+    sync.wait().unwrap();
+}
+
+#[test]
+fn a_background_thread_completes_deferred_io() {
+    let vfs = SimVfs::new(10);
+    vfs.set_deferred_io(true);
+    let device = vfs.complete_io_in_background();
+    let f = create_durable(&vfs, "f");
+    for i in 0..32 {
+        let synced = f.submit_write(buf(b"x"), i);
+        // A future is resolved by the device thread, not by its waiter.
+        while !synced.is_ready() {
+            std::thread::yield_now();
+        }
+    }
+    assert_eq!(f.len().unwrap(), 32);
+    drop(f);
+    drop(vfs);
+    device.join().unwrap();
+}

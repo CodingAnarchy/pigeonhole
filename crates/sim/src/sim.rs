@@ -118,6 +118,10 @@ struct Task {
 /// Time moves only when no task is runnable: the clock jumps to the earliest wakeup, through
 /// [`SimVfs::advance`], so file-system clocks and the scheduler always agree.
 ///
+/// With deferred I/O ([`SimVfs::set_deferred_io`]), the simulated device is one more task:
+/// while I/O is in flight, a step may complete one operation (chosen by the VFS's seed)
+/// instead of stepping a task, and in-flight I/O completes before time moves.
+///
 /// ```
 /// use std::{cell::Cell, rc::Rc};
 /// use pigeonhole_sim::{Sim, Step};
@@ -215,8 +219,9 @@ impl Sim {
     /// Steps one runnable task chosen by the RNG, advancing time to the next wakeup if none
     /// is runnable. Returns `false` when no tasks remain.
     pub fn step(&mut self) -> bool {
+        let io = self.vfs.io_in_flight() > 0;
         if self.tasks.is_empty() {
-            return false;
+            return io && self.vfs.complete_io();
         }
         let now = self.now_nanos();
         self.runnable.clear();
@@ -227,12 +232,21 @@ impl Sim {
                 .filter(|(_, t)| t.wake_at <= now)
                 .map(|(i, _)| i),
         );
+        if self.runnable.is_empty() && io {
+            return self.vfs.complete_io();
+        }
         if self.runnable.is_empty() {
             let wake = self.tasks.iter().map(|t| t.wake_at).min().unwrap_or(now);
             self.vfs.advance(wake - now);
             return self.step();
         }
-        let pick = self.runnable[self.rng.below(self.runnable.len() as u64) as usize];
+        // Without I/O in flight, the draw is the one runs without deferred I/O make.
+        let pick = self
+            .rng
+            .below((self.runnable.len() + usize::from(io)) as u64) as usize;
+        let Some(&pick) = self.runnable.get(pick) else {
+            return self.vfs.complete_io();
+        };
         let task = &mut self.tasks[pick];
         match (task.run)(&mut task.rng) {
             Step::Ready => {}
@@ -373,6 +387,50 @@ mod tests {
         assert_eq!(*n.borrow(), 10);
         assert!(!sim.run_until(5, &mut || false));
         assert_eq!(*n.borrow(), 15);
+    }
+
+    #[test]
+    fn the_device_completes_deferred_io_between_task_steps() {
+        use pigeonhole_io::{IoBuf, OpenOptions};
+        let run = |seed| {
+            let mut sim = Sim::new(seed);
+            let vfs = sim.vfs();
+            vfs.set_deferred_io(true);
+            let file = vfs
+                .open(
+                    std::path::Path::new("/d/f"),
+                    OpenOptions::read_write_create(),
+                )
+                .unwrap();
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let l = log.clone();
+            let mut pending = Vec::new();
+            sim.spawn(
+                "submitter",
+                Box::new(move |_| {
+                    pending.retain(|c: &pigeonhole_io::Completion| !c.is_ready());
+                    l.borrow_mut().push(pending.len());
+                    if l.borrow().len() > 20 {
+                        return if pending.is_empty() {
+                            Step::Done
+                        } else {
+                            Step::Ready
+                        };
+                    }
+                    pending.push(file.submit_write(IoBuf::zeroed(1), 0));
+                    Step::Ready
+                }),
+            );
+            sim.run_until_idle();
+            assert_eq!(vfs.io_in_flight(), 0, "seed {seed}");
+            Rc::try_unwrap(log).unwrap().into_inner()
+        };
+        let log = run(4);
+        assert_eq!(log, run(4), "seed 4 replays");
+        assert!(
+            log.iter().any(|&n| n > 1),
+            "seed 4: I/O stayed in flight across steps: {log:?}"
+        );
     }
 
     #[test]

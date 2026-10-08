@@ -37,7 +37,13 @@
 //!   Reopening through the same `SimVfs` is the restart.
 //! - **Size.** Files are limited to 4 GiB; a write or length past that fails with `Other`
 //!   (like `EFBIG`).
-//! - **Submitted I/O** completes before `submit_*` returns, so runs are deterministic.
+//! - **Submitted I/O** completes before `submit_*` returns, unless deferred
+//!   ([`SimVfs::set_deferred_io`]): then it stays in flight, and nothing about it happens
+//!   (no bytes move, no crash point passes) until the simulator completes it
+//!   ([`SimVfs::complete_io`], in an order the seed chooses) or a thread blocks on its
+//!   [`Completion::wait`], which runs it. A crash before then fails it with `Crashed`: it
+//!   never happened. A handle dropped with I/O in flight stays open (its locks released)
+//!   until that I/O completes, as the kernel holds a file for its in-flight operations.
 //!
 //! Every random decision draws from one seeded generator in a fixed order, so a seed and
 //! the same sequence of calls replay exactly. [`Vfs::random_u64`] is derived from the seed
@@ -49,7 +55,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::{
     Completion, Error, ErrorKind, File, FileIdentity, FileRef, IoBuf, LockMode, OpenOptions,
@@ -188,6 +196,8 @@ pub struct SimVfs {
     seed: u64,
     me: Weak<SimVfs>,
     state: Mutex<SimState>,
+    /// Signalled when deferred I/O is submitted (for [`SimVfs::complete_io_in_background`]).
+    io_submitted: Condvar,
 }
 
 /// Wall clock at simulated time zero: 2026-01-01T00:00:00Z, in microseconds.
@@ -229,6 +239,27 @@ struct SimState {
     shm: BTreeMap<(Option<PathBuf>, String), SharedRegion>,
     killed: HashSet<ProcessId>,
     nanos: u64,
+    /// Whether `submit_*` defers its operation (see [`SimVfs::set_deferred_io`]).
+    deferred: bool,
+    /// Deferred operations not yet completed, in submission order.
+    in_flight: Vec<InFlight>,
+    next_io: u64,
+    /// Picks which in-flight operation completes next. A generator of its own, so deferring
+    /// I/O never shifts the fault decisions a seed makes.
+    io_rng: Rng,
+    /// Deferred operations per handle, counting one that is running.
+    io_pins: HashMap<u64, u32>,
+    /// Handles dropped while pinned by in-flight I/O: closed when it completes.
+    closing: HashSet<u64>,
+}
+
+/// A deferred operation: `job` runs it on its file and resolves its completion.
+struct InFlight {
+    id: u64,
+    node: u64,
+    handle: u64,
+    writable: bool,
+    job: Box<dyn FnOnce(&SimFile) + Send>,
 }
 
 #[derive(Default)]
@@ -358,6 +389,20 @@ impl SimState {
             .is_some_and(|n| n.open.contains_key(&handle))
     }
 
+    /// Closes a handle: it loses its locks, and its node goes once nothing reaches it.
+    fn close(&mut self, node: u64, handle: u64) {
+        if !self.is_open(node, handle) {
+            return;
+        }
+        let node = self.node(node);
+        node.open.remove(&handle);
+        for holders in node.locks.values_mut() {
+            holders.retain(|&(h, _)| h != handle);
+        }
+        node.locks.retain(|_, holders| !holders.is_empty());
+        self.gc();
+    }
+
     fn crash(&mut self, kind: CrashKind) {
         for node in self.nodes.values_mut() {
             node.open.clear();
@@ -441,7 +486,14 @@ impl SimVfs {
                 shm: BTreeMap::new(),
                 killed: HashSet::new(),
                 nanos: 0,
+                deferred: false,
+                in_flight: Vec::new(),
+                next_io: 0,
+                io_rng: Rng(seed ^ 0x6A09_E667_F3BC_C908),
+                io_pins: HashMap::new(),
+                closing: HashSet::new(),
             }),
+            io_submitted: Condvar::new(),
         })
     }
 
@@ -542,6 +594,160 @@ impl SimVfs {
     pub fn enter_process(&self, process: ProcessId) {
         CURRENT_PROCESS.with(|m| m.borrow_mut().insert(self.id, process));
     }
+
+    /// Defers I/O submitted from now on (`submit_read`, `submit_write`, `submit_sync_data`):
+    /// each operation stays in flight until [`SimVfs::complete_io`] (or a blocking
+    /// [`Completion::wait`] on it) runs it, so a simulated run has I/O in flight across its
+    /// scheduling points, as on a real device. Off (the default), submitted I/O completes
+    /// before `submit_*` returns. Turning it off leaves operations already in flight there.
+    ///
+    /// Someone must complete deferred I/O: the scheduler (`pigeonhole-sim`'s `Sim` does it
+    /// as one more task), the harness, or [`SimVfs::complete_io_in_background`] for code
+    /// that runs on threads of its own.
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use pigeonhole_io::{File, IoBuf, OpenOptions, Vfs};
+    /// use pigeonhole_io::sim::SimVfs;
+    ///
+    /// # fn main() -> pigeonhole_io::Result<()> {
+    /// let vfs = SimVfs::new(7);
+    /// vfs.set_deferred_io(true);
+    /// let file = vfs.open(Path::new("/db/f"), OpenOptions::read_write_create())?;
+    /// let mut buf = IoBuf::zeroed(4);
+    /// buf.copy_from_slice(b"data");
+    /// let write = file.submit_write(buf, 0);
+    /// let sync = file.submit_sync_data();
+    /// assert_eq!((file.len()?, vfs.io_in_flight()), (0, 2));
+    /// assert!(vfs.complete_io()); // one of the two, chosen by the seed
+    /// vfs.complete_all_io();
+    /// assert!(write.is_ready() && sync.is_ready());
+    /// assert_eq!(file.len()?, 4);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_deferred_io(&self, on: bool) {
+        self.state().deferred = on;
+    }
+
+    /// Deferred operations in flight.
+    pub fn io_in_flight(&self) -> usize {
+        self.state().in_flight.len()
+    }
+
+    /// Completes one in-flight deferred operation, chosen by the seed, on the calling thread
+    /// (its completion's continuations run here too). Returns `false` if none was in flight.
+    pub fn complete_io(&self) -> bool {
+        self.complete(None)
+    }
+
+    /// Completes deferred operations until none is in flight, including any their
+    /// continuations submit.
+    pub fn complete_all_io(&self) {
+        while self.complete(None) {}
+    }
+
+    /// Completes deferred I/O on a thread of its own, one operation at a time in an order
+    /// the seed chooses, a few yields after each is found in flight, for code whose threads
+    /// block on submitted I/O (an engine running its own shard threads). The order is
+    /// seeded, but what is in flight when depends on the OS scheduler, so such runs do not
+    /// replay exactly. The thread ends once the `SimVfs` is dropped.
+    pub fn complete_io_in_background(self: &Arc<Self>) -> JoinHandle<()> {
+        let me = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("sim-io".into())
+            .spawn(move || {
+                while let Some(vfs) = me.upgrade() {
+                    let yields = {
+                        let (st, _) = vfs
+                            .io_submitted
+                            .wait_timeout_while(vfs.state(), Duration::from_millis(1), |st| {
+                                st.in_flight.is_empty()
+                            })
+                            .unwrap_or_else(PoisonError::into_inner);
+                        let mut st = st;
+                        (!st.in_flight.is_empty()).then(|| st.io_rng.below(8))
+                    };
+                    if let Some(yields) = yields {
+                        for _ in 0..yields {
+                            std::thread::yield_now();
+                        }
+                        vfs.complete(None);
+                    }
+                }
+            })
+            .expect("spawn the simulated I/O thread")
+    }
+
+    /// Runs `run` on `file` now, or defers it (see [`SimVfs::set_deferred_io`]).
+    fn submit<T: Send + 'static>(
+        &self,
+        file: &SimFile,
+        run: impl FnOnce(&SimFile) -> Result<T> + Send + 'static,
+    ) -> Completion<T> {
+        let mut st = self.state();
+        if !st.deferred {
+            drop(st);
+            return Completion::ready(run(file));
+        }
+        let id = st.next_io;
+        st.next_io += 1;
+        *st.io_pins.entry(file.handle).or_default() += 1;
+        let me = self.me.clone();
+        let (done, resolver) = Completion::driven_pair(Some(Arc::new(move || {
+            if let Some(vfs) = me.upgrade() {
+                vfs.complete(Some(id));
+            }
+        })));
+        st.in_flight.push(InFlight {
+            id,
+            node: file.node,
+            handle: file.handle,
+            writable: file.writable,
+            job: Box::new(move |file| resolver.resolve(run(file))),
+        });
+        drop(st);
+        self.io_submitted.notify_all();
+        done
+    }
+
+    /// Completes the in-flight operation `id` (if still in flight), or one chosen by the
+    /// seed. Returns whether one ran.
+    fn complete(&self, id: Option<u64>) -> bool {
+        let op = {
+            let mut st = self.state();
+            let i = match id {
+                Some(id) => st.in_flight.iter().position(|op| op.id == id),
+                None if st.in_flight.is_empty() => None,
+                None => {
+                    let n = st.in_flight.len() as u64;
+                    Some(st.io_rng.below(n) as usize)
+                }
+            };
+            match i {
+                Some(i) => st.in_flight.remove(i),
+                None => return false,
+            }
+        };
+        let file = SimFile {
+            vfs: self.me.upgrade().expect("SimVfs is alive while borrowed"),
+            node: op.node,
+            handle: op.handle,
+            writable: op.writable,
+            owner: false,
+        };
+        (op.job)(&file);
+        let mut st = self.state();
+        let pins = st.io_pins.get_mut(&op.handle).expect("pinned by its I/O");
+        *pins -= 1;
+        if *pins == 0 {
+            st.io_pins.remove(&op.handle);
+            if st.closing.remove(&op.handle) {
+                st.close(op.node, op.handle);
+            }
+        }
+        true
+    }
 }
 
 impl fmt::Debug for SimVfs {
@@ -559,6 +765,9 @@ struct SimFile {
     node: u64,
     handle: u64,
     writable: bool,
+    /// Whether dropping this closes the handle (`false` for the view a deferred operation
+    /// runs on).
+    owner: bool,
 }
 
 impl fmt::Debug for SimFile {
@@ -624,17 +833,21 @@ impl SimFile {
 
 impl Drop for SimFile {
     fn drop(&mut self) {
-        let mut st = self.vfs.state();
-        if !st.is_open(self.node, self.handle) {
+        if !self.owner {
             return;
         }
-        let node = st.node(self.node);
-        node.open.remove(&self.handle);
-        for holders in node.locks.values_mut() {
-            holders.retain(|&(h, _)| h != self.handle);
+        let mut st = self.vfs.state();
+        if !st.io_pins.contains_key(&self.handle) {
+            st.close(self.node, self.handle);
+        } else if st.is_open(self.node, self.handle) {
+            // Closed when its in-flight I/O completes; the locks go now, as with `close(2)`.
+            st.closing.insert(self.handle);
+            let node = st.node(self.node);
+            for holders in node.locks.values_mut() {
+                holders.retain(|&(h, _)| h != self.handle);
+            }
+            node.locks.retain(|_, holders| !holders.is_empty());
         }
-        node.locks.retain(|_, holders| !holders.is_empty());
-        st.gc();
     }
 }
 
@@ -694,11 +907,13 @@ impl File for SimFile {
     }
 
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
-        Completion::ready(self.read_at(&mut buf, offset).map(|()| buf))
+        self.vfs
+            .submit(self, move |f| f.read_at(&mut buf, offset).map(|()| buf))
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
-        Completion::ready(self.write_at(&buf, offset).map(|()| buf))
+        self.vfs
+            .submit(self, move |f| f.write_at(&buf, offset).map(|()| buf))
     }
 
     fn sync_data(&self) -> Result<()> {
@@ -706,7 +921,7 @@ impl File for SimFile {
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
-        Completion::ready(self.sync_data())
+        self.vfs.submit(self, SimFile::sync_data)
     }
 
     fn sync_all(&self) -> Result<()> {
@@ -804,6 +1019,7 @@ impl Vfs for SimVfs {
             node: id,
             handle,
             writable: opts.write || opts.create || opts.create_new,
+            owner: true,
         }))
     }
 
