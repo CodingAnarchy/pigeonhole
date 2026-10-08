@@ -579,3 +579,12 @@ The engine model harness drives the shards on the thread that commits, and with 
 **Interim behavior:** `Store::open_cfg` sets a 120-byte inline limit (values go up to 160 bytes), so about a quarter of the puts take this path under faults, crashes and tablet changes. It doesn't with deferred I/O (#306: drive deferred completions from a helper thread instead). The recovery oracle compares put values above 120 bytes by length, since a WAL record's pointer may name a file blob GC has dropped since. `large_values.rs` covers the paths directly (including an apply that fails with `Busy` after the WAL append, through the `fail_next_apply` hook, and a D34 timestamp collision), and `huge_value.rs` runs the one real round trip above 64 MiB in its own test binary.
 
 **Coordinator:** confirmed after independent review (#301). The review's must-fix (release decided by where the commit stopped, not by its error) and its should-fixes (the D34 timestamp collision, 256-extent spreading) are in the text above. Deferred-I/O coverage is #306 (Phase 3).
+
+<a id="d189"></a>
+## D189 — Arenas are sized for their slots with tablet changes off too (approved; engine, #283, #307; amends D136)
+### Proposed decision: arenas are sized for their slots with tablet changes off too (#283)
+D136 sized arenas for many slots only with tablet changes on: at least 256 chunks, so 64 `(tablet, family)` slots per shard, and smaller chunks when the tablets placed at open need more. Off, an arena was cut into `budget / 64` chunks (capped at 256 KiB), so a budget under 16 MiB served 16 slots. A shard holding more (4 tables of 6 families on one shard: 24) starved when a flush froze every slot. Writes stalled until `Busy`, or the public harness hung.
+
+**Interim behavior:** both modes use `arena_chunk_size`. With tablet changes off, the slots counted are those `shard_for` places at open (`Catalog::max_slots_per_shard`); tables and families created later fit while a shard stays within 64 slots, as with tablet changes on. At the default 64 MiB budget nothing changes (256 KiB chunks either way). `EngineOptions::arena_chunk_bytes` (hidden) pins a layout for tests that starve an arena on purpose (`milestone_b`). A regression target, `engine/tests/slots.rs`, runs the model check with six families on one tablet-off shard. Seed 5 stalled before.
+
+**Coordinator:** confirmed. Smaller chunks can't fail at apply: an entry larger than a chunk takes a contiguous run, and admission waits for one (`values_larger_than_a_small_chunk_are_admitted_and_applied`).
