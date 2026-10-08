@@ -1,6 +1,10 @@
 # Status
 
+> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete in its main parts and fault-tested in simulation, but the on-disk format and the API may change before 1.0 ([`FORMAT.md`](../FORMAT.md)). The wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Not recommended for production use yet. Keep this note in sync with each release.
+
 Live progress against the [build plan](design/spec.md#build-plan). Updated by the coordinator as work lands.
+
+The decision log is a [phase file plus an index](design/decisions/README.md) (`decisions/phase-1.md`); open questions from each crate live in [`design/questions/`](design/questions/) until the coordinator folds them in.
 
 | Step | State |
 |---|---|
@@ -8,7 +12,7 @@ Live progress against the [build plan](design/spec.md#build-plan). Updated by th
 | 2. Interface freeze — public traits/types for every crate, `FORMAT.md` | done ([#1](https://github.com/CodingAnarchy/pigeonhole/pull/1); see [interfaces.md](design/interfaces.md)) |
 | 3. Foundations — `format`, `io`, `sim` | done ([#2](https://github.com/CodingAnarchy/pigeonhole/pull/2), [#3](https://github.com/CodingAnarchy/pigeonhole/pull/3), [#4](https://github.com/CodingAnarchy/pigeonhole/pull/4)) |
 | 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | done — all seven merged, last [#30](https://github.com/CodingAnarchy/pigeonhole/pull/30) (`sst`) |
-| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | all crates merged incl. engine Milestone B ([#63](https://github.com/CodingAnarchy/pigeonhole/pull/63)) and `bench` ([#55](https://github.com/CodingAnarchy/pigeonhole/pull/55)); remaining Phase 1 milestone: tablet splits (#38), harness oracle (#48, #62), docs and bench sizes ([#74](https://github.com/CodingAnarchy/pigeonhole/pull/74): `full` preset, guide and rustdoc for disk-backed storage; model-suite flush/compact steps and the `full` cold-read criterion remain), deterministic background I/O (#61), scaling gate (#51) |
+| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | all crates merged, including engine Milestone B ([#63](https://github.com/CodingAnarchy/pigeonhole/pull/63)), `bench` ([#55](https://github.com/CodingAnarchy/pigeonhole/pull/55)), the per-stream recovery oracle in the engine and public suites (#48), deterministic background I/O (#61), tablet splits, merges and moves, **on by default** ([#168](https://github.com/CodingAnarchy/pigeonhole/pull/168), tracked in #38), the pre-gate edge-case review ([#90](https://github.com/CodingAnarchy/pigeonhole/issues/90)) and its fixes so far (blocking waits park and application-owned close completes, #135; failed side syncs poison, #139; reader snapshots across a writer restart, #140; leaks, #144). Still open in the Phase 1 milestone: the rest of #38, the scaling gate (#51), the review's remaining engine fixes (stall and retry edge cases #141, WAL checkpointing #137, open cost #143, shm and CPU pinning #142, `shrink` #138), the documentation truthfulness fixes ([#146](https://github.com/CodingAnarchy/pigeonhole/issues/146)), and the gate itself |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.

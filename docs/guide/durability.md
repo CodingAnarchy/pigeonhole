@@ -14,7 +14,7 @@ Every commit says how durable it must be before it returns. The default is the s
 | `GroupSync` (default) | The WAL group containing it was fsynced; one fsync is shared by all committers in the group. | Power loss | Nothing, once returned | Systems of record |
 | `Sync` | A dedicated fsync, never batched. | Power loss | Nothing, once returned | Rare latency-isolated critical writes |
 
-In **every** level a crash loses only a suffix of recent commits: never one from the middle, and never part of a row (or part of a batch).
+In **every** level a crash never loses part of a row or part of a batch, and never loses a commit from the middle of a shard's write stream: each shard keeps a prefix of its own WAL stream (decision D84). A commit that touches only one shard is lost or kept whole. A cross-shard batch is kept only if every participant and the coordinator's decision survive, and is otherwise lost as a whole. There is **no single global order** across shards: after a power loss, a weaker commit on one shard can be gone while a later weaker commit on another shard survives. Commits acknowledged at `GroupSync` or `Sync` always survive.
 
 ## Resolution order
 For each commit, the level is the first of:
