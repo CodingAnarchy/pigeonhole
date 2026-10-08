@@ -218,8 +218,8 @@ fn resolver(c: &mut Criterion) {
     g.finish();
 }
 
-/// One counter column holding `n` unfolded `incr` operands (compaction does not fold across
-/// timestamps until #34): the cost of a point get grows with `n`.
+/// One counter column holding `n` unfolded `incr` operands, as it does until a bottommost
+/// compaction folds them (#34): the cost of a point get grows with `n`.
 fn counter(c: &mut Criterion) {
     let vfs: VfsRef = SimVfs::new(2);
     let pager = Pager::create(&vfs, "/counter.phdb".as_ref()).unwrap();

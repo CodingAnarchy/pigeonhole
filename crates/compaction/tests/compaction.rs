@@ -646,9 +646,10 @@ fn a_bad_merge_base_stays_a_merge_failure() {
     ];
     let input = db.sst(&family, &e);
     let (_, kept) = compact(&db, &family, &[input], policy(vec![], 100, true));
+    // The operands fold into one (#34), but never onto the bad base (#21).
     assert_eq!(
-        kept, e,
-        "operands are not folded across timestamps or onto a base"
+        kept,
+        [(key(b"r", b"n", 30, 3, Kind::Merge), i64v(3)), e[2].clone()]
     );
     let mut o = pigeonhole_compaction::ResolveOptions::new(9, 100);
     o.merge = Some(Arc::new(I64Add));
@@ -659,6 +660,47 @@ fn a_bad_merge_base_stays_a_merge_failure() {
         r.next_cell(),
         Err(pigeonhole_compaction::Error::Merge(_))
     ));
+}
+
+/// Issue #34: a counter with N increments compacts to one entry at the bottommost level
+/// (a put, folded onto its base), and only where no read point or later write can tell.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn counter_operands_fold_across_timestamps_at_the_bottom() {
+    let mut db = Db::new(34);
+    let family = FamilyOptions::default();
+    let i64v = |v: i64| stored(&v.to_le_bytes());
+    let n = 200u64;
+    let mut e: Vec<KeyValue> = (1..=n)
+        .rev()
+        .map(|i| (key(b"r", b"n", 10 + i, 1 + i, Kind::Merge), i64v(1)))
+        .collect();
+    e.push((key(b"r", b"n", 5, 1, Kind::Put), i64v(1000)));
+    let input = db.sst(&family, &e);
+    let compact_with =
+        |gc: GcPolicy, fam: &FamilyOptions| compact(&db, fam, std::slice::from_ref(&input), gc).1;
+    let newest = key(b"r", b"n", 10 + n, 1 + n, Kind::Put);
+    assert_eq!(
+        compact_with(policy(vec![], 100, true), &family),
+        [(newest, i64v(1000 + n as i64))]
+    );
+    // Not bottommost, a live snapshot inside the run, the run at or above `min_ts_above`,
+    // or a TTL: only same-timestamp operands may combine, so nothing changes here.
+    let mut above = policy(vec![], 100, true);
+    above.min_ts_above = 10 + n;
+    let mut ttl = family.clone();
+    ttl.ttl_micros = 1_000_000;
+    for (gc, fam) in [
+        (policy(vec![], 100, false), &family),
+        (policy(vec![50], 100, true), &family),
+        (above, &family),
+        (policy(vec![], 100, true), &ttl),
+    ] {
+        assert_eq!(compact_with(gc.clone(), fam).len(), e.len(), "{gc:?}");
+    }
 }
 
 /// Operands at one timestamp and stripe combine into one operand.
