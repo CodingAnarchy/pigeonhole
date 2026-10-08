@@ -2,7 +2,7 @@
 
 Project-level decisions that refine or deviate from [spec.md](../spec.md) and [task-briefs.md](../task-briefs.md). A decision wins over those files. Every decision is numbered and approved; numbers are permanent and global, and code and docs cite them as `Dn`.
 
-**Reading them:** don't read every file. Read this index, then open the decisions that touch your crate or topic, for example `grep -n -A30 '^## D83 ' docs/design/decisions/*.md`. When a decision is amended, read the amendment too ("amended by" below).
+**Reading them:** don't read every file. Read this index, then open the decisions that touch your crate or topic, for example `grep -n -A30 '^## D83 ' docs/design/decisions/*.md`. An amended decision's text states what is in force now and ends with a one-line history; the amending decisions ("amended by" below) stay unchanged as the record of why, so read them only for the reasoning.
 
 **Adding them:** agents never write here. Record open questions and interim behavior in `docs/design/questions/<crate>.md` (see [questions/README.md](../questions/README.md)); the coordinator folds them into the current phase's file with the next free number and adds a line to this index. Deferred work is a GitHub issue ([status](../../status.md#tracked-follow-ups)).
 
@@ -99,7 +99,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D85](phase-1.md#d85) — a failed WAL sync after a group was applied leaves its data visible · engine
 - [D86](phase-1.md#d86) — default timestamps use a per-shard floor seeded at replay · engine
 - [D87](phase-1.md#d87) — reader processes re-pin when idle · engine; changed in review
-- [D88](phase-1.md#d88) — application-owned close does not block · engine · **amended by D150, D151**
+- [D88](phase-1.md#d88) — application-owned close reports its outcome; blocking waits on a shard-driving thread · engine · **amended by D150, D151**
 - [D89](phase-1.md#d89) — `From<format::Error>` maps unknown variants to `Corruption` · engine
 - [D90](phase-1.md#d90) — `Snapshot::at_seqno` is a test hook behind `test-hooks` · engine
 - [D91](phase-1.md#d91) — conditional writes, OCC and prepared shares · changed in review
@@ -130,17 +130,17 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B
 - [D117](phase-1.md#d117) — Is `SetFlushed` the memtable's max seqno, or the shard's visible seqno · engine Milestone B
 - [D118](phase-1.md#d118) — How conservative is `GcPolicy` about reader-process snapshots · engine Milestone B; precise per-slot pinning is #39
-- [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126**
+- [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161**
 - [D120](phase-1.md#d120) — What does `backup` write for an engine with memtables and many levels · engine Milestone B; blob extents are #58
 - [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B · **amended by D156**
 - [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
 - [D123](phase-1.md#d123) — Does the sim's recovery helper cover a coordinator that is also a participant · superseded for new code by D114; engine adoption in #48 · **amended by D125**
 - [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D138, D161, D162**
 - [D125](phase-1.md#d125) — the model suites use the sim's record-level oracle on every crash · harness, #48 · amends D123
-- [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119 · **amended by D161**
+- [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119, D124 · **amended by D138, D161**
 - [D127](phase-1.md#d127) — a model harness attributes an error to an armed power loss only once the crash has fired · harness, #62
 - [D128](phase-1.md#d128) — flush and compaction outputs are trimmed to their length before they are published · pager, compaction, #106
-- [D129](phase-1.md#d129) — tablet changes are off by default until hardened · tablets, #97 · **amended by D153**
+- [D129](phase-1.md#d129) — tablet changes are gated on `tablet_changes`, on by default · tablets, #97 · **amended by D153**
 - [D130](phase-1.md#d130) — a tablet's owner is not persisted; owners are re-derived at open · tablets, #97; persisting placement is #104
 - [D131](phase-1.md#d131) — checkpoints compare slots against the catalog, not the shard · tablets, #97
 - [D132](phase-1.md#d132) — a commit routed through an older tablet map · tablets, #97 · **amended by D145**
