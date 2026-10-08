@@ -629,6 +629,10 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             before_view_publish: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
+            before_shrink_relocates: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            before_shrink_commits: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_parked: Mutex::new(None),
@@ -1126,6 +1130,10 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             before_view_publish: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
+            before_shrink_relocates: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            before_shrink_commits: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_parked: Mutex::new(None),
@@ -1426,8 +1434,10 @@ impl Engine {
         crate::maintenance::backup(&inner.shared, &snapshot, dest)
     }
 
-    /// Relocates tail extents the manifest names and truncates the file (decision D60).
-    /// Returns the bytes released.
+    /// Truncates the free tail, relocates tail extents the manifest names and truncates the
+    /// file again (decision D60). Returns the bytes the file shrank by. An extent with no
+    /// free extent of its size below it stays; `NoSpace` means the disk filled while the
+    /// manifest was being moved.
     pub fn shrink(&self) -> Result<u64> {
         let inner = &self.inner;
         if inner.role != Role::Writer {
@@ -1569,6 +1579,60 @@ impl Engine {
         let referenced: u64 = live.iter().map(|e| e.len()).sum();
         let stats = shared.pager.stats();
         (stats.allocated_bytes + stats.retired_bytes).saturating_sub(referenced)
+    }
+
+    /// Every SST the current catalog names, as `(table, level, sst id)` (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn sst_levels(&self) -> Vec<(TableId, u8, u64)> {
+        let catalog = Arc::clone(&self.inner.shared.view.load().catalog);
+        let mut out = Vec::new();
+        for ((tablet, _), list) in &catalog.ssts {
+            let Some(entry) = catalog.tablet(*tablet) else {
+                continue;
+            };
+            out.extend(
+                list.iter()
+                    .map(|(level, meta)| (entry.table, *level, meta.id.0)),
+            );
+        }
+        out
+    }
+
+    /// Bytes in the block cache (test hook: `shrink`'s tests check that an abandoned copy
+    /// leaves nothing cached).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn block_cache_usage(&self) -> usize {
+        self.inner.shared.cache.usage()
+    }
+
+    /// Runs `f` once, in the next `shrink` round, after it has read the catalog and before it
+    /// relocates anything: where a compaction or `drop_table` can commit under it (test
+    /// hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn before_shrink_relocates(&self, f: Box<dyn FnOnce() + Send>) {
+        *self
+            .inner
+            .shared
+            .before_shrink_relocates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Runs `f` once, in the next `shrink` round that commits, after it has written its
+    /// copies and before it commits them: where a `drop_table` makes a copy one to abandon
+    /// (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn before_shrink_commits(&self, f: Box<dyn FnOnce() + Send>) {
+        *self
+            .inner
+            .shared
+            .before_shrink_commits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
     }
 
     /// Splits the tablet of `table` holding row `at` at `at`; both halves stay on its shard.

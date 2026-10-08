@@ -801,10 +801,18 @@ impl Pager {
         lock(&self.inner.alloc).shrink_plan()
     }
 
+    /// Whether `extent` is exactly an allocated extent that is not retired. A caller that
+    /// read the manifest earlier uses it to tell an extent retired since (a compaction
+    /// replaced it) from a failure, for example after [`Pager::relocate`] refuses.
+    pub fn is_live(&self, extent: Extent) -> bool {
+        lock(&self.inner.alloc).is_live(extent)
+    }
+
     /// Copies `extent` into a newly allocated extent nearer the start of the file and returns
     /// it. The caller publishes the move in the manifest, then retires the old extent.
     ///
-    /// Fails with [`Error::NoSpace`] if no free extent of that size lies below `extent`.
+    /// Fails with [`Error::NoSpace`] if no free extent of that size lies below `extent`, and
+    /// with [`Error::Io`] if `extent` is not live (see [`Pager::is_live`]).
     pub fn relocate(&self, extent: Extent) -> Result<Extent> {
         if !self.inner.writable {
             return Err(io_err(

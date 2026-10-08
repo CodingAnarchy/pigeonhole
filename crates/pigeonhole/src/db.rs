@@ -376,21 +376,28 @@ impl Pigeonhole {
     /// large delete followed by [`compact`](Self::compact) when you need
     /// the disk space back (for example before copying the file, or on a small device).
     ///
-    /// It moves the live data that sits past the point where the file could end into free
-    /// space nearer the start, then truncates. The cost is reading and rewriting that data
-    /// (at most the live bytes in the file's tail) and a manifest commit per round, so run
-    /// it rarely. It runs online: reads, writes, flushes and compactions continue on other
-    /// threads, and in-flight flush or compaction output is never moved. It returns `0`
-    /// when there is nothing to release, for example before `compact` has freed anything.
-    /// Space still held by an open snapshot or scan is not released until that handle is
-    /// dropped; call `shrink` again afterwards.
+    /// It cuts off the free space at the end of the file, moves the live data that sits past
+    /// the point where the file could end into free space nearer the start, and truncates
+    /// again. The cost is reading and rewriting that data (at most the live bytes in the
+    /// file's tail) and a manifest commit per round, so run it rarely. It runs online: reads,
+    /// writes, flushes and compactions continue on other threads, and in-flight flush or
+    /// compaction output is never moved. It returns `0` when there is nothing to release,
+    /// for example before `compact` has freed anything. Space still held by an open
+    /// snapshot or scan is not released until that handle is dropped; call `shrink` again
+    /// afterwards.
+    ///
+    /// The file can end no earlier than its live data packed toward the start. Data lives in
+    /// extents of a power of two from 64 KiB to 64 MiB, each aligned to its size, and the
+    /// first 64 KiB of the file is the header: a file holding one 64 MiB extent (a large
+    /// SST) is at least 128 MiB, however little else it holds. Data with no free extent of
+    /// its size below it stays where it is; that is not an error.
     ///
     /// Errors: [`ErrorCode::Closed`](crate::ErrorCode::Closed) after `close`;
     /// [`ErrorCode::ReadOnly`](crate::ErrorCode::ReadOnly) if this handle cannot write;
-    /// [`ErrorCode::NoSpace`](crate::ErrorCode::NoSpace) when there is no free extent
-    /// below the one being moved (free space and retry); [`ErrorCode::Io`](crate::ErrorCode::Io)
-    /// on a disk failure. A failed shrink loses no data; if it fails while committing the
-    /// manifest, reopen the database.
+    /// [`ErrorCode::NoSpace`](crate::ErrorCode::NoSpace) when the disk is full and moving
+    /// the manifest needs the file to grow by its few KiB first (free space and retry);
+    /// [`ErrorCode::Io`](crate::ErrorCode::Io) on a disk failure. A failed shrink loses no
+    /// data; if it fails while committing the manifest, reopen the database.
     ///
     /// ```
     /// use pigeonhole::{Durability, Family, Options, Pigeonhole};

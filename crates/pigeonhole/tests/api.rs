@@ -1485,6 +1485,69 @@ fn shrink_releases_file_space_after_deletes_and_keeps_data() {
 }
 
 #[test]
+fn shrink_after_deleting_every_row_leaves_a_small_file() {
+    // Issue #138: with every row deleted and compacted away nothing live was left to move,
+    // and shrink returned 0 without truncating: the file kept the length the load gave it,
+    // also after a reopen.
+    let dir = TempDir::new("shrink-all");
+    let path = dir.0.join("db.phdb");
+    let opts = || Options::default().shards(1);
+    let len = || std::fs::metadata(&path).unwrap().len();
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default().max_versions(1))
+        .create_if_missing()
+        .unwrap();
+    // Incompressible 1 KiB values, as in the review's probe.
+    let mut x = 88_172_645_463_325_252u64;
+    for i in 0..3_000u32 {
+        let mut v = [0u8; 1024];
+        for b in &mut v {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        t.mutate(&i.to_be_bytes())
+            .put("f", b"q", &v)
+            .durability(Durability::Buffered)
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    for i in 0..3_000u32 {
+        t.mutate(&i.to_be_bytes())
+            .delete_row()
+            .durability(Durability::Buffered)
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    let before = len();
+    assert!(before >= 3 << 20, "the load grew the file: {before}");
+    let released = db.shrink().unwrap();
+    let after = len();
+    assert!(released > 0 && after < before, "{before} -> {after}");
+    assert!(
+        after <= 1 << 20,
+        "no row is left, yet the file is {after} bytes"
+    );
+    assert_eq!(t.scan_prefix(b"").iter().unwrap().count(), 0);
+    drop(t);
+    db.close().unwrap();
+
+    let db = Pigeonhole::open(&path, opts()).unwrap();
+    db.compact().unwrap();
+    db.shrink().unwrap();
+    db.close().unwrap();
+    assert!(len() <= 1 << 20, "after a reopen: {}", len());
+}
+
+#[test]
 fn a_flush_makes_none_commits_survive_a_power_loss() {
     let vfs = SimVfs::new(21);
     let opts = || sim_options(&vfs).shards(1);

@@ -6,10 +6,11 @@
 //! them as flushed through that seqno. The copy is exactly what a read at the snapshot sees,
 //! writers keep running meanwhile, and the result is one clean file.
 //!
-//! **Shrink** relocates the extents past the pager's shrink point that the manifest names
-//! (decision D60: never an in-flight flush or compaction output, which the manifest does not
-//! name yet, nor an SST a running compaction reads), publishes the moves, and truncates the
-//! file after everything retired has been reclaimed.
+//! **Shrink** truncates the free tail, relocates the extents past the pager's shrink point
+//! that the manifest names (decision D60: never an in-flight flush or compaction output,
+//! which the manifest does not name yet, nor an SST a running compaction reads), publishes
+//! the moves against the catalog current at commit time, and truncates the file again once
+//! everything retired has been reclaimed.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,9 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pigeonhole_compaction::MergingCursor;
 use pigeonhole_format::key::split_suffix;
-use pigeonhole_format::manifest::Edit;
+use pigeonhole_format::manifest::{Edit, SstMeta};
 use pigeonhole_format::scan::ScanFilter;
-use pigeonhole_format::{Cursor, SstId};
+use pigeonhole_format::{Cursor, FamilyId, SstId};
 use pigeonhole_pager::Pager;
 use pigeonhole_sst::{SstReader, SstWriterOptions};
 
@@ -164,24 +165,25 @@ pub(crate) fn backup(shared: &Shared, snapshot: &Snapshot, dest: &Path) -> Resul
     result
 }
 
-/// Where an SST is referenced: `((tablet, family), level)`.
-type SstRef = (
-    (pigeonhole_format::TabletId, pigeonhole_format::FamilyId),
-    u8,
-);
-
 /// Relocates manifest-named extents past the shrink point and truncates the file. Returns
-/// bytes released.
+/// the bytes the file shrank by.
+///
+/// Every round first gives back the free space already at the tail, so a file whose tail
+/// holds nothing live (everything there was deleted and compacted away) shrinks without
+/// moving anything. An extent with no free extent of its class below it is skipped, not an
+/// error (the file then ends after it), and the extents past it still move.
 pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     let mut released = 0;
     for _round in 0..8 {
         if shared.closing.load(Ordering::Acquire) {
             // The close waits for this call: stop between rounds.
-            break;
+            return Ok(released);
         }
-        // Retired extents no view uses any more are free space the relocations can move
-        // into; without this the targets would be allocated past the end of the file.
+        // Retired extents no view uses any more are free space: at the tail they are cut
+        // off now, below it the relocations can move into them (without this the targets
+        // would be allocated past the end of the file).
         shared.reclaim();
+        released += shared.pager.truncate_tail()?;
         let plan = shared.pager.shrink_plan();
         if plan.is_empty() {
             break;
@@ -193,24 +195,37 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .root();
-        // Every SST by extent, with everywhere it is referenced.
-        let mut by_extent: HashMap<(u64, u8), Vec<SstRef>> = HashMap::new();
-        let mut metas: HashMap<SstId, Arc<pigeonhole_format::manifest::SstMeta>> = HashMap::new();
-        for ((tablet, family), list) in &catalog.ssts {
-            for (level, meta) in list {
+        // Every SST by extent, with a family that references it (for its cache priority).
+        // Where it is referenced is decided again at commit time (`Moves::edits`).
+        let mut by_extent: HashMap<(u64, u8), (FamilyId, Arc<SstMeta>)> = HashMap::new();
+        for ((_, family), list) in &catalog.ssts {
+            for (_, meta) in list {
                 by_extent
                     .entry((meta.extent.page, meta.extent.size_class))
-                    .or_default()
-                    .push(((*tablet, *family), *level));
-                metas.insert(meta.id, Arc::clone(meta));
+                    .or_insert_with(|| (*family, Arc::clone(meta)));
             }
         }
-        let mut edits = Vec::new();
+        #[cfg(feature = "test-hooks")]
+        {
+            let hook = shared
+                .before_shrink_relocates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut moves = Moves {
+            pager: Arc::clone(&shared.pager),
+            list: Vec::new(),
+        };
         let mut readers = Vec::new();
         let mut rewrite = false;
         let mut claimed: Vec<SstId> = Vec::new();
-        let mut fresh = Vec::new();
-        let mut stop = false;
+        // An extent retired since the catalog was read: the plan is stale, so a round with
+        // nothing to move plans again instead of stopping.
+        let mut stale = false;
         for extent in plan {
             if [root.snapshot, root.log]
                 .into_iter()
@@ -220,16 +235,8 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                 rewrite = true;
                 continue;
             }
-            let Some(refs) = by_extent.get(&(extent.page, extent.size_class)) else {
+            let Some((family, meta)) = by_extent.get(&(extent.page, extent.size_class)) else {
                 // Not named by the manifest: an output in flight (decision D60).
-                continue;
-            };
-            let Some(meta) = catalog
-                .ssts
-                .get(&refs[0].0)
-                .and_then(|l| l.iter().find(|(_, m)| m.extent == extent))
-                .map(|(_, m)| Arc::clone(m))
-            else {
                 continue;
             };
             {
@@ -245,25 +252,27 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             claimed.push(meta.id);
             let target = match shared.pager.relocate(extent) {
                 Ok(t) => t,
-                Err(pigeonhole_pager::Error::NoSpace) => {
-                    stop = true;
-                    break;
+                // No free extent of its class below it: it stays, and the smaller ones
+                // past it may still move.
+                Err(pigeonhole_pager::Error::NoSpace) => continue,
+                // A compaction that committed after the catalog was read retired it (the
+                // view held here keeps it from being reclaimed, so it is not reused).
+                Err(_) if !shared.pager.is_live(extent) => {
+                    stale = true;
+                    continue;
                 }
                 Err(e) => {
                     unclaim(shared, &claimed);
-                    for e in fresh {
-                        shared.pager.abandon(e);
-                    }
                     return Err(e.into());
                 }
             };
-            fresh.push(target);
             let id = SstId(shared.sst_ids.fetch_add(1, Ordering::Relaxed));
-            let mut new_meta = (*meta).clone();
+            let mut new_meta = (**meta).clone();
             new_meta.id = id;
             new_meta.extent = target;
+            moves.list.push((meta.id, new_meta.clone()));
             let priority = catalog
-                .family(refs[0].0.1)
+                .family(*family)
                 .map_or(pigeonhole_cache::Priority::Normal, |m| {
                     SstSet::priority(m.options.cache_priority)
                 });
@@ -276,31 +285,36 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                 Ok(r) => readers.push((id, Arc::new(r))),
                 Err(e) => {
                     unclaim(shared, &claimed);
-                    for e in fresh {
-                        shared.pager.abandon(e);
-                    }
                     return Err(e.into());
                 }
             }
-            for ((tablet, family), level) in refs {
-                edits.push(Edit::RemoveSst {
-                    tablet: *tablet,
-                    family: *family,
-                    sst: meta.id,
-                });
-                edits.push(Edit::AddSst {
-                    tablet: *tablet,
-                    family: *family,
-                    level: *level,
-                    meta: new_meta.clone(),
-                });
-            }
         }
-        if edits.is_empty() && !rewrite {
+        if moves.list.is_empty() && !rewrite {
             unclaim(shared, &claimed);
+            if stale {
+                continue;
+            }
             break;
         }
-        let (req, waiter) = ManifestReq::with_waiter(ReqKind::Edits(edits));
+        #[cfg(feature = "test-hooks")]
+        {
+            let hook = shared
+                .before_shrink_commits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // The edits are computed against the catalog at commit time, not the one read
+        // above: a compaction or `drop_table` that committed meanwhile removed an SST (its
+        // copy is abandoned), and a trivial move changed its level (the copy goes to the
+        // current one).
+        let (req, waiter) =
+            ManifestReq::with_waiter(ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
+                Ok(moves.edits(catalog))
+            })));
         let req = ManifestReq {
             readers,
             rewrite_snapshot: rewrite,
@@ -311,15 +325,69 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         drop(view);
         drop(catalog);
         // On an error the targets are the manifest's to abandon (`begin` does, for a
-        // refused request) or already named (a commit whose view publish failed).
+        // refused request, and `Moves` does for a request dropped unrun) or already named
+        // (a commit whose view publish failed).
         committed?;
+    }
+    if !shared.closing.load(Ordering::Acquire) {
+        // What the last round's moves retired.
         shared.reclaim();
         released += shared.pager.truncate_tail()?;
-        if stop {
-            break;
-        }
     }
     Ok(released)
+}
+
+/// Shrink's relocated copies, `(old SST, its copy)`, until the commit turns them into edits.
+/// Copies it never turns into edits (the request was dropped unrun) are abandoned.
+struct Moves {
+    pager: Arc<Pager>,
+    list: Vec<(SstId, SstMeta)>,
+}
+
+impl Moves {
+    /// Replaces each old SST by its copy wherever the current `catalog` references it, at
+    /// the level it is at now. A copy of an SST the catalog no longer references is
+    /// abandoned.
+    fn edits(&mut self, catalog: &Catalog) -> Vec<Edit> {
+        let mut edits = Vec::new();
+        for (old, copy) in std::mem::take(&mut self.list) {
+            let refs: Vec<_> = catalog
+                .ssts
+                .iter()
+                .flat_map(|(key, list)| {
+                    list.iter()
+                        .filter(|(_, m)| m.id == old)
+                        .map(move |(level, _)| (*key, *level))
+                })
+                .collect();
+            if refs.is_empty() {
+                self.pager.abandon(copy.extent);
+                continue;
+            }
+            for ((tablet, family), level) in refs {
+                edits.push(Edit::RemoveSst {
+                    tablet,
+                    family,
+                    sst: old,
+                });
+                edits.push(Edit::AddSst {
+                    tablet,
+                    family,
+                    level,
+                    meta: copy.clone(),
+                });
+            }
+        }
+        edits
+    }
+}
+
+impl Drop for Moves {
+    fn drop(&mut self) {
+        for (_, copy) in self.list.drain(..) {
+            self.pager.abandon(copy.extent);
+        }
+    }
 }
 
 fn unclaim(shared: &Shared, ids: &[SstId]) {
