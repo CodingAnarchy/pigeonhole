@@ -167,6 +167,9 @@ struct Attachment {
 pub(crate) struct Inner {
     pub(crate) shared: Arc<Shared>,
     role: Role,
+    /// Refuses writes and catalog changes with `ReadOnly`: a reader process, or a writer
+    /// opened with `allow_unregistered_merge` over a family whose operator is unknown.
+    read_only: bool,
     options: EngineOptions,
     path: PathBuf,
     runtime: Mutex<Option<Runtime<ShardState>>>,
@@ -456,6 +459,8 @@ impl Engine {
                 .unwrap_or_default();
             return Err(Error::UnknownMergeOperator(name));
         }
+        // Opened only because unregistered operators are allowed: read-only (#43).
+        let read_only = catalog.has_unknown_merge;
 
         // 3. Shared memory under a new generation, then presence (D37).
         let mut shm_config = ShmConfig::new(shards as u32);
@@ -888,6 +893,7 @@ impl Engine {
         let inner = Arc::new(Inner {
             shared: Arc::clone(&shared),
             role: Role::Writer,
+            read_only,
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -1053,6 +1059,7 @@ impl Engine {
         let inner = Arc::new(Inner {
             shared,
             role: Role::Reader,
+            read_only: true,
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
@@ -1177,7 +1184,7 @@ impl Engine {
 
     /// Starts an optimistic transaction (Phase 4).
     pub fn begin(&self) -> Result<Txn> {
-        if self.inner.role != Role::Writer {
+        if self.inner.read_only {
             return Err(Error::ReadOnly);
         }
         let snapshot = self.snapshot()?;
@@ -1671,7 +1678,7 @@ impl Inner {
         &self,
         f: impl FnOnce(&mut Catalog) -> Result<Vec<Edit>> + Send + 'static,
     ) -> Result<Arc<View>> {
-        if self.role != Role::Writer {
+        if self.read_only {
             return Err(Error::ReadOnly);
         }
         let _guard = self.enter_maintenance()?;
@@ -1849,7 +1856,7 @@ impl Inner {
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<PendingCommit> {
-        if self.role != Role::Writer {
+        if self.read_only {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
@@ -1923,7 +1930,7 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<(bool, Option<CommitInfo>)> {
-        if self.role != Role::Writer {
+        if self.read_only {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;

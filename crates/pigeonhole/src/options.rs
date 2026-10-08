@@ -164,11 +164,12 @@ impl Options {
         self
     }
 
-    /// Registers a merge operator, referenced by families through its name.
-    ///
-    /// Phase 2: the engine resolves only the built-in `pigeonhole.i64_add` so far, so a
-    /// family that names any other operator is refused with
-    /// [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator).
+    /// Registers a merge operator, referenced by families through its name
+    /// ([`Family::merge_operator`]). A family naming an operator that is not registered is
+    /// refused at creation, and a database whose families name one opens only with
+    /// [`allow_unregistered_merge_operators`](Self::allow_unregistered_merge_operators), with
+    /// [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator) otherwise.
+    /// Registering an operator under the built-in name `pigeonhole.i64_add` replaces it.
     pub fn merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
         self.merge_operators.push(op);
         self
@@ -445,8 +446,9 @@ impl Options {
             o.balance_min_writes = min_writes;
             o.tablet_split_bytes = split_bytes;
         }
-        // Custom operators (`merge_operators`) are kept for Phase 2: the engine resolves only
-        // the built-in `pigeonhole.i64_add` so far, and refuses a family naming any other.
+        for op in &self.merge_operators {
+            o.merge_operators.register(Arc::clone(op));
+        }
         o
     }
 }
@@ -460,8 +462,9 @@ impl ReaderOptions {
             o.block_cache_bytes = bytes;
         }
         o.shm_dir.clone_from(&self.shm_dir);
-        // A reader never resolves custom operators before Phase 2 (see `Options::to_engine`).
-        let _ = &self.merge_operators;
+        for op in &self.merge_operators {
+            o.merge_operators.register(Arc::clone(op));
+        }
         o
     }
 }

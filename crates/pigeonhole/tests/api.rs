@@ -1654,3 +1654,106 @@ fn compact_after_drop_table_covers_the_live_tables() {
     drop(keep);
     db.close().unwrap();
 }
+
+// ---- #43: custom merge operators ----
+
+/// Concatenates byte values, oldest first.
+#[derive(Debug)]
+struct Append;
+
+impl pigeonhole::MergeOperator for Append {
+    fn name(&self) -> &str {
+        "app.append"
+    }
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), pigeonhole::MergeError> {
+        // Stored values: a tag byte, then the payload.
+        let newer = acc.split_off(1);
+        acc.extend_from_slice(&older[1..]);
+        acc.extend_from_slice(&newer);
+        Ok(())
+    }
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), pigeonhole::MergeError> {
+        if let Some(base) = base {
+            let newer = acc.split_off(1);
+            acc.extend_from_slice(&base[1..]);
+            acc.extend_from_slice(&newer);
+        }
+        Ok(())
+    }
+}
+
+fn log_table(db: &Pigeonhole) -> pigeonhole::Result<Table> {
+    db.table("log")?
+        .family("l", Family::default().merge_operator("app.append"))
+        .family("plain", Family::default())
+        .create_if_missing()
+}
+
+fn log_value(t: &Table, row: &[u8]) -> pigeonhole::Result<Option<Vec<u8>>> {
+    Ok(t.get(row, "l", b"q")?.map(|c| c.value().to_vec()))
+}
+
+#[test]
+fn registered_merge_operators_resolve_through_flush_compaction_and_reopen() {
+    let vfs = SimVfs::new(43);
+    let with_append = || sim_options(&vfs).merge_operator(Arc::new(Append));
+    let db = Pigeonhole::open("/db/merge.phdb", with_append()).unwrap();
+    let t = log_table(&db).unwrap();
+    t.mutate(b"r").put("l", b"q", b"a").commit().unwrap();
+    for part in [&b"b"[..], b"c"] {
+        t.mutate(b"r").merge("l", b"q", part).commit().unwrap();
+    }
+    t.mutate(b"r").put("plain", b"q", b"p").commit().unwrap();
+    assert_eq!(log_value(&t, b"r").unwrap().as_deref(), Some(&b"abc"[..]));
+    // Flushed and compacted (operands fold within a timestamp, the rest at read), then
+    // more operands on top.
+    db.flush().unwrap();
+    db.compact().unwrap();
+    t.mutate(b"r").merge("l", b"q", b"d").commit().unwrap();
+    assert_eq!(log_value(&t, b"r").unwrap().as_deref(), Some(&b"abcd"[..]));
+    drop(t);
+    db.close().unwrap();
+
+    // Reopened with the operator registered: the same value.
+    let db = Pigeonhole::open("/db/merge.phdb", with_append()).unwrap();
+    let t = log_table(&db).unwrap();
+    assert_eq!(log_value(&t, b"r").unwrap().as_deref(), Some(&b"abcd"[..]));
+    drop(t);
+    db.close().unwrap();
+
+    // Without it: refused at open.
+    let err = Pigeonhole::open("/db/merge.phdb", sim_options(&vfs))
+        .expect_err("opened without the family's merge operator");
+    assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
+    // Allowed: read-only; the operator's cells fail to read, the other family reads.
+    let db = Pigeonhole::open(
+        "/db/merge.phdb",
+        sim_options(&vfs).allow_unregistered_merge_operators(true),
+    )
+    .unwrap();
+    let t = db.table("log").unwrap().open().unwrap();
+    let err = log_value(&t, b"r").unwrap_err();
+    assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
+    assert_eq!(
+        t.get(b"r", "plain", b"q")
+            .unwrap()
+            .map(|c| c.value().to_vec()),
+        Some(b"p".to_vec())
+    );
+    let err = t
+        .mutate(b"s")
+        .put("plain", b"q", b"x")
+        .commit()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ReadOnly, "{err}");
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_family_naming_an_unregistered_operator_is_refused_at_creation() {
+    let db = db();
+    let err = log_table(&db).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
+    assert!(db.tables().is_empty());
+}
