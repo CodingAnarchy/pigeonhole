@@ -46,8 +46,12 @@ struct Rig {
 
 impl Rig {
     fn open(vfs: &Arc<SimVfs>, background: bool) -> Self {
+        Self::open_at(vfs, DB, background)
+    }
+
+    fn open_at(vfs: &Arc<SimVfs>, path: &str, background: bool) -> Self {
         let (db, mut shards) =
-            Engine::open_application_owned(Path::new(DB), options(Arc::clone(vfs), background))
+            Engine::open_application_owned(Path::new(path), options(Arc::clone(vfs), background))
                 .unwrap();
         let mut rig = Self {
             db,
@@ -655,4 +659,67 @@ fn a_fifo_drop_releases_the_blob_bytes_of_the_ssts_it_drops() {
     rig.db.shrink().unwrap();
     assert_eq!(rig.db.unreferenced_bytes(), 0);
     rig.close();
+}
+
+#[test]
+fn backup_copies_the_values_it_references() {
+    // Issue #58: the copy gets its own blob files, holding the separated values the
+    // snapshot references (from SSTs) and the large values still in the active memtable at
+    // backup time. Those go through the backup's temporary SSTs inline (#268's first phase)
+    // and are separated only by its merge.
+    let vfs = SimVfs::new(39);
+    let mut rig = Rig::open(&vfs, false);
+    let one_version = FamilyOptions {
+        max_versions: 1,
+        ..family()
+    };
+    let t = rig
+        .db
+        .create_table("t", &[("f".into(), one_version)])
+        .unwrap();
+    write(&mut rig, &t, 0..60, 0);
+    rig.flush();
+    rig.compact();
+    write(&mut rig, &t, 0..20, 1);
+    rig.flush();
+    write(&mut rig, &t, 50..60, 2); // large values, left in the active memtable
+    assert!(!rig.db.blob_files().is_empty());
+    let source_files = rig.db.blob_files().len();
+    let expected = |i: u32| match i {
+        0..20 => value(i, 1),
+        50..60 => value(i, 2),
+        _ => value(i, 0),
+    };
+    rig.db.backup(Path::new("/db/copy.phdb")).unwrap();
+    rig.close();
+
+    let copy = Rig::open_at(&vfs, "/db/copy.phdb", false);
+    let t = copy.db.table("t").unwrap();
+    copy.check();
+    assert_eq!(
+        copy.db.unreferenced_bytes(),
+        0,
+        "the copy holds nothing unreferenced"
+    );
+    let files = copy.db.blob_files();
+    assert!(!files.is_empty(), "the copy has blob files");
+    assert!(files.len() <= source_files + 1, "{files:?}");
+    assert!(
+        files.iter().all(|f| f.2 == f.3),
+        "only referenced values: {files:?}"
+    );
+    assert_reads(&copy.db, &t, 60, expected);
+    copy.close();
+    let mut copy = Rig::open_at(&vfs, "/db/copy.phdb", false);
+    let t = copy.db.table("t").unwrap();
+    // The copy keeps working: new separated values get fresh blob ids.
+    write(&mut copy, &t, 20..30, 3);
+    copy.flush();
+    copy.compact();
+    copy.check();
+    assert_reads(&copy.db, &t, 60, |i| match i {
+        20..30 => value(i, 3),
+        _ => expected(i),
+    });
+    copy.close();
 }

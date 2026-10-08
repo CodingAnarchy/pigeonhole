@@ -346,10 +346,9 @@ impl Pigeonhole {
 
     /// Writes a consistent single-file copy to `dest`, which must not exist, while writes
     /// continue. The copy holds exactly the commits visible when this is called and opens
-    /// on its own, without WAL replay or sidecar files. Fails with
-    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) for a database whose
-    /// families store blob files (values above a family's `blob_threshold`;
-    /// [#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)).
+    /// on its own, without WAL replay or sidecar files. Separated values (above a family's
+    /// `blob_threshold`) are copied into the copy's own blob files, which hold only the
+    /// values the copy references.
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole};
