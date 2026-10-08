@@ -923,7 +923,7 @@ fn shrink_crash_sweep(seed: u64) {
     for n in 1.. {
         assert!(n < 5_000, "seed {seed}: runaway sweep");
         let vfs = SimVfs::new(seed);
-        let (mut rig, t) = behind_a_dropped_table(&vfs);
+        let (rig, t) = behind_a_dropped_table(&vfs);
         let len = |vfs: &SimVfs| {
             pigeonhole_io::Vfs::open(vfs, Path::new(DB), pigeonhole_io::OpenOptions::read())
                 .unwrap()
