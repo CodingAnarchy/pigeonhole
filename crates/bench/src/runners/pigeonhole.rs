@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pigeonhole::{Durability, ErrorCode, Family, Options, Pigeonhole, Table};
+use pigeonhole::{Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, Table};
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
@@ -138,7 +138,8 @@ impl Runner for PigeonholeRunner {
         for family in FAMILIES {
             let mut f = Family::default().max_versions(1).bloom_bits(BLOOM_BITS);
             if family == METRIC_FAMILY {
-                f = f.ttl(TIME_SERIES_TTL);
+                // Whole SSTs drop once their newest point expires (D163, #236).
+                f = f.ttl(TIME_SERIES_TTL).compaction(Compaction::FifoByTime);
             }
             builder = builder.family(family, f);
         }
