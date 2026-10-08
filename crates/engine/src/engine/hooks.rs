@@ -6,9 +6,11 @@
 //! The rules:
 //! - Every hook is used by a committed test; delete one when its last test goes.
 //! - A hook does nothing until a test sets it: callbacks run once, flags start clear.
-//!   The exceptions record what a test reads back later (`take_appended`,
-//!   `take_compactions` and the [`ShardCounters`]): they record in every `test-hooks`
-//!   build, but nothing reads them except a test. None changes what the engine does.
+//!   `take_appended` and `take_compactions` record only after a test turns recording on
+//!   with `record_history` (D164's follow-up, #148): with workspace feature unification
+//!   every `test-hooks` build would otherwise grow those vectors for a whole run nobody
+//!   reads. The [`ShardCounters`] are plain counters and always count. None changes what
+//!   the engine does.
 //! - Prefer a public or application-owned seam (`EngineShard` over `SimVfs`,
 //!   `Engine::shard_stats`) to a new hook.
 //!
@@ -59,6 +61,9 @@ impl Once {
 /// The engine-wide hook state (`Shared::hooks`).
 #[derive(Default)]
 pub(crate) struct Hooks {
+    /// Whether `compactions` and `appended` record (`Engine::record_history`); off until a
+    /// test turns it on.
+    pub record: AtomicBool,
     /// Every committed compaction (`Engine::take_compactions`; the records are never built
     /// without the feature, 5-6 6.2).
     pub compactions: Mutex<Vec<CompactionRecord>>,
@@ -133,8 +138,10 @@ impl std::future::Future for PendingMaintenance {
 }
 
 impl PendingMaintenance {
+    /// Polls the current round's replies. Like the blocking `wait` (#148, review 1-2 F10),
+    /// it resolves only once every shard has replied, with the last failure if any, so the
+    /// harness sees what production does: never a result while other shards still work.
     fn poll_round(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
-        let mut failed = None;
         let mut i = 0;
         while i < self.waiters.len() {
             match std::pin::Pin::new(&mut self.waiters[i]).poll(cx) {
@@ -143,22 +150,21 @@ impl PendingMaintenance {
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
                     self.waiters.swap_remove(i);
-                    failed = Some(e);
+                    self.failed = Some(e);
                 }
                 std::task::Poll::Ready(None) => {
                     self.waiters.swap_remove(i);
-                    failed = Some(Error::Closed);
+                    self.failed = Some(Error::Closed);
                 }
                 std::task::Poll::Pending => i += 1,
             }
         }
-        if let Some(e) = failed {
-            return std::task::Poll::Ready(Err(e));
+        if !self.waiters.is_empty() {
+            return std::task::Poll::Pending;
         }
-        if self.waiters.is_empty() {
-            std::task::Poll::Ready(Ok(()))
-        } else {
-            std::task::Poll::Pending
+        match self.failed.take() {
+            Some(e) => std::task::Poll::Ready(Err(e)),
+            None => std::task::Poll::Ready(Ok(())),
         }
     }
 }
@@ -254,6 +260,7 @@ impl Inner {
         Ok(PendingMaintenance {
             waiters: vec![rx],
             rounds: None,
+            failed: None,
         })
     }
 }
@@ -442,6 +449,7 @@ impl Engine {
         Ok(PendingMaintenance {
             waiters,
             rounds: None,
+            failed: None,
         })
     }
 
@@ -469,7 +477,16 @@ impl Engine {
             .store(ts, Ordering::Release);
     }
 
-    /// The compactions committed since the last call (or since open).
+    /// Turns recording for [`take_compactions`](Self::take_compactions) and
+    /// [`take_appended`](Self::take_appended) on or off (off at open). A test that reads
+    /// them turns it on first.
+    #[doc(hidden)]
+    pub fn record_history(&self, on: bool) {
+        self.inner.shared.hooks.record.store(on, Ordering::Release);
+    }
+
+    /// The compactions committed since the last call (or since recording started), when
+    /// recording is on ([`record_history`](Self::record_history)).
     #[doc(hidden)]
     pub fn take_compactions(&self) -> Vec<crate::compact::CompactionRecord> {
         std::mem::take(
@@ -517,7 +534,8 @@ impl Engine {
         )
     }
 
-    /// The WAL records appended since the last call (or since open), in append order.
+    /// The WAL records appended since the last call (or since recording started), in append
+    /// order, when recording is on ([`record_history`](Self::record_history)).
     #[doc(hidden)]
     pub fn take_appended(&self) -> Vec<AppendedRecord> {
         std::mem::take(

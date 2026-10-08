@@ -78,6 +78,7 @@ fn a_commit_wait_held_by_another_shards_group_parks() {
         let t = db
             .create_table(name, &[("f".into(), FamilyOptions::default())])
             .unwrap();
+        db.record_history(true);
         db.take_appended();
         db.commit(put(&t, "probe"), Some(Durability::Buffered))
             .unwrap();

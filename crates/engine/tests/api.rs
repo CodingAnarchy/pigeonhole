@@ -1053,3 +1053,40 @@ fn commit_local_runs_inline_on_the_owning_shard() {
         store.step_shards(vfs.monotonic_nanos());
     }
 }
+
+// ---- #148 / D164: test-hook recording is opt-in ----
+
+#[test]
+fn test_hook_history_records_only_once_turned_on() {
+    let vfs = SimVfs::new(148);
+    let db = Engine::open(Path::new(DB), owned(vfs, 1)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let commit = |row: &[u8]| {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &t, "f", row, b"q", b"v");
+        db.commit(wb, Some(Durability::Buffered)).unwrap();
+    };
+    let compact = || {
+        db.flush().unwrap();
+        commit(b"again");
+        db.flush().unwrap();
+        db.compact(None).unwrap();
+    };
+    // Off at open: nothing is kept, however long the run.
+    commit(b"a");
+    compact();
+    assert!(db.take_appended().is_empty());
+    assert!(db.take_compactions().is_empty());
+    // On: both record; off again: they stop.
+    db.record_history(true);
+    commit(b"b");
+    compact();
+    assert_eq!(db.take_appended().len(), 2);
+    assert!(!db.take_compactions().is_empty());
+    db.record_history(false);
+    commit(b"c");
+    assert!(db.take_appended().is_empty());
+    db.close().unwrap();
+}

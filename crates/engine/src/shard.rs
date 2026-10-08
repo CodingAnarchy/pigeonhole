@@ -3738,11 +3738,13 @@ impl ShardState {
             // Test hook: the append order. A failed write may still have landed (a crash
             // or an I/O error mid-write), so every attempt the stream accepted counts.
             #[cfg(feature = "test-hooks")]
-            if !matches!(
-                result,
-                Err(pigeonhole_wal::Error::RecordTooLarge
-                    | pigeonhole_wal::Error::InvalidArgument { .. })
-            ) {
+            if self.shared.hooks.record.load(Ordering::Acquire)
+                && !matches!(
+                    result,
+                    Err(pigeonhole_wal::Error::RecordTooLarge
+                        | pigeonhole_wal::Error::InvalidArgument { .. })
+                )
+            {
                 use crate::engine::hooks::{AppendedKind, AppendedRecord};
                 self.shared
                     .hooks
@@ -4931,6 +4933,19 @@ impl ShardState {
         out
     }
 
+    /// Whether the test hooks record history (`Engine::record_history`; never without the
+    /// `test-hooks` feature).
+    fn recording(&self) -> bool {
+        #[cfg(feature = "test-hooks")]
+        {
+            self.shared.hooks.record.load(Ordering::Acquire)
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            false
+        }
+    }
+
     /// The picker for a family compacting by `style`.
     fn picker(&self, style: CompactionStyle) -> &CompactionPicker {
         match style {
@@ -5269,9 +5284,9 @@ impl ShardState {
             .min(self.prepared_min_ts(key.1));
         let now = self.shared.vfs.now_micros();
         let gc = compact::gc_policy(&self.shared, fam, &task, mem_min_ts, now);
-        // A test hook's record: production builds keep none (5-6 6.2).
-        let record = (cfg!(feature = "test-hooks")
-            && task.kind == pigeonhole_compaction::TaskKind::Rewrite)
+        // A test hook's record: production builds keep none (5-6 6.2), and test builds only
+        // while a test records (`Engine::record_history`).
+        let record = (self.recording() && task.kind == pigeonhole_compaction::TaskKind::Rewrite)
             .then(|| CompactionRecord {
                 manifest_version: 0,
                 table: meta.table,

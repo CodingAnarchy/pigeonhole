@@ -1617,6 +1617,10 @@ fn families_in_order(view: &View, table: TableId, listed: &[FamilyId]) -> Result
 pub struct PendingMaintenance {
     waiters: Vec<Waiter<Result<()>>>,
     rounds: Option<CompactRounds>,
+    /// A failed reply of the current round, reported once every shard has replied (the
+    /// `test-hooks` future; the blocking `wait` keeps its own).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) failed: Option<Error>,
 }
 
 impl PendingMaintenance {
@@ -2038,6 +2042,8 @@ impl Inner {
         Ok(PendingMaintenance {
             waiters,
             rounds: None,
+            #[cfg(feature = "test-hooks")]
+            failed: None,
         })
     }
 
@@ -2048,7 +2054,12 @@ impl Inner {
         self.check_open()?;
         let rounds = CompactRounds::new(&self.shared, table);
         let waiters = compact_round(&self.shared, table)?;
-        Ok(PendingMaintenance { waiters, rounds })
+        Ok(PendingMaintenance {
+            waiters,
+            rounds,
+            #[cfg(feature = "test-hooks")]
+            failed: None,
+        })
     }
 
     // ---- close ----

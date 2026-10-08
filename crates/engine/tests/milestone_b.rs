@@ -415,6 +415,7 @@ fn the_final_close_waits_for_a_background_manifest_commit() {
     o.compaction.l0_trigger = u32::MAX;
     o.compaction.level_base_bytes = u64::MAX;
     let db = Engine::open(Path::new(DB), o).unwrap();
+    db.record_history(true);
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
@@ -500,6 +501,7 @@ fn dropping_application_owned_shards_mid_commit_still_closes_cleanly() {
 
     o.compaction_threads = 0;
     let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o.clone()).unwrap();
+    db.record_history(true);
     let mut run = |until: &dyn Fn() -> bool| {
         for _ in 0..100_000 {
             let mut more = false;
@@ -636,6 +638,7 @@ fn shrink_releases_space_after_compaction_and_skips_unpublished_output() {
     o.compaction.l0_trigger = u32::MAX;
     o.compaction.level_base_bytes = u64::MAX;
     let db = Engine::open(Path::new(DB), o).unwrap();
+    db.record_history(true);
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
