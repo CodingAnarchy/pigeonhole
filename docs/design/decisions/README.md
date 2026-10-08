@@ -107,7 +107,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D92](phase-1.md#d92) — one resolver for reads and compaction · coordinator
 - [D93](phase-1.md#d93) — the per-stream recovery oracle lives in `pigeonhole-sim` · sim, #40; extended by D114
 - [D94](phase-1.md#d94) — a later stronger commit makes earlier `None` commits durable · owner decision; implemented by #50
-- [D95](phase-1.md#d95) — Phase 2 family settings are refused at creation · pigeonhole
+- [D95](phase-1.md#d95) — Phase 2 family settings are refused at creation · pigeonhole · **amended by D168**
 - [D96](phase-1.md#d96) — every family has the `i64` add operator unless told otherwise · pigeonhole · amends D41
 - [D97](phase-1.md#d97) — `Scan::limit(0)` returns no rows · pigeonhole
 - [D98](phase-1.md#d98) — `TableBuilder::open` adds declared families that are missing · pigeonhole
@@ -131,7 +131,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B
 - [D117](phase-1.md#d117) — Is `SetFlushed` the memtable's max seqno, or the shard's visible seqno · engine Milestone B
 - [D118](phase-1.md#d118) — How conservative is `GcPolicy` about reader-process snapshots · engine Milestone B; precise per-slot pinning is #39
-- [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161**
+- [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161, D166**
 - [D120](phase-1.md#d120) — What does `backup` write for an engine with memtables and many levels · engine Milestone B; blob extents are #58
 - [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B · **amended by D156**
 - [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
@@ -177,6 +177,10 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220
 - [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134
+- [D165](phase-2.md#d165) — The tiered picker's runs, triggers and output levels; the engine picks per family · compaction, #31, #227
+- [D166](phase-2.md#d166) — The write stall follows L0 depth only · compaction, engine, #227 · amends D119
+- [D167](phase-2.md#d167) — The FIFO-by-time picker: expiry drops, the size cap and intra-L0 merges · compaction, #32, #229
+- [D168](phase-2.md#d168) — Tiered and FifoByTime families are accepted by the public API · pigeonhole, #44, #241 · amends D95
 
 ## Open questions
 _None._
