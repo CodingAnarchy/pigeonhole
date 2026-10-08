@@ -191,13 +191,14 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D176](phase-2.md#d176) — The stopped-clock fallbacks apply only to a simulated clock · io, engine, runtime, #263, #267 · amends D126, refines D161, D171
 - [D177](phase-2.md#d177) — Backup releases its snapshot's memtables before the long merge · engine, #262, #268 · **amended by D182**
 - [D178](phase-2.md#d178) — The bench metric family compacts FIFO in Pigeonhole and RocksDB · bench, #236, #270 · refines D163
-- [D179](phase-2.md#d179) — Counters are declared families, combined per timestamp like Bigtable aggregates · owner decision, #274 · supersedes the #233 cross-timestamp fold; amends D41, D73
+- [D179](phase-2.md#d179) — Counters are declared families, combined per timestamp like Bigtable aggregates · owner decision, #274 · supersedes the #233 cross-timestamp fold; amends D41, D73 · **refined by D186**
 - [D180](phase-2.md#d180) — Blob separation and blob GC · compaction, engine, #33, #235 · amends D29, D77 · **refined by D184**
 - [D181](phase-2.md#d181) — File format version 2 · engine, format, #235
 - [D182](phase-2.md#d182) — Backup copies the separated values the snapshot references · engine, #58, #238 · amends D120, refines D177
 - [D183](phase-2.md#d183) — Level outputs are cut into power-of-two pieces so a file at rest stays near its live size · compaction, pager, sst, #185, #276 · refines D160
 - [D184](phase-2.md#d184) — Blob GC follows the blob references each SST records · compaction, engine, format, #240, #285 · refines D180
 - [D185](phase-2.md#d185) — `shrink` relocates blob extents · engine, #231, #286 · amends D160
+- [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179
 
 ## Open questions
 _None._
