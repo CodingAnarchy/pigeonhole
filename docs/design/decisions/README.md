@@ -8,7 +8,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 
 | Phase | File | Range |
 |---|---|---|
-| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D159 |
+| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D160 |
 
 ## Index
 
@@ -71,7 +71,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D57](phase-1.md#d57) — the pager's clean-close flag outlives the open that read it · pager question
 - [D58](phase-1.md#d58) — a failed root commit poisons the pager · pager question
 - [D59](phase-1.md#d59) — an interrupted `Pager::create` is refused, never deleted · owner decision
-- [D60](phase-1.md#d60) — `shrink_plan` cannot tell published extents from in-flight output · pager question
+- [D60](phase-1.md#d60) — `shrink_plan` cannot tell published extents from in-flight output · pager question · **amended by D160**
 - [D61](phase-1.md#d61) — `reclaim` is clamped to the durable root · pager question
 - [D62](phase-1.md#d62) — each phase gate includes an empty phase milestone · owner
 - [D63](phase-1.md#d63) — `SstWriterOptions::created_micros` · sst
@@ -171,6 +171,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D157](phase-1.md#d157) — An open writes one frame per stream; spares wait for use · wal, #143, #172 · amends D35
 - [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
 - [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
+- [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60
 
 ## Open questions
 _None._
