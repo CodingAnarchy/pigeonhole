@@ -48,6 +48,7 @@ pub struct Options {
     wal_segment_size: Option<u64>,
     tablet_changes: bool,
     tablet_balance: Option<(Duration, u64, u64)>,
+    write_stall_timeout: Option<Duration>,
 }
 
 impl Default for Options {
@@ -68,6 +69,7 @@ impl Default for Options {
             wal_segment_size: None,
             tablet_changes: true,
             tablet_balance: None,
+            write_stall_timeout: None,
         }
     }
 }
@@ -136,6 +138,26 @@ impl Options {
     /// [`ErrorCode::ShmUnavailable`](crate::ErrorCode::ShmUnavailable) if it does not.
     pub fn memtable_budget(mut self, bytes: u64) -> Self {
         self.memtable_budget = bytes;
+        self
+    }
+
+    /// How long a write, `flush` or `compact` may wait out a write stall (L0 compaction
+    /// falling behind, or the memtable arena full while snapshots or a slow flush hold it)
+    /// before it fails with [`ErrorCode::Busy`](crate::ErrorCode::Busy) (default 30 s).
+    /// Latency-sensitive applications can fail fast and retry later; batch loaders can wait
+    /// longer. `Duration::ZERO` refuses as soon as a wait would begin. On a clock that does
+    /// not move (a simulator's), a wait nothing can end is refused at once whatever this
+    /// says.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().write_stall_timeout(Duration::from_millis(500));
+    /// # let _ = options;
+    /// ```
+    pub fn write_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.write_stall_timeout = Some(timeout);
         self
     }
 
@@ -441,6 +463,9 @@ impl Options {
             o.wal.segment_size = bytes;
         }
         o.tablet_changes = self.tablet_changes;
+        if let Some(timeout) = self.write_stall_timeout {
+            o.write_stall_timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        }
         if let Some((interval, min_writes, split_bytes)) = self.tablet_balance {
             o.balance_interval_nanos = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
             o.balance_min_writes = min_writes;
