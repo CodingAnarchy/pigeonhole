@@ -631,6 +631,8 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             before_shrink_relocates: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
+            before_shrink_commits: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_parked: Mutex::new(None),
@@ -1130,6 +1132,8 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             before_shrink_relocates: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
+            before_shrink_commits: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
             manifest_park: AtomicBool::new(false),
             #[cfg(feature = "test-hooks")]
             manifest_parked: Mutex::new(None),
@@ -1595,6 +1599,14 @@ impl Engine {
         out
     }
 
+    /// Bytes in the block cache (test hook: `shrink`'s tests check that an abandoned copy
+    /// leaves nothing cached).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn block_cache_usage(&self) -> usize {
+        self.inner.shared.cache.usage()
+    }
+
     /// Runs `f` once, in the next `shrink` round, after it has read the catalog and before it
     /// relocates anything: where a compaction or `drop_table` can commit under it (test
     /// hook).
@@ -1605,6 +1617,20 @@ impl Engine {
             .inner
             .shared
             .before_shrink_relocates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Runs `f` once, in the next `shrink` round that commits, after it has written its
+    /// copies and before it commits them: where a `drop_table` makes a copy one to abandon
+    /// (test hook).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn before_shrink_commits(&self, f: Box<dyn FnOnce() + Send>) {
+        *self
+            .inner
+            .shared
+            .before_shrink_commits
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(f);
     }

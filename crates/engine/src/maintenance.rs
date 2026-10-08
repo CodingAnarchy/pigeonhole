@@ -296,6 +296,17 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             }
             break;
         }
+        #[cfg(feature = "test-hooks")]
+        {
+            let hook = shared
+                .before_shrink_commits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         // The edits are computed against the catalog at commit time, not the one read
         // above: a compaction or `drop_table` that committed meanwhile removed an SST (its
         // copy is abandoned), and a trivial move changed its level (the copy goes to the

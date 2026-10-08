@@ -484,11 +484,11 @@ fn orphaned(catalog: &Catalog, edit: &Edit, created: &[TabletId]) -> bool {
     }
 }
 
-/// Extents of SSTs an edit list newly adds (to abandon if the request is refused). An SST
-/// the same list also removes is moved (a trivial move re-adds it at another level), not
-/// new: its extent is not this request's to free. Each extent once, though an SST that
-/// tablets share (after a split) is added to each of them.
-fn added_extents(edits: &[Edit]) -> Vec<ExtentRef> {
+/// SSTs an edit list newly adds (to abandon if the request is refused). An SST the same
+/// list also removes is moved (a trivial move re-adds it at another level), not new: its
+/// extent is not this request's to free. Each SST once, though one that tablets share
+/// (after a split) is added to each of them.
+fn added_ssts(edits: &[Edit]) -> Vec<(SstId, ExtentRef)> {
     let moved: Vec<SstId> = edits
         .iter()
         .filter_map(|e| match e {
@@ -496,16 +496,32 @@ fn added_extents(edits: &[Edit]) -> Vec<ExtentRef> {
             _ => None,
         })
         .collect();
-    let mut added = Vec::new();
+    let mut added: Vec<(SstId, ExtentRef)> = Vec::new();
     for e in edits {
         if let Edit::AddSst { meta, .. } = e
             && !moved.contains(&meta.id)
-            && !added.contains(&meta.extent)
+            && !added.iter().any(|(id, _)| *id == meta.id)
         {
-            added.push(meta.extent);
+            added.push((meta.id, meta.extent));
         }
     }
     added
+}
+
+/// Frees SSTs that will never be published: their extents, and the blocks their readers
+/// put in the block cache (an opened reader caches its top index under the SST's id and
+/// pins it while it lives: drop the readers first, or their entries stay).
+fn abandon_ssts(shared: &Shared, ssts: &[(SstId, ExtentRef)]) {
+    for (_, extent) in ssts {
+        shared.pager.abandon(*extent);
+    }
+    let files: Vec<u64> = ssts
+        .iter()
+        .map(|(id, _)| pigeonhole_sst::sst_cache_file(*id))
+        .collect();
+    if !files.is_empty() {
+        shared.cache.erase_files(&files);
+    }
 }
 
 /// Takes the queued requests and prepares one commit for them. Returns `None` if the queue
@@ -593,12 +609,30 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                     })
                     .collect();
                 req.readers.retain(|(id, _)| !ids.contains(id));
-                for x in added_extents(&gone) {
-                    shared.pager.abandon(x);
-                }
+                abandon_ssts(shared, &added_ssts(&gone));
             }
             kept
         });
+        if let Ok(own) = &own {
+            // A reader for an SST the edits do not add (a shrink copy whose SST went away;
+            // its extent is already abandoned) is dropped here, which unpins its top index,
+            // and its cached blocks are erased.
+            let unused: Vec<u64> = req
+                .readers
+                .iter()
+                .filter(|(id, _)| {
+                    !own.iter()
+                        .any(|e| matches!(e, Edit::AddSst { meta, .. } if meta.id == *id))
+                })
+                .map(|(id, _)| pigeonhole_sst::sst_cache_file(*id))
+                .collect();
+            if !unused.is_empty() {
+                req.readers
+                    .retain(|(id, _)| !unused.contains(&pigeonhole_sst::sst_cache_file(*id)));
+                shared.cache.erase_files(&unused);
+            }
+        }
+        let readers_of_req = &mut req.readers;
         let own = own.and_then(|own| {
             // Tablets the request itself creates (a split's or merge's outputs) are not
             // orphans.
@@ -613,9 +647,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 // Output for a dropped table is never published: free it now. A tablet
                 // change only re-references SSTs it does not own, so it frees nothing.
                 if !is_tablets {
-                    for x in added_extents(&own) {
-                        shared.pager.abandon(x);
-                    }
+                    readers_of_req.clear();
+                    abandon_ssts(shared, &added_ssts(&own));
                 }
                 return Err(Error::TableNotFound("the table was dropped".to_owned()));
             }
@@ -649,7 +682,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         }
                         retargets.extend(owners);
                         if !is_tablets {
-                            added.extend(added_extents(&own));
+                            added.extend(added_ssts(&own));
                         }
                         edits.extend(own);
                         for (id, r) in req.readers.drain(..) {
@@ -665,9 +698,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         outcomes.push((req, Ok(())));
                     }
                     Err(e) => {
-                        for x in added_extents(&own) {
-                            shared.pager.abandon(x);
-                        }
+                        req.readers.clear();
+                        abandon_ssts(shared, &added_ssts(&own));
                         // A half-applied request: start over from the old catalog.
                         catalog = (*old).clone();
                         for e in &edits {
@@ -749,9 +781,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 // Nothing was written (a snapshot rewrite found no space): refuse the batch
                 // as a whole and free what its requests wrote, as for a refused request.
                 // The writer stays usable, so a commit after space is freed succeeds.
-                for x in added {
-                    shared.pager.abandon(x);
-                }
+                readers.clear();
+                abandon_ssts(shared, &added);
             }
             for (req, r) in outcomes {
                 (req.reply)(r.and_then(|()| Err(crate::error::relay("manifest commit", &e))));

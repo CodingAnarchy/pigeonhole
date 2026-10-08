@@ -261,3 +261,41 @@ fn shrink_abandons_the_copy_of_a_table_dropped_under_it() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn shrink_erases_the_cached_blocks_of_a_copy_it_abandons() {
+    // A `drop_table` that commits after shrink copied an SST: the copy is abandoned at
+    // commit, and its reader, which cached its top index under the copy's id, is dropped
+    // and that entry erased. Before, the entry stayed in the cache until evicted.
+    let vfs = SimVfs::new(1384);
+    let db = Engine::open(Path::new(DB), options(Arc::clone(&vfs))).unwrap();
+    let t = tail_behind_a_dropped_table(&db, 1);
+    assert_eq!(ssts_of(&db, t.id).len(), 1);
+    let cached = db.block_cache_usage();
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let (db2, ran2, id) = (Arc::clone(&db), Arc::clone(&ran), t.id);
+    db.before_shrink_commits(Box::new(move || {
+        db2.drop_table(id).unwrap();
+        ran2.store(true, Ordering::Release);
+    }));
+    db.shrink().unwrap();
+    assert!(
+        ran.load(Ordering::Acquire),
+        "shrink copied the SST and reached its commit"
+    );
+    assert!(db.table("t").is_none());
+    assert_eq!(
+        db.unreferenced_bytes(),
+        0,
+        "the copy's extent was abandoned"
+    );
+    // `t`'s own reader stays pinned by the view shrink held while the drop committed, so
+    // its entries stay too: nothing more and nothing less than before is cached.
+    assert_eq!(
+        db.block_cache_usage(),
+        cached,
+        "the copy's cached index was erased"
+    );
+    db.close().unwrap();
+}
