@@ -30,6 +30,10 @@ pub const FAMILIES: [&str; 4] = [YCSB_FAMILY, SPARSE_FAMILY, METRIC_FAMILY, EDGE
 /// every engine must skip them on read.
 pub const TIME_SERIES_TTL: std::time::Duration = std::time::Duration::from_secs(86_400);
 
+/// How long after [`WorkloadConfig::epoch_micros`] the oldest live time-series point still
+/// has before it expires. A run that reads later than this after its epoch fails.
+pub(crate) const LIVE_MARGIN: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 /// YCSB fields per record.
 pub(crate) const YCSB_FIELDS: u64 = 10;
 /// YCSB E: scan lengths are uniform in `1..=YCSB_MAX_SCAN`.
@@ -94,19 +98,41 @@ impl Gen {
 
     /// Event time (µs) of point `t` of an entity.
     ///
-    /// Loaded points `0..POINTS_PER_ENTITY` are `TTL / 75` apart and end half a step
-    /// before `epoch`, so the oldest quarter is older than [`TIME_SERIES_TTL`] and the
-    /// rest is not, each side half a step (about 9.6 minutes) from the boundary. A run that
-    /// reads more than that after the workload is created sees extra points expire, at
-    /// slightly different moments in each engine. Points appended during the run are
-    /// `epoch` plus one microsecond per point: live for the whole run.
+    /// The oldest quarter of the loaded points `0..POINTS_PER_ENTITY` is older than
+    /// [`TIME_SERIES_TTL`] by at least one step (about 14 minutes) and stays expired. The
+    /// other 75 are one step apart, the oldest [`LIVE_MARGIN`] short of expiring and the
+    /// newest half a step before `epoch`. Ageing is the only drift, so a run can lose live
+    /// points only by outlasting the margin; `Gen::check_epoch_age`
+    /// fails the run when it does. Points appended during the run are
+    /// `epoch` plus one microsecond per point.
     fn point_ts(&self, t: u64) -> u64 {
-        let step = TIME_SERIES_TTL.as_micros() as u64 / 75;
-        if t < POINTS_PER_ENTITY {
+        let ttl = TIME_SERIES_TTL.as_micros() as u64;
+        let step = (ttl - LIVE_MARGIN.as_micros() as u64) / 75;
+        let first_live = POINTS_PER_ENTITY / 4;
+        if t < first_live {
+            self.epoch - ttl - (first_live - t) * step
+        } else if t < POINTS_PER_ENTITY {
             self.epoch - (POINTS_PER_ENTITY - 1 - t) * step - step / 2
         } else {
             self.epoch + (t - POINTS_PER_ENTITY)
         }
+    }
+
+    /// Fails when the run has outlasted [`LIVE_MARGIN`] since the epoch: time-series
+    /// points may then have expired mid-run, at different moments in each engine, and the
+    /// results no longer compare. Other workloads have no TTL to drift against.
+    pub(crate) fn check_epoch_age(&self) -> Result<(), String> {
+        let age = crate::runners::now_micros().saturating_sub(self.epoch);
+        if self.config.kind == WorkloadKind::TimeSeriesTtl && age > LIVE_MARGIN.as_micros() as u64 {
+            return Err(format!(
+                "time-series-ttl ran {}s past its epoch, longer than the {}s its live points \
+                 have before they expire; engines may disagree on which cells are live. \
+                 Use a smaller --scale or fewer --records/--ops",
+                age / 1_000_000,
+                LIVE_MARGIN.as_secs()
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn load(&self) -> LoadIter<'_> {
@@ -561,10 +587,12 @@ mod tests {
             stamps.len(),
             "a quarter of the load is expired"
         );
-        // Nothing sits within a few minutes of the boundary, so a slow run cannot
-        // change which cells are live.
-        let margin = 9 * 60 * 1_000_000;
-        assert!(stamps.iter().all(|ts| (ts + ttl).abs_diff(epoch) > margin));
+        // Live points stay live for LIVE_MARGIN; expired ones are expired by a full step.
+        let margin = LIVE_MARGIN.as_micros() as u64;
+        for ts in &stamps {
+            let expires = ts + ttl;
+            assert!(expires > epoch + margin || expires + 14 * 60 * 1_000_000 < epoch);
+        }
         // Appended points are live and later than any loaded one.
         let appended = w
             .run_ops()
@@ -574,5 +602,24 @@ mod tests {
             })
             .expect("the run appends points");
         assert!(appended >= epoch && stamps.iter().all(|ts| *ts < appended));
+    }
+
+    #[test]
+    fn a_stale_epoch_fails_the_time_series_check() {
+        let old = crate::runners::now_micros() - 7 * 3600 * 1_000_000;
+        let stale = |kind| {
+            Workload::new(WorkloadConfig {
+                epoch_micros: old,
+                ..WorkloadConfig::smoke(kind)
+            })
+            .check_epoch_age()
+        };
+        assert!(stale(WorkloadKind::TimeSeriesTtl).is_err());
+        assert!(stale(WorkloadKind::YcsbA).is_ok());
+        assert!(
+            Workload::new(WorkloadConfig::smoke(WorkloadKind::TimeSeriesTtl))
+                .check_epoch_age()
+                .is_ok()
+        );
     }
 }
