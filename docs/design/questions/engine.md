@@ -27,3 +27,8 @@ D160's `shrink` relocates SST extents only. Blob extents past the shrink point a
 Blob files can hold values up to `2^32 - 1` bytes, but every value still passes through one WAL record and one memtable entry before a flush separates it.
 
 **Interim behavior:** D16's limit stays (`ValueTooLarge` above `min(WAL segment payload, 64 MiB, half the arena)`). Lifting it is #230.
+
+## Proposed decision (amends D120): `backup` copies the values the snapshot references
+D120 refused `backup` of a database with blob files (`Unsupported`) until #58.
+
+**Interim behavior:** with the two-phase backup (#262, #268), phase 1 copies the memtables into temporary SSTs with every value inline: blob files written there would belong to the copy, while phase 2 reads pointers through the source's blob files, and the temporary extents are freed after the merge. Phase 2 reads each source pointer through the snapshot's SST view (its pinned manifest version keeps the source blob files' extents) and writes the values, with the large values of the temporary SSTs, through the same separating sink a flush uses. The copy gets its own blob files (fresh ids from 1) holding exactly the values its SSTs reference, all live. Blob files are not copied extent by extent: that would also copy garbage and old files' layout. Each slot's merge (source and temporary SSTs) is clamped to its tablet's rows: after a split, children share SSTs that hold their siblings' rows too, and before this each child's copy repeated them.
