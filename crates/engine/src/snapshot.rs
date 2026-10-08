@@ -395,8 +395,11 @@ impl SstSet {
             .blob_files
             .iter()
             .map(|(id, b)| {
+                // A file whose extents a shrink replaced (#231) gets a new reader; views of
+                // older versions keep the old one, which reads the retired extents they pin.
                 let open = prev
                     .and_then(|p| p.blobs.get(id))
+                    .filter(|o| o.extents == b.extents)
                     .map(Arc::clone)
                     .unwrap_or_else(|| {
                         Arc::new(OpenBlob {

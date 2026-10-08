@@ -508,15 +508,24 @@ fn added_ssts(edits: &[Edit]) -> Vec<(SstId, ExtentRef)> {
     added
 }
 
-/// Blob files an edit list creates: `PutBlobFile`s of files `catalog` (before the edits)
-/// does not name. Freed with [`abandon_blobs`] if the request is refused.
+/// Blob extents an edit list newly references: those of `PutBlobFile`s that `catalog`
+/// (before the edits) does not list for that file (a new file, or a shrink's copies,
+/// #231). Freed with [`abandon_blobs`] if the request is refused.
 fn added_blobs(catalog: &Catalog, edits: &[Edit]) -> Vec<(BlobFileId, Vec<ExtentRef>)> {
     edits
         .iter()
         .filter_map(|e| match e {
             Edit::PutBlobFile {
                 blob_file, extents, ..
-            } if !catalog.blob_files.contains_key(blob_file) => Some((*blob_file, extents.clone())),
+            } => {
+                let known = catalog.blob_files.get(blob_file).map(|b| &b.extents);
+                let new: Vec<ExtentRef> = extents
+                    .iter()
+                    .filter(|x| known.is_none_or(|k| !k.contains(x)))
+                    .copied()
+                    .collect();
+                (!new.is_empty()).then_some((*blob_file, new))
+            }
             _ => None,
         })
         .collect()
@@ -943,13 +952,22 @@ pub(crate) fn end(
             .erase_files(&[pigeonhole_sst::sst_cache_file(meta.id)]);
     }
     for (id, blob) in &old.blob_files {
-        if !catalog.blob_files.contains_key(id) {
-            for e in &blob.extents {
-                shared.pager.retire(*e, version);
+        match catalog.blob_files.get(id) {
+            None => {
+                for e in &blob.extents {
+                    shared.pager.retire(*e, version);
+                }
+                shared
+                    .cache
+                    .erase_files(&[pigeonhole_sst::blob_cache_file(*id)]);
             }
-            shared
-                .cache
-                .erase_files(&[pigeonhole_sst::blob_cache_file(*id)]);
+            // Extents a shrink replaced (#231): the copies hold the same records at the same
+            // logical offsets, so cached records stay valid.
+            Some(now) => {
+                for e in blob.extents.iter().filter(|e| !now.extents.contains(e)) {
+                    shared.pager.retire(*e, version);
+                }
+            }
         }
     }
     shared.reclaim();

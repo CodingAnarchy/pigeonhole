@@ -37,7 +37,8 @@ use pigeonhole_compaction::{MergingCursor, NewBlobFile};
 use pigeonhole_format::key::split_suffix;
 use pigeonhole_format::manifest::{Edit, SstMeta};
 use pigeonhole_format::scan::ScanFilter;
-use pigeonhole_format::{Cursor, FamilyId, SstId};
+use pigeonhole_format::superblock::ExtentRef;
+use pigeonhole_format::{BlobFileId, Cursor, FamilyId, SstId};
 use pigeonhole_pager::Pager;
 use pigeonhole_sst::{ReadOptions, SstReader, SstWriterOptions};
 
@@ -392,9 +393,17 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         }
         #[cfg(feature = "test-hooks")]
         shared.hooks.before_shrink_relocates.run();
+        // Every blob extent by extent: its file and position in the file's extent list.
+        let mut blob_by_extent: HashMap<(u64, u8), (BlobFileId, usize)> = HashMap::new();
+        for (id, b) in &catalog.blob_files {
+            for (i, e) in b.extents.iter().enumerate() {
+                blob_by_extent.insert((e.page, e.size_class), (*id, i));
+            }
+        }
         let mut moves = Moves {
             pager: Arc::clone(&shared.pager),
             list: Vec::new(),
+            blobs: Vec::new(),
         };
         let mut readers = Vec::new();
         let mut rewrite = false;
@@ -409,6 +418,23 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                 .any(|e| e == extent)
             {
                 rewrite = true;
+                continue;
+            }
+            if let Some(&(blob_file, index)) = blob_by_extent.get(&(extent.page, extent.size_class))
+            {
+                // A blob extent (#231): blob files are never written once published, so a
+                // copy needs no claim; the commit replaces the extent at its position if the
+                // file still has it there.
+                match shared.pager.relocate(extent) {
+                    Ok(target) => moves.blobs.push((blob_file, index, extent, target)),
+                    Err(pigeonhole_pager::Error::NoSpace) => {}
+                    // Dropped (blob GC, `drop_table`) since the catalog was read.
+                    Err(_) if !shared.pager.is_live(extent) => stale = true,
+                    Err(e) => {
+                        unclaim(shared, &claimed);
+                        return Err(e.into());
+                    }
+                }
                 continue;
             }
             let Some((family, meta)) = by_extent.get(&(extent.page, extent.size_class)) else {
@@ -465,7 +491,7 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                 }
             }
         }
-        if moves.list.is_empty() && !rewrite {
+        if moves.list.is_empty() && moves.blobs.is_empty() && !rewrite {
             unclaim(shared, &claimed);
             if stale {
                 continue;
@@ -504,11 +530,13 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     Ok(shrunk())
 }
 
-/// Shrink's relocated copies, `(old SST, its copy)`, until the commit turns them into edits.
-/// Copies it never turns into edits (the request was dropped unrun) are abandoned.
+/// Shrink's relocated copies, `(old SST, its copy)` and `(blob file, extent index, old
+/// extent, its copy)`, until the commit turns them into edits. Copies it never turns into
+/// edits (the request was dropped unrun) are abandoned.
 struct Moves {
     pager: Arc<Pager>,
     list: Vec<(SstId, SstMeta)>,
+    blobs: Vec<(BlobFileId, usize, ExtentRef, ExtentRef)>,
 }
 
 impl Moves {
@@ -545,6 +573,41 @@ impl Moves {
                 });
             }
         }
+        // Blob extents: each copy replaces its extent where the file still has it (a blob
+        // GC or `drop_table` may have dropped the file meanwhile).
+        let mut changed: Vec<(BlobFileId, Vec<ExtentRef>)> = Vec::new();
+        for (blob_file, index, old, copy) in std::mem::take(&mut self.blobs) {
+            let current = changed
+                .iter_mut()
+                .find(|(id, _)| *id == blob_file)
+                .map(|(_, e)| e.clone())
+                .or_else(|| {
+                    catalog
+                        .blob_files
+                        .get(&blob_file)
+                        .map(|b| b.extents.clone())
+                });
+            match current {
+                Some(mut extents) if extents.get(index) == Some(&old) => {
+                    extents[index] = copy;
+                    match changed.iter_mut().find(|(id, _)| *id == blob_file) {
+                        Some((_, e)) => *e = extents,
+                        None => changed.push((blob_file, extents)),
+                    }
+                }
+                _ => self.pager.abandon(copy),
+            }
+        }
+        for (blob_file, extents) in changed {
+            let b = &catalog.blob_files[&blob_file];
+            edits.push(Edit::PutBlobFile {
+                blob_file,
+                family: b.family,
+                extents,
+                total_bytes: b.total_bytes,
+                live_bytes: b.live_bytes,
+            });
+        }
         edits
     }
 }
@@ -553,6 +616,9 @@ impl Drop for Moves {
     fn drop(&mut self) {
         for (_, copy) in self.list.drain(..) {
             self.pager.abandon(copy.extent);
+        }
+        for (_, _, _, copy) in self.blobs.drain(..) {
+            self.pager.abandon(copy);
         }
     }
 }
