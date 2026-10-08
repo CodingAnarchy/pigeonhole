@@ -203,6 +203,9 @@ impl Vfs for Dev {
     fn monotonic_nanos(&self) -> u64 {
         self.sim.monotonic_nanos()
     }
+    fn clock_is_simulated(&self) -> bool {
+        self.sim.clock_is_simulated()
+    }
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.sim.current_process()
     }

@@ -65,6 +65,16 @@ pub trait Vfs: Send + Sync + Debug {
     /// Monotonic time in nanoseconds from an arbitrary origin (scheduling, latencies).
     fn monotonic_nanos(&self) -> u64;
 
+    /// Whether the clocks are simulated: they move only when the program moves them, so a
+    /// reading that stays the same means nothing will change until it does. The engine
+    /// then applies its stopped-clock fallbacks (D126) once a timer sees the clock stand
+    /// still. A real clock (the default) is never taken as stopped, however coarse its
+    /// ticks (ICR 0012, #263). A wrapper around another `Vfs` that keeps its clocks forwards
+    /// this.
+    fn clock_is_simulated(&self) -> bool {
+        false
+    }
+
     /// The calling process.
     fn current_process(&self) -> ProcessId;
 

@@ -1114,6 +1114,10 @@ impl Vfs for SimVfs {
         self.state().nanos
     }
 
+    fn clock_is_simulated(&self) -> bool {
+        true
+    }
+
     fn current_process(&self) -> ProcessId {
         CURRENT_PROCESS.with(|m| m.borrow().get(&self.id).copied().unwrap_or(DEFAULT_PROCESS))
     }

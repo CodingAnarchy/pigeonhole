@@ -1352,6 +1352,9 @@ impl pigeonhole_io::Vfs for Ticking {
     fn monotonic_nanos(&self) -> u64 {
         self.inner.monotonic_nanos() + self.tick()
     }
+    fn clock_is_simulated(&self) -> bool {
+        self.inner.clock_is_simulated()
+    }
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
     }

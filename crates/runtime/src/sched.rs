@@ -345,8 +345,9 @@ pub(crate) fn pool_main(
         }
         sched.collect_woken();
         let now = vfs.monotonic_nanos();
-        if idle_at.take() == Some(now) {
-            // The clock has not moved since we went idle: sleepers check for themselves.
+        if idle_at.take() == Some(now) && vfs.clock_is_simulated() {
+            // A simulated clock has not moved since we went idle: sleepers check for
+            // themselves (a real clock that reads the same only ticks coarsely, #263).
             sched.wake_sleepers();
         }
         sched.wake_due(now);

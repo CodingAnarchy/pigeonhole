@@ -1470,7 +1470,9 @@ impl TimerState {
 /// Sends its message to the shard once a deadline on the VFS clock passes (unless
 /// cancelled).
 ///
-/// The timer first polls the clock. Once it sees the clock move it sleeps until the deadline
+/// On a real clock (`Vfs::clock_is_simulated` false) the timer sleeps until the deadline
+/// at once and never gives up (#263). On a simulated clock it first polls the clock. Once
+/// it sees the clock move it sleeps until the deadline
 /// (`TaskPoll::SleepUntil`: the shard parks rather than spins, issue #89). The runtime runs a
 /// sleeping task early when the clock has not moved since the shard went idle, and the timer
 /// then polls again. After `STALL_TIMER_FROZEN_POLLS` polls in a row that see the clock
@@ -1515,6 +1517,19 @@ impl Task for ClockTimer {
             return TaskPoll::Done;
         }
         let now = self.vfs.monotonic_nanos();
+        if now < self.release_at && !self.vfs.clock_is_simulated() {
+            // A real clock always moves on, however coarse its ticks: sleep until the
+            // deadline, never taking it as stopped (#263).
+            *self
+                .state
+                .waker
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
+            if self.state.cancel.load(Ordering::Acquire) {
+                return TaskPoll::Done;
+            }
+            return TaskPoll::SleepUntil(self.release_at);
+        }
         if now < self.release_at {
             if now != self.last_now {
                 let moved = self.last_now != u64::MAX;

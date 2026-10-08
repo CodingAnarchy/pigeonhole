@@ -30,7 +30,7 @@ Pure encode/decode; never panics on input.
 - **`compress`, `checksum`, `varint`; `Cursor` trait.**
 
 ### `pigeonhole-io` (uses format)
-- **`Vfs`** (`VfsRef = Arc<dyn Vfs>`): `open`, `remove`, `exists`, `list_dir`, `sync_dir`, `open_shared`/`remove_shared`, `now_micros`, `monotonic_nanos`, `current_process`, `process_alive`. Clocks and process liveness live here so the simulator controls them.
+- **`Vfs`** (`VfsRef = Arc<dyn Vfs>`): `open`, `remove`, `exists`, `list_dir`, `sync_dir`, `open_shared`/`remove_shared`, `now_micros`, `monotonic_nanos`, `clock_is_simulated` (ICR 0012), `current_process`, `process_alive`. Clocks and process liveness live here so the simulator controls them.
 - **`File`** (`FileRef = Arc<dyn File>`): positional `read_at`/`write_at`, `submit_read`/`submit_write -> Completion`, `sync_data`, `submit_sync_data -> Completion<()>`, `sync_all`, `len`, `set_len`, `allocate`, non-blocking single-byte `lock`/`unlock` (`LockMode::{Shared, Exclusive}`), `identity` (device, inode), `is_local`.
 - **`IoBuf`** (4096-aligned owned buffer), **`Completion<T = IoBuf>`** (`wait()` for sync callers, `Future` for async, `map`, and `Completion::pair -> (Completion, Resolver)` for layers that build their own async operations).
 - **`SharedRegion`**: mapped shared memory (or `heap(len)`), accessed only via `atomic_u32/atomic_u64(offset)`, `read`/`write` copies, `base_ptr` (for memtable's `unsafe`), `bind_numa`.

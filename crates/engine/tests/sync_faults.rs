@@ -179,6 +179,9 @@ impl Vfs for FaultVfs {
             None => self.inner.monotonic_nanos(),
         }
     }
+    fn clock_is_simulated(&self) -> bool {
+        self.real_clock.is_none() && self.inner.clock_is_simulated()
+    }
     fn current_process(&self) -> ProcessId {
         self.inner.current_process()
     }
