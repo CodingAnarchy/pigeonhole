@@ -224,6 +224,7 @@ fn open(shards: usize, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
     let clock = Arc::clone(&o.vfs);
     let (engine, shards) =
         Engine::open_application_owned(Path::new("/db/data.phdb"), o).expect("open");
+    engine.record_history(true);
     let table = engine
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .expect("table");
@@ -993,6 +994,7 @@ fn open_wide(
     let clock = Arc::clone(&o.vfs);
     let (engine, shards) =
         Engine::open_application_owned(Path::new("/db/data.phdb"), o).expect("open");
+    engine.record_history(true);
     let table = engine.table("t").unwrap_or_else(|| {
         let fams: Vec<(String, FamilyOptions)> = (0..families)
             .map(|i| (format!("f{i:02}"), FamilyOptions::default()))

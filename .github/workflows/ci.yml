@@ -71,6 +71,10 @@ jobs:
       - run: cargo doc -p pigeonhole-bench --no-deps --features "$BENCH_FEATURES"
       - run: cargo test --workspace --exclude pigeonhole-bench --all-features
       - run: cargo test -p pigeonhole-bench --features "$BENCH_FEATURES"
+      # The public crate on its own: feature unification gives the workspace run an engine
+      # built with `test-hooks`, and this run tests the production one (#148, review 1-2 F10).
+      - name: pigeonhole tests without the engine's test hooks
+        run: cargo test -p pigeonhole --all-features
       - run: cargo deny check
       - name: semver checks (published crates only)
         shell: bash

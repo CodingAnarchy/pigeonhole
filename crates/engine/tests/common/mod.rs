@@ -558,6 +558,9 @@ impl Store {
         fams: &[ModelFamily],
     ) -> Result<Self, Error> {
         let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), options)?;
+        // The harness reads the append order and the compactions back (`take_appended`,
+        // `take_compactions`).
+        engine.record_history(true);
         let woke = Arc::new(AtomicBool::new(false));
         for s in &mut shards {
             let w = Arc::clone(&woke);

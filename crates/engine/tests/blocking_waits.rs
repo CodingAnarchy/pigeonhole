@@ -57,6 +57,7 @@ fn table(db: &Engine, name: &str) -> Arc<TableInfo> {
 /// The shard owning `t` (one tablet per new table): commit to it and look at the stream
 /// the record went to. The shards must be running.
 fn shard_of(db: &Engine, t: &TableInfo) -> u32 {
+    db.record_history(true);
     db.take_appended();
     db.commit(put(t, "probe"), Some(Durability::Buffered))
         .unwrap();

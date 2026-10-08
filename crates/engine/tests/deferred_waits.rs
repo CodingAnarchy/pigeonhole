@@ -441,6 +441,7 @@ impl Rig {
     /// The shard owning `t` (one tablet per new table): commits to it and looks at the
     /// stream the record went to.
     fn shard_of(&mut self, t: &TableInfo) -> u32 {
+        self.db.record_history(true);
         self.db.take_appended();
         let mut p = self
             .db

@@ -624,6 +624,7 @@ fn a_commit_whose_write_failed_after_its_ticket_holds_peers_barriers() {
     for i in 0..150u32 {
         db.put(&mut wb, 1, format!("c1-{i:03}").as_bytes(), &value);
     }
+    db.engine.record_history(true);
     let _ = db.engine.take_appended();
     let mut pc = db.engine.submit(wb, Some(Durability::Sync)).unwrap();
     // Run both shards until both PREPAREs are written, and no further: one step at a time,
