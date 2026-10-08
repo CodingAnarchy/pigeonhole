@@ -176,6 +176,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220
+- [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134
 
 ## Open questions
 _None._
