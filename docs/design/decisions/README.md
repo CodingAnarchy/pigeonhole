@@ -9,6 +9,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 | Phase | File | Range |
 |---|---|---|
 | 1 — Core engine | [phase-1.md](phase-1.md) | D1–D162 |
+| 2 — Wide-column model | [phase-2.md](phase-2.md) | D163– |
 
 ## Index
 
@@ -174,6 +175,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
+- [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220
 
 ## Open questions
 _None._
