@@ -25,7 +25,7 @@ Format version **1**, shared-memory layout version **1**. Nothing here is promis
 | Shared-memory directory | `PHDBSHMD` | offset 0 of the directory region |
 | Memtable header | `MEMT` (u32 `0x544D454D`) | offset 0 of each memtable header |
 
-- **Versions.** `FormatVersion` (u32, currently 1) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 1) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
+- **Versions.** `FormatVersion` (u32, currently 2; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 1) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
 
 ## 2. Internal key
 
@@ -73,7 +73,7 @@ The largest value is `2^32 - 1` bytes (decision D16).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | `blob_file` u32: logical blob file id |
-| 4 | 4 | `len` u32: value length |
+| 4 | 4 | `len` u32: length of the stored value the pointer replaced (tag byte included) |
 | 8 | 8 | `offset` u64: logical offset of the blob record within the blob file (§7) |
 
 ## 4. Blocks
@@ -174,7 +174,11 @@ Blob extent header (64 bytes):
 | 20 | 36 | reserved |
 | 56 | 8 | `checksum` u64: xxh3-64 of bytes 0..56 |
 
-Blob record at a logical offset: `len` u64, `checksum` u64 (xxh3-64 of the value), then `len` bytes of value. The pointer's `len` must equal the record's `len`. Because offsets are logical, a value may span several extents; this is how Phase 2 stores values larger than one 64 MiB extent. Until blob separation lands (Phase 2), a value larger than `min(WAL segment payload, 64 MiB, half the shard's memtable arena)` is rejected at write time with `ValueTooLarge` (decision D16).
+Blob record at a logical offset: `len` u64, `checksum` u64 (xxh3-64 of the value), then `len` bytes of value. The value is the stored value (§3) that the pointer replaced, tag byte included, so a reader returns the record as the stored value. The pointer's `len` must equal the record's `len`. Because offsets are logical, a value may span several extents; this is how values larger than one 64 MiB extent can be stored. A value larger than `min(WAL segment payload, 64 MiB, half the shard's memtable arena)` is still rejected at write time with `ValueTooLarge` (decision D16): it must pass through the WAL and a memtable before it is separated.
+
+**Separation.** A put whose stored value has tag `Bytes` and a payload longer than its family's `blob_threshold` (`u32::MAX`: never) is separated when it is written to an SST by a flush or a compaction: the value is appended to a new blob file and the SST holds the `Blob` tag and the pointer. Typed values and merge operands are never separated. Blob records are stored uncompressed: the family's codec (§4.1) applies to SST blocks, which hold the pointers, so nothing is compressed twice. A blob file belongs to one family; every extent of a file has the same size class, and a file of one extent may use any class that holds it.
+
+**Live bytes.** `PutBlobFile.total_bytes` is the file's logical length (record headers plus values); `live_bytes` is the part still referenced: the sum of `16 + len` over the pointers that the SSTs hold within their tablets' rows (an SST shared after a split counts once per tablet, for that tablet's rows). A compaction lowers it for every pointer it drops, and a blob GC for every value it copies to a new file; a file is dropped (`DropBlobFile`) once it reaches zero, and with its table (`DropTable` is accompanied by a `DropBlobFile` per blob file of the table's families).
 
 ## 8. Main file
 
@@ -493,6 +497,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 ## 12. Evolution
 
 - A reader rejects a `FormatVersion` above what it supports and refuses a `ShmLayoutVersion` that differs at all.
+- **Version 2** adds blob files (§7): separated values, `PutBlobFile`/`DropBlobFile` edits in use, and the `Blob` value tag in SSTs. A version 1 build (0.1.0) would read a blob pointer as an empty value, so every structure is now written with version 2 and a version 1 build refuses the file (version 2 also covers zstd blocks, codec 2 in §4.1, which a version 1 build cannot decode). This build still reads version 1 files; a file it writes to (any commit rewrites the superblock) is version 2 from then on.
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.
 - Golden files for every structure are frozen at 1.0 (format brief).

@@ -7,18 +7,23 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use pigeonhole_cache::{BlockCache, Priority};
+use pigeonhole_cache::{BlockCache, Cell, Priority};
 use pigeonhole_compaction::{
-    CellResolver, Error, I64Add, MergeError, MergingCursor, ResolveOptions, ValuePredicate,
-    VecCursor,
+    BlobFetch, CellResolver, Error, I64Add, MergeError, MergingCursor, NewBlobFile, ResolveOptions,
+    ValuePredicate, VecCursor, blob_pointer,
 };
 use pigeonhole_format::key::{Kind, TERMINATOR, encode_key, encode_marker_key, escape_into};
 use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
+use pigeonhole_format::value::BlobPointer;
 use pigeonhole_format::value::ValueTag;
-use pigeonhole_format::{Cursor, Durability, FamilyId, Seqno, SstId, TableId, TabletId, Timestamp};
+use pigeonhole_format::{
+    BlobFileId, Cursor, Durability, FamilyId, Seqno, SstId, TableId, TabletId, Timestamp,
+};
 use pigeonhole_pager::Pager;
 use pigeonhole_sim::{Model, ModelError, ModelFamily, ModelOp, Rng};
-use pigeonhole_sst::{ReadOptions, ScanFilter, SstIter, SstReader, SstWriter, SstWriterOptions};
+use pigeonhole_sst::{
+    BlobReader, ReadOptions, ScanFilter, SstIter, SstReader, SstWriter, SstWriterOptions,
+};
 
 pub const TABLE: &str = "t";
 pub const FAMILY: &str = "f";
@@ -503,6 +508,107 @@ pub fn sst_resolver(
     let sources = ssts
         .iter()
         .map(|s| Src(s.iter(ScanFilter::all(), ReadOptions::default())))
+        .collect();
+    CellResolver::new(MergingCursor::new(sources), options)
+}
+
+/// Readers of the blob files written so far.
+#[derive(Debug, Default)]
+pub struct Blobs(pub Vec<(BlobFileId, Arc<BlobReader>)>);
+
+impl Blobs {
+    /// Opens readers for `files`.
+    pub fn add(&mut self, pager: &Pager, cache: &Arc<BlockCache>, files: &[NewBlobFile]) {
+        for f in files {
+            let r = BlobReader::new(pager.file().clone(), f.id, f.extents.clone(), cache.clone());
+            self.0.push((f.id, Arc::new(r)));
+        }
+    }
+
+    /// Reads the value `ptr` names; panics if its file is unknown.
+    pub fn read(&self, ptr: &BlobPointer) -> Cell {
+        let (_, r) = self
+            .0
+            .iter()
+            .find(|(id, _)| *id == ptr.blob_file)
+            .unwrap_or_else(|| panic!("no blob file {:?}", ptr.blob_file));
+        r.read(ptr).unwrap()
+    }
+}
+
+impl BlobFetch for Blobs {
+    fn fetch(&self, ptr: &BlobPointer) -> Option<Cell> {
+        Some(self.read(ptr))
+    }
+}
+
+/// An SST cursor whose separated values read as the values their pointers name, so the
+/// model oracle sees the same values before and after separation.
+#[derive(Debug)]
+pub struct Resolved {
+    src: Src,
+    blobs: Arc<Blobs>,
+    value: Option<Cell>,
+}
+
+impl Resolved {
+    fn refresh(&mut self) {
+        self.value = (self.src.valid())
+            .then(|| blob_pointer(self.src.value()))
+            .flatten()
+            .map(|p| self.blobs.read(&p));
+    }
+}
+
+impl Cursor for Resolved {
+    type Error = Error;
+    fn valid(&self) -> bool {
+        self.src.valid()
+    }
+    fn key(&self) -> &[u8] {
+        self.src.key()
+    }
+    fn value(&self) -> &[u8] {
+        match &self.value {
+            Some(v) => v,
+            None => self.src.value(),
+        }
+    }
+    fn seek_to_first(&mut self) -> Result<(), Error> {
+        self.src.seek_to_first()?;
+        self.refresh();
+        Ok(())
+    }
+    fn seek(&mut self, target: &[u8]) -> Result<(), Error> {
+        self.src.seek(target)?;
+        self.refresh();
+        Ok(())
+    }
+    fn next(&mut self) -> Result<(), Error> {
+        self.src.next()?;
+        self.refresh();
+        Ok(())
+    }
+    fn skip_row(&mut self) -> Result<(), Error> {
+        self.src.skip_row()?;
+        self.refresh();
+        Ok(())
+    }
+}
+
+/// A resolver over open SSTs whose blob pointers are read through `blobs`.
+pub fn blob_sst_resolver(
+    ssts: &[Arc<SstReader>],
+    blobs: &Arc<Blobs>,
+    options: ResolveOptions,
+) -> CellResolver<MergingCursor<Resolved>> {
+    let sources = ssts
+        .iter()
+        .map(|s| Resolved {
+            src: Src(s.iter(ScanFilter::all(), ReadOptions::default())),
+            blobs: Arc::clone(blobs),
+            value: None,
+        })
         .collect();
     CellResolver::new(MergingCursor::new(sources), options)
 }

@@ -1884,6 +1884,8 @@ pub(crate) struct ShardState {
     /// failure is that caller's. A background compaction's failure is nobody's: it backs
     /// off (issue #141).
     compaction_full: bool,
+    /// Blob GC planning: which slots each candidate blob file was emptied from (issue #33).
+    blob_gc: compact::BlobGc,
     /// Every slot due for a compaction is backing off after a failure, so no compaction can
     /// relieve an L0 stall now (set by `maintain`; D119, issue #141).
     due_backing_off: bool,
@@ -2041,6 +2043,7 @@ impl ShardState {
             compaction: None,
             compact_all: VecDeque::new(),
             compaction_full: false,
+            blob_gc: compact::BlobGc::default(),
             due_backing_off: false,
             backoff_timer: None,
             slot_backoff: HashMap::new(),
@@ -3166,12 +3169,19 @@ impl ShardState {
         opts.ttl_micros = meta.options.ttl_micros;
         opts.versions = 1;
         opts.merge = meta.merge_op.clone();
+        let resolver_blobs = crate::read::ResolverBlobs::attach(&mut opts, &view.ssts);
         let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
         resolver.seek_column(row, qualifier)?;
-        Ok(resolver
-            .next_cell()
-            .map_err(|e| crate::read::read_error(e, meta))?
-            .map(|c| c.value.to_vec()))
+        let next = resolver.next_cell();
+        crate::read::ResolverBlobs::check(resolver_blobs.as_ref())?;
+        let Some(cell) = next.map_err(|e| crate::read::read_error(e, meta))? else {
+            return Ok(None);
+        };
+        // A separated value is compared as the value, not its pointer.
+        Ok(Some(match view.ssts.read_blob(cell.value)? {
+            Some(v) => v.to_vec(),
+            None => cell.value.to_vec(),
+        }))
     }
 
     fn evaluate(&self, table: TableId, row: &[u8], predicate: &Predicate) -> Result<bool> {
@@ -5099,9 +5109,10 @@ impl ShardState {
                     continue;
                 };
                 let rewrite = self.tablets_on();
-                if let Some(t) =
+                if let Some(mut t) =
                     compact::plan_full(tablet, key.1, &fam.levels_meta(), last, &busy, rewrite)
                 {
+                    self.blob_gc.full(&view.catalog, &mut t);
                     task = Some((key, t));
                     break;
                 }
@@ -5129,7 +5140,11 @@ impl ShardState {
         // on a frozen clock, a flush completes or a group is admitted), so a dead device
         // does not loop, and one bad slot does not stop the others (issues #70, #79, #141).
         // A poisoned shard starts none: it is dead until reopen.
-        if (due.is_empty() && self.cleanups.is_empty()) || self.poisoned {
+        if self.poisoned {
+            return;
+        }
+        if due.is_empty() && self.cleanups.is_empty() {
+            self.start_blob_gc(&view, ctx);
             return;
         }
         let busy: Vec<SstId> = self
@@ -5183,12 +5198,55 @@ impl ShardState {
             self.cleanup_turn = true;
             return;
         }
-        // Nothing urgent: rewrite an inherited SST that blocks a merge (#95).
+        // Nothing urgent: rewrite an inherited SST that blocks a merge (#95), or empty blob
+        // files that are mostly garbage.
         self.start_cleanup(&view, &busy, ctx);
+        if self.compaction.is_none() {
+            self.start_blob_gc(&view, ctx);
+        }
         // A slot passed over for its backoff is retried when the backoff ends, even if
         // nothing else happens on the shard by then.
         if let Some(until) = quarantined {
             self.arm_compaction_retry(until, ctx);
+        }
+    }
+
+    /// Starts a blob GC of a slot that may point into a blob file that is mostly garbage
+    /// (issue #33), if there is one and no compaction runs.
+    fn start_blob_gc(&mut self, view: &Arc<View>, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.compaction.is_some() {
+            return;
+        }
+        let now_nanos = ctx.now_nanos();
+        let slots: Vec<(TabletId, FamilyId)> = self
+            .owned_slots(view)
+            .into_iter()
+            .filter(|k| {
+                view.catalog
+                    .family(k.1)
+                    .is_some_and(|m| m.merge != MergeKind::Unknown)
+                    && !self
+                        .slot_backoff
+                        .get(k)
+                        .is_some_and(|&(_, until)| until > now_nanos)
+            })
+            .collect();
+        let busy: Vec<SstId> = self
+            .shared
+            .busy_ssts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        let last = self.shared.picker.max_levels.max(2) - 1;
+        let min_garbage = self.shared.picker.target_sst_bytes / 16;
+        let Some((key, task)) = self.blob_gc.plan(view, &slots, last, &busy, min_garbage) else {
+            return;
+        };
+        if let Err(e) = self.start_compaction(view, key, task, ctx) {
+            trace!("shard {} blob GC start failed: {e}", self.id.0);
+            self.back_off_compaction(key, ctx);
         }
     }
 
@@ -5307,27 +5365,32 @@ impl ShardState {
         let gc = compact::gc_policy(&self.shared, fam, &task, mem_min_ts, now);
         // A test hook's record: production builds keep none (5-6 6.2), and test builds only
         // while a test records (`Engine::record_history`).
-        let record = (self.recording() && task.kind == pigeonhole_compaction::TaskKind::Rewrite)
-            .then(|| CompactionRecord {
-                manifest_version: 0,
-                table: meta.table,
-                tablet: key.0,
-                family: key.1,
-                bottommost: gc.bottommost,
-                snapshots: gc.snapshots.clone(),
-                now: gc.now,
-                min_ts_above: gc.min_ts_above,
-                max_seqno: compact::max_input_seqno(
-                    fam,
-                    &task,
-                    self.memtables.get(&key).and_then(MemSlot::min_seqno),
-                    self.shared.shm.visible_seqno(),
-                ),
-                rows: (
-                    (!tablet.start.is_empty()).then(|| tablet.start.clone()),
-                    tablet.end.clone(),
-                ),
-            });
+        let record = (self.recording()
+            && matches!(
+                task.kind,
+                pigeonhole_compaction::TaskKind::Rewrite
+                    | pigeonhole_compaction::TaskKind::BlobGc { .. }
+            ))
+        .then(|| CompactionRecord {
+            manifest_version: 0,
+            table: meta.table,
+            tablet: key.0,
+            family: key.1,
+            bottommost: gc.bottommost,
+            snapshots: gc.snapshots.clone(),
+            now: gc.now,
+            min_ts_above: gc.min_ts_above,
+            max_seqno: compact::max_input_seqno(
+                fam,
+                &task,
+                self.memtables.get(&key).and_then(MemSlot::min_seqno),
+                self.shared.shm.visible_seqno(),
+            ),
+            rows: (
+                (!tablet.start.is_empty()).then(|| tablet.start.clone()),
+                tablet.end.clone(),
+            ),
+        });
         // Claim the inputs under one lock: a shrink may have claimed one since the plan
         // was made against the busy set (then this round is skipped; `maintain` retries).
         let ids: Vec<SstId> = task
@@ -5370,6 +5433,7 @@ impl ShardState {
             }
         };
         self.compaction = Some(key);
+        self.blob_gc.started(key, &work.task);
         ctx.spawn(Box::new(work));
         Ok(())
     }
@@ -5393,6 +5457,7 @@ impl ShardState {
         }
         let key = self.compaction.take();
         let full = std::mem::take(&mut self.compaction_full);
+        self.blob_gc.finished(result.is_ok());
         trace!(
             "shard {} compaction done: {:?} ({nanos} ns)",
             self.id.0,

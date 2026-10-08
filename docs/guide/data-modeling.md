@@ -46,7 +46,7 @@ let pages = db
 |---|---|
 | Small, hot attributes (status, counters) | `max_versions(1)`, `Priority::High`, `uncompressed()` if tiny |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
-| Large payloads read rarely | its own family; scan other families without touching it. Phase 2: `blob_threshold` |
+| Large payloads read rarely | its own family; scan other families without touching it. `blob_threshold` keeps them out of the family's tree |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
 
 Do not split just to organize: every family is another tree to flush and compact. A `delete_row` also writes one marker per family.
@@ -163,7 +163,7 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 | One huge row for unbounded data | Row reads grow without limit | Bucket rows by time or hash |
 | Read-modify-write counters (`get`, add, `put`) | Races, extra reads | `incr` |
 | One family per attribute | Many trees to flush and compact | Qualifiers inside a few families by access pattern |
-| Large payload in the same family as hot metadata | Scans of metadata decode payload blocks | Separate family (Phase 2: blob threshold) |
+| Large payload in the same family as hot metadata | Scans of metadata decode payload blocks | Separate family, or a `blob_threshold` below the payload size |
 | Value predicates as a query engine over big ranges | They save materialization, not block reads | An inverted row keyed by the value |
 | Long-lived snapshots | Pin memory and space | Take, read, drop |
 | `scan` with different-length byte-array literals (`b"a"..b"bcd"`) | Does not compile (end types differ) | Slices, `scan_prefix` or `scan_bounds` |

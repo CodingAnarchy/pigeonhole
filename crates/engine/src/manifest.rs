@@ -22,7 +22,7 @@ use pigeonhole_format::manifest::{
     encode_block,
 };
 use pigeonhole_format::superblock::ExtentRef;
-use pigeonhole_format::{FormatVersion, ManifestVersion, SstId, TableId, TabletId};
+use pigeonhole_format::{BlobFileId, FormatVersion, ManifestVersion, SstId, TableId, TabletId};
 use pigeonhole_io::{Completion, FileRef};
 use pigeonhole_pager::{Extent, OpenedPager, Pager, Root};
 use pigeonhole_runtime::{Notifier, ShardId, Task, TaskPoll, TaskWaker, Waiter, completion};
@@ -508,6 +508,36 @@ fn added_ssts(edits: &[Edit]) -> Vec<(SstId, ExtentRef)> {
     added
 }
 
+/// Blob files an edit list creates: `PutBlobFile`s of files `catalog` (before the edits)
+/// does not name. Freed with [`abandon_blobs`] if the request is refused.
+fn added_blobs(catalog: &Catalog, edits: &[Edit]) -> Vec<(BlobFileId, Vec<ExtentRef>)> {
+    edits
+        .iter()
+        .filter_map(|e| match e {
+            Edit::PutBlobFile {
+                blob_file, extents, ..
+            } if !catalog.blob_files.contains_key(blob_file) => Some((*blob_file, extents.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Frees blob files that will never be published, and anything cached under their ids.
+fn abandon_blobs(shared: &Shared, blobs: &[(BlobFileId, Vec<ExtentRef>)]) {
+    for (_, extents) in blobs {
+        for e in extents {
+            shared.pager.abandon(*e);
+        }
+    }
+    let files: Vec<u64> = blobs
+        .iter()
+        .map(|(id, _)| pigeonhole_sst::blob_cache_file(*id))
+        .collect();
+    if !files.is_empty() {
+        shared.cache.erase_files(&files);
+    }
+}
+
 /// Frees SSTs that will never be published: their extents, and the blocks their readers
 /// put in the block cache (an opened reader caches its top index under the SST's id and
 /// pins it while it lives: drop the readers first, or their entries stay).
@@ -554,6 +584,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     // What the accepted requests wrote (freed if the whole batch is refused), and the
     // compactions they record (kept only once the batch is prepared).
     let mut added = Vec::new();
+    let mut added_blob_files = Vec::new();
     #[cfg(feature = "test-hooks")]
     let mut records = Vec::new();
     // Owners handed out by tablet changes, re-applied whenever the catalog is rebuilt.
@@ -584,6 +615,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             let table_gone = |e: &Edit| {
                 let tablet = match e {
                     Edit::AddSst { tablet, .. } | Edit::SetFlushed { tablet, .. } => *tablet,
+                    // A blob file the flush separated values of a dropped table into.
+                    Edit::PutBlobFile { family, .. } => return catalog.family(*family).is_none(),
                     _ => return false,
                 };
                 let gone = req
@@ -608,6 +641,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                     .collect();
                 req.readers.retain(|(id, _)| !ids.contains(id));
                 abandon_ssts(shared, &added_ssts(&gone));
+                abandon_blobs(shared, &added_blobs(&catalog, &gone));
             }
             kept
         });
@@ -647,6 +681,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 if !is_tablets {
                     readers_of_req.clear();
                     abandon_ssts(shared, &added_ssts(&own));
+                    abandon_blobs(shared, &added_blobs(&catalog, &own));
                 }
                 return Err(Error::TableNotFound("the table was dropped".to_owned()));
             }
@@ -654,6 +689,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         });
         match own {
             Ok(own) => {
+                let new_blobs = added_blobs(&catalog, &own);
                 let mut applied = Ok(());
                 for e in &own {
                     if let Err(err) = catalog.apply(e, shared.shards) {
@@ -681,6 +717,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         retargets.extend(owners);
                         if !is_tablets {
                             added.extend(added_ssts(&own));
+                            added_blob_files.extend(new_blobs);
                         }
                         edits.extend(own);
                         for (id, r) in req.readers.drain(..) {
@@ -698,6 +735,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                     Err(e) => {
                         req.readers.clear();
                         abandon_ssts(shared, &added_ssts(&own));
+                        abandon_blobs(shared, &new_blobs);
                         // A half-applied request: start over from the old catalog.
                         catalog = (*old).clone();
                         for e in &edits {
@@ -782,6 +820,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 // The writer stays usable, so a commit after space is freed succeeds.
                 readers.clear();
                 abandon_ssts(shared, &added);
+                abandon_blobs(shared, &added_blob_files);
             }
             for (req, r) in outcomes {
                 (req.reply)(r.and_then(|()| Err(crate::error::relay("manifest commit", &e))));

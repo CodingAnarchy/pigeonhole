@@ -405,3 +405,131 @@ fn an_expired_snapshot_does_not_hold_the_new_generations_pin() {
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// Issue #33: a reader process reads separated values through its own view's blob files,
+/// and a snapshot it holds keeps reading them while the writer overwrites and compacts.
+#[test]
+fn a_reader_reads_separated_values_and_keeps_them_while_it_holds_a_snapshot() {
+    let vfs = SimVfs::new(13);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs);
+    let family = FamilyOptions {
+        blob_threshold: 100,
+        max_versions: 1,
+        ..FamilyOptions::default()
+    };
+    let t = w.db.create_table("t", &[("f".into(), family)]).unwrap();
+    write_rows(&mut w, &t, "row", "old", 0..100);
+    assert!(
+        !w.db.blob_files().is_empty(),
+        "the flush separated the values"
+    );
+
+    vfs.enter_process(READER);
+    let reader =
+        Engine::open_reader(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20)).unwrap();
+    let rt = reader.table("t").unwrap();
+    let snap = reader.snapshot().unwrap();
+    assert_eq!(
+        get(&reader, &snap, &rt, "row00042").unwrap(),
+        Some(value("old", 42))
+    );
+
+    // The writer overwrites everything and compacts: the reader's pin keeps the versions
+    // (and the values) its snapshot reads (D118).
+    vfs.enter_process(WRITER);
+    write_rows(&mut w, &t, "row", "new", 0..100);
+    w.compact();
+    w.db.check_blob_accounting().unwrap();
+
+    vfs.enter_process(READER);
+    for i in [0u32, 42, 99] {
+        assert_eq!(
+            get(&reader, &snap, &rt, &format!("row{i:05}")).unwrap(),
+            Some(value("old", i)),
+            "row {i} at the reader's old snapshot"
+        );
+    }
+    drop(snap);
+    let snap = reader.snapshot().unwrap();
+    for i in [0u32, 42, 99] {
+        assert_eq!(
+            get(&reader, &snap, &rt, &format!("row{i:05}")).unwrap(),
+            Some(value("new", i)),
+            "row {i} at a new snapshot"
+        );
+    }
+    drop(snap);
+    drop(reader);
+    vfs.enter_process(WRITER);
+    w.close();
+}
+
+/// Appends `Bytes` payloads, oldest first (base, then operands).
+#[derive(Debug)]
+struct Append;
+
+impl pigeonhole_engine::MergeOperator for Append {
+    fn name(&self) -> &str {
+        "test.append"
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), pigeonhole_engine::MergeError> {
+        let mut out = older.to_vec();
+        out.extend_from_slice(&acc[1..]);
+        *acc = out;
+        Ok(())
+    }
+
+    fn finish(
+        &self,
+        base: Option<&[u8]>,
+        acc: &mut Vec<u8>,
+    ) -> Result<(), pigeonhole_engine::MergeError> {
+        let mut out = base.map_or(vec![0u8], <[u8]>::to_vec);
+        out.extend_from_slice(&acc[1..]);
+        *acc = out;
+        Ok(())
+    }
+}
+
+/// Issue #33 review: a reader process folds operands onto a separated base (the value, not
+/// its pointer).
+#[test]
+fn a_reader_folds_operands_onto_a_separated_base() {
+    let vfs = SimVfs::new(14);
+    let options = || {
+        let mut o = common::options(Arc::clone(&vfs), 1, 4 << 20);
+        o.merge_operators.register(Arc::new(Append));
+        o
+    };
+    vfs.enter_process(WRITER);
+    let (db, shards) = Engine::open_application_owned(Path::new(DB), options()).unwrap();
+    let mut w = Writer { db, shards };
+    let family = FamilyOptions {
+        blob_threshold: 100,
+        merge_operator: "test.append".into(),
+        ..FamilyOptions::default()
+    };
+    let t = w.db.create_table("t", &[("f".into(), family)]).unwrap();
+    write_rows(&mut w, &t, "row", "base", 0..3);
+    assert!(!w.db.blob_files().is_empty(), "the bases are separated");
+    let f = t.family("f").unwrap().id;
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, f, b"row00001", b"q", ValueRef::Bytes(b"+tail"))
+        .unwrap();
+    w.commit(wb);
+    w.flush();
+
+    vfs.enter_process(READER);
+    let reader = Engine::open_reader(Path::new(DB), options()).unwrap();
+    let rt = reader.table("t").unwrap();
+    let snap = reader.snapshot().unwrap();
+    let mut want = value("base", 1);
+    want.extend_from_slice(b"+tail");
+    assert_eq!(get(&reader, &snap, &rt, "row00001").unwrap(), Some(want));
+    drop(snap);
+    drop(reader);
+    vfs.enter_process(WRITER);
+    w.close();
+}

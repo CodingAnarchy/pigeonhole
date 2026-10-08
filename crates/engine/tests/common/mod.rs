@@ -158,6 +158,14 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
         } else {
             Compression::Lz4
         },
+        // Small blob thresholds (values are up to 160 bytes), so flushes and compactions
+        // separate many values and blob GC runs (issue #33).
+        blob_threshold: match f.name.as_str() {
+            "f" => 40,
+            "g" => 100,
+            "ttl" => 60,
+            _ => FamilyOptions::default().blob_threshold,
+        },
         max_versions: f.max_versions,
         ttl_micros: f.ttl_micros,
         merge_operator: if f.i64_add {
@@ -1639,17 +1647,27 @@ impl World {
             Ok(d) => d,
             Err(e) => return fail(FailureClass::Protocol, format!("model dump failed: {e}")),
         };
-        match first_diff(&engine, &model) {
-            None => Ok(()),
-            Some(d) => fail(
+        if let Some(d) = first_diff(&engine, &model) {
+            return fail(
                 class,
                 format!(
                     "state at engine seqno {} (model {}) differs: {d}",
                     snap.seqno(),
                     self.model_seqno(snap.seqno())
                 ),
-            ),
+            );
         }
+        // Blob live counts match the pointers the SSTs hold (reads may fail when faults
+        // are injected; the check then proves nothing).
+        if !(self.cfg.faults.io_error_ppm > 0 && self.faults_on())
+            && let Err(e) = self.store().engine.check_blob_accounting()
+        {
+            return fail(
+                FailureClass::LiveReadMismatch,
+                format!("blob accounting: {e}"),
+            );
+        }
+        Ok(())
     }
 
     fn next_shards(&mut self) -> usize {

@@ -1807,6 +1807,53 @@ fn the_write_stall_timeout_bounds_a_wait_for_room() {
     );
     drop(snaps);
     t.mutate(b"after").put("a", b"q", b"v").commit().unwrap();
+}
+
+#[test]
+fn a_registered_operator_folds_onto_a_separated_base() {
+    // #33 with #43: a base above the family's blob threshold lives in a blob file once
+    // flushed; operands fold onto the value it holds, not onto its pointer.
+    let vfs = SimVfs::new(44);
+    let db = Pigeonhole::open(
+        "/db/merge-blob.phdb",
+        sim_options(&vfs).merge_operator(Arc::new(Append)),
+    )
+    .unwrap();
+    let t = db
+        .table("log")
+        .unwrap()
+        .family(
+            "l",
+            Family::default()
+                .merge_operator("app.append")
+                .blob_threshold(100),
+        )
+        .create_if_missing()
+        .unwrap();
+    let base = vec![b'b'; 500];
+    t.mutate(b"r").put("l", b"q", &base).commit().unwrap();
+    db.flush().unwrap();
+    t.mutate(b"r").merge("l", b"q", b"xy").commit().unwrap();
+    let mut want = base.clone();
+    want.extend_from_slice(b"xy");
+    for stage in ["operand in a memtable", "flushed", "compacted"] {
+        match stage {
+            "flushed" => db.flush().unwrap(),
+            "compacted" => db.compact().unwrap(),
+            _ => {}
+        }
+        assert_eq!(
+            log_value(&t, b"r").unwrap().as_deref(),
+            Some(&want[..]),
+            "{stage}: get"
+        );
+        let row = t.row(b"r").read().unwrap().unwrap();
+        assert_eq!(
+            row.get("l", b"q").map(|c| c.value().to_vec()).as_deref(),
+            Some(&want[..]),
+            "{stage}: row read"
+        );
+    }
     drop(t);
     db.close().unwrap();
 }

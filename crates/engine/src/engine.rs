@@ -1806,10 +1806,20 @@ impl Inner {
     fn drop_table(&self, table: TableId) -> Result<()> {
         let dropped = self.catalog().tablet_ids_of(table);
         self.catalog_change(move |catalog| {
-            if catalog.table(table).is_none() {
+            let Some(info) = catalog.table(table) else {
                 return Err(Error::TableNotFound(format!("table {}", table.0)));
-            }
-            Ok(vec![Edit::DropTable { table }])
+            };
+            // The table's blob files go with it (their extents are retired at this version).
+            let families: Vec<FamilyId> = info.families.iter().map(|f| f.id).collect();
+            let mut edits = vec![Edit::DropTable { table }];
+            edits.extend(
+                catalog
+                    .blob_files
+                    .iter()
+                    .filter(|(_, b)| families.contains(&b.family))
+                    .map(|(id, _)| Edit::DropBlobFile { blob_file: *id }),
+            );
+            Ok(edits)
         })?;
         self.shared.broadcast(|| ShardMsg::DropTablets {
             tablets: dropped.clone(),

@@ -10,6 +10,7 @@ use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{ValueRef, ValueTag, decode_value};
 use pigeonhole_format::{Cursor, Seqno, Timestamp};
 
+use crate::blob::{BlobFetch, blob_pointer};
 use crate::merge::{MergeError, MergeOperator};
 
 /// Values up to this size are copied out of the source while the resolver looks at the rest
@@ -20,8 +21,9 @@ const COPY_LIMIT: usize = 4096;
 /// A predicate on a resolved value.
 ///
 /// Byte predicates compare the value's payload (the stored value without its tag byte);
-/// `I64` matches `i64` and varint values only. A blob pointer matches no byte predicate (the
-/// resolver does not read blobs).
+/// `I64` matches `i64` and varint values only. A separated value is tested on the value its
+/// blob pointer names when [`ResolveOptions::blobs`] is set; [`ValuePredicate::matches`]
+/// alone matches no byte predicate against a pointer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValuePredicate {
     /// Value bytes equal.
@@ -99,6 +101,10 @@ pub struct ResolveOptions {
     /// a counter's base while keeping its operands; [`ResolveOptions::route_time_range`]
     /// picks the right place.
     pub time_range: Option<(Timestamp, Timestamp)>,
+    /// Reads separated values, so that a value predicate (and a merge base folded under
+    /// operands) sees the value rather than its blob pointer. Without it a pointer matches
+    /// no byte predicate.
+    pub blobs: Option<Arc<dyn BlobFetch>>,
 }
 
 impl ResolveOptions {
@@ -113,6 +119,7 @@ impl ResolveOptions {
             value: None,
             merge: None,
             time_range: None,
+            blobs: None,
         }
     }
 
@@ -604,6 +611,7 @@ where
             }
             // The run ends on this base.
             self.run = false;
+            self.load_base();
             let err = self.run_err.take().or_else(|| match &self.opts.merge {
                 Some(op) => op.finish(Some(&self.base_val), &mut self.run_acc).err(),
                 None => Some(MergeError::no_operator()),
@@ -632,6 +640,7 @@ where
                 Ok(Some(Out::Source(ts)))
             }
             (_, true) if base != Base::None => {
+                self.load_base();
                 let err = ops_err.or_else(|| match &self.opts.merge {
                     Some(op) => op.finish(Some(&self.base_val), &mut self.g_acc).err(),
                     None => Some(MergeError::no_operator()),
@@ -677,23 +686,36 @@ where
         if let Some(e) = err {
             return Err(e.into());
         }
-        let first_ok = self.col_versions != 0
-            || self
-                .opts
-                .value
-                .as_ref()
-                .is_none_or(|p| p.matches(&self.out_val));
+        let first_ok = self.col_versions != 0 || self.predicate_ok(&self.out_val);
         Ok(self.count_version(first_ok).then_some(Out::Buffer(ts)))
     }
 
     fn admit_source(&mut self) -> bool {
-        let first_ok = self.col_versions != 0
-            || self
-                .opts
-                .value
-                .as_ref()
-                .is_none_or(|p| p.matches(self.cursor.value()));
+        let first_ok = self.col_versions != 0 || self.predicate_ok(self.cursor.value());
         self.count_version(first_ok)
+    }
+
+    /// Whether `stored` passes the value predicate, reading it from its blob file first if
+    /// it is separated (and the options can).
+    fn predicate_ok(&self, stored: &[u8]) -> bool {
+        let Some(p) = &self.opts.value else {
+            return true;
+        };
+        match (&self.opts.blobs, blob_pointer(stored)) {
+            (Some(blobs), Some(ptr)) => blobs.fetch(&ptr).is_some_and(|v| p.matches(&v)),
+            _ => p.matches(stored),
+        }
+    }
+
+    /// Replaces a separated merge base (copied into `base_val`) by its value, so the
+    /// operator folds onto the value rather than its pointer.
+    fn load_base(&mut self) {
+        if let (Some(blobs), Some(ptr)) = (&self.opts.blobs, blob_pointer(&self.base_val))
+            && let Some(v) = blobs.fetch(&ptr)
+        {
+            self.base_val.clear();
+            self.base_val.extend_from_slice(&v);
+        }
     }
 
     fn count_version(&mut self, first_ok: bool) -> bool {

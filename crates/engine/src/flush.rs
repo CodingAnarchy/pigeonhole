@@ -1,5 +1,6 @@
 //! Flushing frozen memtables to SSTs: a cooperative task per shard writes each frozen
-//! memtable through `SstWriter` into pager extents, syncs the WAL streams whose records the
+//! memtable through `SstWriter` into pager extents (values above the family's blob
+//! threshold into blob files, issue #33), syncs the WAL streams whose records the
 //! data came from (so a flush never persists a share of a cross-shard commit before every
 //! PREPARE and the COMMIT are durable), commits `AddSst` + `SetFlushed` edits through the
 //! manifest writer, and reports back to the shard, which retires the memtables.
@@ -9,6 +10,8 @@ use std::sync::atomic::Ordering;
 use std::task::Poll;
 
 use pigeonhole_cache::BlockCache;
+use pigeonhole_compaction::{BlobSink, NewBlobFile, encode_blob_stored, separates};
+use pigeonhole_format::key::split_suffix;
 use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{Cursor, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId};
@@ -56,7 +59,15 @@ pub(crate) struct FlushedItem {
     pub max_seqno: Seqno,
 }
 
+/// Separated values of a sink: the blob files and the family's threshold.
+struct Separation {
+    sink: BlobSink,
+    threshold: u32,
+}
+
 /// Writes entries into SSTs cut at the extent size, allocating extents from the pager.
+/// With [`SstSink::separating`], values above the blob threshold go to blob files and the
+/// SSTs hold their pointers.
 pub(crate) struct SstSink {
     pager: Arc<Pager>,
     file: FileRef,
@@ -66,6 +77,9 @@ pub(crate) struct SstSink {
     open: Option<(SstWriter, ExtentRef)>,
     pub outputs: Vec<SstMeta>,
     sst_ids: Arc<std::sync::atomic::AtomicU64>,
+    separation: Option<Separation>,
+    /// Blob files finished by [`SstSink::finish_blobs`].
+    pub blob_files: Vec<NewBlobFile>,
 }
 
 impl SstSink {
@@ -84,10 +98,54 @@ impl SstSink {
             open: None,
             outputs: Vec::new(),
             sst_ids,
+            separation: None,
+            blob_files: Vec::new(),
         }
     }
 
+    /// Separates values above `threshold` (the family's `blob_threshold`) into blob files
+    /// with ids from `blob_ids`. Call [`SstSink::finish_blobs`] after the last entry.
+    pub(crate) fn separating(
+        mut self,
+        blob_ids: Arc<std::sync::atomic::AtomicU32>,
+        threshold: u32,
+        target_sst_bytes: u64,
+    ) -> Self {
+        if threshold != u32::MAX {
+            self.separation = Some(Separation {
+                sink: BlobSink::new(
+                    Arc::clone(&self.pager),
+                    blob_ids,
+                    self.estimate / 2,
+                    target_sst_bytes.saturating_mul(4),
+                ),
+                threshold,
+            });
+        }
+        self
+    }
+
+    /// Adds an entry, separating its value first if it is a large put.
     pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some(sep) = &mut self.separation
+            && value.len() > sep.threshold as usize + 1
+            && split_suffix(key).is_ok_and(|(_, _, _, kind)| separates(kind, value, sep.threshold))
+        {
+            let ptr = sep.sink.append(value)?;
+            return self.add_raw(key, &encode_blob_stored(&ptr));
+        }
+        self.add_raw(key, value)
+    }
+
+    /// Finishes the blob files written so far into [`SstSink::blob_files`].
+    pub(crate) fn finish_blobs(&mut self) -> Result<()> {
+        if let Some(sep) = self.separation.take() {
+            self.blob_files = sep.sink.finish()?;
+        }
+        Ok(())
+    }
+
+    fn add_raw(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if let Some((w, _)) = &self.open
             && !w.fits(key.len(), value.len())
         {
@@ -132,6 +190,14 @@ impl SstSink {
 
     /// Returns every extent written so far to the pager.
     pub(crate) fn abandon(&mut self) {
+        if let Some(mut sep) = self.separation.take() {
+            sep.sink.abandon();
+        }
+        for f in self.blob_files.drain(..) {
+            for e in f.extents {
+                self.pager.abandon(e);
+            }
+        }
         if let Some((w, _)) = self.open.take() {
             self.pager.abandon(w.abandon());
         }
@@ -280,12 +346,19 @@ impl FlushTask {
                     item.tablet,
                 );
                 options.created_micros = self.shared.vfs.now_micros();
-                self.sink = Some(SstSink::new(
-                    Arc::clone(&self.shared.pager),
-                    Arc::clone(&self.shared.sst_ids),
-                    options,
-                    item.bytes,
-                ));
+                self.sink = Some(
+                    SstSink::new(
+                        Arc::clone(&self.shared.pager),
+                        Arc::clone(&self.shared.sst_ids),
+                        options,
+                        item.bytes,
+                    )
+                    .separating(
+                        Arc::clone(&self.shared.blob_ids),
+                        item.options.blob_threshold,
+                        self.shared.picker.target_sst_bytes,
+                    ),
+                );
                 let mut it = item.reader.iter();
                 it.seek_to_first()?;
                 self.iter = Some(it);
@@ -305,6 +378,7 @@ impl FlushTask {
                 }
             }
             sink.cut()?;
+            sink.finish_blobs()?;
             let sink = self.sink.take().expect("open");
             self.iter = None;
             self.written.push((self.idx, sink));
@@ -350,6 +424,15 @@ impl FlushTask {
             let item = &self.items[*idx];
             let priority = SstSet::priority(item.options.cache_priority);
             readers.extend(sink.open_readers(&self.shared.cache, priority)?);
+            for f in &sink.blob_files {
+                edits.push(Edit::PutBlobFile {
+                    blob_file: f.id,
+                    family: item.family,
+                    extents: f.extents.clone(),
+                    total_bytes: f.total_bytes,
+                    live_bytes: f.total_bytes,
+                });
+            }
             for meta in &sink.outputs {
                 edits.push(Edit::AddSst {
                     tablet: item.tablet,

@@ -77,7 +77,7 @@ On an existing table, a declared family that is not yet present is added (cheap)
 
 The returned `Table` is cheap to clone and `Send + Sync`. Also available: `db.tables()`, `db.drop_table(name)`, `table.name()`, `table.families()`.
 
-`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `lz4()` (default), `uncompressed()`, `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`, `zstd(level)` (smaller blocks than LZ4, for more CPU), and `merge_operator(name)`, which names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`). Phase 2: `blob_threshold(bytes)` is stored but values stay inline.
+`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `lz4()` (default), `uncompressed()`, `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`, `zstd(level)` (smaller blocks than LZ4, for more CPU), and `merge_operator(name)`, which names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`). `blob_threshold(bytes)` (default 4096) moves larger values to blob files.
 
 ## Write one row atomically
 ```rust
@@ -266,7 +266,7 @@ assert_eq!(pages_copy.get(b"row", "meta", b"k")?.unwrap().value(), b"v");
 ```
 
 - `flush()` and `compact()` return after the work is in the file; both fail with `ErrorCode::Closed` after `close`. They report only their own failure: `compact()` returns the error of the compaction it started, and a background flush or compaction that failed earlier (it is retried after a growing backoff) is never reported to a later call. If the stall timeout (`Options::write_stall_timeout`, 30 s by default) passes while a call waits for room, it fails with the transient `ErrorCode::Busy`.
-- `backup(dest)` writes a new file at `dest`, which must not exist, from a snapshot taken when you call it, so it holds exactly the commits visible at that moment. Commits that land while it runs are not in it. It holds that snapshot's memtables only while it copies them, at the start; the rest of the run holds only the snapshot's SST files, so writers are not stalled by a long backup. A database whose families store blob files cannot be backed up yet (`ErrorCode::Unsupported`); in the current build values stay inline, so this does not occur.
+- `backup(dest)` writes a new file at `dest`, which must not exist, from a snapshot taken when you call it, so it holds exactly the commits visible at that moment. Commits that land while it runs are not in it. It holds that snapshot's memtables only while it copies them, at the start; the rest of the run holds only the snapshot's SST files, so writers are not stalled by a long backup. A database whose families store blob files (any value above a family's `blob_threshold`) cannot be backed up yet (`ErrorCode::Unsupported`, [#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)).
 - The file does not shrink by itself: space freed by compaction is reused by later writes, but the file keeps its length. Call `compact()` and then `shrink()` to give space back to the filesystem.
 - `shrink()` returns the bytes released (`0` when there is nothing to release). It cuts off the free space at the end of the file, moves live data from the file's tail into free space nearer the start, then truncates again, so it costs a read and rewrite of that data. It runs online: other threads keep reading and writing. Space still held by an open snapshot or scan is released on a later call after you drop it. It fails with `ErrorCode::Closed` after `close`, `ErrorCode::NoSpace` if the disk is full when it moves the manifest (which needs a few KiB first), and `ErrorCode::Io` on a disk failure. Use it after a large delete, not routinely.
 - The file cannot end before its live data packed toward the start. Data lives in extents of a power of two from 64 KiB to 64 MiB, each aligned to its size, after a 64 KiB header, so a file holding a 64 MiB SST stays at least 128 MiB however few rows it has. Data with no free extent of its size below it stays put; `shrink` does not report that as an error.
@@ -279,13 +279,12 @@ Reopening after a crash with fewer shards or a smaller `memtable_budget` than be
 | Feature | Current behavior |
 |---|---|
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
-| Blob separation | Phase 2. |
+| `backup` of a database with blob files | `ErrorCode::Unsupported` ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)). |
 
 Later phases:
 
 | Feature | Phase |
 |---|---|
-| Blob separation | 2 |
 | `async` front door (`get_async`, `Scan::stream`, `commit_async`) | 3 |
 
 Available ahead of their phase: `RowMutation::commit_if` (P2), `Transaction` and reader processes (`open_reader`) (P4).

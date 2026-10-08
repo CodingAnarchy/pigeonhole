@@ -281,8 +281,8 @@ impl Engine {
         self.inner.compact_pending(table)
     }
 
-    /// Every entry of every table in `snapshot`'s view, raw (no resolution), in key order
-    /// per `(table, family)`.
+    /// Every entry of every table in `snapshot`'s view, raw (no resolution; separated
+    /// values read from their blob files), in key order per `(table, family)`.
     #[doc(hidden)]
     pub fn raw_entries(&self, snapshot: &Snapshot) -> Result<Vec<RawEntry>> {
         let read = || -> Result<Vec<RawEntry>> {
@@ -302,11 +302,16 @@ impl Engine {
                         None => merged.seek_to_first()?,
                     }
                     while merged.valid() && end.as_deref().is_none_or(|e| merged.key() < e) {
+                        // A separated value is listed as the value, not its pointer.
+                        let value = match view.ssts.read_blob(merged.value())? {
+                            Some(v) => v.to_vec(),
+                            None => merged.value().to_vec(),
+                        };
                         out.push(RawEntry {
                             table: t.table,
                             family,
                             key: merged.key().to_vec(),
-                            value: merged.value().to_vec(),
+                            value,
                         });
                         merged.next()?;
                     }
@@ -353,6 +358,94 @@ impl Engine {
             );
         }
         out
+    }
+
+    /// Every blob file the current catalog names, as `(family, blob file id, total bytes,
+    /// live bytes)` (test hook).
+    #[doc(hidden)]
+    pub fn blob_files(&self) -> Vec<(FamilyId, u32, u64, u64)> {
+        let catalog = Arc::clone(&self.inner.shared.view.load().catalog);
+        catalog
+            .blob_files
+            .iter()
+            .map(|(id, b)| (b.family, id.0, b.total_bytes, b.live_bytes))
+            .collect()
+    }
+
+    /// Checks blob accounting in the current view (test hook): every blob pointer an SST
+    /// holds within its tablet's rows names a blob file of the catalog, of the same family,
+    /// and each file's live bytes are exactly the bytes those pointers reference (16 plus
+    /// the value's length each; an SST shared by several tablets counts once per tablet,
+    /// for its rows in that tablet). Describes the first mismatch.
+    #[doc(hidden)]
+    pub fn check_blob_accounting(&self) -> std::result::Result<(), String> {
+        use pigeonhole_compaction::{blob_pointer, record_bytes};
+        use pigeonhole_format::Cursor;
+        use pigeonhole_format::key::{Kind, split_suffix};
+        use pigeonhole_sst::{ReadOptions, ScanFilter};
+
+        let view = self.inner.shared.view.load_full();
+        let catalog = &view.catalog;
+        let mut refs: BTreeMap<u32, u64> = BTreeMap::new();
+        let err = |e: &dyn std::fmt::Display| e.to_string();
+        for tablet in catalog.tablets() {
+            let range = crate::compact::tablet_range(&tablet).map_err(|e| err(&e))?;
+            for family in catalog.family_ids_of(tablet.table) {
+                let Some(fam) = view.ssts.family(tablet.id, family) else {
+                    continue;
+                };
+                for sst in fam.iter() {
+                    let reader = sst
+                        .reader(&view.ssts, pigeonhole_cache::Priority::Low)
+                        .map_err(|e| err(&e))?;
+                    let mut it = reader.iter(ScanFilter::all(), ReadOptions::default());
+                    match &range.start {
+                        Some(s) => it.seek(s),
+                        None => it.seek_to_first(),
+                    }
+                    .map_err(|e| err(&e))?;
+                    while it.valid() {
+                        if range.end.as_deref().is_some_and(|e| it.key() >= e) {
+                            break;
+                        }
+                        let (_, _, _, kind) = split_suffix(it.key()).map_err(|e| err(&e))?;
+                        if kind == Kind::Put
+                            && let Some(p) = blob_pointer(it.value())
+                        {
+                            match catalog.blob_files.get(&p.blob_file) {
+                                Some(b) if b.family == family => {}
+                                Some(b) => {
+                                    return Err(format!(
+                                        "SST {} of family {} points into blob file {} of family {}",
+                                        sst.meta.id.0, family.0, p.blob_file.0, b.family.0
+                                    ));
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "SST {} points into blob file {}, which the catalog \
+                                         does not name",
+                                        sst.meta.id.0, p.blob_file.0
+                                    ));
+                                }
+                            }
+                            *refs.entry(p.blob_file.0).or_default() += record_bytes(p.len);
+                        }
+                        it.next().map_err(|e| err(&e))?;
+                    }
+                }
+            }
+        }
+        for (id, b) in &catalog.blob_files {
+            let referenced = refs.get(&id.0).copied().unwrap_or(0);
+            if referenced != b.live_bytes {
+                return Err(format!(
+                    "blob file {}: {} live bytes recorded, {referenced} referenced \
+                     ({} written)",
+                    id.0, b.live_bytes, b.total_bytes
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Bytes in the block cache (test hook: `shrink`'s tests check that an abandoned copy

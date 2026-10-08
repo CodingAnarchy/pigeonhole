@@ -3,27 +3,29 @@
 //! filters, merge folding) over a `MergingCursor` of the engine's [`Source`]s.
 
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use pigeonhole_compaction::{MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate};
+use pigeonhole_compaction::{
+    BlobFetch, MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate,
+};
 use pigeonhole_format::key::{
     Escaped, Kind, SUFFIX_LEN, decode_key, encode_row_prefix, row_prefix_len,
 };
 use pigeonhole_format::scan::ScanFilter;
-use pigeonhole_format::value::{ValueRef, decode_value};
+use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
 use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
-use crate::catalog::{FamilyMeta, MergeKind};
-use crate::snapshot::{Snapshot, TabletEntry, View};
+use crate::catalog::{FamilyMeta, I64_ADD, MergeKind};
+use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
 use crate::source::{Pinned, Resolver, Source};
 use crate::{Error, Result};
 
 /// How a [`CellData`] keeps its value alive.
 #[derive(Clone)]
 enum CellValue {
-    /// A copy (small values, merge results, blob reads).
+    /// A copy (small values, merge results, small separated values).
     Inline {
         len: u8,
         bytes: [u8; CellData::INLINE_MAX],
@@ -94,6 +96,40 @@ impl CellData {
             CellValue::Owned(stored.to_vec())
         };
         Self { ts: cell.ts, value }
+    }
+
+    /// A separated value read from its blob file: pinned in the block cache, or copied when
+    /// small.
+    fn from_blob(ts: Timestamp, value: pigeonhole_cache::Cell) -> Self {
+        let bytes: &[u8] = &value;
+        if bytes.len() <= Self::INLINE_MAX {
+            let mut inline = [0u8; Self::INLINE_MAX];
+            inline[..bytes.len()].copy_from_slice(bytes);
+            return Self {
+                ts,
+                value: CellValue::Inline {
+                    len: bytes.len() as u8,
+                    bytes: inline,
+                },
+            };
+        }
+        Self {
+            ts,
+            value: CellValue::Block(value),
+        }
+    }
+
+    /// Builds a cell from a resolved one that the caller would copy (small, or buffered by
+    /// the resolver), reading a separated value from its blob file first.
+    pub(crate) fn resolved(
+        cell: &ResolvedCell<'_>,
+        ssts: &SstSet,
+        pin: impl FnOnce() -> Arc<View>,
+    ) -> Result<Self> {
+        Ok(match ssts.read_blob(cell.value)? {
+            Some(v) => Self::from_blob(cell.ts, v),
+            None => Self::from_cell(cell, None, pin),
+        })
     }
 
     fn from_pinned(ts: Timestamp, value: &LaneValue, pin: impl FnOnce() -> Arc<View>) -> Self {
@@ -185,6 +221,66 @@ impl ReadSpec {
         filter.qualifiers = self.qualifiers.clone();
         opts.route_time_range(&mut filter, self.time_range);
         (opts, filter)
+    }
+}
+
+/// Reads separated values for the resolver (`ResolveOptions::blobs`): a value predicate
+/// tests the value, and a merge operator folds onto the value, not its pointer. The resolver
+/// cannot fail through the hook, so the first error is kept here and the read reports it
+/// after each resolver step ([`ResolverBlobs::check`]).
+#[derive(Debug)]
+pub(crate) struct ResolverBlobs {
+    ssts: Arc<SstSet>,
+    error: Mutex<Option<Error>>,
+}
+
+impl ResolverBlobs {
+    /// Sets `opts.blobs` when the resolver may need a separated value and `ssts` names blob
+    /// files; returns the handle to check after each resolver step. It may need one for a
+    /// value predicate, or to fold operands onto a separated base. The built-in `i64` add
+    /// is the exception: it rejects every base that is not a stored `i64`, with the same
+    /// error, and a separated value never is one (only `Bytes` are separated), so loading
+    /// the base could not change its result. Skipping it keeps a default family's reads
+    /// free of the hook.
+    pub(crate) fn attach(opts: &mut ResolveOptions, ssts: &Arc<SstSet>) -> Option<Arc<Self>> {
+        let folds = opts.merge.as_ref().is_some_and(|m| m.name() != I64_ADD);
+        if !(opts.value.is_some() || folds) || !ssts.has_blobs() {
+            return None;
+        }
+        let blobs = Arc::new(Self {
+            ssts: Arc::clone(ssts),
+            error: Mutex::new(None),
+        });
+        opts.blobs = Some(Arc::clone(&blobs) as Arc<dyn BlobFetch>);
+        Some(blobs)
+    }
+
+    /// Fails with the first error a fetch hit.
+    pub(crate) fn check(blobs: Option<&Arc<Self>>) -> Result<()> {
+        match blobs.and_then(|b| {
+            b.error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        }) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl BlobFetch for ResolverBlobs {
+    fn fetch(&self, ptr: &BlobPointer) -> Option<pigeonhole_cache::Cell> {
+        match self.ssts.read_pointer(ptr) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                let mut slot = self.error.lock().unwrap_or_else(PoisonError::into_inner);
+                if slot.is_none() {
+                    *slot = Some(e);
+                }
+                None
+            }
+        }
     }
 }
 
@@ -335,6 +431,10 @@ struct Lane {
     family: FamilyId,
     meta: FamilyMeta,
     resolver: Resolver,
+    /// The view's SSTs and blob files, to read separated values.
+    ssts: Arc<SstSet>,
+    /// The resolver's blob reads, if it may need any.
+    resolver_blobs: Option<Arc<ResolverBlobs>>,
     /// The held cell: column prefix, timestamp, value.
     col: Vec<u8>,
     ts: Timestamp,
@@ -361,11 +461,9 @@ impl Lane {
             return Ok(());
         }
         let (from_source, large) = {
-            let Some(cell) = self
-                .resolver
-                .next_cell()
-                .map_err(|e| read_error(e, &self.meta))?
-            else {
+            let next = self.resolver.next_cell();
+            ResolverBlobs::check(self.resolver_blobs.as_ref())?;
+            let Some(cell) = next.map_err(|e| read_error(e, &self.meta))? else {
                 self.done = true;
                 return Ok(());
             };
@@ -373,7 +471,9 @@ impl Lane {
             self.col.extend_from_slice(column_of(cell.key));
             self.ts = cell.ts;
             let large = cell.value.len() > CellData::INLINE_MAX;
-            if !(cell.from_source && large) {
+            if let Some(v) = self.ssts.read_blob(cell.value)? {
+                self.value = LaneValue::Pinned(Pinned::Block(v));
+            } else if !(cell.from_source && large) {
                 match &mut self.value {
                     LaneValue::Copied(v) => {
                         v.clear();
@@ -504,10 +604,11 @@ impl ScanCursor {
             let Some(meta) = view.catalog.family(family) else {
                 continue;
             };
-            let (opts, filter) = self
-                .spec
-                .read
-                .resolve_opts(meta, self.snapshot.seqno, self.now);
+            let (mut opts, filter) =
+                self.spec
+                    .read
+                    .resolve_opts(meta, self.snapshot.seqno, self.now);
+            let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
             let sources = view.scan_sources(
                 tablet.shard,
                 tablet.id,
@@ -526,6 +627,8 @@ impl ScanCursor {
                 family,
                 meta: meta.clone(),
                 resolver,
+                ssts: Arc::clone(&view.ssts),
+                resolver_blobs,
                 col: Vec::new(),
                 ts: 0,
                 value: LaneValue::Copied(Vec::new()),
@@ -733,7 +836,8 @@ pub(crate) fn read_row(
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
-        let (opts, filter) = spec.resolve_opts(meta, snapshot.seqno, now);
+        let (mut opts, filter) = spec.resolve_opts(meta, snapshot.seqno, now);
+        let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let sources = view.row_sources(shard, tablet, family, &filter, row, &prefix)?;
         if sources.is_empty() {
             continue;
@@ -743,7 +847,9 @@ pub(crate) fn read_row(
         resolver.seek(&prefix)?;
         loop {
             let (data, column) = {
-                let Some(cell) = resolver.next_cell().map_err(|e| read_error(e, meta))? else {
+                let next = resolver.next_cell();
+                ResolverBlobs::check(resolver_blobs.as_ref())?;
+                let Some(cell) = next.map_err(|e| read_error(e, meta))? else {
                     break;
                 };
                 if !cell.key.starts_with(&prefix) {
@@ -754,7 +860,7 @@ pub(crate) fn read_row(
                     // Pinned below, once the borrow of the resolver ends.
                     None
                 } else {
-                    Some(CellData::from_cell(&cell, None, || Arc::clone(view)))
+                    Some(CellData::resolved(&cell, &view.ssts, || Arc::clone(view))?)
                 };
                 (data, column)
             };
@@ -804,11 +910,12 @@ pub(crate) fn get_in(
     if sources.is_empty() {
         return Ok(None);
     }
-    let (opts, _) = ReadSpec {
+    let (mut opts, _) = ReadSpec {
         versions: 1,
         ..ReadSpec::default()
     }
     .resolve_opts(meta, seqno, now);
+    let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
     let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
     resolver.seek_column(row, qualifier)?;
     // A value above the inline threshold is pinned, not copied (D29). The resolver copies
@@ -819,11 +926,13 @@ pub(crate) fn get_in(
     let mut key_vec: Vec<u8> = Vec::new();
     let mut key_len = 0;
     let (ts, refind) = {
-        let Some(cell) = resolver.next_cell().map_err(|e| read_error(e, meta))? else {
+        let next = resolver.next_cell();
+        ResolverBlobs::check(resolver_blobs.as_ref())?;
+        let Some(cell) = next.map_err(|e| read_error(e, meta))? else {
             return Ok(None);
         };
         if cell.value.len() <= CellData::INLINE_MAX {
-            return Ok(Some(CellData::from_cell(&cell, None, pin)));
+            return Ok(Some(CellData::resolved(&cell, &view.ssts, pin)?));
         }
         if cell.from_source {
             (cell.ts, false)

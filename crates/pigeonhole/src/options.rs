@@ -379,8 +379,11 @@ impl Family {
         self
     }
 
-    /// Store values longer than `bytes` in blob extents (default 4096; Phase 2). Stored with
-    /// the family now; values stay inline until blob separation lands.
+    /// Store values longer than `bytes` in blob files (default 4096; `u32::MAX` never). A
+    /// flush or compaction moves such a value out of the family's tree, which keeps a 16-byte
+    /// pointer, so compactions and scans of other columns do not copy it. Blob GC rewrites
+    /// blob files once they are half garbage. A database with blob files cannot be backed
+    /// up yet ([#58](https://github.com/CodingAnarchy/pigeonhole/issues/58)).
     pub fn blob_threshold(mut self, bytes: u32) -> Self {
         self.options.blob_threshold = bytes;
         self
