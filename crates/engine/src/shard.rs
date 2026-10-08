@@ -1621,6 +1621,12 @@ impl RoomWait {
         self.recheck = Some(state);
     }
 
+    /// Whether the clock stopped at `now`: the timeout or the re-check timer gave up on this
+    /// reading.
+    fn stopped(&self, now: u64) -> bool {
+        self.timer.frozen(now) || self.recheck.as_ref().is_some_and(|t| t.frozen(now))
+    }
+
     /// The wait is over: stops both timers.
     fn cancel(&self) {
         self.timer.cancel();
@@ -2732,7 +2738,8 @@ impl ShardState {
                 self.starve_wait = Some(RoomWait::new(now, timer));
                 (now, false)
             }
-            Some(w) => (w.since, w.timer.frozen(now)),
+            // Either timer giving up on this reading means the clock stopped (#244).
+            Some(w) => (w.since, w.stopped(now)),
         };
         if let Some(w) = &self.starve_wait
             && w.timer.finished()
@@ -3553,7 +3560,11 @@ impl ShardState {
             self.wait_room = true;
             let now = ctx.now_nanos();
             let timeout = self.shared.write_stall_timeout_nanos;
-            let frozen = self.room_wait.as_ref().is_some_and(|w| w.timer.frozen(now));
+            // The clock has stopped if either of the wait's timers gave up on this reading.
+            // The re-check timer counts too (#244): the timeout timer may have seen the clock
+            // move and be asleep towards a deadline the clock never reaches, and a shard
+            // kicked by each re-check never goes idle for it to be polled and notice.
+            let frozen = self.room_wait.as_ref().is_some_and(|w| w.stopped(now));
             let mut refuse = false;
             match &self.room_wait {
                 None => {
@@ -3613,6 +3624,10 @@ impl ShardState {
                 && self.prepared.is_empty()
                 && self.unresolved.is_empty()
                 && self.retired.is_empty();
+            trace!(
+                "shard {} room wait: frozen={frozen} idle={idle} refuse={refuse}",
+                self.id.0
+            );
             if !refuse && !idle && !frozen {
                 // Room freed by a snapshot dropped on another thread or a reader process's
                 // unpin is announced to nobody: look again soon (issue #141).
@@ -5793,16 +5808,44 @@ impl ShardState {
 
 /// Whether `PIGEONHOLE_TRACE` is set: the close and checkpoint protocol logs its steps.
 pub(crate) fn tracing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIGEONHOLE_TRACE").is_some())
+    match TRACING.load(Ordering::Relaxed) {
+        TRACE_UNSET => {
+            let on = std::env::var_os("PIGEONHOLE_TRACE").is_some();
+            let _ = TRACING.compare_exchange(
+                TRACE_UNSET,
+                if on { TRACE_ON } else { TRACE_OFF },
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            TRACING.load(Ordering::Relaxed) == TRACE_ON
+        }
+        state => state == TRACE_ON,
+    }
+}
+
+/// `tracing`'s state: not read from the environment yet, off, or on.
+static TRACING: AtomicU8 = AtomicU8::new(TRACE_UNSET);
+const TRACE_UNSET: u8 = 0;
+const TRACE_OFF: u8 = 1;
+const TRACE_ON: u8 = 2;
+
+/// Turns the engine's `PIGEONHOLE_TRACE` logging on or off for the whole process (test
+/// hook: a model suite's watchdog turns it on once a seed hangs, to see what the shards
+/// are doing then without tracing the whole run, #244).
+#[doc(hidden)]
+pub fn set_tracing(on: bool) {
+    TRACING.store(if on { TRACE_ON } else { TRACE_OFF }, Ordering::Relaxed);
 }
 
 /// Logs to stderr when `PIGEONHOLE_TRACE` is set (CONTRIBUTING.md, "Test environment variables"):
-/// the only output the engine library writes.
+/// the only output the engine library writes. It writes to the stderr handle itself, not
+/// through `eprintln!`, so a test harness's output capture (which shard threads spawned by
+/// a test inherit) cannot swallow it when a hung test aborts the process.
 macro_rules! trace {
     ($($arg:tt)*) => {
         if $crate::shard::tracing() {
-            eprintln!($($arg)*);
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), $($arg)*);
         }
     };
 }
@@ -5876,6 +5919,30 @@ impl ShardHandler for ShardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #244: a room wait whose timeout timer saw the clock move sleeps towards a
+    /// deadline a stopped clock never reaches, and a shard kicked by each re-check never goes
+    /// idle for that timer to be polled again. A re-check timer that gave up on this reading
+    /// must be enough to call the clock stopped, or the wait never takes the frozen-clock
+    /// path (refused with `Busy`, issue #70) and the shard spins (seen in the public model
+    /// suite, seed 53).
+    #[test]
+    fn a_room_wait_sees_a_stopped_clock_through_its_recheck_timer() {
+        let mut wait = RoomWait::new(10, TimerState::new());
+        assert!(!wait.stopped(50));
+        // The timeout timer sleeps; the re-check timer gave up with the clock at 50.
+        let recheck = TimerState::new();
+        recheck.frozen_at.store(50, Ordering::Release);
+        recheck.done.store(true, Ordering::Release);
+        wait.recheck = Some(recheck);
+        assert!(wait.stopped(50));
+        // Once the clock moves on, it is not stopped any more.
+        assert!(!wait.stopped(51));
+        // The timeout timer giving up counts as before.
+        let wait = RoomWait::new(10, TimerState::new());
+        wait.timer.frozen_at.store(60, Ordering::Release);
+        assert!(wait.stopped(60));
+    }
 
     #[test]
     fn a_retry_keeps_its_timestamp_only_where_no_other_write_reached_it() {

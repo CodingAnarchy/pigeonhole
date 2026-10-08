@@ -65,8 +65,9 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 | `PIGEONHOLE_DEFERRED_IO` | engine harness, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |
 | `PIGEONHOLE_SWEEP_STEP` | engine `tablets` and `model_check` crash sweeps | Crash after every Nth mutating operation instead of the default step. |
 | `PIGEONHOLE_SHARDS_64` | engine `model_check` | Runs the 64-shard case, which is skipped otherwise. |
-| `PIGEONHOLE_TRACE` | engine library and engine harness | The engine logs its close, checkpoint, manifest, flush and tablet-change steps to stderr (`shard::trace!`), and the harness logs each operation. |
+| `PIGEONHOLE_TRACE` | engine library and engine harness | The engine logs its close, checkpoint, manifest, flush and tablet-change steps to stderr (`shard::trace!`), and the harness logs each operation. The engine writes to the stderr handle itself, so a test harness's output capture does not hide it; `pigeonhole_engine::set_tracing` turns it on or off at run time. |
 | `PIGEONHOLE_TRACE_LINES` | engine harness | Trace lines a checker failure prints (default 40). |
+| `PIGEONHOLE_SEED_TIMEOUT` | pigeonhole `model` | Seconds one seed may run before the watchdog reports it hung (test, seed, configuration and the step it was on), turns on the engine's trace for 5 s to show what the shards do, and aborts (default 120; #244). |
 | `PIGEONHOLE_SHM_CHILD`, `PIGEONHOLE_MEMTABLE_CHILD`, `PIGEONHOLE_IO_LOCK_PROBE`, `PIGEONHOLE_TEST_SMALL_SHM` | multi-process tests | Set by a test when it re-runs itself as a child process. Don't set them yourself. |
 
 ## Performance discipline
