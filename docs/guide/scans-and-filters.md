@@ -118,7 +118,7 @@ let it = t.scan_prefix(b"sensor:").time_range(t0_us..t1_us).versions(0).iter()?;
 - Within a column, versions are ordered **newest first**.
 - `versions(0)` returns every retained version. What is retained depends on the family's `max_versions` and `ttl`.
 - Do not rely on reading versions older than the family's TTL; expiry is applied by timestamp.
-- Counters written with `incr` are resolved at read time; see the pushdown rules below before combining them with `time_range`.
+- In a counter family each bucket (`incr_at`) is a version, so `time_range` windows buckets; see the pushdown rules below.
 
 ## Limiting work
 - `limit(n)` stops after `n` rows. Use it for pagination: remember the last key and resume with `scan_bounds(Bound::Excluded(last_key), ...)`.
@@ -190,7 +190,7 @@ Filters run **before values are materialized**, and every data source (memtables
 | Value predicates | In version resolution, before materialization | Test the newest visible value of a column. |
 
 Consequences you should know:
-- **Deletes always win.** Delete markers (cell, column, family-in-row) always pass the decoder filters, even when their qualifier or timestamp is outside your filter. Hiding a marker would resurrect older versions, so a `time_range` that excludes a column delete's timestamp still honors the delete. A delete with timestamp `T` hides every version in its scope with timestamp `<= T` (decision D9).
-- **Counters are filtered after they are resolved.** In a family with a merge operator, `time_range` is not pushed down: the counter is resolved from all its operands and its base first, and the resolved value is kept if its timestamp (that of its newest operand) is in the range (proposed D22 amendment). Pushing it down could drop the base and keep the operands, a wrong sum. So `time_range` never computes a windowed sum over an `incr` counter; use time-bucketed qualifiers for that.
+- **Deletes always win.** Delete markers (cell, column, family-in-row) always pass the decoder filters, even when their qualifier or timestamp is outside your filter. Hiding a marker would resurrect older versions, so a `time_range` that excludes a column delete's timestamp still honors the delete. A delete with timestamp `T` hides every version in its scope with timestamp `<= T` (decision D9); in a counter family, only those written before it (decision D179).
+- **Counters are filtered after they are resolved.** In a family with a merge operator, `time_range` applies to resolved versions (decision D82). In a counter family each bucket is resolved on its own, so a `time_range` returns the buckets inside it with their full sums; it never sums buckets for you. In a family from 0.1.0 with the `i64` operator, a run of increments resolves to one version at its newest increment's timestamp, kept if that timestamp is in the range.
 - **`versions(n)` and value predicates see snapshot-visible data.** `value_filter` tests the newest visible value, not any older version of the column.
 - Filtering by qualifier does not change the visibility of a version of a different qualifier.

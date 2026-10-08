@@ -14,9 +14,17 @@ pub struct ModelFamily {
     pub max_versions: u32,
     /// TTL in microseconds; 0 disables it.
     pub ttl_micros: u64,
-    /// Whether merge operands use the built-in `i64` add operator.
+    /// Whether merge operands use the built-in `i64` add operator (a 0.1.0-style family:
+    /// operands at the commit timestamp, folded across timestamps, D41).
     pub i64_add: bool,
+    /// A counter family (decision D179): `i64` values only, operands combine per timestamp,
+    /// deletes hide only older writes. Implies the `i64` add operator.
+    pub counter: bool,
 }
+
+/// The timestamp of a counter family's counter: puts and `Incr`s without a timestamp land
+/// here (decision D179; the engine's `COUNTER_TS`).
+pub const COUNTER_TS: Timestamp = 0;
 
 /// One mutation in a model commit. Rows, families and qualifiers are plain values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +54,9 @@ pub enum ModelOp {
         family: String,
         /// Qualifier.
         qualifier: Vec<u8>,
+        /// Bucket timestamp (counter families only, `incr_at`); `None` is [`COUNTER_TS`] in
+        /// a counter family and the commit timestamp elsewhere.
+        ts: Option<Timestamp>,
         /// Amount.
         delta: i64,
     },
@@ -103,6 +114,10 @@ pub enum ModelError {
     /// A read had to fold merge operands onto a base put whose value is not an 8-byte `i64`
     /// (decision D41); the family is named. Returned by the `try_` read methods.
     MergeFailed(String),
+    /// A write a counter family refuses (a put that is not an 8-byte `i64`, or a
+    /// fixed-timestamp write into one with a TTL), or an `Incr` with a timestamp outside a
+    /// counter family (decision D179); the family is named. `InvalidArgument` in the store.
+    CounterWrite(String),
 }
 
 impl fmt::Display for ModelError {
@@ -112,6 +127,7 @@ impl fmt::Display for ModelError {
             Self::NoSuchFamily(x) => write!(f, "no such family {x:?}"),
             Self::NoMergeOperator(x) => write!(f, "family {x:?} has no merge operator"),
             Self::MergeFailed(x) => write!(f, "merge failed in family {x:?}: base is not an i64"),
+            Self::CounterWrite(x) => write!(f, "write refused by the counter rules of {x:?}"),
         }
     }
 }
@@ -211,6 +227,12 @@ struct Table {
 ///   whose value is not 8 bytes makes the read fail with [`ModelError::MergeFailed`] (D41);
 ///   a put no operand folds onto is returned as written. Without a base the sum is the
 ///   value. An expired base is dropped before folding, so the run then has no base.
+/// - **Counter families (D179)** differ: puts and `Incr`s without a timestamp land at
+///   [`COUNTER_TS`] (a family with a TTL refuses them, and refuses non-8-byte puts), every
+///   timestamp is its own version (operands never fold across timestamps; at one timestamp
+///   the newest put is the base and newer operands add to it), and a delete hides only
+///   entries with a lower seqno within its timestamp scope, so a later write at a covered
+///   timestamp stays visible. Purges never change a counter family's reads.
 /// - `max_versions` keeps the newest N resolved versions (after deletes, TTL and folding).
 /// - Reads order cells by family, then qualifier, then timestamp descending. Families come
 ///   in creation order, or in the caller's order when the read lists families (D39).
@@ -293,13 +315,21 @@ impl Model {
         let seqno = self.commits.len() as Seqno;
         // Keep only the last column-level mutation per (row, family, qualifier, ts).
         let mut last: BTreeMap<CollapseKey<'_>, usize> = BTreeMap::new();
-        for (i, op) in ops.iter().enumerate() {
-            if let Some(key) = column_key(op, commit_ts) {
-                last.insert(key, i);
+        let keys: Vec<Option<CollapseKey<'_>>> = ops
+            .iter()
+            .map(|op| self.collapse_key(op, commit_ts))
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(key) = key {
+                last.insert(*key, i);
             }
         }
-        for (i, op) in ops.iter().enumerate() {
-            let collapsed = column_key(op, commit_ts).is_some_and(|k| last[&k] != i);
+        let collapsed: Vec<bool> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| k.is_some_and(|k| last[&k] != i))
+            .collect();
+        for (op, collapsed) in ops.iter().zip(collapsed) {
             if !collapsed {
                 self.apply(op, commit_ts, seqno);
             }
@@ -327,10 +357,43 @@ impl Model {
             .families
             .get(family)
             .ok_or_else(|| ModelError::NoSuchFamily(family.clone()))?;
-        if matches!(op, ModelOp::Incr { .. }) && !f.i64_add {
-            return Err(ModelError::NoMergeOperator(family.clone()));
+        let refused = || Err(ModelError::CounterWrite(family.clone()));
+        // A fixed-timestamp write into a counter family with a TTL would expire at once.
+        let fixed_with_ttl = |ts: &Option<Timestamp>| ts.is_none() && f.ttl_micros != 0;
+        match op {
+            ModelOp::Incr { ts, .. } if f.counter && fixed_with_ttl(ts) => refused(),
+            ModelOp::Incr { .. } if f.counter => Ok(()),
+            ModelOp::Incr { ts: Some(_), .. } => refused(),
+            ModelOp::Incr { .. } if !f.i64_add => Err(ModelError::NoMergeOperator(family.clone())),
+            ModelOp::Put { ts, value, .. }
+                if f.counter && (value.len() != 8 || fixed_with_ttl(ts)) =>
+            {
+                refused()
+            }
+            _ => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Whether `family` of `table` is a counter family.
+    fn is_counter(&self, table: &str, family: &str) -> bool {
+        self.tables
+            .get(table)
+            .and_then(|t| t.families.get(family))
+            .is_some_and(|f| f.counter)
+    }
+
+    /// The collapse key of a column-level mutation (see [`column_key`]), with counter-family
+    /// puts and operands at [`COUNTER_TS`].
+    fn collapse_key<'a>(&self, op: &'a ModelOp, commit_ts: Timestamp) -> Option<CollapseKey<'a>> {
+        let default_ts = match op {
+            ModelOp::Put { table, family, .. } | ModelOp::Incr { table, family, .. }
+                if self.is_counter(table, family) =>
+            {
+                COUNTER_TS
+            }
+            _ => commit_ts,
+        };
+        column_key(op, commit_ts, default_ts)
     }
 
     /// Applies one validated mutation.
@@ -344,6 +407,15 @@ impl Model {
             | ModelOp::DeleteRow { table, row } => (table, row),
         };
         let t = self.tables.get_mut(table).expect("validated");
+        // Puts and operands without a timestamp: the counter's in a counter family.
+        let default_ts = match op {
+            ModelOp::Put { family, .. } | ModelOp::Incr { family, .. }
+                if t.families[family].counter =>
+            {
+                COUNTER_TS
+            }
+            _ => commit_ts,
+        };
         let mut column = |family: &String, qualifier: &Vec<u8>, ts: Timestamp, kind: Kind| {
             t.columns
                 .entry(row.clone())
@@ -362,16 +434,22 @@ impl Model {
             } => column(
                 family,
                 qualifier,
-                ts.unwrap_or(commit_ts),
+                ts.unwrap_or(default_ts),
                 Kind::Put(value.clone()),
             ),
             ModelOp::Incr {
                 family,
                 qualifier,
+                ts,
                 delta,
                 ..
             } => {
-                column(family, qualifier, commit_ts, Kind::Merge(*delta));
+                column(
+                    family,
+                    qualifier,
+                    ts.unwrap_or(default_ts),
+                    Kind::Merge(*delta),
+                );
             }
             ModelOp::DeleteCell {
                 family,
@@ -658,6 +736,11 @@ impl Model {
         let Some(fam) = t.families.get(&p.family).cloned() else {
             return;
         };
+        if fam.counter {
+            // A counter family's deletes hide only older writes, which a purge drops with
+            // them, so purges never change its reads.
+            return;
+        }
         let first = p.snapshots.iter().copied().min().unwrap_or(Seqno::MAX);
         let mut points: Vec<Seqno> = p.snapshots.clone();
         points.push(Seqno::MAX);
@@ -880,6 +963,9 @@ fn resolve(
     now: Timestamp,
     limit: u32,
 ) -> Result<Vec<(Timestamp, Vec<u8>)>, ModelError> {
+    if family.counter {
+        return resolve_counter(family, entries, family_markers, snapshot, now, limit);
+    }
     let visible = |seqno: Seqno| seqno <= snapshot;
     // Highest timestamp a visible column or family delete covers.
     let covered = entries
@@ -977,12 +1063,97 @@ fn resolve(
         .collect()
 }
 
+/// [`resolve`] for a counter family (D179): a delete hides only entries with a lower seqno
+/// in its scope, and every timestamp is one version: its newest put plus the operands newer
+/// than that put, or the sum of its operands.
+fn resolve_counter(
+    family: &ModelFamily,
+    entries: &[Entry],
+    family_markers: Option<&Vec<Marker>>,
+    snapshot: Seqno,
+    now: Timestamp,
+    limit: u32,
+) -> Result<Vec<(Timestamp, Vec<u8>)>, ModelError> {
+    let visible = |seqno: Seqno| seqno <= snapshot;
+    let hidden = |e: &Entry| {
+        let by_entry = entries.iter().any(|d| {
+            visible(d.seqno)
+                && d.seqno > e.seqno
+                && match d.kind {
+                    Kind::ColumnDelete => e.ts <= d.ts,
+                    Kind::CellDelete => e.ts == d.ts,
+                    Kind::Put(_) | Kind::Merge(_) => false,
+                }
+        });
+        let by_marker = family_markers
+            .into_iter()
+            .flatten()
+            .any(|m| visible(m.1) && m.1 > e.seqno && e.ts <= m.0);
+        by_entry || by_marker
+    };
+    let mut live: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| {
+            visible(e.seqno)
+                && matches!(e.kind, Kind::Put(_) | Kind::Merge(_))
+                && !hidden(e)
+                && (family.ttl_micros == 0 || e.ts.saturating_add(family.ttl_micros) > now)
+        })
+        .collect();
+    live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.seqno)));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < live.len() {
+        let ts = live[i].ts;
+        let end = live[i..]
+            .iter()
+            .position(|e| e.ts != ts)
+            .map_or(live.len(), |n| i + n);
+        let group = &live[i..end];
+        i = end;
+        let mut sum = 0i64;
+        let mut value = None;
+        for e in group {
+            match &e.kind {
+                Kind::Merge(d) => sum = sum.wrapping_add(*d),
+                Kind::Put(v) => {
+                    value = as_i64(v).map(|base| sum.wrapping_add(base));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let base_put = group.iter().any(|e| matches!(e.kind, Kind::Put(_)));
+        out.push((ts, if base_put { value } else { Some(sum) }));
+    }
+    let mut cap = if family.max_versions == 0 {
+        usize::MAX
+    } else {
+        family.max_versions as usize
+    };
+    if limit != 0 {
+        cap = cap.min(limit as usize);
+    }
+    out.truncate(cap);
+    out.into_iter()
+        .map(|(ts, v)| {
+            v.map(|v| (ts, v.to_le_bytes().to_vec()))
+                .ok_or_else(|| ModelError::MergeFailed(family.name.clone()))
+        })
+        .collect()
+}
+
 /// `(row, family, qualifier, ts)` of a column-level mutation, borrowed.
 type CollapseKey<'a> = (&'a str, &'a [u8], &'a str, &'a [u8], Timestamp);
 
 /// The collapse key of a column-level mutation: `(row, family, qualifier, ts)`. Family and row
 /// markers live in their own key space and never collapse with column entries.
-fn column_key(op: &ModelOp, commit_ts: Timestamp) -> Option<CollapseKey<'_>> {
+/// `default_ts` is where a put or operand without a timestamp lands.
+fn column_key(
+    op: &ModelOp,
+    commit_ts: Timestamp,
+    default_ts: Timestamp,
+) -> Option<CollapseKey<'_>> {
     Some(match op {
         ModelOp::Put {
             table,
@@ -991,15 +1162,16 @@ fn column_key(op: &ModelOp, commit_ts: Timestamp) -> Option<CollapseKey<'_>> {
             qualifier,
             ts,
             ..
-        } => (table, row, family, qualifier, ts.unwrap_or(commit_ts)),
-        ModelOp::Incr {
+        }
+        | ModelOp::Incr {
             table,
             row,
             family,
             qualifier,
+            ts,
             ..
-        }
-        | ModelOp::DeleteColumn {
+        } => (table, row, family, qualifier, ts.unwrap_or(default_ts)),
+        ModelOp::DeleteColumn {
             table,
             row,
             family,
@@ -1032,6 +1204,15 @@ mod tests {
             max_versions,
             ttl_micros,
             i64_add,
+            counter: false,
+        }
+    }
+
+    /// A counter family (D179).
+    fn sum_fam(name: &str, max_versions: u32, ttl_micros: u64) -> ModelFamily {
+        ModelFamily {
+            counter: true,
+            ..fam(name, max_versions, ttl_micros, false)
         }
     }
 
@@ -1052,6 +1233,7 @@ mod tests {
             row: row.into(),
             family: "c".into(),
             qualifier: b"n".to_vec(),
+            ts: None,
             delta: d,
         }
     }
@@ -1653,6 +1835,7 @@ mod tests {
             row: b"r".to_vec(),
             family: "f".into(),
             qualifier: b"q".to_vec(),
+            ts: None,
             delta: 1,
         };
         let ok = put("r", "q", None, "x");
@@ -1751,5 +1934,173 @@ mod tests {
             .map(|c| c.ts)
             .collect();
         assert_eq!(ts, [3, 2]);
+    }
+
+    // ---- Counter families (D179) ----
+
+    fn sum_model() -> Model {
+        let mut m = Model::new();
+        m.create_table(
+            "t",
+            vec![
+                sum_fam("s", 0, 0),
+                sum_fam("v", 2, 0),
+                sum_fam("ttl", 0, 100),
+            ],
+        );
+        m
+    }
+
+    fn sum_incr(family: &str, ts: Option<u64>, d: i64) -> ModelOp {
+        ModelOp::Incr {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: family.into(),
+            qualifier: b"n".to_vec(),
+            ts,
+            delta: d,
+        }
+    }
+
+    fn sum_put(family: &str, ts: Option<u64>, v: &[u8]) -> ModelOp {
+        ModelOp::Put {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: family.into(),
+            qualifier: b"n".to_vec(),
+            ts,
+            value: v.to_vec(),
+        }
+    }
+
+    fn sums(m: &Model, family: &str, snap: Seqno, now: u64) -> Vec<(u64, i64)> {
+        m.read_row("t", b"r", &[family], 0, snap, now)
+            .into_iter()
+            .map(|c| (c.ts, i64::from_le_bytes(c.value.try_into().unwrap())))
+            .collect()
+    }
+
+    #[test]
+    fn counter_increments_share_the_fixed_timestamp() {
+        let mut m = sum_model();
+        m.commit(&[sum_incr("s", None, 1)], 10, Durability::Sync);
+        m.commit(&[sum_incr("s", None, 2)], 20, Durability::Sync);
+        assert_eq!(sums(&m, "s", 2, 30), [(COUNTER_TS, 3)]);
+        assert_eq!(sums(&m, "s", 1, 30), [(COUNTER_TS, 1)]);
+        // put_i64 sets it; later increments add to it.
+        m.commit(
+            &[sum_put("s", None, &10i64.to_le_bytes())],
+            30,
+            Durability::Sync,
+        );
+        m.commit(&[sum_incr("s", None, 5)], 40, Durability::Sync);
+        assert_eq!(sums(&m, "s", 4, 50), [(COUNTER_TS, 15)]);
+        assert_eq!(sums(&m, "s", 3, 50), [(COUNTER_TS, 10)]);
+    }
+
+    #[test]
+    fn counter_buckets_are_versions() {
+        let mut m = sum_model();
+        for (ts, d) in [(100, 1), (200, 2), (100, 3), (300, 4)] {
+            m.commit(&[sum_incr("s", Some(ts), d)], 1_000, Durability::Sync);
+            m.commit(&[sum_incr("v", Some(ts), d)], 1_000, Durability::Sync);
+        }
+        assert_eq!(sums(&m, "s", 8, 1_000), [(300, 4), (200, 2), (100, 4)]);
+        // max_versions applies per bucket.
+        assert_eq!(sums(&m, "v", 8, 1_000), [(300, 4), (200, 2)]);
+        // A bucket set with put_i64 at its timestamp.
+        m.commit(
+            &[sum_put("s", Some(200), &7i64.to_le_bytes())],
+            1_000,
+            Durability::Sync,
+        );
+        assert_eq!(sums(&m, "s", 9, 1_000), [(300, 4), (200, 7), (100, 4)]);
+    }
+
+    #[test]
+    fn counter_deletes_hide_only_older_writes() {
+        let column = |q: &[u8]| ModelOp::DeleteColumn {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "s".into(),
+            qualifier: q.to_vec(),
+        };
+        let cell = |ts| ModelOp::DeleteCell {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "s".into(),
+            qualifier: b"n".to_vec(),
+            ts,
+        };
+        let family = ModelOp::DeleteFamily {
+            table: "t".into(),
+            row: b"r".to_vec(),
+            family: "s".into(),
+        };
+        let row = ModelOp::DeleteRow {
+            table: "t".into(),
+            row: b"r".to_vec(),
+        };
+        for del in [column(b"n"), cell(COUNTER_TS), family, row] {
+            let mut m = sum_model();
+            m.commit(&[sum_incr("s", None, 5)], 10, Durability::Sync);
+            m.commit(std::slice::from_ref(&del), 20, Durability::Sync);
+            assert_eq!(sums(&m, "s", 2, 30), [], "{del:?}");
+            m.commit(&[sum_incr("s", None, 3)], 30, Durability::Sync);
+            assert_eq!(sums(&m, "s", 3, 40), [(COUNTER_TS, 3)], "{del:?}");
+            assert_eq!(sums(&m, "s", 1, 40), [(COUNTER_TS, 5)], "{del:?}");
+            // Within one commit the delete hides nothing written with it.
+            m.commit(
+                &[sum_incr("s", Some(5), 1), del.clone()],
+                40,
+                Durability::Sync,
+            );
+            assert_eq!(sums(&m, "s", 4, 50), [(5, 1)], "{del:?}");
+            // Purges never change a counter family's reads.
+            let before = sums(&m, "s", 4, 50);
+            purge_all(&mut m, "s", vec![]);
+            assert_eq!(sums(&m, "s", 4, 50), before);
+        }
+        // A cell delete at one bucket leaves the others.
+        let mut m = sum_model();
+        m.commit(&[sum_incr("s", Some(5), 1)], 10, Durability::Sync);
+        m.commit(&[sum_incr("s", Some(6), 2)], 10, Durability::Sync);
+        m.commit(&[cell(5)], 20, Durability::Sync);
+        assert_eq!(sums(&m, "s", 3, 30), [(6, 2)]);
+    }
+
+    #[test]
+    fn counter_ttl_applies_per_bucket_and_refuses_the_fixed_timestamp() {
+        let mut m = sum_model();
+        for bad in [
+            sum_incr("ttl", None, 1),
+            sum_put("ttl", None, &1i64.to_le_bytes()),
+            sum_put("s", None, b"bytes"),
+            sum_put("s", Some(3), b"bytes"),
+        ] {
+            assert_eq!(
+                m.try_commit(std::slice::from_ref(&bad), 10, Durability::Sync),
+                Err(ModelError::CounterWrite(match &bad {
+                    ModelOp::Incr { family, .. } | ModelOp::Put { family, .. } => family.clone(),
+                    _ => unreachable!(),
+                })),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(m.snapshot(), 0, "refused commits change nothing");
+        m.commit(&[sum_incr("ttl", Some(100), 1)], 10, Durability::Sync);
+        m.commit(&[sum_incr("ttl", Some(150), 2)], 10, Durability::Sync);
+        assert_eq!(sums(&m, "ttl", 2, 199), [(150, 2), (100, 1)]);
+        assert_eq!(sums(&m, "ttl", 2, 200), [(150, 2)]);
+        // A bucket timestamp is for counter families only.
+        let mut c = model();
+        let mut at = incr("r", 1);
+        if let ModelOp::Incr { ts, .. } = &mut at {
+            *ts = Some(5);
+        }
+        assert_eq!(
+            c.try_commit(&[at], 10, Durability::Sync),
+            Err(ModelError::CounterWrite("c".into()))
+        );
     }
 }

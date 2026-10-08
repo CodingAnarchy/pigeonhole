@@ -44,7 +44,8 @@ let pages = db
 
 | Family holds | Settings that help |
 |---|---|
-| Small, hot attributes (status, counters) | `max_versions(1)`, `Priority::High`, `uncompressed()` if tiny |
+| Small, hot attributes (status) | `max_versions(1)`, `Priority::High`, `uncompressed()` if tiny |
+| Counters | `Family::counter()`; a `ttl` to keep only recent buckets |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. `blob_threshold` keeps them out of the family's tree |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -123,25 +124,50 @@ let page = g.row(b"node:a").family("out").column_limit(100).read()?;
 - `delete_column("out", b"node:b")` removes the edge; `delete_family("out")` removes all out-edges of a node.
 - Writing both directions in one `WriteBatch` makes them atomic even if the rows live on different shards.
 
-## Counters with merge operators
-`incr` adds to an `i64` **without reading it**: the write is a blind merge operand resolved at read and compaction time. Concurrent writers never lose updates.
+## Counters
+Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
 
 ```rust
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta"])?;
-pages.mutate(b"com.example/a").incr("meta", b"hits", 1).commit()?;
+let pages = db
+    .table("pages")?
+    .family("meta", Family::default())
+    .family("hits", Family::counter())
+    .create_if_missing()?;
+pages.mutate(b"com.example/a").incr("hits", b"total", 1).commit()?;
+pages.mutate(b"com.example/a").incr("hits", b"total", 2).commit()?;
 
-let hits = pages.get(b"com.example/a", "meta", b"hits")?.and_then(|c| c.as_i64());
-# assert_eq!(hits, Some(1));
+let total = pages.get(b"com.example/a", "hits", b"total")?.and_then(|c| c.as_i64());
+# assert_eq!(total, Some(3));
 # Ok::<(), pigeonhole::Error>(())
 ```
-- The built-in `pigeonhole.i64_add` is the default operator. A missing counter counts as 0; overflow wraps.
-- Write a counter column **only** with `incr` (and `put_i64` to set or reset a base). Mixing arbitrary `put` bytes into a counter column can make resolution fail with `ErrorCode::MergeFailed`.
-- Counters are for totals. For per-period counts, use one column per period (`2026-10-05`) and `incr` each.
-- Until Phase 2, compaction does not fold a counter's increments into one value: each `incr` stays a separate operand, and a read adds them all up (about 30 ns per operand: ~3 µs for 100 increments, ~0.3 ms for 10,000). For a counter incremented millions of times, spread the count over time-bucketed columns so each column holds a bounded number of operands. Phase 2 folds operands in compaction ([#34](https://github.com/CodingAnarchy/pigeonhole/issues/34)).
-- Do not use `time_range` to window a counter; operands are never dropped by pushdown (see [Scans and filters](scans-and-filters.md)).
+- **One cell per counter.** `incr` writes at one fixed timestamp (0), so all increments of a counter are one version. Reads add up the increments not yet combined, and compaction combines them, so a hot counter stays one cell however often it is incremented.
+- **Buckets.** `incr_at(family, qualifier, ts, delta)` adds to the version at timestamp `ts`: use it for per-period counts (hourly, daily). Each bucket is a version of its own, so read them with `.versions(n)` and window them with `.time_range(a..b)`. A TTL expires each bucket on its own; `max_versions(n)` makes reads return the newest `n` buckets but does not shrink storage, because compaction never changes what a counter family reads (deleting a newer bucket shows the older ones again). Bound the number of stored buckets with a TTL.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["hits"])?;
+const DAY: u64 = 86_400_000_000; // microseconds
+let today = 20_000 * DAY;
+pages.mutate(b"com.example/a").incr_at("hits", b"daily", today - DAY, 4).commit()?;
+pages.mutate(b"com.example/a").incr_at("hits", b"daily", today, 1).commit()?;
+pages.mutate(b"com.example/a").incr_at("hits", b"daily", today, 1).commit()?;
+
+let row = pages.row(b"com.example/a").family("hits").versions(7).read()?.unwrap();
+let days: Vec<(u64, i64)> =
+    row.iter().map(|e| (e.cell.timestamp(), e.cell.as_i64().unwrap())).collect();
+assert_eq!(days, [(today, 2), (today - DAY, 4)]);
+# Ok::<(), pigeonhole::Error>(())
+```
+- **Setting a counter.** `put_i64` sets the counter and `put_i64_at` a bucket; later increments add to it. A counter family holds only `i64`s: `put`, `put_at`, `put_f64` and untyped `merge` operands fail with `InvalidArgument`. A counter and a `put_i64` in the same mutation collapse to the last one written, as any two writes to one cell do.
+- **Deleting.** A delete removes what earlier commits wrote: after `delete_column`, `delete_family` or `delete_row`, the next `incr` starts the counter from 0 again. Writes in the same commit as the delete are not hidden, so `incr` then `delete_column` in one mutation leaves the increment visible; delete in one commit and count in the next. (In other families a delete also hides later writes with older timestamps; see [Versions](#versions).) `delete_column`, `delete_family` and `delete_row` take the commit timestamp, so they cover the counter and buckets up to now; a bucket at a later timestamp survives them. `delete_cell(family, qualifier, 0)` deletes the counter, `delete_cell(.., ts)` one bucket.
+- **TTL.** With a TTL the fixed timestamp would expire at once, so a counter family with a TTL takes only buckets: `incr` and `put_i64` fail with `InvalidArgument`; use `incr_at` and `put_i64_at`.
+- A missing counter counts as 0; overflow wraps.
+- **Families from 0.1.0.** In 0.1.0 every family had the `pigeonhole.i64_add` operator and `incr` worked anywhere. Those families keep their 0.1.0 behavior: `incr` writes at the commit timestamp, each increment is its own operand, and runs of them fold across timestamps when read. To move a counter to a counter family, read its value and `put_i64` it there (see the changelog). `Family::default().merge_operator("pigeonhole.i64_add")` still creates such a family.
 - **Custom operators.** Implement `pigeonhole::MergeOperator` (an associative fold: `merge(acc, older)` then `finish(base, acc)`), register it with `Options::merge_operator(Arc::new(op))`, and name it on the family with `Family::merge_operator("name")`, then write operands with `RowMutation::merge`. The operator's name is stored in the file; opening without it registered fails with `ErrorCode::UnknownMergeOperator` unless you set `Options::allow_unregistered_merge_operators(true)`: the handle is then read-only (writes and table changes fail with `ReadOnly`), compaction skips those families, and reads of their merged cells fail with `UnknownMergeOperator`. A family naming an operator that is not registered is refused at creation. Reader processes register operators with `ReaderOptions::merge_operator`. Operators must be associative; non-associative operators are not supported. The operator sees stored values: a tag byte (`0x00` for bytes), then the payload.
 
 ## Versions
@@ -161,7 +187,7 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 | Bare timestamp or auto-increment as the leading key bytes with many writers | Every write hits the same end of the key space | Lead with entity id or a small hash bucket |
 | Little-endian or unpadded decimal numbers in keys | Sorts wrongly | Big-endian fixed width |
 | One huge row for unbounded data | Row reads grow without limit | Bucket rows by time or hash |
-| Read-modify-write counters (`get`, add, `put`) | Races, extra reads | `incr` |
+| Read-modify-write counters (`get`, add, `put`) | Races, extra reads | `incr` in a counter family |
 | One family per attribute | Many trees to flush and compact | Qualifiers inside a few families by access pattern |
 | Large payload in the same family as hot metadata | Scans of metadata decode payload blocks | Separate family, or a `blob_threshold` below the payload size |
 | Value predicates as a query engine over big ranges | They save materialization, not block reads | An inverted row keyed by the value |

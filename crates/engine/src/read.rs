@@ -11,6 +11,7 @@ use pigeonhole_compaction::{
 use pigeonhole_format::key::{
     Escaped, Kind, SUFFIX_LEN, decode_key, encode_row_prefix, row_prefix_len,
 };
+use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
 use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, Timestamp};
@@ -217,6 +218,7 @@ impl ReadSpec {
         opts.columns_per_row = self.columns_per_row;
         opts.value = self.value.clone();
         opts.merge = meta.merge_op.clone();
+        opts.counter = meta.options.kind == FamilyKind::Counter;
         let mut filter = ScanFilter::all();
         filter.qualifiers = self.qualifiers.clone();
         opts.route_time_range(&mut filter, self.time_range);

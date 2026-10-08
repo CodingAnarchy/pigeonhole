@@ -41,13 +41,14 @@ let users = db
     .table("users")?
     .family("profile", Family::default().max_versions(1))
     .family("events", Family::default().ttl(days(30)))
+    .family("stats", Family::counter())
     .create_if_missing()?;
 
 // One row, all families, all or nothing; durable when it returns (GroupSync by default).
 users
     .mutate(b"user:42")
     .put("profile", b"name", b"Ada")
-    .incr("profile", b"logins", 1)
+    .incr("stats", b"logins", 1)
     .put("events", b"2026-10-06T12:00", b"login")
     .commit()?;
 

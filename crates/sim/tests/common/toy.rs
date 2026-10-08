@@ -472,6 +472,8 @@ fn decode(payload: &[u8], families: &[ModelFamily]) -> Option<Record> {
                     row,
                     family,
                     qualifier,
+                    // The toy store's families are never counter families (D179).
+                    ts: None,
                     delta: r.u64()? as i64,
                 }
             }

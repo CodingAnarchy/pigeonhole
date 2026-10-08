@@ -10,7 +10,11 @@ use crate::{ModelOp, Rng};
 /// A family whose name starts with `counter` is treated as an `i64` counter family: the
 /// generator writes only [`ModelOp::Incr`], 8-byte little-endian puts and deletes there, so
 /// a store configured with the `i64` add operator for those families never sees a malformed
-/// operand.
+/// operand. A family whose name starts with `sum` is a counter family of decision D179 (the
+/// model's [`ModelFamily::counter`](crate::ModelFamily::counter)): the same writes, some at
+/// the fixed counter timestamp and some at bucket timestamps (multiples of 4); if its name
+/// contains `ttl`, every put and `Incr` there takes a bucket timestamp (a counter family with
+/// a TTL refuses the fixed one).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct WorkloadSpec {
@@ -193,11 +197,24 @@ impl Workload {
         v
     }
 
+    /// A bucket timestamp for a counter family: a recent multiple of 4 (never the fixed
+    /// counter timestamp).
+    fn bucket(&mut self) -> u64 {
+        (self.recent_ts() / 4 * 4).max(4)
+    }
+
+    /// The timestamp of a put or `Incr` into family `family` of the `sum` kind: a bucket,
+    /// or (without a TTL, three times in four) the fixed counter timestamp.
+    fn sum_ts(&mut self, family: &str) -> Option<u64> {
+        (family.contains("ttl") || self.rng.chance(250_000)).then(|| self.bucket())
+    }
+
     fn mutation(&mut self) -> ModelOp {
         let table = self.table.clone();
         let row = self.row();
         let family = self.family();
-        let counter = family.starts_with("counter");
+        let sum = family.starts_with("sum");
+        let counter = sum || family.starts_with("counter");
         if self.rng.unit() < self.spec.delete_fraction {
             return match self.rng.below(10) {
                 0..=2 => ModelOp::DeleteCell {
@@ -205,7 +222,11 @@ impl Workload {
                     row,
                     family,
                     qualifier: self.qualifier(),
-                    ts: self.recent_ts(),
+                    ts: match (sum, self.rng.below(2)) {
+                        (true, 0) => crate::COUNTER_TS,
+                        (true, _) => self.bucket(),
+                        (false, _) => self.recent_ts(),
+                    },
                 },
                 3..=5 => ModelOp::DeleteColumn {
                     table,
@@ -220,15 +241,21 @@ impl Workload {
         let qualifier = self.qualifier();
         if counter && self.rng.chance(800_000) {
             let delta = self.rng.below(2001) as i64 - 1000;
+            let ts = if sum { self.sum_ts(&family) } else { None };
             return ModelOp::Incr {
                 table,
                 row,
                 family,
                 qualifier,
+                ts,
                 delta,
             };
         }
-        let ts = self.rng.chance(150_000).then(|| self.recent_ts());
+        let ts = if sum {
+            self.sum_ts(&family)
+        } else {
+            self.rng.chance(150_000).then(|| self.recent_ts())
+        };
         let value = if counter {
             (self.rng.below(2001) as i64 - 1000).to_le_bytes().to_vec()
         } else {
@@ -272,9 +299,16 @@ impl Workload {
             | ModelOp::DeleteColumn { qualifier, .. } => qualifier.clone(),
             _ => self.qualifier(),
         };
-        let counter = family.starts_with("counter");
+        let sum = family.starts_with("sum");
+        let counter = sum || family.starts_with("counter");
+        // In a counter family a put or operand without a timestamp is at the counter's, so
+        // a same-column companion uses that or a bucket (the tick's).
+        let tick = (self.tick / 4 * 4).max(4);
+        let sum_ts =
+            |rng: &mut Rng| (family.contains("ttl") || rng.chance(500_000)).then_some(tick);
         match self.rng.below(6) {
             0 if counter => ModelOp::Incr {
+                ts: if sum { sum_ts(&mut self.rng) } else { None },
                 table,
                 row,
                 family,
@@ -282,7 +316,11 @@ impl Workload {
                 delta: self.rng.below(100) as i64,
             },
             0 | 1 => {
-                let ts = self.rng.chance(500_000).then_some(self.tick);
+                let ts = if sum {
+                    sum_ts(&mut self.rng)
+                } else {
+                    self.rng.chance(500_000).then_some(self.tick)
+                };
                 let value = if counter {
                     7i64.to_le_bytes().to_vec()
                 } else {
@@ -298,11 +336,15 @@ impl Workload {
                 }
             }
             2 => ModelOp::DeleteCell {
+                ts: match (sum, self.rng.below(2)) {
+                    (true, 0) => crate::COUNTER_TS,
+                    (true, _) => tick,
+                    (false, _) => self.tick,
+                },
                 table,
                 row,
                 family,
                 qualifier,
-                ts: self.tick,
             },
             3 => ModelOp::DeleteColumn {
                 table,

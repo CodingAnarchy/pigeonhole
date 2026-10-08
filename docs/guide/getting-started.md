@@ -60,8 +60,9 @@ let pages = db
     .family("meta", Family::default().max_versions(1))
     .family("links", Family::default().bloom_bits(10))
     .family("body", Family::default().ttl(days(30)))
+    .family("stats", Family::counter())
     .create_if_missing()?;
-# assert_eq!(pages.families(), ["meta", "links", "body"]);
+# assert_eq!(pages.families(), ["meta", "links", "body", "stats"]);
 # Ok::<(), pigeonhole::Error>(())
 ```
 
@@ -77,19 +78,19 @@ On an existing table, a declared family that is not yet present is added (cheap)
 
 The returned `Table` is cheap to clone and `Send + Sync`. Also available: `db.tables()`, `db.drop_table(name)`, `table.name()`, `table.families()`.
 
-`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `lz4()` (default), `uncompressed()`, `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`, `zstd(level)` (smaller blocks than LZ4, for more CPU), and `merge_operator(name)`, which names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`). `blob_threshold(bytes)` (default 4096) moves larger values to blob files.
+`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `lz4()` (default), `uncompressed()`, `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`, `zstd(level)` (smaller blocks than LZ4, for more CPU), and `merge_operator(name)`, which names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`). `Family::counter()` declares a counter family, the only kind that takes `incr` (see [Counters](data-modeling.md#counters)). `blob_threshold(bytes)` (default 4096) moves larger values to blob files.
 
 ## Write one row atomically
 ```rust
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body"])?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body", "stats"])?;
 let info = pages
     .mutate(b"com.example/a")
     .put("meta", b"status", b"200")
     .put("links", b"com.example/b", b"")
-    .incr("meta", b"hits", 1)
+    .incr("stats", b"hits", 1)
     .delete_column("meta", b"etag")
     .commit()?;
 
@@ -101,7 +102,7 @@ println!("seqno {} at {:?}", info.seqno, info.durability);
 - Builder calls cannot fail. Problems (unknown family, key over 64 KiB, value too large) surface from `commit()`.
 - `commit()` returns `CommitInfo { seqno, durability }`: the sequence number, and the durability level actually applied. It returns only once your write is durable at that level **and** visible to reads, so you always read your own write.
 - Variants: `put_at(family, qualifier, ts, value)` for event time (timestamps are `u64` microseconds since the Unix epoch), `put_i64`, `put_f64`, `delete_cell(family, qualifier, ts)`, `delete_family(family)`, `delete_row()`, `.durability(d)` to override durability for this commit.
-- `incr(family, qualifier, delta)` adds to an `i64` counter without reading it first. The built-in `pigeonhole.i64_add` operator is the default, so no registration is needed.
+- `incr(family, qualifier, delta)` adds to an `i64` counter without reading it first. It needs a counter family (`Family::counter()`); on any other family the commit fails with `ErrorCode::InvalidArgument`.
 
 ## Read
 ### One cell
@@ -109,8 +110,8 @@ println!("seqno {} at {:?}", info.seqno, info.durability);
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body"])?;
-# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("meta", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body", "stats"])?;
+# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("stats", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
 # pages.mutate(b"com.example/b").put("links", b"org.example/y", b"").commit()?;
 if let Some(cell) = pages.get(b"com.example/a", "meta", b"status")? {
     let bytes: &[u8] = cell.value();
@@ -120,7 +121,7 @@ if let Some(cell) = pages.get(b"com.example/a", "meta", b"status")? {
 }
 
 let hits: Option<i64> = pages
-    .get(b"com.example/a", "meta", b"hits")?
+    .get(b"com.example/a", "stats", b"hits")?
     .and_then(|c| c.as_i64());
 # assert_eq!(hits, Some(3));
 # Ok::<(), pigeonhole::Error>(())
@@ -132,8 +133,8 @@ let hits: Option<i64> = pages
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body"])?;
-# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("meta", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body", "stats"])?;
+# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("stats", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
 # pages.mutate(b"com.example/b").put("links", b"org.example/y", b"").commit()?;
 let row = pages
     .row(b"com.example/a")
@@ -158,8 +159,8 @@ if let Some(row) = row {
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body"])?;
-# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("meta", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body", "stats"])?;
+# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("stats", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
 # pages.mutate(b"com.example/b").put("links", b"org.example/y", b"").commit()?;
 let snap = db.snapshot()?;
 for row in pages
@@ -180,8 +181,8 @@ The iterator yields `Result<Row>`. For zero-copy rows use the cursor form:
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body"])?;
-# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("meta", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body", "stats"])?;
+# pages.mutate(b"com.example/a").put("meta", b"status", b"200").incr("stats", b"hits", 3).put("links", b"org.example/x", b"").commit()?;
 # pages.mutate(b"com.example/b").put("links", b"org.example/y", b"").commit()?;
 let mut it = pages.scan_prefix(b"com.example/").iter()?;
 while let Some(row) = it.next_ref()? {
@@ -197,7 +198,7 @@ while let Some(row) = it.next_ref()? {
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body"])?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body", "stats"])?;
 use std::ops::Bound;
 let rows = pages.scan(&b"com.example/"[..]..&b"com.example0"[..]);
 let rows = pages.scan_bounds(Bound::Included(&b"a"[..]), Bound::Excluded(&b"b"[..]));
@@ -211,10 +212,10 @@ See [Scans and filters](scans-and-filters.md) for everything a scan can do.
 # use pigeonhole::*;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
-# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body"])?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta", "links", "body", "stats"])?;
 let mut wb = db.write_batch();
 wb.put(&pages, b"com.example/c", "meta", b"status", b"404")
-  .incr(&pages, b"com.example/c", "meta", b"hits", 1)
+  .incr(&pages, b"com.example/c", "stats", b"hits", 1)
   .delete_row(&pages, b"com.example/old");
 let info = wb.commit_with(Durability::GroupSync)?;
 # Ok::<(), pigeonhole::Error>(())

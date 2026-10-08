@@ -39,10 +39,18 @@ impl Drop for TempDir {
     }
 }
 
-/// Opens (creating if needed) table `name` with default `families`.
+/// Opens (creating if needed) table `name` with `families`: counter families
+/// ([`Family::counter`]) for the names `stats` and `hits`, default ones otherwise.
 pub fn table(db: &Pigeonhole, name: &str, families: &[&str]) -> Result<Table> {
     families
         .iter()
-        .fold(db.table(name)?, |b, f| b.family(f, Family::default()))
+        .fold(db.table(name)?, |b, f| {
+            let family = if matches!(*f, "stats" | "hits") {
+                Family::counter()
+            } else {
+                Family::default()
+            };
+            b.family(f, family)
+        })
         .create_if_missing()
 }

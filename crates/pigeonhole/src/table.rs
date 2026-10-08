@@ -250,18 +250,19 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 ///     .table("pages")?
 ///     .family("meta", Family::default().max_versions(1))
 ///     .family("links", Family::default())
+///     .family("stats", Family::counter())
 ///     .create_if_missing()?;
 ///
 /// pages
 ///     .mutate(b"com.example/a")
 ///     .put("meta", b"status", b"200")
 ///     .put("links", b"com.example/b", b"")
-///     .incr("meta", b"hits", 1)
+///     .incr("stats", b"hits", 1)
 ///     .commit()?;
 ///
 /// let status = pages.get(b"com.example/a", "meta", b"status")?.unwrap();
 /// assert_eq!(status.value(), b"200");
-/// let hits = pages.get(b"com.example/a", "meta", b"hits")?.and_then(|c| c.as_i64());
+/// let hits = pages.get(b"com.example/a", "stats", b"hits")?.and_then(|c| c.as_i64());
 /// assert_eq!(hits, Some(1));
 ///
 /// let row = pages.row(b"com.example/a").family("links").read()?.unwrap();

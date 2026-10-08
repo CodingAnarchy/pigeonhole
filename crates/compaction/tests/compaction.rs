@@ -12,11 +12,11 @@ use common::*;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::{
     BlobFetch, CompactionJob, CompactionOutput, CompactionPicker, CompactionTask, GcPolicy, I64Add,
-    JobContext, JobPoll, KeyRange, Levels, PickerOptions, ResolveOptions, TaskKind, ValuePredicate,
-    blob_pointer, record_bytes, separates,
+    JobContext, JobPoll, KeyRange, Levels, OtherSource, PickerOptions, ResolveOptions, TaskKind,
+    ValuePredicate, blob_pointer, record_bytes, separates,
 };
 use pigeonhole_format::key::{Kind, encode_key, encode_marker_key, split_suffix};
-use pigeonhole_format::manifest::{CompactionStyle, FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{CompactionStyle, FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::{FamilyId, Seqno, SstId, TableId, TabletId, Timestamp};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 use pigeonhole_io::{Vfs, VfsRef};
@@ -226,6 +226,27 @@ fn check_compaction(seed: u64, commits: usize, choose: Choose) {
     if rng.below(4) == 0 {
         gc.min_ts_above = 0;
     }
+    // The other sources a counter family's GC must not combine across (as the engine
+    // computes them), or unknown.
+    let inputs_max = from
+        .iter()
+        .flat_map(|&l| &levels[l])
+        .map(|s| s.0.seqno_range.1)
+        .max()
+        .unwrap_or(0);
+    gc.other_sources = (rng.below(8) != 0).then(|| {
+        levels
+            .iter()
+            .enumerate()
+            .filter(|(l, _)| !from.contains(l))
+            .flat_map(|(_, s)| s)
+            .filter(|s| s.0.seqno_range.0 <= inputs_max)
+            .map(|s| OtherSource {
+                keys: Some((s.0.smallest_key.clone(), s.0.largest_key.clone())),
+                seqnos: s.0.seqno_range,
+            })
+            .collect()
+    });
     // What the model drops when this compaction purges (owner decision: HBase semantics).
     let purge = ModelPurge {
         table: TABLE.into(),
@@ -437,6 +458,18 @@ fn compaction_preserves_reads_fixed_seeds() {
         check_compaction(seed, 35, Choose::Random);
         check_compaction(seed, 35, Choose::Tiered);
     }
+}
+
+/// Counter families with `max_versions` (D179): compaction keeps the buckets beyond the
+/// limit, since a later delete of a newer bucket, or its expiry, shows them again.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn counter_versions_outlive_newer_expired_buckets() {
+    check_compaction(1_601_955_561_661_789_700, 30, Choose::Random);
+    check_compaction(11_470_003_444_189_223_303, 6, Choose::Tiered);
 }
 
 /// Issue #32: the FIFO-by-time picker's drops of expired SSTs, and its merges of L0 files,
@@ -793,6 +826,122 @@ fn operands_combine_within_a_timestamp() {
             (key(b"r", b"n", 10, 2, Kind::Merge), i64v(3))
         ]
     );
+}
+
+/// A counter family (D179): a delete hides only older entries, so compaction drops the
+/// operands under a column delete and keeps the newer ones, and a hot counter's operands at
+/// its fixed timestamp compact to one entry.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn counter_operands_combine_and_deletes_hide_older_ones() {
+    let mut db = Db::new(7);
+    let family = FamilyOptions {
+        merge_operator: "pigeonhole.i64_add".into(),
+        kind: FamilyKind::Counter,
+        ..FamilyOptions::default()
+    };
+    let i64v = |v: i64| stored(&v.to_le_bytes());
+    let e = vec![
+        (key(b"r", b"n", 50, 3, Kind::ColumnDelete), Vec::new()),
+        (key(b"r", b"n", 0, 5, Kind::Merge), i64v(4)),
+        (key(b"r", b"n", 0, 4, Kind::Merge), i64v(2)),
+        (key(b"r", b"n", 0, 2, Kind::Merge), i64v(100)),
+        (key(b"r", b"n", 0, 1, Kind::Merge), i64v(100)),
+    ];
+    let input = db.sst(&family, &e);
+    let mut gc = policy(vec![], 100, false);
+    gc.other_sources = Some(Vec::new());
+    let (_, kept) = compact(&db, &family, std::slice::from_ref(&input), gc.clone());
+    // The column delete (ts 50) hides the operands written before it (seqnos 1 and 2),
+    // not the later ones at the covered timestamp 0.
+    assert_eq!(
+        kept,
+        [
+            (key(b"r", b"n", 50, 3, Kind::ColumnDelete), Vec::new()),
+            (key(b"r", b"n", 0, 5, Kind::Merge), i64v(6)),
+        ]
+    );
+    // At the bottom, with nothing above, the delete goes too.
+    gc.bottommost = true;
+    let (_, kept) = compact(&db, &family, &[input], gc);
+    assert_eq!(kept, [(key(b"r", b"n", 0, 5, Kind::Merge), i64v(6))]);
+}
+
+/// A counter family's operands are not combined across the seqno range of another source
+/// that overlaps their row: a family marker there (seqno 2) hides the older operand but not
+/// the newer, which one combined operand could not express.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn counter_operands_stay_apart_across_another_sources_seqnos() {
+    let mut db = Db::new(8);
+    let family = FamilyOptions {
+        merge_operator: "pigeonhole.i64_add".into(),
+        kind: FamilyKind::Counter,
+        ..FamilyOptions::default()
+    };
+    let i64v = |v: i64| stored(&v.to_le_bytes());
+    let ops = vec![
+        (key(b"r", b"n", 0, 3, Kind::Merge), i64v(4)),
+        (key(b"r", b"n", 0, 1, Kind::Merge), i64v(100)),
+    ];
+    let input = db.sst(&family, &ops);
+    let mut marker = Vec::new();
+    encode_marker_key(&mut marker, b"r", 10, 2).unwrap();
+    let other = db.sst(&family, &[(marker, Vec::new())]);
+    let source = |seqnos| OtherSource {
+        keys: Some((other.0.smallest_key.clone(), other.0.largest_key.clone())),
+        seqnos,
+    };
+    let mut gc = policy(vec![], 100, false);
+    for (others, combined) in [
+        (Some(vec![source((2, 2))]), false),
+        (None, false),
+        // A source above every input seqno, or outside the row, cannot split them.
+        (Some(vec![source((4, 9))]), true),
+        (
+            Some(vec![OtherSource {
+                keys: Some((
+                    key(b"s", b"", 0, 1, Kind::Put),
+                    key(b"t", b"", 0, 1, Kind::Put),
+                )),
+                seqnos: (2, 2),
+            }]),
+            true,
+        ),
+    ] {
+        gc.other_sources = others.clone();
+        let (_, kept) = compact(&db, &family, std::slice::from_ref(&input), gc.clone());
+        if combined {
+            assert_eq!(
+                kept,
+                [(key(b"r", b"n", 0, 3, Kind::Merge), i64v(104))],
+                "{others:?}"
+            );
+        } else {
+            assert_eq!(kept, ops, "{others:?}");
+        }
+    }
+    // Read through the marker: 4, not 104.
+    let mut o = ResolveOptions::new(u64::MAX, 100);
+    o.merge = Some(Arc::new(I64Add));
+    o.counter = true;
+    gc.other_sources = Some(vec![source((2, 2))]);
+    let (out, _) = compact(&db, &family, std::slice::from_ref(&input), gc);
+    let mut ssts: Vec<Arc<SstReader>> = out
+        .added
+        .iter()
+        .map(|(_, m)| open_sst(&db.pager, &db.cache, m))
+        .collect();
+    ssts.push(other.1);
+    let mut r = sst_resolver(&ssts, o);
+    r.seek_column(b"r", b"n").unwrap();
+    assert_eq!(r.next_cell().unwrap().unwrap().value, i64v(4));
 }
 
 /// Large inputs cut into several outputs at row boundaries.
@@ -1214,6 +1363,7 @@ fn purges_match_the_model_purge_hook() {
         max_versions,
         ttl_micros: 0,
         i64_add: true,
+        counter: false,
     };
     let (t, f, r, q) = (
         TABLE.to_string(),

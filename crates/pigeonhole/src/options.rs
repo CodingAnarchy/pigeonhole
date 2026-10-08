@@ -3,14 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pigeonhole_engine::{
-    CachePriority, CompactionStyle, Compression, EngineOptions, FamilyOptions,
+    CachePriority, CompactionStyle, Compression, EngineOptions, FamilyKind, FamilyOptions,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
 
 use crate::MergeOperator;
 
-/// Name of the built-in `i64` add operator, the default operator of every family.
+/// Name of the built-in `i64` add operator, which counter families sum with.
 pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
 
 /// `n` days, for TTLs: `Family::default().ttl(days(30))`. Saturates instead of overflowing.
@@ -326,16 +326,16 @@ pub enum Compaction {
     FifoByTime,
 }
 
-/// A column family's policy. Stored in the file with the family.
+/// A column family's policy. Stored in the file with the family; a family's kind and
+/// options are fixed when it is created.
 ///
 /// The defaults: every version kept, no TTL, 10 bloom bits per key, LZ4 blocks of 16 KiB,
-/// values over 4 KiB separated (Phase 2), the built-in `pigeonhole.i64_add` merge operator
-/// (so `incr` works on any family), normal cache priority, leveled compaction.
+/// values over 4 KiB separated, no merge operator, normal cache priority, leveled
+/// compaction.
 ///
-/// Because every family carries the `i64` add operator, a column holds either plain values or
-/// a counter: an `incr` on top of a base that is not an 8-byte `i64` fails at read with
-/// [`ErrorCode::MergeFailed`](crate::ErrorCode::MergeFailed) (decision D41). Use `merge_operator("")` for a family without
-/// one.
+/// Counters live in a **counter family**, declared with [`Family::counter`] (decision D179,
+/// after Bigtable's aggregate families). `incr` on any other family fails with
+/// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument).
 ///
 /// ```
 /// use pigeonhole::{days, Family, Priority};
@@ -343,24 +343,73 @@ pub enum Compaction {
 /// let hot = Family::default().max_versions(1).cache_priority(Priority::High);
 /// let expiring = Family::default().ttl(days(30)).uncompressed();
 /// assert_ne!(hot, expiring);
+/// let hits = Family::counter();
+/// let daily = Family::counter().ttl(days(90));
+/// assert_ne!(hits, daily);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Family {
     options: FamilyOptions,
 }
 
-impl Default for Family {
-    fn default() -> Self {
+impl Family {
+    /// A counter family: every cell is an `i64` sum (decision D179).
+    ///
+    /// - [`incr`](crate::RowMutation::incr) adds to the column's counter, which lives at
+    ///   one fixed timestamp (0), so a counter is one cell however often it is incremented:
+    ///   its increments combine when read and when compacted.
+    /// - [`incr_at`](crate::RowMutation::incr_at) adds to a *bucket*: the version at a
+    ///   timestamp you choose (an hour or a day, say). Each bucket is its own version. The
+    ///   TTL expires each bucket; `max_versions` limits what reads return, but compaction
+    ///   keeps older buckets (a later delete of a newer one shows them again), so bound
+    ///   storage with a TTL.
+    /// - [`put_i64`](crate::RowMutation::put_i64) sets the counter (`put_i64_at` a bucket);
+    ///   later increments add to it. Other puts are refused with `InvalidArgument`.
+    /// - A delete removes what earlier commits wrote: an `incr` after `delete_column`
+    ///   starts the counter again from 0. A write in the same commit as the delete is not
+    ///   hidden (`incr` then `delete_column` in one mutation leaves the increment). A
+    ///   delete without a timestamp takes the commit timestamp, so a bucket at a later
+    ///   timestamp survives it.
+    ///
+    /// With a TTL the fixed timestamp would expire at once, so such a family takes only
+    /// buckets (`incr_at`, `put_i64_at`); `incr` and `put_i64` fail with `InvalidArgument`.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let t = db.table("pages")?.family("hits", Family::counter()).create_if_missing()?;
+    /// t.mutate(b"home").incr("hits", b"total", 2).commit()?;
+    /// t.mutate(b"home").incr("hits", b"total", 3).commit()?;
+    /// assert_eq!(t.get(b"home", "hits", b"total")?.unwrap().as_i64(), Some(5));
+    ///
+    /// // Hourly buckets: one version per hour.
+    /// let hour = 3_600_000_000; // microseconds
+    /// t.mutate(b"home").incr_at("hits", b"hourly", 7 * hour, 1).commit()?;
+    /// t.mutate(b"home").incr_at("hits", b"hourly", 8 * hour, 4).commit()?;
+    /// t.mutate(b"home").incr_at("hits", b"hourly", 8 * hour, 1).commit()?;
+    /// let row = t.row(b"home").qualifier_prefix(b"hourly").versions(0).read()?.unwrap();
+    /// let hourly: Vec<_> = row
+    ///     .iter()
+    ///     .map(|e| (e.cell.timestamp(), e.cell.as_i64().unwrap()))
+    ///     .collect();
+    /// assert_eq!(hourly, [(8 * hour, 5), (7 * hour, 1)]);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn counter() -> Self {
         Self {
             options: FamilyOptions {
                 merge_operator: I64_ADD.to_owned(),
+                kind: FamilyKind::Counter,
                 ..FamilyOptions::default()
             },
         }
     }
-}
 
-impl Family {
     /// Keep at most `n` versions per column (0 keeps all).
     pub fn max_versions(mut self, n: u32) -> Self {
         self.options.max_versions = n;
@@ -415,9 +464,16 @@ impl Family {
         self
     }
 
-    /// Merge operator for this family, by registered name. `incr` needs none: it uses the
-    /// built-in `pigeonhole.i64_add`, which is the default operator. An empty name leaves
-    /// the family without one, so merge operands (and `incr`) are refused at commit.
+    /// Merge operator for this family, by registered name (see
+    /// [`Options::merge_operator`]): [`RowMutation::merge`](crate::RowMutation::merge)
+    /// writes its operands. Counters need none: declare a [`Family::counter`]. A counter
+    /// family sums with the built-in `pigeonhole.i64_add` and refuses any other name at
+    /// creation.
+    ///
+    /// A family that names `pigeonhole.i64_add` without being a counter family is how
+    /// families created by 0.1.0 read: `incr` there writes at the commit timestamp and
+    /// runs of increments fold across timestamps (decision D41). New counters belong in a
+    /// counter family; see the migration note in the changelog.
     pub fn merge_operator(mut self, name: &str) -> Self {
         name.clone_into(&mut self.options.merge_operator);
         self

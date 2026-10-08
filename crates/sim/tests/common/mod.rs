@@ -73,6 +73,7 @@ pub fn families() -> Vec<ModelFamily> {
         max_versions,
         ttl_micros,
         i64_add,
+        counter: false,
     };
     vec![
         f("f", 0, 0, false),

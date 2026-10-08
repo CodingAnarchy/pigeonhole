@@ -7,8 +7,8 @@
 //! clock only moves when the harness advances it (one microsecond per operation), so a
 //! default commit timestamp is the clock at the commit (decision D11) and the model gets the
 //! same value. A commit that touches one row uses `RowMutation` (every mutation kind); a
-//! multi-row commit uses `WriteBatch` (every mutation kind too). A counter base at an
-//! explicit timestamp is dropped on both sides: there is no typed `put_at`.
+//! multi-row commit uses `WriteBatch` (every mutation kind too). The `counters` target runs
+//! the same tests with counter families (decision D179).
 //!
 //! **Crashes.** Process crashes and power losses between operations, and power losses in
 //! the middle of a commit (`FaultPlan::crash_after_ops`). Crash runs use one shard, so every
@@ -46,8 +46,8 @@ use pigeonhole::{Compaction, Durability, ErrorCode, Family, Options, Pigeonhole,
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
-    CommitStreams, Model, ModelCell, ModelFamily, ModelOp, Op, Rng, StreamCommit, StreamRecord,
-    Workload, WorkloadSpec, check_acknowledged_survive, recovered_from_records,
+    COUNTER_TS, CommitStreams, Model, ModelCell, ModelFamily, ModelOp, Op, Rng, StreamCommit,
+    StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive, recovered_from_records,
 };
 
 const DB: &str = "/db/model.phdb";
@@ -66,19 +66,42 @@ fn table_index(row: &[u8]) -> usize {
     h % TABLES.len()
 }
 
+/// `counter` is a family as 0.1.0 created them (the `i64` add operator, standard kind:
+/// operands at the commit timestamp, D41). The `counters` test target swaps `g` and `ttl`
+/// for the counter families `sum` and `sum_ttl` (D179), keeping four families per table.
 fn families() -> Vec<ModelFamily> {
     let f = |name: &str, max_versions, ttl_micros, i64_add| ModelFamily {
         name: name.into(),
         max_versions,
         ttl_micros,
         i64_add,
+        counter: is_sum(name),
     };
-    vec![
-        f("f", 0, 0, false),
-        f("g", 2, 0, false),
-        f("ttl", 0, 40, false),
-        f("counter", 3, 0, true),
-    ]
+    if env!("CARGO_CRATE_NAME") == "counters" {
+        vec![
+            f("f", 0, 0, false),
+            f("counter", 3, 0, true),
+            f("sum", 2, 0, false),
+            f("sum_ttl", 0, 40, false),
+        ]
+    } else {
+        vec![
+            f("f", 0, 0, false),
+            f("g", 2, 0, false),
+            f("ttl", 0, 40, false),
+            f("counter", 3, 0, true),
+        ]
+    }
+}
+
+/// A counter family of decision D179.
+fn is_sum(family: &str) -> bool {
+    family.starts_with("sum")
+}
+
+/// A family holding only `i64`s.
+fn is_i64(family: &str) -> bool {
+    family.starts_with("counter") || is_sum(family)
 }
 
 /// `g` compacts tiered and `ttl` FIFO by time (#31, #32), and `f` uses zstd (#44); the
@@ -97,7 +120,12 @@ fn public_family(f: &ModelFamily) -> Family {
         "ttl" => 60,
         _ => 4096,
     };
-    let family = Family::default()
+    let family = if f.counter {
+        Family::counter()
+    } else {
+        Family::default()
+    };
+    let family = family
         .max_versions(f.max_versions)
         .ttl(Duration::from_micros(f.ttl_micros))
         .compaction(compaction)
@@ -109,10 +137,15 @@ fn public_family(f: &ModelFamily) -> Family {
         family
     };
     if f.i64_add {
-        family
+        family.merge_operator("pigeonhole.i64_add")
     } else {
-        family.merge_operator("")
+        family
     }
+}
+
+/// A counter family's model value (8 little-endian bytes) as an `i64`.
+fn counter_value(value: &[u8]) -> i64 {
+    i64::from_le_bytes(<[u8; 8]>::try_from(value).expect("8-byte counter value"))
 }
 
 fn create_tables(m: &mut Model) {
@@ -309,10 +342,11 @@ fn show(op: &ModelOp) -> String {
             row,
             family,
             qualifier,
+            ts,
             delta,
         } => {
             format!(
-                "incr {table}/{} {family}:{} {delta}",
+                "incr {table}/{} {family}:{} ts={ts:?} {delta}",
                 text(row),
                 text(qualifier)
             )
@@ -492,10 +526,10 @@ impl Run {
                         ts,
                         value,
                         ..
-                    } => match (family.starts_with("counter"), ts) {
-                        (true, _) => {
-                            let v = <[u8; 8]>::try_from(&value[..]).expect("8-byte counter base");
-                            m.put_i64(family, qualifier, i64::from_le_bytes(v))
+                    } => match (is_i64(family), ts) {
+                        (true, None) => m.put_i64(family, qualifier, counter_value(value)),
+                        (true, Some(ts)) => {
+                            m.put_i64_at(family, qualifier, *ts, counter_value(value))
                         }
                         (false, None) => m.put(family, qualifier, value),
                         (false, Some(ts)) => m.put_at(family, qualifier, *ts, value),
@@ -503,9 +537,17 @@ impl Run {
                     ModelOp::Incr {
                         family,
                         qualifier,
+                        ts: None,
                         delta,
                         ..
                     } => m.incr(family, qualifier, *delta),
+                    ModelOp::Incr {
+                        family,
+                        qualifier,
+                        ts: Some(ts),
+                        delta,
+                        ..
+                    } => m.incr_at(family, qualifier, *ts, *delta),
                     ModelOp::DeleteCell {
                         family,
                         qualifier,
@@ -532,9 +574,17 @@ impl Run {
                         ts: None,
                         value,
                         ..
-                    } if family.starts_with("counter") => {
-                        let v = <[u8; 8]>::try_from(&value[..]).expect("8-byte counter base");
-                        wb.put_i64(t, &row, family, qualifier, i64::from_le_bytes(v))
+                    } if is_i64(family) => {
+                        wb.put_i64(t, &row, family, qualifier, counter_value(value))
+                    }
+                    ModelOp::Put {
+                        family,
+                        qualifier,
+                        ts: Some(ts),
+                        value,
+                        ..
+                    } if is_i64(family) => {
+                        wb.put_i64_at(t, &row, family, qualifier, *ts, counter_value(value))
                     }
                     ModelOp::Put {
                         family,
@@ -553,9 +603,17 @@ impl Run {
                     ModelOp::Incr {
                         family,
                         qualifier,
+                        ts: None,
                         delta,
                         ..
                     } => wb.incr(t, &row, family, qualifier, *delta),
+                    ModelOp::Incr {
+                        family,
+                        qualifier,
+                        ts: Some(ts),
+                        delta,
+                        ..
+                    } => wb.incr_at(t, &row, family, qualifier, *ts, *delta),
                     ModelOp::DeleteColumn {
                         family, qualifier, ..
                     } => wb.delete_column(t, &row, family, qualifier),
@@ -574,11 +632,12 @@ impl Run {
         }
     }
 
-    /// Prepares a generated commit: tables by row, explicit timestamps after the base, no
-    /// counter base at an explicit timestamp (there is no typed `put_at`), and none of the
-    /// writes a purge changes (see [`Deletes`]): a put at a timestamp an earlier delete
-    /// covers (a later write with an explicit older timestamp), or a `delete_cell` in a
-    /// family with `max_versions` (it may uncover an older version, or not once purged).
+    /// Prepares a generated commit: tables by row, explicit timestamps after the base (a
+    /// counter family's fixed timestamp stays), and none of the writes a purge changes (see
+    /// [`Deletes`]): a put at a timestamp an earlier delete covers (a later write with an
+    /// explicit older timestamp), or a `delete_cell` in a family with `max_versions` (it
+    /// may uncover an older version, or not once purged). Purges never change a counter
+    /// family's reads (D179), so its writes all stay.
     fn prepare(&mut self, ops: Vec<ModelOp>) -> Vec<ModelOp> {
         let mut ops: Vec<ModelOp> = ops
             .into_iter()
@@ -592,22 +651,31 @@ impl Run {
                     | ModelOp::DeleteRow { table, row, .. } => (table, row),
                 };
                 *table = TABLES[table_index(row)].to_owned();
-                if let ModelOp::Put { ts: Some(t), .. } | ModelOp::DeleteCell { ts: t, .. } =
-                    &mut op
+                if let ModelOp::Put {
+                    ts: Some(t),
+                    family,
+                    ..
+                }
+                | ModelOp::Incr {
+                    ts: Some(t),
+                    family,
+                    ..
+                }
+                | ModelOp::DeleteCell { ts: t, family, .. } = &mut op
+                    && !(is_sum(family) && *t == COUNTER_TS)
                 {
                     *t += self.base;
                 }
                 op
             })
             .collect();
-        // There is no typed put at an explicit timestamp: a counter's base is `put_i64`.
-        ops.retain(|op| {
-            !matches!(op, ModelOp::Put { family, ts: Some(_), .. } if family.starts_with("counter"))
-        });
         // This commit's timestamp (the clock now, decision D11).
         let now = self.now();
         let d = &self.deletes;
         ops.retain(|op| match op {
+            ModelOp::Put { family, .. } | ModelOp::DeleteCell { family, .. } if is_sum(family) => {
+                true
+            }
             ModelOp::Put {
                 table,
                 row,

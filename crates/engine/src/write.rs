@@ -22,6 +22,11 @@ pub(crate) struct RowDelete {
     pub ts: Option<Timestamp>,
 }
 
+/// The timestamp of a counter family's counter (decision D179): a put or merge operand
+/// without an explicit timestamp in a `FamilyKind::Counter` family is written here, so all
+/// of a counter's increments share one `(column, timestamp)` and combine.
+pub const COUNTER_TS: Timestamp = 0;
+
 /// A multi-row write with one durability point. Mutations are encoded on insert in the WAL
 /// batch encoding (`pigeonhole_format::wal::BatchBuilder`), so commit never re-encodes.
 /// Commit is atomic per row always; across rows it is atomic too (two-phase commit across
@@ -52,7 +57,8 @@ impl WriteBatch {
         Self::default()
     }
 
-    /// Puts a value. `ts = None` uses the commit timestamp.
+    /// Puts a value. `ts = None` uses the commit timestamp, or [`COUNTER_TS`] in a counter
+    /// family (which holds only `i64` values).
     pub fn put(
         &mut self,
         table: TableId,
@@ -81,7 +87,8 @@ impl WriteBatch {
         Ok(())
     }
 
-    /// Writes a merge operand.
+    /// Writes a merge operand. In a counter family (`FamilyKind::Counter`) it lands at
+    /// [`COUNTER_TS`]; elsewhere at the commit timestamp.
     pub fn merge(
         &mut self,
         table: TableId,
@@ -104,6 +111,36 @@ impl WriteBatch {
             row,
             qualifier,
             None,
+            &self.value_buf,
+        )?;
+        Ok(())
+    }
+
+    /// Writes a merge operand at timestamp `ts`: a bucket of a counter family (decision
+    /// D179). Other families refuse it at commit with `InvalidArgument`.
+    pub fn merge_at(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+        ts: Timestamp,
+        operand: ValueRef<'_>,
+    ) -> crate::Result<()> {
+        if matches!(operand, ValueRef::Blob(_)) {
+            return Err(Error::InvalidArgument(
+                "a blob pointer cannot be a merge operand".to_owned(),
+            ));
+        }
+        self.value_buf.clear();
+        encode_value(&mut self.value_buf, operand);
+        self.builder.push(
+            table,
+            family,
+            Kind::Merge,
+            row,
+            qualifier,
+            Some(ts),
             &self.value_buf,
         )?;
         Ok(())

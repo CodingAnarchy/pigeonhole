@@ -51,14 +51,14 @@ use pigeonhole_engine::{
     Snapshot, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::key::decode_key;
-use pigeonhole_format::manifest::CompactionStyle;
+use pigeonhole_format::manifest::{CompactionStyle, FamilyKind};
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, ManifestVersion, Seqno, StreamId, TableId, Timestamp};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimOp, SimVfs};
 use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
-    CommitStreams, Model, ModelCell, ModelFamily, ModelOp, ModelPurge, Op, Rng, Sim, Step,
-    StreamCommit, StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive,
+    COUNTER_TS, CommitStreams, Model, ModelCell, ModelFamily, ModelOp, ModelPurge, Op, Rng, Sim,
+    Step, StreamCommit, StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive,
     recovered_from_records,
 };
 
@@ -125,20 +125,84 @@ pub fn new_model() -> Model {
     m
 }
 
-/// The families every model-check run uses.
+/// The families every model-check run uses. `counter` is a 0.1.0-style family with the
+/// `i64` add operator (operands at the commit timestamp, D41). The `counters` test target
+/// swaps `g` and `ttl` for the counter families `sum` and `sum_ttl` (D179; the workload
+/// writes buckets only in `sum_ttl`), keeping four families per table.
 pub fn families() -> Vec<ModelFamily> {
     let f = |name: &str, max_versions, ttl_micros, i64_add| ModelFamily {
         name: name.into(),
         max_versions,
         ttl_micros,
         i64_add,
+        counter: is_sum(name),
     };
-    vec![
-        f("f", 0, 0, false),
-        f("g", 2, 0, false),
-        f("ttl", 0, 40, false),
-        f("counter", 3, 0, true),
-    ]
+    if env!("CARGO_CRATE_NAME") == "counters" {
+        vec![
+            f("f", 0, 0, false),
+            f("counter", 3, 0, true),
+            f("sum", 2, 0, false),
+            f("sum_ttl", 0, 40, false),
+        ]
+    } else {
+        vec![
+            f("f", 0, 0, false),
+            f("g", 2, 0, false),
+            f("ttl", 0, 40, false),
+            f("counter", 3, 0, true),
+        ]
+    }
+}
+
+/// A counter family of decision D179.
+fn is_sum(family: &str) -> bool {
+    family.starts_with("sum")
+}
+
+/// A family holding only `i64`s (what `put_i64` writes).
+fn is_i64(family: &str) -> bool {
+    family.starts_with("counter") || is_sum(family)
+}
+
+/// Where a put or operand without a timestamp lands: the counter's timestamp in a counter
+/// family, else the commit's.
+fn default_ts(family: &str, commit_ts: Timestamp) -> Timestamp {
+    if is_sum(family) {
+        COUNTER_TS
+    } else {
+        commit_ts
+    }
+}
+
+/// Moves the workload's logical explicit timestamps up by `base`, except a counter family's
+/// fixed timestamp (a cell delete of the counter itself).
+fn shift_ts(op: &mut ModelOp, base: Timestamp) {
+    if let ModelOp::Put {
+        ts: Some(t),
+        family,
+        ..
+    }
+    | ModelOp::Incr {
+        ts: Some(t),
+        family,
+        ..
+    }
+    | ModelOp::DeleteCell { ts: t, family, .. } = op
+        && !(is_sum(family) && *t == COUNTER_TS)
+    {
+        *t += base;
+    }
+}
+
+/// Whether `op` writes at the commit timestamp.
+fn takes_commit_ts(op: &ModelOp) -> bool {
+    match op {
+        ModelOp::Put { ts, family, .. } | ModelOp::Incr { ts, family, .. } => {
+            ts.is_none() && !is_sum(family)
+        }
+        ModelOp::DeleteCell { .. } => false,
+        _ => true,
+    }
 }
 
 /// The engine options of a model family. `g` compacts tiered (issue #31) and `ttl` FIFO by
@@ -168,10 +232,15 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
         },
         max_versions: f.max_versions,
         ttl_micros: f.ttl_micros,
-        merge_operator: if f.i64_add {
+        merge_operator: if f.i64_add || f.counter {
             "pigeonhole.i64_add".to_owned()
         } else {
             String::new()
+        },
+        kind: if f.counter {
+            FamilyKind::Counter
+        } else {
+            FamilyKind::Standard
         },
         ..FamilyOptions::default()
     }
@@ -435,9 +504,14 @@ fn show_in_table(op: &ModelOp) -> String {
             row,
             family,
             qualifier,
+            ts,
             delta,
             ..
-        } => format!("incr {}/{family}:{} {delta:+}", text(row), text(qualifier)),
+        } => format!(
+            "incr {}/{family}:{} ts={ts:?} {delta:+}",
+            text(row),
+            text(qualifier)
+        ),
         ModelOp::DeleteCell {
             row,
             family,
@@ -644,10 +718,7 @@ impl Store {
                     ..
                 } => {
                     // Counter families hold tagged `i64`s (what `put_i64` writes).
-                    let value = match (
-                        family.starts_with("counter"),
-                        <[u8; 8]>::try_from(value.as_slice()),
-                    ) {
+                    let value = match (is_i64(family), <[u8; 8]>::try_from(value.as_slice())) {
                         (true, Ok(b)) => ValueRef::I64(i64::from_le_bytes(b)),
                         _ => ValueRef::Bytes(value),
                     };
@@ -657,9 +728,18 @@ impl Store {
                     row,
                     family,
                     qualifier,
+                    ts: None,
                     delta,
                     ..
                 } => wb.merge(t, fam(family), row, qualifier, ValueRef::I64(*delta))?,
+                ModelOp::Incr {
+                    row,
+                    family,
+                    qualifier,
+                    ts: Some(ts),
+                    delta,
+                    ..
+                } => wb.merge_at(t, fam(family), row, qualifier, *ts, ValueRef::I64(*delta))?,
                 ModelOp::DeleteCell {
                     row,
                     family,
@@ -1692,13 +1772,15 @@ impl World {
                     value,
                     ..
                 } => {
+                    // The engine logs a counter family's default timestamp as explicit.
+                    let ts = ts.or(is_sum(family).then_some(COUNTER_TS));
                     out.insert((
                         t,
                         family.clone(),
                         1,
                         row.clone(),
                         qualifier.clone(),
-                        *ts,
+                        ts,
                         value.clone(),
                     ));
                 }
@@ -1706,16 +1788,18 @@ impl World {
                     row,
                     family,
                     qualifier,
+                    ts,
                     delta,
                     ..
                 } => {
+                    let ts = ts.or(is_sum(family).then_some(COUNTER_TS));
                     out.insert((
                         t,
                         family.clone(),
                         2,
                         row.clone(),
                         qualifier.clone(),
-                        None,
+                        ts,
                         delta.to_le_bytes().to_vec(),
                     ));
                 }
@@ -2542,13 +2626,14 @@ impl World {
                     1,
                     row,
                     qualifier,
-                    ts.unwrap_or(commit_ts),
+                    ts.unwrap_or(default_ts(family, commit_ts)),
                     value.clone(),
                 ),
                 ModelOp::Incr {
                     row,
                     family,
                     qualifier,
+                    ts,
                     delta,
                     ..
                 } => push(
@@ -2556,7 +2641,7 @@ impl World {
                     2,
                     row,
                     qualifier,
-                    commit_ts,
+                    ts.unwrap_or(default_ts(family, commit_ts)),
                     delta.to_le_bytes().to_vec(),
                 ),
                 ModelOp::DeleteCell {
@@ -2622,11 +2707,7 @@ impl World {
     /// timestamp produced, and no op with an explicit one could have (0 when every op
     /// carries its own).
     fn raw_commit_ts(&self, seqno: Seqno, ops: &[ModelOp]) -> Result<Timestamp, Fail> {
-        if !ops.iter().any(|op| match op {
-            ModelOp::Put { ts, .. } => ts.is_none(),
-            ModelOp::DeleteCell { .. } => false,
-            _ => true,
-        }) {
+        if !ops.iter().any(takes_commit_ts) {
             return Ok(0);
         }
         let store = self.store();
@@ -2669,15 +2750,14 @@ impl World {
                         ModelOp::Put {
                             family: f,
                             qualifier: q,
-                            ts,
                             ..
-                        } => f == &family && q == &qualifier && ts.is_none(),
-                        ModelOp::Incr {
+                        }
+                        | ModelOp::Incr {
                             family: f,
                             qualifier: q,
                             ..
-                        }
-                        | ModelOp::DeleteColumn {
+                        } => f == &family && q == &qualifier && takes_commit_ts(op),
+                        ModelOp::DeleteColumn {
                             family: f,
                             qualifier: q,
                             ..
@@ -2702,12 +2782,30 @@ impl World {
                             ts: Some(ts),
                             ..
                         }
+                        | ModelOp::Incr {
+                            family: f,
+                            qualifier: q,
+                            ts: Some(ts),
+                            ..
+                        }
                         | ModelOp::DeleteCell {
                             family: f,
                             qualifier: q,
                             ts,
                             ..
                         } => f == &family && q == &qualifier && *ts == parts.ts,
+                        ModelOp::Put {
+                            family: f,
+                            qualifier: q,
+                            ts: None,
+                            ..
+                        }
+                        | ModelOp::Incr {
+                            family: f,
+                            qualifier: q,
+                            ts: None,
+                            ..
+                        } => f == &family && q == &qualifier && is_sum(f) && parts.ts == COUNTER_TS,
                         _ => false,
                     }
             });
@@ -3111,12 +3209,7 @@ impl World {
     fn prepare_ops(&self, ops: &mut [ModelOp]) {
         for o in ops.iter_mut() {
             place(o);
-            match o {
-                ModelOp::Put { ts: Some(t), .. } | ModelOp::DeleteCell { ts: t, .. } => {
-                    *t += self.base;
-                }
-                _ => {}
-            }
+            shift_ts(o, self.base);
         }
     }
 
@@ -3375,17 +3468,19 @@ impl World {
         let interfere = rng.chance(500_000);
         if interfere {
             let (t, r, f) = reads[0].clone();
-            let value = if f.starts_with("counter") {
+            let value = if is_i64(&f) {
                 77i64.to_le_bytes().to_vec()
             } else {
                 b"interferer".to_vec()
             };
+            // A counter family with a TTL refuses its fixed timestamp: a bucket instead.
+            let ts = (is_sum(&f) && f.contains("ttl")).then_some(now);
             let op = ModelOp::Put {
                 table: t,
                 row: r,
                 family: f,
                 qualifier: b"q0".to_vec(),
-                ts: None,
+                ts,
                 value,
             };
             self.vfs.advance(1_000);
@@ -4387,12 +4482,7 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
             Op::Commit(mut ops, durability) => {
                 for o in &mut ops {
                     place(o);
-                    match o {
-                        ModelOp::Put { ts: Some(t), .. } | ModelOp::DeleteCell { ts: t, .. } => {
-                            *t += base
-                        }
-                        _ => {}
-                    }
+                    shift_ts(o, base);
                 }
                 let durability = cfg.durability.unwrap_or(durability);
                 let batch = store.batch(&ops).expect("batch");

@@ -9,7 +9,9 @@ use std::cmp::Reverse;
 
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::key::{Kind, encode_key, encode_marker_key};
-use pigeonhole_format::manifest::{CachePriority, CompactionStyle, Edit, FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{
+    CachePriority, CompactionStyle, Edit, FamilyKind, FamilyOptions, SstMeta,
+};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{BlobFileId, FamilyId, Lsn, SstId, StreamId, TableId, TabletId};
 use proptest::collection::vec;
@@ -185,6 +187,7 @@ pub fn family_options() -> impl Strategy<Value = FamilyOptions> {
             Just(CompactionStyle::Tiered),
             Just(CompactionStyle::FifoByTime)
         ],
+        prop_oneof![Just(FamilyKind::Standard), Just(FamilyKind::Counter)],
     )
         .prop_map(
             |(
@@ -198,6 +201,7 @@ pub fn family_options() -> impl Strategy<Value = FamilyOptions> {
                 merge_operator,
                 cache_priority,
                 compaction,
+                kind,
             )| FamilyOptions {
                 compression,
                 compression_level,
@@ -209,6 +213,7 @@ pub fn family_options() -> impl Strategy<Value = FamilyOptions> {
                 merge_operator,
                 cache_priority,
                 compaction,
+                kind,
             },
         )
 }
