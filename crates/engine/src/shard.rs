@@ -130,6 +130,10 @@ pub(crate) struct ShardMetrics {
     pub arena_run: AtomicU64,
     #[cfg(feature = "test-hooks")]
     pub arena_len: AtomicU64,
+    /// Reservations that found enough free bytes but no run long enough for their largest
+    /// entry (test hook: a test checks it reached that case, issue #141).
+    #[cfg(feature = "test-hooks")]
+    pub run_waits: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -158,6 +162,8 @@ impl Default for ShardMetrics {
             arena_run: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             arena_len: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            run_waits: AtomicU64::new(0),
         }
     }
 }
@@ -2496,14 +2502,15 @@ impl ShardState {
         // that many (`ShardArena::blocks_left`), every large entry finds a run.
         let chunk = self.chunk_size;
         let reserved = self.reserved;
-        let fits = |arena: &ShardArena| {
-            arena.free_bytes() >= reserved.saturating_add(needed)
-                && (need.run_chunks <= 1
-                    || arena.blocks_left(
-                        need.run_chunks,
-                        (need.alloc_chunks - need.min_large) + reserved.div_ceil(chunk),
-                    ) >= 1)
+        let bytes_fit = |arena: &ShardArena| arena.free_bytes() >= reserved.saturating_add(needed);
+        let run_fits = |arena: &ShardArena| {
+            need.run_chunks <= 1
+                || arena.blocks_left(
+                    need.run_chunks,
+                    (need.alloc_chunks - need.min_large) + reserved.div_ceil(chunk),
+                ) >= 1
         };
+        let fits = |arena: &ShardArena| bytes_fit(arena) && run_fits(arena);
         if !fits(&self.arena) {
             // Memtables whose readers left since the last reclaim count too.
             self.reclaim_retired();
@@ -2520,6 +2527,12 @@ impl ShardState {
             self.arena.region().len()
         );
         if !fits(&self.arena) {
+            #[cfg(feature = "test-hooks")]
+            if bytes_fit(&self.arena) {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .run_waits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let total = self.arena.region().len();
             return Err(if needed + 2 * self.chunk_size > total {
                 Room::Never

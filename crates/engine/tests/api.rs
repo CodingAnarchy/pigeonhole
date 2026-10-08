@@ -734,24 +734,18 @@ fn a_value_with_free_bytes_but_no_long_enough_run_waits_instead_of_poisoning() {
         commit(&x, &row.to_be_bytes(), 15 << 10).unwrap();
         row += 1;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let half = 512usize << 10; // D16's limit: 33 chunks with its node and the prefix.
-    loop {
-        commit(&p1, b"tick", 1).unwrap();
-        let (free, run, len) = db.arena_free(0);
-        if (free as usize) > half * 3 / 2 && (run as usize) < half + chunk {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "never built the fragmented arena: free {free}, largest run {run} of {len}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // Once `x`'s old chunks are reclaimed (the half's own reservation reclaims them if
+    // nothing has yet), the free runs are 31, 31, 31 and 32 chunks: 1.5 MiB free, but half
+    // the arena (D16's limit: 33 chunks with its node and the prefix) fits none of them.
+    let half = 512usize << 10;
     let r = commit(&x, b"half", half);
     assert!(
         matches!(r, Ok(_) | Err(Error::Busy)),
         "a value that fits no run: {r:?}"
+    );
+    assert!(
+        db.arena_run_waits(0) >= 1,
+        "the half never met an arena with enough free bytes but no run for it"
     );
     // The shard is not poisoned.
     commit(&p2, b"after", 100).unwrap();

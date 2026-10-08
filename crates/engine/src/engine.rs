@@ -1794,9 +1794,18 @@ impl Engine {
             .sum()
     }
 
+    /// How many times shard `shard` found enough free arena bytes for a batch but no run
+    /// long enough for its largest entry, and made it wait (issue #141).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn arena_run_waits(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .run_waits
+            .load(Ordering::Relaxed)
+    }
+
     /// Shard `shard`'s arena after its last batch: free bytes, the usable bytes of its
-    /// largest run of free chunks, and its size. A test builds a fragmented arena with it
-    /// (issue #141).
+    /// largest run of free chunks, and its size (issue #141).
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn arena_free(&self, shard: usize) -> (u64, u64, u64) {
