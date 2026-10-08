@@ -3011,7 +3011,7 @@ impl World {
                     Poll::Ready(r) => Some(Outcome::Commit(r)),
                     Poll::Pending => None,
                 },
-                Pending::Thread(rx) => rx.recv_timeout(Duration::from_millis(1)).ok(),
+                Pending::Thread(rx) => recv_within(rx, Duration::from_millis(1)),
             };
             match outcome {
                 Some(o) => resolved.push((inf, o)),
@@ -3966,6 +3966,22 @@ impl World {
                 class: FailureClass::Protocol,
                 message: format!("snapshot: {e}"),
             })
+        }
+    }
+}
+
+/// The helper thread's result if it arrives within `limit` of real time. Unlike
+/// `recv_timeout`, which sleeps on the OS timer (about 15.6 ms per wait on Windows, longer
+/// than asked on macOS), it yields until `limit` passes. The harness polls this between
+/// simulation steps, so each poll costs at most `limit` on every OS (#91).
+fn recv_within<T>(rx: &mpsc::Receiver<T>, limit: Duration) -> Option<T> {
+    let end = std::time::Instant::now() + limit;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return Some(v),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) if std::time::Instant::now() >= end => return None,
+            Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
         }
     }
 }
