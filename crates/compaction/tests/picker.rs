@@ -527,6 +527,13 @@ fn check_fifo(seed: u64, flushes: usize) {
             guard += 1;
             assert!(guard < 100, "{what}: compaction does not converge");
         }
+        // Not due means nothing to pick.
+        assert!(
+            picker
+                .pick(TabletId(1), FamilyId(1), &levels, &[], now, ttl)
+                .is_none(),
+            "{what}: work picked at score < 1"
+        );
         // Nothing expired is left, the size cap holds, and no `trigger` adjacent files fit
         // in one target: fewer than `trigger` files per target-sized slice of the data.
         let l0 = &levels.levels[0];
@@ -611,6 +618,16 @@ fn fifo_drops_expired_ssts_at_any_level_without_io() {
             .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
             .map(|t| (t.inputs, t.kind)),
         Some((vec![(2, vec![SstId(3), SstId(4)])], TaskKind::Drop))
+    );
+    // At the cap exactly, nothing is due and nothing is picked.
+    let mut at_cap = options.clone();
+    at_cap.fifo_max_bytes = 400;
+    let picker = CompactionPicker::new(CompactionStyle::FifoByTime, at_cap);
+    assert!(picker.score(&levels) < 1.0);
+    assert!(
+        picker
+            .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
+            .is_none()
     );
 }
 

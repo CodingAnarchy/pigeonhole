@@ -345,8 +345,10 @@ impl CompactionPicker {
     }
 
     /// [`score`](Self::score) at time `now` for a family whose TTL is `ttl_micros` (0:
-    /// none). FIFO-by-time scores at least 1.0 while an SST has expired and by its size over
-    /// `fifo_max_bytes`; the other styles ignore the time.
+    /// none). FIFO-by-time scores at least 1.0 while an SST has expired or its bytes exceed
+    /// `fifo_max_bytes`, exactly when [`pick`](Self::pick) with the same `now` has work
+    /// unless that work's SSTs are busy (as for every style: the score does not see `busy`,
+    /// and the engine moves on to the next due slot). The other styles ignore the time.
     pub fn score_at(&self, levels: &Levels, now: Timestamp, ttl_micros: u64) -> f64 {
         match self.style {
             CompactionStyle::Leveled => (0..self.last_level())
@@ -366,11 +368,12 @@ impl CompactionPicker {
                     score = score.max(1.0);
                 }
                 let cap = self.options.fifo_max_bytes;
-                if cap != 0 {
-                    let total: u64 = (0..levels.levels.len())
-                        .map(|n| levels.level_bytes(n))
-                        .sum();
-                    score = score.max(total as f64 / cap as f64);
+                let total: u64 = (0..levels.levels.len())
+                    .map(|n| levels.level_bytes(n))
+                    .sum();
+                // Due only past the cap, where `pick` drops something.
+                if cap != 0 && total > cap {
+                    score = score.max((total as f64 / cap as f64).max(1.0));
                 }
                 score
             }
