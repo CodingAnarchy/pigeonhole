@@ -124,6 +124,21 @@ fn read_error_txn_config() -> Config {
     cfg
 }
 
+/// #308: with tablet changes off, seed 266 crashes after three cross-shard commits failed
+/// at a poisoned stream, each leaving only a PREPARE. An earlier refused attempt's PREPARE
+/// held a row-delete marker that one of those commits also writes. The recovery check
+/// took that commit for the refused attempt's seqno and then found the commit's own PREPARE
+/// unexplained (`RecoveredFromTheFuture`). The engine recovered neither (no COMMIT, D83).
+#[test]
+fn a_refused_attempts_prepare_does_not_take_an_unacknowledged_commit() {
+    let mut cfg = read_error_txn_config();
+    cfg.tablet_changes = false;
+    cfg.balance_fast = false;
+    if let Err(f) = run(266, &cfg) {
+        panic!("{f}");
+    }
+}
+
 #[test]
 fn failed_compactions_back_off_after_a_crash() {
     // Issue #79: after a power loss (seed 19) or an injected I/O error (seed 83) killed the
