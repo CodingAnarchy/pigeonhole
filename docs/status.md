@@ -1,6 +1,6 @@
 # Status
 
-> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete in its main parts and fault-tested in simulation, but the on-disk format and the API may change before 1.0 ([`FORMAT.md`](../FORMAT.md)). The wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Not recommended for production use yet. Keep this note in sync with each release.
+> **Maturity: experimental 0.x.** [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0) is on [crates.io](https://crates.io/crates/pigeonhole). The core engine (Phase 1) is complete and fault-tested in simulation, but the on-disk format and the API may change before 1.0 ([`FORMAT.md`](../FORMAT.md)). The wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Not recommended for production use yet. Keep this note in sync with each release.
 
 Live progress against the [build plan](design/spec.md#build-plan). Updated by the coordinator as work lands.
 
@@ -12,34 +12,22 @@ The decision log is a [phase file plus an index](design/decisions/README.md) (`d
 | 2. Interface freeze — public traits/types for every crate, `FORMAT.md` | done ([#1](https://github.com/CodingAnarchy/pigeonhole/pull/1); see [interfaces.md](design/interfaces.md)) |
 | 3. Foundations — `format`, `io`, `sim` | done ([#2](https://github.com/CodingAnarchy/pigeonhole/pull/2), [#3](https://github.com/CodingAnarchy/pigeonhole/pull/3), [#4](https://github.com/CodingAnarchy/pigeonhole/pull/4)) |
 | 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | done — all seven merged, last [#30](https://github.com/CodingAnarchy/pigeonhole/pull/30) (`sst`) |
-| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | all crates merged, including engine Milestone B ([#63](https://github.com/CodingAnarchy/pigeonhole/pull/63)), `bench` ([#55](https://github.com/CodingAnarchy/pigeonhole/pull/55)), the per-stream recovery oracle in the engine and public suites (#48), deterministic background I/O (#61), tablet splits, merges and moves, **on by default** ([#168](https://github.com/CodingAnarchy/pigeonhole/pull/168), tracked in #38), the pre-gate edge-case review ([#90](https://github.com/CodingAnarchy/pigeonhole/issues/90)) and its fixes so far (blocking waits park and application-owned close completes, #135; failed side syncs poison, #139; reader snapshots across a writer restart, #140; leaks, #144; WAL checkpointing bound, #137; cheap opens and replay that spills to L0, #143; `ShmUnavailable` at open on a small `/dev/shm` and opt-in CPU pinning, #142). Still open in the Phase 1 milestone: the rest of #38, the scaling gate (#51), the review's remaining engine fixes (stall and retry edge cases #141, `shrink` #138), the documentation truthfulness fixes ([#146](https://github.com/CodingAnarchy/pigeonhole/issues/146)), and the gate itself |
+| 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | done. Every crate merged, tablets on by default ([#168](https://github.com/CodingAnarchy/pigeonhole/pull/168)), the pre-gate edge-case review ([#90](https://github.com/CodingAnarchy/pigeonhole/issues/90)) and all its Phase 1 fixes landed. **Phase 1 gate passed on 2026-10-08** at `3abef59`: the milestone was empty and the 1–300 fault-injection sweeps (engine model/crash with tablets on, the fast balancer and in-flight I/O, engine tablets, public model) and full CI were green. Published as [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0) (15 crates). |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
 
 | Phase | Gate | Milestone | State |
 |---|---|---|---|
-| 1. Core engine | Fault-injection suite green | [Phase 1](https://github.com/CodingAnarchy/pigeonhole/milestone/1) | in progress |
-| 2. Wide-column model | Sparse-wide bench beats SQLite EAV and hand-keyed RocksDB | [Phase 2](https://github.com/CodingAnarchy/pigeonhole/milestone/2) | not started |
+| 1. Core engine | Fault-injection suite green | [Phase 1](https://github.com/CodingAnarchy/pigeonhole/milestone/1) | **done** (gate passed 2026-10-08; [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0)) |
+| 2. Wide-column model | Sparse-wide bench beats SQLite EAV and hand-keyed RocksDB | [Phase 2](https://github.com/CodingAnarchy/pigeonhole/milestone/2) | in progress: baseline cleanup first ([#184](https://github.com/CodingAnarchy/pigeonhole/issues/184)) |
 | 3. Latency engine | Goals-table p50/p99 met; within 1.5× of RocksDB | [Phase 3](https://github.com/CodingAnarchy/pigeonhole/milestone/3) | not started |
 | 4. Hardening and 1.0 | File format frozen | [Phase 4](https://github.com/CodingAnarchy/pigeonhole/milestone/4) | not started |
 
 ## Tracked follow-ups
-Deferred work from the [decisions audit](design/decisions/README.md), one GitHub issue each (labels: phase, crate; milestone: the phase).
+Deferred work is one GitHub issue each, labeled with its crate and phase and assigned to the phase's milestone (D62). The open list is the milestone itself:
+[Phase 2](https://github.com/CodingAnarchy/pigeonhole/milestone/2) ·
+[Phase 3](https://github.com/CodingAnarchy/pigeonhole/milestone/3) ·
+[Phase 4](https://github.com/CodingAnarchy/pigeonhole/milestone/4).
 
-| Issue | Crate | Phase | Decision | Summary |
-|---|---|---|---|---|
-| [#14](https://github.com/CodingAnarchy/pigeonhole/issues/14) | engine | 1 | D54, ICR 0001 | Map `format::Error::InvalidArgument` to `InvalidArgument` |
-| [#15](https://github.com/CodingAnarchy/pigeonhole/issues/15) | engine | 1 | D29 | Benchmark the small-value copy threshold and `arc-swap` gets |
-| [#16](https://github.com/CodingAnarchy/pigeonhole/issues/16) | engine | 1 | D49 | Finish or persist flush and manifest work before `Runtime::shutdown` |
-| [#20](https://github.com/CodingAnarchy/pigeonhole/issues/20) | engine | 1 | D37 | Writer open order; writer-byte check in last-one-out cleanup |
-| [#22](https://github.com/CodingAnarchy/pigeonhole/issues/22) | engine | 1 | D40 | Refuse `compaction_cores` in application-owned mode |
-| [#23](https://github.com/CodingAnarchy/pigeonhole/issues/23) | engine | 1 | D57, D58, D60, D61 | Honor the pager's contracts (clean flag, poisoning, shrink, reclaim) |
-| [#24](https://github.com/CodingAnarchy/pigeonhole/issues/24) | engine | 1 | D59 | Refuse an interrupted `Pager::create` with `Corruption`; never delete the file |
-| [#26](https://github.com/CodingAnarchy/pigeonhole/issues/26) | engine | 1 | D39 | Families in creation or requested order |
-| [#21](https://github.com/CodingAnarchy/pigeonhole/issues/21) | compaction | 1 | D41 | `I64Add` fails on a non-`i64` base |
-| [#25](https://github.com/CodingAnarchy/pigeonhole/issues/25) | compaction | 1 | D38 | Timestamp-only `CellDelete` in the resolver and GC |
-| [#19](https://github.com/CodingAnarchy/pigeonhole/issues/19) | wal | 3 | D30 | Fully off-thread segment rollover (drop the D30 exception) |
-| [#17](https://github.com/CodingAnarchy/pigeonhole/issues/17) | memtable | 3 | D52 | 1M-entry lookup above the 300 ns target |
-| [#18](https://github.com/CodingAnarchy/pigeonhole/issues/18) | cache | 3 | D50 | 10-thread hit cost |
-
+Known Phase 1 limits carried forward: write throughput does not yet scale with shards ([#154](https://github.com/CodingAnarchy/pigeonhole/issues/154), Phase 3; measurements in [bench.md](bench.md)), open latency is about 14 ms against the 5 ms goal ([#158](https://github.com/CodingAnarchy/pigeonhole/issues/158)), and a file at rest can be 2–4× its live data ([#185](https://github.com/CodingAnarchy/pigeonhole/issues/185), Phase 2).
