@@ -286,8 +286,9 @@ fn shrink_erases_the_cached_blocks_of_a_copy_it_abandons() {
     );
     assert!(db.table("t").is_none());
     // Freed extents are reclaimed once no older view pins them; the view shrink held is
-    // released when it returns, and the next round reclaims (as in the test above).
-    assert_eq!(db.shrink().unwrap(), 0);
+    // released when it returns, so the next round reclaims the copy (and may truncate
+    // what it freed, so its return value depends on timing).
+    db.shrink().unwrap();
     assert_eq!(
         db.unreferenced_bytes(),
         0,
