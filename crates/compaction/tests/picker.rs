@@ -623,6 +623,11 @@ fn fifo_drops_expired_ssts_at_any_level_without_io() {
         Some((vec![(2, vec![SstId(3)])], TaskKind::Drop))
     );
     assert_eq!(pick(&[], 200, 0), None);
+    // #232: the engine's timer goes off when the first SST expires.
+    assert_eq!(picker.next_expiry(&levels, 100), Some(200));
+    assert_eq!(picker.next_expiry(&levels, 0), None);
+    let leveled = CompactionPicker::new(CompactionStyle::Leveled, options.clone());
+    assert_eq!(leveled.next_expiry(&levels, 100), None);
     // Later, across levels; busy ones wait.
     assert_eq!(
         pick(&[SstId(4)], 350, 100),
@@ -685,6 +690,14 @@ fn fifo_merges_the_longest_window_of_small_l0_files() {
             .pick(TabletId(1), FamilyId(1), &levels, &[SstId(3)], 0, 0)
             .is_none()
     );
+    // #232: a busy file splits the windows, and the longest one without it merges.
+    let l0: Vec<_> = (0..6u64).map(|i| timed(&mut id, 0, (i, i), 100)).collect();
+    let ids: Vec<SstId> = l0.iter().map(|s| s.id).collect();
+    let levels = Levels { levels: vec![l0] };
+    let task = picker
+        .pick(TabletId(1), FamilyId(1), &levels, &[ids[2]], 0, 0)
+        .unwrap();
+    assert_eq!(task.inputs, [(0, ids[3..].to_vec())]);
 }
 
 #[test]

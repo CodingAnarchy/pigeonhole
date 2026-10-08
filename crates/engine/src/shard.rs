@@ -4918,6 +4918,8 @@ impl ShardState {
         let mut score = 0.0f64;
         // Slots that need a compaction, most urgent first.
         let mut due: Vec<(f64, (TabletId, FamilyId))> = Vec::new();
+        // The earliest future expiry of a FIFO-by-time slot's SST (#232).
+        let mut next_expiry: Option<Timestamp> = None;
         for key in self.owned_slots(&view) {
             let Some(fam) = view.ssts.family(key.0, key.1) else {
                 continue;
@@ -4932,6 +4934,11 @@ impl ShardState {
             let levels = fam.levels_meta();
             let s = picker.score_at(&levels, now, meta.options.ttl_micros);
             score = score.max(picker.stall_score(&levels));
+            if let Some(at) = picker.next_expiry(&levels, meta.options.ttl_micros)
+                && at > now
+            {
+                next_expiry = Some(next_expiry.map_or(at, |e: Timestamp| e.min(at)));
+            }
             if s >= 1.0 {
                 due.push((s, key));
             }
@@ -4978,6 +4985,18 @@ impl ShardState {
                 w.notify(Err(poisoned_error()));
             }
             return;
+        }
+        // An idle FIFO-by-time family drops an SST when it expires, not at its next flush
+        // (#232): the compaction retry timer fires then. On a stopped clock that timer gave
+        // up and is not armed again until the clock moves (D126, D161).
+        if let Some(at) = next_expiry
+            && !self
+                .backoff_timer
+                .as_ref()
+                .is_some_and(|(t, _)| t.frozen(now_nanos))
+        {
+            let wait = at.saturating_sub(now).saturating_mul(1000);
+            self.arm_compaction_retry(now_nanos.saturating_add(wait), ctx);
         }
         // Full compactions first (a caller waits), one slot at a time.
         while let Some((filter, _)) = self.compact_all.front() {

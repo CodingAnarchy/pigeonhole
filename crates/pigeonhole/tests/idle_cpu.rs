@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use pigeonhole::{Durability, Family, Options, Pigeonhole};
+use pigeonhole::{Compaction, Durability, Family, Options, Pigeonhole};
 use pigeonhole_io::sim::SimVfs;
 use pigeonhole_io::{Vfs, VfsRef};
 
@@ -240,6 +240,26 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
         .family("f", Family::default())
         .create_if_missing()
         .unwrap();
+    // #232: a FIFO-by-time family whose one SST expires in an hour arms the shard's retry
+    // timer for then. The backoff retries below must still fire on time (the timer keeps the
+    // earliest deadline), and the parked shard must not wake for the expiry.
+    let fifo = db
+        .table("fifo")
+        .unwrap()
+        .family(
+            "f",
+            Family::default()
+                .ttl(Duration::from_secs(3600))
+                .compaction(Compaction::FifoByTime),
+        )
+        .create_if_missing()
+        .unwrap();
+    fifo.mutate(b"r")
+        .put("f", b"q", b"v")
+        .durability(Durability::None)
+        .commit()
+        .unwrap();
+    db.flush().unwrap();
     fail.store(true, Ordering::Release);
     // Repeating rows with incompressible values, flushed often: every compaction that
     // rewrites its inputs reads them, and fails.
@@ -304,7 +324,7 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
         "retried {gap:?} after the third failure, after {previous:?} before it"
     );
     fail.store(false, Ordering::Release);
-    drop(t);
+    drop((t, fifo));
     db.close().unwrap();
     stop.store(true, Ordering::Release);
     for d in drivers {

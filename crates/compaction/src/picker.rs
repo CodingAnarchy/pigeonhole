@@ -277,7 +277,7 @@ impl CompactionPicker {
         match self.style {
             CompactionStyle::Leveled | CompactionStyle::Tiered => self.level_score(levels, 0),
             CompactionStyle::FifoByTime => {
-                self.fifo_window(levels).1 as f64 / self.fifo_trigger() as f64
+                self.fifo_window(levels, &[]).1 as f64 / self.fifo_trigger() as f64
             }
         }
     }
@@ -309,9 +309,9 @@ impl CompactionPicker {
         amp / f64::from(self.options.tiered_max_space_amp_percent.max(1))
     }
 
-    /// FIFO: the longest run of adjacent L0 files whose bytes fit in `target_sst_bytes`
-    /// together, as `(start, len)`; the newest on ties.
-    fn fifo_window(&self, levels: &Levels) -> (usize, usize) {
+    /// FIFO: the longest run of adjacent L0 files, none of them `busy`, whose bytes fit in
+    /// `target_sst_bytes` together, as `(start, len)`; the newest on ties.
+    fn fifo_window(&self, levels: &Levels, busy: &[SstId]) -> (usize, usize) {
         let Some(l0) = levels.levels.first() else {
             return (0, 0);
         };
@@ -319,6 +319,11 @@ impl CompactionPicker {
         let mut best = (0, 0);
         let (mut start, mut bytes) = (0, 0u64);
         for (i, s) in l0.iter().enumerate() {
+            if busy.contains(&s.id) {
+                // A busy file splits the windows: one cannot cross it.
+                (start, bytes) = (i + 1, 0);
+                continue;
+            }
             bytes += s.len;
             while bytes > target && start <= i {
                 bytes -= l0[start].len;
@@ -335,6 +340,22 @@ impl CompactionPicker {
     /// itself).
     fn fifo_trigger(&self) -> usize {
         self.options.l0_trigger.max(2) as usize
+    }
+
+    /// FIFO-by-time: when the next SST expires (the earliest `ts_range.1 + ttl_micros` of
+    /// the family's SSTs, possibly already past), or `None` for other styles, without a TTL
+    /// or without SSTs. The engine arms a timer for it, so an idle family drops expired SSTs
+    /// without waiting for its next flush.
+    pub fn next_expiry(&self, levels: &Levels, ttl_micros: u64) -> Option<Timestamp> {
+        if self.style != CompactionStyle::FifoByTime || ttl_micros == 0 {
+            return None;
+        }
+        levels
+            .levels
+            .iter()
+            .flatten()
+            .map(|s| s.ts_range.1.saturating_add(ttl_micros))
+            .min()
     }
 
     /// Urgency: `>= 1.0` means compaction is due. The engine services the highest score
@@ -358,7 +379,7 @@ impl CompactionPicker {
                 .level_score(levels, 0)
                 .max(self.space_amp_score(levels)),
             CompactionStyle::FifoByTime => {
-                let mut score = self.fifo_window(levels).1 as f64 / self.fifo_trigger() as f64;
+                let mut score = self.fifo_window(levels, &[]).1 as f64 / self.fifo_trigger() as f64;
                 if levels
                     .levels
                     .iter()
@@ -483,14 +504,13 @@ impl CompactionPicker {
         if !dropped.is_empty() {
             return Some((dropped, 0, TaskKind::Drop));
         }
-        let (start, len) = self.fifo_window(levels);
+        // The longest window of files not busy, so a busy file does not hold up a merge
+        // elsewhere in L0 (#232).
+        let (start, len) = self.fifo_window(levels, busy);
         if len < self.fifo_trigger() {
             return None;
         }
         let window = &levels.levels.first()?[start..start + len];
-        if window.iter().any(|s| busy.contains(&s.id)) {
-            return None;
-        }
         Some((
             vec![(0, window.iter().map(|s| s.id).collect())],
             0,
