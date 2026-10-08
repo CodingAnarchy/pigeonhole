@@ -6,7 +6,7 @@
 //! |---|---|---|---|
 //! | YCSB A–F | `user<fnv(i)>` (YCSB key order) | `ycsb` | `field0`..`field9` |
 //! | sparse-wide | `sw:<i>` | `attr` | Zipfian over a 10K vocabulary, ~20 per row |
-//! | time-series | `ts:<entity>:<reversed time>` (newest first) | `metric` (TTL) | `v` |
+//! | time-series | `ts:<entity>:<reversed time>` (newest first), event-time timestamps | `metric` (TTL) | `v` |
 //! | adjacency | `v:<vertex>` | `edge` | `edge:<dst>`, power-law degree |
 //! | skewed multi-shard | `sk:<fnv(i)>` | `ycsb` | `field0` |
 
@@ -25,8 +25,9 @@ pub const METRIC_FAMILY: &str = "metric";
 pub const EDGE_FAMILY: &str = "edge";
 /// Every family a runner must create, in a fixed order.
 pub const FAMILIES: [&str; 4] = [YCSB_FAMILY, SPARSE_FAMILY, METRIC_FAMILY, EDGE_FAMILY];
-/// TTL of [`METRIC_FAMILY`]. Long enough that nothing expires during a run, so every
-/// engine reads the same cells; reads still pay the TTL check.
+/// TTL of [`METRIC_FAMILY`]. The time-series workload loads event timestamps that straddle
+/// it: a quarter of the loaded points are already expired, and
+/// every engine must skip them on read.
 pub const TIME_SERIES_TTL: std::time::Duration = std::time::Duration::from_secs(86_400);
 
 /// YCSB fields per record.
@@ -57,6 +58,8 @@ pub(crate) struct Gen {
     n_load: u64,
     /// Sparse-wide: qualifier popularity. Adjacency: out-degree.
     aux: Zipf,
+    /// The workload's "now" in µs ([`WorkloadConfig::epoch_micros`], resolved).
+    epoch: u64,
 }
 
 impl Gen {
@@ -75,12 +78,34 @@ impl Gen {
             WorkloadKind::TimeSeriesTtl => n_items * POINTS_PER_ENTITY,
             _ => n_items,
         };
+        let epoch = match config.epoch_micros {
+            0 => crate::runners::now_micros(),
+            e => e,
+        };
         Self {
             items: Zipf::new(n_items),
             n_items,
             n_load,
             aux,
+            epoch,
             config,
+        }
+    }
+
+    /// Event time (µs) of point `t` of an entity.
+    ///
+    /// Loaded points `0..POINTS_PER_ENTITY` are `TTL / 75` apart and end half a step
+    /// before `epoch`, so the oldest quarter is older than [`TIME_SERIES_TTL`] and the
+    /// rest is not, each side half a step (about 9.6 minutes) from the boundary. A run that
+    /// reads more than that after the workload is created sees extra points expire, at
+    /// slightly different moments in each engine. Points appended during the run are
+    /// `epoch` plus one microsecond per point: live for the whole run.
+    fn point_ts(&self, t: u64) -> u64 {
+        let step = TIME_SERIES_TTL.as_micros() as u64 / 75;
+        if t < POINTS_PER_ENTITY {
+            self.epoch - (POINTS_PER_ENTITY - 1 - t) * step - step / 2
+        } else {
+            self.epoch + (t - POINTS_PER_ENTITY)
         }
     }
 
@@ -203,9 +228,10 @@ impl Iterator for LoadIter<'_> {
                 WorkloadKind::TimeSeriesTtl => {
                     // Interleave entities in time order, as live ingestion would.
                     let (t, e) = (i / g.n_items, i % g.n_items);
-                    BenchOp::Put {
+                    BenchOp::PutAt {
                         row: point_key(e, t),
                         family: METRIC_FAMILY,
+                        ts: g.point_ts(t),
                         cells: vec![(b"v".to_vec(), g.value(rng))],
                     }
                 }
@@ -241,12 +267,12 @@ pub(crate) struct RunIter<'a> {
 }
 
 impl RunIter<'_> {
+    /// YCSB `readallfields=true`: all ten fields of one record.
     fn ycsb_read(&mut self) -> BenchOp {
         let i = self.g.items.sample_scrambled(&mut self.rng);
-        BenchOp::Get {
+        BenchOp::GetRow {
             row: ycsb_key(i),
             family: YCSB_FAMILY,
-            qualifier: field(self.rng.below(YCSB_FIELDS)),
         }
     }
 
@@ -295,10 +321,9 @@ impl Iterator for RunIter<'_> {
                 // Read latest: recently inserted records are the most popular.
                 let back = g.items.sample(&mut self.rng);
                 let i = self.inserted.saturating_sub(1 + back);
-                BenchOp::Get {
+                BenchOp::GetRow {
                     row: ycsb_key(i),
                     family: YCSB_FAMILY,
-                    qualifier: field(self.rng.below(YCSB_FIELDS)),
                 }
             }
             WorkloadKind::YcsbD => self.ycsb_insert(),
@@ -312,10 +337,14 @@ impl Iterator for RunIter<'_> {
                 row: ycsb_key(g.items.sample_scrambled(&mut self.rng)),
                 qualifier: field(self.rng.below(YCSB_FIELDS)),
             },
-            WorkloadKind::SparseWide if p < 0.6 => BenchOp::Get {
+            WorkloadKind::SparseWide if p < 0.4 => BenchOp::Get {
                 row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
                 family: SPARSE_FAMILY,
                 qualifier: sparse_qualifier(g.aux.sample(&mut self.rng)),
+            },
+            WorkloadKind::SparseWide if p < 0.6 => BenchOp::GetRow {
+                row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
+                family: SPARSE_FAMILY,
             },
             WorkloadKind::SparseWide if p < 0.8 => {
                 let row = sparse_key(g.items.sample_scrambled(&mut self.rng));
@@ -340,9 +369,10 @@ impl Iterator for RunIter<'_> {
                 if p < 0.4 {
                     let t = *clock;
                     *clock += 1;
-                    BenchOp::Put {
+                    BenchOp::PutAt {
                         row: point_key(e, t),
                         family: METRIC_FAMILY,
+                        ts: g.point_ts(t),
                         cells: vec![(b"v".to_vec(), g.value(&mut self.rng))],
                     }
                 } else if p < 0.8 {
@@ -395,6 +425,7 @@ mod tests {
     fn ops(kind: WorkloadKind, seed: u64) -> (Vec<BenchOp>, Vec<BenchOp>) {
         let mut w = Workload::new(WorkloadConfig {
             seed,
+            epoch_micros: 2_000_000_000_000_000,
             ..WorkloadConfig::smoke(kind)
         });
         let load = w.load_ops().collect();
@@ -446,7 +477,7 @@ mod tests {
             });
             let reads = w
                 .run_ops()
-                .filter(|op| matches!(op, BenchOp::Get { .. }))
+                .filter(|op| matches!(op, BenchOp::Get { .. } | BenchOp::GetRow { .. }))
                 .count() as f64
                 / cfg.operations as f64;
             assert!(
@@ -486,5 +517,62 @@ mod tests {
         assert!(point_key(3, 10) < point_key(3, 9));
         assert!(entity_prefix(3).as_bytes() < point_key(3, u64::MAX - 1).as_slice());
         assert!(point_key(3, 0) < entity_prefix(4).into_bytes());
+    }
+
+    #[test]
+    fn ycsb_reads_fetch_every_field() {
+        let (_, run) = ops(WorkloadKind::YcsbB, 4);
+        assert!(run.iter().any(|op| matches!(op, BenchOp::GetRow { .. })));
+        assert!(!run.iter().any(|op| matches!(op, BenchOp::Get { .. })));
+    }
+
+    #[test]
+    fn sparse_wide_reads_whole_rows_too() {
+        let (_, run) = ops(WorkloadKind::SparseWide, 4);
+        let count = |f: fn(&BenchOp) -> bool| run.iter().filter(|op| f(op)).count() as f64;
+        let n = run.len() as f64;
+        let gets = count(|op| matches!(op, BenchOp::Get { .. })) / n;
+        let rows = count(|op| matches!(op, BenchOp::GetRow { .. })) / n;
+        assert!(
+            (gets - 0.4).abs() < 0.05 && (rows - 0.2).abs() < 0.05,
+            "{gets} {rows}"
+        );
+    }
+
+    #[test]
+    fn time_series_timestamps_straddle_the_ttl() {
+        let epoch = 2_000_000_000_000_000;
+        let ttl = TIME_SERIES_TTL.as_micros() as u64;
+        let mut w = Workload::new(WorkloadConfig {
+            epoch_micros: epoch,
+            ..WorkloadConfig::smoke(WorkloadKind::TimeSeriesTtl)
+        });
+        let load: Vec<BenchOp> = w.load_ops().collect();
+        let stamps: Vec<u64> = load
+            .iter()
+            .map(|op| match op {
+                BenchOp::PutAt { ts, .. } => *ts,
+                other => panic!("load op {other:?}"),
+            })
+            .collect();
+        let expired = stamps.iter().filter(|ts| **ts + ttl <= epoch).count();
+        assert_eq!(
+            expired * 4,
+            stamps.len(),
+            "a quarter of the load is expired"
+        );
+        // Nothing sits within a few minutes of the boundary, so a slow run cannot
+        // change which cells are live.
+        let margin = 9 * 60 * 1_000_000;
+        assert!(stamps.iter().all(|ts| (ts + ttl).abs_diff(epoch) > margin));
+        // Appended points are live and later than any loaded one.
+        let appended = w
+            .run_ops()
+            .find_map(|op| match op {
+                BenchOp::PutAt { ts, .. } => Some(ts),
+                _ => None,
+            })
+            .expect("the run appends points");
+        assert!(appended >= epoch && stamps.iter().all(|ts| *ts < appended));
     }
 }
