@@ -851,6 +851,17 @@ impl Run {
                     if armed { " (crash armed)" } else { "" }
                 ));
                 let mut result = self.commit(&ops, durability);
+                if let Err(e) = &result
+                    && e.code() == ErrorCode::Busy
+                    && armed
+                    && self.fired()
+                {
+                    // The armed power loss fired (on a flush the wait for room started, say)
+                    // and the commit was refused with `Busy` before it was logged: that
+                    // refusal is the power loss's (D127). Refused, it never landed.
+                    let e = e.clone();
+                    return self.recover_fired(&e);
+                }
                 if matches!(&result, Err(e) if e.code() == ErrorCode::Busy)
                     && !self.snaps.is_empty()
                 {

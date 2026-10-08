@@ -56,10 +56,9 @@ pub enum ErrorCode {
     /// A commit is too large for one WAL record.
     RecordTooLarge = 23,
     /// Writes are stalled. A write that finds the memtable arena full waits while a flush
-    /// frees room; this code means the wait outlasted the engine's stall timeout (30 s by
-    /// default), a transient condition: back off and retry. It also means one batch is
-    /// larger than a shard's arena, which never succeeds: split it or raise
-    /// `Options::memtable_budget`.
+    /// frees room; this code means the wait outlasted the engine's stall timeout (30 s), a
+    /// transient condition: back off and retry. A batch that can never fit gets
+    /// [`ErrorCode::BatchTooLarge`] instead.
     Busy = 24,
     /// A reader process's snapshot was taken before a writer restart, which may have reused
     /// the space it reads. Take a new snapshot and redo the read.
@@ -68,6 +67,10 @@ pub enum ErrorCode {
     /// (application-owned mode), where blocking could deadlock. The commit was submitted
     /// and will apply; poll its future from the event loop instead.
     WouldDeadlock = 26,
+    /// A batch can never fit a shard's memtable arena, even an empty one: its cells need
+    /// more than about half of `Options::memtable_budget`. Retrying never succeeds: split
+    /// the batch, or raise the budget.
+    BatchTooLarge = 27,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
@@ -150,6 +153,7 @@ impl From<pigeonhole_engine::Error> for Error {
             E::NoReaderSlot => ErrorCode::NoReaderSlot,
             E::RecordTooLarge => ErrorCode::RecordTooLarge,
             E::Busy => ErrorCode::Busy,
+            E::BatchTooLarge => ErrorCode::BatchTooLarge,
             E::SnapshotExpired => ErrorCode::SnapshotExpired,
             E::WouldDeadlock => ErrorCode::WouldDeadlock,
             // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
@@ -160,11 +164,12 @@ impl From<pigeonhole_engine::Error> for Error {
         let message = match &e {
             // Built from the fields: the message does not depend on the operator's `Display`.
             E::Merge(m) => format!("merge operator {:?} failed: {}", m.operator, m.message),
-            // A write stall that outlasted the engine's timeout, or a batch larger than the
-            // arena: transient unless the batch itself cannot fit.
-            E::Busy => "memtable arena full: a flush did not free room within the write-stall \
-                        timeout, or one batch is larger than the arena; retry, or raise \
-                        Options::memtable_budget"
+            // A write stall that outlasted the engine's timeout: transient.
+            E::Busy => "stalled: a flush or compaction did not free room within the write-stall \
+                        timeout (30 s); back off and retry, and drop old snapshots"
+                .to_owned(),
+            E::BatchTooLarge => "the batch can never fit a shard's memtable arena (about half \
+                                 of Options::memtable_budget); split it or raise the budget"
                 .to_owned(),
             _ => e.to_string(),
         };

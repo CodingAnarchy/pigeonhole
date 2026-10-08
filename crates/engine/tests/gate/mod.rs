@@ -1,7 +1,11 @@
 //! A VFS that holds, fails or panics on chosen files' asynchronous syncs, so a test can keep
 //! I/O in flight across scheduling points (a WAL group unresolved, a manifest root commit
-//! blocked) and decide when it completes. Storage is `SimVfs` on a real clock.
+//! blocked) and decide when it completes. It also fails reads, and writes to the main
+//! file, whose bytes contain a marker (one table's SST blocks, stored uncompressed), so a
+//! test can make one table's flushes or compactions fail. Storage is `SimVfs` on a real
+//! clock.
 
+// Shared by several test binaries, each using a subset of it (as `tests/common` is).
 #![allow(dead_code)]
 
 use std::collections::HashSet;
@@ -28,6 +32,15 @@ type Held = (PathBuf, Resolver<()>, pigeonhole_io::Result<()>);
 pub struct Gate {
     rules: Mutex<Rules>,
     held: Mutex<Vec<Held>>,
+    /// Reads whose bytes contain this marker fail (one table's SST blocks, say).
+    read_marker: Mutex<Option<Vec<u8>>>,
+    /// When each injected read failure happened.
+    read_failures: Mutex<Vec<Instant>>,
+    /// Writes to the main `.phdb` file whose bytes contain this marker fail (one table's
+    /// SST blocks; WAL records go to other files).
+    write_marker: Mutex<Option<Vec<u8>>>,
+    /// When each injected write failure happened.
+    write_failures: Mutex<Vec<Instant>>,
 }
 
 impl Gate {
@@ -44,6 +57,26 @@ impl Gate {
     /// Panics in the next asynchronous sync of `path` (on whatever thread submits it).
     pub fn panic(&self, path: &Path) {
         self.rules.lock().unwrap().panic.insert(path.to_path_buf());
+    }
+
+    /// Fails every later read (blocking) whose bytes contain `marker`, or none (`None`).
+    pub fn fail_reads_containing(&self, marker: Option<&[u8]>) {
+        *self.read_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// When each injected read failure happened.
+    pub fn read_failures(&self) -> Vec<Instant> {
+        self.read_failures.lock().unwrap().clone()
+    }
+
+    /// Fails every later write to the main file whose bytes contain `marker`, or none.
+    pub fn fail_writes_containing(&self, marker: Option<&[u8]>) {
+        *self.write_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// When each injected write failure happened.
+    pub fn write_failures(&self) -> Vec<Instant> {
+        self.write_failures.lock().unwrap().clone()
     }
 
     /// Paths with a sync held now.
@@ -85,16 +118,26 @@ impl Gate {
 #[derive(Debug)]
 pub struct GateVfs {
     inner: Arc<SimVfs>,
-    start: Instant,
+    /// `None`: the simulator's own clock, frozen unless the test advances it.
+    start: Option<Instant>,
     gate: Arc<Gate>,
 }
 
 /// A new gated VFS and its gate.
 pub fn vfs(seed: u64) -> (VfsRef, Arc<Gate>) {
+    gated(seed, Some(Instant::now()))
+}
+
+/// As [`vfs`], on the simulator's frozen clock.
+pub fn frozen_vfs(seed: u64) -> (VfsRef, Arc<Gate>) {
+    gated(seed, None)
+}
+
+fn gated(seed: u64, start: Option<Instant>) -> (VfsRef, Arc<Gate>) {
     let gate = Arc::new(Gate::default());
     let vfs = Arc::new(GateVfs {
         inner: SimVfs::new(seed),
-        start: Instant::now(),
+        start,
         gate: Arc::clone(&gate),
     });
     (vfs, gate)
@@ -110,6 +153,25 @@ struct GateFile {
 impl GateFile {
     fn failing(&self) -> bool {
         self.gate.rules.lock().unwrap().fail.contains(&self.path)
+    }
+
+    /// Whether a write of `buf` to this file must fail.
+    fn write_fails(&self, buf: &[u8]) -> bool {
+        if !self.path.to_string_lossy().ends_with(".phdb") {
+            return false;
+        }
+        let failing = match &*self.gate.write_marker.lock().unwrap() {
+            Some(marker) => buf.windows(marker.len()).any(|w| w == &marker[..]),
+            None => false,
+        };
+        if failing {
+            self.gate
+                .write_failures
+                .lock()
+                .unwrap()
+                .push(Instant::now());
+        }
+        failing
     }
 
     fn injected() -> pigeonhole_io::Error {
@@ -154,10 +216,10 @@ impl Vfs for GateVfs {
         self.inner.remove_shared(name, dir)
     }
     fn now_micros(&self) -> u64 {
-        self.inner.now_micros() + self.start.elapsed().as_micros() as u64
+        self.inner.now_micros() + self.start.map_or(0, |s| s.elapsed().as_micros() as u64)
     }
     fn monotonic_nanos(&self) -> u64 {
-        self.inner.monotonic_nanos() + self.start.elapsed().as_nanos() as u64
+        self.inner.monotonic_nanos() + self.start.map_or(0, |s| s.elapsed().as_nanos() as u64)
     }
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
@@ -169,9 +231,25 @@ impl Vfs for GateVfs {
 
 impl pigeonhole_io::File for GateFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
-        self.inner.read_at(buf, offset)
+        self.inner.read_at(buf, offset)?;
+        if let Some(marker) = &*self.gate.read_marker.lock().unwrap()
+            && buf.windows(marker.len()).any(|w| w == &marker[..])
+        {
+            self.gate.read_failures.lock().unwrap().push(Instant::now());
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected read failure",
+            ));
+        }
+        Ok(())
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        if self.write_fails(buf) {
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected write failure",
+            ));
+        }
         self.inner.write_at(buf, offset)
     }
     fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> Completion {

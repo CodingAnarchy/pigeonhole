@@ -1176,8 +1176,17 @@ impl ShardState {
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         let last = self.picker.options().max_levels.max(2) - 1;
+        let now = ctx.now_nanos();
+        // Slots waiting out a failed compaction's backoff stay queued (issue #141).
+        let mut later = Vec::new();
         while !self.cleanups.is_empty() {
             let key = self.cleanups.remove(0);
+            if let Some(&(_, until)) = self.slot_backoff.get(&key)
+                && until > now
+            {
+                later.push(key);
+                continue;
+            }
             let Some(tablet) = view.tablets.entry(key.0).filter(|t| t.shard == self.id) else {
                 continue;
             };
@@ -1199,15 +1208,25 @@ impl ShardState {
             let Some(task) = compact::plan_full(tablet, key.1, &levels, last, busy, true) else {
                 // Its inputs are busy: try again after the running work.
                 self.cleanups.insert(0, key);
-                return;
+                break;
             };
             trace!("shard {} cleanup rewrite of {key:?}", self.id.0);
             if let Err(e) = self.start_compaction(view, key, task, ctx) {
                 trace!("shard {} compaction start failed: {e}", self.id.0);
-                self.back_off_compaction(ctx);
+                self.back_off_compaction(key, ctx);
             }
-            return;
+            break;
         }
+        // A cleanup passed over for its slot's backoff runs when the backoff ends, even on
+        // a shard that is idle by then.
+        if let Some(until) = later
+            .iter()
+            .filter_map(|k| self.slot_backoff.get(k).map(|&(_, until)| until))
+            .min()
+        {
+            self.arm_compaction_retry(until, ctx);
+        }
+        self.cleanups.extend(later);
     }
 
     /// The balancer's choice for this interval, if any: a size split, a write-skew (or

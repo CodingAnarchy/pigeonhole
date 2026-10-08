@@ -65,10 +65,22 @@ const STALL_TIMER_FROZEN_POLLS: u32 = 1024;
 /// Failed flushes in a row after which a wait for arena room ends with `Busy` on a frozen
 /// clock (a moving one waits for `write_stall_timeout_nanos`).
 const ROOM_FLUSH_ATTEMPTS: u32 = 4;
-/// How long a failed background compaction first waits before it is retried on a moving
-/// clock; the wait doubles with each failure in a row, up to `COMPACTION_BACKOFF_MAX_NANOS`.
-const COMPACTION_BACKOFF_NANOS: u64 = 1_000_000_000;
-const COMPACTION_BACKOFF_MAX_NANOS: u64 = 60_000_000_000;
+/// A backoff that starts at `base` and doubles with each failure in a row (`failures`, at
+/// least one), up to `cap` times `base`. The bases are `EngineOptions` fields: a failed
+/// compaction's (1 s, capped at 60 s), a failed flush's (10 ms, capped at 1 s) and a room
+/// wait's re-check (1 ms, capped at 100 ms).
+fn backoff_nanos(base: u64, cap: u64, failures: u32) -> u64 {
+    // 2^32 times the base is far past any cap; saturate rather than overflow.
+    let doublings = failures.saturating_sub(1).min(32);
+    base.saturating_mul(1 << doublings)
+        .min(base.saturating_mul(cap))
+        .max(base)
+}
+
+/// Caps of the backoffs, as multiples of their bases.
+const COMPACTION_BACKOFF_CAP: u64 = 60;
+const FLUSH_BACKOFF_CAP: u64 = 100;
+const ROOM_RECHECK_CAP: u64 = 100;
 
 /// The wait before retrying after `failures` failed compactions in a row (at least one).
 /// Attempts of a cross-shard commit refused with `Moved` before it fails with `Busy`
@@ -79,12 +91,6 @@ pub(crate) const MOVED_RETRIES: u32 = 16;
 /// nanoseconds after it was submitted, fails with `Busy` instead of retrying.
 fn moved_gives_up(attempts: u32, waited: u64, timeout: u64) -> bool {
     attempts >= MOVED_RETRIES || waited >= timeout
-}
-
-fn compaction_backoff_nanos(failures: u32) -> u64 {
-    // 2^32 seconds is far past the cap and does not overflow.
-    let doublings = failures.saturating_sub(1).min(32);
-    (COMPACTION_BACKOFF_NANOS << doublings).min(COMPACTION_BACKOFF_MAX_NANOS)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -103,6 +109,10 @@ pub(crate) struct ShardMetrics {
     pub flush_nanos: AtomicU64,
     pub compactions: AtomicU64,
     pub compaction_nanos: AtomicU64,
+    /// Flushes and background compactions that failed (issue #141: they are retried on a
+    /// backoff, and nothing else reports them).
+    pub flush_failures: AtomicU64,
+    pub compaction_failures: AtomicU64,
     pub splits: AtomicU64,
     pub merges: AtomicU64,
     pub moves: AtomicU64,
@@ -112,6 +122,18 @@ pub(crate) struct ShardMetrics {
     /// WAL unpin passes (#137) and the memtables they froze below the size threshold.
     pub unpin_passes: AtomicU64,
     pub unpin_flushes: AtomicU64,
+    /// The arena's free bytes, largest free run and size after the shard's last batch
+    /// (test hook: a test checks it built the fragmented arena it means to, issue #141).
+    #[cfg(feature = "test-hooks")]
+    pub arena_free: AtomicU64,
+    #[cfg(feature = "test-hooks")]
+    pub arena_run: AtomicU64,
+    #[cfg(feature = "test-hooks")]
+    pub arena_len: AtomicU64,
+    /// Reservations that found enough free bytes but no run long enough for their largest
+    /// entry (test hook: a test checks it reached that case, issue #141).
+    #[cfg(feature = "test-hooks")]
+    pub run_waits: AtomicU64,
 }
 
 impl Default for ShardMetrics {
@@ -125,6 +147,8 @@ impl Default for ShardMetrics {
             flush_nanos: AtomicU64::new(0),
             compactions: AtomicU64::new(0),
             compaction_nanos: AtomicU64::new(0),
+            flush_failures: AtomicU64::new(0),
+            compaction_failures: AtomicU64::new(0),
             splits: AtomicU64::new(0),
             merges: AtomicU64::new(0),
             moves: AtomicU64::new(0),
@@ -132,6 +156,14 @@ impl Default for ShardMetrics {
             aborted: AtomicU64::new(0),
             unpin_passes: AtomicU64::new(0),
             unpin_flushes: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            arena_free: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            arena_run: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            arena_len: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            run_waits: AtomicU64::new(0),
         }
     }
 }
@@ -326,6 +358,10 @@ pub(crate) struct Shared {
     pub picker: PickerOptions,
     /// How long a commit waits for arena room before `Busy`.
     pub write_stall_timeout_nanos: u64,
+    /// Backoff bases (`EngineOptions`; issue #141).
+    pub compaction_backoff_nanos: u64,
+    pub flush_backoff_nanos: u64,
+    pub room_recheck_nanos: u64,
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
@@ -906,6 +942,8 @@ pub(crate) enum PrepareError {
     Busy,
     Closed,
     TooLarge,
+    /// The share can never fit the participant's arena (issue #141).
+    NeverFits,
     Io,
 }
 
@@ -916,6 +954,7 @@ impl From<PrepareError> for Error {
             PrepareError::Moved | PrepareError::BelowFloor | PrepareError::Busy => Error::Busy,
             PrepareError::Closed => Error::Closed,
             PrepareError::TooLarge => Error::RecordTooLarge,
+            PrepareError::NeverFits => Error::BatchTooLarge,
             PrepareError::Io => poisoned_error(),
         }
     }
@@ -934,6 +973,7 @@ fn prepare_error_of(e: &Error) -> PrepareError {
         Error::Busy => PrepareError::Busy,
         Error::Closed => PrepareError::Closed,
         Error::RecordTooLarge => PrepareError::TooLarge,
+        Error::BatchTooLarge => PrepareError::NeverFits,
         _ => PrepareError::Io,
     }
 }
@@ -1028,6 +1068,8 @@ pub(crate) enum ShardMsg {
     RetryCompaction,
     /// A refused checkpoint's backoff passed (on a moving clock): retry.
     RetryCheckpoint,
+    /// A failed flush's backoff passed: retry (issue #141).
+    RetryFlush,
     /// Split, merge or move tablets this shard owns (replies when done, if asked). Sent by
     /// the test hooks only; the balancer starts its own changes.
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
@@ -1592,6 +1634,19 @@ impl Task for ClockTimer {
     }
 }
 
+/// Arena room a batch needs (`ShardState::arena_needed`).
+#[derive(Debug, Clone, Copy)]
+struct ArenaNeed {
+    /// Worst-case bytes of free chunks it uses.
+    bytes: usize,
+    /// Chunks its largest entry takes (contiguous).
+    run_chunks: usize,
+    /// Chunks its smallest entry larger than a chunk takes (0 without one).
+    min_large: usize,
+    /// Chunks its allocations can take in all.
+    alloc_chunks: usize,
+}
+
 /// A group waiting for a flush to free memtable arena room (a write stall, counted in the
 /// metrics), refused with `Busy` once `write_stall_timeout_nanos` have passed (D124). On a
 /// frozen clock it is also refused after `ROOM_FLUSH_ATTEMPTS` failed flushes in a row, or
@@ -1602,6 +1657,62 @@ struct RoomWait {
     /// The timeout timer.
     timer: Arc<TimerState>,
     failed_flushes: u32,
+    /// On a moving clock, kicks the shard to look for room again: room freed by a snapshot
+    /// dropped on another thread or a reader process's unpin is not announced (issue #141).
+    recheck: Option<Arc<TimerState>>,
+    /// The re-check timer's last interval (the base doubling up to 100 times it).
+    recheck_nanos: u64,
+}
+
+impl RoomWait {
+    fn new(since: u64, timer: Arc<TimerState>) -> Self {
+        Self {
+            since,
+            timer,
+            failed_flushes: 0,
+            recheck: None,
+            recheck_nanos: 0,
+        }
+    }
+
+    /// Arms the re-check timer unless one is pending: it kicks the shard after `base` (1 ms
+    /// by default), then twice as long each time up to 100 times `base`, so freed room is
+    /// seen within about 100 ms.
+    fn arm_recheck(
+        &mut self,
+        vfs: &VfsRef,
+        base: u64,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+        me: ShardId,
+    ) {
+        if self.recheck.as_ref().is_some_and(|t| !t.finished()) {
+            return;
+        }
+        self.recheck_nanos = if self.recheck_nanos == 0 {
+            base
+        } else {
+            self.recheck_nanos
+                .saturating_mul(2)
+                .min(base.saturating_mul(ROOM_RECHECK_CAP))
+        };
+        let state = TimerState::new();
+        ctx.spawn(Box::new(ClockTimer::new(
+            vfs,
+            ctx.now_nanos().saturating_add(self.recheck_nanos),
+            Arc::clone(&state),
+            ctx.submitter(me).clone(),
+            ShardMsg::Kick,
+        )));
+        self.recheck = Some(state);
+    }
+
+    /// The wait is over: stops both timers.
+    fn cancel(&self) {
+        self.timer.cancel();
+        if let Some(t) = &self.recheck {
+            t.cancel();
+        }
+    }
 }
 
 /// A record of this stream the checkpoint cannot pass yet.
@@ -1772,6 +1883,13 @@ pub(crate) struct ShardState {
     /// A flush failed while closing: the close gives up on flushing (the WAL keeps the data)
     /// and is not clean.
     flush_failed: bool,
+    /// Flushes failed in a row (reset by one that succeeds).
+    flush_failures: u32,
+    /// After a failed flush, none starts until this timer fires (`RetryFlush`), so a device
+    /// that keeps failing is not rewritten back to back (issue #141). On a frozen clock the
+    /// timer gives up and the next flush trigger retries: retrying at once when it gives up
+    /// would loop (it gives up within microseconds when the shard is driven in a loop).
+    flush_retry: Option<Arc<TimerState>>,
     /// Tablets dropped since open: their records need no flush before a checkpoint.
     dropped: HashSet<TabletId>,
 
@@ -1817,14 +1935,19 @@ pub(crate) struct ShardState {
     compaction: Option<(TabletId, FamilyId)>,
     /// `Engine::compact` callers: `(table filter, reply)`, served in order.
     compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>)>,
-    /// The last compaction error (reported to a `compact` caller).
-    compaction_error: Option<Error>,
-    /// A background compaction failed: none starts until a flush or new writes happen, or
-    /// (on a moving clock) `backoff_timer` fires.
-    compaction_backoff: bool,
-    backoff_timer: Option<Arc<TimerState>>,
-    /// Background compactions failed in a row (reset by one that succeeds).
-    compaction_failures: u32,
+    /// The running compaction was started for the `compact_all` caller at the front: its
+    /// failure is that caller's. A background compaction's failure is nobody's: it backs
+    /// off (issue #141).
+    compaction_full: bool,
+    /// Every slot due for a compaction is backing off after a failure, so no compaction can
+    /// relieve an L0 stall now (set by `maintain`; D119, issue #141).
+    due_backing_off: bool,
+    /// Fires (`RetryCompaction`) at its deadline, the earliest end of a slot's backoff.
+    backoff_timer: Option<(Arc<TimerState>, u64)>,
+    /// Slots whose compaction failed: failures in a row and the time (VFS monotonic
+    /// nanoseconds) before which no background compaction picks them again, so one slot
+    /// that keeps failing does not stop compaction for the rest of the shard (issue #141).
+    slot_backoff: HashMap<(TabletId, FamilyId), (u32, u64)>,
     /// Checkpoints refused in a row (a full disk), and the timer that retries the last one
     /// on a moving clock (an idle shard has no other event to retry it on).
     checkpoint_failures: u32,
@@ -1946,6 +2069,8 @@ impl ShardState {
             starved_all: false,
             starve_wait: None,
             flush_failed: false,
+            flush_failures: 0,
+            flush_retry: None,
             dropped: HashSet::new(),
             log: VecDeque::new(),
             log_bytes: 0,
@@ -1966,10 +2091,10 @@ impl ShardState {
             picker,
             compaction: None,
             compact_all: VecDeque::new(),
-            compaction_error: None,
-            compaction_backoff: false,
+            compaction_full: false,
+            due_backing_off: false,
             backoff_timer: None,
-            compaction_failures: 0,
+            slot_backoff: HashMap::new(),
             checkpoint_failures: 0,
             checkpoint_timer: None,
             stall: Stall::default(),
@@ -2248,29 +2373,68 @@ impl ShardState {
         Ok(())
     }
 
-    /// Worst-case arena bytes `batch` needs, so a commit is refused (`Busy`) before its
-    /// record is logged rather than half-applied.
-    fn arena_needed(&self, batch: BatchRef<'_>) -> usize {
+    /// Worst-case arena bytes `batch` needs, so a commit waits for room (or is refused with
+    /// `BatchTooLarge` when it could never fit) before its record is logged rather than
+    /// half-applied.
+    ///
+    /// A memtable bump-allocates entries in runs of whole chunks. An entry that does not fit
+    /// the rest of the current run takes a new run, rounded up to whole chunks, and the
+    /// rest of the old run is lost. That lost tail is shorter than both the entry that did
+    /// not fit and one chunk. So every entry costs at most its size plus `min(size,
+    /// chunk)`, and a single large value costs about its size, not twice it (issue #141).
+    /// Each memtable the batch writes to may also leave its last run's tail unused: one
+    /// chunk more per slot touched. The bound is checked by the memtable crate's property
+    /// test `a_batch_stays_within_the_engine_bound`.
+    ///
+    /// An entry larger than a chunk needs contiguous free chunks, which free bytes scattered
+    /// across the arena do not provide. So this also returns the largest and smallest such
+    /// entry's size in chunks, and how many chunks the batch's allocations can take in all
+    /// (each entry at most its own, each slot it creates one).
+    fn arena_needed(&self, batch: BatchRef<'_>) -> ArenaNeed {
         let mut total = 0usize;
-        // `(tablet, family)` slots the batch would create, each a memtable with a chunk of
-        // its own (a table split into many tablets has many slots).
-        let mut new_slots: Vec<(TabletId, FamilyId)> = Vec::new();
+        let mut waste = 0usize;
+        let mut largest = 0usize;
+        let (mut alloc_chunks, mut min_large) = (0usize, usize::MAX);
+        // `(tablet, family)` slots the batch writes to, and those it would create (each a
+        // memtable with a chunk of its own; a table split into many tablets has many slots).
+        let mut touched: Vec<(TabletId, FamilyId)> = Vec::new();
+        let mut unrouted = 0usize;
+        let mut new_slots = 0usize;
         for m in batch.iter().flatten() {
             let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
-            total += ENTRY_OVERHEAD + key + m.value.len();
-            if self.tablets_on()
-                && let Some((tablet, owner)) = self.tablets.route(m.table, m.row)
-                && owner == self.id
-                && !self.memtables.contains_key(&(tablet, m.family))
-                && !new_slots.contains(&(tablet, m.family))
-            {
-                new_slots.push((tablet, m.family));
+            let entry = ENTRY_OVERHEAD + key + m.value.len();
+            total += entry;
+            waste += entry.min(self.chunk_size);
+            largest = largest.max(entry);
+            // The arena's first chunk loses a 64-byte prefix.
+            let chunks = (entry + 64).div_ceil(self.chunk_size);
+            alloc_chunks += chunks;
+            if chunks > 1 {
+                min_large = min_large.min(chunks);
+            }
+            match self.tablets.route(m.table, m.row) {
+                Some((tablet, _)) if !touched.contains(&(tablet, m.family)) => {
+                    touched.push((tablet, m.family));
+                    if self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family)) {
+                        new_slots += 1;
+                    }
+                }
+                Some(_) => {}
+                None => unrouted += 1,
             }
         }
-        // Each allocation may waste the tail of the previous run (less than the entry), and a
-        // new memtable needs a chunk of its own. With tablet changes on, every slot the batch
-        // creates needs one too, and a freeze needs one more.
-        2 * total + (new_slots.len() + 2) * self.chunk_size
+        // A new memtable needs a chunk of its own, and a freeze needs one more.
+        let chunks = touched.len() + unrouted + new_slots + 2;
+        ArenaNeed {
+            bytes: total + waste + chunks * self.chunk_size,
+            run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
+            min_large: if min_large == usize::MAX {
+                0
+            } else {
+                min_large
+            },
+            alloc_chunks: alloc_chunks + new_slots,
+        }
     }
 
     /// Retires the memtables of slots that hold nothing (an empty active memtable, nothing
@@ -2320,23 +2484,55 @@ impl ShardState {
     /// Reserves arena room for `bytes` (on top of everything already reserved by members of
     /// this group and undecided shares) or returns `None` when it would not fit.
     fn reserve_room(&mut self, bytes: &[u8]) -> std::result::Result<usize, Room> {
-        let needed = match BatchRef::new(bytes) {
+        let need = match BatchRef::new(bytes) {
             Ok(batch) => self.arena_needed(batch),
-            Err(_) => 0,
+            Err(_) => ArenaNeed {
+                bytes: 0,
+                run_chunks: 1,
+                min_large: 0,
+                alloc_chunks: 0,
+            },
         };
-        if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+        let needed = need.bytes;
+        // Entries within a chunk fit any free chunk. A larger entry must also find a long
+        // enough run (issue #141: a run too short for it, with enough free chunks elsewhere,
+        // used to poison the shard at apply). Before any large entry allocates, at most the
+        // batch's other allocations and those reserved for this group's earlier members have
+        // taken chunks: if a block of the largest entry's size is sure to be left after
+        // that many (`ShardArena::blocks_left`), every large entry finds a run.
+        let chunk = self.chunk_size;
+        let reserved = self.reserved;
+        let bytes_fit = |arena: &ShardArena| arena.free_bytes() >= reserved.saturating_add(needed);
+        let run_fits = |arena: &ShardArena| {
+            need.run_chunks <= 1
+                || arena.blocks_left(
+                    need.run_chunks,
+                    (need.alloc_chunks - need.min_large) + reserved.div_ceil(chunk),
+                ) >= 1
+        };
+        let fits = |arena: &ShardArena| bytes_fit(arena) && run_fits(arena);
+        if !fits(&self.arena) {
             // Memtables whose readers left since the last reclaim count too.
             self.reclaim_retired();
             self.refresh_free();
         }
         trace!(
-            "shard {} reserve: needed={needed} free={} reserved={} total={}",
+            "shard {} reserve: needed={needed} run={} of {} chunks free={} largest={} reserved={} total={}",
             self.id.0,
+            need.run_chunks,
+            need.alloc_chunks,
             self.arena.free_bytes(),
+            self.arena.largest_free_run(),
             self.reserved,
             self.arena.region().len()
         );
-        if self.arena.free_bytes() < self.reserved.saturating_add(needed) {
+        if !fits(&self.arena) {
+            #[cfg(feature = "test-hooks")]
+            if bytes_fit(&self.arena) {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .run_waits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let total = self.arena.region().len();
             return Err(if needed + 2 * self.chunk_size > total {
                 Room::Never
@@ -2351,7 +2547,7 @@ impl ShardState {
     /// The wait for arena room is over: account the stall and cancel its timer.
     fn end_room_wait(&mut self, now: u64) {
         if let Some(w) = self.room_wait.take() {
-            w.timer.cancel();
+            w.cancel();
             self.shared.metrics[usize::from(self.id.0)]
                 .stall_nanos
                 .fetch_add(now.saturating_sub(w.since), Ordering::Relaxed);
@@ -2527,6 +2723,17 @@ impl ShardState {
             }
             return;
         }
+        // A failed flush waits out its backoff (the timer's `RetryFlush` comes back here),
+        // unless a `flush` or `compact` caller or a tablet change waits for it: a failure
+        // answers those callers and gives the change up at once, so each retries at most
+        // once and never loops.
+        if self.flush_waiters.is_empty()
+            && self.compact_all.is_empty()
+            && self.op.is_none()
+            && self.flush_retry.as_ref().is_some_and(|t| !t.finished())
+        {
+            return;
+        }
         let items = std::mem::take(&mut self.flush_queue);
         self.flushing = items.iter().map(|i| i.root).collect();
         self.flush_running = true;
@@ -2565,7 +2772,7 @@ impl ShardState {
         let waiting = !self.flush_waiters.is_empty() || !self.compact_all.is_empty();
         if !self.starved_all || !waiting || self.closing {
             if let Some(w) = self.starve_wait.take() {
-                w.timer.cancel();
+                w.cancel();
             }
             if !waiting {
                 self.starved_all = false;
@@ -2578,7 +2785,7 @@ impl ShardState {
         }
         if !self.starved_all {
             if let Some(w) = self.starve_wait.take() {
-                w.timer.cancel();
+                w.cancel();
             }
             self.check_flush_waiters();
             return;
@@ -2599,11 +2806,7 @@ impl ShardState {
         let (since, frozen) = match &self.starve_wait {
             None => {
                 let timer = arm(now, ctx);
-                self.starve_wait = Some(RoomWait {
-                    since: now,
-                    timer,
-                    failed_flushes: 0,
-                });
+                self.starve_wait = Some(RoomWait::new(now, timer));
                 (now, false)
             }
             Some(w) => (w.since, w.timer.frozen(now)),
@@ -2624,6 +2827,15 @@ impl ShardState {
             && self.flush_queue.is_empty()
             && !self.freeze_deferred
             && self.retired.is_empty();
+        if !frozen && let Some(w) = &mut self.starve_wait {
+            // As for a room wait: freed chunks are announced to nobody (issue #141).
+            w.arm_recheck(
+                &self.shared.vfs,
+                self.shared.room_recheck_nanos,
+                ctx,
+                self.id,
+            );
+        }
         if now.saturating_sub(since) >= timeout || idle {
             trace!(
                 "shard {} starved freeze: refusing {} flush and {} compact callers \
@@ -2634,7 +2846,7 @@ impl ShardState {
                 now.saturating_sub(since)
             );
             if let Some(w) = self.starve_wait.take() {
-                w.timer.cancel();
+                w.cancel();
             }
             self.starved_all = false;
             for w in self.flush_waiters.drain(..) {
@@ -2658,6 +2870,10 @@ impl ShardState {
         self.flushing.clear();
         match result {
             Ok(_) => {
+                self.flush_failures = 0;
+                if let Some(t) = self.flush_retry.take() {
+                    t.cancel();
+                }
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
                 metrics.flushes.fetch_add(1, Ordering::Relaxed);
                 metrics.flush_nanos.fetch_add(nanos, Ordering::Relaxed);
@@ -2699,11 +2915,35 @@ impl ShardState {
                 self.advance_checkpoint(ctx);
             }
             Err(e) => {
-                // The frozen memtables stay (the WAL keeps their data); they are queued again
-                // at the next flush trigger, never in a tight loop. A poisoned pager stops
-                // flushing until reopen; a failure while closing makes the close unclean.
+                // The frozen memtables stay (the WAL keeps their data) and are queued again;
+                // no flush starts until a backoff (10 ms doubling to 1 s) passes, so a
+                // device that keeps failing is not rewritten back to back, even while a
+                // writer waits for room (issue #141). A poisoned pager stops flushing until
+                // reopen; a failure while closing makes the close unclean.
                 trace!("shard {} flush failed: {e}", self.id.0);
+                self.shared.metrics[usize::from(self.id.0)]
+                    .flush_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 self.requeue_frozen();
+                if !self.closing {
+                    self.flush_failures = self.flush_failures.saturating_add(1);
+                    if let Some(t) = self.flush_retry.take() {
+                        t.cancel();
+                    }
+                    let state = TimerState::new();
+                    self.flush_retry = Some(Arc::clone(&state));
+                    ctx.spawn(Box::new(ClockTimer::new(
+                        &self.shared.vfs,
+                        ctx.now_nanos().saturating_add(backoff_nanos(
+                            self.shared.flush_backoff_nanos,
+                            FLUSH_BACKOFF_CAP,
+                            self.flush_failures,
+                        )),
+                        state,
+                        ctx.submitter(self.id).clone(),
+                        ShardMsg::RetryFlush,
+                    )));
+                }
                 // A tablet change waiting for this flush gives up (its tablets stay put).
                 self.abort_op(crate::error::relay("flush", &e), ctx);
                 // Whoever asked for this flush hears about the failure now rather than
@@ -2741,7 +2981,7 @@ impl ShardState {
             // than at the next group, which may never come (issue #88).
             self.end_room_wait(ctx.now_nanos());
         }
-        self.compaction_backoff = false;
+        self.end_backoff_on_event(ctx.now_nanos());
         self.check_flush_waiters();
         self.spawn_flush(ctx);
         self.maintain(ctx);
@@ -3154,7 +3394,7 @@ impl ShardState {
         let frozen = self.stall.timer.as_ref().is_some_and(|t| t.frozen(now));
         // A stall lets compaction catch up; when none can run (the last one failed, the
         // pager or this shard is poisoned) holding writers would hold them for ever.
-        let mut hopeless = self.compaction_backoff
+        let mut hopeless = self.due_backing_off
             || self.poisoned
             || self.shared.pager_poisoned.load(Ordering::Acquire);
         if !hopeless && self.stall.score >= 1.0 && self.compaction.is_none() {
@@ -3162,7 +3402,7 @@ impl ShardState {
             // On a frozen clock the bucket never refills: only a compaction's completion
             // can end the stall, so with none running writers are admitted (issue #70). A
             // moving clock keeps pacing them (D119).
-            hopeless = self.compaction_backoff || (frozen && self.compaction.is_none());
+            hopeless = self.due_backing_off || (frozen && self.compaction.is_none());
         }
         if self.stall.score < 1.0 || hopeless {
             self.stall.cancel_timer();
@@ -3252,7 +3492,7 @@ impl ShardState {
             return;
         }
         self.refresh_tablets();
-        self.compaction_backoff = false;
+        self.end_backoff_on_event(ctx.now_nanos());
         let members = std::mem::take(&mut self.pending);
 
         // Admission, in order. A conditional member whose row an earlier member of this
@@ -3353,9 +3593,9 @@ impl ShardState {
                 match self.reserve_room(m.bytes.as_slice()) {
                     Ok(bytes) => m.reserved = bytes,
                     Err(Room::Never) => {
-                        let metrics = &self.shared.metrics[usize::from(self.id.0)];
-                        metrics.stalls.fetch_add(1, Ordering::Relaxed);
-                        m.failed = Some(Error::Busy);
+                        // Not a stall: no flush could ever make room. The caller must split
+                        // the batch or raise `memtable_budget` (issue #141).
+                        m.failed = Some(Error::BatchTooLarge);
                         self.settle(m, Ok(()), ctx);
                         continue;
                     }
@@ -3405,11 +3645,7 @@ impl ShardState {
                         ctx.submitter(self.id).clone(),
                         ShardMsg::Kick,
                     )));
-                    self.room_wait = Some(RoomWait {
-                        since: now,
-                        timer: state,
-                        failed_flushes: 0,
-                    });
+                    self.room_wait = Some(RoomWait::new(now, state));
                 }
                 Some(w)
                     if now.saturating_sub(w.since) >= timeout
@@ -3454,6 +3690,18 @@ impl ShardState {
                 && self.prepared.is_empty()
                 && self.unresolved.is_empty()
                 && self.retired.is_empty();
+            if !refuse && !idle && !frozen {
+                // Room freed by a snapshot dropped on another thread or a reader process's
+                // unpin is announced to nobody: look again soon (issue #141).
+                if let Some(w) = &mut self.room_wait {
+                    w.arm_recheck(
+                        &self.shared.vfs,
+                        self.shared.room_recheck_nanos,
+                        ctx,
+                        self.id,
+                    );
+                }
+            }
             if refuse || idle {
                 // Refuse the waiting members; this group's admitted ones still apply.
                 self.end_room_wait(now);
@@ -4696,8 +4944,11 @@ impl ShardState {
         self.checkpoint_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
             &self.shared.vfs,
-            ctx.now_nanos()
-                .saturating_add(compaction_backoff_nanos(self.checkpoint_failures)),
+            ctx.now_nanos().saturating_add(backoff_nanos(
+                self.shared.compaction_backoff_nanos,
+                COMPACTION_BACKOFF_CAP,
+                self.checkpoint_failures,
+            )),
             state,
             ctx.submitter(self.id).clone(),
             ShardMsg::RetryCheckpoint,
@@ -4748,6 +4999,23 @@ impl ShardState {
             }
         }
         due.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let now_nanos = ctx.now_nanos();
+        // Backoffs of slots this shard no longer has (a dropped table, a tablet merged away
+        // or moved off) go (issue #141).
+        if !self.slot_backoff.is_empty() {
+            let id = self.id;
+            self.slot_backoff.retain(|k, _| {
+                view.tablets.entry(k.0).is_some_and(|t| t.shard == id)
+                    && view.catalog.family(k.1).is_some()
+            });
+        }
+        // A stall waits for compaction only while some due slot may compact (D119).
+        self.due_backing_off = !due.is_empty()
+            && due.iter().all(|(_, k)| {
+                self.slot_backoff
+                    .get(k)
+                    .is_some_and(|&(_, until)| until > now_nanos)
+            });
         trace!(
             "shard {} maintain: score={score:.2} best={:?} compaction={:?} full_waiters={}",
             self.id.0,
@@ -4813,26 +5081,28 @@ impl ShardState {
             }
             match task {
                 Some((key, task)) => match self.start_compaction(&view, key, task, ctx) {
-                    Ok(()) => return,
+                    Ok(()) => {
+                        self.compaction_full = true;
+                        return;
+                    }
                     Err(e) => {
                         let (_, reply) = self.compact_all.pop_front().expect("front");
                         reply.notify(Err(e));
                     }
                 },
                 None => {
+                    // Every slot is fully compacted. A background failure meanwhile is not
+                    // this caller's (issue #141): its own failures were reported at once.
                     let (_, reply) = self.compact_all.pop_front().expect("front");
-                    reply.notify(match self.compaction_error.take() {
-                        Some(e) => Err(e),
-                        None => Ok(()),
-                    });
+                    reply.notify(Ok(()));
                 }
             }
         }
-        // After a failure, nothing retries until the backoff timer fires, a flush completes
-        // or a group is admitted, so a dead device does not loop (issues #70, #79). A
-        // poisoned shard starts none: it is dead until reopen.
-        if (due.is_empty() && self.cleanups.is_empty()) || self.compaction_backoff || self.poisoned
-        {
+        // A slot whose compaction failed is not picked again until its backoff ends (or,
+        // on a frozen clock, a flush completes or a group is admitted), so a dead device
+        // does not loop, and one bad slot does not stop the others (issues #70, #79, #141).
+        // A poisoned shard starts none: it is dead until reopen.
+        if (due.is_empty() && self.cleanups.is_empty()) || self.poisoned {
             return;
         }
         let busy: Vec<SstId> = self
@@ -4853,8 +5123,17 @@ impl ShardState {
             }
         }
         let now = self.shared.vfs.now_micros();
-        // The most urgent slot the picker finds work in (another one's inputs may be busy).
+        // The earliest end of a quarantine that kept a due slot from being picked.
+        let mut quarantined: Option<u64> = None;
+        // The most urgent slot the picker finds work in (another one's inputs may be busy,
+        // or its compactions keep failing: it waits out its own backoff, issue #141).
         for (_, key) in due {
+            if let Some(&(_, until)) = self.slot_backoff.get(&key)
+                && until > now_nanos
+            {
+                quarantined = Some(quarantined.map_or(until, |q: u64| q.min(until)));
+                continue;
+            }
             let Some(fam) = view.ssts.family(key.0, key.1) else {
                 continue;
             };
@@ -4873,34 +5152,78 @@ impl ShardState {
             };
             if let Err(e) = self.start_compaction(&view, key, task, ctx) {
                 trace!("shard {} compaction start failed: {e}", self.id.0);
-                self.back_off_compaction(ctx);
+                self.back_off_compaction(key, ctx);
             }
             self.cleanup_turn = true;
             return;
         }
         // Nothing urgent: rewrite an inherited SST that blocks a merge (#95).
         self.start_cleanup(&view, &busy, ctx);
+        // A slot passed over for its backoff is retried when the backoff ends, even if
+        // nothing else happens on the shard by then.
+        if let Some(until) = quarantined {
+            self.arm_compaction_retry(until, ctx);
+        }
     }
 
-    /// A background compaction failed (or could not start): none starts until a flush
-    /// completes, a group is admitted, or, on a moving clock, `compaction_backoff_nanos`
-    /// pass (D119; issues #70, #79).
-    fn back_off_compaction(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
-        self.compaction_backoff = true;
-        self.compaction_failures = self.compaction_failures.saturating_add(1);
-        if let Some(t) = self.backoff_timer.take() {
+    /// Makes sure a `RetryCompaction` fires by `deadline`.
+    fn arm_compaction_retry(&mut self, deadline: u64, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if let Some((t, at)) = &self.backoff_timer
+            && !t.finished()
+            && *at <= deadline
+        {
+            return;
+        }
+        if let Some((t, _)) = self.backoff_timer.take() {
             t.cancel();
         }
         let state = TimerState::new();
-        self.backoff_timer = Some(Arc::clone(&state));
+        self.backoff_timer = Some((Arc::clone(&state), deadline));
         ctx.spawn(Box::new(ClockTimer::new(
             &self.shared.vfs,
-            ctx.now_nanos()
-                .saturating_add(compaction_backoff_nanos(self.compaction_failures)),
+            deadline,
             state,
             ctx.submitter(self.id).clone(),
             ShardMsg::RetryCompaction,
         )));
+    }
+
+    /// A flush completed or a group was admitted. On a frozen clock the backoff timer never
+    /// fires, so these events end a compaction backoff (and every slot's quarantine) there
+    /// (D126). On a moving clock only the timer does: otherwise under steady writes every
+    /// group would restart a compaction that keeps failing (issue #141).
+    fn end_backoff_on_event(&mut self, now: u64) {
+        let frozen = self
+            .backoff_timer
+            .as_ref()
+            .is_some_and(|(t, _)| t.frozen(now));
+        if frozen {
+            self.slot_backoff.clear();
+            self.due_backing_off = false;
+        }
+    }
+
+    /// `key`'s compaction failed (or could not start): no background compaction picks that
+    /// slot again until `compaction_backoff_nanos` of its failures in a row pass, or, on a
+    /// frozen clock only, a flush completes or a group is admitted (D119, D126; issues #70,
+    /// #79, #141). Other slots go on compacting.
+    fn back_off_compaction(
+        &mut self,
+        key: (TabletId, FamilyId),
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        self.shared.metrics[usize::from(self.id.0)]
+            .compaction_failures
+            .fetch_add(1, Ordering::Relaxed);
+        let e = self.slot_backoff.entry(key).or_insert((0, 0));
+        e.0 = e.0.saturating_add(1);
+        e.1 = ctx.now_nanos().saturating_add(backoff_nanos(
+            self.shared.compaction_backoff_nanos,
+            COMPACTION_BACKOFF_CAP,
+            e.0,
+        ));
+        let until = e.1;
+        self.arm_compaction_retry(until, ctx);
     }
 
     /// The smallest user timestamp `family` gets from the shares this shard prepared and
@@ -5042,7 +5365,8 @@ impl ShardState {
                 busy.remove(id);
             }
         }
-        self.compaction = None;
+        let key = self.compaction.take();
+        let full = std::mem::take(&mut self.compaction_full);
         trace!(
             "shard {} compaction done: {:?} ({nanos} ns)",
             self.id.0,
@@ -5053,7 +5377,9 @@ impl ShardState {
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
                 metrics.compactions.fetch_add(1, Ordering::Relaxed);
                 metrics.compaction_nanos.fetch_add(nanos, Ordering::Relaxed);
-                self.compaction_failures = 0;
+                if let Some(key) = key {
+                    self.slot_backoff.remove(&key);
+                }
                 // On a frozen clock the bucket never refills: compaction progress paces a
                 // stall instead (issue #70).
                 let now = ctx.now_nanos();
@@ -5066,14 +5392,16 @@ impl ShardState {
             // on with the remaining tables.
             Err(Error::TableNotFound(_)) => {}
             Err(e) => {
-                // A full compaction reports the failure to its caller; a background one
-                // waits for the next trigger (a flush or new writes) rather than retrying
-                // in a loop against a device that keeps failing.
-                match self.compact_all.pop_front() {
-                    Some((_, reply)) => reply.notify(Err(e)),
-                    None => self.compaction_error = Some(e),
+                // A full compaction reports the failure to its caller. A background one is
+                // nobody's (a later `compact` must not inherit it, issue #141): it backs off,
+                // and its slot waits out a backoff of its own so the other slots still
+                // compact.
+                if full && let Some((_, reply)) = self.compact_all.pop_front() {
+                    reply.notify(Err(e));
                 }
-                self.back_off_compaction(ctx);
+                if let Some(key) = key {
+                    self.back_off_compaction(key, ctx);
+                }
             }
         }
         // A stalled group waits on this compaction: it runs again whatever the outcome.
@@ -5148,11 +5476,15 @@ impl ShardState {
             self.end_room_wait(ctx.now_nanos());
             self.wait_room = false;
             // No compaction starts while closing: its backoff timer has nothing to retry.
-            if let Some(t) = self.backoff_timer.take() {
+            if let Some((t, _)) = self.backoff_timer.take() {
                 t.cancel();
             }
             // Close's own flush advances the checkpoint; a refused one makes it unclean.
             if let Some(t) = self.checkpoint_timer.take() {
+                t.cancel();
+            }
+            // The close's flush goes at once; one that fails gives up flushing.
+            if let Some(t) = self.flush_retry.take() {
                 t.cancel();
             }
             if self.freeze(true).is_err() {
@@ -5456,11 +5788,17 @@ impl ShardState {
                 self.maintain(ctx);
             }
             ShardMsg::Kick => {}
+            ShardMsg::RetryFlush => {
+                // Only the current backoff timer's firing ends the backoff.
+                if self.flush_retry.as_ref().is_some_and(|t| t.fired()) {
+                    self.flush_retry = None;
+                    self.spawn_flush(ctx);
+                }
+            }
             ShardMsg::RetryCompaction => {
                 // Only the current backoff timer's firing ends the backoff.
-                if self.backoff_timer.as_ref().is_some_and(|t| t.fired()) {
+                if self.backoff_timer.as_ref().is_some_and(|(t, _)| t.fired()) {
                     self.backoff_timer = None;
-                    self.compaction_backoff = false;
                     self.maintain(ctx);
                 }
             }
@@ -5563,9 +5901,17 @@ impl ShardHandler for ShardState {
         self.retry_starved_freeze(ctx);
         self.try_finish_close(ctx);
         #[cfg(feature = "test-hooks")]
-        self.shared.metrics[usize::from(self.id.0)]
-            .aborted
-            .store(self.aborted.len() as u64, Ordering::Relaxed);
+        {
+            let m = &self.shared.metrics[usize::from(self.id.0)];
+            m.aborted
+                .store(self.aborted.len() as u64, Ordering::Relaxed);
+            m.arena_free
+                .store(self.arena.free_bytes() as u64, Ordering::Relaxed);
+            m.arena_run
+                .store(self.arena.largest_free_run() as u64, Ordering::Relaxed);
+            m.arena_len
+                .store(self.arena.region().len() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -5659,14 +6005,19 @@ mod tests {
 
     #[test]
     fn compaction_backoff_doubles_from_one_second_up_to_a_minute() {
-        let secs: Vec<u64> = (1..=9)
-            .map(|f| compaction_backoff_nanos(f) / 1_000_000_000)
-            .collect();
+        let base = 1_000_000_000;
+        let backoff = |f| backoff_nanos(base, COMPACTION_BACKOFF_CAP, f);
+        let secs: Vec<u64> = (1..=9).map(|f| backoff(f) / base).collect();
         assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
         // Never shorter than the first wait, never longer than the cap, at any count.
-        assert_eq!(compaction_backoff_nanos(0), COMPACTION_BACKOFF_NANOS);
+        assert_eq!(backoff(0), base);
         for f in [64, 65, 1_000, u32::MAX] {
-            assert_eq!(compaction_backoff_nanos(f), COMPACTION_BACKOFF_MAX_NANOS);
+            assert_eq!(backoff(f), 60 * base);
         }
+        // A flush's: 10 ms doubling up to 1 s.
+        let ms: Vec<u64> = (1..=9)
+            .map(|f| backoff_nanos(10_000_000, FLUSH_BACKOFF_CAP, f) / 1_000_000)
+            .collect();
+        assert_eq!(ms, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
     }
 }

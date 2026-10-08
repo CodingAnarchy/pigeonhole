@@ -646,6 +646,114 @@ fn catalog_changes_persist_and_tables_can_be_dropped() {
 }
 
 #[test]
+fn a_value_at_the_documented_limit_fits_the_arena() {
+    // Issue #141 (8-9 F3): D16 allows a value up to half a shard's arena, but the arena
+    // accounting charged every entry twice, so such a value (or a batch of a few large
+    // values adding up to it) was refused as if it could never fit. One large entry wastes
+    // at most a chunk, not its own size.
+    for (budget, seed) in [(1u64 << 20, 31), (8 << 20, 32), (64 << 20, 33)] {
+        let vfs = SimVfs::new(seed);
+        let mut o = owned(Arc::clone(&vfs), 1);
+        o.memtable_budget = budget;
+        o.wal.segment_size = (2 * budget).max(4 << 20);
+        let db = Engine::open(Path::new(DB), o).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let half = (budget / 2) as usize;
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &t, "f", b"half", b"q", &vec![3u8; half]);
+        db.commit(wb, Some(Durability::None))
+            .unwrap_or_else(|e| panic!("budget {budget}: a value of half the arena: {e}"));
+        // A batch of four quarter-arena-sized values adds up to the same and fits too.
+        let mut wb = WriteBatch::new();
+        for i in 0..4u8 {
+            put(&mut wb, &t, "f", &[b'b', i], b"q", &vec![i; half / 4]);
+        }
+        db.commit(wb, Some(Durability::None))
+            .unwrap_or_else(|e| panic!("budget {budget}: four eighths of the arena: {e}"));
+        assert_eq!(
+            get_bytes(&db, &t, "f", b"half", b"q").map(|v| v.len()),
+            Some(half)
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn a_value_with_free_bytes_but_no_long_enough_run_waits_instead_of_poisoning() {
+    // Issue #141 review: free bytes scattered across the arena do not hold an entry larger
+    // than a chunk, which needs one contiguous run. With enough free bytes in total but no
+    // run long enough, the commit used to be admitted, failed to allocate at apply, and
+    // poisoned the shard. It now waits for room (here in vain: a stall) and the shard goes on.
+    let vfs = SimVfs::new(34);
+    let mut o = owned(Arc::clone(&vfs), 1);
+    o.memtable_budget = 1 << 20;
+    o.wal.segment_size = 4 << 20;
+    o.write_stall_timeout_nanos = 300_000_000;
+    // Without tablet changes the chunk is a fixed budget / 64.
+    o.tablet_changes = false;
+    let chunk = 16usize << 10;
+    // `x` freezes on its own once it holds 93 chunks.
+    o.memtable_freeze_bytes = (93 * chunk) as u64;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let table = |name: &str| {
+        db.create_table(name, &[("f".into(), FamilyOptions::default())])
+            .unwrap()
+    };
+    let (x, p1, p2) = (table("x"), table("p1"), table("p2"));
+    let commit = |t: &pigeonhole_engine::TableInfo, row: &[u8], len: usize| {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, t, "f", row, b"q", &vec![5u8; len]);
+        db.commit(wb, Some(Durability::None))
+    };
+    let allocated = || {
+        let (free, _, len) = db.arena_free(0);
+        (len - free) as usize / chunk
+    };
+    // `x` takes chunks from the bottom, one per 15 KiB row; `p1` and `p2` each take one
+    // chunk where `x` stopped, so they sit at chunks 31 and 63 as islands.
+    let mut row = 0u32;
+    let mut grow_x_to = |n: usize| {
+        while allocated() < n {
+            assert!(row < 200, "x never reached {n} chunks");
+            commit(&x, &row.to_be_bytes(), 15 << 10).unwrap();
+            row += 1;
+        }
+    };
+    grow_x_to(31);
+    commit(&p1, b"island", 1).unwrap();
+    grow_x_to(63);
+    commit(&p2, b"island", 1).unwrap();
+    // `x` freezes at 93 chunks (its fresh memtable is the third island) and its old chunks
+    // come back once flushed. Write until that flush has happened: counting chunks would
+    // race it (the flush may free them before the count is read).
+    let flushed = db.metrics().flushes;
+    while db.metrics().flushes == flushed {
+        assert!(row < 200, "x never froze and flushed");
+        commit(&x, &row.to_be_bytes(), 15 << 10).unwrap();
+        row += 1;
+    }
+    // Once `x`'s old chunks are reclaimed (the half's own reservation reclaims them if
+    // nothing has yet), the free runs are 31, 31, 31 and 32 chunks: 1.5 MiB free, but half
+    // the arena (D16's limit: 33 chunks with its node and the prefix) fits none of them.
+    let half = 512usize << 10;
+    let r = commit(&x, b"half", half);
+    assert!(
+        matches!(r, Ok(_) | Err(Error::Busy)),
+        "a value that fits no run: {r:?}"
+    );
+    assert!(
+        db.arena_run_waits(0) >= 1,
+        "the half never met an arena with enough free bytes but no run for it"
+    );
+    // The shard is not poisoned.
+    commit(&p2, b"after", 100).unwrap();
+    commit(&x, b"after", 100).unwrap();
+    db.close().unwrap();
+}
+
+#[test]
 fn value_limits_arena_pressure_and_closed_handles() {
     let vfs = SimVfs::new(12);
     let mut o = owned(Arc::clone(&vfs), 1);
@@ -684,11 +792,18 @@ fn value_limits_arena_pressure_and_closed_handles() {
             &vec![1u8; 4096],
         );
     }
+    // Not a stall (issue #141): its own non-retryable error, and no stall is counted (this
+    // test's writes flush long before the arena fills; the refusal used to be counted).
+    let stalls = db.metrics().stalls.0;
     assert!(matches!(
         db.commit(wb, Some(Durability::None)),
-        Err(Error::Busy)
+        Err(Error::BatchTooLarge)
     ));
-    assert!(db.metrics().stalls.0 >= 1);
+    assert_eq!(
+        db.metrics().stalls.0,
+        stalls,
+        "a never-fits refusal is no stall"
+    );
     // Everything written is readable, from memtables and SSTs alike.
     let snap = db.snapshot().unwrap();
     let mut cursor = db
