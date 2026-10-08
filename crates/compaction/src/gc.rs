@@ -34,7 +34,7 @@
 //! A counter delete hides only entries with a lower seqno, so besides the `min_ts_above` rule
 //! (useless there: every source holding a counter has timestamp 0) a bottommost delete
 //! visible at every read point is purged when no other source that may hold keys of its row
-//! has an entry at or below its seqno: nothing outside the inputs is old enough for it to
+//! starts at or below its seqno: nothing outside the inputs is old enough for it to
 //! hide, and what it hides in the inputs is dropped with it. Sources the engine leaves out
 //! of `other_sources` start above the newest input seqno, so they never block it.
 
@@ -278,7 +278,7 @@ impl Gc {
 
     /// Counter families: whether a bottommost delete at `ts` with `seqno`, visible at every
     /// read point, may be purged: by the timestamp rule, or because no other source that
-    /// may hold keys of the row has an entry at or below its seqno (#290).
+    /// may hold keys of the row starts at or below its seqno (#290).
     fn counter_purgeable(&self, ts: Timestamp, seqno: Seqno) -> bool {
         self.purgeable(ts) || (self.bottommost && self.row_guard.iter().all(|&(lo, _)| lo > seqno))
     }

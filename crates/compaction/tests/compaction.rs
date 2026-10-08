@@ -442,15 +442,21 @@ fn check_counter_purge(seed: u64, commits: usize) {
     let family = family_options(&h);
     let max = h.model.snapshot();
 
-    // Each column, and each row's markers, goes whole to the inputs or to the other source.
+    // Units go whole to the inputs or to the other source: each column and each row's
+    // markers, or each `(column, timestamp)` group, or each entry. The finer splits put
+    // cell and column deletes apart from what they hide.
+    let split = rng.below(3);
     let mut outside: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     let (mut inputs, mut other): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
     for (k, v, _) in &h.entries {
-        let (body, _, _, kind) = split_suffix(k).unwrap();
-        let unit = if kind == Kind::FamilyDelete {
-            body[..row_prefix_len(k).unwrap()].to_vec()
-        } else {
-            body.to_vec()
+        let (body, ts, _, kind) = split_suffix(k).unwrap();
+        let unit = match split {
+            _ if kind == Kind::FamilyDelete && split == 0 => {
+                body[..row_prefix_len(k).unwrap()].to_vec()
+            }
+            0 => body.to_vec(),
+            1 => [body, &ts.to_be_bytes()].concat(),
+            _ => k.clone(),
         };
         let out = *outside.entry(unit).or_insert_with(|| rng.chance(350_000));
         if out { &mut other } else { &mut inputs }.push((k.clone(), v.clone()));
@@ -511,7 +517,9 @@ fn check_counter_purge(seed: u64, commits: usize) {
     after.extend(other_sst.as_ref().map(|s| s.1.clone()));
 
     let what = |phase: &str, s: Seqno, now: Timestamp| {
-        format!("seed {seed}: {phase}, listed {listed}, snapshots {snapshots:?}, read at {s}/{now}")
+        format!(
+            "seed {seed}: {phase}, split {split}, listed {listed}, snapshots {snapshots:?}, read at {s}/{now}"
+        )
     };
     let mut points = snapshots.clone();
     points.push(max);
@@ -1037,6 +1045,34 @@ fn counter_deletes_purge_at_the_bottom_by_seqno() {
                 (key(b"r", b"n", 0, 5, Kind::Merge), i64v(4)),
             ]
         };
+        assert_eq!(kept, want, "{others:?}");
+    }
+
+    // Without a marker: a source on the row starting at or below the column delete's seqno
+    // keeps it (an operand there written before it stays hidden).
+    let e = vec![
+        (key(b"r", b"n", 50, 3, Kind::ColumnDelete), Vec::new()),
+        (key(b"r", b"n", 7, 6, Kind::CellDelete), Vec::new()),
+        (key(b"r", b"n", 0, 5, Kind::Merge), i64v(4)),
+    ];
+    let input = db.sst(&family, &e);
+    for (others, purged) in [
+        (Some(vec![]), [true, true]),
+        (Some(vec![source(&row_key, (4, 9))]), [true, false]),
+        (Some(vec![source(&row_key, (3, 9))]), [false, false]),
+        (None, [false, false]),
+    ] {
+        gc.other_sources = others.clone();
+        let (_, kept) = compact(&db, &family, std::slice::from_ref(&input), gc.clone());
+        let mut want = Vec::new();
+        if !purged[1] {
+            want.push(e[1].clone());
+        }
+        if !purged[0] {
+            want.push(e[0].clone());
+        }
+        want.push(e[2].clone());
+        want.sort();
         assert_eq!(kept, want, "{others:?}");
     }
 }
