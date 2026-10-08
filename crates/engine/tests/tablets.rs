@@ -1783,13 +1783,13 @@ fn concurrent_moves_never_take_a_shard_past_its_slots() {
     }
     // #122: the refused move is counted as a slot-budget refusal, and so is a split on the
     // now full shard 2 (its tablet `["", "k4")` would add 21 slots to 63).
-    let (slots, view) = db.engine.metrics().tablet_refusals;
+    let (slots, view) = db.engine.tablet_refusals();
     assert!(slots >= 1, "{:?}", db.engine.metrics());
     assert_eq!(view, 0);
     let m = db.engine.split_tablet_pending(id, b"k2").unwrap();
     let e = db.drive(m).unwrap_err();
     assert!(matches!(e, pigeonhole_engine::Error::Unsupported(_)), "{e}");
-    assert_eq!(db.engine.metrics().tablet_refusals, (slots + 1, 0));
+    assert_eq!(db.engine.tablet_refusals(), (slots + 1, 0));
     assert_eq!(on(&db, 2), 3, "{:?}", db.ranges());
     close(db);
 }
