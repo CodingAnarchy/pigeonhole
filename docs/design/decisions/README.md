@@ -8,7 +8,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 
 | Phase | File | Range |
 |---|---|---|
-| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D160 |
+| 1 — Core engine | [phase-1.md](phase-1.md) | D1–D162 |
 
 ## Index
 
@@ -27,7 +27,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D13](phase-1.md#d13) — family ids are unique per database; SSTs belong to a (tablet, family)
 - [D14](phase-1.md#d14) — extra downward dependencies
 - [D15](phase-1.md#d15) — shared vocabulary types live in `format`
-- [D16](phase-1.md#d16) — value size limits · revised after review
+- [D16](phase-1.md#d16) — value size limits · revised after review · **amended by D162**
 - [D17](phase-1.md#d17) — the `async` feature is off by default until Phase 3
 - [D18](phase-1.md#d18) — filters are cache-line-blocked bloom filters in Phase 1
 - [D19](phase-1.md#d19) — read-your-writes: commits return once visible · revised after review
@@ -135,9 +135,9 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B · **amended by D156**
 - [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
 - [D123](phase-1.md#d123) — Does the sim's recovery helper cover a coordinator that is also a participant · superseded for new code by D114; engine adoption in #48 · **amended by D125**
-- [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D138**
+- [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D138, D161, D162**
 - [D125](phase-1.md#d125) — the model suites use the sim's record-level oracle on every crash · harness, #48 · amends D123
-- [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119
+- [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119 · **amended by D161**
 - [D127](phase-1.md#d127) — a model harness attributes an error to an armed power loss only once the crash has fired · harness, #62
 - [D128](phase-1.md#d128) — flush and compaction outputs are trimmed to their length before they are published · pager, compaction, #106
 - [D129](phase-1.md#d129) — tablet changes are off by default until hardened · tablets, #97 · **amended by D153**
@@ -172,6 +172,8 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
 - [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
 - [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60
+- [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126
+- [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 
 ## Open questions
 _None._
