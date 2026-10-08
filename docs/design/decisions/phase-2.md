@@ -537,3 +537,14 @@ The engine and public harnesses keep four families per table; a new `counters` t
 **Owner:**
 - #284: versions beyond `max_versions` in a counter family are never purged. Reads apply the limit, and a TTL bounds the space. This matches Bigtable, whose version limits are also lazy cleanup rather than a read guarantee. #284 is closed.
 - #295: increments of one counter within one mutation combine (`incr(c, 1).incr(c, 2)` adds 3), as Bigtable's read-modify-write rules do. This is an exception to D34 for counter families.
+
+<a id="d187"></a>
+## D187 — Counter-family deletes purge at the bottom level by seqno (approved; compaction, engine, #290, #298; refines D70, D186)
+### Proposed decision: counter-family deletes purge at the bottom by seqno (#290)
+D70 purges a bottommost delete only below `GcPolicy::min_ts_above`. Every source that holds a fixed-timestamp counter (D179) has minimum timestamp 0, so in a family that uses `incr` the bound stays 0 and no counter tombstone ever purged.
+
+A counter delete hides only entries with a lower seqno in its scope. So a bottommost delete visible at every read point (stripe 0) is also purged when no other source that may hold keys of its row (`GcPolicy::other_sources`, filtered by key range per row) starts at or below its seqno. Nothing outside the inputs is then old enough for it to hide, and what it hides in the inputs is dropped with it (same stripe, lower seqno). Sources the engine leaves out of `other_sources` start above the newest input seqno, so they never block a purge. Later writes take seqnos above `visible`, and prepared shares at or below it are listed. When `other_sources` is `None`, only the timestamp rule applies.
+
+**Interim behavior:** implemented in `gc.rs` (`counter_purgeable`) for cell and column deletes and family markers. Reads never change, so `Model::purge` stays a no-op for counter families. Tests: `counter_deletes_purge_at_the_bottom_by_seqno`, and the proptest `counter_purges_preserve_reads_with_other_sources`, which splits rows between the inputs and another source with interleaved seqnos (whole columns and row markers, `(column, timestamp)` groups, or single entries, so a cell or column delete can land apart from what it hides). It catches a purge that ignores the other sources, for markers and for cell and column deletes, and operand combining that ignores them. The purge relies on compaction subranges being row-aligned (`CompactionTask::subranges`).
+
+**Coordinator:** confirmed after independent review (#298). No path was found where the purge changes a read. The review's test gap (cell and column deletes landing apart from what they hide) is covered.

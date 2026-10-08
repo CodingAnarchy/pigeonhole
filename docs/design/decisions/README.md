@@ -82,7 +82,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D67](phase-1.md#d67) — one block decoder · sst, ICR 0004
 - [D68](phase-1.md#d68) — index partitions and readahead · sst
 - [D69](phase-1.md#d69) — blob record caching and logical length · sst
-- [D70](phase-1.md#d70) — `GcPolicy::min_ts_above` bounds bottommost purges · compaction · **amended by D147**
+- [D70](phase-1.md#d70) — `GcPolicy::min_ts_above` bounds bottommost purges · compaction · **amended by D147** · **refined by D187**
 - [D71](phase-1.md#d71) — additive `JobContext` fields `target_sst_bytes` and `clock` · compaction
 - [D72](phase-1.md#d72) — other additive public API · compaction
 - [D73](phase-1.md#d73) — counter operands are not folded across timestamps in Phase 1 · Phase 2 folding tracked in #34
@@ -198,7 +198,8 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D183](phase-2.md#d183) — Level outputs are cut into power-of-two pieces so a file at rest stays near its live size · compaction, pager, sst, #185, #276 · refines D160
 - [D184](phase-2.md#d184) — Blob GC follows the blob references each SST records · compaction, engine, format, #240, #285 · refines D180
 - [D185](phase-2.md#d185) — `shrink` relocates blob extents · engine, #231, #286 · amends D160
-- [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments
+- [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments · **refined by D187**
+- [D187](phase-2.md#d187) — Counter-family deletes purge at the bottom level by seqno · compaction, engine, #290, #298 · refines D70, D186
 
 ## Open questions
 _None._
