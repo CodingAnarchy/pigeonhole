@@ -74,6 +74,26 @@ fn runs_with_tablet_changes_off_match_the_model() {
 }
 
 #[test]
+fn a_snapshot_taken_before_a_compaction_publishes_reads_its_own_view() {
+    // Issue #204 (seed 193 of the deferred-I/O sweep): a bottommost compaction decided to
+    // purge a row delete, then a commit applied a put at an older explicit timestamp, then
+    // a snapshot was taken, all before the compaction's root commit was durable and its view
+    // published. The put is a later write (D74, D147): visible once the purge is published.
+    // The snapshot reads the view it was taken in, where the delete still hides it, and
+    // that read must never change. The harness took the purge at its `max_seqno` for every
+    // read point, the snapshot's included, and reported `SnapshotChanged`.
+    let mut cfg = Config::standard(250);
+    cfg.shards = 1;
+    (cfg.tablet_changes, cfg.balance_fast) = (false, false);
+    cfg.deferred_io = true;
+    let stats = run(193, &cfg).unwrap_or_else(|f| panic!("{f}"));
+    assert!(
+        stats.reads_at_older_views > 0,
+        "seed 193 no longer reaches the case: {stats:?}"
+    );
+}
+
+#[test]
 fn harness_regressions_from_the_seed_sweep() {
     // Seed 248: an armed crash fired on background I/O and the held snapshots' re-check
     // after a commit found the store dead (issue #62's pattern). Seed 288: a surviving
