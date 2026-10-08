@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, PoisonError, Weak};
 
 use pigeonhole_compaction::{BlobSink, NewBlobFile, blob_pointer, encode_blob_stored};
 use pigeonhole_format::key::Kind;
@@ -63,7 +63,11 @@ const VALUE_EXTENTS: u32 = 256;
 /// they stay. Dropped while it still holds files (not handed to a notifier, or the commit
 /// stopped before its commit point), it queues their `DropBlobFile`.
 pub(crate) struct LargeValues {
-    shared: Arc<Shared>,
+    /// Weak: the guard lives in the commit's reply slot, which the engine may hold (a
+    /// crashed engine's pending commits), so a strong reference would keep the engine
+    /// alive forever. With the engine gone there is nothing to release: the next open
+    /// sweeps what nothing points into.
+    shared: Weak<Shared>,
     files: Vec<BlobFileId>,
 }
 
@@ -79,7 +83,7 @@ impl LargeValues {
     fn new(shared: &Arc<Shared>, files: Vec<BlobFileId>) -> Self {
         shared.large_open.fetch_add(1, Ordering::AcqRel);
         LargeValues {
-            shared: Arc::clone(shared),
+            shared: Arc::downgrade(shared),
             files,
         }
     }
@@ -95,7 +99,10 @@ impl LargeValues {
         notifier.on_resolve(move |outcome| {
             let mut guard = self;
             let succeeded = succeeded(outcome);
-            let shared = Arc::clone(&guard.shared);
+            let Some(shared) = guard.shared.upgrade() else {
+                guard.files.clear();
+                return;
+            };
             let mut logged = shared
                 .large_logged
                 .lock()
@@ -145,8 +152,15 @@ impl LargeValues {
                 .map(|id| Edit::DropBlobFile { blob_file: *id })
                 .collect())
         };
-        let shared = Arc::clone(&self.shared);
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        // Weak in the request too: it waits in the engine's own manifest queue.
+        let weak = Arc::downgrade(&shared);
         let req = ManifestReq::edits(Vec::new(), move |_| {
+            let Some(shared) = weak.upgrade() else {
+                return;
+            };
             let mut pending = shared
                 .large_pending
                 .lock()
@@ -159,14 +173,16 @@ impl LargeValues {
             kind: ReqKind::Catalog(Box::new(change)),
             ..req
         };
-        manifest::submit(&self.shared, ShardId(0), req);
+        manifest::submit(&shared, ShardId(0), req);
     }
 }
 
 impl Drop for LargeValues {
     fn drop(&mut self) {
         self.release();
-        self.shared.large_open.fetch_sub(1, Ordering::AcqRel);
+        if let Some(shared) = self.shared.upgrade() {
+            shared.large_open.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
