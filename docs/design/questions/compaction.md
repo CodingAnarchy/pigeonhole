@@ -1,0 +1,30 @@
+# Compaction questions (Phase 2)
+
+## Proposed decision: the tiered picker's runs, triggers and output levels (#31)
+The spec says only "tiered/universal for write-heavy families". `Levels` keeps L0 overlapping and newest first and every deeper level sorted and disjoint, so a merged run must land in a whole level.
+
+**Interim behavior:**
+- The sorted runs are each L0 file and each non-empty deeper level, newest first.
+- Once L0 holds `l0_trigger` files, all of them merge, taking in the following level runs while each is at most `PickerOptions::tiered_size_ratio_percent` (default 1) larger than what was taken so far. Level 1 is always taken when it is not empty, since the output must go above the first run left out.
+- Once the runs above the oldest one hold more than `PickerOptions::tiered_max_space_amp_percent` (default 200) of its bytes, every run merges into the last level.
+- The output goes just above the first run not taken (the deepest free level), or to the last level when every run was taken. Runs therefore stay ordered newest first down the levels, so GC's `bottommost` and `min_ts_above` mean what they do for leveled. Whole runs move, so no row is ever split (D78 holds trivially).
+- A lone L0 file over levels it does not need to merge with is a `TrivialMove`.
+- `score`, which drives picking, is the larger of L0 depth over `l0_trigger` and space amplification over its cap.
+- The two `PickerOptions` fields are additive (`PickerOptions` is `#[non_exhaustive]`), engine-wide like the leveled knobs; the public crate exposes none of them.
+
+## Q: tiered write amplification once L1 holds a run (#31 review)
+Because L1 is always taken when it holds a run, every L0 merge after that rewrites all of L1. L1 grows by one L0 batch per merge until the size ratio takes in L2 or space amplification fires, and it can reach about 2× the last level first. Over k merges that rewrites up to k batches each, so write amplification grows roughly quadratically in k, where universal compaction's is logarithmic.
+
+**Proposal:** accept this for now. Tiered is still opt-in, and the public crate refuses it until #44. Bound it in [#228](https://github.com/CodingAnarchy/pigeonhole/issues/228) (Phase 2). The preferred fix there is sorted runs in L0, as RocksDB universal does, which is a manifest/format change. The format-free alternative is to push L1..Lk down into a free level before L1 would be forced.
+
+**Interim behavior:** as described; the picker proptest bounds run count and space amplification but not write amplification.
+
+## Proposed decision: the write stall follows L0 depth only (#31 review; D119)
+The engine set the stall score to the highest picking score among the shard's slots. That already let a leveled deeper level over its target pace writers. With tiered's space amplification included, a fresh tree with three equal L0 files (200% amplification, the default cap) would have stalled writers below `l0_trigger`, for the length of a full-tree merge.
+
+**Interim behavior:** the added `CompactionPicker::stall_score` returns L0 depth over `l0_trigger` for every style, and the stall uses only that. `score` (L0, deeper levels, space amplification) only decides which slot compacts first. For leveled families this narrows the stall to L0, as D119 describes it.
+
+## Proposed decision: the engine picks per family (#31)
+The engine built one leveled `CompactionPicker` per shard and used it for every family.
+
+**Interim behavior:** each shard keeps a leveled and a tiered picker and scores and picks each `(tablet, family)` slot with its family's style (a `match`, so a new style fails to compile). `FifoByTime` families keep compacting leveled until #32's picker lands (engine-level only; the public crate refuses the style, D95). Full compactions (`Engine::compact`) and #95 cleanups still merge everything into the last level whatever the style. The engine model-check harness gives family `g` the tiered style, so every suite and seed sweep runs both pickers against the oracle; runs that turn background compaction off for deterministic purges also set `tiered_max_space_amp_percent = u32::MAX`.

@@ -1845,7 +1845,9 @@ pub(crate) struct ShardState {
     unreported: Vec<UnreportedShare>,
 
     // ---- compaction and stalls ----
-    picker: CompactionPicker,
+    /// Pickers by `CompactionStyle`: each family compacts by its own style.
+    leveled: CompactionPicker,
+    tiered: CompactionPicker,
     /// The slot a compaction task is running for.
     compaction: Option<(TabletId, FamilyId)>,
     /// `Engine::compact` callers: `(table filter, reply)`, served in order.
@@ -1938,7 +1940,8 @@ impl ShardState {
         tablets: Arc<TabletMap>,
         ts_floor: Timestamp,
     ) -> Self {
-        let picker = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
+        let leveled = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
+        let tiered = CompactionPicker::new(CompactionStyle::Tiered, shared.picker.clone());
         Self {
             id,
             shared,
@@ -2003,7 +2006,8 @@ impl ShardState {
             commit_ckpt: HashSet::new(),
             share_reports: HashMap::new(),
             unreported: Vec::new(),
-            picker,
+            leveled,
+            tiered,
             compaction: None,
             compact_all: VecDeque::new(),
             compaction_full: false,
@@ -4890,13 +4894,23 @@ impl ShardState {
         out
     }
 
-    /// Scores the shard's slots, refreshes the stall score and starts the most urgent
-    /// compaction (or the next step of a full compaction) if none is running.
+    /// The picker for a family compacting by `style`.
+    fn picker(&self, style: CompactionStyle) -> &CompactionPicker {
+        match style {
+            // FIFO-by-time compacts leveled until its own picker lands (#32).
+            CompactionStyle::Leveled | CompactionStyle::FifoByTime => &self.leveled,
+            CompactionStyle::Tiered => &self.tiered,
+        }
+    }
+
+    /// Scores the shard's slots, refreshes the stall score (L0 depth only, D119) and starts
+    /// the most urgent compaction (or the next step of a full compaction) if none is running.
     fn maintain(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.replaying {
             return;
         }
         let view = self.shared.view.load_full();
+        // The write stall's score: the highest L0 depth over its trigger among the slots.
         let mut score = 0.0f64;
         // Slots that need a compaction, most urgent first.
         let mut due: Vec<(f64, (TabletId, FamilyId))> = Vec::new();
@@ -4910,8 +4924,10 @@ impl ShardState {
             if meta.merge == MergeKind::Unknown {
                 continue;
             }
-            let s = self.picker.score(&fam.levels_meta());
-            score = score.max(s);
+            let picker = self.picker(meta.options.compaction);
+            let levels = fam.levels_meta();
+            let s = picker.score(&levels);
+            score = score.max(picker.stall_score(&levels));
             if s >= 1.0 {
                 due.push((s, key));
             }
@@ -4966,7 +4982,7 @@ impl ShardState {
                 return;
             }
             let filter = *filter;
-            let last = self.picker.options().max_levels.max(2) - 1;
+            let last = self.shared.picker.max_levels.max(2) - 1;
             let busy: Vec<SstId> = self
                 .shared
                 .busy_ssts
@@ -5058,7 +5074,7 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let Some(task) = self.picker.pick(
+            let Some(task) = self.picker(meta.options.compaction).pick(
                 key.0,
                 key.1,
                 &fam.levels_meta(),

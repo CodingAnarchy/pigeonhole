@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use common::*;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::{
-    CompactionJob, CompactionOutput, CompactionTask, GcPolicy, I64Add, JobContext, JobPoll,
-    KeyRange, TaskKind,
+    CompactionJob, CompactionOutput, CompactionPicker, CompactionTask, GcPolicy, I64Add,
+    JobContext, JobPoll, KeyRange, Levels, PickerOptions, TaskKind,
 };
 use pigeonhole_format::key::{Kind, encode_key, encode_marker_key, split_suffix};
-use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{CompactionStyle, FamilyOptions, SstMeta};
 use pigeonhole_format::{FamilyId, Seqno, SstId, TableId, TabletId, Timestamp};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 use pigeonhole_io::{Vfs, VfsRef};
@@ -104,7 +104,16 @@ fn run_sliced(db: &Db, job: &mut CompactionJob) -> usize {
     }
 }
 
-fn check_compaction(seed: u64, commits: usize) {
+/// Which compaction `check_compaction` runs.
+#[derive(Clone, Copy, Debug)]
+enum Choose {
+    /// A random leveled-shaped one.
+    Random,
+    /// The tiered picker's (issue #31).
+    Tiered,
+}
+
+fn check_compaction(seed: u64, commits: usize, choose: Choose) {
     let mut h = random_history(seed, common::commits(commits));
     let mut rng = Rng::new(seed ^ 0xc0c0);
     let mut db = Db::new(seed);
@@ -162,10 +171,31 @@ fn check_compaction(seed: u64, commits: usize) {
 
     // Choose the compaction.
     let choice = rng.below(3);
-    let (from, to): (Vec<usize>, u8) = match choice {
-        0 => (vec![0, 1], 1),
-        1 => (vec![1, 2], 2),
-        _ => (vec![0, 1, 2], 2),
+    let (from, to): (Vec<usize>, u8) = match choose {
+        Choose::Random => match choice {
+            0 => (vec![0, 1], 1),
+            1 => (vec![1, 2], 2),
+            _ => (vec![0, 1, 2], 2),
+        },
+        Choose::Tiered => {
+            let mut options = PickerOptions::default();
+            options.l0_trigger = 1;
+            options.max_levels = 3;
+            options.tiered_size_ratio_percent = rng.below(200) as u32;
+            options.tiered_max_space_amp_percent = 1 + rng.below(300) as u32;
+            let picker = CompactionPicker::new(CompactionStyle::Tiered, options);
+            let metas = Levels {
+                levels: levels
+                    .iter()
+                    .map(|l| l.iter().map(|s| Arc::new(s.0.clone())).collect())
+                    .collect(),
+            };
+            let Some(t) = picker.pick(TabletId(1), FamilyId(1), &metas, &[], 0, 0) else {
+                return;
+            };
+            let from = t.inputs.iter().map(|(l, _)| usize::from(*l)).collect();
+            (from, t.output_level)
+        }
     };
     let bottommost = to == 2 || levels[2].is_empty();
     let mut inputs = Vec::new();
@@ -297,14 +327,21 @@ proptest! {
     /// Done-when (2): no compaction changes any read result at any live snapshot.
     #[test]
     fn compaction_preserves_reads_at_live_snapshots(seed in any::<u64>(), commits in 1usize..40) {
-        check_compaction(seed, commits);
+        check_compaction(seed, commits, Choose::Random);
+    }
+
+    /// Issue #31: the same for the tiered picker's compactions.
+    #[test]
+    fn tiered_compaction_preserves_reads_at_live_snapshots(seed in any::<u64>(), commits in 1usize..40) {
+        check_compaction(seed, commits, Choose::Tiered);
     }
 }
 
 #[test]
 fn compaction_preserves_reads_fixed_seeds() {
     for seed in 0..if cfg!(miri) { 1 } else { 48 } {
-        check_compaction(seed, 35);
+        check_compaction(seed, 35, Choose::Random);
+        check_compaction(seed, 35, Choose::Tiered);
     }
 }
 
@@ -830,9 +867,6 @@ fn same_timestamp_puts_shadow_older_ones() {
 /// bottommost rewrite of X purges the marker and Y's cells come back.
 #[test]
 fn a_row_split_across_bottom_ssts_moves_together() {
-    use pigeonhole_compaction::{CompactionPicker, Levels, PickerOptions};
-    use pigeonhole_format::manifest::CompactionStyle;
-
     let mut db = Db::new(13);
     let family = FamilyOptions::default();
     let mut marker = Vec::new();

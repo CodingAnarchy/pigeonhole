@@ -108,6 +108,7 @@ fn identical_across_shard_counts(seed: u64) {
     let mut cfg = Config::quiet(250);
     // Purges at fixed points (decision D74), as in the model_check equivalent.
     cfg.compaction.l0_trigger = u32::MAX;
+    cfg.compaction.tiered_max_space_amp_percent = u32::MAX;
     cfg.compaction.level_base_bytes = u64::MAX;
     cfg.compact_every = Some(50);
     cfg.tablet_changes = true;

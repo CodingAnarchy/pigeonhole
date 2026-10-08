@@ -280,6 +280,7 @@ fn deferred_io_stays_in_flight_and_a_seed_replays() {
 /// reads differently, so purges must happen at the same points for every shard count.
 fn deterministic_compactions(cfg: &mut Config) {
     cfg.compaction.l0_trigger = u32::MAX;
+    cfg.compaction.tiered_max_space_amp_percent = u32::MAX;
     cfg.compaction.level_base_bytes = u64::MAX;
     cfg.compact_every = Some(50);
 }
