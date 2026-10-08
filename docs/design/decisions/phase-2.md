@@ -215,6 +215,8 @@ The review of #90 (3-4 4.3) found two gaps in network-filesystem detection.
 
 **Coordinator:** confirmed as the safe default. Refusing *local* FUSE filesystems too (ntfs-3g, encrypted home directories such as gocryptfs) is flagged to the owner; an opt-in for trusted local FUSE mounts is the likely follow-up if they want it.
 
+**Owner:** keep refusing FUSE and GPFS by default, and add an explicit opt-in for trusted local FUSE mounts only. Network filesystems stay refused with the opt-in set (#299).
+
 <a id="d174"></a>
 ## D174 — Test-hook recording is opt-in, and the test-hooks wait matches production (approved; engine, #148, #261; refines D164)
 **Interim behavior:**
@@ -236,6 +238,8 @@ FORMAT.md already reserved codec 2 for zstd and `FamilyOptions::compression_leve
 - **Not yet.** Trained dictionaries: FORMAT.md's reserved "compression dictionary address" stays absent.
 
 **Coordinator:** confirmed as interim. The C dependency (libzstd via `zstd-sys`) is flagged to the owner; if they prefer a pure-Rust tree, revisit when `ruzstd` gains real compression levels.
+
+**Owner:** keep libzstd (the C dependency). This decision is final, not interim.
 
 <a id="d176"></a>
 ## D176 — The stopped-clock fallbacks apply only to a simulated clock (approved; io, engine, runtime, #263, #267, ICR 0012; amends D126, refines D161, D171)
@@ -529,3 +533,7 @@ The engine and public harnesses keep four families per table; a new `counters` t
 - `#[non_exhaustive]` on option structs: #296 (Phase 4).
 - Purging buckets beyond `max_versions`: #284 (owner decision). Counter tombstones never purging at the bottom level: #290.
 - Harness arena slots: #283.
+
+**Owner:**
+- #284: versions beyond `max_versions` in a counter family are never purged. Reads apply the limit, and a TTL bounds the space. This matches Bigtable, whose version limits are also lazy cleanup rather than a read guarantee. #284 is closed.
+- #295: increments of one counter within one mutation combine (`incr(c, 1).incr(c, 2)` adds 3), as Bigtable's read-modify-write rules do. This is an exception to D34 for counter families.
