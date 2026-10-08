@@ -295,9 +295,11 @@ pub enum Compaction {
     /// Lowest read and space amplification (the default).
     #[default]
     Leveled,
-    /// Lowest write amplification (Phase 2).
+    /// Lowest write amplification: sorted runs merge when their sizes are similar or space
+    /// amplification passes 200%.
     Tiered,
-    /// Drop whole files when their newest timestamp expires (Phase 2; needs a TTL).
+    /// Drop whole files, with no rewrite, once their newest timestamp expires; for TTL'd,
+    /// time-ordered data. Without a TTL nothing expires (small files still merge).
     FifoByTime,
 }
 
@@ -405,9 +407,7 @@ impl Family {
         self
     }
 
-    /// Compaction strategy. `Tiered` and `FifoByTime` are Phase 2: until then, creating a
-    /// table or family with them fails with
-    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported).
+    /// Compaction strategy (default `Leveled`).
     pub fn compaction(mut self, strategy: Compaction) -> Self {
         self.options.compaction = match strategy {
             Compaction::Leveled => CompactionStyle::Leveled,
@@ -480,9 +480,6 @@ impl Family {
         };
         if o.compression == Compression::Zstd {
             return unsupported("zstd compression");
-        }
-        if o.compaction != CompactionStyle::Leveled {
-            return unsupported("a compaction strategy other than Leveled");
         }
         Ok(o.clone())
     }

@@ -47,7 +47,7 @@ let pages = db
 | Small, hot attributes (status, counters) | `max_versions(1)`, `Priority::High`, `uncompressed()` if tiny |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Phase 2: `blob_threshold` |
-| Data that should expire | `ttl(days(n))`; Phase 2: `Compaction::FifoByTime` drops whole files |
+| Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files |
 
 Do not split just to organize: every family is another tree to flush and compact. A `delete_row` also writes one marker per family.
 
@@ -86,7 +86,7 @@ let row = readings
 Notes:
 - `put_at` sets **event time** as the version timestamp, in microseconds since the Unix epoch. TTL is measured against that timestamp, so supply microseconds, not seconds or milliseconds.
 - A row with millions of columns is fine, but very large rows make a single-row read large. Bucket by day or hour instead: row `sensor:7:2026-10-05`, columns by second. Then a day is one row and a month is a prefix scan.
-- Phase 2: `Compaction::FifoByTime` (needs a TTL) drops expired files wholesale, the cheapest way to age out append-only data.
+- `Compaction::FifoByTime` (with a TTL) drops expired files wholesale, the cheapest way to age out append-only data. It keeps files in arrival order and merges only small neighbours, so it suits data written roughly in time order; a write with an old explicit timestamp lands in a new file and lives until that file expires. Expiry is checked when the family flushes or compacts, and expired cells are hidden from reads in the meantime.
 - If you want history of a **single value**, store it as versions of one column and read with `.versions(n)`; if you want many distinct points, use distinct qualifiers. See Versions below.
 
 ## Adjacency lists (graphs)
