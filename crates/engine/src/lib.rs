@@ -45,7 +45,7 @@ pub use read::{CellData, ReadSpec, RowCell, RowData, ScanCell, ScanCursor, ScanS
 #[doc(hidden)]
 pub use shard::set_tracing;
 pub use snapshot::{Snapshot, TabletMap, View};
-pub use write::{PendingCommit, Predicate, Txn, WriteBatch};
+pub use write::{COUNTER_TS, PendingCommit, Predicate, Txn, WriteBatch};
 
 /// What the engine's own tests reach in with (the `test-hooks` feature, `engine::hooks`).
 #[cfg(feature = "test-hooks")]
@@ -59,7 +59,7 @@ pub use pigeonhole_compaction::{
     I64Add, MergeError, MergeOperator, MergeRegistry, PickerOptions, ValuePredicate,
 };
 pub use pigeonhole_format::compress::Compression;
-pub use pigeonhole_format::manifest::{CachePriority, CompactionStyle, FamilyOptions};
+pub use pigeonhole_format::manifest::{CachePriority, CompactionStyle, FamilyKind, FamilyOptions};
 pub use pigeonhole_format::scan::QualifierFilter;
 pub use pigeonhole_format::value::ValueRef;
 pub use pigeonhole_format::{Durability, FamilyId, Seqno, TableId, Timestamp};

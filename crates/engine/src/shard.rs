@@ -19,7 +19,7 @@ use arc_swap::ArcSwap;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::{CompactionPicker, MergingCursor, PickerOptions, ResolveOptions};
 use pigeonhole_format::key::{encode_key, encode_marker_key, encode_row_prefix, split_suffix};
-use pigeonhole_format::manifest::{CompactionStyle, Edit};
+use pigeonhole_format::manifest::{CompactionStyle, Edit, FamilyKind};
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::wal::{BatchBuilder, BatchRef, StreamList, WalRecord};
 use pigeonhole_format::{
@@ -3169,6 +3169,7 @@ impl ShardState {
         opts.ttl_micros = meta.options.ttl_micros;
         opts.versions = 1;
         opts.merge = meta.merge_op.clone();
+        opts.counter = meta.options.kind == FamilyKind::Counter;
         let resolver_blobs = crate::read::ResolverBlobs::attach(&mut opts, &view.ssts);
         let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
         resolver.seek_column(row, qualifier)?;
@@ -5368,7 +5369,18 @@ impl ShardState {
             .map_or(u64::MAX, MemSlot::min_ts)
             .min(self.prepared_min_ts(key.1));
         let now = self.shared.vfs.now_micros();
-        let gc = compact::gc_policy(&self.shared, fam, &task, mem_min_ts, now);
+        let gc = compact::gc_policy(
+            &self.shared,
+            fam,
+            &task,
+            (
+                mem_min_ts,
+                self.memtables.get(&key).and_then(MemSlot::min_seqno),
+            ),
+            self.prepared.keys().copied(),
+            meta.options.kind == FamilyKind::Counter,
+            now,
+        );
         // A test hook's record: production builds keep none (5-6 6.2), and test builds only
         // while a test records (`Engine::record_history`).
         let record = (self.recording()

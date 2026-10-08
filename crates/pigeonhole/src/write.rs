@@ -189,12 +189,13 @@ fn check_table(db: &Arc<Db>, table: &Table) -> Result<()> {
 /// let pages = db.table("pages")?
 ///     .family("meta", Family::default())
 ///     .family("links", Family::default())
+///     .family("stats", Family::counter())
 ///     .create_if_missing()?;
 /// pages
 ///     .mutate(b"com.example/a")
 ///     .put("meta", b"status", b"200")
 ///     .put("links", b"com.example/b", b"")
-///     .incr("meta", b"hits", 1)
+///     .incr("stats", b"hits", 1)
 ///     .durability(Durability::Buffered)
 ///     .commit()?;
 ///
@@ -258,10 +259,18 @@ impl RowMutation<'_> {
         })
     }
 
-    /// Puts a typed `i64`.
+    /// Puts a typed `i64` at the commit timestamp; in a counter family, sets the counter
+    /// (later increments add to it).
     pub fn put_i64(self, family: &str, qualifier: &[u8], value: i64) -> Self {
         self.op(family, qualifier, 8, |b, t, f, row| {
             b.put(t, f, row, qualifier, None, ValueRef::I64(value))
+        })
+    }
+
+    /// Puts a typed `i64` at an explicit timestamp; in a counter family, sets that bucket.
+    pub fn put_i64_at(self, family: &str, qualifier: &[u8], ts: u64, value: i64) -> Self {
+        self.op(family, qualifier, 8, |b, t, f, row| {
+            b.put(t, f, row, qualifier, Some(ts), ValueRef::I64(value))
         })
     }
 
@@ -272,10 +281,21 @@ impl RowMutation<'_> {
         })
     }
 
-    /// Atomically adds `delta` to an `i64` counter without reading it (a merge operand).
+    /// Atomically adds `delta` (wrapping) to the counter in a counter family
+    /// ([`Family::counter`](crate::Family::counter)) without reading it. Increments of one
+    /// counter combine into one cell; two in the same mutation collapse to the last one
+    /// (decision D34). Other families fail with `InvalidArgument` at commit.
     pub fn incr(self, family: &str, qualifier: &[u8], delta: i64) -> Self {
         self.op(family, qualifier, 8, |b, t, f, row| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))
+        })
+    }
+
+    /// Adds `delta` to the bucket at timestamp `ts` of a counter family (hourly or daily
+    /// totals, say): each bucket is a version of its own.
+    pub fn incr_at(self, family: &str, qualifier: &[u8], ts: u64, delta: i64) -> Self {
+        self.op(family, qualifier, 8, |b, t, f, row| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(delta))
         })
     }
 
@@ -383,12 +403,13 @@ impl RowMutation<'_> {
 /// let g = db.table("g")?
 ///     .family("out", Family::default())
 ///     .family("in", Family::default())
+///     .family("degree", Family::counter())
 ///     .create_if_missing()?;
 /// // Add the edge a -> b in both directions, atomically.
 /// let mut wb = db.write_batch();
 /// wb.put(&g, b"node:a", "out", b"node:b", b"")
 ///     .put(&g, b"node:b", "in", b"node:a", b"")
-///     .incr(&g, b"node:a", "out", b"degree", 1);
+///     .incr(&g, b"node:a", "degree", b"out", 1);
 /// assert_eq!(wb.len(), 3);
 /// let info = wb.commit_with(Durability::Sync)?;
 /// assert_eq!(info.durability, Durability::Sync);
@@ -460,7 +481,7 @@ impl WriteBatch {
         })
     }
 
-    /// Puts a typed `i64`.
+    /// Puts a typed `i64` (in a counter family, sets the counter).
     pub fn put_i64(
         &mut self,
         table: &Table,
@@ -471,6 +492,21 @@ impl WriteBatch {
     ) -> &mut Self {
         self.op(table, row, family, qualifier, 8, |b, t, f| {
             b.put(t, f, row, qualifier, None, ValueRef::I64(value))
+        })
+    }
+
+    /// Puts a typed `i64` at an explicit timestamp (in a counter family, sets that bucket).
+    pub fn put_i64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, Some(ts), ValueRef::I64(value))
         })
     }
 
@@ -488,7 +524,7 @@ impl WriteBatch {
         })
     }
 
-    /// Adds to an `i64` counter.
+    /// Adds to the counter of a counter family (see [`RowMutation::incr`]).
     pub fn incr(
         &mut self,
         table: &Table,
@@ -499,6 +535,21 @@ impl WriteBatch {
     ) -> &mut Self {
         self.op(table, row, family, qualifier, 8, |b, t, f| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))
+        })
+    }
+
+    /// Adds to the bucket at `ts` of a counter family (see [`RowMutation::incr_at`]).
+    pub fn incr_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        delta: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(delta))
         })
     }
 

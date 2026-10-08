@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pigeonhole_cache::BlockCache;
 use pigeonhole_format::key::{row_prefix_len, split_suffix};
-use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{BlobFileId, Cursor, Seqno, SstId, TableId, Timestamp};
 use pigeonhole_io::VfsRef;
@@ -64,6 +64,23 @@ pub struct GcPolicy {
     /// of deletes and of versions beyond `max_versions` apply only below it. Default 0: purge
     /// nothing at the bottom until the engine supplies the bound.
     pub min_ts_above: Timestamp,
+    /// Counter families only (decision D179): the other sources of the slot (SSTs not in
+    /// the task, memtables) that may hold an entry with a seqno at or below the newest
+    /// input seqno. A delete there can hide one of two input operands but not the other,
+    /// so operands are not combined across its seqno range, and a row it overlaps gets no
+    /// `max_versions` purge. `None` (the default) means unknown: no counter operand is
+    /// combined and no counter row is version-purged.
+    pub other_sources: Option<Vec<OtherSource>>,
+}
+
+/// A source of a compaction's slot outside its inputs, for [`GcPolicy::other_sources`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherSource {
+    /// Smallest and largest internal key, or `None` for a source that may hold any key (a
+    /// memtable).
+    pub keys: Option<(Vec<u8>, Vec<u8>)>,
+    /// Smallest and largest seqno.
+    pub seqnos: (Seqno, Seqno),
 }
 
 impl GcPolicy {
@@ -74,6 +91,7 @@ impl GcPolicy {
             now,
             bottommost,
             min_ts_above: 0,
+            other_sources: None,
         }
     }
 }
@@ -538,6 +556,8 @@ impl CompactionJob {
             ttl_micros: context.family.ttl_micros,
             max_versions: context.family.max_versions,
             merge: context.merge.clone(),
+            counter: context.family.kind == FamilyKind::Counter,
+            other_sources: context.gc.other_sources.clone(),
         });
         let mut options =
             SstWriterOptions::for_family(&context.family, context.table, task.family, task.tablet);

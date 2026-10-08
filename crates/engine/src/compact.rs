@@ -8,7 +8,7 @@ use std::task::Poll;
 
 use pigeonhole_compaction::{
     BlobFileStat, BlobRefs, CompactionJob, CompactionOutput, CompactionTask, GcPolicy, JobContext,
-    JobPoll, KeyRange, Levels, NewBlobFile, TaskKind, pick_blob_gc,
+    JobPoll, KeyRange, Levels, NewBlobFile, OtherSource, TaskKind, pick_blob_gc,
 };
 use pigeonhole_format::key::encode_row_prefix;
 use pigeonhole_format::manifest::{Edit, SstMeta};
@@ -306,11 +306,16 @@ impl BlobGc {
 /// plus the oldest reader pin's seqno (a reader's snapshots pin its own view, so the
 /// oldest pin bounds everything a reader can still read), whether the output is bottommost,
 /// and the smallest timestamp above the inputs (other SSTs of the slot and its memtables).
+/// For a counter family it also lists the other sources that may hold a seqno at or below
+/// the newest input seqno (D179): the slot's other SSTs, its memtables (from
+/// `mem_min_seqno`) and the prepared shares (`prepared_seqnos`).
 pub(crate) fn gc_policy(
     shared: &Shared,
     fam: &FamilySsts,
     task: &CompactionTask,
-    mem_min_ts: Timestamp,
+    (mem_min_ts, mem_min_seqno): (Timestamp, Option<Seqno>),
+    prepared_seqnos: impl Iterator<Item = Seqno>,
+    counter: bool,
     now: Timestamp,
 ) -> GcPolicy {
     let mut snapshots = shared.live_seqnos.list();
@@ -341,6 +346,33 @@ pub(crate) fn gc_policy(
         .filter(|s| !input_ids.contains(&s.meta.id))
         .map(|s| s.meta.ts_range.0)
         .fold(mem_min_ts, Timestamp::min);
+    if counter {
+        let inputs_max = fam
+            .iter()
+            .filter(|s| input_ids.contains(&s.meta.id))
+            .map(|s| s.meta.seqno_range.1)
+            .max()
+            .unwrap_or(0);
+        let ssts = fam
+            .iter()
+            .filter(|s| !input_ids.contains(&s.meta.id))
+            .map(|s| OtherSource {
+                keys: Some((s.meta.smallest_key.clone(), s.meta.largest_key.clone())),
+                seqnos: s.meta.seqno_range,
+            });
+        let unbounded = mem_min_seqno
+            .into_iter()
+            .chain(prepared_seqnos)
+            .map(|lo| OtherSource {
+                keys: None,
+                seqnos: (lo, Seqno::MAX),
+            });
+        gc.other_sources = Some(
+            ssts.chain(unbounded)
+                .filter(|o| o.seqnos.0 <= inputs_max)
+                .collect(),
+        );
+    }
     gc
 }
 

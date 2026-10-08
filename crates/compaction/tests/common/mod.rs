@@ -13,14 +13,14 @@ use pigeonhole_compaction::{
     ValuePredicate, VecCursor, blob_pointer,
 };
 use pigeonhole_format::key::{Kind, TERMINATOR, encode_key, encode_marker_key, escape_into};
-use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::value::BlobPointer;
 use pigeonhole_format::value::ValueTag;
 use pigeonhole_format::{
     BlobFileId, Cursor, Durability, FamilyId, Seqno, SstId, TableId, TabletId, Timestamp,
 };
 use pigeonhole_pager::Pager;
-use pigeonhole_sim::{Model, ModelError, ModelFamily, ModelOp, Rng};
+use pigeonhole_sim::{COUNTER_TS, Model, ModelError, ModelFamily, ModelOp, Rng};
 use pigeonhole_sst::{
     BlobReader, ReadOptions, ScanFilter, SstIter, SstReader, SstWriter, SstWriterOptions,
 };
@@ -82,6 +82,8 @@ pub fn random_history(seed: u64, commits: usize) -> History {
         max_versions: [0, 0, 1, 2, 3][rng.below(5) as usize],
         ttl_micros: [0, 0, 120, 300][rng.below(4) as usize],
         i64_add: true,
+        // Half the histories are counter families (decision D179).
+        counter: rng.below(2) == 0,
     };
     let mut model = Model::new();
     model.create_table(TABLE, vec![family.clone()]);
@@ -109,6 +111,9 @@ pub fn extend_history(h: &mut History, rng: &mut Rng, commits: usize, later: boo
         h.last_ts = commit_ts;
         let used_ts = &mut h.used_ts;
         let model = &mut h.model;
+        let counter = h.family.counter;
+        // A counter family with a TTL refuses its fixed timestamp: buckets only.
+        let fixed_ok = h.family.ttl_micros == 0;
         let n_ops = 1 + rng.below(3) as usize;
         let mut ops = Vec::new();
         for _ in 0..n_ops {
@@ -122,13 +127,16 @@ pub fn extend_history(h: &mut History, rng: &mut Rng, commits: usize, later: boo
             let op = match choice {
                 0..=6 => {
                     let ts = match rng.below(4) {
-                        _ if later => None,
+                        _ if later && (!counter || fixed_ok) => None,
                         0 => Some(used_ts[rng.below(used_ts.len() as u64) as usize]),
                         // Above later commit timestamps, but never equal to one.
                         1 => Some(commit_ts + 5 + 10 * rng.below(5)),
+                        _ if counter && !fixed_ok => Some(commit_ts),
                         _ => None,
                     };
                     let value = match rng.below(10) {
+                        // A counter family holds only i64s.
+                        _ if counter => (rng.below(1000) as i64).to_le_bytes().to_vec(),
                         0..=2 => (rng.below(1000) as i64).to_le_bytes().to_vec(),
                         3 => vec![b'L'; 5000 + rng.below(100) as usize],
                         4 => b"abc".to_vec(),
@@ -151,6 +159,13 @@ pub fn extend_history(h: &mut History, rng: &mut Rng, commits: usize, later: boo
                     row,
                     family: family_name,
                     qualifier,
+                    // Counter families: the fixed timestamp or a bucket.
+                    ts: match rng.below(3) {
+                        _ if !counter => None,
+                        0 if fixed_ok => None,
+                        1 => Some(used_ts[rng.below(used_ts.len() as u64) as usize]),
+                        _ => Some(commit_ts + 10 * rng.below(3)),
+                    },
                     delta: rng.below(100) as i64 - 50,
                 },
                 12..=14 => ModelOp::DeleteCell {
@@ -175,7 +190,7 @@ pub fn extend_history(h: &mut History, rng: &mut Rng, commits: usize, later: boo
             };
             ops.push(op);
         }
-        added.extend(commit_ops(model, used_ts, &ops, commit_ts));
+        added.extend(commit_ops(model, used_ts, &ops, commit_ts, counter));
         used_ts.push(commit_ts);
     }
     h.entries.extend(added.iter().cloned());
@@ -189,8 +204,11 @@ fn commit_ops(
     used_ts: &mut Vec<Timestamp>,
     ops: &[ModelOp],
     commit_ts: Timestamp,
+    counter: bool,
 ) -> Vec<Entry> {
     let seqno = model.commit(ops, commit_ts, Durability::Sync);
+    // Where a put or operand without a timestamp lands.
+    let default_ts = if counter { COUNTER_TS } else { commit_ts };
     // The same commit as stored entries, collapsed like the model (D34).
     let mut cells: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut collapse: BTreeMap<(Vec<u8>, Vec<u8>, Timestamp), Vec<u8>> = BTreeMap::new();
@@ -206,19 +224,20 @@ fn commit_ops(
             } => (
                 row,
                 qualifier,
-                ts.unwrap_or(commit_ts),
+                ts.unwrap_or(default_ts),
                 Kind::Put,
                 stored(value),
             ),
             ModelOp::Incr {
                 row,
                 qualifier,
+                ts,
                 delta,
                 ..
             } => (
                 row,
                 qualifier,
-                commit_ts,
+                ts.unwrap_or(default_ts),
                 Kind::Merge,
                 stored(&delta.to_le_bytes()),
             ),
@@ -264,7 +283,8 @@ impl History {
     pub fn commit(&mut self, ops: &[ModelOp], commit_ts: Timestamp) -> Vec<Entry> {
         self.commits += 1;
         self.last_ts = self.last_ts.max(commit_ts);
-        let added = commit_ops(&mut self.model, &mut self.used_ts, ops, commit_ts);
+        let counter = self.family.counter;
+        let added = commit_ops(&mut self.model, &mut self.used_ts, ops, commit_ts, counter);
         self.entries.extend(added.iter().cloned());
         added
     }
@@ -280,6 +300,7 @@ pub fn options(h: &History, snapshot: Seqno, now: Timestamp, versions: u32) -> R
         (v, m) => v.min(m),
     };
     o.merge = Some(Arc::new(I64Add));
+    o.counter = h.family.counter;
     o
 }
 
@@ -620,6 +641,11 @@ pub fn family_options(h: &History) -> FamilyOptions {
         max_versions: h.family.max_versions,
         ttl_micros: h.family.ttl_micros,
         merge_operator: "pigeonhole.i64_add".into(),
+        kind: if h.family.counter {
+            FamilyKind::Counter
+        } else {
+            FamilyKind::Standard
+        },
         ..FamilyOptions::default()
     }
 }

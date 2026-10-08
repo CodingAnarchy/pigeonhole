@@ -24,7 +24,7 @@ fn run(path: &Path) -> pigeonhole::Result<()> {
     let users = db
         .table("users")?
         .family("profile", Family::default().max_versions(1))
-        .family("stats", Family::default())
+        .family("stats", Family::counter())
         .create_if_missing()?;
 
     // One row, two families, all or nothing.

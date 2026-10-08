@@ -15,6 +15,7 @@
 //!     .family("meta", Family::default().max_versions(1))
 //!     .family("links", Family::default().bloom_bits(10))
 //!     .family("body", Family::default().blob_threshold(4096).ttl(days(30)))
+//!     .family("stats", Family::counter())
 //!     .create_if_missing()?;
 //!
 //! // Single-row atomic mutation.
@@ -22,7 +23,7 @@
 //!     .mutate(b"com.example/a")
 //!     .put("meta", b"status", b"200")
 //!     .put("links", b"com.example/b", b"")
-//!     .incr("meta", b"hits", 1)
+//!     .incr("stats", b"hits", 1)
 //!     .delete_column("meta", b"etag")
 //!     .commit()?;
 //!
@@ -31,8 +32,8 @@
 //! assert_eq!(status.unwrap().value(), b"200");
 //!
 //! // Row read, projected to families.
-//! let row = pages.row(b"com.example/a").families(["meta"]).latest().read()?;
-//! assert_eq!(row.unwrap().get("meta", b"hits").unwrap().as_i64(), Some(1));
+//! let row = pages.row(b"com.example/a").families(["meta", "stats"]).latest().read()?;
+//! assert_eq!(row.unwrap().get("stats", b"hits").unwrap().as_i64(), Some(1));
 //!
 //! // Ordered scan with filters pushed into the block decoder.
 //! let snap = db.snapshot()?;

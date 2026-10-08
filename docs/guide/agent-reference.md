@@ -34,7 +34,9 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | WAL size (D155) | Each shard bounds the log written past its oldest still-needed record to twice `memtable_budget` (128 MiB at the defaults). A table that is rarely written does not pin the WAL: past the bound its small memtable is flushed to a small SST. So WAL size and the next open's replay stay bounded however long the process runs. There is no public option for the bound yet. |
 | Files at rest | One file after a clean last `close`. While open, or after a crash: the file plus WAL sidecars and the shm region. Open replays the sidecars. |
 | `None` durability (D94) | A `None` commit buffers its WAL record. A later `GroupSync`/`Sync` commit on the same shard, a `flush`, or a clean close makes it durable; a crash before then loses it. |
-| Typed values | `incr` columns are `i64`. Write counters only with `incr` / `put_i64`: reading an `incr` on top of a base that is not an 8-byte `i64` fails with `MergeFailed` (D41). `merge` writes untyped operands (custom operators); the built-in `i64` add refuses them at read time. |
+| Counters (D179) | Only a counter family (`Family::counter()`) takes `incr`; elsewhere `InvalidArgument`. `incr` writes at a fixed timestamp (0), so a counter is one cell; `incr_at(.., ts, ..)` adds to the bucket (version) at `ts`. Increments combine at read and in compaction. A counter family holds only `i64`s (`put_i64` sets, `put_i64_at` sets a bucket; other puts and untyped `merge`: `InvalidArgument`). A delete there hides only what was written before it, so `incr` after `delete_column` starts from 0. With a TTL: buckets only (`incr`/`put_i64`: `InvalidArgument`). TTL expires each bucket; `max_versions` limits reads per column but compaction keeps the rest (it never changes a counter family's reads), so bound storage with a TTL. |
+| 0.1.0 families | Families created by 0.1.0 store `pigeonhole.i64_add` without the counter kind and keep 0.1.0 behavior: `incr` at the commit timestamp, runs folded across timestamps (D41), bytes under an `incr` fail with `MergeFailed`. Migrate a counter by reading it and `put_i64` into a counter family. |
+| Typed values | `merge` writes untyped operands (custom operators); the built-in `i64` add refuses them. |
 
 ## Types
 | Type | Role |
@@ -103,6 +105,8 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 ## `Family` (all `self -> Self`; stored in file)
 | Method | Meaning |
 |---|---|
+| `Family::default()` | Ordinary family, no merge operator. |
+| `Family::counter()` | Counter family: `i64` sums (`incr`, `incr_at`, `put_i64`, `put_i64_at`); D179. Chain the methods below on it. |
 | `max_versions(u32)` | Keep ≤ n versions per column (0 = all). |
 | `ttl(Duration)` | Expire cells older than this by timestamp. |
 | `bloom_bits(u8)` | Filter bits per key (0 off; default 10). |
@@ -111,7 +115,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `zstd(i8)` | zstd blocks at a libzstd level (1–22, higher smaller and slower; default 3). |
 | `uncompressed()` | No compression. |
 | `block_size(u32)` | Data block bytes (default 16 KiB). |
-| `merge_operator(&str)` | Name of a registered operator (unregistered: `UnknownMergeOperator`). `incr` needs none (`pigeonhole.i64_add` default). |
+| `merge_operator(&str)` | Name of a registered operator (unregistered: `UnknownMergeOperator`) for `merge` operands. Counters use `Family::counter()` instead; `"pigeonhole.i64_add"` on an ordinary family makes a 0.1.0-style family. |
 | `cache_priority(Priority)` | Block cache priority. |
 | `compaction(Compaction)` | Strategy. `Leveled`: reads. `Tiered`: write-heavy; keep the default engine depth (a shallow tree makes write amplification grow linearly, D169). `FifoByTime`: drops a file when its newest cell has expired, so it only drops data with a TTL set (without one nothing expires), dropped on a timer at the earliest expiry (D170). The engine's FIFO size cap is lossy (D167) and not exposed. |
 
@@ -139,8 +143,10 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 |---|---|
 | `put(family, qualifier: &[u8], value: &[u8])` | Bytes at commit timestamp. |
 | `put_at(family, qualifier, ts: u64, value)` | Bytes at explicit timestamp (µs). |
-| `put_i64(family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. |
-| `incr(family, qualifier, delta: i64)` | Blind atomic `i64` add (merge operand). |
+| `put_i64(family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. In a counter family `put_i64` sets the counter. |
+| `put_i64_at(family, qualifier, ts, i64)` | Typed `i64` at `ts` (a counter family's bucket). |
+| `incr(family, qualifier, delta: i64)` | Blind atomic wrapping `i64` add; counter families only. |
+| `incr_at(family, qualifier, ts: u64, delta: i64)` | Add to the bucket at `ts`; counter families only. |
 | `merge(family, qualifier, operand: &[u8])` | Operand for the family's operator (P2 for custom). |
 | `delete_cell(family, qualifier, ts: u64)` | Delete the version at `ts`; later puts at that `ts` stay hidden (D38). |
 | `delete_column(family, qualifier)` | Delete all versions. |
@@ -158,7 +164,9 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `put(&Table, row, family, qualifier, value)` | |
 | `put_at(&Table, row, family, qualifier, ts, value)` | |
 | `put_i64(&Table, row, family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. |
-| `incr(&Table, row, family, qualifier, delta)` | |
+| `put_i64_at(&Table, row, family, qualifier, ts, i64)` | |
+| `incr(&Table, row, family, qualifier, delta)` | Counter families only. |
+| `incr_at(&Table, row, family, qualifier, ts, delta)` | Counter families only. |
 | `merge(&Table, row, family, qualifier, operand)` | Untyped operand (for custom operators). |
 | `delete_cell(&Table, row, family, qualifier, ts)` | D38. |
 | `delete_column(&Table, row, family, qualifier)` | |
@@ -234,8 +242,9 @@ db.close()?;
 # let dir = pigeonhole::doc_support::temp_dir();
 # let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
 # let users = pigeonhole::doc_support::table(&db, "users", &["profile"])?;
-users.mutate(b"user:42").incr("profile", b"logins", 1).commit()?;
-let n: i64 = users.get(b"user:42", "profile", b"logins")?
+let stats = db.table("user_stats")?.family("stats", Family::counter()).create_if_missing()?;
+stats.mutate(b"user:42").incr("stats", b"logins", 1).commit()?;
+let n: i64 = stats.get(b"user:42", "stats", b"logins")?
     .and_then(|c| c.as_i64()).unwrap_or(0);
 # assert_eq!(n, 1);
 # Ok::<(), pigeonhole::Error>(())

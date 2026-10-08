@@ -20,6 +20,16 @@
 //!
 //! Consecutive kept operands of one group and stripe are combined into one operand. Operands
 //! are never folded across timestamps or onto a base (see `docs/design/questions/compaction.md`).
+//!
+//! A counter family (decision D179) resolves differently: every timestamp is its own version
+//! and a delete hides only entries with a lower seqno in its scope. So an entry is hidden at
+//! every read point that sees it only by a delete in its own stripe with a higher seqno, and
+//! a delete is redundant only next to a wider one in its stripe with a higher seqno. Versions
+//! beyond `max_versions` are never purged there: a later delete of a newer bucket, or its
+//! expiry, would show an older one again, and compaction never changes a counter family's
+//! reads (reads apply the limit; the TTL and deletes reclaim the space). Two
+//! operands are combined only if no other source of the slot can hold a delete with a seqno
+//! between theirs (`GcPolicy::other_sources`), which would hide one but not the other.
 
 use std::sync::Arc;
 
@@ -27,7 +37,7 @@ use pigeonhole_format::key::{Kind, SUFFIX_LEN, row_prefix_len, split_suffix};
 use pigeonhole_format::value::{BlobPointer, ValueTag};
 use pigeonhole_format::{BlobFileId, Cursor, Seqno, Timestamp};
 
-use crate::MergeOperator;
+use crate::{MergeOperator, OtherSource};
 
 /// No stripe (no delete seen).
 const NONE: usize = usize::MAX;
@@ -41,6 +51,7 @@ struct GEntry {
     val_start: usize,
     end: usize,
     kind: Kind,
+    seqno: Seqno,
     stripe: usize,
 }
 
@@ -103,6 +114,10 @@ pub(crate) struct GcConfig {
     pub ttl_micros: u64,
     pub max_versions: u32,
     pub merge: Option<Arc<dyn MergeOperator>>,
+    /// Counter-family semantics (D179).
+    pub counter: bool,
+    /// `GcPolicy::other_sources` (counter families only).
+    pub other_sources: Option<Vec<OtherSource>>,
 }
 
 /// Streaming GC state over one ordered input.
@@ -116,10 +131,23 @@ pub(crate) struct Gc {
     min_ts_above: Timestamp,
     max_versions: u32,
     merge: Option<Arc<dyn MergeOperator>>,
+    counter: bool,
+    other_sources: Option<Vec<OtherSource>>,
 
     row: Vec<u8>,
-    /// `(ts, stripe)` of the row's family markers, newest first.
-    markers: Vec<(Timestamp, usize)>,
+    /// `(ts, stripe, seqno)` of the row's family markers, newest first.
+    markers: Vec<(Timestamp, usize, Seqno)>,
+    /// Counter families: seqno ranges of the other sources that overlap the row.
+    row_guard: Vec<(Seqno, Seqno)>,
+    /// Counter families: per stripe, the newest seqno of the column's column deletes seen
+    /// so far (all at newer timestamps; 0 = none).
+    col_del_seqno: Vec<Seqno>,
+    /// Counter families, per stripe, scratch for one group: the newest seqno of a delete
+    /// from outside the group covering it, and of the group's deletes seen so far (any
+    /// kind, and column deletes).
+    c_cover: Vec<Seqno>,
+    c_any: Vec<Seqno>,
+    c_col: Vec<Seqno>,
     col: Vec<u8>,
     /// Lowest stripe of the column's column deletes seen so far (all at newer timestamps).
     col_stripe: usize,
@@ -162,8 +190,15 @@ impl Gc {
             min_ts_above: config.min_ts_above,
             max_versions: config.max_versions,
             merge: config.merge,
+            counter: config.counter,
+            other_sources: config.other_sources,
             row: Vec::new(),
             markers: Vec::new(),
+            row_guard: Vec::new(),
+            col_del_seqno: vec![0; n],
+            c_cover: vec![0; n],
+            c_any: vec![0; n],
+            c_col: vec![0; n],
             col: Vec::new(),
             col_stripe: NONE,
             col_newest: 0,
@@ -212,6 +247,36 @@ impl Gc {
             .unwrap_or(NONE)
     }
 
+    /// Counter families: the seqno ranges of the other sources that may hold keys of the
+    /// row with prefix `row` (everything when the other sources are unknown).
+    fn guard_row(&mut self) {
+        self.row_guard.clear();
+        if !self.counter {
+            return;
+        }
+        let Some(others) = &self.other_sources else {
+            self.row_guard.push((0, Seqno::MAX));
+            return;
+        };
+        let row = self.row.as_slice();
+        for o in others {
+            let overlaps = o.keys.as_ref().is_none_or(|(lo, hi)| {
+                hi.as_slice() >= row && (lo.as_slice() <= row || lo.starts_with(row))
+            });
+            if overlaps {
+                self.row_guard.push(o.seqnos);
+            }
+        }
+    }
+
+    /// Counter families: whether a delete from another source could have a seqno in
+    /// `(older, newer]`.
+    fn guarded(&self, older: Seqno, newer: Seqno) -> bool {
+        self.row_guard
+            .iter()
+            .any(|&(lo, hi)| lo <= newer && hi > older)
+    }
+
     /// Processes the next unit at the cursor (one family marker or one `(column, ts)` group),
     /// appending kept entries to `out`. Returns false at the end of the input or at `end`.
     pub(crate) fn step<C: Cursor>(
@@ -236,13 +301,18 @@ impl Gc {
             self.row.extend_from_slice(&key[..n]);
             self.markers.clear();
             self.col.clear();
+            self.guard_row();
         }
         self.read += 1;
         if kind == Kind::FamilyDelete {
             let stripe = self.stripe(seqno);
-            let redundant = self.markers.iter().any(|m| m.1 <= stripe);
+            // Earlier markers are at newer timestamps, or at this one with higher seqnos.
+            let redundant = self
+                .markers
+                .iter()
+                .any(|m| m.1 <= stripe && (!self.counter || (m.1 == stripe && m.2 > seqno)));
             let keep = !self.expired(ts) && !redundant && !(self.purgeable(ts) && stripe == 0);
-            self.markers.push((ts, stripe));
+            self.markers.push((ts, stripe, seqno));
             if keep {
                 out.push(key, cursor.value());
                 self.kept += 1;
@@ -257,9 +327,14 @@ impl Gc {
             self.col_newest = ts;
             self.counts.fill(0);
             self.run_open.fill(false);
+            self.col_del_seqno.fill(0);
         }
         self.read_group(cursor, ts)?;
-        self.decide(ts, out);
+        if self.counter {
+            self.decide_counter(ts, out);
+        } else {
+            self.decide(ts, out);
+        }
         Ok(true)
     }
 
@@ -288,6 +363,7 @@ impl Gc {
                 val_start,
                 end: self.group_data.len(),
                 kind,
+                seqno,
                 stripe: self.points.partition_point(|&p| p < seqno),
             });
             cursor.next()?;
@@ -431,5 +507,102 @@ impl Gc {
             out.push(&self.acc_key, &self.acc);
         }
         self.col_stripe = self.col_stripe.min(coldel_min);
+    }
+
+    /// [`Gc::decide`] for a counter family (D179): seqno-scoped deletes, one version per
+    /// timestamp, no version purge.
+    fn decide_counter(&mut self, ts: Timestamp, out: &mut OutBuf) {
+        if self.expired(ts) {
+            for e in &self.group {
+                account_drop(
+                    &mut self.blob_delta,
+                    e.kind,
+                    &self.group_data[e.val_start..e.end],
+                );
+            }
+            return;
+        }
+        // Per stripe, the newest seqno of a delete from outside the group covering `ts`:
+        // the column's deletes at newer timestamps and the row's markers at or above `ts`.
+        self.c_cover.copy_from_slice(&self.col_del_seqno);
+        for m in self.markers.iter().filter(|m| m.0 >= ts) {
+            self.c_cover[m.1] = self.c_cover[m.1].max(m.2);
+        }
+        // In-group deletes seen so far (newer seqnos), per stripe: any, and column deletes.
+        self.c_any.fill(0);
+        self.c_col.fill(0);
+        let mut put_min = NONE;
+        let purge_deletes = self.purgeable(ts);
+        // A pending combined operand: its stripe and newest seqno.
+        let mut pending: Option<(usize, Seqno)> = None;
+        for idx in 0..self.group.len() {
+            let e = self.group[idx];
+            let i = e.stripe;
+            let covered = self.c_cover[i].max(self.c_any[i]) > e.seqno;
+            let keep = match e.kind {
+                Kind::Put | Kind::Merge => {
+                    let k = !covered && put_min > i;
+                    if e.kind == Kind::Put {
+                        put_min = put_min.min(i);
+                    }
+                    k
+                }
+                Kind::CellDelete => {
+                    let redundant = covered;
+                    self.c_any[i] = self.c_any[i].max(e.seqno);
+                    !redundant && !(purge_deletes && i == 0)
+                }
+                Kind::ColumnDelete => {
+                    let redundant = self.c_cover[i].max(self.c_col[i]) > e.seqno;
+                    self.c_any[i] = self.c_any[i].max(e.seqno);
+                    self.c_col[i] = self.c_col[i].max(e.seqno);
+                    self.col_del_seqno[i] = self.col_del_seqno[i].max(e.seqno);
+                    !redundant && !(purge_deletes && i == 0)
+                }
+                Kind::FamilyDelete => true,
+            };
+            let key = e.key_start..e.val_start;
+            let value = e.val_start..e.end;
+            if !keep {
+                account_drop(&mut self.blob_delta, e.kind, &self.group_data[value]);
+                continue;
+            }
+            self.kept += 1;
+            if e.kind == Kind::Merge
+                && let Some(op) = &self.merge
+            {
+                if let Some((stripe, newest)) = pending
+                    && stripe == i
+                    && !self.guarded(e.seqno, newest)
+                {
+                    self.scratch.clear();
+                    self.scratch.extend_from_slice(&self.acc);
+                    if op
+                        .merge(&mut self.scratch, &self.group_data[value.clone()])
+                        .is_ok()
+                    {
+                        std::mem::swap(&mut self.acc, &mut self.scratch);
+                        self.kept -= 1;
+                        continue;
+                    }
+                }
+                if pending.is_some() {
+                    out.push(&self.acc_key, &self.acc);
+                }
+                pending = Some((i, e.seqno));
+                self.acc_key.clear();
+                self.acc_key.extend_from_slice(&self.group_data[key]);
+                self.acc.clear();
+                self.acc.extend_from_slice(&self.group_data[value]);
+                continue;
+            }
+            if pending.take().is_some() {
+                out.push(&self.acc_key, &self.acc);
+            }
+            out.push(&self.group_data[key], &self.group_data[value]);
+        }
+        if pending.is_some() {
+            out.push(&self.acc_key, &self.acc);
+        }
     }
 }

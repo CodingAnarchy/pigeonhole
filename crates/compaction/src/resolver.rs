@@ -105,6 +105,11 @@ pub struct ResolveOptions {
     /// operands) sees the value rather than its blob pointer. Without it a pointer matches
     /// no byte predicate.
     pub blobs: Option<Arc<dyn BlobFetch>>,
+    /// Counter-family semantics (`FamilyKind::Counter`, decision D179): operands combine
+    /// only within one `(column, timestamp)`, so every timestamp is its own version (no
+    /// run folds across timestamps), and a delete hides only entries with a lower seqno
+    /// within its timestamp scope (a later write at a covered timestamp stays visible).
+    pub counter: bool,
 }
 
 impl ResolveOptions {
@@ -120,6 +125,7 @@ impl ResolveOptions {
             merge: None,
             time_range: None,
             blobs: None,
+            counter: false,
         }
     }
 
@@ -250,6 +256,8 @@ pub struct CellResolver<C> {
     row: Vec<u8>,
     /// Newest timestamp a visible family marker of the row covers.
     family_cover: Option<Timestamp>,
+    /// Counter families: `(ts, seqno)` of the row's visible family markers.
+    markers: Vec<(Timestamp, Seqno)>,
     /// Columns of the row that returned a version.
     columns_in_row: u32,
 
@@ -257,6 +265,9 @@ pub struct CellResolver<C> {
     col: Vec<u8>,
     /// Newest timestamp a visible column delete of the column covers.
     col_cover: Option<Timestamp>,
+    /// Counter families: newest seqno of a visible column delete of the column seen so far
+    /// (all at timestamps at or above the current group; 0 = none).
+    col_cover_seqno: Seqno,
     /// Versions of the column returned so far.
     col_versions: u32,
     /// Skip the rest of the column (version limit reached or predicate failed).
@@ -301,9 +312,11 @@ where
             opts: options,
             row: Vec::new(),
             family_cover: None,
+            markers: Vec::new(),
             columns_in_row: 0,
             col: Vec::new(),
             col_cover: None,
+            col_cover_seqno: 0,
             col_versions: 0,
             col_skip: false,
             column_bound: false,
@@ -340,6 +353,7 @@ where
     fn reset(&mut self) {
         self.row.clear();
         self.family_cover = None;
+        self.markers.clear();
         self.columns_in_row = 0;
         self.reset_column();
         self.col.clear();
@@ -349,6 +363,7 @@ where
 
     fn reset_column(&mut self) {
         self.col_cover = None;
+        self.col_cover_seqno = 0;
         self.col_versions = 0;
         self.col_skip = false;
         self.run = false;
@@ -383,6 +398,9 @@ where
                 && seqno <= self.opts.snapshot
             {
                 raise(&mut self.family_cover, ts);
+                if self.opts.counter {
+                    self.markers.push((ts, seqno));
+                }
             }
             self.cursor.next()?;
         }
@@ -445,6 +463,16 @@ where
         self.family_cover.is_some_and(|c| ts <= c) || self.col_cover.is_some_and(|c| ts <= c)
     }
 
+    /// Counter families: entries at `ts` with a seqno below this are hidden by a column
+    /// delete or family marker (0 = none).
+    fn cover_seqno(&self, ts: Timestamp) -> Seqno {
+        self.markers
+            .iter()
+            .filter(|m| m.0 >= ts)
+            .map(|m| m.1)
+            .fold(self.col_cover_seqno, Seqno::max)
+    }
+
     /// Whether the cursor's current key is in the current column.
     fn in_column(&self) -> bool {
         let k = self.cursor.key();
@@ -497,11 +525,15 @@ where
                     self.row.clear();
                     self.row.extend_from_slice(&key[..n]);
                     self.family_cover = None;
+                    self.markers.clear();
                     self.columns_in_row = 0;
                 }
                 if kind == Kind::FamilyDelete {
                     if seqno <= self.opts.snapshot {
                         raise(&mut self.family_cover, ts);
+                        if self.opts.counter {
+                            self.markers.push((ts, seqno));
+                        }
                     }
                     self.col.clear();
                     self.cursor.next()?;
@@ -543,7 +575,13 @@ where
     /// produces one now (a group of operands only extends the pending run instead).
     fn group(&mut self, ts: Timestamp) -> Result<Option<Out>, C::Error> {
         let snapshot = self.opts.snapshot;
-        let mut hidden = self.expired(ts) || self.covered(ts);
+        let counter = self.opts.counter;
+        let expired = self.expired(ts);
+        // Timestamp deletes hide the whole group whatever the order. In a counter family a
+        // delete hides only older entries: those below `floor`, and those after it in the
+        // group (seqno descending), which `hidden` then skips.
+        let mut hidden = expired || (!counter && self.covered(ts));
+        let floor = if counter { self.cover_seqno(ts) } else { 0 };
         let mut base = Base::None;
         let mut ops = false;
         let mut ops_err: Option<MergeError> = None;
@@ -556,10 +594,11 @@ where
             if t != ts {
                 break;
             }
-            if seqno <= snapshot {
+            if seqno <= snapshot && seqno >= floor {
                 match kind {
                     Kind::ColumnDelete => {
                         raise(&mut self.col_cover, ts);
+                        self.col_cover_seqno = self.col_cover_seqno.max(seqno);
                         hidden = true;
                     }
                     Kind::CellDelete => hidden = true,
@@ -595,7 +634,7 @@ where
             }
             self.cursor.next()?;
         }
-        if hidden || (base == Base::None && !ops) {
+        if (if counter { expired } else { hidden }) || (base == Base::None && !ops) {
             return Ok(None);
         }
 
@@ -643,6 +682,16 @@ where
                 self.load_base();
                 let err = ops_err.or_else(|| match &self.opts.merge {
                     Some(op) => op.finish(Some(&self.base_val), &mut self.g_acc).err(),
+                    None => Some(MergeError::no_operator()),
+                });
+                std::mem::swap(&mut self.out_key, &mut self.g_key);
+                std::mem::swap(&mut self.out_val, &mut self.g_acc);
+                self.emit_buffer(ts, err)
+            }
+            _ if counter => {
+                // Operands only, in a counter family: the bucket's version is their sum.
+                let err = ops_err.or_else(|| match &self.opts.merge {
+                    Some(op) => op.finish(None, &mut self.g_acc).err(),
                     None => Some(MergeError::no_operator()),
                 });
                 std::mem::swap(&mut self.out_key, &mut self.g_key);

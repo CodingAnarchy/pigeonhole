@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use common::{Store, families, poll_commit};
 use pigeonhole_engine::{
-    Engine, EngineOptions, Error, FamilyOptions, Predicate, ReadSpec, ScanSpec, ValuePredicate,
-    ValueRef, WriteBatch,
+    COUNTER_TS, Engine, EngineOptions, Error, FamilyKind, FamilyOptions, Predicate, ReadSpec,
+    ScanSpec, ValuePredicate, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_format::shm::directory_name;
@@ -1088,5 +1088,169 @@ fn test_hook_history_records_only_once_turned_on() {
     db.record_history(false);
     commit(b"c");
     assert!(db.take_appended().is_empty());
+    db.close().unwrap();
+}
+
+// ---- D179: counter families ----
+
+/// `(timestamp, i64)` of every version of `row`/`q` in `fam`.
+fn counter_versions(
+    db: &Engine,
+    t: &pigeonhole_engine::TableInfo,
+    fam: &str,
+    row: &[u8],
+) -> Vec<(u64, i64)> {
+    let snap = db.snapshot().unwrap();
+    let mut spec = ReadSpec::default();
+    spec.families = vec![t.family(fam).unwrap().id];
+    db.read_row(&snap, t.id, row, &spec)
+        .unwrap()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| match c.data.value() {
+                    ValueRef::I64(v) => (c.data.timestamp(), v),
+                    v => panic!("not an i64: {v:?}"),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn counter_family(ttl_micros: u64) -> FamilyOptions {
+    FamilyOptions {
+        merge_operator: "pigeonhole.i64_add".into(),
+        kind: FamilyKind::Counter,
+        ttl_micros,
+        ..FamilyOptions::default()
+    }
+}
+
+#[test]
+fn counter_family_operands_share_a_timestamp_and_deletes_hide_only_older_ones() {
+    let vfs = SimVfs::new(41);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("c".into(), counter_family(0))])
+        .unwrap();
+    let c = t.family("c").unwrap().id;
+    let incr = |q: &[u8], d: i64| {
+        let mut wb = WriteBatch::new();
+        wb.merge(t.id, c, b"r", q, ValueRef::I64(d)).unwrap();
+        db.commit(wb, None).unwrap();
+    };
+    incr(b"n", 2);
+    incr(b"n", 3);
+    assert_eq!(counter_versions(&db, &t, "c", b"r"), [(COUNTER_TS, 5)]);
+    // Buckets are versions of their own.
+    let mut wb = WriteBatch::new();
+    wb.merge_at(t.id, c, b"r", b"n", 100, ValueRef::I64(7))
+        .unwrap();
+    wb.merge_at(t.id, c, b"r", b"n", 200, ValueRef::I64(1))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    assert_eq!(
+        counter_versions(&db, &t, "c", b"r"),
+        [(200, 1), (100, 7), (COUNTER_TS, 5)]
+    );
+    // A column delete hides what was written before it, not a later increment at a covered
+    // timestamp; flushes and compactions keep it that way.
+    let mut wb = WriteBatch::new();
+    wb.delete_column(t.id, c, b"r", b"n", None).unwrap();
+    db.commit(wb, None).unwrap();
+    assert_eq!(counter_versions(&db, &t, "c", b"r"), []);
+    incr(b"n", 4);
+    assert_eq!(counter_versions(&db, &t, "c", b"r"), [(COUNTER_TS, 4)]);
+    db.flush().unwrap();
+    incr(b"n", 1);
+    db.compact(None).unwrap();
+    assert_eq!(counter_versions(&db, &t, "c", b"r"), [(COUNTER_TS, 5)]);
+    // put_i64 sets the counter; later increments add to it.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, c, b"r", b"n", None, ValueRef::I64(100))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    incr(b"n", 1);
+    assert_eq!(counter_versions(&db, &t, "c", b"r"), [(COUNTER_TS, 101)]);
+    db.close().unwrap();
+}
+
+#[test]
+fn counter_family_write_rules() {
+    let vfs = SimVfs::new(42);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    let t = db
+        .create_table(
+            "t",
+            &[
+                ("c".into(), counter_family(0)),
+                ("ttl".into(), counter_family(1_000_000)),
+                (
+                    "legacy".into(),
+                    FamilyOptions {
+                        merge_operator: "pigeonhole.i64_add".into(),
+                        ..FamilyOptions::default()
+                    },
+                ),
+                ("plain".into(), FamilyOptions::default()),
+            ],
+        )
+        .unwrap();
+    let id = |f: &str| t.family(f).unwrap().id;
+    let refused = |wb: WriteBatch, what: &str| {
+        let err = db.commit(wb, None).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains(what)),
+            "{err}"
+        );
+    };
+    // A counter family holds only i64s.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, id("c"), b"r", b"n", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    refused(wb, "only i64");
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, id("c"), b"r", b"n", ValueRef::Bytes(b"x"))
+        .unwrap();
+    refused(wb, "only i64");
+    // With a TTL its fixed timestamp would expire at once: buckets only.
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, id("ttl"), b"r", b"n", ValueRef::I64(1))
+        .unwrap();
+    refused(wb, "TTL");
+    let now = vfs.now_micros();
+    let mut wb = WriteBatch::new();
+    wb.merge_at(t.id, id("ttl"), b"r", b"n", now, ValueRef::I64(1))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    assert_eq!(counter_versions(&db, &t, "ttl", b"r"), [(now, 1)]);
+    // A bucket timestamp is for counter families only.
+    for f in ["legacy", "plain"] {
+        let mut wb = WriteBatch::new();
+        wb.merge_at(t.id, id(f), b"r", b"n", 5, ValueRef::I64(1))
+            .unwrap();
+        refused(wb, "not a counter family");
+    }
+    // A family without an operator refuses operands.
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, id("plain"), b"r", b"n", ValueRef::I64(1))
+        .unwrap();
+    refused(wb, "no merge operator");
+    // A 0.1.0-style family (the operator, standard kind) is unchanged: operands take the
+    // commit timestamp and fold across timestamps (D41).
+    for d in [1, 2] {
+        let mut wb = WriteBatch::new();
+        wb.merge(t.id, id("legacy"), b"r", b"n", ValueRef::I64(d))
+            .unwrap();
+        db.commit(wb, None).unwrap();
+    }
+    let legacy = counter_versions(&db, &t, "legacy", b"r");
+    assert_eq!(legacy.len(), 1);
+    assert!(legacy[0].0 > COUNTER_TS && legacy[0].1 == 3, "{legacy:?}");
+    // A counter family sums with the built-in operator only.
+    let mut bad = counter_family(0);
+    bad.merge_operator = String::new();
+    let err = db.add_family(t.id, "bad", bad).unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     db.close().unwrap();
 }

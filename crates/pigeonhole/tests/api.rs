@@ -710,70 +710,277 @@ fn a_compaction_purge_uncovers_later_puts_at_older_timestamps() {
     }
 }
 
+/// A table with a counter family `c` and an ordinary family `a` (decision D179).
+fn counters(db: &Pigeonhole) -> Table {
+    db.table("counters")
+        .unwrap()
+        .family("c", Family::counter())
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap()
+}
+
+fn count(t: &Table, row: &[u8], q: &[u8]) -> Option<i64> {
+    t.get(row, "c", q).unwrap().map(|c| c.as_i64().unwrap())
+}
+
+/// `(timestamp, value)` of every version of a counter column.
+fn buckets(t: &Table, row: &[u8], q: &[u8]) -> Vec<(u64, i64)> {
+    t.row(row)
+        .family("c")
+        .qualifier_range(q..=q)
+        .versions(0)
+        .read()
+        .unwrap()
+        .map(|r| {
+            r.iter()
+                .map(|e| (e.cell.timestamp(), e.cell.as_i64().unwrap()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
 fn counters_and_typed_values() {
     let db = db();
-    let t = table(&db);
+    let t = counters(&db);
+    for d in [5, -2, 10] {
+        t.mutate(b"r").incr("c", b"hits", d).commit().unwrap();
+    }
+    assert_eq!(count(&t, b"r", b"hits"), Some(13));
+    // One cell at the fixed timestamp, however many increments.
+    assert_eq!(buckets(&t, b"r", b"hits"), [(0, 13)]);
+    // A put and an increment of the same counter in one commit share its timestamp, so the
+    // last one written wins (D34): reset and add in separate commits.
+    t.mutate(b"r")
+        .put_i64("c", b"hits", 100)
+        .incr("c", b"hits", 7)
+        .commit()
+        .unwrap();
+    assert_eq!(count(&t, b"r", b"hits"), Some(20));
+    t.mutate(b"r").put_i64("c", b"hits", 100).commit().unwrap();
+    t.mutate(b"r").incr("c", b"hits", 1).commit().unwrap();
+    assert_eq!(count(&t, b"r", b"hits"), Some(101));
+    let mut wb = db.write_batch();
+    wb.incr(&t, b"r", "c", b"hits", 1)
+        .incr(&t, b"s", "c", b"hits", 1);
+    wb.commit().unwrap();
+    assert_eq!(count(&t, b"r", b"hits"), Some(102));
+    assert_eq!(count(&t, b"s", b"hits"), Some(1));
+    // Overflow wraps.
+    t.mutate(b"w")
+        .put_i64("c", b"n", i64::MAX)
+        .commit()
+        .unwrap();
+    t.mutate(b"w").incr("c", b"n", 1).commit().unwrap();
+    assert_eq!(count(&t, b"w", b"n"), Some(i64::MIN));
+}
+
+#[test]
+fn counter_buckets_are_versions() {
+    let db = db();
+    let t = counters(&db);
+    let hour = 3_600_000_000;
+    for (h, d) in [(7, 1), (8, 4), (8, 1), (9, 2)] {
+        t.mutate(b"r")
+            .incr_at("c", b"hourly", h * hour, d)
+            .commit()
+            .unwrap();
+    }
+    let mut wb = db.write_batch();
+    wb.incr_at(&t, b"r", "c", b"hourly", 9 * hour, 3);
+    wb.commit().unwrap();
+    assert_eq!(
+        buckets(&t, b"r", b"hourly"),
+        [(9 * hour, 5), (8 * hour, 5), (7 * hour, 1)]
+    );
+    // put_i64_at sets a bucket; later increments add to it.
+    t.mutate(b"r")
+        .put_i64_at("c", b"hourly", 8 * hour, 0)
+        .commit()
+        .unwrap();
+    t.mutate(b"r")
+        .incr_at("c", b"hourly", 8 * hour, 2)
+        .commit()
+        .unwrap();
+    let mut wb = db.write_batch();
+    wb.put_i64_at(&t, b"r", "c", b"hourly", 7 * hour, 50);
+    wb.commit().unwrap();
+    assert_eq!(
+        buckets(&t, b"r", b"hourly"),
+        [(9 * hour, 5), (8 * hour, 2), (7 * hour, 50)]
+    );
+    // A time range reads a window of buckets.
+    let window: Vec<i64> = t
+        .row(b"r")
+        .family("c")
+        .versions(0)
+        .time_range(8 * hour..10 * hour)
+        .read()
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|e| e.cell.as_i64().unwrap())
+        .collect();
+    assert_eq!(window, [5, 2]);
+    // A delete of one bucket leaves the others; flushes and compactions change nothing.
+    t.mutate(b"r")
+        .delete_cell("c", b"hourly", 9 * hour)
+        .commit()
+        .unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(
+        buckets(&t, b"r", b"hourly"),
+        [(8 * hour, 2), (7 * hour, 50)]
+    );
+    // max_versions and the TTL apply per bucket.
+    let capped = db
+        .table("capped")
+        .unwrap()
+        .family("c", Family::counter().max_versions(2))
+        .create()
+        .unwrap();
+    for h in 1..=4 {
+        capped
+            .mutate(b"r")
+            .incr_at("c", b"n", h * hour, 1)
+            .commit()
+            .unwrap();
+    }
+    assert_eq!(buckets(&capped, b"r", b"n"), [(4 * hour, 1), (3 * hour, 1)]);
+}
+
+#[test]
+fn counter_deletes_hide_only_what_came_before() {
+    let db = db();
+    let t = counters(&db);
+    t.mutate(b"r").incr("c", b"n", 5).commit().unwrap();
+    t.mutate(b"r").delete_column("c", b"n").commit().unwrap();
+    assert_eq!(count(&t, b"r", b"n"), None);
+    // The counter starts again from 0: the delete does not hide later increments.
+    t.mutate(b"r").incr("c", b"n", 2).commit().unwrap();
+    assert_eq!(count(&t, b"r", b"n"), Some(2));
+    let before = db.snapshot().unwrap();
+    t.mutate(b"r").delete_row().commit().unwrap();
+    t.mutate(b"r").incr("c", b"n", 1).commit().unwrap();
+    assert_eq!(count(&t, b"r", b"n"), Some(1));
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(count(&t, b"r", b"n"), Some(1));
+    // A snapshot reads the sum of the increments it sees.
+    assert_eq!(
+        t.get_at(&before, b"r", "c", b"n")
+            .unwrap()
+            .unwrap()
+            .as_i64(),
+        Some(2)
+    );
+    t.mutate(b"r").delete_family("c").commit().unwrap();
+    t.mutate(b"r").delete_cell("c", b"m", 0).commit().unwrap();
+    t.mutate(b"r").incr("c", b"m", 4).commit().unwrap();
+    assert_eq!(count(&t, b"r", b"n"), None);
+    assert_eq!(count(&t, b"r", b"m"), Some(4));
+}
+
+#[test]
+fn counter_family_write_rules() {
+    let db = db();
+    let t = counters(&db);
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    // `incr` needs a counter family, and says so.
+    refused(
+        t.mutate(b"r").incr("a", b"n", 1).commit(),
+        "family \"a\" of table \"counters\" has no merge operator",
+    );
+    refused(
+        t.mutate(b"r").incr_at("a", b"n", 5, 1).commit(),
+        "not a counter family",
+    );
+    // A counter family holds only i64s.
+    for m in [
+        t.mutate(b"r").put("c", b"n", b"text"),
+        t.mutate(b"r").put_at("c", b"n", 5, b"text"),
+        t.mutate(b"r").put_f64("c", b"n", 1.5),
+        t.mutate(b"r").merge("c", b"n", &1i64.to_le_bytes()),
+    ] {
+        refused(m.commit(), "only i64 values");
+    }
+    let mut wb = db.write_batch();
+    wb.put(&t, b"r", "c", b"n", b"text");
+    refused(wb.commit(), "only i64 values");
+    // With a TTL the fixed timestamp would expire at once: buckets only.
+    let ttl = db
+        .table("ttl")
+        .unwrap()
+        .family("c", Family::counter().ttl(days(1)))
+        .create()
+        .unwrap();
+    refused(ttl.mutate(b"r").incr("c", b"n", 1).commit(), "TTL");
+    refused(ttl.mutate(b"r").put_i64("c", b"n", 1).commit(), "TTL");
+    let bucket = 4_000_000_000_000_000; // well after the sim clock: not expired
+    ttl.mutate(b"r")
+        .incr_at("c", b"n", bucket, 3)
+        .commit()
+        .unwrap();
+    assert_eq!(buckets(&ttl, b"r", b"n"), [(bucket, 3)]);
+    // A counter family sums with the built-in operator only.
+    let err = db
+        .table("bad")
+        .unwrap()
+        .family("c", Family::counter().merge_operator(""))
+        .create()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+    // Nothing refused was written.
+    assert!(t.row(b"r").read().unwrap().is_none());
+}
+
+/// A family that names `pigeonhole.i64_add` without being a counter family reads and writes
+/// as 0.1.0 created them (D41): increments at the commit timestamp, folded across
+/// timestamps, and bytes on top of a counter fail at read.
+#[test]
+fn families_with_the_i64_operator_keep_0_1_0_semantics() {
+    let db = db();
+    let t = db
+        .table("legacy")
+        .unwrap()
+        .family("a", Family::default().merge_operator("pigeonhole.i64_add"))
+        .create()
+        .unwrap();
     for d in [5, -2, 10] {
         t.mutate(b"r").incr("a", b"hits", d).commit().unwrap();
     }
-    assert_eq!(
-        t.get(b"r", "a", b"hits").unwrap().unwrap().as_i64(),
-        Some(13)
-    );
-    // A put and an operand of the same column in one commit share its timestamp, so the
-    // last one written wins (D34): reset the base and add in separate commits.
-    t.mutate(b"r")
-        .put_i64("a", b"hits", 100)
-        .incr("a", b"hits", 7)
-        .commit()
-        .unwrap();
-    assert_eq!(
-        t.get(b"r", "a", b"hits").unwrap().unwrap().as_i64(),
-        Some(20)
-    );
-    t.mutate(b"r").put_i64("a", b"hits", 100).commit().unwrap();
-    t.mutate(b"r").incr("a", b"hits", 1).commit().unwrap();
-    assert_eq!(
-        t.get(b"r", "a", b"hits").unwrap().unwrap().as_i64(),
-        Some(101)
-    );
-    let mut wb = db.write_batch();
-    wb.incr(&t, b"r", "a", b"hits", 1)
-        .incr(&t, b"s", "a", b"hits", 1);
-    wb.commit().unwrap();
-    assert_eq!(
-        t.get(b"r", "a", b"hits").unwrap().unwrap().as_i64(),
-        Some(102)
-    );
-    // `merge` writes an operand for the family's operator (here the default i64 add).
+    let cell = t.get(b"r", "a", b"hits").unwrap().unwrap();
+    assert_eq!(cell.as_i64(), Some(13));
+    assert!(cell.timestamp() > 0, "at the commit timestamp");
+    // `merge` writes an operand for the family's operator; the built-in takes typed
+    // operands only, so untyped bytes fail at read.
     t.mutate(b"r")
         .merge("a", b"hits", &3i64.to_le_bytes())
         .commit()
         .unwrap();
-    // Bytes on top of a counter, or an operand onto bytes, fail at read with MergeFailed.
+    assert_eq!(
+        t.get(b"r", "a", b"hits").map(|_| ()).unwrap_err().code(),
+        ErrorCode::MergeFailed
+    );
     t.mutate(b"m").put("a", b"c", b"text").commit().unwrap();
     t.mutate(b"m").incr("a", b"c", 1).commit().unwrap();
     assert_eq!(
         t.get(b"m", "a", b"c").map(|_| ()).unwrap_err().code(),
         ErrorCode::MergeFailed
     );
-    // A family without an operator refuses operands at commit.
-    let plain = db
-        .table("plain")
-        .unwrap()
-        .family("p", Family::default().merge_operator(""))
-        .create()
-        .unwrap();
-    assert_eq!(
-        plain
-            .mutate(b"r")
-            .incr("p", b"c", 1)
-            .commit()
-            .unwrap_err()
-            .code(),
-        ErrorCode::InvalidArgument
-    );
+    // Buckets belong to counter families.
+    let err = t
+        .mutate(b"r")
+        .incr_at("a", b"n", 5, 1)
+        .commit()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
 }
 
 #[test]
@@ -1264,19 +1471,12 @@ fn write_batches_have_every_row_mutation() {
         .delete_family(&t, b"r", "b");
     assert_eq!(wb.len(), 4);
     wb.commit().unwrap();
-    let mut wb = db.write_batch();
-    wb.incr(&t, b"r", "a", b"n", 1);
-    wb.commit().unwrap();
-    assert_eq!(t.get(b"r", "a", b"n").unwrap().unwrap().as_i64(), Some(42));
-    // `merge` writes an untyped operand (for custom operators); the built-in i64 add
-    // refuses it at read time, so counters use `incr`.
+    assert_eq!(t.get(b"r", "a", b"n").unwrap().unwrap().as_i64(), Some(41));
+    // Increments and untyped operands need a family with an operator (counters: see
+    // `counters_and_typed_values`; custom operators: `registered_merge_operators_resolve_through_flush_compaction_and_reopen`).
     let mut wb = db.write_batch();
     wb.merge(&t, b"m", "a", b"n", &1i64.to_le_bytes());
-    wb.commit().unwrap();
-    assert_eq!(
-        t.get(b"m", "a", b"n").map(|_| ()).unwrap_err().code(),
-        ErrorCode::MergeFailed
-    );
+    assert_eq!(wb.commit().unwrap_err().code(), ErrorCode::InvalidArgument);
     assert_eq!(
         t.get(b"s", "a", b"f").unwrap().unwrap().typed(),
         Value::F64(1.5)

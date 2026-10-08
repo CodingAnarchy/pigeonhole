@@ -12,7 +12,8 @@ use pigeonhole_format::compress::Compression;
 use pigeonhole_format::filter::{Filter, FilterBuilder, column_hash, row_hash};
 use pigeonhole_format::key::{Kind, decode_key, encode_key, encode_marker_key, encode_seek_key};
 use pigeonhole_format::manifest::{
-    Edit, FamilyOptions, ManifestBlockKind, ManifestHeader, SstMeta, decode_block, encode_block,
+    Edit, FamilyKind, FamilyOptions, ManifestBlockKind, ManifestHeader, SstMeta, decode_block,
+    encode_block,
 };
 use pigeonhole_format::shm::{
     ShmHeader, ViewMemtable, ViewRecord, ViewTablet, directory_name, region_name,
@@ -394,6 +395,16 @@ fn all_edits() -> Vec<Edit> {
             tablet: TabletId(2),
         },
         Edit::DropTable { table: TableId(0) },
+        Edit::PutFamily {
+            table: TableId(1),
+            family: FamilyId(3),
+            name: "hits".into(),
+            options: FamilyOptions {
+                merge_operator: "pigeonhole.i64_add".into(),
+                kind: FamilyKind::Counter,
+                ..FamilyOptions::default()
+            },
+        },
     ]
 }
 
@@ -428,6 +439,28 @@ fn manifest() {
         &mut log,
     );
     check("manifest_delta_log.bin", &log);
+}
+
+/// A snapshot written before `FamilyOptions::kind` existed (0.1.0) still decodes: the
+/// families read as `FamilyKind::Standard`, whatever their merge operator (decision D179).
+#[test]
+fn manifest_without_family_kind() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/manifest_snapshot_0_1.bin");
+    let old = std::fs::read(path).unwrap();
+    let (_, back, _) = decode_block(&old).unwrap();
+    // The counter family and the blob references are newer than the file.
+    let mut want = all_edits();
+    want.pop();
+    want.retain(|e| !matches!(e, Edit::SstBlobRefs { .. }));
+    assert_eq!(back, want);
+    let Edit::PutFamily { options, .. } = &back[2] else {
+        panic!("edit 2 is the family");
+    };
+    assert_eq!(
+        (options.merge_operator.as_str(), options.kind),
+        ("pigeonhole.i64_add", FamilyKind::Standard)
+    );
 }
 
 fn batch() -> BatchBuilder {

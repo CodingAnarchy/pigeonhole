@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::MergeRegistry;
-use pigeonhole_format::manifest::{Edit, FamilyOptions};
+use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions};
 use pigeonhole_format::shm::ViewRecord;
-use pigeonhole_format::wal::{BatchBuilder, WalRecord};
+use pigeonhole_format::value::ValueTag;
+use pigeonhole_format::wal::{BatchBuilder, Mutation, WalRecord};
 use pigeonhole_format::{
     Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, StreamId, TableId, TabletId,
 };
@@ -25,7 +26,7 @@ use pigeonhole_shm::{Presence, ReaderSlot, Role as ShmRole, ShmConfig, ShmRegion
 use pigeonhole_sst::SstWriterOptions;
 use pigeonhole_wal::{Recovery, Wal, WalStream, discover_streams, stream_path};
 
-use crate::catalog::{Catalog, MergeKind};
+use crate::catalog::{Catalog, FamilyMeta, MergeKind};
 use crate::flush::{SstSink, write_memtable};
 use crate::manifest::{self, ManifestWriter, ReqKind};
 use crate::read::{self, get_in};
@@ -38,7 +39,7 @@ use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
     TabletMap, View, ViewPin,
 };
-use crate::write::ReadKey;
+use crate::write::{COUNTER_TS, ReadKey};
 use crate::{
     CellData, EngineOptions, Error, PendingCommit, Predicate, ReadSpec, Result, RowData,
     ScanCursor, ScanSpec, Snapshot, Txn, WriteBatch,
@@ -1834,6 +1835,8 @@ impl Inner {
             }
         }
         let mut shards: Vec<ShardId> = Vec::new();
+        // Whether a counter-family put or operand takes the fixed timestamp (D179).
+        let mut fixed_ts = false;
         for m in batch.batch().iter() {
             let m = m?;
             let Some(meta) = catalog.family(m.family) else {
@@ -1845,12 +1848,21 @@ impl Inner {
                     m.family.0, m.table.0
                 )));
             }
+            if meta.options.kind == FamilyKind::Counter {
+                fixed_ts |= check_counter_write(&m, meta, catalog)?;
+            } else if m.kind == Kind::Merge && m.ts.is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "{} is not a counter family: only a counter family takes increments at a \
+                     chosen timestamp",
+                    family_name(catalog, m.table, m.family)
+                )));
+            }
             if m.kind == Kind::Merge {
                 match meta.merge {
                     MergeKind::None => {
                         return Err(Error::InvalidArgument(format!(
-                            "family {} has no merge operator",
-                            m.family.0
+                            "{} has no merge operator: increments need a counter family",
+                            family_name(catalog, m.table, m.family)
                         )));
                     }
                     MergeKind::Unknown => {
@@ -1870,6 +1882,9 @@ impl Inner {
             if !shards.contains(&shard) {
                 shards.push(shard);
             }
+        }
+        if fixed_ts {
+            return Ok((with_counter_timestamps(&batch.builder, catalog)?, shards));
         }
         Ok((batch.builder, shards))
     }
@@ -2412,12 +2427,73 @@ fn view_from_record(
     })
 }
 
+/// Checks a put or operand into a counter family (D179): its value must be a stored `i64`,
+/// and one without a timestamp takes the fixed counter timestamp, which a family with a TTL
+/// refuses (it would expire at once). Returns whether the mutation needs that timestamp.
+fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> Result<bool> {
+    if !matches!(m.kind, Kind::Put | Kind::Merge) {
+        return Ok(false);
+    }
+    if m.value.len() != 9 || m.value[0] != ValueTag::I64 as u8 {
+        return Err(Error::InvalidArgument(format!(
+            "{} is a counter family: it holds only i64 values (put_i64 / incr)",
+            family_name(catalog, m.table, m.family)
+        )));
+    }
+    if m.ts.is_some() {
+        return Ok(false);
+    }
+    if meta.options.ttl_micros != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "counter {} has a TTL, so its fixed-timestamp counter would expire at once: \
+             write a bucket with an explicit timestamp (incr_at / put_i64_at)",
+            family_name(catalog, m.table, m.family)
+        )));
+    }
+    Ok(true)
+}
+
+/// `family "name" of table "name"` for messages (ids if the catalog does not know them).
+fn family_name(catalog: &Catalog, table: TableId, family: FamilyId) -> String {
+    match catalog.table(table) {
+        Some(t) => match t.families.iter().find(|f| f.id == family) {
+            Some(f) => format!("family {:?} of table {:?}", f.name, t.name),
+            None => format!("family {} of table {:?}", family.0, t.name),
+        },
+        None => format!("family {} of table {}", family.0, table.0),
+    }
+}
+
+/// `batch` with every put and operand of a counter family that has no timestamp moved to
+/// the fixed counter timestamp, [`COUNTER_TS`].
+fn with_counter_timestamps(batch: &BatchBuilder, catalog: &Catalog) -> Result<BatchBuilder> {
+    let mut out = BatchBuilder::new();
+    for m in batch.batch().iter() {
+        let m = m?;
+        let counter = catalog
+            .family(m.family)
+            .is_some_and(|f| f.options.kind == FamilyKind::Counter);
+        let ts = match (m.kind, m.ts) {
+            (Kind::Put | Kind::Merge, None) if counter => Some(COUNTER_TS),
+            (_, ts) => ts,
+        };
+        out.push(m.table, m.family, m.kind, m.row, m.qualifier, ts, m.value)?;
+    }
+    Ok(out)
+}
+
 fn check_merge_operator(
     options: &FamilyOptions,
     registry: &MergeRegistry,
     allow_unregistered: bool,
 ) -> Result<()> {
     let name = options.merge_operator.as_str();
+    if options.kind == FamilyKind::Counter && name != crate::catalog::I64_ADD {
+        return Err(Error::InvalidArgument(format!(
+            "a counter family sums i64s with {}, not {name:?}",
+            crate::catalog::I64_ADD
+        )));
+    }
     if name.is_empty() || registry.get(name).is_some() || allow_unregistered {
         Ok(())
     } else {

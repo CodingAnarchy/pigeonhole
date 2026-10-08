@@ -199,6 +199,21 @@ pub enum CachePriority {
     High = 2,
 }
 
+/// What a family's columns hold, which decides how merge operands and deletes resolve
+/// (decision D179). Numbers are frozen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum FamilyKind {
+    /// Plain cells. Merge operands (with a named operator) fold across timestamps (D41) and
+    /// deletes hide by timestamp. Families written before the kind was stored read as this.
+    #[default]
+    Standard = 0,
+    /// An `i64` sum counter family (Bigtable's aggregate families): operands combine only
+    /// within one `(column, timestamp)` bucket, each bucket is one version, and a delete
+    /// hides only entries written before it (lower seqno) within its timestamp scope.
+    Counter = 1,
+}
+
 /// The persisted policy of one family. Stored in the manifest so another binary interprets
 /// the data the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +238,8 @@ pub struct FamilyOptions {
     pub cache_priority: CachePriority,
     /// Compaction strategy.
     pub compaction: CompactionStyle,
+    /// What the family's columns hold (appended field; absent reads as `Standard`).
+    pub kind: FamilyKind,
 }
 
 impl Default for FamilyOptions {
@@ -240,6 +257,7 @@ impl Default for FamilyOptions {
             merge_operator: String::new(),
             cache_priority: CachePriority::Normal,
             compaction: CompactionStyle::Leveled,
+            kind: FamilyKind::Standard,
         }
     }
 }
@@ -256,6 +274,7 @@ impl FamilyOptions {
         crate::varint::put_bytes(out, self.merge_operator.as_bytes());
         out.push(self.cache_priority as u8);
         out.push(self.compaction as u8);
+        out.push(self.kind as u8);
     }
 
     fn decode(r: &mut Reader<'_>) -> crate::Result<Self> {
@@ -287,6 +306,20 @@ impl FamilyOptions {
                     return Err(Error::Corrupt {
                         what: "family compaction style",
                     });
+                }
+            },
+            // Appended after format 1's first release: absent means `Standard`.
+            kind: if r.remaining() == 0 {
+                FamilyKind::Standard
+            } else {
+                match r.u8()? {
+                    0 => FamilyKind::Standard,
+                    1 => FamilyKind::Counter,
+                    _ => {
+                        return Err(Error::Corrupt {
+                            what: "family kind",
+                        });
+                    }
                 }
             },
         })
