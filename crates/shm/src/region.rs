@@ -967,7 +967,7 @@ mod tests {
     fn create_failures_map_to_unavailable() {
         use pigeonhole_io::Error as IoError;
         for kind in [ErrorKind::NoSpace, ErrorKind::NotFound, ErrorKind::Other] {
-            let e = unavailable(IoError::new(kind, "reserve shared region"));
+            let e = unavailable(IoError::new(kind, "size shared region"));
             assert!(matches!(e, Error::Unavailable), "{kind:?} gave {e:?}");
         }
         let e = unavailable(IoError::new(ErrorKind::Crashed, "open shared region"));

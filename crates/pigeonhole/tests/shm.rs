@@ -35,8 +35,9 @@ const CHILD_ENV: &str = "PIGEONHOLE_TEST_SMALL_SHM";
 #[cfg(target_os = "linux")]
 const CHILD_MARKER: &str = "small-shm child running";
 
-/// A region larger than its tmpfs (Docker's 64 MiB `/dev/shm`, in miniature). With a sparse
-/// region the open succeeded and the first store past the tmpfs size raised `SIGBUS`.
+/// A region larger than its tmpfs (Docker's 64 MiB `/dev/shm`, in miniature). Without the
+/// free-space check at open, the open succeeded and the first store past the tmpfs size
+/// raised `SIGBUS`.
 ///
 /// Mounting a tmpfs needs privileges, so the test re-runs itself in a private mount namespace:
 /// an unprivileged user namespace where the kernel allows one, else `sudo -n` (CI), dropping

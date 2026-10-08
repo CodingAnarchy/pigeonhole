@@ -252,7 +252,7 @@ pub(crate) fn open_region_file(path: &Path, len: u64, mode: SharedOpen) -> Resul
         .open(path)
         .map_err(|e| Error::os("open shared region", e))?;
     if mode == SharedOpen::CreateNew
-        && let Err(e) = reserve_region_file(&file, len)
+        && let Err(e) = size_region_file(&file, len)
     {
         let _ = fs::remove_file(path);
         return Err(e);
@@ -260,46 +260,23 @@ pub(crate) fn open_region_file(path: &Path, len: u64, mode: SharedOpen) -> Resul
     Ok(file)
 }
 
-/// Sizes a new region file to `len` and reserves its storage up front where the filesystem
-/// can, so a full or too-small filesystem (Docker's 64 MiB `/dev/shm`) fails here with
-/// `NoSpace` instead of raising `SIGBUS` on a later store into the mapping. On tmpfs this
-/// commits the region's memory at open. A filesystem that cannot reserve gets a sparse file.
-fn reserve_region_file(file: &fs::File, len: u64) -> Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-    {
-        let size = off(len, "region too large")?;
-        loop {
-            // SAFETY: plain syscall on an fd we own; it reports its error as the return value.
-            match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, size) } {
-                0 => return Ok(()),
-                libc::EINTR => {}
-                libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS => break,
-                e => {
-                    return Err(Error::os(
-                        "reserve shared region",
-                        io::Error::from_raw_os_error(e),
-                    ));
-                }
-            }
-        }
+/// Sizes a new region file to `len`, sparsely: memory (on tmpfs) or disk is used only as the
+/// memtables touch it. First checks that the filesystem has `len` bytes free, so a region that
+/// cannot fit (Docker's 64 MiB `/dev/shm`) fails here with `NoSpace` instead of raising
+/// `SIGBUS` on a later store into the mapping. Space another process takes after this check
+/// can still cause that; reserving instead would commit the whole region's memory at open.
+fn size_region_file(file: &fs::File, len: u64) -> Result<()> {
+    // SAFETY: `statvfs` is plain old data, valid when zeroed.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: plain syscall on an fd we own, writing into `st`, which outlives the call.
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(last_error("statvfs shared region"));
     }
-    #[cfg(target_vendor = "apple")]
-    {
-        let mut store = libc::fstore_t {
-            fst_flags: libc::F_ALLOCATEALL,
-            fst_posmode: libc::F_PEOFPOSMODE,
-            fst_offset: 0,
-            fst_length: off(len, "region too large")?,
-            fst_bytesalloc: 0,
-        };
-        // SAFETY: `store` is a valid `fstore_t` that outlives the call; the fd is ours.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) } != 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::ENOSPC) {
-                return Err(Error::os("reserve shared region", e));
-            }
-            // Anything else (no support on this filesystem): fall back to a sparse file.
-        }
+    if (st.f_bavail as u128) * (st.f_frsize as u128) < u128::from(len) {
+        return Err(Error::new(
+            ErrorKind::NoSpace,
+            "not enough free space for the shared region",
+        ));
     }
     file.set_len(len)
         .map_err(|e| Error::os("size shared region", e))
@@ -353,8 +330,8 @@ pub(crate) fn open_default_shared(name: &str, len: u64, mode: SharedOpen) -> Res
     });
     let result = (|| {
         // A POSIX shared-memory object here (macOS, the BSDs) is anonymous memory backed by
-        // swap, not a size-capped filesystem, so `ftruncate` is all it takes: there is no
-        // tmpfs to run out of later (and macOS offers no call to reserve one anyway).
+        // swap, not a size-capped filesystem, so there is no free space to check: `ftruncate`
+        // is all it takes.
         if mode == SharedOpen::CreateNew {
             let size = off(len, "region too large")?;
             // SAFETY: plain syscall on an fd we own.

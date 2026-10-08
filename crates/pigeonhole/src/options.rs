@@ -128,9 +128,10 @@ impl Options {
     /// larger than the arena fails with `Busy`).
     ///
     /// The shared-memory region holds every shard's arena, about `memtable_budget × shards`
-    /// (256 MiB for the default budget on 4 CPUs), and is reserved when the database opens:
-    /// on Linux it is memory in `/dev/shm` (or [`shm_dir`](Options::shm_dir)). If it does not
-    /// fit, opening fails with [`ErrorCode::ShmUnavailable`](crate::ErrorCode::ShmUnavailable).
+    /// (256 MiB for the default budget on 4 CPUs): on Linux, memory in `/dev/shm` (or a file
+    /// in [`shm_dir`](Options::shm_dir)), used only as the memtables fill. Opening checks
+    /// that the filesystem has that much free and fails with
+    /// [`ErrorCode::ShmUnavailable`](crate::ErrorCode::ShmUnavailable) if it does not.
     pub fn memtable_budget(mut self, bytes: u64) -> Self {
         self.memtable_budget = bytes;
         self
