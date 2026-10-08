@@ -608,8 +608,17 @@ fn drop_table_during_compaction(seed: u64, gone_ssts: u32) {
     // The dropped table's SSTs were retired at the drop and the refused output abandoned:
     // once `shrink` has reclaimed, the pager holds nothing no root references, and the space
     // went back to the filesystem.
+    // (The file may already be as small as its live extents allow: shrink reports what it
+    // gave back, net.)
+    let len = || {
+        vfs.open(Path::new(DB), pigeonhole_io::OpenOptions::read())
+            .unwrap()
+            .len()
+            .unwrap()
+    };
+    let before = len();
     let released = db.shrink().unwrap();
-    assert!(released > 0);
+    assert_eq!(released, before - len());
     assert_eq!(
         db.unreferenced_bytes(),
         0,
