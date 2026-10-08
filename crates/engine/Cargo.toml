@@ -31,7 +31,6 @@ test-hooks = []
 [dev-dependencies]
 pigeonhole-sim = { workspace = true }
 pigeonhole-engine = { path = ".", features = ["test-hooks"] }
-proptest = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]

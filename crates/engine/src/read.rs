@@ -86,6 +86,7 @@ impl CellData {
                     _view: pin(),
                 },
                 Some(Pinned::Block(c)) => CellValue::Block(c),
+                #[cfg(test)]
                 Some(Pinned::Owned(v)) => CellValue::Owned(v),
                 None => CellValue::Owned(stored.to_vec()),
             }
@@ -115,6 +116,7 @@ impl CellData {
                 _view: pin(),
             },
             LaneValue::Pinned(Pinned::Block(c)) => CellValue::Block(c.clone()),
+            #[cfg(test)]
             LaneValue::Pinned(Pinned::Owned(v)) => CellValue::Owned(v.clone()),
         };
         Self { ts, value }

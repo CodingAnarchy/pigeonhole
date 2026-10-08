@@ -858,7 +858,6 @@ dependencies = [
  "pigeonhole-sim",
  "pigeonhole-sst",
  "pigeonhole-wal",
- "proptest",
 ]
 
 [[package]]

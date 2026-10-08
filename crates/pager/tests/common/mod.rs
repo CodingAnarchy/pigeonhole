@@ -1,4 +1,5 @@
 //! Shared test helpers.
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 use pigeonhole_pager::Extent;

@@ -1,5 +1,6 @@
 //! Shared test helpers: seeded proptest configs and strategies biased towards the bytes and
 //! numbers that break order-preserving encodings (0x00, 0xFF, prefixes, extremes).
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 pub mod harness;

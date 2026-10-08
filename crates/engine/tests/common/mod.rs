@@ -29,6 +29,7 @@
 //! commits is read back (`Engine::take_compactions`): bottommost ones are applied to the model
 //! as `Model::purge`, and the dumps of every held snapshot are re-checked, so a compaction
 //! never changes a read at a live snapshot.
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 use std::cell::RefCell;
@@ -36,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -4408,8 +4409,4 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
     }
     drop(sim);
     dump
-}
-
-pub fn db_path() -> PathBuf {
-    PathBuf::from(DB)
 }

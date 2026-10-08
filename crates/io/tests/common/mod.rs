@@ -1,4 +1,5 @@
 //! Helpers shared by the integration tests.
+// Shared by several test binaries, each using a subset of it.
 #![allow(dead_code)]
 
 use std::future::Future;

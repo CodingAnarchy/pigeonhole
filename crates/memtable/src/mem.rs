@@ -43,8 +43,7 @@ mod imp {
     #[derive(Clone)]
     pub(crate) struct Mem {
         /// Keeps the mapping alive (`base` points into it); read only through `base`.
-        #[allow(dead_code)]
-        region: SharedRegion,
+        _region: SharedRegion,
         base: NonNull<u8>,
         len: usize,
     }
@@ -70,7 +69,11 @@ mod imp {
             // SAFETY: `offset <= region.len()`, so the result is within (or one past) the
             // mapping, which stays valid while `region` lives.
             let base = unsafe { region.base_ptr().add(offset) };
-            Self { region, base, len }
+            Self {
+                _region: region,
+                base,
+                len,
+            }
         }
 
         pub(crate) fn heap(len: usize) -> Self {
@@ -140,7 +143,7 @@ mod imp {
             self.atomic_u32(off).store(v, ord);
         }
 
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn load_u64(&self, off: usize, ord: Ordering) -> u64 {
             self.atomic_u64(off).load(ord)
         }
@@ -149,7 +152,7 @@ mod imp {
             self.atomic_u64(off).store(v, ord);
         }
 
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn load_u8(&self, off: usize, ord: Ordering) -> u8 {
             self.atomic_u8(off).load(ord)
         }
@@ -209,7 +212,7 @@ mod imp {
             self.slice(off, len).cmp(other)
         }
 
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         pub(crate) fn copy(&self, off: usize, len: usize) -> Vec<u8> {
             self.slice(off, len).to_vec()
         }
@@ -258,13 +261,6 @@ mod imp {
 
         pub(crate) fn store_u32(&self, off: usize, v: u32, ord: Ordering) {
             self.word(off).store(v, ord);
-        }
-
-        #[allow(dead_code)]
-        pub(crate) fn load_u64(&self, off: usize, ord: Ordering) -> u64 {
-            let lo = self.word(off).load(ord);
-            let hi = self.word(off + 4).load(ord);
-            u64::from(lo) | (u64::from(hi) << 32)
         }
 
         pub(crate) fn store_u64(&self, off: usize, v: u64, ord: Ordering) {

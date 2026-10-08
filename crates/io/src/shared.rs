@@ -48,8 +48,10 @@ struct RegionInner {
 
 enum Backing {
     Heap(Layout),
-    // Held for its `Drop`, which unmaps.
-    Mapped(#[allow(dead_code)] crate::os::Mapping),
+    /// The mapping, held for its `Drop`, which unmaps.
+    Mapped {
+        _mapping: crate::os::Mapping,
+    },
 }
 
 // SAFETY: the memory stays valid while the `Arc` lives, whichever thread holds it, and safe
@@ -86,7 +88,7 @@ impl SharedRegion {
             inner: Arc::new(RegionInner {
                 ptr: mapping.ptr(),
                 len: mapping.len(),
-                backing: Backing::Mapped(mapping),
+                backing: Backing::Mapped { _mapping: mapping },
             }),
         }
     }
@@ -168,7 +170,7 @@ impl SharedRegion {
         let p = self.at(offset, len);
         match &self.inner.backing {
             Backing::Heap(_) => Ok(()),
-            Backing::Mapped(_) => crate::os::bind_numa(p, len, node),
+            Backing::Mapped { .. } => crate::os::bind_numa(p, len, node),
         }
     }
 }
@@ -248,7 +250,7 @@ impl fmt::Debug for SharedRegion {
                 "backing",
                 &match self.inner.backing {
                     Backing::Heap(_) => "heap",
-                    Backing::Mapped(_) => "mapped",
+                    Backing::Mapped { .. } => "mapped",
                 },
             )
             .finish()

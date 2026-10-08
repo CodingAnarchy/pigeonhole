@@ -112,8 +112,8 @@ pub(crate) enum Pinned {
     Arena(ArenaSlice),
     /// A range of a cached block.
     Block(Cell),
-    /// An owned copy.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// An owned copy (the resolver tests' in-memory sources).
+    #[cfg(test)]
     Owned(Vec<u8>),
 }
 
@@ -124,6 +124,7 @@ impl Deref for Pinned {
         match self {
             Pinned::Arena(s) => s,
             Pinned::Block(c) => c,
+            #[cfg(test)]
             Pinned::Owned(v) => v,
         }
     }
