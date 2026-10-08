@@ -13,6 +13,7 @@ use pigeonhole_engine::{
     WriteBatch,
 };
 use pigeonhole_format::Durability;
+use pigeonhole_io::Vfs;
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 
 const DB: &str = "/db/data.phdb";
@@ -221,5 +222,93 @@ fn a_merge_operand_above_the_limit_is_refused() {
     .unwrap();
     assert!(matches!(db.commit(wb, None), Err(Error::ValueTooLarge)));
     assert!(db.blob_files().is_empty());
+    db.close().unwrap();
+}
+
+#[test]
+fn a_commit_that_fails_after_its_wal_append_keeps_its_blob_files() {
+    // The batch is logged, then its apply fails with `Busy` (as an arena miscount would):
+    // the error is one a refused commit also returns, but the record is in the WAL, so the
+    // value's file must stay for the replay to find.
+    let vfs = SimVfs::new(234);
+    let db = open(&vfs);
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    db.fail_next_apply();
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, &row(1), b"q", None, ValueRef::Bytes(&value(1, 0)))
+        .unwrap();
+    assert!(matches!(
+        db.commit(wb, Some(Durability::Sync)),
+        Err(Error::Busy)
+    ));
+    assert_eq!(db.blob_files().len(), 1, "the logged commit's file stays");
+    // A power loss: the synced record is replayed (a close of the poisoned shard could
+    // move its checkpoint past the record instead).
+    vfs.crash(CrashKind::Power);
+    drop(db);
+    let db = open(&vfs);
+    assert_eq!(db.blob_files().len(), 1);
+    db.check_blob_accounting().unwrap();
+    let snap = db.snapshot().unwrap();
+    let got = db.get(&snap, t.id, f, &row(1), b"q").unwrap().unwrap();
+    assert_eq!(
+        got.value(),
+        ValueRef::Bytes(&value(1, 0)),
+        "the replay applied it"
+    );
+    drop(snap);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_value_the_same_commit_collapse_drops_releases_its_blob_file() {
+    // D34: an explicit timestamp equal to the commit's own collides with a default one, and
+    // only the shard (which assigns the commit timestamp) can tell. The displaced value's
+    // file goes, and the bytes counted live are the winner's.
+    let vfs = SimVfs::new(235);
+    let db = open(&vfs);
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    put(&db, &t, 2..3, 0, Durability::Sync);
+    // A default timestamp is the simulated clock at submission, once past the shard's floor.
+    let floor = db.max_ts_floor();
+    if floor >= vfs.now_micros() {
+        vfs.advance(1_000 * (floor - vfs.now_micros() + 1));
+    }
+    let now = vfs.now_micros();
+    let mut wb = WriteBatch::new();
+    wb.put(
+        t.id,
+        f,
+        &row(1),
+        b"q",
+        Some(now),
+        ValueRef::Bytes(&value(1, 0)),
+    )
+    .unwrap();
+    wb.put(t.id, f, &row(1), b"q", None, ValueRef::Bytes(&value(1, 1)))
+        .unwrap();
+    db.commit(wb, Some(Durability::Sync)).unwrap();
+    // The displaced value's file is released; the winner's and row 2's stay.
+    wait_for_blob_files(&db, 2);
+    db.check_blob_accounting().unwrap();
+    let snap = db.snapshot().unwrap();
+    let got = db.get(&snap, t.id, f, &row(1), b"q").unwrap().unwrap();
+    assert_eq!(got.timestamp(), now, "the timestamps collided");
+    assert_eq!(
+        got.value(),
+        ValueRef::Bytes(&value(1, 1)),
+        "the later put wins"
+    );
+    drop(snap);
+    db.close().unwrap();
+    let db = open(&vfs);
+    db.check_blob_accounting().unwrap();
+    assert_eq!(db.blob_files().len(), 2);
     db.close().unwrap();
 }

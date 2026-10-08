@@ -95,6 +95,9 @@ pub(crate) struct Hooks {
     /// Commits no `SstBlobRefs` edit and keeps no blob references, as a build from before
     /// tag 13 (#240) wrote (`Engine::omit_blob_refs`).
     pub omit_blob_refs: AtomicBool,
+    /// Fails the next single-shard batch's apply with `Busy` after its WAL append, without
+    /// applying it, as an arena miscount would (`Engine::fail_next_apply`).
+    pub fail_next_apply: AtomicBool,
 }
 
 /// A shard's test-hook counters (`ShardMetrics::hooks`), stored after each batch.
@@ -806,6 +809,18 @@ impl Engine {
             .hooks
             .omit_blob_refs
             .store(omit, Ordering::Release);
+    }
+
+    /// Fails the next single-shard batch after its WAL append: it is not applied, the shard
+    /// poisons itself and the commit returns `Busy`, as an arena miscount would (#230).
+    /// Test hook.
+    #[doc(hidden)]
+    pub fn fail_next_apply(&self) {
+        self.inner
+            .shared
+            .hooks
+            .fail_next_apply
+            .store(true, Ordering::Release);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits

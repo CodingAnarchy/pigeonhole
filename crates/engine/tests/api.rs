@@ -824,7 +824,11 @@ fn value_limits_arena_pressure_and_closed_handles() {
     while cursor.next_row().unwrap() {
         rows += 1;
     }
-    assert_eq!(rows, written + 1, "every row written, and the large value's");
+    assert_eq!(
+        rows,
+        written + 1,
+        "every row written, and the large value's"
+    );
     db.flush().unwrap();
     db.close().unwrap();
     assert!(matches!(

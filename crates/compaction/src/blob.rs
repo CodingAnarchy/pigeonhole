@@ -142,7 +142,8 @@ struct OpenFile {
 
 /// Writes separated values into new blob files: extents come from the pager, ids from the
 /// engine's blob id allocator. A file is cut once it holds `file_bytes`, or before a value
-/// more than four extents long (the next file takes larger extents). A file of one extent
+/// more than four extents long (the next file takes larger extents; `spread_values` sets
+/// how many). A file of one extent
 /// is trimmed to its length (`Pager::trim`, D128). Nothing is synced: the
 /// root commit that publishes the files covers them, and until then they are unreferenced
 /// space that an aborted job abandons (D8).
@@ -179,6 +180,8 @@ pub struct BlobSink {
     blob_ids: Arc<AtomicU32>,
     extent_bytes: u64,
     file_bytes: u64,
+    /// Extents one value may span before a file takes a larger size class.
+    value_extents: u64,
     open: Option<OpenFile>,
     done: Vec<NewBlobFile>,
 }
@@ -198,21 +201,35 @@ impl BlobSink {
             blob_ids,
             extent_bytes: extent_bytes.clamp(MIN_EXTENT, MAX_DEFAULT_EXTENT),
             file_bytes: file_bytes.max(1),
+            value_extents: 4,
             open: None,
             done: Vec::new(),
         }
+    }
+
+    /// Lets one value span up to `extents` extents (default 4) before a file takes a larger
+    /// size class. Only a file of one extent is trimmed, so a file's waste is the unused
+    /// tail of its last extent: more extents per value bound it more tightly, for a value
+    /// much larger than the sink's extents, at the cost of a longer extent list.
+    pub fn spread_values(mut self, extents: u32) -> Self {
+        self.value_extents = u64::from(extents.max(1));
+        self
     }
 
     /// Appends one stored value (tag byte included) and returns its pointer.
     pub fn append(&mut self, stored: &[u8]) -> Result<BlobPointer> {
         let len = stored.len() as u64;
         if let Some(f) = &self.open
-            && (f.bytes >= self.file_bytes || len > f.payload.saturating_mul(4))
+            && (f.bytes >= self.file_bytes || len > f.payload.saturating_mul(self.value_extents))
         {
             self.cut()?;
         }
         if self.open.is_none() {
-            let class = class_for(self.extent_bytes.max(len.div_ceil(4)).min(MAX_EXTENT));
+            let class = class_for(
+                self.extent_bytes
+                    .max(len.div_ceil(self.value_extents))
+                    .min(MAX_EXTENT),
+            );
             let id = BlobFileId(self.blob_ids.fetch_add(1, Ordering::Relaxed));
             self.open = Some(OpenFile {
                 id,
@@ -359,6 +376,35 @@ mod tests {
         let mut v = vec![0u8];
         v.resize(len, fill);
         v
+    }
+
+    #[test]
+    fn a_spread_value_wastes_at_most_one_small_extent() {
+        // 5 MiB and a bit: four extents per value take 2 MiB extents (3 MiB unused); 256
+        // keep the sink's 1 MiB ones, with less than one of them unused.
+        let len = (5 << 20) + 123;
+        for (spread, extent_len, waste) in [(4, 2 << 20, 3 << 20), (256, 1 << 20, 1 << 20)] {
+            let (pager, s) = sink(1 << 20, u64::MAX);
+            let mut s = s.spread_values(spread);
+            let v = value(len, 9);
+            let p = s.append(&v).unwrap();
+            let files = s.finish().unwrap();
+            assert_eq!(files.len(), 1);
+            let extents = &files[0].extents;
+            assert!(extents.iter().all(|e| e.len() == extent_len), "{extents:?}");
+            let held: u64 = extents.iter().map(|e| e.len()).sum();
+            assert!(
+                held - files[0].total_bytes < waste,
+                "{spread}: {held} bytes held"
+            );
+            let r = BlobReader::new(
+                pager.file().clone(),
+                files[0].id,
+                extents.clone(),
+                Arc::new(BlockCache::new(1 << 20, 1)),
+            );
+            assert_eq!(&r.read(&p).unwrap()[..], &v[..]);
+        }
     }
 
     #[test]

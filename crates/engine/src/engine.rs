@@ -523,6 +523,9 @@ impl Engine {
             flushed_roots: Mutex::new(HashSet::new()),
             busy_ssts: Mutex::new(HashSet::new()),
             large_pending: Mutex::new(HashSet::new()),
+            large_open: AtomicUsize::new(0),
+            large_logged: Mutex::new(HashSet::new()),
+            large_dropped: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
@@ -1012,6 +1015,9 @@ impl Engine {
             flushed_roots: Mutex::new(HashSet::new()),
             busy_ssts: Mutex::new(HashSet::new()),
             large_pending: Mutex::new(HashSet::new()),
+            large_open: AtomicUsize::new(0),
+            large_logged: Mutex::new(HashSet::new()),
+            large_dropped: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
@@ -2014,7 +2020,7 @@ impl Inner {
         let submitted_at = self.shared.vfs.monotonic_nanos();
         let (tx, waiter) = completion();
         if let Some(large) = large {
-            large.settle_on(&tx, crate::large::commit_refused);
+            large.settle_on(&tx, crate::large::commit_succeeded);
         }
         if shards.len() <= 1 {
             let shard = shards.first().copied().unwrap_or(ShardId(0));
@@ -2104,7 +2110,7 @@ impl Inner {
         let submitted_at = self.shared.vfs.monotonic_nanos();
         let (tx, rx) = completion();
         if let Some(large) = large {
-            large.settle_on(&tx, crate::large::check_refused);
+            large.settle_on(&tx, crate::large::check_succeeded);
         }
         self.shared
             .submitter(shard)
@@ -2703,7 +2709,7 @@ impl EngineShard {
         let submitted_at = engine.shared.vfs.monotonic_nanos();
         let (tx, waiter) = completion();
         if let Some(large) = large {
-            large.settle_on(&tx, crate::large::commit_refused);
+            large.settle_on(&tx, crate::large::commit_succeeded);
         }
         driver.with_handler(|h, ctx| {
             h.commit_inline(
