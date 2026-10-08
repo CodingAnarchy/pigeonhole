@@ -1206,7 +1206,12 @@ impl World {
         let store = self.store();
         let view = store.engine.snapshot().expect("snapshot").view().clone();
         let mut out = Vec::new();
-        for op in ops {
+        // In the engine's routing order: `Engine::route` moves row deletes after every other
+        // mutation, and the first shard coordinates a cross-shard commit.
+        let (rest, row_deletes): (Vec<&ModelOp>, Vec<&ModelOp>) = ops
+            .iter()
+            .partition(|op| !matches!(op, ModelOp::DeleteRow { .. }));
+        for op in rest.into_iter().chain(row_deletes) {
             let table = store.tables[op_table(op)].id;
             if let Some((_, shard)) = view.tablets().route(table, op_row(op))
                 && !out.contains(&shard.0)
