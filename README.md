@@ -3,6 +3,8 @@
 **An embedded, single-file, wide-column store in Rust** — BigTable's data model with SQLite's deployment model.
 
 [![CI](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml/badge.svg)](https://github.com/CodingAnarchy/pigeonhole/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/pigeonhole.svg)](https://crates.io/crates/pigeonhole)
+[![docs.rs](https://img.shields.io/docsrs/pigeonhole)](https://docs.rs/pigeonhole)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, but the on-disk format and the API may change before 1.0 ([`FORMAT.md`](FORMAT.md)). The wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Pigeonhole is **not recommended for production use yet**. See [`docs/status.md`](docs/status.md) for the roadmap.
@@ -10,6 +12,12 @@
 > **Status: Phase 1 in progress: usable, disk-backed sync API.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; `flush`, `compact` and `backup` work, and a clean close leaves one file. Commits are crash-safe through the write-ahead log. Tablets split and move between shards (on by default); the Phase 1 gate is still to come. See [`docs/status.md`](docs/status.md) for progress.
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
+
+## Install
+```sh
+cargo add pigeonhole
+```
+or `pigeonhole = "0.1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on [docs.rs](https://docs.rs/pigeonhole); what changed is in the [changelog](CHANGELOG.md) and the [0.1.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0).
 
 ```rust
 use pigeonhole::{Pigeonhole, Options, Family};
@@ -64,6 +72,7 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 - **Using Pigeonhole** (people and agents integrating it): [`docs/guide/`](docs/guide/README.md)
 - **Design**: [`docs/design/spec.md`](docs/design/spec.md)
 - **On-disk format**: [`FORMAT.md`](FORMAT.md)
+- **Changelog**: [`CHANGELOG.md`](CHANGELOG.md)
 - **Contributing** (people and agents building it): [`CONTRIBUTING.md`](CONTRIBUTING.md), [`AGENTS.md`](AGENTS.md)
 
 ## Crates

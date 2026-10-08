@@ -3,12 +3,14 @@
 > **Status: Phase 1 sync API implemented.** Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
-Pigeonhole is not published to crates.io yet. Depend on it from git:
+Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-pigeonhole = { git = "https://github.com/CodingAnarchy/pigeonhole" }
+pigeonhole = "0.1"
 ```
+
+This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
 
 Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature (Phase 3) is off by default and currently gates an empty module.
 

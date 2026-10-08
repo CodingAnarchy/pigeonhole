@@ -39,6 +39,9 @@ Anything left for later is a GitHub issue titled `[crate] summary`, labeled with
 3. Clean up before the PR is ready: remove temporary diagnostics, debug prints, commented-out code and probe tests from the diff; keep a test hook only if a committed test uses it; delete scratch files (logs, traces, copied binaries) you created outside `target/`; stop any background processes you started. Leave deferred work as a milestoned issue, not a TODO.
 4. Open a pull request against `main`. CI must be green before merge.
 
+## Releases
+Before tagging a release: update [`CHANGELOG.md`](CHANGELOG.md) (move `Unreleased` entries under the new version), update the maturity note in `README.md`, `crates/pigeonhole/README.md`, `docs/guide/README.md` and `docs/status.md`, and check the install version in the READMEs and `docs/guide/getting-started.md`.
+
 ## Seed sweeps and local resources
 Several agents often build and test on one machine, so local runs stay small:
 - Run at most one `cargo` command at a time per worktree, and no seed sweep beyond about 20 seeds locally.

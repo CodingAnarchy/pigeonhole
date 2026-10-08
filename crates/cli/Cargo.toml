@@ -1,6 +1,6 @@
 [package]
 name = "pigeonhole-cli"
-description = "phdb: command-line shell and tools for Pigeonhole databases."
+description = "phdb: command-line tool for Pigeonhole databases (placeholder until Phase 4)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
