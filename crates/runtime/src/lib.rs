@@ -413,8 +413,9 @@ impl<H: ShardHandler> ShardCore<H> {
         self.drain();
         self.spawner.local.collect_woken();
         let start = self.vfs.monotonic_nanos();
-        if self.idle_at.take() == Some(start) {
-            // The clock has not moved since the loop went idle: sleepers check for themselves.
+        if self.idle_at.take() == Some(start) && self.vfs.clock_is_simulated() {
+            // A simulated clock has not moved since the loop went idle: sleepers check for
+            // themselves (a real clock that reads the same only ticks coarsely, #263).
             self.spawner.local.wake_sleepers();
         }
         self.spawner.local.wake_due(start);

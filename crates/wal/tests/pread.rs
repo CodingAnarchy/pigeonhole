@@ -228,6 +228,9 @@ impl Vfs for Gated {
     fn monotonic_nanos(&self) -> u64 {
         self.inner.monotonic_nanos()
     }
+    fn clock_is_simulated(&self) -> bool {
+        self.inner.clock_is_simulated()
+    }
     fn current_process(&self) -> ProcessId {
         self.inner.current_process()
     }

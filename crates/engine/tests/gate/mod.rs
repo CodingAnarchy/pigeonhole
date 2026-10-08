@@ -221,6 +221,9 @@ impl Vfs for GateVfs {
     fn monotonic_nanos(&self) -> u64 {
         self.inner.monotonic_nanos() + self.start.map_or(0, |s| s.elapsed().as_nanos() as u64)
     }
+    fn clock_is_simulated(&self) -> bool {
+        self.start.is_none() && self.inner.clock_is_simulated()
+    }
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
     }

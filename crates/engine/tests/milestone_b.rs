@@ -984,6 +984,9 @@ impl Vfs for SlowSyncVfs {
     fn monotonic_nanos(&self) -> u64 {
         self.inner.monotonic_nanos()
     }
+    fn clock_is_simulated(&self) -> bool {
+        self.inner.clock_is_simulated()
+    }
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
     }
@@ -1196,6 +1199,9 @@ impl Vfs for FailReadsVfs {
             Some(start) => self.inner.monotonic_nanos() + start.elapsed().as_nanos() as u64,
             None => self.inner.monotonic_nanos(),
         }
+    }
+    fn clock_is_simulated(&self) -> bool {
+        self.real_clock.is_none() && self.inner.clock_is_simulated()
     }
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
