@@ -723,3 +723,65 @@ fn backup_copies_the_values_it_references() {
     });
     copy.close();
 }
+
+#[test]
+fn shrink_moves_blob_extents_down() {
+    // #231: blob extents past the shrink point move into free space below them like SST
+    // extents: the file shrinks, reads (and a snapshot taken before) are unchanged.
+    let vfs = SimVfs::new(42);
+    let mut rig = Rig::open(&vfs, false);
+    let junk = rig.db.create_table("junk", &[("f".into(), family())]).unwrap();
+    write(&mut rig, &junk, 0..200, 0);
+    rig.flush();
+    let t = rig.db.create_table("t", &[("f".into(), family())]).unwrap();
+    write(&mut rig, &t, 0..200, 1);
+    rig.flush();
+    let t_files: Vec<u32> = rig
+        .db
+        .blob_files()
+        .iter()
+        .filter(|f| f.0 == t.families[0].id)
+        .map(|f| f.1)
+        .collect();
+    assert!(!t_files.is_empty());
+    rig.db.drop_table(junk.id).unwrap();
+    rig.idle();
+    let before = rig.db.snapshot().unwrap();
+    let len = |vfs: &SimVfs| {
+        pigeonhole_io::Vfs::open(vfs, Path::new(DB), pigeonhole_io::OpenOptions::read())
+            .unwrap()
+            .len()
+            .unwrap()
+    };
+    let start = len(&vfs);
+    let released = rig.db.shrink().unwrap();
+    rig.check();
+    assert!(released > 0, "nothing moved: {start} bytes");
+    assert_eq!(start - len(&vfs), released);
+    // `junk` held as much as `t`: with `t`'s blob extents left at the tail the file could
+    // not end below them.
+    assert!(
+        len(&vfs) * 4 < start * 3,
+        "the file only shrank from {start} to {}",
+        len(&vfs)
+    );
+    assert_eq!(
+        rig.db.blob_files().iter().map(|f| f.1).collect::<Vec<_>>(),
+        t_files,
+        "the same blob files, moved"
+    );
+    assert_reads(&rig.db, &t, 200, |i| value(i, 1));
+    let f = t.families[0].id;
+    for i in [1u32, 99, 199] {
+        let v = rig.db.get(&before, t.id, f, &row(i), b"q").unwrap().unwrap();
+        assert_eq!(v.value(), ValueRef::Bytes(&value(i, 1)), "row {i} at the snapshot");
+    }
+    drop(before);
+    rig.db.shrink().unwrap();
+    assert_eq!(rig.db.unreferenced_bytes(), 0);
+    rig.close();
+    let rig = Rig::open(&vfs, false);
+    rig.check();
+    assert_reads(&rig.db, &rig.db.table("t").unwrap(), 200, |i| value(i, 1));
+    rig.close();
+}
