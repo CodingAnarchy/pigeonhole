@@ -200,12 +200,15 @@ pub(crate) fn gc_policy(
         .iter()
         .flat_map(|(_, ids)| ids.iter().copied())
         .collect();
+    // An output in L0 (a FIFO merge of some L0 files) is bottommost only if it takes every
+    // SST of the slot: the L0 files left out may be older.
     let bottommost = fam
         .levels
         .iter()
         .enumerate()
         .skip(usize::from(task.output_level) + 1)
-        .all(|(_, l)| l.is_empty());
+        .all(|(_, l)| l.is_empty())
+        && (task.output_level != 0 || fam.iter().all(|s| input_ids.contains(&s.meta.id)));
     let mut gc = GcPolicy::new(snapshots, now, bottommost);
     gc.min_ts_above = fam
         .iter()

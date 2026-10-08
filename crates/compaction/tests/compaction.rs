@@ -345,6 +345,116 @@ fn compaction_preserves_reads_fixed_seeds() {
     }
 }
 
+/// Issue #32: the FIFO-by-time picker's drops of expired SSTs, and its merges of L0 files,
+/// leave every read at every live snapshot unchanged from the picker's `now` on.
+fn check_fifo(seed: u64, commits: usize) {
+    let h = random_history(seed, common::commits(commits));
+    let ttl = h.family.ttl_micros;
+    if ttl == 0 {
+        return;
+    }
+    let mut rng = Rng::new(seed ^ 0xf1f0);
+    let mut db = Db::new(seed);
+    let family = family_options(&h);
+    let max = h.model.snapshot();
+    // L0 flushes by seqno, newest first.
+    let mut cuts: Vec<Seqno> = (0..rng.below(6)).map(|_| 1 + rng.below(max)).collect();
+    cuts.extend([0, max]);
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut l0: Vec<(SstMeta, Arc<SstReader>)> = Vec::new();
+    for w in cuts.windows(2) {
+        let mut b: Vec<KeyValue> = h
+            .entries
+            .iter()
+            .filter(|e| e.2 > w[0] && e.2 <= w[1])
+            .map(|e| (e.0.clone(), e.1.clone()))
+            .collect();
+        if !b.is_empty() {
+            b.sort();
+            l0.insert(0, db.sst(&family, &b));
+        }
+    }
+    let mut snapshots: Vec<Seqno> = (0..rng.below(4)).map(|_| 1 + rng.below(max)).collect();
+    snapshots.push(max);
+    snapshots.sort_unstable();
+    snapshots.dedup();
+    let now = h.last_ts.saturating_sub(ttl) + rng.below(2 * ttl);
+    let reads_match = |what: &str, ssts: &[(SstMeta, Arc<SstReader>)]| {
+        let readers: Vec<Arc<SstReader>> = ssts.iter().map(|s| s.1.clone()).collect();
+        for &s in &snapshots {
+            for at in [now, now + 1 + ttl / 2] {
+                let what = format!("seed {seed}: {what}, picked at {now}, read at {s}/{at}");
+                let expected = model_reads(&h, s, at);
+                let got = resolver_reads(&h, s, at, |o| sst_resolver(&readers, o));
+                assert_same(&what, &expected, &got);
+            }
+        }
+    };
+    reads_match("before", &l0);
+
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 2;
+    options.target_sst_bytes = 1 + rng.below(4 << 10);
+    let picker = CompactionPicker::new(CompactionStyle::FifoByTime, options);
+    let levels = |l0: &[(SstMeta, Arc<SstReader>)]| Levels {
+        levels: vec![l0.iter().map(|s| Arc::new(s.0.clone())).collect()],
+    };
+    let expired = l0.iter().filter(|s| s.0.ts_range.1 + ttl <= now).count();
+    if let Some(task) = picker.pick(TabletId(1), FamilyId(1), &levels(&l0), &[], now, ttl)
+        && task.kind == TaskKind::Drop
+    {
+        assert_eq!(task.inputs[0].1.len(), expired, "seed {seed}");
+        l0.retain(|s| !task.inputs[0].1.contains(&s.0.id));
+        reads_match("after the drop", &l0);
+    } else {
+        assert_eq!(expired, 0, "seed {seed}");
+    }
+    // A merge of adjacent L0 files is never bottommost unless it takes them all (the engine's
+    // rule): the files left out may be older.
+    let Some(task) = picker.pick(TabletId(1), FamilyId(1), &levels(&l0), &[], now, ttl) else {
+        return;
+    };
+    assert_eq!(task.kind, TaskKind::Rewrite);
+    assert_eq!(task.output_level, 0);
+    let ids = &task.inputs[0].1;
+    let all = ids.len() == l0.len();
+    let mut gc = GcPolicy::new(snapshots.clone(), now, all);
+    gc.min_ts_above = l0
+        .iter()
+        .filter(|s| !ids.contains(&s.0.id))
+        .map(|s| s.0.ts_range.0)
+        .min()
+        .unwrap_or(u64::MAX);
+    let inputs = l0
+        .iter()
+        .filter(|s| ids.contains(&s.0.id))
+        .map(|s| s.1.clone())
+        .collect();
+    let mut job = CompactionJob::new(task.clone(), inputs, db.context(family.clone(), gc));
+    run_sliced(&db, &mut job);
+    let out = job.finish().unwrap();
+    assert_disjoint(&out);
+    let at = l0.iter().position(|s| ids.contains(&s.0.id)).unwrap();
+    l0.retain(|s| !ids.contains(&s.0.id));
+    for (level, meta) in &out.added {
+        assert_eq!(*level, 0);
+        let reader = open_sst(&db.pager, &db.cache, meta);
+        l0.insert(at, (meta.clone(), reader));
+    }
+    reads_match("after the merge", &l0);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(cases(128)))]
+
+    /// Issue #32: expired SSTs are dropped and reads at every live snapshot are unchanged.
+    #[test]
+    fn fifo_drops_and_merges_preserve_reads(seed in any::<u64>(), commits in 1usize..40) {
+        check_fifo(seed, commits);
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Focused cases
 // ---------------------------------------------------------------------------------------

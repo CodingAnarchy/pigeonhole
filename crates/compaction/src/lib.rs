@@ -12,7 +12,7 @@
 //!
 //! Scheduling is not here: the engine decides when, the runtime decides where.
 //!
-//! **Scope.** Leveled and tiered picking (FIFO-by-time returns no work yet), no
+//! **Scope.** Leveled, tiered and FIFO-by-time picking, no
 //! value separation into blob files and no blob GC (the output types carry them for
 //! Phase 2), and merge operands are combined only within one `(column, timestamp)`.
 //!

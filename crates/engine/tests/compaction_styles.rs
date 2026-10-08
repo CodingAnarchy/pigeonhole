@@ -1,6 +1,7 @@
-//! Each family compacts by its own `CompactionStyle` (issue #31): a tiered family's L0
-//! merges go to the last level as whole sorted runs while a leveled one fills L1, under one
-//! application-owned shard over `SimVfs`.
+//! Each family compacts by its own `CompactionStyle` (issues #31, #32): a tiered family's
+//! L0 merges go to the last level as whole sorted runs while a leveled one fills L1, and a
+//! FIFO-by-time family stays in L0 and drops expired SSTs, under one application-owned
+//! shard over `SimVfs`.
 
 mod common;
 
@@ -149,17 +150,18 @@ fn families_compact_by_their_own_style() {
     }
 }
 
-/// Review of #227: a FIFO-by-time family still compacts (leveled, until its own picker
-/// lands in #32), so its L0 never grows without bound.
+/// Issue #32: a FIFO-by-time family keeps its files in L0, merging small adjacent ones (so
+/// L0 never grows without bound), and drops whole SSTs once their newest timestamp expires.
 #[test]
-fn fifo_by_time_families_still_compact() {
+fn fifo_by_time_families_merge_small_files_and_drop_expired_ones() {
     let vfs = SimVfs::new(32);
-    let mut o = common::options(vfs, 1, 16 << 20);
+    let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
     o.tablet_changes = false;
     o.compaction.l0_trigger = 2;
     let mut rig = Rig::open(o);
     let family = FamilyOptions {
         compaction: CompactionStyle::FifoByTime,
+        ttl_micros: 1_000_000,
         ..FamilyOptions::default()
     };
     let t = rig
@@ -173,14 +175,20 @@ fn fifo_by_time_families_still_compact() {
         let flush = rig.db.flush_pending().unwrap();
         rig.wait(flush).unwrap();
         rig.idle();
-        let l0 = rig
-            .levels(t.id)
-            .iter()
-            .find(|l| l.0 == 0)
-            .map_or(0, |l| l.1);
-        assert!(l0 < 2, "round {round}: {:?}", rig.levels(t.id));
+        let levels = rig.levels(t.id);
+        assert!(matches!(levels[..], [(0, 1)]), "round {round}: {levels:?}");
     }
     assert_eq!(rig.get(&t, 7), Some(5u32.to_le_bytes().to_vec()));
+    // Past the TTL, the next flush's maintenance drops the expired SST without a rewrite.
+    vfs.advance(2_000_000_000);
+    rig.put(&t, 100, b"new");
+    let flush = rig.db.flush_pending().unwrap();
+    rig.wait(flush).unwrap();
+    rig.idle();
+    let levels = rig.levels(t.id);
+    assert!(matches!(levels[..], [(0, 1)]), "{levels:?}");
+    assert_eq!(rig.get(&t, 7), None);
+    assert_eq!(rig.get(&t, 100), Some(b"new".to_vec()));
 }
 
 /// Review of #227: the write stall follows L0 depth only (D119). Tiered space

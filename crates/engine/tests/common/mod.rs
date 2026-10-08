@@ -141,11 +141,13 @@ pub fn families() -> Vec<ModelFamily> {
     ]
 }
 
-/// The engine options of a model family. `g` compacts tiered (issue #31), so every suite
-/// runs both pickers; the reference model does not depend on the style.
+/// The engine options of a model family. `g` compacts tiered (issue #31) and `ttl` FIFO by
+/// time (issue #32), so every suite runs every picker; the reference model does not depend
+/// on the style.
 fn family_options(f: &ModelFamily) -> FamilyOptions {
     let compaction = match f.name.as_str() {
         "g" => CompactionStyle::Tiered,
+        "ttl" => CompactionStyle::FifoByTime,
         _ => CompactionStyle::Leveled,
     };
     FamilyOptions {

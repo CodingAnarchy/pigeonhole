@@ -1,4 +1,4 @@
-//! The leveled and tiered pickers under a random flush workload.
+//! The leveled, tiered and FIFO-by-time pickers under random flush workloads.
 #![allow(clippy::field_reassign_with_default)]
 
 mod common;
@@ -458,8 +458,197 @@ fn tiered_merges_l0_with_runs_of_similar_size() {
     assert_eq!((task.output_level, task.kind), (6, TaskKind::TrivialMove));
 }
 
+/// An SST holding timestamps `ts`, `len` bytes, as flush number `id`.
+fn timed(id: &mut u64, row: u64, ts: (u64, u64), len: u64) -> Arc<SstMeta> {
+    let mut s = (*sst(id, row, row + 10, len)).clone();
+    s.ts_range = ts;
+    Arc::new(s)
+}
+
+fn check_fifo(seed: u64, flushes: usize) {
+    let mut rng = Rng::new(seed);
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 2 + rng.below(4) as u32;
+    options.target_sst_bytes = (1 << 20) + rng.below(8 << 20);
+    options.fifo_max_bytes = [0, 40 << 20][rng.below(2) as usize];
+    let ttl = [0, 1_000, 10_000][rng.below(3) as usize];
+    let what = format!("seed {seed}: ttl {ttl}, {options:?}");
+    let picker = CompactionPicker::new(CompactionStyle::FifoByTime, options.clone());
+    let trigger = options.l0_trigger as u64;
+    let mut levels = Levels {
+        levels: vec![Vec::new()],
+    };
+    let (mut id, mut now) = (0, 0u64);
+    for _ in 0..flushes {
+        // Time-ordered flushes, with now and then a late write at an old timestamp.
+        let back = if rng.below(10) == 0 { 5_000 } else { 50 };
+        let start = now.saturating_sub(rng.below(back));
+        now += 1 + rng.below(300);
+        let len = (64 << 10) + rng.below(2 << 20);
+        let s = timed(&mut id, rng.below(ROWS), (start, now), len);
+        levels.levels[0].insert(0, s);
+        let mut guard = 0;
+        while picker.score_at(&levels, now, ttl) >= 1.0 {
+            let task = picker
+                .pick(TabletId(1), FamilyId(1), &levels, &[], now, ttl)
+                .unwrap_or_else(|| panic!("{what}: score >= 1 but no task"));
+            let ids = &task.inputs[0].1;
+            assert_eq!(task.inputs.len(), 1, "{what}");
+            let l0 = &mut levels.levels[0];
+            if task.kind == TaskKind::Drop {
+                for s in l0.iter().filter(|s| ids.contains(&s.id)) {
+                    assert!(
+                        s.ts_range.1 + ttl <= now && ttl != 0 || options.fifo_max_bytes != 0,
+                        "{what}: dropped {s:?} unexpired"
+                    );
+                }
+                l0.retain(|s| !ids.contains(&s.id));
+            } else {
+                assert_eq!((task.kind, task.output_level), (TaskKind::Rewrite, 0));
+                let at = l0.iter().position(|s| s.id == ids[0]).unwrap();
+                let window: Vec<_> = l0.drain(at..at + ids.len()).collect();
+                assert_eq!(
+                    window.iter().map(|s| s.id).collect::<Vec<_>>(),
+                    *ids,
+                    "{what}: not adjacent"
+                );
+                let bytes: u64 = window.iter().map(|s| s.len).sum();
+                assert!(bytes <= options.target_sst_bytes, "{what}");
+                let mut merged = (*window[0]).clone();
+                id += 1;
+                merged.id = SstId(id);
+                merged.len = bytes;
+                merged.ts_range = (
+                    window.iter().map(|s| s.ts_range.0).min().unwrap(),
+                    window.iter().map(|s| s.ts_range.1).max().unwrap(),
+                );
+                l0.insert(at, Arc::new(merged));
+            }
+            guard += 1;
+            assert!(guard < 100, "{what}: compaction does not converge");
+        }
+        // Nothing expired is left, the size cap holds, and no `trigger` adjacent files fit
+        // in one target: fewer than `trigger` files per target-sized slice of the data.
+        let l0 = &levels.levels[0];
+        let total: u64 = l0.iter().map(|s| s.len).sum();
+        if ttl != 0 {
+            assert!(l0.iter().all(|s| s.ts_range.1 + ttl > now), "{what}");
+        }
+        if options.fifo_max_bytes != 0 {
+            assert!(total <= options.fifo_max_bytes, "{what}");
+        }
+        assert!(
+            (l0.len() as u64) < trigger * (total / options.target_sst_bytes + 1),
+            "{what}: {} files, {total} bytes",
+            l0.len()
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(cases(64)))]
+
+    /// Issue #32: under time-ordered flushes, expired SSTs go, the size cap holds, and small
+    /// L0 files merge so the file count tracks the data size.
+    #[test]
+    fn fifo_picker_drops_expired_files_and_bounds_l0(seed in any::<u64>()) {
+        check_fifo(seed, if cfg!(miri) { 20 } else { 300 });
+    }
+}
+
 #[test]
-fn busy_inputs_are_not_picked_and_fifo_waits() {
+fn fifo_drops_expired_ssts_at_any_level_without_io() {
+    let mut id = 0;
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 3;
+    let picker = CompactionPicker::new(CompactionStyle::FifoByTime, options.clone());
+    // L0 newest first; an older run in L2 (after a full compaction).
+    let levels = Levels {
+        levels: vec![
+            vec![
+                timed(&mut id, 0, (300, 400), 100),
+                timed(&mut id, 0, (150, 250), 100),
+            ],
+            vec![],
+            vec![
+                timed(&mut id, 0, (0, 100), 100),
+                timed(&mut id, 50, (90, 200), 100),
+            ],
+        ],
+    };
+    let pick = |busy: &[SstId], now, ttl| {
+        picker
+            .pick(TabletId(1), FamilyId(1), &levels, busy, now, ttl)
+            .map(|t| (t.inputs, t.kind))
+    };
+    // Nothing has expired: two small L0 files are below the trigger of three.
+    assert!(picker.score_at(&levels, 199, 100) < 1.0);
+    assert_eq!(pick(&[], 199, 100), None);
+    // At 200, the SST whose newest timestamp is 100 expires (100 + 100 <= 200), not the
+    // others; without a TTL nothing does.
+    assert!(picker.score_at(&levels, 200, 100) >= 1.0);
+    assert!(picker.score(&levels) < 1.0);
+    assert_eq!(
+        pick(&[], 200, 100),
+        Some((vec![(2, vec![SstId(3)])], TaskKind::Drop))
+    );
+    assert_eq!(pick(&[], 200, 0), None);
+    // Later, across levels; busy ones wait.
+    assert_eq!(
+        pick(&[SstId(4)], 350, 100),
+        Some((
+            vec![(0, vec![SstId(2)]), (2, vec![SstId(3)])],
+            TaskKind::Drop
+        ))
+    );
+    // A size cap drops the oldest by newest timestamp, expired or not.
+    let mut capped = options.clone();
+    capped.fifo_max_bytes = 250;
+    let picker = CompactionPicker::new(CompactionStyle::FifoByTime, capped);
+    assert!(picker.score(&levels) >= 1.0);
+    assert_eq!(
+        picker
+            .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
+            .map(|t| (t.inputs, t.kind)),
+        Some((vec![(2, vec![SstId(3), SstId(4)])], TaskKind::Drop))
+    );
+}
+
+#[test]
+fn fifo_merges_the_longest_window_of_small_l0_files() {
+    let mut id = 0;
+    let mut options = PickerOptions::default();
+    options.l0_trigger = 2;
+    options.target_sst_bytes = 1000;
+    let picker = CompactionPicker::new(CompactionStyle::FifoByTime, options);
+    // Sizes newest first: 900 | 300 300 300 | 800: the three 300s fit in 1000 together.
+    let l0: Vec<_> = [900, 300, 300, 300, 800]
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| timed(&mut id, 0, (i as u64, i as u64), len))
+        .collect();
+    let levels = Levels { levels: vec![l0] };
+    assert!((picker.score(&levels) - 1.5).abs() < 1e-9);
+    // The stall follows that window, not the five L0 files FIFO keeps by design.
+    assert!((picker.stall_score(&levels) - 1.5).abs() < 1e-9);
+    let big = Levels {
+        levels: vec![(0..5).map(|i| timed(&mut id, 0, (i, i), 900)).collect()],
+    };
+    assert!(picker.stall_score(&big) < 1.0);
+    let task = picker
+        .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
+        .unwrap();
+    assert_eq!(task.inputs, [(0, vec![SstId(2), SstId(3), SstId(4)])]);
+    assert_eq!((task.output_level, task.kind), (0, TaskKind::Rewrite));
+    assert!(
+        picker
+            .pick(TabletId(1), FamilyId(1), &levels, &[SstId(3)], 0, 0)
+            .is_none()
+    );
+}
+
+#[test]
+fn busy_inputs_are_not_picked() {
     let mut id = 0;
     let mut levels = Levels::default();
     levels.levels = vec![
@@ -477,12 +666,6 @@ fn busy_inputs_are_not_picked_and_fifo_waits() {
         picker
             .pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
             .is_some()
-    );
-    let p = CompactionPicker::new(CompactionStyle::FifoByTime, PickerOptions::default());
-    assert_eq!(p.score(&levels), 0.0);
-    assert!(
-        p.pick(TabletId(1), FamilyId(1), &levels, &[], 0, 0)
-            .is_none()
     );
 }
 
