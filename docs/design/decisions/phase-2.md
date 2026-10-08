@@ -58,3 +58,17 @@ runner to `FifoByTime` when the picker lands; the hand-written engines have no e
 2. **TTL:** read-time filtering in every engine, so all return the same cells; report store size next to `time-series-ttl` numbers. If they look lopsided, add a RocksDB TTL compaction filter first.
 3. **Event times:** as described; re-anchoring after the load phase is #222, to land before the gate benchmark runs.
 4. **FIFO-by-time:** leveled until the picker lands (#32); then switch the `metric` family and give RocksDB its FIFO-with-TTL compaction as the counterpart.
+
+<a id="d164"></a>
+## D164 — The engine's test hooks live in one module, and a public seam beats a hook (approved; engine, #184, #216–#218; touches D90, D134)
+Phase 1 left about a hundred `#[cfg(feature = "test-hooks")]` sites spread over `engine.rs`, `shard.rs`, `manifest.rs`, `maintenance.rs` and `snapshot.rs`. Issue #184 moved them into `crates/engine/src/engine/hooks.rs`: the `#[doc(hidden)]` `Engine` hook methods, the types they return, and the state they keep (`Shared::hooks`, `ShardMetrics::hooks`, `ReaderState::hooks`). The module docs list the rules: every hook has a committed test that uses it, a hook does nothing until a test sets it, and a public or application-owned seam is preferred to a new hook.
+
+D90 and D134 name hooks individually. D134's `tablet_changes` hook is gone: tests sum `Engine::shard_stats` instead, the per-shard counters the bench added for #51.
+
+**Interim behavior:** as described; the `test-hooks` feature and every remaining hook behave as before.
+
+**Follow-up question (recording in `test-hooks` builds):** `take_appended` and `take_compactions` read back records that every `test-hooks` build keeps (every WAL record appended, every rewrite compaction), and the shard counters are stored after every batch. Because of workspace feature unification (`cargo test --workspace --all-features`, #148 1-2 F10), the public crate's suites run against such an engine too, so those two vectors grow for the length of a run that never drains them. Nothing reads them there, so results do not change, but memory use does. Making recording opt-in (a test turns it on before it reads it) would change the harness, so it is left to #148.
+
+**Interim behavior:** recording stays on in every `test-hooks` build.
+
+**Coordinator:** confirmed. On the follow-up: make the recording opt-in, turned on by the tests that read it, so suites built with the feature through workspace unification don't grow those vectors; tracked with the unification fix in #148.
