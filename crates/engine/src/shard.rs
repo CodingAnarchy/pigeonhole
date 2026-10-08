@@ -1848,6 +1848,7 @@ pub(crate) struct ShardState {
     /// Pickers by `CompactionStyle`: each family compacts by its own style.
     leveled: CompactionPicker,
     tiered: CompactionPicker,
+    fifo: CompactionPicker,
     /// The slot a compaction task is running for.
     compaction: Option<(TabletId, FamilyId)>,
     /// `Engine::compact` callers: `(table filter, reply)`, served in order.
@@ -1942,6 +1943,7 @@ impl ShardState {
     ) -> Self {
         let leveled = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
         let tiered = CompactionPicker::new(CompactionStyle::Tiered, shared.picker.clone());
+        let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
         Self {
             id,
             shared,
@@ -2008,6 +2010,7 @@ impl ShardState {
             unreported: Vec::new(),
             leveled,
             tiered,
+            fifo,
             compaction: None,
             compact_all: VecDeque::new(),
             compaction_full: false,
@@ -4897,9 +4900,9 @@ impl ShardState {
     /// The picker for a family compacting by `style`.
     fn picker(&self, style: CompactionStyle) -> &CompactionPicker {
         match style {
-            // FIFO-by-time compacts leveled until its own picker lands (#32).
-            CompactionStyle::Leveled | CompactionStyle::FifoByTime => &self.leveled,
+            CompactionStyle::Leveled => &self.leveled,
             CompactionStyle::Tiered => &self.tiered,
+            CompactionStyle::FifoByTime => &self.fifo,
         }
     }
 
@@ -4910,6 +4913,7 @@ impl ShardState {
             return;
         }
         let view = self.shared.view.load_full();
+        let now = self.shared.vfs.now_micros();
         // The write stall's score: the highest L0 depth over its trigger among the slots.
         let mut score = 0.0f64;
         // Slots that need a compaction, most urgent first.
@@ -4926,7 +4930,7 @@ impl ShardState {
             }
             let picker = self.picker(meta.options.compaction);
             let levels = fam.levels_meta();
-            let s = picker.score(&levels);
+            let s = picker.score_at(&levels, now, meta.options.ttl_micros);
             score = score.max(picker.stall_score(&levels));
             if s >= 1.0 {
                 due.push((s, key));
@@ -5056,7 +5060,6 @@ impl ShardState {
                 return;
             }
         }
-        let now = self.shared.vfs.now_micros();
         // The earliest end of a quarantine that kept a due slot from being picked.
         let mut quarantined: Option<u64> = None;
         // The most urgent slot the picker finds work in (another one's inputs may be busy,

@@ -1,4 +1,4 @@
-//! Choosing compaction work: levels, tasks and the leveled and tiered pickers.
+//! Choosing compaction work: levels, tasks and the leveled, tiered and FIFO-by-time pickers.
 
 use std::sync::Arc;
 
@@ -43,11 +43,15 @@ pub struct PickerOptions {
     /// Tiered: once the runs above the oldest one hold more than this many percent of its
     /// bytes, every run is merged into the last level.
     pub tiered_max_space_amp_percent: u32,
+    /// FIFO-by-time: once a family's SSTs hold more than this many bytes, the ones with the
+    /// oldest newest timestamps are dropped, expired or not; 0 (the default) never drops by
+    /// size.
+    pub fifo_max_bytes: u64,
 }
 
 impl Default for PickerOptions {
     /// 4 L0 files, 256 MiB at L1, ×10 per level, 7 levels, 64 MiB SSTs; tiered merges take
-    /// in runs up to 1% larger and cap space amplification at 200%.
+    /// in runs up to 1% larger and cap space amplification at 200%; FIFO has no size cap.
     fn default() -> Self {
         Self {
             l0_trigger: 4,
@@ -57,6 +61,7 @@ impl Default for PickerOptions {
             target_sst_bytes: 64 << 20,
             tiered_size_ratio_percent: 1,
             tiered_max_space_amp_percent: 200,
+            fifo_max_bytes: 0,
         }
     }
 }
@@ -152,6 +157,12 @@ pub enum TaskKind {
 /// A picked task: inputs by level, output level and kind.
 type Picked = (Vec<(u8, Vec<SstId>)>, u8, TaskKind);
 
+/// Whether every entry of `s` has expired at `now` under `ttl_micros` (0: no TTL): its
+/// newest timestamp has.
+fn expired(s: &SstMeta, now: Timestamp, ttl_micros: u64) -> bool {
+    ttl_micros != 0 && s.ts_range.1.saturating_add(ttl_micros) <= now
+}
+
 /// The row prefix of an internal key (the whole key if it has none).
 fn row_of(key: &[u8]) -> &[u8] {
     &key[..row_prefix_len(key).unwrap_or(key.len())]
@@ -181,6 +192,14 @@ fn overlaps(s: &SstMeta, lo: &[u8], hi: &[u8]) -> bool {
 /// stay ordered newest first down the levels, and whole runs move, so no row is split. The
 /// score is the larger of L0 depth over its trigger and space amplification over its cap;
 /// the write stall uses only the first ([`stall_score`](Self::stall_score)).
+///
+/// FIFO-by-time: whole SSTs whose newest timestamp has expired (`ts + ttl <= now`) are
+/// dropped with no I/O ([`TaskKind::Drop`]); every entry in them is expired, and so is
+/// everything a tombstone among them hides (a delete hides only older timestamps). Past
+/// `fifo_max_bytes`, the SSTs with the oldest newest timestamps are dropped too. Otherwise,
+/// once `l0_trigger` adjacent L0 files fit in `target_sst_bytes` together, they merge into
+/// one L0 file, so the file count stays near the data size over the target while each file
+/// still covers a short span of time.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -224,7 +243,7 @@ pub struct CompactionPicker {
 }
 
 impl CompactionPicker {
-    /// A picker for `style`. `FifoByTime` returns no work yet.
+    /// A picker for `style`.
     pub fn new(style: CompactionStyle, options: PickerOptions) -> Self {
         Self { style, options }
     }
@@ -250,11 +269,17 @@ impl CompactionPicker {
         }
     }
 
-    /// The L0 write stall's score (D119): L0 depth over `l0_trigger`, whatever the style, so
-    /// writers are paced only while flushes outrun compaction (never for a deeper level or
-    /// for tiered space amplification, which only drive picking).
+    /// The L0 write stall's score (D119): L0 depth over `l0_trigger`, so writers are paced
+    /// only while flushes outrun compaction (never for a deeper level, tiered space
+    /// amplification or FIFO expiry, which only drive picking). FIFO keeps its files in L0,
+    /// so its depth is the longest window of small L0 files a merge would relieve.
     pub fn stall_score(&self, levels: &Levels) -> f64 {
-        self.level_score(levels, 0)
+        match self.style {
+            CompactionStyle::Leveled | CompactionStyle::Tiered => self.level_score(levels, 0),
+            CompactionStyle::FifoByTime => {
+                self.fifo_window(levels).1 as f64 / self.fifo_trigger() as f64
+            }
+        }
     }
 
     /// Tiered: how far the runs above the oldest one exceed the space-amplification cap
@@ -284,9 +309,47 @@ impl CompactionPicker {
         amp / f64::from(self.options.tiered_max_space_amp_percent.max(1))
     }
 
+    /// FIFO: the longest run of adjacent L0 files whose bytes fit in `target_sst_bytes`
+    /// together, as `(start, len)`; the newest on ties.
+    fn fifo_window(&self, levels: &Levels) -> (usize, usize) {
+        let Some(l0) = levels.levels.first() else {
+            return (0, 0);
+        };
+        let target = self.options.target_sst_bytes;
+        let mut best = (0, 0);
+        let (mut start, mut bytes) = (0, 0u64);
+        for (i, s) in l0.iter().enumerate() {
+            bytes += s.len;
+            while bytes > target && start <= i {
+                bytes -= l0[start].len;
+                start += 1;
+            }
+            if i + 1 - start > best.1 {
+                best = (start, i + 1 - start);
+            }
+        }
+        best
+    }
+
+    /// FIFO: the L0 file count that starts a merge (at least two: one file merges into
+    /// itself).
+    fn fifo_trigger(&self) -> usize {
+        self.options.l0_trigger.max(2) as usize
+    }
+
     /// Urgency: `>= 1.0` means compaction is due. The engine services the highest score
-    /// first; it throttles writes on [`stall_score`](Self::stall_score).
+    /// first; it throttles writes on [`stall_score`](Self::stall_score). The same as
+    /// [`score_at`](Self::score_at) with no expiry.
     pub fn score(&self, levels: &Levels) -> f64 {
+        self.score_at(levels, 0, 0)
+    }
+
+    /// [`score`](Self::score) at time `now` for a family whose TTL is `ttl_micros` (0:
+    /// none). FIFO-by-time scores at least 1.0 while an SST has expired or its bytes exceed
+    /// `fifo_max_bytes`, exactly when [`pick`](Self::pick) with the same `now` has work
+    /// unless that work's SSTs are busy (as for every style: the score does not see `busy`,
+    /// and the engine moves on to the next due slot). The other styles ignore the time.
+    pub fn score_at(&self, levels: &Levels, now: Timestamp, ttl_micros: u64) -> f64 {
         match self.style {
             CompactionStyle::Leveled => (0..self.last_level())
                 .map(|n| self.level_score(levels, n))
@@ -294,12 +357,31 @@ impl CompactionPicker {
             CompactionStyle::Tiered => self
                 .level_score(levels, 0)
                 .max(self.space_amp_score(levels)),
-            CompactionStyle::FifoByTime => 0.0,
+            CompactionStyle::FifoByTime => {
+                let mut score = self.fifo_window(levels).1 as f64 / self.fifo_trigger() as f64;
+                if levels
+                    .levels
+                    .iter()
+                    .flatten()
+                    .any(|s| expired(s, now, ttl_micros))
+                {
+                    score = score.max(1.0);
+                }
+                let cap = self.options.fifo_max_bytes;
+                let total: u64 = (0..levels.levels.len())
+                    .map(|n| levels.level_bytes(n))
+                    .sum();
+                // Due only past the cap, where `pick` drops something.
+                if cap != 0 && total > cap {
+                    score = score.max((total as f64 / cap as f64).max(1.0));
+                }
+                score
+            }
         }
     }
 
-    /// The next task, or `None`. `busy` lists SSTs already in a running job. `now` drives
-    /// FIFO expiry.
+    /// The next task, or `None`. `busy` lists SSTs already in a running job. `now` and the
+    /// family's `ttl_micros` (0: none) drive FIFO expiry.
     pub fn pick(
         &self,
         tablet: TabletId,
@@ -309,12 +391,10 @@ impl CompactionPicker {
         now: Timestamp,
         ttl_micros: u64,
     ) -> Option<CompactionTask> {
-        // FIFO-by-time (which uses `now` and the TTL) is not implemented yet.
-        let _ = (now, ttl_micros);
         let (inputs, output_level, kind) = match self.style {
             CompactionStyle::Leveled => self.pick_leveled(levels, busy)?,
             CompactionStyle::Tiered => self.pick_tiered(levels, busy)?,
-            CompactionStyle::FifoByTime => return None,
+            CompactionStyle::FifoByTime => self.pick_fifo(levels, busy, now, ttl_micros)?,
         };
         Some(CompactionTask {
             tablet,
@@ -346,6 +426,76 @@ impl CompactionPicker {
             }
             Some((by_level, n as u8 + 1, kind))
         })
+    }
+
+    /// FIFO-by-time: drop every expired SST (and, past the size cap, the oldest others), or
+    /// else merge the longest window of small adjacent L0 files into L0.
+    fn pick_fifo(
+        &self,
+        levels: &Levels,
+        busy: &[SstId],
+        now: Timestamp,
+        ttl_micros: u64,
+    ) -> Option<Picked> {
+        let mut dropped: Vec<Vec<SstId>> = levels
+            .levels
+            .iter()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|s| expired(s, now, ttl_micros) && !busy.contains(&s.id))
+                    .map(|s| s.id)
+                    .collect()
+            })
+            .collect();
+        let cap = self.options.fifo_max_bytes;
+        let mut left: u64 = levels
+            .levels
+            .iter()
+            .zip(&dropped)
+            .flat_map(|(files, gone)| files.iter().filter(|s| !gone.contains(&s.id)))
+            .map(|s| s.len)
+            .sum();
+        if cap != 0 && left > cap {
+            // Oldest data first: by newest timestamp, then newest seqno.
+            let mut rest: Vec<(usize, &Arc<SstMeta>)> = levels
+                .levels
+                .iter()
+                .enumerate()
+                .flat_map(|(n, files)| files.iter().map(move |s| (n, s)))
+                .filter(|(n, s)| !dropped[*n].contains(&s.id) && !busy.contains(&s.id))
+                .collect();
+            rest.sort_by_key(|(_, s)| (s.ts_range.1, s.seqno_range.1, s.id.0));
+            for (n, s) in rest {
+                if left <= cap {
+                    break;
+                }
+                dropped[n].push(s.id);
+                left -= s.len;
+            }
+        }
+        let dropped: Vec<(u8, Vec<SstId>)> = dropped
+            .into_iter()
+            .enumerate()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(n, ids)| (n as u8, ids))
+            .collect();
+        if !dropped.is_empty() {
+            return Some((dropped, 0, TaskKind::Drop));
+        }
+        let (start, len) = self.fifo_window(levels);
+        if len < self.fifo_trigger() {
+            return None;
+        }
+        let window = &levels.levels.first()?[start..start + len];
+        if window.iter().any(|s| busy.contains(&s.id)) {
+            return None;
+        }
+        Some((
+            vec![(0, window.iter().map(|s| s.id).collect())],
+            0,
+            TaskKind::Rewrite,
+        ))
     }
 
     /// Tiered: every L0 file, plus the following level runs while each is at most
