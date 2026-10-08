@@ -346,13 +346,13 @@ pub(crate) fn gc_policy(
         .filter(|s| !input_ids.contains(&s.meta.id))
         .map(|s| s.meta.ts_range.0)
         .fold(mem_min_ts, Timestamp::min);
-    if counter {
-        let inputs_max = fam
-            .iter()
-            .filter(|s| input_ids.contains(&s.meta.id))
-            .map(|s| s.meta.seqno_range.1)
-            .max()
-            .unwrap_or(0);
+    // Without an input found in `fam` the bound is unknown: `None` guards everything.
+    let inputs_max = fam
+        .iter()
+        .filter(|s| input_ids.contains(&s.meta.id))
+        .map(|s| s.meta.seqno_range.1)
+        .max();
+    if counter && let Some(inputs_max) = inputs_max {
         let ssts = fam
             .iter()
             .filter(|s| !input_ids.contains(&s.meta.id))

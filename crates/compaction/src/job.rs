@@ -65,19 +65,20 @@ pub struct GcPolicy {
     /// nothing at the bottom until the engine supplies the bound.
     pub min_ts_above: Timestamp,
     /// Counter families only (decision D179): the other sources of the slot (SSTs not in
-    /// the task, memtables) that may hold an entry with a seqno at or below the newest
-    /// input seqno. A delete there can hide one of two input operands but not the other,
-    /// so operands are not combined across its seqno range, and a row it overlaps gets no
-    /// `max_versions` purge. `None` (the default) means unknown: no counter operand is
-    /// combined and no counter row is version-purged.
+    /// the task, memtables, prepared cross-shard shares) that may hold an entry with a seqno
+    /// at or below the newest input seqno. A delete there can hide one of two input
+    /// operands but not the other, so operands are not combined across its seqno range.
+    /// `None` (the default) means unknown: no counter operand is combined. (Counter
+    /// families never get a `max_versions` purge, whatever this holds.)
     pub other_sources: Option<Vec<OtherSource>>,
 }
 
-/// A source of a compaction's slot outside its inputs, for [`GcPolicy::other_sources`].
+/// A source of a compaction's slot outside its inputs, for [`GcPolicy::other_sources`]: an
+/// SST not in the task, a memtable, or a prepared, undecided cross-shard share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtherSource {
     /// Smallest and largest internal key, or `None` for a source that may hold any key (a
-    /// memtable).
+    /// memtable or a prepared share).
     pub keys: Option<(Vec<u8>, Vec<u8>)>,
     /// Smallest and largest seqno.
     pub seqnos: (Seqno, Seqno),

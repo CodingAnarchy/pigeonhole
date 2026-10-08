@@ -3,7 +3,7 @@
 Raised while implementing D179 across pigeonhole, engine, compaction, format and sim.
 
 ## Proposed decision: the family kind is stored, not derived from the operator
-A family's kind is a new `FamilyOptions::kind` (`FamilyKind::{Standard, Counter}`), appended as one byte to the family options in the manifest (`PutFamily`). Edit bodies already ignore trailing bytes, so the change is additive within format version 1: a body that ends before the byte reads as `Standard`; an unknown value is `Corrupt`. FORMAT.md §9.2 says so. A golden file of a 0.1.0 snapshot (`manifest_snapshot_0_1.bin`) pins the old encoding.
+A family's kind is a new `FamilyOptions::kind` (`FamilyKind::{Standard, Counter}`), appended as one byte to the family options in the manifest (`PutFamily`). Edit bodies already ignore trailing bytes, so a body that ends before the byte reads as `Standard`; an unknown value is `Corrupt`. It relies on format version 2 (D181): a 0.1.0 reader would otherwise ignore the byte and read counter families as Standard. FORMAT.md §9.2 says so. A golden file of a 0.1.0 snapshot (`manifest_snapshot_0_1.bin`) pins the old encoding.
 
 Deriving the kind from `merge_operator == "pigeonhole.i64_add"` was rejected: every 0.1.0 family stores that name, so every existing family would have become a counter family and refused byte puts.
 

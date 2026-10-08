@@ -365,8 +365,11 @@ impl Family {
     ///   storage with a TTL.
     /// - [`put_i64`](crate::RowMutation::put_i64) sets the counter (`put_i64_at` a bucket);
     ///   later increments add to it. Other puts are refused with `InvalidArgument`.
-    /// - A delete removes what was written before it: an `incr` after `delete_column`
-    ///   starts the counter again from 0.
+    /// - A delete removes what earlier commits wrote: an `incr` after `delete_column`
+    ///   starts the counter again from 0. A write in the same commit as the delete is not
+    ///   hidden (`incr` then `delete_column` in one mutation leaves the increment). A
+    ///   delete without a timestamp takes the commit timestamp, so a bucket at a later
+    ///   timestamp survives it.
     ///
     /// With a TTL the fixed timestamp would expire at once, so such a family takes only
     /// buckets (`incr_at`, `put_i64_at`); `incr` and `put_i64` fail with `InvalidArgument`.
