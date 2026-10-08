@@ -455,3 +455,29 @@ The probe ran on a CI runner (Sweep workflow on the scratch branch `scratch/foot
 **Interim behavior:** superseded; see "Built" above.
 
 **Coordinator:** confirmed (option 1'; no format change, no migration). Measured after compact + shrink: 1.05–1.16× live data for 5–50 MiB (was 2.47–3.08×). L0 stays one SST per flush; backup copies still use the flush sink.
+
+<a id="d184"></a>
+## D184 — Blob GC follows the blob references each SST records (approved; compaction, engine, format, #240, #285; refines D180)
+### Proposed decision (refines D180): blob GC follows the SSTs' recorded blob references
+D180's blob GC rewrote each candidate blob file out of every slot of its family, and remembered in memory which slots it had emptied, so after a reopen (or for a tablet a merge created or a move brought) a slot could be rewritten once more for nothing.
+
+**Interim behavior:**
+- Every commit that adds a new SST also commits `Edit::SstBlobRefs` (manifest tag 13, FORMAT §9.3). It lists the blob files the SST's puts point into, with the bytes they reference (`16 + len` per pointer), and an empty list when the SST holds no pointer. Flushes, compactions, open-time spills, backups and shrink copies all write one. Writers count with `note_blob_ref` as they add entries, so a reference costs no extra I/O. The compaction job returns its outputs' references from the added `CompactionJob::finish_with_blob_refs` (`finish` is unchanged). The catalog drops the references of SSTs no tablet references after each batch, so a trivial move or a split keeps them.
+- Blob GC picks a slot for a candidate file only when one of the slot's SSTs records a reference into it. An SST with no record (written before tag 13) counts as pointing anywhere. After a slot's blob GC commits, its new SSTs record no reference into the file, so the slot is not picked again, across reopens too. The in-memory record of emptied slots is gone.
+- A FIFO `Drop` (D180) uses a dropped SST's recorded bytes instead of reading it when the SST holds only this tablet's rows (not shared with a sibling and not inherited from a split's parent). Otherwise it still reads the SST within the tablet's rows, since the record counts every row.
+- `check_blob_accounting` (test hook, run at every full dump of the engine model harness) also checks that each SST's record equals the pointers it holds.
+
+**Coordinator:** confirmed. Independent review found no must-fix: an SST without a record counts as pointing anywhere, so GC stays conservative for pre-#240 files and terminates once outputs carry records. Tag 13 is skipped by length by builds that predate it.
+
+<a id="d185"></a>
+## D185 — `shrink` relocates blob extents (approved; engine, #231, #286; amends D160)
+### Proposed decision (amends D160): shrink relocates blob extents
+D160's `shrink` relocated SST extents only, and treated blob extents like output in flight, so a blob file at the tail set a floor on the file.
+
+**Interim behavior:**
+- `shrink` also maps the catalog's blob extents and relocates any past the shrink point into a free extent of the same class below. The copy keeps the extent header (file id and position), so it can replace the original in place.
+- The move commits as a `PutBlobFile` whose extent list has the copy at the same position, computed against the catalog at commit time. If the file was dropped meanwhile (blob GC or `drop_table`) or no longer lists that extent, the copy is abandoned. A refused request frees the copies.
+- Blob files are never written once published, so a move needs no claim. A blob GC or backup reading the file keeps reading the old extents through its view, which pins their manifest version.
+- The manifest retires the extents a file's new list drops. Views build a new blob reader for a file whose extents changed, while older views keep theirs, which reads the retired extents they pin. Cached records stay valid: they are keyed by the file and the logical offset, and the bytes are the same.
+
+**Coordinator:** confirmed. The copy is unsynced until the root commit syncs data before the superblock (D58), as for SST moves; a crash before the commit leaves the copy in unnamed, free space.
