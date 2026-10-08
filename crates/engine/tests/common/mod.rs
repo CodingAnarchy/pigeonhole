@@ -68,6 +68,13 @@ pub const DB: &str = "/db/data.phdb";
 /// several tables (deterministically by row) to get cross-shard commits.
 pub const TABLES: [&str; 4] = ["t0", "t1", "t2", "t3"];
 
+/// Splits, merges and moves `engine` completed since open, summed over shards.
+pub fn tablet_changes(engine: &Engine) -> (u64, u64, u64) {
+    engine.shard_stats().iter().fold((0, 0, 0), |(s, m, v), x| {
+        (s + x.splits, m + x.merges, v + x.moves)
+    })
+}
+
 pub fn table_of(row: &[u8]) -> &'static str {
     let h = row.iter().fold(0usize, |h, b| {
         h.wrapping_mul(31).wrapping_add(usize::from(*b))
@@ -2697,7 +2704,7 @@ impl World {
     /// Adds the open engine's split, merge and move counts to the stats.
     fn count_tablet_changes(&mut self) {
         if let Some(store) = &self.store {
-            let (s, m, v) = store.engine.tablet_changes();
+            let (s, m, v) = tablet_changes(&store.engine);
             self.stats.engine_tablet_changes.0 += s;
             self.stats.engine_tablet_changes.1 += m;
             self.stats.engine_tablet_changes.2 += v;

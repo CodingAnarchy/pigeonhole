@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use common::{Config, final_dump, run};
+use common::{Config, final_dump, run, tablet_changes};
 use pigeonhole_engine::{
     Engine, EngineOptions, EngineShard, FamilyOptions, PendingMaintenance, ReadSpec, ScanSpec,
     TableInfo, ValueRef, WriteBatch,
@@ -370,7 +370,7 @@ fn a_tables_writes_spread_across_shards_after_splits() {
     for i in 0..written + 400 {
         assert!(db.get(&key(i)).is_some(), "row {i} lost");
     }
-    let (splits, _, _) = db.engine.tablet_changes();
+    let (splits, _, _) = tablet_changes(&db.engine);
     assert!(splits > 0);
     db.engine.close().unwrap();
     for _ in 0..8 {
@@ -434,7 +434,7 @@ fn a_tablet_splits_at_the_size_threshold_and_merges_when_small_and_cold() {
     }
     assert_eq!(db.ranges().len(), 1, "{:?}", db.ranges());
     assert_eq!(db.scan_rows().len(), 50);
-    let (_, merges, _) = db.engine.tablet_changes();
+    let (_, merges, _) = tablet_changes(&db.engine);
     assert_eq!(merges, 1);
     db.engine.close().unwrap();
     for _ in 0..8 {
@@ -829,7 +829,7 @@ fn tablet_changes_are_refused_when_switched_off() {
     let m = db.engine.balance_pending().unwrap();
     refused(db.drive(m));
     assert_eq!(db.ranges().len(), 1);
-    assert_eq!(db.engine.tablet_changes(), (0, 0, 0));
+    assert_eq!(tablet_changes(&db.engine), (0, 0, 0));
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
@@ -1508,7 +1508,7 @@ fn the_balancer_leaves_a_compacting_tablet_alone() {
     // Big enough to split by size, but compacting: the balancer waits.
     let m = db.engine.balance_pending().unwrap();
     db.drive(m).unwrap();
-    assert_eq!(db.engine.tablet_changes(), (0, 0, 0));
+    assert_eq!(tablet_changes(&db.engine), (0, 0, 0));
     assert_eq!(db.ranges().len(), 1);
     db.engine.park_manifest_commits(false);
     for _ in 0..1_000 {
@@ -1516,7 +1516,7 @@ fn the_balancer_leaves_a_compacting_tablet_alone() {
     }
     let m = db.engine.balance_pending().unwrap();
     db.drive(m).unwrap();
-    assert_eq!(db.engine.tablet_changes().0, 1);
+    assert_eq!(tablet_changes(&db.engine).0, 1);
     close(db);
 }
 
@@ -1689,7 +1689,7 @@ fn lay_out(db: &mut Db, keys: &[&[u8]], owners: &[u16]) {
 }
 
 fn changes(db: &Db) -> u64 {
-    let (s, m, v) = db.engine.tablet_changes();
+    let (s, m, v) = tablet_changes(&db.engine);
     s + m + v
 }
 

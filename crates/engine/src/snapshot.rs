@@ -21,11 +21,6 @@ use pigeonhole_sst::SstReader;
 use crate::catalog::Catalog;
 use crate::{Error, Result};
 
-/// A tablet, its owning shard and its row range `[start, end)` (a test hook).
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub type TabletOwner = (TabletId, u16, Vec<u8>, Option<Vec<u8>>);
-
 /// One tablet of the routing table: a contiguous row range of one table and its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TabletEntry {
@@ -98,16 +93,6 @@ impl TabletMap {
             Some(end) if row >= end.as_slice() => None,
             _ => Some((t.id, t.shard)),
         }
-    }
-
-    /// The tablets of `table` in row order, as `(tablet, shard, start, end)` (a test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn ranges(&self, table: TableId) -> Vec<TabletOwner> {
-        self.tablets_of(table)
-            .iter()
-            .map(|t| (t.id, t.shard.0, t.start.clone(), t.end.clone()))
-            .collect()
     }
 
     /// The tablets of `table` in row order.

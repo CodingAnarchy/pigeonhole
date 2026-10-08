@@ -36,22 +36,22 @@ mod source;
 mod waker;
 mod write;
 
-#[cfg(feature = "test-hooks")]
-pub use compact::CompactionRecord;
 pub use engine::{
     CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats, TableInfo,
 };
-#[cfg(feature = "test-hooks")]
-pub use engine::{ManifestInfo, PendingMaintenance, RawEntry, TabletRange};
 pub use error::{Error, Result};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, ScanCell, ScanCursor, ScanSpec};
-#[cfg(feature = "test-hooks")]
-pub use shard::{AppendedKind, AppendedRecord};
-#[cfg(feature = "test-hooks")]
-pub use snapshot::TabletOwner;
 pub use snapshot::{Snapshot, TabletMap, View};
 pub use write::{PendingCommit, Predicate, Txn, WriteBatch};
+
+/// What the engine's own tests reach in with (the `test-hooks` feature, `engine::hooks`).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use engine::hooks::{
+    AppendedKind, AppendedRecord, CompactionRecord, ManifestInfo, PendingMaintenance, RawEntry,
+    TabletOwner, TabletRange,
+};
 
 pub use pigeonhole_compaction::{
     I64Add, MergeError, MergeOperator, MergeRegistry, PickerOptions, ValuePredicate,

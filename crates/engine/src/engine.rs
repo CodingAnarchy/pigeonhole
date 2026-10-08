@@ -1,3 +1,6 @@
+#[cfg(feature = "test-hooks")]
+pub(crate) mod hooks;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -146,7 +149,7 @@ struct ReaderState {
     shards: usize,
     registry: Arc<MergeRegistry>,
     #[cfg(feature = "test-hooks")]
-    hooks: Mutex<ReaderHooks>,
+    hooks: hooks::ReaderHooks,
 }
 
 /// A reader process's attachment to one region generation.
@@ -158,30 +161,6 @@ struct Attachment {
     /// Snapshots taken in this generation still alive; the pin moves forward when it drops
     /// to zero.
     live: Arc<AtomicUsize>,
-}
-
-/// Test hooks of a reader's snapshot; each runs once.
-#[cfg(feature = "test-hooks")]
-#[derive(Default)]
-struct ReaderHooks {
-    /// Between reading the view record and loading the catalog of its manifest version.
-    after_record: Option<Box<dyn FnOnce() + Send>>,
-    /// After the durable root matched the record's manifest version, before the manifest
-    /// is read.
-    before_manifest_load: Option<Box<dyn FnOnce() + Send>>,
-}
-
-#[cfg(feature = "test-hooks")]
-impl ReaderState {
-    fn run_hook(
-        &self,
-        which: impl FnOnce(&mut ReaderHooks) -> &mut Option<Box<dyn FnOnce() + Send>>,
-    ) {
-        let hook = which(&mut self.hooks.lock().unwrap_or_else(PoisonError::into_inner)).take();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
 }
 
 /// Everything behind an [`Engine`] (and the handle a [`Txn`] keeps).
@@ -306,70 +285,6 @@ enum ReplayedRecordKind {
     Commit { participants: Vec<StreamId> },
 }
 
-/// A future for a maintenance operation (`flush`, `compact`) a test harness drives without
-/// blocking (the `test-hooks` feature).
-#[cfg(feature = "test-hooks")]
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct PendingMaintenance {
-    waiters: Vec<Waiter<Result<()>>>,
-    rounds: Option<CompactRounds>,
-}
-
-#[cfg(feature = "test-hooks")]
-impl std::future::Future for PendingMaintenance {
-    type Output = Result<()>;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        loop {
-            match self.poll_round(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                other => return other,
-            }
-            let this = &mut *self;
-            match this.rounds.as_mut().map(CompactRounds::again) {
-                Some(Some(round)) => this.waiters = round?,
-                _ => return std::task::Poll::Ready(Ok(())),
-            }
-        }
-    }
-}
-
-#[cfg(feature = "test-hooks")]
-impl PendingMaintenance {
-    fn poll_round(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
-        let mut failed = None;
-        let mut i = 0;
-        while i < self.waiters.len() {
-            match std::pin::Pin::new(&mut self.waiters[i]).poll(cx) {
-                std::task::Poll::Ready(Some(Ok(()))) => {
-                    self.waiters.swap_remove(i);
-                }
-                std::task::Poll::Ready(Some(Err(e))) => {
-                    self.waiters.swap_remove(i);
-                    failed = Some(e);
-                }
-                std::task::Poll::Ready(None) => {
-                    self.waiters.swap_remove(i);
-                    failed = Some(Error::Closed);
-                }
-                std::task::Poll::Pending => i += 1,
-            }
-        }
-        if let Some(e) = failed {
-            return std::task::Poll::Ready(Err(e));
-        }
-        if self.waiters.is_empty() {
-            std::task::Poll::Ready(Ok(()))
-        } else {
-            std::task::Poll::Pending
-        }
-    }
-}
-
 /// The rounds of a full compaction with tablet changes on (issue #94). A tablet that moves
 /// during a round can leave a shard before its round reached it and reach one whose round
 /// is over, so a round during which a tablet change finished is followed by another; the
@@ -424,46 +339,6 @@ fn compact_round(shared: &Shared, table: Option<TableId>) -> Result<Vec<Waiter<R
         waiters.push(rx);
     }
     Ok(waiters)
-}
-
-/// One raw entry of a table (a test hook).
-#[cfg(feature = "test-hooks")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[doc(hidden)]
-pub struct RawEntry {
-    /// Table.
-    pub table: TableId,
-    /// Family.
-    pub family: FamilyId,
-    /// Internal key.
-    pub key: Vec<u8>,
-    /// Stored value.
-    pub value: Vec<u8>,
-}
-
-/// A tablet's id, table and row range `[start, end)` (a test hook).
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub type TabletRange = (TabletId, TableId, Vec<u8>, Option<Vec<u8>>);
-
-/// What the manifest of a closed database records (a test hook).
-#[cfg(feature = "test-hooks")]
-#[derive(Debug, Clone, Default)]
-#[doc(hidden)]
-pub struct ManifestInfo {
-    /// Manifest version.
-    pub version: ManifestVersion,
-    /// Per-stream checkpoints.
-    pub checkpoints: BTreeMap<StreamId, Lsn>,
-    /// Flushed-through seqno per `(tablet, family)`.
-    pub flushed: BTreeMap<(TabletId, FamilyId), Seqno>,
-    /// Tablets and their tables.
-    pub tablets: Vec<(TabletId, TableId)>,
-    /// Tablets with their tables and row ranges `[start, end)` (empty start and `None` end
-    /// are unbounded).
-    pub tablet_ranges: Vec<TabletRange>,
-    /// Whether the last close was clean.
-    pub clean: bool,
 }
 
 impl Engine {
@@ -639,25 +514,7 @@ impl Engine {
             busy_ssts: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
-            compactions: Mutex::new(Vec::new()),
-            #[cfg(feature = "test-hooks")]
-            appended: Mutex::new(Vec::new()),
-            #[cfg(feature = "test-hooks")]
-            manifest_race: AtomicBool::new(false),
-            #[cfg(feature = "test-hooks")]
-            manifest_race_waiter: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            before_view_publish: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            before_shrink_relocates: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            before_shrink_commits: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            manifest_park: AtomicBool::new(false),
-            #[cfg(feature = "test-hooks")]
-            manifest_parked: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            refuse_checkpoints: AtomicBool::new(false),
+            hooks: Default::default(),
             picker: options.compaction.clone(),
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
@@ -1143,25 +1000,7 @@ impl Engine {
             busy_ssts: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
-            compactions: Mutex::new(Vec::new()),
-            #[cfg(feature = "test-hooks")]
-            appended: Mutex::new(Vec::new()),
-            #[cfg(feature = "test-hooks")]
-            manifest_race: AtomicBool::new(false),
-            #[cfg(feature = "test-hooks")]
-            manifest_race_waiter: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            before_view_publish: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            before_shrink_relocates: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            before_shrink_commits: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            manifest_park: AtomicBool::new(false),
-            #[cfg(feature = "test-hooks")]
-            manifest_parked: Mutex::new(None),
-            #[cfg(feature = "test-hooks")]
-            refuse_checkpoints: AtomicBool::new(false),
+            hooks: Default::default(),
             picker: options.compaction.clone(),
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
@@ -1209,7 +1048,7 @@ impl Engine {
             shards,
             registry,
             #[cfg(feature = "test-hooks")]
-            hooks: Mutex::new(ReaderHooks::default()),
+            hooks: Default::default(),
         };
         let inner = Arc::new(Inner {
             shared,
@@ -1557,511 +1396,6 @@ impl Engine {
     pub fn close(&self) -> Result<()> {
         self.inner.close(true)
     }
-
-    // ---- test hooks ----
-
-    /// `flush` as a future (test harnesses that drive the shards themselves).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn flush_pending(&self) -> Result<PendingMaintenance> {
-        self.inner.flush_pending()
-    }
-
-    /// `compact` as a future.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn compact_pending(&self, table: Option<TableId>) -> Result<PendingMaintenance> {
-        self.inner.compact_pending(table)
-    }
-
-    /// Every entry of every table in `snapshot`'s view, raw (no resolution), in key order
-    /// per `(table, family)`.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn raw_entries(&self, snapshot: &Snapshot) -> Result<Vec<RawEntry>> {
-        let read = || -> Result<Vec<RawEntry>> {
-            use pigeonhole_compaction::MergingCursor;
-            use pigeonhole_format::Cursor;
-            let view = &snapshot.view;
-            let mut out = Vec::new();
-            let all = pigeonhole_format::scan::ScanFilter::all();
-            for t in view.catalog.tablets() {
-                // Children of a split share SSTs holding their siblings' rows too.
-                let (start, end) = crate::read::clamp_to_tablet(&t, None, None)?;
-                for family in view.catalog.family_ids_of(t.table) {
-                    let sources = view.scan_sources(t.shard, t.id, family, &all, None, None)?;
-                    let mut merged = MergingCursor::new(sources);
-                    match &start {
-                        Some(s) => merged.seek(s)?,
-                        None => merged.seek_to_first()?,
-                    }
-                    while merged.valid() && end.as_deref().is_none_or(|e| merged.key() < e) {
-                        out.push(RawEntry {
-                            table: t.table,
-                            family,
-                            key: merged.key().to_vec(),
-                            value: merged.value().to_vec(),
-                        });
-                        merged.next()?;
-                    }
-                }
-            }
-            Ok(out)
-        };
-        snapshot.checked(read())
-    }
-
-    /// Bytes the pager holds (allocated or retired) that neither the catalog nor the
-    /// manifest root references: output in flight, extents awaiting reclamation, or leaked.
-    /// Zero once idle and reclaimed (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn unreferenced_bytes(&self) -> u64 {
-        let shared = &self.inner.shared;
-        let root = shared
-            .manifest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .root();
-        let mut live: Vec<_> = shared.view.load().catalog.data_extents();
-        live.extend(root.snapshot);
-        live.extend(root.log);
-        live.sort();
-        live.dedup();
-        let referenced: u64 = live.iter().map(|e| e.len()).sum();
-        let stats = shared.pager.stats();
-        (stats.allocated_bytes + stats.retired_bytes).saturating_sub(referenced)
-    }
-
-    /// Every SST the current catalog names, as `(table, level, sst id)` (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn sst_levels(&self) -> Vec<(TableId, u8, u64)> {
-        let catalog = Arc::clone(&self.inner.shared.view.load().catalog);
-        let mut out = Vec::new();
-        for ((tablet, _), list) in &catalog.ssts {
-            let Some(entry) = catalog.tablet(*tablet) else {
-                continue;
-            };
-            out.extend(
-                list.iter()
-                    .map(|(level, meta)| (entry.table, *level, meta.id.0)),
-            );
-        }
-        out
-    }
-
-    /// Bytes in the block cache (test hook: `shrink`'s tests check that an abandoned copy
-    /// leaves nothing cached).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn block_cache_usage(&self) -> usize {
-        self.inner.shared.cache.usage()
-    }
-
-    /// Runs `f` once, in the next `shrink` round, after it has read the catalog and before it
-    /// relocates anything: where a compaction or `drop_table` can commit under it (test
-    /// hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn before_shrink_relocates(&self, f: Box<dyn FnOnce() + Send>) {
-        *self
-            .inner
-            .shared
-            .before_shrink_relocates
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(f);
-    }
-
-    /// Runs `f` once, in the next `shrink` round that commits, after it has written its
-    /// copies and before it commits them: where a `drop_table` makes a copy one to abandon
-    /// (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn before_shrink_commits(&self, f: Box<dyn FnOnce() + Send>) {
-        *self
-            .inner
-            .shared
-            .before_shrink_commits
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(f);
-    }
-
-    /// Splits the tablet of `table` holding row `at` at `at`; both halves stay on its shard.
-    /// Fails with `InvalidArgument` when `at` is the tablet's first row.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn split_tablet_pending(&self, table: TableId, at: &[u8]) -> Result<PendingMaintenance> {
-        let (tablet, shard) = self.inner.tablet_at(table, at)?;
-        self.inner.tablet_op(
-            shard,
-            crate::shard::TabletOpKind::Split {
-                tablet,
-                keys: vec![at.to_vec()],
-                owners: vec![shard, shard],
-            },
-        )
-    }
-
-    /// Moves the tablet of `table` holding `row` to shard `to`.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn move_tablet_pending(
-        &self,
-        table: TableId,
-        row: &[u8],
-        to: u16,
-    ) -> Result<PendingMaintenance> {
-        let (tablet, shard) = self.inner.tablet_at(table, row)?;
-        self.inner.tablet_op(
-            shard,
-            crate::shard::TabletOpKind::Move {
-                tablet,
-                to: ShardId(to),
-            },
-        )
-    }
-
-    /// Merges the tablet of `table` holding `row` with its right neighbour (both must be on
-    /// one shard).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn merge_tablets_pending(&self, table: TableId, row: &[u8]) -> Result<PendingMaintenance> {
-        let view = self.inner.shared.view.load_full();
-        let list = view.tablets.tablets_of(table);
-        let i = list
-            .iter()
-            .position(|t| {
-                t.start.as_slice() <= row && t.end.as_ref().is_none_or(|e| row < e.as_slice())
-            })
-            .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))?;
-        let (Some(l), Some(r)) = (list.get(i), list.get(i + 1)) else {
-            return Err(Error::InvalidArgument("no right neighbour".to_owned()));
-        };
-        self.inner.tablet_op(
-            l.shard,
-            crate::shard::TabletOpKind::Merge {
-                left: l.id,
-                right: r.id,
-            },
-        )
-    }
-
-    /// Runs every shard's balancer now (whatever interval is configured); resolves once the
-    /// splits, moves or merges it started are done.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn balance_pending(&self) -> Result<PendingMaintenance> {
-        self.inner.check_open()?;
-        let mut waiters = Vec::with_capacity(self.inner.shared.shards);
-        for i in 0..self.inner.shared.shards {
-            let (tx, rx) = completion();
-            self.inner
-                .shared
-                .submitter(ShardId(i as u16))
-                .submit(ShardMsg::Balance { reply: Some(tx) })?;
-            waiters.push(rx);
-        }
-        Ok(PendingMaintenance {
-            waiters,
-            rounds: None,
-        })
-    }
-
-    /// The largest default-timestamp floor of any shard (including floors raised by shards
-    /// handing over tablets): the next default timestamp anywhere is above it.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn max_ts_floor(&self) -> pigeonhole_format::Timestamp {
-        let shared = &self.inner.shared;
-        shared
-            .ts_floors
-            .iter()
-            .chain(&shared.ts_raises)
-            .map(|f| f.0.load(Ordering::Acquire))
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Publishes `ts` as `shard`'s default-timestamp floor, whatever the shard assigned: what
-    /// a coordinator reads when it loads the floor just before the shard publishes a higher
-    /// one (a race between threads, issue #105). The shard's own floor is unchanged.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn publish_stale_ts_floor(&self, shard: u16, ts: pigeonhole_format::Timestamp) {
-        self.inner.shared.ts_floors[usize::from(shard)]
-            .0
-            .store(ts, Ordering::Release);
-    }
-
-    /// Splits, merges and moves completed since open, summed over shards.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn tablet_changes(&self) -> (u64, u64, u64) {
-        let mut out = (0, 0, 0);
-        for m in &self.inner.shared.metrics {
-            out.0 += m.splits.load(Ordering::Relaxed);
-            out.1 += m.merges.load(Ordering::Relaxed);
-            out.2 += m.moves.load(Ordering::Relaxed);
-        }
-        out
-    }
-
-    /// The compactions committed since the last call (or since open).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn take_compactions(&self) -> Vec<crate::compact::CompactionRecord> {
-        std::mem::take(
-            &mut *self
-                .inner
-                .shared
-                .compactions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
-    }
-
-    /// Seqnos the shards hold as aborted cross-shard commits, as of each shard's last
-    /// batch (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn aborted_seqnos(&self) -> u64 {
-        self.inner
-            .shared
-            .metrics
-            .iter()
-            .map(|m| m.aborted.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    /// How many times shard `shard` found enough free arena bytes for a batch but no run
-    /// long enough for its largest entry, and made it wait (issue #141).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn arena_run_waits(&self, shard: usize) -> u64 {
-        self.inner.shared.metrics[shard]
-            .run_waits
-            .load(Ordering::Relaxed)
-    }
-
-    /// Shard `shard`'s arena after its last batch: free bytes, the usable bytes of its
-    /// largest run of free chunks, and its size (issue #141).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn arena_free(&self, shard: usize) -> (u64, u64, u64) {
-        let m = &self.inner.shared.metrics[shard];
-        (
-            m.arena_free.load(Ordering::Relaxed),
-            m.arena_run.load(Ordering::Relaxed),
-            m.arena_len.load(Ordering::Relaxed),
-        )
-    }
-
-    /// The WAL records appended since the last call (or since open), in append order.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn take_appended(&self) -> Vec<crate::shard::AppendedRecord> {
-        std::mem::take(
-            &mut *self
-                .inner
-                .shared
-                .appended
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
-    }
-
-    /// Takes the manifest writer's exclusion on this thread, as a commit in progress holds
-    /// it: shards' manifest requests queue up (their pumps find it held and leave) until
-    /// [`release_manifest`](Self::release_manifest). Returns whether it was free (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn hold_manifest(&self) -> bool {
-        manifest::claim(&self.inner.shared)
-    }
-
-    /// Commits every queued manifest request on this thread, which holds the exclusion
-    /// ([`hold_manifest`](Self::hold_manifest)) (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn drain_manifest(&self) {
-        manifest::drain_sync(&self.inner.shared);
-    }
-
-    /// Commits what is queued and releases the exclusion
-    /// [`hold_manifest`](Self::hold_manifest) took (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn release_manifest(&self) {
-        let shared = &self.inner.shared;
-        loop {
-            manifest::drain_sync(shared);
-            manifest::release(shared);
-            if shared.manifest_queue.is_empty() || !manifest::claim(shared) {
-                break;
-            }
-        }
-    }
-
-    /// Runs `f` once, at the start of the next view publish (a shard publishing its
-    /// memtables or a manifest commit), before that publish takes the publish lock: where
-    /// another thread's publish can land in between (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn before_next_view_publish(&self, f: Box<dyn FnOnce() + Send>) {
-        *self
-            .inner
-            .shared
-            .before_view_publish
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(f);
-    }
-
-    /// While `refuse` is set, the manifest writer refuses every batch made only of WAL
-    /// checkpoints with `NoSpace`, through the path a snapshot rewrite that finds no space
-    /// takes (nothing written, the writer stays usable). Test hook.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn refuse_checkpoints(&self, refuse: bool) {
-        self.inner
-            .shared
-            .refuse_checkpoints
-            .store(refuse, Ordering::Release);
-    }
-
-    /// While `park` is set, a background manifest commit whose root commit completed waits
-    /// before it publishes and answers; clearing it wakes the parked commit (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn park_manifest_commits(&self, park: bool) {
-        let shared = &self.inner.shared;
-        shared.manifest_park.store(park, Ordering::Release);
-        if !park {
-            let parked = shared
-                .manifest_parked
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            if let Some(w) = parked {
-                w.wake();
-            }
-        }
-    }
-
-    /// Reader processes: runs `hook` once, in the next snapshot, between reading the view
-    /// record from shared memory and loading the catalog of its manifest version (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn on_reader_view_record(&self, hook: Box<dyn FnOnce() + Send>) {
-        if let Some(r) = &self.inner.reader {
-            r.hooks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .after_record = Some(hook);
-        }
-    }
-
-    /// Reader processes: runs `hook` once, when a snapshot found the durable root at the
-    /// view record's manifest version and is about to read that manifest (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn on_reader_manifest_load(&self, hook: Box<dyn FnOnce() + Send>) {
-        if let Some(r) = &self.inner.reader {
-            r.hooks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .before_manifest_load = Some(hook);
-        }
-    }
-
-    /// The oldest `(seqno, view version)` any reader slot of the current region generation
-    /// pins, and the view version the writer published last (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn reader_pin_and_view(&self) -> (Option<(Seqno, u64)>, u64) {
-        let shared = &self.inner.shared;
-        (shared.shm.oldest_reader_pin(), shared.view.load().version)
-    }
-
-    /// Whether a background manifest commit is parked (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn manifest_commit_parked(&self) -> bool {
-        self.inner
-            .shared
-            .manifest_parked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
-    }
-
-    /// Whether every shard has closed and the final close waits for the manifest writer
-    /// (test hook).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn final_close_pending(&self) -> bool {
-        self.inner
-            .shared
-            .close
-            .final_pending
-            .load(Ordering::Acquire)
-    }
-
-    /// Whether the final close has run (test hook: application-owned shards finish the close
-    /// as they are driven).
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn close_finished(&self) -> bool {
-        self.inner.shared.closed.load(Ordering::Acquire)
-    }
-
-    /// Commits an empty manifest delta from this thread while a second request lands in
-    /// the window between the drain's last `begin` and the release of the writer's
-    /// exclusion (as a shard's submit would, whose pump then leaves). Returns whether that
-    /// second request was committed too, which the release-then-re-check rule guarantees.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn probe_manifest_release_window(&self) -> Result<bool> {
-        use std::task::{Context, Poll, Waker};
-        let shared = &self.inner.shared;
-        shared.manifest_race.store(true, Ordering::Release);
-        manifest::commit_from_thread(shared, manifest::ReqKind::Edits(Vec::new()))?;
-        let waiter = shared
-            .manifest_race_waiter
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let Some(mut waiter) = waiter else {
-            return Err(Error::Corruption("the race window was not entered".into()));
-        };
-        let mut cx = Context::from_waker(Waker::noop());
-        Ok(match std::pin::Pin::new(&mut waiter).poll(&mut cx) {
-            Poll::Ready(Some(Ok(_))) => true,
-            Poll::Ready(Some(Err(e))) => return Err(e),
-            Poll::Ready(None) | Poll::Pending => false,
-        })
-    }
-
-    /// Reads the manifest of a database no writer has open.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn inspect_manifest(vfs: &pigeonhole_io::VfsRef, path: &Path) -> Result<ManifestInfo> {
-        let opened = Pager::open(vfs, path, false)?;
-        let clean = opened.clean_shutdown();
-        let (catalog, _) = manifest::load(&opened, 1, Arc::new(MergeRegistry::default()))?;
-        Ok(ManifestInfo {
-            version: opened.root().manifest_version,
-            checkpoints: catalog.checkpoints.clone(),
-            flushed: catalog.flushed.clone(),
-            tablets: catalog.tablets().iter().map(|t| (t.id, t.table)).collect(),
-            tablet_ranges: catalog
-                .tablets()
-                .into_iter()
-                .map(|t| (t.id, t.table, t.start, t.end))
-                .collect(),
-            clean,
-        })
-    }
 }
 
 impl Drop for Engine {
@@ -2267,10 +1601,11 @@ fn families_in_order(view: &View, table: TableId, listed: &[FamilyId]) -> Result
     Ok(out)
 }
 
-/// A maintenance future: the replies of every shard.
-#[cfg(not(feature = "test-hooks"))]
+/// A maintenance operation in flight: the replies of every shard. `flush` and `compact`
+/// block on it; with the `test-hooks` feature it is also a `Future` a test harness polls.
 #[derive(Debug)]
-pub(crate) struct PendingMaintenance {
+#[doc(hidden)]
+pub struct PendingMaintenance {
     waiters: Vec<Waiter<Result<()>>>,
     rounds: Option<CompactRounds>,
 }
@@ -2292,41 +1627,6 @@ impl PendingMaintenance {
                 None => return Ok(()),
             }
         }
-    }
-}
-
-#[cfg(feature = "test-hooks")]
-impl Inner {
-    /// The tablet of `table` holding `row` and its owner.
-    fn tablet_at(&self, table: TableId, row: &[u8]) -> Result<(TabletId, ShardId)> {
-        self.check_open()?;
-        self.shared
-            .view
-            .load()
-            .tablets()
-            .route(table, row)
-            .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))
-    }
-
-    /// Sends a tablet change to `shard`, the tablets' owner.
-    fn tablet_op(
-        &self,
-        shard: ShardId,
-        op: crate::shard::TabletOpKind,
-    ) -> Result<PendingMaintenance> {
-        if self.role != Role::Writer {
-            return Err(Error::ReadOnly);
-        }
-        self.check_open()?;
-        let (tx, rx) = completion();
-        self.shared.submitter(shard).submit(ShardMsg::TabletOp {
-            op,
-            reply: Some(tx),
-        })?;
-        Ok(PendingMaintenance {
-            waiters: vec![rx],
-            rounds: None,
-        })
     }
 }
 
@@ -2875,7 +2175,7 @@ impl Inner {
                 return Ok(None);
             }
             #[cfg(feature = "test-hooks")]
-            r.run_hook(|h| &mut h.before_manifest_load);
+            r.hooks.before_manifest_load.run();
             let (catalog, _) =
                 manifest::load_root(pager.file(), &root, r.shards, Arc::clone(&r.registry))?;
             *cached = (version, Arc::new(catalog), pager.file().clone());
@@ -2889,7 +2189,7 @@ impl Inner {
         let r = self.reader.as_ref().expect("reader");
         let record = shm.read_view()?;
         #[cfg(feature = "test-hooks")]
-        r.run_hook(|h| &mut h.after_record);
+        r.hooks.after_record.run();
         let Some((catalog, file)) = self.reader_catalog(record.manifest_version)? else {
             return Ok(None);
         };
