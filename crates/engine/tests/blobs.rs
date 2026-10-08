@@ -612,3 +612,47 @@ fn operands_fold_onto_a_separated_base_on_every_read_path() {
     assert!(cas(&want), "check_and_mutate compares the folded value");
     db.close().unwrap();
 }
+
+#[test]
+fn a_fifo_drop_releases_the_blob_bytes_of_the_ssts_it_drops() {
+    // A FIFO-by-time `Drop` removes whole expired SSTs without a job (#32), so the engine
+    // reads their blob pointers itself: the blob files they alone referenced go with them.
+    let vfs = SimVfs::new(41);
+    let mut rig = Rig::open(&vfs, false);
+    let fifo = FamilyOptions {
+        compaction: pigeonhole_engine::CompactionStyle::FifoByTime,
+        ttl_micros: 1_000_000,
+        ..family()
+    };
+    let t = rig.db.create_table("t", &[("f".into(), fifo)]).unwrap();
+    write(&mut rig, &t, 0..30, 0);
+    rig.flush();
+    let first: Vec<u32> = rig.db.blob_files().iter().map(|f| f.1).collect();
+    assert!(!first.is_empty(), "the flush separated the values");
+    rig.check();
+    // Past the TTL, the next flush's maintenance drops the expired SST.
+    vfs.advance(2_000_000_000);
+    write(&mut rig, &t, 100..101, 1); // row 100 is small (inline)
+    rig.flush();
+    rig.check();
+    assert!(
+        rig.db.blob_files().is_empty(),
+        "the dropped SST's blob file is dropped: {:?}",
+        rig.db.blob_files()
+    );
+    let snap = rig.db.snapshot().unwrap();
+    let f = t.families[0].id;
+    assert!(rig.db.get(&snap, t.id, f, &row(3), b"q").unwrap().is_none());
+    assert_eq!(
+        rig.db
+            .get(&snap, t.id, f, &row(100), b"q")
+            .unwrap()
+            .unwrap()
+            .value(),
+        ValueRef::Bytes(&value(100, 1))
+    );
+    drop(snap);
+    rig.db.shrink().unwrap();
+    assert_eq!(rig.db.unreferenced_bytes(), 0);
+    rig.close();
+}

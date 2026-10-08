@@ -474,18 +474,20 @@ fn check_fifo(seed: u64, commits: usize) {
     snapshots.sort_unstable();
     snapshots.dedup();
     let now = h.last_ts.saturating_sub(ttl) + rng.below(2 * ttl);
-    let reads_match = |what: &str, ssts: &[(SstMeta, Arc<SstReader>)]| {
+    // Separated values (the merge's output) are read through their blob files.
+    let reads_match = |what: &str, ssts: &[(SstMeta, Arc<SstReader>)], blobs: &Arc<Blobs>| {
         let readers: Vec<Arc<SstReader>> = ssts.iter().map(|s| s.1.clone()).collect();
         for &s in &snapshots {
             for at in [now, now + 1 + ttl / 2] {
                 let what = format!("seed {seed}: {what}, picked at {now}, read at {s}/{at}");
                 let expected = model_reads(&h, s, at);
-                let got = resolver_reads(&h, s, at, |o| sst_resolver(&readers, o));
+                let got = resolver_reads(&h, s, at, |o| blob_sst_resolver(&readers, blobs, o));
                 assert_same(&what, &expected, &got);
             }
         }
     };
-    reads_match("before", &l0);
+    let no_blobs = Arc::new(Blobs::default());
+    reads_match("before", &l0, &no_blobs);
 
     let mut options = PickerOptions::default();
     options.l0_trigger = 2;
@@ -500,7 +502,7 @@ fn check_fifo(seed: u64, commits: usize) {
     {
         assert_eq!(task.inputs[0].1.len(), expired, "seed {seed}");
         l0.retain(|s| !task.inputs[0].1.contains(&s.0.id));
-        reads_match("after the drop", &l0);
+        reads_match("after the drop", &l0, &no_blobs);
     } else {
         assert_eq!(expired, 0, "seed {seed}");
     }
@@ -529,6 +531,10 @@ fn check_fifo(seed: u64, commits: usize) {
     run_sliced(&db, &mut job);
     let out = job.finish().unwrap();
     assert_disjoint(&out);
+    check_blob_accounting(&db, &out, family.blob_threshold);
+    let mut blobs = Blobs::default();
+    blobs.add(&db.pager, &db.cache, &out.new_blob_files);
+    let blobs = Arc::new(blobs);
     let at = l0.iter().position(|s| ids.contains(&s.0.id)).unwrap();
     l0.retain(|s| !ids.contains(&s.0.id));
     for (level, meta) in &out.added {
@@ -536,7 +542,7 @@ fn check_fifo(seed: u64, commits: usize) {
         let reader = open_sst(&db.pager, &db.cache, meta);
         l0.insert(at, (meta.clone(), reader));
     }
-    reads_match("after the merge", &l0);
+    reads_match("after the merge", &l0, &blobs);
 }
 
 proptest! {

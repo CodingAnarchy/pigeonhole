@@ -408,7 +408,9 @@ pub(crate) struct CompactionWork {
     pub task: CompactionTask,
     job: Option<CompactionJob>,
     /// The view the inputs were taken from: pins their extents while the job reads them.
-    _view: Arc<View>,
+    view: Arc<View>,
+    /// A `Drop`'s blob live-byte changes: the pointers its SSTs held (read before submit).
+    drop_delta: Vec<(BlobFileId, i64)>,
     meta: FamilyMeta,
     record: Option<CompactionRecord>,
     stage: Stage,
@@ -471,13 +473,73 @@ impl CompactionWork {
             shard,
             task,
             job,
-            _view: view,
+            view,
+            drop_delta: Vec::new(),
             meta,
             record,
             stage: Stage::Run,
             waker: StdWaker::default(),
             started,
         })
+    }
+
+    /// For a `Drop`, which removes whole SSTs without a job: the live bytes the blob files
+    /// lose, `16 + len` for every blob pointer a dropped SST holds within the tablet's rows
+    /// (the same accounting a job does for the puts it drops). Reads the SSTs only when the
+    /// family has blob files.
+    fn count_dropped_blobs(&mut self) -> Result<()> {
+        use pigeonhole_compaction::{blob_pointer, record_bytes};
+        use pigeonhole_format::Cursor;
+        use pigeonhole_format::key::{Kind, split_suffix};
+        use pigeonhole_sst::{ReadOptions, ScanFilter};
+
+        let family = self.task.family;
+        if !self
+            .view
+            .catalog
+            .blob_files
+            .values()
+            .any(|b| b.family == family)
+        {
+            return Ok(());
+        }
+        let fam = self
+            .view
+            .ssts
+            .family(self.task.tablet, family)
+            .ok_or_else(|| Error::Corruption("dropped SSTs are gone".to_owned()))?;
+        let priority = SstSet::priority(self.meta.options.cache_priority);
+        let mut read = ReadOptions::default();
+        read.fill_cache = false;
+        read.readahead_blocks = 4;
+        let range = &self.task.range;
+        let mut delta: Vec<(BlobFileId, i64)> = Vec::new();
+        for id in self.task.inputs.iter().flat_map(|(_, ids)| ids.iter()) {
+            let (_, sst) = fam
+                .find(*id)
+                .ok_or_else(|| Error::Corruption(format!("dropped SST {} is gone", id.0)))?;
+            let mut it = sst
+                .reader(&self.view.ssts, priority)?
+                .iter(ScanFilter::all(), read);
+            match &range.start {
+                Some(s) => it.seek(s)?,
+                None => it.seek_to_first()?,
+            }
+            while it.valid() && range.end.as_deref().is_none_or(|e| it.key() < e) {
+                if split_suffix(it.key()).is_ok_and(|(_, _, _, k)| k == Kind::Put)
+                    && let Some(p) = blob_pointer(it.value())
+                {
+                    let bytes = record_bytes(p.len) as i64;
+                    match delta.iter_mut().find(|d| d.0 == p.blob_file) {
+                        Some(d) => d.1 -= bytes,
+                        None => delta.push((p.blob_file, -bytes)),
+                    }
+                }
+                it.next()?;
+            }
+        }
+        self.drop_delta = delta;
+        Ok(())
     }
 
     /// The input SST ids (busy while the work runs).
@@ -572,6 +634,11 @@ impl CompactionWork {
                 }
             }
             (TaskKind::Drop, _) => {
+                blobs = BlobChanges {
+                    family,
+                    new: Vec::new(),
+                    delta: self.drop_delta.clone(),
+                };
                 for (_, ids) in &self.task.inputs {
                     for id in ids {
                         edits.push(Edit::RemoveSst {
@@ -734,7 +801,15 @@ impl Task for CompactionWork {
                                 return TaskPoll::Done;
                             }
                         },
-                        None => None,
+                        None => {
+                            if self.task.kind == TaskKind::Drop
+                                && let Err(e) = self.count_dropped_blobs()
+                            {
+                                self.report(Err(e));
+                                return TaskPoll::Done;
+                            }
+                            None
+                        }
                     };
                     match self.submit(output) {
                         Ok(rx) => self.stage = Stage::Commit(rx),
