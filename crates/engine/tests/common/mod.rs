@@ -4007,6 +4007,179 @@ pub fn read_after_background_crash(
     result
 }
 
+/// Issue #181's scenario, deterministically: a cross-shard commit `X` whose coordinator
+/// logged its PREPARE, then lost its stream to a failed write (another commit's), so it
+/// never appended a COMMIT and `X` aborted after the participant's PREPARE landed. The
+/// participant's checkpoint passes `X`'s PREPARE at once (D116) and a later commit there
+/// survives, while an earlier commit on the coordinator's stream keeps its PREPARE; a
+/// process crash makes the checker meet that hole (`Stats::undecided_prepares_passed`). With `acked`, the client is told `X` was
+/// acknowledged, which no engine does without a COMMIT: the checker must fail `Protocol`.
+/// `cfg` must have the coordinator and participant on different shards, no random faults,
+/// crashes, maintenance or helper-thread commits, and a nonzero `io_error_ppm` (it marks
+/// the injected error as expected; the error itself is injected here).
+pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<Stats, Failure> {
+    let sim = Sim::with_faults(seed, FaultPlan::none());
+    let vfs = sim.vfs();
+    let probe = vfs
+        .open(Path::new("/db/probe"), OpenOptions::read_write_create())
+        .expect("probe");
+    let store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("open");
+    let mut w = World::new(seed, cfg, &vfs, probe, new_model(), store, 0, None);
+    let mut rng = Rng::new(seed);
+    let outcome = (|| -> Result<(), Fail> {
+        // Workload commits, prepared, with the shards they route to.
+        let mut commits =
+            Workload::new(seed ^ 0x5eed, TABLE, cfg.spec.clone()).filter_map(|op| match op {
+                Op::Commit(ops, _) => Some(ops),
+                _ => None,
+            });
+        let mut next = |w: &World, want: &dyn Fn(&[u16]) -> bool| -> Result<_, Fail> {
+            for mut ops in commits.by_ref().take(10_000) {
+                w.prepare_ops(&mut ops);
+                let shards = w.shards_of(&ops);
+                if want(&shards) {
+                    return Ok((ops, shards));
+                }
+            }
+            fail(FailureClass::Protocol, "no workload commit fits".into())
+        };
+        // X on two shards; the coordinator is the shard of its first row.
+        let (x, shards) = next(&w, &|s| s.len() == 2)?;
+        let (coordinator, participant) = (usize::from(shards[0]), usize::from(shards[1]));
+        let (pin, _) = next(&w, &|s| s == [coordinator as u16])?;
+        let (y, _) = next(&w, &|s| s == [coordinator as u16])?;
+        let (z, _) = next(&w, &|s| s == [participant as u16])?;
+        let has = |w: &World, stream: usize, kind: RecKind| {
+            w.stream_records
+                .get(&(stream as u32))
+                .is_some_and(|l| l.iter().any(|r| r.1 == kind))
+        };
+        let step = |w: &mut World, shard: usize| {
+            let now = w.vfs.monotonic_nanos();
+            w.store.as_mut().expect("store open").shards[shard].run_once(now + 1_000);
+            w.drain_appended();
+        };
+        // A commit on the coordinator's stream that no flush persists: its checkpoint stays
+        // below it, so X's PREPARE there survives the crash and makes X known to the checker.
+        w.submit_plain(pin, Durability::Sync, true, &mut rng)?;
+        while !w.poll_in_flight(&mut rng)? {
+            let now = w.vfs.monotonic_nanos();
+            w.store.as_mut().expect("store open").step_shards(now);
+        }
+        w.drain_appended();
+        // X's PREPARE on the coordinator, before the participant hears of X.
+        w.submit_plain(x, Durability::Sync, true, &mut rng)?;
+        for _ in 0..1_000 {
+            if has(&w, coordinator, RecKind::Prepare) {
+                break;
+            }
+            step(&mut w, coordinator);
+        }
+        if !has(&w, coordinator, RecKind::Prepare) || has(&w, participant, RecKind::Prepare) {
+            return fail(
+                FailureClass::Protocol,
+                "the coordinator did not log its PREPARE first".into(),
+            );
+        }
+        // Y's write fails and poisons the coordinator's stream: X can no longer be decided.
+        w.submit_plain(y, Durability::Sync, true, &mut rng)?;
+        let mut every_error = FaultPlan::none();
+        every_error.io_error_ppm = 1_000_000;
+        w.vfs.set_faults(every_error);
+        w.trace.push("every read and write fails".into());
+        let logged = |w: &World| {
+            w.stream_records
+                .get(&(coordinator as u32))
+                .map_or(0, Vec::len)
+        };
+        let before = logged(&w);
+        for _ in 0..1_000 {
+            if logged(&w) > before {
+                break;
+            }
+            step(&mut w, coordinator);
+        }
+        w.vfs.set_faults(FaultPlan::none());
+        w.trace.push("faults off".into());
+        // The participant logs X's PREPARE; the coordinator cannot log a COMMIT, and X and
+        // Y fail. They are settled here, not by `poll_in_flight`, which would reopen the
+        // store as soon as nothing is in flight.
+        for _ in 0..10_000 {
+            if w.in_flight.is_empty() && has(&w, participant, RecKind::Prepare) {
+                break;
+            }
+            let now = w.vfs.monotonic_nanos();
+            w.store.as_mut().expect("store open").step_shards(now);
+            w.drain_appended();
+            let mut i = 0;
+            while i < w.in_flight.len() {
+                let Pending::Poll(pc) = &mut w.in_flight[i].pending else {
+                    unreachable!("plain commits only")
+                };
+                match poll_commit(pc) {
+                    Poll::Pending => i += 1,
+                    Poll::Ready(Err(Error::Io(e))) => {
+                        w.trace.push(format!("  -> I/O error ({e})"));
+                        w.stats.io_errors += 1;
+                        let c = w.in_flight.remove(i).commit;
+                        w.unacked.push(c);
+                    }
+                    Poll::Ready(r) => {
+                        return fail(
+                            FailureClass::Protocol,
+                            format!("X or Y did not fail with an I/O error: {r:?}"),
+                        );
+                    }
+                }
+            }
+        }
+        if !w.in_flight.is_empty()
+            || !has(&w, participant, RecKind::Prepare)
+            || has(&w, coordinator, RecKind::Commit)
+        {
+            return fail(
+                FailureClass::Protocol,
+                "X did not abort with a PREPARE on each participant".into(),
+            );
+        }
+        if acked {
+            for c in &mut w.unacked {
+                c.acked |= matches!(c.streams, CommitStreams::Cross { .. });
+            }
+        }
+        // Z on the participant, past X's PREPARE, which its checkpoint passes at once.
+        w.submit_plain(z, Durability::Sync, true, &mut rng)?;
+        for _ in 0..10_000 {
+            if w.poll_in_flight(&mut rng)? {
+                break;
+            }
+            let now = w.vfs.monotonic_nanos();
+            w.store.as_mut().expect("store open").step_shards(now);
+        }
+        if !w.in_flight.is_empty() {
+            return fail(FailureClass::Protocol, "Z never resolved".into());
+        }
+        w.crash_and_recover(CrashKind::Process, false, &mut rng)
+    })();
+    let result = match outcome {
+        Ok(()) => Ok(w.stats),
+        Err(f) => Err(Failure {
+            seed,
+            class: f.class,
+            op_index: w.op_index,
+            message: f.message,
+            trace: std::mem::take(&mut w.trace),
+        }),
+    };
+    if let Some(mut store) = w.store.take() {
+        let _ = store.engine.close();
+        for _ in 0..4 {
+            store.step_shards(vfs.monotonic_nanos());
+        }
+    }
+    result
+}
+
 /// The final state of a run as a dump plus every read's result (for cross-shard-count
 /// equivalence tests), with optional process crashes and reopens at fixed points.
 pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
