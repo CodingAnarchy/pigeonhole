@@ -2711,10 +2711,12 @@ impl ShardState {
             return;
         }
         // A failed flush waits out its backoff (the timer's `RetryFlush` comes back here),
-        // unless a `flush` or `compact` caller waits for it: each failure answers those at
-        // once, so a call retries at most once and never loops.
+        // unless a `flush` or `compact` caller or a tablet change waits for it: a failure
+        // answers those callers and gives the change up at once, so each retries at most
+        // once and never loops.
         if self.flush_waiters.is_empty()
             && self.compact_all.is_empty()
+            && self.op.is_none()
             && self.flush_retry.as_ref().is_some_and(|t| !t.finished())
         {
             return;
