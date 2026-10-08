@@ -196,6 +196,10 @@ pub struct Config {
     pub balance_fast: bool,
     /// `final_dump` only: a deterministic split, move or merge every this many ops.
     pub tablet_every: Option<usize>,
+    /// `SimVfs::set_deferred_io`: submitted I/O (WAL group syncs, root commits) stays in
+    /// flight until the scheduler completes it, in an order the seed picks, so it spans
+    /// shard slices and client steps. Defaults to `PIGEONHOLE_DEFERRED_IO` (`1` on).
+    pub deferred_io: bool,
 }
 
 impl Config {
@@ -244,6 +248,7 @@ impl Config {
             tablet_ops_ppm: 0,
             balance_fast: tablets_env.as_deref() == Some("1"),
             tablet_every: None,
+            deferred_io: std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1"),
         }
     }
 
@@ -298,6 +303,8 @@ pub struct Stats {
     pub tablet_refused: usize,
     /// Splits, merges and moves the engines performed (requested or the balancer's).
     pub engine_tablet_changes: (u64, u64, u64),
+    /// Client steps that found submitted I/O still in flight (`Config::deferred_io`).
+    pub io_in_flight_steps: usize,
 }
 
 /// What kind of divergence the checker saw.
@@ -467,6 +474,17 @@ pub struct Store {
     pub family_names: HashMap<FamilyId, String>,
     /// Set by any shard's wakeup callback: work arrived for a shard that reported idle.
     pub woke: Arc<AtomicBool>,
+    /// Completes deferred I/O between shard passes (see `Config::deferred_io`).
+    pub vfs: Arc<SimVfs>,
+}
+
+impl Drop for Store {
+    /// A dropped shard's final sync waits for its stream's older syncs (#190). A device
+    /// completes those while it waits; with deferred I/O this thread is the device, so it
+    /// completes everything in flight first (after a crash, the operations fail).
+    fn drop(&mut self) {
+        self.vfs.complete_all_io();
+    }
 }
 
 pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineOptions {
@@ -514,7 +532,7 @@ impl Store {
     }
 
     fn open_with(
-        _vfs: &Arc<SimVfs>,
+        vfs: &Arc<SimVfs>,
         options: EngineOptions,
         fams: &[ModelFamily],
     ) -> Result<Self, Error> {
@@ -551,11 +569,13 @@ impl Store {
             family_ids,
             family_names,
             woke,
+            vfs: Arc::clone(vfs),
         })
     }
 
-    /// Runs every shard until none has work left and no shard was woken during the last
-    /// pass (a shard may wake another one that already reported idle in the same pass).
+    /// Runs every shard until none has work left, no shard was woken during the last pass
+    /// (a shard may wake another one that already reported idle in the same pass) and no
+    /// deferred I/O is in flight (one operation completes per pass).
     pub fn run_until_idle(&mut self) {
         loop {
             self.woke.store(false, Ordering::Release);
@@ -563,6 +583,7 @@ impl Store {
             for s in &mut self.shards {
                 more |= s.run_once(u64::MAX);
             }
+            more |= self.vfs.complete_io();
             if !more && !self.woke.load(Ordering::Acquire) {
                 return;
             }
@@ -623,11 +644,12 @@ impl Store {
         Ok(wb)
     }
 
-    /// Runs every shard once.
+    /// Runs every shard once, then completes one deferred I/O operation if any is in flight.
     pub fn step_shards(&mut self, now: u64) {
         for s in &mut self.shards {
             s.run_once(now + 1_000);
         }
+        self.vfs.complete_io();
     }
 
     /// Drives the shards until `m` resolves (or the engine dies).
@@ -3734,6 +3756,7 @@ pub fn run_traced(seed: u64, cfg: &Config) -> (Result<Stats, Failure>, Vec<SimOp
 fn run_recording(seed: u64, cfg: &Config, record: bool) -> (Result<Stats, Failure>, Vec<SimOp>) {
     let sim = Sim::with_faults(seed, cfg.faults.clone());
     let vfs = sim.vfs();
+    vfs.set_deferred_io(cfg.deferred_io);
     if record {
         vfs.record_ops();
     }
@@ -3842,6 +3865,9 @@ fn run_with(
                     return Step::Done;
                 }
                 let outcome = (|| -> Result<bool, Fail> {
+                    if w.vfs.io_in_flight() > 0 {
+                        w.stats.io_in_flight_steps += 1;
+                    }
                     if !w.poll_in_flight(rng)? {
                         return Ok(true);
                     }
@@ -3937,6 +3963,7 @@ pub fn read_after_background_crash(
 ) -> Result<Stats, Failure> {
     let sim = Sim::with_faults(seed, cfg.faults.clone());
     let vfs = sim.vfs();
+    vfs.set_deferred_io(cfg.deferred_io);
     let probe = vfs
         .open(Path::new("/db/probe"), OpenOptions::read_write_create())
         .expect("probe");
@@ -4185,6 +4212,7 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
 pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
     let sim = Sim::with_faults(seed, cfg.faults.clone());
     let vfs = sim.vfs();
+    vfs.set_deferred_io(cfg.deferred_io);
     let mut store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("open");
     let base = vfs.now_micros();
     let mut results: Vec<String> = Vec::new();
