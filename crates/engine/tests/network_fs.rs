@@ -1,27 +1,30 @@
 //! Issue #147: a database on a network filesystem is refused with `NetworkFilesystem`,
 //! including one whose byte-range locks fail (NFS mounted `nolock`, or lockd down): the
-//! local-filesystem check runs before the writer lock is taken.
+//! local-filesystem check runs before the writer lock is taken. #299 (D173): FUSE is refused
+//! the same way unless `EngineOptions::allow_fuse`, which accepts FUSE only.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use pigeonhole_engine::{Engine, EngineOptions, Error};
 use pigeonhole_io::sim::SimVfs;
-use pigeonhole_io::{FileRef, OpenOptions, Vfs, VfsRef};
+use pigeonhole_io::{FileRef, Locality, OpenOptions, Vfs, VfsRef};
 
 const DB: &str = "/db/remote.phdb";
 
-/// `SimVfs` storage that reports every file as remote; with `locks_fail`, every lock call
-/// fails as `F_OFD_SETLK` does with `ENOLCK`.
+/// `SimVfs` storage that reports every file on a filesystem of kind `locality`; with
+/// `locks_fail`, every lock call fails as `F_OFD_SETLK` does with `ENOLCK`.
 #[derive(Debug)]
 struct RemoteVfs {
     inner: Arc<SimVfs>,
+    locality: Locality,
     locks_fail: bool,
 }
 
 #[derive(Debug)]
 struct RemoteFile {
     inner: FileRef,
+    locality: Locality,
     locks_fail: bool,
 }
 
@@ -29,6 +32,7 @@ impl Vfs for RemoteVfs {
     fn open(&self, path: &Path, opts: OpenOptions) -> pigeonhole_io::Result<FileRef> {
         Ok(Arc::new(RemoteFile {
             inner: self.inner.open(path, opts)?,
+            locality: self.locality,
             locks_fail: self.locks_fail,
         }))
     }
@@ -120,13 +124,17 @@ impl pigeonhole_io::File for RemoteFile {
         self.inner.identity()
     }
     fn is_local(&self) -> pigeonhole_io::Result<bool> {
-        Ok(false)
+        Ok(self.locality == Locality::Local)
+    }
+    fn locality(&self) -> pigeonhole_io::Result<Locality> {
+        Ok(self.locality)
     }
 }
 
-fn open(locks_fail: bool) -> Result<Arc<Engine>, Error> {
+fn options(sim: &Arc<SimVfs>, locality: Locality, locks_fail: bool, fuse: bool) -> EngineOptions {
     let vfs: VfsRef = Arc::new(RemoteVfs {
-        inner: SimVfs::new(147),
+        inner: Arc::clone(sim),
+        locality,
         locks_fail,
     });
     let mut o = EngineOptions::new(vfs);
@@ -135,16 +143,57 @@ fn open(locks_fail: bool) -> Result<Arc<Engine>, Error> {
     o.pin_threads = false;
     o.memtable_budget = 1 << 20;
     o.wal.segment_size = 256 << 10;
-    Engine::open(Path::new(DB), o)
+    o.allow_fuse = fuse;
+    o
+}
+
+fn open(locality: Locality, locks_fail: bool, fuse: bool) -> Result<Arc<Engine>, Error> {
+    Engine::open(
+        Path::new(DB),
+        options(&SimVfs::new(147), locality, locks_fail, fuse),
+    )
 }
 
 #[test]
 fn a_network_filesystem_is_refused_even_when_its_locks_fail() {
     for locks_fail in [false, true] {
-        match open(locks_fail) {
-            Err(Error::NetworkFilesystem) => {}
-            Err(e) => panic!("locks fail: {locks_fail}: {e:?}"),
-            Ok(_) => panic!("locks fail: {locks_fail}: opened on a network filesystem"),
+        // The FUSE opt-in does not admit a network filesystem.
+        for fuse in [false, true] {
+            match open(Locality::Network, locks_fail, fuse) {
+                Err(Error::NetworkFilesystem) => {}
+                Err(e) => panic!("locks fail: {locks_fail}, fuse {fuse}: {e:?}"),
+                Ok(_) => panic!("locks fail: {locks_fail}: opened on a network filesystem"),
+            }
         }
     }
+}
+
+/// #299 (D173): FUSE is refused by default, before the writer lock, and accepted with
+/// `allow_fuse`, by a writer and by a reader process alike.
+#[test]
+fn fuse_is_refused_unless_allowed() {
+    for locks_fail in [false, true] {
+        match open(Locality::Fuse, locks_fail, false) {
+            Err(Error::NetworkFilesystem) => {}
+            Err(e) => panic!("locks fail: {locks_fail}: {e:?}"),
+            Ok(_) => panic!("opened on FUSE without the opt-in"),
+        }
+    }
+    let sim = SimVfs::new(299);
+    let db = Engine::open(Path::new(DB), options(&sim, Locality::Fuse, false, true)).unwrap();
+    db.create_table(
+        "t",
+        &[("f".into(), pigeonhole_engine::FamilyOptions::default())],
+    )
+    .unwrap();
+    match Engine::open_reader(Path::new(DB), options(&sim, Locality::Fuse, false, false)) {
+        Err(Error::NetworkFilesystem) => {}
+        Err(e) => panic!("reader without the opt-in: {e:?}"),
+        Ok(_) => panic!("a reader opened on FUSE without the opt-in"),
+    }
+    let reader =
+        Engine::open_reader(Path::new(DB), options(&sim, Locality::Fuse, false, true)).unwrap();
+    assert!(reader.table("t").is_some());
+    reader.close().unwrap();
+    db.close().unwrap();
 }

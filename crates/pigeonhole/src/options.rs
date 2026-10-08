@@ -44,6 +44,7 @@ pub struct Options {
     create_if_missing: bool,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     allow_unregistered_merge_operators: bool,
+    allow_fuse: bool,
     vfs: Option<VfsRef>,
     wal_segment_size: Option<u64>,
     tablet_changes: bool,
@@ -65,6 +66,7 @@ impl Default for Options {
             create_if_missing: true,
             merge_operators: Vec::new(),
             allow_unregistered_merge_operators: false,
+            allow_fuse: false,
             vfs: None,
             wal_segment_size: None,
             tablet_changes: true,
@@ -205,6 +207,19 @@ impl Options {
         self
     }
 
+    /// Accept a database on a FUSE filesystem (default off; decision D173). Use it only for a
+    /// **local** FUSE mount you trust, such as ntfs-3g or an encrypted home directory
+    /// (gocryptfs). FUSE byte-range locks may be local to one host, so two hosts could
+    /// both open the file as writers and corrupt it, and a sync may not reach stable
+    /// storage, so a commit acknowledged as durable could be lost in a power failure. Never
+    /// set it for sshfs, s3fs, gcsfuse or other network-backed FUSE mounts. Network and
+    /// cluster filesystems (NFS, SMB, GPFS, ...) are refused with
+    /// [`ErrorCode::NetworkFilesystem`](crate::ErrorCode::NetworkFilesystem) either way.
+    pub fn allow_fuse(mut self, yes: bool) -> Self {
+        self.allow_fuse = yes;
+        self
+    }
+
     /// Let a table's tablets split, merge and move between shards (default on), so the
     /// writes of one table spread over every shard. Off, each table is one tablet on one
     /// shard: writes to a single table use one shard thread whatever [`shards`](Self::shards)
@@ -270,6 +285,7 @@ pub struct ReaderOptions {
     block_cache: Option<usize>,
     shm_dir: Option<PathBuf>,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
+    allow_fuse: bool,
     vfs: Option<VfsRef>,
 }
 
@@ -289,6 +305,13 @@ impl ReaderOptions {
     /// Registers a merge operator.
     pub fn merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
         self.merge_operators.push(op);
+        self
+    }
+
+    /// Accept a database on a FUSE filesystem, as [`Options::allow_fuse`] (the same risks
+    /// apply; default off).
+    pub fn allow_fuse(mut self, yes: bool) -> Self {
+        self.allow_fuse = yes;
         self
     }
 
@@ -518,6 +541,7 @@ impl Options {
         o.row_cache_bytes = self.row_cache;
         o.shm_dir.clone_from(&self.shm_dir);
         o.allow_unregistered_merge = self.allow_unregistered_merge_operators;
+        o.allow_fuse = self.allow_fuse;
         if let Some(bytes) = self.wal_segment_size {
             o.wal.segment_size = bytes;
         }
@@ -546,6 +570,7 @@ impl ReaderOptions {
             o.block_cache_bytes = bytes;
         }
         o.shm_dir.clone_from(&self.shm_dir);
+        o.allow_fuse = self.allow_fuse;
         for op in &self.merge_operators {
             o.merge_operators.register(Arc::clone(op));
         }

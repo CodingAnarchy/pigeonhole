@@ -98,6 +98,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `create_if_missing(bool)` | Default true. |
 | `merge_operator(Arc<dyn MergeOperator>)` | Register a custom operator (families name it). |
 | `allow_unregistered_merge_operators(bool)` | Open read-only with compaction off if a family names an unregistered operator. |
+| `allow_fuse(bool)` | Accept a database on FUSE (default off; D173). Only for a trusted **local** FUSE mount: its locks may be host-local and its sync may not be durable. Network filesystems stay refused. Also on `ReaderOptions`. |
 | `tablet_changes(bool)` | Let tablets split, merge and move between shards so one table's writes spread over every shard (default on; off keeps each table as one tablet on one shard). Tablet owners are not stored; a reopen places tablets again. Commits in flight together on one row may apply in either order while its tablet moves. |
 
 `ReaderOptions` (P4, early): `block_cache(usize)` (default 256 MiB **per reader process**, on top of the writer's), `shm_dir(..)`, `merge_operator(..)`.

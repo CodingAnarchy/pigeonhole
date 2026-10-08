@@ -16,7 +16,7 @@ use pigeonhole_format::wal::{BatchBuilder, Mutation, WalRecord};
 use pigeonhole_format::{
     Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, StreamId, TableId, TabletId,
 };
-use pigeonhole_io::{ErrorKind, FileRef, OpenOptions};
+use pigeonhole_io::{ErrorKind, FileRef, Locality, OpenOptions};
 use pigeonhole_memtable::{ArenaRegion, MemtableReader, ShardArena};
 use pigeonhole_pager::Pager;
 use pigeonhole_runtime::{
@@ -429,9 +429,7 @@ impl Engine {
         let mut open_opts = OpenOptions::read();
         open_opts.write = true;
         let file = vfs.open(path, open_opts)?;
-        if !file.is_local()? {
-            return Err(Error::NetworkFilesystem);
-        }
+        check_local(&file, options.allow_fuse)?;
         let writer_lock = WriterLock::acquire(&file)?;
         let identity = file.identity()?;
 
@@ -955,9 +953,7 @@ impl Engine {
         let mut open_opts = OpenOptions::read();
         open_opts.write = true;
         let file = vfs.open(path, open_opts)?;
-        if !file.is_local()? {
-            return Err(Error::NetworkFilesystem);
-        }
+        check_local(&file, options.allow_fuse)?;
         let presence = Presence::acquire(&file)?;
         let identity = file.identity()?;
         let opened = match Pager::open(&vfs, path, false) {
@@ -2480,6 +2476,15 @@ fn with_counter_timestamps(batch: &BatchBuilder, catalog: &Catalog) -> Result<Ba
         out.push(m.table, m.family, m.kind, m.row, m.qualifier, ts, m.value)?;
     }
     Ok(out)
+}
+
+/// Refuses a file on a network filesystem, and on FUSE unless `allow_fuse` (D173, #299).
+fn check_local(file: &FileRef, allow_fuse: bool) -> Result<()> {
+    match file.locality()? {
+        Locality::Local => Ok(()),
+        Locality::Fuse if allow_fuse => Ok(()),
+        _ => Err(Error::NetworkFilesystem),
+    }
 }
 
 fn check_merge_operator(

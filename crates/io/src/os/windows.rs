@@ -86,7 +86,15 @@ pub(crate) fn identity(file: &fs::File) -> Result<FileIdentity> {
     })
 }
 
-pub(crate) fn is_local(file: &fs::File) -> Result<bool> {
+pub(crate) fn locality(file: &fs::File) -> Result<crate::Locality> {
+    Ok(if is_local(file)? {
+        crate::Locality::Local
+    } else {
+        crate::Locality::Network
+    })
+}
+
+fn is_local(file: &fs::File) -> Result<bool> {
     let mut buf = vec![0u16; 1024];
     loop {
         // SAFETY: `buf` is valid for `buf.len()` UTF-16 units.

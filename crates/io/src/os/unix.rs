@@ -6,7 +6,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use super::Liveness;
-use crate::{Error, ErrorKind, FileIdentity, LockMode, Result, SharedOpen};
+use crate::{Error, ErrorKind, FileIdentity, Locality, LockMode, Result, SharedOpen};
 
 pub(crate) fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     file.read_exact_at(buf, offset)
@@ -33,7 +33,9 @@ pub(crate) fn identity(file: &fs::File) -> Result<FileIdentity> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn is_local(file: &fs::File) -> Result<bool> {
+pub(crate) fn locality(file: &fs::File) -> Result<Locality> {
+    /// FUSE's filesystem magic.
+    const FUSE: u32 = 0x6573_5546;
     // Filesystem magic numbers of network and cluster filesystems (linux/magic.h).
     const REMOTE: &[u32] = &[
         0x6969,      // NFS
@@ -48,10 +50,6 @@ pub(crate) fn is_local(file: &fs::File) -> Result<bool> {
         0x0BD0_0BD0, // Lustre
         0x0116_1970, // GFS2
         0x7461_636F, // OCFS2
-        // FUSE (sshfs, s3fs, gcsfuse, JuiceFS, rclone, ...): its byte-range locks are often
-        // local to one host, so two hosts could both be writers. Local FUSE filesystems
-        // (ntfs-3g) are refused too, until an opt-in exists (#147).
-        0x6573_5546,
         0x4750_4653, // GPFS (IBM Spectrum Scale)
     ];
     // SAFETY: `statfs` is plain old data; all-zero is a valid value.
@@ -62,24 +60,48 @@ pub(crate) fn is_local(file: &fs::File) -> Result<bool> {
     }
     #[allow(clippy::unnecessary_cast)] // `f_type` is a different integer type per target.
     let magic = st.f_type as u32;
-    Ok(!REMOTE.contains(&magic))
+    // FUSE (sshfs, s3fs, gcsfuse, JuiceFS, rclone, but also local ntfs-3g): its byte-range
+    // locks are often local to one host, so two hosts could both be writers (#147, D173).
+    Ok(if magic == FUSE {
+        Locality::Fuse
+    } else if REMOTE.contains(&magic) {
+        Locality::Network
+    } else {
+        Locality::Local
+    })
 }
 
 #[cfg(target_vendor = "apple")]
-pub(crate) fn is_local(file: &fs::File) -> Result<bool> {
+pub(crate) fn locality(file: &fs::File) -> Result<Locality> {
     // SAFETY: `statfs` is plain old data; all-zero is a valid value.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: the fd is open for the life of `file`; `st` is a valid out pointer.
     if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
         return Err(last_error("fstatfs"));
     }
-    Ok(st.f_flags & libc::MNT_LOCAL as u32 != 0)
+    if st.f_flags & libc::MNT_LOCAL as u32 != 0 {
+        return Ok(Locality::Local);
+    }
+    // A non-local macFUSE mount names its type `macfuse` (or `osxfuse` before macFUSE 4).
+    let name: Vec<u8> = st
+        .f_fstypename
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    Ok(
+        if name.starts_with(b"macfuse") || name.starts_with(b"osxfuse") {
+            Locality::Fuse
+        } else {
+            Locality::Network
+        },
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-pub(crate) fn is_local(_file: &fs::File) -> Result<bool> {
+pub(crate) fn locality(_file: &fs::File) -> Result<Locality> {
     // No portable way to ask; assume local.
-    Ok(true)
+    Ok(Locality::Local)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
