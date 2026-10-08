@@ -46,7 +46,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D31](phase-1.md#d31) — merge operators are associative folds
 - [D32](phase-1.md#d32) — cursors own what they read
 - [D33](phase-1.md#d33) — configuration structs are non-exhaustive
-- [D34](phase-1.md#d34) — a commit holds one entry per (column, timestamp); last write wins
+- [D34](phase-1.md#d34) — a commit holds one entry per (column, timestamp); last write wins · **amended by D186** (counter families combine same-mutation increments, #295)
 - [D35](phase-1.md#d35) — WAL spare segments are zero-filled off the shard thread · **amended by D157**
 - [D36](phase-1.md#d36) — reader processes open the database file read-write · owner decision U1
 - [D37](phase-1.md#d37) — Windows lock upgrades are not atomic; the writer opens shared memory before taking `Presence` · audit C1, K10
@@ -185,9 +185,9 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D170](phase-2.md#d170) — FIFO-by-time expiry runs on a timer; a busy L0 file splits the merge windows · compaction, engine, #232, #246 · refines D167
 - [D171](phase-2.md#d171) — A room wait's re-check timer can tell the clock stopped · engine, #244, #252 · refines D126, D161 · **amended by D176**
 - [D172](phase-2.md#d172) — Registered merge operators reach the engine; unregistered ones make the handle read-only · pigeonhole, engine, #43, #253 · supersedes D102
-- [D173](phase-2.md#d173) — FUSE and GPFS count as network filesystems; the local check runs before the writer lock · io, engine, #147, #258 · refines D37
+- [D173](phase-2.md#d173) — FUSE and GPFS count as network filesystems; the local check runs before the writer lock · io, engine, #147, #258 · refines D37 · owner: opt-in for local FUSE (#299)
 - [D174](phase-2.md#d174) — Test-hook recording is opt-in, and the test-hooks wait matches production · engine, #148, #261 · refines D164
-- [D175](phase-2.md#d175) — The zstd codec, its library and its level · format, sst, pigeonhole, #44, #255 · amends D168
+- [D175](phase-2.md#d175) — The zstd codec, its library and its level · format, sst, pigeonhole, #44, #255 · amends D168 · owner: keep libzstd
 - [D176](phase-2.md#d176) — The stopped-clock fallbacks apply only to a simulated clock · io, engine, runtime, #263, #267 · amends D126, refines D161, D171
 - [D177](phase-2.md#d177) — Backup releases its snapshot's memtables before the long merge · engine, #262, #268 · **amended by D182**
 - [D178](phase-2.md#d178) — The bench metric family compacts FIFO in Pigeonhole and RocksDB · bench, #236, #270 · refines D163
@@ -198,7 +198,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D183](phase-2.md#d183) — Level outputs are cut into power-of-two pieces so a file at rest stays near its live size · compaction, pager, sst, #185, #276 · refines D160
 - [D184](phase-2.md#d184) — Blob GC follows the blob references each SST records · compaction, engine, format, #240, #285 · refines D180
 - [D185](phase-2.md#d185) — `shrink` relocates blob extents · engine, #231, #286 · amends D160
-- [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179
+- [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments
 
 ## Open questions
 _None._
