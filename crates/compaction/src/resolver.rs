@@ -820,20 +820,32 @@ where
                 }
             }
             if self.col_skip {
-                self.col_skipped += 1;
-                if self.col_skipped > SKIP_STEPS {
-                    // The column prefix ends with the terminator `00 01`: bumping its last
-                    // byte gives the smallest key past every version of the column, and
-                    // before the next column (whose qualifier continues past this one's
-                    // with a byte above `00 02`, or differs earlier).
-                    self.past_col.clear();
-                    self.past_col.extend_from_slice(&self.col);
-                    if let Some(last) = self.past_col.last_mut() {
-                        *last += 1;
+                // The rest of the column is decided: step over its versions with one length
+                // and prefix check each, not a full step (when the whole column is below the
+                // upper bound, so no version needs a bound check).
+                loop {
+                    self.col_skipped += 1;
+                    if self.col_skipped > SKIP_STEPS {
+                        // The column prefix ends with the terminator `00 01`: bumping its last
+                        // byte gives the smallest key past every version of the column, and
+                        // before the next column (whose qualifier continues past this one's
+                        // with a byte above `00 02`, or differs earlier).
+                        self.past_col.clear();
+                        self.past_col.extend_from_slice(&self.col);
+                        if let Some(last) = self.past_col.last_mut() {
+                            *last += 1;
+                        }
+                        self.cursor.seek_forward(&self.past_col)?;
+                        break;
                     }
-                    self.cursor.seek_forward(&self.past_col)?;
-                } else {
                     self.cursor.next()?;
+                    if !self.col_below_upper || !self.cursor.valid() {
+                        break;
+                    }
+                    let k = self.cursor.key();
+                    if k.len() != self.col.len() + SUFFIX_LEN || !k.starts_with(&self.col) {
+                        break;
+                    }
                 }
                 continue;
             }
