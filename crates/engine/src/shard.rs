@@ -816,6 +816,9 @@ impl Reply {
 }
 
 /// A single-shard commit request.
+/// A `check_and_mutate`'s table, row and predicate.
+pub(crate) type RowPredicate = Box<(TableId, Vec<u8>, Predicate)>;
+
 #[derive(Debug)]
 pub(crate) struct CommitReq {
     /// The encoded batch, moved out of the `WriteBatch` (never re-encoded).
@@ -825,8 +828,9 @@ pub(crate) struct CommitReq {
     pub submitted_at: u64,
     /// Optimistic validation: the snapshot seqno and the reads to check.
     pub validate: Option<(Seqno, Vec<ReadKey>)>,
-    /// `check_and_mutate`: the row and predicate to test first.
-    pub predicate: Option<(TableId, Vec<u8>, Predicate)>,
+    /// `check_and_mutate`: the row and predicate to test first. Boxed: rare, and the
+    /// largest part of the request, which every queued message is sized for.
+    pub predicate: Option<RowPredicate>,
     /// A retried cross-shard commit's first timestamp, kept when still above the floor.
     pub commit_ts: Option<Preset>,
     /// Version of the tablet map the commit was routed with (0: unknown): a shard that
@@ -957,7 +961,8 @@ fn prepare_error_of(e: &Error) -> PrepareError {
 #[derive(Debug)]
 pub(crate) enum ShardMsg {
     Commit(CommitReq),
-    Coordinate(CoordinateReq),
+    /// Boxed, so a queued message is sized for a single-shard commit.
+    Coordinate(Box<CoordinateReq>),
     Prepare(PrepareReq),
     Prepared {
         seqno: Seqno,
@@ -1087,7 +1092,7 @@ struct Member {
     reply: Reply,
     submitted_at: u64,
     validate: Option<(Seqno, Vec<ReadKey>)>,
-    predicate: Option<(TableId, Vec<u8>, Predicate)>,
+    predicate: Option<RowPredicate>,
     ticket: Option<CommitTicket>,
     /// Failed before being logged (not applied, resolved with this error).
     failed: Option<Error>,
@@ -3822,7 +3827,7 @@ impl ShardState {
                     continue;
                 }
             }
-            if let Some((table, row, predicate)) = &m.predicate {
+            if let Some((table, row, predicate)) = m.predicate.as_deref() {
                 match self.evaluate(*table, row, predicate) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -4561,7 +4566,7 @@ impl ShardState {
                 check(hash_row(r.table, &r.row));
             }
         }
-        if let Some((table, row, _)) = &m.predicate {
+        if let Some((table, row, _)) = m.predicate.as_deref() {
             check(hash_row(*table, row));
         }
         (same, pending)
@@ -6300,7 +6305,7 @@ impl ShardState {
                     self.pending.push(Member::single(req));
                 }
             }
-            ShardMsg::Coordinate(req) => self.start_coordination(req, ctx),
+            ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),
             ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
             ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
             ShardMsg::Decide {
@@ -6721,5 +6726,21 @@ mod tests {
             .map(|f| backoff_nanos(10_000_000, FLUSH_BACKOFF_CAP, f) / 1_000_000)
             .collect();
         assert_eq!(ms, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+    }
+}
+
+#[cfg(test)]
+mod message_size {
+    /// Every queued message takes the size of the largest `ShardMsg` variant, and the
+    /// channel zeroes and copies whole slots (#64: 264 bytes cost about 270 instructions of
+    /// `memset` per commit). Keep a single-shard commit the largest variant, and small:
+    /// box rare, large fields instead of growing it.
+    #[test]
+    fn a_shard_message_stays_small() {
+        assert!(
+            std::mem::size_of::<super::ShardMsg>() <= 144,
+            "ShardMsg grew to {} bytes",
+            std::mem::size_of::<super::ShardMsg>()
+        );
     }
 }

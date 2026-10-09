@@ -243,7 +243,7 @@ impl ShardState {
                 look(r.table, &r.row, prepare);
             }
         }
-        if let Some((table, row, _)) = &m.predicate {
+        if let Some((table, row, _)) = m.predicate.as_deref() {
             look(*table, row, false);
         }
         out
@@ -309,7 +309,7 @@ impl ShardState {
             &view,
             m.bytes.as_slice(),
             m.validate.as_ref().map(|(_, r)| r.as_slice()),
-            m.predicate.as_ref().map(|(t, r, _)| (*t, r.as_slice())),
+            m.predicate.as_deref().map(|(t, r, _)| (*t, r.as_slice())),
         );
         let shards = match shards {
             Ok(s) => s,
@@ -365,7 +365,9 @@ impl ShardState {
                 if shards[0] == self.id {
                     self.start_coordination(creq, ctx);
                 } else {
-                    let _ = ctx.submitter(shards[0]).submit(ShardMsg::Coordinate(creq));
+                    let _ = ctx
+                        .submitter(shards[0])
+                        .submit(ShardMsg::Coordinate(Box::new(creq)));
                 }
                 None
             }
@@ -1600,7 +1602,7 @@ fn member_rows(m: &Member) -> Vec<u64> {
             out.push(hash_row(r.table, &r.row));
         }
     }
-    if let Some((table, row, _)) = &m.predicate {
+    if let Some((table, row, _)) = m.predicate.as_deref() {
         out.push(hash_row(*table, row));
     }
     out
