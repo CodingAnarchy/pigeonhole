@@ -238,6 +238,26 @@ impl OpenSst {
         let _ = self.reader.set(Arc::clone(&r));
         Ok(self.reader.get().map_or(r, Arc::clone))
     }
+
+    /// As [`OpenSst::reader`], but a reader not yet open is opened only from the block cache:
+    /// what the open misses fails it with `Error::WouldBlock` (async reads, ICR 0014).
+    pub(crate) fn reader_cache_only(
+        &self,
+        set: &SstSet,
+        priority: Priority,
+    ) -> Result<Arc<SstReader>> {
+        if let Some(r) = self.reader.get() {
+            return Ok(Arc::clone(r));
+        }
+        let r = Arc::new(SstReader::open_cache_only(
+            set.file.clone(),
+            &self.meta,
+            Arc::clone(&set.cache),
+            priority,
+        )?);
+        let _ = self.reader.set(Arc::clone(&r));
+        Ok(self.reader.get().map_or(r, Arc::clone))
+    }
 }
 
 /// A blob file the manifest names, with its reader opened on first use. A file's extents
@@ -443,6 +463,15 @@ impl SstSet {
                 ptr.blob_file.0
             ))
         })?;
+        if crate::read::in_async_read() {
+            // An async read takes a cached value as is, and counts a file read it makes
+            // synchronously (D196; until #42's PR 2b for values up to the cache limit, and
+            // for larger ones until #398).
+            if let Some(cell) = reader.cached(ptr) {
+                return Ok(cell);
+            }
+            crate::read::note_sync_read();
+        }
         Ok(reader.read(ptr)?)
     }
 

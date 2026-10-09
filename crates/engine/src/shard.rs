@@ -290,6 +290,8 @@ pub(crate) struct Shared {
     pub shm: ShmRegion,
     pub shards: usize,
     pub view: ArcSwap<View>,
+    /// Reads inside async calls that went to the file synchronously (D196; `Metrics`).
+    pub async_sync_reads: AtomicU64,
     /// Serializes view publishers (shards creating memtables, manifest commits) and holds
     /// the last published version.
     pub view_lock: Mutex<u64>,
@@ -3370,7 +3372,7 @@ impl ShardState {
         {
             let mut key = ColumnKey::new(row, qualifier);
             let probe = Probe::new(&mut key)?;
-            sst_sources_point(fam, &view.ssts, &probe, l.priority, &mut out)?;
+            sst_sources_point::<false>(fam, &view.ssts, &probe, l.priority, &mut out)?;
         }
         Ok(out)
     }

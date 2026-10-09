@@ -43,6 +43,7 @@ use pigeonhole_format::{BlobFileId, FamilyId, SstId, TableId, TabletId};
 pub use iter::SstIter;
 pub use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use pigeonhole_io::FileRef;
+pub use reader::Fetch;
 
 /// Tag bit separating blob-file cache namespaces from SST ones.
 const BLOB_NAMESPACE: u64 = 1 << 63;
@@ -80,6 +81,9 @@ pub enum Error {
     ExtentFull,
     /// Keys were not added in strictly increasing order.
     OutOfOrder,
+    /// A cache-only read ([`ReadOptions::cache_only`], [`SstReader::open_cache_only`]) missed:
+    /// the block it needs, to fetch asynchronously and admit before reading again (ICR 0014).
+    WouldBlock(Box<Fetch>),
 }
 
 impl fmt::Display for Error {
@@ -89,6 +93,7 @@ impl fmt::Display for Error {
             Self::Format(e) => write!(f, "sst: {e}"),
             Self::ExtentFull => write!(f, "sst: the extent is full"),
             Self::OutOfOrder => write!(f, "sst: keys added out of order"),
+            Self::WouldBlock(fetch) => write!(f, "sst: a cache-only read missed ({fetch:?})"),
         }
     }
 }
@@ -336,7 +341,21 @@ impl SstReader {
         priority: Priority,
     ) -> Result<SstReader> {
         Ok(Self {
-            inner: reader::Reader::open(file, meta, cache, priority)?,
+            inner: reader::Reader::open(file, meta, cache, priority, false)?,
+        })
+    }
+
+    /// As [`SstReader::open`], reading only from the block cache: whatever the open needs that
+    /// is not cached (the footer, the top-level index, the filters, the properties) fails it
+    /// with [`Error::WouldBlock`], to fetch and admit before opening again (ICR 0014).
+    pub fn open_cache_only(
+        file: FileRef,
+        meta: &SstMeta,
+        cache: Arc<BlockCache>,
+        priority: Priority,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: reader::Reader::open(file, meta, cache, priority, true)?,
         })
     }
 
@@ -386,6 +405,9 @@ pub struct ReadOptions {
     pub priority: Priority,
     /// Data blocks to read ahead in one submission during forward scans (0 = none).
     pub readahead_blocks: u32,
+    /// Read only what is cached: a block that is not fails the read with
+    /// [`Error::WouldBlock`] instead of being read from the file (async reads, ICR 0014).
+    pub cache_only: bool,
 }
 
 impl Default for ReadOptions {
@@ -394,6 +416,7 @@ impl Default for ReadOptions {
             fill_cache: true,
             priority: Priority::Normal,
             readahead_blocks: 0,
+            cache_only: false,
         }
     }
 }
@@ -491,5 +514,11 @@ impl BlobReader {
     /// corruption error.
     pub fn read(&self, ptr: &BlobPointer) -> Result<Cell> {
         self.inner.read(ptr)
+    }
+
+    /// The value `ptr` names if its record is cached: a lookup only, which never reads the
+    /// file (async reads count the reads they make synchronously, ICR 0014).
+    pub fn cached(&self, ptr: &BlobPointer) -> Option<Cell> {
+        self.inner.cached(ptr)
     }
 }

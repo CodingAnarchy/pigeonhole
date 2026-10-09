@@ -383,6 +383,9 @@ impl RowData {
 pub trait RowSink {
     /// The buffer qualifiers are unescaped into, one after another.
     fn qualifiers(&mut self) -> &mut Vec<u8>;
+    /// Drops every cell and qualifier pushed so far: an async read that missed a block
+    /// starts the row again once it is fetched (ICR 0014).
+    fn clear(&mut self);
     /// Appends a cell of `family` whose qualifier is `qualifier` within
     /// [`RowSink::qualifiers`].
     fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData);
@@ -405,6 +408,11 @@ pub trait RowSink {
 impl RowSink for RowData {
     fn qualifiers(&mut self) -> &mut Vec<u8> {
         &mut self.qualifiers
+    }
+
+    fn clear(&mut self) {
+        self.qualifiers.clear();
+        self.cells.clear();
     }
 
     fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData) {
@@ -1101,7 +1109,7 @@ pub(crate) fn read_row(
         row: row.to_vec(),
         ..RowData::default()
     };
-    let any = read_row_into(
+    let any = read_row_into::<false>(
         &snapshot.view,
         snapshot.seqno,
         table,
@@ -1126,7 +1134,7 @@ thread_local! {
 /// Reads one row through `view` at `seqno` into `sink`: every family in `families` order.
 /// Returns whether any cell was found. A value pinned rather than copied pins `view`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_row_into(
+pub(crate) fn read_row_into<const CACHE_ONLY: bool>(
     view: &Arc<View>,
     seqno: Seqno,
     table: TableId,
@@ -1142,7 +1150,7 @@ pub(crate) fn read_row_into(
         .flatten()
         .unwrap_or_else(point_resolver);
     let mut large = false;
-    let read = read_row_with(
+    let read = read_row_with::<CACHE_ONLY>(
         &mut resolver,
         view,
         seqno,
@@ -1173,7 +1181,7 @@ pub(crate) fn read_row_into(
 // Inlined into `read_row_into`: called through a separate frame, a hot row's per-cell loop
 // measured about 1.5% more instructions.
 #[inline(always)]
-fn read_row_with(
+fn read_row_with<const CACHE_ONLY: bool>(
     resolver: &mut Resolver,
     view: &Arc<View>,
     seqno: Seqno,
@@ -1212,7 +1220,7 @@ fn read_row_with(
         let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let cursor = resolver.cursor_mut();
         cursor.sources_mut().clear();
-        view.row_sources_into(
+        view.row_sources_into::<CACHE_ONLY>(
             shard,
             tablet,
             family,
@@ -1317,7 +1325,7 @@ fn point_resolver() -> Resolver {
 
 /// A point get through `view` at `seqno`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn get_in(
+pub(crate) fn get_in<const CACHE_ONLY: bool>(
     view: &View,
     seqno: Seqno,
     now: Timestamp,
@@ -1328,7 +1336,7 @@ pub(crate) fn get_in(
     pin: impl FnOnce() -> Arc<View>,
 ) -> Result<Option<CellData>> {
     let mut run = Some(|resolver: &mut Resolver| {
-        let got = get_with(
+        let got = get_with::<CACHE_ONLY>(
             resolver, view, seqno, now, table, family, row, qualifier, pin,
         );
         // Whatever happened, the sources (each pins its memtable or SST) and the options
@@ -1382,7 +1390,7 @@ enum Resolved {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn get_with(
+fn get_with<const CACHE_ONLY: bool>(
     resolver: &mut Resolver,
     view: &View,
     seqno: Seqno,
@@ -1406,7 +1414,7 @@ fn get_with(
     let mut key = ColumnKey::new(row, qualifier);
     // The caller clears the sources afterwards, whatever this returns.
     let sources = resolver.cursor_mut().sources_mut();
-    let filled = view.point_sources(shard, tablet, family, &mut key, sources);
+    let filled = view.point_sources::<CACHE_ONLY>(shard, tablet, family, &mut key, sources);
     if filled.is_err() || sources.is_empty() {
         return filled.map(|()| None);
     }
@@ -1864,4 +1872,40 @@ mod tests {
         assert!(matches!(d.value, CellValue::Inline { .. }));
         assert_eq!((d.timestamp(), d.value()), (2, ValueRef::Bytes(&full[..])));
     }
+}
+
+thread_local! {
+    /// While an async read's attempt runs on this thread: the file reads it made
+    /// synchronously so far (D196), counted into `Metrics::async_sync_reads`.
+    static ASYNC_READ: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether an async read's attempt is running on this thread.
+pub(crate) fn in_async_read() -> bool {
+    ASYNC_READ.with(|c| c.get().is_some())
+}
+
+/// Counts a file read the running async read makes synchronously.
+pub(crate) fn note_sync_read() {
+    ASYNC_READ.with(|c| {
+        if let Some(n) = c.get() {
+            c.set(Some(n + 1));
+        }
+    });
+}
+
+/// Runs `f` as an async read's attempt; returns its result and the file reads it made
+/// synchronously. The flag is restored even if `f` panics.
+pub(crate) fn as_async_read<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ASYNC_READ.with(|c| c.set(self.0));
+        }
+    }
+    let restore = Restore(ASYNC_READ.with(|c| c.replace(Some(0))));
+    let out = f();
+    let n = ASYNC_READ.with(|c| c.get()).unwrap_or(0);
+    drop(restore);
+    (out, n)
 }

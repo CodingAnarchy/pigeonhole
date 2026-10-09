@@ -129,6 +129,11 @@ pub struct Cell {
 }
 
 impl Cell {
+    #[cfg(feature = "async")]
+    pub(crate) fn from_data(data: CellData) -> Self {
+        Self { data }
+    }
+
     /// The value bytes.
     #[inline]
     pub fn value(&self) -> &[u8] {
@@ -188,6 +193,11 @@ pub(crate) struct RowBuf {
 impl pigeonhole_engine::RowSink for RowBuf {
     fn qualifiers(&mut self) -> &mut Vec<u8> {
         &mut self.qualifiers
+    }
+
+    fn clear(&mut self) {
+        self.qualifiers.clear();
+        self.cells.clear();
     }
 
     fn push(&mut self, family: FamilyId, qualifier: Range<usize>, data: CellData) {

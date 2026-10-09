@@ -191,10 +191,11 @@ fn covers_row(sst: &OpenSst, row: &[u8]) -> bool {
 }
 
 /// Read options for a scan or a point read.
-fn read_options(priority: Priority, scan: bool) -> ReadOptions {
+fn read_options(priority: Priority, scan: bool, cache_only: bool) -> ReadOptions {
     let mut o = ReadOptions::default();
     o.priority = priority;
     o.readahead_blocks = if scan { 4 } else { 0 };
+    o.cache_only = cache_only;
     o
 }
 
@@ -210,7 +211,7 @@ pub(crate) fn sst_sources_range(
     priority: Priority,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, true);
+    let opts = read_options(priority, true, false);
     for (level, files) in fam.levels.iter().enumerate() {
         let mut picked = files.iter().filter(|sst| overlaps_range(sst, start, end));
         if level == 0 {
@@ -535,19 +536,23 @@ impl<'a> Probe<'a> {
 /// SST sources for a point read of one column: every SST of a level whose range covers the
 /// row (decision D78) and whose filters admit the row and either the column or the row's
 /// family markers (decision D9), newest first.
-pub(crate) fn sst_sources_point(
+pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
     fam: &FamilySsts,
     set: &SstSet,
     probe: &Probe<'_>,
     priority: Priority,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, false);
+    let opts = read_options(priority, false, CACHE_ONLY);
     for sst in fam.iter() {
         if !covers_row(sst, probe.row_prefix) {
             continue;
         }
-        let reader = sst.reader(set, priority)?;
+        let reader = if CACHE_ONLY {
+            sst.reader_cache_only(set, priority)?
+        } else {
+            sst.reader(set, priority)?
+        };
         if !reader.may_contain_row(probe.row)
             || !(reader.may_contain_column(probe.column) || reader.may_contain_column(probe.marker))
         {
@@ -559,7 +564,8 @@ pub(crate) fn sst_sources_point(
 }
 
 /// SST sources for reading one whole row (the row filter applies), newest first.
-pub(crate) fn sst_sources_row(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sst_sources_row<const CACHE_ONLY: bool>(
     fam: &FamilySsts,
     set: &SstSet,
     filter: &ScanFilter,
@@ -568,13 +574,17 @@ pub(crate) fn sst_sources_row(
     priority: Priority,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, false);
+    let opts = read_options(priority, false, CACHE_ONLY);
     let hash = row_hash(escaped_row);
     for sst in fam.iter() {
         if !covers_row(sst, row_prefix) {
             continue;
         }
-        let reader = sst.reader(set, priority)?;
+        let reader = if CACHE_ONLY {
+            sst.reader_cache_only(set, priority)?
+        } else {
+            sst.reader(set, priority)?
+        };
         if !reader.may_contain_row(hash) {
             continue;
         }
@@ -641,7 +651,7 @@ impl View {
     }
 
     /// Sources for a point read of one column, newest first.
-    pub(crate) fn point_sources(
+    pub(crate) fn point_sources<const CACHE_ONLY: bool>(
         &self,
         shard: ShardId,
         tablet: TabletId,
@@ -664,14 +674,14 @@ impl View {
             && !fam.is_empty()
         {
             let probe = Probe::new(key)?;
-            sst_sources_point(fam, &self.ssts, &probe, l.priority, out)?;
+            sst_sources_point::<CACHE_ONLY>(fam, &self.ssts, &probe, l.priority, out)?;
         }
         Ok(())
     }
 
     /// Sources for reading one row, newest first, appended to `out` (a reused source list).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn row_sources_into(
+    pub(crate) fn row_sources_into<const CACHE_ONLY: bool>(
         &self,
         shard: ShardId,
         tablet: TabletId,
@@ -689,7 +699,7 @@ impl View {
         {
             // The escaped row: the row prefix without its terminator.
             let escaped = &row_prefix[..row_prefix.len() - TERMINATOR.len()];
-            sst_sources_row(
+            sst_sources_row::<CACHE_ONLY>(
                 fam, &self.ssts, filter, escaped, row_prefix, l.priority, out,
             )?;
         }
@@ -886,7 +896,7 @@ mod level_tests {
                 f.time_range = Some((2, 4));
                 f
             };
-            let opts = read_options(Priority::Normal, true);
+            let opts = read_options(Priority::Normal, true, false);
             let mut lazy = Source::Sst(
                 SstSource::level(files.clone(), Arc::clone(&set), filter.clone(), opts).unwrap(),
             );

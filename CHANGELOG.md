@@ -19,6 +19,12 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 - `WriteBatch::commit_with_ticket` returns a `CommitTicket` (D196): `wait`, a non-blocking `try_result`, `seqno` once resolved, and `.await` with the `async` feature. It is available without the feature.
 - `pigeonhole-engine`: `Txn::submit`, the non-blocking half of `Txn::commit`.
 - `Options::io_backend` and `ReaderOptions::io_backend` choose the I/O backend (#402): `IoBackend::Pread` (the default, as before), `IoBackend::Uring` (Linux: submitted I/O goes through io_uring, and opening fails with `Unsupported` where it is unavailable), or `IoBackend::Auto` (io_uring where available). `pigeonhole-io` adds the backend as `uring::UringVfs`.
+- **Async gets and row reads** (#42, D196; behind `async`): `Table::get_async` and `get_at_async` (and the same on `ReadTable`) resolve to an owned `Cell`, and `RowRead::read_async` to an owned `Row`. Memtable and cache hits resolve on the first poll. A block the cache does not hold is read through the VFS's asynchronous reads and the read runs again, so no executor thread blocks on it. `Pigeonhole::async_sync_reads` counts the reads that still go to the file synchronously: separated values (for now) and blocks a cache of size 0 cannot keep.
+- `pigeonhole-sst`: `ReadOptions::cache_only`, `Error::WouldBlock(Fetch)`, `Fetch`, `SstReader::open_cache_only` and `BlobReader::cached` (ICR 0014). `pigeonhole-engine`: `Engine::get_latest_async`, `get_async`, `read_row_latest_async` and `read_row_async` (`GetFuture`, `RowFuture`), and `Metrics::async_sync_reads`.
+
+### Changed (breaking)
+- `pigeonhole-engine`: `RowSink` has a new required method, `clear` (an async row read starts the row again after a fetch). Both implementations in the workspace have it.
+- `pigeonhole-sst`: `ReadOptions` gains the public field `cache_only`, so building it with a struct literal no longer compiles; start from `ReadOptions::default()` and set fields.
 
 ## [0.2.0] - 2026-10-09
 The **Phase 2 wide-column model**: counter families, large values and blob separation, per-family compaction styles and zstd, a file at rest near its live size, and the read- and write-path work that met the Phase 2 gate as amended by [D193](docs/design/decisions/phase-2.md#d193). Counters change in a breaking way, and the file format is version 2; see [Migrating from 0.1.0](#migrating-from-010). Every published crate moves to 0.2.0 together.

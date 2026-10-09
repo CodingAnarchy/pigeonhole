@@ -21,6 +21,64 @@ pub(crate) fn corrupt(what: &'static str) -> crate::Error {
 /// Checks a physical block and turns it into what the cache holds: the logical block. An
 /// uncompressed block keeps its I/O buffer (trimmed of the trailer); a compressed one is
 /// decompressed into a heap buffer.
+/// What a cache-only read missed (`Error::WouldBlock`, ICR 0014): one read of the file and
+/// how its bytes enter the block cache. The caller submits the read ([`Fetch::submit`]), admits
+/// the bytes when it completes ([`Fetch::admit`], which verifies them and returns them pinned),
+/// and reads again, now a cache hit.
+#[derive(Clone)]
+pub struct Fetch {
+    file: FileRef,
+    /// Absolute file offset and length of the read.
+    offset: u64,
+    len: usize,
+    cache: Arc<BlockCache>,
+    key: BlockKey,
+    kind: FetchKind,
+    priority: Priority,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FetchKind {
+    /// A block of this kind (checksummed and maybe compressed on disk).
+    Block(BlockKind),
+    /// An SST's footer, cached as its raw bytes for a cache-only open.
+    Footer,
+}
+
+impl std::fmt::Debug for Fetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fetch")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl Fetch {
+    /// Submits the read (the VFS's asynchronous read: a completion that wakes its poller).
+    pub fn submit(&self) -> pigeonhole_io::Completion {
+        self.file.submit_read(IoBuf::zeroed(self.len), self.offset)
+    }
+
+    /// Whether the fetched bytes are in the block cache now. Not after [`Fetch::admit`] when
+    /// the cache keeps nothing (capacity 0, or a block larger than a cache shard): the caller
+    /// then reads synchronously instead of fetching again.
+    pub fn is_cached(&self) -> bool {
+        self.cache.get(self.key).is_some()
+    }
+
+    /// Verifies and decodes the bytes `submit` read and admits them to the block cache,
+    /// returning them pinned: hold the handle until the read that missed has run again.
+    pub fn admit(&self, buf: IoBuf) -> Result<BlockHandle> {
+        let data = match self.kind {
+            FetchKind::Block(kind) => decode_physical(buf, kind)?,
+            FetchKind::Footer => BlockData::from(buf.to_vec()),
+        };
+        Ok(self.cache.insert(self.key, data, self.priority))
+    }
+}
+
 pub(crate) fn decode_physical(mut buf: IoBuf, kind: BlockKind) -> Result<BlockData> {
     match decode_slice(&buf, kind)? {
         Some(data) => Ok(data),
@@ -88,6 +146,7 @@ impl Reader {
         meta: &SstMeta,
         cache: Arc<BlockCache>,
         priority: Priority,
+        cache_only: bool,
     ) -> Result<Self> {
         if meta.len < FOOTER_LEN as u64 || meta.len > meta.extent.len() {
             return Err(corrupt("sst length"));
@@ -95,7 +154,30 @@ impl Reader {
         let base = meta.extent.offset();
         let limit = meta.len - FOOTER_LEN as u64;
         let mut tail = [0; FOOTER_LEN];
-        file.read_at(&mut tail, base + limit)?;
+        if cache_only {
+            // The footer goes through the cache only here, so a cache-only open can fetch it
+            // and run again; a sync open reads it directly, as before.
+            let key = BlockKey {
+                file: crate::sst_cache_file(meta.id),
+                offset: limit,
+            };
+            match cache.get(key) {
+                Some(h) if h.len() == FOOTER_LEN => tail.copy_from_slice(&h),
+                _ => {
+                    return Err(crate::Error::WouldBlock(Box::new(Fetch {
+                        file,
+                        offset: base + limit,
+                        len: FOOTER_LEN,
+                        cache,
+                        key,
+                        kind: FetchKind::Footer,
+                        priority,
+                    })));
+                }
+            }
+        } else {
+            file.read_at(&mut tail, base + limit)?;
+        }
         let footer = Footer::decode(&tail)?;
         let blocks = Blocks {
             file,
@@ -105,19 +187,28 @@ impl Reader {
             cache,
             uncached: BlockCache::disabled(),
         };
-        let top = blocks.read_block(footer.top_index, BlockKind::TopIndex, true, priority)?;
+        // A cache-only open reads only from the cache, and fills it with what it fetches
+        // (the properties block too), so its retry finds everything.
+        let read = |addr: BlockAddr, kind: BlockKind, fill: bool| {
+            if cache_only {
+                blocks.read_block_cache_only(addr, kind, priority)
+            } else {
+                blocks.read_block(addr, kind, fill, priority)
+            }
+        };
+        let top = read(footer.top_index, BlockKind::TopIndex, true)?;
         // Checked once here, so every cursor can trust the top index's tables.
         Block::new(top.clone())?.validate()?;
         let filter = |addr: BlockAddr| -> Result<Option<Filter<BlockHandle>>> {
             if addr.len == 0 {
                 return Ok(None);
             }
-            let h = blocks.read_block(addr, BlockKind::Filter, true, priority)?;
+            let h = read(addr, BlockKind::Filter, true)?;
             Ok(Some(Filter::new(h)?))
         };
         let row_filter = filter(footer.row_filter)?;
         let column_filter = filter(footer.column_filter)?;
-        let props = blocks.read_block(footer.properties, BlockKind::Properties, false, priority)?;
+        let props = read(footer.properties, BlockKind::Properties, false)?;
         let properties = Properties::decode(&props)?;
         Ok(Self {
             blocks,
@@ -182,6 +273,62 @@ impl Blocks {
         self.file.read_at(&mut buf, self.base + addr.offset)?;
         let data = decode_physical(buf, kind)?;
         Ok(self.admit(addr, data, fill_cache, priority))
+    }
+
+    /// The block at `addr` if it is cached (pinned), after the same check as
+    /// [`Blocks::read_block`]: the hit path of a read, for a cursor that handles its misses
+    /// itself ([`Blocks::read_uncached`], or `Error::WouldBlock` in cache-only mode).
+    #[inline]
+    pub(crate) fn lookup(&self, addr: BlockAddr) -> Result<Option<BlockHandle>> {
+        self.check(addr)?;
+        Ok(self.cached(addr))
+    }
+
+    /// Reads a block that [`Blocks::lookup`] did not find, from the file.
+    pub(crate) fn read_uncached(
+        &self,
+        addr: BlockAddr,
+        kind: BlockKind,
+        fill_cache: bool,
+        priority: Priority,
+    ) -> Result<BlockHandle> {
+        let mut buf = IoBuf::zeroed(addr.len as usize);
+        self.file.read_at(&mut buf, self.base + addr.offset)?;
+        let data = decode_physical(buf, kind)?;
+        Ok(self.admit(addr, data, fill_cache, priority))
+    }
+
+    /// [`Blocks::read_block`] from the cache only: a miss fails with `Error::WouldBlock`
+    /// naming the block instead of reading it (a cache-only open, ICR 0014).
+    pub(crate) fn read_block_cache_only(
+        &self,
+        addr: BlockAddr,
+        kind: BlockKind,
+        priority: Priority,
+    ) -> Result<BlockHandle> {
+        match self.lookup(addr)? {
+            Some(h) => Ok(h),
+            None => Err(self.would_block(addr, kind, priority)),
+        }
+    }
+
+    /// The `WouldBlock` error of a cache-only read that missed `addr`.
+    #[cold]
+    pub(crate) fn would_block(
+        &self,
+        addr: BlockAddr,
+        kind: BlockKind,
+        priority: Priority,
+    ) -> crate::Error {
+        crate::Error::WouldBlock(Box::new(Fetch {
+            file: self.file.clone(),
+            offset: self.base + addr.offset,
+            len: addr.len as usize,
+            cache: Arc::clone(&self.cache),
+            key: self.key(addr),
+            kind: FetchKind::Block(kind),
+            priority,
+        }))
     }
 
     /// Hands out a decoded block, inserting it into the cache if asked.
