@@ -17,7 +17,7 @@ jobs:
       - name: callgrind per thread, commit-one and commit-overwrite
         shell: bash
         run: |
-          set -euo pipefail
+          set -eu
           for shape in commit-one commit-overwrite; do
             mkdir -p "/tmp/$shape"
             env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 valgrind --tool=callgrind --collect-atstart=no --separate-threads=yes \
@@ -27,8 +27,8 @@ jobs:
               total=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' "$f")
               [ "${total:-0}" -gt 0 ] || continue
               echo "=== $shape $(basename "$f") total $total"
-              callgrind_annotate --inclusive=no --threshold=95 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -45
+              callgrind_annotate --inclusive=no --threshold=95 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -45 || true
               echo "--- inclusive"
-              callgrind_annotate --inclusive=yes --threshold=99 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -40
+              callgrind_annotate --inclusive=yes --threshold=99 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -40 || true
             done
           done
