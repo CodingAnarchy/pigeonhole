@@ -12,16 +12,21 @@
 //! directory) and removed at the end. `HOT_FLUSH=1` flushes the memtable before reading (all
 //! versions in L0 SSTs); `HOT_COMPACT=1` compacts fully (one version per column), the floor
 //! for the same cells.
+#[path = "support/measure.rs"]
+mod measure;
+use measure::Measured;
+
 use std::ops::Bound;
 use std::time::Instant;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole};
 
-/// One measured iteration: a row read of the hot row and a 10-row scan through it. Not
-/// inlined, so `callgrind --toggle-collect` can count exactly its instructions. Returns the
+/// One measured iteration: a row read of the hot row and a 10-row scan through it, counted by
+/// callgrind while its `Measured` guard lives (`support/measure.rs`). Returns the
 /// cells each read saw and their times in nanoseconds.
 #[inline(never)]
 fn hotrow_iteration(t: &pigeonhole::Table, hot: &[u8]) -> (usize, usize, u64, u64) {
+    let _measured = Measured::start();
     let t0 = Instant::now();
     let row = t.row(hot).family("f").read().unwrap().unwrap();
     let row_cells = row.iter().count();

@@ -13,8 +13,9 @@
 #
 # A shape binary (crates/bench/examples/readshapes.rs is one):
 # - runs as `BINARY SHAPE ITERATIONS DIR`, its work proportional to ITERATIONS;
-# - does its measured work only inside functions whose names contain `shape_` (and not
-#   inside its setup), so callgrind can count them alone;
+# - does its measured work only while a `Measured` guard (crates/bench/examples/support/
+#   measure.rs) is alive on the thread doing it, and none of its setup, so callgrind counts
+#   that work alone (by convention in functions named `shape_*`);
 # - prints `units N` on stderr: the units the measured work handled (cells read, gets,
 #   commits, entries written, as the binary documents);
 # - with `SHAPE_SETUP_ONLY=1` in its environment, does its setup but none of the measured
@@ -29,8 +30,11 @@
 # every state and shape must report units and at least `floor` instructions per unit: work
 # that escapes the measured functions (#346 counted 19 per compacted entry) fails too.
 #
-# On Linux with valgrind, callgrind counts exactly the measured functions
-# (--toggle-collect): deterministic, so CI can compare against a baseline. Elsewhere (macOS),
+# On Linux with valgrind, callgrind counts exactly the measured work: collection starts off
+# (--collect-atstart=no) and each `Measured` guard turns it on for its thread with a client
+# request, which does not depend on callgrind resolving function names (a name match,
+# --toggle-collect, sometimes counted nothing, #350). Deterministic, so CI can compare
+# against a baseline. Elsewhere (macOS),
 # `/usr/bin/time -l` counts the whole process at two iteration counts and the difference
 # removes the setup.
 #
@@ -86,7 +90,7 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
         local pattern="$1" env_set="$2"
         shift 2
         # The environment goes before valgrind: callgrind does not follow `env`'s exec.
-        env $env_set valgrind --tool=callgrind --toggle-collect="$pattern" \
+        env $env_set valgrind --tool=callgrind --collect-atstart=no \
             --callgrind-out-file="$work/cg.out" "$@" </dev/null >/dev/null 2>"$work/err"
         sed -n 's/^summary: \([0-9]*\).*/\1/p' "$work/cg.out"
     }
@@ -96,7 +100,7 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
         local ir
         ir=$(callgrind "$pattern" "SHAPE_SETUP_ONLY=1 $env_set" "$@")
         if [[ "${ir:-0}" != 0 ]]; then
-            echo "$name: the setup alone counted $ir instructions inside $pattern;" \
+            echo "$name: the setup alone counted $ir instructions ($pattern);" \
                 "setup work reaches the measured functions" >&2
             exit 1
         fi

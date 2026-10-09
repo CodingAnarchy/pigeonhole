@@ -12,8 +12,8 @@
 //! | `flush` | 2,000 entries flushed from the memtable to one SST | entries |
 //! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level | entries |
 //!
-//! Only the measured work runs inside functions named `shape_*` (callgrind counts them
-//! with `--toggle-collect='*shape_*'`); the commits a flush or compaction needs are
+//! Only the measured work runs inside functions named `shape_*`, each counting its thread's
+//! work with a `Measured` guard (`support/measure.rs`); the commits a flush or compaction needs are
 //! written first, outside them. The shards are application-owned and each runs on a
 //! thread of its own, inside `shape_run_shard` while a shape is measured, so the commit,
 //! flush and compaction work the shards do is counted along with the caller's. One shard,
@@ -23,6 +23,10 @@
 //! `flush` and `compact` the setup commits grow with ITERATIONS too, so that difference
 //! includes them: only callgrind measures those two shapes alone. The commit shapes are
 //! clean either way.
+#[path = "support/measure.rs"]
+mod measure;
+use measure::Measured;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -181,6 +185,7 @@ fn drive(mut shard: Shard, ctl: &Ctl) {
 // budget, which changes nothing measured.
 #[inline(never)]
 fn shape_run_shard(shard: &mut Shard) {
+    let _measured = Measured::start();
     while shard.run_once(Duration::from_micros(200)) {}
 }
 
@@ -191,6 +196,7 @@ fn run_shard(shard: &mut Shard) {
 
 #[inline(never)]
 fn shape_commit_one(t: &Table, rows: &[Vec<u8>]) {
+    let _measured = Measured::start();
     for row in rows {
         t.mutate(row).put("f", b"q", &VALUE).commit().unwrap();
     }
@@ -198,6 +204,7 @@ fn shape_commit_one(t: &Table, rows: &[Vec<u8>]) {
 
 #[inline(never)]
 fn shape_commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
+    let _measured = Measured::start();
     commit_sixteen(t, rows, quals);
 }
 
@@ -213,10 +220,12 @@ fn commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
 
 #[inline(never)]
 fn shape_flush(db: &Pigeonhole) {
+    let _measured = Measured::start();
     db.flush().unwrap();
 }
 
 #[inline(never)]
 fn shape_compact(db: &Pigeonhole) {
+    let _measured = Measured::start();
     db.compact().unwrap();
 }
