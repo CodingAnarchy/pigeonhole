@@ -20,6 +20,6 @@ jobs:
           set -euo pipefail
           T=target/release/examples
           for r in 1 2 3; do
-            scripts/instructions-per-cell.sh $T/hotrow $T/readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans $T/writepath:commit-one,commit-sixteen,flush,compact $T/ycsb:ycsb-c,ycsb-a > run$r.txt
+            scripts/instructions-per-cell.sh $T/hotrow $T/readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans $T/writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,flush,compact $T/ycsb:ycsb-c,ycsb-a > run$r.txt
           done
           paste run1.txt run2.txt run3.txt | awk '{ printf "| %s | %s | %s | %s |\n", $1, $2, $4, $6 }' | tee -a "$GITHUB_STEP_SUMMARY"

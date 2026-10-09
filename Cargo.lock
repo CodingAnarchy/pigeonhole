@@ -807,6 +807,8 @@ version = "0.2.0"
 dependencies = [
  "fjall",
  "pigeonhole",
+ "pigeonhole-engine",
+ "pigeonhole-io",
  "proptest",
  "rocksdb",
  "rusqlite",
