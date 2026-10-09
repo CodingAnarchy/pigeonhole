@@ -553,6 +553,11 @@ pub struct Memtable {
     max_seqno: Seqno,
     frozen: bool,
     rng: u64,
+    /// The predecessors, at every level, of the last key inserted (the head before any): a
+    /// key that sorts right after it has the same predecessors, so inserts in key order (a
+    /// row's cells, rising row keys) skip the search. Only this writer links nodes and none
+    /// is removed, so they stay exact.
+    splice: [u32; MAX_HEIGHT],
     pin: Arc<Pin>,
 }
 
@@ -609,6 +614,7 @@ impl Memtable {
             max_seqno: 0,
             frozen: false,
             rng: 0x9E37_79B9_7F4A_7C15 ^ (root as u64),
+            splice: [head as u32; MAX_HEIGHT],
             pin,
         })
     }
@@ -655,19 +661,30 @@ impl Memtable {
             node != NULL && node.is_multiple_of(4) && (node as usize) < self.region.len()
         );
 
-        // Predecessors at every level, searching from the top of the head tower.
+        // Predecessors at every level: the last insert's when the key sorts right after
+        // the last key inserted (between it and its successor, two comparisons), else from a
+        // search down from the top of the head tower.
         let mem = &self.region.mem;
-        let mut prev = [self.head; MAX_HEIGHT];
-        let mut cur = self.head;
-        for level in (0..MAX_HEIGHT).rev() {
-            loop {
-                let next = mem.load_u32(tower(cur, level), Ordering::Relaxed);
-                if next == NULL || self.key_cmp(next, key) != Cmp::Less {
-                    break;
-                }
-                cur = next;
+        let mut prev = self.splice;
+        let after_last = {
+            let last = prev[0];
+            (last == self.head || self.key_cmp(last, key) == Cmp::Less) && {
+                let next = mem.load_u32(tower(last, 0), Ordering::Relaxed);
+                next == NULL || self.key_cmp(next, key) != Cmp::Less
             }
-            prev[level] = cur;
+        };
+        if !after_last {
+            let mut cur = self.head;
+            for level in (0..MAX_HEIGHT).rev() {
+                loop {
+                    let next = mem.load_u32(tower(cur, level), Ordering::Relaxed);
+                    if next == NULL || self.key_cmp(next, key) != Cmp::Less {
+                        break;
+                    }
+                    cur = next;
+                }
+                prev[level] = cur;
+            }
         }
 
         // Fill the node; nothing links to it yet, so these are plain writes.
@@ -690,6 +707,9 @@ impl Memtable {
             mem.store_u32(tower(p, level), node, Ordering::Release);
         }
 
+        for (level, p) in prev.iter().enumerate() {
+            self.splice[level] = if level < height { node } else { *p };
+        }
         self.bump += node_len;
         self.used += node_len as u64;
         self.count += 1;
