@@ -657,7 +657,9 @@ impl SimVfs {
     /// assert!(own_io_in_flight());
     /// // Another thread has none of its own.
     /// assert!(!std::thread::spawn(own_io_in_flight).join().unwrap());
-    /// assert!(reap_own_io(None));
+    /// // A thread that waits finds the simulated device done; one that only polls does not.
+    /// assert!(!reap_own_io(None));
+    /// assert!(reap_own_io(Some(std::time::Duration::ZERO)));
     /// assert!(sync.is_ready() && !own_io_in_flight());
     /// # Ok(())
     /// # }
@@ -742,6 +744,8 @@ impl SimVfs {
             {
                 vfs.complete(Some(id));
             }
+            // Ran, or another thread must: either way, once is enough.
+            false
         })));
         st.in_flight.push(InFlight {
             id,
@@ -802,8 +806,13 @@ impl crate::own::OwnIo for SimVfs {
     }
 
     /// Runs every operation this thread submitted in owner-reaps mode, including any their
-    /// continuations submit (the simulated device has always finished them).
-    fn reap_here(&self, _wait: Option<Duration>) -> bool {
+    /// continuations submit, when the thread waits (`Some`): the simulated device finishes
+    /// them for a thread that waits for it, never in a non-waiting reap (`None`), so a
+    /// shard's turn leaves them in flight as a harness expects.
+    fn reap_here(&self, wait: Option<Duration>) -> bool {
+        if wait.is_none() {
+            return false;
+        }
         let me = std::thread::current().id();
         let mut any = false;
         loop {

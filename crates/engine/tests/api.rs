@@ -989,7 +989,7 @@ fn engine_owned_mode_on_real_files() {
     let dir = std::env::temp_dir().join(format!("pigeonhole-engine-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("data.phdb");
-    let vfs: VfsRef = pigeonhole_io::pread::PreadVfs::new(2);
+    let vfs: VfsRef = real_vfs();
     let mut o = EngineOptions::new(Arc::clone(&vfs));
     o.create_if_missing = true;
     o.shards = 2;
@@ -1432,4 +1432,16 @@ fn values_larger_than_a_small_chunk_are_admitted_and_applied() {
     put(&mut wb, &t, "f1", b"after", b"q", b"ok");
     db.commit(wb, None).unwrap();
     db.close().unwrap();
+}
+
+/// Real files through the backend `PIGEONHOLE_IO` names: `uring` runs on io_uring (Linux;
+/// fails where it is unavailable, #402), anything else on `pread`.
+fn real_vfs() -> pigeonhole_io::VfsRef {
+    match std::env::var("PIGEONHOLE_IO").as_deref() {
+        #[cfg(target_os = "linux")]
+        Ok("uring") => pigeonhole_io::uring::UringVfs::new().expect("io_uring is available"),
+        #[cfg(not(target_os = "linux"))]
+        Ok("uring") => panic!("PIGEONHOLE_IO=uring needs Linux"),
+        _ => pigeonhole_io::pread::PreadVfs::new(2),
+    }
 }

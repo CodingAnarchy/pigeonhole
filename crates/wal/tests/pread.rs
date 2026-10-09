@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use common::*;
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
-use pigeonhole_io::pread::PreadVfs;
 use pigeonhole_io::sim::SimVfs;
 use pigeonhole_io::{
     Completion, File, FileIdentity, FileRef, IoBuf, LockMode, OpenOptions, ProcessId, Resolver,
@@ -38,7 +37,7 @@ impl Drop for TempDir {
 fn real_files_roundtrip_and_are_removed() {
     let dir = TempDir::new("roundtrip");
     let db = dir.0.join("data.phdb");
-    let vfs: VfsRef = PreadVfs::new(2);
+    let vfs: VfsRef = real_vfs();
     let opts = opts(4, 1);
     let mut wal = WalStream::create(&vfs, &db, StreamId(0), DB_ID, opts).unwrap();
     let path = pigeonhole_wal::stream_path(&db, StreamId(0));
@@ -360,4 +359,16 @@ fn a_failed_blocking_sync_or_write_poisons_the_stream() {
     wal.append(&batch(1, 10).record(), Durability::Buffered)
         .unwrap();
     wal.sync().unwrap();
+}
+
+/// Real files through the backend `PIGEONHOLE_IO` names: `uring` runs on io_uring (Linux;
+/// fails where it is unavailable, #402), anything else on `pread`.
+fn real_vfs() -> pigeonhole_io::VfsRef {
+    match std::env::var("PIGEONHOLE_IO").as_deref() {
+        #[cfg(target_os = "linux")]
+        Ok("uring") => pigeonhole_io::uring::UringVfs::new().expect("io_uring is available"),
+        #[cfg(not(target_os = "linux"))]
+        Ok("uring") => panic!("PIGEONHOLE_IO=uring needs Linux"),
+        _ => pigeonhole_io::pread::PreadVfs::new(2),
+    }
 }

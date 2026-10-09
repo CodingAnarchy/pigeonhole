@@ -609,6 +609,10 @@ impl Shard {
     /// pending, so this is never `None`; it is bounded by the balancer's current interval:
     /// 100 ms after a write or a tablet change, doubling with each idle pass up to 10 s.
     ///
+    /// With [`IoBackend::Uring`](crate::IoBackend::Uring), I/O the shard submitted goes to
+    /// a ring of the thread that drives it and completes only when that thread runs a shard
+    /// again, so this is `Some(Duration::ZERO)` while any is in flight (#402).
+    ///
     /// After [`run_once`](Shard::run_once) returns `false`, sleep until the
     /// [`set_wakeup`](Shard::set_wakeup) callback fires or this much time passes, whichever
     /// comes first, then call `run_once` again. See [`Pigeonhole::open_application_owned`]
@@ -636,6 +640,12 @@ impl Shard {
     /// # }
     /// ```
     pub fn next_wakeup(&self) -> Option<std::time::Duration> {
+        // I/O on this thread's own ring (`IoBackend::Uring`, #402) completes only when the
+        // thread runs a shard again: due now while any is in flight. A completion fd the
+        // application can wait on instead is #408.
+        if pigeonhole_io::own_io_in_flight() {
+            return Some(std::time::Duration::ZERO);
+        }
         let deadline = self.inner.next_deadline()?;
         let now = self.vfs.monotonic_nanos();
         Some(std::time::Duration::from_nanos(

@@ -347,6 +347,11 @@ struct ShardCore<H: ShardHandler> {
     /// The clock when the loop last went idle with sleeping tasks: if it reads the same at
     /// the next pass, the clock is not moving on its own and sleepers run early to notice.
     idle_at: Option<u64>,
+    /// Whether the thread was given its own I/O ring yet (`Vfs::attach_thread`, at the first
+    /// turn), and whether it got one: a turn reaps only then, so a backend without rings
+    /// costs a turn nothing (#402).
+    attached: bool,
+    own_ring: bool,
 }
 
 impl<H: ShardHandler> ShardCore<H> {
@@ -410,6 +415,15 @@ impl<H: ShardHandler> ShardCore<H> {
     fn run_once(&mut self, deadline: u64) -> bool {
         let _shard = EnterShard::new(self.id);
         self.signal().awake();
+        // A backend with a ring per driving thread (#402) gives the first thread to run this
+        // shard its own; what completed on it resolves now, so the work it unblocks runs this
+        // turn. Without a ring, a turn pays one branch.
+        if !self.attached {
+            self.attach();
+        }
+        if self.own_ring {
+            pigeonhole_io::reap_own_io(None);
+        }
         self.drain();
         self.spawner.local.collect_woken();
         let start = self.vfs.monotonic_nanos();
@@ -442,6 +456,14 @@ impl<H: ShardHandler> ShardCore<H> {
         more
     }
 
+    /// Gives the calling thread its own I/O ring if the backend has them, once.
+    #[cold]
+    fn attach(&mut self) {
+        self.attached = true;
+        self.vfs.attach_thread();
+        self.own_ring = pigeonhole_io::own_io_waker().is_some();
+    }
+
     /// The earliest deadline of a sleeping background task on this shard.
     fn next_deadline(&self) -> Option<u64> {
         self.spawner.local.next_deadline()
@@ -469,12 +491,20 @@ impl<H: ShardHandler> ShardCore<H> {
     }
 }
 
+/// Longest an idle shard thread waits on its own I/O ring before it looks again (a wake or a
+/// completion ends the wait sooner).
+const RING_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Body of an engine-owned shard thread.
 fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
     let _shard = EnterShard::new(core.id);
     let mut idle_park = sched::IdlePark::default();
+    core.attach();
     core.signal()
-        .set_target(WakeTarget::Thread(thread::current()));
+        .set_target(match pigeonhole_io::own_io_waker() {
+            Some(w) => WakeTarget::ThreadRing(thread::current(), w),
+            None => WakeTarget::Thread(thread::current()),
+        });
     loop {
         let deadline = core.vfs.monotonic_nanos().saturating_add(core.time_slice);
         let more = core.run_once(deadline);
@@ -483,6 +513,19 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
             return core.handler;
         }
         if !more {
+            if core.own_ring && pigeonhole_io::own_io_in_flight() {
+                // I/O only this thread completes (its ring, #402): wait on it rather than
+                // park, until a completion, a wake (the ring's eventfd) or the deadline.
+                let now = core.vfs.monotonic_nanos();
+                let until = core
+                    .next_deadline()
+                    .map_or(RING_IDLE_WAIT, |d| {
+                        std::time::Duration::from_nanos(d.saturating_sub(now))
+                    })
+                    .min(RING_IDLE_WAIT);
+                pigeonhole_io::reap_own_io(Some(until));
+                continue;
+            }
             // Until the next message, or the earliest sleeping task's deadline (re-checked
             // sooner while the clock has not shown it keeps real time: a simulated clock
             // moves without waking anyone).
@@ -542,6 +585,8 @@ fn build<H: ShardHandler>(
             vfs: Arc::clone(&config.vfs),
             time_slice: config.slice_nanos(),
             idle_at: None,
+            attached: false,
+            own_ring: false,
         })
         .collect();
     (submitters, cores)

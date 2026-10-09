@@ -24,8 +24,33 @@ pub(crate) trait OwnIo: Send + Sync {
     /// Whether the calling thread has operations in flight that only it can complete.
     fn in_flight_here(&self) -> bool;
     /// Completes the calling thread's finished operations, waiting up to `wait` for one to
-    /// finish when none has. Returns whether any completed.
+    /// finish when none has (`None`: take only what has already finished). Returns whether
+    /// any completed.
     fn reap_here(&self, wait: Option<Duration>) -> bool;
+    /// A handle that interrupts the calling thread's wait in [`OwnIo::reap_here`], if the
+    /// backend's waits can be interrupted.
+    fn waker_here(&self) -> Option<OwnIoWaker> {
+        None
+    }
+}
+
+/// Interrupts its thread's wait in [`reap_own_io`] (an io_uring ring's wait for completions,
+/// #402) from any thread: the scheduler's wakeup for a shard thread that waits on its ring
+/// rather than parking.
+#[derive(Clone)]
+pub struct OwnIoWaker(pub(crate) Arc<dyn Fn() + Send + Sync>);
+
+impl OwnIoWaker {
+    /// Wakes the thread, now if it waits in [`reap_own_io`], or else at its next such wait.
+    pub fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for OwnIoWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnIoWaker")
+    }
 }
 
 thread_local! {
@@ -48,10 +73,18 @@ pub(crate) fn register(own: Weak<dyn OwnIo>) {
 }
 
 /// The live backends of this thread, taken out of the registry's borrow (reaping runs
-/// continuations, which may submit and register again).
+/// continuations, which may submit and register again). Allocates nothing for a thread with
+/// none, the common case.
 fn backends() -> Vec<Arc<dyn OwnIo>> {
-    OWN.try_with(|o| o.borrow().iter().filter_map(Weak::upgrade).collect())
-        .unwrap_or_default()
+    OWN.try_with(|o| {
+        let o = o.borrow();
+        if o.is_empty() {
+            Vec::new()
+        } else {
+            o.iter().filter_map(Weak::upgrade).collect()
+        }
+    })
+    .unwrap_or_default()
 }
 
 /// Whether the calling thread has submitted operations in flight that only it can complete
@@ -62,13 +95,21 @@ pub fn own_io_in_flight() -> bool {
 }
 
 /// Completes the calling thread's finished operations on every backend that leaves them to
-/// it, waiting up to `wait` for one to finish when none has (`None`: do not wait). Their
-/// completions resolve, and their continuations run, on this thread. Returns whether any
-/// completed.
+/// it, waiting up to `wait` for one to finish when none has. `None` takes only what has
+/// already finished, without waiting (a shard's turn); the simulator's device finishes its
+/// operations only for a thread that waits. Their completions resolve, and their
+/// continuations run, on this thread. Returns whether any completed.
 pub fn reap_own_io(wait: Option<Duration>) -> bool {
     let mut any = false;
     for b in backends() {
         any |= b.reap_here(wait);
     }
     any
+}
+
+/// A handle that interrupts the calling thread's waits in [`reap_own_io`], from the first of
+/// its backends that offers one (`None` when no backend's wait can be interrupted: a
+/// scheduler then parks the thread as usual).
+pub fn own_io_waker() -> Option<OwnIoWaker> {
+    backends().iter().find_map(|b| b.waker_here())
 }

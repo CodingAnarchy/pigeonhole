@@ -38,10 +38,12 @@ enum Inner<T> {
 
 type Then<T> = Box<dyn FnOnce(Result<T>) + Send>;
 
-/// Runs a deferred operation's I/O when a thread blocks on its completion (the simulator's
-/// deferred mode, where nothing else may ever complete it). Calling it when the operation
-/// already ran does nothing.
-pub(crate) type Drive = Arc<dyn Fn() + Send + Sync>;
+/// Makes progress on an operation's I/O when a thread blocks on its completion, where nothing
+/// else may ever complete it: the simulator's deferred mode runs the operation; an io_uring
+/// ring owned by the waiting thread reaps it (#402). Returns whether calling it again may
+/// make more progress (`false`: wait for another thread to resolve it). Calling it when the
+/// operation already completed does nothing.
+pub(crate) type Drive = Arc<dyn Fn() -> bool + Send + Sync>;
 
 struct Shared<T> {
     state: Mutex<State<T>>,
@@ -144,9 +146,11 @@ impl<T: Send + 'static> Completion<T> {
                 State::Done(result) => return result,
                 pending @ State::Pending { .. } => {
                     *state = pending;
-                    if let Some(run) = drive.take() {
+                    if let Some(run) = drive {
                         drop(state);
-                        run();
+                        if !run() {
+                            drive = None;
+                        }
                         state = shared.lock();
                         continue;
                     }

@@ -168,3 +168,90 @@ fn the_last_handle_can_go_on_the_reaper_thread() {
         .expect("the completion resolved")
         .unwrap();
 }
+
+// ---- a thread's own ring (#402 PR 3) ----
+
+use pigeonhole_io::{own_io_in_flight, own_io_waker, reap_own_io};
+
+#[test]
+fn an_attached_thread_completes_its_own_io_by_reaping() {
+    let b = Backend::uring("uring-own-ring");
+    b.vfs.attach_thread();
+    assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
+    let f = b.create("f");
+    let write = f.submit_write(filled(4096, 9), 0);
+    // This thread's I/O now: it completes only when the thread reaps or waits on it.
+    assert!(own_io_in_flight() || write.is_ready());
+    while !write.is_ready() {
+        reap_own_io(Some(Duration::from_millis(10)));
+    }
+    write.wait().unwrap();
+    assert!(!own_io_in_flight());
+    // A blocked wait on the owner thread reaps its ring itself.
+    let got = f.submit_read(IoBuf::zeroed(4096), 0).wait().unwrap();
+    assert!(got.iter().all(|&x| x == 9));
+    f.submit_sync_data().wait().unwrap();
+}
+
+#[test]
+fn a_waker_ends_a_ring_wait_from_another_thread() {
+    let b = Backend::uring("uring-own-wake");
+    b.vfs.attach_thread();
+    let waker = own_io_waker().expect("a thread ring");
+    let started = std::time::Instant::now();
+    let w = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        waker.wake();
+    });
+    // Nothing in flight: only the wake (or the long timeout) ends this wait.
+    reap_own_io(Some(Duration::from_secs(10)));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the wake did not end the wait"
+    );
+    w.join().unwrap();
+}
+
+#[test]
+fn a_thread_ending_with_io_in_flight_completes_it() {
+    let b = Backend::uring("uring-own-exit");
+    let f = b.create("f");
+    let vfs = Arc::clone(&b.vfs);
+    let g = Arc::clone(&f);
+    let pending = thread::spawn(move || {
+        vfs.attach_thread();
+        (0..32u64)
+            .map(|i| g.submit_write(filled(4096, 4), i * 4096))
+            .collect::<Vec<_>>()
+    })
+    .join()
+    .unwrap();
+    // The thread's ring went with it, after completing what was in flight.
+    for c in pending {
+        c.wait().unwrap();
+    }
+    let got = f.submit_read(IoBuf::zeroed(32 * 4096), 0).wait().unwrap();
+    assert!(got.iter().all(|&x| x == 4));
+}
+
+#[test]
+fn a_non_waiting_reap_takes_finished_completions() {
+    // A shard's turn reaps without waiting: completions the kernel has finished must be
+    // taken there, not only by a waiting reap (an application-owned loop may never wait).
+    let b = Backend::uring("uring-own-nowait");
+    b.vfs.attach_thread();
+    let f = b.create("f");
+    let write = f.submit_write(filled(4096, 5), 0);
+    for _ in 0..2000 {
+        if write.is_ready() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+        reap_own_io(None);
+    }
+    assert!(
+        write.is_ready(),
+        "a non-waiting reap never took the completion"
+    );
+    write.wait().unwrap();
+}
