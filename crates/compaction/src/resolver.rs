@@ -467,8 +467,9 @@ where
 
     /// Positions for a point read of one column: first seeks the merged cursor to the row's
     /// marker prefix and records any family markers visible at the snapshot, then seeks to
-    /// the column. Costs a second seek per source (usually inside the block the first seek
-    /// already loaded); the row filter has already excluded SSTs without the row.
+    /// the column. The second seek goes forward from the first (`Cursor::seek_forward`:
+    /// usually inside the block the first seek already loaded, a finger search in a
+    /// memtable); the row filter has already excluded SSTs without the row.
     ///
     /// Afterwards [`CellResolver::next_cell`] returns only versions of that column.
     pub fn seek_column(&mut self, row: &[u8], qualifier: &[u8]) -> Result<(), C::Error> {
@@ -496,7 +497,9 @@ where
         self.column_bound = true;
         self.note_row_bound();
         self.note_column_bound();
-        self.cursor.seek(&self.col)
+        // Forward from the marker seek: the column sorts after the row's marker prefix, so a
+        // source may search from where that seek left it (a memtable's finger search).
+        self.cursor.seek_forward(&self.col)
     }
 
     /// The next visible cell, or `None` at the end of the cursor (or of the column after

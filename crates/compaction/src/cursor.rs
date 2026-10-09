@@ -358,6 +358,12 @@ impl<C: Cursor> Cursor for FilteredCursor<C> {
         self.settle()
     }
 
+    fn seek_forward(&mut self, target: &[u8]) -> Result<(), C::Error> {
+        // The inner cursor's own forward seek (a memtable's finger search), not a full one.
+        self.inner.seek_forward(target)?;
+        self.settle()
+    }
+
     fn next(&mut self) -> Result<(), C::Error> {
         self.inner.next()?;
         self.settle()

@@ -31,6 +31,11 @@ pub trait Cursor {
     /// Positions on the first entry whose key is `>= target`, where `target` is at or past
     /// the current key (a forward seek). The default seeks; a merging cursor overrides it to
     /// move only its sources still behind `target`.
+    ///
+    /// On a cursor that is not valid (unpositioned, or exhausted by an earlier move) the
+    /// result depends on the implementation: the default and a memtable cursor position as
+    /// [`Cursor::seek`] does, but a merging cursor stays exhausted, even for a `target`
+    /// before the key it was exhausted from. Use `seek` to position such a cursor.
     fn seek_forward(&mut self, target: &[u8]) -> Result<(), Self::Error> {
         self.seek(target)
     }

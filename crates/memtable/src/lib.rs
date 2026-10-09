@@ -124,6 +124,18 @@ impl std::error::Error for Error {}
 
 /// Maximum skiplist height (the head node's height).
 const MAX_HEIGHT: usize = layout::MAX_HEIGHT;
+
+/// Levels a cursor records for its forward seeks' finger search: with towers growing by 4
+/// per level, the lowest 4 reach about 64 entries ahead (a row's columns and versions, the
+/// forward seeks a read makes); a forward seek farther than that searches from the top. Few
+/// levels keep the cursor small: it is built and moved for every read.
+const FINGER_LEVELS: usize = 4;
+
+/// A search's step count, against a budget that catches a link cycle.
+struct Walk {
+    steps: usize,
+    budget: usize,
+}
 /// Bytes reserved at the start of every arena; offset `0` is null.
 const RESERVED: usize = 64;
 /// Length of the head node: a tower of [`MAX_HEIGHT`] links and no key or value.
@@ -946,6 +958,7 @@ impl MemtableReader {
         MemIter {
             reader: self.clone(),
             node: None,
+            preds: [NULL; FINGER_LEVELS],
             steps: 0,
             budget: 0,
             #[cfg(loom)]
@@ -995,44 +1008,127 @@ impl MemtableReader {
         })
     }
 
-    /// The first node whose key is `>= target`, or `None`.
+    /// The first node whose key is `>= target`, or `None`, recording in `preds` the last
+    /// node before `target` at each of the lowest [`FINGER_LEVELS`] levels. With `finger`,
+    /// `preds` holds those of an earlier search, used when they are all before `target` (a
+    /// finger search, for a forward seek; otherwise a full search): it climbs from level 0 to the first level whose next
+    /// node is at or past `target`, and descends from there, so its cost grows with how far
+    /// the target is, not with the memtable's size; a target past the reach of the recorded
+    /// levels gets a full search. Only reads: nodes are never unlinked, so `preds` stay
+    /// valid lower bounds while writers insert, and a node linked after the climb read its
+    /// predecessor's link is met by the descent like any other.
     ///
     /// Returns the level-0 node it stopped at rather than re-reading the predecessor's link:
     /// the writer may link a new node below `target` there between the two loads.
-    fn lower_bound(&self, target: &[u8]) -> Result<Option<Node>> {
-        let mem = &self.region.mem;
-        let mut cur = self.head;
-        let mut found = None;
-        let mut steps = 0;
-        let mut budget = self.len() + STEP_SLACK;
-        for level in (0..MAX_HEIGHT).rev() {
-            found = None;
-            loop {
-                let next = mem.load_u32(tower(cur, level), Ordering::Acquire);
-                if next == NULL {
-                    break;
-                }
-                let n = self.node(next)?;
-                if level >= n.height {
-                    return Err(Error::Corrupt("node linked above its height"));
-                }
-                steps += 1;
-                if steps > budget {
-                    // Entries may have been published meanwhile; re-read before deciding.
-                    budget = self.len() + STEP_SLACK;
-                    if steps > budget {
-                        return Err(Error::Corrupt("link cycle"));
-                    }
-                }
-                if mem.cmp(n.key_off, n.key_len, target) == Cmp::Less {
-                    cur = next;
-                } else {
-                    found = Some(n);
+    fn search(
+        &self,
+        target: &[u8],
+        preds: &mut [u32; FINGER_LEVELS],
+        finger: bool,
+    ) -> Result<Option<Node>> {
+        let mut walk = Walk {
+            steps: 0,
+            budget: self.len() + STEP_SLACK,
+        };
+        // The recorded predecessors are lower bounds only if they are all before `target`:
+        // the level-0 one is the last of them, so it alone is compared. A target before the
+        // last seek's (allowed when the cursor has moved off its current key or run out)
+        // gets a full search.
+        if finger && self.before(preds[0], target)? {
+            // The lowest recorded level whose next node is at or past `target`.
+            let mut start = None;
+            for (l, &pred) in preds.iter().enumerate() {
+                let next = self.region.mem.load_u32(tower(pred, l), Ordering::Acquire);
+                let past = next == NULL || {
+                    let n = self.node(next)?;
+                    walk.steps += 1;
+                    self.region.mem.cmp(n.key_off, n.key_len, target) != Cmp::Less
+                };
+                if past {
+                    start = Some(l);
                     break;
                 }
             }
+            if let Some(top) = start {
+                // Each level starts from its recorded predecessor (every node between is
+                // before the earlier target) until the walk first moves forward, after which
+                // it is past every recorded predecessor below.
+                let mut cur = preds[top];
+                let mut moved = false;
+                for level in (1..=top).rev() {
+                    if !moved {
+                        cur = preds[level];
+                    }
+                    let from = cur;
+                    self.walk_level(&mut walk, &mut cur, level, target)?;
+                    moved |= cur != from;
+                    preds[level] = cur;
+                }
+                if !moved {
+                    cur = preds[0];
+                }
+                let found = self.walk_level(&mut walk, &mut cur, 0, target)?;
+                preds[0] = cur;
+                return Ok(found);
+            }
+            // Farther than the recorded levels reach: a full search.
         }
+        let mut cur = self.head;
+        for level in (FINGER_LEVELS..MAX_HEIGHT).rev() {
+            self.walk_level(&mut walk, &mut cur, level, target)?;
+        }
+        for level in (1..FINGER_LEVELS).rev() {
+            self.walk_level(&mut walk, &mut cur, level, target)?;
+            preds[level] = cur;
+        }
+        let found = self.walk_level(&mut walk, &mut cur, 0, target)?;
+        preds[0] = cur;
         Ok(found)
+    }
+
+    /// Whether node `off` (the head, or a linked node) sorts before `target`.
+    fn before(&self, off: u32, target: &[u8]) -> Result<bool> {
+        if off == self.head {
+            return Ok(true);
+        }
+        let n = self.node(off)?;
+        Ok(self.region.mem.cmp(n.key_off, n.key_len, target) == Cmp::Less)
+    }
+
+    /// Advances `cur` along `level` while the next node is before `target`; returns that
+    /// next node (the first at or past `target` on this level), or `None` at the level's end.
+    #[inline(always)]
+    fn walk_level(
+        &self,
+        walk: &mut Walk,
+        cur: &mut u32,
+        level: usize,
+        target: &[u8],
+    ) -> Result<Option<Node>> {
+        let mem = &self.region.mem;
+        loop {
+            let next = mem.load_u32(tower(*cur, level), Ordering::Acquire);
+            if next == NULL {
+                return Ok(None);
+            }
+            let n = self.node(next)?;
+            if level >= n.height {
+                return Err(Error::Corrupt("node linked above its height"));
+            }
+            walk.steps += 1;
+            if walk.steps > walk.budget {
+                // Entries may have been published meanwhile; re-read before deciding.
+                walk.budget = self.len() + STEP_SLACK;
+                if walk.steps > walk.budget {
+                    return Err(Error::Corrupt("link cycle"));
+                }
+            }
+            if mem.cmp(n.key_off, n.key_len, target) == Cmp::Less {
+                *cur = next;
+            } else {
+                return Ok(Some(n));
+            }
+        }
     }
 
     /// The node after `node` at level 0, or `None`.
@@ -1084,6 +1180,9 @@ pub struct MemIter {
     reader: MemtableReader,
     /// The current node, or `None` when unpositioned or past the end.
     node: Option<Node>,
+    /// The last node before the last seek's target at each of the lowest levels, where a
+    /// forward seek starts its finger search; `NULL` at level 0 until a seek sets them.
+    preds: [u32; FINGER_LEVELS],
     /// Nodes stepped to since the last seek, and how many are plausible before the walk is
     /// declared a cycle.
     steps: usize,
@@ -1212,12 +1311,24 @@ impl Cursor for MemIter {
     fn seek_to_first(&mut self) -> Result<()> {
         let first = self.reader.successor(self.reader.head)?;
         self.steps = 0;
+        self.preds[0] = NULL;
         self.set(first);
         Ok(())
     }
 
     fn seek(&mut self, target: &[u8]) -> Result<()> {
-        let found = self.reader.lower_bound(target)?;
+        let found = self.reader.search(target, &mut self.preds, false)?;
+        self.steps = 0;
+        self.set(found);
+        Ok(())
+    }
+
+    /// A finger search from the last seek's position: cost grows with the distance to
+    /// `target`. Any `target` gives the first entry `>= target`, as [`Cursor::seek`] does: one
+    /// before the last seek's (the cursor exhausted, or moved past it) gets a full search.
+    fn seek_forward(&mut self, target: &[u8]) -> Result<()> {
+        let finger = self.preds[0] != NULL;
+        let found = self.reader.search(target, &mut self.preds, finger)?;
         self.steps = 0;
         self.set(found);
         Ok(())
