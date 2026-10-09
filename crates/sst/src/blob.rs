@@ -199,10 +199,15 @@ impl Reader {
         if self.verified[i].load(Ordering::Acquire) {
             return Ok(());
         }
-        let extent = self.extents[i];
         let mut b = [0; BLOB_EXTENT_HEADER_LEN];
-        self.file.read_at(&mut b, extent.offset())?;
-        let h = BlobExtentHeader::decode(&b)?;
+        self.file.read_at(&mut b, self.extents[i].offset())?;
+        self.check_header(i, &b)
+    }
+
+    /// Checks extent `i`'s header bytes (FORMAT §7) and records the extent as verified.
+    pub(crate) fn check_header(&self, i: usize, b: &[u8]) -> Result<()> {
+        let extent = self.extents[i];
+        let h = BlobExtentHeader::decode(b)?;
         if h.blob_file != self.blob_file
             || h.extent_index as usize != i
             || extent.size_class != self.extents[0].size_class
@@ -213,6 +218,88 @@ impl Reader {
         }
         self.verified[i].store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Whether extent `i`'s header has been verified.
+    pub(crate) fn is_verified(&self, i: usize) -> bool {
+        self.verified[i].load(Ordering::Acquire)
+    }
+
+    /// A cache-only read of `ptr` (ICR 0014): the value if its record is cached; otherwise
+    /// `Error::WouldBlock` with the fetch it needs (the header of the first extent it
+    /// touches that is not verified yet, then the record itself); or `None` for a record
+    /// too large to cache, which the caller reads synchronously (D196, #398).
+    pub(crate) fn read_cache_only(
+        &self,
+        owner: &Arc<crate::BlobReader>,
+        ptr: &BlobPointer,
+    ) -> Result<Option<Cell>> {
+        if ptr.blob_file != self.blob_file {
+            return Err(Error::Format(FormatError::InvalidArgument {
+                what: "blob pointer names another blob file",
+            }));
+        }
+        if let Some(cell) = self.cached(ptr) {
+            return Ok(Some(cell));
+        }
+        let Some(total) = (ptr.len as usize).checked_add(BLOB_RECORD_HEADER_LEN) else {
+            return Err(Error::Format(FormatError::Corrupt {
+                what: "blob pointer length",
+            }));
+        };
+        let mut unverified = None;
+        for_each_piece(&self.extents, self.payload, ptr.offset, total, |i, _, _| {
+            if unverified.is_none() && !self.is_verified(i) {
+                unverified = Some(i);
+            }
+            Ok(())
+        })?;
+        if let Some(i) = unverified {
+            return Err(Error::WouldBlock(Box::new(crate::Fetch::blob_header(
+                self.file.clone(),
+                Arc::clone(owner),
+                i,
+                self.extents[i].offset(),
+                BLOB_EXTENT_HEADER_LEN,
+            ))));
+        }
+        if total > self.cache_limit {
+            return Ok(None);
+        }
+        let mut pieces = Vec::new();
+        for_each_piece(
+            &self.extents,
+            self.payload,
+            ptr.offset,
+            total,
+            |_, abs, r| {
+                pieces.push((abs, r));
+                Ok(())
+            },
+        )?;
+        Err(Error::WouldBlock(Box::new(crate::Fetch::blob_record(
+            self.file.clone(),
+            Arc::clone(owner),
+            *ptr,
+            pieces,
+            total,
+        ))))
+    }
+
+    /// Verifies a record a cache-only read fetched and caches it (it is within the cache
+    /// limit, or the read would not have fetched it).
+    pub(crate) fn admit_record(
+        &self,
+        ptr: &BlobPointer,
+        buf: IoBuf,
+    ) -> Result<pigeonhole_cache::BlockHandle> {
+        let (header, value) = buf.split_at(BLOB_RECORD_HEADER_LEN);
+        verify_record(header, value, ptr.len)?;
+        let key = BlockKey {
+            file: crate::blob_cache_file(self.blob_file),
+            offset: ptr.offset,
+        };
+        Ok(self.cache.insert(key, BlockData::Io(buf), Priority::Low))
     }
 
     /// The record's value if its record is cached (a lookup only: never reads the file).

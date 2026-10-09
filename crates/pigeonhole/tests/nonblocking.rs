@@ -432,19 +432,27 @@ fn dropping_a_read_future_mid_io_is_safe() {
 }
 
 #[test]
-fn a_separated_value_and_a_cache_that_keeps_nothing_read_synchronously_and_count() {
+fn a_separated_value_waits_on_io_and_a_cache_that_keeps_nothing_reads_synchronously() {
     let vfs = SimVfs::new(4211);
     let db = cold_db(&vfs, "/db/sv.phdb", 50, sim_options(&vfs));
     let t = db.table("t").unwrap().open().unwrap();
-    // A separated value: read synchronously inside the future, counted (D196, #398).
-    let before = db.async_sync_reads();
-    let v = block_on(t.get_async(b"r0007", "big", b"v"))
-        .unwrap()
-        .unwrap();
-    assert_eq!(v.value(), &[7u8; 200]);
+    // A separated value (#42 PR 2b): its extent header and its record are fetched
+    // asynchronously, then cached; no synchronous read.
+    vfs.set_deferred_io(true);
+    let (v, pending) = drive_deferred(&vfs, t.get_async(b"r0007", "big", b"v"));
     assert!(
-        db.async_sync_reads() > before,
-        "the synchronous blob read was not counted"
+        pending > 0,
+        "a cold separated value resolved without waiting on I/O"
+    );
+    assert_eq!(v.unwrap().unwrap().value(), &[7u8; 200]);
+    let (row, _) = drive_deferred(&vfs, t.row(b"r0008").read_async());
+    let row = row.unwrap().unwrap();
+    assert_eq!(row.get("big", b"v").unwrap().value(), &[8u8; 200]);
+    vfs.set_deferred_io(false);
+    assert_eq!(
+        db.async_sync_reads(),
+        0,
+        "a separated value was read synchronously"
     );
     db.close().unwrap();
     // A cache that keeps nothing: the fetched block is not found again, so the read goes
@@ -455,5 +463,75 @@ fn a_separated_value_and_a_cache_that_keeps_nothing_read_synchronously_and_count
     let got = block_on(t.get_async(b"r0011", "f", b"q")).unwrap().unwrap();
     assert_eq!(got.value(), &11u32.to_le_bytes());
     assert!(db.async_sync_reads() > 0);
+    db.close().unwrap();
+}
+
+/// A table with one large separated value per row (`len` bytes, all `i as u8`), flushed and
+/// reopened cold.
+fn cold_blobs(path: &str, rows: u32, len: usize, options: Options) -> Pigeonhole {
+    {
+        let db = Pigeonhole::open(path, options.clone()).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("big", Family::default().blob_threshold(64))
+            .create_if_missing()
+            .unwrap();
+        for i in 0..rows {
+            t.mutate(format!("r{i:04}").as_bytes())
+                .put("big", b"v", &vec![i as u8; len])
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+    Pigeonhole::open(path, options).unwrap()
+}
+
+#[test]
+fn a_separated_value_spanning_blob_extents_is_fetched_in_pieces() {
+    // 100 KiB records in 64 KiB blob extents: most span two extents, so their fetch is two
+    // reads joined into one completion.
+    let vfs = SimVfs::new(4213);
+    let db = cold_blobs("/db/span.phdb", 6, 100 << 10, sim_options(&vfs));
+    let t = db.table("t").unwrap().open().unwrap();
+    vfs.set_deferred_io(true);
+    for i in 0..6u32 {
+        let row = format!("r{i:04}");
+        let (v, pending) = drive_deferred(&vfs, t.get_async(row.as_bytes(), "big", b"v"));
+        assert!(
+            pending > 0 || i > 0,
+            "the first cold record resolved without I/O"
+        );
+        let v = v.unwrap().unwrap();
+        assert_eq!(v.value().len(), 100 << 10, "row {row}");
+        assert!(v.value().iter().all(|&b| b == i as u8), "row {row}");
+    }
+    vfs.set_deferred_io(false);
+    assert_eq!(db.async_sync_reads(), 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_separated_value_too_large_to_cache_reads_synchronously_and_counts() {
+    // A 1 MiB block cache caches records up to 128 KiB (an eighth): a 200 KiB value is read
+    // synchronously inside the async get, and counted (D196 option (a), #398).
+    let vfs = SimVfs::new(4214);
+    let db = cold_blobs(
+        "/db/big.phdb",
+        2,
+        200 << 10,
+        sim_options(&vfs).block_cache(1 << 20),
+    );
+    let t = db.table("t").unwrap().open().unwrap();
+    let v = block_on(t.get_async(b"r0001", "big", b"v"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.value(), &vec![1u8; 200 << 10][..]);
+    assert!(
+        db.async_sync_reads() > 0,
+        "the oversized record's read was not counted"
+    );
     db.close().unwrap();
 }

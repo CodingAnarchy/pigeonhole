@@ -463,14 +463,22 @@ impl SstSet {
                 ptr.blob_file.0
             ))
         })?;
-        if crate::read::in_async_read() {
-            // An async read takes a cached value as is, and counts a file read it makes
-            // synchronously (D196; until #42's PR 2b for values up to the cache limit, and
-            // for larger ones until #398).
-            if let Some(cell) = reader.cached(ptr) {
-                return Ok(cell);
+        match crate::read::async_read_mode() {
+            // An async read's cache-only attempt: the cached value, or the fetch it needs
+            // (`Error::WouldBlock`); a record too large to cache is read synchronously and
+            // counted (D196 option (a), #398).
+            Some(true) => match reader.read_cache_only(ptr)? {
+                Some(cell) => return Ok(cell),
+                None => crate::read::note_sync_read(),
+            },
+            // Its synchronous fallback attempt: a cached value as is, a file read counted.
+            Some(false) => {
+                if let Some(cell) = reader.cached(ptr) {
+                    return Ok(cell);
+                }
+                crate::read::note_sync_read();
             }
-            crate::read::note_sync_read();
+            None => {}
         }
         Ok(reader.read(ptr)?)
     }

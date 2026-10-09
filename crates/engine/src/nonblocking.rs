@@ -10,8 +10,9 @@
 //!
 //! A read falls back to one synchronous attempt, counted in `Metrics::async_sync_reads`,
 //! when the cache cannot keep a fetched block (capacity 0, or a block larger than a cache
-//! shard) or after `MAX_FETCHES` fetches. Separated values are read synchronously too and
-//! counted (D196, #398).
+//! shard) or after `MAX_FETCHES` fetches. A separated value is fetched the same way (its
+//! extent header, then its record, in pieces when it spans extents); one too large to cache
+//! is read synchronously and counted (D196, #398).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -129,13 +130,13 @@ impl Reading {
                     Poll::Ready(r) => r,
                 };
                 let admitted = buf.map_err(Error::from).and_then(|b| Ok(fetch.admit(b)?));
-                let cached = fetch.is_cached();
+                let kept = fetch.is_kept();
                 self.fetch = None;
                 match admitted {
-                    Ok(h) => self.pinned.push(h),
+                    Ok(h) => self.pinned.extend(h),
                     Err(e) => return Poll::Ready(Err(e)),
                 }
-                if !cached {
+                if !kept {
                     // The cache keeps nothing: one synchronous attempt instead.
                     self.go_sync();
                 }
@@ -155,8 +156,9 @@ impl Reading {
                 unreachable!("taken above");
             };
             let cache_only = !self.sync;
-            let (r, sync_reads) =
-                as_async_read(|| attempt(at.view(), at.seqno(), self.now, cache_only));
+            let (r, sync_reads) = as_async_read(cache_only, || {
+                attempt(at.view(), at.seqno(), self.now, cache_only)
+            });
             if sync_reads > 0 {
                 self.inner
                     .shared

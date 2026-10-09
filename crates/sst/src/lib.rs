@@ -521,4 +521,12 @@ impl BlobReader {
     pub fn cached(&self, ptr: &BlobPointer) -> Option<Cell> {
         self.inner.cached(ptr)
     }
+
+    /// A cache-only read of `ptr` (ICR 0014): the value if its record is cached; otherwise
+    /// [`Error::WouldBlock`] with the fetch it needs (an extent header not verified yet, then
+    /// the record); or `None` for a record too large to cache, which the caller reads with
+    /// [`BlobReader::read`].
+    pub fn read_cache_only(self: &Arc<Self>, ptr: &BlobPointer) -> Result<Option<Cell>> {
+        self.inner.read_cache_only(self, ptr)
+    }
 }
