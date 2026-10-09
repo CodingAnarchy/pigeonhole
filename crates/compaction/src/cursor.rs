@@ -310,11 +310,18 @@ impl<C: Cursor> FilteredCursor<C> {
         &self.inner
     }
 
-    /// Moves forward to the first admitted entry at or after the current one.
+    /// Moves forward to the first admitted entry at or after the current one. Inline, so
+    /// a cursor with nothing to filter (every memtable source of an unfiltered read) pays a
+    /// check per step, not a call.
+    #[inline]
     fn settle(&mut self) -> Result<(), C::Error> {
         if self.all {
             return Ok(());
         }
+        self.settle_filtered()
+    }
+
+    fn settle_filtered(&mut self) -> Result<(), C::Error> {
         while self.inner.valid() && !self.filter.admits(self.inner.key()) {
             self.hint.clear();
             if !self
