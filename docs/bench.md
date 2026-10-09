@@ -162,6 +162,59 @@ Run 1 started while the 15-minute load was still 12.3, the tail of another agent
 
 `compare` is symmetric: it flags any change beyond tolerance, faster or slower. An unexplained improvement is as suspect as a regression, and an intended one means it is time for a new baseline. It warns when the two runs come from different machines or build profiles, because the tolerance only means something on one machine. Close other heavy work while measuring. Laptops also throttle and switch between performance and efficiency cores.
 
+## Phase 3 baseline (this Mac, non-reference)
+
+**Two runs, commit `105421a`** (main after 0.2.0), measured 2026-10-09 in a quiet window with the other agents paused. Machine: Apple M5, 10 cores, 24 GiB, macOS 26.5.2, APFS. Release build, `--engine pigeonhole,rocksdb --scale small` (50,000 records, 200,000 measured operations, 5% warmup). The 1-minute load at each start was under 1.5. This is the starting point for the Phase 3 work, not the gate: the gate is the #406 checklist on reference hardware (#405, D197).
+
+Each cell gives run 1 / run 2, in µs. The ratios divide Pigeonhole's worse run by RocksDB's better one.
+
+| Workload | Threads | Pigeonhole ops/s | Pigeonhole p50 | Pigeonhole p99 | RocksDB ops/s | RocksDB p50 | RocksDB p99 | p50 ratio | p99 ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| ycsb-a | 1 | 124.7K / 135.1K | 6.59 / 6.33 | 19.5 / 16.6 | 198.4K / 207.9K | 3.29 / 3.06 | 15.2 / 14.5 | 2.16 | 1.34 |
+| ycsb-b | 1 | 241.8K / 254.8K | 2.72 / 2.64 | 13.4 / 13.4 | 200.6K / 204.0K | 3.34 / 3.26 | 13.4 / 13.3 | 0.83 | 1.01 |
+| ycsb-c | 1 | 514.1K / 533.7K | 1.84 / 1.75 | 2.96 / 2.75 | 354.6K / 365.1K | 2.59 / 2.54 | 5.38 / 5.09 | 0.72 | 0.58 |
+| ycsb-d | 1 | 456.9K / 472.2K | 1.42 / 1.38 | 8.32 / 7.71 | 309.0K / 343.0K | 2.88 / 2.59 | 7.58 / 6.43 | 0.55 | 1.29 |
+| ycsb-e | 1 | 30.5K / 30.7K | 32.3 / 32.1 | 65.0 / 64.5 | 18.1K / 18.9K | 54.0 / 52.2 | 124 / 117 | 0.62 | 0.55 |
+| ycsb-f | 1 | 112.5K / 113.0K | 9.09 / 9.02 | 16.9 / 16.9 | 190.9K / 191.3K | 3.63 / 3.58 | 14.1 / 14.1 | 2.54 | 1.20 |
+| sparse-wide | 1 | 63.5K / 66.9K | 5.63 / 5.47 | 181 / 177 | 47.6K / 47.5K | 3.42 / 3.42 | 285 / 291 | 1.65 | 0.64 |
+| time-series-ttl | 1 | 208.8K / 210.2K | 4.05 / 4.05 | 9.73 / 9.60 | 488.3K / 531.2K | 2.13 / 2.01 | 4.67 / 3.68 | 2.02 | 2.64 |
+| adjacency | 1 | 66.0K / 76.6K | 8.51 / 7.71 | 72.2 / 53.2 | 61.0K / 65.0K | 7.42 / 6.97 | 81.9 / 77.8 | 1.22 | 0.93 |
+| skewed-multi-shard | 4 | 255.5K / 293.1K | 9.73 / 9.21 | 32.4 / 28.2 | 332.4K / 412.2K | 8.96 / 8.64 | 49.4 / 20.4 | 1.13 | 1.59 |
+
+**Against the 1.5× rule:**
+- The point reads are already ahead of RocksDB here:
+  - `ycsb-c` reads all ten fields of a record (`readallfields`), so these numbers are not comparable with the single-field reads in the older tables below;
+  - so are the read-mostly mixes (`ycsb-b`, `ycsb-d`) and the scans (`ycsb-e`, `adjacency`).
+- The gaps are on writes:
+  - updates and read-modify-writes (`ycsb-a`, `ycsb-f` p50);
+  - timestamped appends (`time-series-ttl`);
+  - the sparse-wide median.
+- `skewed-multi-shard` p99 crossed 1.5× in run 2 only; RocksDB's p99 moved from 49.4 to 20.4 µs between the runs.
+
+**Durable commits (`group-commit`, one run, load 1.24).**
+
+| Store | Threads | ops/s | p50 µs | p99 µs | p99.9 µs |
+|---|--:|--:|--:|--:|--:|
+| pigeonhole | 1 | 253 | 3,932 | 6,029 | 16,384 |
+| pigeonhole | 4 | 418 | 9,962 | 17,695 | 50,856 |
+| pigeonhole | 16 | 937 | 15,794 | 37,224 | 44,564 |
+| rocksdb | 1 | 44.3K | 20.4 | 38.1 | 48.6 |
+| rocksdb | 4 | 59.3K | 72.2 | 124 | 270 |
+| rocksdb | 16 | 121.1K | 122 | 230 | 397 |
+
+- **The stores are not comparable here.** On macOS Pigeonhole syncs with `F_FULLFSYNC`, a drive-cache flush of about 4 ms on this SSD. RocksDB's sync does not flush the cache, as its 20 µs shows.
+- **What the table does show is Pigeonhole's own scaling.** Commit latency grows with threads, because with tablets spread over 10 shards each shard syncs its own WAL, so concurrent commits rarely share a sync (#412).
+
+**Sparse-wide gate runs on this Mac are too noisy to compare single runs.** Three `--scale full` runs of the same binary in the same window ranged:
+
+| Measure | Low | High |
+|---|--:|--:|
+| ops/s | 22.0K | 31.6K |
+| p99 µs | 393 | 532 |
+| row-read p99 µs | 461 | 668 |
+
+The noisiest run failed `crates/bench/baselines/phase2-gate/check.py` and the quietest passed. Judge a gate change on several interleaved runs per side, or on #405.
+
 ## Scaling gate results (this Mac, non-reference)
 
 **Single runs, n=1, commit `87afe1f` plus this section's bench changes**, measured 2026-10-08: `phdb-bench scaling --shards N` at `--scale small` (50,000 records, 200,000 measured writes) and `--scale full` (1,000,000 records, 2,000,000 measured writes), release, `skewed-multi-shard`, N client threads, buffered commits, 64 MiB write buffer, tablet changes on, warmup equal to the measured ops (single-threaded, unrecorded).
