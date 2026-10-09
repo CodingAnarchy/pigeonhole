@@ -57,6 +57,19 @@ impl Backend {
         }
     }
 
+    /// Real files with submitted I/O on io_uring. Fails where io_uring is unavailable, so a
+    /// run that should cover it cannot pass on `pread` instead.
+    #[cfg(target_os = "linux")]
+    pub fn uring(tag: &str) -> Self {
+        let dir = TempDir::new(tag);
+        Self {
+            name: "uring",
+            vfs: pigeonhole_io::uring::UringVfs::new().expect("io_uring is available"),
+            root: dir.0.clone(),
+            _dir: Some(dir),
+        }
+    }
+
     pub fn sim(seed: u64) -> Self {
         Self::sim_from(SimVfs::new(seed))
     }

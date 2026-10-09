@@ -70,6 +70,17 @@ impl PreadVfs {
         } else {
             threads
         };
+        Self::with_pool(threads)
+    }
+
+    /// Real files with no I/O threads, for a backend that serves submitted I/O itself (the
+    /// io_uring backend opens and locks files through this one).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn without_pool() -> Arc<Self> {
+        Self::with_pool(0)
+    }
+
+    fn with_pool(threads: usize) -> Arc<Self> {
         Arc::new(Self {
             pool: Pool::start(threads),
             origin: Instant::now(),
@@ -78,6 +89,28 @@ impl PreadVfs {
                 start_time: os::current_start_time(),
             },
         })
+    }
+
+    /// [`Vfs::open`], as the concrete file.
+    pub(crate) fn open_file(&self, path: &Path, opts: OpenOptions) -> Result<Arc<PreadFile>> {
+        let mut o = fs::OpenOptions::new();
+        o.read(true)
+            .write(opts.write || opts.create || opts.create_new)
+            .create(opts.create && !opts.create_new)
+            .create_new(opts.create_new);
+        let file = o.open(path).map_err(|e| Error::os("open", e))?;
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let (file, key) = registry::register(file)?;
+        Ok(Arc::new(PreadFile {
+            inner: Arc::new(FileInner {
+                file: Some(file),
+                pool: Arc::clone(&self.pool),
+                writable: opts.write || opts.create || opts.create_new,
+                held: Mutex::new(HashMap::new()),
+                #[cfg(all(unix, not(target_os = "linux")))]
+                key,
+            }),
+        }))
     }
 }
 
@@ -167,8 +200,17 @@ impl Drop for Pool {
 
 /// An open file. The state lives behind an `Arc` so submitted jobs can carry it.
 #[derive(Debug)]
-struct PreadFile {
+pub(crate) struct PreadFile {
     inner: Arc<FileInner>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreadFile {
+    /// The descriptor, open as long as this handle is.
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.inner.file().as_raw_fd()
+    }
 }
 
 struct FileInner {
@@ -576,24 +618,7 @@ fn region_path(dir: &Path, name: &str) -> PathBuf {
 
 impl Vfs for PreadVfs {
     fn open(&self, path: &Path, opts: OpenOptions) -> Result<FileRef> {
-        let mut o = fs::OpenOptions::new();
-        o.read(true)
-            .write(opts.write || opts.create || opts.create_new)
-            .create(opts.create && !opts.create_new)
-            .create_new(opts.create_new);
-        let file = o.open(path).map_err(|e| Error::os("open", e))?;
-        #[cfg(all(unix, not(target_os = "linux")))]
-        let (file, key) = registry::register(file)?;
-        Ok(Arc::new(PreadFile {
-            inner: Arc::new(FileInner {
-                file: Some(file),
-                pool: Arc::clone(&self.pool),
-                writable: opts.write || opts.create || opts.create_new,
-                held: Mutex::new(HashMap::new()),
-                #[cfg(all(unix, not(target_os = "linux")))]
-                key,
-            }),
-        }))
+        Ok(self.open_file(path, opts)?)
     }
 
     fn remove(&self, path: &Path) -> Result<()> {
