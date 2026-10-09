@@ -193,6 +193,20 @@ impl pigeonhole_engine::RowSink for RowBuf {
     fn push(&mut self, family: FamilyId, qualifier: Range<usize>, data: CellData) {
         RowBuf::push(self, family, qualifier, data);
     }
+
+    fn push_inline(&mut self, family: FamilyId, qualifier: Range<usize>, ts: u64, stored: &[u8]) {
+        let family = self.family_index(family);
+        self.cells.push(RowCell {
+            family,
+            qualifier,
+            cell: Cell {
+                data: CellData::EMPTY,
+            },
+        });
+        if let Some(c) = self.cells.last_mut() {
+            c.cell.data.set_inline(ts, stored);
+        }
+    }
 }
 
 impl RowBuf {
