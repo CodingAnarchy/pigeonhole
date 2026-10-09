@@ -357,7 +357,7 @@ where
 {
     /// A resolver over `cursor`.
     pub fn new(cursor: C, options: ResolveOptions) -> Self {
-        Self {
+        let r = Self {
             cursor,
             opts: options,
             row: Vec::new(),
@@ -388,7 +388,9 @@ where
             out_key: Vec::new(),
             out_val: Vec::new(),
             past_col: Vec::new(),
-        }
+        };
+        debug_assert!(r.is_fresh());
+        r
     }
 
     /// Stops the resolver at the first key `>= end` (the end of a scan range, normally an
@@ -426,7 +428,7 @@ where
         };
     }
 
-    fn reset(&mut self) {
+    fn reset_position(&mut self) {
         self.row.clear();
         self.family_cover = None;
         self.markers.clear();
@@ -455,7 +457,7 @@ where
     /// `key` inside a row would miss that row's markers; use [`CellResolver::seek_column`]
     /// for point reads.
     pub fn seek(&mut self, key: &[u8]) -> Result<(), C::Error> {
-        self.reset();
+        self.reset_position();
         self.cursor.seek(key)
     }
 
@@ -466,7 +468,7 @@ where
     ///
     /// Afterwards [`CellResolver::next_cell`] returns only versions of that column.
     pub fn seek_column(&mut self, row: &[u8], qualifier: &[u8]) -> Result<(), C::Error> {
-        self.reset();
+        self.reset_position();
         // Row prefix, then the marker prefix in the column scratch.
         escape_into(&mut self.row, row);
         self.row.extend_from_slice(&TERMINATOR);
@@ -538,16 +540,47 @@ where
         self.cursor
     }
 
-    /// As [`CellResolver::new`], starting from `buffers`' allocations: the state is that of a
-    /// new resolver.
-    pub fn reuse(cursor: C, options: ResolveOptions, buffers: ResolverBuffers) -> Self {
-        let mut r = Self::new(cursor, options);
-        let ResolverBuffers {
+    /// The cursor, to refill between reads (a point get per call keeps one resolver and
+    /// allocates nothing for it); call [`CellResolver::reset`] before reading again.
+    pub fn cursor_mut(&mut self) -> &mut C {
+        &mut self.cursor
+    }
+
+    /// Puts the resolver in the state `new(cursor, options)` gives it, keeping the cursor
+    /// (reset it separately) and every buffer's allocation. The upper bound is removed.
+    pub fn reset(&mut self, options: ResolveOptions) {
+        self.opts = options;
+        self.reset_state();
+        debug_assert!(self.is_fresh());
+    }
+
+    /// Clears every field but the cursor and options to its value in [`CellResolver::new`].
+    fn reset_state(&mut self) {
+        // Every field, so that one added later is reset too.
+        let Self {
+            cursor: _,
+            opts: _,
             row,
+            family_cover,
             markers,
+            columns_in_row,
             col,
+            col_cover,
+            col_cover_seqno,
+            col_versions,
+            col_skip,
+            col_skipped,
+            column_bound,
+            col_below_upper,
+            row_below_upper,
+            peek,
+            upper,
+            run,
+            run_ts,
             run_key,
             run_acc,
+            run_err,
+            skip_group,
             g_acc,
             g_key,
             base_key,
@@ -555,42 +588,96 @@ where
             out_key,
             out_val,
             past_col,
-        } = buffers;
-        // Cleared when they were taken out (`into_parts`), as `new`'s are empty.
-        r.row = row;
-        r.markers = markers;
-        r.col = col;
-        r.run_key = run_key;
-        r.run_acc = run_acc;
-        r.g_acc = g_acc;
-        r.g_key = g_key;
-        r.base_key = base_key;
-        r.base_val = base_val;
-        r.out_key = out_key;
-        r.out_val = out_val;
-        r.past_col = past_col;
-        r
+        } = self;
+        row.clear();
+        *family_cover = None;
+        markers.clear();
+        *columns_in_row = 0;
+        col.clear();
+        *col_cover = None;
+        *col_cover_seqno = 0;
+        *col_versions = 0;
+        *col_skip = false;
+        *col_skipped = 0;
+        *column_bound = false;
+        *col_below_upper = false;
+        *row_below_upper = false;
+        *peek = None;
+        *upper = None;
+        *run = false;
+        *run_ts = 0;
+        run_key.clear();
+        run_acc.clear();
+        *run_err = None;
+        *skip_group = None;
+        g_acc.clear();
+        g_key.clear();
+        base_key.clear();
+        base_val.clear();
+        out_key.clear();
+        out_val.clear();
+        past_col.clear();
     }
 
-    /// The cursor, and the resolver's allocations cleared for the next
-    /// [`CellResolver::reuse`].
-    pub fn into_parts(self) -> (C, ResolverBuffers) {
-        let mut buffers = ResolverBuffers {
-            row: self.row,
-            markers: self.markers,
-            col: self.col,
-            run_key: self.run_key,
-            run_acc: self.run_acc,
-            g_acc: self.g_acc,
-            g_key: self.g_key,
-            base_key: self.base_key,
-            base_val: self.base_val,
-            out_key: self.out_key,
-            out_val: self.out_val,
-            past_col: self.past_col,
-        };
-        buffers.clear();
-        (self.cursor, buffers)
+    /// Whether every field but the cursor and options holds its value in
+    /// [`CellResolver::new`] (buffers empty, whatever their capacity): what `new` and
+    /// `reset` are both checked against.
+    fn is_fresh(&self) -> bool {
+        let Self {
+            cursor: _,
+            opts: _,
+            row,
+            family_cover,
+            markers,
+            columns_in_row,
+            col,
+            col_cover,
+            col_cover_seqno,
+            col_versions,
+            col_skip,
+            col_skipped,
+            column_bound,
+            col_below_upper,
+            row_below_upper,
+            peek,
+            upper,
+            run,
+            run_ts,
+            run_key,
+            run_acc,
+            run_err,
+            skip_group,
+            g_acc,
+            g_key,
+            base_key,
+            base_val,
+            out_key,
+            out_val,
+            past_col,
+        } = self;
+        [
+            row, col, run_key, run_acc, g_acc, g_key, base_key, base_val, out_key, out_val,
+            past_col,
+        ]
+        .iter()
+        .all(|b| b.is_empty())
+            && markers.is_empty()
+            && family_cover.is_none()
+            && *columns_in_row == 0
+            && col_cover.is_none()
+            && *col_cover_seqno == 0
+            && *col_versions == 0
+            && !*col_skip
+            && *col_skipped == 0
+            && !*column_bound
+            && !*col_below_upper
+            && !*row_below_upper
+            && peek.is_none()
+            && upper.is_none()
+            && !*run
+            && *run_ts == 0
+            && run_err.is_none()
+            && skip_group.is_none()
     }
 
     fn expired(&self, ts: Timestamp) -> bool {
@@ -974,42 +1061,6 @@ where
             self.col_skip = true;
         }
         true
-    }
-}
-
-/// The allocations a [`CellResolver`] keeps between uses: its key, value and marker scratch,
-/// each cleared ([`CellResolver::reuse`], [`CellResolver::into_parts`]). A caller that
-/// resolves many times (a point get per call) keeps one and allocates nothing for it.
-#[derive(Debug, Default)]
-pub struct ResolverBuffers {
-    row: Vec<u8>,
-    markers: Vec<(Timestamp, Seqno)>,
-    col: Vec<u8>,
-    run_key: Vec<u8>,
-    run_acc: Vec<u8>,
-    g_acc: Vec<u8>,
-    g_key: Vec<u8>,
-    base_key: Vec<u8>,
-    base_val: Vec<u8>,
-    out_key: Vec<u8>,
-    out_val: Vec<u8>,
-    past_col: Vec<u8>,
-}
-
-impl ResolverBuffers {
-    fn clear(&mut self) {
-        self.row.clear();
-        self.markers.clear();
-        self.col.clear();
-        self.run_key.clear();
-        self.run_acc.clear();
-        self.g_acc.clear();
-        self.g_key.clear();
-        self.base_key.clear();
-        self.base_val.clear();
-        self.out_key.clear();
-        self.out_val.clear();
-        self.past_col.clear();
     }
 }
 

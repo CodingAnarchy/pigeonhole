@@ -42,77 +42,7 @@ pub struct MergingCursor<C> {
     runner: usize,
 }
 
-/// The allocations a [`MergingCursor`] keeps between uses: its source vector (emptied), heap
-/// and row scratch ([`MergingCursor::reuse`], [`MergingCursor::into_buffers`]). A caller that
-/// merges many times (a point get per call) keeps one and allocates nothing for the merge.
-#[derive(Debug)]
-pub struct MergeBuffers<C> {
-    sources: Vec<C>,
-    heap: Vec<usize>,
-    row: Vec<u8>,
-}
-
-impl<C> Default for MergeBuffers<C> {
-    fn default() -> Self {
-        Self {
-            sources: Vec::new(),
-            heap: Vec::new(),
-            row: Vec::new(),
-        }
-    }
-}
-
 impl<C: Cursor> MergingCursor<C> {
-    /// As [`MergingCursor::new`], with `sources` placed in `buffers`' allocations.
-    ///
-    /// ```
-    /// use pigeonhole_compaction::{MergeBuffers, MergingCursor, VecCursor};
-    /// use pigeonhole_format::Cursor;
-    ///
-    /// let mut buffers = MergeBuffers::default();
-    /// for _ in 0..2 {
-    ///     let a = VecCursor::new(vec![(b"a".to_vec(), b"1".to_vec())]);
-    ///     let b = VecCursor::new(vec![(b"b".to_vec(), b"2".to_vec())]);
-    ///     let mut m = MergingCursor::reuse([a, b], buffers);
-    ///     m.seek_to_first().unwrap();
-    ///     assert_eq!(m.key(), b"a");
-    ///     buffers = m.into_buffers();
-    /// }
-    /// ```
-    pub fn reuse(sources: impl IntoIterator<Item = C>, buffers: MergeBuffers<C>) -> Self {
-        let MergeBuffers {
-            sources: mut list,
-            mut heap,
-            mut row,
-        } = buffers;
-        list.clear();
-        list.extend(sources);
-        heap.clear();
-        heap.reserve(list.len());
-        row.clear();
-        Self {
-            sources: list,
-            heap,
-            row,
-            runner: 0,
-        }
-    }
-
-    /// Drops the sources and returns the emptied allocations for the next
-    /// [`MergingCursor::reuse`].
-    pub fn into_buffers(self) -> MergeBuffers<C> {
-        let Self {
-            mut sources,
-            mut heap,
-            mut row,
-            runner: _,
-        } = self;
-        sources.clear();
-        heap.clear();
-        row.clear();
-        MergeBuffers { sources, heap, row }
-    }
-
     /// Merges `sources`.
     pub fn new(sources: Vec<C>) -> Self {
         let heap = Vec::with_capacity(sources.len());
@@ -133,6 +63,44 @@ impl<C: Cursor> MergingCursor<C> {
     /// The sources, in the order given to [`MergingCursor::new`].
     pub fn sources(&self) -> &[C] {
         &self.sources
+    }
+
+    /// The source list, to refill in place between uses (a point get per call keeps one
+    /// cursor and allocates nothing for the merge); call [`MergingCursor::reset`] after
+    /// changing it.
+    pub fn sources_mut(&mut self) -> &mut Vec<C> {
+        &mut self.sources
+    }
+
+    /// Puts the cursor in the state [`MergingCursor::new`] gives it over its current sources
+    /// (unpositioned), keeping its allocations.
+    ///
+    /// ```
+    /// use pigeonhole_compaction::{MergingCursor, VecCursor};
+    /// use pigeonhole_format::Cursor;
+    ///
+    /// let mut m = MergingCursor::new(Vec::new());
+    /// for _ in 0..2 {
+    ///     m.sources_mut().clear();
+    ///     m.sources_mut().push(VecCursor::new(vec![(b"b".to_vec(), b"2".to_vec())]));
+    ///     m.sources_mut().push(VecCursor::new(vec![(b"a".to_vec(), b"1".to_vec())]));
+    ///     m.reset();
+    ///     m.seek_to_first().unwrap();
+    ///     assert_eq!(m.key(), b"a");
+    /// }
+    /// ```
+    pub fn reset(&mut self) {
+        // Every field, so that one added later is reset too.
+        let Self {
+            sources,
+            heap,
+            row,
+            runner,
+        } = self;
+        heap.clear();
+        heap.reserve(sources.len());
+        row.clear();
+        *runner = 0;
     }
 
     fn less(&self, a: usize, b: usize) -> bool {

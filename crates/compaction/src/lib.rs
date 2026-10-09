@@ -36,14 +36,14 @@ pub use blob::{
     BLOB_STORED_LEN, BlobFetch, BlobFileStat, BlobSink, blob_pointer, encode_blob_stored,
     note_blob_ref, pick_blob_gc, record_bytes, separates,
 };
-pub use cursor::{FilteredCursor, MergeBuffers, MergingCursor, VecCursor};
+pub use cursor::{FilteredCursor, MergingCursor, VecCursor};
 pub use job::{
     BlobRefs, CompactionJob, CompactionOutput, GcPolicy, JobContext, JobPoll, NewBlobFile,
     OtherSource, StreamGc, output_piece_bytes,
 };
 pub use merge::{I64Add, MergeError, MergeOperator, MergeRegistry};
 pub use picker::{CompactionPicker, CompactionTask, KeyRange, Levels, PickerOptions, TaskKind};
-pub use resolver::{CellResolver, ResolveOptions, ResolvedCell, ResolverBuffers, ValuePredicate};
+pub use resolver::{CellResolver, ResolveOptions, ResolvedCell, ValuePredicate};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;

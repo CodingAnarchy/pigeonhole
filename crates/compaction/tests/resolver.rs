@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use common::*;
 use pigeonhole_compaction::{
-    CellResolver, Error, FilteredCursor, I64Add, MergeBuffers, MergeOperator, MergingCursor,
-    ResolveOptions, ResolverBuffers, ValuePredicate, VecCursor,
+    CellResolver, Error, FilteredCursor, I64Add, MergeOperator, MergingCursor, ResolveOptions,
+    ValuePredicate, VecCursor,
 };
 use pigeonhole_format::key::{Kind, encode_key, encode_marker_key};
 use pigeonhole_format::scan::ScanFilter;
@@ -391,13 +391,13 @@ fn cells<C: Cursor<Error = Error>>(r: &mut CellResolver<C>) -> Option<Vec<Resolv
 }
 
 #[test]
-fn a_reused_resolver_reads_as_a_new_one() {
-    // `MergingCursor::reuse` and `CellResolver::reuse` (#46): one set of buffers carried
-    // through point gets and row reads of random histories, each read compared with a
-    // resolver built by `new`. Whatever a read leaves in the buffers must not change the
-    // next one.
-    let mut merge: MergeBuffers<VecCursor> = MergeBuffers::default();
-    let mut scratch = ResolverBuffers::default();
+fn a_reset_resolver_reads_as_a_new_one() {
+    // `MergingCursor::reset` and `CellResolver::reset` (#46): one resolver refilled in
+    // place through point gets and row reads of random histories, each read compared with a
+    // resolver built by `new`. Some reads stop after their first cell, leaving a column,
+    // merge run or upper bound behind: whatever a read leaves must not change the next one.
+    let mut kept = CellResolver::new(MergingCursor::new(Vec::new()), ResolveOptions::new(0, 0));
+    let mut stop_early = Rng::new(7);
     for seed in 0..if cfg!(miri) { 2 } else { 24 } {
         let h = random_history(seed, commits(40));
         let snapshot = h.model.snapshot().max(1);
@@ -407,33 +407,36 @@ fn a_reused_resolver_reads_as_a_new_one() {
             for row in ROWS {
                 for (point, q) in QUALS.iter().map(|q| (true, *q)).chain([(false, &b""[..])]) {
                     let sources = || vec_sources(&h.entries, n, &mut Rng::new(seed));
-                    let read = |r: &mut CellResolver<MergingCursor<VecCursor>>| {
+                    let start = |r: &mut CellResolver<MergingCursor<VecCursor>>| {
                         if point {
                             r.seek_column(row, q).unwrap();
                         } else {
                             r.set_upper_bound(Some(&row_end(row)));
                             r.seek(&row_prefix(row)).unwrap();
                         }
-                        cells(r)
                     };
                     let mut fresh = CellResolver::new(
                         MergingCursor::new(sources()),
                         options(&h, snapshot, now, versions),
                     );
-                    let want = read(&mut fresh);
-                    let mut reused = CellResolver::reuse(
-                        MergingCursor::reuse(sources(), merge),
-                        options(&h, snapshot, now, versions),
-                        scratch,
-                    );
-                    let got = read(&mut reused);
+                    start(&mut fresh);
+                    let want = cells(&mut fresh);
+                    let cursor = kept.cursor_mut();
+                    cursor.sources_mut().clear();
+                    cursor.sources_mut().extend(sources());
+                    cursor.reset();
+                    kept.reset(options(&h, snapshot, now, versions));
+                    start(&mut kept);
+                    if stop_early.below(3) == 0 {
+                        // Leave this read part done; the next reset must undo it.
+                        let _ = kept.next_cell();
+                        continue;
+                    }
+                    let got = cells(&mut kept);
                     assert_eq!(
                         got, want,
                         "seed {seed}, versions {versions}, {n} sources, row {row:?}, point {point} {q:?}"
                     );
-                    let (cursor, buffers) = reused.into_parts();
-                    scratch = buffers;
-                    merge = cursor.into_buffers();
                 }
             }
         }

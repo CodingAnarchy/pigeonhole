@@ -7,8 +7,7 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_compaction::{
-    BlobFetch, MergeBuffers, MergingCursor, ResolveOptions, ResolvedCell, ResolverBuffers,
-    ValuePredicate, blob_pointer,
+    BlobFetch, MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate, blob_pointer,
 };
 use pigeonhole_format::key::{
     Escaped, Kind, SUFFIX_LEN, TERMINATOR, decode_key, encode_row_prefix, row_prefix_len,
@@ -1033,23 +1032,22 @@ pub(crate) fn read_row_into(
     Ok(any)
 }
 
-/// The allocations point gets reuse, one set per reading thread (#46): the sources, the
-/// merging cursor's heap and the resolver's scratch. Taken for a get and put back after, so
-/// a get nested in another on the same thread (none today) just starts empty.
-#[derive(Default)]
-struct PointBuffers {
-    sources: Vec<Source>,
-    merge: MergeBuffers<Source>,
-    resolver: ResolverBuffers,
-}
-
 thread_local! {
-    static POINT_BUFFERS: RefCell<Option<PointBuffers>> = const { RefCell::new(None) };
+    /// The resolver point gets refill in place, one per reading thread (#46): its merging
+    /// cursor's source list and heap and its scratch are reused, and nothing is moved. Between
+    /// gets it holds no source and default options, so it pins no memtable, SST or blob
+    /// reader.
+    static POINT_RESOLVER: RefCell<Option<Resolver>> = const { RefCell::new(None) };
 }
 
-/// A point get returning a longer value drops the resolver's buffers instead of keeping
-/// them for the next get on its thread.
+/// A point get returning a longer value drops the thread's resolver (and the buffers that
+/// value may have grown) instead of keeping it for the next get.
 const KEEP_BUFFERS_BELOW: usize = 64 << 10;
+
+/// An empty resolver for point gets.
+fn point_resolver() -> Resolver {
+    Resolver::new(MergingCursor::new(Vec::new()), ResolveOptions::new(0, 0))
+}
 
 /// A point get through `view` at `seqno`.
 #[allow(clippy::too_many_arguments)]
@@ -1063,35 +1061,37 @@ pub(crate) fn get_in(
     qualifier: &[u8],
     pin: impl FnOnce() -> Arc<View>,
 ) -> Result<Option<CellData>> {
-    let mut run = Some(|buffers: &mut PointBuffers| {
+    let mut run = Some(|resolver: &mut Resolver| {
         let got = get_with(
-            buffers, view, seqno, now, table, family, row, qualifier, pin,
+            resolver, view, seqno, now, table, family, row, qualifier, pin,
         );
-        // Every source was dropped (a source pins its memtable or SST): only the
-        // allocations are kept.
-        debug_assert!(buffers.sources.is_empty());
-        buffers.sources.clear();
+        // Whatever happened, the sources (each pins its memtable or SST) and the options
+        // (merge operator, blob reader) go now; only the allocations stay.
+        let cursor = resolver.cursor_mut();
+        cursor.sources_mut().clear();
+        cursor.reset();
+        resolver.reset(ResolveOptions::new(0, 0));
+        got
+    });
+    // A get nested in another on the same thread, or one during thread teardown, uses a
+    // resolver of its own.
+    let in_place = POINT_RESOLVER.try_with(|cell| {
+        let mut slot = cell.try_borrow_mut().ok()?;
+        let run = run.take().expect("not run yet");
+        let got = run(slot.get_or_insert_with(point_resolver));
         // A large result may have been folded in the resolver's buffers (merge operands are
         // copied whatever their size): not worth keeping that much per thread.
         if got.as_ref().is_ok_and(|c| {
             c.as_ref()
                 .is_some_and(|c| c.stored().len() > KEEP_BUFFERS_BELOW)
         }) {
-            buffers.resolver = ResolverBuffers::default();
+            *slot = None;
         }
-        got
-    });
-    // Used in place (not taken out and put back: the buffers are a few hundred bytes to
-    // move). A get nested in another on the same thread, or one during thread teardown,
-    // starts from empty buffers.
-    let in_place = POINT_BUFFERS.try_with(|cell| {
-        let mut slot = cell.try_borrow_mut().ok()?;
-        let run = run.take().expect("not run yet");
-        Some(run(slot.get_or_insert_with(PointBuffers::default)))
+        Some(got)
     });
     match in_place {
         Ok(Some(got)) => got,
-        _ => (run.take().expect("not run yet"))(&mut PointBuffers::default()),
+        _ => (run.take().expect("not run yet"))(&mut point_resolver()),
     }
 }
 
@@ -1117,7 +1117,7 @@ enum Resolved {
 
 #[allow(clippy::too_many_arguments)]
 fn get_with(
-    buffers: &mut PointBuffers,
+    resolver: &mut Resolver,
     view: &View,
     seqno: Seqno,
     now: Timestamp,
@@ -1136,24 +1136,22 @@ fn get_with(
     if meta.table != table {
         return Err(Error::FamilyNotFound(format!("family {}", family.0)));
     }
-    let filled = view.point_sources(shard, tablet, family, row, qualifier, &mut buffers.sources);
-    if filled.is_err() || buffers.sources.is_empty() {
-        buffers.sources.clear();
+    // The caller clears the sources afterwards, whatever this returns.
+    let sources = resolver.cursor_mut().sources_mut();
+    let filled = view.point_sources(shard, tablet, family, row, qualifier, sources);
+    if filled.is_err() || sources.is_empty() {
         return filled.map(|()| None);
     }
     let mut opts = point_opts(meta, seqno, now);
     let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
-    let cursor = MergingCursor::reuse(
-        buffers.sources.drain(..),
-        std::mem::take(&mut buffers.merge),
-    );
-    let mut resolver = Resolver::reuse(cursor, opts, std::mem::take(&mut buffers.resolver));
+    resolver.cursor_mut().reset();
+    resolver.reset(opts);
     let mut key_buf = [0u8; 512];
     let mut key_vec: Vec<u8> = Vec::new();
     let mut key_len = 0;
     let mut pin = Some(pin);
     let resolved = resolve_point(
-        &mut resolver,
+        resolver,
         view,
         meta,
         resolver_blobs.as_ref(),
@@ -1162,9 +1160,8 @@ fn get_with(
         (&mut key_buf, &mut key_vec, &mut key_len),
         &mut pin,
     );
-    let (mut cursor, resolver_buffers) = resolver.into_parts();
-    buffers.resolver = resolver_buffers;
-    let got = match resolved {
+    let cursor = resolver.cursor_mut();
+    match resolved {
         Ok(Resolved::Done(cell)) => Ok(cell),
         Err(e) => Err(e),
         Ok(Resolved::Refind(ts)) => {
@@ -1186,9 +1183,7 @@ fn get_with(
                 Ok(()) => Err(missing_entry()),
             }
         }
-    };
-    buffers.merge = cursor.into_buffers();
-    got
+    }
 }
 
 fn missing_entry() -> Error {
