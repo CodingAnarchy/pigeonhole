@@ -720,13 +720,23 @@ pub struct BatchIter<'a> {
 
 impl<'a> BatchIter<'a> {
     fn parse(&mut self) -> crate::Result<Mutation<'a>> {
-        let mut r = Reader::new(self.rest, "wal mutation");
-        let table = TableId(r.u32()?);
-        let family = FamilyId(r.u32()?);
-        let flags = r.u8()?;
+        // Decoded without a `Reader`: one bounds check for the fixed fields, and the
+        // length-prefixed parts taken inline (a batch is decoded on every commit's path).
+        // The errors are the same.
+        let truncated = || Error::Truncated { what: MUTATION };
+        let Some((head, mut rest)) = self.rest.split_first_chunk::<9>() else {
+            return Err(truncated());
+        };
+        let table = TableId(u32::from_le_bytes([head[0], head[1], head[2], head[3]]));
+        let family = FamilyId(u32::from_le_bytes([head[4], head[5], head[6], head[7]]));
+        let flags = head[8];
         let kind = Kind::from_u8(flags & !EXPLICIT_TS)?;
         let ts = if flags & EXPLICIT_TS != 0 {
-            Some(r.u64()?)
+            let Some((ts, after)) = rest.split_first_chunk::<8>() else {
+                return Err(truncated());
+            };
+            rest = after;
+            Some(u64::from_le_bytes(*ts))
         } else {
             None
         };
@@ -735,16 +745,44 @@ impl<'a> BatchIter<'a> {
             family,
             kind,
             ts,
-            row: r.bytes()?,
-            qualifier: r.bytes()?,
-            value: r.bytes()?,
+            row: take_bytes(&mut rest)?,
+            qualifier: take_bytes(&mut rest)?,
+            value: take_bytes(&mut rest)?,
         };
         check_mutation(m.kind, m.row, m.qualifier, m.value.len(), |what| {
             Error::Corrupt { what }
         })?;
-        self.rest = r.rest();
+        self.rest = rest;
         Ok(m)
     }
+}
+
+/// What a batch's decode errors name.
+const MUTATION: &str = "wal mutation";
+
+/// Takes a varint-length-prefixed part off the front of `rest`; a length below 128 (one
+/// byte) is read inline. A short part is `Truncated` and a bad length `Corrupt`, both
+/// naming the mutation, as `Reader::bytes` reports them.
+#[inline]
+fn take_bytes<'a>(rest: &mut &'a [u8]) -> crate::Result<&'a [u8]> {
+    let (len, n) = match rest.first() {
+        Some(&b) if b < 0x80 => (usize::from(b), 1),
+        _ => {
+            let (len, n) = crate::varint::get_u64(rest).map_err(|e| match e {
+                Error::Truncated { .. } => Error::Truncated { what: MUTATION },
+                _ => Error::Corrupt { what: MUTATION },
+            })?;
+            let len = usize::try_from(len).map_err(|_| Error::Truncated { what: MUTATION })?;
+            (len, n)
+        }
+    };
+    let body = &rest[n..];
+    if len > body.len() {
+        return Err(Error::Truncated { what: MUTATION });
+    }
+    let (part, after) = body.split_at(len);
+    *rest = after;
+    Ok(part)
 }
 
 impl<'a> Iterator for BatchIter<'a> {
