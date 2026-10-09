@@ -466,9 +466,21 @@ impl SstSet {
 
 /// The manifest versions of every live in-process view, so the pager reclaims only extents
 /// no view can reach (decision D61).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct LiveViews {
     versions: Mutex<BTreeMap<ManifestVersion, u32>>,
+    /// Run when the last view of the oldest version goes (the writer reclaims): otherwise
+    /// what that view alone kept retired would wait for the next manifest commit, however
+    /// idle the database (a view a shard held for a moment when `shrink` reclaimed).
+    on_oldest_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for LiveViews {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveViews")
+            .field("versions", &self.versions)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LiveViews {
@@ -481,14 +493,24 @@ impl LiveViews {
             .or_insert(0) += 1;
     }
 
-    fn unregister(&self, v: ManifestVersion) {
+    /// Whether this was the last view of the oldest version.
+    fn unregister(&self, v: ManifestVersion) -> bool {
         let mut m = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(n) = m.get_mut(&v) {
-            *n -= 1;
-            if *n == 0 {
-                m.remove(&v);
-            }
+        let Some(n) = m.get_mut(&v) else {
+            return false;
+        };
+        *n -= 1;
+        if *n > 0 {
+            return false;
         }
+        m.remove(&v);
+        m.keys().next().is_none_or(|oldest| *oldest > v)
+    }
+
+    /// Sets what runs when the last view of the oldest version goes (once; the writer's
+    /// reclaim). It runs on the thread dropping that view, outside this registry's lock.
+    pub(crate) fn on_oldest_released(&self, f: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.on_oldest_released.set(f);
     }
 
     /// The oldest manifest version any live view uses.
@@ -521,7 +543,11 @@ impl ViewPin {
 
 impl Drop for ViewPin {
     fn drop(&mut self) {
-        self.registry.unregister(self.version);
+        if self.registry.unregister(self.version)
+            && let Some(release) = self.registry.on_oldest_released.get()
+        {
+            release();
+        }
     }
 }
 

@@ -464,6 +464,17 @@ impl Engine {
         use pigeonhole_format::key::{Kind, split_suffix};
         use pigeonhole_sst::{ReadOptions, ScanFilter};
 
+        // The files still settling first, then the view: a release (`large.rs`) drops a file
+        // from `large_pending` only after the view without it is published, so a file not
+        // pending here is not in the view loaded next. The other order could load a view
+        // that still has the file, then miss it in `large_pending`.
+        let pending = self
+            .inner
+            .shared
+            .large_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let view = self.inner.shared.view.load_full();
         let catalog = &view.catalog;
         let mut refs: BTreeMap<u32, u64> = BTreeMap::new();
@@ -569,13 +580,6 @@ impl Engine {
         }
         // A large value's file whose commit has not settled (or whose release has not
         // committed) may have nothing pointing into it yet (#230).
-        let pending = self
-            .inner
-            .shared
-            .large_pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
         for (id, b) in &catalog.blob_files {
             if pending.contains(id) {
                 continue;

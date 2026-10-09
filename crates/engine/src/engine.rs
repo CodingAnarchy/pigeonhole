@@ -592,6 +592,15 @@ impl Engine {
             identity,
             path: path.to_path_buf(),
         });
+        // Extents the oldest live view alone kept retired are reclaimed as soon as it goes,
+        // not at the next manifest commit (a shard's momentary view would otherwise leave
+        // them retired on an idle database). Weak: the registry lives in `Shared`.
+        let weak = Arc::downgrade(&shared);
+        live_views.on_oldest_released(Box::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                shared.reclaim();
+            }
+        }));
         let mut states: Vec<ShardState> = Vec::with_capacity(shards);
         let flushed: HashMap<(TabletId, FamilyId), Seqno> =
             catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect();
