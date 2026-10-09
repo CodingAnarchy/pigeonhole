@@ -14,8 +14,8 @@ use std::task::{Context, Poll, Waker};
 
 use common::{Config, final_dump, run, tablet_changes};
 use pigeonhole_engine::{
-    Engine, EngineOptions, EngineShard, FamilyOptions, PendingMaintenance, ReadSpec, ScanSpec,
-    TableInfo, ValueRef, WriteBatch,
+    CompactionStyle, Engine, EngineOptions, EngineShard, FamilyOptions, PendingMaintenance,
+    ReadSpec, ScanSpec, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::sim::SimVfs;
@@ -1889,4 +1889,125 @@ fn an_idle_shard_backs_off_its_balancer_and_a_write_resets_it() {
     let gap = deadline(&db).saturating_sub(now);
     assert!(gap <= BASE, "a write did not reset the interval: {gap}");
     close(db);
+}
+
+impl Db {
+    /// The rows of a scan of `[start, end)` that stops after `limit` rows (0 = no limit).
+    fn scan_limited(&self, start: &[u8], end: Option<&[u8]>, limit: u64) -> Vec<Vec<u8>> {
+        let snap = self.engine.snapshot().unwrap();
+        let end = end.map_or(Bound::Unbounded, |e| Bound::Excluded(e.to_vec()));
+        let mut spec = ScanSpec::new(Bound::Included(start.to_vec()), end);
+        spec.limit = limit;
+        let mut c = self.engine.scan(&snap, self.table.id, spec).unwrap();
+        let mut out = Vec::new();
+        while c.next_row().unwrap() {
+            out.push(c.row().to_vec());
+        }
+        out
+    }
+
+    /// Checks scans from many starts, with limits and end bounds, against `rows` (sorted).
+    fn check_scans(&self, rows: &[Vec<u8>], when: &str) {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..60 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let i = (x % rows.len() as u64) as usize;
+            // An existing row, or a key just before it (no such row).
+            let start = if x & 1 == 0 {
+                rows[i].clone()
+            } else {
+                let mut k = rows[i].clone();
+                k.pop();
+                k
+            };
+            let from = rows.partition_point(|r| *r < start);
+            for limit in [1u64, 3, 10, 0] {
+                let take = if limit == 0 {
+                    rows.len()
+                } else {
+                    limit as usize
+                };
+                let want: Vec<_> = rows[from..].iter().take(take).cloned().collect();
+                assert_eq!(
+                    self.scan_limited(&start, None, limit),
+                    want,
+                    "{when}: limit {limit}"
+                );
+            }
+            let end = &rows[(i + 40).min(rows.len() - 1)];
+            let to = rows.partition_point(|r| r < end);
+            let want: Vec<_> = rows[from..to.max(from)].to_vec();
+            assert_eq!(
+                self.scan_limited(&start, Some(end), 0),
+                want,
+                "{when}: to {end:?}"
+            );
+        }
+    }
+}
+
+/// #380: scans read each level below 0 through a cursor that opens its SSTs as it reaches
+/// them. Limited and bounded scans from many starts match the rows over levels of several
+/// SSTs, leveled and tiered, before and after a split (whose children share the parent's
+/// SSTs until compaction rewrites them).
+#[test]
+fn limited_scans_over_levels_of_several_ssts_match_across_a_split() {
+    for style in [CompactionStyle::Leveled, CompactionStyle::Tiered] {
+        let mut db = open(1, |o| {
+            o.balance_interval_nanos = u64::MAX;
+            o.tablet_split_bytes = 64 << 20;
+        });
+        db.table = db
+            .engine
+            .create_table(
+                "u",
+                &[("f".into(), FamilyOptions::default().compaction(style))],
+            )
+            .expect("table");
+        let value = vec![0x5A; 200];
+        let mut rows: Vec<Vec<u8>> = (0..2_000).map(key).collect();
+        for r in &rows {
+            db.put(r, &value);
+        }
+        rows.sort();
+        let m = db.engine.flush_pending().unwrap();
+        db.drive(m).unwrap();
+        let m = db.engine.compact_pending(None).unwrap();
+        db.drive(m).unwrap();
+        let table = db.table.id;
+        let deepest_level_ssts = |db: &Db| {
+            let levels = db.engine.sst_levels();
+            (1..8u8)
+                .map(|l| {
+                    levels
+                        .iter()
+                        .filter(|(t, lv, _)| *t == table && *lv == l)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(
+            deepest_level_ssts(&db) >= 2,
+            "{style:?}: no level below 0 with several SSTs: {:?}",
+            db.engine.sst_levels()
+        );
+        db.check_scans(&rows, &format!("{style:?} compacted"));
+        let m = db
+            .engine
+            .split_tablet_pending(table, &rows[rows.len() / 2])
+            .unwrap();
+        db.drive(m).unwrap();
+        assert_eq!(db.ranges().len(), 2);
+        db.check_scans(&rows, &format!("{style:?} split"));
+        let m = db.engine.compact_pending(None).unwrap();
+        db.drive(m).unwrap();
+        db.check_scans(&rows, &format!("{style:?} split and compacted"));
+        db.engine.close().unwrap();
+        for _ in 0..8 {
+            db.step();
+        }
+    }
 }
