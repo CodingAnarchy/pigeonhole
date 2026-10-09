@@ -35,12 +35,13 @@ env:
   CARGO_TERM_COLOR: always
   # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
   # the head's sources of these files, so a new or changed example still has a baseline.
-  EXAMPLES: hotrow readshapes
+  EXAMPLES: hotrow readshapes writepath
   # Shape binaries and their shapes, `EXAMPLE:shape,shape,...` (space-separated), in the
   # contract of scripts/instructions-per-cell.sh. Add a shape here and it is reported and
   # checked for regressions on every PR.
   SHAPES: >-
     readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter
+    writepath:commit-one,commit-sixteen,flush,compact
 
 jobs:
   instructions:
