@@ -10,7 +10,7 @@ use pigeonhole_compaction::{
     CellResolver, Error, FilteredCursor, I64Add, MergeOperator, MergingCursor, ResolveOptions,
     ValuePredicate, VecCursor,
 };
-use pigeonhole_format::key::{Kind, encode_key, encode_marker_key};
+use pigeonhole_format::key::{Kind, encode_column_prefix, encode_key, encode_marker_key};
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::{Cursor, Seqno, Timestamp};
 use pigeonhole_sim::Rng;
@@ -480,6 +480,41 @@ fn a_reset_resolver_reads_as_a_new_one() {
                     assert_eq!(
                         got, want,
                         "seed {seed}, versions {versions}, {n} sources, row {row:?}, point {point} {q:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_column_seek_from_an_encoded_prefix_reads_as_one_from_the_parts() {
+    // `seek_column_encoded` (#46) over random histories: the same cells as `seek_column`.
+    for seed in 0..if cfg!(miri) { 2 } else { 24 } {
+        let h = random_history(seed, commits(40));
+        let snapshot = h.model.snapshot().max(1);
+        let now = h.last_ts + 50;
+        for (versions, n) in [(1, 2), (1, 3), (0, 2)] {
+            for row in ROWS {
+                for q in QUALS {
+                    let resolver = || {
+                        CellResolver::new(
+                            MergingCursor::new(vec_sources(&h.entries, n, &mut Rng::new(seed))),
+                            options(&h, snapshot, now, versions),
+                        )
+                    };
+                    let mut parts = resolver();
+                    parts.seek_column(row, q).unwrap();
+                    let want = cells(&mut parts);
+                    let mut prefix = Vec::new();
+                    encode_column_prefix(&mut prefix, row, q).unwrap();
+                    let row_len = row_prefix(row).len();
+                    let mut encoded = resolver();
+                    encoded.seek_column_encoded(&prefix, row_len).unwrap();
+                    assert_eq!(
+                        cells(&mut encoded),
+                        want,
+                        "seed {seed}, versions {versions}, {n} sources, row {row:?}, {q:?}"
                     );
                 }
             }

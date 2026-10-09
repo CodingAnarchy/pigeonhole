@@ -474,9 +474,38 @@ where
     /// Afterwards [`CellResolver::next_cell`] returns only versions of that column.
     pub fn seek_column(&mut self, row: &[u8], qualifier: &[u8]) -> Result<(), C::Error> {
         self.reset_position();
-        // Row prefix, then the marker prefix in the column scratch.
         escape_into(&mut self.row, row);
         self.row.extend_from_slice(&TERMINATOR);
+        self.seek_marker_then_column(|col| {
+            escape_into(col, qualifier);
+            col.extend_from_slice(&TERMINATOR);
+        })
+    }
+
+    /// As [`CellResolver::seek_column`], from the column prefix already encoded
+    /// ([`encode_column_prefix`](pigeonhole_format::key::encode_column_prefix) of the row
+    /// and qualifier), whose first `row_len` bytes are the row prefix (escaped row and
+    /// terminator): a caller that encoded it for its own use (a point get's filter probes)
+    /// does not have it encoded again.
+    pub fn seek_column_encoded(
+        &mut self,
+        column_prefix: &[u8],
+        row_len: usize,
+    ) -> Result<(), C::Error> {
+        self.reset_position();
+        let (row, qualifier) = column_prefix.split_at(row_len);
+        self.row.extend_from_slice(row);
+        self.seek_marker_then_column(|col| col.extend_from_slice(qualifier))
+    }
+
+    /// The rest of a column seek, with the row prefix in `row`: the marker seek, then the
+    /// column seek, `column` appending the escaped qualifier and terminator to the row
+    /// prefix.
+    fn seek_marker_then_column(
+        &mut self,
+        column: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), C::Error> {
+        // The marker prefix in the column scratch.
         self.col.extend_from_slice(&self.row);
         self.col.extend_from_slice(&MARKER_QUALIFIER);
         self.cursor.seek(&self.col)?;
@@ -492,8 +521,7 @@ where
             self.cursor.next()?;
         }
         self.col.truncate(self.row.len());
-        escape_into(&mut self.col, qualifier);
-        self.col.extend_from_slice(&TERMINATOR);
+        column(&mut self.col);
         self.column_bound = true;
         self.note_row_bound();
         self.note_column_bound();
