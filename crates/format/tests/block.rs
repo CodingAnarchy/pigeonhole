@@ -372,3 +372,44 @@ fn validate_checks_tables_and_cursors_survive_unsorted_ones() {
         assert!(steps < 10, "skip_row looped");
     }
 }
+
+fn key(row: &[u8]) -> Vec<u8> {
+    let mut k = Vec::new();
+    pigeonhole_format::key::encode_key(&mut k, row, b"q", 1, 1, pigeonhole_format::key::Kind::Put)
+        .unwrap();
+    k
+}
+
+#[test]
+fn entry_lengths_either_side_of_one_varint_byte() {
+    // Entry headers whose fields are all one byte take a fast path; any field of 128 or more
+    // takes the general varint decode. Both must read back the same entries.
+    let mut model = BTreeMap::new();
+    for (i, len) in [0usize, 1, 126, 127, 128, 129, 300].into_iter().enumerate() {
+        model.insert(key(&vec![b'k'; 1 + 70 * i]), vec![i as u8; len]);
+    }
+    for interval in [1, 3, 16] {
+        let bytes = build_data(&model, interval);
+        let mut it = Block::new(bytes.as_slice()).unwrap().into_cursor();
+        it.seek_to_first().unwrap();
+        let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(collect(&mut it), want, "restart interval {interval}");
+    }
+}
+
+#[test]
+fn one_byte_entry_header_past_the_block_is_corrupt() {
+    let mut model = BTreeMap::new();
+    let k = key(b"a");
+    model.insert(k.clone(), b"v".to_vec());
+    let mut bytes = build_data(&model, 1);
+    // The header is `shared unshared value_len`; claim a value that runs past the data.
+    assert_eq!(&bytes[..3], &[0, k.len() as u8, 1]);
+    bytes[2] = 0x7F;
+    let mut it = Block::new(bytes.as_slice()).unwrap().into_cursor();
+    assert!(matches!(
+        it.seek_to_first(),
+        Err(pigeonhole_format::Error::Corrupt { .. })
+    ));
+    assert!(!it.valid());
+}
