@@ -51,6 +51,7 @@ pub struct Options {
     tablet_balance: Option<(Duration, u64, u64)>,
     write_stall_timeout: Option<Duration>,
     stale_share: Option<f64>,
+    stale_count: Option<u64>,
 }
 
 impl Default for Options {
@@ -74,6 +75,7 @@ impl Default for Options {
             tablet_balance: None,
             write_stall_timeout: None,
             stale_share: None,
+            stale_count: None,
         }
     }
 }
@@ -152,6 +154,16 @@ impl Options {
     #[doc(hidden)]
     pub fn experimental_stale_flush(mut self, share: f64) -> Self {
         self.stale_share = Some(share);
+        self
+    }
+
+    /// **Experimental, unstable (#287).** As
+    /// [`experimental_stale_flush`](Options::experimental_stale_flush), on a count: flush a
+    /// memtable early once it holds `count` other versions of columns it holds. Off by
+    /// default. May change or go away.
+    #[doc(hidden)]
+    pub fn experimental_stale_flush_count(mut self, count: u64) -> Self {
+        self.stale_count = Some(count);
         self
     }
 
@@ -548,6 +560,9 @@ impl Options {
         o.memtable_stale_min_bytes = self.memtable_budget / 16;
         if let Some(share) = self.stale_share {
             o.memtable_stale_share = share;
+        }
+        if let Some(count) = self.stale_count {
+            o.memtable_stale_count = count;
         }
         if let Some(bytes) = self.block_cache {
             o.block_cache_bytes = bytes;

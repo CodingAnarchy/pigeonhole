@@ -19,6 +19,12 @@ The gate's row-read p99 is about 2× SQLite's (455 µs vs 222–231 µs, runs 5�
 - **Option:** `EngineOptions::memtable_stale_share`, 0 (off) by default. The public crate exposes `Options::experimental_stale_flush(share)`, doc-hidden and unstable. Tests and sweeps can turn it on with `PIGEONHOLE_TEST_STALE_SHARE` (only with `test-hooks`). The bench reads `PHDB_BENCH_STALE_FLUSH`.
 - **Correctness:** it changes only *when* a memtable freezes. Everything after the freeze (D191's flush-time GC, guards, sequencing) is unchanged, and any freeze reason already takes that path.
 
+**What the measurements showed** (full-scale sparse-wide, Pigeonhole only, busy machine, so latencies are only indicative):
+- **The wide reads' stale versions are in the memtable.** Row reads of ≥1,000 cells (~2,760 cells each) step 2.05 memtable entries and 0.017 SST entries per returned cell.
+- **A share signal is diluted.** Sparse-wide memtables are ~98% distinct entries (cold rows), so even a share of 0.02 barely fires (182 → 191 flushes).
+- **A per-column signal wouldn't fire either.** Each hot column has only about one extra version; the stale versions are spread across a hot row's thousands of columns.
+- **A count signal fires on them**, so the option also takes `memtable_stale_count`: freeze at N overwrites. At N = 1,024, wide reads step 1.03 memtable + 0.63 SST = 1.66 entries per cell (from 2.07, −20%), for 187 flushes against 180 and no deeper L0 (max 4 per family either way). The older versions now sit in the SST until compaction.
+
 **Costs to weigh.** More flushes, each smaller (write amplification and shard CPU), and more L0 SSTs between compactions. Each L0 SST is another source for reads until compaction merges it, which could cost reads of rows spread across many L0 files. A workload with no overwrites never trips it (tested), and overwrites of a few hot columns trip it only once the memtable passes the minimum size.
 
 **Measurements before deciding** (with the option on and off):

@@ -378,9 +378,9 @@ pub(crate) struct Shared {
     /// whoever publishes a watermark).
     pub freeze_waiters: FreezeWaiters,
     pub memtable_freeze_bytes: u64,
-    /// The experimental stale trigger (`EngineOptions::memtable_stale_share`): the share and
-    /// the smallest memtable it freezes; `None` when off.
-    pub stale_freeze: Option<(f64, usize)>,
+    /// The experimental stale trigger (`EngineOptions::memtable_stale_share` and
+    /// `memtable_stale_count`); `None` when both are off.
+    pub stale_freeze: Option<StaleFreeze>,
     /// Bytes a stream may hold past its oldest needed record before the slots pinning it
     /// are flushed (`EngineOptions::wal_pin_bytes`, resolved; #137).
     pub wal_pin_bytes: u64,
@@ -6560,15 +6560,26 @@ impl ShardHandler for ShardState {
 /// holds, and its family keeps a limited number of versions (`limited`, checked last), so
 /// a flush drops the shadowed ones (#287).
 fn stale_enough(
-    trigger: Option<(f64, usize)>,
+    trigger: Option<StaleFreeze>,
     table: &pigeonhole_memtable::Memtable,
     limited: impl FnOnce() -> bool,
 ) -> bool {
-    trigger.is_some_and(|(share, min_bytes)| {
-        table.allocated_bytes() >= min_bytes
-            && table.overwrites() as f64 >= share * table.len() as f64
+    trigger.is_some_and(|t| {
+        let overwrites = table.overwrites();
+        table.allocated_bytes() >= t.min_bytes
+            && ((t.share > 0.0 && overwrites as f64 >= t.share * table.len() as f64)
+                || (t.count > 0 && overwrites as u64 >= t.count))
             && limited()
     })
+}
+
+/// The experimental stale trigger's settings (#287): a share of the entries, a count of
+/// them (0 = off), and the smallest memtable it freezes.
+#[derive(Debug, Clone, Copy)]
+pub struct StaleFreeze {
+    pub share: f64,
+    pub count: u64,
+    pub min_bytes: usize,
 }
 
 /// Whether `family` keeps a limited number of versions and is not a counter family: only

@@ -585,12 +585,12 @@ impl Engine {
             },
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
-            stale_freeze: (options.memtable_stale_share > 0.0).then(|| {
-                (
-                    options.memtable_stale_share,
-                    options.memtable_stale_min_bytes.max(2 * chunk as u64) as usize,
-                )
-            }),
+            stale_freeze: (options.memtable_stale_share > 0.0 || options.memtable_stale_count > 0)
+                .then(|| crate::shard::StaleFreeze {
+                    share: options.memtable_stale_share,
+                    count: options.memtable_stale_count,
+                    min_bytes: options.memtable_stale_min_bytes.max(2 * chunk as u64) as usize,
+                }),
             wal_pin_bytes: match options.wal_pin_bytes {
                 0 => options.memtable_budget.saturating_mul(2),
                 n => n,

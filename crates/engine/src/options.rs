@@ -56,6 +56,13 @@ pub struct EngineOptions {
     /// cheaper, at the cost of more, smaller flushes. Proposed for the owner in
     /// `docs/design/questions/engine.md`.
     pub memtable_stale_share: f64,
+    /// **Experimental (#287), off by default (0).** As `memtable_stale_share`, but on a count:
+    /// a memtable also freezes once it holds at least this many other versions of columns
+    /// it holds (and at least `memtable_stale_min_bytes`). A share is diluted by the rows that
+    /// are not overwritten, while the stale versions a hot row's readers step over grow with
+    /// the count; on sparse-wide a count of about 1,000 makes the hot rows' reads step ~20%
+    /// fewer entries for ~4% more flushes.
+    pub memtable_stale_count: u64,
     /// The smallest memtable (allocated bytes) the stale trigger freezes (default 1/4 of
     /// `memtable_freeze_bytes`): smaller ones would make too many small SSTs.
     pub memtable_stale_min_bytes: u64,
@@ -159,6 +166,7 @@ impl EngineOptions {
             memtable_budget,
             memtable_freeze_bytes: memtable_budget / 4,
             memtable_stale_share: stale_share_from_env(),
+            memtable_stale_count: stale_count_from_env(),
             memtable_stale_min_bytes: memtable_budget / 16,
             block_cache_bytes: 256 << 20,
             row_cache_bytes: 0,
@@ -182,6 +190,19 @@ impl EngineOptions {
             room_recheck_nanos: 1_000_000,
         }
     }
+}
+
+/// The stale trigger's count from `PIGEONHOLE_TEST_STALE_COUNT` (as
+/// [`stale_share_from_env`]); 0 (off) otherwise.
+fn stale_count_from_env() -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(count) = std::env::var("PIGEONHOLE_TEST_STALE_COUNT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return count;
+    }
+    0
 }
 
 /// The stale trigger's share from `PIGEONHOLE_TEST_STALE_SHARE` (test builds and the

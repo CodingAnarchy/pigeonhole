@@ -141,6 +141,9 @@ impl Runner for PigeonholeRunner {
         if let Some(share) = stale_flush() {
             options = options.experimental_stale_flush(share);
         }
+        if let Some(count) = stale_count() {
+            options = options.experimental_stale_flush_count(count);
+        }
         let db = Pigeonhole::open(dir.join("bench.phdb"), options).map_err(err)?;
         let mut builder = db.table("bench").map_err(err)?;
         for family in FAMILIES {
@@ -224,7 +227,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             durability(s.sync),
@@ -233,7 +236,8 @@ impl Runner for PigeonholeRunner {
             } else {
                 " tablets=on"
             },
-            stale_flush().map_or(String::new(), |share| format!(" stale-flush={share}"))
+            stale_flush().map_or(String::new(), |share| format!(" stale-flush={share}")),
+            stale_count().map_or(String::new(), |n| format!(" stale-count={n}"))
         )
     }
 }
@@ -364,6 +368,13 @@ fn write_stats_sampler(
         }
     });
     Some((stop, thread))
+}
+
+/// As [`stale_flush`], on a count, from `PHDB_BENCH_STALE_COUNT`; off when unset.
+fn stale_count() -> Option<u64> {
+    std::env::var("PHDB_BENCH_STALE_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 /// The experimental early flush of mostly-overwritten memtables (#287), from

@@ -21,6 +21,10 @@ struct Rig {
 
 impl Rig {
     fn open(seed: u64, stale_share: f64) -> Self {
+        Self::open_with(seed, stale_share, 0)
+    }
+
+    fn open_with(seed: u64, stale_share: f64, stale_count: u64) -> Self {
         let vfs = SimVfs::new(seed);
         let mut o = EngineOptions::new(vfs);
         o.create_if_missing = true;
@@ -29,6 +33,7 @@ impl Rig {
         // Size alone freezes at 4 MiB; the stale trigger from 1 MiB.
         o.memtable_freeze_bytes = 4 << 20;
         o.memtable_stale_share = stale_share;
+        o.memtable_stale_count = stale_count;
         o.memtable_stale_min_bytes = 1 << 20;
         o.compaction.l0_trigger = u32::MAX;
         o.compaction.level_base_bytes = u64::MAX;
@@ -150,5 +155,22 @@ fn a_family_keeping_every_version_never_triggers_it() {
         flushes, 0,
         "the trigger fired for a family that keeps every version"
     );
+    rig.close();
+}
+
+#[test]
+fn the_count_trigger_fires_on_overwrites_alone() {
+    // 2,000 writes to 1,000 columns: half are other versions, a share of 0.5 at most, but a
+    // count of 500 is reached.
+    let mut rig = Rig::open_with(6, 0.0, 500);
+    let flushes = rig.write(1_000);
+    assert!(
+        flushes >= 1,
+        "the count trigger did not flush ({flushes} flushes)"
+    );
+    rig.close();
+    let mut rig = Rig::open_with(7, 0.0, 500);
+    let flushes = rig.write(u32::MAX);
+    assert_eq!(flushes, 0, "distinct columns reached the count trigger");
     rig.close();
 }
