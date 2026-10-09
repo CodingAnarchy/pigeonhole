@@ -50,7 +50,8 @@ pub use runners::rocksdb::RocksDbRunner;
 pub use runners::sqlite::SqliteRunner;
 pub use runners::{BLOOM_BITS, MemoryBudget};
 pub use workload::{
-    EDGE_FAMILY, FAMILIES, METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY,
+    EDGE_FAMILY, FAMILIES, GROUP_COMMIT_CELLS, GROUP_COMMIT_ROWS, GROUP_COMMIT_THREADS,
+    METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY,
 };
 
 /// The benchmark suite.
@@ -76,11 +77,17 @@ pub enum WorkloadKind {
     Adjacency,
     /// Writes skewed across shards (scaling gate).
     SkewedMultiShard,
+    /// Durable commits from concurrent clients: each operation commits
+    /// [`GROUP_COMMIT_CELLS`] cells of one row, under `GroupSync` on Pigeonhole and
+    /// fsync-per-write on the other stores (the Phase 3 commit-latency gate, #53).
+    /// `phdb-bench` sets that durability for this workload; a library caller sets it on
+    /// the runner ([`PigeonholeRunner::group_sync`]).
+    GroupCommit,
 }
 
 impl WorkloadKind {
     /// Every workload, in suite order.
-    pub const ALL: [WorkloadKind; 10] = [
+    pub const ALL: [WorkloadKind; 11] = [
         WorkloadKind::YcsbA,
         WorkloadKind::YcsbB,
         WorkloadKind::YcsbC,
@@ -91,6 +98,7 @@ impl WorkloadKind {
         WorkloadKind::TimeSeriesTtl,
         WorkloadKind::Adjacency,
         WorkloadKind::SkewedMultiShard,
+        WorkloadKind::GroupCommit,
     ];
 
     /// The CLI and report name (`ycsb-a`, `sparse-wide`, ...).
@@ -114,6 +122,7 @@ impl WorkloadKind {
             WorkloadKind::TimeSeriesTtl => "time-series-ttl",
             WorkloadKind::Adjacency => "adjacency",
             WorkloadKind::SkewedMultiShard => "skewed-multi-shard",
+            WorkloadKind::GroupCommit => "group-commit",
         }
     }
 }
@@ -163,10 +172,9 @@ impl WorkloadConfig {
             records: 1_000,
             operations: 2_000,
             value_len: 100,
-            threads: if kind == WorkloadKind::SkewedMultiShard {
-                2
-            } else {
-                1
+            threads: match kind {
+                WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit => 2,
+                _ => 1,
             },
             epoch_micros: 0,
         }
@@ -180,13 +188,20 @@ impl WorkloadConfig {
         Self {
             kind,
             seed: 0x5EED,
-            records: 50_000,
-            operations: 200_000,
-            value_len: 100,
-            threads: if kind == WorkloadKind::SkewedMultiShard {
-                4
+            records: if kind == WorkloadKind::GroupCommit {
+                GROUP_COMMIT_ROWS
             } else {
-                1
+                50_000
+            },
+            operations: if kind == WorkloadKind::GroupCommit {
+                20_000
+            } else {
+                200_000
+            },
+            value_len: 100,
+            threads: match kind {
+                WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit => 4,
+                _ => 1,
             },
             epoch_micros: 0,
         }
@@ -211,10 +226,12 @@ impl WorkloadConfig {
         let mut c = Self::small(kind);
         c.records = match kind {
             WorkloadKind::Adjacency => 2_000_000,
+            WorkloadKind::GroupCommit => GROUP_COMMIT_ROWS,
             _ => 1_000_000,
         };
         c.operations = match kind {
             WorkloadKind::SkewedMultiShard => 2_000_000,
+            WorkloadKind::GroupCommit => 200_000,
             _ => 1_000_000,
         };
         c

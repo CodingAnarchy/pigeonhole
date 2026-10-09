@@ -54,8 +54,8 @@ PR-gating CI builds and tests the bench crate with `sqlite,fjall` only, so it ne
 | Preset | Records | Operations | Use |
 |---|--:|--:|---|
 | `smoke` | 1,000 | 2,000 | What `cargo test` runs; seconds for the whole suite |
-| `small` (default) | 50,000 | 200,000 | A quick check, seconds per workload |
-| `full` | 1,000,000 (adjacency: 2,000,000 edges) | 1,000,000 (skewed-multi-shard: 2,000,000) | The spec's scale: 1M sparse-wide rows, YCSB with 1M records |
+| `small` (default) | 50,000 (group-commit: 1,000) | 200,000 (group-commit: 20,000) | A quick check, seconds per workload |
+| `full` | 1,000,000 (adjacency: 2,000,000 edges; group-commit: 1,000) | 1,000,000 (skewed-multi-shard: 2,000,000; group-commit: 200,000) | The spec's scale: 1M sparse-wide rows, YCSB with 1M records |
 | `larger-than-ram` | same as `full` | same as `full` | The data set is 75–85× the engine's memory budget; gets are split into cold and hot (below) |
 
 Memtables flush to SSTs, so no preset is bounded by memory. At `full` size the data set is several times the 64 MiB write buffer (the runner's default, equal to the engine's), so flushes and compactions run during the load and the measurement, and a run completes without `Busy`. Sparse-wide at `full` loads about 20M cells, YCSB about 10M, and takes minutes per engine. `full` is **not** larger than RAM on a typical workstation, so by itself it does not measure the spec's cold-read target (one I/O per get on data larger than memory). `larger-than-ram` does the next best thing on a laptop.
@@ -88,6 +88,11 @@ Every workload is deterministic for a seed (default `0x5EED`, recorded in every 
 | `time-series-ttl` | `records / 100` entities × 100 points; row `ts:<entity>:<reversed time>`, so a scan from the entity prefix returns the newest point first; family with a 1-day TTL; points carry event timestamps, and a quarter of the loaded ones are already older than the TTL | 40% timestamped append, 40% scan of the newest 10 points, 20% get of a recent point (a miss when expired) |
 | `adjacency` | about `records / 40` vertices; row `v:<id>`, qualifiers `edge:<dst>`, out-degree `1 + Zipf(256)` (mean ≈ 40), Zipfian destinations | 80% scan of one vertex's edges, 10% scan of 10 vertices, 10% add an edge |
 | `skewed-multi-shard` | `records` rows, one cell each | 100% Zipfian writes from `threads` client threads (default 4) |
+| `group-commit` | 1,000 rows (every preset but `smoke`) × 4 fields | 100% durable commits of 4 cells to a uniformly chosen row, from concurrent clients: `GroupSync` on Pigeonhole, fsync per write elsewhere (below). Without `--threads`, runs at 1, 4 and 16 threads; 20,000 commits at `small`, 200,000 at `full` |
+
+**`group-commit`** measures the Goals table's "p99 commit < 200 µs with `fsync` batching" (#53). Each operation is one commit, so its latency is commit latency and cells per second is 4 × the operations per second. The Goals table's other durable-write target, > 1M cells/s across cores, is for batched writes; small commits like these do not measure it. The durability is the workload's, not `--sync`'s: Pigeonhole commits with `Durability::GroupSync`, where a commit returns once it is fsynced and concurrent commits on a shard share one fsync; RocksDB with `sync=true`, where concurrent writers share a write group and its WAL sync (RocksDB's group commit); SQLite with `synchronous=FULL`; fjall with `SyncAll`. The row set is small and overwritten, so the store stays a few MiB and the run measures the commit path rather than flush and compaction. A group-sync commit that arrives while its shard's fsync is in flight waits for the next one, so with several clients p50 sits near two fsync times.
+
+**fsync is not the same call on every OS and engine.** On macOS, Pigeonhole's sync is `F_FULLFSYNC` (a drive cache flush, milliseconds on an internal SSD), while SQLite's `synchronous=FULL` issues a plain `fsync`, which macOS does not flush to stable media unless `PRAGMA fullfsync` is on. SQLite's durable commits on macOS are therefore not comparable. The gate is judged on Linux reference hardware (`fdatasync` everywhere) against RocksDB.
 
 Interpretation notes (details and rationale in [`design/questions/bench.md`](design/questions/bench.md)):
 - A YCSB read fetches all ten fields of the record (`readallfields=true`, `BenchOp::GetRow`); an update still writes one field, as in YCSB. Results measured before [#54](https://github.com/CodingAnarchy/pigeonhole/issues/54) read one field and are not comparable with newer ones.
@@ -130,7 +135,7 @@ Each result row gives the workload, store, store settings, size, client threads,
 |---|---|---|---|
 | RocksDB gap | 1 (reported) | `all --engine pigeonhole,rocksdb` | Reported, not gated |
 | Model value | 2 | `sparse-wide --engine pigeonhole,sqlite,rocksdb` | Pigeonhole beats SQLite EAV and RocksDB on throughput and p99 |
-| Latency | 3 | `ycsb-c` (point get), `ycsb-a`/`skewed-multi-shard` (writes), `adjacency`/`ycsb-e` (scans) | Goals table: get p50 < 2 µs, p99 < 10 µs; within 1.5× of RocksDB |
+| Latency | 3 | `ycsb-c` (point get), `ycsb-a`/`skewed-multi-shard` (writes), `group-commit --engine pigeonhole,rocksdb` (durable commits at 1, 4 and 16 threads), `adjacency`/`ycsb-e` (scans) | Goals table: get p50 < 2 µs, p99 < 10 µs; `group-commit` p99 < 200 µs; within 1.5× of RocksDB |
 | Scaling | 1 onward | `scaling --shards N`, then `compare` against a stored `scaling.json` | N-shard write throughput ≥ 0.8 × N × single-shard (`efficiency` ≥ 0.8), and single-shard p99 does not regress |
 | Reproducibility | all | Two runs, then `compare a.json b.json` | Every result within tolerance |
 

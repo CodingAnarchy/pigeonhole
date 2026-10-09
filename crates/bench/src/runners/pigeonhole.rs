@@ -21,6 +21,8 @@ pub(crate) struct Settings {
     pub(crate) shards: Option<usize>,
     pub(crate) memory: MemoryBudget,
     pub(crate) sync: bool,
+    /// Commits are `GroupSync` (overrides `sync`).
+    pub(crate) group_sync: bool,
     /// `None`: the library default (on).
     pub(crate) tablet_changes: Option<bool>,
 }
@@ -95,6 +97,20 @@ impl PigeonholeRunner {
         self
     }
 
+    /// `true`: every commit is `Durability::GroupSync`-durable: fsynced before it returns,
+    /// with concurrent commits sharing one fsync. Overrides [`sync`](Self::sync). The
+    /// durability of [`WorkloadKind::GroupCommit`](crate::WorkloadKind::GroupCommit).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(PigeonholeRunner::default().group_sync(true).describe().contains(" group-sync"));
+    /// ```
+    pub fn group_sync(mut self, yes: bool) -> Self {
+        self.settings.group_sync = yes;
+        self
+    }
+
     /// `true` (the library default): tablets split, merge and move between shards, so the
     /// bench table's writes spread over every shard ([`Options::tablet_changes`]); `false`:
     /// the table is one tablet on one shard.
@@ -120,7 +136,9 @@ impl Runner for PigeonholeRunner {
     fn open(&mut self, dir: &Path) -> Result<(), String> {
         let s = &self.settings;
         let mut options = Options::default()
-            .durability(if s.sync {
+            .durability(if s.group_sync {
+                Durability::GroupSync
+            } else if s.sync {
                 Durability::Sync
             } else {
                 Durability::Buffered
@@ -211,7 +229,11 @@ impl Runner for PigeonholeRunner {
             "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
-            durability(s.sync),
+            if s.group_sync {
+                "group-sync"
+            } else {
+                durability(s.sync)
+            },
             if s.tablet_changes == Some(false) {
                 ""
             } else {

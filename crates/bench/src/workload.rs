@@ -36,6 +36,17 @@ pub(crate) const LIVE_MARGIN: std::time::Duration = std::time::Duration::from_se
 
 /// YCSB fields per record.
 pub(crate) const YCSB_FIELDS: u64 = 10;
+/// Cells each [`WorkloadKind::GroupCommit`](crate::WorkloadKind::GroupCommit) operation
+/// commits, all in one row: a small row mutation. Cells per second is operations per
+/// second times this.
+pub const GROUP_COMMIT_CELLS: u64 = 4;
+/// Rows of [`WorkloadKind::GroupCommit`](crate::WorkloadKind::GroupCommit) at every preset
+/// but smoke: commits overwrite them, so the store stays small and the run measures the
+/// commit path, not flush and compaction. The load commits with the run's durability, so
+/// it stays short.
+pub const GROUP_COMMIT_ROWS: u64 = 1_000;
+/// Client threads `phdb-bench group-commit` sweeps when `--threads` is not given.
+pub const GROUP_COMMIT_THREADS: [usize; 3] = [1, 4, 16];
 /// YCSB E: scan lengths are uniform in `1..=YCSB_MAX_SCAN`.
 const YCSB_MAX_SCAN: u64 = 100;
 /// Sparse-wide qualifier vocabulary.
@@ -158,6 +169,17 @@ impl Gen {
         }
     }
 
+    /// A [`WorkloadKind::GroupCommit`](crate::WorkloadKind::GroupCommit) row mutation.
+    fn commit(&self, row: Vec<u8>, rng: &mut Rng) -> BenchOp {
+        BenchOp::Put {
+            row,
+            family: YCSB_FAMILY,
+            cells: (0..GROUP_COMMIT_CELLS)
+                .map(|f| (field(f), self.value(rng)))
+                .collect(),
+        }
+    }
+
     fn value(&self, rng: &mut Rng) -> Vec<u8> {
         rng.bytes(self.config.value_len)
     }
@@ -236,6 +258,7 @@ impl Iterator for LoadIter<'_> {
                     family: YCSB_FAMILY,
                     cells: vec![(field(0), g.value(rng))],
                 },
+                WorkloadKind::GroupCommit => g.commit(ycsb_key(i), rng),
                 WorkloadKind::SparseWide => {
                     let n = rng.range(0, 2 * SPARSE_MEAN_CELLS);
                     if n == 0 {
@@ -438,6 +461,11 @@ impl Iterator for RunIter<'_> {
                 family: YCSB_FAMILY,
                 cells: vec![(field(0), g.value(&mut self.rng))],
             },
+            // Uniform rows: concurrent commits rarely touch the same row.
+            WorkloadKind::GroupCommit => {
+                let row = ycsb_key(self.rng.below(g.n_items));
+                g.commit(row, &mut self.rng)
+            }
         };
         Some(op)
     }
@@ -521,6 +549,33 @@ mod tests {
             .count() as f64
             / cfg.operations as f64;
         assert!((scans - 0.95).abs() < 0.02, "scans {scans} seed {seed}");
+    }
+
+    #[test]
+    fn group_commits_are_small_row_mutations_of_loaded_rows() {
+        let (load, run) = ops(WorkloadKind::GroupCommit, 7);
+        let rows: BTreeSet<Vec<u8>> = load
+            .iter()
+            .map(|op| match op {
+                BenchOp::Put { row, .. } => row.clone(),
+                other => panic!("load is puts, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            rows.len() as u64,
+            WorkloadConfig::smoke(WorkloadKind::GroupCommit).records
+        );
+        let mut touched = BTreeSet::new();
+        for op in &run {
+            let BenchOp::Put { row, cells, .. } = op else {
+                panic!("group-commit runs puts, got {op:?}")
+            };
+            assert_eq!(cells.len() as u64, GROUP_COMMIT_CELLS);
+            assert!(rows.contains(row), "seed 7");
+            touched.insert(row.clone());
+        }
+        // Uniform: 2,000 commits over 1,000 rows touch most of them.
+        assert!(touched.len() > 800, "seed 7: {} rows", touched.len());
     }
 
     #[test]
