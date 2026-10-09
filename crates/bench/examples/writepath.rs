@@ -29,6 +29,7 @@ use measure::Measured;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -45,8 +46,7 @@ fn main() {
     let base = std::path::PathBuf::from(args.next().expect(usage));
     let dir = base.join(format!("phdb-writepath-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let ctl = Arc::new(Ctl::default());
-    let (db, drivers) = open(&dir.join("w.phdb"), &ctl);
+    let (db, drivers, ctl) = open(&dir.join("w.phdb"));
     let t = db
         .table("t")
         .unwrap()
@@ -65,15 +65,30 @@ fn main() {
     // The measured work starts and ends with every shard idle: what the setup left running
     // finishes outside `shape_run_shard`, and what the measured work leaves running (the
     // shard's side of the last commit, say) finishes inside it, before the close.
-    let measure = |f: &mut dyn FnMut()| {
+    //
+    // The measured work runs on threads spawned for it, the shards' side and the caller's:
+    // glibc gives a new thread its own allocator arena and cache, so its allocations do not
+    // depend on the heap the setup left, which varies with thread timing (perf287's #354
+    // found up to 3%). The setup's shard threads stay alive meanwhile, so a measured thread
+    // cannot take over one of their arenas.
+    let measure = |f: &mut (dyn FnMut() + Send)| {
         if setup_only {
             return;
         }
         ctl.wait_idle();
         ctl.measuring.store(true, Ordering::Release);
-        f();
+        ctl.wake();
+        // Every shard is with its measured thread before the measured work starts.
+        while ctl.handed.load(Ordering::Acquire) < ctl.shards {
+            thread::yield_now();
+        }
+        thread::scope(|s| s.spawn(f).join().expect("the measured thread panicked"));
         ctl.wait_idle();
         ctl.measuring.store(false, Ordering::Release);
+        ctl.wake();
+        while ctl.handed.load(Ordering::Acquire) > 0 {
+            thread::yield_now();
+        }
     };
     let units = match shape.as_str() {
         "commit-one" => {
@@ -117,13 +132,27 @@ fn main() {
 /// What the shard threads share with the main thread.
 #[derive(Default)]
 struct Ctl {
-    /// Whether a shape is being measured: a shard woken then runs in `shape_run_shard`.
+    /// Whether a shape is being measured: each shard is then driven, in `shape_run_shard`,
+    /// by a thread spawned for the measurement.
     measuring: AtomicBool,
     /// Shard threads running (not parked).
     busy: AtomicUsize,
+    /// The number of shards.
+    shards: usize,
+    /// Shards with their measured thread.
+    handed: AtomicUsize,
+    /// The threads driving the shards now, to wake when `measuring` changes.
+    drivers: Mutex<Vec<thread::Thread>>,
 }
 
 impl Ctl {
+    /// Wakes every thread driving a shard.
+    fn wake(&self) {
+        for t in self.drivers.lock().unwrap().iter() {
+            t.unpark();
+        }
+    }
+
     /// Waits until every shard thread is parked: nothing left to run.
     fn wait_idle(&self) {
         while self.busy.load(Ordering::Acquire) > 0 {
@@ -133,7 +162,7 @@ impl Ctl {
 }
 
 /// Opens with application-owned shards, each driven by a thread of its own.
-fn open(path: &Path, ctl: &Arc<Ctl>) -> (Pigeonhole, Vec<thread::JoinHandle<()>>) {
+fn open(path: &Path) -> (Pigeonhole, Vec<thread::JoinHandle<()>>, Arc<Ctl>) {
     let (db, shards) = Pigeonhole::open_application_owned(
         path,
         Options::default()
@@ -144,32 +173,69 @@ fn open(path: &Path, ctl: &Arc<Ctl>) -> (Pigeonhole, Vec<thread::JoinHandle<()>>
             .block_cache(256 << 20),
     )
     .expect("open");
+    let ctl = Arc::new(Ctl {
+        shards: shards.len(),
+        ..Ctl::default()
+    });
     let drivers = shards
         .into_iter()
         .map(|shard| {
-            let ctl = Arc::clone(ctl);
+            let ctl = Arc::clone(&ctl);
             ctl.busy.fetch_add(1, Ordering::AcqRel);
-            thread::spawn(move || drive(shard, &ctl))
+            thread::spawn(move || run(shard, &ctl))
         })
         .collect();
-    (db, drivers)
+    (db, drivers, ctl)
 }
 
-/// A shard's loop (see `Pigeonhole::open_application_owned`), inside `shape_run_shard`
-/// while a shape is measured. `busy` counts it while it runs.
-fn drive(mut shard: Shard, ctl: &Ctl) {
-    let me = thread::current();
-    shard.set_wakeup(Box::new(move || me.unpark()));
+/// A shard's thread: drives it through the setup, hands it to a thread spawned for the
+/// measurement (waiting, alive, until it comes back), then drives it to the close.
+fn run(mut shard: Shard, ctl: &Ctl) {
     loop {
-        if ctl.measuring.load(Ordering::Acquire) {
+        let Some(next) = drive(shard, ctl, false) else {
+            return;
+        };
+        shard = next;
+        let back = thread::scope(|s| {
+            s.spawn(|| {
+                ctl.busy.fetch_add(1, Ordering::AcqRel);
+                ctl.handed.fetch_add(1, Ordering::AcqRel);
+                let back = drive(shard, ctl, true);
+                ctl.handed.fetch_sub(1, Ordering::AcqRel);
+                back
+            })
+            .join()
+            .expect("a measured shard thread panicked")
+        });
+        let Some(back) = back else {
+            return;
+        };
+        shard = back;
+        ctl.busy.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// A shard's loop (see `Pigeonhole::open_application_owned`) on this thread, in
+/// `shape_run_shard` if `measured`, until the shard closes (`None`) or `measuring` changes
+/// (the shard, idle, for the next thread). `busy` counts the thread while it runs (the
+/// caller counted it in).
+fn drive(mut shard: Shard, ctl: &Ctl, measured: bool) -> Option<Shard> {
+    let me = thread::current();
+    let wake = me.clone();
+    shard.set_wakeup(Box::new(move || wake.unpark()));
+    ctl.drivers.lock().unwrap().push(me.clone());
+    let driven = loop {
+        if measured {
             shape_run_shard(&mut shard);
         } else {
             run_shard(&mut shard);
         }
         if let Some(closed) = shard.closed() {
-            ctl.busy.fetch_sub(1, Ordering::AcqRel);
             closed.unwrap();
-            return;
+            break None;
+        }
+        if ctl.measuring.load(Ordering::Acquire) != measured {
+            break Some(shard);
         }
         ctl.busy.fetch_sub(1, Ordering::AcqRel);
         match shard.next_wakeup() {
@@ -177,7 +243,10 @@ fn drive(mut shard: Shard, ctl: &Ctl) {
             None => thread::park(),
         }
         ctl.busy.fetch_add(1, Ordering::AcqRel);
-    }
+    };
+    ctl.drivers.lock().unwrap().retain(|t| t.id() != me.id());
+    ctl.busy.fetch_sub(1, Ordering::AcqRel);
+    driven
 }
 
 // The two loops must not compile to the same code: rustc merges identical functions, and
