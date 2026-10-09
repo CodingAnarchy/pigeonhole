@@ -42,7 +42,7 @@ env:
   # contract of scripts/instructions-per-cell.sh. Add a shape here and it is reported and
   # checked for regressions on every PR.
   SHAPES: >-
-    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter
+    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,short-scans
     writepath:commit-one,commit-sixteen,flush,compact
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
