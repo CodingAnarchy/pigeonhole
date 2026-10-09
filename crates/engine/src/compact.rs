@@ -474,6 +474,12 @@ pub(crate) struct CompactionWork {
     blob_refs: BlobRefs,
     meta: FamilyMeta,
     record: Option<CompactionRecord>,
+    /// A bottommost purge's guard (#316): its commit installs only if no write below its
+    /// `min_ts_above` voided it since the plan (see `Shard::admit_against_guards`).
+    pub guard: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Test hook (`Engine::hold_compactions`): held before the first slice, then released.
+    #[cfg(feature = "test-hooks")]
+    hold: (bool, bool),
     stage: Stage,
     waker: StdWaker,
     started: u64,
@@ -539,6 +545,9 @@ impl CompactionWork {
             blob_refs: Vec::new(),
             meta,
             record,
+            guard: None,
+            #[cfg(feature = "test-hooks")]
+            hold: (false, false),
             stage: Stage::Run,
             waker: StdWaker::default(),
             started,
@@ -776,10 +785,12 @@ impl CompactionWork {
         // Blob live counts change against the catalog at commit time: other compactions of
         // the family (other tablets after a split share its blob files) commit meanwhile.
         let mut on_refusal = Vec::new();
-        let kind = if blobs.is_empty() {
+        let guard = self.guard.clone();
+        let kind = if blobs.is_empty() && guard.is_none() {
             manifest::ReqKind::Edits(edits)
         } else {
-            // Freed by the writer if `blob_edits` refuses (an undercounted file).
+            // Freed by the writer if the closure refuses (an undercounted blob file, or a
+            // voided guard).
             on_refusal = edits.clone();
             on_refusal.extend(blobs.new.iter().map(|f| Edit::PutBlobFile {
                 blob_file: f.id,
@@ -789,8 +800,26 @@ impl CompactionWork {
                 live_bytes: f.total_bytes,
             }));
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
+                // A bottommost purge installs only if no write below its bound arrived
+                // since the plan; from here on such writes wait for this commit (#316).
+                if let Some(g) = &guard {
+                    use crate::shard::{GUARD_IN_FLIGHT, GUARD_INSTALLING};
+                    use std::sync::atomic::Ordering;
+                    match g.compare_exchange(
+                        GUARD_IN_FLIGHT,
+                        GUARD_INSTALLING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        // A re-run of this closure finds its own claim.
+                        Ok(_) | Err(GUARD_INSTALLING) => {}
+                        Err(_) => return Err(Error::Busy),
+                    }
+                }
                 let mut edits = edits;
-                edits.extend(blob_edits(catalog, blobs)?);
+                if !blobs.is_empty() {
+                    edits.extend(blob_edits(catalog, blobs)?);
+                }
                 Ok(edits)
             }))
         };
@@ -886,6 +915,40 @@ impl Task for CompactionWork {
         loop {
             match &mut self.stage {
                 Stage::Run => {
+                    #[cfg(feature = "test-hooks")]
+                    if !self.hold.1
+                        && self
+                            .shared
+                            .hooks
+                            .compaction_hold
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        let mut held = self
+                            .shared
+                            .hooks
+                            .compaction_held
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if self.hold.0 && held.is_none() {
+                            // Released.
+                            self.hold.1 = true;
+                        } else {
+                            *held = Some(waker.clone());
+                            self.hold.0 = true;
+                            return TaskPoll::Blocked;
+                        }
+                    }
+                    // A write voided the purge (#316): the commit would be refused, so stop
+                    // now rather than finish the rewrite.
+                    if self.guard.as_ref().is_some_and(|g| {
+                        g.load(std::sync::atomic::Ordering::Acquire) == crate::shard::GUARD_VOIDED
+                    }) {
+                        if let Some(job) = self.job.take() {
+                            job.abort();
+                        }
+                        self.report(Err(Error::Busy));
+                        return TaskPoll::Done;
+                    }
                     let output = match self.job.take() {
                         Some(mut job) => match job.run(deadline_nanos) {
                             Ok(JobPoll::Pending) => {
