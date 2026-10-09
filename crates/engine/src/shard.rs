@@ -19,7 +19,7 @@ use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::{CompactionPicker, MergingCursor, PickerOptions, ResolveOptions};
 use pigeonhole_format::hash::{FastBuildHasher, FastMap, FastSet};
 use pigeonhole_format::key::{
-    compare, encode_key, encode_marker_key, encode_row_prefix, split_suffix,
+    compare, encode_key_after_row, encode_marker_after_row, encode_row_prefix, split_suffix,
 };
 use pigeonhole_format::manifest::{CompactionStyle, Edit, FamilyKind};
 use pigeonhole_format::scan::ScanFilter;
@@ -1476,17 +1476,22 @@ impl Dedup {
         if n < 2 {
             return false;
         }
-        self.order.clear();
-        self.order.extend(0..n as u32);
         let keys = &self.keys;
         let part = |at: (u32, u32)| span(bytes, at);
         let cmp = |a: &MutKey, b: &MutKey| {
             (a.table, a.family, a.marker())
                 .cmp(&(b.table, b.family, b.marker()))
-                .then_with(|| part(a.row).cmp(part(b.row)))
-                .then_with(|| part(a.qualifier).cmp(part(b.qualifier)))
+                .then_with(|| compare(part(a.row), part(b.row)))
+                .then_with(|| compare(part(a.qualifier), part(b.qualifier)))
                 .then_with(|| a.ts.cmp(&b.ts))
         };
+        // Already strictly increasing (a row's cells in qualifier order, a sorted batch): no
+        // two are equal, so nothing collapses and the sort is skipped.
+        if keys.windows(2).all(|w| cmp(&w[0], &w[1]).is_lt()) {
+            return false;
+        }
+        self.order.clear();
+        self.order.extend(0..n as u32);
         self.order
             .sort_unstable_by(|a, b| cmp(&keys[*a as usize], &keys[*b as usize]).then(a.cmp(b)));
         let mut dup = false;
@@ -3515,6 +3520,8 @@ impl ShardState {
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let tablets = Arc::clone(&self.tablets);
         let mut last_route: Option<(TableId, &[u8], TabletId)> = None;
+        // The row whose escaped prefix `key_buf` starts with, and its length.
+        let mut row_prefix: Option<(&[u8], usize)> = None;
         let mut key_buf = std::mem::take(&mut self.key_buf);
         let mut result = Ok(());
         self.touched_slots.clear();
@@ -3577,13 +3584,26 @@ impl ShardState {
                 continue;
             }
             let ts = m.ts.unwrap_or(commit_ts);
-            key_buf.clear();
-            let encoded = if m.kind == Kind::FamilyDelete {
-                encode_marker_key(&mut key_buf, m.row, ts, seqno)
-            } else {
-                encode_key(&mut key_buf, m.row, m.qualifier, ts, seqno, m.kind)
+            // The escaped row stays in `key_buf` across a run of writes to one row: only the
+            // qualifier and suffix are encoded for each.
+            let row_len = match row_prefix {
+                Some((row, len)) if compare(row, m.row).is_eq() => len,
+                _ => {
+                    key_buf.clear();
+                    if let Err(e) = encode_row_prefix(&mut key_buf, m.row) {
+                        result = Err(e.into());
+                        break;
+                    }
+                    row_prefix = Some((m.row, key_buf.len()));
+                    key_buf.len()
+                }
             };
-            if let Err(e) = encoded {
+            key_buf.truncate(row_len);
+            if m.kind == Kind::FamilyDelete {
+                encode_marker_after_row(&mut key_buf, ts, seqno);
+            } else if let Err(e) =
+                encode_key_after_row(&mut key_buf, m.qualifier, ts, seqno, m.kind)
+            {
                 result = Err(e.into());
                 break;
             }
@@ -6528,6 +6548,48 @@ impl ShardHandler for ShardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The D34 collapse finds the same losers whether a batch arrives strictly increasing
+    /// (the sort is skipped), out of order, or with repeats inside an increasing run.
+    #[test]
+    fn dedup_finds_the_losers_in_any_order() {
+        let (t, f) = (TableId(1), FamilyId(1));
+        let scan = |cells: &[(&[u8], &[u8], Option<u64>)]| {
+            let mut b = BatchBuilder::new();
+            for (row, q, ts) in cells {
+                b.push(t, f, Kind::Put, row, q, *ts, b"v").unwrap();
+            }
+            let batch = b.batch();
+            let mut d = Dedup::default();
+            let dup = d.scan(batch, batch.as_bytes(), 9);
+            (dup, (0..cells.len()).map(|i| d.wins(i)).collect::<Vec<_>>())
+        };
+        // A row's cells in order: nothing collapses.
+        assert_eq!(
+            scan(&[(b"r", b"a", None), (b"r", b"b", None), (b"s", b"a", None)]),
+            (false, vec![true, true, true])
+        );
+        // Out of order with one repeat: the earlier copy loses.
+        assert_eq!(
+            scan(&[(b"r", b"b", None), (b"r", b"a", None), (b"r", b"b", None)]),
+            (true, vec![false, true, true])
+        );
+        // Increasing but for a repeat next to its first copy (a default timestamp equals the
+        // commit's, 9): the sort runs and the first copy loses.
+        assert_eq!(
+            scan(&[
+                (b"r", b"a", None),
+                (b"r", b"b", Some(9)),
+                (b"r", b"b", None)
+            ]),
+            (true, vec![true, false, true])
+        );
+        // Same column at two timestamps is two cells.
+        assert_eq!(
+            scan(&[(b"r", b"a", Some(3)), (b"r", b"a", Some(4))]),
+            (false, vec![true, true])
+        );
+    }
 
     /// Issue #244: a room wait whose timeout timer saw the clock move sleeps towards a
     /// deadline a stopped clock never reaches, and a shard kicked by each re-check never goes
