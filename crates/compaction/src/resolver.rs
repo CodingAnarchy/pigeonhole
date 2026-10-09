@@ -315,7 +315,7 @@ pub struct CellResolver<C> {
 /// column with many versions (a hot cell overwritten hundreds of times, all still in the
 /// memtable) is then passed with a forward seek of the sources inside it (usually one)
 /// instead of a step per version; a column with a few versions keeps the cheaper steps.
-const SKIP_STEPS: u32 = 16;
+const SKIP_STEPS: u32 = 100_000;
 
 /// Whether internal key `k` is in column `col` and in row `row` (`col` starts with `row`
 /// when set), from one comparison with `col`.
