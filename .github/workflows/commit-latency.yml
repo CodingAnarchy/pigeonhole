@@ -8,6 +8,8 @@ name: Commit latency (Linux, indicative)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [scratch/commit-latency]
 
 permissions:
   contents: read
