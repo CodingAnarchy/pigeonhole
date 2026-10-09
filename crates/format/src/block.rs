@@ -568,13 +568,15 @@ enum KeySrc {
 
 /// Keys up to this long are rebuilt inline, so a cursor allocates nothing for them, even
 /// when one is created per lookup.
-const INLINE_KEY: usize = 128;
+const INLINE_KEY: usize = 127;
 
-/// A key buffer that lives inline until a key outgrows it.
+/// A key buffer that lives inline until a key outgrows it. The inline length is a `u8` at most
+/// `INLINE_KEY`, sliced through `len & 0x7F`, so slicing the 128-byte buffer needs no bounds
+/// check (and a cursor still zeroes only 128 bytes when it is made).
 #[derive(Debug, Clone)]
 struct KeyBuf {
-    inline: [u8; INLINE_KEY],
-    len: usize,
+    inline: [u8; INLINE_KEY + 1],
+    len: u8,
     heap: Vec<u8>,
     spilled: bool,
 }
@@ -582,7 +584,7 @@ struct KeyBuf {
 impl KeyBuf {
     fn new() -> Self {
         Self {
-            inline: [0; INLINE_KEY],
+            inline: [0; INLINE_KEY + 1],
             len: 0,
             heap: Vec::new(),
             spilled: false,
@@ -593,7 +595,7 @@ impl KeyBuf {
         if self.spilled {
             &self.heap
         } else {
-            &self.inline[..self.len]
+            &self.inline[..usize::from(self.len & 0x7F)]
         }
     }
 
@@ -610,20 +612,21 @@ impl KeyBuf {
     fn truncate(&mut self, n: usize) {
         if self.spilled {
             self.heap.truncate(n);
-        } else {
-            self.len = self.len.min(n);
+        } else if n < usize::from(self.len) {
+            self.len = n as u8;
         }
     }
 
     fn extend_from_slice(&mut self, b: &[u8]) {
         if !self.spilled {
-            if self.len + b.len() <= INLINE_KEY {
-                self.inline[self.len..self.len + b.len()].copy_from_slice(b);
-                self.len += b.len();
+            let len = usize::from(self.len);
+            if len + b.len() <= INLINE_KEY {
+                self.inline[len..len + b.len()].copy_from_slice(b);
+                self.len = (len + b.len()) as u8;
                 return;
             }
             self.heap.clear();
-            self.heap.extend_from_slice(&self.inline[..self.len]);
+            self.heap.extend_from_slice(&self.inline[..len]);
             self.spilled = true;
         }
         self.heap.extend_from_slice(b);

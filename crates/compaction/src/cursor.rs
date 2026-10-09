@@ -40,6 +40,9 @@ pub struct MergingCursor<C> {
     row: Vec<u8>,
     /// The heap position (1 or 2) of the smaller child of the top, when there is one.
     runner: usize,
+    /// The source at the top of the heap (`heap[0]`), kept beside it so `key` and `value`
+    /// read it without a bounds check on the heap; 0 when the heap is empty.
+    top: usize,
 }
 
 impl<C: Cursor> MergingCursor<C> {
@@ -51,6 +54,7 @@ impl<C: Cursor> MergingCursor<C> {
             heap,
             row: Vec::new(),
             runner: 0,
+            top: 0,
         }
     }
 
@@ -96,11 +100,13 @@ impl<C: Cursor> MergingCursor<C> {
             heap,
             row,
             runner,
+            top,
         } = self;
         heap.clear();
         heap.reserve(sources.len());
         row.clear();
         *runner = 0;
+        *top = 0;
     }
 
     fn less(&self, a: usize, b: usize) -> bool {
@@ -148,6 +154,7 @@ impl<C: Cursor> MergingCursor<C> {
 
     /// Finds the smaller child of the top after the heap changed (0 when there is none).
     fn set_runner(&mut self) {
+        self.top = self.heap.first().copied().unwrap_or(0);
         self.runner = match self.heap.len() {
             0 | 1 => 0,
             2 => 1,
@@ -164,11 +171,11 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
     }
 
     fn key(&self) -> &[u8] {
-        self.sources[self.heap[0]].key()
+        self.sources[self.top].key()
     }
 
     fn value(&self) -> &[u8] {
-        self.sources[self.heap[0]].value()
+        self.sources[self.top].value()
     }
 
     fn seek_to_first(&mut self) -> Result<(), C::Error> {
