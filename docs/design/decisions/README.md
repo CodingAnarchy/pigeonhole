@@ -208,6 +208,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D192](phase-2.md#d192) — A bottommost compaction's purge runs under the D191 guard, with a fallback after repeated voids · engine, #316, #328 · refines D70, D191
 - [D193](phase-2.md#d193) — The Phase 2 gate is amended: required measures, a documented gap (#387), and floors that may not regress · owner decision, #287, #387 · amends the spec Phase 2 gate
 - [D194](phase-3.md#d194) — Reads skip superseded memtable versions through a writer-only, process-local stale-tail index; off until measured · owner decision, #387 · in-node alternative deferred as #397
+- [D195](phase-3.md#d195) — Three instruction ceilings are raised to main's counts (#384 raced the ceilings; get-sst placement drift); ceiling changes are measured on the current main · owner decision, bench, CI · amends D193
 
 ## Open questions
 _None._
