@@ -68,42 +68,106 @@ pub fn compress_with_level(
     input: &[u8],
     out: &mut Vec<u8>,
 ) -> crate::Result<Compression> {
-    match codec {
-        Compression::None => {}
-        Compression::Lz4 => {
-            let start = out.len();
-            out.resize(
-                start + lz4_flex::block::get_maximum_output_size(input.len()),
-                0,
-            );
-            let n = lz4_flex::block::compress_into(input, &mut out[start..]).map_err(|_| {
-                Error::Corrupt {
-                    what: "lz4 compress",
-                }
-            })?;
-            out.truncate(start + n);
-            // Keep the compressed form only if it saves at least 1/8 of the input.
-            if n < input.len() && (input.len() - n) * 8 >= input.len() {
-                return Ok(Compression::Lz4);
-            }
-            out.truncate(start);
-        }
-        Compression::Zstd => {
-            let start = out.len();
-            out.resize(start + zstd::zstd_safe::compress_bound(input.len()), 0);
-            let n = zstd::bulk::compress_to_buffer(input, &mut out[start..], i32::from(level))
-                .map_err(|_| Error::Corrupt {
-                    what: "zstd compress",
-                })?;
-            out.truncate(start + n);
-            if n < input.len() && (input.len() - n) * 8 >= input.len() {
-                return Ok(Compression::Zstd);
-            }
-            out.truncate(start);
-        }
+    Compressor::default().compress(codec, level, input, out)
+}
+
+/// Compression state kept across blocks, so a writer compressing many blocks allocates and
+/// zero-fills once rather than per block: the LZ4 hash table, the zstd context, and a scratch
+/// buffer the codec writes into (sized to the largest output yet, zeroed only when it
+/// grows), from which only the compressed bytes are copied out. The results are the same as
+/// [`compress_with_level`]'s.
+///
+/// ```
+/// use pigeonhole_format::compress::{Compression, Compressor, decompress};
+///
+/// let mut c = Compressor::default();
+/// let mut packed = Vec::new();
+/// for block in [vec![7u8; 4096], vec![9u8; 4096]] {
+///     packed.clear();
+///     assert_eq!(c.compress(Compression::Lz4, 3, &block, &mut packed).unwrap(), Compression::Lz4);
+///     let mut back = vec![0; block.len()];
+///     decompress(Compression::Lz4, &packed, &mut back).unwrap();
+///     assert_eq!(back, block);
+/// }
+/// ```
+#[derive(Default)]
+pub struct Compressor {
+    lz4: Option<lz4_flex::block::CompressTable>,
+    zstd: Option<(i8, zstd::bulk::Compressor<'static>)>,
+    scratch: Vec<u8>,
+}
+
+impl std::fmt::Debug for Compressor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compressor")
+            .field("scratch", &self.scratch.len())
+            .finish_non_exhaustive()
     }
-    out.extend_from_slice(input);
-    Ok(Compression::None)
+}
+
+impl Compressor {
+    /// Compresses `input` with `codec` (zstd at `level`), appending to `out`. Returns the codec
+    /// actually used: [`Compression::None`] when compression would not save at least 1/8 of
+    /// the size (`input` is then appended as is).
+    pub fn compress(
+        &mut self,
+        codec: Compression,
+        level: i8,
+        input: &[u8],
+        out: &mut Vec<u8>,
+    ) -> crate::Result<Compression> {
+        let n = match codec {
+            Compression::None => None,
+            Compression::Lz4 => {
+                let max = lz4_flex::block::get_maximum_output_size(input.len());
+                let table = self.lz4.get_or_insert_with(Default::default);
+                let scratch = grow(&mut self.scratch, max);
+                let n = lz4_flex::block::compress_into_with_table(input, scratch, table).map_err(
+                    |_| Error::Corrupt {
+                        what: "lz4 compress",
+                    },
+                )?;
+                Some(n)
+            }
+            Compression::Zstd => {
+                let bound = zstd::zstd_safe::compress_bound(input.len());
+                if self.zstd.as_ref().is_none_or(|(l, _)| *l != level) {
+                    let c = zstd::bulk::Compressor::new(i32::from(level)).map_err(|_| {
+                        Error::Corrupt {
+                            what: "zstd compress",
+                        }
+                    })?;
+                    self.zstd = Some((level, c));
+                }
+                let scratch = grow(&mut self.scratch, bound);
+                let (_, c) = self.zstd.as_mut().expect("set above");
+                let n = c
+                    .compress_to_buffer(input, scratch)
+                    .map_err(|_| Error::Corrupt {
+                        what: "zstd compress",
+                    })?;
+                Some(n)
+            }
+        };
+        // Keep the compressed form only if it saves at least 1/8 of the input.
+        if let Some(n) = n
+            && n < input.len()
+            && (input.len() - n) * 8 >= input.len()
+        {
+            out.extend_from_slice(&self.scratch[..n]);
+            return Ok(codec);
+        }
+        out.extend_from_slice(input);
+        Ok(Compression::None)
+    }
+}
+
+/// The first `len` bytes of `scratch`, grown (and zeroed) only past its largest size yet.
+fn grow(scratch: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if scratch.len() < len {
+        scratch.resize(len, 0);
+    }
+    &mut scratch[..len]
 }
 
 /// Decompresses `input` into `out`, which must be exactly `uncompressed_len` bytes long.

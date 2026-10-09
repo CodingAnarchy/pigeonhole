@@ -1,8 +1,9 @@
 //! Building an SST (FORMAT §5): data blocks streamed to the extent as they fill, then index
 //! partitions, top index, filters, properties and, in a separate final write, the footer.
 
-use pigeonhole_format::block::{BlockAddr, BlockBuilder, BlockKind, TRAILER_LEN, seal_with_level};
+use pigeonhole_format::block::{BlockAddr, BlockBuilder, BlockKind, TRAILER_LEN, seal_with};
 use pigeonhole_format::compress::Compression;
+use pigeonhole_format::compress::Compressor;
 use pigeonhole_format::filter::{FilterBuilder, column_hash, row_hash};
 use pigeonhole_format::key::{SUFFIX_LEN, decode_key};
 use pigeonhole_format::manifest::SstMeta;
@@ -54,6 +55,8 @@ pub(crate) struct Writer {
     props: Properties,
     scratch: Vec<u8>,
     addr_buf: Vec<u8>,
+    /// Kept across the blocks this SST seals (no per-block table or buffer zero-fill).
+    compressor: Compressor,
 }
 
 impl std::fmt::Debug for Writer {
@@ -100,6 +103,7 @@ impl Writer {
             props,
             scratch: Vec::new(),
             addr_buf: Vec::new(),
+            compressor: Compressor::default(),
             opts,
         }
     }
@@ -235,12 +239,13 @@ impl Writer {
     fn seal_data_block(&mut self) -> Result<()> {
         let offset = self.flushed + self.out.len() as u64;
         let start = self.out.len();
-        seal_with_level(
+        seal_with(
             BlockKind::Data,
             self.opts.compression,
             self.opts.compression_level,
             self.data.finish(),
             &mut self.out,
+            &mut self.compressor,
         )?;
         self.data.reset();
         let len = (self.out.len() - start) as u32;
@@ -280,12 +285,13 @@ impl Writer {
 
     fn seal_partition(&mut self) -> Result<()> {
         let offset = self.index_out.len() as u64;
-        seal_with_level(
+        seal_with(
             BlockKind::Index,
             self.opts.compression,
             self.opts.compression_level,
             self.index.finish(),
             &mut self.index_out,
+            &mut self.compressor,
         )?;
         let len = (self.index_out.len() as u64 - offset) as u32;
         self.partitions
@@ -388,12 +394,13 @@ impl Writer {
         fill(&mut self.scratch);
         let offset = self.flushed + self.out.len() as u64;
         let start = self.out.len();
-        seal_with_level(
+        seal_with(
             kind,
             codec,
             self.opts.compression_level,
             &self.scratch,
             &mut self.out,
+            &mut self.compressor,
         )?;
         let len = (self.out.len() - start) as u32;
         self.check_room(offset + u64::from(len))?;
