@@ -537,8 +537,8 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("get, memtable (snapshot)", "get", 9.0),
     ("get_latest, memtable", "get", 9.0),
     ("get_latest, memtable miss", "get", 7.0),
-    ("get_latest, SST, block cached", "get", 10.0),
-    ("get, SST, block cached (snapshot)", "get", 10.0),
+    ("get_latest, SST, block cached", "get", 8.0),
+    ("get, SST, block cached (snapshot)", "get", 8.0),
     ("read_row, memtable", "row", 15.0),
     ("read_row, memtable", "extra cell", 0.5),
     ("read_row, SST, cached", "row", 16.0),
@@ -552,6 +552,15 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("commit, 16 cells, 8 per group", "commit", 7.5),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
+];
+
+/// Bytes allocated per unit allowed, where the bytes are what a change cut (#46: a point
+/// get's sources were sized for four, about 4 KiB).
+const BYTE_BUDGETS: &[(&str, &str, f64)] = &[
+    ("get, memtable (snapshot)", "get", 1_400.0),
+    ("get_latest, memtable", "get", 1_400.0),
+    ("get_latest, memtable miss", "get", 1_250.0),
+    ("get_latest, SST, block cached", "get", 2_300.0),
 ];
 
 /// Bytes allocated per value byte allowed: a large put (separated at commit) and a row read
@@ -593,6 +602,18 @@ fn allocations_per_operation() {
             over.push(format!(
                 "{path}: {:.2} allocations per {unit}, budget {budget}",
                 r.allocs
+            ));
+        }
+    }
+    for &(path, unit, budget) in BYTE_BUDGETS {
+        let r = out
+            .iter()
+            .find(|r| r.path == path && r.unit == unit)
+            .unwrap_or_else(|| panic!("no measurement for budget {path} / {unit}"));
+        if r.bytes > budget {
+            over.push(format!(
+                "{path}: {:.0} bytes per {unit}, budget {budget}",
+                r.bytes
             ));
         }
     }
