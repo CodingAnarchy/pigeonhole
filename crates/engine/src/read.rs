@@ -6,7 +6,7 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_compaction::{
-    BlobFetch, MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate,
+    BlobFetch, MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate, blob_pointer,
 };
 use pigeonhole_format::key::{
     Escaped, Kind, SUFFIX_LEN, TERMINATOR, decode_key, encode_row_prefix, row_prefix_len,
@@ -65,6 +65,37 @@ pub struct CellData {
 impl CellData {
     /// Values up to this many bytes are copied rather than pinned.
     pub const INLINE_MAX: usize = 128;
+
+    /// An empty inline value at timestamp 0, to be overwritten in place with
+    /// [`CellData::set_inline`].
+    pub const EMPTY: CellData = CellData {
+        ts: 0,
+        value: CellValue::Inline {
+            len: 0,
+            bytes: [0; Self::INLINE_MAX],
+        },
+    };
+
+    /// Makes this cell a copy of `stored` (a stored value of at most
+    /// [`CellData::INLINE_MAX`] bytes) at `ts`, reusing its inline bytes when it has them.
+    pub fn set_inline(&mut self, ts: Timestamp, stored: &[u8]) {
+        debug_assert!(stored.len() <= Self::INLINE_MAX);
+        self.ts = ts;
+        match &mut self.value {
+            CellValue::Inline { len, bytes } => {
+                bytes[..stored.len()].copy_from_slice(stored);
+                *len = stored.len() as u8;
+            }
+            v => {
+                let mut bytes = [0u8; Self::INLINE_MAX];
+                bytes[..stored.len()].copy_from_slice(stored);
+                *v = CellValue::Inline {
+                    len: stored.len() as u8,
+                    bytes,
+                };
+            }
+        }
+    }
 
     /// Builds a cell from a resolved one. `source` is the source the merged cursor is on
     /// (to pin a large value without copying); `pin` is called only when the value is large
@@ -353,6 +384,20 @@ pub trait RowSink {
     /// Appends a cell of `family` whose qualifier is `qualifier` within
     /// [`RowSink::qualifiers`].
     fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData);
+    /// Appends a cell whose value is a copy of `stored` (at most [`CellData::INLINE_MAX`]
+    /// bytes). Sinks that store cells in a vector override this to build the cell in place
+    /// rather than move it (#287).
+    fn push_inline(
+        &mut self,
+        family: FamilyId,
+        qualifier: std::ops::Range<usize>,
+        ts: Timestamp,
+        stored: &[u8],
+    ) {
+        let mut data = CellData::EMPTY;
+        data.set_inline(ts, stored);
+        self.push(family, qualifier, data);
+    }
 }
 
 impl RowSink for RowData {
@@ -366,6 +411,23 @@ impl RowSink for RowData {
             qualifier: qualifier.start as u32..qualifier.end as u32,
             data,
         });
+    }
+
+    fn push_inline(
+        &mut self,
+        family: FamilyId,
+        qualifier: std::ops::Range<usize>,
+        ts: Timestamp,
+        stored: &[u8],
+    ) {
+        self.cells.push(RowCell {
+            family,
+            qualifier: qualifier.start as u32..qualifier.end as u32,
+            data: CellData::EMPTY,
+        });
+        if let Some(c) = self.cells.last_mut() {
+            c.data.set_inline(ts, stored);
+        }
     }
 }
 
@@ -911,6 +973,13 @@ pub(crate) fn read_row_into(
                 let data = if cell.from_source && cell.value.len() > CellData::INLINE_MAX {
                     // Pinned below, once the borrow of the resolver ends.
                     None
+                } else if cell.value.len() <= CellData::INLINE_MAX
+                    && blob_pointer(cell.value).is_none()
+                {
+                    // Small and not separated: copied straight into the sink's cell.
+                    sink.push_inline(family, qualifier, cell.ts, cell.value);
+                    any = true;
+                    continue;
                 } else {
                     Some(CellData::resolved(&cell, &view.ssts, || Arc::clone(view))?)
                 };
@@ -1352,5 +1421,31 @@ mod tests {
                 c("s", "q", 1, b"s")
             ]
         );
+    }
+
+    #[test]
+    fn set_inline_overwrites_any_cell_in_place() {
+        use super::{CellData, CellValue};
+        let stored = |v: &[u8]| {
+            let mut out = Vec::new();
+            encode_value(&mut out, ValueRef::Bytes(v));
+            out
+        };
+        // From the empty cell, as `RowSink::push_inline` builds it.
+        let mut d = CellData::EMPTY;
+        d.set_inline(7, &stored(b"abc"));
+        assert_eq!((d.timestamp(), d.value()), (7, ValueRef::Bytes(b"abc")));
+        // A shorter value over a longer one keeps only its own bytes.
+        d.set_inline(8, &stored(b"x"));
+        assert_eq!((d.timestamp(), d.value()), (8, ValueRef::Bytes(b"x")));
+        // Over a cell that held a heap value.
+        let mut d = CellData {
+            ts: 1,
+            value: CellValue::Owned(stored(&[9; 300])),
+        };
+        let full = vec![5; CellData::INLINE_MAX - 1];
+        d.set_inline(2, &stored(&full));
+        assert!(matches!(d.value, CellValue::Inline { .. }));
+        assert_eq!((d.timestamp(), d.value()), (2, ValueRef::Bytes(&full[..])));
     }
 }
