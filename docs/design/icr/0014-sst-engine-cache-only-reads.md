@@ -73,7 +73,7 @@ D196: async reads must not block their executor thread on a block the cache does
   - A separated value is fetched like a block (#42's PR 2b): each blob extent header it touches, verified once, then the record, whose pieces (a record can span extents) are read and joined into one completion. One above the blob cache limit is read synchronously and counted (D196 option (a), #398).
 - **A row read restarts from an empty copy of its sink** (the futures require `S: Clone`). An earlier draft added a required `RowSink::clear`, which `cargo semver-checks` rejected against 0.2.0 as a breaking change, so `RowSink` is unchanged.
 
-## Amendment in #42's PR 2b
+## Amendment in #42's PR 2b (approved, coordinator, 2026-10-09)
 
 The approved surface changed in three ways, all inside `pigeonhole-sst` and its one caller (the engine's async futures):
 - `Fetch::admit` returns `Option<BlockHandle>`: a fetched blob extent header is kept as a verified flag, not as a block.
