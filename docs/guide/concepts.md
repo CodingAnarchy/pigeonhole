@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status: Phase 1 sync API implemented.** Features from later phases are labeled.
+> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Features from later phases are labeled.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 
@@ -26,8 +26,8 @@ Families are declared when a table is created (adding one later is cheap). Each 
 | `max_versions(n)` | Keep at most *n* versions per column (0 keeps all). |
 | `ttl(d)` | Cells whose timestamp is older than *d* expire. |
 | `bloom_bits(b)` | Bloom filter bits per key, to skip files on misses. |
-| `blob_threshold(bytes)` | Values larger than this (default 4096) move to blob files when they are flushed; the family's tree keeps a 16-byte pointer, so compaction and scans of other columns do not copy them. |
-| compression | LZ4 by default; `uncompressed()`; `zstd(level)`. |
+| `blob_threshold(bytes)` | Values larger than this (default 4096; `u32::MAX` never) move to blob files when they are flushed or compacted; the family's tree keeps a 16-byte pointer, so compaction and scans of other columns do not copy them. Blob GC rewrites a blob file once it is about half garbage, and `compact()` empties every file with garbage. Blob records are not compressed: for large compressible values, raise the threshold to keep them inline. |
+| compression | LZ4 by default; `uncompressed()`; `zstd(level)`: smaller blocks than LZ4 for more CPU, at libzstd levels 1–22 (higher is smaller and slower; negative is faster; default 3). |
 | cache priority | How long the family's blocks stay cached. |
 
 ### Compaction styles
@@ -57,6 +57,8 @@ Values are bytes, with typed forms for `i64` and `f64`. A value can be up to 4 G
 
 ## Deletes
 Deletes write markers: one cell version (`delete_cell`), a whole column (`delete_column`), a family within a row (`delete_family`), or a whole row (`delete_row`, which writes one family marker per family in the same atomic commit). A column or family delete with timestamp *T* hides every version in its scope with timestamp ≤ *T*, regardless of when it was written, so a later `put` with an older timestamp stays hidden; a `put` with a newer timestamp is visible again. A cell delete hides the version at exactly its timestamp, again regardless of when it was written: a later `put` at that same timestamp stays hidden, so write the replacement at another timestamp.
+
+In a counter family a delete hides only what earlier commits wrote, so counting starts again after it ([Counters](data-modeling.md#counters)).
 
 These rules hold only until compaction purges the markers (HBase semantics, decision D74). A bottommost compaction with no open snapshot that needs them removes delete markers and versions beyond `max_versions` for good. After that, a write with an **older explicit timestamp** (`put_at`, `delete_cell`) behaves as if they never existed: a `put_at` below a purged delete becomes visible, and deleting the newest version does not bring back a purged older one. Writes with default timestamps are never affected. See [Data modeling](data-modeling.md#versions).
 

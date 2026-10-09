@@ -1,6 +1,6 @@
 # Getting started
 
-> **Status: Phase 1 sync API implemented.** Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
+> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
 Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:
@@ -10,7 +10,7 @@ Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add
 pigeonhole = "0.1"
 ```
 
-This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
+This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). This guide describes `main`, released next as 0.2.0. Until then, the counter families, values above 64 MiB and FUSE opt-in it describes need a git dependency on the repository, and 0.1.0 behaves as its own docs say (the [changelog](../../CHANGELOG.md) lists every difference). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
 
 Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature (Phase 3) is off by default and currently gates an empty module.
 
@@ -222,6 +222,51 @@ let info = wb.commit_with(Durability::GroupSync)?;
 ```
 A `WriteBatch` spans any rows and tables, is atomic across all of them, and has **one durability point**. `commit()` uses the writer default; `commit_with(d)` overrides it for this commit. Builder methods take `&mut self` and return `&mut Self`, so chain them or call them in a loop. `commit` consumes the batch.
 
+## Conditional writes and transactions
+`commit_if` commits a row mutation only if a condition on that row holds, atomically (BigTable's `check_and_mutate`). It returns `None` when the condition failed and nothing was written.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let jobs = pigeonhole::doc_support::table(&db, "jobs", &["meta"])?;
+let unclaimed = Condition::Absent { family: "meta".into(), qualifier: b"owner".to_vec() };
+let first = jobs.mutate(b"job:1").put("meta", b"owner", b"w1").commit_if(&unclaimed)?;
+let second = jobs.mutate(b"job:1").put("meta", b"owner", b"w2").commit_if(&unclaimed)?;
+assert!(first.is_some() && second.is_none());
+
+// Compare a value: `ValueFilter::Equals`, `Prefix` or `I64(ordering, n)`.
+let is_w1 = Condition::Value {
+    family: "meta".into(),
+    qualifier: b"owner".to_vec(),
+    filter: ValueFilter::Equals(b"w1".to_vec()),
+};
+assert!(jobs.mutate(b"job:1").put("meta", b"state", b"done").commit_if(&is_w1)?.is_some());
+# Ok::<(), pigeonhole::Error>(())
+```
+`Condition::Exists` and `Condition::Absent` test a column, `Condition::Value` its newest value. The condition and the mutation are on one row.
+
+For invariants across rows, a `Transaction` (P4, available now) reads, buffers writes and commits them atomically. It is optimistic: if a commit changed anything it read before it commits, `commit` fails with `ErrorCode::Conflict` and nothing is written, so retry the whole transaction.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let bank = pigeonhole::doc_support::table(&db, "bank", &["acct"])?;
+# bank.mutate(b"alice").put("acct", b"balance", b"10").commit()?;
+let mut txn = db.transaction()?;
+let alice = txn.get(&bank, b"alice", "acct", b"balance")?.map(|c| c.to_owned());
+# assert_eq!(alice.unwrap().value(), b"10");
+txn.put(&bank, b"alice", "acct", b"balance", b"5")
+    .put(&bank, b"bob", "acct", b"balance", b"5");
+match txn.commit() {
+    Ok(_) => {}
+    Err(e) if e.code() == ErrorCode::Conflict => { /* re-read and try again */ }
+    Err(e) => return Err(e),
+}
+# Ok::<(), pigeonhole::Error>(())
+```
+
 ## Close
 ```rust
 # use pigeonhole::*;
@@ -270,7 +315,7 @@ assert_eq!(pages_copy.get(b"row", "meta", b"k")?.unwrap().value(), b"v");
 - `backup(dest)` writes a new file at `dest`, which must not exist, from a snapshot taken when you call it, so it holds exactly the commits visible at that moment. Commits that land while it runs are not in it. It holds that snapshot's memtables only while it copies them, at the start; the rest of the run holds only the snapshot's SST files, so writers are not stalled by a long backup. Separated values are copied into the copy's own blob files, which hold only the values the snapshot references.
 - The file does not shrink by itself: space freed by compaction is reused by later writes, but the file keeps its length. Call `compact()` and then `shrink()` to give space back to the filesystem.
 - `shrink()` returns the bytes released (`0` when there is nothing to release). It cuts off the free space at the end of the file, moves live data from the file's tail into free space nearer the start, then truncates again, so it costs a read and rewrite of that data. It runs online: other threads keep reading and writing. Space still held by an open snapshot or scan is released on a later call after you drop it. It fails with `ErrorCode::Closed` after `close`, `ErrorCode::NoSpace` if the disk is full when it moves the manifest (which needs a few KiB first), and `ErrorCode::Io` on a disk failure. Use it after a large delete, not routinely.
-- The file cannot end before its live data packed toward the start. Data lives in extents of a power of two from 64 KiB to 64 MiB, each aligned to its size, after a 64 KiB header, so a file holding a 64 MiB SST stays at least 128 MiB however few rows it has. Data with no free extent of its size below it stays put; `shrink` does not report that as an error.
+- After `compact()` and `shrink()`, a file above a few MiB is typically 1.05–1.2× its live data: compaction cuts its outputs into power-of-two pieces that pack tightly (D183), and `shrink` moves blob files as well as SSTs (D185). A small file is dominated by fixed metadata (about 1 MiB). Data with no free extent of its size below it stays put; `shrink` does not report that as an error.
 
 ## What happens when writes outrun the disk
 Reopening after a crash with fewer shards or a smaller `memtable_budget` than before works: if the WAL's unflushed data does not fit the memtable arenas, the open writes it to the file as it replays, which makes that open slower. A write that finds the memtable arena full waits (a write stall) while a flush frees room. `ErrorCode::Busy` means the wait ran past the stall timeout (`Options::write_stall_timeout`, 30 s by default): it is **transient**, so back off and retry. A single batch that can never fit a shard's arena (more than about half of it) fails at once with `ErrorCode::BatchTooLarge`, which never succeeds on retry: split the batch or raise `Options::memtable_budget`. See [Errors](errors.md).
@@ -287,7 +332,7 @@ Later phases:
 |---|---|
 | `async` front door (`get_async`, `Scan::stream`, `commit_async`) | 3 |
 
-Available ahead of their phase: `RowMutation::commit_if` (P2), `Transaction` and reader processes (`open_reader`) (P4).
+Available ahead of their phase: `Transaction` and reader processes (`open_reader`) (P4).
 
 ## Next
 [Durability](durability.md) · [Scans and filters](scans-and-filters.md) · [Data modeling](data-modeling.md) · [Errors](errors.md) · [Agent reference](agent-reference.md)

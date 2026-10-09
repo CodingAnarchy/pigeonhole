@@ -1,6 +1,6 @@
 # Status
 
-> **Maturity: experimental 0.x.** [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0) is on [crates.io](https://crates.io/crates/pigeonhole). The core engine (Phase 1) is complete and fault-tested in simulation, but the on-disk format and the API may change before 1.0 ([`FORMAT.md`](../FORMAT.md)). The wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Not recommended for production use yet. Keep this note in sync with each release.
+> **Maturity: experimental 0.x.** [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0) is on [crates.io](https://crates.io/crates/pigeonhole). The core engine (Phase 1) is complete and fault-tested in simulation. The wide-column model (Phase 2) is on `main` for 0.2.0, but its gate is not met yet ([#287](https://github.com/CodingAnarchy/pigeonhole/issues/287)). The on-disk format and the API may change before 1.0 ([`FORMAT.md`](../FORMAT.md)). The latency work (Phase 3) is still to come. Not recommended for production use yet. Keep this note in sync with each release.
 
 Live progress against the [build plan](design/spec.md#build-plan). Updated by the coordinator as work lands.
 
@@ -20,7 +20,7 @@ Every gate also requires the phase's GitHub milestone to have no open issues (D6
 | Phase | Gate | Milestone | State |
 |---|---|---|---|
 | 1. Core engine | Fault-injection suite green | [Phase 1](https://github.com/CodingAnarchy/pigeonhole/milestone/1) | **done** (gate passed 2026-10-08; [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0)) |
-| 2. Wide-column model | Sparse-wide bench beats SQLite EAV and hand-keyed RocksDB | [Phase 2](https://github.com/CodingAnarchy/pigeonhole/milestone/2) | in progress: baseline cleanup first ([#184](https://github.com/CodingAnarchy/pigeonhole/issues/184)) |
+| 2. Wide-column model | Sparse-wide bench beats SQLite EAV and hand-keyed RocksDB | [Phase 2](https://github.com/CodingAnarchy/pigeonhole/milestone/2) | in progress. On `main` for 0.2.0: counter families (D179, D186, D187), blob separation with values up to 4 GiB − 2 (D180, D188) and blob GC (D184), per-family compaction styles (D168), zstd (D175), a file at rest near its live size after `compact` and `shrink` (D183, D185), and the FUSE opt-in (D173). **The gate is not met yet**: sparse-wide is slower than SQLite EAV and RocksDB ([#287](https://github.com/CodingAnarchy/pigeonhole/issues/287)). |
 | 3. Latency engine | Goals-table p50/p99 met; within 1.5× of RocksDB | [Phase 3](https://github.com/CodingAnarchy/pigeonhole/milestone/3) | not started |
 | 4. Hardening and 1.0 | File format frozen | [Phase 4](https://github.com/CodingAnarchy/pigeonhole/milestone/4) | not started |
 
@@ -30,4 +30,4 @@ Deferred work is one GitHub issue each, labeled with its crate and phase and ass
 [Phase 3](https://github.com/CodingAnarchy/pigeonhole/milestone/3) ·
 [Phase 4](https://github.com/CodingAnarchy/pigeonhole/milestone/4).
 
-Known Phase 1 limits carried forward: write throughput does not yet scale with shards ([#154](https://github.com/CodingAnarchy/pigeonhole/issues/154), Phase 3; measurements in [bench.md](bench.md)), open latency is about 14 ms against the 5 ms goal ([#158](https://github.com/CodingAnarchy/pigeonhole/issues/158)). A file at rest used to be 2–4× its live data; after `compact` and `shrink` it is now 1.05–1.16× above 5 MiB ([#185](https://github.com/CodingAnarchy/pigeonhole/issues/185); see [pager questions](design/questions/pager.md)).
+Known Phase 1 limits carried forward: write throughput does not yet scale with shards ([#154](https://github.com/CodingAnarchy/pigeonhole/issues/154), Phase 3; measurements in [bench.md](bench.md)), open latency is about 14 ms against the 5 ms goal ([#158](https://github.com/CodingAnarchy/pigeonhole/issues/158)). A file at rest used to be 2–4× its live data; after `compact` and `shrink` it is now 1.05–1.16× above 5 MiB ([#185](https://github.com/CodingAnarchy/pigeonhole/issues/185), [D183](design/decisions/phase-2.md#d183)).

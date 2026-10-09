@@ -1,6 +1,6 @@
 # Data modeling
 
-> **Status: Phase 1 sync API implemented.** Phase 2+ features are labeled. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole is a sorted map. Good models make the reads you do most **one point get or one contiguous scan**. Everything below follows from three facts:
 

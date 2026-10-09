@@ -1,6 +1,6 @@
 # Scans and filters
 
-> **Status: Phase 1 sync API implemented.** Semantics come from the spec and decision D22. `Scan::stream` (async) is Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Semantics come from the spec and decision D22. `Scan::stream` (async) is Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Both `Table::row(key)` (a `RowRead`) and `Table::scan*` (a `Scan`) are builders. Nothing happens until you call `.read()` or `.iter()`. They share most of their methods.
 
@@ -157,7 +157,7 @@ let text = scan().value_filter(ValueFilter::Prefix(b"text/".to_vec())).iter()?;
 let big = scan().value_filter(ValueFilter::I64(Ordering::Greater, 100)).iter()?; // i64 values compared with 100
 # Ok::<(), pigeonhole::Error>(())
 ```
-A value predicate tests the **newest visible value of a column**, then the cell is materialized only if it matches. It cannot use an index; it saves materialization, not block reads. For hot lookups by value, store an inverted row instead (see [Data modeling](data-modeling.md)).
+A value predicate tests the **newest visible value of a column**, then the cell is materialized only if it matches. A value stored in a blob file is read and tested like an inline one. It cannot use an index; it saves materialization, not block reads. For hot lookups by value, store an inverted row instead (see [Data modeling](data-modeling.md)).
 
 ## Snapshots
 ```rust

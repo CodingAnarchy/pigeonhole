@@ -1,6 +1,6 @@
 # Durability
 
-> **Status: Phase 1 sync API implemented, including flush to disk.** Semantics here come from the spec and decisions D12 and D19. Async commit forms are Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Semantics here come from the spec and decisions D12 and D19. Async commit forms are Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every commit says how durable it must be before it returns. The default is the strongest batched level, so a commit that returns is on disk unless you asked for less.
 
