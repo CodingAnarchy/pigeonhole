@@ -1,16 +1,16 @@
 # Getting started
 
-> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
+> **Status:** this guide describes 0.2.0, the current release; the [changelog](../../CHANGELOG.md) lists what changed. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
 Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-pigeonhole = "0.1"
+pigeonhole = "0.2"
 ```
 
-This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). This guide describes `main`, released next as 0.2.0. Until then, the counter families, values above 64 MiB and FUSE opt-in it describes need a git dependency on the repository, and 0.1.0 behaves as its own docs say (the [changelog](../../CHANGELOG.md) lists every difference). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
+This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). Upgrading from 0.1.0: the [changelog](../../CHANGELOG.md) lists every difference and how to migrate (counter families, the version 2 file format, the FUSE opt-in). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
 
 Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature (Phase 3) is off by default and currently gates an empty module.
 

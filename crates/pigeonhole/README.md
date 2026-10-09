@@ -6,7 +6,10 @@ SQLite's deployment model (one file, a library, no server).
 
 > **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in
 > simulation, and the wide-column model (Phase 2: counter families, blob separation,
-> compaction styles, zstd) is in this release, though its performance gate is not met yet. The
+> compaction styles, zstd) is complete in this release: its performance gate is met as amended
+> by [D193](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-2.md#d193), with one documented
+> gap, the read tail of wide, heavily overwritten rows
+> ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The
 > on-disk format and the API may change before 1.0
 > ([`FORMAT.md`](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md)). The
 > latency work (Phase 3) is still to come. Pigeonhole is **not recommended for production use
@@ -26,10 +29,10 @@ SQLite's deployment model (one file, a library, no server).
 cargo add pigeonhole
 ```
 
-or `pigeonhole = "0.1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on
+or `pigeonhole = "0.2"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on
 [docs.rs](https://docs.rs/pigeonhole). See the
 [changelog](https://github.com/CodingAnarchy/pigeonhole/blob/main/CHANGELOG.md) and the
-[0.1.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0).
+[0.2.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.0).
 
 ## Quickstart
 
