@@ -1448,20 +1448,35 @@ fn a_read_after_a_background_fired_crash_is_that_crash() {
         ts: None,
         value: vec![7; 100 << 10],
     };
+    let mid_commit = run.stats.mid_commit_crashes;
     run.step(Op::Commit(vec![big], Durability::None), &mut rng)
         .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
-    assert!(
-        run.armed && run.log.last().is_some_and(|c| c.acked),
-        "seed {seed}: the crash fired on the commit itself: {:?}",
-        run.trace.iter().rev().take(4).collect::<Vec<_>>()
-    );
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while !run.fired() {
+    if run.armed {
+        // The usual order: the commit was acknowledged, and the background flush its memtable
+        // fill starts fires the crash afterwards, with no client call in progress.
         assert!(
-            std::time::Instant::now() < deadline,
-            "seed {seed}: the background flush never fired the armed crash"
+            run.log.last().is_some_and(|c| c.acked),
+            "seed {seed}: armed, but the commit was not acknowledged: {:?}",
+            run.trace.iter().rev().take(4).collect::<Vec<_>>()
         );
-        std::thread::sleep(Duration::from_millis(1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !run.fired() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seed {seed}: the background flush never fired the armed crash"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    } else {
+        // The background flush took the crash before the commit returned (a scheduling race
+        // CI met at seed 101): the commit must have returned that crash unacknowledged (a
+        // `Durability::None` put may then be lost), and the run has recovered from it.
+        assert_eq!(
+            run.stats.mid_commit_crashes,
+            mid_commit + 1,
+            "seed {seed}: the crash fired, but not as the commit's unacknowledged failure: {:?}",
+            run.trace.iter().rev().take(4).collect::<Vec<_>>()
+        );
     }
     run.step(scan_all(), &mut rng)
         .unwrap_or_else(|e| panic!("seed {seed}: {e}\n{}", run.trace.join("\n")));
