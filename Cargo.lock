@@ -867,6 +867,7 @@ version = "0.2.0"
 dependencies = [
  "crc32c",
  "criterion",
+ "foldhash",
  "lz4_flex 0.14.0",
  "proptest",
  "twox-hash",

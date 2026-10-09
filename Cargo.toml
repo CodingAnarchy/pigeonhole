@@ -51,6 +51,7 @@ pigeonhole-capi = { path = "crates/capi", version = "0.2.0" }
 
 # External dependencies. Each one is justified in docs/design/interfaces.md.
 crc32c = "0.6"
+foldhash = "0.2"
 twox-hash = { version = "2", default-features = false, features = ["std", "xxhash3_64"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 zstd = { version = "0.13", default-features = false }

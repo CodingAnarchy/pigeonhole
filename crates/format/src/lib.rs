@@ -18,6 +18,7 @@ pub mod compress;
 pub mod cursor;
 pub mod error;
 pub mod filter;
+pub mod hash;
 pub mod ids;
 pub mod key;
 pub mod manifest;
