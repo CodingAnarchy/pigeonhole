@@ -93,3 +93,38 @@ The checklist covers:
 **Why.** The latency targets alone could pass while a roadmap item, such as io_uring or the row cache, was never built. And Goals-table targets that the gate wording doesn't name could go unmeasured: write throughput, scan throughput, open time and scaling.
 
 **How an item leaves.** An item may leave Phase 3 only by an owner decision that says where it goes (an issue in a later milestone). The same rule applies to a feature measured not to help, such as a row cache that never pays off: removing it, or keeping it off by default, is an owner decision recorded here or in a later D-entry.
+
+<a id="d198"></a>
+## D198 — A commit crosses threads with a bounded, adaptive spin before parking; combining only on evidence (owner decision, 2026-10-09; engine, runtime, #64; from proposal C, #416)
+**Why.** A buffered commit's latency is mostly the thread handoff, not the work. `crates/bench/examples/commitpath.rs` ran buffered one-field overwrites (ycsb-a's write) from one client to one shard, under several shard drivers:
+
+| how the shard runs | macOS p50 / p99 µs | Linux runner, run 1, p50 / p99 µs | Linux runner, run 2, p50 / p99 µs |
+|---|--:|--:|--:|
+| engine shard thread (today) | 4.96 / 10.46 | 33.02 / 45.77 | 25.05 / 52.32 |
+| application thread that parks (the same wakeups) | 5.92 / 10.79 | 31.87 / 46.10 | 24.49 / 50.62 |
+| shard spins, client parks | | | 13.00 / 25.48 |
+| shard parks, client spins | | | 7.70 / 16.34 |
+| both spin | 3.67 / 7.92 | 3.71 / 7.64 | 3.36 / 8.52 |
+| inline: the client runs the shard right after submitting | 1.29 / 3.21 | 3.11 / 7.19 | 1.70 / 4.10 |
+
+macOS is an Apple M5 (not quiet, indicative). The Linux runner is GitHub `ubuntu-latest` (`commit-latency.yml`), a VM.
+- **The CPU work** is the `inline` row: about 1.3–3 µs, and about 10.6K instructions per commit on callgrind.
+- **Crossing threads** with nobody sleeping adds about 2–3 µs.
+- **Wakeups** add about 2 µs on macOS, and 20–30 µs on the Linux VM, where they are about 90% of a buffered commit.
+- **Both sides matter:** on Linux run 2, spinning only the client saves 17 µs and spinning only the shard 11.5 µs; the savings overlap.
+
+RocksDB writes on the caller's thread (a write-group leader), which is the main reason `ycsb-a` and `ycsb-f` p50 were 2.2–2.5× RocksDB's in the Phase 3 baseline (`docs/bench.md`).
+
+**Owner decisions.**
+1. **Build C1: a bounded, adaptive spin before parking.**
+   - **Client:** `PendingCommit::wait` spin-polls its completion before it parks.
+   - **Shard:** an engine-owned shard thread spin-polls its queue, once it drains, before it parks.
+   - **Adaptive:** each side skips the spin when its recent waits were long (a durable commit waiting for a sync, a stalled shard), and a spinning wait yields between polls.
+   - **Not covered:** application-owned shards, whose loop is the application's.
+2. **C2 (combining) only on evidence.** A committing thread that runs its idle shard is acceptable in principle only if C1 is measured not to be enough for the Goals-table commit targets.
+   - There is no C2 work until then, and it comes back to the owner with that evidence.
+   - C2 would change the spec's "every write executes on exactly one pinned shard thread".
+3. **C1 defaults.**
+   - On for engine-owned shards once measured: about 15 µs on the client and about 50 µs on the shard, tuned on #405.
+   - This holds provided the idle-CPU test still passes: an idle database never keeps spinning.
+   - Both windows are documented options that can be set to 0, for battery-powered or CPU-constrained users.

@@ -211,6 +211,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D195](phase-3.md#d195) — Three instruction ceilings are raised to main's counts (#384 raced the ceilings; get-sst placement drift); ceiling changes are measured on the current main · owner decision, bench, CI · amends D193
 - [D196](phase-3.md#d196) — The async front door: commit tickets are handles (seqno once resolved), misses wake on I/O through a cache-only read tier, a scan step's unpredicted miss reads synchronously (counted) · pigeonhole, engine, sst, #42 · amends the spec's "Sync and async" · full scan fix deferred as #398
 - [D197](phase-3.md#d197) — The Phase 3 gate is binding on its contents: every roadmap item and every Goals-table target in the #406 checklist, on the reference hardware · owner decision, #406, #405 · amends the spec Phase 3 gate
+- [D198](phase-3.md#d198) — A commit crosses threads with a bounded, adaptive spin before parking (client and engine-owned shards, about 15 and 50 µs, settable to 0); combining (the caller runs its idle shard) only on measured evidence · owner decision, #64, #416
 
 ## Open questions
 _None._
