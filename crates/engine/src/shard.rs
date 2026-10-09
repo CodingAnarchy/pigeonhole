@@ -1282,6 +1282,22 @@ fn guard_state(
     state
 }
 
+/// Consecutive voided purges after which a slot compacts without one (#316). The purge
+/// is left to a later compaction.
+const PURGE_VOID_LIMIT: u32 = 3;
+
+/// A bottommost compaction's purge guard (#316). Its purge assumed that nothing outside
+/// its inputs has a timestamp below `min_ts_above`; a write in `family` with a timestamp
+/// below that bound and at most `max_ts` (the newest input timestamp: a write above every
+/// input changes nothing the purge drops) breaks that assumption.
+#[derive(Debug)]
+struct CompactionGuard {
+    family: FamilyId,
+    min_ts_above: Timestamp,
+    max_ts: Timestamp,
+    state: Arc<AtomicU8>,
+}
+
 /// The memtables of one `(tablet, family)` on this shard.
 #[derive(Debug)]
 struct MemSlot {
@@ -1854,6 +1870,15 @@ pub(crate) struct ShardState {
     guarded: Vec<(u32, FamilyId, Arc<AtomicU8>)>,
     /// Roots whose guarded flush a delete voided: flushed again without the guard.
     voided_roots: HashSet<u32>,
+    /// The running compaction's purge guard (#316), when it is bottommost and purges
+    /// below a `min_ts_above` it sampled at its plan: a write in the family that could
+    /// land below that bound, among the inputs' timestamps, voids it before it installs and
+    /// waits while it installs.
+    compaction_guard: Option<CompactionGuard>,
+    /// Consecutive voided compactions per slot: at `PURGE_VOID_LIMIT` the slot compacts
+    /// without the purge below `min_ts_above` (and so without a guard), so a backfill
+    /// written newest to oldest cannot keep it from installing.
+    purge_voids: HashMap<(TabletId, FamilyId), u32>,
     /// Rows (hashed with their table) of prepared, undecided shares, with a count per row.
     pending_rows: HashMap<u64, u32>,
     /// Arena bytes reserved by admitted-but-unapplied members and undecided shares.
@@ -2077,6 +2102,8 @@ impl ShardState {
             prepared: HashMap::new(),
             guarded: Vec::new(),
             voided_roots: HashSet::new(),
+            compaction_guard: None,
+            purge_voids: HashMap::new(),
             pending_rows: HashMap::new(),
             reserved: 0,
             to_freeze: Vec::new(),
@@ -3721,11 +3748,12 @@ impl ShardState {
                     continue;
                 }
             }
-            // A delete in a family whose memtable is being flushed under the guard (#287)
-            // voids that flush's purge, or waits while its commit installs the purge.
-            if !self.guarded.is_empty()
+            // A delete in a family whose memtable is being flushed under the guard (#287),
+            // or a write below a running bottommost compaction's bound (#316), voids that
+            // purge, or waits while its commit installs it.
+            if (!self.guarded.is_empty() || self.compaction_guard.is_some())
                 && !matches!(m.kind, MemberKind::CommitRecord { .. })
-                && !self.admit_against_guards(m.bytes.as_slice())
+                && !self.admit_against_guards(&m)
             {
                 // It waits for the install's outcome (`on_flushed`), a PREPARE too: the
                 // install never waits on any commit's decision, so this cannot deadlock two
@@ -3851,7 +3879,7 @@ impl ShardState {
             // flush task runs, after this call.
             for m in &admitted {
                 if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                    let admitted_again = self.admit_against_guards(m.bytes.as_slice());
+                    let admitted_again = self.admit_against_guards(m);
                     debug_assert!(admitted_again, "a fresh guard is never installing");
                 }
             }
@@ -4439,29 +4467,60 @@ impl ShardState {
     }
 
     /// Counts or releases the rows of a prepared share.
-    /// Checks a member's deletes against the guarded flushes (#287): voids every one of a
-    /// family it deletes in that has not started installing, and returns false (wait) if one
-    /// has. Its seqno is above every entry of those memtables, and it becomes visible only
-    /// after admission, so a delete either voids the purge or lands after the install.
-    fn admit_against_guards(&self, bytes: &[u8]) -> bool {
+    /// Checks a member against the guarded flushes (#287) and the running compaction's
+    /// guard (#316): voids every guard it touches that has not started installing, and
+    /// returns false (wait) if one has. A flush's guard is touched by a delete in its family;
+    /// the compaction's by any write in its family whose timestamp may land below the
+    /// guard's bound and at most its newest input timestamp. The member's seqno is above every
+    /// entry the purge read, and it becomes visible only after admission, so it either voids
+    /// the purge or lands after the install.
+    fn admit_against_guards(&self, m: &Member) -> bool {
         #[cfg(feature = "test-hooks")]
         if self.shared.hooks.flush_gc_mutation.load(Ordering::Acquire) == 3 {
             return true;
         }
-        let Ok(batch) = BatchRef::new(bytes) else {
-            // An undecodable batch fails its apply; it deletes nothing.
+        let Ok(batch) = BatchRef::new(m.bytes.as_slice()) else {
+            // An undecodable batch fails its apply; it writes nothing.
             return true;
         };
+        // The least timestamp a mutation without one gets: for a single commit its preset if
+        // that still fits the floor, else a fresh default above the floor (`default_ts_or`);
+        // a share's commit timestamp, which may be below this shard's floor (D11 refuses
+        // that only with tablet changes on).
+        let default_ts = match m.kind {
+            MemberKind::Single if m.commit_ts == 0 => self.ts_floor + 1,
+            MemberKind::Single => m.commit_ts.min(self.ts_floor + 1),
+            _ => m.commit_ts,
+        };
         let mut families: Vec<FamilyId> = Vec::new();
+        let mut below = false;
         for mu in batch.iter().flatten() {
             if !matches!(mu.kind, Kind::Put | Kind::Merge) && !families.contains(&mu.family) {
                 families.push(mu.family);
             }
-        }
-        for (_, family, state) in &self.guarded {
-            if !families.contains(family) {
-                continue;
+            if let Some(g) = &self.compaction_guard
+                && mu.family == g.family
+            {
+                // The purge drops only input entries below `min_ts_above` (a column's versions
+                // only when its newest input is below it), so a write at or above that bound
+                // is one it allowed for. A write above every input is a newer version, a
+                // delete hiding no input, or one hiding them all, the same with or without
+                // the purge.
+                let ts = mu.ts.unwrap_or(default_ts);
+                below |= ts < g.min_ts_above && ts <= g.max_ts;
             }
+        }
+        let flushes = self
+            .guarded
+            .iter()
+            .filter(|(_, family, _)| families.contains(family))
+            .map(|(_, _, state)| state);
+        let compaction = self
+            .compaction_guard
+            .as_ref()
+            .filter(|_| below)
+            .map(|g| &g.state);
+        for state in flushes.chain(compaction) {
             match state.compare_exchange(
                 GUARD_IN_FLIGHT,
                 GUARD_VOIDED,
@@ -5646,7 +5705,7 @@ impl ShardState {
             .map_or(u64::MAX, MemSlot::min_ts)
             .min(self.prepared_min_ts(key.1));
         let now = self.shared.vfs.now_micros();
-        let gc = compact::gc_policy(
+        let mut gc = compact::gc_policy(
             &self.shared,
             fam,
             &task,
@@ -5658,6 +5717,14 @@ impl ShardState {
             meta.options.kind == FamilyKind::Counter,
             now,
         );
+        // A slot whose purge writes kept voiding compacts once without it (#316).
+        if self
+            .purge_voids
+            .get(&key)
+            .is_some_and(|n| *n >= PURGE_VOID_LIMIT)
+        {
+            gc.min_ts_above = 0;
+        }
         // A test hook's record: production builds keep none (5-6 6.2), and test builds only
         // while a test records (`Engine::record_history`).
         let record = (self.recording()
@@ -5708,6 +5775,27 @@ impl ShardState {
             }
             busy.extend(ids.iter().copied());
         }
+        // A bottommost purge below `min_ts_above` runs under a guard (#316): a write that
+        // could land among its inputs below that bound before it installs voids it.
+        let guard = (gc.bottommost
+            && gc.min_ts_above > 0
+            && meta.options.kind != FamilyKind::Counter
+            && matches!(
+                task.kind,
+                pigeonhole_compaction::TaskKind::Rewrite
+                    | pigeonhole_compaction::TaskKind::BlobGc { .. }
+            ))
+        .then(|| CompactionGuard {
+            family: key.1,
+            min_ts_above: gc.min_ts_above,
+            max_ts: fam
+                .iter()
+                .filter(|s| ids.contains(&s.meta.id))
+                .map(|s| s.meta.ts_range.1)
+                .max()
+                .unwrap_or(u64::MAX),
+            state: Arc::new(AtomicU8::new(GUARD_IN_FLIGHT)),
+        });
         let work = match CompactionWork::new(
             Arc::clone(&self.shared),
             self.id,
@@ -5718,7 +5806,10 @@ impl ShardState {
             gc,
             record,
         ) {
-            Ok(w) => w,
+            Ok(mut w) => {
+                w.guard = guard.as_ref().map(|g| Arc::clone(&g.state));
+                w
+            }
             Err(e) => {
                 let mut busy = self
                     .shared
@@ -5732,6 +5823,7 @@ impl ShardState {
             }
         };
         self.compaction = Some(key);
+        self.compaction_guard = guard;
         ctx.spawn(Box::new(work));
         Ok(())
     }
@@ -5755,6 +5847,12 @@ impl ShardState {
         }
         let key = self.compaction.take();
         let full = std::mem::take(&mut self.compaction_full);
+        // A write voided the purge before its commit (#316): the commit was refused, and
+        // the slot compacts again at once with a fresh bound (not a failure).
+        let voided = self
+            .compaction_guard
+            .take()
+            .is_some_and(|g| g.state.load(Ordering::Acquire) == GUARD_VOIDED);
         trace!(
             "shard {} compaction done: {:?} ({nanos} ns)",
             self.id.0,
@@ -5767,6 +5865,7 @@ impl ShardState {
                 metrics.compaction_nanos.fetch_add(nanos, Ordering::Relaxed);
                 if let Some(key) = key {
                     self.slot_backoff.remove(&key);
+                    self.purge_voids.remove(&key);
                 }
                 // On a frozen clock the bucket never refills: compaction progress paces a
                 // stall instead (issue #70).
@@ -5779,6 +5878,20 @@ impl ShardState {
             // its inputs are retired with the table. Nothing failed; a full compaction goes
             // on with the remaining tables.
             Err(Error::TableNotFound(_)) => {}
+            Err(Error::Busy) if voided => {
+                if let Some(key) = key {
+                    *self.purge_voids.entry(key).or_insert(0) += 1;
+                }
+                #[cfg(feature = "test-hooks")]
+                self.shared.metrics[usize::from(self.id.0)]
+                    .hooks
+                    .purge_voids
+                    .fetch_add(1, Ordering::Relaxed);
+                trace!(
+                    "shard {} compaction purge voided by a write; compacting again",
+                    self.id.0
+                );
+            }
             Err(e) => {
                 // A full compaction reports the failure to its caller. A background one is
                 // nobody's (a later `compact` must not inherit it, issue #141): it backs off,

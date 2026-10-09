@@ -95,6 +95,10 @@ pub(crate) struct Hooks {
     /// `Engine::park_manifest_commits`), and the parked pump's waker.
     pub manifest_park: AtomicBool,
     pub manifest_parked: Mutex<Option<TaskWaker>>,
+    /// Holds each compaction job before its first slice (`Engine::hold_compactions`), and
+    /// the held job's waker (`Engine::release_held_compaction` takes it to let it run).
+    pub compaction_hold: AtomicBool,
+    pub compaction_held: Mutex<Option<TaskWaker>>,
     /// Refuses batches of only `WalCheckpoint` edits as `NoSpace`, as a snapshot rewrite
     /// that finds no space does (`Engine::refuse_checkpoints`).
     pub refuse_checkpoints: AtomicBool,
@@ -106,7 +110,7 @@ pub(crate) struct Hooks {
     pub fail_next_apply: AtomicBool,
     /// A deliberate fault in the flush GC (`Engine::mutate_flush_gc`, #287): 1 treats the
     /// guard as always holding, 2 drops the snapshot floor (no live read point is kept), 3
-    /// lets deletes pass guarded flushes without voiding them.
+    /// lets writes pass guarded flushes and compactions without voiding them.
     pub flush_gc_mutation: std::sync::atomic::AtomicU8,
 }
 
@@ -121,7 +125,8 @@ pub enum FlushGcMutation {
     DropGuard,
     /// Keep no live snapshot's versions (only the latest read point).
     DropSnapshotFloor,
-    /// A delete arriving while a guarded flush is in flight does not void it.
+    /// A delete arriving while a guarded flush is in flight, or a write below a running
+    /// bottommost compaction's bound (#316), does not void it or wait for its install.
     IgnoreVoids,
 }
 
@@ -138,6 +143,9 @@ pub(crate) struct ShardCounters {
     /// Reservations that found enough free bytes but no run long enough for their largest
     /// entry (`Engine::arena_run_waits`: a test checks it reached that case, issue #141).
     pub run_waits: AtomicU64,
+    /// Compactions whose purge a write voided before they installed
+    /// (`Engine::compaction_purge_voids`, #316).
+    pub purge_voids: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -819,6 +827,16 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
+    /// How many compactions on shard `shard` a write voided before they installed their
+    /// purge, so that they compacted again (#316).
+    #[doc(hidden)]
+    pub fn compaction_purge_voids(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .purge_voids
+            .load(Ordering::Relaxed)
+    }
+
     /// Shard `shard`'s arena after its last batch: free bytes, the usable bytes of its
     /// largest run of free chunks, and its size (issue #141).
     #[doc(hidden)]
@@ -962,6 +980,46 @@ impl Engine {
     pub fn reader_pin_and_view(&self) -> (Option<(Seqno, u64)>, u64) {
         let shared = &self.inner.shared;
         (shared.shm.oldest_reader_pin(), shared.view.load().version)
+    }
+
+    /// While `hold` is set, every compaction job waits before its first slice until
+    /// [`release_held_compaction`](Self::release_held_compaction) lets it run; clearing it
+    /// lets them all run (test hook, #316).
+    #[doc(hidden)]
+    pub fn hold_compactions(&self, hold: bool) {
+        let hooks = &self.inner.shared.hooks;
+        hooks.compaction_hold.store(hold, Ordering::Release);
+        if !hold {
+            self.release_held_compaction();
+        }
+    }
+
+    /// Lets the held compaction job run (test hook).
+    #[doc(hidden)]
+    pub fn release_held_compaction(&self) {
+        let held = self
+            .inner
+            .shared
+            .hooks
+            .compaction_held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(w) = held {
+            w.wake();
+        }
+    }
+
+    /// Whether a compaction job is held before its first slice (test hook).
+    #[doc(hidden)]
+    pub fn compaction_held(&self) -> bool {
+        self.inner
+            .shared
+            .hooks
+            .compaction_held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     /// Whether a background manifest commit is parked (test hook).
