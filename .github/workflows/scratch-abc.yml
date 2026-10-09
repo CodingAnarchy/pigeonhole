@@ -1,0 +1,36 @@
+name: scratch callgrind A/B/C
+on:
+  push:
+    branches: [scratch/skip-steps]
+permissions:
+  contents: read
+jobs:
+  abc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build A (HEAD~3), B (HEAD~2), C (HEAD~1)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for x in A:HEAD~3 B:HEAD~2 C:HEAD~1; do
+            n=${x%%:*}; rev=${x#*:}
+            git worktree add -q /tmp/w$n "$rev"
+            (cd /tmp/w$n && cargo build --release -p pigeonhole-bench --example hotrow --example readshapes --target-dir "$GITHUB_WORKSPACE/target")
+            mkdir -p /tmp/bin$n
+            cp target/release/examples/hotrow target/release/examples/readshapes /tmp/bin$n/
+          done
+      - name: count
+        shell: bash
+        run: |
+          set -euo pipefail
+          for n in A B C; do
+            scripts/instructions-per-cell.sh /tmp/bin$n/hotrow /tmp/bin$n/readshapes:row,scan,scan-filtered,versions,rows,short-scans > $n.txt
+          done
+          paste A.txt B.txt C.txt | awk '{ printf "| %s | %s | %s | %s | %+.1f%% | %+.1f%% |\n", $1, $2, $4, $6, 100*($4-$2)/$2, 100*($6-$4)/$4 }' | tee -a "$GITHUB_STEP_SUMMARY"
