@@ -14,21 +14,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
       - run: CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -p pigeonhole-bench --example writepath
-      - name: callgrind per thread, commit-one and commit-overwrite
+      - name: who calls memset, malloc and free (commit-one, per thread)
         shell: bash
         run: |
           set -eu
-          for shape in commit-one commit-overwrite; do
-            mkdir -p "/tmp/$shape"
-            env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 valgrind --tool=callgrind --collect-atstart=no --separate-threads=yes \
-              --callgrind-out-file="/tmp/$shape/cg.out" target/release/examples/writepath "$shape" 4 /tmp >/dev/null 2>"/tmp/$shape/err"
-            grep '^units' "/tmp/$shape/err"
-            for f in /tmp/$shape/cg.out*; do
-              total=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' "$f")
-              [ "${total:-0}" -gt 0 ] || continue
-              echo "=== $shape $(basename "$f") total $total"
-              callgrind_annotate --inclusive=no --threshold=95 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -45 || true
-              echo "--- inclusive"
-              callgrind_annotate --inclusive=yes --threshold=99 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -40 || true
+          env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 valgrind --tool=callgrind --collect-atstart=no --separate-threads=yes \
+            --callgrind-out-file=/tmp/cg.out target/release/examples/writepath commit-one 4 /tmp >/dev/null 2>/tmp/err
+          grep '^units' /tmp/err
+          for f in /tmp/cg.out*; do
+            total=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' "$f")
+            [ "${total:-0}" -gt 0 ] || continue
+            echo "=== $(basename "$f") total $total"
+            callgrind_annotate --tree=caller --inclusive=yes --threshold=99 "$f" 2>/dev/null > /tmp/tree.txt || true
+            for fn in '__memset_avx2_unaligned_erms' '__memcpy_avx_unaligned_erms' ':malloc ' '_int_malloc' ':free ' 'BatchIter as core::iter'; do
+              echo "--- callers of $fn"
+              grep -n -B12 "\* .*$fn" /tmp/tree.txt | grep -E "<\s|\*" | sed -E 's# \[[^]]*\]##; s#/rustc/[0-9a-f]+/library/##; s#/home/runner/[^ ]*/(crates/)#\1#' | cut -c1-200 | head -24 || true
             done
           done
