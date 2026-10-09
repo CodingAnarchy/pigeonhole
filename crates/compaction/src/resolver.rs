@@ -586,6 +586,7 @@ where
             col_below_upper,
             row_below_upper,
             peek,
+            last,
             upper,
             run,
             run_ts,
@@ -615,6 +616,7 @@ where
         *col_below_upper = false;
         *row_below_upper = false;
         *peek = None;
+        *last = None;
         *upper = None;
         *run = false;
         *run_ts = 0;
@@ -652,6 +654,7 @@ where
             col_below_upper,
             row_below_upper,
             peek,
+            last,
             upper,
             run,
             run_ts,
@@ -685,6 +688,7 @@ where
             && !*col_below_upper
             && !*row_below_upper
             && peek.is_none()
+            && last.is_none()
             && upper.is_none()
             && !*run
             && *run_ts == 0
