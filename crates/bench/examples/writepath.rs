@@ -25,7 +25,7 @@
 //! clean either way.
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -41,8 +41,8 @@ fn main() {
     let base = std::path::PathBuf::from(args.next().expect(usage));
     let dir = base.join(format!("phdb-writepath-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let measuring = Arc::new(AtomicBool::new(false));
-    let (db, drivers) = open(&dir.join("w.phdb"), &measuring);
+    let ctl = Arc::new(Ctl::default());
+    let (db, drivers) = open(&dir.join("w.phdb"), &ctl);
     let t = db
         .table("t")
         .unwrap()
@@ -58,13 +58,18 @@ fn main() {
     // `SHAPE_SETUP_ONLY=1`: the setup alone, without the measured work (the script checks
     // that callgrind then counts nothing inside the `shape_` functions).
     let setup_only = std::env::var_os("SHAPE_SETUP_ONLY").is_some();
+    // The measured work starts and ends with every shard idle: what the setup left running
+    // finishes outside `shape_run_shard`, and what the measured work leaves running (the
+    // shard's side of the last commit, say) finishes inside it, before the close.
     let measure = |f: &mut dyn FnMut()| {
         if setup_only {
             return;
         }
-        measuring.store(true, Ordering::Release);
+        ctl.wait_idle();
+        ctl.measuring.store(true, Ordering::Release);
         f();
-        measuring.store(false, Ordering::Release);
+        ctl.wait_idle();
+        ctl.measuring.store(false, Ordering::Release);
     };
     let units = match shape.as_str() {
         "commit-one" => {
@@ -105,8 +110,26 @@ fn main() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// What the shard threads share with the main thread.
+#[derive(Default)]
+struct Ctl {
+    /// Whether a shape is being measured: a shard woken then runs in `shape_run_shard`.
+    measuring: AtomicBool,
+    /// Shard threads running (not parked).
+    busy: AtomicUsize,
+}
+
+impl Ctl {
+    /// Waits until every shard thread is parked: nothing left to run.
+    fn wait_idle(&self) {
+        while self.busy.load(Ordering::Acquire) > 0 {
+            thread::yield_now();
+        }
+    }
+}
+
 /// Opens with application-owned shards, each driven by a thread of its own.
-fn open(path: &Path, measuring: &Arc<AtomicBool>) -> (Pigeonhole, Vec<thread::JoinHandle<()>>) {
+fn open(path: &Path, ctl: &Arc<Ctl>) -> (Pigeonhole, Vec<thread::JoinHandle<()>>) {
     let (db, shards) = Pigeonhole::open_application_owned(
         path,
         Options::default()
@@ -120,32 +143,36 @@ fn open(path: &Path, measuring: &Arc<AtomicBool>) -> (Pigeonhole, Vec<thread::Jo
     let drivers = shards
         .into_iter()
         .map(|shard| {
-            let measuring = Arc::clone(measuring);
-            thread::spawn(move || drive(shard, &measuring))
+            let ctl = Arc::clone(ctl);
+            ctl.busy.fetch_add(1, Ordering::AcqRel);
+            thread::spawn(move || drive(shard, &ctl))
         })
         .collect();
     (db, drivers)
 }
 
 /// A shard's loop (see `Pigeonhole::open_application_owned`), inside `shape_run_shard`
-/// while a shape is measured.
-fn drive(mut shard: Shard, measuring: &AtomicBool) {
+/// while a shape is measured. `busy` counts it while it runs.
+fn drive(mut shard: Shard, ctl: &Ctl) {
     let me = thread::current();
     shard.set_wakeup(Box::new(move || me.unpark()));
     loop {
-        if measuring.load(Ordering::Acquire) {
+        if ctl.measuring.load(Ordering::Acquire) {
             shape_run_shard(&mut shard);
         } else {
             run_shard(&mut shard);
         }
         if let Some(closed) = shard.closed() {
+            ctl.busy.fetch_sub(1, Ordering::AcqRel);
             closed.unwrap();
             return;
         }
+        ctl.busy.fetch_sub(1, Ordering::AcqRel);
         match shard.next_wakeup() {
             Some(due) => thread::park_timeout(due),
             None => thread::park(),
         }
+        ctl.busy.fetch_add(1, Ordering::AcqRel);
     }
 }
 
