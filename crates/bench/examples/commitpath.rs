@@ -11,10 +11,13 @@
 //! | `threads` | the engine's own shard thread (`Engine::open`, as `phdb-bench` runs) | parking (`Engine::commit`) |
 //! | `park` | an application thread that parks between groups, woken by the engine | parking |
 //! | `spin` | an application thread that never parks | spinning on the commit's future |
+//! | `spin-shard` | an application thread that never parks | parking |
+//! | `spin-client` | an application thread that parks between groups | spinning on the commit's future |
 //! | `inline` | the client's own thread, right after submitting (`run_once` until the commit resolves) | — |
 //!
 //! `spin` minus `inline` is the cost of crossing threads with no sleeping on either side;
-//! `park` minus `spin` is the wakeups. `inline` is the floor a commit could reach on the
+//! `park` minus `spin` is the wakeups, and `spin-shard` and `spin-client` split them by side
+//! (the shard woken by a submit, the client woken by its commit's completion). `inline` is the floor a commit could reach on the
 //! caller's thread (what a write-group leader would pay).
 //!
 //! The store: one shard, tablet changes off, a memtable no run fills, 50,000 rows of one
@@ -143,11 +146,18 @@ fn engine_threads(dir: &Path, commits: usize) {
     db.close().unwrap();
 }
 
-/// A shard on its own thread, parking between groups (`spin: false`) or never.
-fn driven(dir: &Path, commits: usize, spin: bool) {
+/// A shard on its own thread that parks between groups unless `shard_spins`; the client
+/// parks on its commit unless `client_spins`.
+fn driven(dir: &Path, commits: usize, shard_spins: bool, client_spins: bool) {
+    let mode = match (shard_spins, client_spins) {
+        (false, false) => "park",
+        (true, true) => "spin",
+        (true, false) => "spin-shard",
+        (false, true) => "spin-client",
+    };
     let (db, mut shards) =
-        Engine::open_application_owned(&dir.join(format!("driven-{spin}.phdb")), options())
-            .unwrap();
+        Engine::open_application_owned(&dir.join(format!("{mode}.phdb")), options()).unwrap();
+    let spin = shard_spins;
     let mut shard: EngineShard = shards.remove(0);
     let stop = Arc::new(AtomicBool::new(false));
     let driver = {
@@ -169,7 +179,7 @@ fn driven(dir: &Path, commits: usize, spin: bool) {
     };
     let t = create(&db);
     let commit = |wb: WriteBatch| {
-        if spin {
+        if client_spins {
             poll_until(db.submit(wb, None).unwrap(), std::hint::spin_loop).unwrap();
         } else {
             db.commit(wb, None).unwrap();
@@ -177,7 +187,7 @@ fn driven(dir: &Path, commits: usize, spin: bool) {
     };
     load(&t, commit);
     let lat = measure(&t, commits, commit);
-    report(if spin { "spin" } else { "park" }, &lat);
+    report(mode, &lat);
     stop.store(true, Ordering::Release);
     db.close().unwrap();
     driver.join().unwrap();
@@ -217,8 +227,10 @@ fn main() {
     println!("| mode | p50 µs | p99 µs | p99.9 µs | mean µs |");
     println!("|---|--:|--:|--:|--:|");
     engine_threads(&dir, commits);
-    driven(&dir, commits, false);
-    driven(&dir, commits, true);
+    driven(&dir, commits, false, false);
+    driven(&dir, commits, true, true);
+    driven(&dir, commits, true, false);
+    driven(&dir, commits, false, true);
     inline(&dir, commits);
     std::fs::remove_dir_all(&dir).ok();
 }
