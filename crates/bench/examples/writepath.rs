@@ -55,7 +55,13 @@ fn main() {
             .map(|i| format!("{prefix}:{i:010}").into_bytes())
             .collect()
     };
+    // `SHAPE_SETUP_ONLY=1`: the setup alone, without the measured work (the script checks
+    // that callgrind then counts nothing inside the `shape_` functions).
+    let setup_only = std::env::var_os("SHAPE_SETUP_ONLY").is_some();
     let measure = |f: &mut dyn FnMut()| {
+        if setup_only {
+            return;
+        }
         measuring.store(true, Ordering::Release);
         f();
         measuring.store(false, Ordering::Release);
@@ -90,7 +96,7 @@ fn main() {
         }
         other => panic!("unknown shape {other}: commit-one, commit-sixteen, flush or compact"),
     };
-    eprintln!("units {units}");
+    eprintln!("units {}", if setup_only { 0 } else { units });
     drop(t);
     db.close().unwrap();
     for d in drivers {

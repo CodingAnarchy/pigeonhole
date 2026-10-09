@@ -16,7 +16,14 @@
 # - does its measured work only inside functions whose names contain `shape_` (and not
 #   inside its setup), so callgrind can count them alone;
 # - prints `units N` on stderr: the units the measured work handled (cells read, gets,
-#   commits, entries written, as the binary documents).
+#   commits, entries written, as the binary documents);
+# - with `SHAPE_SETUP_ONLY=1` in its environment, does its setup but none of the measured
+#   work (hotrow.rs too).
+#
+# The guard: on Linux every state and shape also runs once with `SHAPE_SETUP_ONLY=1`, and the
+# script fails unless callgrind counts nothing inside the measured functions then. Setup that
+# reaches them (rustc merging a setup function into an identical measured one, as #347
+# found, or measured code called from the setup) would otherwise be counted silently.
 #
 # On Linux with valgrind, callgrind counts exactly the measured functions
 # (--toggle-collect): deterministic, so CI can compare against a baseline. Elsewhere (macOS),
@@ -57,12 +64,25 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
             --callgrind-out-file="$work/cg.out" "$@" </dev/null >/dev/null 2>"$work/err"
         sed -n 's/^summary: \([0-9]*\).*/\1/p' "$work/cg.out"
     }
+    guard() { # name, pattern, environment, then the command: fails if setup alone is counted
+        local name="$1" pattern="$2" env_set="$3"
+        shift 3
+        local ir
+        ir=$(callgrind "$pattern" "SHAPE_SETUP_ONLY=1 $env_set" "$@")
+        if [[ "${ir:-0}" != 0 ]]; then
+            echo "$name: the setup alone counted $ir instructions inside $pattern;" \
+                "setup work reaches the measured functions" >&2
+            exit 1
+        fi
+    }
     for s in "${states[@]}"; do
         name="${s%%:*}"; env_set="${s#*:}"
+        guard "$name" '*hotrow_iteration*' "$env_set" "$bin" 20 "$work"
         ir=$(callgrind '*hotrow_iteration*' "$env_set" "$bin" 20 "$work")
         echo "$name $(( ir / $(units_of "$work/err") ))"
     done
     while read -r shape_bin name; do
+        guard "$name" '*shape_*' "" "$shape_bin" "$name" 4 "$work"
         ir=$(callgrind '*shape_*' "" "$shape_bin" "$name" 4 "$work")
         echo "$name $(( ir / $(units_of "$work/err") ))"
     done < <(shape_runs "$@")

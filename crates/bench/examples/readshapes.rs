@@ -218,6 +218,13 @@ fn main() {
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut units = 0;
+    // `SHAPE_SETUP_ONLY=1`: the setup alone, no measured iteration (the script checks that
+    // callgrind then counts nothing inside the `shape_` functions).
+    let iters = if std::env::var_os("SHAPE_SETUP_ONLY").is_some() {
+        0
+    } else {
+        iters
+    };
     for _ in 0..iters {
         units += match shape.as_str() {
             "get-mem" => shape_get(&t, &mut rng, ROWS / 2),
