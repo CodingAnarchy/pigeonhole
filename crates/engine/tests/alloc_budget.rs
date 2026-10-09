@@ -400,6 +400,28 @@ fn rows_and_scans(out: &mut Vec<Row>) -> f64 {
             allocs: (many.0 - one.0) / 32.0,
             bytes: (many.1 - one.1) / 32.0,
         });
+        // A scan's setup (#287): opening a 5-row scan, its first row and dropping it, on a
+        // thread that has scanned before.
+        let setup = |rig: &Rig| {
+            counted(|| {
+                let mut spec = ScanSpec::new(Bound::Included(row(100)), Bound::Unbounded);
+                spec.limit = 5;
+                let mut cur = rig.db.scan(&snap, t, spec).unwrap();
+                assert!(cur.next_row().unwrap());
+            })
+        };
+        setup(&rig);
+        let (a, b, ()) = setup(&rig);
+        out.push(Row {
+            path: if flush {
+                "scan, SST, cached"
+            } else {
+                "scan, memtable"
+            },
+            unit: "scan",
+            allocs: a as f64,
+            bytes: b as f64,
+        });
         drop(snap);
     }
     rig.close();
@@ -547,6 +569,8 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("scan, memtable", "extra cell", 0.0),
     ("scan, SST, cached", "row", 0.0),
     ("scan, SST, cached", "extra cell", 0.0),
+    ("scan, memtable", "scan", 10.0),
+    ("scan, SST, cached", "scan", 10.0),
     ("commit, 1 cell", "commit", 6.0),
     ("commit, 16 cells", "commit", 8.0),
     ("commit, 16 cells, 8 per group", "commit", 7.5),
