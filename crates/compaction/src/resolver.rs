@@ -203,6 +203,15 @@ enum Base {
     Large,
 }
 
+/// An entry the group loop stopped on and parsed (outside its column), for the next step.
+#[derive(Debug, Clone, Copy)]
+struct Peek {
+    same_row: bool,
+    ts: Timestamp,
+    seqno: Seqno,
+    kind: Kind,
+}
+
 /// Applies MVCC visibility to an ordered cursor: snapshot seqno, cell/column/family deletes,
 /// TTL, version limits, columns per row, value predicates and merge resolution. A lending
 /// iterator; no allocation per cell except merge results (buffers are reused).
@@ -283,9 +292,13 @@ pub struct CellResolver<C> {
     /// Every key of `row` is below `upper` (or there is none): a new column of the row skips
     /// the bound check too.
     row_below_upper: bool,
-    /// The cursor's current entry is known not to be in `col` (the group loop stopped on it):
-    /// whether it is in `row`. Taken by the next step; cleared whenever the cursor moves.
-    peek: Option<bool>,
+    /// The cursor's current entry is known not to be in `col` (the group loop stopped on it
+    /// and parsed it): taken by the next step, with the entry's column body in `next_col`, so
+    /// that step fetches no key. Cleared whenever the cursor moves.
+    peek: Option<Peek>,
+    /// The column body of the entry a step moves to (from the group loop with `peek`, or
+    /// copied by the step itself), swapped into `col` when a new column starts.
+    next_col: Vec<u8>,
     /// Stop at keys `>= upper`.
     upper: Option<Vec<u8>>,
 
@@ -374,6 +387,7 @@ where
             col_below_upper: false,
             row_below_upper: false,
             peek: None,
+            next_col: Vec::new(),
             upper: None,
             run: false,
             run_ts: 0,
@@ -555,6 +569,7 @@ where
             out_key,
             out_val,
             past_col,
+            next_col,
         } = buffers;
         // Cleared when they were taken out (`into_parts`), as `new`'s are empty.
         r.row = row;
@@ -569,6 +584,7 @@ where
         r.out_key = out_key;
         r.out_val = out_val;
         r.past_col = past_col;
+        r.next_col = next_col;
         r
     }
 
@@ -588,6 +604,7 @@ where
             out_key: self.out_key,
             out_val: self.out_val,
             past_col: self.past_col,
+            next_col: self.next_col,
         };
         buffers.clear();
         (self.cursor, buffers)
@@ -636,35 +653,40 @@ where
             self.skip_rest_of_group(ts)?;
         }
         loop {
-            // One key fetch per step, and one comparison of the key with the column (or none:
-            // the group loop already made it for this entry).
+            // At most one key fetch per step, with one comparison of the key with the column;
+            // none when the group loop already parsed the entry (`peek`).
             let peeked = self.peek.take();
-            let k = if self.cursor.valid() {
-                Some(self.cursor.key())
-            } else {
+            let step = if !self.cursor.valid() {
                 None
-            };
-            let (in_col, same_row) = match (k, peeked) {
-                (None, _) => (false, false),
-                (Some(_), Some(same_row)) => (false, same_row),
-                (Some(k), None) => locate_key(k, &self.col, &self.row),
-            };
-            let k = match k {
-                Some(k) if !self.past_bounds(in_col, same_row) => k,
-                _ => {
-                    if self.run {
-                        if let Some(out) = self.flush_run()? {
-                            return Ok(Some(out));
-                        }
+            } else if let Some(p) = peeked {
+                (!self.past_bounds(false, p.same_row))
+                    .then_some((false, p.same_row, p.ts, p.seqno, p.kind))
+            } else {
+                let k = self.cursor.key();
+                let (in_col, same_row) = locate_key(k, &self.col, &self.row);
+                if self.past_bounds(in_col, same_row) {
+                    None
+                } else {
+                    let Ok((_, ts, seqno, kind)) = split_suffix(k) else {
+                        debug_assert!(false, "malformed internal key from a source");
+                        self.cursor.next()?;
                         continue;
+                    };
+                    if !in_col {
+                        self.next_col.clear();
+                        self.next_col.extend_from_slice(&k[..k.len() - SUFFIX_LEN]);
                     }
-                    return Ok(None);
+                    Some((in_col, same_row, ts, seqno, kind))
                 }
             };
-            let Ok((_, ts, seqno, kind)) = split_suffix(k) else {
-                debug_assert!(false, "malformed internal key from a source");
-                self.cursor.next()?;
-                continue;
+            let Some((in_col, same_row, ts, seqno, kind)) = step else {
+                if self.run {
+                    if let Some(out) = self.flush_run()? {
+                        return Ok(Some(out));
+                    }
+                    continue;
+                }
+                return Ok(None);
             };
             if !in_col {
                 // The column ends: a pending run is its last version.
@@ -674,19 +696,19 @@ where
                     }
                     continue;
                 }
-                // The new row and column are copied from the same key fetch.
+                // The new row and column come from the entry's column body (`next_col`).
                 if !same_row {
-                    let Ok(n) = row_prefix_len(k) else {
+                    let Ok(n) = row_prefix_len(&self.next_col) else {
                         debug_assert!(false, "malformed internal key from a source");
                         self.cursor.next()?;
                         continue;
                     };
                     self.row.clear();
-                    self.row.extend_from_slice(&k[..n]);
+                    self.row.extend_from_slice(&self.next_col[..n]);
                 }
-                self.col.clear();
-                if kind != Kind::FamilyDelete {
-                    self.col.extend_from_slice(&k[..k.len() - SUFFIX_LEN]);
+                std::mem::swap(&mut self.col, &mut self.next_col);
+                if kind == Kind::FamilyDelete {
+                    self.col.clear();
                 }
                 if !same_row {
                     self.family_cover = None;
@@ -775,7 +797,20 @@ where
                     let k = self.cursor.key();
                     let (in_col, same_row) = locate_key(k, &self.col, &self.row);
                     if !in_col {
-                        self.peek = Some(same_row);
+                        // Hand the entry to the next step, parsed, with its column body;
+                        // not when reads stop at this column (a point read).
+                        if !self.column_bound
+                            && let Ok((_, ts, seqno, kind)) = split_suffix(k)
+                        {
+                            self.next_col.clear();
+                            self.next_col.extend_from_slice(&k[..k.len() - SUFFIX_LEN]);
+                            self.peek = Some(Peek {
+                                same_row,
+                                ts,
+                                seqno,
+                                kind,
+                            });
+                        }
                         break;
                     }
                     let Ok((_, t, seqno, kind)) = split_suffix(k) else {
@@ -994,6 +1029,7 @@ pub struct ResolverBuffers {
     out_key: Vec<u8>,
     out_val: Vec<u8>,
     past_col: Vec<u8>,
+    next_col: Vec<u8>,
 }
 
 impl ResolverBuffers {
@@ -1010,6 +1046,7 @@ impl ResolverBuffers {
         self.out_key.clear();
         self.out_val.clear();
         self.past_col.clear();
+        self.next_col.clear();
     }
 }
 
