@@ -1,6 +1,6 @@
 # 0014: cache-only reads in `pigeonhole-sst` and `pigeonhole-engine`, for async reads
 
-**Status:** Proposed (#42, D196). Implemented in #42's PR 2a; it needs approval before that PR merges.
+**Status:** Approved (coordinator, 2026-10-09; #42, D196). Implemented in #42's PR 2a (#411).
 
 ## Change
 
