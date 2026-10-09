@@ -39,7 +39,7 @@ mod workload;
 pub use histogram::Histogram;
 pub use report::{
     Comparison, Delta, Environment, LatencyStats, OpTypeStats, ReadSplit, RunDetail, RunRecord,
-    SUITE_FORMAT, Scaling, ShardShare, Suite, Tolerance, compare,
+    SUITE_FORMAT, Scaling, ShardShare, Stalls, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -431,6 +431,12 @@ pub trait Runner {
     fn shard_shares(&self) -> Vec<ShardShare> {
         Vec::new()
     }
+
+    /// Cumulative stall counters since open ([`Stalls`]); `None` (the default) for stores
+    /// that do not report them. [`run_detailed`] reads it around the measured phase.
+    fn stalls(&self) -> Option<Stalls> {
+        None
+    }
 }
 
 /// Runs Pigeonhole through its public API.
@@ -544,7 +550,7 @@ pub fn run_detailed(
         .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
     let closed = runner.close();
-    let (load, elapsed, threads, hist, split, shards) = result?;
+    let (load, elapsed, threads, hist, split, (shards, stalls)) = result?;
     closed?;
     let ops = hist.count();
     let (reads, by_type) = split.into_split();
@@ -572,6 +578,7 @@ pub fn run_detailed(
             reads,
             by_type,
             shards,
+            stalls,
         },
     })
 }
@@ -674,7 +681,19 @@ fn row_hash(row: &[u8]) -> u64 {
     h.finish()
 }
 
-type Measured = (Duration, Duration, usize, Histogram, Split, Vec<ShardShare>);
+type Measured = (
+    Duration,
+    Duration,
+    usize,
+    Histogram,
+    Split,
+    (Vec<ShardShare>, Option<Stalls>),
+);
+
+/// What the measured phase stalled on, between two [`Runner::stalls`] readings.
+fn stalls_between(before: Option<Stalls>, after: Option<Stalls>) -> Option<Stalls> {
+    Some(Stalls::between(&before?, &after?))
+}
 
 /// Per-shard shares between two [`Runner::shard_shares`] readings.
 fn shares_between(before: &[ShardShare], after: &[ShardShare]) -> Vec<ShardShare> {
@@ -716,7 +735,7 @@ fn measure(
     if clients.len() < 2 {
         let mut hist = Histogram::new();
         let mut split = Split::default();
-        let before = runner.shard_shares();
+        let before = (runner.shard_shares(), runner.stalls());
         let start = Instant::now();
         for (op, class) in ops.iter().zip(&classes) {
             let t = Instant::now();
@@ -726,7 +745,10 @@ fn measure(
             split.record(op, *class, latency);
         }
         let elapsed = start.elapsed();
-        let shards = shares_between(&before, &runner.shard_shares());
+        let shards = (
+            shares_between(&before.0, &runner.shard_shares()),
+            stalls_between(before.1, runner.stalls()),
+        );
         return Ok((load, elapsed, 1, hist, split, shards));
     }
 
@@ -760,7 +782,7 @@ fn measure(
                 })
             })
             .collect();
-        let before = runner.shard_shares();
+        let before = (runner.shard_shares(), runner.stalls());
         barrier.wait();
         let start = Instant::now();
         let mut hist = Histogram::new();
@@ -781,7 +803,10 @@ fn measure(
             }
         }
         let elapsed = start.elapsed();
-        let shards = shares_between(&before, &runner.shard_shares());
+        let shards = (
+            shares_between(&before.0, &runner.shard_shares()),
+            stalls_between(before.1, runner.stalls()),
+        );
         match first_err {
             Some(e) => Err(e),
             None => Ok((load, elapsed, n, hist, split, shards)),

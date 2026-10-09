@@ -269,6 +269,14 @@ impl Pigeonhole {
         self.db.engine.shard_stats()
     }
 
+    /// The engine's counters since open: commits, flushes, compactions, write stalls, WAL
+    /// unpin passes, inline WAL syncs and file growths. A bench hook (ICR 0015) that shows
+    /// what stalled during a run; take two readings and subtract for a phase.
+    #[doc(hidden)]
+    pub fn engine_metrics(&self) -> crate::EngineMetrics {
+        self.db.engine.metrics()
+    }
+
     /// The writer default durability.
     pub fn default_durability(&self) -> Durability {
         self.db.engine.default_durability()

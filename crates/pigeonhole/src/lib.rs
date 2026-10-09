@@ -126,6 +126,9 @@ pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
 
+/// The engine's counters, for [`Pigeonhole::engine_metrics`] (a bench hook, ICR 0015).
+#[doc(hidden)]
+pub use pigeonhole_engine::Metrics as EngineMetrics;
 #[doc(hidden)]
 pub use pigeonhole_engine::ShardStats;
 pub use pigeonhole_engine::{MergeError, MergeOperator};

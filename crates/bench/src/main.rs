@@ -427,6 +427,9 @@ mod tests {
         let suite = bench(&a).unwrap();
         assert_eq!(suite.results.len(), 1);
         assert!(suite.to_markdown().contains("| ycsb-c | pigeonhole |"));
+        // Pigeonhole reports what its measured phase stalled on (ICR 0015).
+        assert!(suite.results[0].detail.stalls.is_some());
+        assert!(suite.to_markdown().contains("| Inline WAL syncs |"));
         let a = args(&format!(
             "scaling --scale smoke --shards 2 --write-buffer 16777216 --dir {}",
             dir.display()

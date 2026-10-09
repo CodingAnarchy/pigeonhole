@@ -317,6 +317,62 @@ pub struct RunDetail {
     /// stores without shards.
     #[serde(default)]
     pub shards: Vec<ShardShare>,
+    /// What the measured phase stalled on (Pigeonhole only); `None` for other stores and in
+    /// results written before it existed.
+    #[serde(default)]
+    pub stalls: Option<Stalls>,
+}
+
+/// What a run's measured phase stalled on (Pigeonhole, from its engine metrics, ICR 0015):
+/// the write path's stalls and the background work behind them.
+///
+/// ```
+/// use pigeonhole_bench::Stalls;
+///
+/// let before = Stalls { flushes: 2, write_stalls: 1, ..Default::default() };
+/// let after = Stalls { flushes: 5, write_stalls: 1, ..Default::default() };
+/// let d = Stalls::between(&before, &after);
+/// assert_eq!((d.flushes, d.write_stalls), (3, 0));
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stalls {
+    /// Commits that waited for memtable room or the L0 token bucket, and the time they
+    /// waited.
+    pub write_stalls: u64,
+    /// See [`Stalls::write_stalls`].
+    pub write_stall_nanos: u64,
+    /// Flushes and compactions completed.
+    pub flushes: u64,
+    /// See [`Stalls::flushes`].
+    pub compactions: u64,
+    /// WAL unpin passes, and the small memtables they froze (#175).
+    pub unpin_passes: u64,
+    /// See [`Stalls::unpin_passes`].
+    pub unpin_flushes: u64,
+    /// WAL rollovers synced on a shard thread (#19).
+    pub wal_inline_syncs: u64,
+    /// File growths, and the time they held the page allocator (#28, #182).
+    pub file_growths: u64,
+    /// See [`Stalls::file_growths`].
+    pub file_growth_nanos: u64,
+}
+
+impl Stalls {
+    /// The counts between two cumulative readings.
+    pub fn between(before: &Stalls, after: &Stalls) -> Stalls {
+        let d = |a: u64, b: u64| b.saturating_sub(a);
+        Stalls {
+            write_stalls: d(before.write_stalls, after.write_stalls),
+            write_stall_nanos: d(before.write_stall_nanos, after.write_stall_nanos),
+            flushes: d(before.flushes, after.flushes),
+            compactions: d(before.compactions, after.compactions),
+            unpin_passes: d(before.unpin_passes, after.unpin_passes),
+            unpin_flushes: d(before.unpin_flushes, after.unpin_flushes),
+            wal_inline_syncs: d(before.wal_inline_syncs, after.wal_inline_syncs),
+            file_growths: d(before.file_growths, after.file_growths),
+            file_growth_nanos: d(before.file_growth_nanos, after.file_growth_nanos),
+        }
+    }
 }
 
 /// One shard's share of a run's measured phase (Pigeonhole only): whether the scaling
@@ -607,6 +663,34 @@ impl Suite {
                         d.moves,
                     );
                 }
+            }
+        }
+        let stalled: Vec<(&RunRecord, &Stalls)> = self
+            .results
+            .iter()
+            .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)))
+            .collect();
+        if !stalled.is_empty() {
+            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms |\n");
+            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
+            for (r, st) in stalled {
+                let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
+                let _ = writeln!(
+                    s,
+                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} |",
+                    r.workload,
+                    r.store,
+                    r.threads,
+                    st.write_stalls,
+                    ms(st.write_stall_nanos),
+                    st.flushes,
+                    st.compactions,
+                    st.unpin_passes,
+                    st.unpin_flushes,
+                    st.wal_inline_syncs,
+                    st.file_growths,
+                    ms(st.file_growth_nanos),
+                );
             }
         }
         if let Some(sc) = &self.scaling {

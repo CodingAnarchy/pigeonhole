@@ -70,7 +70,7 @@ use pigeonhole_io::{Completion, VfsRef};
 
 pub use mem::MemWal;
 pub use recovery::Recovery;
-pub use stream::{SpareSegments, WalStream};
+pub use stream::{SpareSegments, WalCounters, WalStream};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;

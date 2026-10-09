@@ -70,7 +70,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::Hasher;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
@@ -294,6 +294,8 @@ impl OpenedPager {
                     poisoned: false,
                 }),
                 committing: AtomicBool::new(false),
+                growths: AtomicU64::new(0),
+                growth_nanos: AtomicU64::new(0),
             }),
         })
     }
@@ -343,6 +345,9 @@ struct Inner {
     state: Mutex<CommitState>,
     /// Set while a root commit runs; overlapping commits are refused.
     committing: AtomicBool,
+    /// File growths, and the nanoseconds they held the allocator (ICR 0015).
+    growths: AtomicU64,
+    growth_nanos: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -685,6 +690,7 @@ impl Pager {
         // power loss after the commit could cut the file short of a published extent.
         let (_, end) = alloc.grow_target(class);
         let from = alloc.frontier() * UNIT_BYTES;
+        let started = std::time::Instant::now();
         self.inner
             .file
             .allocate(from, end * UNIT_BYTES - from)
@@ -695,6 +701,11 @@ impl Pager {
             lock(&self.inner.state).poisoned = true;
             return Err(e.into());
         }
+        self.inner.growths.fetch_add(1, Ordering::Relaxed);
+        self.inner.growth_nanos.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         Ok(alloc.alloc_grown(class))
     }
 
@@ -1022,6 +1033,8 @@ impl Pager {
             file_bytes: alloc.frontier() * UNIT_BYTES,
             allocated_bytes: (alloc.used_units() - alloc.retired_units()) * UNIT_BYTES,
             retired_bytes: alloc.retired_units() * UNIT_BYTES,
+            growths: self.inner.growths.load(Ordering::Relaxed),
+            growth_nanos: self.inner.growth_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -1053,12 +1066,32 @@ pub struct PagerStats {
     pub allocated_bytes: u64,
     /// Bytes retired but not yet reclaimed.
     pub retired_bytes: u64,
+    /// File growths since open: each held the allocator across a `fallocate` and a
+    /// `sync_all` (#28, #182; ICR 0015).
+    pub growths: u64,
+    /// Wall-clock nanoseconds those growths held the allocator.
+    pub growth_nanos: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pigeonhole_io::sim::SimVfs;
+
+    #[test]
+    fn growths_are_counted() {
+        let vfs: VfsRef = SimVfs::new(1);
+        let pager = Pager::create(&vfs, "/db".as_ref()).unwrap();
+        let before = pager.stats().growths;
+        let e = pager.allocate(1 << 20).unwrap();
+        let s = pager.stats();
+        assert!(s.growths > before, "{s:?}");
+        pager.abandon(e);
+        // Freed space is reused without growing.
+        let e = pager.allocate(1 << 20).unwrap();
+        assert_eq!(pager.stats().growths, s.growths);
+        pager.abandon(e);
+    }
 
     #[test]
     fn try_reclaim_does_not_wait_for_a_held_allocator() {

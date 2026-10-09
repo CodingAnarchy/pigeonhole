@@ -7,6 +7,14 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ## [Unreleased]
 
 ### Added
+- Stall counters (ICR 0015, #64):
+  - `pigeonhole-engine`: `Metrics::wal_inline_syncs` and `Metrics::file_growths`;
+  - `pigeonhole-pager`: `PagerStats::growths` and `growth_nanos`;
+  - `pigeonhole-wal`: `WalCounters` from `WalStream::counters`.
+
+  `phdb-bench` reports what each Pigeonhole run's measured phase stalled on: write stalls, flushes, compactions, WAL unpin passes, inline WAL syncs and file growths. JSON has it in `detail.stalls`, and the markdown summary prints a table.
+
+### Added
 - **Async commits** (Phase 3, #42; behind the `async` feature, which stays off by default until the async front door is complete): `RowMutation::commit_async`, `WriteBatch::commit_async` and `commit_with_async`, and `Transaction::commit_async` and `commit_with_async` return a `nonblocking::CommitFuture`. It submits at the call and resolves when the commit is durable at its level and visible, as the sync `commit` returns. Dropping it does not roll the commit back. It runs on any executor (no runtime dependency, no `spawn_blocking`) and on an application-owned shard's own event loop.
 - `WriteBatch::commit_with_ticket` returns a `CommitTicket` (D196): `wait`, a non-blocking `try_result`, `seqno` once resolved, and `.await` with the `async` feature. It is available without the feature.
 - `pigeonhole-engine`: `Txn::submit`, the non-blocking half of `Txn::commit`.
