@@ -19,22 +19,29 @@
 # Raised by D195 (owner decision, 2026-10-09): flushed 1905 -> 1912 and compacted 1282 -> 1288
 # (#384 merged after these ceilings were measured), get-sst 17883 -> 17983 with headroom 0.5%
 # (placement drift on main after #392/#396). Each is main 99f8929's count times (1 + headroom).
+#
+# Lowered from main c8a05d6's code (the highest of three identical CI runs, run 37990735235)
+# with `instruction-ceilings.py lower`. The YCSB shapes (crates/bench/examples/ycsb.rs) were
+# added from that run with 1.0% headroom: identical code varied by up to 0.54% (ycsb-c
+# 83935-84387 in that run) and 0.4% (ycsb-a, an earlier run, 37988769459).
 
 as-written 2573 0.3
 flushed 1912 0.3
-compacted 1288 0.3
+compacted 1287 0.3
 get-mem 7270 0.3
-get-sst 17983 0.5
+get-sst 17958 0.5
 get-miss 4628 0.3
-row 2635 1.0
+row 2574 1.0
 scan 1440 0.3
 scan-filtered 7458 0.3
-versions 5950 0.3
-counter 9856 0.3
-rows 20928 0.3
-level-scans 15320 0.6
-short-scans 14621 0.3
-commit-one 10718 0.6
-commit-sixteen 52862 0.3
-flush 2200 0.3
-compact 2875 0.5
+versions 5802 0.3
+counter 9855 0.3
+rows 20413 0.3
+level-scans 15095 0.6
+short-scans 14518 0.3
+commit-one 10714 0.6
+commit-sixteen 52858 0.3
+flush 2199 0.3
+compact 2869 0.5
+ycsb-c 85231 1.0
+ycsb-a 47131 1.0

@@ -3,7 +3,8 @@ name: Instructions per cell
 # Read-path instructions per unit, counted by callgrind (deterministic), for the PR's base and
 # head: the hot row's three states (crates/bench/examples/hotrow.rs, per cell) and the read
 # shapes of crates/bench/examples/readshapes.rs (point gets, narrow rows, scans, filtered
-# scans, multi-version and counter reads) and write shapes of writepath.rs. A main-vs-branch
+# scans, multi-version and counter reads), write shapes of writepath.rs and the YCSB-style
+# operations of ycsb.rs. A main-vs-branch
 # table goes in the job summary, and the job fails if any state or shape gets worse by more
 # than its threshold in THRESHOLDS (#287: no regressions; the thresholds only absorb
 # callgrind's run-to-run noise). Runs only when the read path changes.
@@ -21,6 +22,7 @@ on:
       - 'crates/bench/examples/hotrow.rs'
       - 'crates/bench/examples/readshapes.rs'
       - 'crates/bench/examples/writepath.rs'
+      - 'crates/bench/examples/ycsb.rs'
       - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
       - 'scripts/instruction-ceilings.py'
@@ -39,13 +41,14 @@ env:
   CARGO_TERM_COLOR: always
   # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
   # the head's sources of these files, so a new or changed example still has a baseline.
-  EXAMPLES: hotrow readshapes writepath
+  EXAMPLES: hotrow readshapes writepath ycsb
   # Shape binaries and their shapes, `EXAMPLE:shape,shape,...` (space-separated), in the
   # contract of scripts/instructions-per-cell.sh. Add a shape here and it is reported and
   # checked for regressions on every PR.
   SHAPES: >-
     readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans
     writepath:commit-one,commit-sixteen,flush,compact
+    ycsb:ycsb-c,ycsb-a
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
   # run-to-run noise on identical code (#354): within 0.1% for the hot-row states and read
@@ -53,7 +56,8 @@ env:
   # their measured work on fresh threads (#360): two identical-code runs agreed within 0.2%
   # (runs 37900128944 and 37901737150). If a shape proves noisier on CI, report it rather
   # than raising its threshold silently.
-  THRESHOLDS: default=0.5 row=1.5
+  # The YCSB shapes get 1.0%: identical code varied by up to 0.54% across runs.
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0
 
 jobs:
   instructions:
