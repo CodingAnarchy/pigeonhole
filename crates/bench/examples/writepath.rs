@@ -9,6 +9,8 @@
 //! |---|---|---|
 //! | `commit-one` | 500 commits of one 100-byte cell | commits |
 //! | `commit-sixteen` | 125 commits of 16 cells in one row | commits |
+//! | `commit-overwrite` | 500 commits of one 100-byte cell over one of 2,000 existing rows (`ycsb-a`'s write) | commits |
+//! | `commit-at` | 500 timestamped appends of one 100-byte cell to a new row of a family with a TTL (`time-series-ttl`'s write) | commits |
 //! | `flush` | 2,000 entries flushed from the memtable to one SST | entries |
 //! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level | entries |
 //!
@@ -27,6 +29,8 @@ mod measure;
 mod shards;
 use measure::Measured;
 use shards::Shards;
+
+use std::time::Duration;
 
 use pigeonhole::{Family, Pigeonhole, Table};
 
@@ -72,6 +76,42 @@ fn main() {
             measure(&mut || shape_commit_sixteen(&t, &rows, &quals));
             rows.len()
         }
+        "commit-overwrite" => {
+            // A fixed set of rows, written first; the measured commits overwrite them in a
+            // scattered order, so each lands inside the memtable's existing keys.
+            let set = rows("ow", 2_000);
+            for row in &set {
+                t.mutate(row).put("f", b"q", &VALUE).commit().unwrap();
+            }
+            let order: Vec<Vec<u8>> = (0..500 * iters)
+                .map(|i| set[i * 7_919 % set.len()].clone())
+                .collect();
+            measure(&mut || shape_commit_one(&t, &order));
+            order.len()
+        }
+        "commit-at" => {
+            // A table of its own, so the other shapes' setup is unchanged. TTL, no FIFO
+            // compaction: its expiry timer would fire on wall time.
+            let m = db
+                .table("m")
+                .unwrap()
+                .family("m", Family::default().ttl(Duration::from_secs(86_400)))
+                .create_if_missing()
+                .unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64;
+            // One entity's newest points, newest first in row order (as the bench's keys).
+            let points: Vec<(Vec<u8>, u64)> = (0..500 * iters as u64)
+                .map(|i| {
+                    let ts = now - 1_000_000 + i;
+                    (format!("ts:e0001:{:016x}", u64::MAX - ts).into_bytes(), ts)
+                })
+                .collect();
+            measure(&mut || shape_commit_at(&m, &points));
+            points.len()
+        }
         "flush" => {
             let rows = rows("six", 125 * iters);
             commit_sixteen(&t, &rows, &quals);
@@ -89,7 +129,10 @@ fn main() {
             measure(&mut || shape_compact(&db));
             rows.len() * 16
         }
-        other => panic!("unknown shape {other}: commit-one, commit-sixteen, flush or compact"),
+        other => panic!(
+            "unknown shape {other}: commit-one, commit-sixteen, commit-overwrite, commit-at, \
+             flush or compact"
+        ),
     };
     eprintln!("units {}", if setup_only { 0 } else { units });
     drop(t);
@@ -103,6 +146,17 @@ fn shape_commit_one(t: &Table, rows: &[Vec<u8>]) {
     let _measured = Measured::start();
     for row in rows {
         t.mutate(row).put("f", b"q", &VALUE).commit().unwrap();
+    }
+}
+
+#[inline(never)]
+fn shape_commit_at(m: &Table, points: &[(Vec<u8>, u64)]) {
+    let _measured = Measured::start();
+    for (row, ts) in points {
+        m.mutate(row)
+            .put_at("m", b"v", *ts, &VALUE)
+            .commit()
+            .unwrap();
     }
 }
 
