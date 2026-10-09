@@ -120,6 +120,13 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
     while read -r shape_bin name; do
         ir=$(callgrind '*shape_*' "" "$shape_bin" "$name" 4 "$work")
         report "$name" "$ir" "$(units_of "$work/err")"
+        if [[ -n "${PROFILE_SHAPES:-}" ]]; then
+            {
+                echo "===== callers $name ====="
+                callgrind_annotate --tree=caller --inclusive=yes "$work/cg.out" > "$work/tree.txt" 2>/dev/null || true
+                { grep -B16 -E '\* .*(memset|memcmp)' "$work/tree.txt" | head -70; } || true
+            } >&2
+        fi
     done < <(shape_runs "$@")
     for group in "$@"; do
         last="${group##*,}"; last="${last##*:}"
