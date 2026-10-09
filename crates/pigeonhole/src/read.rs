@@ -529,14 +529,8 @@ impl<'t> Scan<'t> {
 pub(crate) fn fill_row(cursor: &mut ScanCursor, buf: &mut RowBuf) -> Result<()> {
     buf.clear();
     buf.key.extend_from_slice(cursor.row());
-    loop {
-        let start = buf.qualifiers.len();
-        let Some(family) = cursor.next_cell_into(&mut buf.qualifiers)? else {
-            return Ok(());
-        };
-        let end = buf.qualifiers.len();
-        cursor.push_current(family, start..end, buf);
-    }
+    while cursor.push_next_cell(buf)? {}
+    Ok(())
 }
 
 /// Rows of a scan, in key order. As an [`Iterator`] it yields owned [`Row`]s (cheap: values
@@ -571,14 +565,7 @@ impl RowIter<'_> {
             return Ok(false);
         }
         self.buf.key.extend_from_slice(self.cursor.row());
-        loop {
-            let start = self.buf.qualifiers.len();
-            let Some(family) = self.cursor.next_cell_into(&mut self.buf.qualifiers)? else {
-                break;
-            };
-            let end = self.buf.qualifiers.len();
-            self.cursor.push_current(family, start..end, &mut self.buf);
-        }
+        while self.cursor.push_next_cell(&mut self.buf)? {}
         Ok(true)
     }
 
