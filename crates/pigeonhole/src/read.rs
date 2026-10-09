@@ -445,14 +445,7 @@ impl RowIter<'_> {
             return Ok(false);
         }
         self.buf.key.extend_from_slice(self.cursor.row());
-        loop {
-            let start = self.buf.qualifiers.len();
-            let Some(family) = self.cursor.next_cell_into(&mut self.buf.qualifiers)? else {
-                break;
-            };
-            let end = self.buf.qualifiers.len();
-            self.cursor.push_current(family, start..end, &mut self.buf);
-        }
+        while self.cursor.push_next_cell(&mut self.buf)? {}
         Ok(true)
     }
 

@@ -490,9 +490,19 @@ impl<'a> Escaped<'a> {
         !self.0.contains(&0)
     }
 
-    /// Appends the unescaped bytes to `out`.
+    /// Appends the unescaped bytes to `out`. The runs between escapes are copied whole: a
+    /// row or qualifier rarely holds a `0x00`, so this is usually one copy (#287), not a step
+    /// per byte. Tolerates malformed input as [`Escaped`]'s comparisons do.
     pub fn unescape_into(&self, out: &mut Vec<u8>) {
-        out.extend(self.raw_bytes());
+        let mut rest = self.0;
+        while let Some(i) = rest.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&rest[..=i]);
+            rest = &rest[i + 1..];
+            if let [0xFF, tail @ ..] = rest {
+                rest = tail;
+            }
+        }
+        out.extend_from_slice(rest);
     }
 
     /// Compares with raw (unescaped) bytes without allocating.

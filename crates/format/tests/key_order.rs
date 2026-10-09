@@ -4,7 +4,7 @@ mod common;
 
 use common::{Cell, cell, config, num, part, sized};
 use pigeonhole_format::key::{
-    Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
+    Escaped, Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
     encode_column_prefix, encode_key, encode_key_after_row, encode_marker_after_row,
     encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
 };
@@ -204,5 +204,31 @@ proptest! {
             }
         }
         prop_assert_eq!(parts, whole);
+    }
+}
+
+proptest! {
+    /// `unescape_into` copies the runs between escapes whole (#287); it must still follow the
+    /// byte rule `Escaped`'s comparisons use, malformed input included: `00 FF` is `00`, and a
+    /// `00` not followed by `FF` is taken as is.
+    #[test]
+    fn unescape_follows_the_byte_rule(
+        bytes in vec(prop_oneof![Just(0u8), Just(0xFFu8), any::<u8>()], 0..64),
+    ) {
+        let mut want = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            want.push(b);
+            i += 1;
+            if b == 0 && bytes.get(i) == Some(&0xFF) {
+                i += 1;
+            }
+        }
+        // Appends after what the buffer holds.
+        let mut got = vec![9u8];
+        Escaped::new(&bytes).unescape_into(&mut got);
+        prop_assert_eq!(&got[1..], &want[..]);
+        prop_assert!(Escaped::new(&bytes).eq_raw(&want));
     }
 }

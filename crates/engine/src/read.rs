@@ -926,6 +926,64 @@ impl ScanCursor {
         Ok(None)
     }
 
+    /// Appends the current row's next cell to `sink`, its qualifier unescaped into
+    /// [`RowSink::qualifiers`]: [`ScanCursor::next_cell_into`] and
+    /// [`ScanCursor::push_current`] in one step, which reads the resolver's cell once rather
+    /// than once for its column and again for its value (#287). Returns `false` when the row
+    /// is done.
+    pub fn push_next_cell(&mut self, sink: &mut impl RowSink) -> Result<bool> {
+        if !self.in_row {
+            return Ok(false);
+        }
+        if let Some(i) = self.last_lane.take() {
+            let fetched = self.lanes[i].fetch();
+            self.snapshot.checked(fetched)?;
+        }
+        // A column of the current row starts with its escaped row and the terminator (which
+        // never occurs inside an escaped row).
+        let row_len = self.row_esc.len() + TERMINATOR.len();
+        while self.lane_idx < self.lanes.len() {
+            let i = self.lane_idx;
+            let lane = &self.lanes[i];
+            let pushed = match lane.resolver.current().filter(|_| lane.pending) {
+                Some(cell) => {
+                    let col = column_of(cell.key);
+                    let in_row = col.len() >= row_len
+                        && col.starts_with(&self.row_esc)
+                        && col[self.row_esc.len()..row_len] == TERMINATOR;
+                    if in_row {
+                        let end = col.len().saturating_sub(2).max(row_len);
+                        let qualifiers = sink.qualifiers();
+                        let start = qualifiers.len();
+                        Escaped::new(&col[row_len..end]).unescape_into(qualifiers);
+                        let qualifier = start..qualifiers.len();
+                        let bytes = match &lane.pinned {
+                            Some(v) => v,
+                            None => cell.value,
+                        };
+                        if bytes.len() <= CellData::INLINE_MAX {
+                            sink.push_inline(lane.family, qualifier, lane.ts, bytes);
+                        } else {
+                            sink.push(
+                                lane.family,
+                                qualifier,
+                                lane.data(|| Arc::clone(&self.snapshot.view)),
+                            );
+                        }
+                    }
+                    in_row
+                }
+                None => false,
+            };
+            if pushed {
+                self.last_lane = Some(i);
+                return Ok(true);
+            }
+            self.lane_idx += 1;
+        }
+        Ok(false)
+    }
+
     /// The cell last returned by [`ScanCursor::next_cell`], as a pinned [`CellData`] (no
     /// copy of a large value).
     ///
