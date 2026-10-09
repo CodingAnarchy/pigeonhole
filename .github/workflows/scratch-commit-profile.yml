@@ -1,0 +1,34 @@
+name: scratch commit profile
+on:
+  push:
+    branches: [scratch/commit-profile]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - run: CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -p pigeonhole-bench --example writepath
+      - name: callgrind per thread, commit-one and commit-overwrite
+        shell: bash
+        run: |
+          set -euo pipefail
+          for shape in commit-one commit-overwrite; do
+            mkdir -p "/tmp/$shape"
+            env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 valgrind --tool=callgrind --collect-atstart=no --separate-threads=yes \
+              --callgrind-out-file="/tmp/$shape/cg.out" target/release/examples/writepath "$shape" 4 /tmp >/dev/null 2>"/tmp/$shape/err"
+            grep '^units' "/tmp/$shape/err"
+            for f in /tmp/$shape/cg.out*; do
+              total=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' "$f")
+              [ "${total:-0}" -gt 0 ] || continue
+              echo "=== $shape $(basename "$f") total $total"
+              callgrind_annotate --inclusive=no --threshold=95 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -45
+              echo "--- inclusive"
+              callgrind_annotate --inclusive=yes --threshold=99 "$f" 2>/dev/null | sed -n '/^Ir/,$p' | head -40
+            done
+          done
