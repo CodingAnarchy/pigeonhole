@@ -1131,12 +1131,10 @@ fn counter_versions(
 }
 
 fn counter_family(ttl_micros: u64) -> FamilyOptions {
-    FamilyOptions {
-        merge_operator: "pigeonhole.i64_add".into(),
-        kind: FamilyKind::Counter,
-        ttl_micros,
-        ..FamilyOptions::default()
-    }
+    FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_add")
+        .kind(FamilyKind::Counter)
+        .ttl_micros(ttl_micros)
 }
 
 #[test]
@@ -1200,10 +1198,7 @@ fn counter_family_write_rules() {
                 ("ttl".into(), counter_family(1_000_000)),
                 (
                     "legacy".into(),
-                    FamilyOptions {
-                        merge_operator: "pigeonhole.i64_add".into(),
-                        ..FamilyOptions::default()
-                    },
+                    FamilyOptions::default().merge_operator("pigeonhole.i64_add"),
                 ),
                 ("plain".into(), FamilyOptions::default()),
             ],
@@ -1281,10 +1276,7 @@ fn counter_writes_in_one_commit_combine() {
                 ("c".into(), counter_family(0)),
                 (
                     "legacy".into(),
-                    FamilyOptions {
-                        merge_operator: "pigeonhole.i64_add".into(),
-                        ..FamilyOptions::default()
-                    },
+                    FamilyOptions::default().merge_operator("pigeonhole.i64_add"),
                 ),
             ],
         )

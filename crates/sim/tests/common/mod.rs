@@ -68,12 +68,12 @@ impl Config {
 }
 
 pub fn families() -> Vec<ModelFamily> {
-    let f = |name: &str, max_versions, ttl_micros, i64_add| ModelFamily {
-        name: name.into(),
-        max_versions,
-        ttl_micros,
-        i64_add,
-        counter: false,
+    let f = |name: &str, max_versions, ttl_micros, i64_add| {
+        ModelFamily::new(name)
+            .max_versions(max_versions)
+            .ttl_micros(ttl_micros)
+            .i64_add(i64_add)
+            .counter(false)
     };
     vec![
         f("f", 0, 0, false),

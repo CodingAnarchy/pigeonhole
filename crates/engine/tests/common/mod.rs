@@ -131,12 +131,12 @@ pub fn new_model() -> Model {
 /// writes buckets only in `sum_ttl`), keeping four families per table; the `slots` target
 /// has all six (#283).
 pub fn families() -> Vec<ModelFamily> {
-    let f = |name: &str, max_versions, ttl_micros, i64_add| ModelFamily {
-        name: name.into(),
-        max_versions,
-        ttl_micros,
-        i64_add,
-        counter: is_sum(name),
+    let f = |name: &str, max_versions, ttl_micros, i64_add| {
+        ModelFamily::new(name)
+            .max_versions(max_versions)
+            .ttl_micros(ttl_micros)
+            .i64_add(i64_add)
+            .counter(is_sum(name))
     };
     if env!("CARGO_CRATE_NAME") == "slots" {
         // Six families: 24 slots on a shard holding every table (#283).
@@ -225,36 +225,36 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
         "ttl" => CompactionStyle::FifoByTime,
         _ => CompactionStyle::Leveled,
     };
-    FamilyOptions {
-        compaction,
-        // `f` stores its blocks with zstd (#44), the others with LZ4.
-        compression: if f.name == "f" {
-            Compression::Zstd
+    // `f` stores its blocks with zstd (#44), the others with LZ4.
+    let compression = if f.name == "f" {
+        Compression::Zstd
+    } else {
+        Compression::Lz4
+    };
+    // Small blob thresholds (values are up to 160 bytes), so flushes and compactions
+    // separate many values and blob GC runs (issue #33).
+    let blob_threshold = match f.name.as_str() {
+        "f" => 40,
+        "g" => 100,
+        "ttl" => 60,
+        _ => FamilyOptions::default().blob_threshold,
+    };
+    FamilyOptions::default()
+        .compaction(compaction)
+        .compression(compression)
+        .blob_threshold(blob_threshold)
+        .max_versions(f.max_versions)
+        .ttl_micros(f.ttl_micros)
+        .merge_operator(if f.i64_add || f.counter {
+            "pigeonhole.i64_add"
         } else {
-            Compression::Lz4
-        },
-        // Small blob thresholds (values are up to 160 bytes), so flushes and compactions
-        // separate many values and blob GC runs (issue #33).
-        blob_threshold: match f.name.as_str() {
-            "f" => 40,
-            "g" => 100,
-            "ttl" => 60,
-            _ => FamilyOptions::default().blob_threshold,
-        },
-        max_versions: f.max_versions,
-        ttl_micros: f.ttl_micros,
-        merge_operator: if f.i64_add || f.counter {
-            "pigeonhole.i64_add".to_owned()
-        } else {
-            String::new()
-        },
-        kind: if f.counter {
+            ""
+        })
+        .kind(if f.counter {
             FamilyKind::Counter
         } else {
             FamilyKind::Standard
-        },
-        ..FamilyOptions::default()
-    }
+        })
 }
 
 #[derive(Clone)]
@@ -1658,15 +1658,12 @@ impl World {
     }
 
     fn model_purge(&self, e: &PurgeEvent) -> ModelPurge {
-        ModelPurge {
-            table: e.table.clone(),
-            family: e.family.clone(),
-            rows: e.rows.clone(),
-            snapshots: e.snapshots.iter().map(|s| self.model_seqno(*s)).collect(),
-            now: e.now,
-            min_ts_above: e.min_ts_above,
-            max_seqno: self.model_seqno(e.max_seqno),
-        }
+        ModelPurge::new(e.table.clone(), e.family.clone())
+            .rows(e.rows.clone())
+            .snapshots(e.snapshots.iter().map(|s| self.model_seqno(*s)).collect())
+            .now(e.now)
+            .min_ts_above(e.min_ts_above)
+            .max_seqno(self.model_seqno(e.max_seqno))
     }
 
     fn apply_purge(&mut self, e: &PurgeEvent) {

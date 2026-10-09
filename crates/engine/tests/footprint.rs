@@ -55,10 +55,7 @@ fn at_rest(mib: u64, keep_pct: u64, separate: bool) -> (u64, u64, u64, usize) {
             "t",
             &[(
                 "f".into(),
-                FamilyOptions {
-                    blob_threshold: if separate { 512 } else { u32::MAX },
-                    ..FamilyOptions::default()
-                },
+                FamilyOptions::default().blob_threshold(if separate { 512 } else { u32::MAX }),
             )],
         )
         .unwrap();

@@ -70,12 +70,12 @@ fn table_index(row: &[u8]) -> usize {
 /// operands at the commit timestamp, D41). The `counters` test target swaps `g` and `ttl`
 /// for the counter families `sum` and `sum_ttl` (D179), keeping four families per table.
 fn families() -> Vec<ModelFamily> {
-    let f = |name: &str, max_versions, ttl_micros, i64_add| ModelFamily {
-        name: name.into(),
-        max_versions,
-        ttl_micros,
-        i64_add,
-        counter: is_sum(name),
+    let f = |name: &str, max_versions, ttl_micros, i64_add| {
+        ModelFamily::new(name)
+            .max_versions(max_versions)
+            .ttl_micros(ttl_micros)
+            .i64_add(i64_add)
+            .counter(is_sum(name))
     };
     if env!("CARGO_CRATE_NAME") == "counters" {
         vec![

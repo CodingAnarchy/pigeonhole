@@ -249,20 +249,17 @@ fn check_compaction(seed: u64, commits: usize, choose: Choose) {
             .collect()
     });
     // What the model drops when this compaction purges (owner decision: HBase semantics).
-    let purge = ModelPurge {
-        table: TABLE.into(),
-        family: FAMILY.into(),
-        rows: (Bound::Unbounded, Bound::Unbounded),
-        snapshots: snapshots.clone(),
-        now: gc_now,
-        min_ts_above: gc.min_ts_above,
-        max_seqno: from
-            .iter()
-            .flat_map(|&l| &levels[l])
-            .map(|s| s.0.seqno_range.1)
-            .max()
-            .unwrap_or(0),
-    };
+    let purge = ModelPurge::new(TABLE, FAMILY)
+        .snapshots(snapshots.clone())
+        .now(gc_now)
+        .min_ts_above(gc.min_ts_above)
+        .max_seqno(
+            from.iter()
+                .flat_map(|&l| &levels[l])
+                .map(|s| s.0.seqno_range.1)
+                .max()
+                .unwrap_or(0),
+        );
     let mut job = CompactionJob::new(task(by_level, to), inputs, db.context(family.clone(), gc));
     run_sliced(&db, &mut job);
     let read = job.entries_read();
@@ -958,11 +955,9 @@ fn operands_combine_within_a_timestamp() {
 )]
 fn counter_operands_combine_and_deletes_hide_older_ones() {
     let mut db = Db::new(7);
-    let family = FamilyOptions {
-        merge_operator: "pigeonhole.i64_add".into(),
-        kind: FamilyKind::Counter,
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_add")
+        .kind(FamilyKind::Counter);
     let i64v = |v: i64| stored(&v.to_le_bytes());
     let e = vec![
         (key(b"r", b"n", 50, 3, Kind::ColumnDelete), Vec::new()),
@@ -1000,11 +995,9 @@ fn counter_operands_combine_and_deletes_hide_older_ones() {
 )]
 fn counter_deletes_purge_at_the_bottom_by_seqno() {
     let mut db = Db::new(9);
-    let family = FamilyOptions {
-        merge_operator: "pigeonhole.i64_add".into(),
-        kind: FamilyKind::Counter,
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_add")
+        .kind(FamilyKind::Counter);
     let i64v = |v: i64| stored(&v.to_le_bytes());
     let mut marker = Vec::new();
     encode_marker_key(&mut marker, b"r", 60, 4).unwrap();
@@ -1087,11 +1080,9 @@ fn counter_deletes_purge_at_the_bottom_by_seqno() {
 )]
 fn counter_operands_stay_apart_across_another_sources_seqnos() {
     let mut db = Db::new(8);
-    let family = FamilyOptions {
-        merge_operator: "pigeonhole.i64_add".into(),
-        kind: FamilyKind::Counter,
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_add")
+        .kind(FamilyKind::Counter);
     let i64v = |v: i64| stored(&v.to_le_bytes());
     let ops = vec![
         (key(b"r", b"n", 0, 3, Kind::Merge), i64v(4)),
@@ -1524,15 +1515,13 @@ fn check_purge_scenario(
     let now = h.last_ts + 1;
     let gc = policy(snapshots.clone(), now, true);
     let (out, _) = compact(&db, &fam, std::slice::from_ref(&input), gc);
-    h.model.purge(&ModelPurge {
-        table: TABLE.into(),
-        family: FAMILY.into(),
-        rows: (Bound::Unbounded, Bound::Unbounded),
-        snapshots: snapshots.clone(),
-        now,
-        min_ts_above: u64::MAX,
-        max_seqno: h.model.snapshot(),
-    });
+    h.model.purge(
+        &ModelPurge::new(TABLE, FAMILY)
+            .snapshots(snapshots.clone())
+            .now(now)
+            .min_ts_above(u64::MAX)
+            .max_seqno(h.model.snapshot()),
+    );
     let max = h.model.snapshot();
     let mut ssts: Vec<_> = out
         .added
@@ -1565,12 +1554,12 @@ fn check_purge_scenario(
 )]
 fn purges_match_the_model_purge_hook() {
     use pigeonhole_sim::{ModelFamily, ModelOp};
-    let fam = |max_versions| ModelFamily {
-        name: FAMILY.into(),
-        max_versions,
-        ttl_micros: 0,
-        i64_add: true,
-        counter: false,
+    let fam = |max_versions| {
+        ModelFamily::new(FAMILY)
+            .max_versions(max_versions)
+            .ttl_micros(0)
+            .i64_add(true)
+            .counter(false)
     };
     let (t, f, r, q) = (
         TABLE.to_string(),
@@ -1707,15 +1696,13 @@ fn check_blob_gc(seed: u64, commits: usize) -> usize {
         policy(snapshots.clone(), now, true),
     );
     check_blob_accounting(&db, &first, family.blob_threshold);
-    h.model.purge(&ModelPurge {
-        table: TABLE.into(),
-        family: FAMILY.into(),
-        rows: (Bound::Unbounded, Bound::Unbounded),
-        snapshots: snapshots.clone(),
-        now,
-        min_ts_above: u64::MAX,
-        max_seqno: max,
-    });
+    h.model.purge(
+        &ModelPurge::new(TABLE, FAMILY)
+            .snapshots(snapshots.clone())
+            .now(now)
+            .min_ts_above(u64::MAX)
+            .max_seqno(max),
+    );
     let mut blobs = Blobs::default();
     blobs.add(&db.pager, &db.cache, &first.new_blob_files);
     let old: Vec<_> = first

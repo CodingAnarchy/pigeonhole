@@ -206,10 +206,7 @@ fn a_lost_commit_leaves_a_blob_file_the_open_sweeps() {
 fn a_merge_operand_above_the_limit_is_refused() {
     let vfs = SimVfs::new(233);
     let db = open(&vfs);
-    let family = FamilyOptions {
-        merge_operator: "pigeonhole.i64_add".into(),
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default().merge_operator("pigeonhole.i64_add");
     let t = db.create_table("t", &[("f".into(), family)]).unwrap();
     let mut wb = WriteBatch::new();
     wb.merge(

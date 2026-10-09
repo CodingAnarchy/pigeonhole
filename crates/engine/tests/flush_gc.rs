@@ -42,10 +42,7 @@ impl Rig {
         let mut shard = shards.remove(0);
         while shard.run_once(u64::MAX) {}
         db.mutate_flush_gc(mutation);
-        let family = FamilyOptions {
-            max_versions: 1,
-            ..FamilyOptions::default()
-        };
+        let family = FamilyOptions::default().max_versions(1);
         let t = db.create_table("t", &[("f".into(), family)]).unwrap();
         Self { db, shard, t }
     }

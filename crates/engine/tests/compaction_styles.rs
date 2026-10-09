@@ -104,10 +104,7 @@ fn families_compact_by_their_own_style() {
     o.compaction.level_base_bytes = u64::MAX;
     let mut rig = Rig::open(o);
     let table = |rig: &Rig, name: &str, compaction| {
-        let family = FamilyOptions {
-            compaction,
-            ..FamilyOptions::default()
-        };
+        let family = FamilyOptions::default().compaction(compaction);
         rig.db.create_table(name, &[("f".into(), family)]).unwrap()
     };
     let leveled = table(&rig, "leveled", CompactionStyle::Leveled);
@@ -159,11 +156,9 @@ fn fifo_by_time_families_merge_small_files_and_drop_expired_ones() {
     o.tablet_changes = false;
     o.compaction.l0_trigger = 2;
     let mut rig = Rig::open(o);
-    let family = FamilyOptions {
-        compaction: CompactionStyle::FifoByTime,
-        ttl_micros: 1_000_000,
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default()
+        .compaction(CompactionStyle::FifoByTime)
+        .ttl_micros(1_000_000);
     let t = rig
         .db
         .create_table("fifo", &[("f".into(), family)])
@@ -202,10 +197,7 @@ fn tiered_space_amp_does_not_stall_writers() {
     o.compaction.l0_trigger = 64;
     o.compaction.tiered_max_space_amp_percent = 10;
     let mut rig = Rig::open(o);
-    let family = FamilyOptions {
-        compaction: CompactionStyle::Tiered,
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default().compaction(CompactionStyle::Tiered);
     let t = rig
         .db
         .create_table("tiered", &[("f".into(), family)])

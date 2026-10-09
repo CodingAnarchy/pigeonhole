@@ -229,11 +229,9 @@ fn a_shard_in_compaction_backoff_parks_and_retries_on_time() {
     // #232: a FIFO-by-time family whose one SST expires in an hour arms the shard's retry
     // timer for then. The backoff retries below must still fire on time (the timer keeps the
     // earliest deadline), and the parked shard must not wake for the expiry.
-    let fifo = FamilyOptions {
-        compaction: pigeonhole_format::manifest::CompactionStyle::FifoByTime,
-        ttl_micros: 3_600_000_000,
-        ..FamilyOptions::default()
-    };
+    let fifo = FamilyOptions::default()
+        .compaction(pigeonhole_format::manifest::CompactionStyle::FifoByTime)
+        .ttl_micros(3_600_000_000);
     let ft = db.create_table("fifo", &[("f".into(), fifo)]).unwrap();
     let mut wb = WriteBatch::new();
     wb.put(

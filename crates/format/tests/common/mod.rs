@@ -202,18 +202,19 @@ pub fn family_options() -> impl Strategy<Value = FamilyOptions> {
                 cache_priority,
                 compaction,
                 kind,
-            )| FamilyOptions {
-                compression,
-                compression_level,
-                block_size,
-                bloom_bits,
-                max_versions,
-                ttl_micros,
-                blob_threshold,
-                merge_operator,
-                cache_priority,
-                compaction,
-                kind,
+            )| {
+                FamilyOptions::default()
+                    .compression(compression)
+                    .compression_level(compression_level)
+                    .block_size(block_size)
+                    .bloom_bits(bloom_bits)
+                    .max_versions(max_versions)
+                    .ttl_micros(ttl_micros)
+                    .blob_threshold(blob_threshold)
+                    .merge_operator(merge_operator)
+                    .cache_priority(cache_priority)
+                    .compaction(compaction)
+                    .kind(kind)
             },
         )
 }

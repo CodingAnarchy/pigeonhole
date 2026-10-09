@@ -118,10 +118,7 @@ impl Rig {
 
 /// A family separating values longer than 100 bytes.
 fn family() -> FamilyOptions {
-    FamilyOptions {
-        blob_threshold: 100,
-        ..FamilyOptions::default()
-    }
+    FamilyOptions::default().blob_threshold(100)
 }
 
 /// Row `i`'s value in generation `generation`: large (separated) for most rows, small
@@ -289,10 +286,7 @@ fn a_conditional_write_compares_a_separated_value() {
 fn blob_gc_reclaims_overwritten_values() {
     let vfs = SimVfs::new(35);
     let mut rig = Rig::open(&vfs, false);
-    let one_version = FamilyOptions {
-        max_versions: 1,
-        ..family()
-    };
+    let one_version = family().max_versions(1);
     let t = rig
         .db
         .create_table("t", &[("f".into(), one_version)])
@@ -439,10 +433,7 @@ fn dropping_a_table_drops_its_blob_files() {
 fn a_snapshot_reads_a_blob_file_that_blob_gc_dropped() {
     let vfs = SimVfs::new(38);
     let mut rig = Rig::open(&vfs, false);
-    let one_version = FamilyOptions {
-        max_versions: 1,
-        ..family()
-    };
+    let one_version = family().max_versions(1);
     let t = rig
         .db
         .create_table("t", &[("f".into(), one_version)])
@@ -535,14 +526,8 @@ fn operands_fold_onto_a_separated_base_on_every_read_path() {
     o.compaction.level_base_bytes = u64::MAX;
     o.merge_operators.register(Arc::new(Append));
     let db = Engine::open(Path::new(DB), o).unwrap();
-    let appended = FamilyOptions {
-        merge_operator: "test.append".into(),
-        ..family()
-    };
-    let counter = FamilyOptions {
-        merge_operator: "pigeonhole.i64_add".into(),
-        ..family()
-    };
+    let appended = family().merge_operator("test.append");
+    let counter = family().merge_operator("pigeonhole.i64_add");
     let t = db
         .create_table("t", &[("a".into(), appended), ("c".into(), counter)])
         .unwrap();
@@ -623,11 +608,9 @@ fn a_fifo_drop_releases_the_blob_bytes_of_the_ssts_it_drops() {
     // reads their blob pointers itself: the blob files they alone referenced go with them.
     let vfs = SimVfs::new(41);
     let mut rig = Rig::open(&vfs, false);
-    let fifo = FamilyOptions {
-        compaction: pigeonhole_engine::CompactionStyle::FifoByTime,
-        ttl_micros: 1_000_000,
-        ..family()
-    };
+    let fifo = family()
+        .compaction(pigeonhole_engine::CompactionStyle::FifoByTime)
+        .ttl_micros(1_000_000);
     let t = rig.db.create_table("t", &[("f".into(), fifo)]).unwrap();
     write(&mut rig, &t, 0..30, 0);
     rig.flush();
@@ -669,10 +652,7 @@ fn backup_copies_the_values_it_references() {
     // and are separated only by its merge.
     let vfs = SimVfs::new(39);
     let mut rig = Rig::open(&vfs, false);
-    let one_version = FamilyOptions {
-        max_versions: 1,
-        ..family()
-    };
+    let one_version = family().max_versions(1);
     let t = rig
         .db
         .create_table("t", &[("f".into(), one_version)])
@@ -827,10 +807,7 @@ fn blob_gc_empties_files_of_ssts_written_without_references() {
     let vfs = SimVfs::new(43);
     let mut rig = Rig::open(&vfs, false);
     rig.db.omit_blob_refs(true);
-    let one_version = FamilyOptions {
-        max_versions: 1,
-        ..family()
-    };
+    let one_version = family().max_versions(1);
     let t = rig
         .db
         .create_table("t", &[("f".into(), one_version)])
@@ -1065,10 +1042,7 @@ fn fragmented_below_a_large_sst(vfs: &Arc<SimVfs>) -> (Rig, TableInfo) {
     }
     rig.idle();
     // Not separated: one 1 MiB SST.
-    let fam = FamilyOptions {
-        blob_threshold: u32::MAX,
-        ..FamilyOptions::default()
-    };
+    let fam = FamilyOptions::default().blob_threshold(u32::MAX);
     let big = rig.db.create_table("big", &[("f".into(), fam)]).unwrap();
     for i in 0..90u32 {
         let mut wb = WriteBatch::new();
@@ -1129,10 +1103,7 @@ fn shrink_clears_a_region_for_a_large_extent() {
 /// a test can flush while `shrink` runs.
 fn fragmented_on_threads(vfs: &Arc<SimVfs>) -> (Arc<Engine>, TableInfo) {
     let db = Engine::open(Path::new(DB), options(Arc::clone(vfs), false)).unwrap();
-    let fam = || FamilyOptions {
-        blob_threshold: u32::MAX,
-        ..FamilyOptions::default()
-    };
+    let fam = || FamilyOptions::default().blob_threshold(u32::MAX);
     let mut small = Vec::new();
     for n in 0..40u32 {
         let t = db
