@@ -1823,6 +1823,79 @@ fn a_flush_makes_none_commits_survive_a_power_loss() {
     db.close().unwrap();
 }
 
+/// Drives application-owned shards on a thread. [`Driver::quiesce`] runs them until a pass
+/// finds no work and holds them there (nothing in flight, no shard holding a view) until
+/// [`Driver::resume`].
+struct Driver {
+    ctl: Arc<(std::sync::Mutex<DriverCtl>, std::sync::Condvar)>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct DriverCtl {
+    hold: bool,
+    held: bool,
+    stop: bool,
+}
+
+impl Driver {
+    fn start(mut shards: Vec<pigeonhole::Shard>) -> Self {
+        let ctl = Arc::new((
+            std::sync::Mutex::new(DriverCtl::default()),
+            std::sync::Condvar::new(),
+        ));
+        let c = Arc::clone(&ctl);
+        let thread = std::thread::spawn(move || {
+            loop {
+                let mut busy = false;
+                for s in &mut shards {
+                    busy |= s.run_once(Duration::from_millis(1));
+                }
+                let (m, cv) = &*c;
+                let mut st = m.lock().unwrap();
+                if st.stop && !busy {
+                    return;
+                }
+                if st.hold && !busy {
+                    st.held = true;
+                    cv.notify_all();
+                    while st.hold {
+                        st = cv.wait(st).unwrap();
+                    }
+                    st.held = false;
+                }
+                drop(st);
+                if !busy {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        Self { ctl, thread }
+    }
+
+    /// Returns once every shard is idle and held.
+    fn quiesce(&self) {
+        let (m, cv) = &*self.ctl;
+        let mut st = m.lock().unwrap();
+        st.hold = true;
+        while !st.held {
+            st = cv.wait(st).unwrap();
+        }
+    }
+
+    fn resume(&self) {
+        let (m, cv) = &*self.ctl;
+        m.lock().unwrap().hold = false;
+        cv.notify_all();
+    }
+
+    /// After the close: the shards finish it, then the thread ends.
+    fn stop(self) {
+        self.ctl.0.lock().unwrap().stop = true;
+        self.thread.join().unwrap();
+    }
+}
+
 #[test]
 fn compact_after_drop_table_covers_the_live_tables() {
     // #83: `compact()` after `drop_table` failed with `TableNotFound` (or `Corruption`)
@@ -1837,7 +1910,12 @@ fn compact_after_drop_table_covers_the_live_tables() {
             .len()
             .unwrap()
     };
-    let db = Pigeonhole::open(path, sim_options(&vfs)).unwrap();
+    // Application-owned shards, driven by `Driver`: before `shrink` they are run until idle and
+    // held there, so no background work (a compaction of the dropped table still finishing,
+    // a shard's momentary view) keeps the dropped table's extents retired (#366: on
+    // engine-owned threads that happened once in CI and left the file unshrunk).
+    let (db, shards) = Pigeonhole::open_application_owned(path, sim_options(&vfs)).unwrap();
+    let driver = Driver::start(shards);
     let make = |name: &str| {
         db.table(name)
             .unwrap()
@@ -1870,12 +1948,16 @@ fn compact_after_drop_table_covers_the_live_tables() {
     // Compacting again (nothing left of the dropped table) succeeds too.
     db.compact().unwrap();
     // The dropped table's SSTs were retired and reclaimed: shrink gives their space back.
+    // It commits on this thread, so it runs with the shards held idle.
+    driver.quiesce();
     db.shrink().unwrap();
+    driver.resume();
     let after = file_len();
     assert!(after < before / 2, "{after} vs {before}");
     assert_eq!(keep.scan_prefix(b"").iter().unwrap().count(), 400);
     drop(keep);
     db.close().unwrap();
+    driver.stop();
 
     let db = Pigeonhole::open(path, sim_options(&vfs)).unwrap();
     assert!(db.table("gone").unwrap().open().is_err());
