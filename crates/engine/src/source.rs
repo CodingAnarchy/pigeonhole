@@ -377,8 +377,9 @@ impl View {
         Ok(())
     }
 
-    /// Sources for reading one row, newest first.
-    pub(crate) fn row_sources(
+    /// Sources for reading one row, newest first, appended to `out` (a reused source list).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn row_sources_into(
         &self,
         shard: ShardId,
         tablet: TabletId,
@@ -386,21 +387,28 @@ impl View {
         filter: &ScanFilter,
         row: &[u8],
         row_prefix: &[u8],
-    ) -> Result<Vec<Source>> {
+        out: &mut Vec<Source>,
+    ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
-        let mut out = Vec::new();
         if let Some(set) = l.mems {
-            mem_sources(set, filter, &mut out);
+            mem_sources(set, filter, out);
         }
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
-            let mut escaped = Vec::with_capacity(row.len() * 2);
-            escape_into(&mut escaped, row);
+            // Inline for rows of usual length: nothing allocated per read.
+            let mut escaped = SmallVec::<[u8; 96]>::new();
+            let mut rest = row;
+            while let Some(i) = rest.iter().position(|&b| b == 0) {
+                escaped.extend_from_slice(&rest[..=i]);
+                escaped.push(0xFF);
+                rest = &rest[i + 1..];
+            }
+            escaped.extend_from_slice(rest);
             sst_sources_row(
-                fam, &self.ssts, filter, &escaped, row_prefix, l.priority, &mut out,
+                fam, &self.ssts, filter, &escaped, row_prefix, l.priority, out,
             )?;
         }
-        Ok(out)
+        Ok(())
     }
 }
