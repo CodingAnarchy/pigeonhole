@@ -529,6 +529,15 @@ impl BatchBuilder {
         Self::default()
     }
 
+    /// An empty batch with room for about `bytes` of encoded mutations before it grows
+    /// (one allocation, where [`BatchBuilder::new`] allocates its header and grows on the
+    /// first push, #320).
+    pub fn with_capacity(bytes: usize) -> Self {
+        let mut buf = Vec::with_capacity(4 + bytes);
+        buf.extend_from_slice(&[0; 4]);
+        Self { buf, count: 0 }
+    }
+
     /// Appends one mutation. `ts == None` means "use the commit timestamp". `value` is an
     /// already-encoded stored value ([`crate::value`]); empty for deletes.
     #[allow(clippy::too_many_arguments)]

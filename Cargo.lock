@@ -858,6 +858,7 @@ dependencies = [
  "pigeonhole-sim",
  "pigeonhole-sst",
  "pigeonhole-wal",
+ "smallvec",
 ]
 
 [[package]]
