@@ -83,7 +83,10 @@ fn account_drop(delta: &mut Vec<(BlobFileId, i64)>, kind: Kind, value: &[u8]) {
 #[derive(Debug, Default)]
 pub(crate) struct OutBuf {
     data: Vec<u8>,
-    items: Vec<(usize, usize, usize)>,
+    /// `(key start, value start, end)`, in `data` or (`true`) in the GC's group buffer: a
+    /// kept entry of the group just decided is not copied again, as long as the buffer is
+    /// emptied (or [`own`](Self::own)ed) before the GC's next step.
+    items: Vec<(usize, usize, usize, bool)>,
 }
 
 impl OutBuf {
@@ -92,16 +95,36 @@ impl OutBuf {
         self.data.extend_from_slice(key);
         let v = self.data.len();
         self.data.extend_from_slice(value);
-        self.items.push((k, v, self.data.len()));
+        self.items.push((k, v, self.data.len(), false));
+    }
+
+    /// An entry of the GC's group buffer, by position.
+    fn push_group(&mut self, key: usize, value: usize, end: usize) {
+        self.items.push((key, value, end, true));
     }
 
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
 
-    pub(crate) fn get(&self, i: usize) -> (&[u8], &[u8]) {
-        let (k, v, e) = self.items[i];
-        (&self.data[k..v], &self.data[v..e])
+    /// Entry `i`; `group` is the GC's group buffer ([`Gc::group_data`]).
+    pub(crate) fn get<'a>(&'a self, i: usize, group: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+        let (k, v, e, in_group) = self.items[i];
+        let bytes = if in_group { group } else { &self.data };
+        (&bytes[k..v], &bytes[v..e])
+    }
+
+    /// Copies the entries still in the GC's group buffer into this buffer, before the GC's
+    /// next step reuses it.
+    pub(crate) fn own(&mut self, group: &[u8]) {
+        for item in &mut self.items {
+            let (k, v, e, in_group) = *item;
+            if in_group {
+                let start = self.data.len();
+                self.data.extend_from_slice(&group[k..e]);
+                *item = (start, start + (v - k), start + (e - k), false);
+            }
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -229,6 +252,12 @@ impl Gc {
     }
 
     /// Forgets the current row (at a range boundary).
+    /// The group buffer the kept entries of the last step may point into
+    /// ([`OutBuf::get`]).
+    pub(crate) fn group_data(&self) -> &[u8] {
+        &self.group_data
+    }
+
     pub(crate) fn reset(&mut self) {
         self.row.clear();
         self.markers.clear();
@@ -527,7 +556,7 @@ impl Gc {
             if pending.take().is_some() {
                 out.push(&self.acc_key, &self.acc);
             }
-            out.push(&self.group_data[key], &self.group_data[value]);
+            out.push_group(key.start, value.start, value.end);
         }
         if pending.is_some() {
             out.push(&self.acc_key, &self.acc);
@@ -624,7 +653,7 @@ impl Gc {
             if pending.take().is_some() {
                 out.push(&self.acc_key, &self.acc);
             }
-            out.push(&self.group_data[key], &self.group_data[value]);
+            out.push_group(key.start, value.start, value.end);
         }
         if pending.is_some() {
             out.push(&self.acc_key, &self.acc);
