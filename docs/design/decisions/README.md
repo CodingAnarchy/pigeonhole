@@ -205,6 +205,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D190](phase-2.md#d190) — `shrink` clears a region when a large extent has no hole below it · pager, engine, #314, #319 · amends D160
 - [D191](phase-2.md#d191) — Flush-time version GC, and a guarded purge of versions beyond `max_versions` · engine, compaction, sim, #287, #315 · refines D70, D74 · **refined by D192**
 - [D192](phase-2.md#d192) — A bottommost compaction's purge runs under the D191 guard, with a fallback after repeated voids · engine, #316, #328 · refines D70, D191
+- [D193](phase-2.md#d193) — The Phase 2 gate is amended: required measures, a documented gap (#387), and floors that may not regress · owner decision, #287, #387 · amends the spec Phase 2 gate
 
 ## Open questions
 _None._
