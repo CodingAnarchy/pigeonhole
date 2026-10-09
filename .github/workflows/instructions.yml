@@ -20,6 +20,7 @@ on:
       - 'crates/bench/examples/hotrow.rs'
       - 'crates/bench/examples/readshapes.rs'
       - 'crates/bench/examples/writepath.rs'
+      - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
       - '.github/workflows/instructions.yml'
   workflow_dispatch:
@@ -78,6 +79,8 @@ jobs:
           for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-head/; done
           git worktree add -q /tmp/base "$base"
           cp "${srcs[@]}" /tmp/base/crates/bench/examples/
+          # Shared example modules (the `Measured` guard), also at the head's version.
+          cp -R crates/bench/examples/support /tmp/base/crates/bench/examples/
           (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
             --target-dir "$GITHUB_WORKSPACE/target")
           for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-base/; done
