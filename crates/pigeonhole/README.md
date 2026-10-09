@@ -5,18 +5,19 @@ column families, sparse qualifiers, timestamped versions, TTLs, prefix and range
 SQLite's deployment model (one file, a library, no server).
 
 > **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in
-> simulation, but the on-disk format and the API may change before 1.0
+> simulation, and the wide-column model (Phase 2: counter families, blob separation,
+> compaction styles, zstd) is in this release, though its performance gate is not met yet. The
+> on-disk format and the API may change before 1.0
 > ([`FORMAT.md`](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md)). The
-> wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Pigeonhole is
-> **not recommended for production use yet**. See the
+> latency work (Phase 3) is still to come. Pigeonhole is **not recommended for production use
+> yet**. See the
 > [status and roadmap](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md).
 
-> **Status: Phase 1 in progress.** The blocking API is implemented, disk-backed and
-> crash-safe through the write-ahead log: memtables flush into the file and compact, so data
-> is bounded by the disk, not memory (`Options::memtable_budget` only sizes the per-shard
-> write buffer). `flush`, `compact` and `backup` work, and a clean close leaves one file.
-> A table's tablets split and move between shards, so one table's writes spread over
-> them (`Options::tablet_changes`, on by default). The async API arrives in
+> **Status.** The blocking API is implemented, disk-backed and crash-safe through the
+> write-ahead log: memtables flush into the file and compact, so data is bounded by the disk,
+> not memory (`Options::memtable_budget` only sizes the per-shard write buffer). A clean close
+> leaves one file. A table's tablets split and move between shards, so one table's writes
+> spread over them (`Options::tablet_changes`, on by default). The async API arrives in
 > Phase 3 behind the `async` feature.
 
 ## Install

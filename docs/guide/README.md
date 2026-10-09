@@ -2,13 +2,13 @@
 
 This guide is for people and agents **using** Pigeonhole in their own projects. If you are working **on** Pigeonhole, read [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) and [`../../AGENTS.md`](../../AGENTS.md) instead.
 
-> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, but the on-disk format and the API may change before 1.0 ([`FORMAT.md`](../../FORMAT.md)). The wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Pigeonhole is **not recommended for production use yet**. See [`../status.md`](../status.md) for the roadmap.
+> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, and the wide-column model (Phase 2: counter families, blob separation, compaction styles, zstd) is on `main` for 0.2.0, though its performance gate is not met yet. The on-disk format and the API may change before 1.0 ([`FORMAT.md`](../../FORMAT.md)). The latency work (Phase 3) is still to come. Pigeonhole is **not recommended for production use yet**. See [`../status.md`](../status.md) for the roadmap.
 
-> **Status: Phase 1 sync API implemented.** Every name used in this guide exists in the `pigeonhole` crate and works as described, except where a page says otherwise; see [What the current build does not do yet](getting-started.md#what-the-current-build-does-not-do-yet). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features labeled with a later phase: **P2** wide-column model (zstd, custom merge operators; blob separation and `commit_if` already work), **P3** async, **P4** hardening of reader processes and transactions (both already work).
+> **Status:** this guide describes `main`, which will be released as 0.2.0. crates.io has 0.1.0; the [changelog](../../CHANGELOG.md) lists what changed, with migration notes. Every name used in this guide exists in the `pigeonhole` crate and works as described, except where a page says otherwise; see [What the current build does not do yet](getting-started.md#what-the-current-build-does-not-do-yet). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Labels for later phases: **P3** async, **P4** hardening of reader processes and transactions (both already work).
 
 ## Contents
-1. [Concepts](concepts.md): tables, rows, families, qualifiers, timestamps, versions, deletes.
-2. [Getting started](getting-started.md): install, open, create a table, write, read, scan, batches, close.
+1. [Concepts](concepts.md): tables, rows, families (compaction styles, compression, blob separation), qualifiers, timestamps, values, deletes.
+2. [Getting started](getting-started.md): install, open, create a table, write, read, scan, batches, conditional writes and transactions, close, maintenance.
 3. [Durability](durability.md): the four levels, how they resolve, what each survives, mixed levels, commit results.
 4. [Scans and filters](scans-and-filters.md): row, prefix and range scans, projection, versions, time ranges, snapshots, pushdown semantics.
 5. [Data modeling](data-modeling.md): row-key design, family split, time series with TTL, adjacency lists, counters, versions, anti-patterns.

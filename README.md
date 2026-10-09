@@ -7,9 +7,9 @@
 [![docs.rs](https://img.shields.io/docsrs/pigeonhole)](https://docs.rs/pigeonhole)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, but the on-disk format and the API may change before 1.0 ([`FORMAT.md`](FORMAT.md)). The wide-column model (Phase 2) and the latency work (Phase 3) are still to come. Pigeonhole is **not recommended for production use yet**. See [`docs/status.md`](docs/status.md) for the roadmap.
+> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, and the wide-column model (Phase 2: counter families, blob separation, compaction styles, zstd) is on `main` for 0.2.0, though its performance gate is not met yet. The on-disk format and the API may change before 1.0 ([`FORMAT.md`](FORMAT.md)). The latency work (Phase 3) is still to come. Pigeonhole is **not recommended for production use yet**. See [`docs/status.md`](docs/status.md) for the roadmap.
 
-> **Status: Phase 1 in progress: usable, disk-backed sync API.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; `flush`, `compact` and `backup` work, and a clean close leaves one file. Commits are crash-safe through the write-ahead log. Tablets split and move between shards (on by default); the Phase 1 gate is still to come. See [`docs/status.md`](docs/status.md) for progress.
+> **Status: usable, disk-backed sync API.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. crates.io has 0.1.0; `main` holds the 0.2.0 changes (see the [changelog](CHANGELOG.md)).
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
 
@@ -55,7 +55,7 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 |---|---|
 | **Table** | A namespace with its own families. Many tables share one file. |
 | **Row key** | Arbitrary bytes (≤ 64 KiB), sorted lexicographically. Unit of atomicity and locality. |
-| **Family** | Declared up front; its own physical LSM tree with its own policy (compression, bloom bits, versions, TTL, blob threshold, cache priority). |
+| **Family** | Declared up front; its own physical LSM tree with its own policy (compression, bloom bits, versions, TTL, blob threshold, cache priority, compaction style). A counter family holds `i64` sums. |
 | **Qualifier** | Arbitrary bytes created on write, sorted within the family. Absent cells cost nothing. |
 | **Timestamp** | `u64`, newest first. Hybrid logical clock by default; user-supplied for event time. |
 | **Value** | Bytes, up to 4 GiB − 2. Values above a family's blob threshold live in blob files; one too large for the WAL and memtable (above the smaller of 64 MiB and half a shard's memtable arena) is written to a blob file as it is committed. Optional typed merge operators. |

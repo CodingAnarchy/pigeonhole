@@ -1,6 +1,6 @@
 # Errors
 
-> **Status: Phase 1 sync API implemented.** Codes are stable; some can only occur once the feature that raises them lands (noted per row). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Codes are stable. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every fallible call returns `pigeonhole::Result<T>` = `Result<T, pigeonhole::Error>`.
 
@@ -47,7 +47,7 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | 17 | `ValueTooLarge` | A value exceeds the size limit. | A put value above 4 GiB − 2 bytes, or a merge operand above the inline limit `min(WAL segment payload, 64 MiB, half the shard's memtable arena)` (decision D16). | Split the value across qualifiers, or store it outside the database and keep a reference. |
 | 18 | `NoSpace` | The device is full. | Disk full, quota. | Free space and retry. The commit did not apply. For `shrink` (the disk filled while it moved the manifest), nothing was lost; free space and call it again. |
 | 19 | `InvalidArgument` | An argument is invalid. | For example a malformed option or table name, or `compaction_cores(k)` with `k > 0` passed to `open_application_owned`, which starts no shard or compaction threads. Counters (D179): `incr` on a family that is not a counter family ("has no merge operator: increments need a counter family"), `incr_at` outside a counter family, a non-`i64` put or untyped `merge` into a counter family ("holds only i64 values"), `incr`/`put_i64` without a timestamp in a counter family with a TTL, or `Family::counter()` with another merge operator. Nothing of the commit is applied. | Check `message()` and fix the call: declare counters with `Family::counter()`, write buckets with `incr_at`/`put_i64_at` where there is a TTL. |
-| 20 | `Unsupported` | The feature is not available in this build. | Calling a feature gated off or not yet implemented. | Enable the feature, or use the supported alternative. |
+| 20 | `Unsupported` | The feature is not available in this build. | Reserved: the current public API does not return it. | Treat it as a programmer error and report it. |
 | 21 | `Closed` | The database is closed. | A table or snapshot handle used after `close()`. | Reopen the database. |
 | 22 | `NoReaderSlot` | Every reader slot in the shared-memory region is taken. | Too many concurrent reader processes. | Close idle readers, then retry. |
 | 23 | `RecordTooLarge` | A commit is too large for one WAL record. | A very large `WriteBatch`. | Split it into smaller batches (each atomic on its own). |

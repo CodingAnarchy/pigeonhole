@@ -1,6 +1,6 @@
 # Agent reference
 
-> **Status: Phase 1 sync API implemented.** Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). **P2/P3/P4** mark the phase a feature ships in; "early" marks one that already works. If this page and the rustdoc disagree, the rustdoc wins.
+> **Status:** describes `main`, released next as 0.2.0 (crates.io has 0.1.0; [changelog](../../CHANGELOG.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). **P2/P3/P4** mark the phase a feature ships in; "early" marks one that already works. If this page and the rustdoc disagree, the rustdoc wins.
 
 Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Errors: [`errors.md`](errors.md).
 
@@ -13,7 +13,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Version order | Newest timestamp first; the same timestamp is ordered by inverted seqno (later commit first). Multiple mutations to the same (row, family, qualifier, timestamp) **within one commit** collapse to the last one written (D34), except that a counter family's increments of one cell add up in order (`incr(1).incr(2)` adds 3; `put_i64(5).incr(1)` gives 6; D186). |
 | Atomicity | One `RowMutation` = one row, all families, all-or-nothing. `WriteBatch` = any rows/tables, atomic, one durability point. |
 | Builder errors | Surface at `commit`/`read`/`iter`, not at the builder call. |
-| Purges (D74) | Delete markers and versions beyond `max_versions` are purged by a bottommost compaction with no snapshot that needs them. After that, a write with an **older explicit timestamp** behaves as if they never existed: a `put_at` below a purged delete becomes visible. Default timestamps are never affected. |
+| Purges (D74) | Delete markers and versions beyond `max_versions` are purged by a bottommost compaction with no snapshot that needs them. After that, a write with an **older explicit timestamp** behaves as if they never existed: a `put_at` below a purged delete becomes visible. Default timestamps are never affected. Counter families never change reads by a purge: their deletes hide only earlier commits, and versions beyond `max_versions` are kept (D186, D187). |
 | Delete rule (D9, D38) | `delete_column`/`delete_family` at ts `T` hides every version in scope with ts ≤ `T`, regardless of commit order. `delete_cell(ts)` hides every version at exactly `ts`, also regardless of commit order: a later `put_at(.., ts, ..)` at that timestamp stays hidden. To rewrite a deleted version, use another timestamp. |
 | `delete_row` (D10) | One family marker per family, same commit. |
 | Read-your-writes (D19) | `commit` returns after durable at level **and** visible. |
@@ -53,7 +53,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `RowMutation`, `WriteBatch`, `Transaction` | Writes; `Transaction` is P4, early. |
 | `CommitInfo { seqno: u64, durability: Durability }` | Commit result. |
 | `RowRead`, `Scan`, `RowIter` | Read builders; scan iterator. |
-| `ValueFilter`, `Condition` | Value predicate; `commit_if` condition (P2, early). |
+| `ValueFilter`, `Condition` | Value predicate; `commit_if` condition. |
 | `CellRef<'a>`, `Cell`, `Row`, `RowRef<'a>`, `CellEntry<'a>`, `Value<'a>` | Borrowed and owned results. |
 | `Error`, `ErrorCode`, `Result<T>` | Errors. |
 | `MergeOperator`, `MergeError` | Custom merge operators: an associative fold over stored values (tag byte, then payload). |
@@ -75,7 +75,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `set_default_durability(&self, Durability)` | Applies to later commits. |
 | `flush(&self) -> Result<()>` | Write every memtable into the file; returns when the SSTs are in the manifest. Makes `None` commits durable. Fails with `Busy` if the flush finds no room for its fresh memtables past the stall timeout, and with the flush's own error (`Io`, `NoSpace`) if it fails. |
 | `compact(&self) -> Result<()>` | Flush, then merge every level of every table into the last (purges per `max_versions`, TTL and tombstones). Reports only a failure of the compaction it started for this call, at once. A failed background compaction backs off (1 s, doubling to 60 s per table-and-family) and is never handed to a later `compact()`. |
-| `shrink(&self) -> Result<u64>` | Truncate free space at the end of the file, relocate live data from the tail into free space and truncate again; returns bytes released (`0` if none). Online; costs a rewrite of the tail data. Call after deletes + `compact`. The floor is the live extents packed (power-of-two sizes aligned to their size after a 64 KiB header: one 64 MiB SST means a 128 MiB file); data with nowhere lower to go stays, not an error. Errors: `Closed`, `ReadOnly`, `NoSpace` (disk full while moving the manifest), `Io`. |
+| `shrink(&self) -> Result<u64>` | Truncate free space at the end of the file, relocate live data from the tail into free space and truncate again; returns bytes released (`0` if none). Online; costs a rewrite of the tail data. Call after deletes + `compact`. Relocates SST and blob extents (D185); after `compact` + `shrink` a file above a few MiB is about 1.05–1.2× its live data (D183), a small one about 1 MiB of metadata. Data with nowhere lower to go stays, not an error. Errors: `Closed`, `ReadOnly`, `NoSpace` (disk full while moving the manifest), `Io`. |
 | `backup(&self, dest: impl AsRef<Path>) -> Result<()>` | Consistent single-file copy at a snapshot taken now, while writes continue. `dest` must not exist. Holds its snapshot's memtables only while it copies them (at most one arena's worth written to the copy); the long SST copy that follows pins file extents, not memtable space, so writers are not stalled by it. The copy opens with no WAL replay and no sidecars. Separated values are copied into the copy's own blob files (only those it references). |
 | `close(self) -> Result<()>` | Flushes memtables, checkpoints the WAL; the last handle out removes the sidecars and shm, leaving one file. |
 
@@ -111,7 +111,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `max_versions(u32)` | Keep ≤ n versions per column (0 = all). |
 | `ttl(Duration)` | Expire cells older than this by timestamp. |
 | `bloom_bits(u8)` | Filter bits per key (0 off; default 10). |
-| `blob_threshold(u32)` | Values longer than this go to blob files at flush (default 4096; `u32::MAX` never). Blob GC rewrites files that are half garbage; `compact()` empties every file with garbage. |
+| `blob_threshold(u32)` | Values longer than this go to blob files at flush or compaction (default 4096; `u32::MAX` never). Blob records are not compressed. Blob GC rewrites files that are half garbage; `compact()` empties every file with garbage. |
 | `lz4()` | Default compression. |
 | `zstd(i8)` | zstd blocks at a libzstd level (1–22, higher smaller and slower; default 3). |
 | `uncompressed()` | No compression. |
@@ -148,14 +148,14 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `put_i64_at(family, qualifier, ts, i64)` | Typed `i64` at `ts` (a counter family's bucket). |
 | `incr(family, qualifier, delta: i64)` | Blind atomic wrapping `i64` add; counter families only. |
 | `incr_at(family, qualifier, ts: u64, delta: i64)` | Add to the bucket at `ts`; counter families only. |
-| `merge(family, qualifier, operand: &[u8])` | Operand for the family's operator (P2 for custom). |
+| `merge(family, qualifier, operand: &[u8])` | Operand for the family's registered operator. |
 | `delete_cell(family, qualifier, ts: u64)` | Delete the version at `ts`; later puts at that `ts` stay hidden (D38). |
 | `delete_column(family, qualifier)` | Delete all versions. |
 | `delete_family(family)` | Delete all columns of a family in this row. |
 | `delete_row()` | Delete whole row. |
 | `durability(Durability)` | Override for this commit. |
 | `commit(self) -> Result<CommitInfo>` | Commit. |
-| `commit_if(self, &Condition) -> Result<Option<CommitInfo>>` | P2, early. Compare-and-set on this row; `None` if condition failed. |
+| `commit_if(self, &Condition) -> Result<Option<CommitInfo>>` | Compare-and-set on this row (BigTable `check_and_mutate`); `None` if the condition failed and nothing was written. |
 
 `Condition` variants: `Exists { family: String, qualifier: Vec<u8> }`, `Absent { .. }`, `Value { family, qualifier, filter: ValueFilter }`.
 
