@@ -14,6 +14,10 @@
 //! - `get-miss`: point gets of rows that do not exist;
 //! - `row`: row reads of one narrow row (8 cells);
 //! - `scan`: 200-row range scans (1,600 cells);
+//! - `rows`: row reads of one narrow row (8 cells), counted per row: the fixed cost of a
+//!   row read (snapshot, routing, sources) as much as its cells;
+//! - `short-scans`: 5-row range scans, counted per row: a scan's setup amortized over few
+//!   rows;
 //! - `scan-filtered`: the same scans with a qualifier prefix (one cell per row);
 //! - `versions`: row reads of `q0` with `versions(3)`;
 //! - `counter`: point gets of counter cells (operands folded on read).
@@ -21,7 +25,8 @@
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
 //! iteration is one `#[inline(never)]` function named `shape_*` that counts its work with a
 //! `Measured` guard (`support/measure.rs`), and on stderr the run prints `units N`: one per
-//! point get (hit or miss), one per returned cell otherwise. A full scan before the
+//! point get (hit or miss), one per row for `rows` and `short-scans`, one per returned cell
+//! otherwise. A full scan before the
 //! measured iterations warms the block cache, so every shape measures steady-state reads.
 //!
 //! The store is built deterministically (`support/driver.rs`): one application-owned shard,
@@ -104,6 +109,37 @@ fn shape_row(t: &Table, rng: &mut Rng) -> usize {
     for _ in 0..200 {
         let row = t.row(&row_key(rng.below(ROWS))).family("f").read().unwrap();
         n += std::hint::black_box(row.map_or(0, |r| r.iter().count()));
+    }
+    n
+}
+
+#[inline(never)]
+fn shape_rows(t: &Table, rng: &mut Rng) -> usize {
+    let _measured = Measured::start();
+    let mut n = 0;
+    for _ in 0..200 {
+        let row = t.row(&row_key(rng.below(ROWS))).family("f").read().unwrap();
+        n += usize::from(std::hint::black_box(
+            row.is_some_and(|r| r.iter().count() == 8),
+        ));
+    }
+    n
+}
+
+#[inline(never)]
+fn shape_short_scans(t: &Table, rng: &mut Rng) -> usize {
+    let _measured = Measured::start();
+    let mut n = 0;
+    for _ in 0..40 {
+        let start = row_key(rng.below(ROWS - 5));
+        let scan = t
+            .scan_bounds(Bound::Included(&start[..]), Bound::Unbounded)
+            .family("f")
+            .limit(5);
+        let mut it = scan.iter().unwrap();
+        while let Some(r) = it.next_ref().unwrap() {
+            n += usize::from(std::hint::black_box(r.iter().count()) > 0);
+        }
     }
     n
 }
@@ -244,6 +280,8 @@ fn main() {
                 "get-miss" => shape_get_miss(&t, &mut rng),
                 "row" => shape_row(&t, &mut rng),
                 "scan" => shape_scan(&t, &mut rng, false),
+                "rows" => shape_rows(&t, &mut rng),
+                "short-scans" => shape_short_scans(&t, &mut rng),
                 "scan-filtered" => shape_scan(&t, &mut rng, true),
                 "versions" => shape_versions(&t, &mut rng),
                 "counter" => shape_counter(&t, &mut rng),
