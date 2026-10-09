@@ -181,6 +181,30 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 
 **Deletes and version limits are not permanent for writes with older timestamps** (HBase semantics). Until compaction purges them, a delete keeps hiding any later write at or below its timestamp, and `max_versions` only limits what reads return. Once a compaction at the bottom of the tree has run with no open snapshot that still needs them, the delete markers and the versions beyond `max_versions` are gone for good. After that, a write with an older explicit timestamp (`put_at`, `delete_cell`) behaves as if they never existed: a `put_at` below a purged delete becomes visible, and deleting the newest version does not bring back a purged older one. Writes with default timestamps are never affected, because their timestamps are newer than anything a purge removes. If you rewrite history with explicit timestamps, write the replacement at a timestamp newer than the delete instead of relying on the delete to keep hiding it.
 
+## Wide, overwritten rows
+An overwrite adds a version; it does not replace the old one in place. Older versions stay in the tree until a flush or compaction drops them, and a read steps over every version it passes. A row that is wide (thousands of columns), overwritten often and read whole therefore has a higher read tail than a store that updates in place: on the Phase 2 benchmark, whose hot rows are like this, the row-read p99 is about twice SQLite's and the scan p99 about 1.6 times ([D193](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-2.md#d193), work tracked in [#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). To keep it down:
+
+- **Read only the columns you need.** `get` for one cell, or `qualifier_prefix` / `qualifier_range` on a row read or scan, seeks past the rest of the row instead of stepping through it.
+- **Set `max_versions`.** The default, 0, keeps every version, so not even compaction drops them. `max_versions(1)` lets flushes and compactions drop the older ones (unless an open snapshot still needs them).
+- **Let compaction run.** After a bulk load or a burst of overwrites, and before a read-heavy phase, `compact()` rewrites the trees so reads step over current versions only.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let profiles = db
+    .table("profiles")?
+    .family("attr", Family::default().max_versions(1))
+    .create_if_missing()?;
+profiles.mutate(b"user:42").put("attr", b"pref.theme", b"dark").commit()?;
+// The columns this read needs, not the whole row.
+let prefs = profiles.row(b"user:42").family("attr").qualifier_prefix(b"pref.").read()?;
+assert!(prefs.is_some());
+// After the load, before a read-heavy phase.
+db.compact()?;
+# Ok::<(), pigeonhole::Error>(())
+```
+
 ## Anti-patterns
 | Don't | Why | Instead |
 |---|---|---|
