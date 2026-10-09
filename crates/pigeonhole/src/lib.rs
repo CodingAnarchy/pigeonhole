@@ -124,7 +124,7 @@ pub use error::{Error, ErrorCode, Result};
 pub use options::{Compaction, Family, Options, Priority, ReaderOptions, days};
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use table::{ReadTable, Table, TableBuilder};
-pub use write::{CommitInfo, RowMutation, Transaction, WriteBatch};
+pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
 
 #[doc(hidden)]
 pub use pigeonhole_engine::ShardStats;

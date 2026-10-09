@@ -444,6 +444,19 @@ impl Txn {
         &mut self.batch
     }
 
+    /// Submits the transaction for validation and commit without waiting: the
+    /// [`PendingCommit`] resolves as [`Txn::commit`] returns (an async caller polls it). It
+    /// never blocks, so a thread that drives a shard may call it (D88).
+    pub fn submit(self, durability: Option<Durability>) -> crate::Result<PendingCommit> {
+        let Txn {
+            engine,
+            snapshot,
+            reads,
+            batch,
+        } = self;
+        engine.submit(batch, durability, Some((snapshot.seqno, reads)), None)
+    }
+
     /// Validates and commits.
     pub fn commit(self, durability: Option<Durability>) -> crate::Result<CommitInfo> {
         let Txn {

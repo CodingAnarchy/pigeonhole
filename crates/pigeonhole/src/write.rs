@@ -1,6 +1,9 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
-use pigeonhole_engine::{FamilyId, Predicate, TableId, Txn, ValueRef};
+use pigeonhole_engine::{FamilyId, PendingCommit, Predicate, TableId, Txn, ValueRef};
 use pigeonhole_format::Durability;
 use pigeonhole_format::key::MAX_KEY_PART;
 
@@ -148,6 +151,23 @@ impl Builder {
         self.error.is_none()
     }
 
+    /// Submits through `db` without waiting, reporting the first builder error instead if
+    /// there was one.
+    fn submit(self, db: &Db, durability: Option<Durability>) -> Result<Submitted> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let (largest_value, max_value) = (self.largest_value, db.max_value);
+        db.engine
+            .submit(self.batch, durability)
+            .map(|pending| Submitted {
+                pending,
+                largest_value,
+                max_value,
+            })
+            .map_err(|e| commit_error(e, largest_value, max_value))
+    }
+
     /// Commits through `db`, reporting the first builder error instead if there was one.
     fn commit(self, db: &Db, durability: Option<Durability>) -> Result<CommitInfo> {
         if let Some(e) = self.error {
@@ -158,6 +178,117 @@ impl Builder {
             .commit(self.batch, durability)
             .map(CommitInfo::from)
             .map_err(|e| commit_error(e, largest, db.max_value))
+    }
+}
+
+/// A commit handed to the engine and not yet resolved, with what its error needs: the base
+/// of async commits and of [`CommitTicket`].
+#[derive(Debug)]
+pub(crate) struct Submitted {
+    pub(crate) pending: PendingCommit,
+    largest_value: usize,
+    max_value: usize,
+}
+
+impl Submitted {
+    /// The commit's result, as the sync `commit` reports it.
+    pub(crate) fn outcome(
+        &self,
+        r: pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>,
+    ) -> Result<CommitInfo> {
+        r.map(CommitInfo::from)
+            .map_err(|e| commit_error(e, self.largest_value, self.max_value))
+    }
+}
+
+/// A submitted commit, to wait on now or check later ([`WriteBatch::commit_with_ticket`];
+/// D196). The commit is already on its way: dropping the ticket does not roll it back, and
+/// the commit lands or fails atomically either way. With the `async` feature a ticket is
+/// also a future (`ticket.await`).
+///
+/// ```
+/// use pigeonhole::{Durability, Family, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(2))?;
+/// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+/// let mut wb = db.write_batch();
+/// wb.put(&t, b"r", "f", b"q", b"v");
+/// let mut ticket = wb.commit_with_ticket(Durability::Buffered)?;
+/// // Do other work, check without blocking, then wait.
+/// let _maybe = ticket.seqno();
+/// let info = ticket.wait()?;
+/// assert!(info.seqno > 0);
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "dropping a ticket does not cancel the commit, but its result is lost"]
+pub struct CommitTicket {
+    state: TicketState,
+}
+
+#[derive(Debug)]
+pub(crate) enum TicketState {
+    Pending(Submitted),
+    Done(Result<CommitInfo>),
+}
+
+impl CommitTicket {
+    fn new(submitted: Submitted) -> Self {
+        Self {
+            state: TicketState::Pending(submitted),
+        }
+    }
+
+    /// Blocks until the commit meets its durability level and is visible, as
+    /// [`WriteBatch::commit_with`] does, and returns its result.
+    pub fn wait(self) -> Result<CommitInfo> {
+        match self.state {
+            TicketState::Done(r) => r,
+            TicketState::Pending(s) => {
+                let Submitted {
+                    pending,
+                    largest_value,
+                    max_value,
+                } = s;
+                pending
+                    .wait()
+                    .map(CommitInfo::from)
+                    .map_err(|e| commit_error(e, largest_value, max_value))
+            }
+        }
+    }
+
+    /// The commit's result if it has resolved (durable at its level and visible), without
+    /// blocking; `None` while it is in flight. Once resolved, every call returns the same
+    /// result.
+    pub fn try_result(&mut self) -> Option<Result<CommitInfo>> {
+        if let TicketState::Pending(s) = &mut self.state {
+            let mut cx = Context::from_waker(Waker::noop());
+            let done = match Pin::new(&mut s.pending).poll(&mut cx) {
+                Poll::Ready(r) => s.outcome(r),
+                Poll::Pending => return None,
+            };
+            self.state = TicketState::Done(done);
+        }
+        match &self.state {
+            TicketState::Done(r) => Some(r.clone()),
+            TicketState::Pending(_) => None,
+        }
+    }
+
+    /// The commit's sequence number once it has resolved successfully (D196: a seqno is
+    /// assigned by the owning shard after submission, so it is not known at once).
+    pub fn seqno(&mut self) -> Option<u64> {
+        self.try_result()?.ok().map(|c| c.seqno)
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn into_state(self) -> TicketState {
+        self.state
     }
 }
 
@@ -349,6 +480,12 @@ impl RowMutation<'_> {
     /// Commits.
     pub fn commit(self) -> Result<CommitInfo> {
         self.builder.commit(&self.table.db, self.durability)
+    }
+
+    /// Submits without waiting (the async front door's commit).
+    #[cfg(feature = "async")]
+    pub(crate) fn submit(self) -> Result<Submitted> {
+        self.builder.submit(&self.table.db, self.durability)
     }
 
     /// Commits only if `condition` holds on this row, atomically (BigTable's
@@ -635,6 +772,18 @@ impl WriteBatch {
     pub fn commit_with(self, durability: Durability) -> Result<CommitInfo> {
         self.builder.commit(&self.db, Some(durability))
     }
+
+    /// Submits with `durability` and returns at once with a [`CommitTicket`] to wait on or
+    /// check later (D196). Fails here only if the batch could not be submitted (a builder
+    /// error, a closed database); the commit's own outcome comes through the ticket.
+    pub fn commit_with_ticket(self, durability: Durability) -> Result<CommitTicket> {
+        self.submit(Some(durability)).map(CommitTicket::new)
+    }
+
+    /// Submits without waiting (the async front door's commit).
+    pub(crate) fn submit(self, durability: Option<Durability>) -> Result<Submitted> {
+        self.builder.submit(&self.db, durability)
+    }
 }
 
 /// An optimistic multi-row transaction (Phase 4): serializable for the ranges it reads.
@@ -704,6 +853,25 @@ impl Transaction {
             self.error = Some(e);
         }
         self
+    }
+
+    /// Submits without waiting (the async front door's commit), with the checks
+    /// [`Transaction::commit`] makes.
+    #[cfg(feature = "async")]
+    pub(crate) fn submit(self, durability: Option<Durability>) -> Result<Submitted> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        self.db.check_open()?;
+        let (largest_value, max_value) = (self.largest_value, self.db.max_value);
+        self.txn
+            .submit(durability)
+            .map(|pending| Submitted {
+                pending,
+                largest_value,
+                max_value,
+            })
+            .map_err(|e| commit_error(e, largest_value, max_value))
     }
 
     fn finish(self, durability: Option<Durability>) -> Result<CommitInfo> {
