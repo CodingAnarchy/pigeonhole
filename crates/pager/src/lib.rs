@@ -71,7 +71,7 @@ use std::fmt;
 use std::hash::Hasher;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
 use pigeonhole_format::{FormatVersion, ManifestVersion, PAGE_SIZE};
@@ -371,6 +371,15 @@ struct PendingCommit {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The guard, or `None` while another thread holds `m`.
+fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(g) => Some(g),
+        Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 /// The smallest size class holding `bytes`.
@@ -818,6 +827,15 @@ impl Pager {
         lock(&self.inner.alloc).reclaim(oldest_live.min(durable))
     }
 
+    /// As [`Pager::reclaim`], but never waits: `None` (nothing done) if another thread holds
+    /// the allocator or the root state, which it may hold across a growth's `fallocate` and
+    /// `sync_all` or a truncation's sync. For reclaims nobody waits on (the last view of
+    /// an old version going): the holder's own commit or shrink reclaims anyway.
+    pub fn try_reclaim(&self, oldest_live: ManifestVersion) -> Option<usize> {
+        let durable = try_lock(&self.inner.state)?.root.manifest_version;
+        Some(try_lock(&self.inner.alloc)?.reclaim(oldest_live.min(durable)))
+    }
+
     /// Extents past the shrink point that must move before the file can shrink.
     ///
     /// The shrink point is where the live (not retired) extents would end if packed toward
@@ -1035,4 +1053,31 @@ pub struct PagerStats {
     pub allocated_bytes: u64,
     /// Bytes retired but not yet reclaimed.
     pub retired_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pigeonhole_io::sim::SimVfs;
+
+    #[test]
+    fn try_reclaim_does_not_wait_for_a_held_allocator() {
+        // A growth holds the allocator across a `fallocate` and a `sync_all`: a reclaim
+        // nobody waits on gives up instead of blocking for them.
+        let vfs: VfsRef = SimVfs::new(1);
+        let pager = Arc::new(Pager::create(&vfs, "/db".as_ref()).unwrap());
+        let e = pager.allocate(64 << 10).unwrap();
+        pager.abandon(e);
+        let held = lock(&pager.inner.alloc);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = Arc::clone(&pager);
+        let t = std::thread::spawn(move || tx.send(p.try_reclaim(u64::MAX)).unwrap());
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("try_reclaim blocked on the held allocator");
+        assert_eq!(got, None);
+        drop(held);
+        t.join().unwrap();
+        assert_eq!(pager.try_reclaim(u64::MAX), Some(0));
+    }
 }

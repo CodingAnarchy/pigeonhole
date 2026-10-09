@@ -469,9 +469,11 @@ impl SstSet {
 #[derive(Default)]
 pub(crate) struct LiveViews {
     versions: Mutex<BTreeMap<ManifestVersion, u32>>,
-    /// Run when the last view of the oldest version goes (the writer reclaims): otherwise
-    /// what that view alone kept retired would wait for the next manifest commit, however
-    /// idle the database (a view a shard held for a moment when `shrink` reclaimed).
+    /// Run when the last in-process view of the oldest version goes (the writer reclaims,
+    /// without waiting for a busy pager): otherwise what that view alone kept retired would
+    /// wait for the next manifest commit, however idle the database (a view a shard held for
+    /// a moment when `shrink` reclaimed). A reader process's unpin is not seen here; it waits
+    /// for the next commit.
     on_oldest_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 

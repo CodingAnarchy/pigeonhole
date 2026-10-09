@@ -595,6 +595,13 @@ impl Shared {
         self.pager.reclaim(self.oldest_live_manifest());
     }
 
+    /// As [`Shared::reclaim`], skipped if the pager is busy (it may be mid-`fsync`): for the
+    /// reclaim when an old view goes, on whatever thread drops it (a user's snapshot, a
+    /// scan's end, a shard). The busy holder's commit or shrink reclaims anyway.
+    pub(crate) fn try_reclaim(&self) {
+        let _ = self.pager.try_reclaim(self.oldest_live_manifest());
+    }
+
     pub(crate) fn default_durability(&self) -> Durability {
         match self.default_durability.load(Ordering::Relaxed) {
             0 => Durability::None,

@@ -592,13 +592,15 @@ impl Engine {
             identity,
             path: path.to_path_buf(),
         });
-        // Extents the oldest live view alone kept retired are reclaimed as soon as it goes,
-        // not at the next manifest commit (a shard's momentary view would otherwise leave
-        // them retired on an idle database). Weak: the registry lives in `Shared`.
+        // Extents the oldest live in-process view alone kept retired are reclaimed as soon
+        // as it goes, not at the next manifest commit (a shard's momentary view would
+        // otherwise leave them retired on an idle database). Never blocking: it runs on the
+        // thread dropping the view. A reader process's unpin still waits for the next
+        // commit. Weak: the registry lives in `Shared`.
         let weak = Arc::downgrade(&shared);
         live_views.on_oldest_released(Box::new(move || {
             if let Some(shared) = weak.upgrade() {
-                shared.reclaim();
+                shared.try_reclaim();
             }
         }));
         let mut states: Vec<ShardState> = Vec::with_capacity(shards);
