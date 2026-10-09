@@ -762,6 +762,7 @@ fn a_value_with_free_bytes_but_no_long_enough_run_waits_instead_of_poisoning() {
 /// `len - free`.
 #[test]
 fn arena_counters_are_one_snapshot() {
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
     for seed in 0..10 {
         let vfs = SimVfs::new(seed);
@@ -770,11 +771,16 @@ fn arena_counters_are_one_snapshot() {
         o.memtable_freeze_bytes = 256 << 10;
         let db = Engine::open(Path::new(DB), o).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
+        // The commits start only once the reader runs, and it reads at least once, so reads
+        // race the commits on every platform (a reader scheduled after the last commit read
+        // nothing on Windows CI).
+        let started = Arc::new(Barrier::new(2));
         let reader = {
-            let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
+            let (db, stop, started) = (Arc::clone(&db), Arc::clone(&stop), Arc::clone(&started));
             std::thread::spawn(move || {
+                started.wait();
                 let mut reads = 0u64;
-                while !stop.load(Ordering::Acquire) {
+                loop {
                     let (free, run, len) = db.arena_free(0);
                     assert!(len > 0, "seed {seed}: no length after open");
                     assert!(
@@ -782,10 +788,13 @@ fn arena_counters_are_one_snapshot() {
                         "seed {seed}: a torn read: run {run} free {free} len {len}"
                     );
                     reads += 1;
+                    if stop.load(Ordering::Acquire) {
+                        return reads;
+                    }
                 }
-                reads
             })
         };
+        started.wait();
         let t = db
             .create_table("t", &[("f".into(), FamilyOptions::default())])
             .unwrap();
