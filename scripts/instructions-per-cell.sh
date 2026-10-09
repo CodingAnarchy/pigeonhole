@@ -28,8 +28,9 @@ set -euo pipefail
 
 bin="${1:-target/release/examples/hotrow}"
 shift || true
+# A fresh scratch directory per run (callgrind output, the examples' stores, which they
+# remove themselves). It is left in the system temp directory, not deleted recursively.
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
 
 states=("as-written:" "flushed:HOT_FLUSH=1" "compacted:HOT_COMPACT=1")
 
