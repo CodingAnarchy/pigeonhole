@@ -131,6 +131,12 @@ pub struct EngineOptions {
     /// that nothing announced (a snapshot dropped on another thread, a reader process's
     /// unpin): nanoseconds, default 1 ms, doubling up to 100 times this. Mostly for tests.
     pub room_recheck_nanos: u64,
+    /// **Experimental (D194, #387), off by default.** The writer keeps a process-local
+    /// stale-tail index beside each memtable, and row reads and scans pass a finished
+    /// column's superseded memtable versions in one jump. Same results either way. On
+    /// for every writer of the process once any writer opens with it (a prototype switch);
+    /// `PIGEONHOLE_EXPERIMENTAL_TAIL_INDEX=1` sets the default, for test and bench runs.
+    pub memtable_tail_index: bool,
 }
 
 impl EngineOptions {
@@ -166,6 +172,8 @@ impl EngineOptions {
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,
+            memtable_tail_index: std::env::var_os("PIGEONHOLE_EXPERIMENTAL_TAIL_INDEX")
+                .is_some_and(|v| v == "1"),
         }
     }
 }

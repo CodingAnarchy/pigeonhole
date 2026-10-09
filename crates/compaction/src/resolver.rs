@@ -110,6 +110,10 @@ pub struct ResolveOptions {
     /// run folds across timestamps), and a delete hides only entries with a lower seqno
     /// within its timestamp scope (a later write at a covered timestamp stays visible).
     pub counter: bool,
+    /// Pass a finished column's remaining entries with [`Cursor::skip_column`] where the
+    /// cursor can (a memtable with a stale-tail index, D194), instead of a step each. Off by
+    /// default; the result is the same either way.
+    pub skip_columns: bool,
 }
 
 impl ResolveOptions {
@@ -126,6 +130,7 @@ impl ResolveOptions {
             time_range: None,
             blobs: None,
             counter: false,
+            skip_columns: false,
         }
     }
 
@@ -275,6 +280,9 @@ pub struct CellResolver<C> {
     /// Entries of the column stepped over while skipping it; past [`SKIP_STEPS`] the
     /// resolver seeks past the column instead.
     col_skipped: u32,
+    /// The cursor could not skip the rest of the column (`Cursor::skip_column` returned
+    /// `false`): step it without asking again.
+    col_noskip: bool,
     /// After `seek_column`: stop at the end of `col`.
     column_bound: bool,
     /// Every key of `col` is below `upper` (or there is none), so entries inside the column
@@ -372,6 +380,7 @@ where
             col_versions: 0,
             col_skip: false,
             col_skipped: 0,
+            col_noskip: false,
             column_bound: false,
             col_below_upper: false,
             row_below_upper: false,
@@ -452,6 +461,7 @@ where
         self.col_versions = 0;
         self.col_skip = false;
         self.col_skipped = 0;
+        self.col_noskip = false;
         self.run = false;
         self.run_err = None;
     }
@@ -613,6 +623,7 @@ where
             col_versions,
             col_skip,
             col_skipped,
+            col_noskip,
             column_bound,
             col_below_upper,
             row_below_upper,
@@ -643,6 +654,7 @@ where
         *col_versions = 0;
         *col_skip = false;
         *col_skipped = 0;
+        *col_noskip = false;
         *column_bound = false;
         *col_below_upper = false;
         *row_below_upper = false;
@@ -681,6 +693,7 @@ where
             col_versions,
             col_skip,
             col_skipped,
+            col_noskip,
             column_bound,
             col_below_upper,
             row_below_upper,
@@ -715,6 +728,7 @@ where
             && *col_versions == 0
             && !*col_skip
             && *col_skipped == 0
+            && !*col_noskip
             && !*column_bound
             && !*col_below_upper
             && !*row_below_upper
@@ -860,7 +874,10 @@ where
                         *last += 1;
                     }
                     self.cursor.seek_forward(&self.past_col)?;
-                } else {
+                } else if !self.opts.skip_columns || self.col_noskip {
+                    self.cursor.next()?;
+                } else if !self.cursor.skip_column(&self.col)? {
+                    self.col_noskip = true;
                     self.cursor.next()?;
                 }
                 continue;

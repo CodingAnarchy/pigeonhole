@@ -408,6 +408,9 @@ impl Engine {
         options: EngineOptions,
         mode: Mode,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
+        if options.memtable_tail_index {
+            crate::shard::enable_tail_index();
+        }
         let shards = if options.shards == 0 {
             pigeonhole_io::sys::available_cpus().max(1)
         } else {

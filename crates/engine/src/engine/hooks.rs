@@ -777,6 +777,20 @@ impl Engine {
             .store(ts, Ordering::Release);
     }
 
+    /// Sets the process-wide D194 stale-tail switch. Memtables created while it was on keep
+    /// their index; with it off, reads step over their superseded versions as without one.
+    /// Test hook.
+    #[doc(hidden)]
+    pub fn set_tail_index(on: bool) {
+        crate::shard::set_tail_index(on);
+    }
+
+    /// Memtable jumps reads have taken in this process (D194). Test hook.
+    #[doc(hidden)]
+    pub fn tail_skips() -> u64 {
+        crate::shard::TAIL_SKIPS.load(Ordering::Relaxed)
+    }
+
     /// Breaks the flush GC on purpose (#287), so a test can check the oracle catches it;
     /// [`FlushGcMutation::None`] restores it.
     #[doc(hidden)]

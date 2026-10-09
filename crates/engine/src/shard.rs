@@ -285,6 +285,45 @@ impl FreezeWaiters {
 }
 
 /// Engine-wide state every shard and every caller shares.
+/// Whether writers create memtables with a stale-tail index and reads skip finished
+/// columns with it (D194, `EngineOptions::memtable_tail_index`). Process-wide and sticky
+/// for the prototype: a memtable without an index (a reader process's) just steps.
+static TAIL_INDEX: AtomicBool = AtomicBool::new(false);
+
+/// Turns the D194 stale-tail index on for this process.
+pub(crate) fn enable_tail_index() {
+    TAIL_INDEX.store(true, Ordering::Relaxed);
+}
+
+/// Sets the D194 switch (test hook: memtables created while it was on keep their index,
+/// so turning it off makes the same data read by stepping).
+#[cfg(feature = "test-hooks")]
+pub(crate) fn set_tail_index(on: bool) {
+    TAIL_INDEX.store(on, Ordering::Relaxed);
+}
+
+/// Memtable jumps taken by reads (test hook).
+#[cfg(feature = "test-hooks")]
+pub(crate) static TAIL_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the D194 stale-tail index is on.
+#[inline]
+pub(crate) fn tail_index_on() -> bool {
+    TAIL_INDEX.load(Ordering::Relaxed)
+}
+
+/// A slot's new active memtable, with the stale-tail index when it is on.
+fn new_memtable(
+    arena: &mut ShardArena,
+) -> std::result::Result<Memtable, pigeonhole_memtable::Error> {
+    let m = Memtable::create(arena)?;
+    Ok(if tail_index_on() {
+        m.with_tail_index()
+    } else {
+        m
+    })
+}
+
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,
@@ -1395,7 +1434,7 @@ fn slot_of<'a>(
     match memtables.entry(key) {
         std::collections::btree_map::Entry::Occupied(e) => Ok(e.into_mut()),
         std::collections::btree_map::Entry::Vacant(e) => {
-            let active = MemEntry::new(Memtable::create(arena)?);
+            let active = MemEntry::new(new_memtable(arena)?);
             *view_dirty = true;
             Ok(e.insert(MemSlot {
                 active,
@@ -2816,7 +2855,7 @@ impl ShardState {
                 );
                 None
             } else {
-                Memtable::create(&mut self.arena).ok()
+                new_memtable(&mut self.arena).ok()
             };
             let Some(fresh) = fresh else {
                 trace!(
