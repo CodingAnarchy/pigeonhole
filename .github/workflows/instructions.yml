@@ -47,7 +47,7 @@ env:
   # checked for regressions on every PR.
   SHAPES: >-
     readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans
-    writepath:commit-one,commit-sixteen,flush,compact
+    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,flush,compact
     ycsb:ycsb-c,ycsb-a
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
@@ -57,7 +57,7 @@ env:
   # (runs 37900128944 and 37901737150). If a shape proves noisier on CI, report it rather
   # than raising its threshold silently.
   # The YCSB shapes get 1.0%: identical code varied by up to 0.54% across runs.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0
 
 jobs:
   instructions:

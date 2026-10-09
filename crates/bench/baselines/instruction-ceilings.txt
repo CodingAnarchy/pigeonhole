@@ -24,6 +24,10 @@
 # with `instruction-ceilings.py lower`. The YCSB shapes (crates/bench/examples/ycsb.rs) were
 # added from that run with 1.0% headroom: identical code varied by up to 0.54% (ycsb-c
 # 83935-84387 in that run) and 0.4% (ycsb-a, an earlier run, 37988769459).
+#
+# commit-overwrite and commit-at (crates/bench/examples/writepath.rs) were added from three
+# identical CI runs (run 38002948065): commit-overwrite varied by 0.58% (12480-12553), so it
+# gets 1.0% headroom and a 1.0% per-change threshold; commit-at by 0.05% (11661-11667).
 
 as-written 2573 0.3
 flushed 1912 0.3
@@ -45,3 +49,5 @@ flush 2199 0.3
 compact 2869 0.5
 ycsb-c 85231 1.0
 ycsb-a 47131 1.0
+commit-overwrite 12679 1.0
+commit-at 11703 0.3

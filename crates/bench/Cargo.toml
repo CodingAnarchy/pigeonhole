@@ -37,6 +37,9 @@ workspace = true
 
 [dev-dependencies]
 proptest = { workspace = true }
+# The `commitpath` example drives the engine's shards directly.
+pigeonhole-engine = { workspace = true }
+pigeonhole-io = { workspace = true }
 
 [[example]]
 name = "hotrow_runners"
