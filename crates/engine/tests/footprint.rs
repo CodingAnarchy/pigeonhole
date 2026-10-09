@@ -134,16 +134,7 @@ fn a_compacted_and_shrunk_file_is_about_its_data() {
         // The last piece of a stream rounds up to a power of two: small data has the most
         // slack (0.5 MiB of data: about 1.2x). Besides the SSTs the file holds a fixed
         // `METADATA`: the header unit, the manifest snapshot and the manifest log's extent.
-        let bound = if live < 1 << 20 {
-            1.3
-        } else if (mib, keep_pct) == (50, 10) {
-            // TEMPORARY (#314): with flush GC (#287) this shape's pieces land where `shrink`
-            // cannot move the large ones down (small extents fragment every aligned hole
-            // below them): 1.35x. #314 must restore 1.2x here.
-            1.4
-        } else {
-            1.2
-        };
+        let bound = if live < 1 << 20 { 1.3 } else { 1.2 };
         assert!(
             len as f64 <= live as f64 * bound + METADATA as f64,
             "load {mib} MiB, kept {keep_pct}%: the file is {ratio:.2}x its data ({len} for {live})"
