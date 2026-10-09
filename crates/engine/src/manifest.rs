@@ -1192,6 +1192,10 @@ pub(crate) fn commit_from_thread(shared: &Shared, kind: ReqKind) -> Result<Manif
     commit_req_from_thread(shared, req, waiter)
 }
 
+/// How long a thread with I/O only it completes waits on that I/O before it looks at the
+/// manifest writer again (#207).
+const OWN_IO_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// As [`commit_from_thread`], for a request built with [`ManifestReq::with_waiter`].
 ///
 /// While another holds the exclusion the thread parks: it is woken when the holder
@@ -1235,6 +1239,13 @@ pub(crate) fn commit_req_from_thread(
         // A release or completion between the checks above and the registration is caught
         // here; one after it unparks us.
         if !shared.manifest_busy.load(Ordering::SeqCst) || shared.manifest_flight.ready() {
+            continue;
+        }
+        // I/O only this thread completes (a shard driver's ring, #207), such as the root
+        // commit of the pump that holds the writer: reap it rather than park, or nothing
+        // ever would.
+        if pigeonhole_io::own_io_in_flight() {
+            pigeonhole_io::reap_own_io(Some(OWN_IO_SLICE));
             continue;
         }
         std::thread::park();

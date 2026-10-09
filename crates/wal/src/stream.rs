@@ -197,6 +197,10 @@ struct Pool {
     inline_rollover_syncs: u64,
 }
 
+/// How long a thread with I/O only it completes waits on that I/O before it checks the
+/// stream's syncs again (#207).
+const OWN_IO_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+
 impl Shared {
     fn pool(&self) -> MutexGuard<'_, Pool> {
         self.pool.lock().unwrap_or_else(PoisonError::into_inner)
@@ -261,6 +265,15 @@ impl Shared {
         r?;
         let mut syncs = self.syncs();
         while !syncs.drained(barrier) {
+            if pigeonhole_io::own_io_in_flight() {
+                // An older sync may be I/O only this thread completes (a shard driver's
+                // ring, #207): reap it, outside the lock its completion takes, rather than
+                // wait for ever.
+                drop(syncs);
+                pigeonhole_io::reap_own_io(Some(OWN_IO_SLICE));
+                syncs = self.syncs();
+                continue;
+            }
             syncs = self
                 .sync_done
                 .wait(syncs)
