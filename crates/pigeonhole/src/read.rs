@@ -266,25 +266,20 @@ impl<'t> RowRead<'t> {
     /// Performs the read. `None` if the row has no matching cell.
     pub fn read(mut self) -> Result<Option<RowRef<'t>>> {
         let (info, snapshot) = self.sel.start(self.core)?;
-        let Some(data) = self.core.db.engine.read_row(
+        // The engine resolves the cells straight into the row this returns (#287): no
+        // intermediate row and no second copy of each cell.
+        let mut buf = RowBuf::new(info, 0);
+        let any = self.core.db.engine.read_row_into(
             &snapshot,
             self.core.info.id,
             &self.row,
             &self.sel.spec,
-        )?
-        else {
-            return Ok(None);
-        };
-        if data.cells.is_empty() {
+            &mut buf,
+        )?;
+        if !any {
             return Ok(None);
         }
-        let mut buf = RowBuf::new(info, data.cells.len());
-        buf.key = data.row;
-        buf.qualifiers = data.qualifiers;
-        for c in data.cells {
-            let qualifier = c.qualifier.start as usize..c.qualifier.end as usize;
-            buf.push(c.family, qualifier, c.data);
-        }
+        buf.key = self.row;
         Ok(Some(RowRef::owned(buf)))
     }
 }

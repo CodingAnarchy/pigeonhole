@@ -194,3 +194,52 @@ fn lending_scan_allocations_do_not_grow_with_cells() {
         "allocations grow with cells per row: {per_row:?} (1 vs 32 cells, {rows} rows)"
     );
 }
+
+/// Allocator calls of one `RowRead::read` (after a warm-up), reading every cell's value and
+/// qualifier, for a row of `cells` cells.
+fn row_read_allocations(t: &Table, cells: usize) -> u64 {
+    let row = format!("wide{cells:04}");
+    let mut m = t.mutate(row.as_bytes());
+    for c in 0..cells {
+        m = m.put("f", format!("q{c:04}").as_bytes(), &[7u8; 24]);
+    }
+    m.commit().expect("commit");
+    let read = || {
+        let r = t.row(row.as_bytes()).read().expect("read").expect("row");
+        r.iter()
+            .map(|e| e.cell.value().len() + e.qualifier.len())
+            .sum::<usize>()
+    };
+    let _ = read();
+    let (n, seen) = allocations(read);
+    assert!(seen > 0);
+    n
+}
+
+/// #287 item 1: a row read builds the row it returns directly (no intermediate row, no
+/// second copy of each cell). Its allocations are a constant per read plus the row
+/// buffers' growth, which is logarithmic in the cells.
+#[test]
+fn row_read_allocations_per_cell() {
+    let (db, t) = open("row_read");
+    let one = row_read_allocations(&t, 1);
+    let wide = row_read_allocations(&t, 33);
+    let per_cell = (wide - one) as f64 / 32.0;
+    eprintln!(
+        "row read: {one} allocator calls for 1 cell, {wide} for 33 ({per_cell:.2} per extra cell)"
+    );
+    assert!(
+        one <= ROW_READ_BUDGET.0,
+        "{one} allocator calls for a 1-cell row"
+    );
+    assert!(
+        per_cell <= ROW_READ_BUDGET.1,
+        "{per_cell:.2} allocator calls per extra cell"
+    );
+    drop(t);
+    db.close().expect("close");
+}
+
+/// `(allocator calls for a 1-cell row read, per extra cell)`; lower them when a change
+/// improves the path.
+const ROW_READ_BUDGET: (u64, f64) = (32, 0.5);

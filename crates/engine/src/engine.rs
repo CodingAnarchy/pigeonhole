@@ -1291,6 +1291,24 @@ impl Engine {
         snapshot.checked(read::read_row(snapshot, table, row, &families, spec, now))
     }
 
+    /// Reads one row, projected by `spec`, into `sink`: the cells go straight into the
+    /// caller's buffer, with no intermediate [`RowData`]. Returns whether the row has a
+    /// visible cell.
+    pub fn read_row_into(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        row: &[u8],
+        spec: &ReadSpec,
+        sink: &mut impl read::RowSink,
+    ) -> Result<bool> {
+        let families = families_in_order(&snapshot.view, table, &spec.families)?;
+        let now = self.inner.shared.vfs.now_micros();
+        snapshot.checked(read::read_row_into(
+            snapshot, table, row, &families, spec, now, sink,
+        ))
+    }
+
     /// Starts an ordered scan.
     pub fn scan(&self, snapshot: &Snapshot, table: TableId, spec: ScanSpec) -> Result<ScanCursor> {
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
