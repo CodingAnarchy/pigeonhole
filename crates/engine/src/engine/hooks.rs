@@ -463,7 +463,22 @@ impl Engine {
         use pigeonhole_format::key::{Kind, split_suffix};
         use pigeonhole_sst::{ReadOptions, ScanFilter};
 
+        // A file is settling if `large_pending` holds it before or after the view is loaded:
+        // a release (`large.rs`) drops it from `large_pending` only after the view without
+        // it is published (so the set read before covers a view that still has it), and a
+        // new file joins `large_pending` before the view with it is published (so the set
+        // read after covers that).
+        let settling = || {
+            self.inner
+                .shared
+                .large_pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+        let mut pending = settling();
         let view = self.inner.shared.view.load_full();
+        pending.extend(settling());
         let catalog = &view.catalog;
         let mut refs: BTreeMap<u32, u64> = BTreeMap::new();
         let err = |e: &dyn std::fmt::Display| e.to_string();
@@ -568,13 +583,6 @@ impl Engine {
         }
         // A large value's file whose commit has not settled (or whose release has not
         // committed) may have nothing pointing into it yet (#230).
-        let pending = self
-            .inner
-            .shared
-            .large_pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
         for (id, b) in &catalog.blob_files {
             if pending.contains(id) {
                 continue;

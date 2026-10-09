@@ -74,6 +74,18 @@ fn assert_reads(db: &Engine, t: &TableInfo, rows: u32, expected: impl Fn(u32) ->
     }
 }
 
+/// Waits (bounded) until nothing the pager holds is unreferenced: a view a shard holds for a
+/// moment keeps retired extents until it goes.
+fn wait_for_unreferenced_zero(db: &Engine) {
+    for _ in 0..2_000 {
+        if db.unreferenced_bytes() == 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("{} bytes still unreferenced", db.unreferenced_bytes());
+}
+
 /// Waits (bounded) for the manifest to drop blob files a refused commit released.
 fn wait_for_blob_files(db: &Engine, n: usize) {
     for _ in 0..10_000 {
@@ -198,7 +210,10 @@ fn a_lost_commit_leaves_a_blob_file_the_open_sweeps() {
     assert!(db.get(&snap, t.id, f, &row(2), b"q").unwrap().is_none());
     drop(snap);
     db.shrink().unwrap();
-    assert_eq!(db.unreferenced_bytes(), 0);
+    // A shard may hold an older view for a moment (scoring its slots after a commit), and
+    // what that view keeps stays retired until it goes; it is reclaimed then, with nothing
+    // else running (`tests/reclaim.rs`).
+    wait_for_unreferenced_zero(&db);
     db.close().unwrap();
 }
 
