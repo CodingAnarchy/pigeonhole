@@ -418,7 +418,7 @@ Each phase ships only when its gate passes; the latency work deliberately follow
 |---|---|---|---|
 | 1 | Core engine | WAL, memtable, SSTs; single-file allocator; leveled compaction; Rust get, put, scan; shards and tablets | **Correctness:** fault-injection suite green; RocksDB gap reported, not gated |
 | 2 | Wide-column model | Versions and TTL; filters, merge ops; `check_and_mutate`; blob separation; per-family compaction | **Model value:** sparse-wide bench beats hand-keyed RocksDB, and SQLite EAV on throughput, get and put p99 and p99.9; wide overwritten row reads are a documented gap (amended by D193) |
-| 3 | Latency engine | io_uring, O_DIRECT; owned block cache; row cache; group commit tuning; async Rust API | **Latency:** p50 and p99 targets in the Goals table met; within 1.5× of RocksDB |
+| 3 | Latency engine | io_uring, O_DIRECT; owned block cache; row cache; group commit tuning; async Rust API | **Latency:** p50 and p99 targets in the Goals table met; within 1.5× of RocksDB; every roadmap item delivered and every Goals-table target met, per the checklist in #406, on the reference hardware (amended by D197) |
 | 4 | Hardening and 1.0 | Stable C ABI, Arrow; CLI and dump tools; multi-process readers; OCC transactions | **1.0 release:** file format frozen; compatibility promise |
 
 ### Risks
