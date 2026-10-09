@@ -133,6 +133,7 @@ struct Shared {
     /// Set by the first failed write or sync; every later append, write or sync is refused.
     poisoned: AtomicBool,
     pool: Mutex<Pool>,
+    counters: Arc<WalCounters>,
     /// Every sync of the stream file in flight (see [`Syncs`]).
     syncs: Mutex<Syncs>,
     /// Signalled whenever a sync finishes.
@@ -191,10 +192,31 @@ struct Pool {
     blank: Vec<usize>,
     /// Slots the stream can recycle (below its checkpoint), published by the stream.
     recyclable: usize,
+}
+
+/// A stream's shard-thread stall counters ([`WalStream::counters`], ICR 0015): shared, so a
+/// metrics reader on another thread sees them without the stream or its locks.
+///
+/// ```
+/// let c = pigeonhole_wal::WalCounters::default();
+/// assert_eq!((c.inline_grows(), c.inline_rollover_syncs()), (0, 0));
+/// ```
+#[derive(Debug, Default)]
+pub struct WalCounters {
+    inline_grows: AtomicU64,
+    inline_rollover_syncs: AtomicU64,
+}
+
+impl WalCounters {
     /// Rollovers that found no recyclable or ready slot and grew the file inline.
-    inline_grows: u64,
+    pub fn inline_grows(&self) -> u64 {
+        self.inline_grows.load(Ordering::Relaxed)
+    }
+
     /// Rollovers that synced the full segment on the shard thread (no slot was ready).
-    inline_rollover_syncs: u64,
+    pub fn inline_rollover_syncs(&self) -> u64 {
+        self.inline_rollover_syncs.load(Ordering::Relaxed)
+    }
 }
 
 /// How long a thread with I/O only it completes waits on that I/O before it checks the
@@ -727,6 +749,7 @@ impl WalStream {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
                 pool: Mutex::new(Pool::default()),
+                counters: Arc::default(),
                 syncs: Mutex::new(Syncs::default()),
                 sync_done: Condvar::new(),
             }),
@@ -801,14 +824,20 @@ impl WalStream {
     /// Rollovers that found neither a recyclable nor a prepared slot and allocated one
     /// inline, on the shard thread (a sign that spares are not being prepared fast enough).
     pub fn inline_grows(&self) -> u64 {
-        self.shared.pool().inline_grows
+        self.shared.counters.inline_grows()
     }
 
     /// Rollovers that synced the full segment on the shard thread because neither a
     /// recyclable nor a prepared slot was ready (decision D30's one exception). With spares
     /// prepared in time this stays 0.
     pub fn inline_rollover_syncs(&self) -> u64 {
-        self.shared.pool().inline_rollover_syncs
+        self.shared.counters.inline_rollover_syncs()
+    }
+
+    /// The stream's stall counters, shared: a metrics reader keeps the handle and reads it
+    /// from any thread while the stream runs on its shard (ICR 0015).
+    pub fn counters(&self) -> Arc<WalCounters> {
+        Arc::clone(&self.shared.counters)
     }
 
     /// Whether the next segment can start in a recyclable or prepared slot.
@@ -857,7 +886,10 @@ impl WalStream {
                         (slot, SlotSource::Extended)
                     }
                 } else {
-                    self.shared.pool().inline_grows += 1;
+                    self.shared
+                        .counters
+                        .inline_grows
+                        .fetch_add(1, Ordering::Relaxed);
                     self.file
                         .allocate(slot as u64 * self.segment_size, self.segment_size)?;
                     self.shared.side_sync(|| self.file.sync_all())?;
@@ -949,7 +981,10 @@ impl WalStream {
         } else {
             self.shared.durable_sync(|| self.file.sync_data())?;
             self.shared.durable.fetch_max(end.0, Ordering::Release);
-            self.shared.pool().inline_rollover_syncs += 1;
+            self.shared
+                .counters
+                .inline_rollover_syncs
+                .fetch_add(1, Ordering::Relaxed);
         }
         self.start_segment(end.epoch(), end.offset(), false)?;
         Ok(())

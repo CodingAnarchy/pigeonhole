@@ -125,6 +125,12 @@ pub struct Metrics {
     /// they froze below the size threshold (#137). Flushes per pass is the cost of the
     /// bound: many small L0 SSTs per pass mean cold slots spread over many shards.
     pub unpin: (u64, u64),
+    /// WAL rollovers that synced the full segment on a shard thread because no spare slot
+    /// was ready (decision D30's exception, #19).
+    pub wal_inline_syncs: u64,
+    /// File growths and the nanoseconds they held the page allocator across a `fallocate`
+    /// and a `sync_all` (#28, #182).
+    pub file_growths: (u64, u64),
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -803,7 +809,9 @@ impl Engine {
             }
             for (stream, rec) in recoveries {
                 let i = stream.0 as usize;
-                states[i].set_wal(Box::new(rec.into_stream(options.wal)?));
+                let wal = rec.into_stream(options.wal)?;
+                let _ = shared.metrics[i].wal.set(wal.counters());
+                states[i].set_wal(Box::new(wal));
                 have_wal[i] = true;
             }
         } else {
@@ -826,6 +834,7 @@ impl Engine {
                     let end = rec.end();
                     let mut wal = rec.into_stream(options.wal)?;
                     wal.checkpoint(end)?;
+                    let _ = shared.metrics[i].wal.set(wal.counters());
                     states[i].set_wal(Box::new(wal));
                     states[i].set_recovery_state(
                         catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect(),
@@ -857,6 +866,7 @@ impl Engine {
             db_id,
             options.wal,
         )?) {
+            let _ = shared.metrics[stream.0 as usize].wal.set(wal.counters());
             states[stream.0 as usize].set_wal(Box::new(wal));
         }
         for s in &mut states {
@@ -1512,7 +1522,10 @@ impl Engine {
             m.stalls.1 += s.stall_nanos.load(Ordering::Relaxed);
             m.unpin.0 += s.unpin_passes.load(Ordering::Relaxed);
             m.unpin.1 += s.unpin_flushes.load(Ordering::Relaxed);
+            m.wal_inline_syncs += s.wal.get().map_or(0, |c| c.inline_rollover_syncs());
         }
+        let pager = shared.pager.stats();
+        m.file_growths = (pager.growths, pager.growth_nanos);
         m
     }
 

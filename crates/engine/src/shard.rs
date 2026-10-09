@@ -125,6 +125,8 @@ pub(crate) struct ShardMetrics {
     /// splits refused because the tablet map would outgrow the shared-memory view (D28).
     pub refused_slots: AtomicU64,
     pub refused_view: AtomicU64,
+    /// The shard's WAL stream stall counters (ICR 0015), once the stream is open.
+    pub wal: std::sync::OnceLock<Arc<pigeonhole_wal::WalCounters>>,
     /// Test-hook counters (`engine::hooks::ShardCounters`).
     #[cfg(feature = "test-hooks")]
     pub hooks: crate::engine::hooks::ShardCounters,
@@ -150,6 +152,7 @@ impl Default for ShardMetrics {
             unpin_flushes: AtomicU64::new(0),
             refused_slots: AtomicU64::new(0),
             refused_view: AtomicU64::new(0),
+            wal: std::sync::OnceLock::new(),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
         }
