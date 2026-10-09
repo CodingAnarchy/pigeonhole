@@ -4,9 +4,9 @@ mod common;
 
 use common::{Cell, cell, config, num, part, sized};
 use pigeonhole_format::key::{
-    Kind, column_prefix_len, common_prefix_len, compare, decode_key, encode_column_prefix,
-    encode_key, encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len,
-    split_suffix,
+    Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
+    encode_column_prefix, encode_key, encode_marker_prefix, encode_row_prefix, encode_seek_key,
+    row_prefix_len, split_suffix,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -153,5 +153,30 @@ proptest! {
         prop_assert_eq!(common_prefix_len(&a, &b), naive);
         prop_assert_eq!(common_prefix_len(&b, &a), naive);
         prop_assert_eq!(common_prefix_len(&a, &a), a.len());
+    }
+}
+
+proptest! {
+    #![proptest_config(config(2000))]
+
+    /// A key of a row already decoded decodes the same without its row scanned again, cells
+    /// and family markers alike (rows and qualifiers may hold zero bytes, which escape).
+    #[test]
+    fn decode_key_in_row_matches_decode_key(
+        row in vec(0u8..3, 0..12),
+        first in vec(0u8..3, 0..8),
+        second in prop::option::of(vec(0u8..3, 0..8)),
+        ts in any::<u64>(),
+        seqno in 0u64..1 << 40,
+    ) {
+        let mut a = Vec::new();
+        encode_key(&mut a, &row, &first, ts, seqno, Kind::Put).unwrap();
+        let row_len = decode_key(&a).unwrap().row.as_escaped().len();
+        let mut b = Vec::new();
+        match &second {
+            Some(q) => encode_key(&mut b, &row, q, ts, seqno, Kind::Put).unwrap(),
+            None => pigeonhole_format::key::encode_marker_key(&mut b, &row, ts, seqno).unwrap(),
+        }
+        prop_assert_eq!(decode_key_in_row(&b, row_len).unwrap(), decode_key(&b).unwrap());
     }
 }
