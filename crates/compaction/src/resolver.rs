@@ -636,29 +636,32 @@ where
             self.skip_rest_of_group(ts)?;
         }
         loop {
-            // One comparison of the key with the column per step (or none: the group loop
-            // already made it for this entry).
+            // One key fetch per step, and one comparison of the key with the column (or none:
+            // the group loop already made it for this entry).
             let peeked = self.peek.take();
-            let (in_col, same_row, suffix) = if self.cursor.valid() {
-                let k = self.cursor.key();
-                let (in_col, same_row) = match peeked {
-                    Some(same_row) => (false, same_row),
-                    None => locate_key(k, &self.col, &self.row),
-                };
-                (in_col, same_row, split_suffix(k).ok())
+            let k = if self.cursor.valid() {
+                Some(self.cursor.key())
             } else {
-                (false, false, None)
+                None
             };
-            if !self.cursor.valid() || self.past_bounds(in_col, same_row) {
-                if self.run {
-                    if let Some(out) = self.flush_run()? {
-                        return Ok(Some(out));
+            let (in_col, same_row) = match (k, peeked) {
+                (None, _) => (false, false),
+                (Some(_), Some(same_row)) => (false, same_row),
+                (Some(k), None) => locate_key(k, &self.col, &self.row),
+            };
+            let k = match k {
+                Some(k) if !self.past_bounds(in_col, same_row) => k,
+                _ => {
+                    if self.run {
+                        if let Some(out) = self.flush_run()? {
+                            return Ok(Some(out));
+                        }
+                        continue;
                     }
-                    continue;
+                    return Ok(None);
                 }
-                return Ok(None);
-            }
-            let Some((_, ts, seqno, kind)) = suffix else {
+            };
+            let Ok((_, ts, seqno, kind)) = split_suffix(k) else {
                 debug_assert!(false, "malformed internal key from a source");
                 self.cursor.next()?;
                 continue;
@@ -671,21 +674,26 @@ where
                     }
                     continue;
                 }
-                let key = self.cursor.key();
+                // The new row and column are copied from the same key fetch.
                 if !same_row {
-                    let Ok(n) = row_prefix_len(key) else {
+                    let Ok(n) = row_prefix_len(k) else {
                         debug_assert!(false, "malformed internal key from a source");
                         self.cursor.next()?;
                         continue;
                     };
                     self.row.clear();
-                    self.row.extend_from_slice(&key[..n]);
+                    self.row.extend_from_slice(&k[..n]);
+                }
+                self.col.clear();
+                if kind != Kind::FamilyDelete {
+                    self.col.extend_from_slice(&k[..k.len() - SUFFIX_LEN]);
+                }
+                if !same_row {
                     self.family_cover = None;
                     self.markers.clear();
                     self.columns_in_row = 0;
                     self.note_row_bound();
                 }
-                let key = self.cursor.key();
                 if kind == Kind::FamilyDelete {
                     if seqno <= self.opts.snapshot {
                         raise(&mut self.family_cover, ts);
@@ -693,13 +701,9 @@ where
                             self.markers.push((ts, seqno));
                         }
                     }
-                    self.col.clear();
                     self.cursor.next()?;
                     continue;
                 }
-                let body = key.len() - SUFFIX_LEN;
-                self.col.clear();
-                self.col.extend_from_slice(&key[..body]);
                 self.reset_column();
                 self.note_column_bound();
                 let limit = self.opts.columns_per_row;
