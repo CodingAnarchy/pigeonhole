@@ -82,6 +82,10 @@ pub(crate) struct Hooks {
     /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
     /// (`Engine::before_snapshot_view_load`, #315 review).
     pub before_snapshot_view_load: Once,
+    /// Runs in the next unpinned read as of now (`get_latest`, `read_row_latest_into`),
+    /// between its first visible-seqno read and its view load
+    /// (`Engine::before_latest_view_load`).
+    pub before_latest_view_load: Once,
     /// Runs in the next shrink round, between its catalog read and its relocations
     /// (`Engine::before_shrink_relocates`).
     pub before_shrink_relocates: Once,
@@ -632,6 +636,23 @@ impl Engine {
     #[doc(hidden)]
     pub fn before_snapshot_view_load(&self, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.before_snapshot_view_load.set(f);
+    }
+
+    /// Runs `f` once, on the calling thread of the next unpinned read as of now
+    /// (`get_latest`, `read_row_latest_into`), after its first visible-seqno read and before it
+    /// loads the view: where a test publishes a flush in between (test hook). `f` may set the
+    /// hook again, to run in the read's next try too.
+    #[doc(hidden)]
+    pub fn before_latest_view_load(&self, f: Box<dyn FnOnce() + Send>) {
+        self.inner.shared.hooks.before_latest_view_load.set(f);
+    }
+
+    /// Runs `f` once, in the calling thread's next row read, after its first family and
+    /// before its second: where a test flushes, compacts and reclaims while the read holds
+    /// its view (#392 review; test hook).
+    #[doc(hidden)]
+    pub fn between_row_read_families(&self, f: Box<dyn FnOnce()>) {
+        crate::read::BETWEEN_ROW_FAMILIES.with(|h| *h.borrow_mut() = Some(f));
     }
 
     /// Runs `f` once, on the calling thread of the next `backup`, right after it released its

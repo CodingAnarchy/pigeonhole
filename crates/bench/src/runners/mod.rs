@@ -372,7 +372,11 @@ mod agreement {
             }
             let read: u64 = want.iter().map(|t| t.cells).sum();
             assert!(
-                read > 0 || kind == WorkloadKind::SkewedMultiShard,
+                read > 0
+                    || matches!(
+                        kind,
+                        WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit
+                    ),
                 "{kind:?} reads nothing"
             );
             for (i, (w, g)) in want.iter().zip(&got).enumerate() {

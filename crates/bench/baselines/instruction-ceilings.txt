@@ -15,12 +15,16 @@
 #   python3 scripts/instruction-ceilings.py lower COUNTS
 # (COUNTS from the workflow's head run). It only lowers. Never raise a ceiling without an
 # owner decision; a raise edits this file by hand and cites that decision.
+#
+# Raised by D195 (owner decision, 2026-10-09): flushed 1905 -> 1912 and compacted 1282 -> 1288
+# (#384 merged after these ceilings were measured), get-sst 17883 -> 17983 with headroom 0.5%
+# (placement drift on main after #392/#396). Each is main 99f8929's count times (1 + headroom).
 
 as-written 2573 0.3
-flushed 1905 0.3
-compacted 1282 0.3
+flushed 1912 0.3
+compacted 1288 0.3
 get-mem 7270 0.3
-get-sst 17883 0.3
+get-sst 17983 0.5
 get-miss 4628 0.3
 row 2635 1.0
 scan 1440 0.3
