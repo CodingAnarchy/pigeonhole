@@ -1,4 +1,4 @@
-# Decisions made in Phase 2 (D163–)
+# Decisions made in Phase 2 (D163–D193)
 
 Indexed in [README.md](README.md). Numbers are permanent and continue from Phase 1; code and docs cite them as `Dn`.
 
