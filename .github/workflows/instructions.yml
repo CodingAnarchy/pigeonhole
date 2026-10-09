@@ -1,0 +1,76 @@
+name: Instructions per cell
+
+# Read-path instructions per cell on hotrow (crates/bench/examples/hotrow.rs), counted by
+# callgrind (deterministic), for the PR's base and head: a main-vs-branch table in the job
+# summary, and a failure if any hot-row state gets more than 3% worse (#287). Runs only when
+# the read path changes.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/compaction/**'
+      - 'crates/engine/**'
+      - 'crates/sst/**'
+      - 'crates/format/**'
+      - 'crates/memtable/**'
+      - 'crates/cache/**'
+      - 'crates/pigeonhole/**'
+      - 'crates/bench/examples/hotrow.rs'
+      - 'scripts/instructions-per-cell.sh'
+      - '.github/workflows/instructions.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  instructions:
+    name: hotrow instructions per cell (callgrind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install valgrind
+        run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build hotrow (head and base)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          cargo build --release -p pigeonhole-bench --example hotrow
+          cp target/release/examples/hotrow /tmp/hotrow-head
+          git worktree add -q /tmp/base "$base"
+          # The base may predate the measured-iteration hook: build it with the head's hotrow.
+          cp crates/bench/examples/hotrow.rs /tmp/base/crates/bench/examples/hotrow.rs
+          (cd /tmp/base && cargo build --release -p pigeonhole-bench --example hotrow \
+            --target-dir "$GITHUB_WORKSPACE/target")
+          cp target/release/examples/hotrow /tmp/hotrow-base
+      - name: count
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/instructions-per-cell.sh /tmp/hotrow-base > /tmp/base.txt
+          scripts/instructions-per-cell.sh /tmp/hotrow-head > /tmp/head.txt
+          {
+            echo "### hotrow instructions per cell (callgrind; row read + 10-row scan)"
+            echo
+            echo "| State | base | head | change |"
+            echo "|---|--:|--:|--:|"
+            paste -d' ' /tmp/base.txt /tmp/head.txt | awk '{ print $1, $2, $4 }' | while read -r state b h; do
+              echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          paste -d' ' /tmp/base.txt /tmp/head.txt | awk '
+            $4 > $2 * 1.03 { print "regression: " $1 " " $2 " -> " $4; bad = 1 }
+            END { exit bad }'

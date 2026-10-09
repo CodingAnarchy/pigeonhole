@@ -17,6 +17,28 @@ use std::time::Instant;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole};
 
+/// One measured iteration: a row read of the hot row and a 10-row scan through it. Not
+/// inlined, so `callgrind --toggle-collect` can count exactly its instructions. Returns the
+/// cells each read saw and their times in nanoseconds.
+#[inline(never)]
+fn hotrow_iteration(t: &pigeonhole::Table, hot: &[u8]) -> (usize, usize, u64, u64) {
+    let t0 = Instant::now();
+    let row = t.row(hot).family("f").read().unwrap().unwrap();
+    let row_cells = row.iter().count();
+    let row_t = t0.elapsed().as_nanos() as u64;
+    let t0 = Instant::now();
+    let mut it = t
+        .scan_bounds(Bound::Included(&b"h:04995"[..]), Bound::Unbounded)
+        .limit(10)
+        .iter()
+        .unwrap();
+    let mut scan_cells = 0;
+    while let Some(r) = it.next_ref().unwrap() {
+        scan_cells += std::hint::black_box(r.iter().count());
+    }
+    (row_cells, scan_cells, row_t, t0.elapsed().as_nanos() as u64)
+}
+
 fn main() {
     let iters: usize = std::env::args()
         .nth(1)
@@ -87,24 +109,18 @@ fn main() {
     }
     eprintln!("setup done"); // `sample` the process from here to profile the reads.
     let mut cells = 0;
+    let mut read_cells = 0;
     let mut row_ns = Vec::with_capacity(iters);
     let mut scan_ns = Vec::with_capacity(iters);
     for _ in 0..iters {
-        let t0 = Instant::now();
-        let row = t.row(hot).family("f").read().unwrap().unwrap();
-        cells = row.iter().count();
-        row_ns.push(t0.elapsed().as_nanos() as u64);
-        let t0 = Instant::now();
-        let mut it = t
-            .scan_bounds(Bound::Included(&b"h:04995"[..]), Bound::Unbounded)
-            .limit(10)
-            .iter()
-            .unwrap();
-        while let Some(r) = it.next_ref().unwrap() {
-            std::hint::black_box(r.iter().count());
-        }
-        scan_ns.push(t0.elapsed().as_nanos() as u64);
+        let (row_cells, scan_cells, row_t, scan_t) = hotrow_iteration(&t, hot);
+        cells = row_cells;
+        read_cells += (row_cells + scan_cells) as u64;
+        row_ns.push(row_t);
+        scan_ns.push(scan_t);
     }
+    // For instruction counts (`scripts/instructions-per-cell.sh`): cells read in all.
+    eprintln!("cells read {read_cells}");
     row_ns.sort_unstable();
     scan_ns.sort_unstable();
     let p = |v: &[u64], q: f64| v[((v.len() - 1) as f64 * q) as usize] as f64 / 1000.0;
