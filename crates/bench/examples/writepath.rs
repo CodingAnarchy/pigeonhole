@@ -18,6 +18,11 @@
 //! thread of its own, inside `shape_run_shard` while a shape is measured, so the commit,
 //! flush and compaction work the shards do is counted along with the caller's. One shard,
 //! tablet changes off and a memtable that holds every write keep the work deterministic.
+//!
+//! On macOS the script counts whole processes at two iteration counts (`time -l`). For
+//! `flush` and `compact` the setup commits grow with ITERATIONS too, so that difference
+//! includes them: only callgrind measures those two shapes alone. The commit shapes are
+//! clean either way.
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
