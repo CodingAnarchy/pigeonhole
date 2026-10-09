@@ -489,6 +489,23 @@ impl<B: Deref<Target = [u8]>> Block<B> {
         let corrupt = || Error::Corrupt {
             what: "block entry",
         };
+        // Most entries have all three fields under 128: one byte each, decoded without the
+        // general varint loop (#287).
+        if let Some(&[shared, unshared, value_len]) = b.get(offset..offset + 3)
+            && (shared | unshared | value_len) < 0x80
+        {
+            let key_start = offset + 3;
+            let key_end = key_start + usize::from(unshared);
+            let value_end = key_end + usize::from(value_len);
+            if value_end > b.len() {
+                return Err(corrupt());
+            }
+            return Ok(Entry {
+                shared: usize::from(shared),
+                unshared: key_start..key_end,
+                value: key_end..value_end,
+            });
+        }
         let mut pos = offset;
         let mut field = || -> crate::Result<usize> {
             let (v, n) = crate::varint::get_u64(b.get(pos..).ok_or_else(corrupt)?)?;
