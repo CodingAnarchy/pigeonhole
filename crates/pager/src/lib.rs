@@ -688,7 +688,7 @@ impl Pager {
         // as `NoSpace`. The `sync_all` makes the new length durable now, because root commits
         // sync with `sync_data`, which need not persist a length change: without it a
         // power loss after the commit could cut the file short of a published extent.
-        let (_, end) = alloc.grow_target(class);
+        let end = alloc.grow_end(class);
         let from = alloc.frontier() * UNIT_BYTES;
         let started = std::time::Instant::now();
         self.inner
@@ -706,7 +706,7 @@ impl Pager {
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        Ok(alloc.alloc_grown(class))
+        Ok(alloc.alloc_grown_to(class, end))
     }
 
     /// Returns an extent that was allocated but never published in a root (an abandoned

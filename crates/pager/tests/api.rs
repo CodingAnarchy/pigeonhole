@@ -545,3 +545,30 @@ fn a_released_region_frees_what_it_held() {
         Err(Error::NoSpace)
     ));
 }
+
+#[test]
+fn a_large_file_grows_by_an_eighth_and_the_free_tail_truncates_away() {
+    // #28: from 64 MiB on, a growth adds an eighth of the file past the extent that needed
+    // it, so growths are rare; `truncate_tail` (run by `shrink` and the clean close) cuts
+    // the unused tail off again.
+    let pager = Pager::create(&sim(), path()).unwrap();
+    // 1 MiB extents up to 64 MiB of file: each grows the file by its own size.
+    while pager.stats().file_bytes < 64 << 20 {
+        pager.allocate(1 << 20).unwrap();
+    }
+    let before = pager.stats().file_bytes;
+    let growths = pager.stats().growths;
+    let mut last = pager.allocate(1 << 20).unwrap();
+    let grown = pager.stats().file_bytes;
+    assert_eq!(pager.stats().growths, growths + 1);
+    assert!(grown >= before + before / 8, "{before} -> {grown}");
+    // The slack serves the next allocations: the file does not grow.
+    for _ in 0..4 {
+        last = pager.allocate(1 << 20).unwrap();
+    }
+    assert_eq!(pager.stats().file_bytes, grown);
+    assert_eq!(pager.stats().growths, growths + 1, "no further growth");
+    let end = last.offset() + last.len();
+    assert!(pager.truncate_tail().unwrap() > 0);
+    assert_eq!(pager.stats().file_bytes, end);
+}

@@ -651,6 +651,14 @@ impl Shared {
             // Under the exclusion (see `try_final_close`): no commit is in flight, and the
             // queue is drained first, so nothing commits after the clean mark and clears it.
             manifest::drain_sync(self);
+            // A file at rest ends at its last extent (D183): the free tail a growth left
+            // ahead of the data (#28), and extents nothing uses any more, are cut off.
+            self.reclaim();
+            if let Err(e) = self.pager.truncate_tail() {
+                clean = Err(e.into());
+            }
+        }
+        if clean.is_ok() {
             let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
             clean = manifest.mark_clean();
         }

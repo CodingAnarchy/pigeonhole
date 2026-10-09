@@ -20,6 +20,12 @@ use crate::Extent;
 pub(crate) const UNIT_PAGES: u64 = 16;
 /// Bytes per unit.
 pub(crate) const UNIT_BYTES: u64 = 64 * 1024;
+
+/// The most a growth adds past the extent that needed it: 1 GiB.
+pub(crate) const GROWTH_CAP_UNITS: u64 = (1 << 30) / UNIT_BYTES;
+
+/// The file size (64 MiB) from which a growth adds an eighth of the file (at least 8 MiB).
+pub(crate) const GROWTH_FROM_UNITS: u64 = (64 << 20) / UNIT_BYTES;
 /// Number of size classes (0..=10).
 const CLASSES: usize = Extent::MAX_CLASS as usize + 1;
 
@@ -255,11 +261,32 @@ impl Alloc {
     /// Records a growth planned by [`grow_target`](Self::grow_target) once the file has been
     /// extended: the alignment gap becomes free and the extent is used.
     pub(crate) fn alloc_grown(&mut self, class: u8) -> Extent {
-        let (unit, end) = self.grow_target(class);
+        let (_, end) = self.grow_target(class);
+        self.alloc_grown_to(class, end)
+    }
+
+    /// As [`alloc_grown`](Self::alloc_grown), with the file grown further, to `end` units:
+    /// the units past the extent are free.
+    pub(crate) fn alloc_grown_to(&mut self, class: u8, end: u64) -> Extent {
+        let (unit, extent_end) = self.grow_target(class);
+        debug_assert!(end >= extent_end);
         let old = self.frontier;
-        self.frontier = end;
+        self.frontier = end.max(extent_end);
         self.free_range(old, unit);
+        self.free_range(extent_end, self.frontier);
         self.mark_used(unit, class)
+    }
+
+    /// The file's end after growing it for an extent of `class`. From [`GROWTH_FROM_UNITS`]
+    /// on, past the extent by an eighth of the file, at most [`GROWTH_CAP_UNITS`], so
+    /// growths (each an `fallocate` and a `sync_all` under the allocator lock) are rare as
+    /// the file grows (#28); a smaller file grows by the extent alone, as before.
+    pub(crate) fn grow_end(&self, class: u8) -> u64 {
+        let (_, extent_end) = self.grow_target(class);
+        if self.frontier < GROWTH_FROM_UNITS {
+            return extent_end;
+        }
+        extent_end.max(self.frontier + (self.frontier / 8).min(GROWTH_CAP_UNITS))
     }
 
     /// Whether `e` is exactly a pending extent: live and not known to be published.
@@ -870,5 +897,22 @@ mod tests {
         a.truncate(a.used_end());
         a.check();
         assert_eq!(a.frontier(), 5);
+    }
+
+    #[test]
+    fn growth_adds_an_eighth_of_a_large_file() {
+        // Below 64 MiB a growth is the extent alone.
+        let a = Alloc::empty(16);
+        assert_eq!(a.grow_end(0), a.grow_target(0).1);
+        // From 64 MiB on, an eighth of the file past the extent.
+        let mut a = Alloc::empty(GROWTH_FROM_UNITS);
+        let end = a.grow_end(0);
+        assert_eq!(end, GROWTH_FROM_UNITS + GROWTH_FROM_UNITS / 8);
+        let e = a.alloc_grown_to(0, end);
+        assert_eq!(e, ext(GROWTH_FROM_UNITS, 0));
+        assert_eq!(a.frontier(), end, "the slack is part of the file, and free");
+        // The cap: never more than 1 GiB past the extent.
+        let a = Alloc::empty(GROWTH_CAP_UNITS * 16);
+        assert_eq!(a.grow_end(0), GROWTH_CAP_UNITS * 17);
     }
 }
