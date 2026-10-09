@@ -21,7 +21,7 @@ use pigeonhole_sst::QualifierFilter;
 
 use crate::catalog::{FamilyMeta, I64_ADD, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
-use crate::source::{ColumnKey, Pinned, Resolver, Source};
+use crate::source::{ColumnKey, Pinned, Resolver, Source, row_prefix};
 use crate::{Error, Result};
 
 /// How a [`CellData`] keeps its value alive.
@@ -1030,10 +1030,12 @@ fn read_row_with(
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
     };
-    let mut prefix = Vec::new();
-    encode_row_prefix(&mut prefix, row)?;
-    let mut past = Vec::new();
-    past_row(&prefix, &mut past);
+    // Inline for rows of usual length: the setup allocates nothing per read.
+    let prefix = row_prefix(row)?;
+    let mut past = prefix.clone();
+    if let Some(last) = past.last_mut() {
+        *last += 1;
+    }
     let mut any = false;
     for &family in families {
         let Some(meta) = view.catalog.family(family) else {
@@ -1048,7 +1050,6 @@ fn read_row_with(
             tablet,
             family,
             &filter,
-            row,
             &prefix,
             cursor.sources_mut(),
         )?;
