@@ -37,3 +37,11 @@ In the common overwrite pattern (each new version has a newer timestamp, so it i
 - No other shape regresses beyond noise (0.2%; `row` 1%), the write shapes included, and every absolute ceiling holds. macOS does not regress.
 - Equivalence: the sim model and the engine's randomized read tests agree with the index on and off, with deletes at the same and older timestamps, snapshots, time-bounded and multi-version reads, merge and counter families, and a concurrent writer (loom on the table's insert and lookup).
 - A gate run in a quiet window the coordinator schedules shows the wide-row read and scan p99 drop. If the instructions drop but the gate tail does not move, it is closed, like the early flush.
+
+<a id="d195"></a>
+## D195 — Three instruction ceilings are raised to main's counts, and a change to the ceilings is measured on the current main (owner decision, 2026-10-09; bench, CI; amends D193)
+**Decision.** The D193 ceilings for `flushed` (1905 → 1912) and `compacted` (1282 → 1288) are raised to main 99f8929's counts times their 0.3% headroom. `get-sst` is raised from 17883 to 17983, with its headroom raised from 0.3% to 0.5%.
+
+**Why.** The ceilings were measured on a main without #384 (scans reuse their resolvers), which merged just before them. #384 raised `flushed` by 0.4% and `compacted` by 0.5%, within the per-change thresholds, so main was above both ceilings as soon as they took effect. `get-sst` drifted 0.36% on main after #392 and #396, neither of which touches the SST read path: the code-placement variation already seen on other shapes. None of these is a regression to undo. With main above its ceilings, every PR failed the check.
+
+**Process.** A PR that changes `crates/bench/baselines/instruction-ceilings.txt` merges only when its base is the current main, so its CI measured the code it sets the ceilings for. A PR whose base predates a change to that file is rebased before it merges. The coordinator's merge script enforces both. Any other raise still needs an owner decision (D193).
