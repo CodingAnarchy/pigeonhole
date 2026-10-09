@@ -286,6 +286,8 @@ pub struct CellResolver<C> {
     /// The cursor's current entry is known not to be in `col` (the group loop stopped on it):
     /// whether it is in `row`. Taken by the next step; cleared whenever the cursor moves.
     peek: Option<bool>,
+    /// Where the cell last returned by `next_cell` lives, until the cursor moves again.
+    last: Option<Out>,
     /// Stop at keys `>= upper`.
     upper: Option<Vec<u8>>,
 
@@ -374,6 +376,7 @@ where
             col_below_upper: false,
             row_below_upper: false,
             peek: None,
+            last: None,
             upper: None,
             run: false,
             run_ts: 0,
@@ -438,6 +441,7 @@ where
         self.row_below_upper = false;
         self.peek = None;
         self.skip_group = None;
+        self.last = None;
     }
 
     fn reset_column(&mut self) {
@@ -499,25 +503,33 @@ where
     /// Fails with the cursor's error, or with a [`MergeError`] when a version that would be
     /// returned folds operands onto a base the operator rejects (D41).
     pub fn next_cell(&mut self) -> Result<Option<ResolvedCell<'_>>, C::Error> {
-        Ok(match self.advance()? {
-            None => None,
-            Some(Out::Source(ts)) => Some(ResolvedCell {
+        self.last = None;
+        self.last = self.advance()?;
+        Ok(self.current())
+    }
+
+    /// The cell [`CellResolver::next_cell`] last returned, again: valid until the resolver
+    /// next moves (`next_cell`, a seek, `skip_row`), so a caller can hold it without copying.
+    pub fn current(&self) -> Option<ResolvedCell<'_>> {
+        Some(match self.last? {
+            Out::Source(ts) => ResolvedCell {
                 key: self.cursor.key(),
                 ts,
                 value: self.cursor.value(),
                 from_source: true,
-            }),
-            Some(Out::Buffer(ts)) => Some(ResolvedCell {
+            },
+            Out::Buffer(ts) => ResolvedCell {
                 key: &self.out_key,
                 ts,
                 value: &self.out_val,
                 from_source: false,
-            }),
+            },
         })
     }
 
     /// Skips the rest of the current row.
     pub fn skip_row(&mut self) -> Result<(), C::Error> {
+        self.last = None;
         self.skip_group = None;
         self.peek = None;
         self.run = false;
