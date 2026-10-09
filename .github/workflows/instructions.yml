@@ -1,9 +1,11 @@
 name: Instructions per cell
 
-# Read-path instructions per cell on hotrow (crates/bench/examples/hotrow.rs), counted by
-# callgrind (deterministic), for the PR's base and head: a main-vs-branch table in the job
-# summary, and a failure if any hot-row state gets more than 3% worse (#287). Runs only when
-# the read path changes.
+# Read-path instructions per unit, counted by callgrind (deterministic), for the PR's base and
+# head: the hot row's three states (crates/bench/examples/hotrow.rs, per cell) and the read
+# shapes of crates/bench/examples/readshapes.rs (point gets, narrow rows, scans, filtered
+# scans, multi-version and counter reads). A main-vs-branch table goes in the job summary, and
+# the job fails if any state or shape gets more than 3% worse (#287). Runs only when the read
+# path changes.
 
 on:
   pull_request:
@@ -16,6 +18,8 @@ on:
       - 'crates/cache/**'
       - 'crates/pigeonhole/**'
       - 'crates/bench/examples/hotrow.rs'
+      - 'crates/bench/examples/readshapes.rs'
+      - 'crates/bench/examples/writepath.rs'
       - 'scripts/instructions-per-cell.sh'
       - '.github/workflows/instructions.yml'
   workflow_dispatch:
@@ -29,6 +33,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
+  # the head's sources of these files, so a new or changed example still has a baseline.
+  EXAMPLES: hotrow readshapes
+  # Shape binaries and their shapes, `EXAMPLE:shape,shape,...` (space-separated), in the
+  # contract of scripts/instructions-per-cell.sh. Add a shape here and it is reported and
+  # checked for regressions on every PR.
+  SHAPES: >-
+    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter
 
 jobs:
   instructions:
@@ -43,29 +55,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install valgrind
         run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
-      - name: build hotrow (head and base)
+      - name: build the examples (head and base)
         shell: bash
         run: |
           set -euo pipefail
           base="${{ github.event.pull_request.base.sha || 'origin/main' }}"
-          cargo build --release -p pigeonhole-bench --example hotrow
-          cp target/release/examples/hotrow /tmp/hotrow-head
+          flags=() srcs=()
+          for e in $EXAMPLES; do
+            flags+=(--example "$e")
+            srcs+=("crates/bench/examples/$e.rs")
+          done
+          mkdir -p /tmp/bin-head /tmp/bin-base
+          cargo build --release -p pigeonhole-bench "${flags[@]}"
+          for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-head/; done
           git worktree add -q /tmp/base "$base"
-          # The base may predate the measured-iteration hook: build it with the head's hotrow.
-          cp crates/bench/examples/hotrow.rs /tmp/base/crates/bench/examples/hotrow.rs
-          (cd /tmp/base && cargo build --release -p pigeonhole-bench --example hotrow \
+          cp "${srcs[@]}" /tmp/base/crates/bench/examples/
+          (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
             --target-dir "$GITHUB_WORKSPACE/target")
-          cp target/release/examples/hotrow /tmp/hotrow-base
+          for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-base/; done
       - name: count
         shell: bash
         run: |
           set -euo pipefail
-          scripts/instructions-per-cell.sh /tmp/hotrow-base > /tmp/base.txt
-          scripts/instructions-per-cell.sh /tmp/hotrow-head > /tmp/head.txt
+          for side in base head; do
+            groups=()
+            for g in $SHAPES; do groups+=("/tmp/bin-$side/$g"); done
+            scripts/instructions-per-cell.sh "/tmp/bin-$side/hotrow" "${groups[@]}" > "/tmp/$side.txt"
+          done
           {
-            echo "### hotrow instructions per cell (callgrind; row read + 10-row scan)"
+            echo "### Instructions per unit (callgrind)"
             echo
-            echo "| State | base | head | change |"
+            echo "Hot row (\`hotrow.rs\`, row read + 10-row scan): per cell. Shapes: per unit as each example documents (\`readshapes.rs\`: per point get, or per returned cell)."
+            echo
+            echo "| State or shape | base | head | change |"
             echo "|---|--:|--:|--:|"
             paste -d' ' /tmp/base.txt /tmp/head.txt | awk '{ print $1, $2, $4 }' | while read -r state b h; do
               echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
