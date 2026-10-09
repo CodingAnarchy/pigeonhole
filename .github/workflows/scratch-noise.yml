@@ -1,0 +1,25 @@
+name: scratch callgrind noise
+on:
+  push:
+    branches: [scratch/ycsb-noise]
+permissions:
+  contents: read
+jobs:
+  noise:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - run: cargo build --release -p pigeonhole-bench --example hotrow --example readshapes --example writepath --example ycsb
+      - name: three runs of the same binaries, every shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          T=target/release/examples
+          for r in 1 2 3; do
+            scripts/instructions-per-cell.sh $T/hotrow $T/readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans $T/writepath:commit-one,commit-sixteen,flush,compact $T/ycsb:ycsb-c,ycsb-a > run$r.txt
+          done
+          paste run1.txt run2.txt run3.txt | awk '{ printf "| %s | %s | %s | %s |\n", $1, $2, $4, $6 }' | tee -a "$GITHUB_STEP_SUMMARY"
