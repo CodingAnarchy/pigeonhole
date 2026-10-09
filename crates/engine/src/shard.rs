@@ -2081,7 +2081,7 @@ impl ShardState {
         let leveled = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
         let tiered = CompactionPicker::new(CompactionStyle::Tiered, shared.picker.clone());
         let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
-        Self {
+        let shard = Self {
             id,
             shared,
             wal: None,
@@ -2184,6 +2184,25 @@ impl ShardState {
             balance_timer: None,
             balance_interval: 0,
             balance_epoch: 0,
+        };
+        shard.publish_arena();
+        shard
+    }
+
+    /// Test hook: the arena's free bytes, largest free run and size, as one snapshot
+    /// (`Engine::arena_free`), from the shard's construction on. Nothing without test hooks.
+    fn publish_arena(&self) {
+        #[cfg(feature = "test-hooks")]
+        {
+            *self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .arena
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = (
+                self.arena.free_bytes() as u64,
+                self.arena.largest_free_run() as u64,
+                self.arena.region().len() as u64,
+            );
         }
     }
 
@@ -6436,13 +6455,8 @@ impl ShardHandler for ShardState {
             let m = &self.shared.metrics[usize::from(self.id.0)].hooks;
             m.aborted
                 .store(self.aborted.len() as u64, Ordering::Relaxed);
-            m.arena_free
-                .store(self.arena.free_bytes() as u64, Ordering::Relaxed);
-            m.arena_run
-                .store(self.arena.largest_free_run() as u64, Ordering::Relaxed);
-            m.arena_len
-                .store(self.arena.region().len() as u64, Ordering::Relaxed);
         }
+        self.publish_arena();
     }
 }
 

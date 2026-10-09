@@ -137,9 +137,8 @@ pub(crate) struct ShardCounters {
     pub aborted: AtomicU64,
     /// The arena's free bytes, largest free run and size (`Engine::arena_free`: a test
     /// checks it built the fragmented arena it means to, issue #141).
-    pub arena_free: AtomicU64,
-    pub arena_run: AtomicU64,
-    pub arena_len: AtomicU64,
+    /// One snapshot, so a reader never pairs values from different batches.
+    pub arena: Mutex<(u64, u64, u64)>,
     /// Reservations that found enough free bytes but no run long enough for their largest
     /// entry (`Engine::arena_run_waits`: a test checks it reached that case, issue #141).
     pub run_waits: AtomicU64,
@@ -841,12 +840,11 @@ impl Engine {
     /// largest run of free chunks, and its size (issue #141).
     #[doc(hidden)]
     pub fn arena_free(&self, shard: usize) -> (u64, u64, u64) {
-        let m = &self.inner.shared.metrics[shard].hooks;
-        (
-            m.arena_free.load(Ordering::Relaxed),
-            m.arena_run.load(Ordering::Relaxed),
-            m.arena_len.load(Ordering::Relaxed),
-        )
+        *self.inner.shared.metrics[shard]
+            .hooks
+            .arena
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The WAL records appended since the last call (or since recording started), in append

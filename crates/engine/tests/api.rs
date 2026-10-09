@@ -755,6 +755,58 @@ fn a_value_with_free_bytes_but_no_long_enough_run_waits_instead_of_poisoning() {
     db.close().unwrap();
 }
 
+/// The arena counters a test reads (`Engine::arena_free`) are one snapshot, published from
+/// open: a reader racing the shard never sees a free count from one batch with the length
+/// or the largest run from another. A torn read once showed more free bytes than the arena
+/// holds (a length still 0 before the first batch), and the test above failed computing
+/// `len - free`.
+#[test]
+fn arena_counters_are_one_snapshot() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for seed in 0..10 {
+        let vfs = SimVfs::new(seed);
+        let mut o = owned(Arc::clone(&vfs), 1);
+        o.memtable_budget = 1 << 20;
+        o.memtable_freeze_bytes = 256 << 10;
+        let db = Engine::open(Path::new(DB), o).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    let (free, run, len) = db.arena_free(0);
+                    assert!(len > 0, "seed {seed}: no length after open");
+                    assert!(
+                        run <= free && free <= len,
+                        "seed {seed}: a torn read: run {run} free {free} len {len}"
+                    );
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        for i in 0..300u32 {
+            let mut wb = WriteBatch::new();
+            put(
+                &mut wb,
+                &t,
+                "f",
+                &i.to_be_bytes(),
+                b"q",
+                &vec![3u8; 2048 + (i as usize % 7) * 1024],
+            );
+            db.commit(wb, Some(Durability::None)).unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        assert!(reader.join().unwrap() > 0);
+        db.close().unwrap();
+    }
+}
+
 #[test]
 fn value_limits_arena_pressure_and_closed_handles() {
     let vfs = SimVfs::new(12);
