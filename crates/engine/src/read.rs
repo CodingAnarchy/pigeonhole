@@ -1063,36 +1063,48 @@ pub(crate) fn get_in(
     qualifier: &[u8],
     pin: impl FnOnce() -> Arc<View>,
 ) -> Result<Option<CellData>> {
-    let mut buffers = POINT_BUFFERS
-        .try_with(|b| b.borrow_mut().take())
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let got = get_with(
-        &mut buffers,
-        view,
-        seqno,
-        now,
-        table,
-        family,
-        row,
-        qualifier,
-        pin,
-    );
-    // Every source was dropped (a source pins its memtable or SST): only the allocations
-    // are kept.
-    debug_assert!(buffers.sources.is_empty());
-    buffers.sources.clear();
-    // A large result may have been folded in the resolver's buffers (merge operands are
-    // copied whatever their size): not worth keeping that much per thread.
-    if got.as_ref().is_ok_and(|c| {
-        c.as_ref()
-            .is_some_and(|c| c.stored().len() > KEEP_BUFFERS_BELOW)
-    }) {
-        buffers.resolver = ResolverBuffers::default();
+    let mut run = Some(|buffers: &mut PointBuffers| {
+        let got = get_with(
+            buffers, view, seqno, now, table, family, row, qualifier, pin,
+        );
+        // Every source was dropped (a source pins its memtable or SST): only the
+        // allocations are kept.
+        debug_assert!(buffers.sources.is_empty());
+        buffers.sources.clear();
+        // A large result may have been folded in the resolver's buffers (merge operands are
+        // copied whatever their size): not worth keeping that much per thread.
+        if got.as_ref().is_ok_and(|c| {
+            c.as_ref()
+                .is_some_and(|c| c.stored().len() > KEEP_BUFFERS_BELOW)
+        }) {
+            buffers.resolver = ResolverBuffers::default();
+        }
+        got
+    });
+    // Used in place (not taken out and put back: the buffers are a few hundred bytes to
+    // move). A get nested in another on the same thread, or one during thread teardown,
+    // starts from empty buffers.
+    let in_place = POINT_BUFFERS.try_with(|cell| {
+        let mut slot = cell.try_borrow_mut().ok()?;
+        let run = run.take().expect("not run yet");
+        Some(run(slot.get_or_insert_with(PointBuffers::default)))
+    });
+    match in_place {
+        Ok(Some(got)) => got,
+        _ => (run.take().expect("not run yet"))(&mut PointBuffers::default()),
     }
-    let _ = POINT_BUFFERS.try_with(|b| *b.borrow_mut() = Some(buffers));
-    got
+}
+
+/// A point get's resolver options: as `ReadSpec { versions: 1, .. }.resolve_opts`, built
+/// directly (no spec, filter or time range to make and drop on every get).
+fn point_opts(meta: &FamilyMeta, seqno: Seqno, now: Timestamp) -> ResolveOptions {
+    let mut opts = ResolveOptions::new(seqno, now);
+    opts.ttl_micros = meta.options.ttl_micros;
+    // `versions: 1` folded with the family's `max_versions` (0 = unlimited): always 1.
+    opts.versions = 1;
+    opts.merge = meta.merge_op.clone();
+    opts.counter = meta.options.kind == FamilyKind::Counter;
+    opts
 }
 
 /// How a point get's resolution ended.
@@ -1129,11 +1141,7 @@ fn get_with(
         buffers.sources.clear();
         return filled.map(|()| None);
     }
-    let (mut opts, _) = ReadSpec {
-        versions: 1,
-        ..ReadSpec::default()
-    }
-    .resolve_opts(meta, seqno, now);
+    let mut opts = point_opts(meta, seqno, now);
     let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
     let cursor = MergingCursor::reuse(
         buffers.sources.drain(..),
