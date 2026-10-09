@@ -1,0 +1,34 @@
+name: Commit latency (Linux, indicative)
+
+# Commit-path timing on a Linux runner (#64, #412): where a buffered commit's latency goes
+# (crates/bench/examples/commitpath.rs: engine threads, a parking or spinning driver, and
+# the shard run inline by the client), and durable group commits from 1, 4 and 16 clients
+# (`phdb-bench group-commit`). A hosted runner is not reference hardware (D5): the numbers
+# are indicative, for comparing designs, and never gate anything. Manual only.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  commit-latency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p pigeonhole-bench --example commitpath --bin phdb-bench
+      - name: commit path
+        run: |
+          {
+            echo "### Commit path (one client, one shard, buffered overwrites)"
+            echo
+            target/release/examples/commitpath 200000 "$RUNNER_TEMP"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: group commit
+        run: |
+          target/release/phdb-bench group-commit --dir "$RUNNER_TEMP" --markdown /tmp/gc.md
+          { echo; echo "### group-commit"; echo; cat /tmp/gc.md; } | tee -a "$GITHUB_STEP_SUMMARY"
