@@ -89,8 +89,11 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
     callgrind() { # pattern, environment, then the command; prints the instructions counted
         local pattern="$1" env_set="$2"
         shift 2
-        # The environment goes before valgrind: callgrind does not follow `env`'s exec.
-        env $env_set valgrind --tool=callgrind --collect-atstart=no \
+        # The environment goes before valgrind: callgrind does not follow `env`'s exec. A fixed
+        # mmap threshold stops glibc moving it whenever any thread frees a large block, which
+        # decided by thread timing whether a growing buffer's realloc copied (#354).
+        env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 $env_set \
+            valgrind --tool=callgrind --collect-atstart=no \
             --callgrind-out-file="$work/cg.out" "$@" </dev/null >/dev/null 2>"$work/err"
         sed -n 's/^summary: \([0-9]*\).*/\1/p' "$work/cg.out"
     }

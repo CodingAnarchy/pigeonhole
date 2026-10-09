@@ -12,6 +12,12 @@
 //! directory) and removed at the end. `HOT_FLUSH=1` flushes the memtable before reading (all
 //! versions in L0 SSTs); `HOT_COMPACT=1` compacts fully (one version per column), the floor
 //! for the same cells.
+//!
+//! Every state is built deterministically (`support/driver.rs`): one application-owned shard,
+//! only the flushes and compactions above, and the reads start with the shard idle. As
+//! written, the hot row is in the memtable and one L0 SST.
+#[path = "support/driver.rs"]
+mod driver;
 #[path = "support/measure.rs"]
 mod measure;
 use measure::Measured;
@@ -19,7 +25,7 @@ use measure::Measured;
 use std::ops::Bound;
 use std::time::Instant;
 
-use pigeonhole::{Durability, Family, Options, Pigeonhole};
+use pigeonhole::{Durability, Family, Options};
 
 /// One measured iteration: a row read of the hot row and a 10-row scan through it, counted by
 /// callgrind while its `Measured` guard lives (`support/measure.rs`). Returns the
@@ -53,14 +59,12 @@ fn main() {
         .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
     let dir = base.join(format!("phdb-hotrow-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let db = Pigeonhole::open(
-        dir.join("hot.phdb"),
+    let (db, driver) = driver::Driver::open(
+        &dir.join("hot.phdb"),
         Options::default()
             .durability(Durability::Buffered)
-            .memtable_budget(64 << 20)
             .block_cache(256 << 20),
-    )
-    .expect("open");
+    );
     let t = db
         .table("t")
         .unwrap()
@@ -119,21 +123,25 @@ fn main() {
         std::hint::black_box(r.iter().count());
     }
     drop(it);
+    driver.wait_idle();
     eprintln!("setup done"); // `sample` the process from here to profile the reads.
     // `SHAPE_SETUP_ONLY=1`: the setup alone, no measured iteration (the script checks that
     // callgrind then counts nothing inside `hotrow_iteration`).
     let iters = if setup_only() { 0 } else { iters };
-    let mut cells = 0;
-    let mut read_cells = 0;
-    let mut row_ns = Vec::with_capacity(iters);
-    let mut scan_ns = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let (row_cells, scan_cells, row_t, scan_t) = hotrow_iteration(&t, hot);
-        cells = row_cells;
-        read_cells += (row_cells + scan_cells) as u64;
-        row_ns.push(row_t);
-        scan_ns.push(scan_t);
-    }
+    let (cells, read_cells, mut row_ns, mut scan_ns) = driver::on_fresh_thread(|| {
+        let mut cells = 0;
+        let mut read_cells = 0;
+        let mut row_ns = Vec::with_capacity(iters);
+        let mut scan_ns = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let (row_cells, scan_cells, row_t, scan_t) = hotrow_iteration(&t, hot);
+            cells = row_cells;
+            read_cells += (row_cells + scan_cells) as u64;
+            row_ns.push(row_t);
+            scan_ns.push(scan_t);
+        }
+        (cells, read_cells, row_ns, scan_ns)
+    });
     // For instruction counts (`scripts/instructions-per-cell.sh`): cells read in all.
     eprintln!("cells read {read_cells}");
     row_ns.sort_unstable();
@@ -153,6 +161,7 @@ fn main() {
     );
     drop(t);
     db.close().unwrap();
+    driver.join();
     std::fs::remove_dir_all(&dir).ok();
 }
 

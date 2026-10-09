@@ -23,13 +23,18 @@
 //! `Measured` guard (`support/measure.rs`), and on stderr the run prints `units N`: one per
 //! point get (hit or miss), one per returned cell otherwise. A full scan before the
 //! measured iterations warms the block cache, so every shape measures steady-state reads.
+//!
+//! The store is built deterministically (`support/driver.rs`): one application-owned shard,
+//! only the setup's own flush, and the measured reads start with the shard idle.
+#[path = "support/driver.rs"]
+mod driver;
 #[path = "support/measure.rs"]
 mod measure;
 use measure::Measured;
 
 use std::ops::Bound;
 
-use pigeonhole::{Durability, Family, Options, Pigeonhole, Table};
+use pigeonhole::{Durability, Family, Options, Table};
 
 const ROWS: u32 = 20_000;
 const CELLS: u32 = 8;
@@ -177,18 +182,12 @@ fn main() {
         .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
     let dir = base.join(format!("phdb-readshapes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let db = Pigeonhole::open(
-        dir.join("shapes.phdb"),
-        // One shard: shard threads allocate memtable chunks in a racy order, and a memtable's
-        // skiplist heights are seeded from where it sits, so several shards make counts vary
-        // from run to run.
+    let (db, driver) = driver::Driver::open(
+        &dir.join("shapes.phdb"),
         Options::default()
-            .shards(1)
             .durability(Durability::Buffered)
-            .memtable_budget(64 << 20)
             .block_cache(256 << 20),
-    )
-    .expect("open");
+    );
     let t = db
         .table("t")
         .unwrap()
@@ -224,6 +223,7 @@ fn main() {
         t.mutate(&row_key(r)).incr("c", b"n", 2).commit().unwrap();
     }
     warm(&t);
+    driver.wait_idle();
     eprintln!("setup done");
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -235,22 +235,27 @@ fn main() {
     } else {
         iters
     };
-    for _ in 0..iters {
-        units += match shape.as_str() {
-            "get-mem" => shape_get(&t, &mut rng, ROWS / 2),
-            "get-sst" => shape_get(&t, &mut rng, 0),
-            "get-miss" => shape_get_miss(&t, &mut rng),
-            "row" => shape_row(&t, &mut rng),
-            "scan" => shape_scan(&t, &mut rng, false),
-            "scan-filtered" => shape_scan(&t, &mut rng, true),
-            "versions" => shape_versions(&t, &mut rng),
-            "counter" => shape_counter(&t, &mut rng),
-            other => panic!("unknown shape {other}"),
-        };
-    }
+    units += driver::on_fresh_thread(|| {
+        let mut units = 0;
+        for _ in 0..iters {
+            units += match shape.as_str() {
+                "get-mem" => shape_get(&t, &mut rng, ROWS / 2),
+                "get-sst" => shape_get(&t, &mut rng, 0),
+                "get-miss" => shape_get_miss(&t, &mut rng),
+                "row" => shape_row(&t, &mut rng),
+                "scan" => shape_scan(&t, &mut rng, false),
+                "scan-filtered" => shape_scan(&t, &mut rng, true),
+                "versions" => shape_versions(&t, &mut rng),
+                "counter" => shape_counter(&t, &mut rng),
+                other => panic!("unknown shape {other}"),
+            };
+        }
+        units
+    });
     // For instruction counts (`scripts/instructions-per-cell.sh`): units read in all.
     eprintln!("units {units}");
     drop(t);
     db.close().unwrap();
+    driver.join();
     std::fs::remove_dir_all(&dir).ok();
 }
