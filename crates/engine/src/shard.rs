@@ -8,9 +8,8 @@
 //! engine-wide [`Shared`] state (lock-free view publication behind a publish mutex, the
 //! manifest queue, and the registries flush and compaction consult).
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::hash::Hasher;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Waker;
@@ -18,6 +17,7 @@ use std::task::Waker;
 use arc_swap::ArcSwap;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::{CompactionPicker, MergingCursor, PickerOptions, ResolveOptions};
+use pigeonhole_format::hash::{FastBuildHasher, FastMap, FastSet};
 use pigeonhole_format::key::{encode_key, encode_marker_key, encode_row_prefix, split_suffix};
 use pigeonhole_format::manifest::{CompactionStyle, Edit, FamilyKind};
 use pigeonhole_format::scan::ScanFilter;
@@ -1480,11 +1480,13 @@ impl Dedup {
     }
 }
 
+/// A row's hash for the admission sets (`touched`, `pending_rows`, `parked_rows`): one seeded
+/// fast hasher for the process, so every shard hashes a row alike, and user row bytes cannot
+/// be chosen to collide.
 fn hash_row(table: TableId, row: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
-    h.write_u32(table.0);
-    h.write(row);
-    h.finish()
+    static ROWS: std::sync::LazyLock<FastBuildHasher> =
+        std::sync::LazyLock::new(FastBuildHasher::default);
+    ROWS.hash_one((table.0, row))
 }
 
 /// Prepares spare WAL segments off the foreground loop (decision D35).
@@ -1887,7 +1889,7 @@ pub(crate) struct ShardState {
     /// written newest to oldest cannot keep it from installing.
     purge_voids: HashMap<(TabletId, FamilyId), u32>,
     /// Rows (hashed with their table) of prepared, undecided shares, with a count per row.
-    pending_rows: HashMap<u64, u32>,
+    pending_rows: FastMap<u64, u32>,
     /// Arena bytes reserved by admitted-but-unapplied members and undecided shares.
     reserved: usize,
     /// `(tablet, family)` slots whose active memtable crossed the freeze threshold.
@@ -1896,7 +1898,7 @@ pub(crate) struct ShardState {
     ts_floor: Timestamp,
     key_buf: Vec<u8>,
     dedup: Dedup,
-    touched: HashSet<u64>,
+    touched: FastSet<u64>,
     /// Slots the last `apply` wrote (deduplicated).
     touched_slots: Vec<(TabletId, FamilyId)>,
     closing: bool,
@@ -2024,7 +2026,7 @@ pub(crate) struct ShardState {
     /// Single-shard commits touching `moving` tablets, held (unlogged) until the change is
     /// done and then routed again.
     parked: Vec<Member>,
-    parked_rows: HashSet<u64>,
+    parked_rows: FastSet<u64>,
     /// Fires when the oldest parked commit or retry reaches `write_stall_timeout_nanos`
     /// (its deadline, its state); both then fail with `Busy` (#102).
     tablet_timer: Option<(u64, Arc<TimerState>)>,
@@ -2111,13 +2113,13 @@ impl ShardState {
             voided_roots: HashSet::new(),
             compaction_guard: None,
             purge_voids: HashMap::new(),
-            pending_rows: HashMap::new(),
+            pending_rows: FastMap::default(),
             reserved: 0,
             to_freeze: Vec::new(),
             ts_floor,
             key_buf: Vec::new(),
             dedup: Dedup::default(),
-            touched: HashSet::new(),
+            touched: FastSet::default(),
             touched_slots: Vec::new(),
             closing: false,
             close_stage: CloseStage::Open,
@@ -2174,7 +2176,7 @@ impl ShardState {
             op: None,
             op_queue: VecDeque::new(),
             parked: Vec::new(),
-            parked_rows: HashSet::new(),
+            parked_rows: FastSet::default(),
             tablet_timer: None,
             lost_version: 0,
             retries: Vec::new(),
