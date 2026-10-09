@@ -178,7 +178,7 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
                         Priority::Low,
                     )?);
                     sources.push(Source::Sst(
-                        reader.iter(all.clone(), ReadOptions::default()),
+                        reader.iter(all.clone(), ReadOptions::default()).into(),
                     ));
                 }
                 if sources.is_empty() {

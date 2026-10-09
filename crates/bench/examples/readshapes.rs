@@ -8,7 +8,8 @@
 //! The store: 20,000 narrow rows of 8 cells (`r:00000`..), the first half flushed to SSTs and
 //! the second half still in the memtable. Column `q0` of every row has 3 versions in family
 //! `f` (which keeps 4), and family `c` (a counter family) holds a counter per 10th row,
-//! incremented 5 times, partly before the flush. Shapes:
+//! incremented 5 times, partly before the flush. A second table, `l`, holds the same 20,000
+//! rows of 8 cells fully compacted: its bottom level is several SSTs. Shapes:
 //!
 //! - `get-mem`, `get-sst`: point gets of an existing cell in the memtable or SST half;
 //! - `get-miss`: point gets of rows that do not exist;
@@ -18,6 +19,8 @@
 //!   row read (snapshot, routing, sources) as much as its cells;
 //! - `short-scans`: 5-row range scans, counted per row: a scan's setup amortized over few
 //!   rows;
+//! - `level-scans`: the 5-row scans of `short-scans` on table `l`, counted per row: a scan
+//!   over a level of several SSTs, of which it reads one or two;
 //! - `scan-filtered`: the same scans with a qualifier prefix (one cell per row);
 //! - `versions`: row reads of `q0` with `versions(3)`;
 //! - `counter`: point gets of counter cells (operands folded on read).
@@ -25,7 +28,8 @@
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
 //! iteration is one `#[inline(never)]` function named `shape_*` that counts its work with a
 //! `Measured` guard (`support/measure.rs`), and on stderr the run prints `units N`: one per
-//! point get (hit or miss), one per row for `rows` and `short-scans`, one per returned cell
+//! point get (hit or miss), one per row for `rows`, `short-scans` and `level-scans`, one per
+//! returned cell
 //! otherwise. A full scan before the
 //! measured iterations warms the block cache, so every shape measures steady-state reads.
 //!
@@ -224,6 +228,24 @@ fn main() {
             .durability(Durability::Buffered)
             .block_cache(256 << 20),
     );
+    // Table `l` first, compacted while it is the only table, so table `t` below is built
+    // exactly as without it.
+    let l = db
+        .table("l")
+        .unwrap()
+        .family("f", Family::default().bloom_bits(10))
+        .create_if_missing()
+        .unwrap();
+    for r in 0..ROWS {
+        let key = row_key(r);
+        let mut m = l.mutate(&key);
+        for q in 0..CELLS {
+            m = m.put("f", format!("q{q}").as_bytes(), &[7u8; 40]);
+        }
+        m.commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
     let t = db
         .table("t")
         .unwrap()
@@ -259,6 +281,11 @@ fn main() {
         t.mutate(&row_key(r)).incr("c", b"n", 2).commit().unwrap();
     }
     warm(&t);
+    let mut it = l.scan_prefix(b"").family("f").iter().unwrap();
+    while let Some(r) = it.next_ref().unwrap() {
+        std::hint::black_box(r.iter().count());
+    }
+    drop(it);
     driver.wait_idle();
     eprintln!("setup done");
 
@@ -282,6 +309,7 @@ fn main() {
                 "scan" => shape_scan(&t, &mut rng, false),
                 "rows" => shape_rows(&t, &mut rng),
                 "short-scans" => shape_short_scans(&t, &mut rng),
+                "level-scans" => shape_short_scans(&l, &mut rng),
                 "scan-filtered" => shape_scan(&t, &mut rng, true),
                 "versions" => shape_versions(&t, &mut rng),
                 "counter" => shape_counter(&t, &mut rng),
@@ -293,6 +321,7 @@ fn main() {
     // For instruction counts (`scripts/instructions-per-cell.sh`): units read in all.
     eprintln!("units {units}");
     drop(t);
+    drop(l);
     db.close().unwrap();
     driver.join();
     std::fs::remove_dir_all(&dir).ok();

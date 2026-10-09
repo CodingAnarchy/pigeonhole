@@ -12,7 +12,9 @@ use pigeonhole_cache::{Cell, Priority};
 use pigeonhole_compaction::{CellResolver, FilteredCursor, MergingCursor};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::filter::{column_hash, row_hash};
-use pigeonhole_format::key::{MARKER_QUALIFIER, MAX_KEY_PART, TERMINATOR, escape_into};
+use pigeonhole_format::key::{
+    MARKER_QUALIFIER, MAX_KEY_PART, TERMINATOR, escape_into, row_prefix_len,
+};
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::{FamilyId, TabletId};
 use pigeonhole_memtable::{ArenaSlice, MemIter, MemtableReader};
@@ -30,8 +32,8 @@ use crate::{Error, Result};
 pub(crate) enum Source {
     /// A memtable (active or frozen), filtered like an SST.
     Mem(FilteredCursor<MemIter>),
-    /// An SST (the filter runs inside its block decoder).
-    Sst(SstIter),
+    /// An SST, or the SSTs of one level below 0 (the filter runs inside the block decoder).
+    Sst(SstSource),
     /// An in-memory source for the resolver tests.
     #[cfg(test)]
     Vec(pigeonhole_compaction::VecCursor),
@@ -73,7 +75,7 @@ impl Cursor for Source {
     fn seek_to_first(&mut self) -> Result<()> {
         match self {
             Source::Mem(it) => Ok(it.seek_to_first()?),
-            Source::Sst(it) => Ok(it.seek_to_first()?),
+            Source::Sst(it) => it.seek_to_first(),
             #[cfg(test)]
             Source::Vec(it) => Ok(it.seek_to_first()?),
         }
@@ -82,7 +84,7 @@ impl Cursor for Source {
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         match self {
             Source::Mem(it) => Ok(it.seek(target)?),
-            Source::Sst(it) => Ok(it.seek(target)?),
+            Source::Sst(it) => it.seek(target),
             #[cfg(test)]
             Source::Vec(it) => Ok(it.seek(target)?),
         }
@@ -92,7 +94,7 @@ impl Cursor for Source {
         match self {
             // A finger search from the memtable cursor's last seek.
             Source::Mem(it) => Ok(it.seek_forward(target)?),
-            Source::Sst(it) => Ok(it.seek_forward(target)?),
+            Source::Sst(it) => it.seek(target),
             #[cfg(test)]
             Source::Vec(it) => Ok(it.seek_forward(target)?),
         }
@@ -101,7 +103,7 @@ impl Cursor for Source {
     fn next(&mut self) -> Result<()> {
         match self {
             Source::Mem(it) => Ok(it.next()?),
-            Source::Sst(it) => Ok(it.next()?),
+            Source::Sst(it) => it.next(),
             #[cfg(test)]
             Source::Vec(it) => Ok(it.next()?),
         }
@@ -110,7 +112,7 @@ impl Cursor for Source {
     fn skip_row(&mut self) -> Result<()> {
         match self {
             Source::Mem(it) => Ok(it.skip_row()?),
-            Source::Sst(it) => Ok(it.skip_row()?),
+            Source::Sst(it) => it.skip_row(),
             #[cfg(test)]
             Source::Vec(it) => Ok(it.skip_row()?),
         }
@@ -150,7 +152,7 @@ impl Source {
     pub(crate) fn pin_value(&self) -> Pinned {
         match self {
             Source::Mem(it) => Pinned::Arena(it.inner().value_slice()),
-            Source::Sst(it) => Pinned::Block(it.value_cell()),
+            Source::Sst(it) => Pinned::Block(it.iter.value_cell()),
             #[cfg(test)]
             Source::Vec(it) => Pinned::Owned(it.value().to_vec()),
         }
@@ -196,10 +198,12 @@ fn read_options(priority: Priority, scan: bool) -> ReadOptions {
     o
 }
 
-/// SST sources for a scan of `[start, end)` (row prefixes), newest first.
+/// SST sources for a scan of `[start, end)` (row prefixes), newest first: one per SST of
+/// level 0 (they overlap), and one per deeper level (its SSTs are sorted and disjoint, so a
+/// [`LevelIter`] opens and seeks only the ones the scan reaches).
 pub(crate) fn sst_sources_range(
     fam: &FamilySsts,
-    set: &SstSet,
+    set: &Arc<SstSet>,
     filter: &ScanFilter,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
@@ -207,12 +211,33 @@ pub(crate) fn sst_sources_range(
     out: &mut Vec<Source>,
 ) -> Result<()> {
     let opts = read_options(priority, true);
-    for sst in fam.iter() {
-        if !overlaps_range(sst, start, end) {
+    for (level, files) in fam.levels.iter().enumerate() {
+        let mut picked = files.iter().filter(|sst| overlaps_range(sst, start, end));
+        if level == 0 {
+            for sst in picked {
+                let reader = sst.reader(set, priority)?;
+                out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
+            }
             continue;
         }
-        let reader = sst.reader(set, priority)?;
-        out.push(Source::Sst(reader.iter(filter.clone(), opts)));
+        let Some(first) = picked.next() else {
+            continue;
+        };
+        let rest: Vec<_> = picked.cloned().collect();
+        if rest.is_empty() {
+            let reader = first.reader(set, priority)?;
+            out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
+            continue;
+        }
+        let mut level_files = Vec::with_capacity(rest.len() + 1);
+        level_files.push(Arc::clone(first));
+        level_files.extend(rest);
+        out.push(Source::Sst(SstSource::level(
+            level_files,
+            Arc::clone(set),
+            filter.clone(),
+            opts,
+        )?));
     }
     Ok(())
 }
@@ -293,6 +318,187 @@ pub(crate) fn row_prefix(row: &[u8]) -> Result<SmallVec<[u8; 96]>> {
     Ok(out)
 }
 
+/// An SST's cursor, or, for a level below 0 (its SSTs sorted by key and disjoint) with more
+/// than one SST in range, the cursor of the level: it opens and seeks an SST only when it
+/// reaches it (as RocksDB's `LevelIterator` does), so a scan bounded by a limit rather than
+/// an end key touches the one or two SSTs it reads, not every SST to the right of its start.
+/// The open SST's cursor serves every entry directly; the level only acts when it runs out
+/// or seeks.
+///
+/// A level opens an SST's reader when it reaches it, so a failure to open one (I/O,
+/// corruption) surfaces from a scan's `next` or seek, not from creating the scan.
+#[derive(Debug)]
+pub(crate) struct SstSource {
+    /// The open SST's cursor.
+    iter: SstIter,
+    /// The level, when there is more than one SST in it.
+    level: Option<Box<Level>>,
+}
+
+/// The SSTs of a level an [`SstSource`] walks.
+#[derive(Debug)]
+struct Level {
+    files: Vec<Arc<OpenSst>>,
+    set: Arc<SstSet>,
+    filter: ScanFilter,
+    opts: ReadOptions,
+    /// Index in `files` of the open SST.
+    at: usize,
+    /// A seek has positioned the cursor: before one, the open SST's cursor is invalid
+    /// without having run out, and `next` must not move on to the next SST.
+    positioned: bool,
+    /// Scratch for `skip_row`'s seek past a row.
+    past_row: Vec<u8>,
+}
+
+impl From<SstIter> for SstSource {
+    fn from(iter: SstIter) -> Self {
+        Self { iter, level: None }
+    }
+}
+
+impl Level {
+    /// The cursor of the SST at `i`, unpositioned; `at` moves only if it opened.
+    fn open(&mut self, i: usize) -> Result<SstIter> {
+        let reader = self.files[i].reader(&self.set, self.opts.priority)?;
+        self.at = i;
+        Ok(reader.iter(self.filter.clone(), self.opts))
+    }
+}
+
+impl SstSource {
+    /// The cursor of a level's `files` (in key order, at least one), with the first opened.
+    fn level(
+        files: Vec<Arc<OpenSst>>,
+        set: Arc<SstSet>,
+        filter: ScanFilter,
+        opts: ReadOptions,
+    ) -> Result<Self> {
+        // The level cursor is correct only over disjoint SSTs in key order, which every level
+        // below 0 keeps (and `tablets.rs` checks when merging tablets).
+        debug_assert!(
+            files
+                .windows(2)
+                .all(|w| w[0].meta.largest_key < w[1].meta.smallest_key),
+            "the SSTs of a level below 0 overlap or are out of order"
+        );
+        let mut level = Box::new(Level {
+            files,
+            set,
+            filter,
+            opts,
+            at: 0,
+            positioned: false,
+            past_row: Vec::new(),
+        });
+        let iter = level.open(0)?;
+        Ok(Self {
+            iter,
+            level: Some(level),
+        })
+    }
+
+    /// While the open SST is exhausted and the level has more, moves to the first entry of
+    /// the next one.
+    #[cold]
+    fn next_file(&mut self) -> Result<()> {
+        let Some(level) = self.level.as_mut().filter(|l| l.positioned) else {
+            return Ok(());
+        };
+        while !self.iter.valid() && level.at + 1 < level.files.len() {
+            self.iter = level.open(level.at + 1)?;
+            self.iter.seek_to_first()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn valid(&self) -> bool {
+        self.iter.valid()
+    }
+
+    #[inline]
+    fn key(&self) -> &[u8] {
+        self.iter.key()
+    }
+
+    #[inline]
+    fn value(&self) -> &[u8] {
+        self.iter.value()
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        if let Some(level) = &mut self.level {
+            level.positioned = true;
+            if level.at != 0 {
+                self.iter = level.open(0)?;
+            }
+        }
+        self.iter.seek_to_first()?;
+        self.next_file()
+    }
+
+    /// Also the forward seek: an SST cursor's forward seek is a seek. The level's seek reuses
+    /// the open SST when the target is still in it.
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        if let Some(level) = &mut self.level {
+            level.positioned = true;
+            // The first SST whose largest key is at or past the target holds the first entry
+            // `>= target`, or (if the filter hides the rest of it) precedes the SST that does;
+            // past every SST, the last one's seek runs out.
+            let i = level
+                .files
+                .partition_point(|f| f.meta.largest_key.as_slice() < target)
+                .min(level.files.len() - 1);
+            if i != level.at {
+                self.iter = level.open(i)?;
+            }
+        }
+        self.iter.seek(target)?;
+        if self.level.is_some() && !self.iter.valid() {
+            self.next_file()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn next(&mut self) -> Result<()> {
+        self.iter.next()?;
+        if self.level.is_some() && !self.iter.valid() {
+            self.next_file()?;
+        }
+        Ok(())
+    }
+
+    fn skip_row(&mut self) -> Result<()> {
+        let Some(level) = self.level.as_mut().filter(|_| self.iter.valid()) else {
+            return Ok(self.iter.skip_row()?);
+        };
+        let Ok(n) = row_prefix_len(self.iter.key()) else {
+            return self.next();
+        };
+        let row = &self.iter.key()[..n];
+        if !level.files[level.at].meta.largest_key.starts_with(row) {
+            // The row ends within this SST, so the next SST starts with a later row.
+            self.iter.skip_row()?;
+            return self.next_file();
+        }
+        // The row may continue into the next SST: seek past it. `escaped row ++ 00 02` sorts
+        // after every key of the row and before every later row (as `SstIter::skip_row`).
+        let mut past = std::mem::take(&mut level.past_row);
+        past.clear();
+        past.extend_from_slice(row);
+        if let Some(last) = past.last_mut() {
+            *last = 0x02;
+        }
+        let r = self.seek(&past);
+        if let Some(level) = &mut self.level {
+            level.past_row = past;
+        }
+        r
+    }
+}
+
 /// The filter probes of a point read: hashes of the row, the column and the row's marker
 /// key (FORMAT §6), computed once per read from its [`ColumnKey`].
 pub(crate) struct Probe<'a> {
@@ -347,7 +553,7 @@ pub(crate) fn sst_sources_point(
         {
             continue;
         }
-        out.push(Source::Sst(reader.iter(ScanFilter::all(), opts)));
+        out.push(Source::Sst(reader.iter(ScanFilter::all(), opts).into()));
     }
     Ok(())
 }
@@ -372,7 +578,7 @@ pub(crate) fn sst_sources_row(
         if !reader.may_contain_row(hash) {
             continue;
         }
-        out.push(Source::Sst(reader.iter(filter.clone(), opts)));
+        out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
     }
     Ok(())
 }
@@ -499,5 +705,287 @@ mod row_prefix_tests {
         }
         assert!(row_prefix(&vec![1u8; MAX_KEY_PART + 1]).is_err());
         assert!(row_prefix(&vec![1u8; MAX_KEY_PART]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    //! The lazy level cursor against the eager merge of its SSTs, over random disjoint
+    //! SSTs (rows may span two) and random moves.
+
+    use std::sync::Arc;
+
+    use pigeonhole_cache::{BlockCache, Priority};
+    use pigeonhole_compaction::MergingCursor;
+    use pigeonhole_format::Cursor;
+    use pigeonhole_format::key::{Kind, encode_key, encode_row_prefix};
+    use pigeonhole_format::manifest::FamilyOptions;
+    use pigeonhole_format::scan::ScanFilter;
+    use pigeonhole_format::superblock::ExtentRef;
+    use pigeonhole_format::{FamilyId, SstId, TableId, TabletId};
+    use pigeonhole_io::sim::SimVfs;
+    use pigeonhole_io::{OpenOptions, Vfs};
+    use pigeonhole_sst::{SstReader, SstWriter, SstWriterOptions};
+
+    use super::{Source, SstSource, read_options, sst_sources_range};
+    use crate::snapshot::{FamilySsts, OpenSst, SstSet};
+
+    /// xorshift64*, seeded per case.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    type Entries = Vec<(Vec<u8>, Vec<u8>)>;
+
+    fn entries(rng: &mut Rng) -> Entries {
+        let n = 1 + rng.below(160);
+        let mut out = Vec::new();
+        for seqno in 1..=n {
+            // Rows with a zero byte exercise the escaping of the row prefix.
+            let row = [b'r', rng.below(3) as u8, b'0' + rng.below(6) as u8];
+            let qualifier = [b'q', rng.below(5) as u8];
+            let kind = if rng.below(5) == 0 {
+                Kind::CellDelete
+            } else {
+                Kind::Put
+            };
+            let mut key = Vec::new();
+            encode_key(&mut key, &row, &qualifier, 1 + rng.below(5), seqno, kind).unwrap();
+            let value = if kind == Kind::Put {
+                vec![0, seqno as u8, row[2]]
+            } else {
+                Vec::new()
+            };
+            out.push((key, value));
+        }
+        out.sort();
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
+    }
+
+    /// Writes `chunks` as SSTs of one file, each opened.
+    fn ssts(chunks: &[&[(Vec<u8>, Vec<u8>)]]) -> (Arc<SstSet>, Vec<Arc<OpenSst>>) {
+        let vfs = SimVfs::new(1);
+        let file = vfs
+            .open("/db".as_ref(), OpenOptions::read_write_create())
+            .unwrap();
+        let cache = Arc::new(BlockCache::new(1 << 20, 0));
+        // Small blocks: an SST of a few entries still has several.
+        let family = FamilyOptions::default().block_size(128);
+        let files = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let options =
+                    SstWriterOptions::for_family(&family, TableId(1), FamilyId(1), TabletId(1));
+                let extent = ExtentRef {
+                    page: 1024 * (i as u64 + 1),
+                    size_class: 6,
+                };
+                let mut w = SstWriter::new(file.clone(), extent, SstId(i as u64 + 1), options);
+                for (k, v) in *chunk {
+                    w.add(k, v).unwrap();
+                }
+                let meta = w.finish().unwrap();
+                let reader =
+                    SstReader::open(file.clone(), &meta, Arc::clone(&cache), Priority::Normal)
+                        .unwrap();
+                Arc::new(OpenSst::new(Arc::new(meta), Some(Arc::new(reader))))
+            })
+            .collect();
+        (Arc::new(SstSet::empty(file, cache)), files)
+    }
+
+    /// A seek target: an entry's key, a row prefix, or a key just past an entry.
+    fn target(rng: &mut Rng, all: &Entries) -> Vec<u8> {
+        let (k, _) = &all[rng.below(all.len() as u64) as usize];
+        match rng.below(3) {
+            0 => k.clone(),
+            1 => {
+                let mut p = Vec::new();
+                let row = [b'r', rng.below(3) as u8, b'0' + rng.below(7) as u8];
+                encode_row_prefix(&mut p, &row).unwrap();
+                p
+            }
+            _ => {
+                let mut p = k.clone();
+                p.push(0);
+                p
+            }
+        }
+    }
+
+    fn same(lazy: &Source, eager: &MergingCursor<Source>, case: &str) {
+        assert_eq!(lazy.valid(), eager.valid(), "{case}");
+        if lazy.valid() {
+            assert_eq!(lazy.key(), eager.key(), "{case}");
+            assert_eq!(lazy.value(), eager.value(), "{case}");
+            assert_eq!(&*lazy.pin_value(), eager.value(), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_level_cursor_moves_as_the_merge_of_its_ssts() {
+        let base = std::env::var("PH_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x1e7e1_u64);
+        let cases = if cfg!(miri) { 4 } else { 400 };
+        for case in 0..cases {
+            let seed = base.wrapping_add(case);
+            let mut rng = Rng(seed | 1);
+            let all = entries(&mut rng);
+            // Cut into 2..=6 non-empty SSTs, anywhere (a row may span a cut).
+            let parts = (2 + rng.below(5) as usize).min(all.len());
+            if parts < 2 {
+                continue;
+            }
+            let mut cuts: Vec<usize> = (0..parts - 1)
+                .map(|_| 1 + rng.below(all.len() as u64 - 1) as usize)
+                .collect();
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut chunks = Vec::new();
+            let mut from = 0;
+            for &c in cuts.iter().chain([all.len()].iter()) {
+                chunks.push(&all[from..c]);
+                from = c;
+            }
+            let (set, files) = ssts(&chunks);
+            let filter = if rng.below(2) == 0 {
+                ScanFilter::all()
+            } else {
+                let mut f = ScanFilter::all();
+                f.time_range = Some((2, 4));
+                f
+            };
+            let opts = read_options(Priority::Normal, true);
+            let mut lazy = Source::Sst(
+                SstSource::level(files.clone(), Arc::clone(&set), filter.clone(), opts).unwrap(),
+            );
+            let mut eager = MergingCursor::new(
+                files
+                    .iter()
+                    .map(|f| {
+                        let r = f.reader(&set, Priority::Normal).unwrap();
+                        Source::Sst(r.iter(filter.clone(), opts).into())
+                    })
+                    .collect(),
+            );
+            let case = format!("seed {seed}");
+            for _ in 0..40 {
+                match rng.below(6) {
+                    0 => {
+                        lazy.seek_to_first().unwrap();
+                        eager.seek_to_first().unwrap();
+                    }
+                    1 | 2 => {
+                        let t = target(&mut rng, &all);
+                        lazy.seek(&t).unwrap();
+                        eager.seek(&t).unwrap();
+                    }
+                    3 => {
+                        // A forward seek only from a valid position, to a target at or past it.
+                        if !eager.valid() {
+                            continue;
+                        }
+                        let t = target(&mut rng, &all);
+                        if t.as_slice() < eager.key() {
+                            continue;
+                        }
+                        lazy.seek_forward(&t).unwrap();
+                        eager.seek_forward(&t).unwrap();
+                    }
+                    4 => {
+                        lazy.next().unwrap();
+                        eager.next().unwrap();
+                    }
+                    _ => {
+                        lazy.skip_row().unwrap();
+                        eager.skip_row().unwrap();
+                    }
+                }
+                same(&lazy, &eager, &case);
+            }
+            // And a full walk from the start.
+            lazy.seek_to_first().unwrap();
+            eager.seek_to_first().unwrap();
+            while eager.valid() {
+                same(&lazy, &eager, &case);
+                lazy.next().unwrap();
+                eager.next().unwrap();
+            }
+            same(&lazy, &eager, &case);
+        }
+    }
+
+    /// The row prefix of `row`.
+    fn prefix(row: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        encode_row_prefix(&mut p, row).unwrap();
+        p
+    }
+
+    /// A range (row starts) and the sources and level cursors it should get.
+    type RangeCase<'a> = (Option<&'a [u8]>, Option<&'a [u8]>, usize, usize);
+
+    /// `sst_sources_range` picks the SSTs a range overlaps: one source per SST of level 0,
+    /// one per deeper level (a plain SST source when only one of its SSTs is in range).
+    #[test]
+    fn a_range_gets_one_source_per_level_below_0() {
+        // Rows `a`..`f`, one cell each, cut into three SSTs: [a b] [c d] [e f].
+        let all: Entries = [b"a", b"b", b"c", b"d", b"e", b"f"]
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut key = Vec::new();
+                encode_key(&mut key, &row[..], b"q", 1, i as u64 + 1, Kind::Put).unwrap();
+                (key, vec![0, i as u8])
+            })
+            .collect();
+        let (set, files) = ssts(&[&all[0..2], &all[2..4], &all[4..6]]);
+        let l0 = ssts(&[&all[0..6]]).1;
+        let fam = FamilySsts {
+            levels: vec![l0, files],
+        };
+        // (start, end) -> (sources, of which levels)
+        let cases: [RangeCase<'_>; 6] = [
+            (None, None, 2, 1),
+            (Some(b"b"), None, 2, 1),
+            (Some(b"c"), Some(b"d"), 2, 0), // only [c d] in level 1
+            (Some(b"e"), None, 2, 0),       // only [e f]
+            (Some(b"b"), Some(b"d"), 2, 1), // [a b] and [c d]
+            (Some(b"g"), None, 0, 0),
+        ];
+        for (start, end, sources, levels) in cases {
+            let (start, end) = (start.map(prefix), end.map(prefix));
+            let mut out = Vec::new();
+            sst_sources_range(
+                &fam,
+                &set,
+                &ScanFilter::all(),
+                start.as_deref(),
+                end.as_deref(),
+                Priority::Normal,
+                &mut out,
+            )
+            .unwrap();
+            let lazy = out
+                .iter()
+                .filter(|s| matches!(s, Source::Sst(s) if s.level.is_some()))
+                .count();
+            assert_eq!((out.len(), lazy), (sources, levels), "{start:?}..{end:?}");
+        }
     }
 }
