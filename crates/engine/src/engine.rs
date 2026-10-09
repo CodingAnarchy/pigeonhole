@@ -2567,8 +2567,8 @@ fn view_from_record(
             .1
             .push((m.age, reader, m.root));
     }
-    let mut pieces: Vec<HashMap<(TabletId, FamilyId), Arc<MemSet>>> =
-        (0..shm.shard_count()).map(|_| HashMap::new()).collect();
+    let mut pieces: Vec<pigeonhole_format::hash::FastMap<(TabletId, FamilyId), Arc<MemSet>>> =
+        (0..shm.shard_count()).map(|_| Default::default()).collect();
     for (k, (shard, mut list)) in sets {
         list.sort_by_key(|(age, ..)| *age);
         let roots = list.iter().map(|(_, _, r)| *r).collect();

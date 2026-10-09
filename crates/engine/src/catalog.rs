@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use pigeonhole_compaction::{MergeOperator, MergeRegistry};
+use pigeonhole_format::hash::FastMap;
 use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{
@@ -71,7 +72,7 @@ pub(crate) type SstList = Vec<(u8, Arc<SstMeta>)>;
 pub struct Catalog {
     tables: BTreeMap<TableId, Arc<TableInfo>>,
     by_name: HashMap<String, TableId>,
-    families: HashMap<FamilyId, FamilyMeta>,
+    families: FastMap<FamilyId, FamilyMeta>,
     tablets: BTreeMap<TabletId, TabletEntry>,
     pub(crate) counters: Counters,
     pub(crate) checkpoints: BTreeMap<StreamId, Lsn>,

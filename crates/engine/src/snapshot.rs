@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_cache::{BlockCache, Cell, Priority};
 use pigeonhole_compaction::{Levels, blob_pointer};
+use pigeonhole_format::hash::FastMap;
 use pigeonhole_format::key::{compare, row_prefix_len};
 use pigeonhole_format::manifest::{CachePriority, SstMeta};
 use pigeonhole_format::shm::{ViewMemtable, ViewRecord, ViewTablet};
@@ -65,12 +66,12 @@ pub(crate) struct TabletEntry {
 pub struct TabletMap {
     version: u64,
     /// Per table, tablets sorted by start row.
-    tables: HashMap<TableId, Vec<TabletEntry>>,
+    tables: FastMap<TableId, Vec<TabletEntry>>,
 }
 
 impl TabletMap {
     pub(crate) fn build(version: u64, tablets: &[TabletEntry]) -> Self {
-        let mut tables: HashMap<TableId, Vec<TabletEntry>> = HashMap::new();
+        let mut tables: FastMap<TableId, Vec<TabletEntry>> = FastMap::default();
         for t in tablets {
             tables.entry(t.table).or_default().push(t.clone());
         }
@@ -165,14 +166,14 @@ impl MemSet {
 /// of its memtables is created or frozen; the other shards' pieces are shared by reference.
 #[derive(Debug, Default)]
 pub(crate) struct ShardMems {
-    pub map: HashMap<(TabletId, FamilyId), Arc<MemSet>>,
+    pub map: FastMap<(TabletId, FamilyId), Arc<MemSet>>,
 }
 
 impl ShardMems {
     /// The piece without the memtables `drop` names, or `None` if it holds none of them.
     pub(crate) fn without(&self, drop: &dyn Fn(u32) -> bool) -> Option<Arc<ShardMems>> {
         let mut changed = false;
-        let mut map = HashMap::with_capacity(self.map.len());
+        let mut map = FastMap::with_capacity_and_hasher(self.map.len(), Default::default());
         for (k, set) in &self.map {
             match set.without(drop) {
                 Some(s) => {
@@ -317,10 +318,10 @@ impl FamilySsts {
 pub(crate) struct SstSet {
     pub file: FileRef,
     pub cache: Arc<BlockCache>,
-    pub map: HashMap<(TabletId, FamilyId), Arc<FamilySsts>>,
-    by_id: HashMap<SstId, Arc<OpenSst>>,
+    pub map: FastMap<(TabletId, FamilyId), Arc<FamilySsts>>,
+    by_id: FastMap<SstId, Arc<OpenSst>>,
     /// The blob files of this manifest version.
-    blobs: HashMap<BlobFileId, Arc<OpenBlob>>,
+    blobs: FastMap<BlobFileId, Arc<OpenBlob>>,
 }
 
 impl std::fmt::Debug for SstSet {
@@ -339,9 +340,9 @@ impl SstSet {
         Self {
             file,
             cache,
-            map: HashMap::new(),
-            by_id: HashMap::new(),
-            blobs: HashMap::new(),
+            map: FastMap::default(),
+            by_id: FastMap::default(),
+            blobs: FastMap::default(),
         }
     }
 
@@ -354,8 +355,8 @@ impl SstSet {
         file: FileRef,
         cache: Arc<BlockCache>,
     ) -> Self {
-        let mut by_id: HashMap<SstId, Arc<OpenSst>> = HashMap::new();
-        let mut map = HashMap::new();
+        let mut by_id: FastMap<SstId, Arc<OpenSst>> = FastMap::default();
+        let mut map = FastMap::default();
         for (key, list) in &catalog.ssts {
             let mut levels: Vec<Vec<Arc<OpenSst>>> = Vec::new();
             for (level, meta) in list {
