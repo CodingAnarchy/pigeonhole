@@ -143,6 +143,9 @@ impl StreamGc {
     /// Reads the next unit at `cursor` (a family marker or a whole `(column, timestamp)`
     /// group) and buffers what it keeps. Returns false at the end of the cursor.
     pub fn step<C: Cursor>(&mut self, cursor: &mut C) -> std::result::Result<bool, C::Error> {
+        // Entries a step left in the GC's group buffer (not drained yet) are copied out
+        // before this step reuses it.
+        self.out.own(self.gc.group_data());
         self.gc.step(cursor, None, &mut self.out)
     }
 
@@ -152,7 +155,7 @@ impl StreamGc {
         mut f: impl FnMut(&[u8], &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
         for i in 0..self.out.len() {
-            let (k, v) = self.out.get(i);
+            let (k, v) = self.out.get(i, self.gc.group_data());
             f(k, v)?;
         }
         self.out.clear();
@@ -733,7 +736,7 @@ impl CompactionJob {
                 .step(&mut self.cursor, self.sub_end.as_deref(), &mut self.out)?;
             self.sink.read = self.gc.read;
             for i in 0..self.out.len() {
-                let (k, v) = self.out.get(i);
+                let (k, v) = self.out.get(i, self.gc.group_data());
                 match self.sink.place(k, v)? {
                     Some(stored) => self.sink.add(k, &stored)?,
                     None => self.sink.add(k, v)?,
