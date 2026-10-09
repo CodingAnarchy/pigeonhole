@@ -23,6 +23,8 @@ on:
       - 'crates/bench/examples/writepath.rs'
       - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
+      - 'scripts/instruction-ceilings.py'
+      - 'crates/bench/baselines/instruction-ceilings.txt'
       - '.github/workflows/instructions.yml'
   workflow_dispatch:
 
@@ -113,6 +115,15 @@ jobs:
               echo "| $state | $b | $h | $(awk -v b="$b" -v h="$h" 'BEGIN { printf "%+.1f%%", 100 * (h - b) / b }') |"
             done
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          # The head must also stay at or below every shape's absolute ceiling (D193): the
+          # Phase 2 floors may not regress, not even in steps below the per-PR thresholds.
+          {
+            echo
+            echo "### Absolute ceilings (D193, crates/bench/baselines/instruction-ceilings.txt)"
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          ceilings=0
+          python3 scripts/instruction-ceilings.py check /tmp/head.txt | tee -a "$GITHUB_STEP_SUMMARY" || ceilings=1
           paste -d' ' /tmp/base.txt /tmp/head.txt | awk -v thresholds="$THRESHOLDS" '
             BEGIN {
               n = split(thresholds, kv, " ")
@@ -126,3 +137,7 @@ jobs:
               }
             }
             END { exit bad }'
+          if [ "$ceilings" != 0 ]; then
+            echo "a shape is above its absolute ceiling, or has none (D193)"
+            exit 1
+          fi
