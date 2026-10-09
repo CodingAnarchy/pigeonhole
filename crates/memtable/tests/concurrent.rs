@@ -109,6 +109,20 @@ fn check_lower_bounds(landed: &[(Vec<u8>, Option<Vec<u8>>)], before: &Model, aft
 
 #[test]
 fn readers_see_consistent_prefixes_of_the_writer() {
+    readers_see_consistent_prefixes(None);
+}
+
+/// The same with the writer inserting in ascending runs of 64 (a row's cells, rising keys):
+/// most inserts take the insert splice (no search) while readers scan and seek, and each
+/// run's first key searches.
+#[test]
+fn readers_see_consistent_prefixes_of_a_writer_in_key_order() {
+    readers_see_consistent_prefixes(Some(64));
+}
+
+/// Readers race one writer inserting the seed's entries, in their random order or sorted in
+/// runs of `sorted_runs`.
+fn readers_see_consistent_prefixes(sorted_runs: Option<usize>) {
     let seed = common::seed();
     let (n, readers, arena_len, chunk) = if cfg!(miri) {
         (60, 2, 256 * 1024, 16 * 1024)
@@ -120,7 +134,12 @@ fn readers_see_consistent_prefixes_of_the_writer() {
     let reader = mt.reader();
     let ledger = Arc::new(Mutex::new(Ledger::default()));
     let done = Arc::new(AtomicBool::new(false));
-    let entries = common::entries(seed, n);
+    let mut entries = common::entries(seed, n);
+    if let Some(run) = sorted_runs {
+        for chunk in entries.chunks_mut(run) {
+            chunk.sort();
+        }
+    }
     let mut final_entries: Vec<Entry> = entries.clone();
     final_entries.sort();
 

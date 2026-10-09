@@ -88,8 +88,10 @@ proptest! {
     })]
 
     /// Inserts in ascending runs (a row's cells, rising keys) take the insert splice, and
-    /// a run's first key may fall anywhere: the memtable still agrees with a `BTreeMap`, and
-    /// its towers do too (seeks to every key land on it).
+    /// a run's first key may fall anywhere; a repeated internal key, inserted right after its
+    /// first copy, must take the search (the splice needs the last key strictly below). The
+    /// memtable still agrees with a multimap (a repeated key's copies in any order), and its
+    /// towers do too (a seek to every key lands on it).
     #[test]
     fn matches_a_btreemap_inserted_in_runs(
         entries in vec(
@@ -97,6 +99,7 @@ proptest! {
             0..MAX_ENTRIES,
         ),
         runs in vec(1usize..20, 1..20),
+        repeats in vec(any::<prop::sample::Index>(), 0..8),
     ) {
         let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
@@ -117,22 +120,37 @@ proptest! {
             keyed[at..end].sort();
             at = end;
         }
+        // Repeat some keys, each right after its first copy, with a value of their own.
+        if !keyed.is_empty() {
+            for (n, r) in repeats.iter().enumerate() {
+                let i = r.index(keyed.len());
+                let (key, _) = keyed[i].clone();
+                keyed.insert(i + 1, (key, vec![0xEE, n as u8]));
+            }
+        }
         let mut arena = ShardArena::new(ArenaRegion::heap(128 * 1024), 4096);
         let mut mt = Memtable::create(&mut arena).unwrap();
-        let mut model = BTreeMap::new();
+        let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
         for (key, value) in &keyed {
             mt.insert(&mut arena, key, value).unwrap();
-            model.insert(key.clone(), value.clone());
+            model.entry(key.clone()).or_default().push(value.clone());
         }
-        prop_assert_eq!(mt.len(), model.len());
+        prop_assert_eq!(mt.len(), keyed.len());
         let reader = mt.reader();
         let mut it = reader.iter();
         it.seek_to_first().unwrap();
-        for (k, v) in &model {
-            prop_assert!(it.valid());
-            prop_assert_eq!(it.key(), &k[..]);
-            prop_assert_eq!(it.value(), &v[..]);
-            it.next().unwrap();
+        for (k, values) in &model {
+            let mut seen = Vec::new();
+            for _ in values {
+                prop_assert!(it.valid());
+                prop_assert_eq!(it.key(), &k[..]);
+                seen.push(it.value().to_vec());
+                it.next().unwrap();
+            }
+            let mut want = values.clone();
+            want.sort();
+            seen.sort();
+            prop_assert_eq!(seen, want);
         }
         prop_assert!(!it.valid());
         for k in model.keys() {

@@ -553,10 +553,13 @@ pub struct Memtable {
     max_seqno: Seqno,
     frozen: bool,
     rng: u64,
-    /// The predecessors, at every level, of the last key inserted (the head before any): a
-    /// key that sorts right after it has the same predecessors, so inserts in key order (a
-    /// row's cells, rising row keys) skip the search. Only this writer links nodes and none
-    /// is removed, so they stay exact.
+    /// The insert splice: per level, the node a key sorting right after the last one
+    /// inserted links behind. Below the last inserted node's height it is that node itself;
+    /// at and above it, the last node at that level that sorts before it (the head when
+    /// none does, and at every level before any insert). A key between the last node and its
+    /// level-0 successor has exactly these predecessors, so inserts in key order (a row's
+    /// cells, rising row keys) skip the search. Only this writer links nodes and none is
+    /// removed, so the splice stays exact.
     splice: [u32; MAX_HEIGHT],
     pin: Arc<Pin>,
 }
