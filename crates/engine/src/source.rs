@@ -613,15 +613,31 @@ impl View {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<Source>> {
-        let l = self.locate(shard, tablet, family);
         let mut out = Vec::new();
+        self.scan_sources_into(shard, tablet, family, filter, start, end, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`View::scan_sources`] appended to `out` (a reused source list).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_sources_into(
+        &self,
+        shard: ShardId,
+        tablet: TabletId,
+        family: FamilyId,
+        filter: &ScanFilter,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        out: &mut Vec<Source>,
+    ) -> Result<()> {
+        let l = self.locate(shard, tablet, family);
         if let Some(set) = l.mems {
-            mem_sources(set, filter, &mut out);
+            mem_sources(set, filter, out);
         }
         if let Some(fam) = l.ssts {
-            sst_sources_range(fam, &self.ssts, filter, start, end, l.priority, &mut out)?;
+            sst_sources_range(fam, &self.ssts, filter, start, end, l.priority, out)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Sources for a point read of one column, newest first.
