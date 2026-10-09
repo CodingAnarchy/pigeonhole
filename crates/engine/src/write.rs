@@ -296,6 +296,8 @@ pub struct PendingCommit {
     pub(crate) shared: Arc<crate::shard::Shared>,
     /// Resolved by the shard; waiting for visibility (async polling).
     pub(crate) resolved: Option<CommitInfo>,
+    /// How long `wait` polls before it parks (D198): 0 for a durable commit.
+    pub(crate) spin_nanos: u64,
 }
 
 impl PendingCommit {
@@ -310,9 +312,91 @@ impl PendingCommit {
     /// [`Error::WouldDeadlock`]: the commit was submitted and will apply, but its outcome
     /// must be awaited from the event loop (poll this future there) or another thread.
     pub fn wait(mut self) -> crate::Result<CommitInfo> {
-        let info = wait_reply(&self.shared, &mut self.waiter)?;
-        wait_visible(&self.shared, info.seqno)?;
+        let mut spin = SpinWait::new(self.spin_nanos);
+        let info = wait_reply_spinning(&self.shared, &mut self.waiter, &mut spin)?;
+        wait_visible_spinning(&self.shared, info.seqno, &mut spin)?;
         Ok(info)
+    }
+}
+
+/// A blocking wait's poll before it parks (D198): up to its window, unless this thread's
+/// recent polls kept finding nothing (then it skips the next 1, 2, 4, ... up to 64 polls).
+/// A shard usually answers a buffered commit within a few microseconds, and a parked
+/// thread's wakeup costs that again or more.
+struct SpinWait {
+    window: u64,
+    end: Option<std::time::Instant>,
+    hit: Option<bool>,
+}
+
+thread_local! {
+    /// `(polls to skip, backoff exponent)` for this thread's commit waits.
+    static SPIN_BACKOFF: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+impl SpinWait {
+    fn new(window: u64) -> Self {
+        let window = if window == 0 {
+            0
+        } else {
+            SPIN_BACKOFF.with(|b| {
+                let (skip, level) = b.get();
+                if skip > 0 {
+                    b.set((skip - 1, level));
+                    0
+                } else {
+                    window
+                }
+            })
+        };
+        Self {
+            window,
+            end: None,
+            hit: None,
+        }
+    }
+
+    /// Polls `ready` until it is true or the window ends. Returns whether it became true.
+    fn poll(&mut self, mut ready: impl FnMut() -> bool) -> bool {
+        if self.window == 0 {
+            return false;
+        }
+        let end = *self.end.get_or_insert_with(|| {
+            std::time::Instant::now() + std::time::Duration::from_nanos(self.window)
+        });
+        let mut polls = 0u32;
+        loop {
+            if ready() {
+                self.hit.get_or_insert(true);
+                return true;
+            }
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(64) {
+                if std::time::Instant::now() >= end {
+                    self.hit = Some(false);
+                    self.window = 0;
+                    return false;
+                }
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+impl Drop for SpinWait {
+    fn drop(&mut self) {
+        let Some(hit) = self.hit else { return };
+        SPIN_BACKOFF.with(|b| {
+            let (_, level) = b.get();
+            b.set(if hit {
+                (0, 0)
+            } else {
+                let level = (level + 1).min(6);
+                (1 << (level - 1), level)
+            });
+        });
     }
 }
 
@@ -322,6 +406,15 @@ pub(crate) fn wait_reply<T: Send>(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<T>>,
 ) -> crate::Result<T> {
+    wait_reply_spinning(shared, waiter, &mut SpinWait::new(0))
+}
+
+/// [`wait_reply`], polling first for up to `spin`'s window.
+fn wait_reply_spinning<T: Send>(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<T>>,
+    spin: &mut SpinWait,
+) -> crate::Result<T> {
     if shared.drivers.current_drives() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         return match Pin::new(waiter).poll(&mut cx) {
@@ -329,6 +422,22 @@ pub(crate) fn wait_reply<T: Send>(
             Poll::Ready(None) => Err(Error::Closed),
             Poll::Pending => Err(Error::WouldDeadlock),
         };
+    }
+    let mut polled = None;
+    spin.poll(|| {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match Pin::new(&mut *waiter).poll(&mut cx) {
+            Poll::Pending => false,
+            ready => {
+                polled = Some(ready);
+                true
+            }
+        }
+    });
+    match polled {
+        Some(Poll::Ready(Some(r))) => return r,
+        Some(Poll::Ready(None)) => return Err(Error::Closed),
+        _ => {}
     }
     let waker = crate::waker::thread_waker();
     let mut cx = Context::from_waker(&waker);
@@ -348,11 +457,23 @@ pub(crate) fn wait_visible(
     shared: &crate::shard::Shared,
     seqno: pigeonhole_format::Seqno,
 ) -> crate::Result<()> {
+    wait_visible_spinning(shared, seqno, &mut SpinWait::new(0))
+}
+
+/// [`wait_visible`], polling first for what is left of `spin`'s window.
+fn wait_visible_spinning(
+    shared: &crate::shard::Shared,
+    seqno: pigeonhole_format::Seqno,
+    spin: &mut SpinWait,
+) -> crate::Result<()> {
     if shared.shm.visible_seqno() >= seqno {
         return Ok(());
     }
     if shared.drivers.current_drives() {
         return Err(Error::WouldDeadlock);
+    }
+    if spin.poll(|| shared.shm.visible_seqno() >= seqno) {
+        return Ok(());
     }
     let waker = crate::waker::thread_waker();
     while !shared.wait_visible(seqno, &waker) {

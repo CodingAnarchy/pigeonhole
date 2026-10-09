@@ -339,6 +339,8 @@ pub(crate) struct Shared {
     pub compaction_backoff_nanos: u64,
     pub flush_backoff_nanos: u64,
     pub room_recheck_nanos: u64,
+    /// `EngineOptions::commit_spin_nanos` (D198).
+    pub commit_spin_nanos: u64,
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,

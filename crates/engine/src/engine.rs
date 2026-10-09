@@ -553,6 +553,7 @@ impl Engine {
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             room_recheck_nanos: options.room_recheck_nanos.max(1),
+            commit_spin_nanos: options.commit_spin_nanos,
             locks: Mutex::new(Some(Locks {
                 _writer: writer_lock,
                 presence,
@@ -934,6 +935,7 @@ impl Engine {
         config.shards = shards;
         config.pin_threads = options.pin_threads;
         config.compaction_threads = options.compaction_threads;
+        config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
         let inner = Arc::new(Inner {
             shared: Arc::clone(&shared),
             role: Role::Writer,
@@ -1059,6 +1061,7 @@ impl Engine {
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             room_recheck_nanos: options.room_recheck_nanos.max(1),
+            commit_spin_nanos: options.commit_spin_nanos,
             locks: Mutex::new(None),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
@@ -2295,6 +2298,11 @@ impl Inner {
             waiter,
             shared: Arc::clone(&self.shared),
             resolved: None,
+            // A durable commit waits for a sync: polling for it would only burn the CPU.
+            spin_nanos: match durability {
+                Durability::None | Durability::Buffered => self.shared.commit_spin_nanos,
+                _ => 0,
+            },
         })
     }
 
@@ -3046,6 +3054,7 @@ impl EngineShard {
             waiter,
             shared: Arc::clone(&engine.shared),
             resolved: None,
+            spin_nanos: 0,
         })
     }
 
