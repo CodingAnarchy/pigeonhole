@@ -172,7 +172,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D157](phase-1.md#d157) — An open writes one frame per stream; spares wait for use · wal, #143, #172 · amends D35
 - [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
 - [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
-- [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60 · **amended by D183, D185**
+- [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60 · **amended by D183, D185, D190**
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126 · **amended by D171, D176**
 - [D162](phase-1.md#d162) — A batch that can never fit gets `BatchTooLarge`, not `Busy` · engine, #141, #186 · refines D16, D124
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220 · **amended by D178**
@@ -202,6 +202,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D187](phase-2.md#d187) — Counter-family deletes purge at the bottom level by seqno · compaction, engine, #290, #298 · refines D70, D186
 - [D188](phase-2.md#d188) — Values above the inline limit are separated into blob files at commit time · engine, runtime, #230, #301 · amends D16
 - [D189](phase-2.md#d189) — Arenas are sized for their slots with tablet changes off too · engine, #283, #307 · amends D136
+- [D190](phase-2.md#d190) — `shrink` clears a region when a large extent has no hole below it · pager, engine, #314, #319 · amends D160
 
 ## Open questions
 _None._
