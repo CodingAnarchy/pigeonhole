@@ -12,16 +12,21 @@
 //! directory) and removed at the end. `HOT_FLUSH=1` flushes the memtable before reading (all
 //! versions in L0 SSTs); `HOT_COMPACT=1` compacts fully (one version per column), the floor
 //! for the same cells.
+#[path = "support/measure.rs"]
+mod measure;
+use measure::Measured;
+
 use std::ops::Bound;
 use std::time::Instant;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole};
 
-/// One measured iteration: a row read of the hot row and a 10-row scan through it. Not
-/// inlined, so `callgrind --toggle-collect` can count exactly its instructions. Returns the
+/// One measured iteration: a row read of the hot row and a 10-row scan through it, counted by
+/// callgrind while its `Measured` guard lives (`support/measure.rs`). Returns the
 /// cells each read saw and their times in nanoseconds.
 #[inline(never)]
 fn hotrow_iteration(t: &pigeonhole::Table, hot: &[u8]) -> (usize, usize, u64, u64) {
+    let _measured = Measured::start();
     let t0 = Instant::now();
     let row = t.row(hot).family("f").read().unwrap().unwrap();
     let row_cells = row.iter().count();
@@ -115,6 +120,9 @@ fn main() {
     }
     drop(it);
     eprintln!("setup done"); // `sample` the process from here to profile the reads.
+    // `SHAPE_SETUP_ONLY=1`: the setup alone, no measured iteration (the script checks that
+    // callgrind then counts nothing inside `hotrow_iteration`).
+    let iters = if setup_only() { 0 } else { iters };
     let mut cells = 0;
     let mut read_cells = 0;
     let mut row_ns = Vec::with_capacity(iters);
@@ -130,7 +138,10 @@ fn main() {
     eprintln!("cells read {read_cells}");
     row_ns.sort_unstable();
     scan_ns.sort_unstable();
-    let p = |v: &[u64], q: f64| v[((v.len() - 1) as f64 * q) as usize] as f64 / 1000.0;
+    let p = |v: &[u64], q: f64| {
+        v.get((v.len().saturating_sub(1) as f64 * q) as usize)
+            .map_or(0.0, |&ns| ns as f64 / 1000.0)
+    };
     println!(
         "cells {cells} | row read p10 {:.1} p50 {:.1} p90 {:.1} µs | scan p10 {:.1} p50 {:.1} p90 {:.1} µs",
         p(&row_ns, 0.1),
@@ -143,4 +154,10 @@ fn main() {
     drop(t);
     db.close().unwrap();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Whether to run the setup only (`SHAPE_SETUP_ONLY` set), for the measurement guard of
+/// `scripts/instructions-per-cell.sh`.
+fn setup_only() -> bool {
+    std::env::var_os("SHAPE_SETUP_ONLY").is_some()
 }

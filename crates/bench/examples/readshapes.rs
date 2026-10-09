@@ -19,10 +19,14 @@
 //! - `counter`: point gets of counter cells (operands folded on read).
 //!
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
-//! iteration is one `#[inline(never)]` function whose name contains `shape_` (for
-//! `callgrind --toggle-collect='*shape_*'`), and on stderr the run prints `units N`: one per
+//! iteration is one `#[inline(never)]` function named `shape_*` that counts its work with a
+//! `Measured` guard (`support/measure.rs`), and on stderr the run prints `units N`: one per
 //! point get (hit or miss), one per returned cell otherwise. A full scan before the
 //! measured iterations warms the block cache, so every shape measures steady-state reads.
+#[path = "support/measure.rs"]
+mod measure;
+use measure::Measured;
+
 use std::ops::Bound;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole, Table};
@@ -64,6 +68,7 @@ fn row_key(r: u32) -> [u8; 7] {
 
 #[inline(never)]
 fn shape_get(t: &Table, rng: &mut Rng, base: u32) -> usize {
+    let _measured = Measured::start();
     let mut n = 0;
     for _ in 0..500 {
         let r = base + rng.below(ROWS / 2);
@@ -77,6 +82,7 @@ fn shape_get(t: &Table, rng: &mut Rng, base: u32) -> usize {
 
 #[inline(never)]
 fn shape_get_miss(t: &Table, rng: &mut Rng) -> usize {
+    let _measured = Measured::start();
     let mut n = 0;
     for _ in 0..500 {
         let miss = t.get(&key(b'x', rng.below(ROWS)), "f", b"q1").unwrap();
@@ -88,6 +94,7 @@ fn shape_get_miss(t: &Table, rng: &mut Rng) -> usize {
 
 #[inline(never)]
 fn shape_row(t: &Table, rng: &mut Rng) -> usize {
+    let _measured = Measured::start();
     let mut n = 0;
     for _ in 0..200 {
         let row = t.row(&row_key(rng.below(ROWS))).family("f").read().unwrap();
@@ -98,6 +105,7 @@ fn shape_row(t: &Table, rng: &mut Rng) -> usize {
 
 #[inline(never)]
 fn shape_scan(t: &Table, rng: &mut Rng, filtered: bool) -> usize {
+    let _measured = Measured::start();
     let mut n = 0;
     for _ in 0..4 {
         let start = row_key(rng.below(ROWS - 200));
@@ -116,6 +124,7 @@ fn shape_scan(t: &Table, rng: &mut Rng, filtered: bool) -> usize {
 
 #[inline(never)]
 fn shape_versions(t: &Table, rng: &mut Rng) -> usize {
+    let _measured = Measured::start();
     let mut n = 0;
     for _ in 0..300 {
         let row = t
@@ -132,6 +141,7 @@ fn shape_versions(t: &Table, rng: &mut Rng) -> usize {
 
 #[inline(never)]
 fn shape_counter(t: &Table, rng: &mut Rng) -> usize {
+    let _measured = Measured::start();
     let mut n = 0;
     for _ in 0..500 {
         let r = 10 * rng.below(ROWS / 10);
@@ -218,6 +228,13 @@ fn main() {
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut units = 0;
+    // `SHAPE_SETUP_ONLY=1`: the setup alone, no measured iteration (the script checks that
+    // callgrind then counts nothing inside the `shape_` functions).
+    let iters = if std::env::var_os("SHAPE_SETUP_ONLY").is_some() {
+        0
+    } else {
+        iters
+    };
     for _ in 0..iters {
         units += match shape.as_str() {
             "get-mem" => shape_get(&t, &mut rng, ROWS / 2),

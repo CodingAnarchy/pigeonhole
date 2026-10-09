@@ -12,8 +12,8 @@
 //! | `flush` | 2,000 entries flushed from the memtable to one SST | entries |
 //! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level | entries |
 //!
-//! Only the measured work runs inside functions named `shape_*` (callgrind counts them
-//! with `--toggle-collect='*shape_*'`); the commits a flush or compaction needs are
+//! Only the measured work runs inside functions named `shape_*`, each counting its thread's
+//! work with a `Measured` guard (`support/measure.rs`); the commits a flush or compaction needs are
 //! written first, outside them. The shards are application-owned and each runs on a
 //! thread of its own, inside `shape_run_shard` while a shape is measured, so the commit,
 //! flush and compaction work the shards do is counted along with the caller's. One shard,
@@ -23,9 +23,13 @@
 //! `flush` and `compact` the setup commits grow with ITERATIONS too, so that difference
 //! includes them: only callgrind measures those two shapes alone. The commit shapes are
 //! clean either way.
+#[path = "support/measure.rs"]
+mod measure;
+use measure::Measured;
+
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -41,8 +45,8 @@ fn main() {
     let base = std::path::PathBuf::from(args.next().expect(usage));
     let dir = base.join(format!("phdb-writepath-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let measuring = Arc::new(AtomicBool::new(false));
-    let (db, drivers) = open(&dir.join("w.phdb"), &measuring);
+    let ctl = Arc::new(Ctl::default());
+    let (db, drivers) = open(&dir.join("w.phdb"), &ctl);
     let t = db
         .table("t")
         .unwrap()
@@ -55,10 +59,21 @@ fn main() {
             .map(|i| format!("{prefix}:{i:010}").into_bytes())
             .collect()
     };
+    // `SHAPE_SETUP_ONLY=1`: the setup alone, without the measured work (the script checks
+    // that callgrind then counts nothing inside the `shape_` functions).
+    let setup_only = std::env::var_os("SHAPE_SETUP_ONLY").is_some();
+    // The measured work starts and ends with every shard idle: what the setup left running
+    // finishes outside `shape_run_shard`, and what the measured work leaves running (the
+    // shard's side of the last commit, say) finishes inside it, before the close.
     let measure = |f: &mut dyn FnMut()| {
-        measuring.store(true, Ordering::Release);
+        if setup_only {
+            return;
+        }
+        ctl.wait_idle();
+        ctl.measuring.store(true, Ordering::Release);
         f();
-        measuring.store(false, Ordering::Release);
+        ctl.wait_idle();
+        ctl.measuring.store(false, Ordering::Release);
     };
     let units = match shape.as_str() {
         "commit-one" => {
@@ -90,7 +105,7 @@ fn main() {
         }
         other => panic!("unknown shape {other}: commit-one, commit-sixteen, flush or compact"),
     };
-    eprintln!("units {units}");
+    eprintln!("units {}", if setup_only { 0 } else { units });
     drop(t);
     db.close().unwrap();
     for d in drivers {
@@ -99,8 +114,26 @@ fn main() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// What the shard threads share with the main thread.
+#[derive(Default)]
+struct Ctl {
+    /// Whether a shape is being measured: a shard woken then runs in `shape_run_shard`.
+    measuring: AtomicBool,
+    /// Shard threads running (not parked).
+    busy: AtomicUsize,
+}
+
+impl Ctl {
+    /// Waits until every shard thread is parked: nothing left to run.
+    fn wait_idle(&self) {
+        while self.busy.load(Ordering::Acquire) > 0 {
+            thread::yield_now();
+        }
+    }
+}
+
 /// Opens with application-owned shards, each driven by a thread of its own.
-fn open(path: &Path, measuring: &Arc<AtomicBool>) -> (Pigeonhole, Vec<thread::JoinHandle<()>>) {
+fn open(path: &Path, ctl: &Arc<Ctl>) -> (Pigeonhole, Vec<thread::JoinHandle<()>>) {
     let (db, shards) = Pigeonhole::open_application_owned(
         path,
         Options::default()
@@ -114,32 +147,36 @@ fn open(path: &Path, measuring: &Arc<AtomicBool>) -> (Pigeonhole, Vec<thread::Jo
     let drivers = shards
         .into_iter()
         .map(|shard| {
-            let measuring = Arc::clone(measuring);
-            thread::spawn(move || drive(shard, &measuring))
+            let ctl = Arc::clone(ctl);
+            ctl.busy.fetch_add(1, Ordering::AcqRel);
+            thread::spawn(move || drive(shard, &ctl))
         })
         .collect();
     (db, drivers)
 }
 
 /// A shard's loop (see `Pigeonhole::open_application_owned`), inside `shape_run_shard`
-/// while a shape is measured.
-fn drive(mut shard: Shard, measuring: &AtomicBool) {
+/// while a shape is measured. `busy` counts it while it runs.
+fn drive(mut shard: Shard, ctl: &Ctl) {
     let me = thread::current();
     shard.set_wakeup(Box::new(move || me.unpark()));
     loop {
-        if measuring.load(Ordering::Acquire) {
+        if ctl.measuring.load(Ordering::Acquire) {
             shape_run_shard(&mut shard);
         } else {
             run_shard(&mut shard);
         }
         if let Some(closed) = shard.closed() {
+            ctl.busy.fetch_sub(1, Ordering::AcqRel);
             closed.unwrap();
             return;
         }
+        ctl.busy.fetch_sub(1, Ordering::AcqRel);
         match shard.next_wakeup() {
             Some(due) => thread::park_timeout(due),
             None => thread::park(),
         }
+        ctl.busy.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -148,6 +185,7 @@ fn drive(mut shard: Shard, measuring: &AtomicBool) {
 // budget, which changes nothing measured.
 #[inline(never)]
 fn shape_run_shard(shard: &mut Shard) {
+    let _measured = Measured::start();
     while shard.run_once(Duration::from_micros(200)) {}
 }
 
@@ -158,6 +196,7 @@ fn run_shard(shard: &mut Shard) {
 
 #[inline(never)]
 fn shape_commit_one(t: &Table, rows: &[Vec<u8>]) {
+    let _measured = Measured::start();
     for row in rows {
         t.mutate(row).put("f", b"q", &VALUE).commit().unwrap();
     }
@@ -165,6 +204,7 @@ fn shape_commit_one(t: &Table, rows: &[Vec<u8>]) {
 
 #[inline(never)]
 fn shape_commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
+    let _measured = Measured::start();
     commit_sixteen(t, rows, quals);
 }
 
@@ -180,10 +220,12 @@ fn commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
 
 #[inline(never)]
 fn shape_flush(db: &Pigeonhole) {
+    let _measured = Measured::start();
     db.flush().unwrap();
 }
 
 #[inline(never)]
 fn shape_compact(db: &Pigeonhole) {
+    let _measured = Measured::start();
     db.compact().unwrap();
 }
