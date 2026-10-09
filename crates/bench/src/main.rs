@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pigeonhole_bench::{
-    Environment, MemoryBudget, PigeonholeRunner, RunOptions, RunRecord, Runner, Scaling, Suite,
-    Tolerance, WorkloadConfig, WorkloadKind, compare, run_detailed,
+    Environment, GROUP_COMMIT_THREADS, MemoryBudget, PigeonholeRunner, RunOptions, RunRecord,
+    Runner, Scaling, Suite, Tolerance, WorkloadConfig, WorkloadKind, compare, run_detailed,
 };
 
 /// Default warmup of `scaling`, as a fraction of the measured ops. The balancer needs about
@@ -30,8 +30,11 @@ USAGE:
 
 WORKLOADS:
     ycsb-a ycsb-b ycsb-c ycsb-d ycsb-e ycsb-f sparse-wide time-series-ttl
-    adjacency skewed-multi-shard
+    adjacency skewed-multi-shard group-commit
     all       every workload above
+              (group-commit: durable commits, GroupSync on Pigeonhole and fsync on
+              the others whatever --sync says; without --threads it runs at 1, 4
+              and 16 client threads)
     scaling   the scaling gate: skewed-multi-shard on Pigeonhole at 1 and N shards
 
 OPTIONS:
@@ -65,7 +68,7 @@ OPTIONS:
                            gets 2T [default: 0.20]
 ";
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Args {
     command: String,
     positional: Vec<String>,
@@ -195,9 +198,17 @@ fn missing(feature: &str) -> Result<Box<dyn Runner>, String> {
     ))
 }
 
-fn runner(a: &Args, engine: &str) -> Result<Box<dyn Runner>, String> {
+/// The runner for `engine`. [`WorkloadKind::GroupCommit`] commits durably: `GroupSync` on
+/// Pigeonhole, fsync on every write elsewhere (RocksDB's concurrent writers then share a
+/// write group, its group commit).
+fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>, String> {
+    let group = kind == WorkloadKind::GroupCommit;
+    let a = &Args {
+        sync: a.sync || group,
+        ..a.clone()
+    };
     match engine {
-        "pigeonhole" => Ok(Box::new(pigeonhole(a, None))),
+        "pigeonhole" => Ok(Box::new(pigeonhole(a, None).group_sync(group))),
         #[cfg(feature = "rocksdb")]
         "rocksdb" => Ok(Box::new(
             pigeonhole_bench::RocksDbRunner::default()
@@ -285,9 +296,19 @@ fn bench(a: &Args) -> Result<Suite, String> {
         };
         for kind in kinds {
             let c = config(a, kind)?;
+            let threads = match (kind, a.threads) {
+                (WorkloadKind::GroupCommit, None) => GROUP_COMMIT_THREADS.to_vec(),
+                _ => vec![c.threads],
+            };
             for engine in &a.engines {
-                let mut r = runner(a, engine)?;
-                suite.results.push(one(a, &root, &mut seq, r.as_mut(), &c)?);
+                for &t in &threads {
+                    let c = WorkloadConfig {
+                        threads: t,
+                        ..c.clone()
+                    };
+                    let mut r = runner(a, engine, kind)?;
+                    suite.results.push(one(a, &root, &mut seq, r.as_mut(), &c)?);
+                }
             }
         }
         Ok(())
@@ -431,6 +452,31 @@ mod tests {
             assert!(r.detail.shards.iter().map(|s| s.tablets_end).sum::<u64>() >= 1);
         }
         assert!(suite.to_markdown().contains("| Shard | Commits | Share |"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn group_commit_sweeps_threads_durably() {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-gc-{}", std::process::id()));
+        let a = args(&format!(
+            "group-commit --scale smoke --ops 64 --shards 2 --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        let threads: Vec<usize> = suite.results.iter().map(|r| r.threads).collect();
+        assert_eq!(threads, GROUP_COMMIT_THREADS);
+        assert!(
+            suite
+                .results
+                .iter()
+                .all(|r| r.store_config.contains(" group-sync"))
+        );
+        // `--threads` picks one count.
+        let a = args(&format!(
+            "group-commit --scale smoke --ops 64 --threads 2 --shards 2 --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        assert_eq!(bench(&a).unwrap().results.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
