@@ -241,6 +241,9 @@ struct SimState {
     nanos: u64,
     /// Whether `submit_*` defers its operation (see [`SimVfs::set_deferred_io`]).
     deferred: bool,
+    /// Whether only the submitting thread completes a deferred operation (see
+    /// [`SimVfs::set_owner_reaps`]).
+    owner_reaps: bool,
     /// Deferred operations not yet completed, in submission order.
     in_flight: Vec<InFlight>,
     next_io: u64,
@@ -256,6 +259,8 @@ struct SimState {
 /// A deferred operation: `job` runs it on its file and resolves its completion.
 struct InFlight {
     id: u64,
+    /// The submitting thread, in owner-reaps mode: the only one that completes it.
+    owner: Option<std::thread::ThreadId>,
     node: u64,
     handle: u64,
     writable: bool,
@@ -487,6 +492,7 @@ impl SimVfs {
                 killed: HashSet::new(),
                 nanos: 0,
                 deferred: false,
+                owner_reaps: false,
                 in_flight: Vec::new(),
                 next_io: 0,
                 io_rng: Rng(seed ^ 0x6A09_E667_F3BC_C908),
@@ -630,6 +636,36 @@ impl SimVfs {
         self.state().deferred = on;
     }
 
+    /// With deferred I/O, completes a deferred operation only on the thread that submitted
+    /// it, as an io_uring ring owned by a shard thread does (#207): by
+    /// [`reap_own_io`](crate::reap_own_io), or a blocking [`Completion::wait`] on that
+    /// thread. A wait on another thread blocks until the owner reaps. Operations submitted
+    /// before the switch keep the mode they were submitted in;
+    /// [`SimVfs::complete_io`] still completes any of them (a harness's override).
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use pigeonhole_io::{File, IoBuf, OpenOptions, Vfs, own_io_in_flight, reap_own_io};
+    /// use pigeonhole_io::sim::SimVfs;
+    ///
+    /// # fn main() -> pigeonhole_io::Result<()> {
+    /// let vfs = SimVfs::new(7);
+    /// vfs.set_deferred_io(true);
+    /// vfs.set_owner_reaps(true);
+    /// let file = vfs.open(Path::new("/db/f"), OpenOptions::read_write_create())?;
+    /// let sync = file.submit_sync_data();
+    /// assert!(own_io_in_flight());
+    /// // Another thread has none of its own.
+    /// assert!(!std::thread::spawn(own_io_in_flight).join().unwrap());
+    /// assert!(reap_own_io(None));
+    /// assert!(sync.is_ready() && !own_io_in_flight());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_owner_reaps(&self, on: bool) {
+        self.state().owner_reaps = on;
+    }
+
     /// Deferred operations in flight.
     pub fn io_in_flight(&self) -> usize {
         self.state().in_flight.len()
@@ -693,14 +729,23 @@ impl SimVfs {
         let id = st.next_io;
         st.next_io += 1;
         *st.io_pins.entry(file.handle).or_default() += 1;
+        let owner = st.owner_reaps.then(|| std::thread::current().id());
+        if owner.is_some() {
+            let own: Weak<dyn crate::own::OwnIo> = self.me.clone();
+            crate::own::register(own);
+        }
         let me = self.me.clone();
         let (done, resolver) = Completion::driven_pair(Some(Arc::new(move || {
-            if let Some(vfs) = me.upgrade() {
+            // An owner-reaped operation runs only when its own thread blocks on it.
+            if owner.is_none_or(|o| o == std::thread::current().id())
+                && let Some(vfs) = me.upgrade()
+            {
                 vfs.complete(Some(id));
             }
         })));
         st.in_flight.push(InFlight {
             id,
+            owner,
             node: file.node,
             handle: file.handle,
             writable: file.writable,
@@ -747,6 +792,33 @@ impl SimVfs {
             }
         }
         true
+    }
+}
+
+impl crate::own::OwnIo for SimVfs {
+    fn in_flight_here(&self) -> bool {
+        let me = std::thread::current().id();
+        self.state().in_flight.iter().any(|op| op.owner == Some(me))
+    }
+
+    /// Runs every operation this thread submitted in owner-reaps mode, including any their
+    /// continuations submit (the simulated device has always finished them).
+    fn reap_here(&self, _wait: Option<Duration>) -> bool {
+        let me = std::thread::current().id();
+        let mut any = false;
+        loop {
+            let next = {
+                let st = self.state();
+                st.in_flight
+                    .iter()
+                    .find(|op| op.owner == Some(me))
+                    .map(|op| op.id)
+            };
+            match next {
+                Some(id) => any |= self.complete(Some(id)),
+                None => return any,
+            }
+        }
     }
 }
 

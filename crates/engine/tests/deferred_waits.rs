@@ -680,6 +680,47 @@ fn catalog_changes_and_shrink_on_the_driver_finish_an_in_flight_pump_commit() {
     });
 }
 
+/// #207 (1): as above, but the driving thread is the only one that completes I/O, as with
+/// an io_uring ring the shard thread reaps (`SimVfs::set_owner_reaps`). The pump's root
+/// commit was submitted by this thread while it ran the shard, so the catalog change and
+/// `shrink` blocked on the manifest writer must reap it themselves, or wait for ever.
+#[test]
+fn catalog_changes_and_shrink_on_the_driver_reap_their_own_root_commit() {
+    each_seed(|seed| {
+        let mut rig = Rig::open(seed, 1);
+        let t = rig.table("t");
+        rig.sim.set_owner_reaps(true);
+
+        let mut flushed = vec![pump_commit_in_flight(&mut rig, &t, 0)];
+        assert!(pigeonhole_io::own_io_in_flight(), "seed {seed}: not owned");
+        let u = rig
+            .db
+            .create_table("u", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+
+        flushed.push(pump_commit_in_flight(&mut rig, &t, 1));
+        rig.db.drop_table(u.id).unwrap();
+        assert!(rig.db.table("u").is_none());
+
+        flushed.push(pump_commit_in_flight(&mut rig, &t, 2));
+        rig.db.shrink().unwrap();
+
+        rig.settle();
+        for mut f in flushed {
+            assert!(
+                matches!(poll(&mut f), Poll::Ready(Ok(()))),
+                "seed {seed}: a flush did not complete"
+            );
+        }
+        assert!(has(&rig.db, &t, "r2-049"));
+        rig.db.close().unwrap();
+        rig.close_loop().unwrap();
+        let vfs = rig.vfs();
+        drop(rig);
+        assert!(Engine::inspect_manifest(&vfs, Path::new(DB)).unwrap().clean);
+    });
+}
+
 // ---- D151: the application-owned close ----
 
 /// Commits rows of every durability, some with their syncs still in flight.
@@ -782,6 +823,56 @@ fn dropping_a_shard_with_a_wal_sync_in_flight_completes_once_the_sync_does() {
         );
         rig.sim.complete_all_io();
         dropper.join().unwrap();
+
+        assert!(
+            rig.db.close().is_err(),
+            "seed {seed}: unclean close reported Ok"
+        );
+        let vfs = rig.vfs();
+        let sim = Arc::clone(&rig.sim);
+        drop(rig);
+        sim.set_deferred_io(false);
+        let (db, mut shards) =
+            Engine::open_application_owned(Path::new(DB), options(vfs, 1)).unwrap();
+        while shards[0].run_once(u64::MAX) {}
+        let t = db.table("t").unwrap();
+        assert!(
+            has(&db, &t, "synced"),
+            "seed {seed}: the synced commit was lost"
+        );
+        db.close().unwrap();
+        while shards[0].closed().is_none() {
+            shards[0].run_once(u64::MAX);
+        }
+    });
+}
+
+/// #207 (2): as above, but the thread dropping the shard is the one that submitted the
+/// sync, and the only one that completes I/O (`SimVfs::set_owner_reaps`, as an io_uring
+/// ring the shard thread reaps): the drop's final sync must reap the older sync it waits
+/// for, or wait for ever.
+#[test]
+fn dropping_a_shard_on_its_driver_reaps_the_wal_sync_in_flight() {
+    each_seed(|seed| {
+        let mut rig = Rig::open(seed, 1);
+        let t = rig.table("t");
+        rig.sim.set_owner_reaps(true);
+        drop(
+            rig.db
+                .submit(put(&t, "synced"), Some(Durability::Sync))
+                .unwrap(),
+        );
+        rig.run();
+        assert!(
+            rig.dev.in_flight(&wal(0)) > 0 && pigeonhole_io::own_io_in_flight(),
+            "seed {seed}: no sync of this thread in flight"
+        );
+
+        drop(rig.shards.pop().unwrap());
+        assert!(
+            !pigeonhole_io::own_io_in_flight(),
+            "seed {seed}: the drop left its sync in flight"
+        );
 
         assert!(
             rig.db.close().is_err(),
