@@ -415,9 +415,8 @@ impl RowIter<'_> {
             let Some(family) = self.cursor.next_cell_into(&mut self.buf.qualifiers)? else {
                 break;
             };
-            let data = self.cursor.current_data();
             let end = self.buf.qualifiers.len();
-            self.buf.push(family, start..end, data);
+            self.cursor.push_current(family, start..end, &mut self.buf);
         }
         Ok(true)
     }

@@ -873,6 +873,29 @@ impl ScanCursor {
         let lane = &self.lanes[i];
         CellData::from_pinned(lane.ts, &lane.value, || Arc::clone(&self.snapshot.view))
     }
+
+    /// Appends the cell last returned by [`ScanCursor::next_cell`] to `sink`, as `family`
+    /// with `qualifier` (a range of the sink's qualifiers): the cell of
+    /// [`ScanCursor::current_data`], but a small value is copied straight into the sink's
+    /// cell rather than moved there in a [`CellData`] (#287).
+    ///
+    /// # Panics
+    /// If no cell has been returned for the current row.
+    pub fn push_current(
+        &self,
+        family: FamilyId,
+        qualifier: std::ops::Range<usize>,
+        sink: &mut impl RowSink,
+    ) {
+        let i = self.last_lane.expect("push_current before next_cell");
+        let lane = &self.lanes[i];
+        let bytes: &[u8] = &lane.value;
+        if bytes.len() <= CellData::INLINE_MAX {
+            sink.push_inline(family, qualifier, lane.ts, bytes);
+        } else {
+            sink.push(family, qualifier, self.current_data());
+        }
+    }
 }
 
 /// Narrows `[start, end)` (row prefixes, `None` = unbounded) to the rows of `tablet`.
