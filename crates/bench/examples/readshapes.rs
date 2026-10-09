@@ -21,7 +21,8 @@
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
 //! iteration is one `#[inline(never)]` function whose name contains `shape_` (for
 //! `callgrind --toggle-collect='*shape_*'`), and on stderr the run prints `units N`: one per
-//! point get (hit or miss), one per returned cell otherwise.
+//! point get (hit or miss), one per returned cell otherwise. A full scan before the
+//! measured iterations warms the block cache, so every shape measures steady-state reads.
 use std::ops::Bound;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole, Table};
@@ -141,6 +142,22 @@ fn shape_counter(t: &Table, rng: &mut Rng) -> usize {
     n
 }
 
+/// Reads every row of both families once (outside the measured functions), so every block
+/// is in the cache and the shapes measure steady-state reads, not first-touch block loads.
+fn warm(t: &Table) {
+    for family in ["f", "c"] {
+        let mut it = t
+            .scan_prefix(b"")
+            .family(family)
+            .versions(0)
+            .iter()
+            .unwrap();
+        while let Some(r) = it.next_ref().unwrap() {
+            std::hint::black_box(r.iter().count());
+        }
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let shape = args.next().expect("SHAPE");
@@ -196,6 +213,7 @@ fn main() {
     for r in (0..ROWS).step_by(10) {
         t.mutate(&row_key(r)).incr("c", b"n", 2).commit().unwrap();
     }
+    warm(&t);
     eprintln!("setup done");
 
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);

@@ -107,6 +107,13 @@ fn main() {
     if std::env::var_os("HOT_FLUSH").is_some() {
         db.flush().unwrap();
     }
+    // Read everything once, outside the measured iterations, so they measure steady-state
+    // reads (every block cached), not first-touch block loads.
+    let mut it = t.scan_prefix(b"").versions(0).iter().unwrap();
+    while let Some(r) = it.next_ref().unwrap() {
+        std::hint::black_box(r.iter().count());
+    }
+    drop(it);
     eprintln!("setup done"); // `sample` the process from here to profile the reads.
     let mut cells = 0;
     let mut read_cells = 0;
