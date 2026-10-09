@@ -48,20 +48,21 @@ shape_runs() {
 }
 
 if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
-    callgrind() { # pattern, then the command; prints the instructions counted
-        local pattern="$1"
-        shift
-        valgrind --tool=callgrind --toggle-collect="$pattern" \
+    callgrind() { # pattern, environment, then the command; prints the instructions counted
+        local pattern="$1" env_set="$2"
+        shift 2
+        # The environment goes before valgrind: callgrind does not follow `env`'s exec.
+        env $env_set valgrind --tool=callgrind --toggle-collect="$pattern" \
             --callgrind-out-file="$work/cg.out" "$@" </dev/null >/dev/null 2>"$work/err"
         sed -n 's/^summary: \([0-9]*\).*/\1/p' "$work/cg.out"
     }
     for s in "${states[@]}"; do
         name="${s%%:*}"; env_set="${s#*:}"
-        ir=$(callgrind '*hotrow_iteration*' env $env_set "$bin" 20 "$work")
+        ir=$(callgrind '*hotrow_iteration*' "$env_set" "$bin" 20 "$work")
         echo "$name $(( ir / $(units_of "$work/err") ))"
     done
     while read -r shape_bin name; do
-        ir=$(callgrind '*shape_*' "$shape_bin" "$name" 4 "$work")
+        ir=$(callgrind '*shape_*' "" "$shape_bin" "$name" 4 "$work")
         echo "$name $(( ir / $(units_of "$work/err") ))"
     done < <(shape_runs "$@")
 elif [[ -x /usr/bin/time ]] && [[ "$(uname)" == Darwin ]]; then

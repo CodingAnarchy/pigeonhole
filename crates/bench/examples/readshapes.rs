@@ -152,7 +152,11 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("create the store directory");
     let db = Pigeonhole::open(
         dir.join("shapes.phdb"),
+        // One shard: shard threads allocate memtable chunks in a racy order, and a memtable's
+        // skiplist heights are seeded from where it sits, so several shards make counts vary
+        // from run to run.
         Options::default()
+            .shards(1)
             .durability(Durability::Buffered)
             .memtable_budget(64 << 20)
             .block_cache(256 << 20),
