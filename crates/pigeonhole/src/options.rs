@@ -45,6 +45,7 @@ pub struct Options {
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     allow_unregistered_merge_operators: bool,
     allow_fuse: bool,
+    io_backend: Option<IoBackend>,
     vfs: Option<VfsRef>,
     wal_segment_size: Option<u64>,
     tablet_changes: bool,
@@ -67,6 +68,7 @@ impl Default for Options {
             merge_operators: Vec::new(),
             allow_unregistered_merge_operators: false,
             allow_fuse: false,
+            io_backend: None,
             vfs: None,
             wal_segment_size: None,
             tablet_changes: true,
@@ -220,6 +222,22 @@ impl Options {
         self
     }
 
+    /// The I/O backend (default [`IoBackend::Pread`]). With [`IoBackend::Uring`] the open
+    /// fails with [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) where io_uring
+    /// is unavailable (not Linux, an old kernel, a container that blocks it);
+    /// [`IoBackend::Auto`] uses `pread` there instead.
+    ///
+    /// ```
+    /// use pigeonhole::{IoBackend, Options};
+    ///
+    /// let options = Options::default().io_backend(IoBackend::Auto);
+    /// # let _ = options;
+    /// ```
+    pub fn io_backend(mut self, backend: IoBackend) -> Self {
+        self.io_backend = Some(backend);
+        self
+    }
+
     /// Let a table's tablets split, merge and move between shards (default on), so the
     /// writes of one table spread over every shard. Off, each table is one tablet on one
     /// shard: writes to a single table use one shard thread whatever [`shards`](Self::shards)
@@ -286,6 +304,7 @@ pub struct ReaderOptions {
     shm_dir: Option<PathBuf>,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     allow_fuse: bool,
+    io_backend: Option<IoBackend>,
     vfs: Option<VfsRef>,
 }
 
@@ -312,6 +331,12 @@ impl ReaderOptions {
     /// apply; default off).
     pub fn allow_fuse(mut self, yes: bool) -> Self {
         self.allow_fuse = yes;
+        self
+    }
+
+    /// The I/O backend, as [`Options::io_backend`] (default [`IoBackend::Pread`]).
+    pub fn io_backend(mut self, backend: IoBackend) -> Self {
+        self.io_backend = Some(backend);
         self
     }
 
@@ -523,8 +548,11 @@ impl Family {
 
 impl Options {
     /// The engine configuration these options describe.
-    pub(crate) fn to_engine(&self) -> EngineOptions {
-        let vfs = self.vfs.clone().unwrap_or_else(default_vfs);
+    pub(crate) fn to_engine(&self) -> Result<EngineOptions, pigeonhole_engine::Error> {
+        let vfs = match &self.vfs {
+            Some(v) => Arc::clone(v),
+            None => backend_vfs(self.io_backend)?,
+        };
         let mut o = EngineOptions::new(vfs);
         o.create_if_missing = self.create_if_missing;
         o.shards = self.shards;
@@ -555,14 +583,17 @@ impl Options {
         for op in &self.merge_operators {
             o.merge_operators.register(Arc::clone(op));
         }
-        o
+        Ok(o)
     }
 }
 
 impl ReaderOptions {
     /// The engine configuration these options describe.
-    pub(crate) fn to_engine(&self) -> EngineOptions {
-        let vfs = self.vfs.clone().unwrap_or_else(default_vfs);
+    pub(crate) fn to_engine(&self) -> Result<EngineOptions, pigeonhole_engine::Error> {
+        let vfs = match &self.vfs {
+            Some(v) => Arc::clone(v),
+            None => backend_vfs(self.io_backend)?,
+        };
         let mut o = EngineOptions::new(vfs);
         if let Some(bytes) = self.block_cache {
             o.block_cache_bytes = bytes;
@@ -572,7 +603,7 @@ impl ReaderOptions {
         for op in &self.merge_operators {
             o.merge_operators.register(Arc::clone(op));
         }
-        o
+        Ok(o)
     }
 }
 
@@ -583,7 +614,48 @@ impl Family {
     }
 }
 
-/// The platform's default filesystem backend.
-fn default_vfs() -> VfsRef {
-    pigeonhole_io::pread::PreadVfs::new(0)
+/// Which I/O backend a database runs its file I/O on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum IoBackend {
+    /// A pool of threads serving submitted I/O with `pread` and `pwrite`, on every platform
+    /// (the default).
+    #[default]
+    Pread,
+    /// io_uring (Linux): submitted I/O goes through a ring instead of a thread pool. Opening
+    /// fails where it is unavailable.
+    Uring,
+    /// io_uring where it is available, `pread` otherwise.
+    Auto,
+}
+
+/// The backend `backend` names; unset, the one `PIGEONHOLE_IO` names (a test variable:
+/// `pread`, `uring` or `auto`), else [`IoBackend::Pread`].
+fn backend_vfs(backend: Option<IoBackend>) -> Result<VfsRef, pigeonhole_engine::Error> {
+    let backend = backend.unwrap_or_else(|| match std::env::var("PIGEONHOLE_IO").as_deref() {
+        Ok("uring") => IoBackend::Uring,
+        Ok("auto") => IoBackend::Auto,
+        _ => IoBackend::Pread,
+    });
+    let pread = || -> VfsRef { pigeonhole_io::pread::PreadVfs::new(0) };
+    match backend {
+        IoBackend::Pread => Ok(pread()),
+        IoBackend::Uring => uring_vfs().ok_or(pigeonhole_engine::Error::Unsupported(
+            "io_uring is unavailable on this system",
+        )),
+        IoBackend::Auto => Ok(uring_vfs().unwrap_or_else(pread)),
+    }
+}
+
+/// An io_uring backend, if the kernel offers one.
+#[cfg(target_os = "linux")]
+fn uring_vfs() -> Option<VfsRef> {
+    pigeonhole_io::uring::UringVfs::new()
+        .ok()
+        .map(|v| v as VfsRef)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uring_vfs() -> Option<VfsRef> {
+    None
 }

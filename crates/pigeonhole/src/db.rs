@@ -92,7 +92,7 @@ impl Pigeonhole {
     /// process, fails with [`ErrorCode::WriterLocked`](crate::ErrorCode::WriterLocked).
     /// Opening replays the WAL sidecars; there is no full-file recovery scan.
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Pigeonhole> {
-        let engine_options = options.to_engine();
+        let engine_options = options.to_engine()?;
         let max_value = max_value(&engine_options);
         let shm = ShmFootprint::of(&engine_options);
         let engine = Engine::open(path.as_ref(), engine_options).map_err(|e| shm.explain(e))?;
@@ -110,7 +110,7 @@ impl Pigeonhole {
     /// requirement as SQLite in WAL mode). A file on read-only media, or one the reader's
     /// user cannot write, cannot be opened this way (decision D36).
     pub fn open_reader(path: impl AsRef<Path>, options: ReaderOptions) -> Result<PigeonholeReader> {
-        let engine = Engine::open_reader(path.as_ref(), options.to_engine())?;
+        let engine = Engine::open_reader(path.as_ref(), options.to_engine()?)?;
         Ok(PigeonholeReader {
             db: Db::new(engine, 0),
         })
@@ -196,7 +196,7 @@ impl Pigeonhole {
         path: impl AsRef<Path>,
         options: Options,
     ) -> Result<(Pigeonhole, Vec<Shard>)> {
-        let engine_options = options.to_engine();
+        let engine_options = options.to_engine()?;
         let vfs = Arc::clone(&engine_options.vfs);
         let max_value = max_value(&engine_options);
         let shm = ShmFootprint::of(&engine_options);

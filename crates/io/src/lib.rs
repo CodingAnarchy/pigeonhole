@@ -9,7 +9,7 @@
 //! - [`sim::SimVfs`]: in-memory, deterministic from a seed, with torn writes, reordered
 //!   fsyncs, ENOSPC and crashes. With [`sim::FaultPlan::none`] it is the plain in-memory mock
 //!   other crates test against.
-//! - io_uring arrives in Phase 3 behind the same traits.
+//! - [`uring::UringVfs`] (Linux): real files with submitted I/O on io_uring (#402).
 //!
 //! This crate also owns the other OS-facing `unsafe` the engine needs: shared-memory mappings
 //! ([`SharedRegion`]), byte-range locks, thread pinning and NUMA binding ([`sys`]).
@@ -28,6 +28,8 @@ pub mod pread;
 mod shared;
 pub mod sim;
 pub mod sys;
+#[cfg(target_os = "linux")]
+pub mod uring;
 mod vfs;
 
 pub use buf::IoBuf;

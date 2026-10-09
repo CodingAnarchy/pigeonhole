@@ -17,6 +17,10 @@ pigeonhole-format = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The io_uring backend (#402): Linux only; every use is in `src/uring/`.
+io-uring = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # `Win32_Security` gates `CreateFileMappingW` (its signature names SECURITY_ATTRIBUTES).
 windows-sys = { workspace = true, features = ["Win32_Security"] }

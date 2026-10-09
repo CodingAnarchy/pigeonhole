@@ -58,6 +58,7 @@ zstd = { version = "0.13", default-features = false }
 arc-swap = "1"
 smallvec = "1"
 libc = "0.2"
+io-uring = "0.7.15"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading"] }
 # Dev-only.
 proptest = "1"

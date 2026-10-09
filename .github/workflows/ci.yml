@@ -75,6 +75,13 @@ jobs:
       # built with `test-hooks`, and this run tests the production one (#148, review 1-2 F10).
       - name: pigeonhole tests without the engine's test hooks
         run: cargo test -p pigeonhole --all-features
+      # The io_uring backend (#402): the io parity suite and `tests/uring.rs` already ran it
+      # above; this runs the public crate's suites on it. `uring` fails to open rather than
+      # fall back, so a runner without io_uring fails here instead of passing on `pread`.
+      - name: pigeonhole tests on io_uring
+        run: cargo test -p pigeonhole --all-features
+        env:
+          PIGEONHOLE_IO: uring
       - run: cargo deny check
       - name: semver checks (published crates only)
         shell: bash

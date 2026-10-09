@@ -1,5 +1,6 @@
-//! The backend parity suite: every test body here runs against both `PreadVfs` (real files)
-//! and `SimVfs` (in memory), and must behave identically.
+//! The backend parity suite: every test body here runs against `PreadVfs` (real files),
+//! `UringVfs` (real files, submitted I/O on io_uring; Linux) and `SimVfs` (in memory), and
+//! must behave identically.
 
 mod common;
 
@@ -15,6 +16,13 @@ macro_rules! parity {
             $(#[test]
             fn $name() {
                 super::$name(&super::Backend::pread(stringify!($name)));
+            })*
+        }
+        #[cfg(all(target_os = "linux", not(miri)))]
+        mod uring {
+            $(#[test]
+            fn $name() {
+                super::$name(&super::Backend::uring(concat!("uring-", stringify!($name))));
             })*
         }
         mod sim {
