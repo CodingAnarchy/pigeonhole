@@ -59,7 +59,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          # A PR checks out GitHub's merge of the head into the current main, which may be
+          # newer than the event's base.sha: the merge's first parent is exactly the main it
+          # was built on, so the table shows only the PR's own change.
+          if git rev-parse -q --verify HEAD^2 >/dev/null; then
+            base="$(git rev-parse HEAD^1)"
+          else
+            base=origin/main
+          fi
           flags=() srcs=()
           for e in $EXAMPLES; do
             flags+=(--example "$e")
