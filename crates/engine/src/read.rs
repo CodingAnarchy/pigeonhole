@@ -509,10 +509,11 @@ struct Lane {
     ssts: Arc<SstSet>,
     /// The resolver's blob reads, if it may need any.
     resolver_blobs: Option<Arc<ResolverBlobs>>,
-    /// The held cell: column prefix, timestamp, value.
-    col: Vec<u8>,
+    /// The held cell is the resolver's current one (`CellResolver::current`, valid while
+    /// `pending`), not a copy: its timestamp, and its value pinned when it is separated or a
+    /// large value borrowed from a source.
     ts: Timestamp,
-    value: LaneValue,
+    pinned: Option<LaneValue>,
     pending: bool,
     done: bool,
 }
@@ -527,10 +528,12 @@ impl std::fmt::Debug for Lane {
 }
 
 impl Lane {
-    /// Fetches the next visible cell into the lane. Values the resolver buffered are
-    /// copied; large ones borrowed from a source are pinned.
+    /// Moves to the next visible cell. The lane holds it where the resolver has it; only a
+    /// separated value (read from its blob file) or a large one borrowed from a source is
+    /// pinned.
     fn fetch(&mut self) -> Result<()> {
         self.pending = false;
+        self.pinned = None;
         if self.done {
             return Ok(());
         }
@@ -541,33 +544,45 @@ impl Lane {
                 self.done = true;
                 return Ok(());
             };
-            self.col.clear();
-            self.col.extend_from_slice(column_of(cell.key));
             self.ts = cell.ts;
             let large = cell.value.len() > CellData::INLINE_MAX;
             if let Some(v) = self.ssts.read_blob(cell.value)? {
-                self.value = LaneValue::Pinned(Pinned::Block(v));
-            } else if !(cell.from_source && large) {
-                match &mut self.value {
-                    LaneValue::Copied(v) => {
-                        v.clear();
-                        v.extend_from_slice(cell.value);
-                    }
-                    other => *other = LaneValue::Copied(cell.value.to_vec()),
-                }
+                self.pinned = Some(LaneValue::Pinned(Pinned::Block(v)));
             }
             (cell.from_source, large)
         };
-        if from_source && large {
+        if from_source && large && self.pinned.is_none() {
             let src = self
                 .resolver
                 .cursor()
                 .current()
                 .expect("the merged cursor is on the returned entry");
-            self.value = LaneValue::Pinned(src.pin_value());
+            self.pinned = Some(LaneValue::Pinned(src.pin_value()));
         }
         self.pending = true;
         Ok(())
+    }
+
+    /// The held cell's column prefix (only while `pending`).
+    fn col(&self) -> &[u8] {
+        self.resolver.current().map_or(&[], |c| column_of(c.key))
+    }
+
+    /// The held cell's stored value (only while `pending`).
+    fn value(&self) -> &[u8] {
+        match &self.pinned {
+            Some(v) => v,
+            None => self.resolver.current().map_or(&[], |c| c.value),
+        }
+    }
+
+    /// The held cell as a [`CellData`]: a large value stays pinned when it is, and is
+    /// copied otherwise (a large merge result the resolver buffered).
+    fn data(&self, pin: impl FnOnce() -> Arc<View>) -> CellData {
+        match &self.pinned {
+            Some(v) => CellData::from_pinned(self.ts, v, pin),
+            None => CellData::from_pinned(self.ts, &LaneValue::Copied(self.value().to_vec()), pin),
+        }
     }
 }
 
@@ -703,9 +718,8 @@ impl ScanCursor {
                 resolver,
                 ssts: Arc::clone(&view.ssts),
                 resolver_blobs,
-                col: Vec::new(),
                 ts: 0,
-                value: LaneValue::Copied(Vec::new()),
+                pinned: None,
                 pending: false,
                 done: false,
             });
@@ -735,7 +749,7 @@ impl ScanCursor {
     /// Drops the rest of the current row in every lane.
     fn skip_current_row(&mut self) -> Result<()> {
         for lane in &mut self.lanes {
-            if lane.pending && row_of(&lane.col) == self.row_esc {
+            if lane.pending && row_of(lane.col()) == self.row_esc {
                 lane.pending = false;
                 lane.resolver.skip_row()?;
             }
@@ -775,7 +789,7 @@ impl ScanCursor {
                 if !lane.pending {
                     continue;
                 }
-                let row = row_of(&lane.col);
+                let row = row_of(lane.col());
                 if best.is_none_or(|b| row < b) {
                     best = Some(row);
                 }
@@ -826,7 +840,7 @@ impl ScanCursor {
                 family,
                 qualifier: &self.qual_buf,
                 ts: lane.ts,
-                stored: &lane.value,
+                stored: lane.value(),
             }
         }))
     }
@@ -848,14 +862,15 @@ impl ScanCursor {
         while self.lane_idx < self.lanes.len() {
             let i = self.lane_idx;
             let lane = &self.lanes[i];
+            let col = if lane.pending { lane.col() } else { &[] };
             if lane.pending
-                && lane.col.len() >= row_len
-                && lane.col.starts_with(&self.row_esc)
-                && lane.col[self.row_esc.len()..row_len] == TERMINATOR
+                && col.len() >= row_len
+                && col.starts_with(&self.row_esc)
+                && col[self.row_esc.len()..row_len] == TERMINATOR
             {
                 self.last_lane = Some(i);
-                let end = lane.col.len().saturating_sub(2).max(row_len);
-                Escaped::new(&lane.col[row_len..end]).unescape_into(qualifiers);
+                let end = col.len().saturating_sub(2).max(row_len);
+                Escaped::new(&col[row_len..end]).unescape_into(qualifiers);
                 return Ok(Some(lane.family));
             }
             self.lane_idx += 1;
@@ -870,8 +885,7 @@ impl ScanCursor {
     /// If no cell has been returned for the current row.
     pub fn current_data(&self) -> CellData {
         let i = self.last_lane.expect("current_data before next_cell");
-        let lane = &self.lanes[i];
-        CellData::from_pinned(lane.ts, &lane.value, || Arc::clone(&self.snapshot.view))
+        self.lanes[i].data(|| Arc::clone(&self.snapshot.view))
     }
 
     /// Appends the cell last returned by [`ScanCursor::next_cell`] to `sink`, as `family`
@@ -889,7 +903,7 @@ impl ScanCursor {
     ) {
         let i = self.last_lane.expect("push_current before next_cell");
         let lane = &self.lanes[i];
-        let bytes: &[u8] = &lane.value;
+        let bytes = lane.value();
         if bytes.len() <= CellData::INLINE_MAX {
             sink.push_inline(family, qualifier, lane.ts, bytes);
         } else {

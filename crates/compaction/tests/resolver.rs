@@ -175,6 +175,50 @@ fn large_values_are_returned_from_the_source() {
     assert!(r.next_cell().unwrap().is_none());
 }
 
+/// `current` repeats the cell `next_cell` returned (from the source or from the buffers)
+/// until the resolver moves.
+#[test]
+fn current_repeats_the_last_cell_until_the_resolver_moves() {
+    let big = stored(&vec![7u8; 10_000]);
+    let e = vec![
+        (key(b"r", b"x", 9, 5, Kind::Put), big.clone()),
+        (key(b"r", b"x", 8, 4, Kind::Put), stored(b"small")),
+        (key(b"r", b"y", 9, 6, Kind::Put), stored(b"y")),
+        (key(b"s", b"z", 9, 7, Kind::Put), stored(b"z")),
+    ];
+    let mut r = CellResolver::new(VecCursor::new(e), all_versions(9));
+    assert!(r.current().is_none());
+    r.seek(b"").unwrap();
+    assert!(r.current().is_none());
+    let mut seen = Vec::new();
+    while let Some(c) = r.next_cell().unwrap() {
+        let returned = (c.key.to_vec(), c.ts, c.value.to_vec(), c.from_source);
+        let again = r.current().unwrap();
+        assert_eq!(
+            (
+                again.key.to_vec(),
+                again.ts,
+                again.value.to_vec(),
+                again.from_source
+            ),
+            returned
+        );
+        seen.push(returned);
+        if seen.len() == 3 {
+            // Skipping the rest of the row moves the resolver: nothing is current.
+            r.skip_row().unwrap();
+            assert!(r.current().is_none());
+        }
+    }
+    assert!(r.current().is_none());
+    // Large from the source, then the small older version and `y` from the buffers, then `z`
+    // in the next row.
+    assert_eq!(
+        seen.iter().map(|s| (s.1, s.3)).collect::<Vec<_>>(),
+        [(9, true), (8, false), (9, false), (9, false)]
+    );
+}
+
 /// #21: an `i64` fold onto a non-`i64` base is a `MergeError`, never 0; the sum works.
 #[test]
 fn i64_add_rejects_a_non_i64_base() {
