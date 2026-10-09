@@ -53,6 +53,34 @@ pub fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
+/// The length of the longest common prefix of `a` and `b`, compared eight bytes at a time
+/// (as [`compare`] does): the bytes a block entry shares with the previous key.
+///
+/// ```
+/// use pigeonhole_format::key::common_prefix_len;
+///
+/// assert_eq!(common_prefix_len(b"row:10:a", b"row:10:b"), 7);
+/// assert_eq!(common_prefix_len(b"row", b"row:1"), 3);
+/// assert_eq!(common_prefix_len(b"", b"x"), 0);
+/// ```
+#[inline]
+pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let (mut x, mut y) = (&a[..n], &b[..n]);
+    let mut i = 0;
+    while let (Some((p, xs)), Some((q, ys))) =
+        (x.split_first_chunk::<8>(), y.split_first_chunk::<8>())
+    {
+        if p != q {
+            let diff = u64::from_be_bytes(*p) ^ u64::from_be_bytes(*q);
+            return i + (diff.leading_zeros() / 8) as usize;
+        }
+        i += 8;
+        (x, y) = (xs, ys);
+    }
+    i + x.iter().zip(y).take_while(|(p, q)| p == q).count()
+}
+
 /// Maximum length, in unescaped bytes, of a row key or a qualifier (64 KiB).
 pub const MAX_KEY_PART: usize = 64 * 1024;
 

@@ -4,8 +4,9 @@ mod common;
 
 use common::{Cell, cell, config, num, part, sized};
 use pigeonhole_format::key::{
-    Kind, column_prefix_len, compare, decode_key, encode_column_prefix, encode_key,
-    encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
+    Kind, column_prefix_len, common_prefix_len, compare, decode_key, encode_column_prefix,
+    encode_key, encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len,
+    split_suffix,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -143,5 +144,14 @@ proptest! {
         prop_assert_eq!(compare(&a, &b), a.cmp(&b));
         prop_assert_eq!(compare(&b, &a), b.cmp(&a));
         prop_assert_eq!(compare(&a, &a), std::cmp::Ordering::Equal);
+    }
+
+    /// `common_prefix_len` counts the leading bytes `a` and `b` share.
+    #[test]
+    fn common_prefix_len_counts_shared_bytes((a, b) in shared_prefix_pair()) {
+        let naive = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        prop_assert_eq!(common_prefix_len(&a, &b), naive);
+        prop_assert_eq!(common_prefix_len(&b, &a), naive);
+        prop_assert_eq!(common_prefix_len(&a, &a), a.len());
     }
 }

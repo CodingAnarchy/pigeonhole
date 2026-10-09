@@ -286,43 +286,53 @@ impl BlockBuilder {
                 what: "block builder: add after finish",
             });
         }
-        if self.entries > 0 && crate::key::compare(key, &self.last_key).is_le() {
-            return Err(Error::InvalidArgument {
-                what: "block builder: keys out of order",
-            });
+        // One pass over the previous key: the common prefix gives the order check, the shared
+        // bytes and whether the row continues.
+        let lcp = crate::key::common_prefix_len(key, &self.last_key);
+        if self.entries > 0 {
+            // `key > last_key`: it differs at `lcp` with a larger byte, or extends it.
+            let greater = match (key.get(lcp), self.last_key.get(lcp)) {
+                (Some(k), Some(l)) => k > l,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !greater {
+                return Err(Error::InvalidArgument {
+                    what: "block builder: keys out of order",
+                });
+            }
         }
         if self.buf.len() > MAX_BLOCK_LEN {
             return Err(Error::ValueTooLarge);
         }
         let offset = self.buf.len() as u32;
-        let row_len = if self.data {
-            Some(crate::key::row_prefix_len(key)?)
-        } else {
+        // A key sharing the previous key's whole row prefix (which ends with the row's
+        // terminator) is in the same row, with the same prefix length. The previous key may
+        // be the last of the previous block (`reset` keeps it).
+        let same_row = matches!(self.last_row_len, Some(n) if lcp >= n);
+        let row_len = if !self.data {
             None
+        } else if same_row {
+            self.last_row_len
+        } else {
+            Some(crate::key::row_prefix_len(key)?)
         };
         let shared = if self.entries.is_multiple_of(self.restart_interval) {
             self.restarts.push(offset);
             0
         } else {
-            key.iter()
-                .zip(&self.last_key)
-                .take_while(|(a, b)| a == b)
-                .count()
+            lcp
         };
-        if self.data {
-            let same_row =
-                matches!(self.last_row_len, Some(n) if key.starts_with(&self.last_key[..n]));
-            if !same_row {
-                self.row_starts.push(offset);
-            }
+        if self.data && !same_row {
+            self.row_starts.push(offset);
         }
         crate::varint::put_u64(&mut self.buf, shared as u64);
         crate::varint::put_u64(&mut self.buf, (key.len() - shared) as u64);
         crate::varint::put_u64(&mut self.buf, value.len() as u64);
         self.buf.extend_from_slice(&key[shared..]);
         self.buf.extend_from_slice(value);
-        self.last_key.clear();
-        self.last_key.extend_from_slice(key);
+        self.last_key.truncate(lcp);
+        self.last_key.extend_from_slice(&key[lcp..]);
         self.last_row_len = row_len;
         self.entries += 1;
         Ok(())
