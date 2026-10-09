@@ -280,6 +280,12 @@ pub struct CellResolver<C> {
     /// Every key of `col` is below `upper` (or there is none), so entries inside the column
     /// skip the bound check.
     col_below_upper: bool,
+    /// Every key of `row` is below `upper` (or there is none): a new column of the row skips
+    /// the bound check too.
+    row_below_upper: bool,
+    /// The cursor's current entry is known not to be in `col` (the group loop stopped on it):
+    /// whether it is in `row`. Taken by the next step; cleared whenever the cursor moves.
+    peek: Option<bool>,
     /// Stop at keys `>= upper`.
     upper: Option<Vec<u8>>,
 
@@ -309,6 +315,37 @@ pub struct CellResolver<C> {
 /// instead of a step per version; a column with a few versions keeps the cheaper steps.
 const SKIP_STEPS: u32 = 8;
 
+/// Whether internal key `k` is in column `col` and in row `row` (`col` starts with `row`
+/// when set), from one comparison with `col`.
+fn locate_key(k: &[u8], col: &[u8], row: &[u8]) -> (bool, bool) {
+    if col.is_empty() {
+        let same_row = !row.is_empty() && common_prefix_len(k, row) == row.len();
+        return (false, same_row);
+    }
+    let cp = common_prefix_len(k, col);
+    let in_col = cp == col.len() && k.len() == col.len() + SUFFIX_LEN;
+    let same_row = !row.is_empty() && cp >= row.len();
+    (in_col, same_row)
+}
+
+/// The length of the longest common prefix of `a` and `b`, eight bytes at a time.
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_le_bytes(a[i..i + 8].try_into().expect("8 bytes"));
+        let y = u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"));
+        if x != y {
+            return i + ((x ^ y).trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
 /// `max(a, b)` over optional timestamps.
 fn raise(cover: &mut Option<Timestamp>, ts: Timestamp) {
     *cover = Some(cover.map_or(ts, |c| c.max(ts)));
@@ -335,6 +372,8 @@ where
             col_skipped: 0,
             column_bound: false,
             col_below_upper: false,
+            row_below_upper: false,
+            peek: None,
             upper: None,
             run: false,
             run_ts: 0,
@@ -365,15 +404,25 @@ where
             None => self.upper = None,
         }
         self.col_below_upper = false;
+        self.row_below_upper = false;
     }
 
     /// Records whether every key of the column `col` sorts below `upper`. Exact unless
     /// `upper` starts with `col` (a bound inside the column), which is then checked per entry:
     /// otherwise a key `col + suffix` compares with `upper` as `col` does.
     fn note_column_bound(&mut self) {
-        self.col_below_upper = match self.upper.as_deref() {
+        self.col_below_upper = self.row_below_upper
+            || match self.upper.as_deref() {
+                None => true,
+                Some(u) => !u.starts_with(&self.col) && self.col.as_slice() < u,
+            };
+    }
+
+    /// Records whether every key of the row `row` sorts below `upper`, as for a column.
+    fn note_row_bound(&mut self) {
+        self.row_below_upper = match self.upper.as_deref() {
             None => true,
-            Some(u) => !u.starts_with(&self.col) && self.col.as_slice() < u,
+            Some(u) => !u.starts_with(&self.row) && self.row.as_slice() < u,
         };
     }
 
@@ -386,6 +435,8 @@ where
         self.col.clear();
         self.column_bound = false;
         self.col_below_upper = false;
+        self.row_below_upper = false;
+        self.peek = None;
         self.skip_group = None;
     }
 
@@ -437,6 +488,7 @@ where
         escape_into(&mut self.col, qualifier);
         self.col.extend_from_slice(&TERMINATOR);
         self.column_bound = true;
+        self.note_row_bound();
         self.note_column_bound();
         self.cursor.seek(&self.col)
     }
@@ -467,6 +519,7 @@ where
     /// Skips the rest of the current row.
     pub fn skip_row(&mut self) -> Result<(), C::Error> {
         self.skip_group = None;
+        self.peek = None;
         self.run = false;
         self.col_skip = true;
         if self.cursor.valid() && !self.row.is_empty() && self.cursor.key().starts_with(&self.row) {
@@ -509,13 +562,13 @@ where
         !self.col.is_empty() && k.len() == self.col.len() + SUFFIX_LEN && k.starts_with(&self.col)
     }
 
-    /// Whether the cursor's entry is past the column bound or the upper bound; `in_col` is
-    /// [`Self::in_column`] for it.
-    fn past_bounds(&self, in_col: bool) -> bool {
+    /// Whether the cursor's entry is past the column bound or the upper bound; `in_col` and
+    /// `same_row` are [`Self::locate`]'s for it.
+    fn past_bounds(&self, in_col: bool, same_row: bool) -> bool {
         if self.column_bound && !in_col {
             return true;
         }
-        if in_col && self.col_below_upper {
+        if (in_col && self.col_below_upper) || (same_row && self.row_below_upper) {
             return false;
         }
         self.upper
@@ -528,8 +581,20 @@ where
             self.skip_rest_of_group(ts)?;
         }
         loop {
-            let in_col = self.cursor.valid() && self.in_column();
-            if !self.cursor.valid() || self.past_bounds(in_col) {
+            // One comparison of the key with the column per step (or none: the group loop
+            // already made it for this entry).
+            let peeked = self.peek.take();
+            let (in_col, same_row, suffix) = if self.cursor.valid() {
+                let k = self.cursor.key();
+                let (in_col, same_row) = match peeked {
+                    Some(same_row) => (false, same_row),
+                    None => locate_key(k, &self.col, &self.row),
+                };
+                (in_col, same_row, split_suffix(k).ok())
+            } else {
+                (false, false, None)
+            };
+            if !self.cursor.valid() || self.past_bounds(in_col, same_row) {
                 if self.run {
                     if let Some(out) = self.flush_run()? {
                         return Ok(Some(out));
@@ -538,7 +603,7 @@ where
                 }
                 return Ok(None);
             }
-            let Ok((_, ts, seqno, kind)) = split_suffix(self.cursor.key()) else {
+            let Some((_, ts, seqno, kind)) = suffix else {
                 debug_assert!(false, "malformed internal key from a source");
                 self.cursor.next()?;
                 continue;
@@ -552,7 +617,7 @@ where
                     continue;
                 }
                 let key = self.cursor.key();
-                if self.row.is_empty() || !key.starts_with(&self.row) {
+                if !same_row {
                     let Ok(n) = row_prefix_len(key) else {
                         debug_assert!(false, "malformed internal key from a source");
                         self.cursor.next()?;
@@ -563,7 +628,9 @@ where
                     self.family_cover = None;
                     self.markers.clear();
                     self.columns_in_row = 0;
+                    self.note_row_bound();
                 }
+                let key = self.cursor.key();
                 if kind == Kind::FamilyDelete {
                     if seqno <= self.opts.snapshot {
                         raise(&mut self.family_cover, ts);
@@ -605,7 +672,7 @@ where
                 }
                 continue;
             }
-            if let Some(out) = self.group(ts)? {
+            if let Some(out) = self.group(ts, seqno, kind)? {
                 return Ok(Some(out));
             }
         }
@@ -624,7 +691,7 @@ where
 
     /// Reads the whole `(column, ts)` group the cursor is on and returns its version, if it
     /// produces one now (a group of operands only extends the pending run instead).
-    fn group(&mut self, ts: Timestamp) -> Result<Option<Out>, C::Error> {
+    fn group(&mut self, ts: Timestamp, seqno: Seqno, kind: Kind) -> Result<Option<Out>, C::Error> {
         let snapshot = self.opts.snapshot;
         let counter = self.opts.counter;
         let expired = self.expired(ts);
@@ -638,13 +705,29 @@ where
         let mut ops_err: Option<MergeError> = None;
         // Copy the base whenever it will be folded (operands above it), not only when small.
         let fold_ready = self.run;
-        while self.cursor.valid() && self.in_column() {
-            let Ok((_, t, seqno, kind)) = split_suffix(self.cursor.key()) else {
-                break;
+        // The first entry is in the column (the caller checked); the loop stops on the first
+        // that is not, and leaves what it found for the next step.
+        let mut first = Some((seqno, kind));
+        while self.cursor.valid() {
+            let (seqno, kind) = match first.take() {
+                Some(sk) => sk,
+                None => {
+                    // One key fetch: the column check and the suffix.
+                    let k = self.cursor.key();
+                    let (in_col, same_row) = locate_key(k, &self.col, &self.row);
+                    if !in_col {
+                        self.peek = Some(same_row);
+                        break;
+                    }
+                    let Ok((_, t, seqno, kind)) = split_suffix(k) else {
+                        break;
+                    };
+                    if t != ts {
+                        break;
+                    }
+                    (seqno, kind)
+                }
             };
-            if t != ts {
-                break;
-            }
             if seqno <= snapshot && seqno >= floor {
                 match kind {
                     Kind::ColumnDelete => {
@@ -722,6 +805,7 @@ where
                     return Ok(None);
                 }
                 self.cursor.seek(&self.base_key)?;
+                self.peek = None;
                 debug_assert!(self.cursor.valid() && self.cursor.key() == self.base_key);
                 if !self.admit_source() {
                     return Ok(None);
@@ -831,5 +915,24 @@ where
             self.col_skip = true;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::common_prefix_len;
+
+    #[test]
+    fn common_prefix_len_finds_the_first_difference() {
+        let a: Vec<u8> = (0..40).collect();
+        for at in 0..40 {
+            let mut b = a.clone();
+            b[at] ^= 0x80;
+            assert_eq!(common_prefix_len(&a, &b), at, "differ at {at}");
+        }
+        assert_eq!(common_prefix_len(&a, &a), 40);
+        assert_eq!(common_prefix_len(&a[..13], &a), 13);
+        assert_eq!(common_prefix_len(&a, &a[..21]), 21);
+        assert_eq!(common_prefix_len(&[], &a), 0);
     }
 }
