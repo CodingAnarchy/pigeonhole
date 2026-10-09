@@ -473,3 +473,75 @@ fn relocate_refuses_retired_and_unallocated_extents() {
     );
     assert_eq!(pager.stats().allocated_bytes, 0, "nothing was allocated");
 }
+
+#[test]
+fn a_region_cleared_for_a_large_extent_takes_it_whole() {
+    // #314: units 1..48 hold 64 KiB extents, a 1 MiB extent sits at 48. Freeing most of
+    // 16..32 and 40..47 leaves no free 16-unit hole below it, and no hole below 16.
+    let vfs = sim();
+    let pager = Pager::create(&vfs, path()).unwrap();
+    let unit = |e: &Extent| e.page / 16;
+    let small: Vec<Extent> = (1..48).map(|_| pager.allocate(64 << 10).unwrap()).collect();
+    let big = pager.allocate(1 << 20).unwrap();
+    assert_eq!(unit(&big), 48);
+    let fill = |e: Extent, b: u8| pager.write(e, 0, &vec![b; e.len() as usize]).unwrap();
+    let holds = |e: Extent, b: u8| {
+        let mut got = vec![0u8; e.len() as usize];
+        pager.read(e, 0, &mut got).unwrap();
+        got.iter().all(|&x| x == b)
+    };
+    for e in &small {
+        let u = unit(e);
+        if ((17..32).contains(&u) && u != 18) || (40..47).contains(&u) {
+            pager.abandon(*e);
+        } else {
+            fill(*e, u as u8);
+        }
+    }
+    fill(big, 0xbb);
+    assert!(matches!(pager.relocate(big), Err(Error::NoSpace)));
+
+    // 16..32 holds the least (units 16 and 18); 32..48 could be cleared too.
+    let clearing = pager.clear_for(big, |_| true).unwrap();
+    assert_eq!(unit(&clearing.region), 16);
+    assert_eq!(clearing.region.size_class, 4);
+    let occupants: Vec<u64> = clearing.occupants.iter().map(unit).collect();
+    assert_eq!(occupants, vec![16, 18]);
+    // The only holes outside the region and below the large extent are above both: they
+    // move up, which `relocate` (below itself) would refuse.
+    for &o in &clearing.occupants {
+        assert!(matches!(pager.relocate(o), Err(Error::NoSpace)));
+        let to = pager.relocate_below(o, big).unwrap();
+        assert!(unit(&to) > unit(&o) && unit(&to) < 48, "{o:?} -> {to:?}");
+        assert!(holds(to, unit(&o) as u8));
+        pager.abandon(o);
+    }
+    // Held: the occupants' old units and the region's free space go to no one else.
+    for _ in 0..4 {
+        let e = pager.allocate(64 << 10).unwrap();
+        assert!(!(16..32).contains(&unit(&e)), "{e:?}");
+    }
+    let moved = pager.relocate_into(big, clearing.region).unwrap();
+    assert_eq!(moved, clearing.region);
+    assert!(holds(moved, 0xbb));
+    assert!(!pager.release_region(clearing.region), "taken");
+}
+
+#[test]
+fn a_released_region_frees_what_it_held() {
+    let vfs = sim();
+    let pager = Pager::create(&vfs, path()).unwrap();
+    let small: Vec<Extent> = (1..32).map(|_| pager.allocate(64 << 10).unwrap()).collect();
+    let big = pager.allocate(1 << 20).unwrap();
+    for e in small.iter().filter(|e| e.page / 16 % 2 == 1) {
+        pager.abandon(*e);
+    }
+    let clearing = pager.clear_for(big, |_| true).unwrap();
+    let held = pager.stats().allocated_bytes;
+    assert!(pager.release_region(clearing.region));
+    assert!(pager.stats().allocated_bytes < held);
+    assert!(matches!(
+        pager.relocate_into(big, clearing.region),
+        Err(Error::NoSpace)
+    ));
+}

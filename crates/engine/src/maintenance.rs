@@ -342,6 +342,42 @@ fn copy_at(
     Ok((sink, blob_files))
 }
 
+/// A region `shrink` cleared for `big` (`Pager::clear_for`), held until `big` moves in;
+/// released when dropped (a no-op once `Pager::relocate_into` took it).
+struct Held {
+    pager: Arc<Pager>,
+    big: ExtentRef,
+    region: ExtentRef,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.pager.release_region(self.region);
+    }
+}
+
+/// Where `shrink` moves an extent.
+#[derive(Clone, Copy)]
+enum Target {
+    /// The lowest free extent of its class below this one (itself, or the extent a region
+    /// is cleared for).
+    Below(ExtentRef),
+    /// A held region (`Held`).
+    Into(ExtentRef),
+}
+
+/// What became of an extent `shrink` tried to move.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Moved {
+    Yes,
+    /// No room: no free extent of its class below, or the held region still has an
+    /// occupant's old extent in it.
+    NoSpace,
+    /// Not moved, and room has nothing to do with it: claimed by a compaction, not named by
+    /// the manifest (output in flight), or retired since the catalog was read.
+    Skipped,
+}
+
 /// Relocates manifest-named extents past the shrink point and truncates the file. Returns
 /// the bytes the file shrank by, net: a round's manifest commit can grow the file by what
 /// a later truncation gives back.
@@ -353,6 +389,12 @@ fn copy_at(
 pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     let start = shared.pager.stats().file_bytes;
     let shrunk = || start.saturating_sub(shared.pager.stats().file_bytes);
+    // A region cleared for a large extent (#314): held across rounds, so the space the
+    // occupants leave goes to the large extent and not to a flush meanwhile.
+    let mut held: Option<Held> = None;
+    // A cleared region went unused (the large extent left the plan, or a pinned version
+    // kept the occupants' old extents): clear no other this call.
+    let mut wasted = false;
     for _round in 0..8 {
         if shared.closing.load(Ordering::Acquire) {
             // The close waits for this call: stop between rounds.
@@ -364,6 +406,11 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         shared.reclaim();
         shared.pager.truncate_tail()?;
         let plan = shared.pager.shrink_plan();
+        if held.as_ref().is_some_and(|h| !plan.contains(&h.big)) {
+            // Moved or replaced otherwise: the region is not needed.
+            held = None;
+            wasted = true;
+        }
         if plan.is_empty() {
             break;
         }
@@ -404,35 +451,39 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         // An extent retired since the catalog was read: the plan is stale, so a round with
         // nothing to move plans again instead of stopping.
         let mut stale = false;
-        for extent in plan {
-            if [root.snapshot, root.log]
-                .into_iter()
-                .flatten()
-                .any(|e| e == extent)
-            {
+        let roots: Vec<ExtentRef> = [root.snapshot, root.log].into_iter().flatten().collect();
+        let relocate = |extent: ExtentRef, to: Target| match to {
+            Target::Below(limit) => shared.pager.relocate_below(extent, limit),
+            Target::Into(region) => shared.pager.relocate_into(extent, region),
+        };
+        let mut move_to = |extent: ExtentRef, to: Target| -> Result<Moved> {
+            if roots.contains(&extent) {
+                // The manifest's own extents move by a snapshot rewrite.
                 rewrite = true;
-                continue;
+                return Ok(Moved::Yes);
             }
             if let Some(&(blob_file, index)) = blob_by_extent.get(&(extent.page, extent.size_class))
             {
                 // A blob extent (#231): blob files are never written once published, so a
                 // copy needs no claim; the commit replaces the extent at its position if the
                 // file still has it there.
-                match shared.pager.relocate(extent) {
-                    Ok(target) => moves.blobs.push((blob_file, index, extent, target)),
-                    Err(pigeonhole_pager::Error::NoSpace) => {}
-                    // Dropped (blob GC, `drop_table`) since the catalog was read.
-                    Err(_) if !shared.pager.is_live(extent) => stale = true,
-                    Err(e) => {
-                        unclaim(shared, &claimed);
-                        return Err(e.into());
+                return match relocate(extent, to) {
+                    Ok(target) => {
+                        moves.blobs.push((blob_file, index, extent, target));
+                        Ok(Moved::Yes)
                     }
-                }
-                continue;
+                    Err(pigeonhole_pager::Error::NoSpace) => Ok(Moved::NoSpace),
+                    // Dropped (blob GC, `drop_table`) since the catalog was read.
+                    Err(_) if !shared.pager.is_live(extent) => {
+                        stale = true;
+                        Ok(Moved::Skipped)
+                    }
+                    Err(e) => Err(e.into()),
+                };
             }
             let Some((family, meta)) = by_extent.get(&(extent.page, extent.size_class)) else {
                 // Not named by the manifest: an output in flight (decision D60).
-                continue;
+                return Ok(Moved::Skipped);
             };
             {
                 let mut busy = shared
@@ -440,26 +491,22 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if busy.contains(&meta.id) {
-                    continue;
+                    return Ok(Moved::Skipped);
                 }
                 busy.insert(meta.id);
             }
             claimed.push(meta.id);
-            let target = match shared.pager.relocate(extent) {
+            let target = match relocate(extent, to) {
                 Ok(t) => t,
-                // No free extent of its class below it: it stays, and the smaller ones
-                // past it may still move.
-                Err(pigeonhole_pager::Error::NoSpace) => continue,
+                // No room: it stays, and the smaller ones past it may still move.
+                Err(pigeonhole_pager::Error::NoSpace) => return Ok(Moved::NoSpace),
                 // A compaction that committed after the catalog was read retired it (the
                 // view held here keeps it from being reclaimed, so it is not reused).
                 Err(_) if !shared.pager.is_live(extent) => {
                     stale = true;
-                    continue;
+                    return Ok(Moved::Skipped);
                 }
-                Err(e) => {
-                    unclaim(shared, &claimed);
-                    return Err(e.into());
-                }
+                Err(e) => return Err(e.into()),
             };
             let id = SstId(shared.sst_ids.fetch_add(1, Ordering::Relaxed));
             let mut new_meta = (**meta).clone();
@@ -471,18 +518,83 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                 .map_or(pigeonhole_cache::Priority::Normal, |m| {
                     SstSet::priority(m.options.cache_priority)
                 });
-            match SstReader::open(
+            let r = SstReader::open(
                 shared.pager.file().clone(),
                 &new_meta,
                 Arc::clone(&shared.cache),
                 priority,
-            ) {
-                Ok(r) => readers.push((id, Arc::new(r))),
-                Err(e) => {
-                    unclaim(shared, &claimed);
-                    return Err(e.into());
+            )?;
+            readers.push((id, Arc::new(r)));
+            Ok(Moved::Yes)
+        };
+        // Whether an extent can be moved out of a region cleared for a larger one: the
+        // manifest's, a blob extent, or an SST no compaction held when the round began (a
+        // copy: `Pager::clear_for` calls this under the allocator's lock; a claim taken
+        // since makes that move a no-op).
+        let busy: std::collections::HashSet<SstId> = shared
+            .busy_ssts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let movable = |e: ExtentRef| {
+            roots.contains(&e)
+                || blob_by_extent.contains_key(&(e.page, e.size_class))
+                || by_extent
+                    .get(&(e.page, e.size_class))
+                    .is_some_and(|(_, m)| !busy.contains(&m.id))
+        };
+        let mut failed = None;
+        for extent in plan {
+            let to = match &held {
+                Some(h) if h.big == extent => Target::Into(h.region),
+                _ => Target::Below(extent),
+            };
+            match move_to(extent, to) {
+                Ok(Moved::Yes) => {
+                    if matches!(to, Target::Into(_)) {
+                        // The region is the large extent's now (releasing it is a no-op).
+                        held = None;
+                    }
                 }
+                Ok(Moved::NoSpace) if matches!(to, Target::Into(_)) => {
+                    // An occupant's old extent is still in the region: a pinned version
+                    // keeps it from being reclaimed. Wait (held) without clearing more.
+                    wasted = true;
+                }
+                Ok(Moved::NoSpace) if held.is_none() && !wasted => {
+                    // Small extents fragment every aligned hole of its class below it. Clear
+                    // one region (for the largest such extent that has one) and hold it; the
+                    // extent moves in once the occupants' old extents are reclaimed.
+                    let Some(clearing) = shared.pager.clear_for(extent, movable) else {
+                        continue;
+                    };
+                    crate::shard::trace!(
+                        "shrink: clearing {:?} of {:?} for {extent:?}",
+                        clearing.region,
+                        clearing.occupants
+                    );
+                    held = Some(Held {
+                        pager: Arc::clone(&shared.pager),
+                        big: extent,
+                        region: clearing.region,
+                    });
+                    for occupant in clearing.occupants {
+                        if let Err(e) = move_to(occupant, Target::Below(extent)) {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => failed = Some(e),
             }
+            if failed.is_some() {
+                break;
+            }
+        }
+        if let Some(e) = failed {
+            unclaim(shared, &claimed);
+            return Err(e);
         }
         if moves.list.is_empty() && moves.blobs.is_empty() && !rewrite {
             unclaim(shared, &claimed);
@@ -515,6 +627,8 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         // (a commit whose view publish failed).
         committed?;
     }
+    // A region still held is free space again before the tail is cut.
+    drop(held);
     if !shared.closing.load(Ordering::Acquire) {
         // What the last round's moves retired.
         shared.reclaim();

@@ -33,6 +33,9 @@ struct Used {
     /// pending extents may be abandoned or trimmed. An SST published in this session stays
     /// pending here, since the pager never sees the manifest's contents.
     published: bool,
+    /// Holds free space of a region cleared for a larger extent (`Alloc::clear_for`): never
+    /// published, and taken by `Alloc::claim_region` or freed by `Alloc::release_region`.
+    placeholder: bool,
 }
 
 /// Why a set of live extents cannot be loaded.
@@ -46,9 +49,9 @@ pub(crate) enum LoadError {
     PastEnd,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Alloc {
-    free: [BTreeSet<u64>; CLASSES],
+    free: FreeLists,
     used: BTreeMap<u64, Used>,
     /// `(superseded_at, unit)` of every retired extent.
     retired: BTreeSet<(ManifestVersion, u64)>,
@@ -56,6 +59,31 @@ pub(crate) struct Alloc {
     frontier: u64,
     used_units: u64,
     retired_units: u64,
+    /// Regions held for a larger extent (`clear_for`): first unit -> class. Space freed
+    /// inside one becomes a placeholder, not free, so no allocation lands there.
+    held: BTreeMap<u64, u8>,
+}
+
+/// A region `Alloc::clear_for` could clear: occupied units, first unit, and occupants as
+/// `(unit, class)`, largest first.
+type Candidate = (u64, u64, Vec<(u64, u8)>);
+
+/// Free blocks per class, lowest address first.
+type FreeLists = [BTreeSet<u64>; CLASSES];
+
+/// Takes a block of `class` from `free` as `Alloc::alloc_lowest` would: the lowest-addressed
+/// free block that fits, split down. Returns its unit.
+fn take_lowest(free: &mut FreeLists, class: u8) -> Option<u64> {
+    let (unit, from) = (class..=Extent::MAX_CLASS)
+        .filter_map(|k| free[k as usize].first().map(|&u| (u, k)))
+        .min()?;
+    free[from as usize].remove(&unit);
+    let mut k = from;
+    while k > class {
+        k -= 1;
+        free[k as usize].insert(unit + units(k));
+    }
+    Some(unit)
 }
 
 /// Units in an extent of `class`.
@@ -89,6 +117,7 @@ impl Alloc {
             frontier: frontier.max(1),
             used_units: 0,
             retired_units: 0,
+            held: BTreeMap::new(),
         };
         a.free_range(1, a.frontier);
         a
@@ -115,6 +144,7 @@ impl Alloc {
             frontier,
             used_units: 0,
             retired_units: 0,
+            held: BTreeMap::new(),
         };
         let mut next = 1;
         for (u, class) in extents {
@@ -132,6 +162,7 @@ impl Alloc {
                     class,
                     retired: None,
                     published: true,
+                    placeholder: false,
                 },
             );
             a.used_units += units(class);
@@ -189,6 +220,7 @@ impl Alloc {
                 class,
                 retired: None,
                 published: false,
+                placeholder: false,
             },
         );
         self.used_units += units(class);
@@ -257,10 +289,33 @@ impl Alloc {
         if !self.is_pending(e) {
             return false;
         }
-        self.used.remove(&unit);
-        self.used_units -= units(e.size_class);
-        self.free_block(unit, e.size_class);
+        self.free_used(unit);
         true
+    }
+
+    /// Frees the used extent at `unit`, or keeps it as a placeholder inside a held region.
+    fn free_used(&mut self, unit: u64) {
+        if self.in_held(unit) {
+            let u = self.used.get_mut(&unit).expect("used");
+            *u = Used {
+                class: u.class,
+                retired: None,
+                published: false,
+                placeholder: true,
+            };
+            return;
+        }
+        let used = self.used.remove(&unit).expect("used");
+        self.used_units -= units(used.class);
+        self.free_block(unit, used.class);
+    }
+
+    /// Whether `unit` lies inside a held region.
+    fn in_held(&self, unit: u64) -> bool {
+        self.held
+            .range(..=unit)
+            .next_back()
+            .is_some_and(|(&at, &class)| unit < at + units(class))
     }
 
     /// Shrinks a pending extent to `class` in place, freeing its upper halves at once.
@@ -277,6 +332,7 @@ impl Alloc {
                 class,
                 retired: None,
                 published: false,
+                placeholder: false,
             },
         );
         self.used_units -= units(e.size_class) - units(class);
@@ -309,11 +365,9 @@ impl Alloc {
         };
         let done = std::mem::replace(&mut self.retired, keep);
         for &(_, unit) in &done {
-            let used = self.used.remove(&unit).expect("retired extent is used");
-            let n = units(used.class);
-            self.used_units -= n;
+            let n = units(self.used[&unit].class);
             self.retired_units -= n;
-            self.free_block(unit, used.class);
+            self.free_used(unit);
         }
         done.len()
     }
@@ -356,7 +410,7 @@ impl Alloc {
         let mut classes: Vec<u8> = self
             .used
             .values()
-            .filter(|u| u.retired.is_none())
+            .filter(|u| u.retired.is_none() && !u.placeholder)
             .map(|u| u.class)
             .collect();
         classes.sort_unstable_by(|a, b| b.cmp(a));
@@ -370,11 +424,150 @@ impl Alloc {
         let mut plan: Vec<Extent> = self
             .used
             .iter()
-            .filter(|(u, used)| used.retired.is_none() && **u + units(used.class) > target)
+            .filter(|(u, used)| {
+                used.retired.is_none() && !used.placeholder && **u + units(used.class) > target
+            })
             .map(|(&u, used)| extent(u, used.class))
             .collect();
         plan.sort_unstable_by(|a, b| b.size_class.cmp(&a.size_class).then(b.page.cmp(&a.page)));
         plan
+    }
+
+    /// Clears room for `big`, a live extent no free block of its class lies below. A
+    /// candidate is a region of its class and alignment below it whose occupants are all
+    /// live, smaller and `movable`, and can each move to a free block outside the region and
+    /// below `big`: tried on a copy of the free lists, largest first, taking the lowest free
+    /// block as the moves will (`alloc_lowest`; a snapshot rewrite of the manifest's
+    /// extents allocates the same way, though its new snapshot may need a larger class
+    /// than the old one, in which case it can land above `big`). Of the first `tries` candidates
+    /// among the lowest `scan` regions, the one with the fewest occupied units wins (the
+    /// lowest on a tie). It is held: its free blocks, and the occupants' old extents once they
+    /// are freed, become placeholders, so nothing else is allocated there until
+    /// `claim_region` or `release_region`. Returns the region and the occupants to move.
+    pub(crate) fn clear_for(
+        &mut self,
+        big: Extent,
+        movable: &dyn Fn(Extent) -> bool,
+        tries: usize,
+        scan: usize,
+    ) -> Option<(Extent, Vec<Extent>)> {
+        let limit = unit_of(big)?;
+        let size = units(big.size_class);
+        let mut tried = 0;
+        let mut best: Option<Candidate> = None;
+        for at in (size..limit.saturating_sub(size - 1))
+            .step_by(size as usize)
+            .take(scan)
+        {
+            if tried >= tries {
+                break;
+            }
+            // Inside a used extent that starts below it: nothing to clear.
+            if self
+                .used
+                .range(..at)
+                .next_back()
+                .is_some_and(|(&u, used)| u + units(used.class) > at)
+            {
+                continue;
+            }
+            let occupants: Vec<(u64, Used)> = self
+                .used
+                .range(at..at + size)
+                .map(|(&u, used)| (u, *used))
+                .collect();
+            if occupants.is_empty()
+                || occupants.iter().any(|(u, used)| {
+                    used.retired.is_some()
+                        || used.placeholder
+                        || used.class >= big.size_class
+                        || !movable(extent(*u, used.class))
+                })
+            {
+                continue;
+            }
+            tried += 1;
+            let mut free = self.free.clone();
+            for set in &mut free {
+                let inside: Vec<u64> = set.range(at..at + size).copied().collect();
+                for u in inside {
+                    set.remove(&u);
+                }
+            }
+            let mut by_size: Vec<(u64, u8)> =
+                occupants.iter().map(|(u, used)| (*u, used.class)).collect();
+            by_size.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let fits = by_size.iter().all(|&(_, class)| {
+                take_lowest(&mut free, class).is_some_and(|t| t + units(class) <= limit)
+            });
+            if !fits {
+                continue;
+            }
+            let cost: u64 = by_size.iter().map(|&(_, c)| units(c)).sum();
+            if best.as_ref().is_none_or(|(c, _, _)| cost < *c) {
+                best = Some((cost, at, by_size));
+            }
+        }
+        let (_, at, occupants) = best?;
+        self.held.insert(at, big.size_class);
+        for class in 0..CLASSES {
+            let inside: Vec<u64> = self.free[class].range(at..at + size).copied().collect();
+            for u in inside {
+                self.free[class].remove(&u);
+                self.mark_used(u, class as u8);
+                self.used.get_mut(&u).expect("marked").placeholder = true;
+            }
+        }
+        let occupants = occupants.into_iter().map(|(u, c)| extent(u, c)).collect();
+        Some((extent(at, big.size_class), occupants))
+    }
+
+    /// Takes the held `region` as one used (pending) extent once nothing but placeholders
+    /// is inside it (the occupants' old extents are freed). `None`, changing nothing, while
+    /// anything else is.
+    pub(crate) fn claim_region(&mut self, region: Extent) -> Option<Extent> {
+        let at = unit_of(region)?;
+        let class = region.size_class;
+        if self.held.get(&at) != Some(&class) {
+            return None;
+        }
+        let size = units(class);
+        let inside: Vec<(u64, Used)> = self
+            .used
+            .range(at..at + size)
+            .map(|(&u, used)| (u, *used))
+            .collect();
+        if inside.iter().any(|(_, used)| !used.placeholder) {
+            return None;
+        }
+        self.held.remove(&at);
+        for (u, used) in inside {
+            self.used.remove(&u);
+            self.used_units -= units(used.class);
+        }
+        Some(self.mark_used(at, class))
+    }
+
+    /// Stops holding `region`: its placeholders become free space. Returns false if it was
+    /// not held.
+    pub(crate) fn release_region(&mut self, region: Extent) -> bool {
+        let Some(at) = unit_of(region) else {
+            return false;
+        };
+        if self.held.get(&at) != Some(&region.size_class) {
+            return false;
+        }
+        self.held.remove(&at);
+        let placeholders: Vec<u64> = self
+            .used
+            .range(at..at + units(region.size_class))
+            .filter(|(_, used)| used.placeholder)
+            .map(|(&u, _)| u)
+            .collect();
+        for u in placeholders {
+            self.free_used(u);
+        }
+        true
     }
 
     pub(crate) fn frontier(&self) -> u64 {
@@ -548,6 +741,115 @@ mod tests {
         a.truncate(a.used_end());
         a.check();
         assert_eq!(a.frontier(), 3);
+    }
+
+    /// Issue #314's layout (64 KiB units): every 16-aligned hole below the 1 MiB extent at
+    /// 96 holds a small extent, so it cannot move until one region is cleared.
+    fn fragmented() -> (Alloc, Extent) {
+        let live = [
+            (2, 1),
+            (8, 3),
+            (16, 4),
+            (32, 2),
+            (36, 1),
+            (38, 0),
+            (39, 0),
+            (40, 0),
+            (42, 0),
+            (44, 0),
+            (46, 0),
+            (48, 0),
+            (52, 2),
+            (64, 5),
+            (96, 4),
+        ]
+        .map(|(u, c)| extent(u, c));
+        let a = Alloc::load(112, live).unwrap();
+        (a, extent(96, 4))
+    }
+
+    #[test]
+    fn clearing_a_region_lets_a_large_extent_move_down() {
+        let (mut a, big) = fragmented();
+        assert!(a.clone().alloc_lowest(4).is_none_or(|t| t.page > big.page));
+        let (region, occupants) = a.clear_for(big, &|_| true, 16, 512).unwrap();
+        // 32..48 could be cleared too, but 48..64 moves less: the SST at 48 and the manifest
+        // log at 52, into the holes at 41 and 4..8.
+        assert_eq!(region, extent(48, 4));
+        assert_eq!(occupants, vec![extent(52, 2), extent(48, 0)]);
+        a.check();
+        // Both move into the lowest hole that fits: below 48.
+        let log = a.alloc_lowest(2).unwrap();
+        let sst = a.alloc_lowest(0).unwrap();
+        assert!(
+            log.page < 48 * UNIT_PAGES && sst.page < 48 * UNIT_PAGES,
+            "{log:?} {sst:?}"
+        );
+        // Published at load: the moves' commit retires the occupants; until a reclaim frees
+        // them, the region cannot be taken.
+        for o in &occupants {
+            assert!(a.retire(*o, 1));
+        }
+        assert_eq!(a.claim_region(region), None);
+        a.check();
+        // Reclaimed, they stay held: a flush between the reclaim and the large move
+        // allocates elsewhere (here, everything left below the file's end).
+        a.reclaim(u64::MAX);
+        a.check();
+        while let Some(e) = a.alloc_free(0) {
+            assert!(
+                !(48 * UNIT_PAGES..64 * UNIT_PAGES).contains(&e.page),
+                "{e:?}"
+            );
+        }
+        assert_eq!(a.claim_region(region), Some(extent(48, 4)));
+        assert_eq!(a.claim_region(region), None, "taken");
+        a.check();
+    }
+
+    #[test]
+    fn a_released_region_is_free_space_again() {
+        let (mut a, big) = fragmented();
+        let used = a.used_units;
+        let (region, occupants) = a.clear_for(big, &|_| true, 16, 512).unwrap();
+        assert!(a.used_units > used, "held");
+        // Placeholders are not extents to move.
+        assert!(a.shrink_plan().iter().all(|e| e.page >= 64 * UNIT_PAGES));
+        for o in &occupants {
+            assert!(a.retire(*o, 1));
+        }
+        a.reclaim(u64::MAX);
+        assert!(a.release_region(region));
+        assert!(!a.release_region(region), "no longer held");
+        a.check();
+        // The occupants (retired, then reclaimed) and the held space are all free.
+        assert_eq!(a.used_units, used - 5);
+        assert_eq!(a.alloc_lowest(4), Some(extent(48, 4)));
+    }
+
+    #[test]
+    fn a_region_with_an_occupant_that_cannot_move_is_skipped() {
+        let (mut a, big) = fragmented();
+        // The SST at 48 is pinned: 32..48 is cleared instead, moving more.
+        let pinned = extent(48, 0);
+        let (region, occupants) = a.clear_for(big, &|e| e != pinned, 16, 512).unwrap();
+        assert_eq!(region, extent(32, 4));
+        assert_eq!(occupants.len(), 8, "{occupants:?}");
+        a.check();
+        // With the manifest snapshot at 39 pinned too, no region can be cleared.
+        let (mut a, big) = fragmented();
+        let used = a.used_units;
+        let pinned = [extent(48, 0), extent(39, 0)];
+        assert!(
+            a.clear_for(big, &|e| !pinned.contains(&e), 16, 512)
+                .is_none()
+        );
+        assert_eq!(a.used_units, used, "nothing reserved");
+        a.check();
+        // Nor when the scan stops before the regions that qualify.
+        let (mut a, big) = fragmented();
+        assert!(a.clear_for(big, &|_| true, 16, 1).is_none());
+        a.check();
     }
 
     #[test]

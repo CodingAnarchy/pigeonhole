@@ -239,12 +239,14 @@ impl ManifestWriter {
             &mut block,
         );
         // Running out of space here leaves the writer usable; any other allocation failure
-        // (a failed growth sync poisoned the pager) or a failed write poisons it.
+        // (a failed growth sync poisoned the pager) or a failed write poisons it. Lowest
+        // first: the manifest settles low in the file, and `shrink` counts on a rewrite to
+        // move it into the lowest hole that fits (#314).
         let allocated = self
             .pager
-            .allocate(block.len() as u64)
+            .allocate_lowest(block.len() as u64)
             .and_then(
-                |snapshot| match self.pager.allocate(LOG_EXTENT_LEN as u64) {
+                |snapshot| match self.pager.allocate_lowest(LOG_EXTENT_LEN as u64) {
                     Ok(log) => Ok((snapshot, log)),
                     Err(e) => {
                         self.pager.abandon(snapshot);

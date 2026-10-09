@@ -17,16 +17,18 @@
 //! differ in what they may block on:
 //!
 //! - [`Pager::allocate`], [`Pager::abandon`], [`Pager::retire`], [`Pager::reclaim`],
-//!   [`Pager::stats`] and [`Pager::shrink_plan`] only touch memory, except that `allocate`
-//!   preallocates more file (one `fallocate` of at most 64 MiB, under the allocator lock)
-//!   when no free extent fits. They run per flush or compaction output, never per write.
+//!   [`Pager::stats`], [`Pager::shrink_plan`] and [`Pager::clear_for`] only touch
+//!   memory, except that `allocate` preallocates more file (one `fallocate` of at most
+//!   64 MiB, under the allocator lock) when no free extent fits. They run per flush or
+//!   compaction output, never per write.
 //! - [`Pager::read`] and [`Pager::write`] are positional I/O on the caller's thread.
 //! - [`Pager::commit_root`] and [`Pager::mark_clean`] block on two fsyncs. They must not run
 //!   on a shard's foreground loop (decision D30): the manifest task uses
 //!   [`Pager::submit_commit_root`], whose fsyncs run on the I/O backend. Root commits must
 //!   not overlap; an overlapping commit fails instead of racing.
-//! - [`Pager::relocate`] and [`Pager::truncate_tail`] copy or truncate on the caller's thread
-//!   (online shrink is a background job).
+//! - [`Pager::relocate`], [`Pager::relocate_below`], [`Pager::relocate_into`] and
+//!   [`Pager::truncate_tail`] copy or truncate on the caller's thread (online shrink is a
+//!   background job).
 //!
 //! # Example
 //!
@@ -76,6 +78,16 @@ use pigeonhole_format::{FormatVersion, ManifestVersion, PAGE_SIZE};
 use pigeonhole_io::{Completion, ErrorKind, FileRef, OpenOptions, VfsRef};
 
 use crate::alloc::{Alloc, LoadError, UNIT_BYTES, UNIT_PAGES};
+
+/// A region [`Pager::clear_for`] holds for a larger extent, and the live extents to move
+/// out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clearing {
+    /// The region, as an extent of the class it is cleared for.
+    pub region: Extent,
+    /// The region's live extents, largest first.
+    pub occupants: Vec<Extent>,
+}
 
 /// An allocated extent: `64 KiB << size_class` bytes at `page`. The persisted form.
 pub use pigeonhole_format::superblock::ExtentRef as Extent;
@@ -628,6 +640,18 @@ impl Pager {
     /// Allocates the smallest extent of at least `bytes` (64 KiB minimum), growing the file
     /// if needed. Never returns an extent that is allocated or awaiting reclamation.
     pub fn allocate(&self, bytes: u64) -> Result<Extent> {
+        self.allocate_from(bytes, false)
+    }
+
+    /// As [`Pager::allocate`], from the lowest-addressed free block that fits whatever its
+    /// size (splitting a larger one) rather than the smallest free class. The manifest's
+    /// snapshot rewrites use it, so the manifest settles low in the file instead of in
+    /// whichever small hole is free, which `shrink` relies on to move it out of the way.
+    pub fn allocate_lowest(&self, bytes: u64) -> Result<Extent> {
+        self.allocate_from(bytes, true)
+    }
+
+    fn allocate_from(&self, bytes: u64, lowest: bool) -> Result<Extent> {
         let class = class_for(bytes)?;
         if !self.inner.writable {
             return Err(io_err(
@@ -636,7 +660,12 @@ impl Pager {
             ));
         }
         let mut alloc = lock(&self.inner.alloc);
-        if let Some(e) = alloc.alloc_free(class) {
+        let free = if lowest {
+            alloc.alloc_lowest(class)
+        } else {
+            alloc.alloc_free(class)
+        };
+        if let Some(e) = free {
             return Ok(e);
         }
         // The allocator lock is held across this one `fallocate` and `sync_all` (at most
@@ -801,6 +830,67 @@ impl Pager {
         lock(&self.inner.alloc).shrink_plan()
     }
 
+    /// Makes room for `big`, a live extent that [`Pager::relocate`] cannot move because
+    /// small extents fragment every aligned hole of its class below it (#314).
+    ///
+    /// Picks a region of `big`'s class below it whose occupants are all live, smaller and
+    /// `movable`, and can each be relocated outside the region and below `big` (by
+    /// [`Pager::relocate_below`], or for the manifest's, a snapshot rewrite's
+    /// [`Pager::allocate_lowest`]: both take the lowest free block); of the first few such
+    /// regions (among the lowest few hundred), the one with the least to move.
+    ///
+    /// The region is then held: its free space, and the occupants' old extents once they
+    /// are reclaimed, stay unallocatable (placeholders, never published, so free again at
+    /// the next open). The caller moves the occupants out (`big` as the limit), publishes
+    /// the moves and, once their old extents are reclaimed, moves `big` in with
+    /// [`Pager::relocate_into`]; or gives up with [`Pager::release_region`]. `None` if no
+    /// region qualifies; nothing is held then.
+    pub fn clear_for(&self, big: Extent, movable: impl Fn(Extent) -> bool) -> Option<Clearing> {
+        /// Candidate regions tried, and regions looked at, per call.
+        const TRIES: usize = 16;
+        const SCAN: usize = 512;
+        let (region, occupants) = lock(&self.inner.alloc).clear_for(big, &movable, TRIES, SCAN)?;
+        Some(Clearing { region, occupants })
+    }
+
+    /// Stops holding a region [`Pager::clear_for`] cleared: what it held becomes free
+    /// space. Returns false if it was not held (taken by [`Pager::relocate_into`]).
+    pub fn release_region(&self, region: Extent) -> bool {
+        lock(&self.inner.alloc).release_region(region)
+    }
+
+    /// Copies `extent` into the held `region` ([`Pager::clear_for`]), which it takes whole,
+    /// and returns the copy, as [`Pager::relocate`] does; the region is no longer held.
+    /// Fails with [`Error::NoSpace`], changing nothing, while anything but held free space
+    /// is still inside it (an occupant's old extent not reclaimed yet), and with
+    /// [`Error::Io`] if `extent` is not live.
+    pub fn relocate_into(&self, extent: Extent, region: Extent) -> Result<Extent> {
+        if !self.inner.writable {
+            return Err(io_err(
+                ErrorKind::Unsupported,
+                "relocate on a read-only pager",
+            ));
+        }
+        let target = {
+            let mut alloc = lock(&self.inner.alloc);
+            if !alloc.is_live(extent) {
+                return Err(io_err(
+                    ErrorKind::Other,
+                    "relocate of an extent that is not live (unallocated or retired)",
+                ));
+            }
+            if region.size_class != extent.size_class || region.page >= extent.page {
+                return Err(Error::NoSpace);
+            }
+            alloc.claim_region(region).ok_or(Error::NoSpace)?
+        };
+        if let Err(e) = self.copy_extent(extent, target) {
+            self.abandon(target);
+            return Err(e);
+        }
+        Ok(target)
+    }
+
     /// Whether `extent` is exactly an allocated extent that is not retired. A caller that
     /// read the manifest earlier uses it to tell an extent retired since (a compaction
     /// replaced it) from a failure, for example after [`Pager::relocate`] refuses.
@@ -814,6 +904,13 @@ impl Pager {
     /// Fails with [`Error::NoSpace`] if no free extent of that size lies below `extent`, and
     /// with [`Error::Io`] if `extent` is not live (see [`Pager::is_live`]).
     pub fn relocate(&self, extent: Extent) -> Result<Extent> {
+        self.relocate_below(extent, extent)
+    }
+
+    /// As [`Pager::relocate`], into the lowest free extent that lies below `limit` rather
+    /// than below `extent` itself: an occupant of a region [`Pager::clear_for`] reserved may
+    /// move up, as long as it stays below the extent the region is cleared for.
+    pub fn relocate_below(&self, extent: Extent, limit: Extent) -> Result<Extent> {
         if !self.inner.writable {
             return Err(io_err(
                 ErrorKind::Unsupported,
@@ -829,7 +926,7 @@ impl Pager {
                 ));
             }
             match alloc.alloc_lowest(extent.size_class) {
-                Some(t) if t.page < extent.page => t,
+                Some(t) if t.page < limit.page => t,
                 Some(t) => {
                     alloc.release_live(t);
                     return Err(Error::NoSpace);
