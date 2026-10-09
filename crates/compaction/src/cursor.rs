@@ -66,7 +66,7 @@ impl<C: Cursor> MergingCursor<C> {
     }
 
     fn less(&self, a: usize, b: usize) -> bool {
-        match self.sources[a].key().cmp(self.sources[b].key()) {
+        match cmp_keys(self.sources[a].key(), self.sources[b].key()) {
             std::cmp::Ordering::Less => true,
             std::cmp::Ordering::Equal => a < b,
             std::cmp::Ordering::Greater => false,
@@ -116,6 +116,30 @@ impl<C: Cursor> MergingCursor<C> {
             _ => 1 + usize::from(self.less(self.heap[2], self.heap[1])),
         };
     }
+}
+
+/// Byte-wise comparison of two keys, as `<[u8]>::cmp`, inline: eight bytes at a time as
+/// big-endian words, then the tail byte by byte. Internal keys are short (a column prefix and
+/// a 17-byte suffix), so a library `memcmp` call costs more than the comparison; two keys of
+/// one column agree on their prefix words and differ in the timestamp and seqno words.
+#[inline]
+fn cmp_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let n = a.len().min(b.len());
+    let (mut x, mut y) = (&a[..n], &b[..n]);
+    while let (Some((p, xs)), Some((q, ys))) =
+        (x.split_first_chunk::<8>(), y.split_first_chunk::<8>())
+    {
+        if p != q {
+            return u64::from_be_bytes(*p).cmp(&u64::from_be_bytes(*q));
+        }
+        (x, y) = (xs, ys);
+    }
+    for (p, q) in x.iter().zip(y) {
+        if p != q {
+            return p.cmp(q);
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 impl<C: Cursor> Cursor for MergingCursor<C> {
@@ -380,5 +404,39 @@ impl Cursor for VecCursor {
             self.pos += 1;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cmp_keys;
+    use proptest::prelude::*;
+
+    /// Two slices from a small alphabet that often share a long prefix (as two keys of one
+    /// column do) and differ in length.
+    fn pair() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
+        (
+            prop::collection::vec(0u8..3, 0..40),
+            prop::collection::vec(0u8..3, 0..20),
+            prop::collection::vec(0u8..3, 0..20),
+        )
+            .prop_map(|(shared, a, b)| {
+                let mut x = shared.clone();
+                x.extend(a);
+                let mut y = shared;
+                y.extend(b);
+                (x, y)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(5_000))]
+
+        #[test]
+        fn cmp_keys_is_byte_order((a, b) in pair()) {
+            prop_assert_eq!(cmp_keys(&a, &b), a.cmp(&b));
+            prop_assert_eq!(cmp_keys(&b, &a), b.cmp(&a));
+            prop_assert_eq!(cmp_keys(&a, &a), std::cmp::Ordering::Equal);
+        }
     }
 }
