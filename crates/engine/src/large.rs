@@ -234,6 +234,11 @@ pub(crate) fn separate(
     limit: usize,
 ) -> Result<(BatchBuilder, Option<LargeValues>)> {
     let batch = builder.batch();
+    // A value is no longer than the batch holding it: a batch within the limit has nothing
+    // to separate, and no value too large for one (most commits stop here, undecoded).
+    if batch.as_bytes().len() <= limit {
+        return Ok((builder, None));
+    }
     let mut large = false;
     for m in batch.iter() {
         let m = m?;

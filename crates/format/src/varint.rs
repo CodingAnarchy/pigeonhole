@@ -25,7 +25,19 @@ pub fn put_u64(out: &mut Vec<u8>, mut v: u64) {
 
 /// Decodes a varint from the front of `input`; returns the value and the bytes consumed.
 /// Only the canonical (shortest) encoding is accepted, so every value has one encoding.
+#[inline]
 pub fn get_u64(input: &[u8]) -> crate::Result<(u64, usize)> {
+    // One byte (a value below 128): most lengths and counts, decoded inline.
+    if let Some(&b) = input.first()
+        && b < 0x80
+    {
+        return Ok((u64::from(b), 1));
+    }
+    get_u64_long(input)
+}
+
+/// [`get_u64`] past its one-byte case.
+fn get_u64_long(input: &[u8]) -> crate::Result<(u64, usize)> {
     let mut v = 0u64;
     for (i, &b) in input.iter().take(MAX_VARINT_LEN).enumerate() {
         // The tenth byte may only carry the top bit of a u64.
@@ -62,6 +74,7 @@ pub fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Decodes a varint-length-prefixed byte string; returns it and the bytes consumed.
+#[inline]
 pub fn get_bytes(input: &[u8]) -> crate::Result<(&[u8], usize)> {
     let (len, n) = get_u64(input)?;
     let rest = &input[n..];
