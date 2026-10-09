@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use common::*;
 use pigeonhole_compaction::{
-    CellResolver, Error, FilteredCursor, I64Add, MergeOperator, MergingCursor, ResolveOptions,
-    ValuePredicate, VecCursor,
+    CellResolver, Error, FilteredCursor, I64Add, MergeBuffers, MergeOperator, MergingCursor,
+    ResolveOptions, ResolverBuffers, ValuePredicate, VecCursor,
 };
 use pigeonhole_format::key::{Kind, encode_key, encode_marker_key};
 use pigeonhole_format::scan::ScanFilter;
@@ -371,5 +371,71 @@ fn a_column_with_many_versions_is_skipped_by_seeking() {
             }
         }
         assert_eq!(got, want, "versions {versions}");
+    }
+}
+
+/// A resolved cell: key, timestamp and stored value.
+type Resolved = (Vec<u8>, Timestamp, Vec<u8>);
+
+/// Every cell `r` returns; `None` on a merge error.
+fn cells<C: Cursor<Error = Error>>(r: &mut CellResolver<C>) -> Option<Vec<Resolved>> {
+    let mut out = Vec::new();
+    loop {
+        match r.next_cell() {
+            Ok(Some(c)) => out.push((c.key.to_vec(), c.ts, c.value.to_vec())),
+            Ok(None) => return Some(out),
+            Err(Error::Merge(_)) => return None,
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+}
+
+#[test]
+fn a_reused_resolver_reads_as_a_new_one() {
+    // `MergingCursor::reuse` and `CellResolver::reuse` (#46): one set of buffers carried
+    // through point gets and row reads of random histories, each read compared with a
+    // resolver built by `new`. Whatever a read leaves in the buffers must not change the
+    // next one.
+    let mut merge: MergeBuffers<VecCursor> = MergeBuffers::default();
+    let mut scratch = ResolverBuffers::default();
+    for seed in 0..if cfg!(miri) { 2 } else { 24 } {
+        let h = random_history(seed, commits(40));
+        let snapshot = h.model.snapshot().max(1);
+        let now = h.last_ts + 50;
+        // Two sources take the merging cursor's two-way path (#335), three the heap.
+        for (versions, n) in [(1, 2), (1, 3), (0, 2), (2, 3)] {
+            for row in ROWS {
+                for (point, q) in QUALS.iter().map(|q| (true, *q)).chain([(false, &b""[..])]) {
+                    let sources = || vec_sources(&h.entries, n, &mut Rng::new(seed));
+                    let read = |r: &mut CellResolver<MergingCursor<VecCursor>>| {
+                        if point {
+                            r.seek_column(row, q).unwrap();
+                        } else {
+                            r.set_upper_bound(Some(&row_end(row)));
+                            r.seek(&row_prefix(row)).unwrap();
+                        }
+                        cells(r)
+                    };
+                    let mut fresh = CellResolver::new(
+                        MergingCursor::new(sources()),
+                        options(&h, snapshot, now, versions),
+                    );
+                    let want = read(&mut fresh);
+                    let mut reused = CellResolver::reuse(
+                        MergingCursor::reuse(sources(), merge),
+                        options(&h, snapshot, now, versions),
+                        scratch,
+                    );
+                    let got = read(&mut reused);
+                    assert_eq!(
+                        got, want,
+                        "seed {seed}, versions {versions}, {n} sources, row {row:?}, point {point} {q:?}"
+                    );
+                    let (cursor, buffers) = reused.into_parts();
+                    scratch = buffers;
+                    merge = cursor.into_buffers();
+                }
+            }
+        }
     }
 }

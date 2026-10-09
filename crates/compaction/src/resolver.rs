@@ -538,6 +538,61 @@ where
         self.cursor
     }
 
+    /// As [`CellResolver::new`], starting from `buffers`' allocations: the state is that of a
+    /// new resolver.
+    pub fn reuse(cursor: C, options: ResolveOptions, buffers: ResolverBuffers) -> Self {
+        let mut r = Self::new(cursor, options);
+        let ResolverBuffers {
+            row,
+            markers,
+            col,
+            run_key,
+            run_acc,
+            g_acc,
+            g_key,
+            base_key,
+            base_val,
+            out_key,
+            out_val,
+            past_col,
+        } = buffers;
+        // Cleared when they were taken out (`into_parts`), as `new`'s are empty.
+        r.row = row;
+        r.markers = markers;
+        r.col = col;
+        r.run_key = run_key;
+        r.run_acc = run_acc;
+        r.g_acc = g_acc;
+        r.g_key = g_key;
+        r.base_key = base_key;
+        r.base_val = base_val;
+        r.out_key = out_key;
+        r.out_val = out_val;
+        r.past_col = past_col;
+        r
+    }
+
+    /// The cursor, and the resolver's allocations cleared for the next
+    /// [`CellResolver::reuse`].
+    pub fn into_parts(self) -> (C, ResolverBuffers) {
+        let mut buffers = ResolverBuffers {
+            row: self.row,
+            markers: self.markers,
+            col: self.col,
+            run_key: self.run_key,
+            run_acc: self.run_acc,
+            g_acc: self.g_acc,
+            g_key: self.g_key,
+            base_key: self.base_key,
+            base_val: self.base_val,
+            out_key: self.out_key,
+            out_val: self.out_val,
+            past_col: self.past_col,
+        };
+        buffers.clear();
+        (self.cursor, buffers)
+    }
+
     fn expired(&self, ts: Timestamp) -> bool {
         self.opts.ttl_micros != 0 && ts.saturating_add(self.opts.ttl_micros) <= self.opts.now
     }
@@ -915,6 +970,42 @@ where
             self.col_skip = true;
         }
         true
+    }
+}
+
+/// The allocations a [`CellResolver`] keeps between uses: its key, value and marker scratch,
+/// each cleared ([`CellResolver::reuse`], [`CellResolver::into_parts`]). A caller that
+/// resolves many times (a point get per call) keeps one and allocates nothing for it.
+#[derive(Debug, Default)]
+pub struct ResolverBuffers {
+    row: Vec<u8>,
+    markers: Vec<(Timestamp, Seqno)>,
+    col: Vec<u8>,
+    run_key: Vec<u8>,
+    run_acc: Vec<u8>,
+    g_acc: Vec<u8>,
+    g_key: Vec<u8>,
+    base_key: Vec<u8>,
+    base_val: Vec<u8>,
+    out_key: Vec<u8>,
+    out_val: Vec<u8>,
+    past_col: Vec<u8>,
+}
+
+impl ResolverBuffers {
+    fn clear(&mut self) {
+        self.row.clear();
+        self.markers.clear();
+        self.col.clear();
+        self.run_key.clear();
+        self.run_acc.clear();
+        self.g_acc.clear();
+        self.g_key.clear();
+        self.base_key.clear();
+        self.base_val.clear();
+        self.out_key.clear();
+        self.out_val.clear();
+        self.past_col.clear();
     }
 }
 

@@ -2,11 +2,13 @@
 //! `pigeonhole-compaction`'s `CellResolver` (snapshot visibility, deletes, TTL, versions,
 //! filters, merge folding) over a `MergingCursor` of the engine's [`Source`]s.
 
+use std::cell::RefCell;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_compaction::{
-    BlobFetch, MergingCursor, ResolveOptions, ResolvedCell, ValuePredicate, blob_pointer,
+    BlobFetch, MergeBuffers, MergingCursor, ResolveOptions, ResolvedCell, ResolverBuffers,
+    ValuePredicate, blob_pointer,
 };
 use pigeonhole_format::key::{
     Escaped, Kind, SUFFIX_LEN, TERMINATOR, decode_key, encode_row_prefix, row_prefix_len,
@@ -1007,9 +1009,79 @@ pub(crate) fn read_row_into(
     Ok(any)
 }
 
+/// The allocations point gets reuse, one set per reading thread (#46): the sources, the
+/// merging cursor's heap and the resolver's scratch. Taken for a get and put back after, so
+/// a get nested in another on the same thread (none today) just starts empty.
+#[derive(Default)]
+struct PointBuffers {
+    sources: Vec<Source>,
+    merge: MergeBuffers<Source>,
+    resolver: ResolverBuffers,
+}
+
+thread_local! {
+    static POINT_BUFFERS: RefCell<Option<PointBuffers>> = const { RefCell::new(None) };
+}
+
+/// A point get returning a longer value drops the resolver's buffers instead of keeping
+/// them for the next get on its thread.
+const KEEP_BUFFERS_BELOW: usize = 64 << 10;
+
 /// A point get through `view` at `seqno`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_in(
+    view: &View,
+    seqno: Seqno,
+    now: Timestamp,
+    table: TableId,
+    family: FamilyId,
+    row: &[u8],
+    qualifier: &[u8],
+    pin: impl FnOnce() -> Arc<View>,
+) -> Result<Option<CellData>> {
+    let mut buffers = POINT_BUFFERS
+        .try_with(|b| b.borrow_mut().take())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let got = get_with(
+        &mut buffers,
+        view,
+        seqno,
+        now,
+        table,
+        family,
+        row,
+        qualifier,
+        pin,
+    );
+    // Every source was dropped (a source pins its memtable or SST): only the allocations
+    // are kept.
+    debug_assert!(buffers.sources.is_empty());
+    buffers.sources.clear();
+    // A large result may have been folded in the resolver's buffers (merge operands are
+    // copied whatever their size): not worth keeping that much per thread.
+    if got.as_ref().is_ok_and(|c| {
+        c.as_ref()
+            .is_some_and(|c| c.stored().len() > KEEP_BUFFERS_BELOW)
+    }) {
+        buffers.resolver = ResolverBuffers::default();
+    }
+    let _ = POINT_BUFFERS.try_with(|b| *b.borrow_mut() = Some(buffers));
+    got
+}
+
+/// How a point get's resolution ended.
+enum Resolved {
+    Done(Option<CellData>),
+    /// A large put the resolver copied: re-found by its key (in the caller's buffers) and
+    /// pinned, at this timestamp.
+    Refind(Timestamp),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn get_with(
+    buffers: &mut PointBuffers,
     view: &View,
     seqno: Seqno,
     now: Timestamp,
@@ -1028,9 +1100,10 @@ pub(crate) fn get_in(
     if meta.table != table {
         return Err(Error::FamilyNotFound(format!("family {}", family.0)));
     }
-    let sources = view.point_sources(shard, tablet, family, row, qualifier)?;
-    if sources.is_empty() {
-        return Ok(None);
+    let filled = view.point_sources(shard, tablet, family, row, qualifier, &mut buffers.sources);
+    if filled.is_err() || buffers.sources.is_empty() {
+        buffers.sources.clear();
+        return filled.map(|()| None);
     }
     let (mut opts, _) = ReadSpec {
         versions: 1,
@@ -1038,63 +1111,113 @@ pub(crate) fn get_in(
     }
     .resolve_opts(meta, seqno, now);
     let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
-    let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
-    resolver.seek_column(row, qualifier)?;
-    // A value above the inline threshold is pinned, not copied (D29). The resolver copies
-    // values up to its own limit while it reads the group; a copy of a put (the output key
-    // names exactly that entry; a fold's key is an operand's) is re-found with one seek and
-    // pinned, so the pinned bytes are the version itself.
+    let cursor = MergingCursor::reuse(
+        buffers.sources.drain(..),
+        std::mem::take(&mut buffers.merge),
+    );
+    let mut resolver = Resolver::reuse(cursor, opts, std::mem::take(&mut buffers.resolver));
     let mut key_buf = [0u8; 512];
     let mut key_vec: Vec<u8> = Vec::new();
     let mut key_len = 0;
+    let mut pin = Some(pin);
+    let resolved = resolve_point(
+        &mut resolver,
+        view,
+        meta,
+        resolver_blobs.as_ref(),
+        row,
+        qualifier,
+        (&mut key_buf, &mut key_vec, &mut key_len),
+        &mut pin,
+    );
+    let (mut cursor, resolver_buffers) = resolver.into_parts();
+    buffers.resolver = resolver_buffers;
+    let got = match resolved {
+        Ok(Resolved::Done(cell)) => Ok(cell),
+        Err(e) => Err(e),
+        Ok(Resolved::Refind(ts)) => {
+            let key: &[u8] = if key_vec.is_empty() {
+                &key_buf[..key_len]
+            } else {
+                &key_vec
+            };
+            match cursor.seek(key) {
+                Err(e) => Err(e),
+                Ok(()) if cursor.valid() && cursor.key() == key => match cursor.current() {
+                    Some(src) => {
+                        let value = LaneValue::Pinned(src.pin_value());
+                        let pin = pin.take().expect("not used yet");
+                        Ok(Some(CellData::from_pinned(ts, &value, pin)))
+                    }
+                    None => Err(missing_entry()),
+                },
+                Ok(()) => Err(missing_entry()),
+            }
+        }
+    };
+    buffers.merge = cursor.into_buffers();
+    got
+}
+
+fn missing_entry() -> Error {
+    Error::Corruption("point get: a resolved entry is not in its sources".into())
+}
+
+/// Resolves a point get's column. A value above the inline threshold is pinned, not copied
+/// (D29). The resolver copies values up to its own limit while it reads the group; a copy of
+/// a put (the output key names exactly that entry; a fold's key is an operand's) is re-found
+/// with one seek and pinned, so the pinned bytes are the version itself: its key goes to
+/// `key` and the caller seeks.
+#[allow(clippy::too_many_arguments)]
+fn resolve_point<P: FnOnce() -> Arc<View>>(
+    resolver: &mut Resolver,
+    view: &View,
+    meta: &FamilyMeta,
+    resolver_blobs: Option<&Arc<ResolverBlobs>>,
+    row: &[u8],
+    qualifier: &[u8],
+    key: (&mut [u8; 512], &mut Vec<u8>, &mut usize),
+    pin: &mut Option<P>,
+) -> Result<Resolved> {
+    let (key_buf, key_vec, key_len) = key;
+    resolver.seek_column(row, qualifier)?;
     let (ts, refind) = {
         let next = resolver.next_cell();
-        ResolverBlobs::check(resolver_blobs.as_ref())?;
+        ResolverBlobs::check(resolver_blobs)?;
         let Some(cell) = next.map_err(|e| read_error(e, meta))? else {
-            return Ok(None);
+            return Ok(Resolved::Done(None));
         };
         if cell.value.len() <= CellData::INLINE_MAX {
-            return Ok(Some(CellData::resolved(&cell, &view.ssts, pin)?));
+            let pin = pin.take().expect("not used yet");
+            return Ok(Resolved::Done(Some(CellData::resolved(
+                &cell, &view.ssts, pin,
+            )?)));
         }
         if cell.from_source {
             (cell.ts, false)
         } else if decode_key(cell.key).is_ok_and(|k| k.kind == Kind::Put) {
-            key_len = cell.key.len();
-            if key_len <= key_buf.len() {
-                key_buf[..key_len].copy_from_slice(cell.key);
+            *key_len = cell.key.len();
+            if *key_len <= key_buf.len() {
+                key_buf[..*key_len].copy_from_slice(cell.key);
             } else {
                 key_vec.extend_from_slice(cell.key);
             }
             (cell.ts, true)
         } else {
-            return Ok(Some(CellData::from_cell(&cell, None, pin)));
+            let pin = pin.take().expect("not used yet");
+            return Ok(Resolved::Done(Some(CellData::from_cell(&cell, None, pin))));
         }
     };
-    if !refind {
-        let src = resolver
-            .cursor()
-            .current()
-            .expect("the merged cursor is on the returned entry");
-        let value = LaneValue::Pinned(src.pin_value());
-        return Ok(Some(CellData::from_pinned(ts, &value, pin)));
+    if refind {
+        return Ok(Resolved::Refind(ts));
     }
-    let key: &[u8] = if key_vec.is_empty() {
-        &key_buf[..key_len]
-    } else {
-        &key_vec
-    };
-    let mut cursor = resolver.into_cursor();
-    cursor.seek(key)?;
-    if cursor.valid()
-        && cursor.key() == key
-        && let Some(src) = cursor.current()
-    {
-        let value = LaneValue::Pinned(src.pin_value());
-        return Ok(Some(CellData::from_pinned(ts, &value, pin)));
-    }
-    Err(Error::Corruption(
-        "point get: a resolved entry is not in its sources".into(),
-    ))
+    let src = resolver
+        .cursor()
+        .current()
+        .expect("the merged cursor is on the returned entry");
+    let value = LaneValue::Pinned(src.pin_value());
+    let pin = pin.take().expect("not used yet");
+    Ok(Resolved::Done(Some(CellData::from_pinned(ts, &value, pin))))
 }
 
 /// Whether a stored value satisfies a predicate (decision D77).

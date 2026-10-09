@@ -534,11 +534,11 @@ fn maintenance(out: &mut Vec<Row>) {
 /// Measured on macOS, where a `std` lock allocates on first use; Linux counts one fewer per
 /// commit, so these are upper bounds there.
 const BUDGETS: &[(&str, &str, f64)] = &[
-    ("get, memtable (snapshot)", "get", 9.0),
-    ("get_latest, memtable", "get", 9.0),
-    ("get_latest, memtable miss", "get", 7.0),
-    ("get_latest, SST, block cached", "get", 8.0),
-    ("get, SST, block cached (snapshot)", "get", 8.0),
+    ("get, memtable (snapshot)", "get", 1.0),
+    ("get_latest, memtable", "get", 1.0),
+    ("get_latest, memtable miss", "get", 1.0),
+    ("get_latest, SST, block cached", "get", 1.0),
+    ("get, SST, block cached (snapshot)", "get", 1.0),
     ("read_row, memtable", "row", 15.0),
     ("read_row, memtable", "extra cell", 0.5),
     ("read_row, SST, cached", "row", 16.0),
@@ -555,12 +555,12 @@ const BUDGETS: &[(&str, &str, f64)] = &[
 ];
 
 /// Bytes allocated per unit allowed, where the bytes are what a change cut (#46: a point
-/// get's sources were sized for four, about 4 KiB).
+/// get's sources were sized for four, about 4 KiB; it now reuses its thread's buffers).
 const BYTE_BUDGETS: &[(&str, &str, f64)] = &[
-    ("get, memtable (snapshot)", "get", 1_400.0),
-    ("get_latest, memtable", "get", 1_400.0),
-    ("get_latest, memtable miss", "get", 1_250.0),
-    ("get_latest, SST, block cached", "get", 2_300.0),
+    ("get, memtable (snapshot)", "get", 256.0),
+    ("get_latest, memtable", "get", 256.0),
+    ("get_latest, memtable miss", "get", 256.0),
+    ("get_latest, SST, block cached", "get", 256.0),
 ];
 
 /// Bytes allocated per value byte allowed: a large put (separated at commit) and a row read

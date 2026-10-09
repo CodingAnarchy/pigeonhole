@@ -42,7 +42,77 @@ pub struct MergingCursor<C> {
     runner: usize,
 }
 
+/// The allocations a [`MergingCursor`] keeps between uses: its source vector (emptied), heap
+/// and row scratch ([`MergingCursor::reuse`], [`MergingCursor::into_buffers`]). A caller that
+/// merges many times (a point get per call) keeps one and allocates nothing for the merge.
+#[derive(Debug)]
+pub struct MergeBuffers<C> {
+    sources: Vec<C>,
+    heap: Vec<usize>,
+    row: Vec<u8>,
+}
+
+impl<C> Default for MergeBuffers<C> {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            heap: Vec::new(),
+            row: Vec::new(),
+        }
+    }
+}
+
 impl<C: Cursor> MergingCursor<C> {
+    /// As [`MergingCursor::new`], with `sources` placed in `buffers`' allocations.
+    ///
+    /// ```
+    /// use pigeonhole_compaction::{MergeBuffers, MergingCursor, VecCursor};
+    /// use pigeonhole_format::Cursor;
+    ///
+    /// let mut buffers = MergeBuffers::default();
+    /// for _ in 0..2 {
+    ///     let a = VecCursor::new(vec![(b"a".to_vec(), b"1".to_vec())]);
+    ///     let b = VecCursor::new(vec![(b"b".to_vec(), b"2".to_vec())]);
+    ///     let mut m = MergingCursor::reuse([a, b], buffers);
+    ///     m.seek_to_first().unwrap();
+    ///     assert_eq!(m.key(), b"a");
+    ///     buffers = m.into_buffers();
+    /// }
+    /// ```
+    pub fn reuse(sources: impl IntoIterator<Item = C>, buffers: MergeBuffers<C>) -> Self {
+        let MergeBuffers {
+            sources: mut list,
+            mut heap,
+            mut row,
+        } = buffers;
+        list.clear();
+        list.extend(sources);
+        heap.clear();
+        heap.reserve(list.len());
+        row.clear();
+        Self {
+            sources: list,
+            heap,
+            row,
+            runner: 0,
+        }
+    }
+
+    /// Drops the sources and returns the emptied allocations for the next
+    /// [`MergingCursor::reuse`].
+    pub fn into_buffers(self) -> MergeBuffers<C> {
+        let Self {
+            mut sources,
+            mut heap,
+            mut row,
+            runner: _,
+        } = self;
+        sources.clear();
+        heap.clear();
+        row.clear();
+        MergeBuffers { sources, heap, row }
+    }
+
     /// Merges `sources`.
     pub fn new(sources: Vec<C>) -> Self {
         let heap = Vec::with_capacity(sources.len());

@@ -355,24 +355,26 @@ impl View {
         family: FamilyId,
         row: &[u8],
         qualifier: &[u8],
-    ) -> Result<Vec<Source>> {
+        out: &mut Vec<Source>,
+    ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
-        // Sized for the memtables and a couple of SSTs: a source is about 1 KiB, and a
-        // `Vec` grown from empty would hold four (#46).
+        // Room for the memtables and a couple of SSTs: a source is about 1 KiB, and a `Vec`
+        // grown from empty would hold four (#46). `out` is normally a reused buffer that
+        // already has it.
         let mems = l.mems.map_or(0, |set| set.readers.len());
         let ssts = l.ssts.map_or(0, |fam| fam.iter().take(2).count());
-        let mut out = Vec::with_capacity(mems + ssts);
+        out.reserve(mems + ssts);
         let all = ScanFilter::all();
         if let Some(set) = l.mems {
-            mem_sources(set, &all, &mut out);
+            mem_sources(set, &all, out);
         }
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
             let probe = Probe::new(row, qualifier)?;
-            sst_sources_point(fam, &self.ssts, &probe, l.priority, &mut out)?;
+            sst_sources_point(fam, &self.ssts, &probe, l.priority, out)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Sources for reading one row, newest first.
