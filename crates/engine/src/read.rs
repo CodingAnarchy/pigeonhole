@@ -80,6 +80,7 @@ impl CellData {
 
     /// Makes this cell a copy of `stored` (a stored value of at most
     /// [`CellData::INLINE_MAX`] bytes) at `ts`, reusing its inline bytes when it has them.
+    #[inline]
     pub fn set_inline(&mut self, ts: Timestamp, stored: &[u8]) {
         debug_assert!(stored.len() <= Self::INLINE_MAX);
         self.ts = ts;
