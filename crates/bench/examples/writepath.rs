@@ -1,94 +1,166 @@
-//! A write-path microbenchmark (#287): 1-cell and 16-cell commits of 100-byte values,
-//! then a flush and a full compaction of what they wrote. Each phase is a function of its
-//! own (`writepath_commit_one`, `writepath_commit_sixteen`, `writepath_flush`,
-//! `writepath_compact`) so callgrind can count it alone (`--toggle-collect`), and the
-//! number of ops or entries it handled goes to stderr as `ops <phase> <n>`. On macOS the
-//! process's retired instructions per op are printed as well (they include the kernel and
-//! the engine's other threads, so they are only a local guide).
+//! A write-path microbenchmark (#287), one shape per run, for
+//! `scripts/instructions-per-cell.sh`:
 //!
 //! ```text
-//! cargo run --release -p pigeonhole-bench --example writepath -- [OPS] [DIR]
+//! cargo run --release -p pigeonhole-bench --example writepath -- SHAPE ITERATIONS DIR
 //! ```
 //!
-//! `OPS` 1-cell commits and `OPS / 4` 16-cell commits (default 20,000: the memtable holds
-//! them, so no flush runs during the commits). `WRITE_PHASE=one|sixteen` runs only that
-//! commit phase; `WRITE_PHASE=loop` repeats commits, a flush and a compaction until
-//! killed, to profile with `sample` or `perf`.
-use pigeonhole::{Durability, Family, Options, Pigeonhole, Table};
+//! | Shape | One iteration | Units (`units N` on stderr) |
+//! |---|---|---|
+//! | `commit-one` | 500 commits of one 100-byte cell | commits |
+//! | `commit-sixteen` | 125 commits of 16 cells in one row | commits |
+//! | `flush` | 2,000 entries flushed from the memtable to one SST | entries |
+//! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level | entries |
+//!
+//! Only the measured work runs inside functions named `shape_*` (callgrind counts them
+//! with `--toggle-collect='*shape_*'`); the commits a flush or compaction needs are
+//! written first, outside them. The shards are application-owned and each runs on a
+//! thread of its own, inside `shape_run_shard` while a shape is measured, so the commit,
+//! flush and compaction work the shards do is counted along with the caller's. One shard,
+//! tablet changes off and a memtable that holds every write keep the work deterministic.
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
+use pigeonhole::{Durability, Family, Options, Pigeonhole, Shard, Table};
+
+const VALUE: [u8; 100] = [7; 100];
 
 fn main() {
-    let ops: usize = std::env::args()
-        .nth(1)
-        .map_or(20_000, |s| s.parse().expect("OPS"));
-    let base = std::env::args()
-        .nth(2)
-        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
-    let phase = std::env::var("WRITE_PHASE").ok();
+    let mut args = std::env::args().skip(1);
+    let usage = "usage: writepath SHAPE ITERATIONS DIR";
+    let shape = args.next().expect(usage);
+    let iters: usize = args.next().expect(usage).parse().expect("ITERATIONS");
+    let base = std::path::PathBuf::from(args.next().expect(usage));
     let dir = base.join(format!("phdb-writepath-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let db = Pigeonhole::open(
-        dir.join("w.phdb"),
-        Options::default()
-            .durability(Durability::Buffered)
-            .memtable_budget(1 << 30)
-            .block_cache(256 << 20),
-    )
-    .expect("open");
+    let measuring = Arc::new(AtomicBool::new(false));
+    let (db, drivers) = open(&dir.join("w.phdb"), &measuring);
     let t = db
         .table("t")
         .unwrap()
         .family("f", Family::default())
         .create_if_missing()
         .unwrap();
-    // Keys are formatted up front, outside the measured functions.
     let quals: Vec<Vec<u8>> = (0..16).map(|q| format!("q{q:02}").into_bytes()).collect();
     let rows = |prefix: &str, n: usize| -> Vec<Vec<u8>> {
         (0..n)
             .map(|i| format!("{prefix}:{i:010}").into_bytes())
             .collect()
     };
-    if phase.as_deref() == Some("loop") {
-        let mut round = 0u64;
-        loop {
-            writepath_commit_sixteen(&t, &rows(&format!("r{round}"), ops), &quals);
-            writepath_flush(&db);
-            writepath_compact(&db);
-            round += 1;
+    let measure = |f: &mut dyn FnMut()| {
+        measuring.store(true, Ordering::Release);
+        f();
+        measuring.store(false, Ordering::Release);
+    };
+    let units = match shape.as_str() {
+        "commit-one" => {
+            let rows = rows("one", 500 * iters);
+            measure(&mut || shape_commit_one(&t, &rows));
+            rows.len()
         }
-    }
-    let mut entries = 0;
-    if phase.as_deref().is_none_or(|p| p == "one") {
-        let rows = rows("one", ops);
-        measure("commit_one", ops, || writepath_commit_one(&t, &rows));
-        entries += ops;
-    }
-    if phase.as_deref().is_none_or(|p| p == "sixteen") {
-        let rows = rows("six", ops / 4);
-        measure("commit_sixteen", ops / 4, || {
-            writepath_commit_sixteen(&t, &rows, &quals)
-        });
-        entries += ops / 4 * 16;
-    }
-    if phase.is_none() {
-        measure("flush", entries, || writepath_flush(&db));
-        measure("compact", entries, || writepath_compact(&db));
-    }
+        "commit-sixteen" => {
+            let rows = rows("six", 125 * iters);
+            measure(&mut || shape_commit_sixteen(&t, &rows, &quals));
+            rows.len()
+        }
+        "flush" => {
+            let rows = rows("six", 125 * iters);
+            commit_sixteen(&t, &rows, &quals);
+            measure(&mut || shape_flush(&db));
+            rows.len() * 16
+        }
+        "compact" => {
+            // Three L0 SSTs, below the compaction trigger (4): nothing compacts before the
+            // measured compaction.
+            let rows = rows("six", 125 * iters);
+            for part in rows.chunks(rows.len().div_ceil(3)) {
+                commit_sixteen(&t, part, &quals);
+                db.flush().unwrap();
+            }
+            measure(&mut || shape_compact(&db));
+            rows.len() * 16
+        }
+        other => panic!("unknown shape {other}: commit-one, commit-sixteen, flush or compact"),
+    };
+    eprintln!("units {units}");
     drop(t);
     db.close().unwrap();
+    for d in drivers {
+        d.join().unwrap();
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
-const VALUE: [u8; 100] = [7; 100];
+/// Opens with application-owned shards, each driven by a thread of its own.
+fn open(path: &Path, measuring: &Arc<AtomicBool>) -> (Pigeonhole, Vec<thread::JoinHandle<()>>) {
+    let (db, shards) = Pigeonhole::open_application_owned(
+        path,
+        Options::default()
+            .shards(1)
+            .tablet_changes(false)
+            .durability(Durability::Buffered)
+            .memtable_budget(1 << 30)
+            .block_cache(256 << 20),
+    )
+    .expect("open");
+    let drivers = shards
+        .into_iter()
+        .map(|shard| {
+            let measuring = Arc::clone(measuring);
+            thread::spawn(move || drive(shard, &measuring))
+        })
+        .collect();
+    (db, drivers)
+}
+
+/// A shard's loop (see `Pigeonhole::open_application_owned`), inside `shape_run_shard`
+/// while a shape is measured.
+fn drive(mut shard: Shard, measuring: &AtomicBool) {
+    let me = thread::current();
+    shard.set_wakeup(Box::new(move || me.unpark()));
+    loop {
+        if measuring.load(Ordering::Acquire) {
+            shape_run_shard(&mut shard);
+        } else {
+            run_shard(&mut shard);
+        }
+        if let Some(closed) = shard.closed() {
+            closed.unwrap();
+            return;
+        }
+        match shard.next_wakeup() {
+            Some(due) => thread::park_timeout(due),
+            None => thread::park(),
+        }
+    }
+}
 
 #[inline(never)]
-fn writepath_commit_one(t: &Table, rows: &[Vec<u8>]) {
+fn shape_run_shard(shard: &mut Shard) {
+    while shard.run_once(Duration::from_micros(200)) {}
+}
+
+#[inline(never)]
+fn run_shard(shard: &mut Shard) {
+    while shard.run_once(Duration::from_micros(200)) {}
+}
+
+#[inline(never)]
+fn shape_commit_one(t: &Table, rows: &[Vec<u8>]) {
     for row in rows {
         t.mutate(row).put("f", b"q", &VALUE).commit().unwrap();
     }
 }
 
 #[inline(never)]
-fn writepath_commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
+fn shape_commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
+    commit_sixteen(t, rows, quals);
+}
+
+fn commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
     for row in rows {
         let mut m = t.mutate(row);
         for q in quals {
@@ -99,44 +171,11 @@ fn writepath_commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
 }
 
 #[inline(never)]
-fn writepath_flush(db: &Pigeonhole) {
+fn shape_flush(db: &Pigeonhole) {
     db.flush().unwrap();
 }
 
 #[inline(never)]
-fn writepath_compact(db: &Pigeonhole) {
+fn shape_compact(db: &Pigeonhole) {
     db.compact().unwrap();
-}
-
-/// Runs `f`, reports its op count on stderr and, on macOS, the instructions per op.
-fn measure(phase: &str, n: usize, f: impl FnOnce()) {
-    let before = instructions();
-    f();
-    let after = instructions();
-    eprintln!("ops {phase} {n}");
-    if let (Some(a), Some(b)) = (before, after) {
-        println!(
-            "{phase}: {:.0} instructions per op",
-            (b - a) as f64 / n as f64
-        );
-    }
-}
-
-/// Instructions retired by the whole process (`proc_pid_rusage`, `ri_instructions`).
-#[cfg(target_os = "macos")]
-fn instructions() -> Option<u64> {
-    unsafe extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
-    }
-    // RUSAGE_INFO_V4: a 16-byte uuid, then u64 fields; `ri_instructions` is the 30th.
-    const RUSAGE_INFO_V4: i32 = 4;
-    let mut b = [0u64; 64];
-    // SAFETY: the buffer is larger than `rusage_info_v4` (and suitably aligned).
-    let r = unsafe { proc_pid_rusage(std::process::id() as i32, RUSAGE_INFO_V4, b.as_mut_ptr()) };
-    (r == 0).then_some(b[2 + 29])
-}
-
-#[cfg(not(target_os = "macos"))]
-fn instructions() -> Option<u64> {
-    None
 }
