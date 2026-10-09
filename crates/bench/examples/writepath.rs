@@ -143,6 +143,9 @@ fn drive(mut shard: Shard, measuring: &AtomicBool) {
     }
 }
 
+// The two loops must not compile to the same code: rustc merges identical functions, and
+// then the setup's shard work would be counted as the shape's. They differ in their slice
+// budget, which changes nothing measured.
 #[inline(never)]
 fn shape_run_shard(shard: &mut Shard) {
     while shard.run_once(Duration::from_micros(200)) {}
@@ -150,7 +153,7 @@ fn shape_run_shard(shard: &mut Shard) {
 
 #[inline(never)]
 fn run_shard(shard: &mut Shard) {
-    while shard.run_once(Duration::from_micros(200)) {}
+    while shard.run_once(Duration::from_micros(1000)) {}
 }
 
 #[inline(never)]
