@@ -1,0 +1,36 @@
+name: scratch callgrind annotate
+on:
+  push:
+    branches: [scratch/callgrind-annotate]
+permissions:
+  contents: read
+jobs:
+  annotate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build
+        run: CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -p pigeonhole-bench --example hotrow --example readshapes
+      - name: callgrind
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cg() { # name, env, command...
+            local name="$1" envs="$2"; shift 2
+            env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 $envs valgrind --tool=callgrind --collect-atstart=no \
+              --callgrind-out-file=out/$name.cg "$@" >/dev/null 2>out/$name.err </dev/null
+            callgrind_annotate --inclusive=no out/$name.cg > out/$name.self.txt
+          }
+          cg as-written "" target/release/examples/hotrow 20 /tmp
+          cg flushed HOT_FLUSH=1 target/release/examples/hotrow 20 /tmp
+          cg compacted HOT_COMPACT=1 target/release/examples/hotrow 20 /tmp
+          grep -h "cells read\|units" out/*.err
+      - uses: actions/upload-artifact@v4
+        with:
+          name: callgrind
+          path: out/
