@@ -9,7 +9,7 @@
 //! the record meets the requested durability and is visible, exactly when the sync `commit`
 //! would return. Async and sync committers join the same commit groups. Dropping the future
 //! after the call does **not** roll the commit back: it lands or fails atomically either
-//! way. A [`CommitTicket`](crate::CommitTicket) is also a future (`ticket.await`).
+//! way. A [`CommitTicket`] is also a future (`ticket.await`).
 //!
 //! ```
 //! use pigeonhole::{Durability, Family, Options, Pigeonhole};
