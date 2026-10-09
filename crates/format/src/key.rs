@@ -330,6 +330,57 @@ pub fn decode_key(key: &[u8]) -> crate::Result<KeyParts<'_>> {
     })
 }
 
+/// [`decode_key`] for a key whose first `row_len + 2` bytes (an escaped row and its
+/// terminator) are those of a key already decoded: the row is not scanned again, and
+/// everything after it is checked as `decode_key` checks it. A writer adding a row's cells in
+/// order decodes each row once.
+///
+/// ```
+/// use pigeonhole_format::key::{Kind, decode_key, decode_key_in_row, encode_key};
+///
+/// let mut a = Vec::new();
+/// encode_key(&mut a, b"row", b"q1", 5, 1, Kind::Put).unwrap();
+/// let mut b = Vec::new();
+/// encode_key(&mut b, b"row", b"q2", 5, 2, Kind::Put).unwrap();
+/// let row_len = decode_key(&a).unwrap().row.as_escaped().len();
+/// assert_eq!(decode_key_in_row(&b, row_len).unwrap(), decode_key(&b).unwrap());
+/// ```
+pub fn decode_key_in_row(key: &[u8], row_len: usize) -> crate::Result<KeyParts<'_>> {
+    let (body, ts, seqno, kind) = split_suffix(key)?;
+    if body.get(row_len..row_len + 2) != Some(&TERMINATOR[..]) {
+        return Err(Error::Corrupt {
+            what: "key: row terminator",
+        });
+    }
+    let rest = &body[row_len + 2..];
+    let qualifier = if rest == MARKER_QUALIFIER {
+        None
+    } else {
+        let (q_len, q_raw) = scan_escaped(rest)?;
+        if q_len + 2 != rest.len() {
+            return Err(Error::Corrupt {
+                what: "key: trailing bytes",
+            });
+        }
+        if q_raw > MAX_KEY_PART {
+            return Err(Error::KeyTooLarge);
+        }
+        Some(Escaped(&rest[..q_len]))
+    };
+    if qualifier.is_none() != (kind == Kind::FamilyDelete) {
+        return Err(Error::Corrupt {
+            what: "key: marker kind",
+        });
+    }
+    Ok(KeyParts {
+        row: Escaped(&body[..row_len]),
+        qualifier,
+        ts,
+        seqno,
+        kind,
+    })
+}
+
 /// Splits the fixed 17-byte suffix off `key` without parsing the variable part.
 pub fn split_suffix(key: &[u8]) -> crate::Result<(&[u8], Timestamp, Seqno, Kind)> {
     let Some(split) = key.len().checked_sub(SUFFIX_LEN) else {

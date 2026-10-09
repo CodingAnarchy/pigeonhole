@@ -5,7 +5,7 @@ use pigeonhole_format::block::{BlockAddr, BlockBuilder, BlockKind, TRAILER_LEN, 
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::compress::Compressor;
 use pigeonhole_format::filter::{FilterBuilder, column_hash, row_hash};
-use pigeonhole_format::key::{SUFFIX_LEN, decode_key};
+use pigeonhole_format::key::{SUFFIX_LEN, common_prefix_len, decode_key, decode_key_in_row};
 use pigeonhole_format::manifest::SstMeta;
 use pigeonhole_format::sst::{FOOTER_LEN, Footer, Properties};
 use pigeonhole_format::superblock::ExtentRef;
@@ -47,6 +47,8 @@ pub(crate) struct Writer {
     /// The last sealed data block, waiting for the next key to pick its separator.
     pending: Option<BlockAddr>,
     last_key: Vec<u8>,
+    /// The escaped row length of `last_key`.
+    last_row_len: usize,
     max_key_len: usize,
     row_filter: FilterBuilder,
     column_filter: FilterBuilder,
@@ -95,6 +97,7 @@ impl Writer {
             partitions: Vec::new(),
             pending: None,
             last_key: Vec::new(),
+            last_row_len: 0,
             max_key_len: 0,
             row_filter: FilterBuilder::new(opts.bloom_bits),
             column_filter: FilterBuilder::new(opts.bloom_bits),
@@ -168,10 +171,27 @@ impl Writer {
     }
 
     pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        if self.props.entries > 0 && key <= self.last_key.as_slice() {
-            return Err(Error::OutOfOrder);
+        let first = self.props.entries == 0;
+        // One pass over the previous key: the common prefix gives the order check, and
+        // whether the row and the column continue.
+        let lcp = common_prefix_len(key, &self.last_key);
+        if !first {
+            let greater = match (key.get(lcp), self.last_key.get(lcp)) {
+                (Some(k), Some(l)) => k > l,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !greater {
+                return Err(Error::OutOfOrder);
+            }
         }
-        let parts = decode_key(key)?;
+        // The same escaped row and terminator as the previous key: that row was decoded.
+        let same_row = !first && lcp >= self.last_row_len + 2;
+        let parts = if same_row {
+            decode_key_in_row(key, self.last_row_len)?
+        } else {
+            decode_key(key)?
+        };
         let column_len = key.len() - SUFFIX_LEN;
         let row_len = parts.row.as_escaped().len();
         let entry = ENTRY_HEADER_MAX + key.len() + value.len();
@@ -183,13 +203,11 @@ impl Writer {
         }
         self.data.add(key, value)?;
 
-        let first = self.props.entries == 0;
-        let last_len = self.last_key.len();
-        let new_column = first || self.last_key[..last_len - SUFFIX_LEN] != key[..column_len];
+        let new_column =
+            first || !(lcp >= column_len && self.last_key.len() - SUFFIX_LEN == column_len);
         if new_column {
-            // A new row starts a new column too; compare row prefixes only then.
-            let new_row = first || !self.last_key.starts_with(&key[..row_len + 2]);
-            if new_row {
+            // A new row starts a new column too.
+            if !same_row {
                 self.props.rows += 1;
                 self.row_keys += 1;
                 if self.filters() {
@@ -222,8 +240,9 @@ impl Writer {
             p.seqno_range.1.max(parts.seqno),
         );
         p.ts_range = (p.ts_range.0.min(parts.ts), p.ts_range.1.max(parts.ts));
-        self.last_key.clear();
-        self.last_key.extend_from_slice(key);
+        self.last_key.truncate(lcp);
+        self.last_key.extend_from_slice(&key[lcp..]);
+        self.last_row_len = row_len;
         self.max_key_len = self.max_key_len.max(key.len());
         Ok(())
     }
