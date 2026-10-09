@@ -7,6 +7,7 @@ use pigeonhole_format::key::{
     Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
     encode_column_prefix, encode_key, encode_key_after_row, encode_marker_after_row,
     encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
+    starts_with,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -144,6 +145,14 @@ proptest! {
         prop_assert_eq!(compare(&a, &b), a.cmp(&b));
         prop_assert_eq!(compare(&b, &a), b.cmp(&a));
         prop_assert_eq!(compare(&a, &a), std::cmp::Ordering::Equal);
+    }
+
+    /// `starts_with` is `<[u8]>::starts_with`, both ways round.
+    #[test]
+    fn starts_with_is_the_slice_one((a, b) in shared_prefix_pair()) {
+        prop_assert_eq!(starts_with(&a, &b), a.starts_with(&b));
+        prop_assert_eq!(starts_with(&b, &a), b.starts_with(&a));
+        prop_assert!(starts_with(&a, &a[..a.len() / 2]));
     }
 
     /// `common_prefix_len` counts the leading bytes `a` and `b` share.

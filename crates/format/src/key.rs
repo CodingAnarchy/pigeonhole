@@ -53,6 +53,13 @@ pub fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
+/// Whether `bytes` starts with `prefix`: `<[u8]>::starts_with`, compared inline as
+/// [`compare`] does (no library call for these short keys).
+#[inline]
+pub fn starts_with(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes.len() >= prefix.len() && compare(&bytes[..prefix.len()], prefix).is_eq()
+}
+
 /// The length of the longest common prefix of `a` and `b`, compared eight bytes at a time
 /// (as [`compare`] does): the bytes a block entry shares with the previous key.
 ///

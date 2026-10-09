@@ -407,7 +407,8 @@ impl Sink {
     }
 
     fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        let row_start = self.last_row.is_empty() || !key.starts_with(&self.last_row);
+        let row_start =
+            self.last_row.is_empty() || !pigeonhole_format::key::starts_with(key, &self.last_row);
         if let Some(o) = &self.open {
             // Prefer to cut between rows once less than an eighth of the extent is left (a
             // thirty-second for pieces, which should fill their class: the index, filters

@@ -40,7 +40,9 @@
 
 use std::sync::Arc;
 
-use pigeonhole_format::key::{Kind, SUFFIX_LEN, row_prefix_len, split_suffix};
+use pigeonhole_format::key::{
+    Kind, SUFFIX_LEN, compare, row_prefix_len, split_suffix, starts_with,
+};
 use pigeonhole_format::value::{BlobPointer, ValueTag};
 use pigeonhole_format::{BlobFileId, Cursor, Seqno, Timestamp};
 
@@ -332,7 +334,7 @@ impl Gc {
         end: Option<&[u8]>,
         out: &mut OutBuf,
     ) -> Result<bool, C::Error> {
-        if !cursor.valid() || end.is_some_and(|e| cursor.key() >= e) {
+        if !cursor.valid() || end.is_some_and(|e| compare(cursor.key(), e).is_ge()) {
             return Ok(false);
         }
         let key = cursor.key();
@@ -342,7 +344,7 @@ impl Gc {
             cursor.next()?;
             return Ok(true);
         };
-        if self.row.is_empty() || !key.starts_with(&self.row) {
+        if self.row.is_empty() || !starts_with(key, &self.row) {
             let n = row_prefix_len(key).unwrap_or(body.len());
             self.row.clear();
             self.row.extend_from_slice(&key[..n]);
@@ -373,7 +375,7 @@ impl Gc {
             cursor.next()?;
             return Ok(true);
         }
-        if body != self.col.as_slice() {
+        if !compare(body, &self.col).is_eq() {
             self.col.clear();
             self.col.extend_from_slice(body);
             self.col_stripe = NONE;
@@ -398,7 +400,7 @@ impl Gc {
         let col_len = self.col.len();
         while cursor.valid() {
             let key = cursor.key();
-            if key.len() != col_len + SUFFIX_LEN || !key.starts_with(&self.col) {
+            if key.len() != col_len + SUFFIX_LEN || !starts_with(key, &self.col) {
                 break;
             }
             let Ok((_, t, seqno, kind)) = split_suffix(key) else {
