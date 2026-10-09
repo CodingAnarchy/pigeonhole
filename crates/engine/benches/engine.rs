@@ -175,22 +175,33 @@ fn commits(c: &mut Criterion) {
         Durability::Sync,
     ] {
         group.bench_function(format!("{d:?}"), |b| {
-            // Without flushes the arena is finite: cap the commits per sample and scale.
+            // Without flushes the arena is finite: time every commit, in chunks of at most
+            // 5,000 with an untimed flush between them. (Scaling a capped chunk's time up
+            // overflowed `Duration` once warm-up grew the iteration count.)
             b.iter_custom(|iters| {
-                let n = iters.min(5_000);
-                let start = Instant::now();
-                for _ in 0..n {
-                    i += 1;
-                    let mut wb = WriteBatch::new();
-                    put(
-                        &mut wb,
-                        &t,
-                        &i.to_be_bytes(),
-                        b"value-of-32-bytes-padding-......",
-                    );
-                    black_box(db.commit(wb, Some(d)).unwrap());
+                let mut timed = std::time::Duration::ZERO;
+                let mut left = iters;
+                while left > 0 {
+                    let n = left.min(5_000);
+                    left -= n;
+                    let start = Instant::now();
+                    for _ in 0..n {
+                        i += 1;
+                        let mut wb = WriteBatch::new();
+                        put(
+                            &mut wb,
+                            &t,
+                            &i.to_be_bytes(),
+                            b"value-of-32-bytes-padding-......",
+                        );
+                        black_box(db.commit(wb, Some(d)).unwrap());
+                    }
+                    timed += start.elapsed();
+                    if left > 0 {
+                        db.flush().unwrap();
+                    }
                 }
-                start.elapsed().mul_f64(iters as f64 / n as f64)
+                timed
             })
         });
     }

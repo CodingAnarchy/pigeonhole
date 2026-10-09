@@ -43,12 +43,25 @@ pub const COUNTER_TS: Timestamp = 0;
 /// wb.clear();
 /// assert!(wb.is_empty());
 /// ```
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct WriteBatch {
     pub(crate) builder: BatchBuilder,
     pub(crate) row_deletes: Vec<RowDelete>,
     /// Scratch for value encoding (kept between calls).
     value_buf: Vec<u8>,
+}
+
+/// Bytes a new batch has room for before it grows: a few small mutations (#320).
+const INITIAL_BATCH_BYTES: usize = 256;
+
+impl Default for WriteBatch {
+    fn default() -> Self {
+        Self {
+            builder: BatchBuilder::with_capacity(INITIAL_BATCH_BYTES),
+            row_deletes: Vec::new(),
+            value_buf: Vec::new(),
+        }
+    }
 }
 
 impl WriteBatch {

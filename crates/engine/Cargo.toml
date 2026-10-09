@@ -23,6 +23,7 @@ pigeonhole-shm = { workspace = true }
 pigeonhole-sst = { workspace = true }
 pigeonhole-compaction = { workspace = true }
 arc-swap = { workspace = true }
+smallvec = { workspace = true }
 
 [features]
 # Test-only hooks (`src/engine/hooks.rs`), enabled by the dev-dependency below for the

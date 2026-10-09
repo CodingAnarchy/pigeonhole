@@ -9,16 +9,21 @@ use std::task::{Context, Poll, Waker};
 /// A callback that sees the outcome before the waiter does ([`Notifier::on_resolve`]).
 type Hook<T> = Box<dyn FnOnce(Option<&T>) + Send>;
 
+/// One lock for everything, and the condition variable signalled only when a thread blocks
+/// on it: on platforms whose locks are boxed lazily (macOS), a completion then allocates
+/// one lock and nothing else (#320).
 struct Slot<T> {
     state: Mutex<SlotState<T>>,
     cv: Condvar,
-    hook: Mutex<Option<Hook<T>>>,
 }
 
 struct SlotState<T> {
     value: Option<T>,
     done: bool,
     waker: Option<Waker>,
+    hook: Option<Hook<T>>,
+    /// A thread waits on `cv` (`Waiter::wait`).
+    blocked: bool,
 }
 
 impl<T> Slot<T> {
@@ -27,21 +32,22 @@ impl<T> Slot<T> {
     }
 
     fn resolve(&self, value: Option<T>) {
-        let hook = self
-            .hook
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        // The hook runs outside the lock, before the value is visible.
+        let hook = self.lock().hook.take();
         if let Some(hook) = hook {
             hook(value.as_ref());
         }
-        let waker = {
+        let (waker, blocked) = {
             let mut s = self.lock();
             s.value = value;
             s.done = true;
-            s.waker.take()
+            (s.waker.take(), s.blocked)
         };
-        self.cv.notify_one();
+        // `blocked` is set under the lock before a waiter sleeps, and the waiter checks `done`
+        // under the same lock first, so a waiter that sleeps is always signalled.
+        if blocked {
+            self.cv.notify_one();
+        }
         if let Some(w) = waker {
             w.wake();
         }
@@ -67,9 +73,10 @@ pub fn completion<T: Send>() -> (Notifier<T>, Waiter<T>) {
             value: None,
             done: false,
             waker: None,
+            hook: None,
+            blocked: false,
         }),
         cv: Condvar::new(),
-        hook: Mutex::new(None),
     });
     (
         Notifier {
@@ -112,7 +119,7 @@ impl<T: Send> Notifier<T> {
     /// ```
     pub fn on_resolve(&self, hook: impl FnOnce(Option<&T>) + Send + 'static) {
         if let Some(slot) = &self.slot {
-            *slot.hook.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+            slot.lock().hook = Some(Box::new(hook));
         }
     }
 
@@ -164,6 +171,7 @@ impl<T: Send> Waiter<T> {
     pub fn wait(self) -> Option<T> {
         let mut s = self.slot.lock();
         while !s.done {
+            s.blocked = true;
             s = self.slot.cv.wait(s).unwrap_or_else(PoisonError::into_inner);
         }
         s.value.take()
@@ -183,5 +191,44 @@ impl<T: Send> Future for Waiter<T> {
             _ => s.waker = Some(cx.waker().clone()),
         }
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_waiter_is_always_woken() {
+        // The condition variable is signalled only when a waiter blocks: race the waiter
+        // going to sleep against the notification, both ways, many times. A lost wakeup
+        // hangs the test.
+        for i in 0..20_000u32 {
+            let (notifier, waiter) = completion::<u32>();
+            let t = std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    std::thread::yield_now();
+                }
+                notifier.notify(i);
+            });
+            assert_eq!(waiter.wait(), Some(i));
+            t.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_hook_runs_before_the_waiter_sees_the_value() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let (notifier, waiter) = completion::<u32>();
+        let seen = Arc::clone(&ran);
+        notifier.on_resolve(move |v| {
+            assert_eq!(v, Some(&7));
+            seen.store(true, Ordering::SeqCst);
+        });
+        let t = std::thread::spawn(move || notifier.notify(7));
+        assert_eq!(waiter.wait(), Some(7));
+        assert!(ran.load(Ordering::SeqCst));
+        t.join().unwrap();
     }
 }

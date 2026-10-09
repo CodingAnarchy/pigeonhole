@@ -1739,10 +1739,14 @@ struct Logged {
     kind: LoggedKind,
 }
 
+/// The slots a logged single-shard commit wrote: inline for up to two (most commits write
+/// one tablet's family), so logging a commit allocates nothing (#320).
+type LoggedSlots = smallvec::SmallVec<[(TabletId, FamilyId); 2]>;
+
 #[derive(Debug)]
 enum LoggedKind {
     /// A single-shard commit writing to these slots.
-    Single { slots: Vec<(TabletId, FamilyId)> },
+    Single { slots: LoggedSlots },
     /// A participant's PREPARE writing to these slots.
     Prepare {
         slots: Vec<(TabletId, FamilyId)>,
@@ -1834,6 +1838,9 @@ pub(crate) struct ShardState {
     tablets: Arc<TabletMap>,
     /// Members drained since the last group.
     pending: Vec<Member>,
+    /// Emptied member vectors kept for the next group and `pending` (#320): a commit then
+    /// allocates none for the group's bookkeeping.
+    member_bufs: Vec<Vec<Member>>,
     /// Groups whose sync is in flight, oldest first.
     unresolved: VecDeque<Group>,
     next_group: u64,
@@ -2062,6 +2069,7 @@ impl ShardState {
             retired: Vec::new(),
             tablets,
             pending: Vec::new(),
+            member_bufs: Vec::new(),
             unresolved: VecDeque::new(),
             next_group: 1,
             held: BTreeSet::new(),
@@ -2276,7 +2284,9 @@ impl ShardState {
                 end,
                 pos: self.log_bytes,
                 seqno,
-                kind: LoggedKind::Single { slots },
+                kind: LoggedKind::Single {
+                    slots: slots.into_iter().collect(),
+                },
             }),
             ReplayedKind::Prepare {
                 slots,
@@ -2427,7 +2437,8 @@ impl ShardState {
         let (mut alloc_chunks, mut min_large) = (0usize, usize::MAX);
         // `(tablet, family)` slots the batch writes to, and those it would create (each a
         // memtable with a chunk of its own; a table split into many tablets has many slots).
-        let mut touched: Vec<(TabletId, FamilyId)> = Vec::new();
+        // Inline for a few: admission computes this for every commit (#320).
+        let mut touched: smallvec::SmallVec<[(TabletId, FamilyId); 4]> = smallvec::SmallVec::new();
         let mut unrouted = 0usize;
         let mut new_slots = 0usize;
         for m in batch.iter().flatten() {
@@ -3610,12 +3621,14 @@ impl ShardState {
         }
         self.refresh_tablets();
         self.end_backoff_on_event(ctx.now_nanos());
-        let members = std::mem::take(&mut self.pending);
+        let spare = self.member_buf();
+        let mut members = std::mem::replace(&mut self.pending, spare);
 
         // Admission, in order. A conditional member whose row an earlier member of this
         // group already touched runs in the next group instead, with everything after it,
         // so conditions see the applied state and submission order holds per row.
-        let mut admitted: Vec<Member> = Vec::with_capacity(members.len());
+        let mut admitted = self.member_buf();
+        admitted.reserve(members.len());
         self.touched.clear();
         // Once a conditional member is held back, every later plain commit waits with it
         // (per-row submission order); two-phase-commit records never wait, since the share
@@ -3624,7 +3637,7 @@ impl ShardState {
         let mut need_room = false;
         // A member waits for a guarded flush's install: the shard wakes on its outcome.
         let mut guard_wait = false;
-        for mut m in members {
+        for mut m in members.drain(..) {
             if cut && matches!(m.kind, MemberKind::Single) {
                 self.pending.push(m);
                 continue;
@@ -3776,6 +3789,7 @@ impl ShardState {
             }
             admitted.push(m);
         }
+        self.return_member_buf(members);
         if need_room {
             self.wait_room = true;
             let now = ctx.now_nanos();
@@ -3899,6 +3913,7 @@ impl ShardState {
             }
         }
         if admitted.is_empty() {
+            self.return_member_buf(admitted);
             self.publish_watermark();
             return;
         }
@@ -4090,7 +4105,7 @@ impl ShardState {
                     m.reserved = 0;
                     if let Some(t) = m.ticket {
                         let kind = LoggedKind::Single {
-                            slots: self.touched_slots.clone(),
+                            slots: self.touched_slots.iter().copied().collect(),
                         };
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                     }
@@ -4357,7 +4372,8 @@ impl ShardState {
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         let failed = outcome.is_err();
-        for m in group.members {
+        let mut members = group.members;
+        for m in members.drain(..) {
             let outcome = if failed {
                 Err(Error::Io(pigeonhole_io::Error::new(
                     ErrorKind::Other,
@@ -4368,7 +4384,21 @@ impl ShardState {
             };
             self.settle(m, outcome, ctx);
         }
+        self.return_member_buf(members);
         self.try_finish_close(ctx);
+    }
+
+    /// An empty member vector, from the spares if one is kept.
+    fn member_buf(&mut self) -> Vec<Member> {
+        self.member_bufs.pop().unwrap_or_default()
+    }
+
+    /// Keeps an emptied member vector for reuse (a few, none oversized).
+    fn return_member_buf(&mut self, buf: Vec<Member>) {
+        debug_assert!(buf.is_empty());
+        if self.member_bufs.len() < 4 && buf.capacity() <= 256 {
+            self.member_bufs.push(buf);
+        }
     }
 
     /// Whether `m`'s rows (written, read, or its predicate row) overlap rows touched by an

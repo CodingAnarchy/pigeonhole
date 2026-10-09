@@ -531,6 +531,8 @@ fn maintenance(out: &mut Vec<Row>) {
 
 /// Allocations per unit allowed on the hottest paths: today's values with a little headroom
 /// (#320). Lower one when a change improves its path; a path over budget fails the test.
+/// Measured on macOS, where a `std` lock allocates on first use; Linux counts one fewer per
+/// commit, so these are upper bounds there.
 const BUDGETS: &[(&str, &str, f64)] = &[
     ("get, memtable (snapshot)", "get", 9.0),
     ("get_latest, memtable", "get", 9.0),
@@ -545,9 +547,9 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("scan, memtable", "extra cell", 0.0),
     ("scan, SST, cached", "row", 0.0),
     ("scan, SST, cached", "extra cell", 0.0),
-    ("commit, 1 cell", "commit", 15.0),
-    ("commit, 16 cells", "commit", 18.0),
-    ("commit, 16 cells, 8 per group", "commit", 16.0),
+    ("commit, 1 cell", "commit", 6.0),
+    ("commit, 16 cells", "commit", 8.0),
+    ("commit, 16 cells, 8 per group", "commit", 7.5),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];

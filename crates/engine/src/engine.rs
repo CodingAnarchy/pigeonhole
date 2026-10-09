@@ -40,6 +40,9 @@ use crate::snapshot::{
     TabletMap, View, ViewPin,
 };
 use crate::write::{COUNTER_TS, ReadKey};
+
+/// The shards a commit writes to: inline for up to four (no allocation per commit, #320).
+pub(crate) type Shards = smallvec::SmallVec<[ShardId; 4]>;
 use crate::{
     CellData, EngineOptions, Error, PendingCommit, Predicate, ReadSpec, Result, RowData,
     ScanCursor, ScanSpec, Snapshot, Txn, WriteBatch,
@@ -1936,7 +1939,7 @@ impl Inner {
     }
 
     /// Validates and routes a batch: per-shard parts in first-appearance order.
-    fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Vec<ShardId>)> {
+    fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
             let info = catalog
@@ -1948,7 +1951,7 @@ impl Inner {
                     .push(rd.table, f.id, Kind::FamilyDelete, &rd.row, &[], rd.ts, &[])?;
             }
         }
-        let mut shards: Vec<ShardId> = Vec::new();
+        let mut shards = Shards::new();
         // Whether a counter-family put or operand takes the fixed timestamp (D179), and how
         // many counter puts and operands there are (two may combine, #295).
         let mut fixed_ts = false;
