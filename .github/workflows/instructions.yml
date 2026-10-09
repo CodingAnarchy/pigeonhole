@@ -47,12 +47,11 @@ env:
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
   # run-to-run noise on identical code (#354): within 0.1% for the hot-row states and read
-  # shapes. `row` keeps 1.5% for now. The writepath shapes `commit-one`, `commit-sixteen` and
-  # `compact` still vary by up to 0.9% on one binary (commit-one is bimodal, +0.58%): a
-  # temporary 1.0% until writepath.rs runs its measured work on a fresh thread like
-  # readshapes (ctr274's follow-up), then tighten them. If a shape proves noisier on CI,
-  # report it rather than raising its threshold silently.
-  THRESHOLDS: default=0.5 row=1.5 commit-one=1.0 commit-sixteen=1.0 compact=1.0
+  # shapes. `row` keeps 1.5% for now. The writepath shapes take the default too since they run
+  # their measured work on fresh threads (#360): two identical-code runs agreed within 0.2%
+  # (runs 37900128944 and 37901737150). If a shape proves noisier on CI, report it rather
+  # than raising its threshold silently.
+  THRESHOLDS: default=0.5 row=1.5
 
 jobs:
   instructions:
