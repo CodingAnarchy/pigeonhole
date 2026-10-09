@@ -959,6 +959,15 @@ pub(crate) fn read_row(
     Ok(any.then_some(out))
 }
 
+thread_local! {
+    /// The resolver row reads refill in place, one per reading thread (#287), as point gets
+    /// refill theirs: its merging cursor's source list and heap and its scratch are reused.
+    /// Between reads it holds no source and default options, so it pins no memtable, SST or
+    /// blob reader. Taken while in use, so a read nested in another gets a resolver of its
+    /// own.
+    static ROW_RESOLVER: std::cell::Cell<Option<Resolver>> = const { std::cell::Cell::new(None) };
+}
+
 /// Reads one row through `view` into `sink`: every family in `families` order. Returns
 /// whether any cell was found.
 pub(crate) fn read_row_into(
@@ -969,6 +978,53 @@ pub(crate) fn read_row_into(
     spec: &ReadSpec,
     now: Timestamp,
     sink: &mut impl RowSink,
+) -> Result<bool> {
+    let mut resolver = ROW_RESOLVER
+        .try_with(std::cell::Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_else(point_resolver);
+    let mut large = false;
+    let read = read_row_with(
+        &mut resolver,
+        snapshot,
+        table,
+        row,
+        families,
+        spec,
+        now,
+        sink,
+        &mut large,
+    );
+    // Whatever happened, the sources (each pins its memtable or SST) and the options (merge
+    // operator, blob reader) go now; only the allocations stay, unless a large value grew
+    // them.
+    let cursor = resolver.cursor_mut();
+    cursor.sources_mut().clear();
+    cursor.reset();
+    resolver.reset(ResolveOptions::new(0, 0));
+    if !large {
+        let _ = ROW_RESOLVER.try_with(|slot| slot.set(Some(resolver)));
+    }
+    read
+}
+
+/// [`read_row_into`] with the thread's resolver. Sets `large` when a value the resolver
+/// buffered was too large to keep its buffers for.
+#[allow(clippy::too_many_arguments)]
+// Inlined into `read_row_into`: called through a separate frame, a hot row's per-cell loop
+// measured about 1.5% more instructions.
+#[inline(always)]
+fn read_row_with(
+    resolver: &mut Resolver,
+    snapshot: &Snapshot,
+    table: TableId,
+    row: &[u8],
+    families: &[FamilyId],
+    spec: &ReadSpec,
+    now: Timestamp,
+    sink: &mut impl RowSink,
+    large: &mut bool,
 ) -> Result<bool> {
     let view = &snapshot.view;
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
@@ -985,11 +1041,22 @@ pub(crate) fn read_row_into(
         };
         let (mut opts, filter) = spec.resolve_opts(meta, snapshot.seqno, now);
         let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
-        let sources = view.row_sources(shard, tablet, family, &filter, row, &prefix)?;
-        if sources.is_empty() {
+        let cursor = resolver.cursor_mut();
+        cursor.sources_mut().clear();
+        view.row_sources_into(
+            shard,
+            tablet,
+            family,
+            &filter,
+            row,
+            &prefix,
+            cursor.sources_mut(),
+        )?;
+        if cursor.sources().is_empty() {
             continue;
         }
-        let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
+        cursor.reset();
+        resolver.reset(opts);
         resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;
         loop {
@@ -1002,6 +1069,7 @@ pub(crate) fn read_row_into(
                 if !cell.key.starts_with(&prefix) {
                     break;
                 }
+                *large |= !cell.from_source && cell.value.len() > KEEP_BUFFERS_BELOW;
                 // The qualifier goes straight into the sink, unescaped from the key.
                 let column = column_of(cell.key);
                 let end = column.len().saturating_sub(2).max(prefix.len());

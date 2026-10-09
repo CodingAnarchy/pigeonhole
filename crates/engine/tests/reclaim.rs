@@ -9,8 +9,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use pigeonhole_engine::{Engine, EngineOptions, EngineShard, FamilyOptions, ValueRef, WriteBatch};
-use pigeonhole_format::Durability;
+use pigeonhole_engine::{
+    Engine, EngineOptions, EngineShard, FamilyOptions, ReadSpec, ValueRef, WriteBatch,
+};
+use pigeonhole_format::{Durability, TableId};
 use pigeonhole_io::sim::SimVfs;
 
 /// One application-owned shard driven by the test: nothing runs unless the test drives it.
@@ -143,6 +145,59 @@ fn a_point_get_keeps_no_memtable_alive_on_its_thread() {
     let got = rig.db.get_latest(t.id, f, b"row0007", b"q").unwrap();
     assert!(got.is_some());
     drop(got);
+    let p = rig.db.flush_pending().unwrap();
+    rig.wait(p).unwrap();
+    rig.idle();
+    // The arena counters are published after a batch.
+    put(&mut rig, b"last", 1);
+    assert_eq!(
+        rig.db.arena_free(0).0,
+        free_before,
+        "the flushed memtable's chunks did not come back"
+    );
+    rig.close();
+}
+
+#[test]
+fn a_row_read_keeps_no_memtable_alive_on_its_thread() {
+    // A row read keeps its resolver on the thread for the next one (#287), as point gets do:
+    // its sources must go after each read, and after a failed one too. One left there would
+    // pin its memtable, whose chunks then never come back after the flush.
+    let vfs = SimVfs::new(47);
+    let mut rig = Rig::open(&vfs);
+    let t = rig
+        .db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    let put = |rig: &mut Rig, row: &[u8], len: usize| {
+        let mut wb = WriteBatch::new();
+        wb.put(t.id, f, row, b"q", None, ValueRef::Bytes(&vec![7u8; len]))
+            .unwrap();
+        let p = rig.db.submit(wb, Some(Durability::Buffered)).unwrap();
+        rig.wait(p).unwrap();
+    };
+    put(&mut rig, b"first", 1);
+    let (free_before, _, _) = rig.db.arena_free(0);
+    // About 1 MiB: many chunks.
+    for i in 0..1000u32 {
+        put(&mut rig, format!("row{i:04}").as_bytes(), 1000);
+    }
+    assert!(rig.db.arena_free(0).0 < free_before);
+    let snap = rig.db.snapshot().unwrap();
+    let got = rig
+        .db
+        .read_row(&snap, t.id, b"row0007", &ReadSpec::default())
+        .unwrap();
+    assert!(got.is_some());
+    drop(got);
+    // A read that fails (an unknown table) takes the same thread's resolver.
+    assert!(
+        rig.db
+            .read_row(&snap, TableId(u32::MAX), b"row0007", &ReadSpec::default())
+            .is_err()
+    );
+    drop(snap);
     let p = rig.db.flush_pending().unwrap();
     rig.wait(p).unwrap();
     rig.idle();

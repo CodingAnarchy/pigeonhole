@@ -242,4 +242,4 @@ fn row_read_allocations_per_cell() {
 
 /// `(allocator calls for a 1-cell row read, per extra cell)`; lower them when a change
 /// improves the path.
-const ROW_READ_BUDGET: (u64, f64) = (32, 0.5);
+const ROW_READ_BUDGET: (u64, f64) = (22, 0.5);
