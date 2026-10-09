@@ -44,17 +44,11 @@ impl BlobReader {
 ```rust
 pub enum Error { /* ... */ #[doc(hidden)] WouldBlock(Box<pigeonhole_sst::Fetch>) } // internal
 
-pub trait RowSink {
-    // ...existing methods...
-    /// Drops every cell and qualifier pushed so far (an async read starts the row again).
-    fn clear(&mut self); // new required method
-}
-
 impl Engine {
     pub fn get_latest_async(&self, table, family, row, qualifier) -> GetFuture;
     pub fn get_async(&self, snapshot: &Snapshot, table, family, row, qualifier) -> GetFuture;
-    pub fn read_row_latest_async<S: RowSink + Unpin>(&self, table, row, families, spec, sink: S) -> RowFuture<S>;
-    pub fn read_row_async<S: RowSink + Unpin>(&self, snapshot, table, row, families, spec, sink: S) -> RowFuture<S>;
+    pub fn read_row_latest_async<S: RowSink + Clone + Unpin>(&self, table, row, families, spec, sink: S) -> RowFuture<S>;
+    pub fn read_row_async<S: RowSink + Clone + Unpin>(&self, snapshot, table, row, families, spec, sink: S) -> RowFuture<S>;
 }
 pub struct GetFuture;    // Future<Output = Result<Option<CellData>>>
 pub struct RowFuture<S>; // Future<Output = Result<Option<S>>>
@@ -74,10 +68,10 @@ D196: async reads must not block their executor thread on a block the cache does
 - **The futures** take their read point on the first poll: the latest view as `get_latest` reads it (D188, #315), or the snapshot given; a reader process takes a snapshot, with the expired-snapshot retry. They keep fetched blocks pinned until they resolve.
   - They fall back to one synchronous attempt, counted in `Metrics::async_sync_reads`, when a fetched block is not cached afterwards (capacity 0, or a block larger than a cache shard), or after 64 fetches.
   - Separated values are read synchronously and counted: until #42's PR 2b for records up to the blob cache limit, and until #398 above it (D196, owner).
-- **`RowSink::clear`** is a new required method. Both implementations (`RowData`, pigeonhole's `RowBuf`) are in the workspace.
+- **A row read restarts from an empty copy of its sink** (the futures require `S: Clone`). An earlier draft added a required `RowSink::clear`, which `cargo semver-checks` rejected against 0.2.0 as a breaking change, so `RowSink` is unchanged.
 
 ## Callers
 
 - `pigeonhole-engine`: `source.rs` (`read_options`, `sst_sources_point`, `sst_sources_row`, `View::point_sources`, `View::row_sources_into` take `cache_only`), `snapshot.rs` (`OpenSst::reader_tiered`, `SstSet::read_pointer` counts synchronous blob reads inside async reads), `read.rs` (`get_in`, `get_with`, `read_row_into`, `read_row_with` take `cache_only`; sync callers pass `false`), `shard.rs` (its own point read passes `false`), the new `nonblocking.rs`.
-- `pigeonhole`: `Table`/`ReadTable::get_async` and `get_at_async`, `RowRead::read_async`, `Pigeonhole`/`PigeonholeReader::async_sync_reads` (behind `async`); `RowBuf` implements `RowSink::clear`.
+- `pigeonhole`: `Table`/`ReadTable::get_async` and `get_at_async`, `RowRead::read_async`, `Pigeonhole`/`PigeonholeReader::async_sync_reads` (behind `async`).
 - No other crate constructs `ReadOptions` with a struct literal (the engine uses `Default` and sets fields).

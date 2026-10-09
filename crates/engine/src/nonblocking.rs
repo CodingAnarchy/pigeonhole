@@ -270,6 +270,9 @@ pub struct RowFuture<S> {
     families: Vec<FamilyId>,
     spec: ReadSpec,
     sink: Option<S>,
+    /// The sink as given, empty: each attempt starts from a copy of it, so cells pushed
+    /// before a miss are dropped.
+    empty: S,
 }
 
 impl<S> std::fmt::Debug for RowFuture<S> {
@@ -281,7 +284,7 @@ impl<S> std::fmt::Debug for RowFuture<S> {
     }
 }
 
-impl<S: RowSink> RowFuture<S> {
+impl<S: RowSink + Clone> RowFuture<S> {
     pub(crate) fn new(
         inner: Arc<Inner>,
         snapshot: Option<Snapshot>,
@@ -297,12 +300,13 @@ impl<S: RowSink> RowFuture<S> {
             row: row.to_vec(),
             families: families.to_vec(),
             spec: spec.clone(),
+            empty: sink.clone(),
             sink: Some(sink),
         }
     }
 }
 
-impl<S: RowSink + Unpin> Future for RowFuture<S> {
+impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
     type Output = Result<Option<S>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -312,9 +316,10 @@ impl<S: RowSink + Unpin> Future for RowFuture<S> {
                 "row read polled after it resolved".into(),
             )));
         };
-        let (table, row, families, spec) = (this.table, &this.row, &this.families, &this.spec);
+        let (table, row, families, spec, empty) =
+            (this.table, &this.row, &this.families, &this.spec, &this.empty);
         let r = this.reading.poll_read(cx, |view, seqno, now, cache_only| {
-            sink.clear();
+            sink.clone_from(empty);
             let families = crate::engine::families_in_order(view, table, families)?;
             if cache_only {
                 read::read_row_into::<true>(view, seqno, table, row, &families, spec, now, sink)

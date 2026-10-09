@@ -383,9 +383,6 @@ impl RowData {
 pub trait RowSink {
     /// The buffer qualifiers are unescaped into, one after another.
     fn qualifiers(&mut self) -> &mut Vec<u8>;
-    /// Drops every cell and qualifier pushed so far: an async read that missed a block
-    /// starts the row again once it is fetched (ICR 0014).
-    fn clear(&mut self);
     /// Appends a cell of `family` whose qualifier is `qualifier` within
     /// [`RowSink::qualifiers`].
     fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData);
@@ -408,11 +405,6 @@ pub trait RowSink {
 impl RowSink for RowData {
     fn qualifiers(&mut self) -> &mut Vec<u8> {
         &mut self.qualifiers
-    }
-
-    fn clear(&mut self) {
-        self.qualifiers.clear();
-        self.cells.clear();
     }
 
     fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData) {

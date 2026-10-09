@@ -1397,7 +1397,7 @@ impl Engine {
 
     /// [`Engine::read_row_latest_into`] as a future, as [`Engine::get_latest_async`]: it
     /// resolves to `sink` holding the row, or `None` if the row has no visible cell.
-    pub fn read_row_latest_async<S: read::RowSink + Unpin>(
+    pub fn read_row_latest_async<S: read::RowSink + Clone + Unpin>(
         &self,
         table: TableId,
         row: &[u8],
@@ -1418,7 +1418,7 @@ impl Engine {
 
     /// [`Engine::read_row_into_families`] (at `snapshot`) as a future, as
     /// [`Engine::read_row_latest_async`].
-    pub fn read_row_async<S: read::RowSink + Unpin>(
+    pub fn read_row_async<S: read::RowSink + Clone + Unpin>(
         &self,
         snapshot: &Snapshot,
         table: TableId,

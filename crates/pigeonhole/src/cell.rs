@@ -195,11 +195,6 @@ impl pigeonhole_engine::RowSink for RowBuf {
         &mut self.qualifiers
     }
 
-    fn clear(&mut self) {
-        self.qualifiers.clear();
-        self.cells.clear();
-    }
-
     fn push(&mut self, family: FamilyId, qualifier: Range<usize>, data: CellData) {
         RowBuf::push(self, family, qualifier, data);
     }

@@ -23,7 +23,6 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 - `pigeonhole-sst`: `ReadOptions::cache_only`, `Error::WouldBlock(Fetch)`, `Fetch`, `SstReader::open_cache_only` and `BlobReader::cached` (ICR 0014). `pigeonhole-engine`: `Engine::get_latest_async`, `get_async`, `read_row_latest_async` and `read_row_async` (`GetFuture`, `RowFuture`), and `Metrics::async_sync_reads`.
 
 ### Changed (breaking)
-- `pigeonhole-engine`: `RowSink` has a new required method, `clear` (an async row read starts the row again after a fetch). Both implementations in the workspace have it.
 - `pigeonhole-sst`: `ReadOptions` gains the public field `cache_only`, so building it with a struct literal no longer compiles; start from `ReadOptions::default()` and set fields.
 
 ## [0.2.0] - 2026-10-09
