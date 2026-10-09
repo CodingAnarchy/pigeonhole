@@ -4,13 +4,14 @@
 //! checked `unreferenced_bytes` right after `shrink` failed now and then.
 
 use std::future::Future;
+use std::ops::Bound;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, EngineShard, FamilyOptions, ReadSpec, ValueRef, WriteBatch,
+    Engine, EngineOptions, EngineShard, FamilyOptions, ReadSpec, ScanSpec, ValueRef, WriteBatch,
 };
 use pigeonhole_format::{Durability, TableId};
 use pigeonhole_io::sim::SimVfs;
@@ -145,6 +146,67 @@ fn a_point_get_keeps_no_memtable_alive_on_its_thread() {
     let got = rig.db.get_latest(t.id, f, b"row0007", b"q").unwrap();
     assert!(got.is_some());
     drop(got);
+    let p = rig.db.flush_pending().unwrap();
+    rig.wait(p).unwrap();
+    rig.idle();
+    // The arena counters are published after a batch.
+    put(&mut rig, b"last", 1);
+    assert_eq!(
+        rig.db.arena_free(0).0,
+        free_before,
+        "the flushed memtable's chunks did not come back"
+    );
+    rig.close();
+}
+
+#[test]
+fn a_scan_keeps_no_memtable_alive_on_its_thread() {
+    // A scan keeps its resolvers on the thread for the next one (#287), as row reads and
+    // point gets do: their sources must go when a tablet ends, when the scan ends, and when
+    // a cursor is dropped mid-row. One left there would pin its memtable, whose chunks then
+    // never come back after the flush.
+    let vfs = SimVfs::new(47);
+    let mut rig = Rig::open(&vfs);
+    let t = rig
+        .db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    let put = |rig: &mut Rig, row: &[u8], len: usize| {
+        let mut wb = WriteBatch::new();
+        wb.put(t.id, f, row, b"q", None, ValueRef::Bytes(&vec![7u8; len]))
+            .unwrap();
+        let p = rig.db.submit(wb, Some(Durability::Buffered)).unwrap();
+        rig.wait(p).unwrap();
+    };
+    put(&mut rig, b"first", 1);
+    let (free_before, _, _) = rig.db.arena_free(0);
+    // About 1 MiB: many chunks.
+    for i in 0..1000u32 {
+        put(&mut rig, format!("row{i:04}").as_bytes(), 1000);
+    }
+    assert!(rig.db.arena_free(0).0 < free_before);
+    let snap = rig.db.snapshot().unwrap();
+    let scan = |start: &[u8], limit: u64| {
+        let mut spec = ScanSpec::new(Bound::Included(start.to_vec()), Bound::Unbounded);
+        spec.limit = limit;
+        rig.db.scan(&snap, t.id, spec).unwrap()
+    };
+    // To the end; to a limit; and dropped inside a row, its lanes still holding sources.
+    let mut c = scan(b"", 0);
+    let mut rows = 0;
+    while c.next_row().unwrap() {
+        rows += 1;
+    }
+    assert_eq!(rows, 1001);
+    drop(c);
+    let mut c = scan(b"row0100", 5);
+    while c.next_row().unwrap() {}
+    drop(c);
+    let mut c = scan(b"row0500", 0);
+    assert!(c.next_row().unwrap());
+    drop(c);
+    drop(snap);
     let p = rig.db.flush_pending().unwrap();
     rig.wait(p).unwrap();
     rig.idle();

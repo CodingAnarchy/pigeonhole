@@ -503,8 +503,12 @@ impl std::ops::Deref for LaneValue {
 /// out yet.
 struct Lane {
     family: FamilyId,
-    meta: FamilyMeta,
+    /// The family's merge operator name when the build does not know it (to name it in the
+    /// error a merge then fails with), `None` otherwise: no copy of the family's metadata.
+    unknown_merge: Option<String>,
     resolver: Resolver,
+    /// A value the resolver buffered was too large to keep its buffers for the next scan.
+    grew: bool,
     /// The view's SSTs and blob files, to read separated values.
     ssts: Arc<SstSet>,
     /// The resolver's blob reads, if it may need any.
@@ -540,12 +544,17 @@ impl Lane {
         let (from_source, large) = {
             let next = self.resolver.next_cell();
             ResolverBlobs::check(self.resolver_blobs.as_ref())?;
-            let Some(cell) = next.map_err(|e| read_error(e, &self.meta))? else {
+            let Some(cell) = next.map_err(|e| match (e, &self.unknown_merge) {
+                (Error::Merge(_), Some(name)) => Error::UnknownMergeOperator(name.clone()),
+                (e, _) => e,
+            })?
+            else {
                 self.done = true;
                 return Ok(());
             };
             self.ts = cell.ts;
             let large = cell.value.len() > CellData::INLINE_MAX;
+            self.grew |= !cell.from_source && cell.value.len() > KEEP_BUFFERS_BELOW;
             if let Some(v) = self.ssts.read_blob(cell.value)? {
                 self.pinned = Some(LaneValue::Pinned(Pinned::Block(v)));
             }
@@ -596,8 +605,14 @@ pub struct ScanCursor {
     spec: ScanSpec,
     families: Vec<FamilyId>,
     now: Timestamp,
-    /// Tablets not yet scanned, in row order.
-    tablets: std::collections::VecDeque<TabletEntry>,
+    table: TableId,
+    /// Index of the next tablet to scan among the table's tablets in the snapshot's view.
+    next_tablet: usize,
+    /// The scan's start and end as row-prefix bounds, encoded on the first tablet.
+    bounds: Option<RowBounds>,
+    /// The bounds clamped to the current tablet (reused buffers).
+    lo: Vec<u8>,
+    hi: Vec<u8>,
     lanes: Vec<Lane>,
     /// Escaped and unescaped current row.
     row_esc: Vec<u8>,
@@ -620,19 +635,16 @@ impl ScanCursor {
         families: Vec<FamilyId>,
         now: Timestamp,
     ) -> Self {
-        let tablets = snapshot
-            .view
-            .tablets()
-            .tablets_of(table)
-            .iter()
-            .cloned()
-            .collect();
         Self {
             snapshot,
             spec,
             families,
             now,
-            tablets,
+            table,
+            next_tablet: 0,
+            bounds: None,
+            lo: Vec::new(),
+            hi: Vec::new(),
             lanes: Vec::new(),
             row_esc: Vec::new(),
             row: Vec::new(),
@@ -676,16 +688,30 @@ impl ScanCursor {
     /// Builds the lanes for the next tablet, seeking each to the scan start. Returns false
     /// when no tablet is left.
     fn open_next_tablet(&mut self) -> Result<bool> {
-        let Some(tablet) = self.tablets.pop_front() else {
+        self.recycle_lanes();
+        let view = Arc::clone(&self.snapshot.view);
+        let Some(tablet) = view.tablets().tablets_of(self.table).get(self.next_tablet) else {
             return Ok(false);
         };
-        let view = Arc::clone(&self.snapshot.view);
-        let (start, end) = self.bounds()?;
+        self.next_tablet += 1;
+        if self.bounds.is_none() {
+            self.bounds = Some(self.bounds()?);
+        }
+        let (start, end) = self.bounds.as_ref().expect("encoded above");
         // Clamp to the tablet: after a split, children share their parent's SSTs (D13), which
         // hold rows of the sibling too.
-        let (start, end) = clamp_to_tablet(&tablet, start, end)?;
-        self.lanes.clear();
-        if matches!((&start, &end), (Some(s), Some(e)) if s >= e) {
+        let (has_lo, has_hi) = clamp_into(
+            tablet,
+            start.as_deref(),
+            end.as_deref(),
+            &mut self.lo,
+            &mut self.hi,
+        )?;
+        let (start, end) = (
+            has_lo.then_some(&self.lo[..]),
+            has_hi.then_some(&self.hi[..]),
+        );
+        if matches!((start, end), (Some(s), Some(e)) if s >= e) {
             // No row of the scan is in this tablet: it opens with no lanes.
             return Ok(true);
         }
@@ -698,24 +724,30 @@ impl ScanCursor {
                     .read
                     .resolve_opts(meta, self.snapshot.seqno, self.now);
             let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
-            let sources = view.scan_sources(
+            let mut resolver = take_scan_resolver();
+            let filled = view.scan_sources_into(
                 tablet.shard,
                 tablet.id,
                 family,
                 &filter,
-                start.as_deref(),
-                end.as_deref(),
-            )?;
-            let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
-            resolver.set_upper_bound(end.as_deref());
-            match &start {
-                Some(s) => resolver.seek(s)?,
-                None => resolver.seek(&[])?,
+                start,
+                end,
+                resolver.cursor_mut().sources_mut(),
+            );
+            if let Err(e) = filled {
+                // The sources filled so far go now, so the resolver pins nothing.
+                give_back(resolver);
+                return Err(e);
             }
+            resolver.cursor_mut().reset();
+            resolver.reset(opts);
+            resolver.set_upper_bound(end);
             self.lanes.push(Lane {
                 family,
-                meta: meta.clone(),
+                unknown_merge: (meta.merge == MergeKind::Unknown)
+                    .then(|| meta.options.merge_operator.clone()),
                 resolver,
+                grew: false,
                 ssts: Arc::clone(&view.ssts),
                 resolver_blobs,
                 ts: 0,
@@ -723,8 +755,24 @@ impl ScanCursor {
                 pending: false,
                 done: false,
             });
+            // A failed seek leaves the lane in place; its sources go with the others.
+            let lane = self.lanes.last_mut().expect("pushed above");
+            match start {
+                Some(s) => lane.resolver.seek(s)?,
+                None => lane.resolver.seek(&[])?,
+            }
         }
         Ok(true)
+    }
+
+    /// Ends the current lanes: each resolver goes back to the thread's pool for the next
+    /// lanes, unless a large value grew its buffers.
+    fn recycle_lanes(&mut self) {
+        for lane in self.lanes.drain(..) {
+            if !lane.grew {
+                give_back(lane.resolver);
+            }
+        }
     }
 
     /// Makes sure every lane either holds a pending cell or is exhausted.
@@ -796,7 +844,7 @@ impl ScanCursor {
             }
             let Some(best) = best else {
                 // This tablet is exhausted.
-                self.lanes.clear();
+                self.recycle_lanes();
                 continue;
             };
             self.row_esc.clear();
@@ -812,7 +860,7 @@ impl ScanCursor {
                 || (self.spec.limit != 0 && self.rows_emitted >= self.spec.limit)
             {
                 self.done = true;
-                self.lanes.clear();
+                self.recycle_lanes();
                 return Ok(false);
             }
             self.rows_emitted += 1;
@@ -910,6 +958,100 @@ impl ScanCursor {
             sink.push(family, qualifier, self.current_data());
         }
     }
+}
+
+impl Drop for ScanCursor {
+    fn drop(&mut self) {
+        self.recycle_lanes();
+    }
+}
+
+thread_local! {
+    /// Resolvers scans refill in place, kept by each scanning thread (#287) as row reads and
+    /// point gets keep theirs: a scan takes one per lane and gives it back when the lane ends
+    /// (its tablet or the scan does, or the cursor is dropped). Each comes back with no source
+    /// and default options, so the pool pins no memtable, SST or blob reader.
+    static SCAN_RESOLVERS: RefCell<Vec<Resolver>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Resolvers a thread keeps for its scans (one per family a scan reads, for a few families).
+const SCAN_RESOLVERS_KEPT: usize = 4;
+
+/// A resolver for a scan lane: one of the thread's, or a new one. The pool is sized here,
+/// when a scan starts, so giving a resolver back (at its end) never allocates.
+fn take_scan_resolver() -> Resolver {
+    SCAN_RESOLVERS
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.reserve(SCAN_RESOLVERS_KEPT);
+            pool.pop()
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(point_resolver)
+}
+
+/// Returns a lane's resolver to the thread's pool: its sources (each pins its memtable or
+/// SST) and options (merge operator, blob reader) go now, its allocations stay. Past
+/// [`SCAN_RESOLVERS_KEPT`] it is dropped.
+fn give_back(mut resolver: Resolver) {
+    let cursor = resolver.cursor_mut();
+    cursor.sources_mut().clear();
+    cursor.reset();
+    resolver.reset(ResolveOptions::new(0, 0));
+    let _ = SCAN_RESOLVERS.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < SCAN_RESOLVERS_KEPT {
+            pool.push(resolver);
+        }
+    });
+}
+
+/// [`clamp_to_tablet`] into reused buffers: `lo` and `hi` receive the clamped start and end,
+/// and the result says which are set (`false` = unbounded).
+fn clamp_into(
+    tablet: &TabletEntry,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    lo: &mut Vec<u8>,
+    hi: &mut Vec<u8>,
+) -> Result<(bool, bool)> {
+    lo.clear();
+    let has_lo = if tablet.start.is_empty() {
+        if let Some(s) = start {
+            lo.extend_from_slice(s);
+        }
+        start.is_some()
+    } else {
+        encode_row_prefix(lo, &tablet.start)?;
+        if let Some(s) = start
+            && s > lo.as_slice()
+        {
+            lo.clear();
+            lo.extend_from_slice(s);
+        }
+        true
+    };
+    hi.clear();
+    let has_hi = match &tablet.end {
+        None => {
+            if let Some(e) = end {
+                hi.extend_from_slice(e);
+            }
+            end.is_some()
+        }
+        Some(e) => {
+            encode_row_prefix(hi, e)?;
+            if let Some(x) = end
+                && x < hi.as_slice()
+            {
+                hi.clear();
+                hi.extend_from_slice(x);
+            }
+            true
+        }
+    };
+    Ok((has_lo, has_hi))
 }
 
 /// Narrows `[start, end)` (row prefixes, `None` = unbounded) to the rows of `tablet`.
