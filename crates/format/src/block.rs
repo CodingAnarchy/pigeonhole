@@ -166,12 +166,32 @@ pub fn seal_with_level(
     logical: &[u8],
     out: &mut Vec<u8>,
 ) -> crate::Result<BlockTrailer> {
+    seal_with(
+        kind,
+        codec,
+        level,
+        logical,
+        out,
+        &mut crate::compress::Compressor::default(),
+    )
+}
+
+/// [`seal_with_level`] with a [`Compressor`](crate::compress::Compressor) kept across the
+/// blocks a writer seals.
+pub fn seal_with(
+    kind: BlockKind,
+    codec: Compression,
+    level: i8,
+    logical: &[u8],
+    out: &mut Vec<u8>,
+    compressor: &mut crate::compress::Compressor,
+) -> crate::Result<BlockTrailer> {
     if logical.len() > MAX_BLOCK_LEN {
         return Err(Error::ValueTooLarge);
     }
     let uncompressed_len = logical.len() as u32;
     let start = out.len();
-    let compression = crate::compress::compress_with_level(codec, level, logical, out)?;
+    let compression = compressor.compress(codec, level, logical, out)?;
     out.extend_from_slice(&[kind as u8, compression as u8, 0, 0]);
     out.extend_from_slice(&uncompressed_len.to_le_bytes());
     let checksum = crate::checksum::xxh3_64(&out[start..]);
