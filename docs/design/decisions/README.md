@@ -82,11 +82,11 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D67](phase-1.md#d67) — one block decoder · sst, ICR 0004
 - [D68](phase-1.md#d68) — index partitions and readahead · sst
 - [D69](phase-1.md#d69) — blob record caching and logical length · sst
-- [D70](phase-1.md#d70) — `GcPolicy::min_ts_above` bounds bottommost purges · compaction · **amended by D147** · **refined by D187**
+- [D70](phase-1.md#d70) — `GcPolicy::min_ts_above` bounds bottommost purges · compaction · **amended by D147** · **refined by D187, D191**
 - [D71](phase-1.md#d71) — additive `JobContext` fields `target_sst_bytes` and `clock` · compaction
 - [D72](phase-1.md#d72) — other additive public API · compaction
 - [D73](phase-1.md#d73) — counter operands are not folded across timestamps in Phase 1 · Phase 2 folding tracked in #34
-- [D74](phase-1.md#d74) — purges follow HBase semantics · owner decision · amends D9
+- [D74](phase-1.md#d74) — purges follow HBase semantics · owner decision · amends D9 · **refined by D191**
 - [D75](phase-1.md#d75) — `I64Add` accepts only `ValueTag::I64` values · compaction
 - [D76](phase-1.md#d76) — `ResolveOptions::versions` and the family's `max_versions` · compaction
 - [D77](phase-1.md#d77) — value predicates on typed and blob values · compaction · **amended by D180**
@@ -203,6 +203,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D188](phase-2.md#d188) — Values above the inline limit are separated into blob files at commit time · engine, runtime, #230, #301 · amends D16
 - [D189](phase-2.md#d189) — Arenas are sized for their slots with tablet changes off too · engine, #283, #307 · amends D136
 - [D190](phase-2.md#d190) — `shrink` clears a region when a large extent has no hole below it · pager, engine, #314, #319 · amends D160
+- [D191](phase-2.md#d191) — Flush-time version GC, and a guarded purge of versions beyond `max_versions` · engine, compaction, sim, #287, #315 · refines D70, D74
 
 ## Open questions
 _None._
