@@ -1275,9 +1275,12 @@ impl Engine {
         // memtables is published. Unpinned, the seqno must still be current after the view
         // loads: then no flush in between had inputs above it, so its GC kept what a read at
         // it sees (#315 review). Otherwise read again; under a steady stream of commits, fall
-        // back to a pinned snapshot.
+        // back to a pinned snapshot. (The loop of `Inner::latest_view`, written out: through
+        // the helper, a point get measured a few instructions more, #287.)
         for _ in 0..GET_LATEST_TRIES {
             let seqno = inner.shared.shm.visible_seqno();
+            #[cfg(feature = "test-hooks")]
+            inner.shared.hooks.before_latest_view_load.run();
             let view = inner.shared.view.load();
             if inner.shared.shm.visible_seqno() != seqno {
                 continue;
@@ -1333,8 +1336,48 @@ impl Engine {
         let families = families_in_order(&snapshot.view, table, families)?;
         let now = self.inner.shared.vfs.now_micros();
         snapshot.checked(read::read_row_into(
-            snapshot, table, row, &families, spec, now, sink,
+            &snapshot.view,
+            snapshot.seqno,
+            table,
+            row,
+            &families,
+            spec,
+            now,
+            sink,
         ))
+    }
+
+    /// As [`Engine::read_row_into_families`], as of now and without creating a snapshot:
+    /// the view is read as [`Engine::get_latest`] reads it (the visible seqno, the view
+    /// through an `arc-swap` guard, the seqno again), and a value the sink pins rather than
+    /// copies pins only that view.
+    pub fn read_row_latest_into(
+        &self,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: &mut impl read::RowSink,
+    ) -> Result<bool> {
+        let inner = &self.inner;
+        if inner.role == Role::Reader {
+            // As in `get_latest`: a snapshot a writer restart expired is retried.
+            let mut tries = 0;
+            loop {
+                let snapshot = inner.snapshot()?;
+                match self.read_row_into_families(&snapshot, table, row, families, spec, sink) {
+                    Err(Error::SnapshotExpired) if tries < READER_EXPIRED_RETRIES => tries += 1,
+                    other => return other,
+                }
+            }
+        }
+        if let Some((view, seqno)) = inner.latest_view() {
+            let families = families_in_order(&view, table, families)?;
+            let now = inner.shared.vfs.now_micros();
+            return read::read_row_into(&view, seqno, table, row, &families, spec, now, sink);
+        }
+        let snapshot = inner.snapshot()?;
+        self.read_row_into_families(&snapshot, table, row, families, spec, sink)
     }
 
     /// Starts an ordered scan.
@@ -2210,6 +2253,29 @@ impl Inner {
             crate::write::wait_visible(&self.shared, info.seqno)?;
         }
         Ok((applied, info))
+    }
+
+    /// The view and a seqno it covers, for an unpinned read as of now (writer process). The
+    /// seqno first, then the view: a seqno is only visible once the view holding its
+    /// memtables is published (and with them any blob pointers they hold, D188). Unpinned,
+    /// the seqno must still be current after the view loads: then no flush in between had
+    /// inputs above it, so its GC kept what a read at it sees (#315 review). Otherwise read
+    /// again; under a steady stream of commits, `None` after [`GET_LATEST_TRIES`], and the
+    /// caller falls back to a pinned snapshot.
+    /// `Engine::get_latest` writes the same loop out (see there).
+    // Inlined: called out of line, a row read paid for the call and the returned guard.
+    #[inline(always)]
+    fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, Seqno)> {
+        for _ in 0..GET_LATEST_TRIES {
+            let seqno = self.shared.shm.visible_seqno();
+            #[cfg(feature = "test-hooks")]
+            self.shared.hooks.before_latest_view_load.run();
+            let view = self.shared.view.load();
+            if self.shared.shm.visible_seqno() == seqno {
+                return Some((view, seqno));
+            }
+        }
+        None
     }
 
     pub(crate) fn snapshot(&self) -> Result<Snapshot> {

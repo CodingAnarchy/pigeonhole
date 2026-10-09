@@ -82,6 +82,10 @@ pub(crate) struct Hooks {
     /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
     /// (`Engine::before_snapshot_view_load`, #315 review).
     pub before_snapshot_view_load: Once,
+    /// Runs in the next unpinned read as of now (`get_latest`, `read_row_latest_into`),
+    /// between its first visible-seqno read and its view load
+    /// (`Engine::before_latest_view_load`).
+    pub before_latest_view_load: Once,
     /// Runs in the next shrink round, between its catalog read and its relocations
     /// (`Engine::before_shrink_relocates`).
     pub before_shrink_relocates: Once,
@@ -632,6 +636,15 @@ impl Engine {
     #[doc(hidden)]
     pub fn before_snapshot_view_load(&self, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.before_snapshot_view_load.set(f);
+    }
+
+    /// Runs `f` once, on the calling thread of the next unpinned read as of now
+    /// (`get_latest`, `read_row_latest_into`), after its first visible-seqno read and before it
+    /// loads the view: where a test publishes a flush in between (test hook). `f` may set the
+    /// hook again, to run in the read's next try too.
+    #[doc(hidden)]
+    pub fn before_latest_view_load(&self, f: Box<dyn FnOnce() + Send>) {
+        self.inner.shared.hooks.before_latest_view_load.set(f);
     }
 
     /// Runs `f` once, on the calling thread of the next `backup`, right after it released its

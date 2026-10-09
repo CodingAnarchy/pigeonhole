@@ -1101,7 +1101,16 @@ pub(crate) fn read_row(
         row: row.to_vec(),
         ..RowData::default()
     };
-    let any = read_row_into(snapshot, table, row, families, spec, now, &mut out)?;
+    let any = read_row_into(
+        &snapshot.view,
+        snapshot.seqno,
+        table,
+        row,
+        families,
+        spec,
+        now,
+        &mut out,
+    )?;
     Ok(any.then_some(out))
 }
 
@@ -1114,10 +1123,12 @@ thread_local! {
     static ROW_RESOLVER: std::cell::Cell<Option<Resolver>> = const { std::cell::Cell::new(None) };
 }
 
-/// Reads one row through `view` into `sink`: every family in `families` order. Returns
-/// whether any cell was found.
+/// Reads one row through `view` at `seqno` into `sink`: every family in `families` order.
+/// Returns whether any cell was found. A value pinned rather than copied pins `view`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_row_into(
-    snapshot: &Snapshot,
+    view: &Arc<View>,
+    seqno: Seqno,
     table: TableId,
     row: &[u8],
     families: &[FamilyId],
@@ -1133,7 +1144,8 @@ pub(crate) fn read_row_into(
     let mut large = false;
     let read = read_row_with(
         &mut resolver,
-        snapshot,
+        view,
+        seqno,
         table,
         row,
         families,
@@ -1163,7 +1175,8 @@ pub(crate) fn read_row_into(
 #[inline(always)]
 fn read_row_with(
     resolver: &mut Resolver,
-    snapshot: &Snapshot,
+    view: &Arc<View>,
+    seqno: Seqno,
     table: TableId,
     row: &[u8],
     families: &[FamilyId],
@@ -1172,7 +1185,6 @@ fn read_row_with(
     sink: &mut impl RowSink,
     large: &mut bool,
 ) -> Result<bool> {
-    let view = &snapshot.view;
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
     };
@@ -1187,7 +1199,7 @@ fn read_row_with(
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
-        let (mut opts, filter) = spec.resolve_opts(meta, snapshot.seqno, now);
+        let (mut opts, filter) = spec.resolve_opts(meta, seqno, now);
         let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let cursor = resolver.cursor_mut();
         cursor.sources_mut().clear();

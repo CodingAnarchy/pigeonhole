@@ -420,3 +420,154 @@ fn a_delete_admitted_before_a_room_wait_freeze_voids_the_guard() {
         None
     );
 }
+
+/// The shard behind a mutex, so a hook running inside a read can drive it, and a put of a
+/// new version of `row`/`q` that a hook can call (as in
+/// `a_snapshot_pins_its_seqno_before_it_loads_the_view`).
+type Drive = Arc<
+    dyn Fn(
+            Pin<Box<dyn Future<Output = Result<(), pigeonhole_engine::Error>> + Send>>,
+        ) -> Result<(), pigeonhole_engine::Error>
+        + Send
+        + Sync,
+>;
+
+fn shared_rig(
+    seed: u64,
+) -> (
+    Arc<Engine>,
+    Arc<std::sync::Mutex<EngineShard>>,
+    Arc<TableInfo>,
+    Drive,
+) {
+    let Rig { db, shard, t } = Rig::open(seed, FlushGcMutation::None);
+    let shard = Arc::new(std::sync::Mutex::new(shard));
+    let drive: Drive = {
+        let shard = Arc::clone(&shard);
+        Arc::new(move |mut f| {
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(r) = f.as_mut().poll(&mut cx) {
+                    return r;
+                }
+                shard.lock().unwrap().run_once(u64::MAX);
+            }
+        })
+    };
+    (db, shard, t, drive)
+}
+
+fn put_and_flush(db: &Arc<Engine>, drive: &Drive, t: &TableInfo, v: Vec<u8>, flush: bool) {
+    let mut wb = WriteBatch::new();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        b"row",
+        b"q",
+        None,
+        ValueRef::Bytes(&v),
+    )
+    .unwrap();
+    let pending = db.submit(wb, Some(Durability::Buffered)).unwrap();
+    drive(Box::pin(async move { pending.await.map(drop) })).unwrap();
+    if flush {
+        drive(Box::pin(db.flush_pending().unwrap())).unwrap();
+    }
+}
+
+fn read_row_latest(db: &Engine, t: &TableInfo) -> Vec<Vec<u8>> {
+    let mut row = pigeonhole_engine::RowData::default();
+    let spec = pigeonhole_engine::ReadSpec::default();
+    db.read_row_latest_into(t.id, b"row", &[], &spec, &mut row)
+        .unwrap();
+    row.cells
+        .iter()
+        .map(|c| common::value_bytes(c.data.value()))
+        .collect()
+}
+
+fn close_shared(db: Arc<Engine>, shard: Arc<std::sync::Mutex<EngineShard>>) {
+    db.close().unwrap();
+    let mut shard = shard.lock().unwrap();
+    while shard.closed().is_none() {
+        shard.run_once(u64::MAX);
+    }
+}
+
+/// A row read as of now reads no snapshot: it reads the visible seqno, loads the view, and
+/// checks the seqno again (#287, as `get_latest` does). The hook runs between the seqno read
+/// and the view load: it writes a newer version and flushes, so the flush's GC
+/// (max_versions 1) drops the older one. A read at the old seqno through the new view would
+/// then see neither version (an empty row); the re-check makes it read again and see the
+/// newer one.
+#[test]
+fn a_row_read_as_of_now_rereads_when_a_flush_publishes_before_its_view_load() {
+    let (db, shard, t, drive) = shared_rig(2874);
+    put_and_flush(&db, &drive, &t, b"v1".to_vec(), false);
+    {
+        let (db2, drive, t) = (Arc::clone(&db), Arc::clone(&drive), Arc::clone(&t));
+        db.before_latest_view_load(Box::new(move || {
+            put_and_flush(&db2, &drive, &t, b"v2".to_vec(), true);
+        }));
+    }
+    assert_eq!(
+        read_row_latest(&db, &t),
+        [b"v2".to_vec()],
+        "the read lost the version the flush's GC kept for its seqno"
+    );
+    close_shared(db, shard);
+}
+
+/// The same race for `get_latest`, whose loop the row read now shares.
+#[test]
+fn get_latest_rereads_when_a_flush_publishes_before_its_view_load() {
+    let (db, shard, t, drive) = shared_rig(2875);
+    put_and_flush(&db, &drive, &t, b"v1".to_vec(), false);
+    {
+        let (db2, drive, t) = (Arc::clone(&db), Arc::clone(&drive), Arc::clone(&t));
+        db.before_latest_view_load(Box::new(move || {
+            put_and_flush(&db2, &drive, &t, b"v2".to_vec(), true);
+        }));
+    }
+    let got = db
+        .get_latest(t.id, t.families[0].id, b"row", b"q")
+        .unwrap()
+        .map(|c| common::value_bytes(c.value()));
+    assert_eq!(got, Some(b"v2".to_vec()));
+    close_shared(db, shard);
+}
+
+/// Under a commit and flush between every seqno read and view load, the row read gives up
+/// after its tries and reads through a pinned snapshot instead, and still reads the newest
+/// version.
+#[test]
+fn a_row_read_as_of_now_falls_back_to_a_snapshot_under_steady_commits() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let (db, shard, t, drive) = shared_rig(2876);
+    put_and_flush(&db, &drive, &t, b"v0".to_vec(), false);
+    let runs = Arc::new(AtomicU32::new(0));
+    fn arm(db: &Arc<Engine>, drive: &Drive, t: &Arc<TableInfo>, runs: &Arc<AtomicU32>) {
+        let (db2, drive2, t2, runs2) = (
+            Arc::clone(db),
+            Arc::clone(drive),
+            Arc::clone(t),
+            Arc::clone(runs),
+        );
+        db.before_latest_view_load(Box::new(move || {
+            let n = runs2.fetch_add(1, Ordering::Relaxed) + 1;
+            put_and_flush(&db2, &drive2, &t2, format!("v{n}").into_bytes(), true);
+            // Every try of this read; none after it (the fallback snapshot runs no such hook).
+            if n < 4 {
+                arm(&db2, &drive2, &t2, &runs2);
+            }
+        }));
+    }
+    arm(&db, &drive, &t, &runs);
+    assert_eq!(read_row_latest(&db, &t), [b"v4".to_vec()]);
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        4,
+        "one commit per try, four tries"
+    );
+    close_shared(db, shard);
+}
