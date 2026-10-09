@@ -5,8 +5,8 @@ mod common;
 use common::{Cell, cell, config, num, part, sized};
 use pigeonhole_format::key::{
     Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
-    encode_column_prefix, encode_key, encode_marker_prefix, encode_row_prefix, encode_seek_key,
-    row_prefix_len, split_suffix,
+    encode_column_prefix, encode_key, encode_key_after_row, encode_marker_after_row,
+    encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -178,5 +178,31 @@ proptest! {
             None => pigeonhole_format::key::encode_marker_key(&mut b, &row, ts, seqno).unwrap(),
         }
         prop_assert_eq!(decode_key_in_row(&b, row_len).unwrap(), decode_key(&b).unwrap());
+    }
+
+    /// A row prefix and then the rest of the key, cell or family marker, are exactly the
+    /// key `encode_key` / `encode_marker_key` write (rows and qualifiers with zero bytes).
+    #[test]
+    fn a_key_after_its_row_prefix_is_the_whole_key(
+        row in vec(0u8..3, 0..12),
+        qualifier in prop::option::of(vec(0u8..3, 0..8)),
+        ts in any::<u64>(),
+        seqno in any::<u64>(),
+        kind in prop_oneof![Just(Kind::Put), Just(Kind::Merge), Just(Kind::CellDelete), Just(Kind::ColumnDelete)],
+    ) {
+        let mut whole = Vec::new();
+        let mut parts = Vec::new();
+        encode_row_prefix(&mut parts, &row).unwrap();
+        match &qualifier {
+            Some(q) => {
+                encode_key(&mut whole, &row, q, ts, seqno, kind).unwrap();
+                encode_key_after_row(&mut parts, q, ts, seqno, kind).unwrap();
+            }
+            None => {
+                pigeonhole_format::key::encode_marker_key(&mut whole, &row, ts, seqno).unwrap();
+                encode_marker_after_row(&mut parts, ts, seqno);
+            }
+        }
+        prop_assert_eq!(parts, whole);
     }
 }

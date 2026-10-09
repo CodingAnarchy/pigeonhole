@@ -206,6 +206,46 @@ pub fn encode_marker_prefix(out: &mut Vec<u8>, row: &[u8]) -> crate::Result<()> 
     Ok(())
 }
 
+/// Appends what follows a row prefix ([`encode_row_prefix`]) in a cell key: with that prefix
+/// already in `out`, `out` ends up holding exactly what [`encode_key`] writes, so a writer
+/// adding many cells of one row escapes the row once.
+///
+/// ```
+/// use pigeonhole_format::key::{Kind, encode_key, encode_key_after_row, encode_row_prefix};
+///
+/// let mut whole = Vec::new();
+/// encode_key(&mut whole, b"row", b"q", 5, 1, Kind::Put).unwrap();
+/// let mut parts = Vec::new();
+/// encode_row_prefix(&mut parts, b"row").unwrap();
+/// encode_key_after_row(&mut parts, b"q", 5, 1, Kind::Put).unwrap();
+/// assert_eq!(parts, whole);
+/// ```
+pub fn encode_key_after_row(
+    out: &mut Vec<u8>,
+    qualifier: &[u8],
+    ts: Timestamp,
+    seqno: Seqno,
+    kind: Kind,
+) -> crate::Result<()> {
+    if kind == Kind::FamilyDelete {
+        return Err(Error::InvalidArgument {
+            what: "FamilyDelete needs encode_marker_key",
+        });
+    }
+    check_part(qualifier)?;
+    escape_into(out, qualifier);
+    out.extend_from_slice(&TERMINATOR);
+    put_suffix(out, ts, seqno, kind as u8);
+    Ok(())
+}
+
+/// [`encode_key_after_row`] for a family marker: with the row prefix in `out`, `out` ends up
+/// holding exactly what [`encode_marker_key`] writes.
+pub fn encode_marker_after_row(out: &mut Vec<u8>, ts: Timestamp, seqno: Seqno) {
+    out.extend_from_slice(&MARKER_QUALIFIER);
+    put_suffix(out, ts, seqno, Kind::FamilyDelete as u8);
+}
+
 /// Appends the escaped row and its terminator: a prefix shared by every key of `row`.
 pub fn encode_row_prefix(out: &mut Vec<u8>, row: &[u8]) -> crate::Result<()> {
     check_part(row)?;
