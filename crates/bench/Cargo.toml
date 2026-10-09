@@ -37,3 +37,7 @@ workspace = true
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[[example]]
+name = "hotrow_runners"
+required-features = ["sqlite"]
