@@ -43,6 +43,14 @@ pub struct MergingCursor<C> {
     /// The source at the top of the heap (`heap[0]`), kept beside it so `key` and `value`
     /// read it without a bounds check on the heap; 0 when the heap is empty.
     top: usize,
+    /// A copy of the runner's key (`sources[heap[runner]]`): the runner does not move while
+    /// the top steps, so a step compares against the copy instead of fetching the runner's
+    /// key through its source again. Taken lazily, on the second comparison with the same
+    /// runner (`runner_seen`), so sources that trade places every step never copy.
+    runner_key: Vec<u8>,
+    /// Comparisons with the current runner so far: 0 (none), 1 (one, through its source),
+    /// 2 (`runner_key` holds its key).
+    runner_seen: u8,
 }
 
 impl<C: Cursor> MergingCursor<C> {
@@ -55,6 +63,8 @@ impl<C: Cursor> MergingCursor<C> {
             row: Vec::new(),
             runner: 0,
             top: 0,
+            runner_key: Vec::new(),
+            runner_seen: 0,
         }
     }
 
@@ -101,12 +111,16 @@ impl<C: Cursor> MergingCursor<C> {
             row,
             runner,
             top,
+            runner_key,
+            runner_seen,
         } = self;
         heap.clear();
         heap.reserve(sources.len());
         row.clear();
         *runner = 0;
         *top = 0;
+        runner_key.clear();
+        *runner_seen = 0;
     }
 
     fn less(&self, a: usize, b: usize) -> bool {
@@ -160,6 +174,7 @@ impl<C: Cursor> MergingCursor<C> {
             2 => 1,
             _ => 1 + usize::from(self.less(self.heap[2], self.heap[1])),
         };
+        self.runner_seen = 0;
     }
 }
 
@@ -226,7 +241,30 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             // Only the top moved: it stays while it is below the smaller of its children,
             // one comparison; otherwise that child takes its place and it sinks from there.
             let r = self.runner;
-            if r == 0 || self.less(top, self.heap[r]) {
+            if r == 0 {
+                return Ok(());
+            }
+            // `less(top, heap[r])`, against the runner's copied key once it stays.
+            let runner = self.heap[r];
+            let order = match self.runner_seen {
+                2 => compare(self.sources[top].key(), &self.runner_key),
+                seen => {
+                    let key = self.sources[runner].key();
+                    let order = compare(self.sources[top].key(), key);
+                    if seen == 1 {
+                        self.runner_key.clear();
+                        self.runner_key.extend_from_slice(key);
+                    }
+                    self.runner_seen = seen + 1;
+                    order
+                }
+            };
+            let below = match order {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => top < runner,
+                std::cmp::Ordering::Greater => false,
+            };
+            if below {
                 return Ok(());
             }
             self.heap.swap(0, r);
