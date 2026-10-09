@@ -38,6 +38,7 @@ The next release is **0.2.0**: counters change in a breaking way (below), and ev
 - A database on NFS without working locks now fails to open with `NetworkFilesystem` instead of an I/O error about locks, and FUSE and GPFS mounts are refused as network filesystems (#147).
 
 ### Changed
+- **Flushes purge overwritten versions** (#287). A flush runs its memtable through compaction's GC: it drops what a non-bottommost compaction could (expired cells, cells hidden by a delete at every live snapshot). It also drops versions beyond `max_versions` when no other source of the family's tablet holds a delete. Hot, often-overwritten cells reach L0 already trimmed, so row reads and scans step over far fewer stale versions. Live snapshots read exactly what they did before. Delete markers are still purged only by a bottommost compaction.
 - The write stall follows L0 depth only; deeper levels and tiered space amplification no longer pace writers (D119).
 - On-disk format version 2 (FORMAT §12). This build reads 0.1.0 files, but a file it has written cannot be opened by 0.1.0.
 - A file at rest stays near its live size: compaction cuts its level outputs into power-of-two pieces, so after `compact()` and `shrink()` a file above 5 MiB is 1.05–1.16× its live data, where it was 2–4× (#185, D183). No migration: each compaction rewrites its outputs in the new shape.
