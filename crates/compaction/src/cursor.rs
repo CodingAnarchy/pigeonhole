@@ -10,8 +10,11 @@ use pigeonhole_format::scan::ScanFilter;
 /// earlier source wins and both entries are yielded).
 ///
 /// A binary min-heap of source indices: `next` is one source step plus `O(log k)` key
-/// comparisons, and nothing allocates after the first seek. After an error the cursor must be
-/// re-seeked before use.
+/// comparisons, and nothing allocates after the first seek. The heap remembers the smaller
+/// child of its top, so a step that leaves the top source on top (a run of one source's
+/// entries, such as a column's versions in one memtable) costs one comparison, and one that
+/// does not costs no more than a plain sift. With two sources every step is one comparison.
+/// After an error the cursor must be re-seeked before use.
 ///
 /// ```
 /// use pigeonhole_compaction::{MergingCursor, VecCursor};
@@ -35,6 +38,8 @@ pub struct MergingCursor<C> {
     heap: Vec<usize>,
     /// Scratch for `skip_row`.
     row: Vec<u8>,
+    /// The heap position (1 or 2) of the smaller child of the top, when there is one.
+    runner: usize,
 }
 
 impl<C: Cursor> MergingCursor<C> {
@@ -45,6 +50,7 @@ impl<C: Cursor> MergingCursor<C> {
             sources,
             heap,
             row: Vec::new(),
+            runner: 0,
         }
     }
 
@@ -99,6 +105,16 @@ impl<C: Cursor> MergingCursor<C> {
         for i in (0..self.heap.len() / 2).rev() {
             self.sift_down(i);
         }
+        self.set_runner();
+    }
+
+    /// Finds the smaller child of the top after the heap changed (0 when there is none).
+    fn set_runner(&mut self) {
+        self.runner = match self.heap.len() {
+            0 | 1 => 0,
+            2 => 1,
+            _ => 1 + usize::from(self.less(self.heap[2], self.heap[1])),
+        };
     }
 }
 
@@ -160,8 +176,18 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             let last = self.heap.len() - 1;
             self.heap.swap(0, last);
             self.heap.pop();
+            self.sift_down(0);
+        } else {
+            // Only the top moved: it stays while it is below the smaller of its children,
+            // one comparison; otherwise that child takes its place and it sinks from there.
+            let r = self.runner;
+            if r == 0 || self.less(top, self.heap[r]) {
+                return Ok(());
+            }
+            self.heap.swap(0, r);
+            self.sift_down(r);
         }
-        self.sift_down(0);
+        self.set_runner();
         Ok(())
     }
 
