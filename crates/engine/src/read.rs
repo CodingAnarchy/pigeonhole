@@ -341,16 +341,29 @@ impl RowData {
     pub fn qualifier(&self, cell: &RowCell) -> &[u8] {
         &self.qualifiers[cell.qualifier.start as usize..cell.qualifier.end as usize]
     }
+}
 
-    /// Appends a resolved cell (its qualifier unescaped into the shared buffer). `column`
-    /// is the cell's column prefix and `row_len` the length of its row prefix.
-    fn push(&mut self, family: FamilyId, column: &[u8], row_len: usize, data: CellData) {
-        let start = self.qualifiers.len() as u32;
-        let end = column.len().saturating_sub(2).max(row_len);
-        Escaped::new(&column[row_len..end]).unescape_into(&mut self.qualifiers);
+/// Where a row read puts the cells it resolves ([`Engine::read_row_into`](crate::Engine::read_row_into)),
+/// in order: by family (in [`ReadSpec::families`] order), then qualifier, newest version
+/// first. A caller's own row buffer can take them directly, without an intermediate
+/// [`RowData`] (#287).
+pub trait RowSink {
+    /// The buffer qualifiers are unescaped into, one after another.
+    fn qualifiers(&mut self) -> &mut Vec<u8>;
+    /// Appends a cell of `family` whose qualifier is `qualifier` within
+    /// [`RowSink::qualifiers`].
+    fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData);
+}
+
+impl RowSink for RowData {
+    fn qualifiers(&mut self) -> &mut Vec<u8> {
+        &mut self.qualifiers
+    }
+
+    fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData) {
         self.cells.push(RowCell {
             family,
-            qualifier: start..self.qualifiers.len() as u32,
+            qualifier: qualifier.start as u32..qualifier.end as u32,
             data,
         });
     }
@@ -837,6 +850,25 @@ pub(crate) fn read_row(
     spec: &ReadSpec,
     now: Timestamp,
 ) -> Result<Option<RowData>> {
+    let mut out = RowData {
+        row: row.to_vec(),
+        ..RowData::default()
+    };
+    let any = read_row_into(snapshot, table, row, families, spec, now, &mut out)?;
+    Ok(any.then_some(out))
+}
+
+/// Reads one row through `view` into `sink`: every family in `families` order. Returns
+/// whether any cell was found.
+pub(crate) fn read_row_into(
+    snapshot: &Snapshot,
+    table: TableId,
+    row: &[u8],
+    families: &[FamilyId],
+    spec: &ReadSpec,
+    now: Timestamp,
+    sink: &mut impl RowSink,
+) -> Result<bool> {
     let view = &snapshot.view;
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
@@ -845,12 +877,7 @@ pub(crate) fn read_row(
     encode_row_prefix(&mut prefix, row)?;
     let mut past = Vec::new();
     past_row(&prefix, &mut past);
-    let mut out = RowData {
-        row: row.to_vec(),
-        ..RowData::default()
-    };
-    // The current cell's column prefix, reused across cells.
-    let mut column = Vec::new();
+    let mut any = false;
     for &family in families {
         let Some(meta) = view.catalog.family(family) else {
             continue;
@@ -865,7 +892,7 @@ pub(crate) fn read_row(
         resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;
         loop {
-            let data = {
+            let (data, qualifier) = {
                 let next = resolver.next_cell();
                 ResolverBlobs::check(resolver_blobs.as_ref())?;
                 let Some(cell) = next.map_err(|e| read_error(e, meta))? else {
@@ -874,14 +901,20 @@ pub(crate) fn read_row(
                 if !cell.key.starts_with(&prefix) {
                     break;
                 }
-                column.clear();
-                column.extend_from_slice(column_of(cell.key));
-                if cell.from_source && cell.value.len() > CellData::INLINE_MAX {
+                // The qualifier goes straight into the sink, unescaped from the key.
+                let column = column_of(cell.key);
+                let end = column.len().saturating_sub(2).max(prefix.len());
+                let qualifiers = sink.qualifiers();
+                let start = qualifiers.len();
+                Escaped::new(&column[prefix.len()..end]).unescape_into(qualifiers);
+                let qualifier = start..qualifiers.len();
+                let data = if cell.from_source && cell.value.len() > CellData::INLINE_MAX {
                     // Pinned below, once the borrow of the resolver ends.
                     None
                 } else {
                     Some(CellData::resolved(&cell, &view.ssts, || Arc::clone(view))?)
-                }
+                };
+                (data, qualifier)
             };
             let data = match data {
                 Some(d) => d,
@@ -898,10 +931,11 @@ pub(crate) fn read_row(
                     CellData::from_pinned(ts, &value, || Arc::clone(view))
                 }
             };
-            out.push(family, &column, prefix.len(), data);
+            sink.push(family, qualifier, data);
+            any = true;
         }
     }
-    Ok((!out.cells.is_empty()).then_some(out))
+    Ok(any)
 }
 
 /// A point get through `view` at `seqno`.

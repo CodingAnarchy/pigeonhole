@@ -185,6 +185,16 @@ pub(crate) struct RowBuf {
     last_family: Option<(FamilyId, usize)>,
 }
 
+impl pigeonhole_engine::RowSink for RowBuf {
+    fn qualifiers(&mut self) -> &mut Vec<u8> {
+        &mut self.qualifiers
+    }
+
+    fn push(&mut self, family: FamilyId, qualifier: Range<usize>, data: CellData) {
+        RowBuf::push(self, family, qualifier, data);
+    }
+}
+
 impl RowBuf {
     /// An empty row whose families are named by `info`, with room for `cells` cells.
     pub(crate) fn new(info: Arc<TableInfo>, cells: usize) -> Self {

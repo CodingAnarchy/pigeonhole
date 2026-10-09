@@ -42,7 +42,7 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use options::EngineOptions;
-pub use read::{CellData, ReadSpec, RowCell, RowData, ScanCell, ScanCursor, ScanSpec};
+pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 #[doc(hidden)]
 pub use shard::set_tracing;
 pub use snapshot::{Snapshot, TabletMap, View};
