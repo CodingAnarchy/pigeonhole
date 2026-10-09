@@ -51,6 +51,8 @@ pub struct Options {
     tablet_changes: bool,
     tablet_balance: Option<(Duration, u64, u64)>,
     write_stall_timeout: Option<Duration>,
+    commit_spin: Option<Duration>,
+    shard_spin: Option<Duration>,
 }
 
 impl Default for Options {
@@ -74,6 +76,8 @@ impl Default for Options {
             tablet_changes: true,
             tablet_balance: None,
             write_stall_timeout: None,
+            commit_spin: None,
+            shard_spin: None,
         }
     }
 }
@@ -162,6 +166,35 @@ impl Options {
     /// ```
     pub fn write_stall_timeout(mut self, timeout: Duration) -> Self {
         self.write_stall_timeout = Some(timeout);
+        self
+    }
+
+    /// How long a thread waiting for its buffered (or non-durable) commit polls for the
+    /// result before it sleeps (default 15 µs). A shard usually answers within a few
+    /// microseconds, and putting the thread to sleep and waking it costs that again or more
+    /// (D198). A durable commit waits for a disk sync and sleeps at once. A wait that keeps
+    /// finding nothing polls less often. `Duration::ZERO` always sleeps at once: for
+    /// battery-powered or CPU-constrained hosts.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().commit_spin(Duration::ZERO).shard_spin(Duration::ZERO);
+    /// # let _ = options;
+    /// ```
+    pub fn commit_spin(mut self, window: Duration) -> Self {
+        self.commit_spin = Some(window);
+        self
+    }
+
+    /// How long a shard thread that just handled a commit keeps polling for the next one
+    /// before it sleeps (default 50 µs, D198), so a steady stream of commits is taken
+    /// without waking the thread each time. An idle database never polls, and polls that
+    /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
+    /// by application-owned shards, whose loop the application runs.
+    pub fn shard_spin(mut self, window: Duration) -> Self {
+        self.shard_spin = Some(window);
         self
     }
 
@@ -572,6 +605,12 @@ impl Options {
             o.wal.segment_size = bytes;
         }
         o.tablet_changes = self.tablet_changes;
+        if let Some(window) = self.commit_spin {
+            o.commit_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
+        }
+        if let Some(window) = self.shard_spin {
+            o.shard_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
+        }
         if let Some(timeout) = self.write_stall_timeout {
             o.write_stall_timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         }
