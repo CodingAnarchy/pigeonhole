@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arc_swap::ArcSwap;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::MergeRegistry;
+use pigeonhole_format::key::compare;
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions};
 use pigeonhole_format::shm::ViewRecord;
 use pigeonhole_format::value::{ValueRef, ValueTag, encode_value};
@@ -1985,6 +1986,8 @@ impl Inner {
         // many counter puts and operands there are (two may combine, #295).
         let mut fixed_ts = false;
         let mut counter_writes = 0usize;
+        // The shard of the last row routed: a batch's writes to one row route once.
+        let mut last: Option<(TableId, &[u8], ShardId)> = None;
         for m in batch.batch().iter() {
             let m = m?;
             let Some(meta) = catalog.family(m.family) else {
@@ -2022,8 +2025,17 @@ impl Inner {
                     MergeKind::I64Add | MergeKind::Registered => {}
                 }
             }
-            let Some((_, shard)) = view.tablets().route(m.table, m.row) else {
-                return Err(Error::TableNotFound(format!("table {}", m.table.0)));
+            let shard = match last {
+                Some((table, row, shard)) if table == m.table && compare(row, m.row).is_eq() => {
+                    shard
+                }
+                _ => {
+                    let Some((_, shard)) = view.tablets().route(m.table, m.row) else {
+                        return Err(Error::TableNotFound(format!("table {}", m.table.0)));
+                    };
+                    last = Some((m.table, m.row, shard));
+                    shard
+                }
             };
             if !shards.contains(&shard) {
                 shards.push(shard);

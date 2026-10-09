@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_cache::{BlockCache, Cell, Priority};
 use pigeonhole_compaction::{Levels, blob_pointer};
-use pigeonhole_format::key::row_prefix_len;
+use pigeonhole_format::key::{compare, row_prefix_len};
 use pigeonhole_format::manifest::{CachePriority, SstMeta};
 use pigeonhole_format::shm::{ViewMemtable, ViewRecord, ViewTablet};
 use pigeonhole_format::superblock::ExtentRef;
@@ -89,10 +89,10 @@ impl TabletMap {
     pub fn route(&self, table: TableId, row: &[u8]) -> Option<(TabletId, ShardId)> {
         let list = self.tables.get(&table)?;
         // The last tablet whose start is <= row.
-        let idx = list.partition_point(|t| t.start.as_slice() <= row);
+        let idx = list.partition_point(|t| compare(&t.start, row).is_le());
         let t = list.get(idx.checked_sub(1)?)?;
         match &t.end {
-            Some(end) if row >= end.as_slice() => None,
+            Some(end) if compare(row, end).is_ge() => None,
             _ => Some((t.id, t.shard)),
         }
     }
