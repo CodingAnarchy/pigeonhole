@@ -4,6 +4,7 @@
 //! `pigeonhole-compaction`'s `MergingCursor` and `CellResolver`: reads and compaction share
 //! one implementation of the delete, TTL, version and merge rules.
 
+use std::cell::Cell as StdCell;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use pigeonhole_format::{FamilyId, TabletId};
 use pigeonhole_memtable::{ArenaSlice, MemIter, MemtableReader};
 use pigeonhole_runtime::ShardId;
 use pigeonhole_sst::{ReadOptions, SstIter};
+use smallvec::SmallVec;
 
 use crate::snapshot::{FamilySsts, MemSet, OpenSst, SstSet, View};
 use crate::{Error, Result};
@@ -208,24 +210,42 @@ pub(crate) fn sst_sources_range(
 /// The filter probes of a point read: hashes of the row, the column and the row's marker
 /// key (FORMAT §6), computed once per read.
 pub(crate) struct Probe {
-    pub row_prefix: Vec<u8>,
+    /// The escaped row prefix: inline for rows of usual length, so a point read allocates
+    /// nothing for it (#46).
+    pub row_prefix: SmallVec<[u8; 96]>,
     row: u64,
     column: u64,
     marker: u64,
 }
 
+thread_local! {
+    /// Scratch for encoding a probe's keys, kept by each reading thread (#46). Taken while
+    /// in use, so a nested probe on the same thread (none today) would get a fresh one.
+    static PROBE_SCRATCH: StdCell<Vec<u8>> = const { StdCell::new(Vec::new()) };
+}
+
 impl Probe {
     pub(crate) fn new(row: &[u8], qualifier: &[u8]) -> Result<Self> {
-        let mut buf = Vec::with_capacity(row.len() * 2 + qualifier.len() * 2 + 8);
-        escape_into(&mut buf, row);
-        let row_h = row_hash(&buf);
+        let mut buf = PROBE_SCRATCH.take();
         buf.clear();
-        encode_column_prefix(&mut buf, row, qualifier)?;
-        let column = column_hash(&buf);
+        let probe = Self::encode(&mut buf, row, qualifier);
+        // A key long enough to grow the scratch past 64 KiB is not worth keeping.
+        if buf.capacity() <= 64 << 10 {
+            PROBE_SCRATCH.set(buf);
+        }
+        probe
+    }
+
+    fn encode(buf: &mut Vec<u8>, row: &[u8], qualifier: &[u8]) -> Result<Self> {
+        escape_into(buf, row);
+        let row_h = row_hash(buf);
         buf.clear();
-        encode_marker_prefix(&mut buf, row)?;
-        let marker = column_hash(&buf);
-        let row_prefix = buf[..buf.len() - 2].to_vec();
+        encode_column_prefix(buf, row, qualifier)?;
+        let column = column_hash(buf);
+        buf.clear();
+        encode_marker_prefix(buf, row)?;
+        let marker = column_hash(buf);
+        let row_prefix = SmallVec::from_slice(&buf[..buf.len() - 2]);
         Ok(Self {
             row_prefix,
             row: row_h,
@@ -337,7 +357,11 @@ impl View {
         qualifier: &[u8],
     ) -> Result<Vec<Source>> {
         let l = self.locate(shard, tablet, family);
-        let mut out = Vec::new();
+        // Sized for the memtables and a couple of SSTs: a source is about 1 KiB, and a
+        // `Vec` grown from empty would hold four (#46).
+        let mems = l.mems.map_or(0, |set| set.readers.len());
+        let ssts = l.ssts.map_or(0, |fam| fam.iter().take(2).count());
+        let mut out = Vec::with_capacity(mems + ssts);
         let all = ScanFilter::all();
         if let Some(set) = l.mems {
             mem_sources(set, &all, &mut out);
