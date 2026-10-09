@@ -399,10 +399,24 @@ impl Cursor for SstIter {
     }
 
     fn next(&mut self) -> Result<()> {
-        if !self.valid() {
+        let Some(data) = self.data.as_mut().filter(|d| d.valid()) else {
             return Ok(());
+        };
+        // The usual step: the next entry of the same block, no filter to apply.
+        match data.next() {
+            Ok(()) if data.valid() && self.filter_all => Ok(()),
+            Ok(()) => self.run(|it| {
+                if valid(&it.data) {
+                    Ok(())
+                } else {
+                    it.advance_block()
+                }
+            }),
+            Err(e) => {
+                self.data = None;
+                Err(e.into())
+            }
         }
-        self.run(Self::next_raw)
     }
 
     /// Uses the block's row-start table; crosses into the next block only if the row
