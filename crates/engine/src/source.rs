@@ -274,6 +274,25 @@ impl Drop for ColumnKey {
     }
 }
 
+/// A row read's row prefix (escaped row and terminator, as
+/// [`encode_row_prefix`](pigeonhole_format::key::encode_row_prefix) writes it), inline for
+/// rows of usual length so a row read allocates nothing for it (#287).
+pub(crate) fn row_prefix(row: &[u8]) -> Result<SmallVec<[u8; 96]>> {
+    if row.len() > MAX_KEY_PART {
+        return Err(pigeonhole_format::Error::KeyTooLarge.into());
+    }
+    let mut out = SmallVec::new();
+    let mut rest = row;
+    while let Some(i) = rest.iter().position(|&b| b == 0) {
+        out.extend_from_slice(&rest[..=i]);
+        out.push(0xFF);
+        rest = &rest[i + 1..];
+    }
+    out.extend_from_slice(rest);
+    out.extend_from_slice(&TERMINATOR);
+    Ok(out)
+}
+
 /// The filter probes of a point read: hashes of the row, the column and the row's marker
 /// key (FORMAT §6), computed once per read from its [`ColumnKey`].
 pub(crate) struct Probe<'a> {
@@ -436,7 +455,6 @@ impl View {
         tablet: TabletId,
         family: FamilyId,
         filter: &ScanFilter,
-        row: &[u8],
         row_prefix: &[u8],
         out: &mut Vec<Source>,
     ) -> Result<()> {
@@ -447,19 +465,39 @@ impl View {
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
-            // Inline for rows of usual length: nothing allocated per read.
-            let mut escaped = SmallVec::<[u8; 96]>::new();
-            let mut rest = row;
-            while let Some(i) = rest.iter().position(|&b| b == 0) {
-                escaped.extend_from_slice(&rest[..=i]);
-                escaped.push(0xFF);
-                rest = &rest[i + 1..];
-            }
-            escaped.extend_from_slice(rest);
+            // The escaped row: the row prefix without its terminator.
+            let escaped = &row_prefix[..row_prefix.len() - TERMINATOR.len()];
             sst_sources_row(
-                fam, &self.ssts, filter, &escaped, row_prefix, l.priority, out,
+                fam, &self.ssts, filter, escaped, row_prefix, l.priority, out,
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod row_prefix_tests {
+    use pigeonhole_format::key::{MAX_KEY_PART, encode_row_prefix};
+
+    use super::row_prefix;
+
+    #[test]
+    fn a_row_prefix_is_the_formats_encoding() {
+        let long = vec![7u8; 300];
+        let rows: [&[u8]; 6] = [
+            b"",
+            b"r",
+            b"\x00",
+            b"a\x00b\x00\x00",
+            b"\xff\x00\xff",
+            &long,
+        ];
+        for row in rows {
+            let mut want = Vec::new();
+            encode_row_prefix(&mut want, row).unwrap();
+            assert_eq!(&row_prefix(row).unwrap()[..], &want[..], "row {row:?}");
+        }
+        assert!(row_prefix(&vec![1u8; MAX_KEY_PART + 1]).is_err());
+        assert!(row_prefix(&vec![1u8; MAX_KEY_PART]).is_ok());
     }
 }

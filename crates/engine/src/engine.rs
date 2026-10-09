@@ -26,6 +26,7 @@ use pigeonhole_runtime::{
 use pigeonhole_shm::{Presence, ReaderSlot, Role as ShmRole, ShmConfig, ShmRegion, WriterLock};
 use pigeonhole_sst::SstWriterOptions;
 use pigeonhole_wal::{Recovery, Wal, WalStream, discover_streams, stream_path};
+use smallvec::SmallVec;
 
 use crate::catalog::{Catalog, FamilyMeta, MergeKind};
 use crate::flush::{SstSink, write_memtable};
@@ -1329,7 +1330,7 @@ impl Engine {
             snapshot.clone(),
             table,
             spec,
-            families,
+            families.into_vec(),
             now,
         ))
     }
@@ -1735,7 +1736,12 @@ fn replay_error(e: Error) -> Error {
 
 /// The families of `table` to read: in creation order, or as listed (duplicates and unknown
 /// ids dropped), decision D39.
-fn families_in_order(view: &View, table: TableId, listed: &[FamilyId]) -> Result<Vec<FamilyId>> {
+/// Inline for up to four families, so a row read allocates nothing for them (#287).
+fn families_in_order(
+    view: &View,
+    table: TableId,
+    listed: &[FamilyId],
+) -> Result<SmallVec<[FamilyId; 4]>> {
     let info = view
         .catalog
         .table(table)
@@ -1743,7 +1749,7 @@ fn families_in_order(view: &View, table: TableId, listed: &[FamilyId]) -> Result
     if listed.is_empty() {
         return Ok(info.families.iter().map(|f| f.id).collect());
     }
-    let mut out = Vec::with_capacity(listed.len());
+    let mut out = SmallVec::with_capacity(listed.len());
     for &f in listed {
         if !out.contains(&f) && info.families.iter().any(|x| x.id == f) {
             out.push(f);
