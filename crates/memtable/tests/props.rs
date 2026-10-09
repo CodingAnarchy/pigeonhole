@@ -64,9 +64,9 @@ proptest! {
 
         let mut probes: Vec<Vec<u8>> = targets;
         probes.extend(model.keys().cloned());
-        for target in probes {
-            it.seek(&target).unwrap();
-            match model.range(target..).next() {
+        for target in &probes {
+            it.seek(target).unwrap();
+            match model.range(target.clone()..).next() {
                 Some((k, v)) => {
                     prop_assert!(it.valid());
                     prop_assert_eq!(it.key(), &k[..]);
@@ -74,6 +74,36 @@ proptest! {
                 }
                 None => prop_assert!(!it.valid()),
             }
+        }
+
+        // Forward seeks (a finger search from the last seek): one seek, then ascending
+        // targets, sometimes stepping on first (the cursor may then be past the target).
+        probes.sort();
+        let mut first = true;
+        for (i, target) in probes.iter().enumerate() {
+            if first {
+                it.seek(target).unwrap();
+                first = false;
+            } else {
+                if i % 3 == 0 && it.valid() {
+                    it.next().unwrap();
+                }
+                it.seek_forward(target).unwrap();
+            }
+            match model.range(target.clone()..).next() {
+                Some((k, v)) => {
+                    prop_assert!(it.valid(), "forward seek to {:?} missed {:?}", target, k);
+                    prop_assert_eq!(it.key(), &k[..]);
+                    prop_assert_eq!(it.value(), &v[..]);
+                }
+                None => prop_assert!(!it.valid()),
+            }
+        }
+        // A forward seek without an earlier seek is a plain seek.
+        let mut fresh = reader.iter();
+        if let Some(target) = probes.last() {
+            fresh.seek_forward(target).unwrap();
+            prop_assert_eq!(fresh.valid(), model.range(target.clone()..).next().is_some());
         }
     }
 }
@@ -253,4 +283,89 @@ proptest! {
             prop_assert!(used <= bound, "used {used} > bound {bound}");
         }
     }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "10,000 entries")]
+fn forward_seeks_far_beyond_the_finger_reach_fall_back_to_a_full_search() {
+    // The finger search records the lowest 4 levels (about 64 entries of reach at the tower
+    // ratio of 4): forward seeks over longer distances, and short ones in between, all land
+    // on the lower bound.
+    let mut arena = ShardArena::new(ArenaRegion::heap(64 << 20), 64 * 1024);
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    let mut keys = Vec::new();
+    for i in 0..10_000u64 {
+        let mut key = Vec::new();
+        encode_key(
+            &mut key,
+            format!("row{i:07}").as_bytes(),
+            b"q",
+            1,
+            i + 1,
+            Kind::Put,
+        )
+        .unwrap();
+        mt.insert(&mut arena, &key, b"v").unwrap();
+        keys.push(key);
+    }
+    keys.sort();
+    let reader = mt.reader();
+    let mut it = reader.iter();
+    it.seek(&keys[0]).unwrap();
+    let mut at = 0;
+    for step in [1usize, 3, 40, 300, 2, 6_000, 5, 64, 2_000] {
+        at = (at + step).min(keys.len() - 1);
+        it.seek_forward(&keys[at]).unwrap();
+        assert!(it.valid());
+        assert_eq!(
+            it.key(),
+            &keys[at][..],
+            "forward seek of {step} entries to {at}"
+        );
+    }
+    // Past the last key: invalid.
+    let mut beyond = keys[keys.len() - 1].clone();
+    beyond.push(0xFF);
+    it.seek_forward(&beyond).unwrap();
+    assert!(!it.valid());
+}
+
+#[test]
+fn a_forward_seek_before_the_last_seeks_target_finds_what_seek_would() {
+    // `Cursor::seek_forward` promises only a target at or past the current key, and nothing
+    // on an exhausted cursor: a target before the last seek's must not start from that
+    // seek's finger, which is past entries the target wants.
+    let mut arena = ShardArena::new(ArenaRegion::heap(1 << 20), 64 * 1024);
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    let key = |i: u64| {
+        let mut k = Vec::new();
+        encode_key(
+            &mut k,
+            format!("row{i:03}").as_bytes(),
+            b"q",
+            1,
+            1,
+            Kind::Put,
+        )
+        .unwrap();
+        k
+    };
+    for i in 0..200 {
+        mt.insert(&mut arena, &key(i), b"v").unwrap();
+    }
+    let reader = mt.reader();
+    let mut it = reader.iter();
+    // Past the last entry: the cursor is exhausted.
+    it.seek(&key(500)).unwrap();
+    assert!(!it.valid());
+    it.seek_forward(&key(150)).unwrap();
+    assert!(
+        it.valid(),
+        "entries in [target, last seek's target) were missed"
+    );
+    assert_eq!(it.key(), &key(150)[..]);
+    // And from a valid cursor, a target before the last seek's: as `seek`.
+    it.seek(&key(120)).unwrap();
+    it.seek_forward(&key(30)).unwrap();
+    assert_eq!(it.key(), &key(30)[..]);
 }

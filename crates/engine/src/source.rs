@@ -88,6 +88,16 @@ impl Cursor for Source {
         }
     }
 
+    fn seek_forward(&mut self, target: &[u8]) -> Result<()> {
+        match self {
+            // A finger search from the memtable cursor's last seek.
+            Source::Mem(it) => Ok(it.seek_forward(target)?),
+            Source::Sst(it) => Ok(it.seek_forward(target)?),
+            #[cfg(test)]
+            Source::Vec(it) => Ok(it.seek_forward(target)?),
+        }
+    }
+
     fn next(&mut self) -> Result<()> {
         match self {
             Source::Mem(it) => Ok(it.next()?),

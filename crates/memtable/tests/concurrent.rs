@@ -85,6 +85,53 @@ fn run_seeks(
         let at = it.valid().then(|| it.key().to_vec());
         landed.push((target, at));
     }
+    // Forward seeks (a finger search from the last seek) while the writer inserts: random
+    // targets in ascending order, and keys present before the read, which must hit.
+    let mut targets: Vec<Vec<u8>> = (0..20).map(|_| common::random_entry(rng, 0).0).collect();
+    targets.sort();
+    for (i, target) in targets.into_iter().enumerate() {
+        if i == 0 {
+            it.seek(&target).unwrap();
+        } else {
+            it.seek_forward(&target).unwrap();
+        }
+        let at = it.valid().then(|| it.key().to_vec());
+        landed.push((target, at));
+    }
+    let mut hits: Vec<&Vec<u8>> = (0..10.min(keys.len()))
+        .map(|_| keys[rng.below(keys.len())])
+        .collect();
+    hits.sort();
+    for (i, k) in hits.into_iter().enumerate() {
+        if i == 0 {
+            it.seek(k).unwrap();
+        } else {
+            it.seek_forward(k).unwrap();
+        }
+        assert!(
+            it.valid(),
+            "forward seek missed a key present before the seek"
+        );
+        assert_eq!(it.key(), &k[..]);
+    }
+    // Short forward seeks, the finger search's own path rather than its fallback to a full
+    // search: a key present before the read, then each of its next few neighbours (`keys`
+    // is sorted), while the writer links new entries between them.
+    for _ in 0..5 {
+        if keys.is_empty() {
+            break;
+        }
+        let j = rng.below(keys.len());
+        it.seek(keys[j]).unwrap();
+        for k in keys.iter().skip(j + 1).take(4) {
+            it.seek_forward(k).unwrap();
+            assert!(
+                it.valid(),
+                "short forward seek missed a key present before the seek"
+            );
+            assert_eq!(it.key(), &k[..]);
+        }
+    }
     landed
 }
 

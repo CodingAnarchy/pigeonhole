@@ -143,3 +143,47 @@ fn loom_count_publishes_every_counted_entry() {
         assert_eq!(mt.reader().len(), 1);
     });
 }
+
+#[test]
+fn loom_forward_seek_sees_an_entry_linked_after_the_finger() {
+    model().check(|| {
+        let mut arena = ShardArena::new(ArenaRegion::heap(2048), 1024);
+        let mut mt = Memtable::create(&mut arena).unwrap();
+        let (a, c, d) = (key(1, 1), key(3, 1), key(4, 1));
+        mt.insert(&mut arena, &a, b"\x00a").unwrap();
+        mt.insert(&mut arena, &d, b"\x00d").unwrap();
+        let reader = mt.reader();
+        let c2 = c.clone();
+
+        let writer = thread::spawn(move || {
+            // Linked between the finger (`a`) and the forward seek's lower bound (`d`).
+            mt.insert(&mut arena, &c2, b"\x00c").unwrap();
+            mt
+        });
+        let seeker = thread::spawn(move || {
+            let mut it = reader.iter();
+            // Lands on `d` and records `a` as the level-0 finger.
+            it.seek(&key(2, 1)).unwrap();
+            assert!(it.valid());
+            // A count of three promises `c` is reachable.
+            let n = reader.len();
+            it.seek_forward(&c).unwrap();
+            assert!(it.valid());
+            if n == 3 {
+                assert_eq!(
+                    it.key(),
+                    &c[..],
+                    "the forward seek missed a published entry"
+                );
+            } else {
+                assert!(
+                    it.key() == &c[..] || it.key() == &d[..],
+                    "landed on {:?}",
+                    it.key()
+                );
+            }
+        });
+        let _mt = writer.join().unwrap();
+        seeker.join().unwrap();
+    });
+}
