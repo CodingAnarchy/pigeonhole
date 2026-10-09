@@ -54,3 +54,31 @@ pub fn table(db: &Pigeonhole, name: &str, families: &[&str]) -> Result<Table> {
         })
         .create_if_missing()
 }
+
+/// Runs `fut` to completion on the calling thread: a minimal executor for examples and
+/// tests (the thread parks until the future's waker unparks it). Applications use their own
+/// executor.
+pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+        std::thread::park();
+    }
+}

@@ -6,6 +6,11 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+- **Async commits** (Phase 3, #42; behind the `async` feature, which stays off by default until the async front door is complete): `RowMutation::commit_async`, `WriteBatch::commit_async` and `commit_with_async`, and `Transaction::commit_async` and `commit_with_async` return a `nonblocking::CommitFuture`. It submits at the call and resolves when the commit is durable at its level and visible, as the sync `commit` returns. Dropping it does not roll the commit back. It runs on any executor (no runtime dependency, no `spawn_blocking`) and on an application-owned shard's own event loop.
+- `WriteBatch::commit_with_ticket` returns a `CommitTicket` (D196): `wait`, a non-blocking `try_result`, `seqno` once resolved, and `.await` with the `async` feature. It is available without the feature.
+- `pigeonhole-engine`: `Txn::submit`, the non-blocking half of `Txn::commit`.
+
 ## [0.2.0] - 2026-10-09
 The **Phase 2 wide-column model**: counter families, large values and blob separation, per-family compaction styles and zstd, a file at rest near its live size, and the read- and write-path work that met the Phase 2 gate as amended by [D193](docs/design/decisions/phase-2.md#d193). Counters change in a breaking way, and the file format is version 2; see [Migrating from 0.1.0](#migrating-from-010). Every published crate moves to 0.2.0 together.
 
