@@ -240,7 +240,7 @@ impl Model {
     /// };
     /// let commits = [put(b"a", 0), put(b"b", 1)];
     /// let m = Model::from_commits(
-    ///     |m| m.create_table("t", vec![ModelFamily { name: "f".into(), ..Default::default() }]),
+    ///     |m| m.create_table("t", vec![ModelFamily::new("f")]),
     ///     &commits[..1],
     /// );
     /// assert_eq!(m.get("t", b"r", "f", b"q", m.snapshot(), 20).unwrap().value, b"a");

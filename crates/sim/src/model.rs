@@ -6,7 +6,17 @@ use pigeonhole_format::{Durability, Seqno, Timestamp};
 use pigeonhole_io::sim::CrashKind;
 
 /// Policy of a model family (mirrors the persisted family options that change semantics).
+///
+/// `#[non_exhaustive]`: build it with [`ModelFamily::new`] and the setters.
+///
+/// ```
+/// use pigeonhole_sim::ModelFamily;
+///
+/// let f = ModelFamily::new("hits").counter(true).max_versions(3);
+/// assert!(f.counter && !f.i64_add);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ModelFamily {
     /// Family name.
     pub name: String,
@@ -20,6 +30,45 @@ pub struct ModelFamily {
     /// A counter family (decision D179): `i64` values only, operands combine per timestamp,
     /// deletes hide only older writes. Implies the `i64` add operator.
     pub counter: bool,
+}
+
+impl ModelFamily {
+    /// A family named `name` with the defaults: every version kept, no TTL, no merge
+    /// operator, not a counter family.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Sets `max_versions` (0 keeps all).
+    #[must_use]
+    pub fn max_versions(mut self, n: u32) -> Self {
+        self.max_versions = n;
+        self
+    }
+
+    /// Sets `ttl_micros` (0 disables TTL).
+    #[must_use]
+    pub fn ttl_micros(mut self, micros: u64) -> Self {
+        self.ttl_micros = micros;
+        self
+    }
+
+    /// Sets `i64_add` (the built-in `i64` add operator, 0.1.0-style).
+    #[must_use]
+    pub fn i64_add(mut self, yes: bool) -> Self {
+        self.i64_add = yes;
+        self
+    }
+
+    /// Sets `counter` (a counter family, D179).
+    #[must_use]
+    pub fn counter(mut self, yes: bool) -> Self {
+        self.counter = yes;
+        self
+    }
 }
 
 /// The timestamp of a counter family's counter: puts and `Incr`s without a timestamp land
@@ -245,7 +294,7 @@ struct Table {
 /// use pigeonhole_sim::{Model, ModelFamily, ModelOp};
 ///
 /// let mut m = Model::new();
-/// m.create_table("t", vec![ModelFamily { name: "f".into(), ..Default::default() }]);
+/// m.create_table("t", vec![ModelFamily::new("f")]);
 /// let put = |v: &[u8]| ModelOp::Put {
 ///     table: "t".into(), row: b"r".to_vec(), family: "f".into(),
 ///     qualifier: b"q".to_vec(), ts: None, value: v.to_vec(),
@@ -946,7 +995,10 @@ impl Model {
 
 /// What [`Model::purge`] removes: the bottommost-compaction purge of one family's input
 /// entries (owner decision on purges vs later writes, HBase semantics).
+///
+/// `#[non_exhaustive]`: build it with [`ModelPurge::new`] and the setters.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ModelPurge {
     /// Table name.
     pub table: String,
@@ -962,6 +1014,58 @@ pub struct ModelPurge {
     pub min_ts_above: Timestamp,
     /// The newest seqno among the compaction's inputs; newer entries are above them.
     pub max_seqno: Seqno,
+}
+
+impl ModelPurge {
+    /// A purge of `family` in `table` over every row, with no live snapshot, `now` 0, and
+    /// `min_ts_above` and `max_seqno` 0, so it purges nothing until the setters say what
+    /// the compaction covered.
+    pub fn new(table: impl Into<String>, family: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            family: family.into(),
+            rows: (Bound::Unbounded, Bound::Unbounded),
+            snapshots: Vec::new(),
+            now: 0,
+            min_ts_above: 0,
+            max_seqno: 0,
+        }
+    }
+
+    /// Sets `rows`, the rows the compaction covered.
+    #[must_use]
+    pub fn rows(mut self, rows: (Bound<Vec<u8>>, Bound<Vec<u8>>)) -> Self {
+        self.rows = rows;
+        self
+    }
+
+    /// Sets `snapshots`, the live snapshot seqnos.
+    #[must_use]
+    pub fn snapshots(mut self, snapshots: Vec<Seqno>) -> Self {
+        self.snapshots = snapshots;
+        self
+    }
+
+    /// Sets `now`, the compaction's clock (TTL).
+    #[must_use]
+    pub fn now(mut self, now: Timestamp) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// Sets `min_ts_above`: nothing at or above it is purged.
+    #[must_use]
+    pub fn min_ts_above(mut self, ts: Timestamp) -> Self {
+        self.min_ts_above = ts;
+        self
+    }
+
+    /// Sets `max_seqno`, the newest seqno among the compaction's inputs.
+    #[must_use]
+    pub fn max_seqno(mut self, seqno: Seqno) -> Self {
+        self.max_seqno = seqno;
+        self
+    }
 }
 
 /// Indices into `entries` of the entries each visible version is made of (base and the
@@ -1396,15 +1500,13 @@ mod tests {
 
     fn purge_all(m: &mut Model, family: &str, snapshots: Vec<Seqno>) {
         let now = 1_000;
-        m.purge(&ModelPurge {
-            table: "t".into(),
-            family: family.into(),
-            rows: (Bound::Unbounded, Bound::Unbounded),
-            snapshots,
-            now,
-            min_ts_above: u64::MAX,
-            max_seqno: m.snapshot(),
-        });
+        m.purge(
+            &ModelPurge::new("t", family)
+                .snapshots(snapshots)
+                .now(now)
+                .min_ts_above(u64::MAX)
+                .max_seqno(m.snapshot()),
+        );
     }
 
     #[test]

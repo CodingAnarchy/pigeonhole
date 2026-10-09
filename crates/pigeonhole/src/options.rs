@@ -425,11 +425,9 @@ impl Family {
     /// ```
     pub fn counter() -> Self {
         Self {
-            options: FamilyOptions {
-                merge_operator: I64_ADD.to_owned(),
-                kind: FamilyKind::Counter,
-                ..FamilyOptions::default()
-            },
+            options: FamilyOptions::default()
+                .merge_operator(I64_ADD.to_owned())
+                .kind(FamilyKind::Counter),
         }
     }
 

@@ -216,7 +216,22 @@ pub enum FamilyKind {
 
 /// The persisted policy of one family. Stored in the manifest so another binary interprets
 /// the data the same way.
+///
+/// `#[non_exhaustive]`, so fields can be added without a breaking release: build it from
+/// [`FamilyOptions::default`] and the setters, one per field.
+///
+/// ```
+/// use pigeonhole_format::manifest::{CompactionStyle, FamilyKind, FamilyOptions};
+///
+/// let counters = FamilyOptions::default()
+///     .merge_operator("pigeonhole.i64_add")
+///     .kind(FamilyKind::Counter)
+///     .compaction(CompactionStyle::Tiered);
+/// assert_eq!(counters.kind, FamilyKind::Counter);
+/// assert_eq!(counters.max_versions, 0); // the default
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FamilyOptions {
     /// Block codec.
     pub compression: Compression,
@@ -263,6 +278,83 @@ impl Default for FamilyOptions {
 }
 
 impl FamilyOptions {
+    /// Sets `compression`: block codec.
+    #[must_use]
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Sets `compression_level`: zstd level when `compression` is zstd.
+    #[must_use]
+    pub fn compression_level(mut self, compression_level: i8) -> Self {
+        self.compression_level = compression_level;
+        self
+    }
+
+    /// Sets `block_size`: target uncompressed data-block size.
+    #[must_use]
+    pub fn block_size(mut self, block_size: u32) -> Self {
+        self.block_size = block_size;
+        self
+    }
+
+    /// Sets `bloom_bits`: bloom bits per key; 0 disables both filters.
+    #[must_use]
+    pub fn bloom_bits(mut self, bloom_bits: u8) -> Self {
+        self.bloom_bits = bloom_bits;
+        self
+    }
+
+    /// Sets `max_versions`: versions kept per column; 0 keeps all.
+    #[must_use]
+    pub fn max_versions(mut self, max_versions: u32) -> Self {
+        self.max_versions = max_versions;
+        self
+    }
+
+    /// Sets `ttl_micros`: time to live in microseconds; 0 disables TTL.
+    #[must_use]
+    pub fn ttl_micros(mut self, ttl_micros: u64) -> Self {
+        self.ttl_micros = ttl_micros;
+        self
+    }
+
+    /// Sets `blob_threshold`: values longer than this are separated into blob extents; `u32::MAX` disables it.
+    #[must_use]
+    pub fn blob_threshold(mut self, blob_threshold: u32) -> Self {
+        self.blob_threshold = blob_threshold;
+        self
+    }
+
+    /// Sets `cache_priority`: cache priority.
+    #[must_use]
+    pub fn cache_priority(mut self, cache_priority: CachePriority) -> Self {
+        self.cache_priority = cache_priority;
+        self
+    }
+
+    /// Sets `compaction`: compaction strategy.
+    #[must_use]
+    pub fn compaction(mut self, compaction: CompactionStyle) -> Self {
+        self.compaction = compaction;
+        self
+    }
+
+    /// Sets `kind`: what the family's columns hold.
+    #[must_use]
+    pub fn kind(mut self, kind: FamilyKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Sets `merge_operator`: the merge operator's name; empty for none.
+    #[must_use]
+    pub fn merge_operator(mut self, name: impl Into<String>) -> Self {
+        self.merge_operator = name.into();
+        self
+    }
+
     fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.compression as u8);
         out.push(self.compression_level as u8);

@@ -318,10 +318,7 @@ fn all_edits() -> Vec<Edit> {
             table: TableId(1),
             family: FamilyId(2),
             name: "links".into(),
-            options: FamilyOptions {
-                merge_operator: "pigeonhole.i64_add".into(),
-                ..FamilyOptions::default()
-            },
+            options: FamilyOptions::default().merge_operator("pigeonhole.i64_add"),
         },
         Edit::PutTablet {
             tablet: TabletId(3),
@@ -399,11 +396,9 @@ fn all_edits() -> Vec<Edit> {
             table: TableId(1),
             family: FamilyId(3),
             name: "hits".into(),
-            options: FamilyOptions {
-                merge_operator: "pigeonhole.i64_add".into(),
-                kind: FamilyKind::Counter,
-                ..FamilyOptions::default()
-            },
+            options: FamilyOptions::default()
+                .merge_operator("pigeonhole.i64_add")
+                .kind(FamilyKind::Counter),
         },
     ]
 }

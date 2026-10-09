@@ -26,11 +26,9 @@ fn an_idle_fifo_family_drops_ssts_when_they_expire() {
     o.wal.spare_segments = 1;
     o.tablet_changes = false;
     let db = Engine::open(Path::new(DB), o).unwrap();
-    let family = FamilyOptions {
-        compaction: CompactionStyle::FifoByTime,
-        ttl_micros: TTL.as_micros() as u64,
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default()
+        .compaction(CompactionStyle::FifoByTime)
+        .ttl_micros(TTL.as_micros() as u64);
     let t = db.create_table("fifo", &[("f".into(), family)]).unwrap();
     let mut wb = WriteBatch::new();
     wb.put(

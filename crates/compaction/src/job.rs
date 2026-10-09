@@ -255,6 +255,7 @@ pub struct NewBlobFile {
 
 /// The result of a job, for the engine to turn into manifest edits.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct CompactionOutput {
     /// New SSTs and their levels.
     pub added: Vec<(u8, SstMeta)>,

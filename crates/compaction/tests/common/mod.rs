@@ -89,17 +89,13 @@ pub fn counter_history(seed: u64, commits: usize) -> History {
 /// A random history; `counter` forces the family kind (else half are counter families).
 fn history_of(seed: u64, commits: usize, counter: Option<bool>) -> History {
     let mut rng = Rng::new(seed);
-    let family = ModelFamily {
-        name: FAMILY.into(),
-        max_versions: [0, 0, 1, 2, 3][rng.below(5) as usize],
-        ttl_micros: [0, 0, 120, 300][rng.below(4) as usize],
-        i64_add: true,
-        counter: rng.below(2) == 0,
-    };
-    let family = ModelFamily {
-        counter: counter.unwrap_or(family.counter),
-        ..family
-    };
+    let family = ModelFamily::new(FAMILY)
+        .max_versions([0, 0, 1, 2, 3][rng.below(5) as usize])
+        .ttl_micros([0, 0, 120, 300][rng.below(4) as usize])
+        .i64_add(true)
+        .counter(rng.below(2) == 0);
+    let forced = counter.unwrap_or(family.counter);
+    let family = family.counter(forced);
     let mut model = Model::new();
     model.create_table(TABLE, vec![family.clone()]);
     let mut h = History {
@@ -653,18 +649,16 @@ pub fn blob_sst_resolver(
 
 /// Family options for SSTs in tests: small blocks so SSTs have several.
 pub fn family_options(h: &History) -> FamilyOptions {
-    FamilyOptions {
-        block_size: 512,
-        max_versions: h.family.max_versions,
-        ttl_micros: h.family.ttl_micros,
-        merge_operator: "pigeonhole.i64_add".into(),
-        kind: if h.family.counter {
+    FamilyOptions::default()
+        .block_size(512)
+        .max_versions(h.family.max_versions)
+        .ttl_micros(h.family.ttl_micros)
+        .merge_operator("pigeonhole.i64_add")
+        .kind(if h.family.counter {
             FamilyKind::Counter
         } else {
             FamilyKind::Standard
-        },
-        ..FamilyOptions::default()
-    }
+        })
 }
 
 /// Writes sorted `entries` as one SST.

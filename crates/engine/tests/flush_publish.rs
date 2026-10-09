@@ -40,10 +40,7 @@ fn a_flush_published_while_a_shard_publishes_its_memtables_counts_each_operand_o
             }
         }
     };
-    let counter = FamilyOptions {
-        merge_operator: "pigeonhole.i64_add".to_owned(),
-        ..FamilyOptions::default()
-    };
+    let counter = FamilyOptions::default().merge_operator("pigeonhole.i64_add");
     let t = engine
         .create_table(
             "t",

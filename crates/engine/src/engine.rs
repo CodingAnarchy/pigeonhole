@@ -57,6 +57,7 @@ pub enum Role {
 
 /// A family as the catalog knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FamilyInfo {
     /// Id.
     pub id: FamilyId,
@@ -68,6 +69,7 @@ pub struct FamilyInfo {
 
 /// A table as the catalog knows it. Immutable; adding a family publishes a new `TableInfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TableInfo {
     /// Id.
     pub id: TableId,
@@ -95,6 +97,7 @@ pub struct CommitInfo {
 
 /// Counters and latencies.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Metrics {
     /// Commits per durability level, indexed by `Durability as usize`.
     pub commits: [u64; 4],
@@ -122,6 +125,7 @@ pub struct Metrics {
 /// One shard's share of the work, for benchmarks that check writes spread over shards
 /// (issue #51). Counters are cumulative since open; take two and subtract for a phase.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShardStats {
     /// Commits the shard applied, summed over durability levels.
     pub commits: u64,

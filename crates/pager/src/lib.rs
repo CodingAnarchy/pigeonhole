@@ -1027,6 +1027,7 @@ impl Pager {
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct PagerStats {
     /// File length in bytes.
     pub file_bytes: u64,

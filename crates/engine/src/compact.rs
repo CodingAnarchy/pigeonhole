@@ -31,6 +31,7 @@ use crate::{Error, Result};
 /// whether it could purge. A test hook (`Engine::take_compactions`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
+#[non_exhaustive]
 pub struct CompactionRecord {
     /// The manifest version that published the output.
     pub manifest_version: ManifestVersion,

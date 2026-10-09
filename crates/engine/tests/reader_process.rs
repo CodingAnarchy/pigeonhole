@@ -222,10 +222,7 @@ fn a_reader_view_never_mixes_a_record_with_another_versions_catalog() {
     let w = Arc::new(Mutex::new(Writer::open(&vfs)));
     let (t, f) = {
         let w = w.lock().unwrap();
-        let fo = FamilyOptions {
-            merge_operator: "pigeonhole.i64_add".to_owned(),
-            ..FamilyOptions::default()
-        };
+        let fo = FamilyOptions::default().merge_operator("pigeonhole.i64_add");
         let t = w.db.create_table("t", &[("f".into(), fo)]).unwrap();
         let f = t.family("f").unwrap().id;
         (t, f)
@@ -413,11 +410,7 @@ fn a_reader_reads_separated_values_and_keeps_them_while_it_holds_a_snapshot() {
     let vfs = SimVfs::new(13);
     vfs.enter_process(WRITER);
     let mut w = Writer::open(&vfs);
-    let family = FamilyOptions {
-        blob_threshold: 100,
-        max_versions: 1,
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default().blob_threshold(100).max_versions(1);
     let t = w.db.create_table("t", &[("f".into(), family)]).unwrap();
     write_rows(&mut w, &t, "row", "old", 0..100);
     assert!(
@@ -506,11 +499,9 @@ fn a_reader_folds_operands_onto_a_separated_base() {
     vfs.enter_process(WRITER);
     let (db, shards) = Engine::open_application_owned(Path::new(DB), options()).unwrap();
     let mut w = Writer { db, shards };
-    let family = FamilyOptions {
-        blob_threshold: 100,
-        merge_operator: "test.append".into(),
-        ..FamilyOptions::default()
-    };
+    let family = FamilyOptions::default()
+        .blob_threshold(100)
+        .merge_operator("test.append");
     let t = w.db.create_table("t", &[("f".into(), family)]).unwrap();
     write_rows(&mut w, &t, "row", "base", 0..3);
     assert!(!w.db.blob_files().is_empty(), "the bases are separated");

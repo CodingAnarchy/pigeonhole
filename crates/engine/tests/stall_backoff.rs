@@ -51,10 +51,7 @@ const BACKOFF: Duration = Duration::from_millis(20);
 const STALLED: Duration = Duration::from_millis(100);
 
 fn table(db: &Engine, name: &str) -> Arc<TableInfo> {
-    let f = FamilyOptions {
-        compression: Compression::None,
-        ..FamilyOptions::default()
-    };
+    let f = FamilyOptions::default().compression(Compression::None);
     db.create_table(name, &[("f".into(), f)]).unwrap()
 }
 

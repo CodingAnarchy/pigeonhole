@@ -125,10 +125,7 @@ impl Rig {
             Engine::open_application_owned(Path::new(&format!("/db/{name}.phdb")), o).unwrap();
         let mut shard = shards.remove(0);
         while shard.run_once(u64::MAX) {}
-        let family = FamilyOptions {
-            blob_threshold: u32::MAX,
-            ..FamilyOptions::default()
-        };
+        let family = FamilyOptions::default().blob_threshold(u32::MAX);
         let t = (*db.create_table("t", &[("f".into(), family)]).unwrap()).clone();
         let quals = (0..64).map(|c| format!("q{c:03}").into_bytes()).collect();
         Self {
