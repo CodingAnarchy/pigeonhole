@@ -39,7 +39,7 @@ pub use blob::{
 pub use cursor::{FilteredCursor, MergingCursor, VecCursor};
 pub use job::{
     BlobRefs, CompactionJob, CompactionOutput, GcPolicy, JobContext, JobPoll, NewBlobFile,
-    OtherSource, output_piece_bytes,
+    OtherSource, StreamGc, output_piece_bytes,
 };
 pub use merge::{I64Add, MergeError, MergeOperator, MergeRegistry};
 pub use picker::{CompactionPicker, CompactionTask, KeyRange, Levels, PickerOptions, TaskKind};

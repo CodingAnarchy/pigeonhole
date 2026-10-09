@@ -192,6 +192,9 @@ impl std::fmt::Debug for Inner {
     }
 }
 
+/// Unpinned tries of `Engine::get_latest` before it takes a pinned snapshot.
+const GET_LATEST_TRIES: u32 = 4;
+
 /// An open database. `Send + Sync`; share it with `Arc`.
 ///
 /// ```
@@ -1249,13 +1252,23 @@ impl Engine {
             }
         }
         // The seqno first, then the view: a seqno is only visible once the view holding its
-        // memtables is published.
-        let seqno = inner.shared.shm.visible_seqno();
-        let view = inner.shared.view.load();
-        let now = inner.shared.vfs.now_micros();
-        get_in(&view, seqno, now, table, family, row, qualifier, || {
-            Arc::clone(&view)
-        })
+        // memtables is published. Unpinned, the seqno must still be current after the view
+        // loads: then no flush in between had inputs above it, so its GC kept what a read at
+        // it sees (#315 review). Otherwise read again; under a steady stream of commits, fall
+        // back to a pinned snapshot.
+        for _ in 0..GET_LATEST_TRIES {
+            let seqno = inner.shared.shm.visible_seqno();
+            let view = inner.shared.view.load();
+            if inner.shared.shm.visible_seqno() != seqno {
+                continue;
+            }
+            let now = inner.shared.vfs.now_micros();
+            return get_in(&view, seqno, now, table, family, row, qualifier, || {
+                Arc::clone(&view)
+            });
+        }
+        let snapshot = inner.snapshot()?;
+        inner.get(&snapshot, table, family, row, qualifier)
     }
 
     /// Reads one row, projected by `spec`. `None` if the row has no visible cell.
@@ -2134,13 +2147,20 @@ impl Inner {
         if self.reader.is_some() {
             return self.reader_snapshot();
         }
-        let seqno = self.shared.shm.visible_seqno();
+        // The seqno is pinned before the view loads (and read under the pin's lock), so a
+        // flush GC that publishes in between keeps what it reads; still seqno before view: a
+        // seqno is only visible once the view holding its memtables is published.
+        let pin =
+            SeqnoPin::pin_visible(&self.shared.live_seqnos, || self.shared.shm.visible_seqno());
+        let seqno = pin.seqno();
+        #[cfg(feature = "test-hooks")]
+        self.shared.hooks.before_snapshot_view_load.run();
         let view = self.shared.view.load_full();
         Ok(Snapshot {
             seqno,
             view,
             _live: None,
-            _pin: Some(Arc::new(SeqnoPin::new(&self.shared.live_seqnos, seqno))),
+            _pin: Some(Arc::new(pin)),
         })
     }
 

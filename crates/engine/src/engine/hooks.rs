@@ -76,6 +76,12 @@ pub(crate) struct Hooks {
     /// Runs at the start of the next `publish_view`, before the publish lock
     /// (`Engine::before_next_view_publish`).
     pub before_view_publish: Once,
+    /// Makes the next group's second member wait for arena room, as a full arena would
+    /// (`Engine::force_room_wait_once`, #315 review).
+    pub room_wait_once: AtomicBool,
+    /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
+    /// (`Engine::before_snapshot_view_load`, #315 review).
+    pub before_snapshot_view_load: Once,
     /// Runs in the next shrink round, between its catalog read and its relocations
     /// (`Engine::before_shrink_relocates`).
     pub before_shrink_relocates: Once,
@@ -98,6 +104,25 @@ pub(crate) struct Hooks {
     /// Fails the next single-shard batch's apply with `Busy` after its WAL append, without
     /// applying it, as an arena miscount would (`Engine::fail_next_apply`).
     pub fail_next_apply: AtomicBool,
+    /// A deliberate fault in the flush GC (`Engine::mutate_flush_gc`, #287): 1 treats the
+    /// guard as always holding, 2 drops the snapshot floor (no live read point is kept), 3
+    /// lets deletes pass guarded flushes without voiding them.
+    pub flush_gc_mutation: std::sync::atomic::AtomicU8,
+}
+
+/// A deliberate fault in the flush GC, for tests that check the oracle catches it
+/// (`Engine::mutate_flush_gc`, #287).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum FlushGcMutation {
+    /// The real GC.
+    None,
+    /// Purge versions beyond `max_versions` even when another source holds a delete.
+    DropGuard,
+    /// Keep no live snapshot's versions (only the latest read point).
+    DropSnapshotFloor,
+    /// A delete arriving while a guarded flush is in flight does not void it.
+    IgnoreVoids,
 }
 
 /// A shard's test-hook counters (`ShardMetrics::hooks`), stored after each batch.
@@ -574,6 +599,26 @@ impl Engine {
         self.inner.shared.hooks.before_shrink_relocates.set(f);
     }
 
+    /// The next commit group's second member waits for room as if the arena were full: the
+    /// stall path freezes memtables after the group's first member was admitted (test hook,
+    /// #315 review).
+    #[doc(hidden)]
+    pub fn force_room_wait_once(&self) {
+        self.inner
+            .shared
+            .hooks
+            .room_wait_once
+            .store(true, Ordering::Release);
+    }
+
+    /// Runs `f` once, on the calling thread of the next writer `snapshot()`, after it pinned
+    /// its seqno and before it loads the view: where a test publishes a flush in between
+    /// (#315 review; test hook).
+    #[doc(hidden)]
+    pub fn before_snapshot_view_load(&self, f: Box<dyn FnOnce() + Send>) {
+        self.inner.shared.hooks.before_snapshot_view_load.set(f);
+    }
+
     /// Runs `f` once, on the calling thread of the next `backup`, right after it released its
     /// snapshot's memtables and before it merges the SSTs: where a test writes past the
     /// arena while the backup still runs (#262; test hook).
@@ -696,8 +741,25 @@ impl Engine {
             .store(ts, Ordering::Release);
     }
 
-    /// Turns recording for [`take_compactions`](Self::take_compactions) and
-    /// [`take_appended`](Self::take_appended) on or off (off at open). A test that reads
+    /// Breaks the flush GC on purpose (#287), so a test can check the oracle catches it;
+    /// [`FlushGcMutation::None`] restores it.
+    #[doc(hidden)]
+    pub fn mutate_flush_gc(&self, m: FlushGcMutation) {
+        let v = match m {
+            FlushGcMutation::None => 0,
+            FlushGcMutation::DropGuard => 1,
+            FlushGcMutation::DropSnapshotFloor => 2,
+            FlushGcMutation::IgnoreVoids => 3,
+        };
+        self.inner
+            .shared
+            .hooks
+            .flush_gc_mutation
+            .store(v, Ordering::Release);
+    }
+
+    /// Turns recording for [`take_compactions`](Self::take_compactions) (flushes too, #287)
+    /// and [`take_appended`](Self::take_appended) on or off (off at open). A test that reads
     /// them turns it on first.
     #[doc(hidden)]
     pub fn record_history(&self, on: bool) {
@@ -708,6 +770,22 @@ impl Engine {
     /// recording is on ([`record_history`](Self::record_history)).
     #[doc(hidden)]
     pub fn take_compactions(&self) -> Vec<crate::compact::CompactionRecord> {
+        let mut all = self
+            .inner
+            .shared
+            .hooks
+            .compactions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (flushes, compactions) = std::mem::take(&mut *all).into_iter().partition(|r| r.flush);
+        *all = flushes;
+        compactions
+    }
+
+    /// Every compaction and flush record committed since the last call, in commit order
+    /// (#287: a flush's GC drops history and may purge versions, so the model replays both).
+    #[doc(hidden)]
+    pub fn take_gc_records(&self) -> Vec<crate::compact::CompactionRecord> {
         std::mem::take(
             &mut *self
                 .inner

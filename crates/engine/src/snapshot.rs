@@ -551,17 +551,28 @@ pub(crate) struct SeqnoPin {
 }
 
 impl SeqnoPin {
-    pub(crate) fn new(registry: &Arc<LiveSeqnos>, seqno: Seqno) -> Self {
-        *registry
+    /// Reads the visible seqno with `visible` and registers it, in one critical section with
+    /// the GC's reading of the list (`compact::gc_snapshots`): a flush or compaction that read
+    /// the list before saw only inputs at or below this seqno (reads at it equal latest for
+    /// them), and one that reads it after keeps its versions (#315 review). The caller loads
+    /// the view afterwards.
+    pub(crate) fn pin_visible(registry: &Arc<LiveSeqnos>, visible: impl FnOnce() -> Seqno) -> Self {
+        let mut seqnos = registry
             .seqnos
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(seqno)
-            .or_insert(0) += 1;
+            .unwrap_or_else(PoisonError::into_inner);
+        let seqno = visible();
+        *seqnos.entry(seqno).or_insert(0) += 1;
+        drop(seqnos);
         Self {
             registry: Arc::clone(registry),
             seqno,
         }
+    }
+
+    /// The pinned seqno.
+    pub(crate) fn seqno(&self) -> Seqno {
+        self.seqno
     }
 }
 

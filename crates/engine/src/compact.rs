@@ -52,7 +52,40 @@ pub struct CompactionRecord {
     pub max_seqno: Seqno,
     /// The tablet's row range (unescaped; `None` is unbounded).
     pub rows: (Option<Vec<u8>>, Option<Vec<u8>>),
+    /// A flush's record, not a compaction's (#287: a flush's GC drops history too).
+    pub flush: bool,
+    /// A flush that ran the guarded purge of versions beyond `max_versions` (#287): no
+    /// delete purge, and versions counted within the flushed memtable only.
+    pub versions_purge: bool,
+    /// A flush's input: the seqnos of the commits its memtable held (the slot's other
+    /// sources can hold seqnos in the same range). `None` for a compaction, whose input is
+    /// every entry of the range at or below `max_seqno`.
+    pub input_seqnos: Option<Vec<Seqno>>,
+    /// A flush with `versions_purge`: the visible seqno when its commit installed the purge.
+    /// Every delete of the family at or below it was there before the install.
+    pub install_seqno: SeqnoCell,
 }
+
+/// A seqno filled in when a flush installs its purge (test hook, #287): the visible seqno at
+/// that moment. Compares by value.
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct SeqnoCell(pub Arc<std::sync::atomic::AtomicU64>);
+
+impl SeqnoCell {
+    /// The seqno (0 until set).
+    pub fn get(&self) -> Seqno {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl PartialEq for SeqnoCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for SeqnoCell {}
 
 /// The row prefix of an internal key (the whole key if it has none).
 fn row_of(key: &[u8]) -> &[u8] {
@@ -302,6 +335,21 @@ impl BlobGc {
     }
 }
 
+/// The read points GC must preserve (decision D70): every live snapshot of this process plus
+/// the oldest reader pin's seqno (a reader's snapshots pin its own view, so the oldest pin
+/// bounds everything a reader can still read), ascending.
+pub(crate) fn gc_snapshots(shared: &Shared) -> Vec<Seqno> {
+    let mut snapshots = shared.live_seqnos.list();
+    if let Some((seqno, _)) = shared.shm.oldest_reader_pin()
+        && seqno != 0
+    {
+        snapshots.push(seqno);
+    }
+    snapshots.sort_unstable();
+    snapshots.dedup();
+    snapshots
+}
+
 /// The GC policy of `task` over `fam` (decision D70): every live snapshot of this process
 /// plus the oldest reader pin's seqno (a reader's snapshots pin its own view, so the
 /// oldest pin bounds everything a reader can still read), whether the output is bottommost,
@@ -318,14 +366,7 @@ pub(crate) fn gc_policy(
     counter: bool,
     now: Timestamp,
 ) -> GcPolicy {
-    let mut snapshots = shared.live_seqnos.list();
-    if let Some((seqno, _)) = shared.shm.oldest_reader_pin()
-        && seqno != 0
-    {
-        snapshots.push(seqno);
-    }
-    snapshots.sort_unstable();
-    snapshots.dedup();
+    let snapshots = gc_snapshots(shared);
     let input_ids: Vec<SstId> = task
         .inputs
         .iter()
@@ -733,9 +774,19 @@ impl CompactionWork {
         let (tx, rx) = completion();
         // Blob live counts change against the catalog at commit time: other compactions of
         // the family (other tablets after a split share its blob files) commit meanwhile.
+        let mut on_refusal = Vec::new();
         let kind = if blobs.is_empty() {
             manifest::ReqKind::Edits(edits)
         } else {
+            // Freed by the writer if `blob_edits` refuses (an undercounted file).
+            on_refusal = edits.clone();
+            on_refusal.extend(blobs.new.iter().map(|f| Edit::PutBlobFile {
+                blob_file: f.id,
+                family: blobs.family,
+                extents: f.extents.clone(),
+                total_bytes: f.total_bytes,
+                live_bytes: f.total_bytes,
+            }));
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
                 let mut edits = edits;
                 edits.extend(blob_edits(catalog, blobs)?);
@@ -746,9 +797,10 @@ impl CompactionWork {
             kind,
             readers,
             flushed_roots: Vec::new(),
-            compaction: self.record.take(),
+            compactions: self.record.take().into_iter().collect(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
+            on_refusal,
             reply: Box::new(manifest::notify(tx)),
         };
         manifest::submit(&self.shared, self.shard, req);

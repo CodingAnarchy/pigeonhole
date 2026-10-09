@@ -357,16 +357,21 @@ pub(crate) struct ManifestReq {
     pub readers: Vec<(SstId, Arc<SstReader>)>,
     /// Memtables the edits flush, as `(shard, root)`: dropped from the published view.
     pub flushed_roots: Vec<(u16, u32)>,
-    /// A compaction to record (test hook; the version is filled in at commit). Always `None`
-    /// without the `test-hooks` feature, which records nothing (5-6 6.2).
+    /// Compactions (and flushes that purged versions, #287) to record (test hook; the
+    /// version is filled in at commit). Always empty without the `test-hooks` feature, which
+    /// records nothing (5-6 6.2).
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
-    pub compaction: Option<CompactionRecord>,
+    pub compactions: Vec<CompactionRecord>,
     /// Rewrite the manifest snapshot (shrink relocates the manifest extents).
     pub rewrite_snapshot: bool,
     /// The table of each tablet the edits touch, for a request whose slots are independent
     /// (a flush): the edits of a tablet whose table was dropped meanwhile are skipped and
     /// the rest commit, instead of the whole request being refused. Empty: refuse.
     pub dropped_ok: Vec<(TabletId, TableId)>,
+    /// The outputs a `ReqKind::Catalog` request adds (its `AddSst`s and new blob files'
+    /// `PutBlobFile`s), freed if its closure refuses: the writer never sees a refused
+    /// closure's edits, and the caller has handed the outputs over.
+    pub on_refusal: Vec<Edit>,
     /// Called with the outcome once the commit is durable (or failed).
     pub reply: Box<dyn FnOnce(Result<ManifestVersion>) + Send>,
 }
@@ -390,9 +395,10 @@ impl ManifestReq {
             kind: ReqKind::Edits(edits),
             readers: Vec::new(),
             flushed_roots: Vec::new(),
-            compaction: None,
+            compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
+            on_refusal: Vec::new(),
             reply: Box::new(reply),
         }
     }
@@ -404,9 +410,10 @@ impl ManifestReq {
             kind,
             readers: Vec::new(),
             flushed_roots: Vec::new(),
-            compaction: None,
+            compactions: Vec::new(),
             rewrite_snapshot: false,
             dropped_ok: Vec::new(),
+            on_refusal: Vec::new(),
             reply: Box::new(move |r| tx.notify(r)),
         };
         (req, rx)
@@ -738,7 +745,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         flushed_roots.append(&mut req.flushed_roots);
                         rewrite |= req.rewrite_snapshot;
                         #[cfg(feature = "test-hooks")]
-                        if let Some(mut c) = req.compaction.take() {
+                        for mut c in std::mem::take(&mut req.compactions) {
                             c.manifest_version = writer.next_version();
                             records.push(c);
                         }
@@ -761,6 +768,12 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 }
             }
             Err(e) => {
+                // A refused closure: free the outputs it would have added (readers first, so
+                // their cached blocks go too).
+                req.readers.clear();
+                let refused = std::mem::take(&mut req.on_refusal);
+                abandon_ssts(shared, &added_ssts(&refused));
+                abandon_blobs(shared, &added_blobs(&catalog, &refused));
                 outcomes.push((req, Err(e)));
             }
         }
