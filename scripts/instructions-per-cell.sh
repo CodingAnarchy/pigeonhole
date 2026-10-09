@@ -1,49 +1,85 @@
 #!/usr/bin/env bash
-# Instructions retired per cell read on hotrow (crates/bench/examples/hotrow.rs), for the three
-# hot-row states: as written (versions in the memtable and L0), flushed (L0), fully compacted.
-# Instructions don't depend on machine load, unlike timing (#287).
+# Instructions retired per unit, for the read and write paths (#287): the three hot-row states
+# of crates/bench/examples/hotrow.rs (as written, flushed, compacted; per cell), then the
+# shapes of any shape binaries given. Instructions don't depend on machine load, unlike
+# timing.
 #
-#   scripts/instructions-per-cell.sh [HOTROW_BINARY]
+#   scripts/instructions-per-cell.sh HOTROW_BINARY [SHAPE_BINARY:shape,shape,... ...]
 #
-# On Linux with valgrind, callgrind counts exactly the measured iterations
-# (--toggle-collect on `hotrow_iteration`): deterministic, so CI can compare against a
-# baseline. Elsewhere (macOS), `/usr/bin/time -l` counts the whole process at two iteration
-# counts and the difference removes the setup.
+# for example
 #
-# Output: one line per state, `state instructions_per_cell`.
+#   scripts/instructions-per-cell.sh target/release/examples/hotrow \
+#       target/release/examples/readshapes:get-mem,get-sst,row
+#
+# A shape binary (crates/bench/examples/readshapes.rs is one):
+# - runs as `BINARY SHAPE ITERATIONS DIR`, its work proportional to ITERATIONS;
+# - does its measured work only inside functions whose names contain `shape_` (and not
+#   inside its setup), so callgrind can count them alone;
+# - prints `units N` on stderr: the units the measured work handled (cells read, gets,
+#   commits, entries written, as the binary documents).
+#
+# On Linux with valgrind, callgrind counts exactly the measured functions
+# (--toggle-collect): deterministic, so CI can compare against a baseline. Elsewhere (macOS),
+# `/usr/bin/time -l` counts the whole process at two iteration counts and the difference
+# removes the setup.
+#
+# Output: one line per state or shape, `name instructions_per_unit`.
 set -euo pipefail
 
 bin="${1:-target/release/examples/hotrow}"
+shift || true
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 states=("as-written:" "flushed:HOT_FLUSH=1" "compacted:HOT_COMPACT=1")
 
-# Cells read in the measured iterations, from hotrow's stderr.
-cells_of() { sed -n 's/^cells read \([0-9]*\)$/\1/p' "$1"; }
+# Units handled by the measured work, from a run's stderr (hotrow prints `cells read N`).
+units_of() { sed -nE 's/^(cells read|units) ([0-9]+)$/\2/p' "$1"; }
+
+# Each `BINARY:shape,shape` argument as lines `BINARY shape`.
+shape_runs() {
+    local group shapes
+    for group in "$@"; do
+        IFS=, read -r -a shapes <<<"${group##*:}"
+        for s in "${shapes[@]}"; do
+            echo "${group%:*} $s"
+        done
+    done
+}
 
 if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
-    iters=20
+    callgrind() { # pattern, then the command; prints the instructions counted
+        local pattern="$1"
+        shift
+        valgrind --tool=callgrind --toggle-collect="$pattern" \
+            --callgrind-out-file="$work/cg.out" "$@" </dev/null >/dev/null 2>"$work/err"
+        sed -n 's/^summary: \([0-9]*\).*/\1/p' "$work/cg.out"
+    }
     for s in "${states[@]}"; do
         name="${s%%:*}"; env_set="${s#*:}"
-        out="$work/cg.out"
-        env $env_set valgrind --tool=callgrind --toggle-collect='*hotrow_iteration*' \
-            --callgrind-out-file="$out" "$bin" "$iters" "$work" >/dev/null 2>"$work/err"
-        ir=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' "$out")
-        cells=$(cells_of "$work/err")
-        echo "$name $(( ir / cells ))"
+        ir=$(callgrind '*hotrow_iteration*' env $env_set "$bin" 20 "$work")
+        echo "$name $(( ir / $(units_of "$work/err") ))"
     done
+    while read -r shape_bin name; do
+        ir=$(callgrind '*shape_*' "$shape_bin" "$name" 4 "$work")
+        echo "$name $(( ir / $(units_of "$work/err") ))"
+    done < <(shape_runs "$@")
 elif [[ -x /usr/bin/time ]] && [[ "$(uname)" == Darwin ]]; then
-    count() { # instructions retired by a whole run of `iters` iterations
-        env $2 /usr/bin/time -l "$bin" "$1" "$work" 2>"$work/err" >/dev/null
+    count() { # the command; prints the instructions retired by the whole run
+        /usr/bin/time -l "$@" </dev/null 2>"$work/err" >/dev/null
         awk '/instructions retired/{print $1}' "$work/err"
     }
     for s in "${states[@]}"; do
         name="${s%%:*}"; env_set="${s#*:}"
-        a=$(count 1000 "$env_set"); a_cells=$(cells_of "$work/err")
-        b=$(count 3000 "$env_set"); b_cells=$(cells_of "$work/err")
-        echo "$name $(( (b - a) / (b_cells - a_cells) ))"
+        a=$(count env $env_set "$bin" 1000 "$work"); a_units=$(units_of "$work/err")
+        b=$(count env $env_set "$bin" 3000 "$work"); b_units=$(units_of "$work/err")
+        echo "$name $(( (b - a) / (b_units - a_units) ))"
     done
+    while read -r shape_bin name; do
+        a=$(count "$shape_bin" "$name" 100 "$work"); a_units=$(units_of "$work/err")
+        b=$(count "$shape_bin" "$name" 300 "$work"); b_units=$(units_of "$work/err")
+        echo "$name $(( (b - a) / (b_units - a_units) ))"
+    done < <(shape_runs "$@")
 else
     echo "needs valgrind (Linux) or /usr/bin/time -l (macOS)" >&2
     exit 1
