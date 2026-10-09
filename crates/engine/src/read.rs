@@ -21,7 +21,7 @@ use pigeonhole_sst::QualifierFilter;
 
 use crate::catalog::{FamilyMeta, I64_ADD, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
-use crate::source::{Pinned, Resolver, Source};
+use crate::source::{ColumnKey, Pinned, Resolver, Source};
 use crate::{Error, Result};
 
 /// How a [`CellData`] keeps its value alive.
@@ -1218,9 +1218,11 @@ fn get_with(
     if meta.table != table {
         return Err(Error::FamilyNotFound(format!("family {}", family.0)));
     }
+    // Encoded once, for the filter probes and the resolver.
+    let mut key = ColumnKey::new(row, qualifier);
     // The caller clears the sources afterwards, whatever this returns.
     let sources = resolver.cursor_mut().sources_mut();
-    let filled = view.point_sources(shard, tablet, family, row, qualifier, sources);
+    let filled = view.point_sources(shard, tablet, family, &mut key, sources);
     if filled.is_err() || sources.is_empty() {
         return filled.map(|()| None);
     }
@@ -1237,8 +1239,7 @@ fn get_with(
         view,
         meta,
         resolver_blobs.as_ref(),
-        row,
-        qualifier,
+        &key,
         (&mut key_buf, &mut key_vec, &mut key_len),
         &mut pin,
     );
@@ -1283,13 +1284,12 @@ fn resolve_point<P: FnOnce() -> Arc<View>>(
     view: &View,
     meta: &FamilyMeta,
     resolver_blobs: Option<&Arc<ResolverBlobs>>,
-    row: &[u8],
-    qualifier: &[u8],
+    column: &ColumnKey,
     key: (&mut [u8; 512], &mut Vec<u8>, &mut usize),
     pin: &mut Option<P>,
 ) -> Result<Resolved> {
     let (key_buf, key_vec, key_len) = key;
-    resolver.seek_column(row, qualifier)?;
+    resolver.seek_column_encoded(column.prefix(), column.row_len())?;
     let (ts, refind) = {
         let next = resolver.next_cell();
         ResolverBlobs::check(resolver_blobs)?;

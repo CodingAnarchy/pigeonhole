@@ -47,7 +47,7 @@ use crate::compact::{self, CompactionRecord, CompactionWork};
 use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
 use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
-use crate::source::{Probe, Resolver, Source, mem_sources_from, sst_sources_point};
+use crate::source::{ColumnKey, Probe, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::write::ReadKey;
 use crate::{CommitInfo, Error, Predicate, Result};
 
@@ -3365,7 +3365,8 @@ impl ShardState {
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
-            let probe = Probe::new(row, qualifier)?;
+            let mut key = ColumnKey::new(row, qualifier);
+            let probe = Probe::new(&mut key)?;
             sst_sources_point(fam, &view.ssts, &probe, l.priority, &mut out)?;
         }
         Ok(out)

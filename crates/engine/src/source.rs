@@ -12,7 +12,7 @@ use pigeonhole_cache::{Cell, Priority};
 use pigeonhole_compaction::{CellResolver, FilteredCursor, MergingCursor};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::filter::{column_hash, row_hash};
-use pigeonhole_format::key::{encode_column_prefix, encode_marker_prefix, escape_into};
+use pigeonhole_format::key::{MARKER_QUALIFIER, MAX_KEY_PART, TERMINATOR, escape_into};
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::{FamilyId, TabletId};
 use pigeonhole_memtable::{ArenaSlice, MemIter, MemtableReader};
@@ -217,48 +217,90 @@ pub(crate) fn sst_sources_range(
     Ok(())
 }
 
+/// A point read's column prefix (escaped row, terminator, escaped qualifier, terminator),
+/// encoded once per read for both its filter probes and its resolver (#46). Held in the
+/// reading thread's scratch, so a point read allocates nothing for it.
+pub(crate) struct ColumnKey {
+    buf: Vec<u8>,
+    /// Length of the row prefix (escaped row and terminator) at the start of `buf`.
+    row_len: usize,
+    /// Length of the column prefix; `buf` may hold scratch past it.
+    len: usize,
+    /// The row or qualifier is longer than a key part may be: no SST can hold it.
+    oversized: bool,
+}
+
+thread_local! {
+    /// Scratch for a point read's [`ColumnKey`], kept by each reading thread (#46). Taken
+    /// while in use, so a nested read on the same thread (none today) gets a fresh one.
+    static KEY_SCRATCH: StdCell<Vec<u8>> = const { StdCell::new(Vec::new()) };
+}
+
+impl ColumnKey {
+    pub(crate) fn new(row: &[u8], qualifier: &[u8]) -> Self {
+        let mut buf = KEY_SCRATCH.try_with(StdCell::take).unwrap_or_default();
+        buf.clear();
+        escape_into(&mut buf, row);
+        buf.extend_from_slice(&TERMINATOR);
+        let row_len = buf.len();
+        escape_into(&mut buf, qualifier);
+        buf.extend_from_slice(&TERMINATOR);
+        Self {
+            len: buf.len(),
+            buf,
+            row_len,
+            oversized: row.len() > MAX_KEY_PART || qualifier.len() > MAX_KEY_PART,
+        }
+    }
+
+    /// The column prefix.
+    pub(crate) fn prefix(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Length of the row prefix at the start of [`ColumnKey::prefix`].
+    pub(crate) fn row_len(&self) -> usize {
+        self.row_len
+    }
+}
+
+impl Drop for ColumnKey {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.buf);
+        // A key long enough to grow the scratch past 64 KiB is not worth keeping.
+        if buf.capacity() <= 64 << 10 {
+            let _ = KEY_SCRATCH.try_with(|s| s.set(buf));
+        }
+    }
+}
+
 /// The filter probes of a point read: hashes of the row, the column and the row's marker
-/// key (FORMAT §6), computed once per read.
-pub(crate) struct Probe {
-    /// The escaped row prefix: inline for rows of usual length, so a point read allocates
-    /// nothing for it (#46).
-    pub row_prefix: SmallVec<[u8; 96]>,
+/// key (FORMAT §6), computed once per read from its [`ColumnKey`].
+pub(crate) struct Probe<'a> {
+    /// The row prefix (escaped row and terminator).
+    pub row_prefix: &'a [u8],
     row: u64,
     column: u64,
     marker: u64,
 }
 
-thread_local! {
-    /// Scratch for encoding a probe's keys, kept by each reading thread (#46). Taken while
-    /// in use, so a nested probe on the same thread (none today) would get a fresh one.
-    static PROBE_SCRATCH: StdCell<Vec<u8>> = const { StdCell::new(Vec::new()) };
-}
-
-impl Probe {
-    pub(crate) fn new(row: &[u8], qualifier: &[u8]) -> Result<Self> {
-        let mut buf = PROBE_SCRATCH.take();
-        buf.clear();
-        let probe = Self::encode(&mut buf, row, qualifier);
-        // A key long enough to grow the scratch past 64 KiB is not worth keeping.
-        if buf.capacity() <= 64 << 10 {
-            PROBE_SCRATCH.set(buf);
+impl<'a> Probe<'a> {
+    pub(crate) fn new(key: &'a mut ColumnKey) -> Result<Self> {
+        if key.oversized {
+            return Err(pigeonhole_format::Error::KeyTooLarge.into());
         }
-        probe
-    }
-
-    fn encode(buf: &mut Vec<u8>, row: &[u8], qualifier: &[u8]) -> Result<Self> {
-        escape_into(buf, row);
-        let row_h = row_hash(buf);
-        buf.clear();
-        encode_column_prefix(buf, row, qualifier)?;
-        let column = column_hash(buf);
-        buf.clear();
-        encode_marker_prefix(buf, row)?;
-        let marker = column_hash(buf);
-        let row_prefix = SmallVec::from_slice(&buf[..buf.len() - 2]);
+        let (row_len, len) = (key.row_len, key.len);
+        let row = row_hash(&key.buf[..row_len - TERMINATOR.len()]);
+        let column = column_hash(&key.buf[..len]);
+        // The marker prefix (row prefix and marker qualifier), built past the column prefix.
+        key.buf.truncate(len);
+        key.buf.extend_from_within(..row_len);
+        key.buf.extend_from_slice(&MARKER_QUALIFIER);
+        let marker = column_hash(&key.buf[len..]);
+        let key: &'a ColumnKey = key;
         Ok(Self {
-            row_prefix,
-            row: row_h,
+            row_prefix: &key.buf[..row_len],
+            row,
             column,
             marker,
         })
@@ -271,13 +313,13 @@ impl Probe {
 pub(crate) fn sst_sources_point(
     fam: &FamilySsts,
     set: &SstSet,
-    probe: &Probe,
+    probe: &Probe<'_>,
     priority: Priority,
     out: &mut Vec<Source>,
 ) -> Result<()> {
     let opts = read_options(priority, false);
     for sst in fam.iter() {
-        if !covers_row(sst, &probe.row_prefix) {
+        if !covers_row(sst, probe.row_prefix) {
             continue;
         }
         let reader = sst.reader(set, priority)?;
@@ -363,8 +405,7 @@ impl View {
         shard: ShardId,
         tablet: TabletId,
         family: FamilyId,
-        row: &[u8],
-        qualifier: &[u8],
+        key: &mut ColumnKey,
         out: &mut Vec<Source>,
     ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
@@ -381,7 +422,7 @@ impl View {
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
-            let probe = Probe::new(row, qualifier)?;
+            let probe = Probe::new(key)?;
             sst_sources_point(fam, &self.ssts, &probe, l.priority, out)?;
         }
         Ok(())
