@@ -647,6 +647,14 @@ impl Engine {
         self.inner.shared.hooks.before_latest_view_load.set(f);
     }
 
+    /// Runs `f` once, in the calling thread's next row read, after its first family and
+    /// before its second: where a test flushes, compacts and reclaims while the read holds
+    /// its view (#392 review; test hook).
+    #[doc(hidden)]
+    pub fn between_row_read_families(&self, f: Box<dyn FnOnce()>) {
+        crate::read::BETWEEN_ROW_FAMILIES.with(|h| *h.borrow_mut() = Some(f));
+    }
+
     /// Runs `f` once, on the calling thread of the next `backup`, right after it released its
     /// snapshot's memtables and before it merges the SSTs: where a test writes past the
     /// arena while the backup still runs (#262; test hook).

@@ -1195,7 +1195,16 @@ fn read_row_with(
         *last += 1;
     }
     let mut any = false;
+    #[cfg(feature = "test-hooks")]
+    let mut first = true;
     for &family in families {
+        #[cfg(feature = "test-hooks")]
+        {
+            if !first {
+                run_between_row_families();
+            }
+            first = false;
+        }
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
@@ -1271,6 +1280,22 @@ fn read_row_with(
         }
     }
     Ok(any)
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Runs once on this thread, in the next row read, before it reads its second family
+    /// (`Engine::between_row_read_families`; test hook).
+    pub(crate) static BETWEEN_ROW_FAMILIES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-hooks")]
+fn run_between_row_families() {
+    let f = BETWEEN_ROW_FAMILIES.with(|h| h.borrow_mut().take());
+    if let Some(f) = f {
+        f();
+    }
 }
 
 thread_local! {

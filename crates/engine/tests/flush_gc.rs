@@ -571,3 +571,74 @@ fn a_row_read_as_of_now_falls_back_to_a_snapshot_under_steady_commits() {
     );
     close_shared(db, shard);
 }
+
+/// #392 review: a row read as of now holds its view (through the `arc-swap` guard) for the
+/// whole read. Between its two families a flush and a compaction publish newer views and
+/// retire the SSTs it reads; their extents stay retired, not freed, until the read ends, and
+/// the read's second family still reads its seqno's version from them.
+#[test]
+fn a_row_read_as_of_now_keeps_its_view_while_flushes_and_compactions_publish() {
+    let (db, shard, _t, drive) = shared_rig(2877);
+    let family = FamilyOptions::default().max_versions(1);
+    let two = db
+        .create_table("two", &[("a".into(), family.clone()), ("b".into(), family)])
+        .unwrap();
+    let put_both = |db: &Arc<Engine>, drive: &Drive, v: &[u8]| {
+        let mut wb = WriteBatch::new();
+        for f in &two.families {
+            wb.put(two.id, f.id, b"row", b"q", None, ValueRef::Bytes(v))
+                .unwrap();
+        }
+        let pending = db.submit(wb, Some(Durability::Buffered)).unwrap();
+        drive(Box::pin(async move { pending.await.map(drop) })).unwrap();
+        drive(Box::pin(db.flush_pending().unwrap())).unwrap();
+    };
+    put_both(&db, &drive, b"v1");
+    let idle =
+        |shard: &std::sync::Mutex<EngineShard>| while shard.lock().unwrap().run_once(u64::MAX) {};
+    idle(&shard);
+    assert_eq!(db.unreferenced_bytes(), 0);
+    let retired_mid_read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let (db2, drive2, shard2, retired) = (
+            Arc::clone(&db),
+            Arc::clone(&drive),
+            Arc::clone(&shard),
+            Arc::clone(&retired_mid_read),
+        );
+        let two = Arc::clone(&two);
+        db.between_row_read_families(Box::new(move || {
+            let mut wb = WriteBatch::new();
+            for f in &two.families {
+                wb.put(two.id, f.id, b"row", b"q", None, ValueRef::Bytes(b"v2"))
+                    .unwrap();
+            }
+            let pending = db2.submit(wb, Some(Durability::Buffered)).unwrap();
+            drive2(Box::pin(async move { pending.await.map(drop) })).unwrap();
+            drive2(Box::pin(db2.flush_pending().unwrap())).unwrap();
+            drive2(Box::pin(db2.compact_pending(None).unwrap())).unwrap();
+            while shard2.lock().unwrap().run_once(u64::MAX) {}
+            retired.store(
+                db2.unreferenced_bytes(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }));
+    }
+    assert_eq!(
+        read_row_latest(&db, &two),
+        [b"v1".to_vec(), b"v1".to_vec()],
+        "both families at the read's seqno"
+    );
+    assert!(
+        retired_mid_read.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the compaction's inputs were freed while the read held its view"
+    );
+    idle(&shard);
+    assert_eq!(
+        db.unreferenced_bytes(),
+        0,
+        "the read's end frees what its view kept retired"
+    );
+    assert_eq!(read_row_latest(&db, &two), [b"v2".to_vec(), b"v2".to_vec()]);
+    close_shared(db, shard);
+}

@@ -88,11 +88,11 @@ pub enum Condition {
     },
 }
 
-/// The selection shared by row reads and scans, with family names kept until the read
-/// starts (builders never fail; errors surface at `read`/`iter`).
 /// A read's selected families, resolved: inline for up to four.
 type FamilyIds = SmallVec<[FamilyId; 4]>;
 
+/// The selection shared by row reads and scans, with family names kept until the read
+/// starts (builders never fail; errors surface at `read`/`iter`).
 #[derive(Debug, Clone)]
 struct Selection {
     /// The selected families' names, one after another (`ends` marks where each ends):
@@ -140,13 +140,13 @@ impl Selection {
         self.spec.time_range = Some((range.start, range.end));
     }
 
-    /// Resolves the projection against the catalog as of now and takes the snapshot. Returns
-    /// the catalog entry, which names every family the read can return.
-    /// For a read as of now (no snapshot given): the table's info and the selected families'
-    /// ids, resolved from the current catalog before the engine loads its view, so the view
-    /// sees every family resolved. `None` when a name does not resolve: the caller then takes
-    /// the snapshot path, which reports it exactly as before (a family created meanwhile is
-    /// found there).
+    /// For a read as of now (no snapshot given): the table's info and the families to read,
+    /// resolved from the current catalog before the engine loads its view, so the view sees
+    /// every one of them. With no families selected, that is every family of this catalog
+    /// entry, named explicitly: a family added before the view loads is not read, as the
+    /// entry could not name its cells. `None` when a name does not resolve (or the table has
+    /// no family): the caller then takes the snapshot path, which reports it exactly as
+    /// before (a family created meanwhile is found there).
     fn start_latest(&self, core: &TableCore) -> Result<Option<(Arc<TableInfo>, FamilyIds)>> {
         core.db.check_open()?;
         let info = core.current_info();
@@ -159,18 +159,22 @@ impl Selection {
                 ids.push(family.id);
             }
         }
+        if self.ends.is_empty() {
+            ids.extend(info.families.iter().map(|f| f.id));
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
         Ok(Some((info, ids)))
     }
 
-    /// The snapshot, the table's info, and the selected families' ids (empty: every family).
+    /// Takes the snapshot, then resolves the projection against the catalog as of then: the
+    /// table's info, which names every family the read can return, the snapshot, and the
+    /// selected families' ids (empty: every family).
     fn start(
         &mut self,
         core: &TableCore,
-    ) -> Result<(
-        Arc<TableInfo>,
-        pigeonhole_engine::Snapshot,
-        SmallVec<[FamilyId; 4]>,
-    )> {
+    ) -> Result<(Arc<TableInfo>, pigeonhole_engine::Snapshot, FamilyIds)> {
         core.db.check_open()?;
         // The snapshot first: the catalog read afterwards includes every family it can see.
         let snapshot = match self.snapshot.take() {
@@ -528,7 +532,56 @@ impl Iterator for RowIter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use pigeonhole_engine::{FamilyOptions, ValueRef, WriteBatch};
+
     use super::Selection;
+    use crate::{Family, Options, Pigeonhole};
+
+    /// #392 review: a read as of now resolves its families from the catalog before the
+    /// engine loads its view. A family added (and written) in between must not come back as
+    /// a cell the catalog entry cannot name (family `""`): without a selection, the read
+    /// names the entry's families.
+    #[test]
+    fn a_family_added_before_the_view_loads_is_not_read_unnamed() {
+        let dir = crate::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
+        let engine = Arc::clone(&t.core.db.engine);
+        let table = t.core.info.id;
+        engine.before_latest_view_load(Box::new({
+            let engine = Arc::clone(&engine);
+            move || {
+                let info = engine
+                    .add_family(table, "x", FamilyOptions::default())
+                    .unwrap();
+                let x = info.family("x").unwrap().id;
+                let mut wb = WriteBatch::new();
+                wb.put(table, x, b"r", b"q", None, ValueRef::Bytes(b"new"))
+                    .unwrap();
+                engine.commit(wb, None).unwrap();
+            }
+        }));
+        let row = t.row(b"r").read().unwrap().unwrap();
+        let families: Vec<&str> = row.iter().map(|e| e.family).collect();
+        assert_eq!(
+            families,
+            ["f"],
+            "a cell of a family the read could not name"
+        );
+        // The next read's catalog has `x`.
+        let row = t.row(b"r").read().unwrap().unwrap();
+        let families: Vec<&str> = row.iter().map(|e| e.family).collect();
+        assert_eq!(families, ["f", "x"]);
+        db.close().unwrap();
+    }
 
     #[test]
     fn family_names_come_back_in_order_inline_or_spilled() {

@@ -26,6 +26,8 @@ pigeonhole-shm = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]
+# The engine's test hooks, for the unit tests that race a read (never in a normal build).
+pigeonhole-engine = { workspace = true, features = ["test-hooks"] }
 pigeonhole-sim = { workspace = true }
 criterion = { workspace = true }
 
