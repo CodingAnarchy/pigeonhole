@@ -209,6 +209,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D193](phase-2.md#d193) — The Phase 2 gate is amended: required measures, a documented gap (#387), and floors that may not regress · owner decision, #287, #387 · amends the spec Phase 2 gate
 - [D194](phase-3.md#d194) — Reads skip superseded memtable versions through a writer-only, process-local stale-tail index; off until measured · owner decision, #387 · in-node alternative deferred as #397
 - [D195](phase-3.md#d195) — Three instruction ceilings are raised to main's counts (#384 raced the ceilings; get-sst placement drift); ceiling changes are measured on the current main · owner decision, bench, CI · amends D193
+- [D197](phase-3.md#d197) — The Phase 3 gate is binding on its contents: every roadmap item and every Goals-table target in the #406 checklist, on the reference hardware · owner decision, #406, #405 · amends the spec Phase 3 gate
 
 ## Open questions
 _None._
