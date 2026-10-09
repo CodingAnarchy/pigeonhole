@@ -72,3 +72,11 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 
 ## Performance discipline
 Optimization, simplification and performance are maintained continuously, not bolted on: keep hot paths allocation-free where the spec says so, prefer the simplest structure that meets the brief, and add a criterion benchmark for any path with a latency target. Note measured numbers in the PR.
+
+### Floors: what Phase 2 reached may not regress (D193)
+- **Per change.** The `Instructions per cell` workflow counts instructions per unit with callgrind on Linux for every hot-row state, read shape and write shape, at the PR's base and head. It fails a PR that makes any shape worse than its threshold (`THRESHOLDS` in `.github/workflows/instructions.yml`).
+- **Absolute ceilings.** The same job fails if any shape's count at the head is above its ceiling in `crates/bench/baselines/instruction-ceilings.txt`. That stops small regressions under the threshold from adding up.
+  - When a change improves a shape, lower its ceiling in the same PR: `scripts/instruction-ceilings.py lower COUNTS` with the head's counts (from the job summary or `scripts/instructions-per-cell.sh`). The job summary says which ceilings can go lower.
+  - A ceiling is never raised without an owner decision; cite it in the commit.
+  - A new shape needs a ceiling in the same PR that adds it.
+- **Gate runs.** Every official sparse-wide gate run (the Phase 3 gate, and before each release) is compared with the Phase 2 baseline: `crates/bench/baselines/phase2-gate/run-gate.sh`, on a quiet machine. A loss beyond run-to-run noise in Pigeonhole's throughput, p99, p99.9, or get, put, row-read or scan p99 blocks the gate or release until it's fixed or the owner accepts it (see the README there).

@@ -1,0 +1,36 @@
+# Absolute instruction ceilings per shape (D193): the Phase 2 floors may not regress.
+#
+# `shape ceiling headroom_percent`: instructions per unit on Linux callgrind
+# (scripts/instructions-per-cell.sh, the instructions workflow). The workflow fails when the
+# head commit is above any ceiling, in addition to the per-change thresholds, and when a
+# shape has no ceiling.
+#
+# Set from main 67100f4: the highest of three identical runs of every shape on CI (run
+# 37983937317), times (1 + headroom). Headroom 0.3% for shapes identical to within 0.1%
+# across those runs. More where identical code varied: level-scans 0.34% (15177-15228),
+# commit-one 0.25% (10627-10654), compact 0.25% (2853-2860), and row, identical here but
+# about 1% noisy across placement changes (its per-change threshold is 1.5%).
+#
+# Lower a ceiling when a change improves a shape:
+#   python3 scripts/instruction-ceilings.py lower COUNTS
+# (COUNTS from the workflow's head run). It only lowers. Never raise a ceiling without an
+# owner decision; a raise edits this file by hand and cites that decision.
+
+as-written 2573 0.3
+flushed 1905 0.3
+compacted 1282 0.3
+get-mem 7270 0.3
+get-sst 17883 0.3
+get-miss 4628 0.3
+row 2635 1.0
+scan 1440 0.3
+scan-filtered 7458 0.3
+versions 5950 0.3
+counter 9856 0.3
+rows 20928 0.3
+level-scans 15320 0.6
+short-scans 14621 0.3
+commit-one 10718 0.6
+commit-sixteen 52862 0.3
+flush 2200 0.3
+compact 2875 0.5

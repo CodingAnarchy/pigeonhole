@@ -1,0 +1,341 @@
+{
+  "format": 1,
+  "environment": {
+    "cpu": "Apple M5",
+    "cores": 10,
+    "memory_bytes": 25769803776,
+    "os": "macos 26.5.2",
+    "arch": "aarch64",
+    "filesystem": "apfs",
+    "reference": false,
+    "label": "non-reference (D5)",
+    "profile": "release",
+    "git_rev": "cdfeb56280dd",
+    "started_unix": 1791572400,
+    "load_average": 1.8
+  },
+  "results": [
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on",
+      "workload": "sparse-wide",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 1000000,
+      "value_len": 100,
+      "threads": 1,
+      "load_secs": 18.945226166,
+      "run_secs": 34.823300416,
+      "throughput": 28716.405052191363,
+      "p50_ns": 7679,
+      "p99_ns": 389119,
+      "p999_ns": 528383,
+      "mean_ns": 34774,
+      "max_ns": 6097916,
+      "warmup_ops": 50000,
+      "detail": {
+        "store_bytes": 2583691264,
+        "busy_retries": 0,
+        "reads": {
+          "cold": {
+            "count": 122676,
+            "p50_ns": 2719,
+            "p99_ns": 177151,
+            "p999_ns": 246783
+          },
+          "hot": {
+            "count": 477384,
+            "p50_ns": 2927,
+            "p99_ns": 380927,
+            "p999_ns": 505855
+          }
+        },
+        "by_type": [
+          {
+            "op": "get",
+            "stats": {
+              "count": 399998,
+              "p50_ns": 2095,
+              "p99_ns": 97791,
+              "p999_ns": 175103
+            },
+            "mean_ns": 4111
+          },
+          {
+            "op": "put",
+            "stats": {
+              "count": 200020,
+              "p50_ns": 8511,
+              "p99_ns": 16895,
+              "p999_ns": 58367
+            },
+            "mean_ns": 9226
+          },
+          {
+            "op": "row read",
+            "stats": {
+              "count": 200062,
+              "p50_ns": 11519,
+              "p99_ns": 454655,
+              "p999_ns": 544767
+            },
+            "mean_ns": 59734
+          },
+          {
+            "op": "scan",
+            "stats": {
+              "count": 199920,
+              "p50_ns": 40447,
+              "p99_ns": 489471,
+              "p999_ns": 585727
+            },
+            "mean_ns": 96706
+          }
+        ],
+        "shards": [
+          {
+            "commits": 14001,
+            "tablets_start": 16,
+            "tablets_end": 16,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 6662,
+            "tablets_start": 3,
+            "tablets_end": 3,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 833,
+            "tablets_start": 3,
+            "tablets_end": 3,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 79,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 60,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 2612,
+            "tablets_start": 3,
+            "tablets_end": 3,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 301,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 163,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 87697,
+            "tablets_start": 8,
+            "tablets_end": 8,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          },
+          {
+            "commits": 87612,
+            "tablets_start": 8,
+            "tablets_end": 8,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          }
+        ]
+      }
+    },
+    {
+      "store": "sqlite-eav",
+      "store_config": "page_cache=320MiB buffered",
+      "workload": "sparse-wide",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 1000000,
+      "value_len": 100,
+      "threads": 1,
+      "load_secs": 29.453418834,
+      "run_secs": 36.957956334,
+      "throughput": 27057.773188612045,
+      "p50_ns": 7071,
+      "p99_ns": 244735,
+      "p999_ns": 1040383,
+      "mean_ns": 36913,
+      "max_ns": 18161500,
+      "warmup_ops": 50000,
+      "detail": {
+        "store_bytes": 2883887104,
+        "busy_retries": 0,
+        "reads": {
+          "cold": {
+            "count": 122676,
+            "p50_ns": 4127,
+            "p99_ns": 215039,
+            "p999_ns": 1114111
+          },
+          "hot": {
+            "count": 477384,
+            "p50_ns": 2879,
+            "p99_ns": 194559,
+            "p999_ns": 245759
+          }
+        },
+        "by_type": [
+          {
+            "op": "get",
+            "stats": {
+              "count": 399998,
+              "p50_ns": 2543,
+              "p99_ns": 155647,
+              "p999_ns": 270335
+            },
+            "mean_ns": 12990
+          },
+          {
+            "op": "put",
+            "stats": {
+              "count": 200020,
+              "p50_ns": 11007,
+              "p99_ns": 178175,
+              "p999_ns": 11993087
+            },
+            "mean_ns": 51763
+          },
+          {
+            "op": "row read",
+            "stats": {
+              "count": 200062,
+              "p50_ns": 6943,
+              "p99_ns": 222207,
+              "p999_ns": 303103
+            },
+            "mean_ns": 38272
+          },
+          {
+            "op": "scan",
+            "stats": {
+              "count": 199920,
+              "p50_ns": 23551,
+              "p99_ns": 292863,
+              "p999_ns": 1032191
+            },
+            "mean_ns": 68558
+          }
+        ],
+        "shards": []
+      }
+    },
+    {
+      "store": "rocksdb",
+      "store_config": "write_buffer=64MiB cache=256MiB bloom=10 buffered",
+      "workload": "sparse-wide",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 1000000,
+      "value_len": 100,
+      "threads": 1,
+      "load_secs": 6.889832792,
+      "run_secs": 49.130836042,
+      "throughput": 20353.81606665801,
+      "p50_ns": 5471,
+      "p99_ns": 708607,
+      "p999_ns": 1011711,
+      "mean_ns": 49084,
+      "max_ns": 5322167,
+      "warmup_ops": 50000,
+      "detail": {
+        "store_bytes": 2227027056,
+        "busy_retries": 0,
+        "reads": {
+          "cold": {
+            "count": 122676,
+            "p50_ns": 6143,
+            "p99_ns": 178175,
+            "p999_ns": 252927
+          },
+          "hot": {
+            "count": 477384,
+            "p50_ns": 4447,
+            "p99_ns": 696319,
+            "p999_ns": 991231
+          }
+        },
+        "by_type": [
+          {
+            "op": "get",
+            "stats": {
+              "count": 399998,
+              "p50_ns": 3503,
+              "p99_ns": 160767,
+              "p999_ns": 180223
+            },
+            "mean_ns": 9681
+          },
+          {
+            "op": "put",
+            "stats": {
+              "count": 200020,
+              "p50_ns": 3711,
+              "p99_ns": 8895,
+              "p999_ns": 13183
+            },
+            "mean_ns": 4229
+          },
+          {
+            "op": "row read",
+            "stats": {
+              "count": 200062,
+              "p50_ns": 14527,
+              "p99_ns": 839679,
+              "p999_ns": 1019903
+            },
+            "mean_ns": 94530
+          },
+          {
+            "op": "scan",
+            "stats": {
+              "count": 199920,
+              "p50_ns": 42239,
+              "p99_ns": 880639,
+              "p999_ns": 1073151
+            },
+            "mean_ns": 127322
+          }
+        ],
+        "shards": []
+      }
+    }
+  ],
+  "scaling": null
+}
