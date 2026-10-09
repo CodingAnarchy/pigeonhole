@@ -102,7 +102,8 @@ fn measure(t: &TableInfo, commits: usize, mut commit: impl FnMut(WriteBatch)) ->
     lat
 }
 
-fn report(mode: &str, lat: &[Duration]) {
+/// Prints a row and returns the p50.
+fn report(mode: &str, lat: &[Duration]) -> Duration {
     let at = |q: f64| lat[((lat.len() as f64 * q) as usize).min(lat.len() - 1)];
     let mean = lat.iter().sum::<Duration>() / lat.len() as u32;
     let us = |d: Duration| d.as_secs_f64() * 1e6;
@@ -113,6 +114,7 @@ fn report(mode: &str, lat: &[Duration]) {
         us(at(0.999)),
         us(mean)
     );
+    at(0.50)
 }
 
 fn create(db: &Engine) -> Arc<TableInfo> {
@@ -140,7 +142,8 @@ fn poll_until<F: std::future::Future + Unpin>(mut f: F, mut between: impl FnMut(
     }
 }
 
-fn engine_threads(dir: &Path, commits: usize, spins: bool) {
+/// Returns the p50.
+fn engine_threads(dir: &Path, commits: usize, spins: bool) -> Duration {
     let mode = if spins { "threads" } else { "threads-nospin" };
     let db = Engine::open(&dir.join(format!("{mode}.phdb")), options(spins)).unwrap();
     let t = create(&db);
@@ -150,8 +153,9 @@ fn engine_threads(dir: &Path, commits: usize, spins: bool) {
     let lat = measure(&t, commits, |wb| {
         db.commit(wb, None).unwrap();
     });
-    report(mode, &lat);
+    let p50 = report(mode, &lat);
     db.close().unwrap();
+    p50
 }
 
 /// A shard on its own thread that parks between groups unless `shard_spins`; the client
@@ -234,12 +238,23 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("create the store directory");
     println!("| mode | p50 µs | p99 µs | p99.9 µs | mean µs |");
     println!("|---|--:|--:|--:|--:|");
-    engine_threads(&dir, commits, true);
-    engine_threads(&dir, commits, false);
+    let spinning = engine_threads(&dir, commits, true);
+    let parking = engine_threads(&dir, commits, false);
     driven(&dir, commits, false, false);
     driven(&dir, commits, true, true);
     driven(&dir, commits, true, false);
     driven(&dir, commits, false, true);
     inline(&dir, commits);
     std::fs::remove_dir_all(&dir).ok();
+    // The one wall-clock check of the default spin (D198; the instruction shapes run with
+    // the client's spin off, since its poll count depends on timing): with the defaults, a
+    // buffered commit's median must not be clearly worse than without spinning. The margin
+    // allows for a shared runner's noise.
+    let (s, p) = (spinning.as_secs_f64() * 1e6, parking.as_secs_f64() * 1e6);
+    println!();
+    if s > p * 1.25 {
+        println!("FAIL: p50 {s:.2} µs with the default spin against {p:.2} µs without (D198)");
+        std::process::exit(1);
+    }
+    println!("ok: p50 {s:.2} µs with the default spin against {p:.2} µs without (D198)");
 }

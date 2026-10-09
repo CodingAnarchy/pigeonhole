@@ -1,6 +1,6 @@
 # 0016: spin windows before parking: `Options::commit_spin`, `Options::shard_spin`, and their engine and runtime fields (D198)
 
-**Status:** Proposed (perf287, 2026-10-09), implementing D198 (approved by the owner). Everything is additive.
+**Status:** Approved (coordinator, 2026-10-09), implementing D198 (approved by the owner). Everything is additive.
 
 ## Change
 
