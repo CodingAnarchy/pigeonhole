@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 
 use pigeonhole_compaction::ValuePredicate;
 use pigeonhole_format::Kind;
-use pigeonhole_format::value::{ValueRef, encode_value};
+use pigeonhole_format::value::{ValueRef, ValueTag, encode_value};
 use pigeonhole_format::wal::{BatchBuilder, BatchRef};
 use pigeonhole_format::{Durability, FamilyId, TableId, Timestamp};
 use pigeonhole_runtime::Waiter;
@@ -73,17 +73,40 @@ impl WriteBatch {
                 "a blob pointer cannot be written directly".to_owned(),
             ));
         }
+        self.push_value(table, family, Kind::Put, row, qualifier, ts, value)
+    }
+
+    /// Appends a put or merge operand. A `Bytes` value is written straight into the batch
+    /// (its only copy until the commit routes it, #320); the small typed ones are encoded
+    /// first.
+    #[allow(clippy::too_many_arguments)]
+    fn push_value(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        kind: Kind,
+        row: &[u8],
+        qualifier: &[u8],
+        ts: Option<Timestamp>,
+        value: ValueRef<'_>,
+    ) -> crate::Result<()> {
+        if let ValueRef::Bytes(payload) = value {
+            self.builder.push_tagged(
+                table,
+                family,
+                kind,
+                row,
+                qualifier,
+                ts,
+                ValueTag::Bytes as u8,
+                payload,
+            )?;
+            return Ok(());
+        }
         self.value_buf.clear();
         encode_value(&mut self.value_buf, value);
-        self.builder.push(
-            table,
-            family,
-            Kind::Put,
-            row,
-            qualifier,
-            ts,
-            &self.value_buf,
-        )?;
+        self.builder
+            .push(table, family, kind, row, qualifier, ts, &self.value_buf)?;
         Ok(())
     }
 
@@ -102,18 +125,7 @@ impl WriteBatch {
                 "a blob pointer cannot be a merge operand".to_owned(),
             ));
         }
-        self.value_buf.clear();
-        encode_value(&mut self.value_buf, operand);
-        self.builder.push(
-            table,
-            family,
-            Kind::Merge,
-            row,
-            qualifier,
-            None,
-            &self.value_buf,
-        )?;
-        Ok(())
+        self.push_value(table, family, Kind::Merge, row, qualifier, None, operand)
     }
 
     /// Writes a merge operand at timestamp `ts`: a bucket of a counter family (decision
@@ -132,18 +144,15 @@ impl WriteBatch {
                 "a blob pointer cannot be a merge operand".to_owned(),
             ));
         }
-        self.value_buf.clear();
-        encode_value(&mut self.value_buf, operand);
-        self.builder.push(
+        self.push_value(
             table,
             family,
             Kind::Merge,
             row,
             qualifier,
             Some(ts),
-            &self.value_buf,
-        )?;
-        Ok(())
+            operand,
+        )
     }
 
     /// Deletes one version.

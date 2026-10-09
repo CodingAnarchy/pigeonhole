@@ -25,7 +25,7 @@ Pure encode/decode; never panics on input.
 - **`filter`:** `FilterBuilder`, `Filter<B>::may_contain`, `row_hash`, `column_hash`.
 - **`scan`:** `ScanFilter` (qualifier selection, time range on puts) and `QualifierFilter`; `ScanFilter::admits` is the one entry-level rule every source applies (D22).
 - **`sst`:** `Footer`, `Properties`. **`blob`:** extent header, record header. **`superblock`:** `Superblock`, `ExtentRef`, lock-byte offsets. **`manifest`:** `ManifestHeader`, `Edit`, `FamilyOptions`, `SstMeta`, `encode_block`/`decode_block` (snapshot block plus delta log, D7).
-- **`wal`:** `SegmentHeader` (with `prev_epoch`/`prev_end` chaining, D25), `FrameEncoder`/`FrameDecoder` (fragmentation, `Decoded::Stop`), `WalRecord` (Batch/Prepare/Commit, identified by seqno, D26), `BatchBuilder`/`BatchRef`/`Mutation` (the batch encoding that is both the engine's `WriteBatch` and the WAL payload).
+- **`wal`:** `SegmentHeader` (with `prev_epoch`/`prev_end` chaining, D25), `FrameEncoder`/`FrameDecoder` (fragmentation, `Decoded::Stop`), `WalRecord` (Batch/Prepare/Commit, identified by seqno, D26), `BatchBuilder`/`BatchRef`/`Mutation` (the batch encoding that is both the engine's `WriteBatch` and the WAL payload). Additive (#320): `BatchBuilder::push_tagged` writes a value given as its tag byte and payload, with no encoded copy.
 - **`shm`:** header field offsets, `ShmHeader`, `ViewRecord`, reader-slot and memtable-node offsets, `directory_name`/`region_name` and the directory layout (D27).
 - **`compress`, `checksum`, `varint`; `Cursor` trait.**
 

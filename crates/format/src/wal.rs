@@ -507,17 +507,16 @@ fn check_mutation(
     kind: Kind,
     row: &[u8],
     qualifier: &[u8],
-    value: &[u8],
+    value_len: usize,
     shape: fn(&'static str) -> Error,
 ) -> crate::Result<()> {
     if row.len() > MAX_KEY_PART || qualifier.len() > MAX_KEY_PART {
         return Err(Error::KeyTooLarge);
     }
-    if value.len() as u64 > MAX_VALUE_LEN {
+    if value_len as u64 > MAX_VALUE_LEN {
         return Err(Error::ValueTooLarge);
     }
-    if (kind.is_delete() && !value.is_empty())
-        || (kind == Kind::FamilyDelete && !qualifier.is_empty())
+    if (kind.is_delete() && value_len != 0) || (kind == Kind::FamilyDelete && !qualifier.is_empty())
     {
         return Err(shape("mutation: delete with value or qualifier"));
     }
@@ -543,11 +542,48 @@ impl BatchBuilder {
         ts: Option<Timestamp>,
         value: &[u8],
     ) -> crate::Result<()> {
-        check_mutation(kind, row, qualifier, value, |what| Error::InvalidArgument {
-            what,
+        self.push_parts(table, family, kind, row, qualifier, ts, &[], value)
+    }
+
+    /// As [`BatchBuilder::push`], for a stored value of `tag` followed by `payload` (a
+    /// [`crate::value`] encoding), written straight into the batch: the caller needs no
+    /// buffer holding the encoded value (#320).
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_tagged(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        kind: crate::Kind,
+        row: &[u8],
+        qualifier: &[u8],
+        ts: Option<Timestamp>,
+        tag: u8,
+        payload: &[u8],
+    ) -> crate::Result<()> {
+        self.push_parts(table, family, kind, row, qualifier, ts, &[tag], payload)
+    }
+
+    /// Appends one mutation whose value is `head` followed by `tail`.
+    #[allow(clippy::too_many_arguments)]
+    fn push_parts(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        kind: crate::Kind,
+        row: &[u8],
+        qualifier: &[u8],
+        ts: Option<Timestamp>,
+        head: &[u8],
+        tail: &[u8],
+    ) -> crate::Result<()> {
+        let value_len = head.len() + tail.len();
+        check_mutation(kind, row, qualifier, value_len, |what| {
+            Error::InvalidArgument { what }
         })?;
         let count = self.count.checked_add(1).ok_or(Error::ValueTooLarge)?;
         let b = &mut self.buf;
+        // One growth for the whole mutation, not one per field.
+        b.reserve(4 + 4 + 1 + 8 + 3 * 10 + row.len() + qualifier.len() + value_len);
         b.extend_from_slice(&table.0.to_le_bytes());
         b.extend_from_slice(&family.0.to_le_bytes());
         match ts {
@@ -559,7 +595,9 @@ impl BatchBuilder {
         }
         crate::varint::put_bytes(b, row);
         crate::varint::put_bytes(b, qualifier);
-        crate::varint::put_bytes(b, value);
+        crate::varint::put_u64(b, value_len as u64);
+        b.extend_from_slice(head);
+        b.extend_from_slice(tail);
         self.count = count;
         b[..4].copy_from_slice(&count.to_le_bytes());
         Ok(())
@@ -692,8 +730,8 @@ impl<'a> BatchIter<'a> {
             qualifier: r.bytes()?,
             value: r.bytes()?,
         };
-        check_mutation(m.kind, m.row, m.qualifier, m.value, |what| Error::Corrupt {
-            what,
+        check_mutation(m.kind, m.row, m.qualifier, m.value.len(), |what| {
+            Error::Corrupt { what }
         })?;
         self.rest = r.rest();
         Ok(m)
