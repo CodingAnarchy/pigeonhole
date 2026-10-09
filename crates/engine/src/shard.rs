@@ -378,6 +378,9 @@ pub(crate) struct Shared {
     /// whoever publishes a watermark).
     pub freeze_waiters: FreezeWaiters,
     pub memtable_freeze_bytes: u64,
+    /// The experimental stale trigger (`EngineOptions::memtable_stale_share`): the share and
+    /// the smallest memtable it freezes; `None` when off.
+    pub stale_freeze: Option<(f64, usize)>,
     /// Bytes a stream may hold past its oldest needed record before the slots pinning it
     /// are flushed (`EngineOptions::wal_pin_bytes`, resolved; #137).
     pub wal_pin_bytes: u64,
@@ -2761,7 +2764,10 @@ impl ShardState {
             if slot.seal != Seal::Open {
                 continue;
             }
-            let big = slot.active.table.allocated_bytes() >= threshold;
+            let big = slot.active.table.allocated_bytes() >= threshold
+                || stale_enough(self.shared.stale_freeze, &slot.active.table, || {
+                    versions_limited(&self.shared, key.1)
+                });
             trace!(
                 "shard {} freeze {:?}: all={all} big={big} empty={} max_seqno={} visible={visible}",
                 self.id.0,
@@ -3631,7 +3637,10 @@ impl ShardState {
             if !self.touched_slots.contains(&(tablet, m.family)) {
                 self.touched_slots.push((tablet, m.family));
             }
-            if slot.active.table.allocated_bytes() >= threshold
+            if (slot.active.table.allocated_bytes() >= threshold
+                || stale_enough(self.shared.stale_freeze, &slot.active.table, || {
+                    versions_limited(&self.shared, m.family)
+                }))
                 && !self.to_freeze.contains(&(tablet, m.family))
             {
                 self.to_freeze.push((tablet, m.family));
@@ -6544,6 +6553,36 @@ impl ShardHandler for ShardState {
         }
         self.publish_arena();
     }
+}
+
+/// Whether the experimental stale trigger freezes `table`: it holds at least the trigger's
+/// smallest size, at least its share of the entries are other versions of a column it
+/// holds, and its family keeps a limited number of versions (`limited`, checked last), so
+/// a flush drops the shadowed ones (#287).
+fn stale_enough(
+    trigger: Option<(f64, usize)>,
+    table: &pigeonhole_memtable::Memtable,
+    limited: impl FnOnce() -> bool,
+) -> bool {
+    trigger.is_some_and(|(share, min_bytes)| {
+        table.allocated_bytes() >= min_bytes
+            && table.overwrites() as f64 >= share * table.len() as f64
+            && limited()
+    })
+}
+
+/// Whether `family` keeps a limited number of versions and is not a counter family: only
+/// then does a flush drop shadowed versions (D191), so only then does the stale trigger
+/// apply. Every version of a family that keeps all of them is live.
+fn versions_limited(shared: &Shared, family: FamilyId) -> bool {
+    shared
+        .view
+        .load()
+        .catalog
+        .family(family)
+        .is_some_and(|meta| {
+            meta.options.max_versions != 0 && meta.options.kind != FamilyKind::Counter
+        })
 }
 
 #[cfg(test)]

@@ -69,7 +69,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
-use pigeonhole_format::key::split_suffix;
+use pigeonhole_format::key::{SUFFIX_LEN, split_suffix};
 use pigeonhole_format::shm::memtable as layout;
 use pigeonhole_format::version::MEMTABLE_MAGIC;
 use pigeonhole_format::{Cursor, Seqno};
@@ -573,6 +573,9 @@ pub struct Memtable {
     /// cells, rising row keys) skip the search. Only this writer links nodes and none is
     /// removed, so the splice stays exact.
     splice: [u32; MAX_HEIGHT],
+    /// Inserts that landed next to an entry of the same column (another version of it):
+    /// how much of the memtable is versions a newer one may shadow (#287).
+    overwrites: u32,
     pin: Arc<Pin>,
 }
 
@@ -630,6 +633,7 @@ impl Memtable {
             frozen: false,
             rng: 0x9E37_79B9_7F4A_7C15 ^ (root as u64),
             splice: [head as u32; MAX_HEIGHT],
+            overwrites: 0,
             pin,
         })
     }
@@ -702,6 +706,16 @@ impl Memtable {
             }
         }
 
+        // Another version of the same column sorts right next to this one (versions of a
+        // column are adjacent, newest first): one comparison with each neighbour's column.
+        let body = key.len().saturating_sub(SUFFIX_LEN);
+        let next = mem.load_u32(tower(prev[0], 0), Ordering::Relaxed);
+        if (next != NULL && self.same_column(next, key, body))
+            || (prev[0] != self.head && self.same_column(prev[0], key, body))
+        {
+            self.overwrites += 1;
+        }
+
         // Fill the node; nothing links to it yet, so these are plain writes.
         let off = node as usize;
         mem.write_u32(off + layout::N_KEY_LEN, key_len);
@@ -760,6 +774,19 @@ impl Memtable {
 
     /// Compares the key of the (writer-trusted) node at `node` with `key`.
     #[inline]
+    /// Whether `node`'s key has the same column as `key`, whose first `body` bytes (its key
+    /// without the suffix) are the column.
+    fn same_column(&self, node: u32, key: &[u8], body: usize) -> bool {
+        let mem = &self.region.mem;
+        let off = node as usize;
+        let key_len = mem.read_u32(off + layout::N_KEY_LEN) as usize;
+        if key_len != key.len() {
+            return false;
+        }
+        let height = mem.read_u8(off + layout::N_HEIGHT) as usize;
+        mem.cmp(off + layout::N_TOWER + 4 * height, body, &key[..body]) == Cmp::Equal
+    }
+
     fn key_cmp(&self, node: u32, key: &[u8]) -> Cmp {
         let mem = &self.region.mem;
         let off = node as usize;
@@ -806,6 +833,12 @@ impl Memtable {
     /// Whether no entry was inserted.
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Inserts that landed next to another version of the same column: an estimate of the
+    /// entries a newer version shadows, which a flush may drop (#287).
+    pub fn overwrites(&self) -> usize {
+        self.overwrites as usize
     }
 
     /// Bytes allocated in the arena (drives freezing): the chunks this memtable owns, which

@@ -50,6 +50,7 @@ pub struct Options {
     tablet_changes: bool,
     tablet_balance: Option<(Duration, u64, u64)>,
     write_stall_timeout: Option<Duration>,
+    stale_share: Option<f64>,
 }
 
 impl Default for Options {
@@ -72,6 +73,7 @@ impl Default for Options {
             tablet_changes: true,
             tablet_balance: None,
             write_stall_timeout: None,
+            stale_share: None,
         }
     }
 }
@@ -140,6 +142,16 @@ impl Options {
     /// [`ErrorCode::ShmUnavailable`](crate::ErrorCode::ShmUnavailable) if it does not.
     pub fn memtable_budget(mut self, bytes: u64) -> Self {
         self.memtable_budget = bytes;
+        self
+    }
+
+    /// **Experimental, unstable (#287).** Also flush a memtable early once `share` (0 to 1)
+    /// of its entries are other versions of columns it holds (and it holds at least 1/16 of
+    /// the memtable budget), in families with `max_versions` set. Off by default; for measuring hot-row read costs. May change or
+    /// go away.
+    #[doc(hidden)]
+    pub fn experimental_stale_flush(mut self, share: f64) -> Self {
+        self.stale_share = Some(share);
         self
     }
 
@@ -533,6 +545,10 @@ impl Options {
         o.durability = self.durability;
         o.memtable_budget = self.memtable_budget;
         o.memtable_freeze_bytes = self.memtable_budget / 4;
+        o.memtable_stale_min_bytes = self.memtable_budget / 16;
+        if let Some(share) = self.stale_share {
+            o.memtable_stale_share = share;
+        }
         if let Some(bytes) = self.block_cache {
             o.block_cache_bytes = bytes;
         }

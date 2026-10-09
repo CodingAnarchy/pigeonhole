@@ -31,6 +31,11 @@ pub(crate) struct Open {
     table: Table,
     /// Writes retried after `Busy`, shared with every client.
     busy: Arc<AtomicU64>,
+    /// The write-stats sampler (`PHDB_BENCH_WRITE_STATS`), stopped before the close.
+    sampler: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
 }
 
 /// How many times a write refused with `Busy` is retried (each after the engine's own
@@ -133,6 +138,9 @@ impl Runner for PigeonholeRunner {
         if let Some(n) = s.shards {
             options = options.shards(n);
         }
+        if let Some(share) = stale_flush() {
+            options = options.experimental_stale_flush(share);
+        }
         let db = Pigeonhole::open(dir.join("bench.phdb"), options).map_err(err)?;
         let mut builder = db.table("bench").map_err(err)?;
         for family in FAMILIES {
@@ -144,10 +152,12 @@ impl Runner for PigeonholeRunner {
             builder = builder.family(family, f);
         }
         let table = builder.create_if_missing().map_err(err)?;
+        let sampler = write_stats_sampler(&db);
         self.open = Some(Open {
             db,
             table,
             busy: Arc::default(),
+            sampler,
         });
         Ok(())
     }
@@ -158,7 +168,13 @@ impl Runner for PigeonholeRunner {
 
     fn close(&mut self) -> Result<(), String> {
         match self.open.take() {
-            Some(Open { db, table, .. }) => {
+            Some(Open {
+                db, table, sampler, ..
+            }) => {
+                if let Some((stop, thread)) = sampler {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = thread.join();
+                }
                 drop(table);
                 db.close().map_err(err)
             }
@@ -208,7 +224,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             durability(s.sync),
@@ -216,7 +232,8 @@ impl Runner for PigeonholeRunner {
                 ""
             } else {
                 " tablets=on"
-            }
+            },
+            stale_flush().map_or(String::new(), |share| format!(" stale-flush={share}"))
         )
     }
 }
@@ -306,6 +323,56 @@ fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, Str
         }
     }
     Ok(t)
+}
+
+/// With `PHDB_BENCH_WRITE_STATS` set to a file path, a thread appends one CSV line a second
+/// for measuring flush policy (#287): seconds since open, flushes, compactions, write
+/// stalls, L0 SSTs in all, the most L0 SSTs of one table family, and SSTs in all.
+fn write_stats_sampler(
+    db: &Pigeonhole,
+) -> Option<(
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+)> {
+    use std::io::Write as _;
+    let path = std::env::var_os("PHDB_BENCH_WRITE_STATS")?;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    let _ = writeln!(out, "secs,flushes,compactions,stalls,l0,l0_max,ssts");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let db = db.clone();
+    let flag = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let mut next = std::time::Duration::ZERO;
+        while !flag.load(Ordering::Relaxed) {
+            if start.elapsed() >= next {
+                let (flushes, compactions, stalls, levels, l0_max) = db.debug_write_stats();
+                let _ = writeln!(
+                    out,
+                    "{:.0},{flushes},{compactions},{stalls},{},{l0_max},{}",
+                    start.elapsed().as_secs_f64(),
+                    levels.first().copied().unwrap_or(0),
+                    levels.iter().sum::<usize>()
+                );
+                next += std::time::Duration::from_secs(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    Some((stop, thread))
+}
+
+/// The experimental early flush of mostly-overwritten memtables (#287), from
+/// `PHDB_BENCH_STALE_FLUSH` (the share, for example `0.5`); off when unset. For measuring it
+/// against the default; not a benchmark setting the comparison should use otherwise.
+fn stale_flush() -> Option<f64> {
+    std::env::var("PHDB_BENCH_STALE_FLUSH")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 #[cfg(test)]

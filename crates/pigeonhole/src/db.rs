@@ -269,6 +269,16 @@ impl Pigeonhole {
         self.db.engine.shard_stats()
     }
 
+    /// **Unstable, for measuring flush policy (#287).** Flushes, compactions and write
+    /// stalls completed so far, SSTs per level now, and the most L0 SSTs any one table
+    /// family holds now.
+    #[doc(hidden)]
+    pub fn debug_write_stats(&self) -> (u64, u64, u64, Vec<usize>, usize) {
+        let m = self.db.engine.metrics();
+        let (levels, l0_max) = self.db.engine.debug_ssts_per_level();
+        (m.flushes, m.compactions, m.stalls.0, levels, l0_max)
+    }
+
     /// The writer default durability.
     pub fn default_durability(&self) -> Durability {
         self.db.engine.default_durability()

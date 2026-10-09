@@ -585,6 +585,12 @@ impl Engine {
             },
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
+            stale_freeze: (options.memtable_stale_share > 0.0).then(|| {
+                (
+                    options.memtable_stale_share,
+                    options.memtable_stale_min_bytes.max(2 * chunk as u64) as usize,
+                )
+            }),
             wal_pin_bytes: match options.wal_pin_bytes {
                 0 => options.memtable_budget.saturating_mul(2),
                 n => n,
@@ -1065,6 +1071,7 @@ impl Engine {
             drivers: Default::default(),
             freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
+            stale_freeze: None,
             wal_pin_bytes: 0,
             submitters: std::sync::OnceLock::new(),
             shm_dir: options.shm_dir.clone(),
@@ -1431,6 +1438,25 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// SSTs per level over every tablet and family of the current view, and the most L0 SSTs
+    /// any one (tablet, family) holds. For measuring flush policy (#287); unstable.
+    #[doc(hidden)]
+    pub fn debug_ssts_per_level(&self) -> (Vec<usize>, usize) {
+        let view = self.inner.shared.view.load();
+        let mut levels: Vec<usize> = Vec::new();
+        let mut l0_max = 0;
+        for family in view.ssts.map.values() {
+            for (level, ssts) in family.levels.iter().enumerate() {
+                if levels.len() <= level {
+                    levels.resize(level + 1, 0);
+                }
+                levels[level] += ssts.len();
+            }
+            l0_max = l0_max.max(family.levels.first().map_or(0, Vec::len));
+        }
+        (levels, l0_max)
     }
 
     /// Current metrics.

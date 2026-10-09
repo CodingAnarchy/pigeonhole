@@ -681,3 +681,29 @@ fn largest_free_run_is_the_largest_contiguous_free_space() {
         [2, 1, 1, 0, 0]
     );
 }
+
+#[test]
+fn overwrites_count_inserts_next_to_another_version_of_their_column() {
+    let mut arena = small();
+    let mut m = Memtable::create(&mut arena).unwrap();
+    let put = |m: &mut Memtable, arena: &mut ShardArena, q: &[u8], ts: u64, seqno: u64| {
+        let mut k = Vec::new();
+        encode_key(&mut k, b"r", q, ts, seqno, Kind::Put).unwrap();
+        m.insert(arena, &k, b"\x00v").unwrap();
+    };
+    put(&mut m, &mut arena, b"a", 1, 1);
+    put(&mut m, &mut arena, b"b", 1, 2);
+    assert_eq!(m.overwrites(), 0);
+    // A newer version of `a` sorts before the older one; an older one after it.
+    put(&mut m, &mut arena, b"a", 2, 3);
+    assert_eq!(m.overwrites(), 1);
+    put(&mut m, &mut arena, b"a", 0, 4);
+    assert_eq!(m.overwrites(), 2);
+    // A column whose name extends another's is a different column.
+    put(&mut m, &mut arena, b"ab", 1, 5);
+    put(&mut m, &mut arena, b"c", 1, 6);
+    assert_eq!(m.overwrites(), 2);
+    put(&mut m, &mut arena, b"c", 5, 7);
+    assert_eq!(m.overwrites(), 3);
+    assert_eq!(m.len(), 7);
+}

@@ -47,6 +47,18 @@ pub struct EngineOptions {
     /// A memtable freezes at this many bytes (default 1/4 of the budget; never below two
     /// arena chunks, `memtable_budget / 32`).
     pub memtable_freeze_bytes: u64,
+    /// **Experimental (#287), off by default (0).** A memtable also freezes, before it reaches
+    /// `memtable_freeze_bytes`, once at least this share (0 to 1) of its entries are other
+    /// versions of a column it already holds (the memtable's overwrite count) and it holds
+    /// at least `memtable_stale_min_bytes`. Only for families that keep a limited number of
+    /// versions and are not counters: elsewhere a flush drops no versions. Reads of hot rows step over those versions until
+    /// a flush drops the shadowed ones (D191), so flushing them sooner makes the reads
+    /// cheaper, at the cost of more, smaller flushes. Proposed for the owner in
+    /// `docs/design/questions/engine.md`.
+    pub memtable_stale_share: f64,
+    /// The smallest memtable (allocated bytes) the stale trigger freezes (default 1/4 of
+    /// `memtable_freeze_bytes`): smaller ones would make too many small SSTs.
+    pub memtable_stale_min_bytes: u64,
     /// Block cache capacity in bytes.
     pub block_cache_bytes: usize,
     /// Row cache capacity in bytes (0 disables it).
@@ -146,6 +158,8 @@ impl EngineOptions {
             durability: Durability::GroupSync,
             memtable_budget,
             memtable_freeze_bytes: memtable_budget / 4,
+            memtable_stale_share: stale_share_from_env(),
+            memtable_stale_min_bytes: memtable_budget / 16,
             block_cache_bytes: 256 << 20,
             row_cache_bytes: 0,
             shm_dir: None,
@@ -168,4 +182,17 @@ impl EngineOptions {
             room_recheck_nanos: 1_000_000,
         }
     }
+}
+
+/// The stale trigger's share from `PIGEONHOLE_TEST_STALE_SHARE` (test builds and the
+/// `test-hooks` feature only, so sweeps can run with the trigger on); 0 (off) otherwise.
+fn stale_share_from_env() -> f64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(share) = std::env::var("PIGEONHOLE_TEST_STALE_SHARE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        return share;
+    }
+    0.0
 }
