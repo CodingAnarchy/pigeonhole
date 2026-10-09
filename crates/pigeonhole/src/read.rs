@@ -5,6 +5,8 @@ use pigeonhole_engine::{
     FamilyId, QualifierFilter, ReadSpec, ScanCursor, ScanSpec, TableInfo, ValuePredicate,
 };
 
+use smallvec::SmallVec;
+
 use crate::cell::RowBuf;
 use crate::table::{TableCore, family_not_found};
 use crate::{Result, Row, RowRef, Snapshot};
@@ -90,7 +92,10 @@ pub enum Condition {
 /// starts (builders never fail; errors surface at `read`/`iter`).
 #[derive(Debug, Clone)]
 struct Selection {
-    families: Vec<String>,
+    /// The selected families' names, one after another (`ends` marks where each ends):
+    /// inline for a couple of short names, so a read allocates nothing for them (#287).
+    names: SmallVec<[u8; 32]>,
+    ends: SmallVec<[u32; 4]>,
     spec: ReadSpec,
     snapshot: Option<Snapshot>,
 }
@@ -100,10 +105,27 @@ impl Selection {
         let mut spec = ReadSpec::default();
         spec.versions = 1;
         Self {
-            families: Vec::new(),
+            names: SmallVec::new(),
+            ends: SmallVec::new(),
             spec,
             snapshot: None,
         }
+    }
+
+    fn push_family(&mut self, name: &str) {
+        self.names.extend_from_slice(name.as_bytes());
+        let end = u32::try_from(self.names.len()).expect("family names under 4 GiB");
+        self.ends.push(end);
+    }
+
+    /// The selected families' names, in order.
+    fn family_names(&self) -> impl Iterator<Item = &str> {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let name = &self.names[start..end as usize];
+            start = end as usize;
+            std::str::from_utf8(name).expect("pushed from a str")
+        })
     }
 
     fn qualifier_bounds(&mut self, start: Bound<&[u8]>, end: Bound<&[u8]>) {
@@ -117,7 +139,15 @@ impl Selection {
 
     /// Resolves the projection against the catalog as of now and takes the snapshot. Returns
     /// the catalog entry, which names every family the read can return.
-    fn start(&mut self, core: &TableCore) -> Result<(Arc<TableInfo>, pigeonhole_engine::Snapshot)> {
+    /// The snapshot, the table's info, and the selected families' ids (empty: every family).
+    fn start(
+        &mut self,
+        core: &TableCore,
+    ) -> Result<(
+        Arc<TableInfo>,
+        pigeonhole_engine::Snapshot,
+        SmallVec<[FamilyId; 4]>,
+    )> {
         core.db.check_open()?;
         // The snapshot first: the catalog read afterwards includes every family it can see.
         let snapshot = match self.snapshot.take() {
@@ -128,8 +158,8 @@ impl Selection {
             None => core.db.engine.snapshot()?,
         };
         let info = core.current_info();
-        let mut ids: Vec<FamilyId> = Vec::with_capacity(self.families.len());
-        for name in &self.families {
+        let mut ids = SmallVec::new();
+        for name in self.family_names() {
             let id = info
                 .family(name)
                 .ok_or_else(|| family_not_found(&info.name, name))?
@@ -138,8 +168,7 @@ impl Selection {
                 ids.push(id);
             }
         }
-        self.spec.families = ids;
-        Ok((info, snapshot))
+        Ok((info, snapshot, ids))
     }
 }
 
@@ -148,13 +177,17 @@ macro_rules! selection_methods {
     () => {
         /// Read only these families (default: all), in this order.
         pub fn families<'f>(mut self, families: impl IntoIterator<Item = &'f str>) -> Self {
-            self.sel.families = families.into_iter().map(str::to_owned).collect();
+            self.sel.names.clear();
+            self.sel.ends.clear();
+            for name in families {
+                self.sel.push_family(name);
+            }
             self
         }
 
         /// Add one family to the projection.
         pub fn family(mut self, family: &str) -> Self {
-            self.sel.families.push(family.to_owned());
+            self.sel.push_family(family);
             self
         }
 
@@ -265,14 +298,15 @@ impl<'t> RowRead<'t> {
 
     /// Performs the read. `None` if the row has no matching cell.
     pub fn read(mut self) -> Result<Option<RowRef<'t>>> {
-        let (info, snapshot) = self.sel.start(self.core)?;
+        let (info, snapshot, families) = self.sel.start(self.core)?;
         // The engine resolves the cells straight into the row this returns (#287): no
         // intermediate row and no second copy of each cell.
         let mut buf = RowBuf::new(info, 0);
-        let any = self.core.db.engine.read_row_into(
+        let any = self.core.db.engine.read_row_into_families(
             &snapshot,
             self.core.info.id,
             &self.row,
+            &families,
             &self.sel.spec,
             &mut buf,
         )?;
@@ -359,9 +393,10 @@ impl<'t> Scan<'t> {
 
     /// Starts the scan.
     pub fn iter(mut self) -> Result<RowIter<'t>> {
-        let (info, snapshot) = self.sel.start(self.core)?;
+        let (info, snapshot, families) = self.sel.start(self.core)?;
         let mut spec = ScanSpec::new(self.start, self.end);
         spec.read = self.sel.spec;
+        spec.read.families = families.into_vec();
         // `ScanSpec::limit` uses 0 for "unlimited"; `limit(0)` asks for no rows.
         spec.limit = self.limit.unwrap_or(0);
         let cursor = self
@@ -443,5 +478,36 @@ impl Iterator for RowIter<'_> {
             Ok(false) => None,
             Err(e) => Some(Err(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Selection;
+
+    #[test]
+    fn family_names_come_back_in_order_inline_or_spilled() {
+        let mut sel = Selection::new();
+        assert_eq!(sel.family_names().count(), 0);
+        sel.push_family("f");
+        sel.push_family("");
+        sel.push_family("été");
+        assert_eq!(sel.family_names().collect::<Vec<_>>(), ["f", "", "été"]);
+        assert!(!sel.names.spilled());
+        // Past the inline bytes and the inline count: the same names, now on the heap.
+        let long = "a-family-name-longer-than-the-inline-buffer";
+        for _ in 0..5 {
+            sel.push_family(long);
+        }
+        assert!(sel.names.spilled());
+        let names: Vec<&str> = sel.family_names().collect();
+        assert_eq!(names.len(), 8);
+        assert_eq!(&names[..3], ["f", "", "été"]);
+        assert!(names[3..].iter().all(|n| *n == long));
+        // `families` replaces the selection.
+        sel.names.clear();
+        sel.ends.clear();
+        sel.push_family("g");
+        assert_eq!(sel.family_names().collect::<Vec<_>>(), ["g"]);
     }
 }

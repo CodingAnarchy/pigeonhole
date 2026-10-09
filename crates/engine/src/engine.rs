@@ -1315,7 +1315,22 @@ impl Engine {
         spec: &ReadSpec,
         sink: &mut impl read::RowSink,
     ) -> Result<bool> {
-        let families = families_in_order(&snapshot.view, table, &spec.families)?;
+        self.read_row_into_families(snapshot, table, row, &spec.families, spec, sink)
+    }
+
+    /// As [`Engine::read_row_into`], reading `families` (empty: every family of the table)
+    /// instead of `spec.families`, so a caller with the ids at hand need not build a `Vec`
+    /// for them.
+    pub fn read_row_into_families(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: &mut impl read::RowSink,
+    ) -> Result<bool> {
+        let families = families_in_order(&snapshot.view, table, families)?;
         let now = self.inner.shared.vfs.now_micros();
         snapshot.checked(read::read_row_into(
             snapshot, table, row, &families, spec, now, sink,
