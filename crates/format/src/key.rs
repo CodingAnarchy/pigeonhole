@@ -18,6 +18,41 @@
 
 use crate::{Error, Seqno, Timestamp};
 
+/// Byte-wise comparison of two keys (or rows, or any byte strings): exactly `<[u8]>::cmp`,
+/// lexicographic with a shorter prefix first, but inline. It reads eight bytes at a time as
+/// big-endian words, then the tail byte by byte. Internal keys are short (a column prefix and
+/// the 17-byte suffix), so a library `memcmp` call costs more than the comparison itself; two
+/// keys of one column agree on their prefix words and differ in the timestamp and seqno words.
+/// Every hot key comparison (merges, the memtable, routing, block building) uses it.
+///
+/// ```
+/// use std::cmp::Ordering;
+/// use pigeonhole_format::key::compare;
+///
+/// assert_eq!(compare(b"row:1", b"row:2"), Ordering::Less);
+/// assert_eq!(compare(b"row", b"row:1"), Ordering::Less);
+/// assert_eq!(compare(b"row:10", b"row:1"), Ordering::Greater);
+/// ```
+#[inline]
+pub fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let n = a.len().min(b.len());
+    let (mut x, mut y) = (&a[..n], &b[..n]);
+    while let (Some((p, xs)), Some((q, ys))) =
+        (x.split_first_chunk::<8>(), y.split_first_chunk::<8>())
+    {
+        if p != q {
+            return u64::from_be_bytes(*p).cmp(&u64::from_be_bytes(*q));
+        }
+        (x, y) = (xs, ys);
+    }
+    for (p, q) in x.iter().zip(y) {
+        if p != q {
+            return p.cmp(q);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 /// Maximum length, in unescaped bytes, of a row key or a qualifier (64 KiB).
 pub const MAX_KEY_PART: usize = 64 * 1024;
 

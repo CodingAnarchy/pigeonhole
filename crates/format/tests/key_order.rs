@@ -4,8 +4,8 @@ mod common;
 
 use common::{Cell, cell, config, num, part, sized};
 use pigeonhole_format::key::{
-    Kind, column_prefix_len, decode_key, encode_column_prefix, encode_key, encode_marker_prefix,
-    encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
+    Kind, column_prefix_len, compare, decode_key, encode_column_prefix, encode_key,
+    encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -20,6 +20,7 @@ proptest! {
         for (a, ea) in cells.iter().zip(&encoded) {
             for (b, eb) in cells.iter().zip(&encoded) {
                 prop_assert_eq!(ea.cmp(eb), a.logical().cmp(&b.logical()), "{:?} vs {:?}", a, b);
+                prop_assert_eq!(compare(ea, eb), ea.cmp(eb), "{:?} vs {:?}", a, b);
             }
         }
     }
@@ -118,5 +119,29 @@ fn limits_and_kinds() {
     assert!(decode_key(&seek).is_err());
     for b in 0..=255u8 {
         assert_eq!(Kind::from_u8(b).is_ok(), (1..=5).contains(&b));
+    }
+}
+
+/// Two byte strings from a small alphabet that often share a long prefix (as two keys of one
+/// column do) and differ in length.
+fn shared_prefix_pair() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
+    (vec(0u8..3, 0..40), vec(0u8..3, 0..20), vec(0u8..3, 0..20)).prop_map(|(shared, a, b)| {
+        let mut x = shared.clone();
+        x.extend(a);
+        let mut y = shared;
+        y.extend(b);
+        (x, y)
+    })
+}
+
+proptest! {
+    #![proptest_config(config(5000))]
+
+    /// `compare` is exactly `<[u8]>::cmp`, both ways round.
+    #[test]
+    fn compare_is_byte_order((a, b) in shared_prefix_pair()) {
+        prop_assert_eq!(compare(&a, &b), a.cmp(&b));
+        prop_assert_eq!(compare(&b, &a), b.cmp(&a));
+        prop_assert_eq!(compare(&a, &a), std::cmp::Ordering::Equal);
     }
 }

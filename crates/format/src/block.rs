@@ -266,7 +266,7 @@ impl BlockBuilder {
                 what: "block builder: add after finish",
             });
         }
-        if self.entries > 0 && key <= self.last_key.as_slice() {
+        if self.entries > 0 && crate::key::compare(key, &self.last_key).is_le() {
             return Err(Error::InvalidArgument {
                 what: "block builder: keys out of order",
             });

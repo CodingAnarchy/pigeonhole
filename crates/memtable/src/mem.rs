@@ -209,7 +209,7 @@ mod imp {
         }
 
         pub(crate) fn cmp(&self, off: usize, len: usize, other: &[u8]) -> super::Cmp {
-            self.slice(off, len).cmp(other)
+            pigeonhole_format::key::compare(self.slice(off, len), other)
         }
 
         #[cfg(test)]
