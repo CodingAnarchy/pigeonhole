@@ -18,7 +18,9 @@ use arc_swap::ArcSwap;
 use pigeonhole_cache::BlockCache;
 use pigeonhole_compaction::{CompactionPicker, MergingCursor, PickerOptions, ResolveOptions};
 use pigeonhole_format::hash::{FastBuildHasher, FastMap, FastSet};
-use pigeonhole_format::key::{encode_key, encode_marker_key, encode_row_prefix, split_suffix};
+use pigeonhole_format::key::{
+    compare, encode_key, encode_marker_key, encode_row_prefix, split_suffix,
+};
 use pigeonhole_format::manifest::{CompactionStyle, Edit, FamilyKind};
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::wal::{BatchBuilder, BatchRef, StreamList, WalRecord};
@@ -1404,23 +1406,39 @@ fn slot_of<'a>(
 /// Same-commit collapse scratch (decision D34): the last mutation per
 /// `(table, family, row, qualifier, timestamp)` wins. Mutations are compared exactly (by the
 /// bytes of their key parts, located by offset within the batch), with reusable buffers and
-/// no per-cell allocation.
+/// no per-cell allocation. The scan is also the batch's only decode on apply: `apply` reads
+/// each mutation back from `keys`.
 #[derive(Debug, Default)]
 struct Dedup {
     keys: Vec<MutKey>,
     order: Vec<u32>,
     loser: Vec<bool>,
+    /// The batch failed to decode after `keys.len()` mutations.
+    error: Option<pigeonhole_format::Error>,
 }
 
-/// Where a mutation's key parts lie within the batch bytes.
+/// A mutation of the batch, its parts located within the batch bytes.
 #[derive(Debug, Clone, Copy)]
 struct MutKey {
     table: u32,
     family: u32,
-    marker: bool,
+    kind: Kind,
+    /// The timestamp it applies at (its own, or the commit's).
+    ts: Timestamp,
     row: (u32, u32),
     qualifier: (u32, u32),
-    ts: Timestamp,
+    value: (u32, u32),
+}
+
+impl MutKey {
+    fn marker(&self) -> bool {
+        self.kind == Kind::FamilyDelete
+    }
+}
+
+/// `part` of the batch `bytes` (a `MutKey` span).
+fn span(bytes: &[u8], (off, len): (u32, u32)) -> &[u8] {
+    &bytes[off as usize..(off + len) as usize]
 }
 
 impl Dedup {
@@ -1428,19 +1446,28 @@ impl Dedup {
     /// duplicate exists.
     fn scan(&mut self, batch: BatchRef<'_>, bytes: &[u8], commit_ts: Timestamp) -> bool {
         self.keys.clear();
+        self.error = None;
         let base = bytes.as_ptr() as usize;
-        let span = |part: &[u8]| -> (u32, u32) {
+        let at = |part: &[u8]| -> (u32, u32) {
             let off = (part.as_ptr() as usize).wrapping_sub(base);
             (off as u32, part.len() as u32)
         };
-        for m in batch.iter().flatten() {
+        for m in batch.iter() {
+            let m = match m {
+                Ok(m) => m,
+                Err(e) => {
+                    self.error = Some(e);
+                    break;
+                }
+            };
             self.keys.push(MutKey {
                 table: m.table.0,
                 family: m.family.0,
-                marker: m.kind == Kind::FamilyDelete,
-                row: span(m.row),
-                qualifier: span(m.qualifier),
+                kind: m.kind,
                 ts: m.ts.unwrap_or(commit_ts),
+                row: at(m.row),
+                qualifier: at(m.qualifier),
+                value: at(m.value),
             });
         }
         let n = self.keys.len();
@@ -1452,10 +1479,10 @@ impl Dedup {
         self.order.clear();
         self.order.extend(0..n as u32);
         let keys = &self.keys;
-        let part = |(off, len): (u32, u32)| &bytes[off as usize..(off + len) as usize];
+        let part = |at: (u32, u32)| span(bytes, at);
         let cmp = |a: &MutKey, b: &MutKey| {
-            (a.table, a.family, a.marker)
-                .cmp(&(b.table, b.family, b.marker))
+            (a.table, a.family, a.marker())
+                .cmp(&(b.table, b.family, b.marker()))
                 .then_with(|| part(a.row).cmp(part(b.row)))
                 .then_with(|| part(a.qualifier).cmp(part(b.qualifier)))
                 .then_with(|| a.ts.cmp(&b.ts))
@@ -1898,6 +1925,8 @@ pub(crate) struct ShardState {
     ts_floor: Timestamp,
     key_buf: Vec<u8>,
     dedup: Dedup,
+    /// The row hashes of the member `reserve_room` sized last, for `touch_rows`.
+    admit_rows: Vec<u64>,
     touched: FastSet<u64>,
     /// Slots the last `apply` wrote (deduplicated).
     touched_slots: Vec<(TabletId, FamilyId)>,
@@ -2119,6 +2148,7 @@ impl ShardState {
             ts_floor,
             key_buf: Vec::new(),
             dedup: Dedup::default(),
+            admit_rows: Vec::new(),
             touched: FastSet::default(),
             touched_slots: Vec::new(),
             closing: false,
@@ -2485,7 +2515,10 @@ impl ShardState {
     /// across the arena do not provide. So this also returns the largest and smallest such
     /// entry's size in chunks, and how many chunks the batch's allocations can take in all
     /// (each entry at most its own, each slot it creates one).
-    fn arena_needed(&self, batch: BatchRef<'_>) -> ArenaNeed {
+    /// Also leaves in `rows` the hash of each row the batch writes (once per run of writes
+    /// to one row), which `touch_rows` records if the member is admitted.
+    fn arena_needed(&self, batch: BatchRef<'_>, rows: &mut Vec<u64>) -> ArenaNeed {
+        rows.clear();
         let mut total = 0usize;
         let mut waste = 0usize;
         let mut largest = 0usize;
@@ -2496,6 +2529,9 @@ impl ShardState {
         let mut touched: smallvec::SmallVec<[(TabletId, FamilyId); 4]> = smallvec::SmallVec::new();
         let mut unrouted = 0usize;
         let mut new_slots = 0usize;
+        // The row of the previous write and its tablet: a run of writes to one row routes
+        // and hashes it once.
+        let mut last: Option<(TableId, &[u8], Option<TabletId>)> = None;
         for m in batch.iter().flatten() {
             let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
             let entry = ENTRY_OVERHEAD + key + m.value.len();
@@ -2508,8 +2544,17 @@ impl ShardState {
             if chunks > 1 {
                 min_large = min_large.min(chunks);
             }
-            match self.tablets.route(m.table, m.row) {
-                Some((tablet, _)) if !touched.contains(&(tablet, m.family)) => {
+            let tablet = match last {
+                Some((t, r, tablet)) if t == m.table && compare(r, m.row).is_eq() => tablet,
+                _ => {
+                    let tablet = self.tablets.route(m.table, m.row).map(|(t, _)| t);
+                    rows.push(hash_row(m.table, m.row));
+                    last = Some((m.table, m.row, tablet));
+                    tablet
+                }
+            };
+            match tablet {
+                Some(tablet) if !touched.contains(&(tablet, m.family)) => {
                     touched.push((tablet, m.family));
                     if self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family)) {
                         new_slots += 1;
@@ -2596,8 +2641,10 @@ impl ShardState {
     /// Reserves arena room for `bytes` (on top of everything already reserved by members of
     /// this group and undecided shares) or returns `None` when it would not fit.
     fn reserve_room(&mut self, bytes: &[u8]) -> std::result::Result<usize, Room> {
+        let mut rows = std::mem::take(&mut self.admit_rows);
+        rows.clear();
         let need = match BatchRef::new(bytes) {
-            Ok(batch) => self.arena_needed(batch),
+            Ok(batch) => self.arena_needed(batch, &mut rows),
             Err(_) => ArenaNeed {
                 bytes: 0,
                 run_chunks: 1,
@@ -2605,6 +2652,7 @@ impl ShardState {
                 alloc_chunks: 0,
             },
         };
+        self.admit_rows = rows;
         let needed = need.bytes;
         // Entries within a chunk fit any free chunk. A larger entry must also find a long
         // enough run (issue #141: a run too short for it, with enough free chunks elsewhere,
@@ -3473,13 +3521,17 @@ impl ShardState {
         let track = !self.replaying
             && self.shared.balance.enabled
             && self.shared.balance.interval_nanos > 0;
-        for (i, m) in batch.iter().enumerate() {
-            let m = match m {
-                Ok(m) => m,
-                Err(e) => {
-                    result = Err(e.into());
-                    break;
-                }
+        // The mutations as the scan decoded them (the batch is decoded once).
+        let keys = std::mem::take(&mut self.dedup.keys);
+        for (i, k) in keys.iter().enumerate() {
+            let m = pigeonhole_format::wal::Mutation {
+                table: TableId(k.table),
+                family: FamilyId(k.family),
+                kind: k.kind,
+                row: span(bytes, k.row),
+                qualifier: span(bytes, k.qualifier),
+                ts: Some(k.ts),
+                value: span(bytes, k.value),
             };
             if dups && !self.dedup.wins(i) {
                 // A value separated at commit time that loses the collapse: its blob file
@@ -3563,6 +3615,13 @@ impl ShardState {
             {
                 self.to_freeze.push((tablet, m.family));
             }
+        }
+        self.dedup.keys = keys;
+        if result.is_ok()
+            && let Some(e) = self.dedup.error.take()
+        {
+            // Mutations before the undecodable one were applied, as they always were.
+            result = Err(e.into());
         }
         self.key_buf = key_buf;
         result
@@ -4483,15 +4542,12 @@ impl ShardState {
     }
 
     /// Records `m`'s written rows as touched by this group.
+    /// Uses the row hashes `reserve_room` left for `m`, which admission sizes just before.
     fn touch_rows(&mut self, m: &Member) {
         if matches!(m.kind, MemberKind::CommitRecord { .. }) {
             return;
         }
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
-            for mu in batch.iter().flatten() {
-                self.touched.insert(hash_row(mu.table, mu.row));
-            }
-        }
+        self.touched.extend(self.admit_rows.iter().copied());
     }
 
     /// Counts or releases the rows of a prepared share.
