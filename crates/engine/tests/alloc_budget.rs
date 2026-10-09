@@ -462,6 +462,28 @@ fn commits(out: &mut Vec<Row>) {
 fn large_put(out: &mut Vec<Row>) -> f64 {
     let mut rig = Rig::open("large");
     let value = vec![1u8; 1 << 20];
+    // Steady state: the file already has the room. A dropped table's large values leave
+    // free extents, so the measured puts don't grow the simulated file (whose in-memory
+    // growth would count here, though a real file grows without allocating).
+    let scratch = rig
+        .db
+        .create_table("scratch", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for key in rows(0, 8) {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            scratch.id,
+            scratch.families[0].id,
+            &key,
+            b"q",
+            None,
+            ValueRef::Bytes(&value),
+        )
+        .unwrap();
+        rig.commit(wb);
+    }
+    rig.db.drop_table(scratch.id).unwrap();
+    rig.idle();
     let keys = rows(0, 8);
     let mut next = 0usize;
     let (allocs, bytes) = per_op(4, |_| {
@@ -526,17 +548,20 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("scan, memtable", "extra cell", 0.0),
     ("scan, SST, cached", "row", 0.0),
     ("scan, SST, cached", "extra cell", 0.0),
-    ("commit, 1 cell", "commit", 20.0),
-    ("commit, 16 cells", "commit", 24.0),
-    ("commit, 16 cells, 8 per group", "commit", 21.0),
+    ("commit, 1 cell", "commit", 15.0),
+    ("commit, 16 cells", "commit", 18.0),
+    ("commit, 16 cells, 8 per group", "commit", 16.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];
 
 /// Bytes allocated per value byte allowed: a large put (separated at commit) and a row read
-/// from cached SST blocks. A row read copies each value once into a buffer that grows by
-/// doubling, so its reallocations move the bytes again (about 2.4 today).
-const LARGE_PUT_COPIES: f64 = 9.5;
+/// from cached SST blocks. A large put copies the value once, into the batch (#320; it was
+/// three times with the simulated file's growth), and the simulated file keeps one more
+/// copy of every write it has not synced (a real file does not), so about 2.0. A row read
+/// copies each value once into a buffer that grows by doubling, so its reallocations move
+/// the bytes again (about 2.4 today).
+const LARGE_PUT_COPIES: f64 = 2.1;
 const ROW_READ_COPIES: f64 = 2.6;
 
 #[test]
