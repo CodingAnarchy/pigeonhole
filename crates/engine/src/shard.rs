@@ -1119,6 +1119,23 @@ enum MemberKind {
 }
 
 /// One record of a group: a commit, a participant's PREPARE, or a coordinator's COMMIT.
+/// Group syncs a shard keeps in flight per stream before later groups batch behind them
+/// (D207). The interim default; the gate run on the reference machine (#405) compares 1, 2
+/// and unlimited and decides it.
+const GROUP_SYNC_DEPTH: u32 = 1;
+
+/// [`GROUP_SYNC_DEPTH`], or `PIGEONHOLE_GROUP_SYNC_DEPTH` (a measurement variable, as
+/// `PIGEONHOLE_IO`: `0` is unlimited, as before D207), read once per process.
+fn group_sync_depth() -> u32 {
+    static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("PIGEONHOLE_GROUP_SYNC_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(GROUP_SYNC_DEPTH)
+    })
+}
+
 #[derive(Debug)]
 struct Member {
     kind: MemberKind,
@@ -2034,9 +2051,12 @@ pub(crate) struct ShardState {
     member_bufs: Vec<Vec<Member>>,
     /// Groups whose sync is in flight, oldest first.
     unresolved: VecDeque<Group>,
-    /// A group sync is in flight (D207): a group that needs one meanwhile batches behind it
-    /// instead of starting its own, and the next sync covers every such group.
-    group_sync_in_flight: bool,
+    /// Group syncs in flight (D207). Once there are `group_sync_depth` of them, a group that
+    /// needs one batches behind them instead of starting its own, and the next sync covers
+    /// every such group.
+    group_syncs_in_flight: u32,
+    /// [`group_sync_depth`], read once.
+    group_sync_depth: u32,
     /// Groups batched behind the in-flight group sync wait in `unresolved` for the next.
     sync_wanted: bool,
     next_group: u64,
@@ -2304,7 +2324,8 @@ impl ShardState {
             pending: Vec::new(),
             member_bufs: Vec::new(),
             unresolved: VecDeque::new(),
-            group_sync_in_flight: false,
+            group_syncs_in_flight: 0,
+            group_sync_depth: group_sync_depth(),
             sync_wanted: false,
             next_group: 1,
             held: BTreeSet::new(),
@@ -4440,12 +4461,15 @@ impl ShardState {
                 && !(need_group_sync && unsynced)
                 && buffered_end.is_some_and(|end| end > wal.written());
             if (need_group_sync && unsynced) || held {
-                if last_sync.is_none() && self.group_sync_in_flight {
-                    // D207: a group sync is in flight. Overlapping it would only contend on
-                    // the file (D58 counts a sync once every older one finished), so this
-                    // group waits for the next sync, which covers every group batched by
-                    // then. A group with a `Sync` member's own sync does not batch: that
-                    // sync covers only the records before it.
+                if last_sync.is_none()
+                    && self.group_sync_depth != 0
+                    && self.group_syncs_in_flight >= self.group_sync_depth
+                {
+                    // D207: as many group syncs as allowed are in flight. Another one would
+                    // contend on the file (D58 counts a sync once every older one finished),
+                    // so this group waits for the next sync, which covers every group
+                    // batched by then. A group with a `Sync` member's own sync does not
+                    // batch: that sync covers only the records before it.
                     batched = true;
                     self.sync_wanted = true;
                 } else {
@@ -4557,7 +4581,7 @@ impl ShardState {
                 self.unresolved.push_back(group);
                 self.publish_watermark();
                 if group_sync {
-                    self.group_sync_in_flight = true;
+                    self.group_syncs_in_flight += 1;
                 }
                 self.on_sync_done(completion, id, group_sync, ctx);
             }
@@ -5228,7 +5252,7 @@ impl ShardState {
         };
         match wal.submit_sync() {
             Ok(c) => {
-                self.group_sync_in_flight = true;
+                self.group_syncs_in_flight += 1;
                 self.on_sync_done(c, through, true, ctx);
             }
             Err(e) => {
@@ -7087,7 +7111,7 @@ impl ShardState {
                 group_sync,
             } => {
                 if group_sync {
-                    self.group_sync_in_flight = false;
+                    self.group_syncs_in_flight = self.group_syncs_in_flight.saturating_sub(1);
                 }
                 self.resolve_through(group, result, ctx);
                 if group_sync && self.sync_wanted {
