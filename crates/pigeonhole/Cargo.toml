@@ -34,6 +34,8 @@ pigeonhole-engine = { workspace = true, features = ["test-hooks"] }
 pigeonhole-sim = { workspace = true }
 futures-core = { workspace = true }
 criterion = { workspace = true }
+# The app-owned io_uring test waits in `poll` on the shard's completion fd (#408).
+libc = { workspace = true }
 
 [[bench]]
 name = "public"

@@ -650,7 +650,9 @@ impl Shard {
     ///
     /// With [`IoBackend::Uring`](crate::IoBackend::Uring), I/O the shard submitted goes to
     /// a ring of the thread that drives it and completes only when that thread runs a shard
-    /// again, so this is `Some(Duration::ZERO)` while any is in flight (#402).
+    /// again: wait on [`io_fd`](Shard::io_fd) too, which turns readable when some has
+    /// finished. Where the thread has no such descriptor, this is `Some(Duration::ZERO)` while
+    /// any is in flight (#402).
     ///
     /// After [`run_once`](Shard::run_once) returns `false`, sleep until the
     /// [`set_wakeup`](Shard::set_wakeup) callback fires or this much time passes, whichever
@@ -680,9 +682,9 @@ impl Shard {
     /// ```
     pub fn next_wakeup(&self) -> Option<std::time::Duration> {
         // I/O on this thread's own ring (`IoBackend::Uring`, #402) completes only when the
-        // thread runs a shard again: due now while any is in flight. A completion fd the
-        // application can wait on instead is #408.
-        if pigeonhole_io::own_io_in_flight() {
+        // thread runs a shard again: due now while any is in flight, unless the thread has a
+        // completion fd to wait on (`io_fd`, #408).
+        if pigeonhole_io::own_io_in_flight() && pigeonhole_io::own_io_fd().is_none() {
             return Some(std::time::Duration::ZERO);
         }
         let deadline = self.inner.next_deadline()?;
@@ -698,6 +700,37 @@ impl Shard {
     /// reports the same result.
     pub fn closed(&self) -> Option<Result<()>> {
         self.inner.closed().map(|r| r.map_err(Into::into))
+    }
+
+    /// A file descriptor that turns readable when I/O this thread submitted has finished and
+    /// waits for [`run_once`](Shard::run_once) to complete it (#408), for an application
+    /// that waits in its own event loop: wait until it is readable, the
+    /// [`set_wakeup`](Shard::set_wakeup) callback fires, or [`next_wakeup`](Shard::next_wakeup)
+    /// passes, then call `run_once`, which resets it. Call it on the thread that drives the
+    /// shard, after its first `run_once`. `None` where that thread has none: with
+    /// [`IoBackend::Pread`](crate::IoBackend::Pread), on systems without io_uring, or with a
+    /// custom VFS. A thread that drives several shards gets the same descriptor from each.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use pigeonhole::{IoBackend, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let options = Options::default().shards(1).io_backend(IoBackend::Auto);
+    /// let (db, mut shards) = Pigeonhole::open_application_owned(dir.join("w.phdb"), options)?;
+    /// let shard = &mut shards[0];
+    /// while shard.run_once(Duration::from_micros(200)) {}
+    /// if let Some(fd) = shard.io_fd() {
+    ///     // Add `fd` (readable) to the loop's poll set, with `next_wakeup` as the timeout.
+    ///     # let _ = fd;
+    /// }
+    /// # drop(db);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn io_fd(&self) -> Option<i32> {
+        pigeonhole_io::own_io_fd()
     }
 
     /// Registers a callback invoked (from any thread) when work arrives for this shard. It

@@ -388,3 +388,45 @@ fn ring_stats_count_rings_and_pools() {
     t.join().unwrap();
     stats(1, 1);
 }
+
+// ---- the completion fd (#408) ----
+
+use pigeonhole_io::own_io_fd;
+
+/// Whether `fd` turns readable within `ms` milliseconds.
+fn readable(fd: i32, ms: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live `pollfd`.
+    unsafe { libc::poll(&mut p, 1, ms) == 1 }
+}
+
+#[test]
+fn the_completion_fd_turns_readable_before_any_reap() {
+    // An application's event loop waits on the fd, not in the ring. A ring that runs its
+    // completion work only when its owner enters it (DEFER_TASKRUN) must still signal the
+    // fd when that work is queued, or such a loop would sleep through its own I/O.
+    let _serial = serial();
+    let b = Backend::uring("uring-own-fd");
+    b.vfs.attach_thread();
+    let fd = own_io_fd().expect("a thread ring offers a completion fd");
+    let f = b.create("f");
+    reap_own_io(None);
+    assert!(!readable(fd, 0), "nothing in flight yet");
+    let write = f.submit_write(filled(4096, 3), 0);
+    assert!(
+        readable(fd, 5000),
+        "the fd did not turn readable for a completion nobody reaped"
+    );
+    while !write.is_ready() {
+        reap_own_io(Some(Duration::from_millis(10)));
+    }
+    write.wait().unwrap();
+    // A reap resets it; another thread (no ring of its own) has none.
+    reap_own_io(None);
+    assert!(!readable(fd, 0), "the reap reset it");
+    assert!(thread::spawn(own_io_fd).join().unwrap().is_none());
+}

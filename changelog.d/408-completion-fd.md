@@ -1,0 +1,2 @@
+### Added
+- `Shard::io_fd` (#408): with `IoBackend::Uring`, a file descriptor that turns readable when I/O the driving thread submitted has finished, so an application-owned loop can wait in its own `poll`/`epoll` instead of polling. `Shard::next_wakeup` no longer returns `Some(Duration::ZERO)` while I/O is in flight when the thread has one. `pigeonhole-io` adds `own_io_fd` (the eventfd each thread ring registers with the kernel).

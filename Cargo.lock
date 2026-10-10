@@ -787,6 +787,7 @@ version = "0.2.0"
 dependencies = [
  "criterion",
  "futures-core",
+ "libc",
  "pigeonhole-engine",
  "pigeonhole-format",
  "pigeonhole-io",
