@@ -1600,7 +1600,7 @@ fn point_resolver() -> Resolver {
 pub(crate) fn get_in<const CACHE_ONLY: bool>(
     view: &View,
     seqno: Seqno,
-    now: Timestamp,
+    now: impl FnOnce() -> Timestamp,
     table: TableId,
     family: FamilyId,
     row: &[u8],
@@ -1679,7 +1679,7 @@ fn get_with<const CACHE_ONLY: bool>(
     resolver: &mut Resolver,
     view: &View,
     seqno: Seqno,
-    now: Timestamp,
+    now: impl FnOnce() -> Timestamp,
     table: TableId,
     family: FamilyId,
     row: &[u8],
@@ -1703,6 +1703,12 @@ fn get_with<const CACHE_ONLY: bool>(
         Ok(_) if sources.is_empty() => return Ok(None),
         Ok(markers) => markers,
         Err(e) => return Err(e),
+    };
+    // The clock only for a family with a TTL, the one thing a point get uses it for.
+    let now = if meta.options.ttl_micros == 0 {
+        0
+    } else {
+        now()
     };
     let mut opts = point_opts(meta, seqno, now);
     let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);

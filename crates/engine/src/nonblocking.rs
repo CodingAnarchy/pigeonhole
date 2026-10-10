@@ -260,13 +260,27 @@ impl Future for GetFuture {
                 return Ok(hit);
             }
             if cache_only {
-                get_in::<true>(view, seqno, now, table, family, row, qualifier, || {
-                    Arc::clone(view)
-                })
+                get_in::<true>(
+                    view,
+                    seqno,
+                    || now,
+                    table,
+                    family,
+                    row,
+                    qualifier,
+                    || Arc::clone(view),
+                )
             } else {
-                get_in::<false>(view, seqno, now, table, family, row, qualifier, || {
-                    Arc::clone(view)
-                })
+                get_in::<false>(
+                    view,
+                    seqno,
+                    || now,
+                    table,
+                    family,
+                    row,
+                    qualifier,
+                    || Arc::clone(view),
+                )
             }
         })
     }
