@@ -68,28 +68,32 @@
 # from four identical runs (the instructions workflow's base and head sides on PR #467, run
 # 38052048487, and a scratch callgrind run, 38051428167), which agreed exactly (1440, 1417,
 # 1327), with 0.3% headroom.
+#
+# Re-baselined after #483, #497, #498 and #500 (main 07a0fe2): lowered with
+# `instruction-ceilings.py lower` from the higher of this PR's base and head counts (run
+# 38092917766); counter keeps its permanent 0.5% headroom. Nothing rose.
 as-written 2051 0.3
-flushed 1867 0.3
-compacted 1259 0.3
-get-mem 5770 0.3
-get-sst 17339 0.5
-get-miss 4269 0.3
-row 2486 1.0
-scan 1413 0.3
-scan-filtered 7400 0.3
-versions 5609 0.3
-counter 9502 0.5
-rows 19745 0.3
-level-scans 14683 0.6
-short-scans 14092 0.3
-commit-one 9842 0.3
+flushed 1865 0.3
+compacted 1257 0.3
+get-mem 5666 0.3
+get-sst 17272 0.5
+get-miss 4165 0.3
+row 2475 1.0
+scan 1404 0.3
+scan-filtered 7335 0.3
+versions 5591 0.3
+counter 9388 0.5
+rows 19655 0.3
+level-scans 14439 0.6
+short-scans 13936 0.3
+commit-one 9785 0.3
 commit-sixteen 50577 0.3
 flush 2199 0.3
-compact 2698 0.5
-ycsb-c 47342 1.0
-ycsb-a 29487 1.0
-commit-overwrite 11913 0.5
-commit-at 10885 0.3
-scan-narrow 1445 0.3
-scan-small 1422 0.3
+compact 2692 0.5
+ycsb-c 43293 1.0
+ycsb-a 27326 1.0
+commit-overwrite 11863 0.5
+commit-at 10725 0.3
+scan-narrow 1435 0.3
+scan-small 1411 0.3
 scan-wide 1331 0.3
