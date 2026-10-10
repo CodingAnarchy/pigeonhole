@@ -25,6 +25,8 @@ pub(crate) struct Settings {
     pub(crate) group_sync: bool,
     /// `None`: the library default (on).
     pub(crate) tablet_changes: Option<bool>,
+    /// Row cache bytes (`Options::row_cache`); 0, the library default, is off.
+    pub(crate) row_cache: u64,
 }
 
 #[derive(Debug)]
@@ -126,6 +128,21 @@ impl PigeonholeRunner {
         self.settings.tablet_changes = Some(yes);
         self
     }
+
+    /// Row cache bytes (`Options::row_cache`, D201); 0 (the default) leaves it off. The
+    /// gate window measures reads with it on and off to decide its default (#405).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("rowcache"));
+    /// let r = PigeonholeRunner::default().row_cache(64 << 20);
+    /// assert!(r.describe().contains(" rowcache=64MiB"));
+    /// ```
+    pub fn row_cache(mut self, bytes: u64) -> Self {
+        self.settings.row_cache = bytes;
+        self
+    }
 }
 
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
@@ -145,6 +162,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     }
     if let Some(n) = s.shards {
         options = options.shards(n);
+    }
+    if s.row_cache > 0 {
+        options = options.row_cache(usize::try_from(s.row_cache).unwrap_or(usize::MAX));
     }
     options
 }
@@ -250,7 +270,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.group_sync {
@@ -262,6 +282,11 @@ impl Runner for PigeonholeRunner {
                 ""
             } else {
                 " tablets=on"
+            },
+            if s.row_cache > 0 {
+                format!(" rowcache={}MiB", s.row_cache >> 20)
+            } else {
+                String::new()
             }
         )
     }
