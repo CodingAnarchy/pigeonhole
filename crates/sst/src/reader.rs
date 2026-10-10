@@ -18,67 +18,193 @@ pub(crate) fn corrupt(what: &'static str) -> crate::Error {
     crate::Error::Format(FormatError::Corrupt { what })
 }
 
-/// Checks a physical block and turns it into what the cache holds: the logical block. An
-/// uncompressed block keeps its I/O buffer (trimmed of the trailer); a compressed one is
-/// decompressed into a heap buffer.
-/// What a cache-only read missed (`Error::WouldBlock`, ICR 0014): one read of the file and
-/// how its bytes enter the block cache. The caller submits the read ([`Fetch::submit`]), admits
-/// the bytes when it completes ([`Fetch::admit`], which verifies them and returns them pinned),
-/// and reads again, now a cache hit.
+/// What a cache-only read missed (`Error::WouldBlock`, ICR 0014): the read of the file it
+/// needs (one range, or the pieces of a blob record that spans extents) and what to do with
+/// the bytes. The caller submits the read ([`Fetch::submit`]), admits the bytes when it
+/// completes ([`Fetch::admit`], which verifies them, keeps them, and returns a pinned handle
+/// when there is one to hold), and reads again.
 #[derive(Clone)]
 pub struct Fetch {
     file: FileRef,
-    /// Absolute file offset and length of the read.
-    offset: u64,
+    /// Absolute file offset of each piece, and where it goes in the assembled bytes.
+    pieces: Vec<(u64, std::ops::Range<usize>)>,
     len: usize,
-    cache: Arc<BlockCache>,
-    key: BlockKey,
-    kind: FetchKind,
-    priority: Priority,
+    then: Then,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum FetchKind {
-    /// A block of this kind (checksummed and maybe compressed on disk).
-    Block(BlockKind),
+#[derive(Clone)]
+enum Then {
+    /// A block of this kind (checksummed and maybe compressed on disk), into the cache.
+    Block {
+        cache: Arc<BlockCache>,
+        key: BlockKey,
+        kind: BlockKind,
+        priority: Priority,
+    },
     /// An SST's footer, cached as its raw bytes for a cache-only open.
-    Footer,
+    Footer {
+        cache: Arc<BlockCache>,
+        key: BlockKey,
+        priority: Priority,
+    },
+    /// A blob extent's header, verified and recorded as such in its reader.
+    BlobHeader {
+        reader: Arc<crate::BlobReader>,
+        index: usize,
+    },
+    /// A blob record, verified and cached.
+    BlobRecord {
+        reader: Arc<crate::BlobReader>,
+        ptr: pigeonhole_format::value::BlobPointer,
+    },
 }
 
 impl std::fmt::Debug for Fetch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.then {
+            Then::Block { kind, .. } => format!("{kind:?}"),
+            Then::Footer { .. } => "Footer".into(),
+            Then::BlobHeader { index, .. } => format!("BlobHeader({index})"),
+            Then::BlobRecord { .. } => "BlobRecord".into(),
+        };
         f.debug_struct("Fetch")
-            .field("offset", &self.offset)
+            .field("offset", &self.pieces.first().map(|p| p.0))
             .field("len", &self.len)
-            .field("kind", &self.kind)
+            .field("pieces", &self.pieces.len())
+            .field("kind", &kind)
             .finish()
     }
 }
 
 impl Fetch {
-    /// Submits the read (the VFS's asynchronous read: a completion that wakes its poller).
+    fn one(file: FileRef, offset: u64, len: usize, then: Then) -> Self {
+        Self {
+            file,
+            pieces: vec![(offset, 0..len)],
+            len,
+            then,
+        }
+    }
+
+    pub(crate) fn blob_header(
+        file: FileRef,
+        reader: Arc<crate::BlobReader>,
+        index: usize,
+        offset: u64,
+        len: usize,
+    ) -> Self {
+        Self::one(file, offset, len, Then::BlobHeader { reader, index })
+    }
+
+    pub(crate) fn blob_record(
+        file: FileRef,
+        reader: Arc<crate::BlobReader>,
+        ptr: pigeonhole_format::value::BlobPointer,
+        pieces: Vec<(u64, std::ops::Range<usize>)>,
+        len: usize,
+    ) -> Self {
+        Self {
+            file,
+            pieces,
+            len,
+            then: Then::BlobRecord { reader, ptr },
+        }
+    }
+
+    /// Submits the read through the VFS's asynchronous reads: one completion that wakes its
+    /// poller once every piece has arrived.
     pub fn submit(&self) -> pigeonhole_io::Completion {
-        self.file.submit_read(IoBuf::zeroed(self.len), self.offset)
+        if let [(offset, _)] = self.pieces.as_slice() {
+            return self.file.submit_read(IoBuf::zeroed(self.len), *offset);
+        }
+        // Several pieces: each read's continuation copies its bytes into place, and the last
+        // one resolves the joined completion (or the first failure does).
+        struct Join {
+            buf: Option<IoBuf>,
+            left: usize,
+            resolver: Option<pigeonhole_io::Resolver<IoBuf>>,
+        }
+        let (done, resolver) = pigeonhole_io::Completion::pair();
+        let join = Arc::new(std::sync::Mutex::new(Join {
+            buf: Some(IoBuf::zeroed(self.len)),
+            left: self.pieces.len(),
+            resolver: Some(resolver),
+        }));
+        for (offset, range) in &self.pieces {
+            let (join, range) = (Arc::clone(&join), range.clone());
+            let read = self.file.submit_read(IoBuf::zeroed(range.len()), *offset);
+            // The continuation runs when the read completes, whether or not the mapped
+            // completion is kept.
+            drop(read.map(move |r| {
+                let mut j = join
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let finished = match r {
+                    Ok(piece) => {
+                        if let Some(buf) = j.buf.as_mut() {
+                            buf[range].copy_from_slice(&piece);
+                        }
+                        j.left -= 1;
+                        (j.left == 0).then(|| j.buf.take().map(Ok)).flatten()
+                    }
+                    Err(e) => {
+                        j.buf = None;
+                        Some(Err(e))
+                    }
+                };
+                if let Some(result) = finished
+                    && let Some(resolver) = j.resolver.take()
+                {
+                    drop(j);
+                    resolver.resolve(result);
+                }
+                Ok(())
+            }));
+        }
+        done
     }
 
-    /// Whether the fetched bytes are in the block cache now. Not after [`Fetch::admit`] when
-    /// the cache keeps nothing (capacity 0, or a block larger than a cache shard): the caller
+    /// Whether what was fetched is kept now, so the read that missed will find it: the block
+    /// or record in the cache, or the header recorded as verified. A block is not kept when
+    /// the cache keeps nothing (capacity 0, or a block larger than a cache shard); the caller
     /// then reads synchronously instead of fetching again.
-    pub fn is_cached(&self) -> bool {
-        self.cache.get(self.key).is_some()
+    pub fn is_kept(&self) -> bool {
+        match &self.then {
+            Then::Block { cache, key, .. } | Then::Footer { cache, key, .. } => {
+                cache.get(*key).is_some()
+            }
+            Then::BlobHeader { reader, index } => reader.inner.is_verified(*index),
+            Then::BlobRecord { reader, ptr } => reader.inner.cached(ptr).is_some(),
+        }
     }
 
-    /// Verifies and decodes the bytes `submit` read and admits them to the block cache,
-    /// returning them pinned: hold the handle until the read that missed has run again.
-    pub fn admit(&self, buf: IoBuf) -> Result<BlockHandle> {
-        let data = match self.kind {
-            FetchKind::Block(kind) => decode_physical(buf, kind)?,
-            FetchKind::Footer => BlockData::from(buf.to_vec()),
-        };
-        Ok(self.cache.insert(self.key, data, self.priority))
+    /// Verifies and keeps the bytes `submit` read, returning a pinned handle when there is
+    /// one (a block or record; hold it until the read that missed has run again).
+    pub fn admit(&self, buf: IoBuf) -> Result<Option<BlockHandle>> {
+        Ok(match &self.then {
+            Then::Block {
+                cache,
+                key,
+                kind,
+                priority,
+            } => Some(cache.insert(*key, decode_physical(buf, *kind)?, *priority)),
+            Then::Footer {
+                cache,
+                key,
+                priority,
+            } => Some(cache.insert(*key, BlockData::from(buf.to_vec()), *priority)),
+            Then::BlobHeader { reader, index } => {
+                reader.inner.check_header(*index, &buf)?;
+                None
+            }
+            Then::BlobRecord { reader, ptr } => Some(reader.inner.admit_record(ptr, buf)?),
+        })
     }
 }
 
+/// Checks a physical block and turns it into what the cache holds: the logical block. An
+/// uncompressed block keeps its I/O buffer (trimmed of the trailer); a compressed one is
+/// decompressed into a heap buffer.
 pub(crate) fn decode_physical(mut buf: IoBuf, kind: BlockKind) -> Result<BlockData> {
     match decode_slice(&buf, kind)? {
         Some(data) => Ok(data),
@@ -164,15 +290,16 @@ impl Reader {
             match cache.get(key) {
                 Some(h) if h.len() == FOOTER_LEN => tail.copy_from_slice(&h),
                 _ => {
-                    return Err(crate::Error::WouldBlock(Box::new(Fetch {
+                    return Err(crate::Error::WouldBlock(Box::new(Fetch::one(
                         file,
-                        offset: base + limit,
-                        len: FOOTER_LEN,
-                        cache,
-                        key,
-                        kind: FetchKind::Footer,
-                        priority,
-                    })));
+                        base + limit,
+                        FOOTER_LEN,
+                        Then::Footer {
+                            cache,
+                            key,
+                            priority,
+                        },
+                    ))));
                 }
             }
         } else {
@@ -320,15 +447,17 @@ impl Blocks {
         kind: BlockKind,
         priority: Priority,
     ) -> crate::Error {
-        crate::Error::WouldBlock(Box::new(Fetch {
-            file: self.file.clone(),
-            offset: self.base + addr.offset,
-            len: addr.len as usize,
-            cache: Arc::clone(&self.cache),
-            key: self.key(addr),
-            kind: FetchKind::Block(kind),
-            priority,
-        }))
+        crate::Error::WouldBlock(Box::new(Fetch::one(
+            self.file.clone(),
+            self.base + addr.offset,
+            addr.len as usize,
+            Then::Block {
+                cache: Arc::clone(&self.cache),
+                key: self.key(addr),
+                kind,
+                priority,
+            },
+        )))
     }
 
     /// Hands out a decoded block, inserting it into the cache if asked.

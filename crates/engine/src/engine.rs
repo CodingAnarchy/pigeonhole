@@ -131,9 +131,9 @@ pub struct Metrics {
     /// File growths and the nanoseconds they held the page allocator across a `fallocate`
     /// and a `sync_all` (#28, #182).
     pub file_growths: (u64, u64),
-    /// File reads made synchronously inside async reads: a separated value (D196, #398), a
-    /// block the cache could not keep, or a read that missed too often. Zero when async
-    /// reads never block their executor thread.
+    /// File reads made synchronously inside async reads: a separated value too large to
+    /// cache (D196, #398), a block the cache could not keep, or a read that missed too
+    /// often. Zero when async reads never block their executor thread.
     pub async_sync_reads: u64,
 }
 

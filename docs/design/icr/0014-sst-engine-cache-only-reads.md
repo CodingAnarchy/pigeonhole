@@ -23,9 +23,9 @@ pub enum Error {
 /// One read of the file a cache-only read missed, and how its bytes enter the cache.
 pub struct Fetch { /* private */ }
 impl Fetch {
-    pub fn submit(&self) -> pigeonhole_io::Completion;      // the VFS's async read
-    pub fn admit(&self, buf: IoBuf) -> Result<BlockHandle>; // verify, decode, cache, pin
-    pub fn is_cached(&self) -> bool;                        // false if the cache keeps nothing
+    pub fn submit(&self) -> pigeonhole_io::Completion;              // the VFS's async read(s)
+    pub fn admit(&self, buf: IoBuf) -> Result<Option<BlockHandle>>; // verify, keep, pin
+    pub fn is_kept(&self) -> bool;                                  // false if the cache keeps nothing
 }
 
 impl SstReader {
@@ -36,6 +36,9 @@ impl SstReader {
 impl BlobReader {
     /// The value if its record is cached; never reads the file.
     pub fn cached(&self, ptr: &BlobPointer) -> Option<Cell>;
+    /// The cached value; or `WouldBlock` with the fetch it needs (an extent header not
+    /// verified yet, then the record); or `None` for a record too large to cache.
+    pub fn read_cache_only(self: &Arc<Self>, ptr: &BlobPointer) -> Result<Option<Cell>>;
 }
 ```
 
@@ -67,8 +70,17 @@ D196: async reads must not block their executor thread on a block the cache does
 - **Readahead never runs in cache-only mode:** a miss on the first block of a run is a `WouldBlock` for that block.
 - **The futures** take their read point on the first poll: the latest view as `get_latest` reads it (D188, #315), or the snapshot given; a reader process takes a snapshot, with the expired-snapshot retry. They keep fetched blocks pinned until they resolve.
   - They fall back to one synchronous attempt, counted in `Metrics::async_sync_reads`, when a fetched block is not cached afterwards (capacity 0, or a block larger than a cache shard), or after 64 fetches.
-  - Separated values are read synchronously and counted: until #42's PR 2b for records up to the blob cache limit, and until #398 above it (D196, owner).
+  - A separated value is fetched like a block (#42's PR 2b): each blob extent header it touches, verified once, then the record, whose pieces (a record can span extents) are read and joined into one completion. One above the blob cache limit is read synchronously and counted (D196 option (a), #398).
 - **A row read restarts from an empty copy of its sink** (the futures require `S: Clone`). An earlier draft added a required `RowSink::clear`, which `cargo semver-checks` rejected against 0.2.0 as a breaking change, so `RowSink` is unchanged.
+
+## Amendment in #42's PR 2b (approved, coordinator, 2026-10-09)
+
+The approved surface changed in three ways, all inside `pigeonhole-sst` and its one caller (the engine's async futures):
+- `Fetch::admit` returns `Option<BlockHandle>`: a fetched blob extent header is kept as a verified flag, not as a block.
+- `Fetch::is_cached` is renamed `is_kept`.
+- `BlobReader::read_cache_only` is new.
+
+A `Fetch` may now carry several pieces (a blob record spanning extents). `submit` still returns one completion.
 
 ## Callers
 

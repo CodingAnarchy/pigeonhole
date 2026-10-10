@@ -66,7 +66,7 @@ Dropping a ticket, like dropping any submitted commit or commit future, does not
 - The internal sst/engine API change is ICR 0014.
 - **Fallbacks, counted** in `Metrics::async_sync_reads` (public as `Pigeonhole::async_sync_reads`):
   - A separated value larger than the blob cache limit (`min(MAX_CACHED_RECORD, cache/8)`) is read synchronously inside the async read. This is option (a), approved by the owner; the alternative, keeping the fetched record in the future, is folded into #398.
-  - Until #42's PR 2b, smaller separated values are read synchronously too (a record can span two blob extents, so it needs a multi-range fetch).
+  - Smaller separated values are fetched asynchronously like blocks (#42's PR 2b): the header of each blob extent the record touches, verified once, then the record, read in pieces joined into one completion when it spans extents.
   - A block the cache cannot keep (capacity 0, or larger than a cache shard) makes the read synchronous for its next attempt, as do more than 64 fetches for one read.
 
 ### Scan streams prefetch, and an unpredicted miss inside a step reads synchronously (owner decision; #398)

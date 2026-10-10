@@ -278,8 +278,8 @@ impl Pigeonhole {
     }
 
     /// File reads made synchronously inside async reads since open (D196, #398): a
-    /// separated value, or a block the cache could not keep. Zero means no async read
-    /// blocked its executor thread on the file.
+    /// separated value too large to cache, or a block the cache could not keep. Zero means
+    /// no async read blocked its executor thread on the file.
     #[cfg(feature = "async")]
     pub fn async_sync_reads(&self) -> u64 {
         self.db.engine.metrics().async_sync_reads
@@ -501,8 +501,8 @@ pub struct PigeonholeReader {
 
 impl PigeonholeReader {
     /// File reads made synchronously inside async reads since open (D196, #398): a
-    /// separated value, or a block the cache could not keep. Zero means no async read
-    /// blocked its executor thread on the file.
+    /// separated value too large to cache, or a block the cache could not keep. Zero means
+    /// no async read blocked its executor thread on the file.
     #[cfg(feature = "async")]
     pub fn async_sync_reads(&self) -> u64 {
         self.db.engine.metrics().async_sync_reads

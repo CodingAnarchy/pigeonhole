@@ -14,7 +14,8 @@
 //! it is cached; the read point is taken on the first poll, so every attempt sees the same
 //! data. Dropping a read future is always safe. Two cases read synchronously inside the
 //! future, counted by [`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads)
-//! (D196, #398): a separated value, and a block the cache cannot keep (a cache of size 0).
+//! (D196, #398): a separated value too large to cache (above an eighth of the block cache,
+//! at most 1 MiB), and a block the cache cannot keep (a cache of size 0).
 //!
 //! **Commits.** `commit_async` and `commit_with_async` submit at the call, then resolve when
 //! the record meets the requested durability and is visible, exactly when the sync `commit`

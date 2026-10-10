@@ -1867,37 +1867,40 @@ mod tests {
 }
 
 thread_local! {
-    /// While an async read's attempt runs on this thread: the file reads it made
-    /// synchronously so far (D196), counted into `Metrics::async_sync_reads`.
-    static ASYNC_READ: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// While an async read's attempt runs on this thread: whether it is cache-only, and the
+    /// file reads it made synchronously so far (D196), counted into
+    /// `Metrics::async_sync_reads`.
+    static ASYNC_READ: std::cell::Cell<Option<(bool, u64)>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Whether an async read's attempt is running on this thread.
-pub(crate) fn in_async_read() -> bool {
-    ASYNC_READ.with(|c| c.get().is_some())
+/// The running async read's mode on this thread: `Some(cache_only)`, or `None` outside one.
+pub(crate) fn async_read_mode() -> Option<bool> {
+    ASYNC_READ.with(|c| c.get().map(|(cache_only, _)| cache_only))
 }
 
 /// Counts a file read the running async read makes synchronously.
 pub(crate) fn note_sync_read() {
     ASYNC_READ.with(|c| {
-        if let Some(n) = c.get() {
-            c.set(Some(n + 1));
+        if let Some((cache_only, n)) = c.get() {
+            c.set(Some((cache_only, n + 1)));
         }
     });
 }
 
-/// Runs `f` as an async read's attempt; returns its result and the file reads it made
-/// synchronously. The flag is restored even if `f` panics.
-pub(crate) fn as_async_read<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    struct Restore(Option<u64>);
+/// Runs `f` as an async read's attempt (`cache_only`, or a synchronous fallback); returns
+/// its result and the file reads it made synchronously. The flag is restored even if `f`
+/// panics.
+pub(crate) fn as_async_read<T>(cache_only: bool, f: impl FnOnce() -> T) -> (T, u64) {
+    struct Restore(Option<(bool, u64)>);
     impl Drop for Restore {
         fn drop(&mut self) {
             ASYNC_READ.with(|c| c.set(self.0));
         }
     }
-    let restore = Restore(ASYNC_READ.with(|c| c.replace(Some(0))));
+    let restore = Restore(ASYNC_READ.with(|c| c.replace(Some((cache_only, 0)))));
     let out = f();
-    let n = ASYNC_READ.with(|c| c.get()).unwrap_or(0);
+    let n = ASYNC_READ.with(|c| c.get()).map_or(0, |(_, n)| n);
     drop(restore);
     (out, n)
 }
