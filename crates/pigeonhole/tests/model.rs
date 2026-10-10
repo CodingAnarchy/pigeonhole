@@ -1461,9 +1461,6 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
                 drop(tables);
                 db.close().map_err(|e| format!("final close: {e}"))?;
             }
-            if run.cfg.row_cache > 0 && run.stats.reads > 100 && run.stats.row_cache_hits == 0 {
-                return Err(format!("seed {seed}: the row cache never hit"));
-            }
             Ok(run.stats)
         }
         Err(e) => {
@@ -1506,6 +1503,9 @@ fn seed_timeout() -> Duration {
 fn check(cfg: &Config) {
     let test = std::thread::current().name().unwrap_or("?").to_owned();
     let limit = seed_timeout();
+    // Row cache hits over every seed: a crash-heavy seed may hit none (each crash empties
+    // the cache), but a test whose seeds never hit is not testing the cache (D201).
+    let (mut reads, mut row_cache_hits) = (0, 0);
     for seed in seeds() {
         let started = Instant::now();
         let progress = Arc::new(Mutex::new(String::new()));
@@ -1520,7 +1520,11 @@ fn check(cfg: &Config) {
                 .expect("spawn a seed's thread")
         };
         match rx.recv_timeout(limit) {
-            Ok(Ok(stats)) => eprintln!("seed {seed}: {stats:?} in {:?}", started.elapsed()),
+            Ok(Ok(stats)) => {
+                eprintln!("seed {seed}: {stats:?} in {:?}", started.elapsed());
+                reads += stats.reads;
+                row_cache_hits += stats.row_cache_hits;
+            }
             Ok(Err(e)) => panic!("{e}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let at = progress
@@ -1551,6 +1555,10 @@ fn check(cfg: &Config) {
         }
         let _ = worker.join();
     }
+    assert!(
+        cfg.row_cache == 0 || reads < 500 || row_cache_hits > 0,
+        "{test}: the row cache never hit in {reads} reads"
+    );
 }
 
 #[test]
