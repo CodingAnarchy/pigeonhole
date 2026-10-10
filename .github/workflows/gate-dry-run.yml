@@ -1,0 +1,62 @@
+name: Gate window dry run
+
+# The Phase 3 gate-window script (crates/bench/baselines/phase3-gate/run-window.sh, #405) at
+# --scale small on a GitHub Linux runner: every step, end to end, so script bugs show up
+# here instead of on the rented reference machine. The numbers are not reference numbers
+# (shared runner, small sizes, D5); only that every step ran and the summary was written
+# counts. It runs on pull requests that change the gate-window scripts, and by hand.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/bench/baselines/phase3-gate/**'
+      - 'crates/bench/baselines/phase3-io/**'
+      - 'crates/bench/baselines/phase2-gate/run-gate.sh'
+      - '.github/workflows/gate-dry-run.yml'
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes its older dry run (cancelled); a run dispatched
+# by hand is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dry-run:
+    name: run-window.sh --scale small
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libclang (bindgen for librocksdb-sys) and nvme-cli
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev clang nvme-cli gdb elfutils
+      - name: Run every step at small scale
+        # As root (the cold steps empty the page cache and start cgroup scopes), with the
+        # runner's toolchain. /mnt is the runner's larger scratch disk.
+        run: >
+          sudo -E env "PATH=$PATH"
+          crates/bench/baselines/phase3-gate/run-window.sh /mnt/gate-data /mnt/gate-results
+          --scale small
+      - name: Summary
+        if: always()
+        run: cat /mnt/gate-results/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-dry-run-${{ github.run_id }}
+          path: |
+            /mnt/gate-results/*.json
+            /mnt/gate-results/*.jsonl
+            /mnt/gate-results/*.md
+            /mnt/gate-results/*.txt
+            /mnt/gate-results/*.tsv
+            /mnt/gate-results/logs/
+            /mnt/gate-results/timedout.txt
