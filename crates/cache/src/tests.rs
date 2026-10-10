@@ -192,3 +192,40 @@ fn erase_files_batches() {
     }
     assert_eq!(c.usage(), 8 * 4 * 10);
 }
+
+#[test]
+fn lookups_are_counted_across_shards_and_threads() {
+    let c = Arc::new(BlockCache::new(1 << 20, 8));
+    for off in 0..64 {
+        drop(c.insert(key(off), block(10), Priority::Normal));
+    }
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            let c = Arc::clone(&c);
+            std::thread::spawn(move || {
+                // Offsets 0..64 are cached, 64..128 are not: half hit, half miss.
+                for i in 0..n(1000) {
+                    drop(c.get(key(u64::from(i) % 128)));
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let lookups = u64::from(4 * n(1000));
+    let (hits, misses) = c.hits_and_misses();
+    assert_eq!(hits + misses, lookups);
+    assert_eq!(
+        hits,
+        (0..u64::from(n(1000))).filter(|i| i % 128 < 64).count() as u64 * 4
+    );
+}
+
+#[test]
+fn a_disabled_cache_counts_nothing() {
+    let c = BlockCache::disabled();
+    drop(c.insert(key(0), block(10), Priority::Normal));
+    assert!(c.get(key(0)).is_none());
+    assert_eq!(c.hits_and_misses(), (0, 0));
+}
