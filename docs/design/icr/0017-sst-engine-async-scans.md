@@ -1,6 +1,6 @@
 # 0017: async scans in `pigeonhole-sst` and `pigeonhole-engine`
 
-**Status:** Proposed (#42, D196). Implemented in #42's PR 3; it needs approval before that PR merges.
+**Status:** Approved (coordinator, 2026-10-10; #42, D196). Implemented in #42's PR 3 (#429).
 
 ## Change
 
