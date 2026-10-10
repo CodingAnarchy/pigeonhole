@@ -15,7 +15,11 @@
 //! workload's 20,000 records of ten 100-byte fields, flushed and compacted into the last
 //! level. Then the first 20,000 YCSB-A operations run and are flushed to an L0 SST, and the
 //! next 10,000 stay in the memtable, so a read merges the memtable, L0 and the last level as
-//! in a running store. A scan of the table warms the block cache. The operations come from
+//! in a running store. Row reads of every record, in key order, warm the block cache.
+//!
+//! The shapes are deterministic: every write takes an explicit timestamp from a counter, and
+//! the warm-up reads in a fixed order (see `WRITE_TS` and the warm-up). Two runs of one binary
+//! count within about 0.002%; before, they differed by up to 1%. The operations come from
 //! the bench's own generator (`pigeonhole_bench::Workload`, seed `0x5EED`), the same
 //! streams `phdb-bench` runs.
 //!
@@ -30,6 +34,8 @@ mod measure;
 mod shards;
 use measure::Measured;
 use shards::Shards;
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pigeonhole::{Family, Table};
 use pigeonhole_bench::{BenchOp, Workload, WorkloadConfig, WorkloadKind};
@@ -52,8 +58,16 @@ fn config(kind: WorkloadKind, operations: usize) -> WorkloadConfig {
     }
 }
 
-/// One operation through the public API, as `phdb-bench`'s Pigeonhole runner does it.
-/// Returns the cells read.
+/// Every write takes an explicit timestamp from this counter, so the store's bytes are the
+/// same on every run: with commit timestamps from the clock, adjacent versions of a column
+/// share a varying number of key bytes, block cuts move, and the reads' instruction counts
+/// with them (about 0.2% for `ycsb-c`, 0.5% for `ycsb-a`). The counter only rises, so each
+/// write is the newest version, as a commit timestamp would make it. The difference from
+/// `phdb-bench`'s puts: the commit takes no clock reading for its timestamp.
+static WRITE_TS: AtomicU64 = AtomicU64::new(1_700_000_000_000_000);
+
+/// One operation through the public API, as `phdb-bench`'s Pigeonhole runner does it,
+/// except that a put takes the next [`WRITE_TS`]. Returns the cells read.
 fn execute(t: &Table, op: &BenchOp) -> usize {
     match op {
         BenchOp::GetRow { row, family } => {
@@ -68,7 +82,7 @@ fn execute(t: &Table, op: &BenchOp) -> usize {
         BenchOp::Put { row, family, cells } => {
             let mut m = t.mutate(row);
             for (q, v) in cells {
-                m = m.put(family, q, v);
+                m = m.put_at(family, q, WRITE_TS.fetch_add(1, Ordering::Relaxed), v);
             }
             m.commit().unwrap();
             0
@@ -134,11 +148,15 @@ fn main() {
         _ => Workload::new(config(kind, POOL)).run_ops().collect(),
     };
     assert_eq!(pool.len(), POOL);
-    let mut it = t.scan_prefix(b"").iter().unwrap();
-    while let Some(r) = it.next_ref().unwrap() {
-        std::hint::black_box(r.iter().count());
+    // Warm the block cache with row reads in key order. A scan would admit blocks through
+    // readahead completions, whose order varies with timing, and a hash table's probe
+    // lengths depend on the order its keys arrived (the setup's compaction does the same, so
+    // its blocks are not the ones the reads look up).
+    for op in Workload::new(config(WorkloadKind::YcsbC, 0)).load_ops() {
+        if let BenchOp::Put { row, family, .. } = op {
+            execute(&t, &BenchOp::GetRow { row, family });
+        }
     }
-    drop(it);
     eprintln!("setup done");
 
     // `SHAPE_SETUP_ONLY=1`: the setup alone, without the measured work (the script checks
