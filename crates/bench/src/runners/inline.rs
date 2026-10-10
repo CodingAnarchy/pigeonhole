@@ -19,7 +19,7 @@ use pigeonhole::{Pigeonhole, Shard, Table};
 use super::pigeonhole::{create_table, err, options};
 use crate::{
     BenchOp, Histogram, PigeonholeRunner, RunDetail, RunOptions, RunRecord, Runner, ShardShare,
-    Workload, WorkloadConfig,
+    Stalls, Workload, WorkloadConfig,
 };
 
 /// Commits each shard thread keeps in flight (D204).
@@ -292,9 +292,9 @@ impl PigeonholeRunner {
                 break;
             }
         }
-        let before = db.shard_stats();
+        let (before, stalls_before) = (db.shard_stats(), super::pigeonhole::stalls(&db));
         let (shards, elapsed, hist) = phase(&t, shards, measured, INLINE_IN_FLIGHT, true)?;
-        let after = db.shard_stats();
+        let (after, stalls_after) = (db.shard_stats(), super::pigeonhole::stalls(&db));
         let detail_shards = before
             .iter()
             .zip(&after)
@@ -331,6 +331,7 @@ impl PigeonholeRunner {
             warmup_ops: warmup,
             detail: RunDetail {
                 shards: detail_shards,
+                stalls: Some(Stalls::between(&stalls_before, &stalls_after)),
                 ..RunDetail::default()
             },
         })

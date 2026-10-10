@@ -521,8 +521,16 @@ mod tests {
             let commits: u64 = r.detail.shards.iter().map(|s| s.commits).sum();
             assert_eq!(commits, r.operations);
             assert!(r.detail.shards.iter().map(|s| s.tablets_end).sum::<u64>() >= 1);
+            // The visibility counters (ICR 0023): a waiter is woken at most once.
+            let st = r.detail.stalls.expect("pigeonhole reports its counters");
+            assert!(st.visibility_woken <= st.visibility_waits, "{st:?}");
         }
         assert!(suite.to_markdown().contains("| Shard | Commits | Share |"));
+        assert!(
+            suite
+                .to_markdown()
+                .contains("visibility waits per operation")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

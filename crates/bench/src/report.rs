@@ -366,6 +366,22 @@ pub struct Stalls {
     /// See [`Stalls::shard_parks`].
     #[serde(default)]
     pub commit_parks: u64,
+    /// Async commits that waited on the global visibility watermark (D19), and the
+    /// waiter-list entries their registrations scanned (ICR 0023, #154).
+    #[serde(default)]
+    pub visibility_waits: u64,
+    /// See [`Stalls::visibility_waits`].
+    #[serde(default)]
+    pub visibility_scanned: u64,
+    /// Visibility wake passes, and the waiters they woke.
+    #[serde(default)]
+    pub visibility_wake_passes: u64,
+    /// See [`Stalls::visibility_wake_passes`].
+    #[serde(default)]
+    pub visibility_woken: u64,
+    /// Visibility registrations and wake passes that found the waiter list locked.
+    #[serde(default)]
+    pub visibility_contended: u64,
 }
 
 impl Stalls {
@@ -385,6 +401,11 @@ impl Stalls {
             shard_parks: d(before.shard_parks, after.shard_parks),
             shard_wakes: d(before.shard_wakes, after.shard_wakes),
             commit_parks: d(before.commit_parks, after.commit_parks),
+            visibility_waits: d(before.visibility_waits, after.visibility_waits),
+            visibility_scanned: d(before.visibility_scanned, after.visibility_scanned),
+            visibility_wake_passes: d(before.visibility_wake_passes, after.visibility_wake_passes),
+            visibility_woken: d(before.visibility_woken, after.visibility_woken),
+            visibility_contended: d(before.visibility_contended, after.visibility_contended),
         }
     }
 }
@@ -460,6 +481,11 @@ pub struct Scaling {
     /// the run fails as skewed whatever its efficiency (D204).
     #[serde(default)]
     pub max_share: f64,
+    /// The N-shard run's async commits that waited on the global visibility watermark, per
+    /// operation (0 when the run did not report it): near 0 means the watermark is not what
+    /// the shards wait on (D19, #154).
+    #[serde(default)]
+    pub visibility_waits_per_op: f64,
 }
 
 impl Scaling {
@@ -488,6 +514,9 @@ impl Scaling {
             } else {
                 top as f64 / total as f64
             },
+            visibility_waits_per_op: multi.detail.stalls.map_or(0.0, |st| {
+                st.visibility_waits as f64 / multi.operations.max(1) as f64
+            }),
         }
     }
 
@@ -720,14 +749,14 @@ impl Suite {
             .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)))
             .collect();
         if !stalled.is_empty() {
-            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op |\n");
-            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
+            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) |\n");
+            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
             for (r, st) in stalled {
                 let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
                 let per_op = |n: u64| format!("{:.2}", n as f64 / r.operations.max(1) as f64);
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} ({}) |",
                     r.workload,
                     r.store,
                     r.threads,
@@ -743,6 +772,8 @@ impl Suite {
                     per_op(st.shard_parks),
                     per_op(st.shard_wakes),
                     per_op(st.commit_parks),
+                    st.visibility_waits,
+                    st.visibility_contended,
                 );
             }
         }
@@ -751,7 +782,7 @@ impl Suite {
                 s,
                 "\n**Scaling gate:** {} shards reach {} ops/s against {} ops/s on one shard: \
                  efficiency {:.2} (gate ≥ {:.1}); the busiest shard took {:.0}% of the commits \
-                 (at most {:.0}%) — {}.",
+                 (at most {:.0}%); {:.3} visibility waits per operation — {}.",
                 sc.shards,
                 ops(sc.multi_shard_throughput),
                 ops(sc.single_shard_throughput),
@@ -759,6 +790,7 @@ impl Suite {
                 Scaling::GATE,
                 100.0 * sc.max_share,
                 100.0 * sc.max_share_allowed(),
+                sc.visibility_waits_per_op,
                 if !sc.spread() {
                     "fail: skewed, the table was not spread"
                 } else if sc.passes() {

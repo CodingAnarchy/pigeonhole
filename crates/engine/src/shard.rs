@@ -216,6 +216,28 @@ pub(crate) struct Padded(pub AtomicU64);
 pub(crate) struct VisibilityWaiters {
     pub count: AtomicUsize,
     pub list: Mutex<Vec<(Seqno, Waker)>>,
+    /// Counters (ICR 0023, #154): registrations that found their seqno not yet visible, list entries
+    /// they scanned, registrations and wake passes that found the lock held, wake passes
+    /// that took the lock, and waiters woken.
+    pub waits: AtomicU64,
+    pub scanned: AtomicU64,
+    pub contended: AtomicU64,
+    pub passes: AtomicU64,
+    pub woken: AtomicU64,
+}
+
+impl VisibilityWaiters {
+    /// The list, locked; a lock already held counts as contention.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(Seqno, Waker)>> {
+        match self.list.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.contended.fetch_add(1, Ordering::Relaxed);
+                self.list.lock().unwrap_or_else(PoisonError::into_inner)
+            }
+        }
+    }
 }
 
 /// Shards waiting for the watermark to pass a deferred freeze, each with the seqno its
@@ -459,11 +481,11 @@ impl Shared {
             return true;
         }
         {
-            let mut list = self
-                .waiters
-                .list
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            self.waiters.waits.fetch_add(1, Ordering::Relaxed);
+            let mut list = self.waiters.lock();
+            self.waiters
+                .scanned
+                .fetch_add(list.len() as u64, Ordering::Relaxed);
             if !list.iter().any(|(s, w)| *s == seqno && w.will_wake(waker)) {
                 list.push((seqno, waker.clone()));
             }
@@ -535,16 +557,14 @@ impl Shared {
             return;
         }
         let visible = self.shm.visible_seqno();
-        let mut list = self
-            .waiters
-            .list
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut list = self.waiters.lock();
+        self.waiters.passes.fetch_add(1, Ordering::Relaxed);
         let mut i = 0;
         while i < list.len() {
             if list[i].0 <= visible {
                 let (_, w) = list.swap_remove(i);
                 w.wake();
+                self.waiters.woken.fetch_add(1, Ordering::Relaxed);
             } else {
                 i += 1;
             }

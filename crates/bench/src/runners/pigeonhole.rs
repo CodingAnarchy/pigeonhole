@@ -257,21 +257,7 @@ impl Runner for PigeonholeRunner {
     }
 
     fn stalls(&self) -> Option<crate::Stalls> {
-        let m = self.open.as_ref()?.db.engine_metrics();
-        Some(crate::Stalls {
-            write_stalls: m.stalls.0,
-            write_stall_nanos: m.stalls.1,
-            flushes: m.flushes,
-            compactions: m.compactions,
-            unpin_passes: m.unpin.0,
-            unpin_flushes: m.unpin.1,
-            wal_inline_syncs: m.wal_inline_syncs,
-            file_growths: m.file_growths.0,
-            file_growth_nanos: m.file_growths.1,
-            shard_parks: m.shard_idle.0,
-            shard_wakes: m.shard_idle.1,
-            commit_parks: m.commit_parks,
-        })
+        Some(stalls(&self.open.as_ref()?.db))
     }
 
     fn client(&self) -> Option<Box<dyn Client>> {
@@ -403,6 +389,31 @@ fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, Str
         }
     }
     Ok(t)
+}
+
+/// The engine's cumulative stall and visibility counters ([`crate::Stalls`], ICR 0015,
+/// ICR 0023).
+pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
+    let m = db.engine_metrics();
+    crate::Stalls {
+        write_stalls: m.stalls.0,
+        write_stall_nanos: m.stalls.1,
+        flushes: m.flushes,
+        compactions: m.compactions,
+        unpin_passes: m.unpin.0,
+        unpin_flushes: m.unpin.1,
+        wal_inline_syncs: m.wal_inline_syncs,
+        file_growths: m.file_growths.0,
+        file_growth_nanos: m.file_growths.1,
+        shard_parks: m.shard_idle.0,
+        shard_wakes: m.shard_idle.1,
+        commit_parks: m.commit_parks,
+        visibility_waits: m.visibility_waits.0,
+        visibility_scanned: m.visibility_waits.1,
+        visibility_wake_passes: m.visibility_wakes.0,
+        visibility_woken: m.visibility_wakes.1,
+        visibility_contended: m.visibility_contended,
+    }
 }
 
 #[cfg(test)]
