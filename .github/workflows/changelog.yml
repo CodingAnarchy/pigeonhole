@@ -1,0 +1,27 @@
+name: Changelog
+
+# Checks the changelog.d/ fragments (scripts/changelog.py) and the tool's own tests. Python
+# only, a few seconds, and on every PR: docs-only PRs skip CI (its paths-ignore) but can still
+# add or break a fragment.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fragments:
+    name: changelog fragments
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/changelog.py check
+      - run: python3 scripts/test_changelog.py

@@ -9,3 +9,4 @@
 proptest-regressions/
 /.claude/settings.local.json
 /scratch/
+__pycache__/
