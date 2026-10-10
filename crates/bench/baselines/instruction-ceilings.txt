@@ -28,6 +28,10 @@
 # commit-overwrite and commit-at (crates/bench/examples/writepath.rs) were added from three
 # identical CI runs (run 38002948065): commit-overwrite varied by 0.58% (12480-12553), so it
 # gets 1.0% headroom and a 1.0% per-change threshold; commit-at by 0.05% (11661-11667).
+#
+# Lowered after #420 (a 144-byte shard message: commit-one -5%) and #421 (commit spin options),
+# and with the ycsb shapes deterministic (#434), from this PR's head run on main f9056a1
+# (`instruction-ceilings.py lower`; nothing raised).
 
 as-written 2573 0.3
 flushed 1912 0.3
