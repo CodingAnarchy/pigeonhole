@@ -208,7 +208,21 @@ pub struct UringVfs {
 impl UringVfs {
     /// Probes io_uring and starts the shared ring and its reaper thread.
     pub fn new() -> Result<Arc<Self>> {
-        let ring = RingHandle::start()?;
+        let ring = RingHandle::start(false)?;
+        Ok(Arc::new(Self {
+            files: PreadVfs::without_pool(),
+            ring,
+        }))
+    }
+
+    /// As [`UringVfs::new`], for application-owned mode (#408), where the engine starts no
+    /// threads: the shared ring, for threads with no ring of their own, has no reaper. The
+    /// threads that drive shards ([`Vfs::attach_thread`]) reap it: each one's ring polls the
+    /// shared ring's eventfd, so a completion there also turns every driving thread's
+    /// completion fd ([`crate::own_io_fd`]) readable, and that thread's next reap takes it. A
+    /// thread blocked on one of the shared ring's completions reaps it itself.
+    pub fn new_application_owned() -> Result<Arc<Self>> {
+        let ring = RingHandle::start(true)?;
         Ok(Arc::new(Self {
             files: PreadVfs::without_pool(),
             ring,
@@ -227,7 +241,12 @@ impl Vfs for UringVfs {
     /// and it reaps the completions itself (in its turns and its waits). Where the kernel
     /// lacks what such a ring needs, the thread keeps using the shared ring.
     fn attach_thread(&self) {
-        ThreadRing::attach(self.ring.id(), &self.ring.counts);
+        let client = self
+            .ring
+            .reaper
+            .is_none()
+            .then(|| Arc::clone(&self.ring.ring));
+        ThreadRing::attach(self.ring.id(), &self.ring.counts, client);
     }
 
     fn ring_stats(&self) -> Option<crate::RingStats> {
@@ -335,7 +354,9 @@ impl UringFile {
                 done
             }
             None => {
-                let (done, resolver) = Completion::pair();
+                // With no reaper, a blocked wait reaps the shared ring itself.
+                let drive = self.ring.reaper.is_none().then(|| self.ring.ring.drive());
+                let (done, resolver) = Completion::driven_pair(drive);
                 self.ring.ring.submit(Op {
                     file: Arc::clone(&self.file),
                     kind: kind(resolver),
@@ -633,9 +654,15 @@ struct Ring {
     counted: Counted,
     /// Held while pushing to the submission queue (one pusher at a time).
     sq: Mutex<()>,
+    /// Held while taking completions (the reaper, or the threads that reap a ring without
+    /// one), never while they run.
+    cq: Mutex<()>,
     table: Mutex<Table>,
     /// Set when the last handle goes: the reaper ends once nothing is in flight.
     shutdown: AtomicBool,
+    /// Without a reaper (application-owned mode, #408): registered with the ring, so each
+    /// completion signals it; the driving threads' rings poll it.
+    notify: Option<EventFd>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -644,7 +671,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Ring {
     /// A ring whose kernel supports every operation this backend submits.
-    fn probe(counts: &Arc<RingCounts>) -> Result<Self> {
+    fn probe(counts: &Arc<RingCounts>, notify: bool) -> Result<Self> {
         let unsupported = |e: io::Error| Error {
             kind: ErrorKind::Unsupported,
             context: "io_uring",
@@ -668,13 +695,25 @@ impl Ring {
         if !needed.iter().all(|&op| probe.is_supported(op)) {
             return Err(Error::new(ErrorKind::Unsupported, "io_uring operations"));
         }
+        let notify = if notify {
+            let e = EventFd::new().map_err(unsupported)?;
+            uring
+                .submitter()
+                .register_eventfd(e.raw())
+                .map_err(unsupported)?;
+            Some(e)
+        } else {
+            None
+        };
         Ok(Self {
             uring,
             counted: Counted::new(counts),
             pool: LazyPool::default(),
             sq: Mutex::new(()),
+            cq: Mutex::new(()),
             table: Mutex::new(Table::default()),
             shutdown: AtomicBool::new(false),
+            notify,
         })
     }
 
@@ -733,36 +772,77 @@ impl Ring {
                     return;
                 }
             }
-            let mut done = Vec::new();
-            let mut again = Vec::new();
-            {
-                // SAFETY: only this thread (the reaper) ever borrows the completion queue.
-                let mut cq = unsafe { self.uring.completion_shared() };
-                cq.sync();
-                let mut table = lock(&self.table);
-                for cqe in &mut cq {
-                    if cqe.user_data() == SHUTDOWN {
-                        continue;
-                    }
-                    let Some(op) = table.take(cqe.user_data()) else {
-                        continue;
-                    };
-                    match op.complete(cqe.result()) {
-                        Step::Done(resolve) => done.push(resolve),
-                        Step::Again(op) => again.push(op),
-                    }
-                }
-            }
-            for op in again {
-                self.submit(op);
-            }
-            for resolve in done {
-                resolve();
-            }
+            self.take_completions();
             if self.shutdown.load(Ordering::Acquire) && lock(&self.table).live == 0 {
                 return;
             }
         }
+    }
+
+    /// Reaps a ring without a reaper (#408), from any thread: takes what has completed,
+    /// waiting up to `wait` for something to when nothing has (`None`: do not wait).
+    /// Returns whether an operation completed.
+    fn reap_now(&self, wait: Option<Duration>) -> bool {
+        if let Some(notify) = &self.notify {
+            notify.drain();
+        }
+        if let Some(t) = wait
+            && lock(&self.table).live > 0
+        {
+            let ts = types::Timespec::new()
+                .sec(t.as_secs())
+                .nsec(t.subsec_nanos());
+            let args = types::SubmitArgs::new().timespec(&ts);
+            let _ = self.uring.submitter().submit_with_args(1, &args);
+        }
+        self.take_completions()
+    }
+
+    /// What a blocked [`Completion::wait`] on a ring without a reaper calls: reaps it, from
+    /// whichever thread waits.
+    fn drive(self: &Arc<Self>) -> crate::completion::Drive {
+        let ring = Arc::downgrade(self);
+        Arc::new(move || match ring.upgrade() {
+            Some(r) => {
+                r.reap_now(Some(DRIVE_SLICE));
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Takes the completions the ring holds and resolves them (outside any lock, so their
+    /// continuations may submit or reap again). Returns whether an operation completed.
+    fn take_completions(&self) -> bool {
+        let mut done = Vec::new();
+        let mut again = Vec::new();
+        {
+            let _cq = lock(&self.cq);
+            // SAFETY: `self.cq` is held, so this is the only borrow of the completion queue.
+            let mut cq = unsafe { self.uring.completion_shared() };
+            cq.sync();
+            let mut table = lock(&self.table);
+            for cqe in &mut cq {
+                if cqe.user_data() == SHUTDOWN {
+                    continue;
+                }
+                let Some(op) = table.take(cqe.user_data()) else {
+                    continue;
+                };
+                match op.complete(cqe.result()) {
+                    Step::Done(resolve) => done.push(resolve),
+                    Step::Again(op) => again.push(op),
+                }
+            }
+        }
+        for op in again {
+            self.submit(op);
+        }
+        let any = !done.is_empty();
+        for resolve in done {
+            resolve();
+        }
+        any
     }
 
     /// Fails every operation in flight (the ring can no longer complete them).
@@ -787,14 +867,14 @@ fn fail(op: Op, e: io::Error) {
     }
 }
 
-/// The shared ring and its reaper thread; dropping the last handle stops the reaper once
-/// everything in flight has completed.
+/// The shared ring and its reaper thread (none in application-owned mode, #408); dropping
+/// the last handle stops the reaper once everything in flight has completed.
 struct RingHandle {
     ring: Arc<Ring>,
     /// This backend's rings: the shared one and the threads' own.
     counts: Arc<RingCounts>,
-    reaper: Mutex<Option<JoinHandle<()>>>,
-    reaper_id: ThreadId,
+    /// The reaper and its thread; `None` without one.
+    reaper: Option<(Mutex<Option<JoinHandle<()>>>, ThreadId)>,
 }
 
 impl RingHandle {
@@ -803,33 +883,49 @@ impl RingHandle {
         std::ptr::from_ref(self) as usize
     }
 
-    fn start() -> Result<Arc<Self>> {
+    fn start(application_owned: bool) -> Result<Arc<Self>> {
         let counts = Arc::new(RingCounts::default());
-        let ring = Arc::new(Ring::probe(&counts)?);
+        let ring = Arc::new(Ring::probe(&counts, application_owned)?);
+        if application_owned {
+            return Ok(Arc::new(Self {
+                ring,
+                counts,
+                reaper: None,
+            }));
+        }
         let r = Arc::clone(&ring);
         let reaper = thread::Builder::new()
             .name("pigeonhole-uring".into())
             .spawn(move || r.reap())
             .map_err(|e| Error::os("spawn the io_uring reaper", e))?;
+        let id = reaper.thread().id();
         Ok(Arc::new(Self {
-            reaper_id: reaper.thread().id(),
             ring,
             counts,
-            reaper: Mutex::new(Some(reaper)),
+            reaper: Some((Mutex::new(Some(reaper)), id)),
         }))
     }
 }
 
 impl Drop for RingHandle {
     fn drop(&mut self) {
+        let Some((reaper, reaper_id)) = &self.reaper else {
+            // No reaper (#408): complete what is in flight here, before the ring and the
+            // buffers the kernel writes into go. Continuations run outside the ring's locks,
+            // so this works from one too.
+            while lock(&self.ring.table).live > 0 {
+                self.ring.reap_now(Some(Duration::from_millis(10)));
+            }
+            return;
+        };
         self.ring.shutdown.store(true, Ordering::Release);
         // Wake the reaper; it ends once nothing is in flight.
         let nop = opcode::Nop::new().build().user_data(SHUTDOWN);
         let _ = self.ring.push(&nop);
-        let reaper = lock(&self.reaper).take();
+        let reaper = lock(reaper).take();
         // The last handle can go on the reaper itself (a continuation holding a file): it
         // then ends on its own after this call.
-        if thread::current().id() != self.reaper_id
+        if thread::current().id() != *reaper_id
             && let Some(r) = reaper
         {
             let _ = r.join();
@@ -839,6 +935,9 @@ impl Drop for RingHandle {
 
 /// The `user_data` of the poll that wakes a thread's ring wait.
 const WAKE: u64 = u64::MAX - 1;
+
+/// The `user_data` of a thread ring's poll of the reaper-less shared ring's eventfd (#408).
+const CLIENT: u64 = u64::MAX - 2;
 
 /// Longest a waiting [`Completion`] on a ring's owner thread reaps before it checks its
 /// result again.
@@ -868,6 +967,9 @@ struct ThreadRing {
     /// for a thread that waits on it in its own event loop ([`crate::own_io_fd`], #408).
     /// `None` if the kernel refused the registration.
     notify: Option<EventFd>,
+    /// The backend's shared ring when it has no reaper (application-owned mode, #408): this
+    /// ring polls its eventfd and reaps it when that fires.
+    client: Option<Arc<Ring>>,
 }
 
 /// An eventfd, closed on drop.
@@ -917,11 +1019,11 @@ impl ThreadRing {
 
     /// Gives the calling thread a ring for `backend` (once). Without the kernel support it
     /// needs (timed waits), the thread keeps using the shared ring.
-    fn attach(backend: usize, counts: &Arc<RingCounts>) {
+    fn attach(backend: usize, counts: &Arc<RingCounts>, client: Option<Arc<Ring>>) {
         if Self::current(backend).is_some() {
             return;
         }
-        let Some(ring) = Self::new(backend, counts) else {
+        let Some(ring) = Self::new(backend, counts, client) else {
             return;
         };
         let own: std::sync::Weak<dyn crate::own::OwnIo> = Arc::downgrade(&ring) as _;
@@ -929,7 +1031,11 @@ impl ThreadRing {
         let _ = THREAD_RINGS.try_with(|r| r.borrow_mut().push(ring));
     }
 
-    fn new(backend: usize, counts: &Arc<RingCounts>) -> Option<Arc<Self>> {
+    fn new(
+        backend: usize,
+        counts: &Arc<RingCounts>,
+        client: Option<Arc<Ring>>,
+    ) -> Option<Arc<Self>> {
         // Completions run only when this thread enters the ring (no work on other threads),
         // where the kernel offers it (6.1); a plain ring otherwise. The task-run flag tells
         // a non-waiting reap that deferred completions are pending, so its enter carries
@@ -970,8 +1076,10 @@ impl ThreadRing {
             backend,
             wake: Arc::new(EventFd::new().ok()?),
             notify,
+            client,
         });
         ring.arm_wake().ok()?;
+        ring.arm_client().ok()?;
         Some(ring)
     }
 
@@ -980,6 +1088,24 @@ impl ThreadRing {
         let poll = opcode::PollAdd::new(types::Fd(self.wake.raw()), libc::POLLIN as u32)
             .build()
             .user_data(WAKE);
+        self.push(&poll)
+    }
+
+    /// Polls the reaper-less shared ring's eventfd (multishot: one arm serves every signal),
+    /// so a completion there ends this ring's waits and signals its completion fd.
+    fn arm_client(&self) -> io::Result<()> {
+        let Some(fd) = self
+            .client
+            .as_ref()
+            .and_then(|c| c.notify.as_ref())
+            .map(EventFd::raw)
+        else {
+            return Ok(());
+        };
+        let poll = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32)
+            .multi(true)
+            .build()
+            .user_data(CLIENT);
         self.push(&poll)
     }
 
@@ -1084,6 +1210,7 @@ impl ThreadRing {
         let mut done = Vec::new();
         let mut again = Vec::new();
         let mut woke = false;
+        let (mut client_due, mut client_rearm) = (false, false);
         {
             // SAFETY: only the owner thread borrows this ring's completion queue, and the
             // borrow ends before any completion's continuation runs.
@@ -1093,6 +1220,12 @@ impl ThreadRing {
             for cqe in &mut cq {
                 if cqe.user_data() == WAKE {
                     woke = true;
+                    continue;
+                }
+                if cqe.user_data() == CLIENT {
+                    client_due = true;
+                    // A multishot poll that ended (no more to come) must be armed again.
+                    client_rearm |= !io_uring::cqueue::more(cqe.flags());
                     continue;
                 }
                 let Some(op) = table.take(cqe.user_data()) else {
@@ -1109,12 +1242,18 @@ impl ThreadRing {
             // Re-armed for the next wake; a failure leaves waits to their timeouts.
             let _ = self.arm_wake();
         }
+        if client_rearm {
+            let _ = self.arm_client();
+        }
         for op in again {
             self.submit(op);
         }
-        let any = !done.is_empty();
+        let mut any = !done.is_empty();
         for resolve in done {
             resolve();
+        }
+        if client_due && let Some(client) = &self.client {
+            any |= client.reap_now(None);
         }
         any
     }

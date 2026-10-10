@@ -627,9 +627,18 @@ impl Family {
 impl Options {
     /// The engine configuration these options describe.
     pub(crate) fn to_engine(&self) -> Result<EngineOptions, pigeonhole_engine::Error> {
+        self.to_engine_for(false)
+    }
+
+    /// The engine configuration these options describe, for an application-owned open when
+    /// `application_owned` (an io_uring backend then starts no reaper thread, #408).
+    pub(crate) fn to_engine_for(
+        &self,
+        application_owned: bool,
+    ) -> Result<EngineOptions, pigeonhole_engine::Error> {
         let vfs = match &self.vfs {
             Some(v) => Arc::clone(v),
-            None => backend_vfs(self.io_backend)?,
+            None => backend_vfs(self.io_backend, application_owned)?,
         };
         let direct_io = self.direct_io.unwrap_or_else(env_direct_io);
         let mut o = EngineOptions::new(vfs);
@@ -682,7 +691,7 @@ impl ReaderOptions {
     pub(crate) fn to_engine(&self) -> Result<EngineOptions, pigeonhole_engine::Error> {
         let vfs = match &self.vfs {
             Some(v) => Arc::clone(v),
-            None => backend_vfs(self.io_backend)?,
+            None => backend_vfs(self.io_backend, false)?,
         };
         let direct_io = self.direct_io.unwrap_or_else(env_direct_io);
         let mut o = EngineOptions::new(vfs);
@@ -732,8 +741,12 @@ pub struct IoRings {
 }
 
 /// The backend `backend` names; unset, the one `PIGEONHOLE_IO` names (a test variable:
-/// `pread`, `uring` or `auto`), else [`IoBackend::Pread`].
-fn backend_vfs(backend: Option<IoBackend>) -> Result<VfsRef, pigeonhole_engine::Error> {
+/// `pread`, `uring` or `auto`), else [`IoBackend::Pread`]. For an application-owned open,
+/// an io_uring backend without a reaper thread.
+fn backend_vfs(
+    backend: Option<IoBackend>,
+    application_owned: bool,
+) -> Result<VfsRef, pigeonhole_engine::Error> {
     let backend = backend.unwrap_or_else(|| match std::env::var("PIGEONHOLE_IO").as_deref() {
         Ok("uring") => IoBackend::Uring,
         Ok("auto") => IoBackend::Auto,
@@ -742,10 +755,10 @@ fn backend_vfs(backend: Option<IoBackend>) -> Result<VfsRef, pigeonhole_engine::
     let pread = || -> VfsRef { pigeonhole_io::pread::PreadVfs::new(0) };
     match backend {
         IoBackend::Pread => Ok(pread()),
-        IoBackend::Uring => uring_vfs().ok_or(pigeonhole_engine::Error::Unsupported(
-            "io_uring is unavailable on this system",
-        )),
-        IoBackend::Auto => Ok(uring_vfs().unwrap_or_else(pread)),
+        IoBackend::Uring => uring_vfs(application_owned).ok_or(
+            pigeonhole_engine::Error::Unsupported("io_uring is unavailable on this system"),
+        ),
+        IoBackend::Auto => Ok(uring_vfs(application_owned).unwrap_or_else(pread)),
     }
 }
 
@@ -757,13 +770,16 @@ fn env_direct_io() -> bool {
 
 /// An io_uring backend, if the kernel offers one.
 #[cfg(target_os = "linux")]
-fn uring_vfs() -> Option<VfsRef> {
-    pigeonhole_io::uring::UringVfs::new()
-        .ok()
-        .map(|v| v as VfsRef)
+fn uring_vfs(application_owned: bool) -> Option<VfsRef> {
+    let vfs = if application_owned {
+        pigeonhole_io::uring::UringVfs::new_application_owned()
+    } else {
+        pigeonhole_io::uring::UringVfs::new()
+    };
+    vfs.ok().map(|v| v as VfsRef)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn uring_vfs() -> Option<VfsRef> {
+fn uring_vfs(_application_owned: bool) -> Option<VfsRef> {
     None
 }

@@ -209,7 +209,7 @@ impl Pigeonhole {
         path: impl AsRef<Path>,
         options: Options,
     ) -> Result<(Pigeonhole, Vec<Shard>)> {
-        let engine_options = options.to_engine()?;
+        let engine_options = options.to_engine_for(true)?;
         let vfs = Arc::clone(&engine_options.vfs);
         let max_value = max_value(&engine_options);
         let shm = ShmFootprint::of(&engine_options);

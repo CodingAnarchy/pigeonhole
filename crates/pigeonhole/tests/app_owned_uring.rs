@@ -106,6 +106,17 @@ fn drive(mut shard: Shard) -> (u64, u64) {
     (sleeps, zero)
 }
 
+/// The threads of this process the library named (`pigeonhole-*`: shard, compaction, pool
+/// and reaper threads). `/proc` keeps the first 15 bytes of a name.
+fn library_threads() -> Vec<String> {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| name.starts_with("pigeonhole"))
+        .collect()
+}
+
 #[test]
 fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
     let dir = TempDir::new("loop");
@@ -114,7 +125,11 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
     let (db, mut shards) =
-        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
+        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options.clone())
+            .expect("io_uring");
+    // The engine starts no threads in application-owned mode (#408): not even io_uring's
+    // reaper.
+    assert_eq!(library_threads(), Vec::<String>::new());
     let shard = shards.pop().unwrap();
     let driver = std::thread::spawn(move || drive(shard));
     let started = Instant::now();
@@ -141,6 +156,32 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
     drop(t);
     db.close().unwrap();
     let (sleeps, zero) = driver.join().unwrap();
+    // Reopened with a cold cache, an async get from this thread (which has no ring) fetches
+    // its blocks through the shared ring, which has no reaper: the driving thread's fd fires
+    // for those completions and its next turn takes them.
+    #[cfg(feature = "async")]
+    {
+        let (db, mut shards) =
+            Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).unwrap();
+        let driver = std::thread::spawn({
+            let shard = shards.pop().unwrap();
+            move || drive(shard)
+        });
+        let t = db.table("t").unwrap().open().unwrap();
+        let cell = pigeonhole::doc_support::block_on(t.get_async(b"row1-0100", "f", b"q"))
+            .unwrap()
+            .expect("the row is there");
+        assert_eq!(cell.value(), &[7u8; 512]);
+        assert_eq!(
+            db.async_sync_reads(),
+            0,
+            "every block was fetched asynchronously"
+        );
+        assert_eq!(library_threads(), Vec::<String>::new());
+        drop(t);
+        db.close().unwrap();
+        driver.join().unwrap();
+    }
     // The loop slept on its fds rather than spinning: `next_wakeup` was zero only now and
     // then (a write stall's pacing, say), not once per I/O in flight.
     assert!(
