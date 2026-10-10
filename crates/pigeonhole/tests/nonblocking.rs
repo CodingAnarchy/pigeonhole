@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use pigeonhole::doc_support::block_on;
 use pigeonhole::nonblocking::CommitFuture;
-use pigeonhole::{Durability, ErrorCode, Family, Options, Pigeonhole, Shard, Table};
+use pigeonhole::{Condition, Durability, ErrorCode, Family, Options, Pigeonhole, Shard, Table};
 use pigeonhole_io::sim::SimVfs;
 
 fn sim_options(vfs: &Arc<SimVfs>) -> Options {
@@ -246,6 +246,135 @@ fn a_commit_future_resolves_on_its_shards_own_event_loop() {
     while shard.closed().is_none() {
         shard.run_once(Duration::from_millis(1));
     }
+}
+
+/// Polls `fut` on this thread, the shard's event loop, between slices of shard work (D88).
+fn on_event_loop<F: Future + Unpin>(shard: &mut Shard, mut fut: F) -> F::Output {
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..100_000 {
+        if let Poll::Ready(r) = Pin::new(&mut fut).poll(&mut cx) {
+            return r;
+        }
+        shard.run_once(Duration::from_millis(1));
+    }
+    panic!("the future never resolved on its event loop");
+}
+
+#[test]
+fn conditional_commits_flushes_and_compactions_resolve_on_the_event_loop() {
+    let vfs = SimVfs::new(4207);
+    let (db, mut shards) =
+        Pigeonhole::open_application_owned("/db/app.phdb", sim_options(&vfs).shards(1)).unwrap();
+    let mut shard: Shard = shards.remove(0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let driver = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                shard.run_once(Duration::from_millis(1));
+            }
+            shard
+        })
+    };
+    let t = table(&db);
+    stop.store(true, Ordering::Release);
+    let mut shard = driver.join().unwrap();
+    // This thread is now the event loop. Once it has run the shard, the blocking forms refuse
+    // here (they could wait on this very shard) and submit nothing; the futures resolve.
+    shard.run_once(Duration::from_millis(1));
+    let absent = Condition::Absent {
+        family: "f".into(),
+        qualifier: b"q".to_vec(),
+    };
+    assert_eq!(
+        t.mutate(b"c")
+            .put("f", b"q", b"v")
+            .commit_if(&absent)
+            .unwrap_err()
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(db.flush().unwrap_err().code(), ErrorCode::InvalidArgument);
+    let applied = on_event_loop(
+        &mut shard,
+        t.mutate(b"c").put("f", b"q", b"v").commit_if_async(&absent),
+    );
+    assert!(applied.unwrap().is_some());
+    let refused = on_event_loop(
+        &mut shard,
+        t.mutate(b"c").put("f", b"q", b"w").commit_if_async(&absent),
+    );
+    assert!(refused.unwrap().is_none());
+    assert_eq!(value(&t, b"c"), Some(b"v".to_vec()));
+    on_event_loop(&mut shard, db.flush_async()).unwrap();
+    on_event_loop(&mut shard, db.compact_async()).unwrap();
+    assert_eq!(value(&t, b"c"), Some(b"v".to_vec()));
+    // Errors found before submission resolve on the first poll.
+    let bad = Condition::Exists {
+        family: "nope".into(),
+        qualifier: vec![],
+    };
+    let e = block_on(t.mutate(b"c").put("f", b"q", b"x").commit_if_async(&bad)).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FamilyNotFound);
+    db.close().unwrap();
+    while shard.closed().is_none() {
+        shard.run_once(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn an_async_flush_makes_unsynced_commits_durable() {
+    let vfs = SimVfs::new(4208);
+    let db = Pigeonhole::open("/db/f.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    t.mutate(b"r")
+        .put("f", b"q", b"v")
+        .durability(Durability::None)
+        .commit()
+        .unwrap();
+    block_on(db.flush_async()).unwrap();
+    // A power loss now keeps what the flush put in the file.
+    vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+    drop(t);
+    drop(db);
+    let db = Pigeonhole::open("/db/f.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    assert_eq!(value(&t, b"r"), Some(b"v".to_vec()));
+    block_on(db.compact_async()).unwrap();
+    assert_eq!(value(&t, b"r"), Some(b"v".to_vec()));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_transactions_async_read_is_recorded_even_if_dropped() {
+    let vfs = SimVfs::new(4209);
+    let db = Pigeonhole::open("/db/t.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    t.mutate(b"a").put("f", b"q", b"1").commit().unwrap();
+    let mut txn = db.transaction().unwrap();
+    let cell = block_on(txn.get_async(&t, b"a", "f", b"q"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cell.value(), b"1");
+    // The snapshot holds: a later commit is not seen.
+    t.mutate(b"a").put("f", b"q", b"2").commit().unwrap();
+    let again = block_on(txn.get_async(&t, b"a", "f", b"q"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.value(), b"1");
+    txn.put(&t, b"b", "f", b"q", b"x");
+    assert_eq!(
+        block_on(txn.commit_async()).unwrap_err().code(),
+        ErrorCode::Conflict
+    );
+    // Recorded at the call: a read future dropped unpolled still conflicts.
+    let mut txn = db.transaction().unwrap();
+    drop(txn.get_async(&t, b"a", "f", b"q"));
+    txn.put(&t, b"b", "f", b"q", b"y");
+    t.mutate(b"a").put("f", b"q", b"3").commit().unwrap();
+    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
+    assert_eq!(value(&t, b"b"), None);
+    db.close().unwrap();
 }
 
 // ---- Async reads (#42 PR 2a, D196, ICR 0014) ----

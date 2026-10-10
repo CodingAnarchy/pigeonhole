@@ -46,8 +46,8 @@ use crate::write::{COUNTER_TS, ReadKey};
 /// The shards a commit writes to: inline for up to four (no allocation per commit, #320).
 pub(crate) type Shards = smallvec::SmallVec<[ShardId; 4]>;
 use crate::{
-    CellData, EngineOptions, Error, PendingCommit, Predicate, ReadSpec, Result, RowData,
-    ScanCursor, ScanSpec, Snapshot, Txn, WriteBatch,
+    CellData, EngineOptions, Error, PendingCheck, PendingCommit, Predicate, ReadSpec, Result,
+    RowData, ScanCursor, ScanSpec, Snapshot, Txn, WriteBatch,
 };
 
 /// Whether this handle may write.
@@ -1231,7 +1231,26 @@ impl Engine {
         durability: Option<Durability>,
     ) -> Result<(bool, Option<CommitInfo>)> {
         self.inner
-            .check_and_mutate(table, row, predicate, batch, durability)
+            .shared
+            .refuse_blocking_on_driver("check_and_mutate")?;
+        self.inner
+            .submit_check_and_mutate(table, row, predicate, batch, durability)?
+            .wait()
+    }
+
+    /// Submits [`check_and_mutate`](Engine::check_and_mutate) without waiting: the
+    /// [`PendingCheck`] resolves as `check_and_mutate` returns (an async caller polls it).
+    /// It never blocks, so a thread that drives a shard may call it (D88).
+    pub fn submit_check_and_mutate(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<PendingCheck> {
+        self.inner
+            .submit_check_and_mutate(table, row, predicate, batch, durability)
     }
 
     /// Starts an optimistic transaction (Phase 4).
@@ -1521,6 +1540,20 @@ impl Engine {
     pub fn compact(&self, table: Option<TableId>) -> Result<()> {
         self.inner.shared.refuse_blocking_on_driver("compact")?;
         self.inner.compact_pending(table)?.wait()
+    }
+
+    /// Submits [`flush`](Engine::flush) without waiting: the [`PendingMaintenance`] resolves
+    /// as `flush` returns (an async caller polls it). It never blocks, so a thread that
+    /// drives a shard may call it (D88).
+    pub fn submit_flush(&self) -> Result<PendingMaintenance> {
+        self.inner.flush_pending()
+    }
+
+    /// Submits [`compact`](Engine::compact) without waiting, as
+    /// [`submit_flush`](Engine::submit_flush). Each further round of a full compaction is
+    /// submitted when the future sees the previous one done.
+    pub fn submit_compact(&self, table: Option<TableId>) -> Result<PendingMaintenance> {
+        self.inner.compact_pending(table)
     }
 
     /// Writes a consistent single-file copy to `dest` while writers run: everything visible
@@ -1932,16 +1965,18 @@ pub(crate) fn families_in_order(
     Ok(out)
 }
 
-/// A maintenance operation in flight: the replies of every shard. `flush` and `compact`
-/// block on it; with the `test-hooks` feature it is also a `Future` a test harness polls.
+/// A maintenance operation in flight ([`Engine::submit_flush`], [`Engine::submit_compact`]):
+/// the replies of every shard. `flush` and `compact` block on it; an async caller polls it
+/// as a `Future`, woken by the shards' replies. It resolves only once every shard replied
+/// (to every round of a full compaction), with the last failure if any. Dropping it does
+/// not stop the operation.
 #[derive(Debug)]
-#[doc(hidden)]
+#[must_use = "dropping a pending flush or compaction does not stop it, but its result is lost"]
 pub struct PendingMaintenance {
     waiters: Vec<Waiter<Result<()>>>,
     rounds: Option<CompactRounds>,
     /// A failed reply of the current round, reported once every shard has replied (the
-    /// `test-hooks` future; the blocking `wait` keeps its own).
-    #[cfg(feature = "test-hooks")]
+    /// future; the blocking `wait` keeps its own).
     pub(crate) failed: Option<Error>,
 }
 
@@ -1961,6 +1996,59 @@ impl PendingMaintenance {
                 Some(round) => self.waiters = round?,
                 None => return Ok(()),
             }
+        }
+    }
+}
+
+impl std::future::Future for PendingMaintenance {
+    type Output = Result<()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        loop {
+            match self.poll_round(cx) {
+                std::task::Poll::Ready(Ok(())) => {}
+                other => return other,
+            }
+            let this = &mut *self;
+            match this.rounds.as_mut().map(CompactRounds::again) {
+                Some(Some(round)) => this.waiters = round?,
+                _ => return std::task::Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+impl PendingMaintenance {
+    /// Polls the current round's replies. Like the blocking `wait` (#148, review 1-2 F10),
+    /// it resolves only once every shard has replied, with the last failure if any, so the
+    /// caller never sees a result while other shards still work.
+    fn poll_round(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
+        let mut i = 0;
+        while i < self.waiters.len() {
+            match std::pin::Pin::new(&mut self.waiters[i]).poll(cx) {
+                std::task::Poll::Ready(Some(Ok(()))) => {
+                    self.waiters.swap_remove(i);
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    self.waiters.swap_remove(i);
+                    self.failed = Some(e);
+                }
+                std::task::Poll::Ready(None) => {
+                    self.waiters.swap_remove(i);
+                    self.failed = Some(Error::Closed);
+                }
+                std::task::Poll::Pending => i += 1,
+            }
+        }
+        if !self.waiters.is_empty() {
+            return std::task::Poll::Pending;
+        }
+        match self.failed.take() {
+            Some(e) => std::task::Poll::Ready(Err(e)),
+            None => std::task::Poll::Ready(Ok(())),
         }
     }
 }
@@ -2306,19 +2394,18 @@ impl Inner {
         })
     }
 
-    fn check_and_mutate(
+    fn submit_check_and_mutate(
         &self,
         table: TableId,
         row: &[u8],
         predicate: &Predicate,
         batch: WriteBatch,
         durability: Option<Durability>,
-    ) -> Result<(bool, Option<CommitInfo>)> {
+    ) -> Result<PendingCheck> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
-        self.shared.refuse_blocking_on_driver("check_and_mutate")?;
         for rd in &batch.row_deletes {
             if rd.table != table || rd.row != row {
                 return Err(Error::InvalidArgument(
@@ -2365,12 +2452,11 @@ impl Inner {
                 map_version: view.tablets().version(),
                 attempts: 0,
             }))?;
-        let mut rx = rx;
-        let (applied, info) = crate::write::wait_reply(&self.shared, &mut rx)?;
-        if let Some(info) = info {
-            crate::write::wait_visible(&self.shared, info.seqno)?;
-        }
-        Ok((applied, info))
+        Ok(PendingCheck {
+            waiter: rx,
+            shared: Arc::clone(&self.shared),
+            resolved: None,
+        })
     }
 
     /// The view and a seqno it covers, for an unpinned read as of now (writer process). The
@@ -2458,7 +2544,6 @@ impl Inner {
         Ok(PendingMaintenance {
             waiters,
             rounds: None,
-            #[cfg(feature = "test-hooks")]
             failed: None,
         })
     }
@@ -2473,7 +2558,6 @@ impl Inner {
         Ok(PendingMaintenance {
             waiters,
             rounds,
-            #[cfg(feature = "test-hooks")]
             failed: None,
         })
     }
