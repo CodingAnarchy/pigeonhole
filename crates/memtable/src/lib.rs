@@ -613,8 +613,6 @@ pub struct Memtable {
     /// removed, so the splice stays exact.
     splice: [u32; MAX_HEIGHT],
     pin: Arc<Pin>,
-    /// The arena's chunk size (for the stale-tail index).
-    chunk_size: usize,
 }
 
 impl Memtable {
@@ -672,7 +670,6 @@ impl Memtable {
             rng: 0x9E37_79B9_7F4A_7C15 ^ (root as u64),
             splice: [head as u32; MAX_HEIGHT],
             pin,
-            chunk_size: arena.chunk_size,
         })
     }
 
@@ -710,7 +707,7 @@ impl Memtable {
     /// If the memtable already holds entries.
     pub fn with_tail_index(self) -> Self {
         assert_eq!(self.count, 0, "with_tail_index on a memtable with entries");
-        let index = TailIndex::new(self.region.len(), self.chunk_size);
+        let index = TailIndex::new(self.region.len());
         if self.pin.tails.set(index).is_err() {
             unreachable!("a new memtable's pin has no index yet");
         }
