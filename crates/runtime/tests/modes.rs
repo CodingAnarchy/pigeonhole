@@ -626,10 +626,29 @@ fn sleeping_task_fires_on_time_real(mode: Mode) {
         done: Some(n),
     };
     h.submitter(0).submit(Msg::Spawn(Box::new(task))).unwrap();
+    // A plain thread sleeping to the same deadline: how late this machine wakes a parked
+    // thread right now. A loaded runner can wake any thread hundreds of milliseconds late
+    // (main's macOS CI: 263 ms), which is not the shard's lateness.
+    let reference = {
+        let vfs = Arc::clone(&vfs);
+        thread::spawn(move || {
+            loop {
+                let now = vfs.monotonic_nanos();
+                if now >= at {
+                    return now;
+                }
+                thread::sleep(Duration::from_nanos(at - now));
+            }
+        })
+    };
     let fired = w.wait().unwrap();
+    let reference_late = Duration::from_nanos(reference.join().unwrap() - at);
     assert!(fired >= at, "fired before its deadline");
     let late = Duration::from_nanos(fired - at);
-    assert!(late < Duration::from_millis(200), "fired {late:?} late");
+    assert!(
+        late < Duration::from_millis(200) + reference_late,
+        "fired {late:?} late (a plain sleeping thread woke {reference_late:?} late)"
+    );
     // A polling timer runs millions of times in 300 ms; a parked one a handful (the 10 ms
     // re-check runs it only while the clock has not moved).
     let runs = runs.load(Ordering::Relaxed);
