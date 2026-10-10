@@ -947,6 +947,12 @@ impl ScanCursor {
             return Ok(true);
         }
         for &family in &self.families {
+            // Nothing of this family in the tablet: no resolver, options or sources for it (a
+            // table's empty families, #406). Located once, for the sources below too.
+            let located = view.locate(tablet.shard, tablet.id, family);
+            if !located.has_data() {
+                continue;
+            }
             let Some(meta) = view.catalog.family(family) else {
                 continue;
             };
@@ -956,10 +962,8 @@ impl ScanCursor {
                     .resolve_opts(meta, self.snapshot.seqno, self.now);
             let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
             let mut resolver = take_scan_resolver();
-            let filled = view.scan_sources_into::<CACHE_ONLY>(
-                tablet.shard,
-                tablet.id,
-                family,
+            let filled = view.scan_sources_located::<CACHE_ONLY>(
+                &located,
                 &filter,
                 start,
                 end,

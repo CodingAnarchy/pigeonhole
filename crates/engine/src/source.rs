@@ -716,6 +716,14 @@ pub(crate) struct Located<'a> {
     pub priority: Priority,
 }
 
+impl Located<'_> {
+    /// Whether the family has any memtable or SST here: a scan skips it when it has
+    /// neither, before it sets anything up for it (#406).
+    pub(crate) fn has_data(&self) -> bool {
+        self.mems.is_some_and(|m| !m.readers.is_empty()) || self.ssts.is_some_and(|f| !f.is_empty())
+    }
+}
+
 impl View {
     /// Where `(tablet, family)` lives in this view.
     pub(crate) fn locate(&self, shard: ShardId, tablet: TabletId, family: FamilyId) -> Located<'_> {
@@ -757,6 +765,18 @@ impl View {
         out: &mut Vec<Source>,
     ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
+        self.scan_sources_located::<CACHE_ONLY>(&l, filter, start, end, out)
+    }
+
+    /// [`View::scan_sources_into`] from a [`View::locate`] the caller already made.
+    pub(crate) fn scan_sources_located<const CACHE_ONLY: bool>(
+        &self,
+        l: &Located<'_>,
+        filter: &ScanFilter,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        out: &mut Vec<Source>,
+    ) -> Result<()> {
         if let Some(set) = l.mems {
             mem_sources(set, filter, out);
         }
