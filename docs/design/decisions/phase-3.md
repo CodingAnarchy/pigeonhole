@@ -32,11 +32,9 @@ In the common overwrite pattern (each new version has a newer timestamp, so it i
 - **Writes:** each insert whose successor is in the same column costs one table insert. `commit-one` and `commit-sixteen` must stay within their floors (D193).
 - **Memory:** two `u32`s per indexed node, plus slack, in process memory. That is roughly 10% of the arena bytes on the gate's node sizes. The capacity is fixed per memtable, so it never grows.
 
-**Enabling it.** It is built off by default. It is turned on only if all of these hold, and otherwise closed (like #375 and #377):
-- On Linux callgrind: as-written and flushed hot-row read and scan improve.
-- No other shape regresses beyond noise (0.2%; `row` 1%), the write shapes included, and every absolute ceiling holds. macOS does not regress.
-- Equivalence: the sim model and the engine's randomized read tests agree with the index on and off, with deletes at the same and older timestamps, snapshots, time-bounded and multi-version reads, merge and counter families, and a concurrent writer (loom on the table's insert and lookup).
-- A gate run in a quiet window the coordinator schedules shows the wide-row read and scan p99 drop. If the instructions drop but the gate tail does not move, it is closed, like the early flush.
+**Enabling it (amended by D199).** The index is on by default for the writer process; `EngineOptions::memtable_tail_index` stays an option, so it can be turned off. It ships only with its equivalence, loom and Miri tests and sweeps passing. The write cost it adds is accepted for the read gains (D199): about 200 instructions per overwrite commit (`commit-overwrite` +1.57%) and about 100 per timestamped append (`commit-at` +0.88%). The wide-row read and scan p99 with the index on are reported in the #405 gate run, which no longer decides enabling.
+
+*History: Amended by D199 (on by default, its write cost accepted; it was built off, to be enabled only if no shape regressed beyond noise and a gate run moved the wide-row p99).*
 
 <a id="d195"></a>
 ## D195 — Three instruction ceilings are raised to main's counts, and a change to the ceilings is measured on the current main (owner decision, 2026-10-09; bench, CI; amends D193)
@@ -132,3 +130,28 @@ RocksDB writes on the caller's thread (a write-group leader), which is the main 
    - On for engine-owned shards once measured: about 15 µs on the client and about 50 µs on the shard, tuned on #405.
    - This holds provided the idle-CPU test still passes: an idle database never keeps spinning.
    - Both windows are documented options that can be set to 0, for battery-powered or CPU-constrained users.
+
+<a id="d199"></a>
+## D199 — The stale-tail index is on by default; its write cost is accepted for its read gains (owner decision, 2026-10-09; memtable, engine, bench, #387; amends D194)
+D194 built the index off by default. It was to be enabled only if no shape, the write shapes included, regressed beyond noise, and only if a gate run moved the wide-row p99. Measured on Linux callgrind, same binary, index off against on (run 38008347250, on main with the insert fix that reuses the level-0 successor):
+
+| shape | off | on | change |
+|---|--:|--:|--:|
+| as-written (hot row) | 2579 | 2096 | −18.7% |
+| ycsb-c | 84008 | 48118 | −42.7% |
+| ycsb-a (half overwrites) | 46614 | 30339 | −34.9% |
+| row, rows, scan, short-scans | | | −0.3% to −0.7% |
+| commit-one, commit-sixteen, flush, compact, other read shapes | | | within ±0.17% |
+| commit-overwrite | 12526 | 12723 | +1.57% |
+| commit-at | 11654 | 11756 | +0.88% |
+
+The two write shapes pay for the index's bookkeeping:
+- **An overwrite's** successor is the version it supersedes, so it records a tail: a column compare, reading the successor's tail and writing its own. That is about 200 instructions per commit.
+- **A timestamped append's** successor is another row, so it pays the column compare and records nothing (about 100).
+
+**Owner decisions.**
+1. **The marginal write cost is accepted** for the read gains. This amends D194's rule that no shape may regress beyond noise.
+2. **The index is on by default for the writer process.** The option stays, so it can be turned off. It ships only with its equivalence, loom and Miri tests and sweeps passing.
+3. **Ceilings:** the PR that turns it on raises only the `commit-overwrite` and `commit-at` ceilings, by the measured amount, citing this decision. It lowers the read-shape ceilings the index improves (`instruction-ceilings.py lower`, based on current main, D195). Nothing else is raised.
+4. **Trimming the write cost** (a cheaper column test; no tail for short chains) stays a separately measured follow-up. If it wins, it lowers those two ceilings again.
+5. **The #405 gate run** still reports the wide-row read and scan p99 with the index on; it no longer decides enabling.
