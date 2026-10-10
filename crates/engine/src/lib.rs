@@ -49,7 +49,7 @@ pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::RowCacheStats;
 #[doc(hidden)]
-pub use shard::set_tracing;
+pub use shard::{group_sync_depth, set_tracing};
 pub use snapshot::{Snapshot, TabletMap, View};
 pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, Txn, WriteBatch};
 

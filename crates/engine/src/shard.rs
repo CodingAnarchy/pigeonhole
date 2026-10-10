@@ -1120,13 +1120,16 @@ enum MemberKind {
 
 /// One record of a group: a commit, a participant's PREPARE, or a coordinator's COMMIT.
 /// Group syncs a shard keeps in flight per stream before later groups batch behind them
-/// (D207). The interim default; the gate run on the reference machine (#405) compares 1, 2
-/// and unlimited and decides it.
-const GROUP_SYNC_DEPTH: u32 = 1;
+/// (D207). Interim defaults, from the Linux runner and macOS (#412); the gate run on the
+/// reference machine (#405) compares 1, 2 and unlimited and decides it. macOS: 1, since
+/// `F_FULLFSYNC` serializes on the device, so a second sync in flight only queues. Elsewhere:
+/// 2, since Linux file systems fold concurrent `fdatasync`s of one file into one journal
+/// commit, so a second one in flight keeps the device busy.
+const GROUP_SYNC_DEPTH: u32 = if cfg!(target_os = "macos") { 1 } else { 2 };
 
 /// [`GROUP_SYNC_DEPTH`], or `PIGEONHOLE_GROUP_SYNC_DEPTH` (a measurement variable, as
 /// `PIGEONHOLE_IO`: `0` is unlimited, as before D207), read once per process.
-fn group_sync_depth() -> u32 {
+pub fn group_sync_depth() -> u32 {
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
         std::env::var("PIGEONHOLE_GROUP_SYNC_DEPTH")

@@ -59,7 +59,13 @@ fn data_syncs(vfs: &SimVfs) -> usize {
 }
 
 #[test]
-fn concurrent_group_sync_commits_batch_behind_the_sync_in_flight() {
+fn concurrent_group_sync_commits_batch_behind_the_syncs_in_flight() {
+    // The platform's depth (D207: 1 on macOS, 2 elsewhere), or the measurement override.
+    let depth = pigeonhole_engine::group_sync_depth() as usize;
+    if depth == 0 {
+        // Unlimited: every group syncs on its own, as before D207.
+        return;
+    }
     let vfs = SimVfs::new(207);
     let mut o = EngineOptions::new(vfs.clone());
     o.create_if_missing = true;
@@ -74,15 +80,10 @@ fn concurrent_group_sync_commits_batch_behind_the_sync_in_flight() {
     vfs.set_deferred_io(true);
     vfs.record_ops();
 
-    // The first commit's group starts a sync, which stays in flight.
-    let mut pending = vec![
-        engine
-            .submit(batch(&t, 0), Some(Durability::GroupSync))
-            .unwrap(),
-    ];
-    idle(shard);
-    // The other clients commit one at a time, each in a group of its own, while it is.
-    for i in 1..CLIENTS {
+    // The clients commit one at a time, each in a group of its own: the first `depth` groups
+    // each start a sync, which stays in flight; the rest batch behind them.
+    let mut pending = Vec::new();
+    for i in 0..CLIENTS {
         pending.push(
             engine
                 .submit(batch(&t, i), Some(Durability::GroupSync))
@@ -96,22 +97,29 @@ fn concurrent_group_sync_commits_batch_behind_the_sync_in_flight() {
         "none acknowledged before a sync"
     );
 
-    // The first sync completes: its commit is acknowledged; the batched ones are not (their
-    // records came after it), and one sync for all of them starts.
+    // The syncs in flight complete: their commits are acknowledged; the batched ones are not
+    // (their records came after them), and one sync for all of them starts.
     vfs.complete_all_io();
     idle(shard);
-    assert!(matches!(poll(&mut pending[0]), Poll::Ready(Ok(_))));
+    for (i, pc) in pending[..depth].iter_mut().enumerate() {
+        assert!(matches!(poll(pc), Poll::Ready(Ok(_))), "commit {i}");
+    }
     assert!(
-        pending[1..].iter_mut().all(|pc| poll(pc).is_pending()),
+        pending[depth..].iter_mut().all(|pc| poll(pc).is_pending()),
         "a batched commit acknowledged before the sync that covers it"
     );
-    assert_eq!(data_syncs(&vfs), 1);
+    assert_eq!(data_syncs(&vfs), depth);
 
-    // The batched sync completes: every commit is acknowledged, after two syncs in all.
+    // The batched sync completes: every commit is acknowledged, after depth + 1 syncs.
     vfs.complete_all_io();
     idle(shard);
     for (i, pc) in pending.iter_mut().enumerate() {
         assert!(matches!(poll(pc), Poll::Ready(Ok(_))), "commit {i}");
     }
-    assert_eq!(data_syncs(&vfs), 2, "{CLIENTS} commits shared two syncs");
+    assert_eq!(
+        data_syncs(&vfs),
+        depth + 1,
+        "{CLIENTS} commits shared {} syncs",
+        depth + 1
+    );
 }
