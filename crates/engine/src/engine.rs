@@ -1486,6 +1486,19 @@ impl Engine {
         ))
     }
 
+    /// [`Engine::scan`] for an async scan: its rows are polled with
+    /// [`ScanCursor::poll_next_row`], which never blocks on a block it could predict (D196).
+    pub fn scan_async(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        spec: ScanSpec,
+    ) -> Result<ScanCursor> {
+        Ok(self
+            .scan(snapshot, table, spec)?
+            .into_async(Arc::clone(&self.inner.shared)))
+    }
+
     // ---- maintenance ----
 
     /// Freezes and flushes every memtable; returns when the SSTs are in the manifest. A

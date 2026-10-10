@@ -786,6 +786,7 @@ name = "pigeonhole"
 version = "0.2.0"
 dependencies = [
  "criterion",
+ "futures-core",
  "pigeonhole-engine",
  "pigeonhole-format",
  "pigeonhole-io",

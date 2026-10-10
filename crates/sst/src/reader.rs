@@ -396,6 +396,7 @@ impl Blocks {
         if let Some(h) = self.cached(addr) {
             return Ok(h);
         }
+        crate::note_file_read();
         let mut buf = IoBuf::zeroed(addr.len as usize);
         self.file.read_at(&mut buf, self.base + addr.offset)?;
         let data = decode_physical(buf, kind)?;
@@ -419,6 +420,7 @@ impl Blocks {
         fill_cache: bool,
         priority: Priority,
     ) -> Result<BlockHandle> {
+        crate::note_file_read();
         let mut buf = IoBuf::zeroed(addr.len as usize);
         self.file.read_at(&mut buf, self.base + addr.offset)?;
         let data = decode_physical(buf, kind)?;
@@ -447,7 +449,12 @@ impl Blocks {
         kind: BlockKind,
         priority: Priority,
     ) -> crate::Error {
-        crate::Error::WouldBlock(Box::new(Fetch::one(
+        crate::Error::WouldBlock(Box::new(self.fetch(addr, kind, priority)))
+    }
+
+    /// The fetch of the block at `addr`, admitted to the cache.
+    pub(crate) fn fetch(&self, addr: BlockAddr, kind: BlockKind, priority: Priority) -> Fetch {
+        Fetch::one(
             self.file.clone(),
             self.base + addr.offset,
             addr.len as usize,
@@ -457,7 +464,20 @@ impl Blocks {
                 kind,
                 priority,
             },
-        )))
+        )
+    }
+
+    /// The fetch of `addr` if the cache does not hold it (and its address is valid).
+    pub(crate) fn fetch_if_missing(
+        &self,
+        addr: BlockAddr,
+        kind: BlockKind,
+        priority: Priority,
+    ) -> Option<Fetch> {
+        match self.lookup(addr) {
+            Ok(None) => Some(self.fetch(addr, kind, priority)),
+            _ => None,
+        }
     }
 
     /// Hands out a decoded block, inserting it into the cache if asked.
@@ -487,6 +507,7 @@ impl Blocks {
         }
         let start = first.offset;
         let end = last.offset + u64::from(last.len);
+        crate::note_file_read();
         let mut buf = IoBuf::zeroed((end - start) as usize);
         self.file.read_at(&mut buf, self.base + start)?;
         addrs

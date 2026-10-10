@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use futures_core::Stream;
 use pigeonhole::doc_support::block_on;
 use pigeonhole::nonblocking::CommitFuture;
 use pigeonhole::{Durability, ErrorCode, Family, Options, Pigeonhole, Shard, Table};
@@ -533,5 +534,144 @@ fn a_separated_value_too_large_to_cache_reads_synchronously_and_counts() {
         db.async_sync_reads() > 0,
         "the oversized record's read was not counted"
     );
+    db.close().unwrap();
+}
+
+// ---- Scan streams (#42 PR 3, D196) ----
+
+/// Polls the stream's next item with the simulated device deferring I/O (completing it
+/// whenever the stream is pending); returns the item and how many polls were pending.
+fn next_deferred<S: futures_core::Stream + Unpin>(
+    vfs: &SimVfs,
+    s: &mut S,
+) -> (Option<S::Item>, usize) {
+    let count = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let mut pending = 0;
+    loop {
+        if let Poll::Ready(item) = Pin::new(&mut *s).poll_next(&mut cx) {
+            return (item, pending);
+        }
+        pending += 1;
+        assert!(pending < 10_000, "the stream never produced an item");
+        assert!(vfs.io_in_flight() > 0, "pending with no I/O in flight");
+        vfs.complete_all_io();
+    }
+}
+
+type Cells = Vec<(Vec<u8>, String, Vec<u8>, Vec<u8>)>;
+
+fn row_cells(r: &pigeonhole::Row) -> Cells {
+    r.view()
+        .iter()
+        .map(|e| {
+            (
+                r.key().to_vec(),
+                e.family.to_owned(),
+                e.qualifier.to_vec(),
+                e.cell.value().to_vec(),
+            )
+        })
+        .collect()
+}
+
+fn sync_scan(t: &Table, prefix: &[u8]) -> Cells {
+    t.scan_prefix(prefix)
+        .iter()
+        .unwrap()
+        .flat_map(|r| row_cells(&r.unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_memtable_scan_stream_yields_what_the_iterator_does() {
+    let vfs = SimVfs::new(4215);
+    let db = Pigeonhole::open("/db/sm.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    for i in 0..200u32 {
+        t.mutate(format!("r{i:04}").as_bytes())
+            .put("f", b"q", &i.to_le_bytes())
+            .commit()
+            .unwrap();
+    }
+    let mut s = t.scan_prefix(b"r").stream();
+    let mut got = Cells::new();
+    while let (Some(row), _) = next_deferred(&vfs, &mut s) {
+        got.extend(row_cells(&row.unwrap()));
+    }
+    assert_eq!(got, sync_scan(&t, b"r"));
+    // limit(0) yields nothing; a bad family is the first item.
+    let (none, _) = next_deferred(&vfs, &mut t.scan_prefix(b"r").limit(0).stream());
+    assert!(none.is_none());
+    let mut bad = t.scan_prefix(b"r").family("nope").stream();
+    let (first, _) = next_deferred(&vfs, &mut bad);
+    assert_eq!(
+        first.unwrap().unwrap_err().code(),
+        ErrorCode::FamilyNotFound
+    );
+    assert!(next_deferred(&vfs, &mut bad).0.is_none());
+    let (limited, _) = {
+        let mut s = t.scan_prefix(b"r").limit(3).stream();
+        let mut n = 0;
+        while let (Some(r), _) = next_deferred(&vfs, &mut s) {
+            r.unwrap();
+            n += 1;
+        }
+        (n, ())
+    };
+    assert_eq!(limited, 3);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_cold_scan_stream_waits_on_io_and_yields_what_the_iterator_does() {
+    let vfs = SimVfs::new(4216);
+    let db = cold_db(&vfs, "/db/sc.phdb", 2000, sim_options(&vfs));
+    let t = db.table("t").unwrap().open().unwrap();
+    vfs.set_deferred_io(true);
+    let mut s = t.scan_prefix(b"r").family("f").stream();
+    let mut got = Cells::new();
+    let mut pending_total = 0;
+    loop {
+        let (row, pending) = next_deferred(&vfs, &mut s);
+        pending_total += pending;
+        match row {
+            Some(r) => got.extend(row_cells(&r.unwrap())),
+            None => break,
+        }
+    }
+    assert!(pending_total > 0, "a cold scan never waited on I/O");
+    vfs.set_deferred_io(false);
+    let want: Cells = t
+        .scan_prefix(b"r")
+        .family("f")
+        .iter()
+        .unwrap()
+        .flat_map(|r| row_cells(&r.unwrap()))
+        .collect();
+    assert_eq!(got.len(), want.len());
+    assert_eq!(got, want);
+    assert_eq!(
+        db.async_sync_reads(),
+        0,
+        "a forward scan read a block synchronously"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn dropping_a_scan_stream_mid_io_is_safe() {
+    let vfs = SimVfs::new(4217);
+    let db = cold_db(&vfs, "/db/sd.phdb", 500, sim_options(&vfs));
+    let t = db.table("t").unwrap().open().unwrap();
+    vfs.set_deferred_io(true);
+    let mut s = t.scan_prefix(b"r").stream();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
+    drop(s);
+    vfs.complete_all_io();
+    vfs.set_deferred_io(false);
+    assert_eq!(t.scan_prefix(b"r").iter().unwrap().count(), 500);
     db.close().unwrap();
 }

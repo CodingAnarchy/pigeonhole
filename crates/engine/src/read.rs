@@ -629,7 +629,34 @@ pub struct ScanCursor {
     last_lane: Option<usize>,
     qual_buf: Vec<u8>,
     done: bool,
+    /// An async scan's state (`Engine::scan_async`), `None` for a sync one.
+    nb: Option<Box<AsyncScan>>,
 }
+
+/// What an async scan keeps between polls (D196, #398).
+struct AsyncScan {
+    shared: Arc<crate::shard::Shared>,
+    fetch: Option<(pigeonhole_io::Completion, Box<pigeonhole_sst::Fetch>)>,
+    /// Blocks it fetched and has not stepped past yet.
+    pinned: Vec<pigeonhole_cache::BlockHandle>,
+    /// Fetches while positioning the current tablet: past `MAX_POSITION_FETCHES`, or when
+    /// the cache keeps nothing, it positions synchronously (counted).
+    fetches: u32,
+    sync: bool,
+}
+
+impl std::fmt::Debug for AsyncScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncScan")
+            .field("fetching", &self.fetch.is_some())
+            .field("pinned", &self.pinned.len())
+            .field("sync", &self.sync)
+            .finish()
+    }
+}
+
+/// Fetches an async scan makes positioning one tablet before it positions synchronously.
+const MAX_POSITION_FETCHES: u32 = 64;
 
 impl ScanCursor {
     pub(crate) fn new(
@@ -658,7 +685,173 @@ impl ScanCursor {
             last_lane: None,
             qual_buf: Vec::new(),
             done: false,
+            nb: None,
         }
+    }
+
+    /// The next row of an async scan ([`Engine::scan_async`](crate::Engine::scan_async)):
+    /// `Ready(Ok(true))` when the cursor is on a row (read its cells, inside
+    /// [`ScanCursor::counted`]), `Ready(Ok(false))` at the end.
+    ///
+    /// Each tablet is positioned cache-only: its cursors' seeks and first cells read only
+    /// cached blocks, and what they miss is fetched asynchronously before positioning again
+    /// (a position can be redone, as a get can). Then each step first fetches the blocks the
+    /// SST cursors will read next, if uncached (one ahead per cursor, only as the scan is
+    /// polled), and steps synchronously: a block it still misses (not predicted) is read
+    /// synchronously and counted in `Metrics::async_sync_reads` (D196, #398). On a sync
+    /// cursor this is `next_row`.
+    pub fn poll_next_row(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<bool>> {
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::Poll;
+        let Some(mut nb) = self.nb.take() else {
+            return Poll::Ready(self.next_row());
+        };
+        let out = loop {
+            if let Some((completion, fetch)) = &mut nb.fetch {
+                let buf = match std::pin::Pin::new(completion).poll(cx) {
+                    Poll::Pending => {
+                        self.nb = Some(nb);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(r) => r,
+                };
+                let admitted = buf.map_err(Error::from).and_then(|b| Ok(fetch.admit(b)?));
+                let kept = fetch.is_kept();
+                nb.fetch = None;
+                match admitted {
+                    Ok(h) => nb.pinned.extend(h),
+                    Err(e) => break Err(e),
+                }
+                if !kept {
+                    // The cache keeps nothing: prefetching or positioning cache-only would
+                    // fetch the same block again; read synchronously from now on (counted).
+                    nb.sync = true;
+                    nb.shared.async_sync_reads.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if self.done {
+                break Ok(false);
+            }
+            if self.lanes.is_empty() && !self.in_row && !nb.sync {
+                // Position the next tablet cache-only; on a miss, undo and fetch.
+                let tablet = self.next_tablet;
+                let positioned = self.open_next_tablet::<true>().and_then(|more| {
+                    if more {
+                        self.fill_lanes()?;
+                    }
+                    Ok(more)
+                });
+                match positioned {
+                    Err(Error::WouldBlock(fetch)) => {
+                        self.recycle_lanes();
+                        self.next_tablet = tablet;
+                        nb.fetches += 1;
+                        if nb.fetches > MAX_POSITION_FETCHES {
+                            nb.sync = true;
+                            nb.shared.async_sync_reads.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            let completion = fetch.submit();
+                            nb.fetch = Some((completion, fetch));
+                        }
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                    Ok(false) => {
+                        self.done = true;
+                        break Ok(false);
+                    }
+                    Ok(true) => {
+                        nb.fetches = 0;
+                        nb.pinned.clear();
+                        for lane in &mut self.lanes {
+                            for source in lane.resolver.cursor_mut().sources_mut() {
+                                source.set_cache_only(false);
+                            }
+                        }
+                    }
+                }
+            }
+            if !nb.sync {
+                // One block ahead per cursor; fetched one at a time.
+                let mut upcoming = Vec::new();
+                for lane in &self.lanes {
+                    for source in lane.resolver.cursor().sources() {
+                        source.upcoming(1, &mut upcoming);
+                        if !upcoming.is_empty() {
+                            break;
+                        }
+                    }
+                    if !upcoming.is_empty() {
+                        break;
+                    }
+                }
+                if let Some(fetch) = upcoming.into_iter().next() {
+                    let completion = fetch.submit();
+                    nb.fetch = Some((completion, Box::new(fetch)));
+                    continue;
+                }
+            }
+            let ((stepped, blob_reads), file_reads) = pigeonhole_sst::counting_file_reads(|| {
+                as_async_read(false, || {
+                    if nb.sync {
+                        self.advance_row_impl::<true>()
+                    } else {
+                        self.advance_row_impl::<false>()
+                    }
+                })
+            });
+            if blob_reads + file_reads > 0 {
+                nb.shared
+                    .async_sync_reads
+                    .fetch_add(blob_reads + file_reads, Ordering::Relaxed);
+            }
+            match stepped {
+                // The tablet ran out: position the next one.
+                Ok(None) => continue,
+                Ok(Some(row)) => {
+                    // Blocks stepped past need not stay pinned.
+                    nb.pinned.clear();
+                    break Ok(row);
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        self.nb = Some(nb);
+        Poll::Ready(self.snapshot.checked(out))
+    }
+
+    /// Runs `f` on this cursor counting the file reads it makes synchronously into
+    /// `Metrics::async_sync_reads` (an async scan reading a row's cells after
+    /// [`ScanCursor::poll_next_row`]); on a sync cursor it just runs `f`.
+    pub fn counted<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let Some(shared) = self.nb.as_ref().map(|nb| Arc::clone(&nb.shared)) else {
+            return f(self);
+        };
+        let ((out, blob_reads), file_reads) =
+            pigeonhole_sst::counting_file_reads(|| as_async_read(false, || f(self)));
+        if blob_reads + file_reads > 0 {
+            shared.async_sync_reads.fetch_add(
+                blob_reads + file_reads,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        out
+    }
+
+    /// The cursor of an async scan ([`ScanCursor::poll_next_row`]).
+    pub(crate) fn into_async(mut self, shared: Arc<crate::shard::Shared>) -> Self {
+        self.nb = Some(Box::new(AsyncScan {
+            shared,
+            fetch: None,
+            pinned: Vec::new(),
+            fetches: 0,
+            sync: false,
+        }));
+        self
     }
 
     /// The scan's start and end as row-prefix bounds (`None` = unbounded).
@@ -691,7 +884,7 @@ impl ScanCursor {
 
     /// Builds the lanes for the next tablet, seeking each to the scan start. Returns false
     /// when no tablet is left.
-    fn open_next_tablet(&mut self) -> Result<bool> {
+    fn open_next_tablet<const CACHE_ONLY: bool>(&mut self) -> Result<bool> {
         self.recycle_lanes();
         let view = Arc::clone(&self.snapshot.view);
         let Some(tablet) = view.tablets().tablets_of(self.table).get(self.next_tablet) else {
@@ -729,7 +922,7 @@ impl ScanCursor {
                     .resolve_opts(meta, self.snapshot.seqno, self.now);
             let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
             let mut resolver = take_scan_resolver();
-            let filled = view.scan_sources_into(
+            let filled = view.scan_sources_into::<CACHE_ONLY>(
                 tablet.shard,
                 tablet.id,
                 family,
@@ -818,8 +1011,17 @@ impl ScanCursor {
     }
 
     fn advance_row(&mut self) -> Result<bool> {
+        Ok(self.advance_row_impl::<true>()?.unwrap_or(false))
+    }
+
+    /// Advances to the next row; with `OPEN`, opening the next tablets as it needs them;
+    /// without, `None` where it would open one (an async scan positions it cache-only first).
+    // Inlined: as a separate function a sync scan measured about 3.5 instructions more per
+    // row (#42).
+    #[inline(always)]
+    fn advance_row_impl<const OPEN: bool>(&mut self) -> Result<Option<bool>> {
         if self.done {
-            return Ok(false);
+            return Ok(Some(false));
         }
         // Drop whatever is left of the current row.
         if self.in_row {
@@ -830,9 +1032,14 @@ impl ScanCursor {
             self.in_row = false;
         }
         loop {
-            if self.lanes.is_empty() && !self.open_next_tablet()? {
-                self.done = true;
-                return Ok(false);
+            if self.lanes.is_empty() {
+                if !OPEN {
+                    return Ok(None);
+                }
+                if !self.open_next_tablet::<false>()? {
+                    self.done = true;
+                    return Ok(Some(false));
+                }
             }
             self.fill_lanes()?;
             // The smallest pending row across lanes.
@@ -865,13 +1072,13 @@ impl ScanCursor {
             {
                 self.done = true;
                 self.recycle_lanes();
-                return Ok(false);
+                return Ok(Some(false));
             }
             self.rows_emitted += 1;
             self.in_row = true;
             self.lane_idx = 0;
             self.last_lane = None;
-            return Ok(true);
+            return Ok(Some(true));
         }
     }
 

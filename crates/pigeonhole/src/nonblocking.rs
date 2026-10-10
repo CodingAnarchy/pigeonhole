@@ -1,5 +1,5 @@
 //! The async front door (Phase 3, #42): the same operations as the sync API, over the same
-//! engine, as futures. Built so far: commits, gets and row reads. Scan streams follow.
+//! engine, as futures: commits, gets, row reads and scan streams.
 //!
 //! Futures depend only on `std::task`, so they run on any executor (Tokio, smol, a custom
 //! one); none of them spawns a thread or uses `spawn_blocking`. A commit future is woken by
@@ -50,6 +50,7 @@ use crate::write::{Submitted, TicketState};
 use crate::{
     Cell, CommitInfo, CommitTicket, Error, Result, Row, RowMutation, Transaction, WriteBatch,
 };
+use pigeonhole_engine::ScanCursor;
 
 /// A submitted commit's result, as a future: resolves when the commit meets its durability
 /// level and is visible (see the [module docs](self)). Dropping it does not roll the commit
@@ -224,4 +225,66 @@ fn polled_after_done() -> Error {
         crate::ErrorCode::InvalidArgument,
         "a read future polled after it resolved",
     )
+}
+
+/// A scan as a [`Stream`](futures_core::Stream) of owned [`Row`]s ([`Scan::stream`](crate::Scan::stream)).
+/// Borrows its table as a lifetime, as [`RowIter`](crate::RowIter) does. Dropping it is
+/// always safe.
+#[must_use = "a stream does nothing unless polled"]
+pub struct RowStream<'t> {
+    inner: std::result::Result<(ScanCursor, RowBuf), Option<Error>>,
+    done: bool,
+    _table: std::marker::PhantomData<&'t crate::Table>,
+}
+
+impl std::fmt::Debug for RowStream<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowStream")
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
+impl RowStream<'_> {
+    pub(crate) fn new(started: Result<(ScanCursor, RowBuf)>, limit_zero: bool) -> Self {
+        Self {
+            inner: started.map_err(Some),
+            done: limit_zero,
+            _table: std::marker::PhantomData,
+        }
+    }
+}
+
+impl futures_core::Stream for RowStream<'_> {
+    type Item = Result<Row>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.done {
+            return Poll::Ready(None);
+        }
+        let (cursor, buf) = match &mut this.inner {
+            Ok(parts) => parts,
+            Err(e) => {
+                this.done = true;
+                return Poll::Ready(e.take().map(Err));
+            }
+        };
+        let item = match cursor.poll_next_row(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(false)) => None,
+            Poll::Ready(Ok(true)) => match cursor.counted(|c| crate::read::fill_row(c, buf)) {
+                Ok(()) => {
+                    let next = buf.empty_like();
+                    Some(Ok(Row::new(std::mem::replace(buf, next))))
+                }
+                Err(e) => Some(Err(e)),
+            },
+            Poll::Ready(Err(e)) => Some(Err(e.into())),
+        };
+        if !matches!(item, Some(Ok(_))) {
+            this.done = true;
+        }
+        Poll::Ready(item)
+    }
 }

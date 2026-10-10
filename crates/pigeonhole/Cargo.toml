@@ -14,7 +14,7 @@ readme = "README.md"
 [features]
 # Phase 3: the async front door (`get_async`, `commit_async`, scan streams). Becomes
 # default-on when it is implemented, per the spec's "Sync and async" section.
-async = []
+async = ["dep:futures-core"]
 # Phase 3: optional Tokio conveniences, never requirements.
 tokio = ["async"]
 
@@ -24,11 +24,13 @@ pigeonhole-format = { workspace = true }
 pigeonhole-io = { workspace = true }
 pigeonhole-shm = { workspace = true }
 smallvec = { workspace = true }
+futures-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The engine's test hooks, for the unit tests that race a read (never in a normal build).
 pigeonhole-engine = { workspace = true, features = ["test-hooks"] }
 pigeonhole-sim = { workspace = true }
+futures-core = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]
