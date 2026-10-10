@@ -48,9 +48,10 @@ use std::task::{Context, Poll};
 use pigeonhole_format::Durability;
 
 use crate::cell::RowBuf;
-use crate::write::{Submitted, TicketState};
+use crate::write::{Submitted, SubmittedCheck, TicketState};
 use crate::{
-    Cell, CommitInfo, CommitTicket, Error, Result, Row, RowMutation, Transaction, WriteBatch,
+    Cell, CommitInfo, CommitTicket, Condition, Error, Pigeonhole, Result, Row, RowMutation,
+    Transaction, WriteBatch,
 };
 use pigeonhole_engine::ScanCursor;
 
@@ -128,6 +129,21 @@ impl RowMutation<'_> {
     }
 }
 
+impl RowMutation<'_> {
+    /// [`commit_if`](RowMutation::commit_if), as a future: submits now, resolves to `None` if
+    /// the condition failed, or to the commit once it is durable at its level and visible.
+    /// Dropping the future does not roll it back: the check and the write happen
+    /// atomically on the row's shard either way.
+    pub fn commit_if_async(self, condition: &Condition) -> CheckFuture {
+        CheckFuture {
+            state: match self.submit_if(condition) {
+                Ok(s) => CheckState::Pending(s),
+                Err(e) => CheckState::Ready(Some(Err(e))),
+            },
+        }
+    }
+}
+
 impl WriteBatch {
     /// [`commit`](WriteBatch::commit), as a future (writer default durability). Dropping the
     /// future does not roll it back.
@@ -154,6 +170,86 @@ impl Transaction {
     /// roll it back.
     pub fn commit_with_async(self, durability: Durability) -> CommitFuture {
         CommitFuture::new(self.submit(Some(durability)))
+    }
+}
+
+/// A conditional commit's result, as a future ([`RowMutation::commit_if_async`]): `None` if
+/// the condition failed. Dropping it does not roll the commit back.
+#[derive(Debug)]
+#[must_use = "dropping a commit future does not cancel the commit, but its result is lost"]
+pub struct CheckFuture {
+    state: CheckState,
+}
+
+#[derive(Debug)]
+enum CheckState {
+    Pending(SubmittedCheck),
+    /// Refused before submission; `None` once taken.
+    Ready(Option<Result<Option<CommitInfo>>>),
+}
+
+impl Future for CheckFuture {
+    type Output = Result<Option<CommitInfo>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.state {
+            CheckState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
+                Poll::Ready(r) => {
+                    let out = s.outcome(r);
+                    self.state = CheckState::Ready(None);
+                    Poll::Ready(out)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            CheckState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
+                Err(Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    "commit future polled after it resolved",
+                ))
+            })),
+        }
+    }
+}
+
+/// A flush or a compaction as a future ([`Pigeonhole::flush_async`],
+/// [`Pigeonhole::compact_async`]). Dropping it does not stop the operation.
+#[derive(Debug)]
+#[must_use = "dropping a flush or compaction future does not stop it, but its result is lost"]
+pub struct MaintenanceFuture {
+    inner: std::result::Result<pigeonhole_engine::PendingMaintenance, Option<Error>>,
+}
+
+impl Future for MaintenanceFuture {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.inner {
+            Ok(m) => Pin::new(m).poll(cx).map(|r| r.map_err(Error::from)),
+            Err(e) => Poll::Ready(Err(e.take().unwrap_or_else(polled_after_done))),
+        }
+    }
+}
+
+impl Pigeonhole {
+    /// [`flush`](Pigeonhole::flush), as a future: submitted to every shard now, resolved
+    /// when the flushed SSTs are in the manifest, woken by the shards' replies (no thread).
+    /// Dropping it does not stop the flush.
+    pub fn flush_async(&self) -> MaintenanceFuture {
+        MaintenanceFuture {
+            inner: self.db.engine.submit_flush().map_err(|e| Some(e.into())),
+        }
+    }
+
+    /// [`compact`](Pigeonhole::compact), as a future, as [`flush_async`](Self::flush_async).
+    /// Dropping it does not stop the compaction.
+    pub fn compact_async(&self) -> MaintenanceFuture {
+        MaintenanceFuture {
+            inner: self
+                .db
+                .engine
+                .submit_compact(None)
+                .map_err(|e| Some(e.into())),
+        }
     }
 }
 

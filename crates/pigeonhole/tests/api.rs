@@ -1065,8 +1065,9 @@ fn durability_defaults_and_overrides() {
     }
 }
 
-#[test]
-fn conditional_commits() {
+/// Conditional commits through either front door (#42's parity: the same cases, the same
+/// results).
+fn conditional_commits(front: Front) {
     let db = db();
     let t = table(&db);
     let absent = Condition::Absent {
@@ -1080,21 +1081,21 @@ fn conditional_commits() {
     assert!(
         t.mutate(b"r")
             .put("a", b"x", b"1")
-            .commit_if(&exists)
+            .commit_if_via(front, &exists)
             .unwrap()
             .is_none()
     );
     assert!(
         t.mutate(b"r")
             .put("a", b"lock", b"w1")
-            .commit_if(&absent)
+            .commit_if_via(front, &absent)
             .unwrap()
             .is_some()
     );
     assert!(
         t.mutate(b"r")
             .put("a", b"lock", b"w2")
-            .commit_if(&absent)
+            .commit_if_via(front, &absent)
             .unwrap()
             .is_none()
     );
@@ -1106,7 +1107,7 @@ fn conditional_commits() {
     assert!(
         t.mutate(b"r")
             .delete_column("a", b"lock")
-            .commit_if(&owner_is(b"w2"))
+            .commit_if_via(front, &owner_is(b"w2"))
             .unwrap()
             .is_none()
     );
@@ -1114,7 +1115,7 @@ fn conditional_commits() {
         .mutate(b"r")
         .delete_column("a", b"lock")
         .durability(Durability::Sync)
-        .commit_if(&owner_is(b"w1"))
+        .commit_if_via(front, &owner_is(b"w1"))
         .unwrap()
         .unwrap();
     assert_eq!(info.durability, Durability::Sync);
@@ -1129,14 +1130,14 @@ fn conditional_commits() {
     assert!(
         t.mutate(b"n")
             .put_i64("a", b"v", 8)
-            .commit_if(&gt(7))
+            .commit_if_via(front, &gt(7))
             .unwrap()
             .is_none()
     );
     assert!(
         t.mutate(b"n")
             .put_i64("a", b"v", 8)
-            .commit_if(&gt(6))
+            .commit_if_via(front, &gt(6))
             .unwrap()
             .is_some()
     );
@@ -1147,7 +1148,54 @@ fn conditional_commits() {
     assert_eq!(
         t.mutate(b"n")
             .put("a", b"v", b"x")
-            .commit_if(&bad)
+            .commit_if_via(front, &bad)
+            .unwrap_err()
+            .code(),
+        ErrorCode::FamilyNotFound
+    );
+}
+
+/// Transactions through either front door.
+fn transactions_commit_or_conflict(front: Front) {
+    let db = db();
+    let t = table(&db);
+    t.mutate(b"a").put("a", b"bal", b"10").commit().unwrap();
+    let mut txn = db.transaction().unwrap();
+    assert_eq!(
+        txn.get_via(front, &t, b"a", "a", b"bal")
+            .unwrap()
+            .unwrap()
+            .value(),
+        b"10"
+    );
+    txn.put(&t, b"a", "a", b"bal", b"5")
+        .put(&t, b"b", "a", b"bal", b"5")
+        .delete_column(&t, b"c", "a", b"bal");
+    let info = txn.commit_with_via(front, Durability::GroupSync).unwrap();
+    assert_eq!(info.durability, Durability::GroupSync);
+    assert_eq!(value(&t, b"b", "a", b"bal").as_deref(), Some(&b"5"[..]));
+
+    let mut txn = db.transaction().unwrap();
+    let _ = txn.get_via(front, &t, b"a", "a", b"bal").unwrap();
+    txn.put(&t, b"a", "a", b"bal", b"0");
+    t.mutate(b"a").put("a", b"bal", b"99").commit().unwrap();
+    assert_eq!(
+        txn.commit_via(front).unwrap_err().code(),
+        ErrorCode::Conflict
+    );
+    assert_eq!(value(&t, b"a", "a", b"bal").as_deref(), Some(&b"99"[..]));
+
+    // Errors while buffering surface at commit.
+    let mut txn = db.transaction().unwrap();
+    txn.put(&t, b"a", "nope", b"q", b"v");
+    assert_eq!(
+        txn.commit_via(front).unwrap_err().code(),
+        ErrorCode::FamilyNotFound
+    );
+    let mut txn = db.transaction().unwrap();
+    assert_eq!(
+        txn.get_via(front, &t, b"a", "nope", b"q")
+            .map(|_| ())
             .unwrap_err()
             .code(),
         ErrorCode::FamilyNotFound
@@ -1155,41 +1203,115 @@ fn conditional_commits() {
 }
 
 #[test]
-fn transactions_commit_or_conflict() {
-    let db = db();
-    let t = table(&db);
-    t.mutate(b"a").put("a", b"bal", b"10").commit().unwrap();
-    let mut txn = db.transaction().unwrap();
-    assert_eq!(
-        txn.get(&t, b"a", "a", b"bal").unwrap().unwrap().value(),
-        b"10"
-    );
-    txn.put(&t, b"a", "a", b"bal", b"5")
-        .put(&t, b"b", "a", b"bal", b"5")
-        .delete_column(&t, b"c", "a", b"bal");
-    let info = txn.commit_with(Durability::GroupSync).unwrap();
-    assert_eq!(info.durability, Durability::GroupSync);
-    assert_eq!(value(&t, b"b", "a", b"bal").as_deref(), Some(&b"5"[..]));
+fn conditional_commits_sync() {
+    conditional_commits(Front::Sync);
+}
 
-    let mut txn = db.transaction().unwrap();
-    let _ = txn.get(&t, b"a", "a", b"bal").unwrap();
-    txn.put(&t, b"a", "a", b"bal", b"0");
-    t.mutate(b"a").put("a", b"bal", b"99").commit().unwrap();
-    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
-    assert_eq!(value(&t, b"a", "a", b"bal").as_deref(), Some(&b"99"[..]));
+#[cfg(feature = "async")]
+#[test]
+fn conditional_commits_async() {
+    conditional_commits(Front::Async);
+}
 
-    // Errors while buffering surface at commit.
-    let mut txn = db.transaction().unwrap();
-    txn.put(&t, b"a", "nope", b"q", b"v");
-    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::FamilyNotFound);
-    let mut txn = db.transaction().unwrap();
-    assert_eq!(
-        txn.get(&t, b"a", "nope", b"q")
-            .map(|_| ())
-            .unwrap_err()
-            .code(),
-        ErrorCode::FamilyNotFound
-    );
+#[test]
+fn transactions_commit_or_conflict_sync() {
+    transactions_commit_or_conflict(Front::Sync);
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn transactions_commit_or_conflict_async() {
+    transactions_commit_or_conflict(Front::Async);
+}
+
+/// Which front door a parity test goes through (#42).
+#[derive(Debug, Clone, Copy)]
+enum Front {
+    Sync,
+    #[cfg(feature = "async")]
+    Async,
+}
+
+/// `commit_if` through a front door.
+trait CommitIfVia {
+    fn commit_if_via(
+        self,
+        front: Front,
+        c: &Condition,
+    ) -> pigeonhole::Result<Option<pigeonhole::CommitInfo>>;
+}
+
+impl CommitIfVia for pigeonhole::RowMutation<'_> {
+    fn commit_if_via(
+        self,
+        front: Front,
+        c: &Condition,
+    ) -> pigeonhole::Result<Option<pigeonhole::CommitInfo>> {
+        match front {
+            Front::Sync => self.commit_if(c),
+            #[cfg(feature = "async")]
+            Front::Async => pigeonhole::doc_support::block_on(self.commit_if_async(c)),
+        }
+    }
+}
+
+/// A transaction's reads and commits through a front door.
+trait TxnVia {
+    fn get_via(
+        &mut self,
+        front: Front,
+        t: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> pigeonhole::Result<Option<Cell>>;
+    fn commit_via(self, front: Front) -> pigeonhole::Result<pigeonhole::CommitInfo>;
+    fn commit_with_via(
+        self,
+        front: Front,
+        d: Durability,
+    ) -> pigeonhole::Result<pigeonhole::CommitInfo>;
+}
+
+impl TxnVia for pigeonhole::Transaction {
+    fn get_via(
+        &mut self,
+        front: Front,
+        t: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> pigeonhole::Result<Option<Cell>> {
+        match front {
+            Front::Sync => self
+                .get(t, row, family, qualifier)
+                .map(|c| c.map(|c| c.to_owned())),
+            #[cfg(feature = "async")]
+            Front::Async => {
+                pigeonhole::doc_support::block_on(self.get_async(t, row, family, qualifier))
+            }
+        }
+    }
+
+    fn commit_via(self, front: Front) -> pigeonhole::Result<pigeonhole::CommitInfo> {
+        match front {
+            Front::Sync => self.commit(),
+            #[cfg(feature = "async")]
+            Front::Async => pigeonhole::doc_support::block_on(self.commit_async()),
+        }
+    }
+
+    fn commit_with_via(
+        self,
+        front: Front,
+        d: Durability,
+    ) -> pigeonhole::Result<pigeonhole::CommitInfo> {
+        match front {
+            Front::Sync => self.commit_with(d),
+            #[cfg(feature = "async")]
+            Front::Async => pigeonhole::doc_support::block_on(self.commit_with_async(d)),
+        }
+    }
 }
 
 // ---- lifecycle ----

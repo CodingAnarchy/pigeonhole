@@ -11,8 +11,11 @@ Every data operation has two forms over the same engine: a blocking method, and 
 | `RowRead::read()` | `RowRead::read_async()` | `Result<Option<Row>>` |
 | `Scan::iter()` | `Scan::stream()` | a `futures_core::Stream` of `Result<Row>` |
 | `RowMutation::commit()` | `RowMutation::commit_async()` | `Result<CommitInfo>` |
+| `RowMutation::commit_if(&cond)` | `RowMutation::commit_if_async(&cond)` | `Result<Option<CommitInfo>>` (`None`: the condition failed) |
 | `WriteBatch::commit()` / `commit_with(d)` | `commit_async()` / `commit_with_async(d)` | `Result<CommitInfo>` |
+| `Transaction::get(&t, row, family, qualifier)` | `Transaction::get_async(..)` | `Result<Option<Cell>>` |
 | `Transaction::commit()` / `commit_with(d)` | `commit_async()` / `commit_with_async(d)` | `Result<CommitInfo>` (`Conflict` on a conflict) |
+| `Pigeonhole::flush()` / `compact()` | `flush_async()` / `compact_async()` | `Result<()>` |
 | `CommitTicket::wait()` | `ticket.await` | `Result<CommitInfo>` |
 
 `ReadTable` (reader processes) has `get_async` and `get_at_async` too, and its `row` and `scan` builders have `read_async` and `stream`.
@@ -92,7 +95,9 @@ An error setting up the scan (an unknown family, a closed database) arrives as t
 
 ## Cancellation
 - **Reads and scans:** dropping the future or the stream is always safe. Nothing is left half done.
-- **Commits:** dropping a commit future after `commit_async` returned does **not** roll the commit back. The commit lands or fails atomically either way, and you lose only its result. To submit now and learn the outcome later, keep the future, or use `WriteBatch::commit_with_ticket(durability)`. That returns a `CommitTicket`, which works without the `async` feature: `wait()` blocks, `try_result()` checks without blocking, `seqno()` is `Some` once the commit succeeded, and with `async` it can be awaited.
+- **Transaction reads:** `Transaction::get_async` records the read when you call it, not when it resolves. A read future dropped unpolled still counts when the transaction commits: a write to that cell since the snapshot makes the commit fail with `Conflict`. That is conservative: it can add a conflict, never miss one.
+- **Flushes and compactions:** dropping `flush_async` or `compact_async` does not stop the operation; you lose only its result.
+- **Commits:** dropping a commit future after `commit_async` (or `commit_if_async`) returned does **not** roll the commit back. The commit lands or fails atomically either way, and you lose only its result. To submit now and learn the outcome later, keep the future, or use `WriteBatch::commit_with_ticket(durability)`. That returns a `CommitTicket`, which works without the `async` feature: `wait()` blocks, `try_result()` checks without blocking, `seqno()` is `Some` once the commit succeeded, and with `async` it can be awaited.
 
 ## When an async read blocks
 A few rare cases still read synchronously inside the future. Each one is counted in `Pigeonhole::async_sync_reads()` (and on `PigeonholeReader`), so you can see whether your workload hits them:
@@ -104,7 +109,7 @@ A few rare cases still read synchronously inside the future. Each one is counted
 Making scan steps resumable, so the last case never blocks, is tracked in [#398](https://github.com/CodingAnarchy/pigeonhole/issues/398).
 
 ## Application-owned mode
-With `open_application_owned`, the blocking `commit` refuses to run on a thread that drives a shard, because it could wait on that same shard (D88). The async commits are how you commit from the event loop: submit with `commit_async` and await the future there.
+With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `compact` refuse to run on a thread that drives a shard, because they could wait on that same shard (D88). The async forms are how you call them from the event loop: submit with `commit_async`, `commit_if_async`, `flush_async` or `compact_async` and await the future there.
 
 ## Sync-only calls
 These calls have no async form (owner decision recorded in [D196](../design/decisions/phase-3.md#d196)):
@@ -118,7 +123,6 @@ These calls have no async form (owner decision recorded in [D196](../design/deci
 
 - **Open, close and schema calls:** `open`, `open_reader`, `open_application_owned`, `close`, `table(..)` with `create`, `create_if_missing` or `open`, and `drop_table`. They are short, and you usually call them at startup and shutdown.
 - **Cheap calls** that never wait on I/O in a writer process: `snapshot`, `write_batch`, `transaction`, the builders, `tables`, `shard_stats`, `engine_metrics`, and the durability getters and setters.
-- **Coming in the next async release:** `RowMutation::commit_if`, `Transaction::get`, `flush` and `compact` get async forms (`commit_if_async`, `Transaction::get_async`, `flush_async`, `compact_async`). Until then, call them from a blocking-pool task.
 
 ## Next
 [Durability](durability.md) · [Scans and filters](scans-and-filters.md) · [Agent reference](agent-reference.md)

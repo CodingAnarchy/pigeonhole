@@ -38,6 +38,7 @@ mod source;
 mod waker;
 mod write;
 
+pub use engine::PendingMaintenance;
 pub use engine::{
     CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats, TableInfo,
 };
@@ -48,14 +49,14 @@ pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCurs
 #[doc(hidden)]
 pub use shard::set_tracing;
 pub use snapshot::{Snapshot, TabletMap, View};
-pub use write::{COUNTER_TS, PendingCommit, Predicate, Txn, WriteBatch};
+pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, Txn, WriteBatch};
 
 /// What the engine's own tests reach in with (the `test-hooks` feature, `engine::hooks`).
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use engine::hooks::{
-    AppendedKind, AppendedRecord, CompactionRecord, FlushGcMutation, ManifestInfo,
-    PendingMaintenance, RawEntry, TabletOwner, TabletRange,
+    AppendedKind, AppendedRecord, CompactionRecord, FlushGcMutation, ManifestInfo, RawEntry,
+    TabletOwner, TabletRange,
 };
 
 pub use pigeonhole_compaction::{

@@ -326,8 +326,6 @@ Reopening after a crash with fewer shards or a smaller `memtable_budget` than be
 |---|---|
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
 
-Async gaps (Phase 3, being closed): `RowMutation::commit_if`, `Transaction::get`, `flush` and `compact` have no async form yet (see [Async](async.md#sync-only-calls)).
-
 Available ahead of their phase: `Transaction` and reader processes (`open_reader`) (P4).
 
 ## Next

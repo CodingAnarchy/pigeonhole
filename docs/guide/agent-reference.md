@@ -54,7 +54,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `CommitInfo { seqno: u64, durability: Durability }` | Commit result. |
 | `RowRead`, `Scan`, `RowIter` | Read builders; scan iterator. |
 | `CommitTicket` | A submitted commit to wait on or check later (`commit_with_ticket`). |
-| `nonblocking::{GetFuture, RowFuture, RowStream, CommitFuture}` | Async results (feature `async`, default on). |
+| `nonblocking::{GetFuture, RowFuture, RowStream, CommitFuture, CheckFuture, MaintenanceFuture}` | Async results (feature `async`, default on). |
 | `ValueFilter`, `Condition` | Value predicate; `commit_if` condition. |
 | `CellRef<'a>`, `Cell`, `Row`, `RowRef<'a>`, `CellEntry<'a>`, `Value<'a>` | Borrowed and owned results. |
 | `Error`, `ErrorCode`, `Result<T>` | Errors. |
@@ -227,11 +227,14 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 | `RowMutation::commit_async(self) -> CommitFuture` | `Output = Result<CommitInfo>`. Submitted at the call; resolves when durable and visible. |
 | `WriteBatch::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | As above. |
 | `Transaction::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | `Conflict` on a conflicting commit. |
+| `RowMutation::commit_if_async(self, &Condition) -> CheckFuture` | `Output = Result<Option<CommitInfo>>`; `None` if the condition failed. |
+| `Transaction::get_async(&mut self, &Table, row, family, qualifier) -> GetFuture` | Read recorded at the call (a dropped future still counts at commit). |
+| `Pigeonhole::flush_async(&self)` / `compact_async(&self) -> MaintenanceFuture` | `Output = Result<()>`; dropping does not stop it. |
 | `WriteBatch::commit_with_ticket(self, Durability) -> Result<CommitTicket>` | No feature needed. `CommitTicket`: `wait(self)`, `try_result(&mut self) -> Option<Result<CommitInfo>>`, `seqno(&mut self) -> Option<u64>`; `IntoFuture` with `async`. |
 | `Pigeonhole::async_sync_reads(&self) -> u64` (also `PigeonholeReader`) | Reads an async call did synchronously (oversized blob, uncacheable block, unpredicted scan block; #398). |
 
 Dropping a read future or stream: always safe. Dropping a commit future or ticket: the commit still lands or fails atomically.
-Not async yet (next async release): `RowMutation::commit_if`, `Transaction::get`, `flush`, `compact`. Sync-only by design (D196): `backup`, `shrink` (long-running; run on your executor's blocking pool), and open, close, table create/open/drop (short).
+Sync-only by design (D196): `backup`, `shrink` (long-running; run on your executor's blocking pool), and open, close, table create/open/drop (short).
 
 ## Recipes
 ### 1. Open, create table, write, read

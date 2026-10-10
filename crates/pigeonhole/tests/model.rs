@@ -1320,9 +1320,10 @@ impl Run {
         if self.cfg.flush_ppm > 0 && rng.chance(self.cfg.flush_ppm) {
             self.stats.flushes += 1;
             self.trace.push("FLUSH".into());
-            let mut result = self.db().flush();
+            let async_front = self.async_front(rng);
+            let mut result = front::flush(self.db(), async_front);
             if self.busy_with_snapshots(&result) {
-                result = self.db().flush();
+                result = front::flush(self.db(), async_front);
             }
             match result {
                 Ok(()) => {}
@@ -1333,9 +1334,10 @@ impl Run {
         if self.cfg.compact_ppm > 0 && rng.chance(self.cfg.compact_ppm) {
             self.stats.compactions += 1;
             self.trace.push("COMPACT".into());
-            let mut result = self.db().compact();
+            let async_front = self.async_front(rng);
+            let mut result = front::compact(self.db(), async_front);
             if self.busy_with_snapshots(&result) {
-                result = self.db().compact();
+                result = front::compact(self.db(), async_front);
             }
             match result {
                 Ok(()) => {}
@@ -1814,6 +1816,24 @@ mod front {
         }
         let _ = async_front;
         r.read().map(|r| r.map(|r| r.to_owned()))
+    }
+
+    pub fn flush(db: &pigeonhole::Pigeonhole, async_front: bool) -> Result<()> {
+        #[cfg(feature = "async")]
+        if async_front {
+            return pigeonhole::doc_support::block_on(db.flush_async());
+        }
+        let _ = async_front;
+        db.flush()
+    }
+
+    pub fn compact(db: &pigeonhole::Pigeonhole, async_front: bool) -> Result<()> {
+        #[cfg(feature = "async")]
+        if async_front {
+            return pigeonhole::doc_support::block_on(db.compact_async());
+        }
+        let _ = async_front;
+        db.compact()
     }
 
     /// The scan's rows through its stream.

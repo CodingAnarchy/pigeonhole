@@ -556,6 +556,62 @@ impl Future for PendingCommit {
     }
 }
 
+/// A [`check_and_mutate`](crate::Engine::check_and_mutate) submitted to its shard and not
+/// yet resolved ([`Engine::submit_check_and_mutate`](crate::Engine::submit_check_and_mutate)):
+/// resolves to whether the batch applied, and its commit when it did, once that commit is
+/// durable at its level and visible. Dropping it does not roll back.
+#[derive(Debug)]
+#[must_use = "dropping a pending check does not cancel it, but its result is lost"]
+pub struct PendingCheck {
+    pub(crate) waiter: Waiter<crate::Result<(bool, Option<CommitInfo>)>>,
+    pub(crate) shared: Arc<crate::shard::Shared>,
+    /// Resolved by the shard; waiting for visibility (async polling).
+    pub(crate) resolved: Option<(bool, Option<CommitInfo>)>,
+}
+
+impl PendingCheck {
+    /// Blocks until the check resolved and an applied commit is visible, as
+    /// [`PendingCommit::wait`] does (including its refusal on a thread that drives a shard).
+    pub fn wait(mut self) -> crate::Result<(bool, Option<CommitInfo>)> {
+        let (applied, info) = wait_reply(&self.shared, &mut self.waiter)?;
+        if let Some(info) = info {
+            wait_visible(&self.shared, info.seqno)?;
+        }
+        Ok((applied, info))
+    }
+}
+
+impl Future for PendingCheck {
+    type Output = crate::Result<(bool, Option<CommitInfo>)>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let outcome = match this.resolved {
+            Some(outcome) => outcome,
+            None => match Pin::new(&mut this.waiter).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Err(Error::Closed)),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(Some(Ok(outcome))) => {
+                    this.resolved = Some(outcome);
+                    outcome
+                }
+            },
+        };
+        // As a commit: an applied batch is visible once the global watermark covers it (D19).
+        let Some(info) = outcome.1 else {
+            return Poll::Ready(Ok(outcome));
+        };
+        if this.shared.wait_visible(info.seqno, cx.waker()) {
+            Poll::Ready(Ok(outcome))
+        } else if this.shared.visibility_ended() {
+            Poll::Ready(Err(Error::Closed))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// One `(table, row, family)` a transaction read; validated at commit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReadKey {
@@ -599,6 +655,34 @@ impl Txn {
         }
         self.engine
             .get(&self.snapshot, table, family, row, qualifier)
+    }
+
+    /// [`get`](Txn::get) as a future: records the read at the call, then reads at the
+    /// transaction's snapshot as [`Engine::get_async`](crate::Engine::get_async) does. A
+    /// read recorded and then dropped unpolled still counts at validation (conservative).
+    pub fn get_async(
+        &mut self,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+    ) -> crate::GetFuture {
+        let key = ReadKey {
+            table,
+            row: row.to_vec(),
+            family,
+        };
+        if !self.reads.contains(&key) {
+            self.reads.push(key);
+        }
+        crate::GetFuture::new(
+            Arc::clone(&self.engine),
+            Some(self.snapshot.clone()),
+            table,
+            family,
+            row,
+            qualifier,
+        )
     }
 
     /// The buffered writes.

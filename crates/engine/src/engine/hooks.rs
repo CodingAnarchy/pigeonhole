@@ -33,7 +33,7 @@ use pigeonhole_runtime::{ShardId, TaskWaker, Waiter, completion};
 pub use super::PendingMaintenance;
 pub use crate::compact::CompactionRecord;
 
-use super::{CompactRounds, Engine, Inner, Role};
+use super::{Engine, Inner, Role};
 use crate::manifest;
 use crate::shard::ShardMsg;
 use crate::snapshot::{Snapshot, TabletMap};
@@ -159,59 +159,6 @@ pub(crate) struct ReaderHooks {
     /// After the durable root matched the record's manifest version, before the manifest
     /// is read.
     pub before_manifest_load: Once,
-}
-
-impl std::future::Future for PendingMaintenance {
-    type Output = Result<()>;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        loop {
-            match self.poll_round(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                other => return other,
-            }
-            let this = &mut *self;
-            match this.rounds.as_mut().map(CompactRounds::again) {
-                Some(Some(round)) => this.waiters = round?,
-                _ => return std::task::Poll::Ready(Ok(())),
-            }
-        }
-    }
-}
-
-impl PendingMaintenance {
-    /// Polls the current round's replies. Like the blocking `wait` (#148, review 1-2 F10),
-    /// it resolves only once every shard has replied, with the last failure if any, so the
-    /// harness sees what production does: never a result while other shards still work.
-    fn poll_round(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
-        let mut i = 0;
-        while i < self.waiters.len() {
-            match std::pin::Pin::new(&mut self.waiters[i]).poll(cx) {
-                std::task::Poll::Ready(Some(Ok(()))) => {
-                    self.waiters.swap_remove(i);
-                }
-                std::task::Poll::Ready(Some(Err(e))) => {
-                    self.waiters.swap_remove(i);
-                    self.failed = Some(e);
-                }
-                std::task::Poll::Ready(None) => {
-                    self.waiters.swap_remove(i);
-                    self.failed = Some(Error::Closed);
-                }
-                std::task::Poll::Pending => i += 1,
-            }
-        }
-        if !self.waiters.is_empty() {
-            return std::task::Poll::Pending;
-        }
-        match self.failed.take() {
-            Some(e) => std::task::Poll::Ready(Err(e)),
-            None => std::task::Poll::Ready(Ok(())),
-        }
-    }
 }
 
 /// A WAL record the engine appended to a stream (test hook): the per-stream append order,

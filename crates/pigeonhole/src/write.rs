@@ -490,11 +490,58 @@ impl RowMutation<'_> {
 
     /// Commits only if `condition` holds on this row, atomically (BigTable's
     /// `check_and_mutate`; Phase 2). Returns `None` if the condition failed.
-    pub fn commit_if(self, condition: &Condition) -> Result<Option<CommitInfo>> {
-        if let Some(e) = self.builder.error {
+    pub fn commit_if(mut self, condition: &Condition) -> Result<Option<CommitInfo>> {
+        if let Some(e) = self.builder.error.take() {
             return Err(e);
         }
-        let predicate = match condition {
+        let predicate = self.predicate(condition)?;
+        let db = &self.table.db;
+        let largest = self.builder.largest_value;
+        let (applied, info) = db
+            .engine
+            .check_and_mutate(
+                self.table.info.id,
+                &self.row,
+                &predicate,
+                self.builder.batch,
+                self.durability,
+            )
+            .map_err(|e| commit_error(e, largest, db.max_value))?;
+        Ok(if applied {
+            info.map(CommitInfo::from)
+        } else {
+            None
+        })
+    }
+
+    /// Submits [`commit_if`](RowMutation::commit_if) without waiting (the async front door).
+    #[cfg(feature = "async")]
+    pub(crate) fn submit_if(mut self, condition: &Condition) -> Result<SubmittedCheck> {
+        if let Some(e) = self.builder.error.take() {
+            return Err(e);
+        }
+        let predicate = self.predicate(condition)?;
+        let db = &self.table.db;
+        let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
+        db.engine
+            .submit_check_and_mutate(
+                self.table.info.id,
+                &self.row,
+                &predicate,
+                self.builder.batch,
+                self.durability,
+            )
+            .map(|pending| SubmittedCheck {
+                pending,
+                largest_value,
+                max_value,
+            })
+            .map_err(|e| commit_error(e, largest_value, max_value))
+    }
+
+    /// The engine's form of `condition`, on this row's table.
+    fn predicate(&self, condition: &Condition) -> Result<Predicate> {
+        Ok(match condition {
             Condition::Exists { family, qualifier } => Predicate::Exists {
                 family: self.table.family_id(family)?,
                 qualifier: qualifier.clone(),
@@ -512,19 +559,28 @@ impl RowMutation<'_> {
                 qualifier: qualifier.clone(),
                 predicate: filter.to_engine(),
             },
-        };
-        let db = &self.table.db;
-        let largest = self.builder.largest_value;
-        let (applied, info) = db
-            .engine
-            .check_and_mutate(
-                self.table.info.id,
-                &self.row,
-                &predicate,
-                self.builder.batch,
-                self.durability,
-            )
-            .map_err(|e| commit_error(e, largest, db.max_value))?;
+        })
+    }
+}
+
+/// A submitted [`RowMutation::commit_if`] (the async front door), with what its error
+/// mapping needs.
+#[cfg(feature = "async")]
+#[derive(Debug)]
+pub(crate) struct SubmittedCheck {
+    pub(crate) pending: pigeonhole_engine::PendingCheck,
+    largest_value: usize,
+    max_value: usize,
+}
+
+#[cfg(feature = "async")]
+impl SubmittedCheck {
+    /// The public result of the engine's outcome: `None` when the condition failed.
+    pub(crate) fn outcome(
+        &self,
+        r: pigeonhole_engine::Result<(bool, Option<pigeonhole_engine::CommitInfo>)>,
+    ) -> Result<Option<CommitInfo>> {
+        let (applied, info) = r.map_err(|e| commit_error(e, self.largest_value, self.max_value))?;
         Ok(if applied {
             info.map(CommitInfo::from)
         } else {
@@ -901,6 +957,28 @@ impl Transaction {
             .txn
             .get(table.core.info.id, family, row, qualifier)?
             .map(CellRef::owned))
+    }
+
+    /// [`get`](Transaction::get) as a future resolving to an owned [`Cell`](crate::Cell): the
+    /// read is recorded at the call (so it counts at commit even if the future is dropped
+    /// unpolled), then made at the transaction's snapshot as
+    /// [`Table::get_async`](crate::Table::get_async) does.
+    #[cfg(feature = "async")]
+    pub fn get_async(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> crate::nonblocking::GetFuture {
+        let started = check_table(&self.db, table)
+            .and_then(|()| self.db.check_open())
+            .and_then(|()| table.core.family_id(family))
+            .map(|family| {
+                self.txn
+                    .get_async(table.core.info.id, family, row, qualifier)
+            });
+        crate::nonblocking::GetFuture::new(started)
     }
 
     /// Buffers a put.
