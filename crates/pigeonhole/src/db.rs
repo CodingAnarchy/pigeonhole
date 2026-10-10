@@ -8,8 +8,8 @@ use pigeonhole_io::VfsRef;
 
 use crate::table::TableCore;
 use crate::{
-    Error, ErrorCode, Options, ReadTable, ReaderOptions, Result, TableBuilder, Transaction,
-    WriteBatch,
+    Error, ErrorCode, IoRings, Options, ReadTable, ReaderOptions, Result, TableBuilder,
+    Transaction, WriteBatch,
 };
 
 /// What every handle derived from one open database shares: the engine, whether
@@ -17,17 +17,27 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct Db {
     pub(crate) engine: Arc<Engine>,
+    /// The I/O backend the engine runs on (for [`Pigeonhole::io_rings`]).
+    vfs: VfsRef,
     closed: AtomicBool,
     /// Largest value accepted at commit (decision D16), for error messages; 0 for readers.
     pub(crate) max_value: usize,
 }
 
 impl Db {
-    fn new(engine: Arc<Engine>, max_value: usize) -> Arc<Self> {
+    fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize) -> Arc<Self> {
         Arc::new(Self {
             engine,
+            vfs,
             closed: AtomicBool::new(false),
             max_value,
+        })
+    }
+
+    fn io_rings(&self) -> Option<IoRings> {
+        self.vfs.ring_stats().map(|s| IoRings {
+            rings: s.rings,
+            pooled: s.pooled,
         })
     }
 
@@ -93,11 +103,12 @@ impl Pigeonhole {
     /// Opening replays the WAL sidecars; there is no full-file recovery scan.
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Pigeonhole> {
         let engine_options = options.to_engine()?;
+        let vfs = Arc::clone(&engine_options.vfs);
         let max_value = max_value(&engine_options);
         let shm = ShmFootprint::of(&engine_options);
         let engine = Engine::open(path.as_ref(), engine_options).map_err(|e| shm.explain(e))?;
         Ok(Pigeonhole {
-            db: Db::new(engine, max_value),
+            db: Db::new(engine, vfs, max_value),
         })
     }
 
@@ -110,9 +121,11 @@ impl Pigeonhole {
     /// requirement as SQLite in WAL mode). A file on read-only media, or one the reader's
     /// user cannot write, cannot be opened this way (decision D36).
     pub fn open_reader(path: impl AsRef<Path>, options: ReaderOptions) -> Result<PigeonholeReader> {
-        let engine = Engine::open_reader(path.as_ref(), options.to_engine()?)?;
+        let engine_options = options.to_engine()?;
+        let vfs = Arc::clone(&engine_options.vfs);
+        let engine = Engine::open_reader(path.as_ref(), engine_options)?;
         Ok(PigeonholeReader {
-            db: Db::new(engine, 0),
+            db: Db::new(engine, vfs, 0),
         })
     }
 
@@ -211,7 +224,7 @@ impl Pigeonhole {
             .collect();
         Ok((
             Pigeonhole {
-                db: Db::new(engine, max_value),
+                db: Db::new(engine, Arc::clone(&vfs), max_value),
             },
             shards,
         ))
@@ -283,6 +296,21 @@ impl Pigeonhole {
     #[cfg(feature = "async")]
     pub fn async_sync_reads(&self) -> u64 {
         self.db.engine.metrics().async_sync_reads
+    }
+
+    /// With [`IoBackend::Uring`](crate::IoBackend::Uring) (#402): how many io_uring rings the
+    /// database has now (a shared one, plus one per shard thread that got its own) and how
+    /// many got a registered buffer pool (a ring registers one on the first read that can
+    /// use it: today, an async read's block fetch). `None` on other backends.
+    ///
+    /// Pools are pinned memory, charged to the user's locked-memory limit (`RLIMIT_MEMLOCK`,
+    /// often 8 MiB) unless the process has `CAP_IPC_LOCK`; a process registers them up to
+    /// half that limit, 1 MiB a ring. Rings past it, or shard threads that run on the shared
+    /// ring, use plain buffers: correct, but each read pins its pages. `pooled < rings`
+    /// says that happened; raise the limit (or grant the capability) for a pool on every
+    /// ring.
+    pub fn io_rings(&self) -> Option<IoRings> {
+        self.db.io_rings()
     }
 
     /// The writer default durability.
@@ -506,6 +534,11 @@ impl PigeonholeReader {
     #[cfg(feature = "async")]
     pub fn async_sync_reads(&self) -> u64 {
         self.db.engine.metrics().async_sync_reads
+    }
+
+    /// As [`Pigeonhole::io_rings`].
+    pub fn io_rings(&self) -> Option<IoRings> {
+        self.db.io_rings()
     }
 
     /// Opens an existing table for reading.

@@ -694,6 +694,16 @@ pub enum IoBackend {
     Auto,
 }
 
+/// A database's io_uring rings now ([`Pigeonhole::io_rings`](crate::Pigeonhole::io_rings)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub struct IoRings {
+    /// Rings: the shared one, plus one per shard thread that got its own.
+    pub rings: usize,
+    /// Rings with a registered buffer pool; the rest use plain buffers.
+    pub pooled: usize,
+}
+
 /// The backend `backend` names; unset, the one `PIGEONHOLE_IO` names (a test variable:
 /// `pread`, `uring` or `auto`), else [`IoBackend::Pread`].
 fn backend_vfs(backend: Option<IoBackend>) -> Result<VfsRef, pigeonhole_engine::Error> {

@@ -6,6 +6,16 @@ use std::sync::Arc;
 
 use crate::{FileRef, OpenOptions, Result, SharedOpen, SharedRegion};
 
+/// A backend's io_uring rings now ([`Vfs::ring_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct RingStats {
+    /// Rings: the shared one, plus one per shard thread that got its own.
+    pub rings: usize,
+    /// Rings with a registered buffer pool (fixed buffers); the rest use plain buffers.
+    pub pooled: usize,
+}
+
 /// Device and inode of a file: the same on every process however the path is spelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
@@ -88,6 +98,14 @@ pub trait Vfs: Send + Sync + Debug {
     /// The default, for backends whose completions arrive on threads of their own, does
     /// nothing.
     fn attach_thread(&self) {}
+
+    /// For a backend with io_uring rings (#402): how many rings it has now and how many got
+    /// a registered buffer pool (a ring registers one on the first read that can use it). Rings past the locked-memory budget, and shard threads whose
+    /// ring could not be created (they use the shared one), run with plain buffers; this
+    /// shows when that happens. `None` for other backends (the default).
+    fn ring_stats(&self) -> Option<RingStats> {
+        None
+    }
 
     /// A random 64-bit value, for identifiers that must be unique (a new database's id).
     ///

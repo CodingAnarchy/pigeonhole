@@ -126,7 +126,7 @@ pub mod nonblocking;
 pub use cell::{Cell, CellEntry, CellRef, Row, RowRef, Value};
 pub use db::{Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
-pub use options::{Compaction, Family, IoBackend, Options, Priority, ReaderOptions, days};
+pub use options::{Compaction, Family, IoBackend, IoRings, Options, Priority, ReaderOptions, days};
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};

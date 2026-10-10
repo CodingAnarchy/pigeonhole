@@ -6,13 +6,21 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use common::Backend;
 use pigeonhole_io::{ErrorKind, IoBuf, OpenOptions};
+
+/// One test at a time: every ring registers buffers against the user's locked-memory limit
+/// (RLIMIT_MEMLOCK), which rings of tests running side by side would exhaust, leaving the
+/// tests that check registration with plain buffers.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// A buffer of `len` bytes holding `byte` at every position.
 fn filled(len: usize, byte: u8) -> IoBuf {
@@ -23,6 +31,7 @@ fn filled(len: usize, byte: u8) -> IoBuf {
 
 #[test]
 fn many_threads_submit_at_once() {
+    let _serial = serial();
     let b = Backend::uring("uring-many-threads");
     let f = b.create("f");
     let threads: Vec<_> = (0..8u64)
@@ -52,6 +61,7 @@ fn many_threads_submit_at_once() {
 
 #[test]
 fn many_operations_in_flight_overflow_the_queue() {
+    let _serial = serial();
     // More than the ring's 256 entries at once: submission waits for room, nothing is lost.
     let b = Backend::uring("uring-overflow");
     let f = b.create("f");
@@ -69,6 +79,7 @@ fn many_operations_in_flight_overflow_the_queue() {
 
 #[test]
 fn a_dropped_completion_still_completes_its_operation() {
+    let _serial = serial();
     let b = Backend::uring("uring-dropped");
     let f = b.create("f");
     for i in 0..100u64 {
@@ -91,6 +102,7 @@ fn a_dropped_completion_still_completes_its_operation() {
 
 #[test]
 fn large_reads_and_writes_complete_in_full() {
+    let _serial = serial();
     let b = Backend::uring("uring-large");
     let f = b.create("f");
     let len = 9 << 20;
@@ -105,6 +117,7 @@ fn large_reads_and_writes_complete_in_full() {
 
 #[test]
 fn a_read_past_the_end_fails_with_unexpected_eof() {
+    let _serial = serial();
     let b = Backend::uring("uring-eof");
     let f = b.create("f");
     f.submit_write(filled(1000, 1), 0).wait().unwrap();
@@ -121,6 +134,7 @@ fn a_read_past_the_end_fails_with_unexpected_eof() {
 
 #[test]
 fn errors_arrive_through_the_completion() {
+    let _serial = serial();
     let b = Backend::uring("uring-errors");
     drop(b.create("f"));
     // A read-only handle: the kernel refuses the write (EBADF).
@@ -131,6 +145,7 @@ fn errors_arrive_through_the_completion() {
 
 #[test]
 fn dropping_the_backend_with_operations_in_flight_completes_them() {
+    let _serial = serial();
     let b = Backend::uring("uring-teardown");
     let f = b.create("f");
     let pending: Vec<_> = (0..64u64)
@@ -148,6 +163,7 @@ fn dropping_the_backend_with_operations_in_flight_completes_them() {
 
 #[test]
 fn the_last_handle_can_go_on_the_reaper_thread() {
+    let _serial = serial();
     // A continuation holding the only file handle runs on the reaper thread: dropping that
     // handle there must not make the reaper wait for itself.
     let b = Backend::uring("uring-last-on-reaper");
@@ -175,6 +191,7 @@ use pigeonhole_io::{own_io_in_flight, own_io_waker, reap_own_io};
 
 #[test]
 fn an_attached_thread_completes_its_own_io_by_reaping() {
+    let _serial = serial();
     let b = Backend::uring("uring-own-ring");
     b.vfs.attach_thread();
     assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
@@ -195,6 +212,7 @@ fn an_attached_thread_completes_its_own_io_by_reaping() {
 
 #[test]
 fn a_waker_ends_a_ring_wait_from_another_thread() {
+    let _serial = serial();
     let b = Backend::uring("uring-own-wake");
     b.vfs.attach_thread();
     let waker = own_io_waker().expect("a thread ring");
@@ -214,6 +232,7 @@ fn a_waker_ends_a_ring_wait_from_another_thread() {
 
 #[test]
 fn a_thread_ending_with_io_in_flight_completes_it() {
+    let _serial = serial();
     let b = Backend::uring("uring-own-exit");
     let f = b.create("f");
     let vfs = Arc::clone(&b.vfs);
@@ -236,6 +255,7 @@ fn a_thread_ending_with_io_in_flight_completes_it() {
 
 #[test]
 fn a_non_waiting_reap_takes_finished_completions() {
+    let _serial = serial();
     // A shard's turn reaps without waiting: completions the kernel has finished must be
     // taken there, not only by a waiting reap (an application-owned loop may never wait).
     let b = Backend::uring("uring-own-nowait");
@@ -254,4 +274,117 @@ fn a_non_waiting_reap_takes_finished_completions() {
         "a non-waiting reap never took the completion"
     );
     write.wait().unwrap();
+}
+
+// ---- registered buffers (#402 PR 4) ----
+
+#[test]
+fn read_bufs_are_registered_and_fixed_io_round_trips() {
+    let _serial = serial();
+    let b = Backend::uring("uring-fixed-shared");
+    let f = b.create("f");
+    // The shared ring's pool (this thread has no ring of its own).
+    let mut w = f.read_buf(8192);
+    assert!(w.is_registered(), "the kernel accepted the registered pool");
+    w.fill(0x6B);
+    f.submit_write(w, 4096).wait().unwrap();
+    let r = f.submit_read(f.read_buf(8192), 4096).wait().unwrap();
+    assert!(r.is_registered());
+    assert!(r.iter().all(|&x| x == 0x6B));
+    // Kept beyond its I/O: copied out, the slot goes back.
+    let kept = r.detached();
+    assert!(!kept.is_registered() && kept.iter().all(|&x| x == 0x6B));
+}
+
+#[test]
+fn an_attached_thread_reads_into_its_own_rings_slots() {
+    let _serial = serial();
+    let b = Backend::uring("uring-fixed-thread");
+    b.vfs.attach_thread();
+    let f = b.create("f");
+    let mut w = f.read_buf(4096);
+    assert!(w.is_registered());
+    w.fill(0x21);
+    f.submit_write(w, 0).wait().unwrap();
+    let r = f.submit_read(f.read_buf(4096), 0).wait().unwrap();
+    assert!(r.iter().all(|&x| x == 0x21));
+    // A buffer from another ring's pool goes as a plain buffer, and works.
+    let other = thread::spawn({
+        let f = Arc::clone(&f);
+        move || f.read_buf(4096)
+    })
+    .join()
+    .unwrap();
+    assert!(other.is_registered());
+    let r = f.submit_read(other, 0).wait().unwrap();
+    assert!(r.iter().all(|&x| x == 0x21));
+}
+
+#[test]
+fn a_dry_pool_falls_back_to_plain_buffers() {
+    let _serial = serial();
+    let b = Backend::uring("uring-fixed-dry");
+    let f = b.create("f");
+    f.submit_write(filled(4096, 1), 0).wait().unwrap();
+    // Take slots until the pool runs dry (as many as the kernel accepted, at most 16).
+    let mut held = Vec::new();
+    loop {
+        let b = f.read_buf(4096);
+        if !b.is_registered() {
+            break;
+        }
+        held.push(b);
+        assert!(held.len() <= 16, "a pool larger than its slots");
+    }
+    assert!(!held.is_empty(), "the kernel accepted the registered pool");
+    let plain = f.read_buf(4096);
+    assert!(!plain.is_registered(), "every slot is taken");
+    let r = f.submit_read(plain, 0).wait().unwrap();
+    assert!(r.iter().all(|&x| x == 1));
+    // Longer than a slot: plain too.
+    assert!(!f.read_buf(1 << 20).is_registered());
+    drop(held);
+    assert!(f.read_buf(4096).is_registered(), "slots came back");
+}
+
+#[test]
+fn ring_stats_count_rings_and_pools() {
+    let _serial = serial();
+    let b = Backend::uring("uring-ring-stats");
+    let f = b.create("f");
+    let stats = |rings, pooled| {
+        let s = b
+            .vfs
+            .ring_stats()
+            .expect("an io_uring backend reports its rings");
+        assert_eq!((s.rings, s.pooled), (rings, pooled), "{s:?}");
+    };
+    // A ring registers its pool on the first read that can use one, not before.
+    stats(1, 0);
+    assert!(!f.read_buf(1 << 20).is_registered(), "longer than a slot");
+    stats(1, 0);
+    drop(f.read_buf(4096));
+    stats(1, 1);
+    let vfs = Arc::clone(&b.vfs);
+    let g = Arc::clone(&f);
+    let (tx, rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let t = thread::spawn(move || {
+        vfs.attach_thread();
+        let before = vfs.ring_stats().unwrap();
+        drop(g.read_buf(4096));
+        tx.send((before, vfs.ring_stats().unwrap())).unwrap();
+        done_rx.recv().unwrap();
+    });
+    let (attached, used) = rx.recv().unwrap();
+    assert_eq!(
+        (attached.rings, attached.pooled),
+        (2, 1),
+        "the thread's own ring, no pool yet"
+    );
+    // One test at a time, with the budget at half the limit: both fit a default 8 MiB.
+    assert_eq!((used.rings, used.pooled), (2, 2), "both rings got pools");
+    done_tx.send(()).unwrap();
+    t.join().unwrap();
+    stats(1, 1);
 }

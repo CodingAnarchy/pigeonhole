@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pigeonhole::{
-    Cell, Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, Priority, Row,
-    Table, Value, ValueFilter, days,
+    Cell, Compaction, Condition, Durability, ErrorCode, Family, IoBackend, Options, Pigeonhole,
+    Priority, Row, Table, Value, ValueFilter, days,
 };
 use pigeonhole_io::sim::SimVfs;
 
@@ -1406,6 +1406,28 @@ fn real_files_reopen_and_lock() {
     assert_eq!(value(&t, b"r", "a", b"q").as_deref(), Some(&b"durable"[..]));
     drop(t);
     copy.close().unwrap();
+}
+
+#[test]
+fn io_rings_report_the_backend() {
+    let dir = TempDir::new("io-rings");
+    let path = dir.0.join("db.phdb");
+    let opts = || Options::default().shards(2).memtable_budget(4 << 20);
+    let db = Pigeonhole::open(&path, opts().io_backend(IoBackend::Pread)).unwrap();
+    assert_eq!(db.io_rings(), None, "pread has no rings");
+    db.close().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let db = Pigeonhole::open(&path, opts().io_backend(IoBackend::Uring)).unwrap();
+        let t = table(&db);
+        t.mutate(b"r").put("a", b"q", b"v").commit().unwrap();
+        // The shared ring, plus the shard threads' own; how many got pools depends on the
+        // locked-memory limit and on the other tests' rings in this process.
+        let rings = db.io_rings().expect("io_uring reports its rings");
+        assert!(rings.rings >= 1 && rings.pooled <= rings.rings, "{rings:?}");
+        drop(t);
+        db.close().unwrap();
+    }
 }
 
 #[test]
