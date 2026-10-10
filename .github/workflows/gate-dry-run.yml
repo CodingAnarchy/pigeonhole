@@ -35,7 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install libclang (bindgen for librocksdb-sys) and nvme-cli
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev clang nvme-cli
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev clang nvme-cli gdb elfutils
       - name: Run every step at small scale
         # As root (the cold steps empty the page cache and start cgroup scopes), with the
         # runner's toolchain. /mnt is the runner's larger scratch disk.
@@ -57,3 +57,4 @@ jobs:
             /mnt/gate-results/*.txt
             /mnt/gate-results/*.tsv
             /mnt/gate-results/logs/
+            /mnt/gate-results/timedout.txt

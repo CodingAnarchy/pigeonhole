@@ -178,12 +178,19 @@ rows.append(("Phase 2 floors hold (D193 sparse-wide gate)", "", verdict(None if 
 rows.append(("D193 instruction ceilings", "measured by CI's instructions job, not here", "see CI", "-"))
 
 machine = load("machine.json") or {}
+try:
+    with open(path("timedout.txt")) as f:
+        timedout = [l.strip() for l in f if l.strip()]
+except OSError:
+    timedout = []
 print("# Phase 3 gate window: summary\n")
 print(f"- **Machine:** {machine.get('cpu', '?')}, {machine.get('cpus', '?')} CPUs, {machine.get('memory', '?')}")
 print(f"- **Kernel:** {machine.get('kernel', '?')}; **drive:** {machine.get('drive', '?')}; **mount:** {machine.get('mount', '?')}")
 print(f"- **Commit:** {machine.get('commit', '?')}; **scale:** {machine.get('scale', '?')}")
 for w in machine.get("warnings", []):
     print(f"- **Warning:** {w}")
+for t in timedout:
+    print(f"- **Timed out:** step `{t}` (its stacks: `logs/{t}.stacks`); its targets read \"not run\"")
 print("\n## Targets (#406)\n")
 print("| Target | Measured | Verdict | Source |")
 print("|---|---|---|---|")

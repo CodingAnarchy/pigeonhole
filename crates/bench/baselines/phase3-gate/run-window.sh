@@ -11,6 +11,10 @@
 # run that step again. `--scale small` runs everything at small sizes: the dry run, on any
 # Linux box or CI runner, that catches script bugs before rented hours do.
 #
+# A step that runs past 3x its estimate (at small scale, past its estimate or 20 minutes) is
+# taken for a hang: every thread's stack goes to logs/STEP.stacks (gdb), it is killed and
+# listed in timedout.txt, and the window moves on.
+#
 # Steps (estimated minutes at full scale, from laptop runs scaled; the log records the real
 # ones in RESULTS_DIR/durations.tsv):
 #   setup          machine, kernel, drive and file-system checks; machine.json        1
@@ -82,16 +86,64 @@ remaining() { # minutes left after step $1
 }
 
 # Runs step NAME (the function step_NAME) unless it is done, logging its output and time.
+# Every thread's stack of each process in process group $1 (the step's), into file $2:
+# gdb, else eu-stack, else SIGQUIT (which at least leaves a core where cores are on).
+stacks() {
+    local pid comm
+    for pid in $(pgrep -g "$1"); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+        case "$comm" in bash | tee | sleep | timeout) continue ;; esac
+        echo "=== pid $pid ($comm)" >> "$2"
+        if command -v gdb > /dev/null; then
+            timeout 120 gdb -p "$pid" -batch -ex 'thread apply all bt' >> "$2" 2>&1 || true
+        elif command -v eu-stack > /dev/null; then
+            timeout 60 eu-stack -p "$pid" >> "$2" 2>&1 || true
+        else
+            kill -QUIT "$pid" 2> /dev/null || true
+        fi
+    done
+}
+
+# Runs step NAME (the function step_NAME) unless it is done, logging its output and time. A
+# step that outlives its limit (3x its estimate at full scale) is a hang: its stacks are
+# taken, it is killed, recorded in timedout.txt and the window moves on, so one hang cannot
+# eat the rented hours.
 run() {
     local name="$1" start end
     if [[ -e "$results/$name.done" ]]; then
         echo "== $name: done earlier, skipped"
         return
     fi
-    echo "== $name ($(date -u +%H:%MZ); about ${minutes[$name]} min; then about $(remaining "$name") min left)"
+    local limit=$((minutes[$name] * 3))
+    ((limit >= 15)) || limit=15
+    if [[ "$scale" == small ]]; then
+        limit=$((minutes[$name] > 20 ? minutes[$name] : 20))
+    fi
+    echo "== $name ($(date -u +%H:%MZ); about ${minutes[$name]} min, limit $limit; then about $(remaining "$name") min left)"
     start=$(date +%s)
-    local status=0
-    "step_$name" > >(tee "$results/logs/$name.log") 2>&1 || status=$?
+    local status=0 pid
+    # Its own process group (job control), so the whole step can be inspected and killed.
+    set -m
+    ("step_$name") > >(tee "$results/logs/$name.log") 2>&1 &
+    pid=$!
+    set +m
+    while kill -0 "$pid" 2> /dev/null; do
+        if (($(date +%s) - start >= limit * 60)); then
+            echo "== $name TIMED OUT after $limit min; stacks: $results/logs/$name.stacks" \
+                | tee -a "$results/logs/$name.log" >&2
+            stacks "$pid" "$results/logs/$name.stacks"
+            kill -TERM -- "-$pid" 2> /dev/null || true
+            sleep 10
+            kill -KILL -- "-$pid" 2> /dev/null || true
+            wait "$pid" 2> /dev/null || true
+            echo "$name" >> "$results/timedout.txt"
+            # The killed step's store, set aside (not deleted) so the next step starts clean.
+            [[ ! -e "$data/bench" ]] || mv "$data/bench" "$data/bench.timedout.$name.$start"
+            return
+        fi
+        sleep 5
+    done
+    wait "$pid" || status=$?
     if [[ $status == 0 ]]; then
         end=$(date +%s)
         printf '%s\t%d\t%s\n' "$name" $(((end - start) / 60)) "$scale" >> "$results/durations.tsv"

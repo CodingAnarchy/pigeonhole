@@ -12,11 +12,12 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 # build-essential, clang and libclang: RocksDB's bindings (bindgen) and the C parts of the
-# workspace; nvme-cli and xfsprogs: the drive; linux-tools: cpupower.
+# workspace; nvme-cli and xfsprogs: the drive; gdb and elfutils: stacks of a hung step;
+# linux-tools: cpupower.
 apt-get install -y -q build-essential clang libclang-dev pkg-config python3 git curl \
-    nvme-cli xfsprogs tmux "linux-tools-$(uname -r)" linux-tools-common || \
+    nvme-cli xfsprogs tmux gdb elfutils "linux-tools-$(uname -r)" linux-tools-common || \
     apt-get install -y -q build-essential clang libclang-dev pkg-config python3 git curl \
-        nvme-cli xfsprogs tmux
+        nvme-cli xfsprogs tmux gdb elfutils
 
 if ! command -v cargo >/dev/null && [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
