@@ -26,7 +26,7 @@ use pigeonhole_io::IoBuf;
 
 use crate::hash::hash_of;
 use crate::s3fifo::Sharded;
-use crate::sync::{Arc, AtomicU64, lock};
+use crate::sync::{Arc, AtomicU64, lock, read};
 
 /// Identifies a cached block: a namespace (an SST id or a blob file id, tagged by the caller
 /// so the two never collide) and the block's offset within it.
@@ -147,7 +147,7 @@ impl BlockCache {
     #[inline]
     pub fn get(&self, key: BlockKey) -> Option<BlockHandle> {
         let shard = self.shards.shard(hash_of(&key))?;
-        lock(shard).get(&key).map(|block| BlockHandle { block })
+        read(shard).get(&key).map(|block| BlockHandle { block })
     }
 
     /// Inserts a block (replacing any entry with the same key) and returns it pinned.
@@ -403,7 +403,7 @@ impl RowCache {
     #[inline]
     pub fn get(&self, family: u64, row: &[u8], epoch: u64) -> Option<RowHandle> {
         let h = Self::hash(family, row);
-        lock(self.shards.shard(h)?)
+        read(self.shards.shard(h)?)
             .get_if(&h, |e| e.is(family, row) && e.epoch == epoch)
             .map(|entry| RowHandle { entry })
     }

@@ -1,7 +1,8 @@
 //! The eviction core shared by [`BlockCache`](crate::BlockCache) and
 //! [`RowCache`](crate::RowCache): a sharded S3-FIFO with pins and priorities.
 //!
-//! Each shard is a `Mutex` around three FIFOs (Yang et al., SOSP '23):
+//! Each shard is a `RwLock` around three FIFOs (Yang et al., SOSP '23). A hit takes it shared
+//! and bumps an atomic hit count; inserts, evictions and removals take it exclusively (#18):
 //!
 //! - **small** (~10% of the bytes): new entries land here. An entry not hit while in small is
 //!   evicted ("one-hit wonders" never reach main) and its key goes to the ghost queue; an
@@ -33,7 +34,9 @@ use std::hash::Hash;
 
 use crate::Priority;
 use crate::hash::BuildKeyHasher;
-use crate::sync::{Arc, Mutex, lock};
+use std::sync::atomic::Ordering;
+
+use crate::sync::{Arc, AtomicU8, RwLock, lock};
 
 /// Maximum hit count per priority: S3-FIFO's 2 bits for `Normal`, one life for `Low`, and
 /// more lives for `High`, so a hot `High` block outlasts an equally hot `Normal` one in main.
@@ -63,7 +66,10 @@ struct Slot<V> {
     /// behind by removals are recognized as stale.
     id: u64,
     charge: usize,
-    freq: u8,
+    /// Hits since the last eviction pass, bumped under a shared lock (a hit) and changed
+    /// otherwise only under the exclusive one; a lost concurrent bump only ages the entry a
+    /// pass sooner.
+    freq: AtomicU8,
     priority: Priority,
     queue: Queue,
 }
@@ -115,19 +121,24 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
     /// Looks up `key` and pins it. Allocation-free: a hash probe, a counter bump and an
     /// `Arc` increment.
     #[inline]
-    pub(crate) fn get(&mut self, key: &K) -> Option<Arc<V>> {
+    pub(crate) fn get(&self, key: &K) -> Option<Arc<V>> {
         self.get_if(key, |_| true)
     }
 
     /// Like [`get`](Self::get), but only when `pred` accepts the value (one hash probe; a
     /// rejected entry's hit count is untouched).
     #[inline]
-    pub(crate) fn get_if(&mut self, key: &K, pred: impl FnOnce(&V) -> bool) -> Option<Arc<V>> {
-        let slot = self.map.get_mut(key)?;
+    pub(crate) fn get_if(&self, key: &K, pred: impl FnOnce(&V) -> bool) -> Option<Arc<V>> {
+        let slot = self.map.get(key)?;
         if !pred(&slot.value) {
             return None;
         }
-        slot.freq = (slot.freq + 1).min(max_freq(slot.priority));
+        // Saturated counts are left unwritten: a hot entry's slot then stays clean in other
+        // cores' caches (#18).
+        let freq = slot.freq.load(Ordering::Relaxed);
+        if freq < max_freq(slot.priority) {
+            slot.freq.store(freq + 1, Ordering::Relaxed);
+        }
         Some(Arc::clone(&slot.value))
     }
 
@@ -166,7 +177,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
                 value,
                 id,
                 charge,
-                freq,
+                freq: AtomicU8::new(freq),
                 priority,
                 queue,
             },
@@ -297,8 +308,9 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
             self.small.push_back((key, id));
             return Step::Pinned;
         }
-        if slot.freq > 0 {
-            slot.freq -= 1;
+        let freq = slot.freq.load(Ordering::Relaxed);
+        if freq > 0 {
+            slot.freq.store(freq - 1, Ordering::Relaxed);
             slot.queue = Queue::Main;
             self.small_usage -= slot.charge;
             self.main.push_back((key, id));
@@ -328,8 +340,9 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
             self.main.push_back((key, id));
             return Step::Pinned;
         }
-        if slot.freq > 0 {
-            slot.freq -= 1;
+        let freq = slot.freq.load(Ordering::Relaxed);
+        if freq > 0 {
+            slot.freq.store(freq - 1, Ordering::Relaxed);
             self.main.push_back((key, id));
             return Step::Other;
         }
@@ -362,7 +375,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
 /// Keeps each shard's lock word on its own cache line (128 bytes covers adjacent-line
 /// prefetch on x86 and the line size on Apple silicon).
 #[repr(align(128))]
-struct Padded<K, V>(Mutex<Shard<K, V>>);
+struct Padded<K, V>(RwLock<Shard<K, V>>);
 
 /// A fixed set of shards, picked by key hash.
 pub(crate) struct Sharded<K, V> {
@@ -380,7 +393,7 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
         };
         let shards = (0..n)
             .map(|i| {
-                Padded(Mutex::new(Shard::new(
+                Padded(RwLock::new(Shard::new(
                     capacity / n + usize::from(i < capacity % n),
                 )))
             })
@@ -398,7 +411,7 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
 
     /// The shard for `hash`, or `None` when there are no shards.
     #[inline]
-    pub(crate) fn shard(&self, hash: u64) -> Option<&Mutex<Shard<K, V>>> {
+    pub(crate) fn shard(&self, hash: u64) -> Option<&RwLock<Shard<K, V>>> {
         let n = self.shards.len() as u64;
         // Lemire's multiply-shift range reduction over hash bits 16..48. The shard's HashMap
         // hashes the same key to the same value and uses the low bits for the bucket and the
