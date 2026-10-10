@@ -890,12 +890,11 @@ impl Memtable {
         }
         let start = off + layout::N_TOWER + 4 * height;
         // Neighbouring rows usually differ near the end of the row (sequential ids, time
-        // keys), past a long shared prefix: the column's last word settles most misses, and
-        // the rest is compared only up to that word.
-        let head = column.saturating_sub(8);
-        let tail = column - head;
-        mem.cmp(start + head, tail, &key[head..column]) == Cmp::Equal
-            && mem.cmp(start, head, &key[..head]) == Cmp::Equal
+        // keys), past a long shared prefix: the column's last word settles most misses.
+        if column >= 8 && mem.cmp(start + column - 8, 8, &key[column - 8..column]) != Cmp::Equal {
+            return false;
+        }
+        mem.cmp(start, column, &key[..column]) == Cmp::Equal
     }
 
     /// A geometric height with ratio 1/4, from a private xorshift generator.
