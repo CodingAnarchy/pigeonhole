@@ -1,6 +1,6 @@
 # Phase 3 gate window (#405, #406)
 
-The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 9.75 hours at full scale. It is resumable, and it leaves one tarball to copy back.
+The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 9.8 hours at full scale. It is resumable, and it leaves one tarball to copy back.
 
 ## Before renting
 
@@ -33,7 +33,7 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
 - **Detach** (`Ctrl-b d`) and come back later. Nothing else should run on the machine meanwhile: the setup step refuses to start above a load of 1.0.
 - **The steps:**
   1. `setup`: records the machine, and refuses a setup that would not count.
-  2. `build`.
+  2. `build`, then `memtable-lookup`: the memtable's 1M- and 10k-entry point lookup (#17; criterion, pinned to one core).
   3. `phase2-gate`: the D193 floors.
   4. `all` against RocksDB, three times: twice on io_uring (the reproducibility pair) and once on pread (the backend decision).
   5. `latency`: point gets and durable group commit.

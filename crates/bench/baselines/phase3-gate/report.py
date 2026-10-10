@@ -8,7 +8,7 @@ readahead) and each step's duration.
 
 A target whose file is missing reads "not run". The verdicts are the script's reading of
 the numbers against the spec; the owner's gate decision is still made from the files."""
-import json, os, statistics, sys
+import json, os, re, statistics, sys
 
 R = sys.argv[1]
 GROUP_COMMIT_CELLS = 4  # crates/bench/src/workload.rs
@@ -80,6 +80,28 @@ if got:
                  f"p50 {us(g['p50_ns']):.2f} µs, p99 {us(g['p99_ns']):.2f} µs", verdict(ok), "latency-ycsb-c.json"))
 else:
     rows.append(("Point get in memory: p50 < 2 µs, p99 < 10 µs", "", verdict(None), "latency-ycsb-c.json"))
+
+# Memtable point lookup at 1M entries: <= 300 ns (#17; criterion `seek/`, median of the
+# estimate). Criterion prints the name, then `time: [low mid high]`, on one line or two.
+UNITS = {"ps": 1e-3, "ns": 1.0, "us": 1e3, "µs": 1e3, "ms": 1e6, "s": 1e9}
+seek, name = {}, None
+try:
+    with open(path("memtable-lookup.txt")) as f:
+        for l in f:
+            if l.lstrip().startswith("seek/"):
+                name = l.split("time:")[0].strip()
+            m = re.search(r"time:\s*\[\S+ \S+ (\S+) (\S+)", l)
+            if m and name:
+                seek[name] = float(m.group(1)) * UNITS.get(m.group(2), 1.0)
+except OSError:
+    pass
+hit_1m = next((v for k, v in seek.items() if k.startswith("seek/1M/hit")), None)
+if hit_1m is not None:
+    others = ", ".join(f"{k.split('/', 1)[1]} {v:.0f} ns" for k, v in seek.items() if not k.startswith("seek/1M/hit"))
+    rows.append(("Memtable point lookup at 1M entries: ≤ 300 ns (#17)", f"1M hit {hit_1m:.0f} ns ({others})",
+                 verdict(hit_1m <= 300), "memtable-lookup.txt"))
+else:
+    rows.append(("Memtable point lookup at 1M entries: ≤ 300 ns (#17)", "", verdict(None), "memtable-lookup.txt"))
 
 # Cold get: one I/O (direct I/O, 1 thread, present rows; median over runs).
 cg = [l for l in lines("cold-get.jsonl") if l.get("phase") == "present" and l.get("mode") == "direct" and l.get("threads") == 1]

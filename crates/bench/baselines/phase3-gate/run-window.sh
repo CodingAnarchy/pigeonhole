@@ -19,6 +19,7 @@
 # ones in RESULTS_DIR/durations.tsv):
 #   setup          machine, kernel, drive and file-system checks; machine.json        1
 #   build          phdb-bench (rocksdb, sqlite) and the examples                      10
+#   memtable-lookup  memtable 1M/10k point lookup (#17; criterion)                    5
 #   phase2-gate    D193 sparse-wide gate against SQLite and RocksDB (run-gate.sh)     40
 #   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring               90
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2)         90
@@ -61,9 +62,9 @@ mkdir -p "$data" "$results/logs"
 data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
-steps=(setup build phase2-gate all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
+steps=(setup build memtable-lookup phase2-gate all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     group-sync-depth row-cache scaling open-latency cold-get cold-scan scan-cache report)
-declare -A minutes=([setup]=1 [build]=10 [phase2-gate]=40 [all-uring-1]=90 [all-uring-2]=90
+declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [all-uring-1]=90 [all-uring-2]=90
     [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [group-sync-depth]=15 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
     [cold-scan]=45 [scan-cache]=10 [report]=1)
 
@@ -169,6 +170,14 @@ step_build() {
     cargo build --release -p pigeonhole-bench --features sqlite,rocksdb \
         --manifest-path "$root/Cargo.toml"
     cargo build --release -p pigeonhole-bench --examples --manifest-path "$root/Cargo.toml"
+}
+
+# #17: memtable point lookup at 1M and 10k entries (criterion; target <= 300 ns at 1M),
+# pinned to one core so another core's work does not move it (perf287).
+step_memtable-lookup() {
+    (cd "$root" && taskset -c 2 cargo bench -p pigeonhole-memtable --bench memtable -- 'seek/' \
+        2>&1 | grep -E '^seek/|time:') | tee "$results/memtable-lookup.txt"
+    cp -r "$root/target/criterion" "$results/memtable-criterion"
 }
 
 step_phase2-gate() {
