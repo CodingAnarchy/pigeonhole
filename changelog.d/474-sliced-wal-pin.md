@@ -1,0 +1,2 @@
+### Changed
+- WAL pin passes (the flushes that keep each shard's WAL within twice `memtable_budget`, D155) no longer scan the shard's whole log in one go. They work from an index of the log, built in the background only when the log nears the bound, and run in short slices between commits (D206, #474, #175). At the default sizes, a pass that used to block its shard for 6–11 ms now runs in slices averaging under 50 µs. The WAL can exceed the bound by what is written while a pass runs, a few MB at most at the defaults.

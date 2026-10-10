@@ -316,3 +316,103 @@ fn a_participant_serves_an_unpin_for_a_lower_seqno_decided_later() {
         db.metrics().unpin
     );
 }
+
+/// What [`mixed`] measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MixStats {
+    /// Unpin passes (own and served) and the memtables they froze below the threshold.
+    passes: u64,
+    small_flushes: u64,
+    /// The largest WAL seen.
+    max_wal: u64,
+}
+
+/// Slots of mixed temperature on four shards (#175): 8 tables (one tablet each, tablet `n` on
+/// shard `n % 4`) of 4 families, so 32 slots. Each commit writes a 1 KB value to a slot drawn
+/// with weight `1 / (rank + 1)`, and one commit in 10 also writes a slot of another table,
+/// most often on another shard (a cross-shard commit). Deterministic: one commit at a time,
+/// every shard driven by the test. Debug builds check every pass's slots and requests against
+/// a scan of the whole log.
+fn mixed(seed: u64, commits: u32) -> MixStats {
+    const TABLES: usize = 8;
+    const FAMILIES: usize = 4;
+    let vfs = SimVfs::new(seed);
+    let db = Engine::open(Path::new(DB), options(&vfs, 4)).unwrap();
+    let fams: Vec<(String, FamilyOptions)> = (0..FAMILIES)
+        .map(|f| (format!("f{f}"), FamilyOptions::default()))
+        .collect();
+    let tables: Vec<_> = (0..TABLES)
+        .map(|t| db.create_table(&format!("t{t}"), &fams).unwrap())
+        .collect();
+    db.close().unwrap();
+    drop(db);
+
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), options(&vfs, 4)).unwrap();
+    let slots: Vec<(pigeonhole_format::TableId, u32)> = tables
+        .iter()
+        .flat_map(|t| (0..FAMILIES).map(move |f| (t.id, t.family(&format!("f{f}")).unwrap().id.0)))
+        .collect();
+    // Weights 1 / (rank + 1) over a seeded shuffle of the slots.
+    let mut rng = pigeonhole_sim::Rng::new(seed);
+    let mut order: Vec<usize> = (0..slots.len()).collect();
+    for i in (1..order.len()).rev() {
+        order.swap(i, rng.below(i as u64 + 1) as usize);
+    }
+    let weights: Vec<f64> = (0..slots.len()).map(|r| 1.0 / (r as f64 + 1.0)).collect();
+    let total: f64 = weights.iter().sum();
+    let pick = |rng: &mut pigeonhole_sim::Rng| {
+        let mut x = rng.below(1 << 30) as f64 / f64::from(1 << 30) * total;
+        for (r, w) in weights.iter().enumerate() {
+            if x < *w {
+                return order[r];
+            }
+            x -= w;
+        }
+        order[slots.len() - 1]
+    };
+    let v = vec![7u8; VALUE];
+    let mut max_wal = 0;
+    for i in 0..commits {
+        let mut wb = WriteBatch::new();
+        let a = pick(&mut rng);
+        put(&mut wb, slots[a].0, slots[a].1, &i.to_be_bytes(), &v);
+        if rng.below(10) == 0 {
+            let b = pick(&mut rng);
+            if slots[b].0 != slots[a].0 {
+                put(&mut wb, slots[b].0, slots[b].1, &i.to_be_bytes(), &v);
+            }
+        }
+        drive(
+            &mut shards,
+            db.submit(wb, Some(Durability::Buffered)).unwrap(),
+        );
+        if i % 1000 == 0 {
+            max_wal = max_wal.max(wal_bytes(&vfs));
+        }
+    }
+    max_wal = max_wal.max(wal_bytes(&vfs));
+    let m = db.metrics();
+    drop(shards);
+    drop(db);
+    MixStats {
+        passes: m.unpin.0,
+        small_flushes: m.unpin.1,
+        max_wal,
+    }
+}
+
+/// The WAL stays bounded with slots of every temperature and cross-shard commits (#175).
+/// `-- --nocapture` prints passes, the small memtables they froze, and the largest WAL.
+#[test]
+fn mixed_temperatures_keep_the_wal_bounded() {
+    for seed in [175, 176] {
+        let s = mixed(seed, if cfg!(miri) { 500 } else { 40_000 });
+        println!("seed {seed}: {s:?}");
+        // Four streams, each bounded as in `a_cold_slot_does_not_pin_the_wal`.
+        assert!(s.max_wal <= 4 * 3 * BUDGET, "seed {seed}: {s:?}");
+        assert!(
+            s.passes > 0,
+            "seed {seed}: the limit was never reached: {s:?}"
+        );
+    }
+}

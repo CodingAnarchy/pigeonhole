@@ -218,6 +218,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D202](phase-3.md#d202) — Application-owned io_uring loops wait on a completion fd (`Shard::io_fd`): a DEFER_TASKRUN ring signals its registered eventfd before its owner reaps (settled on CI); the fd is an opt-in, so loops that never take it keep polling · coordinator decision, #408
 - [D204](phase-3.md#d204) — The scaling gate measures application-owned shards writing inline (N up to cores); engine-owned synchronous clients are reported · owner decision, bench, #154 · amends the spec Goals scaling definition and the #406 checklist
 - [D205](phase-3.md#d205) — The scan target counts decoded bytes (row key + qualifier + value) on the bench's default 100 B / 8-cell shape; small and wide shapes are reported · owner decision, bench, #29 · amends the spec Goals scan line and the #406 checklist
+- [D206](phase-3.md#d206) — WAL pin passes run in bounded slices from a lazily built log index; the WAL bound may be exceeded by what is logged while a pass runs · coordinator decision, engine, #474, #175 · amends D155
 
 ## Open questions
 _None._
