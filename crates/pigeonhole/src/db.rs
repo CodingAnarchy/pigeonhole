@@ -290,7 +290,7 @@ impl Pigeonhole {
     }
 
     /// The engine's counters since open: commits, flushes, compactions, write stalls, WAL
-    /// unpin passes, inline WAL syncs and file growths. A bench hook (ICR 0015) that shows
+    /// unpin passes, inline WAL syncs, file growths and block-cache hits and misses. A bench hook (ICR 0015) that shows
     /// what stalled during a run; take two readings and subtract for a phase.
     #[doc(hidden)]
     pub fn engine_metrics(&self) -> crate::EngineMetrics {

@@ -118,7 +118,8 @@ pub struct Metrics {
     pub compaction_failures: u64,
     /// Write stalls (token-bucket waits and refused commits) and total stalled nanoseconds.
     pub stalls: (u64, u64),
-    /// Block cache hits and misses (the cache does not count them yet: always zero).
+    /// Block cache lookups that hit and that missed since open (#57). A miss is a block read
+    /// from the file; with the cache disabled (`block_cache_bytes` 0) nothing is counted.
     pub block_cache: (u64, u64),
     /// Passes that flushed slots pinning a WAL checkpoint (a shard's own, past
     /// `EngineOptions::wal_pin_bytes`, or at another shard's request), and the memtables
@@ -1722,6 +1723,7 @@ impl Engine {
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
+        m.block_cache = shared.cache.hits_and_misses();
         m
     }
 

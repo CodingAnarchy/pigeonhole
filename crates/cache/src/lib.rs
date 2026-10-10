@@ -143,11 +143,38 @@ impl BlockCache {
         }
     }
 
-    /// Looks up a block and pins it. Allocation-free.
+    /// Looks up a block and pins it, counting a hit or a miss
+    /// ([`hits_and_misses`](Self::hits_and_misses)). Allocation-free.
     #[inline]
     pub fn get(&self, key: BlockKey) -> Option<BlockHandle> {
-        let shard = self.shards.shard(hash_of(&key))?;
-        read(shard).get(&key).map(|block| BlockHandle { block })
+        let shard = self.shards.padded(hash_of(&key))?;
+        let found = read(&shard.lock)
+            .get(&key)
+            .map(|block| BlockHandle { block });
+        let counter = if found.is_some() {
+            &shard.hits
+        } else {
+            &shard.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
+    /// Lookups ([`get`](Self::get)) that found their block, and lookups that did not, since
+    /// the cache was made (ICR 0024). A disabled cache counts nothing.
+    ///
+    /// ```
+    /// use pigeonhole_cache::{BlockCache, BlockKey, Priority};
+    ///
+    /// let cache = BlockCache::new(1 << 20, 0);
+    /// let key = BlockKey { file: 1, offset: 0 };
+    /// assert!(cache.get(key).is_none());
+    /// drop(cache.insert(key, vec![0; 8].into(), Priority::Normal));
+    /// assert!(cache.get(key).is_some());
+    /// assert_eq!(cache.hits_and_misses(), (1, 1));
+    /// ```
+    pub fn hits_and_misses(&self) -> (u64, u64) {
+        self.shards.lookups()
     }
 
     /// Inserts a block (replacing any entry with the same key) and returns it pinned.

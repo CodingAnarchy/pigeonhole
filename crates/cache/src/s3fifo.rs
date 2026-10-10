@@ -36,7 +36,7 @@ use crate::Priority;
 use crate::hash::BuildKeyHasher;
 use std::sync::atomic::Ordering;
 
-use crate::sync::{Arc, AtomicU8, RwLock, lock};
+use crate::sync::{Arc, AtomicU8, AtomicU64, RwLock, lock};
 
 /// Maximum hit count per priority: S3-FIFO's 2 bits for `Normal`, one life for `Low`, and
 /// more lives for `High`, so a hot `High` block outlasts an equally hot `Normal` one in main.
@@ -373,9 +373,17 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
 }
 
 /// Keeps each shard's lock word on its own cache line (128 bytes covers adjacent-line
-/// prefetch on x86 and the line size on Apple silicon).
-#[repr(align(128))]
-struct Padded<K, V>(RwLock<Shard<K, V>>);
+/// prefetch on x86 and the line size on Apple silicon), with its lookup counters beside it
+/// (first, so they share the lock word's 64-byte line: a lookup that took the lock adds to
+/// a line it already holds).
+#[repr(C, align(128))]
+pub(crate) struct Padded<K, V> {
+    /// Lookups that found their entry (the block cache counts them; [`Sharded::lookups`]).
+    pub(crate) hits: AtomicU64,
+    /// Lookups that did not.
+    pub(crate) misses: AtomicU64,
+    pub(crate) lock: RwLock<Shard<K, V>>,
+}
 
 /// A fixed set of shards, picked by key hash.
 pub(crate) struct Sharded<K, V> {
@@ -392,10 +400,10 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
             shards
         };
         let shards = (0..n)
-            .map(|i| {
-                Padded(RwLock::new(Shard::new(
-                    capacity / n + usize::from(i < capacity % n),
-                )))
+            .map(|i| Padded {
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                lock: RwLock::new(Shard::new(capacity / n + usize::from(i < capacity % n))),
             })
             .collect();
         Self { shards, capacity }
@@ -412,23 +420,39 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
     /// The shard for `hash`, or `None` when there are no shards.
     #[inline]
     pub(crate) fn shard(&self, hash: u64) -> Option<&RwLock<Shard<K, V>>> {
+        self.padded(hash).map(|s| &s.lock)
+    }
+
+    /// [`Sharded::shard`] with its lookup counters.
+    #[inline]
+    pub(crate) fn padded(&self, hash: u64) -> Option<&Padded<K, V>> {
         let n = self.shards.len() as u64;
         // Lemire's multiply-shift range reduction over hash bits 16..48. The shard's HashMap
         // hashes the same key to the same value and uses the low bits for the bucket and the
         // top 7 bits as its probe tag; taking the shard from the top bits would give every
         // key in a shard the same tag prefix and defeat probe filtering.
         let mid = u64::from((hash >> 16) as u32);
-        self.shards.get(((mid * n) >> 32) as usize).map(|s| &s.0)
+        self.shards.get(((mid * n) >> 32) as usize)
     }
 
     pub(crate) fn for_each(&self, mut f: impl FnMut(&mut Shard<K, V>)) {
         for s in self.shards.iter() {
-            f(&mut lock(&s.0));
+            f(&mut lock(&s.lock));
         }
     }
 
     pub(crate) fn usage(&self) -> usize {
-        self.shards.iter().map(|s| lock(&s.0).usage()).sum()
+        self.shards.iter().map(|s| lock(&s.lock).usage()).sum()
+    }
+
+    /// Hits and misses counted in every shard's [`Padded`] counters.
+    pub(crate) fn lookups(&self) -> (u64, u64) {
+        self.shards.iter().fold((0, 0), |(h, m), s| {
+            (
+                h + s.hits.load(Ordering::Relaxed),
+                m + s.misses.load(Ordering::Relaxed),
+            )
+        })
     }
 
     pub(crate) fn capacity(&self) -> usize {
