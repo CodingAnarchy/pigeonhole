@@ -48,7 +48,7 @@ use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
 use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
 use crate::source::{ColumnKey, Resolver, Source, mem_sources_from, sst_sources_point};
-use crate::write::ReadKey;
+use crate::write::{ReadKey, Settled};
 use crate::{CommitInfo, Error, Predicate, Result};
 
 /// Worst-case memtable overhead per entry: node header and a full tower, plus alignment.
@@ -823,7 +823,7 @@ pub(crate) fn remove_wal_files(vfs: &VfsRef, path: &std::path::Path) -> Result<(
 /// What a committer wants back.
 #[derive(Debug)]
 pub(crate) enum Reply {
-    Commit(Notifier<Result<CommitInfo>>),
+    Commit(Notifier<Result<Settled>>),
     Check(Notifier<Result<(bool, Option<CommitInfo>)>>),
     /// Internal (2PC records): nothing to notify directly.
     None,
@@ -831,8 +831,14 @@ pub(crate) enum Reply {
 
 impl Reply {
     fn resolve(self, outcome: Result<CommitInfo>) {
+        self.resolve_returning(outcome, None);
+    }
+
+    /// Resolves, handing a commit's batch buffer back to its committer for reuse (#320):
+    /// freed here, it would be freed on another thread than the one that allocated it.
+    fn resolve_returning(self, outcome: Result<CommitInfo>, batch: Option<BatchBuilder>) {
         match self {
-            Reply::Commit(n) => n.notify(outcome),
+            Reply::Commit(n) => n.notify(outcome.map(|info| Settled { info, batch })),
             Reply::Check(n) => n.notify(outcome.map(|i| (true, Some(i)))),
             Reply::None => {}
         }
@@ -899,7 +905,7 @@ fn preset_fits(
 pub(crate) struct CoordinateReq {
     pub parts: Vec<(ShardId, Arc<BatchBuilder>)>,
     pub durability: Durability,
-    pub reply: Notifier<Result<CommitInfo>>,
+    pub reply: Notifier<Result<Settled>>,
     pub submitted_at: u64,
     pub validate: Option<(Seqno, Vec<ReadKey>)>,
     /// Version of the tablet map the parts were routed with: a commit a participant refused
@@ -1209,7 +1215,7 @@ struct Group {
 struct Coord {
     participants: usize,
     durability: Durability,
-    reply: Option<Notifier<Result<CommitInfo>>>,
+    reply: Option<Notifier<Result<Settled>>>,
     submitted_at: u64,
     prepared: usize,
     applied: usize,
@@ -4771,7 +4777,11 @@ impl ShardState {
                     self.shared.metrics[usize::from(self.id.0)]
                         .record(m.durability, now.saturating_sub(m.submitted_at));
                 }
-                m.reply.resolve(result);
+                let batch = match std::mem::replace(&mut m.bytes, Bytes::Streams(Vec::new())) {
+                    Bytes::Own(b) => Some(b),
+                    _ => None,
+                };
+                m.reply.resolve_returning(result, batch);
             }
             MemberKind::Prepare { coordinator } => {
                 if let Err(e) = &result {
@@ -5242,7 +5252,7 @@ impl ShardState {
             }
         };
         if let Some(reply) = c.reply.take() {
-            reply.notify(outcome);
+            reply.notify(outcome.map(Settled::from));
         }
         self.try_finish_close(ctx);
     }
