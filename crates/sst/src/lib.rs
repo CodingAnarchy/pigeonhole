@@ -101,6 +101,53 @@ pub(crate) fn note_file_read() {
     });
 }
 
+thread_local! {
+    /// While `counting_readahead` runs on this thread: what its cursors' readahead did.
+    static READAHEAD: std::cell::Cell<Option<ReadaheadCounts>> = const { std::cell::Cell::new(None) };
+}
+
+/// What scan readahead did ([`ReadOptions::readahead_blocks`], #402), as counted by
+/// [`counting_readahead`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadaheadCounts {
+    /// Block fetches submitted ahead of the scan.
+    pub issued: u64,
+    /// Blocks the scan took from its readahead instead of the cache or the file.
+    pub used: u64,
+    /// Blocks the scan reached while their fetch was still in flight, and waited for (read
+    /// once, late: a readahead that did not run far enough ahead).
+    pub waited: u64,
+}
+
+/// Runs `f` and returns what the readahead of cursors stepped on this thread did during it
+/// (nested calls restore the outer count). A bench and test hook, like
+/// [`counting_file_reads`].
+pub fn counting_readahead<T>(f: impl FnOnce() -> T) -> (T, ReadaheadCounts) {
+    struct Restore(Option<ReadaheadCounts>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READAHEAD.with(|c| c.set(self.0));
+        }
+    }
+    let restore = Restore(READAHEAD.with(|c| c.replace(Some(ReadaheadCounts::default()))));
+    let out = f();
+    let n = READAHEAD.with(std::cell::Cell::get).unwrap_or_default();
+    drop(restore);
+    (out, n)
+}
+
+/// Counts readahead, if `counting_readahead` is running.
+#[cold]
+pub(crate) fn note_readahead(f: impl FnOnce(&mut ReadaheadCounts)) {
+    READAHEAD.with(|c| {
+        if let Some(mut n) = c.get() {
+            f(&mut n);
+            c.set(Some(n));
+        }
+    });
+}
+
 /// SST errors.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -439,7 +486,7 @@ impl SstReader {
                 let mut it = Block::new(h).ok()?.into_cursor();
                 it.seek_to_first().ok()?;
                 let first = BlockAddr::decode_varint(it.value()).ok()?;
-                blocks.fetch_if_missing(first, BlockKind::Data, priority)
+                blocks.fetch_if_missing(first, BlockKind::Data, priority, true)
             }
             Err(_) => None,
         }
@@ -460,8 +507,16 @@ pub struct ReadOptions {
     pub fill_cache: bool,
     /// Cache priority for inserted blocks.
     pub priority: Priority,
-    /// Data blocks to read ahead in one submission during forward scans (0 = none).
+    /// Data blocks to fetch ahead during forward scans (0 = none, the default): on a cache
+    /// miss, the cursor submits fetches for up to this many of the next blocks the cache lacks
+    /// ([`SstIter::upcoming`]) and reads on while they complete, one batch at a time (#402).
+    /// Never on seeks. With `fill_cache` false the blocks are held by the cursor, not cached,
+    /// and a seek drops them.
     pub readahead_blocks: u32,
+    /// Readahead submits each run of blocks adjacent on disk as one read instead of one read
+    /// per block (#402; off by default, measured before it is decided).
+    #[doc(hidden)]
+    pub readahead_merge: bool,
     /// Read only what is cached: a block that is not fails the read with
     /// [`Error::WouldBlock`] instead of being read from the file (async reads, ICR 0014).
     pub cache_only: bool,
@@ -473,6 +528,7 @@ impl Default for ReadOptions {
             fill_cache: true,
             priority: Priority::Normal,
             readahead_blocks: 0,
+            readahead_merge: false,
             cache_only: false,
         }
     }

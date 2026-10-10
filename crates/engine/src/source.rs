@@ -205,11 +205,32 @@ fn covers_row(sst: &OpenSst, row: &[u8]) -> bool {
     sst.first_row() <= row && row <= sst.last_row()
 }
 
+/// Data blocks a scan fetches ahead (`ReadOptions::readahead_blocks`), and whether adjacent
+/// ones go as one read: 4 and no, unless `PIGEONHOLE_READAHEAD=N[,merge]` (a bench and test
+/// variable, read once per process) says otherwise, until #431 decides both from the gate
+/// measurement (#405).
+fn scan_readahead() -> (u32, bool) {
+    static READAHEAD: std::sync::OnceLock<(u32, bool)> = std::sync::OnceLock::new();
+    *READAHEAD.get_or_init(|| {
+        let Ok(v) = std::env::var("PIGEONHOLE_READAHEAD") else {
+            return (4, false);
+        };
+        let mut parts = v.split(',');
+        let blocks = parts
+            .next()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(4);
+        (blocks, parts.any(|p| p.trim() == "merge"))
+    })
+}
+
 /// Read options for a scan or a point read.
 fn read_options(priority: Priority, scan: bool, cache_only: bool) -> ReadOptions {
     let mut o = ReadOptions::default();
     o.priority = priority;
-    o.readahead_blocks = if scan { 4 } else { 0 };
+    if scan {
+        (o.readahead_blocks, o.readahead_merge) = scan_readahead();
+    }
     o.cache_only = cache_only;
     o
 }

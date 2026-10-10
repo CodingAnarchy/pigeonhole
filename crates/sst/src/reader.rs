@@ -114,22 +114,7 @@ impl Fetch {
     /// One read of `len` bytes at `offset`. On a direct handle (#403) it covers the aligned
     /// pages around them, and the buffer it resolves to keeps just them, in place.
     fn submit_piece(&self, offset: u64, len: usize) -> pigeonhole_io::Completion {
-        match self.file.direct_align() {
-            // A registered slot where the backend has one (#402): slots are page-aligned, so
-            // they serve a direct handle's aligned read too.
-            None => self.file.submit_read(self.file.read_buf(len), offset),
-            Some(a) => {
-                let (start, alen, head) = aligned(offset, len, a);
-                self.file
-                    .submit_read(self.file.read_buf(alen), start)
-                    .map(move |r| {
-                        r.map(|mut b| {
-                            b.keep(head..head + len);
-                            b
-                        })
-                    })
-            }
-        }
+        submit_bytes(&self.file, offset, len)
     }
 
     /// Submits the read through the VFS's asynchronous reads: one completion that wakes its
@@ -252,6 +237,26 @@ pub(crate) fn read_bytes(file: &FileRef, offset: u64, len: usize) -> Result<IoBu
     }
 }
 
+/// Submits a read of `len` bytes at `offset`, resolving to a buffer of just them. On a direct
+/// handle (#403) it covers the aligned pages around them, and the buffer keeps just the bytes,
+/// in place (as [`read_bytes`]).
+fn submit_bytes(file: &FileRef, offset: u64, len: usize) -> pigeonhole_io::Completion {
+    match file.direct_align() {
+        // A registered slot where the backend has one (#402): slots are page-aligned, so they
+        // serve a direct handle's aligned read too.
+        None => file.submit_read(file.read_buf(len), offset),
+        Some(a) => {
+            let (start, alen, head) = aligned(offset, len, a);
+            file.submit_read(file.read_buf(alen), start).map(move |r| {
+                r.map(|mut b| {
+                    b.keep(head..head + len);
+                    b
+                })
+            })
+        }
+    }
+}
+
 /// Reads exactly `out.len()` bytes at `offset` into `out`, any slice: on a direct handle
 /// through an aligned bounce buffer (a copy; for small or piecewise reads).
 pub(crate) fn read_into(file: &FileRef, out: &mut [u8], offset: u64) -> Result<()> {
@@ -345,7 +350,7 @@ pub(crate) struct Blocks {
     limit: u64,
     pub(crate) cache: Arc<BlockCache>,
     /// Hands out unshared handles for reads that must not fill the cache.
-    uncached: BlockCache,
+    uncached: Arc<BlockCache>,
 }
 
 impl std::fmt::Debug for Reader {
@@ -405,7 +410,7 @@ impl Reader {
             base,
             limit,
             cache,
-            uncached: BlockCache::disabled(),
+            uncached: Arc::new(BlockCache::disabled()),
         };
         // A cache-only open reads only from the cache, and fills it with what it fetches
         // (the properties block too), so its retry finds everything.
@@ -545,12 +550,29 @@ impl Blocks {
 
     /// The fetch of the block at `addr`, admitted to the cache.
     pub(crate) fn fetch(&self, addr: BlockAddr, kind: BlockKind, priority: Priority) -> Fetch {
+        self.fetch_with(addr, kind, priority, true)
+    }
+
+    /// The fetch of the block at `addr`, admitted to the cache if `fill_cache`, else handed
+    /// out unshared (a read that must not fill the cache, as [`Blocks::admit`]).
+    pub(crate) fn fetch_with(
+        &self,
+        addr: BlockAddr,
+        kind: BlockKind,
+        priority: Priority,
+        fill_cache: bool,
+    ) -> Fetch {
+        let cache = if fill_cache {
+            &self.cache
+        } else {
+            &self.uncached
+        };
         Fetch::one(
             self.file.clone(),
             self.base + addr.offset,
             addr.len as usize,
             Then::Block {
-                cache: Arc::clone(&self.cache),
+                cache: Arc::clone(cache),
                 key: self.key(addr),
                 kind,
                 priority,
@@ -558,15 +580,23 @@ impl Blocks {
         )
     }
 
-    /// The fetch of `addr` if the cache does not hold it (and its address is valid).
+    /// Submits one read of `len` bytes at block offset `offset` (a run of adjacent blocks,
+    /// for readahead that merges them).
+    pub(crate) fn submit_run(&self, offset: u64, len: usize) -> pigeonhole_io::Completion {
+        submit_bytes(&self.file, self.base + offset, len)
+    }
+
+    /// The fetch of `addr` (as [`Blocks::fetch_with`]) if the cache does not hold it (and
+    /// its address is valid).
     pub(crate) fn fetch_if_missing(
         &self,
         addr: BlockAddr,
         kind: BlockKind,
         priority: Priority,
+        fill_cache: bool,
     ) -> Option<Fetch> {
         match self.lookup(addr) {
-            Ok(None) => Some(self.fetch(addr, kind, priority)),
+            Ok(None) => Some(self.fetch_with(addr, kind, priority, fill_cache)),
             _ => None,
         }
     }
@@ -582,35 +612,8 @@ impl Blocks {
         let cache = if fill_cache {
             &*self.cache
         } else {
-            &self.uncached
+            &*self.uncached
         };
         cache.insert(self.key(addr), data, priority)
-    }
-
-    /// Reads the contiguous run `addrs` (checked, ascending, adjacent) in one I/O and decodes
-    /// each block.
-    pub(crate) fn read_run(&self, addrs: &[BlockAddr], kind: BlockKind) -> Result<Vec<BlockData>> {
-        let (Some(first), Some(last)) = (addrs.first(), addrs.last()) else {
-            return Ok(Vec::new());
-        };
-        for a in addrs {
-            self.check(*a)?;
-        }
-        let start = first.offset;
-        let end = last.offset + u64::from(last.len);
-        crate::note_file_read();
-        let buf = read_bytes(&self.file, self.base + start, (end - start) as usize)?;
-        addrs
-            .iter()
-            .map(|a| {
-                let at = (a.offset - start) as usize;
-                let physical = &buf[at..at + a.len as usize];
-                // One copy per block: decompression, or the payload of a stored block.
-                Ok(match decode_slice(physical, kind)? {
-                    Some(data) => data,
-                    None => BlockData::from(physical[..physical.len() - TRAILER_LEN].to_vec()),
-                })
-            })
-            .collect()
     }
 }

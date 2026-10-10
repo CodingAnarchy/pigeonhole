@@ -501,3 +501,141 @@ fn upcoming_names_the_next_uncached_blocks_in_order() {
     it.upcoming(10, &mut none);
     assert!(none.is_empty());
 }
+
+// ---- readahead on `upcoming` (#402) ----
+
+/// The store of a readahead test: its VFS, the reader, and the entries in order.
+type ManyBlocks = (
+    Arc<pigeonhole_io::sim::SimVfs>,
+    Arc<SstReader>,
+    Vec<(Vec<u8>, Vec<u8>)>,
+);
+
+/// 800 rows in 256-byte blocks (50+ data blocks; index partitions of about eight entries), and
+/// the entries.
+fn many_blocks(vfs_seed: u64) -> ManyBlocks {
+    let mut m = Model::new();
+    for i in 0..800u32 {
+        let mut k = Vec::new();
+        encode_key(
+            &mut k,
+            format!("row{i:05}").as_bytes(),
+            b"q",
+            1,
+            1,
+            Kind::Put,
+        )
+        .unwrap();
+        m.insert(k, b"\x00value-value-value".to_vec());
+    }
+    let l = Layout {
+        block_size: 256,
+        restart_interval: 2,
+        compression: pigeonhole_format::compress::Compression::None,
+        compression_level: 3,
+        bloom_bits: 0,
+    };
+    let (vfs, file) = sim_file(vfs_seed, EXTENT);
+    let meta = write_sst(&file, EXTENT, &m, &l);
+    let r = open(&file, &meta);
+    assert!(r.properties().data_blocks >= 50);
+    let want = m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    (vfs, r, want)
+}
+
+fn readahead(blocks: u32, fill_cache: bool, merge: bool) -> ReadOptions {
+    let mut o = ReadOptions::default();
+    o.readahead_blocks = blocks;
+    o.fill_cache = fill_cache;
+    o.readahead_merge = merge;
+    o
+}
+
+/// Every combination of filling the cache and merging adjacent fetches.
+const FILL_MERGE: [(bool, bool); 4] = [(true, false), (false, false), (true, true), (false, true)];
+
+#[test]
+fn readahead_fetches_ahead_and_the_scan_uses_what_it_fetched() {
+    // A cold scan without readahead reads every block itself.
+    let (_vfs, r, want) = many_blocks(21);
+    let (got, plain_reads) = pigeonhole_sst::counting_file_reads(|| {
+        scan(&mut r.iter(ScanFilter::all(), ReadOptions::default()))
+    });
+    assert_eq!(got, want);
+    for (fill, merge) in FILL_MERGE {
+        let (_vfs, r, want) = many_blocks(21);
+        let ((got, reads), counts) = pigeonhole_sst::counting_readahead(|| {
+            pigeonhole_sst::counting_file_reads(|| {
+                scan(&mut r.iter(ScanFilter::all(), readahead(4, fill, merge)))
+            })
+        });
+        assert_eq!(got, want, "fill {fill} merge {merge}");
+        assert!(
+            counts.issued > 0 && counts.used > 0,
+            "fill {fill}: {counts:?}"
+        );
+        assert!(counts.used <= counts.issued, "fill {fill}: {counts:?}");
+        // Most blocks came ahead of the scan instead of from its own reads. A cursor that
+        // does not fill the cache stops its walk at each uncached index partition (about
+        // eight blocks here), so it gains less.
+        let gain = if fill { 2 } else { 1 };
+        assert!(
+            reads * gain < plain_reads,
+            "fill {fill}: {reads} reads with readahead, {plain_reads} without"
+        );
+        // A cursor that must not fill the cache leaves it as it was: the first block (read
+        // synchronously) is cached only when filling.
+        let mut cached = r.iter(ScanFilter::all(), {
+            let mut o = ReadOptions::default();
+            o.cache_only = true;
+            o
+        });
+        let first = cached.seek_to_first();
+        assert_eq!(first.is_ok(), fill, "fill {fill}: {first:?}");
+    }
+}
+
+#[test]
+fn a_cache_only_cursor_never_fetches_ahead() {
+    let (_vfs, r, _) = many_blocks(22);
+    let mut o = readahead(4, true, false);
+    o.cache_only = true;
+    let (res, counts) =
+        pigeonhole_sst::counting_readahead(|| r.iter(ScanFilter::all(), o).seek_to_first());
+    assert!(matches!(res, Err(Error::WouldBlock(_))), "{res:?}");
+    assert_eq!(counts.issued, 0);
+}
+
+#[test]
+fn a_scan_waits_for_fetches_still_in_flight_and_seeks_drop_them() {
+    // Completions that resolve only when waited for (an owner-reaped ring): the scan reaches
+    // blocks whose fetch is in flight, waits for them, and reads each once.
+    for (fill, merge) in FILL_MERGE {
+        let (vfs, r, want) = many_blocks(23);
+        vfs.set_deferred_io(true);
+        vfs.set_owner_reaps(true);
+        let ((got, reads), counts) = pigeonhole_sst::counting_readahead(|| {
+            pigeonhole_sst::counting_file_reads(|| {
+                scan(&mut r.iter(ScanFilter::all(), readahead(4, fill, merge)))
+            })
+        });
+        assert_eq!(got, want, "fill {fill} merge {merge}");
+        assert!(counts.waited > 0, "fill {fill}: {counts:?}");
+        assert!(reads < want.len() as u64, "fill {fill}: {reads} reads");
+        // Seeking back and forth with fetches in flight returns the right entries.
+        let mut it = r.iter(ScanFilter::all(), readahead(4, fill, merge));
+        for start in [0, 600, 200, 799, 0] {
+            it.seek(&want[start].0).unwrap();
+            for w in want[start..].iter().take(30) {
+                assert!(it.valid());
+                assert_eq!(
+                    (it.key(), it.value()),
+                    (&w.0[..], &w.1[..]),
+                    "fill {fill} merge {merge}"
+                );
+                it.next().unwrap();
+            }
+        }
+        pigeonhole_io::reap_own_io(Some(std::time::Duration::ZERO));
+    }
+}

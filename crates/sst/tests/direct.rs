@@ -35,9 +35,21 @@ proptest! {
         // Block by block, and in contiguous runs (readahead).
         let r = open(&direct, &meta);
         prop_assert_eq!(scan(&mut r.iter(ScanFilter::all(), ReadOptions::default())), want.clone());
-        let mut ahead = ReadOptions::default();
-        ahead.readahead_blocks = 4;
-        prop_assert_eq!(scan(&mut r.iter(ScanFilter::all(), ahead)), want.clone());
+        // Readahead fetches (one per block, or merged runs of adjacent blocks): a fetch that
+        // failed its alignment would be dropped and its block read synchronously, so every
+        // fetch issued must be used.
+        for merge in [false, true] {
+            let mut ahead = ReadOptions::default();
+            ahead.readahead_blocks = 4;
+            ahead.readahead_merge = merge;
+            // A fresh reader and cache: the blocks are not cached yet.
+            let cold = open(&direct, &meta);
+            let (got, counts) = pigeonhole_sst::counting_readahead(|| {
+                scan(&mut cold.iter(ScanFilter::all(), ahead))
+            });
+            prop_assert_eq!(got, want.clone());
+            prop_assert_eq!(counts.used, counts.issued, "merge {}: {:?}", merge, counts);
+        }
 
         // A cache-only open fetches what it misses (footer, index, filters) asynchronously.
         let cache = Arc::new(BlockCache::new(8 << 20, 2));

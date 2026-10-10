@@ -810,6 +810,7 @@ dependencies = [
  "pigeonhole",
  "pigeonhole-engine",
  "pigeonhole-io",
+ "pigeonhole-sst",
  "proptest",
  "rocksdb",
  "rusqlite",
