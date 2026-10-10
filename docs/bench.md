@@ -146,7 +146,7 @@ Each result row gives the workload, store, store settings, size, client threads,
 - No client thread competes with the shards for cores, so the gate runs at N up to the core count.
 - The load goes through the blocking API first. Then the warm-up (as long as the measured part, unrecorded) and the measured writes run inline.
 - A commit's latency is from submission to resolution, so it includes the time it waited behind the other commits in flight.
-- The warm-up runs until the balancer has spread the table: every shard owns a tablet and a pass of the warm-up writes changes nothing, capped at 30 s with a warning. A fixed warm-up can end before the first split.
+- The warm-up runs until the balancer has spread the table and settled: every shard owns a tablet, and nothing has split, merged or moved for 2 s (longer than the balancer's dwell). It's capped at 30 s, with a warning. A fixed warm-up can end before the first split.
 - **The run must be spread.** If one shard took more than 2/N of the measured commits, the gate fails as skewed whatever its efficiency. The busiest share is printed with the verdict, and each shard's share is printed in every result.
 
 **Reported beside it, not gating:** the engine-owned shape, with synchronous client threads (four per shard) at half the gate's shards, so the clients have cores of their own. `scaling` prints both, and the JSON carries the second as `scaling_sync`.
