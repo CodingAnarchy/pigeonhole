@@ -220,6 +220,7 @@ impl Pigeonhole {
             .map(|inner| Shard {
                 inner,
                 vfs: Arc::clone(&vfs),
+                io_fd_used: std::sync::atomic::AtomicBool::new(false),
             })
             .collect();
         Ok((
@@ -620,6 +621,9 @@ impl Snapshot {
 pub struct Shard {
     inner: EngineShard,
     vfs: VfsRef,
+    /// The application asked for [`Shard::io_fd`] and got one, so it waits on it: then
+    /// `next_wakeup` need not report in-flight I/O as due now (#408).
+    io_fd_used: std::sync::atomic::AtomicBool,
 }
 
 impl Shard {
@@ -650,9 +654,10 @@ impl Shard {
     ///
     /// With [`IoBackend::Uring`](crate::IoBackend::Uring), I/O the shard submitted goes to
     /// a ring of the thread that drives it and completes only when that thread runs a shard
-    /// again: wait on [`io_fd`](Shard::io_fd) too, which turns readable when some has
-    /// finished. Where the thread has no such descriptor, this is `Some(Duration::ZERO)` while
-    /// any is in flight (#402).
+    /// again, so this is `Some(Duration::ZERO)` while any is in flight (#402), unless the
+    /// application waits on [`io_fd`](Shard::io_fd), which turns readable when some has
+    /// finished: once `io_fd` has returned a descriptor, in-flight I/O no longer counts as due
+    /// (#408).
     ///
     /// After [`run_once`](Shard::run_once) returns `false`, sleep until the
     /// [`set_wakeup`](Shard::set_wakeup) callback fires or this much time passes, whichever
@@ -684,7 +689,12 @@ impl Shard {
         // I/O on this thread's own ring (`IoBackend::Uring`, #402) completes only when the
         // thread runs a shard again: due now while any is in flight, unless the thread has a
         // completion fd to wait on (`io_fd`, #408).
-        if pigeonhole_io::own_io_in_flight() && pigeonhole_io::own_io_fd().is_none() {
+        // An application that never asked for the fd keeps polling (a loop that only sleeps
+        // for `next_wakeup` would otherwise sleep through its own I/O).
+        if pigeonhole_io::own_io_in_flight()
+            && !(self.io_fd_used.load(std::sync::atomic::Ordering::Relaxed)
+                && pigeonhole_io::own_io_fd().is_some())
+        {
             return Some(std::time::Duration::ZERO);
         }
         let deadline = self.inner.next_deadline()?;
@@ -707,7 +717,9 @@ impl Shard {
     /// that waits in its own event loop: wait until it is readable, the
     /// [`set_wakeup`](Shard::set_wakeup) callback fires, or [`next_wakeup`](Shard::next_wakeup)
     /// passes, then call `run_once`, which resets it. Call it on the thread that drives the
-    /// shard, after its first `run_once`. `None` where that thread has none: with
+    /// shard, after its first `run_once`. Asking for it is the opt-in: from then on
+    /// `next_wakeup` no longer reports this thread's in-flight I/O as due now, so a loop that
+    /// takes the descriptor must wait on it. `None` where that thread has none: with
     /// [`IoBackend::Pread`](crate::IoBackend::Pread), on systems without io_uring, or with a
     /// custom VFS. A thread that drives several shards gets the same descriptor from each.
     ///
@@ -730,7 +742,12 @@ impl Shard {
     /// # }
     /// ```
     pub fn io_fd(&self) -> Option<i32> {
-        pigeonhole_io::own_io_fd()
+        let fd = pigeonhole_io::own_io_fd();
+        if fd.is_some() {
+            self.io_fd_used
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        fd
     }
 
     /// Registers a callback invoked (from any thread) when work arrives for this shard. It
