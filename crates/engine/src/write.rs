@@ -312,6 +312,12 @@ impl PendingCommit {
     /// [`Error::WouldDeadlock`]: the commit was submitted and will apply, but its outcome
     /// must be awaited from the event loop (poll this future there) or another thread.
     pub fn wait(mut self) -> crate::Result<CommitInfo> {
+        if self.spin_nanos == 0 {
+            // No spin: exactly the parking wait.
+            let info = wait_reply(&self.shared, &mut self.waiter)?;
+            wait_visible(&self.shared, info.seqno)?;
+            return Ok(info);
+        }
         let mut spin = SpinWait::new(self.spin_nanos);
         let info = wait_reply_spinning(&self.shared, &mut self.waiter, &mut spin)?;
         wait_visible_spinning(&self.shared, info.seqno, &mut spin)?;
@@ -406,7 +412,23 @@ pub(crate) fn wait_reply<T: Send>(
     shared: &crate::shard::Shared,
     waiter: &mut Waiter<crate::Result<T>>,
 ) -> crate::Result<T> {
-    wait_reply_spinning(shared, waiter, &mut SpinWait::new(0))
+    if shared.drivers.current_drives() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        return match Pin::new(waiter).poll(&mut cx) {
+            Poll::Ready(Some(r)) => r,
+            Poll::Ready(None) => Err(Error::Closed),
+            Poll::Pending => Err(Error::WouldDeadlock),
+        };
+    }
+    let waker = crate::waker::thread_waker();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match Pin::new(&mut *waiter).poll(&mut cx) {
+            Poll::Ready(Some(r)) => return r,
+            Poll::Ready(None) => return Err(Error::Closed),
+            Poll::Pending => std::thread::park(),
+        }
+    }
 }
 
 /// [`wait_reply`], polling first for up to `spin`'s window.
@@ -457,7 +479,20 @@ pub(crate) fn wait_visible(
     shared: &crate::shard::Shared,
     seqno: pigeonhole_format::Seqno,
 ) -> crate::Result<()> {
-    wait_visible_spinning(shared, seqno, &mut SpinWait::new(0))
+    if shared.shm.visible_seqno() >= seqno {
+        return Ok(());
+    }
+    if shared.drivers.current_drives() {
+        return Err(Error::WouldDeadlock);
+    }
+    let waker = crate::waker::thread_waker();
+    while !shared.wait_visible(seqno, &waker) {
+        if shared.visibility_ended() {
+            return Err(Error::Closed);
+        }
+        std::thread::park();
+    }
+    Ok(())
 }
 
 /// [`wait_visible`], polling first for what is left of `spin`'s window.
