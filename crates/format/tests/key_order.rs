@@ -4,9 +4,10 @@ mod common;
 
 use common::{Cell, cell, config, num, part, sized};
 use pigeonhole_format::key::{
-    Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
+    Escaped, Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
     encode_column_prefix, encode_key, encode_key_after_row, encode_marker_after_row,
-    encode_marker_prefix, encode_row_prefix, encode_seek_key, row_prefix_len, split_suffix,
+    encode_marker_prefix, encode_row_prefix, encode_seek_key, escape_into, row_prefix_len,
+    split_suffix,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -37,6 +38,62 @@ proptest! {
         let a = Cell { row, qual: q1, ts: ts1, seqno: 1, kind: Kind::Put }.encode();
         let b = Cell { row: long, qual: q2, ts: ts2, seqno: 1, kind: Kind::Put }.encode();
         prop_assert!(a < b);
+    }
+
+    /// `unescape_into` drops the `FF` after every `00` and keeps everything else, malformed
+    /// input included (a `00` not followed by `FF` is kept as is), at every length across
+    /// the eight-byte steps of its zero search, and agrees with `eq_raw` (#406).
+    #[test]
+    fn unescape_matches_bytewise(
+        bytes in vec(prop_oneof![3 => any::<u8>(), 1 => Just(0u8), 1 => Just(0xFF)], 0..40),
+        prefix in vec(any::<u8>(), 0..4),
+    ) {
+        let mut expect = prefix.clone();
+        let mut i = 0;
+        while i < bytes.len() {
+            expect.push(bytes[i]);
+            if bytes[i] == 0 && bytes.get(i + 1) == Some(&0xFF) {
+                i += 1;
+            }
+            i += 1;
+        }
+        let e = Escaped::new(&bytes);
+        let mut got = prefix.clone();
+        e.unescape_into(&mut got);
+        prop_assert_eq!(&got, &expect);
+        prop_assert!(e.eq_raw(&got[prefix.len()..]));
+        let mut long = prefix.clone();
+        e.unescape_long_into(&mut long);
+        prop_assert_eq!(&long, &expect);
+    }
+
+    /// Escaping then unescaping is the identity, and the escaped form is the byte-wise
+    /// rule (`00` becomes `00 FF`), for parts with zeros anywhere across the eight-byte
+    /// steps; a key built from such parts parses back to them.
+    #[test]
+    fn escape_round_trips(
+        row in vec(prop_oneof![3 => any::<u8>(), 1 => Just(0u8)], 0..40),
+        qual in vec(prop_oneof![3 => any::<u8>(), 1 => Just(0u8)], 0..40),
+    ) {
+        let mut esc = Vec::new();
+        escape_into(&mut esc, &row);
+        let expect: Vec<u8> = row
+            .iter()
+            .flat_map(|&b| if b == 0 { vec![0, 0xFF] } else { vec![b] })
+            .collect();
+        prop_assert_eq!(&esc, &expect);
+        let mut back = Vec::new();
+        Escaped::new(&esc).unescape_into(&mut back);
+        prop_assert_eq!(&back, &row);
+        let mut back = Vec::new();
+        Escaped::new(&esc).unescape_long_into(&mut back);
+        prop_assert_eq!(&back, &row);
+        let mut key = Vec::new();
+        encode_key(&mut key, &row, &qual, 7, 9, Kind::Put).unwrap();
+        let parts = decode_key(&key).unwrap();
+        prop_assert!(parts.row.eq_raw(&row));
+        prop_assert!(parts.qualifier.unwrap().eq_raw(&qual));
+        prop_assert_eq!(row_prefix_len(&key).unwrap(), expect.len() + 2);
     }
 
     /// Decoding recovers every field; the prefix helpers agree with the encoders.

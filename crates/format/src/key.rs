@@ -279,10 +279,56 @@ pub fn encode_seek_key(
     Ok(())
 }
 
+/// The index of the first `0x00` in `b`. Rows and qualifiers are walked for their escapes and
+/// terminators on every key parse; a long one is searched eight bytes per step, out of line,
+/// so the byte loop that short parts (most qualifiers) take inlines as small as it was: a
+/// 28-byte row cost about 15 instructions per byte byte-at-a-time (#406).
+#[inline]
+fn find_zero(b: &[u8]) -> Option<usize> {
+    if b.len() < 16 {
+        b.iter().position(|&c| c == 0)
+    } else {
+        find_zero_words(b)
+    }
+}
+
+/// [`find_zero`] eight bytes per step.
+#[inline(never)]
+fn find_zero_words(b: &[u8]) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let (chunks, rest) = b.as_chunks::<8>();
+    for (k, c) in chunks.iter().enumerate() {
+        let w = u64::from_le_bytes(*c);
+        // The lowest flagged byte is the first zero (a flag above a zero may be false).
+        let z = w.wrapping_sub(ONES) & !w & HIGHS;
+        if z != 0 {
+            return Some(8 * k + (z.trailing_zeros() / 8) as usize);
+        }
+    }
+    let at = 8 * chunks.len();
+    rest.iter().position(|&c| c == 0).map(|i| at + i)
+}
+
+/// [`Escaped::unescape_into`] for a long part: the runs between escapes copied whole. Out of
+/// line, so the short path inlines as small as it was.
+#[inline(never)]
+fn unescape_runs(escaped: &[u8], out: &mut Vec<u8>) {
+    let mut rest = escaped;
+    while let Some(i) = find_zero(rest) {
+        out.extend_from_slice(&rest[..=i]);
+        rest = &rest[i + 1..];
+        if let [0xFF, tail @ ..] = rest {
+            rest = tail;
+        }
+    }
+    out.extend_from_slice(rest);
+}
+
 /// Appends the escaped form of `part` (no terminator).
 pub fn escape_into(out: &mut Vec<u8>, part: &[u8]) {
     let mut rest = part;
-    while let Some(i) = rest.iter().position(|&b| b == 0) {
+    while let Some(i) = find_zero(rest) {
         out.extend_from_slice(&rest[..=i]);
         out.push(0xFF);
         rest = &rest[i + 1..];
@@ -493,6 +539,20 @@ impl<'a> Escaped<'a> {
     /// Appends the unescaped bytes to `out`.
     pub fn unescape_into(&self, out: &mut Vec<u8>) {
         out.extend(self.raw_bytes());
+    }
+
+    /// Like [`Escaped::unescape_into`], for a part that is often long (a scan's row key):
+    /// from 16 bytes on the runs between escapes are copied whole (one copy when there is
+    /// none) rather than byte by byte, about 15 instructions per byte (#406). A separate
+    /// method, so the per-cell calls of `unescape_into` (qualifiers, mostly short) keep
+    /// their code as it was.
+    pub fn unescape_long_into(&self, out: &mut Vec<u8>) {
+        if self.0.len() < 16 {
+            // Through `unescape_into`, so its byte loop stays one copy, inlined as it was.
+            self.unescape_into(out);
+        } else {
+            unescape_runs(self.0, out);
+        }
     }
 
     /// Compares with raw (unescaped) bytes without allocating.
