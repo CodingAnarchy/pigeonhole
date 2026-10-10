@@ -18,9 +18,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes its older dry run (cancelled); a run dispatched
+# by hand is never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
