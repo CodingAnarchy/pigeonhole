@@ -970,6 +970,12 @@ impl ScanCursor {
                 give_back(resolver);
                 return Err(e);
             }
+            if resolver.cursor_mut().sources().is_empty() {
+                // Nothing of this family in the tablet's range: no lane, so the scan does not
+                // set one up, seek it or poll it per row (a table's empty families, #406).
+                give_back(resolver);
+                continue;
+            }
             opts.skip_columns = skips_columns(resolver.cursor_mut().sources());
             resolver.cursor_mut().reset();
             resolver.reset(opts);
@@ -1056,6 +1062,12 @@ impl ScanCursor {
     #[inline(always)]
     fn advance_row_impl<const OPEN: bool>(&mut self) -> Result<Option<bool>> {
         if self.done {
+            return Ok(Some(false));
+        }
+        // A scan at its row limit is done: never read the next row just to stop there.
+        if self.spec.limit != 0 && self.rows_emitted >= self.spec.limit {
+            self.done = true;
+            self.recycle_lanes();
             return Ok(Some(false));
         }
         // Drop whatever is left of the current row.
