@@ -205,6 +205,8 @@ struct Pool {
 pub struct WalCounters {
     inline_grows: AtomicU64,
     inline_rollover_syncs: AtomicU64,
+    rollover_blocks: AtomicU64,
+    rollover_waits: AtomicU64,
 }
 
 impl WalCounters {
@@ -217,6 +219,133 @@ impl WalCounters {
     pub fn inline_rollover_syncs(&self) -> u64 {
         self.inline_rollover_syncs.load(Ordering::Relaxed)
     }
+
+    /// Times the engine held a group back because the stream was blocked ([`Wal::blocked`]):
+    /// its segment was nearly full while that segment's own header still waited for the
+    /// previous segment's sync (#19). Counted once per hold ([`Wal::notify_unblocked`]).
+    pub fn rollover_blocks(&self) -> u64 {
+        self.rollover_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Rollovers that had to wait on the stream's thread for the previous rollover's sync (a
+    /// segment filled while its own header was still held back; a group larger than what
+    /// [`Wal::blocked`] leaves room for). Expected to stay 0 (#19).
+    pub fn rollover_waits(&self) -> u64 {
+        self.rollover_waits.load(Ordering::Relaxed)
+    }
+}
+
+/// A rollover's submitted sync of the full segment, which the successor's header must wait
+/// for (FORMAT §10.1 rule 1): settled by the sync's continuation, observed without blocking
+/// by the stream, and followed by work queued on it (#19).
+#[derive(Default)]
+struct RolloverSync {
+    state: Mutex<RolloverState>,
+    settled: Condvar,
+}
+
+#[derive(Default)]
+struct RolloverState {
+    /// `None` while in flight; then whether it succeeded.
+    done: Option<bool>,
+    /// Its error, until the stream reports it (once: later calls see `Poisoned`).
+    error: Option<pigeonhole_io::Error>,
+    /// The kind of that error, for every sync chained after it.
+    kind: Option<pigeonhole_io::ErrorKind>,
+    then: Vec<Box<dyn FnOnce(bool) + Send>>,
+}
+
+impl RolloverSync {
+    fn lock(&self) -> MutexGuard<'_, RolloverState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the sync finished, and how: `None` while in flight.
+    fn done(&self) -> Option<bool> {
+        self.lock().done
+    }
+
+    /// The failed sync's error, for a sync chained after it.
+    fn chained_error(&self) -> pigeonhole_io::Error {
+        let kind = self.lock().kind.unwrap_or(pigeonhole_io::ErrorKind::Other);
+        pigeonhole_io::Error::new(kind, "wal rollover sync failed")
+    }
+
+    /// The failed sync's error, the first time it is asked for.
+    fn take_error(&self) -> Option<pigeonhole_io::Error> {
+        self.lock().error.take()
+    }
+
+    /// Records the outcome and runs what waited for it (outside the lock).
+    fn settle(&self, r: &pigeonhole_io::Result<()>) {
+        let ok = r.is_ok();
+        let then = {
+            let mut st = self.lock();
+            st.done = Some(ok);
+            if let Err(e) = r {
+                st.error = Some(pigeonhole_io::Error::new(
+                    e.kind,
+                    "wal rollover sync failed",
+                ));
+                st.kind = Some(e.kind);
+            }
+            std::mem::take(&mut st.then)
+        };
+        self.settled.notify_all();
+        for f in then {
+            f(ok);
+        }
+    }
+
+    /// Runs `f` with the outcome once the sync finished (now if it has).
+    fn then(&self, f: impl FnOnce(bool) + Send + 'static) {
+        let mut st = self.lock();
+        match st.done {
+            Some(ok) => {
+                drop(st);
+                f(ok);
+            }
+            None => st.then.push(Box::new(f)),
+        }
+    }
+
+    /// Blocks until the sync finished (the rare wait [`WalCounters::rollover_waits`]
+    /// counts), reaping I/O only this thread completes meanwhile (#207).
+    fn wait(&self) -> bool {
+        let mut st = self.lock();
+        loop {
+            if let Some(ok) = st.done {
+                return ok;
+            }
+            if pigeonhole_io::own_io_in_flight() {
+                drop(st);
+                pigeonhole_io::reap_own_io(Some(OWN_IO_SLICE));
+                st = self.lock();
+                continue;
+            }
+            st = self
+                .settled
+                .wait_timeout(st, OWN_IO_SLICE)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// A successor segment's header frame, held back until the previous segment's rollover sync
+/// is durable (FORMAT §10.1 rule 1). The successor's records are written meanwhile: under the
+/// slot's stale header (an older epoch, or zeros) replay never reads them (§10.2), and none is
+/// acknowledged before the header is written (#19).
+struct HeldHeader {
+    frame: Vec<u8>,
+    /// Absolute file offset of the header (the slot's start).
+    at: u64,
+    /// Where the previous, full segment ends: what [`Wal::written`] reports meanwhile.
+    prev_end: Lsn,
+    synced: Arc<RolloverSync>,
+    /// The epoch of the stale segment a recycled slot still holds (its header is on disk
+    /// until this one is written); `None` for a prepared or blank slot.
+    stale: Option<u32>,
 }
 
 /// How long a thread with I/O only it completes waits on that I/O before it checks the
@@ -499,13 +628,15 @@ impl SpareSegments {
 ///
 /// Appends are buffered in memory and framed as they arrive; [`Wal::write`] hands the buffer
 /// to the kernel with one positional write. When a segment fills, the stream writes what is
-/// left of it, syncs it and then buffers the successor's header with `prev_end` set to where
-/// the full segment ended. FORMAT §10.1 rule 1 (a full segment is durable before its
-/// successor's header is written) holds either way, and D30 is kept as follows: when a
-/// recyclable or prepared slot is ready, the old segment's sync is submitted to the I/O
-/// backend and the next write waits for it before writing the successor's header (normally
-/// it has completed by then); only when no such slot is ready does the stream sync inline
-/// ([`WalStream::inline_rollover_syncs`] counts those).
+/// left of it, syncs it and starts the successor with `prev_end` set to where the full
+/// segment ended. FORMAT §10.1 rule 1 (a full segment is durable before its successor's
+/// header is written) holds either way. When a recyclable or prepared slot is ready, the old
+/// segment's sync is submitted to the I/O backend and never waited for on this thread (D200):
+/// the successor's header is held back until that sync completes, while its records are
+/// written as usual (replay ignores them under the slot's stale header, and
+/// [`Wal::written`] does not count them until the header is written). Only when no such slot
+/// is ready does the stream sync inline ([`WalStream::inline_rollover_syncs`] counts those;
+/// D30's remaining exception).
 ///
 /// The successor goes into a slot whose epoch is below the latest checkpoint if there is one,
 /// else into a slot prepared by [`SpareSegments::prepare`] (zero-filled and synced, so its
@@ -570,9 +701,11 @@ pub struct WalStream {
     buf: Vec<u8>,
     /// Record encoding scratch, reused across appends.
     scratch: Vec<u8>,
-    /// The submitted sync of the previous segment, which must complete before the current
-    /// segment's header is written (FORMAT §10.1 rule 1).
-    rollover_sync: Option<Completion<()>>,
+    /// The current segment's header while it waits for the previous segment's submitted
+    /// sync (FORMAT §10.1 rule 1).
+    held: Option<HeldHeader>,
+    /// The epoch the current segment's slot held before, if it was recycled.
+    stale: Option<u32>,
     shared: Arc<Shared>,
 }
 
@@ -744,7 +877,8 @@ impl WalStream {
             written_off: 0,
             buf: Vec::new(),
             scratch: Vec::new(),
-            rollover_sync: None,
+            held: None,
+            stale: None,
             shared: Arc::new(Shared {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
@@ -809,6 +943,17 @@ impl WalStream {
         self.poison_on_err(synced)?;
         self.shared.durable.fetch_max(lsn.0, Ordering::Release);
         Ok(())
+    }
+
+    /// While the current segment's header is held back (#19): its epoch, and the epoch of the
+    /// stale segment its recycled slot still holds (`None` for a prepared slot). A test hook
+    /// for crash sweeps that must crash inside that window.
+    #[doc(hidden)]
+    pub fn held_header(&self) -> Option<(u32, Option<u32>)> {
+        self.held
+            .as_ref()
+            .filter(|h| h.synced.done().is_none())
+            .map(|h| (self.epoch, h.stale))
     }
 
     /// A handle for preparing spare slots on a background task.
@@ -940,6 +1085,7 @@ impl WalStream {
             .filter(|&e| e != POOLED)
             .ok_or_else(|| corrupt("wal epochs exhausted"))?;
         let (slot, source) = self.take_slot(at_open)?;
+        self.stale = (source == SlotSource::Recycled).then_some(self.slots[slot]);
         self.slots[slot] = epoch;
         self.max_epoch = epoch;
         self.slot = slot;
@@ -965,19 +1111,48 @@ impl WalStream {
     }
 
     /// The current segment is full: write and sync it, then chain a new one to its end
-    /// (FORMAT §10.1 rule 1). With a spare slot ready the sync is submitted and `write_buf`
-    /// waits for it before writing the successor's header; otherwise it runs inline (D30).
+    /// (FORMAT §10.1 rule 1). With a spare slot ready the sync is submitted, and the
+    /// successor's header is held back until it is durable while its records are written as
+    /// usual (#19); otherwise the sync runs inline (D30).
     fn rollover(&mut self) -> Result<()> {
+        if let Some(held) = &self.held
+            && held.synced.done().is_none()
+        {
+            // The current segment filled while its own header still waits for the previous
+            // rollover's sync: it cannot be chained before that header is written. Rare
+            // (`blocked` holds groups back first); counted.
+            self.shared
+                .counters
+                .rollover_waits
+                .fetch_add(1, Ordering::Relaxed);
+            held.synced.wait();
+        }
         self.write_buf()?;
         let end = Lsn::new(self.epoch, self.written_off as u32);
         if self.spare_ready() {
             let shared = Arc::clone(&self.shared);
+            let synced = Arc::new(RolloverSync::default());
+            let settle = Arc::clone(&synced);
             // A failure poisons the stream at once and surfaces from the next `write_buf`.
-            self.rollover_sync = Some(self.shared.submit_durable_sync(&self.file).map(move |r| {
-                r?;
-                shared.durable.fetch_max(end.0, Ordering::Release);
-                Ok(())
+            drop(self.shared.submit_durable_sync(&self.file).map(move |r| {
+                if r.is_ok() {
+                    shared.durable.fetch_max(end.0, Ordering::Release);
+                }
+                settle.settle(&r);
+                r
             }));
+            self.start_segment(end.epoch(), end.offset(), false)?;
+            // Hold the header back; the records after it are written as they come.
+            let frame = self.buf.split_off(0);
+            self.written_off = FRAME;
+            self.held = Some(HeldHeader {
+                frame,
+                at: self.slot as u64 * self.segment_size,
+                prev_end: end,
+                synced,
+                stale: self.stale,
+            });
+            return Ok(());
         } else {
             self.shared.durable_sync(|| self.file.sync_data())?;
             self.shared.durable.fetch_max(end.0, Ordering::Release);
@@ -996,14 +1171,36 @@ impl WalStream {
 
     /// Refuses work on a poisoned stream. A rollover sync whose failure poisoned it reports
     /// its own error first (its caller learns why, e.g. `Crashed`).
+    /// Refuses work on a poisoned stream. A rollover sync whose failure poisoned it reports
+    /// its own error first (its caller learns why, e.g. `Crashed`).
     fn check_poisoned(&mut self) -> Result<()> {
         if self.shared.poisoned.load(Ordering::Acquire) {
-            if let Some(synced) = self.rollover_sync.take() {
-                synced.wait()?;
+            if let Some(e) = self.held.as_ref().and_then(|h| h.synced.take_error()) {
+                return Err(e.into());
             }
             return Err(Error::Poisoned);
         }
         Ok(())
+    }
+
+    /// Writes the held header once the previous segment's sync is durable; leaves it held
+    /// while that sync is in flight (never waits). A failed sync has poisoned the stream.
+    fn release_header(&mut self) -> Result<()> {
+        let Some(held) = &self.held else {
+            return Ok(());
+        };
+        match held.synced.done() {
+            None => Ok(()),
+            Some(false) => Err(held
+                .synced
+                .take_error()
+                .map_or(Error::Poisoned, Error::from)),
+            Some(true) => {
+                self.file.write_at(&held.frame, held.at)?;
+                self.held = None;
+                Ok(())
+            }
+        }
     }
 
     /// Poisons the stream if `r` is an I/O or format failure (argument errors leave it usable).
@@ -1015,9 +1212,7 @@ impl WalStream {
     }
 
     fn write_buf(&mut self) -> Result<()> {
-        if let Some(synced) = self.rollover_sync.take() {
-            synced.wait()?;
-        }
+        self.release_header()?;
         if !self.buf.is_empty() {
             let at = self.slot as u64 * self.segment_size + self.written_off;
             self.file.write_at(&self.buf, at)?;
@@ -1067,6 +1262,10 @@ impl Wal for WalStream {
     }
 
     fn sync(&mut self) -> Result<Lsn> {
+        // Blocking by contract (tests, shutdown): a held header waits for its rollover sync.
+        if let Some(held) = &self.held {
+            held.synced.wait();
+        }
         let lsn = self.write()?;
         let r = self.shared.durable_sync(|| self.file.sync_data());
         self.poison_on_err(r)?;
@@ -1076,16 +1275,58 @@ impl Wal for WalStream {
 
     fn submit_sync(&mut self) -> Result<Completion<Lsn>> {
         let lsn = self.write()?;
-        let shared = Arc::clone(&self.shared);
-        Ok(self.shared.submit_durable_sync(&self.file).map(move |r| {
-            r?;
-            shared.durable.fetch_max(lsn.0, Ordering::Release);
-            Ok(lsn)
-        }))
+        let Some(held) = &self.held else {
+            let shared = Arc::clone(&self.shared);
+            return Ok(self.shared.submit_durable_sync(&self.file).map(move |r| {
+                r?;
+                shared.durable.fetch_max(lsn.0, Ordering::Release);
+                Ok(lsn)
+            }));
+        };
+        // The header still waits for the previous segment's sync: chain this sync after it
+        // and after the header's write, without waiting here (#19). Everything appended so
+        // far is written already, up to `upto`.
+        let upto = Lsn::new(self.epoch, self.written_off as u32);
+        let (done, resolver) = Completion::pair();
+        let (shared, file) = (Arc::clone(&self.shared), Arc::clone(&self.file));
+        let (frame, at) = (held.frame.clone(), held.at);
+        let rollover = Arc::clone(&held.synced);
+        held.synced.then(move |ok| {
+            if !ok {
+                resolver.resolve(Err(rollover.chained_error()));
+                return;
+            }
+            let mut header = pigeonhole_io::IoBuf::zeroed(frame.len());
+            header.copy_from_slice(&frame);
+            // The same bytes the stream writes when it releases the header itself.
+            drop(file.submit_write(header, at).map(move |r| {
+                if let Err(e) = r {
+                    shared.poisoned.store(true, Ordering::Release);
+                    resolver.resolve(Err(e));
+                    return Ok(());
+                }
+                let synced = Arc::clone(&shared);
+                drop(shared.submit_durable_sync(&file).map(move |r| {
+                    let r = r.map(|()| {
+                        synced.durable.fetch_max(upto.0, Ordering::Release);
+                        upto
+                    });
+                    resolver.resolve(r);
+                    Ok(())
+                }));
+                Ok(())
+            }));
+        });
+        Ok(done)
     }
 
     fn written(&self) -> Lsn {
-        Lsn::new(self.epoch, self.written_off as u32)
+        // Records written under a held header are not handed over yet: a process crash
+        // would lose them with the header (#19).
+        match &self.held {
+            Some(held) => held.prev_end,
+            None => Lsn::new(self.epoch, self.written_off as u32),
+        }
     }
 
     fn durable(&self) -> Lsn {
@@ -1106,6 +1347,30 @@ impl Wal for WalStream {
 
     fn spares(&self) -> Option<SpareSegments> {
         Some(WalStream::spares(self))
+    }
+
+    fn blocked(&self) -> bool {
+        // The current segment's header still waits for the previous rollover's sync, and a
+        // quarter of the segment or less is left: filling it would have to wait for that
+        // sync on this thread (#19).
+        self.held
+            .as_ref()
+            .is_some_and(|h| h.synced.done().is_none())
+            && self.segment_size - self.append_pos() <= self.segment_size / 4
+    }
+
+    fn notify_unblocked(&self, wake: Box<dyn FnOnce() + Send>) {
+        match &self.held {
+            Some(h) if h.synced.done().is_none() => {
+                // One call per time the engine holds a group back (`blocked`): counted.
+                self.shared
+                    .counters
+                    .rollover_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                h.synced.then(move |_| wake());
+            }
+            _ => wake(),
+        }
     }
 
     fn remove(self: Box<Self>) -> Result<()> {

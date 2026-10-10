@@ -163,6 +163,28 @@ The two write shapes pay for the index's bookkeeping:
 4. **Trimming the write cost** (a cheaper column test; no tail for short chains) stays a separately measured follow-up. If it wins, it lowers those two ceilings again.
 5. **The #405 gate run** still reports the wide-row read and scan p99 with the index on; it no longer decides enabling.
 
+<a id="d200"></a>
+## D200 — A WAL rollover never waits on the shard thread for the full segment's sync: only the successor's header waits, and its records are written meanwhile (coordinator decision, 2026-10-10; wal, engine, #19; amends D30)
+**Before.** D30 let a rollover submit the full segment's sync when a spare slot was ready, but the next `write` waited for that sync before writing the successor's header. With no spare ready, the rollover synced inline (D30's exception).
+
+**Now (#19 PR 1).** The rollover submits the sync and holds back only the successor's header frame:
+- **Records go first.** The records after the header are written as they come, into the slot, at their offsets. FORMAT §10.1 rule 1 now says explicitly that this is allowed.
+  - Until the header is written, the slot keeps a stale header: zeros, or a recycled slot's older epoch, at least two below the new one.
+  - That header cannot be chained to the full segment, and replay stops at the first fragment of another epoch, so the early frames are never replayed.
+- **Nothing is acknowledged on them before the header.** `Wal::written` stays at the full segment's end while the header is held, so a Buffered commit in the successor is not met by a `write`.
+  - The engine resolves such a group through a sync, which writes the header first.
+  - A Buffered ticket is met by `written` or by `durable`, since durable implies handed over.
+- **A sync submitted meanwhile** is chained: the rollover sync completes, then the header is written (a submitted write), then the group's `sync_data`, then the completion resolves.
+- **The stream releases the header itself** on its first write after the rollover sync completed, checked without waiting.
+- **The edge.** A segment nearly full (a quarter or less left) while its own header is still held: `Wal::blocked` holds the engine's next group back, and `Wal::notify_unblocked` kicks the shard when the sync completes.
+  - Counted: `WalCounters::rollover_blocks` (episodes), and `Metrics::wal_rollover_blocks`.
+  - A single group larger than that quarter would still wait, counted in `WalCounters::rollover_waits`. At the default 64 MiB segments it should never happen.
+- **What remains of D30's exception:** the inline sync when no spare slot is ready, removed by #19 PR 2.
+- **Checked by:**
+  - the wal crash sweep with deferred I/O, crashing inside the window over recycled slots (closest stale epoch two below the held one): no acknowledged commit is lost, and no early frame replays;
+  - a process-kill sweep inside the window, for Buffered;
+  - a mutation check: acknowledging Buffered records under a held header loses commits.
+
 <a id="d201"></a>
 ## D201 — The row cache: per-row write watermarks as epochs, latest reads of the newest version only, gets consult without filling (approved; coordinator, 2026-10-10; cache, engine, pigeonhole, #404; plan approved, measurement decides the default)
 The spec lists a per-family row cache "for small, very hot rows, keyed by (row, family, snapshot-epoch)", and `RowCache` exists, keyed by an engine-supplied epoch. #404 wires it.

@@ -128,6 +128,10 @@ pub struct Metrics {
     /// WAL rollovers that synced the full segment on a shard thread because no spare slot
     /// was ready (decision D30's exception, #19).
     pub wal_inline_syncs: u64,
+    /// Times a shard held a group back because its WAL stream's segment was nearly full
+    /// while that segment's header still waited for the previous segment's sync (#19).
+    /// Expected to stay near 0.
+    pub wal_rollover_blocks: u64,
     /// File growths and the nanoseconds they held the page allocator across a `fallocate`
     /// and a `sync_all` (#28, #182).
     pub file_growths: (u64, u64),
@@ -1690,6 +1694,7 @@ impl Engine {
             m.unpin.0 += s.unpin_passes.load(Ordering::Relaxed);
             m.unpin.1 += s.unpin_flushes.load(Ordering::Relaxed);
             m.wal_inline_syncs += s.wal.get().map_or(0, |c| c.inline_rollover_syncs());
+            m.wal_rollover_blocks += s.wal.get().map_or(0, |c| c.rollover_blocks());
         }
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);

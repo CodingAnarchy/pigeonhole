@@ -90,7 +90,17 @@ fn workload(vfs: &VfsRef, opts: WalOptions, seed: u64) -> Trace {
             }
         }
         let synced = match strongest {
-            Durability::Buffered => wal.write().map(|_| false),
+            // As the engine does: Buffered records a held segment header covers (#19) are
+            // not handed over by `write`, so their group is resolved through a sync.
+            Durability::Buffered => wal.write().and_then(|_| {
+                if group.iter().all(|t| wal.satisfies(t)) {
+                    Ok(false)
+                } else {
+                    wal.submit_sync()
+                        .and_then(|c| c.wait().map_err(Error::from))
+                        .map(|_| true)
+                }
+            }),
             Durability::Sync => wal.sync().map(|_| true),
             _ => wal
                 .submit_sync()
@@ -427,4 +437,221 @@ fn a_slot_grown_before_a_process_crash_survives_a_later_power_loss() {
     assert_eq!(got.seqnos(), [1, 2]);
     assert_eq!(got.end, t2.end);
     assert!(t2.end > t1.end);
+}
+
+// ---- crash points inside a rollover's window (#19) ----
+
+/// What the deferred workload saw: the trace, and the held header (epoch, stale epoch) when
+/// it stopped, if a crash hit inside a rollover's window.
+struct DeferredRun {
+    trace: Trace,
+    held_at_crash: Option<(u32, Option<u32>)>,
+}
+
+/// Completes deferred I/O until `done` holds or nothing is in flight.
+fn drive(sim: &SimVfs, done: impl Fn() -> bool) {
+    while !done() && sim.complete_io() {}
+}
+
+/// The workload with deferred I/O: syncs complete only when the harness completes them, in
+/// a seeded order, so a rollover's sync is often still in flight while the next records are
+/// written under the successor's held-back header. The workload checks `blocked` before each
+/// append and completes I/O while it holds, as the engine waits for `notify_unblocked`.
+fn deferred_workload(sim: &std::sync::Arc<SimVfs>, opts: WalOptions, seed: u64) -> DeferredRun {
+    deferred_workload_until(sim, opts, seed, u64::MAX)
+}
+
+/// [`deferred_workload`], stopping before its append number `appends` (mid-group) with
+/// whatever is in flight still in flight (no final completion).
+fn deferred_workload_until(
+    sim: &std::sync::Arc<SimVfs>,
+    opts: WalOptions,
+    seed: u64,
+    appends: u64,
+) -> DeferredRun {
+    sim.set_deferred_io(true);
+    let vfs: VfsRef = sim.clone();
+    let mut rng = Rng(seed);
+    let mut trace = Trace::default();
+    let mut held_at_crash = None;
+    let mut wal = match WalStream::create(&vfs, db(), STREAM, DB_ID, opts) {
+        Ok(w) => w,
+        Err(e) => {
+            note(&mut trace, e);
+            return DeferredRun {
+                trace,
+                held_at_crash,
+            };
+        }
+    };
+    let mut seqno = 0;
+    'groups: for _ in 0..GROUPS * 3 {
+        let n = 1 + rng.below(4);
+        let mut group = Vec::new();
+        let mut strongest = Durability::Buffered;
+        for _ in 0..n {
+            seqno += 1;
+            let rec = batch(seqno, rng.below(30_000) as usize);
+            let level = [
+                Durability::Buffered,
+                Durability::GroupSync,
+                Durability::Sync,
+            ][rng.below(3) as usize];
+            strongest = strongest.max(level);
+            if seqno > appends {
+                return DeferredRun {
+                    held_at_crash: wal.held_header(),
+                    trace,
+                };
+            }
+            drive(sim, || !wal.blocked());
+            let appended = wal.append(&rec.record(), level);
+            if appended.is_err() {
+                held_at_crash = wal.held_header();
+            }
+            match appended {
+                Ok(t) => {
+                    group.push(t);
+                    trace.appended.push((t, rec));
+                }
+                Err(e) => {
+                    note(&mut trace, e);
+                    break 'groups;
+                }
+            }
+        }
+        let written = wal.write();
+        let synced = written.and_then(|_| {
+            if strongest == Durability::Buffered && group.iter().all(|t| wal.satisfies(t)) {
+                return Ok(false);
+            }
+            let c = wal.submit_sync()?;
+            drive(sim, || c.is_ready());
+            c.wait().map_err(Error::from).map(|_| true)
+        });
+        match synced {
+            Ok(synced) => {
+                for t in &group {
+                    if synced || t.durability == Durability::Buffered {
+                        assert!(wal.satisfies(t), "seed {seed}: {t:?} not satisfied");
+                        trace.acked.push(*t);
+                    }
+                }
+            }
+            Err(e) => {
+                held_at_crash = wal.held_header();
+                note(&mut trace, e);
+                break;
+            }
+        }
+        // Leave a seeded number of operations in flight (a rollover's sync among them).
+        for _ in 0..rng.below(3) {
+            sim.complete_io();
+        }
+        // Checkpoint often, so slots are recycled and successors land on stale headers.
+        if rng.below(2) == 0 {
+            let cp = group[rng.below(group.len() as u64) as usize].end;
+            if cp > trace.checkpoint && cp <= wal.durable() {
+                if let Err(e) = wal.checkpoint(cp) {
+                    note(&mut trace, e);
+                    break;
+                }
+                trace.checkpoint = cp;
+            }
+        }
+        if held_at_crash.is_none() {
+            held_at_crash = wal.held_header();
+        }
+    }
+    // The run ended without a crash (or with one between calls): what is held now.
+    sim.complete_all_io();
+    DeferredRun {
+        trace,
+        held_at_crash,
+    }
+}
+
+#[test]
+fn crashes_inside_a_rollovers_window_lose_no_acknowledged_commit() {
+    // FORMAT §10.1 rule 1 lets a successor's records be written before its header, which
+    // waits for the full segment's sync: under the slot's stale header (a recycled slot's
+    // older epoch) they must never replay, and every acknowledged commit must survive.
+    let opts = opts(16, 1);
+    let (mut in_window, mut over_recycled) = (0, 0);
+    let mut closest_stale = u32::MAX;
+    for seed in 0..4u64 {
+        let dry = SimVfs::new(seed);
+        let run = deferred_workload(&dry, opts, seed);
+        assert_eq!(run.trace.unexpected, None, "seed {seed}");
+        let total = dry.mutating_ops();
+        for n in 1..=total {
+            for (torn, reorder) in [(false, false), (true, true)] {
+                let mut plan = FaultPlan::none();
+                plan.torn_writes = torn;
+                plan.reorder_unsynced = reorder;
+                plan.crash_after_ops = Some(n);
+                let sim = SimVfs::with_faults(seed, plan);
+                let run = deferred_workload(&sim, opts, seed);
+                let ctx = format!(
+                    "seed {seed} crash after op {n} torn={torn} reorder={reorder} held {:?}",
+                    run.held_at_crash
+                );
+                assert_eq!(run.trace.unexpected, None, "{ctx}");
+                if sim.mutating_ops() < n {
+                    continue;
+                }
+                if let Some((epoch, stale)) = run.held_at_crash {
+                    in_window += 1;
+                    if let Some(stale) = stale {
+                        over_recycled += 1;
+                        closest_stale = closest_stale.min(epoch - stale);
+                    }
+                }
+                let vfs: VfsRef = sim.clone();
+                if !vfs.exists(&path()).unwrap() {
+                    assert!(run.trace.acked.is_empty(), "{ctx}: acked without a file");
+                    continue;
+                }
+                check(&vfs, &run.trace, durable_levels, &ctx);
+            }
+        }
+    }
+    // The sweep did crash inside the window, over recycled slots too.
+    assert!(
+        in_window > 0 && over_recycled > 0,
+        "{in_window} in the window, {over_recycled} over a recycled slot"
+    );
+    eprintln!(
+        "{in_window} crashes in a rollover window, {over_recycled} over a recycled slot; closest stale epoch {closest_stale} below the held one"
+    );
+}
+
+#[test]
+fn buffered_survives_a_process_kill_inside_a_rollovers_window() {
+    // Records written under a held-back header are not handed over (`written` stays at the
+    // full segment's end), so no Buffered commit is acknowledged on them until the header
+    // is written: a process kill then loses no acknowledged commit at any level.
+    let opts = opts(16, 1);
+    let mut in_window = 0;
+    for seed in 200..212u64 {
+        for appends in 1..GROUPS * 6 {
+            let sim = SimVfs::new(seed);
+            let run = deferred_workload_until(&sim, opts, seed, appends);
+            assert_eq!(run.trace.unexpected, None, "seed {seed}");
+            in_window += usize::from(run.held_at_crash.is_some());
+            sim.crash(CrashKind::Process);
+            let vfs: VfsRef = sim.clone();
+            check(
+                &vfs,
+                &run.trace,
+                |_| true,
+                &format!(
+                    "seed {seed} process kill after {appends} appends, held {:?}",
+                    run.held_at_crash
+                ),
+            );
+        }
+    }
+    assert!(in_window > 0, "no kill landed inside a rollover's window");
+    eprintln!("{in_window} process kills inside a rollover window");
 }

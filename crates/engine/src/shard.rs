@@ -1890,6 +1890,9 @@ pub(crate) struct ShardState {
     pub(crate) id: ShardId,
     shared: Arc<Shared>,
     pub(crate) wal: Option<Box<dyn Wal>>,
+    /// The WAL stream reported itself blocked and will kick the shard when it is not (#19):
+    /// groups wait meanwhile.
+    wal_blocked: bool,
     /// A write or sync failed: the stream is poisoned until reopen.
     poisoned: bool,
     /// End of the newest PREPARE or COMMIT record given a ticket since open. Other shards' flushes
@@ -2142,6 +2145,7 @@ impl ShardState {
             id,
             shared,
             wal: None,
+            wal_blocked: false,
             poisoned: false,
             cross_end: Lsn::default(),
             cross_durable_at_close: false,
@@ -3675,6 +3679,28 @@ impl ShardState {
 
     // ---- stalls ----
 
+    /// Whether the group must wait for the WAL stream (#19): its segment is nearly full while
+    /// the segment's header still waits for the previous one's rollover sync, so appending
+    /// on would wait for that sync on this thread. The stream kicks the shard once it can
+    /// take more.
+    fn wal_held_back(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) -> bool {
+        let Some(wal) = self.wal.as_ref() else {
+            return false;
+        };
+        if !wal.blocked() {
+            self.wal_blocked = false;
+            return false;
+        }
+        if !self.wal_blocked {
+            self.wal_blocked = true;
+            let submitter = ctx.submitter(self.id).clone();
+            wal.notify_unblocked(Box::new(move || {
+                let _ = submitter.submit(ShardMsg::Kick);
+            }));
+        }
+        true
+    }
+
     /// Whether the group must wait for the token bucket (L0 too deep). Spawns the timer
     /// that re-kicks the shard once a token is due.
     fn stalled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) -> bool {
@@ -3776,7 +3802,7 @@ impl ShardState {
             self.pending.len(),
             self.stall.score
         );
-        if self.stalled(ctx) {
+        if self.wal_held_back(ctx) || self.stalled(ctx) {
             return;
         }
         self.refresh_tablets();
@@ -4224,7 +4250,15 @@ impl ShardState {
                 self.fail_all(group.members, ctx);
                 return;
             }
-            if need_group_sync && unsynced {
+            // A Buffered ticket `write` did not cover: its record is in a segment whose
+            // header still waits for the previous rollover's sync (#19). Resolve the group
+            // through a sync then, which writes that header first.
+            let held = last_sync.is_none()
+                && group
+                    .members
+                    .iter()
+                    .any(|m| m.ticket.is_some_and(|t| !wal.satisfies(&t)));
+            if (need_group_sync && unsynced) || held {
                 match wal.submit_sync() {
                     Ok(c) => last_sync = Some(c),
                     Err(_) => {
