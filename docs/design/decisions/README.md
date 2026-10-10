@@ -213,7 +213,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D197](phase-3.md#d197) — The Phase 3 gate is binding on its contents: every roadmap item and every Goals-table target in the #406 checklist, on the reference hardware · owner decision, #406, #405 · amends the spec Phase 3 gate
 - [D198](phase-3.md#d198) — A commit crosses threads with a bounded, adaptive spin before parking (client and engine-owned shards, about 15 and 50 µs, settable to 0); combining (the caller runs its idle shard) only on measured evidence · owner decision, #64, #416
 - [D199](phase-3.md#d199) — The stale-tail index is on by default; its write cost (commit-overwrite +1.57%, commit-at +0.88%) is accepted for its read gains (ycsb-a −35%, ycsb-c −43%, hot row −19%) · owner decision, #387 · amends D194
-- [D200](phase-3.md#d200) — A WAL rollover never waits on the shard thread for the full segment's sync: only the successor's header waits (FORMAT §10.1 rule 1 now allows its records first); Buffered groups in that window resolve through a sync · coordinator decision, #19 · amends D30
+- [D200](phase-3.md#d200) — A WAL rollover never waits on the shard thread for the full segment's sync: only the successor's header waits (FORMAT §10.1 rule 1 now allows its records first); Buffered groups in that window resolve through a sync; with no spare slot ready the engine holds its group back while one is prepared, dropping D30's inline exception · coordinator decision, #19 · amends D30
 - [D201](phase-3.md#d201) — The row cache: per-row write watermarks as epochs, latest newest-version reads only, gets consult without filling · cache, engine, pigeonhole, #404 · default decided by measurement (D197)
 
 ## Open questions

@@ -179,7 +179,16 @@ The two write shapes pay for the index's bookkeeping:
 - **The edge.** A segment nearly full (a quarter or less left) while its own header is still held: `Wal::blocked` holds the engine's next group back, and `Wal::notify_unblocked` kicks the shard when the sync completes.
   - Counted: `WalCounters::rollover_blocks` (episodes), and `Metrics::wal_rollover_blocks`.
   - A single group larger than that quarter would still wait, counted in `WalCounters::rollover_waits`. At the default 64 MiB segments it should never happen.
-- **What remains of D30's exception:** the inline sync when no spare slot is ready, removed by #19 PR 2.
+- **D30's exception is dropped (#19 PR 2).** With no recyclable or prepared slot ready, a segment's last quarter also makes `Wal::blocked` true.
+  - The engine prepares a spare at once, ahead of its usual "half a segment in" schedule. The preparation wakes `Wal::notify_unblocked`'s waiters.
+  - So a rollover never grows the file or syncs inline in steady state. `SpareSegments::prepare` now zero-fills blank slots instead of counting them as spares.
+- **What is left inline: two counted fallbacks, never steady state.**
+  1. A group larger than the segment's last quarter.
+  2. A failed preparation (a full disk, say). The stream then stops waiting and rolls over inline, which reports the failure.
+  - `inline_rollover_syncs`, `inline_grows` and `rollover_waits` count them.
+- **A permanent debug guard checks all of this.**
+  - The engine wraps its group commit in `StrictForeground`. Inside it, a blocking sync or wait reached from `append`, `write` or `submit_sync` panics in debug builds, except in those counted fallbacks.
+  - Release builds compile it out.
 - **Checked by:**
   - the wal crash sweep with deferred I/O, crashing inside the window over recycled slots (closest stale epoch two below the held one): no acknowledged commit is lost, and no early frame replays;
   - a process-kill sweep inside the window, for Buffered;

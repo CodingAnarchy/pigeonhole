@@ -136,7 +136,7 @@ WAL group syncs use `Wal::submit_sync` and root commits use `Pager::submit_commi
 
 **One recorded exception (audit, K5/K19).** FORMAT §10.1 rule 1 requires a full WAL segment to be durable before its successor's header is written. When a recyclable or prepared spare slot is ready, `WalStream`'s rollover submits that sync too, and the next write waits for it before writing the successor's header (normally it has already completed). A rollover syncs inline, on the shard thread, **only when no prepared spare is ready** (it then takes a blank slot or grows the file inline). Both are counted in metrics (`WalStream::inline_rollover_syncs`, `WalStream::inline_grows`) and stay at zero when spares are prepared in time (D35). Making rollover fully off-thread is Phase 3 work ([#19](https://github.com/CodingAnarchy/pigeonhole/issues/19)).
 
-**Amended by [D200](phase-3.md#d200):** the next write no longer waits for the rollover sync; only the successor's header waits for it.
+**Amended by [D200](phase-3.md#d200):** the next write no longer waits for the rollover sync, and only the successor's header waits for it. The exception is dropped: with no spare slot ready, the engine holds its group back while one is prepared, so a rollover never syncs or grows inline in steady state. Only counted fallbacks remain (an oversized group, a failed preparation).
 
 <a id="d31"></a>
 ## D31 — merge operators are associative folds (approved)
