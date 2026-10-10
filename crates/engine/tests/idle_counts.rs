@@ -3,7 +3,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pigeonhole_engine::{Engine, EngineOptions, FamilyOptions, ValueRef, WriteBatch};
 use pigeonhole_format::Durability;
@@ -19,14 +19,31 @@ fn commits_after_idle_pauses_count_parks_and_wakes() {
     // The client parks at once, so a commit that finds the shard asleep parks too.
     o.commit_spin_nanos = 0;
     let db = Engine::open(&dir.join("idle.phdb"), o).unwrap();
+    // Waits until the shard has parked since its park count was `seen`: a sleep alone does
+    // not guarantee it, since a loaded runner can keep the shard thread in its spin (whose
+    // yields drop its priority) past any fixed pause. Returns the new count.
+    let parked_after = |seen: u64| {
+        let start = Instant::now();
+        loop {
+            let parks = db.metrics().shard_idle.0;
+            if parks > seen {
+                return parks;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the shard did not park within 5 s ({parks} parks)"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // Read before the table is made: making it guarantees a later park, while the shard
+    // may already have parked again by the time it returns.
+    let seen = db.metrics().shard_idle.0;
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
     let f = t.families[0].id;
-    // Pauses far past the shard's 50 µs spin: the shard has parked before `before`, and
-    // parks again after each commit, before `after`.
-    let pause = || std::thread::sleep(Duration::from_millis(20));
-    pause();
+    let mut parks = parked_after(seen);
     let before = db.metrics();
     const COMMITS: u64 = 5;
     for i in 0..COMMITS {
@@ -40,8 +57,9 @@ fn commits_after_idle_pauses_count_parks_and_wakes() {
             ValueRef::Bytes(b"v"),
         )
         .unwrap();
+        // The shard is parked: this commit wakes it, and it parks again once idle.
         db.commit(wb, None).unwrap();
-        pause();
+        parks = parked_after(parks);
     }
     let after = db.metrics();
     let parks = after.shard_idle.0 - before.shard_idle.0;
