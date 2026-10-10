@@ -634,11 +634,12 @@ impl SimVfs {
         CURRENT_PROCESS.with(|m| m.borrow_mut().insert(self.id, process));
     }
 
-    /// Defers I/O submitted from now on (`submit_read`, `submit_write`, `submit_sync_data`):
-    /// each operation stays in flight until [`SimVfs::complete_io`] (or a blocking
-    /// [`Completion::wait`] on it) runs it, so a simulated run has I/O in flight across its
-    /// scheduling points, as on a real device. Off (the default), submitted I/O completes
-    /// before `submit_*` returns. Turning it off leaves operations already in flight there.
+    /// Defers I/O submitted from now on (`submit_read`, `submit_write`, `submit_sync_data`,
+    /// `submit_sync_all`, `submit_sync_dir`): each operation stays in flight until
+    /// [`SimVfs::complete_io`] (or a blocking [`Completion::wait`] on it) runs it, so a
+    /// simulated run has I/O in flight across its scheduling points, as on a real device. Off
+    /// (the default), submitted I/O completes before `submit_*` returns. Turning it off
+    /// leaves operations already in flight there.
     ///
     /// Someone must complete deferred I/O: the scheduler (`pigeonhole-sim`'s `Sim` does it
     /// as one more task), the harness, or [`SimVfs::complete_io_in_background`] for code
@@ -1188,6 +1189,10 @@ impl File for SimFile {
 
     fn sync_all(&self) -> Result<()> {
         self.sync(true)
+    }
+
+    fn submit_sync_all(&self) -> Completion<()> {
+        self.vfs.submit(self, SimFile::sync_all)
     }
 
     fn len(&self) -> Result<u64> {

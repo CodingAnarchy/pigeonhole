@@ -196,6 +196,46 @@ impl<T: Send + 'static> Completion<T> {
     }
 }
 
+impl Completion<()> {
+    /// `n` completions that each resolve with this one's outcome, for one operation several
+    /// waiters depend on (one directory sync covering several new files, #158). A blocking
+    /// [`Completion::wait`] on any of them makes progress on this one's I/O as a wait on it
+    /// would. A failure reaches the first with its OS error, and the others as an error of
+    /// the same kind and context.
+    ///
+    /// ```
+    /// use pigeonhole_io::Completion;
+    ///
+    /// let (c, resolver) = Completion::<()>::pair();
+    /// let fanned = c.fan_out(3);
+    /// assert!(fanned.iter().all(|c| !c.is_ready()));
+    /// resolver.resolve(Ok(()));
+    /// assert!(fanned.into_iter().all(|c| c.wait().is_ok()));
+    /// ```
+    pub fn fan_out(self, n: usize) -> Vec<Completion<()>> {
+        let drive = match &self.inner {
+            Inner::Pending(shared) => shared.drive.clone(),
+            Inner::Ready(_) => None,
+        };
+        let (out, resolvers): (Vec<_>, Vec<_>) = (0..n)
+            .map(|_| Completion::driven_pair(drive.clone()))
+            .unzip();
+        drop(self.map(move |r| {
+            let copy = r.as_ref().err().map(|e| (e.kind, e.context));
+            let mut first = Some(r);
+            for resolver in resolvers {
+                resolver.resolve(match (first.take(), copy) {
+                    (Some(r), _) => r,
+                    (None, Some((kind, context))) => Err(Error::new(kind, context)),
+                    (None, None) => Ok(()),
+                });
+            }
+            Ok(())
+        }));
+        out
+    }
+}
+
 fn taken<T>(result: Option<Result<T>>) -> Result<T> {
     result.expect("completion polled after it finished")
 }

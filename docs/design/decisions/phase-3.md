@@ -293,6 +293,7 @@ The internal interface change is ICR 0019.
   - **No blocking flush:** a clean reopen makes no blocking `sync_data`, `sync_all` or `sync_dir` on the opening thread. Putting back any one of the three fails it.
   - **Crash sweeps:** power loss after every mutating operation of a reopen and its first GroupSync commit, after a clean close and after a process kill (the recovering path), with deferred I/O. Nothing acknowledged is lost.
   - **Ordering:** with the directory sync held (`SimVfs::hold_dir_syncs`), a GroupSync commit after a clean reopen is not acknowledged, and a power loss then loses nothing. Taking the directory sync out of the streams' ordering fails it.
+- `wal/tests/open_io.rs`: a blocking sync right after `create_all`, with nothing else completing I/O, drives the open-time syncs to completion rather than waiting for ever (the hang the first sweep found). Mutation-checked: without the drive, or with fanned-out handles that lose it, it hangs.
 - `pager/tests/open_sync.rs`: a clean close at the recorded length skips the length sync. An unclean close, or a length longer or shorter than recorded, syncs. Each condition is mutation-checked.
 
 <a id="d204"></a>
