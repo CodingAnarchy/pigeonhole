@@ -40,7 +40,9 @@ Anything left for later is a GitHub issue titled `[crate] summary`, labeled with
 4. Open a pull request against `main`. CI must be green before merge.
 
 ## Releases
-Before tagging a release: update [`CHANGELOG.md`](CHANGELOG.md) (move `Unreleased` entries under the new version), update the maturity note in `README.md`, `crates/pigeonhole/README.md`, `docs/guide/README.md` and `docs/status.md`, and check the install version in the READMEs and `docs/guide/getting-started.md`.
+A PR with a user-visible change adds a fragment file under [`changelog.d/`](changelog.d/README.md) instead of editing `CHANGELOG.md`, so parallel PRs don't conflict.
+
+Before tagging a release: update [`CHANGELOG.md`](CHANGELOG.md) (fold the `changelog.d/` fragments and any `Unreleased` entries under the new version, then delete the fragments), update the maturity note in `README.md`, `crates/pigeonhole/README.md`, `docs/guide/README.md` and `docs/status.md`, and check the install version in the READMEs and `docs/guide/getting-started.md`.
 
 ## Seed sweeps and local resources
 Several agents often build and test on one machine, so local runs stay small:
