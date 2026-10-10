@@ -30,28 +30,29 @@
 # gets 1.0% headroom and a 1.0% per-change threshold; commit-at by 0.05% (11661-11667).
 #
 # Lowered after #420 (a 144-byte shard message: commit-one -5%) and #421 (commit spin options),
-# and with the ycsb shapes deterministic (#434), from this PR's head run on main f9056a1
+# and with the ycsb shapes deterministic (#434), from this PR's head run on main f9056a1 (run
+# 38025169628)
 # (`instruction-ceilings.py lower`; nothing raised).
 
-as-written 2573 0.3
-flushed 1912 0.3
-compacted 1287 0.3
-get-mem 7270 0.3
-get-sst 17958 0.5
+as-written 2544 0.3
+flushed 1882 0.3
+compacted 1279 0.3
+get-mem 7269 0.3
+get-sst 17516 0.5
 get-miss 4628 0.3
-row 2574 1.0
-scan 1440 0.3
-scan-filtered 7458 0.3
-versions 5802 0.3
-counter 9855 0.3
-rows 20413 0.3
-level-scans 15095 0.6
-short-scans 14518 0.3
-commit-one 10714 0.6
-commit-sixteen 52858 0.3
+row 2545 1.0
+scan 1436 0.3
+scan-filtered 7422 0.3
+versions 5728 0.3
+counter 9767 0.3
+rows 20214 0.3
+level-scans 14984 0.6
+short-scans 14462 0.3
+commit-one 10176 0.6
+commit-sixteen 52301 0.3
 flush 2199 0.3
-compact 2869 0.5
-ycsb-c 85231 1.0
-ycsb-a 47131 1.0
-commit-overwrite 12679 1.0
-commit-at 11703 0.3
+compact 2867 0.5
+ycsb-c 83316 1.0
+ycsb-a 46022 1.0
+commit-overwrite 12147 1.0
+commit-at 11186 0.3
