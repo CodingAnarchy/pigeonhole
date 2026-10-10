@@ -23,6 +23,10 @@ pub enum ErrorKind {
     Crashed,
     /// Anything else; see the source error.
     Other,
+    // After `Other`, so the existing variants keep their discriminants.
+    /// Direct I/O at an offset, length or buffer address not aligned to the handle's
+    /// [`File::direct_align`](crate::File::direct_align) (#403).
+    Misaligned,
 }
 
 impl ErrorKind {
@@ -35,6 +39,7 @@ impl ErrorKind {
             ErrorKind::UnexpectedEof => "unexpected end of file",
             ErrorKind::Unsupported => "unsupported",
             ErrorKind::Crashed => "crashed",
+            ErrorKind::Misaligned => "misaligned direct I/O",
             ErrorKind::Other => "I/O error",
         }
     }

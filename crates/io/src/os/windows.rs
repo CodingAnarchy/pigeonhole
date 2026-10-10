@@ -454,3 +454,19 @@ mod tests {
         result.unwrap();
     }
 }
+
+/// Asks for direct I/O (#403) when opening: `FILE_FLAG_NO_BUFFERING`.
+pub(crate) fn open_direct(o: &mut fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    o.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING);
+}
+
+/// Nothing more to do on Windows.
+pub(crate) fn after_open_direct(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+/// The alignment unbuffered I/O needs: 4096 (a multiple of every common sector size).
+pub(crate) fn direct_align(_file: &fs::File) -> usize {
+    4096
+}

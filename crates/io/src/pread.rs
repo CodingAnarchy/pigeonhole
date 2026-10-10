@@ -98,7 +98,31 @@ impl PreadVfs {
             .write(opts.write || opts.create || opts.create_new)
             .create(opts.create && !opts.create_new)
             .create_new(opts.create_new);
-        let file = o.open(path).map_err(|e| Error::os("open", e))?;
+        if opts.direct {
+            os::open_direct(&mut o);
+        }
+        let file = o.open(path).map_err(|e| {
+            // A file system that refuses direct I/O (tmpfs, some FUSE mounts) says EINVAL.
+            if opts.direct && e.kind() == std::io::ErrorKind::InvalidInput {
+                Error {
+                    kind: ErrorKind::Unsupported,
+                    context: "open for direct I/O",
+                    source: Some(e),
+                }
+            } else {
+                Error::os("open", e)
+            }
+        })?;
+        let direct_align = if opts.direct {
+            os::after_open_direct(&file).map_err(|e| Error {
+                kind: ErrorKind::Unsupported,
+                context: "open for direct I/O",
+                source: Some(e),
+            })?;
+            Some(os::direct_align(&file))
+        } else {
+            None
+        };
         #[cfg(all(unix, not(target_os = "linux")))]
         let (file, key) = registry::register(file)?;
         Ok(Arc::new(PreadFile {
@@ -106,6 +130,7 @@ impl PreadVfs {
                 file: Some(file),
                 pool: Arc::clone(&self.pool),
                 writable: opts.write || opts.create || opts.create_new,
+                direct_align,
                 held: Mutex::new(HashMap::new()),
                 #[cfg(all(unix, not(target_os = "linux")))]
                 key,
@@ -206,6 +231,11 @@ pub(crate) struct PreadFile {
 
 #[cfg(target_os = "linux")]
 impl PreadFile {
+    /// [`FileInner::check_aligned`], for a backend that submits this file's I/O itself.
+    pub(crate) fn check_aligned(&self, ptr: *const u8, len: usize, offset: u64) -> Result<()> {
+        self.inner.check_aligned(ptr, len, offset)
+    }
+
     /// The descriptor, open as long as this handle is.
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
@@ -218,6 +248,8 @@ struct FileInner {
     file: Option<fs::File>,
     pool: Arc<Pool>,
     writable: bool,
+    /// For a direct-I/O handle (#403), the alignment every read and write must keep.
+    direct_align: Option<usize>,
     /// Locks this handle holds, by byte.
     held: Mutex<HashMap<u64, LockMode>>,
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -238,11 +270,26 @@ impl FileInner {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        self.check_aligned(buf.as_ptr(), buf.len(), offset)?;
         os::read_exact_at(self.file(), buf, offset).map_err(|e| Error::os("read", e))
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        self.check_aligned(buf.as_ptr(), buf.len(), offset)?;
         os::write_all_at(self.file(), buf, offset).map_err(|e| Error::os("write", e))
+    }
+
+    /// On a direct handle, fails a misaligned I/O before the kernel sees it, the same way on
+    /// every platform (macOS's `F_NOCACHE` would accept it; Linux would say EINVAL).
+    pub(crate) fn check_aligned(&self, ptr: *const u8, len: usize, offset: u64) -> Result<()> {
+        if let Some(a) = self.direct_align
+            && (!offset.is_multiple_of(a as u64)
+                || !len.is_multiple_of(a)
+                || !(ptr as usize).is_multiple_of(a))
+        {
+            return Err(Error::new(ErrorKind::Misaligned, "direct I/O"));
+        }
+        Ok(())
     }
 
     fn sync_data(&self) -> Result<()> {
@@ -490,6 +537,10 @@ mod registry {
 }
 
 impl File for PreadFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.inner.direct_align
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.inner.read_at(buf, offset)
     }
@@ -499,6 +550,9 @@ impl File for PreadFile {
     }
 
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
+        if let Err(e) = self.inner.check_aligned(buf.as_ptr(), buf.len(), offset) {
+            return Completion::ready(Err(e));
+        }
         let (done, resolver) = Completion::pair();
         let inner = Arc::clone(&self.inner);
         self.inner.pool.submit(Box::new(move || {
@@ -508,6 +562,9 @@ impl File for PreadFile {
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
+        if let Err(e) = self.inner.check_aligned(buf.as_ptr(), buf.len(), offset) {
+            return Completion::ready(Err(e));
+        }
         let (done, resolver) = Completion::pair();
         let inner = Arc::clone(&self.inner);
         self.inner.pool.submit(Box::new(move || {

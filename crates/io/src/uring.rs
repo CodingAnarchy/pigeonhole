@@ -164,6 +164,10 @@ impl UringFile {
 }
 
 impl File for UringFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.file.direct_align()
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.file.read_at(buf, offset)
     }
@@ -173,6 +177,9 @@ impl File for UringFile {
     }
 
     fn submit_read(&self, buf: IoBuf, offset: u64) -> Completion {
+        if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
+            return Completion::ready(Err(e));
+        }
         self.submit(|resolver| Kind::Read {
             buf,
             offset,
@@ -182,6 +189,9 @@ impl File for UringFile {
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
+        if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
+            return Completion::ready(Err(e));
+        }
         self.submit(|resolver| Kind::Write {
             buf,
             offset,

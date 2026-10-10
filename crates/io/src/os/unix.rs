@@ -597,3 +597,56 @@ mod tests {
         }
     }
 }
+
+/// Asks for direct I/O (#403) when opening: `O_DIRECT` on Linux. macOS sets `F_NOCACHE` after
+/// the open instead ([`after_open_direct`]).
+pub(crate) fn open_direct(o: &mut fs::OpenOptions) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_DIRECT);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = o;
+}
+
+/// Finishes opening `file` for direct I/O: `F_NOCACHE` on macOS; nothing elsewhere.
+pub(crate) fn after_open_direct(file: &fs::File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a plain fcntl on a descriptor `file` owns.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = file;
+    Ok(())
+}
+
+/// The alignment direct I/O on `file` needs: what `statx` reports (`STATX_DIOALIGN`, Linux
+/// 6.1+), else 4096 (the common device and page size, and what the simulator enforces).
+pub(crate) fn direct_align(file: &fs::File) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: zeroed `statx` is a valid out-parameter.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: an empty path with AT_EMPTY_PATH stats the descriptor itself, writing into
+        // a live `statx`.
+        let r = unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_DIOALIGN,
+                &mut stx,
+            )
+        };
+        if r == 0 && stx.stx_mask & libc::STATX_DIOALIGN != 0 && stx.stx_dio_offset_align > 0 {
+            return (stx.stx_dio_offset_align as usize).max(stx.stx_dio_mem_align as usize);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    4096
+}

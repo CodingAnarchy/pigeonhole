@@ -13,8 +13,11 @@ pub struct OpenOptions {
     pub create: bool,
     /// Fail if the file exists (implies `create`).
     pub create_new: bool,
-    /// Bypass the OS page cache (O_DIRECT / F_NOCACHE / FILE_FLAG_NO_BUFFERING) where
-    /// supported; ignored elsewhere. Phase 3.
+    /// Bypass the OS page cache (#403): `O_DIRECT` on Linux, `F_NOCACHE` on macOS,
+    /// `FILE_FLAG_NO_BUFFERING` on Windows. Every read and write on such a handle must then
+    /// be aligned ([`File::direct_align`]): its offset, its length and its buffer's address
+    /// (an [`IoBuf`] is). A file system that refuses direct I/O fails the open with
+    /// [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported); open without it instead.
     pub direct: bool,
 }
 
@@ -53,6 +56,14 @@ pub trait File: Send + Sync + Debug {
 
     /// Writes all of `buf` at `offset`.
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()>;
+
+    /// For a handle opened with [`OpenOptions::direct`], the alignment its I/O needs: offsets,
+    /// lengths and buffer addresses a multiple of it, else
+    /// [`ErrorKind::Misaligned`](crate::ErrorKind::Misaligned). `None` for a buffered
+    /// handle, whose I/O may start and end anywhere (the default).
+    fn direct_align(&self) -> Option<usize> {
+        None
+    }
 
     /// Submits a read of `buf.len()` bytes at `offset` and returns at once.
     fn submit_read(&self, buf: IoBuf, offset: u64) -> Completion;
