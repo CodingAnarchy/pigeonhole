@@ -111,11 +111,30 @@ impl Fetch {
         }
     }
 
+    /// One read of `len` bytes at `offset`. On a direct handle (#403) it covers the aligned
+    /// pages around them, and the buffer it resolves to keeps just them, in place.
+    fn submit_piece(&self, offset: u64, len: usize) -> pigeonhole_io::Completion {
+        match self.file.direct_align() {
+            None => self.file.submit_read(IoBuf::zeroed(len), offset),
+            Some(a) => {
+                let (start, alen, head) = aligned(offset, len, a);
+                self.file
+                    .submit_read(IoBuf::zeroed(alen), start)
+                    .map(move |r| {
+                        r.map(|mut b| {
+                            b.keep(head..head + len);
+                            b
+                        })
+                    })
+            }
+        }
+    }
+
     /// Submits the read through the VFS's asynchronous reads: one completion that wakes its
     /// poller once every piece has arrived.
     pub fn submit(&self) -> pigeonhole_io::Completion {
         if let [(offset, _)] = self.pieces.as_slice() {
-            return self.file.submit_read(IoBuf::zeroed(self.len), *offset);
+            return self.submit_piece(*offset, self.len);
         }
         // Several pieces: each read's continuation copies its bytes into place, and the last
         // one resolves the joined completion (or the first failure does).
@@ -132,7 +151,7 @@ impl Fetch {
         }));
         for (offset, range) in &self.pieces {
             let (join, range) = (Arc::clone(&join), range.clone());
-            let read = self.file.submit_read(IoBuf::zeroed(range.len()), *offset);
+            let read = self.submit_piece(*offset, range.len());
             // The continuation runs when the read completes, whether or not the mapped
             // completion is kept.
             drop(read.map(move |r| {
@@ -200,6 +219,46 @@ impl Fetch {
             Then::BlobRecord { reader, ptr } => Some(reader.inner.admit_record(ptr, buf)?),
         })
     }
+}
+
+/// The aligned read around `len` bytes at `offset`: its start, its length, and where the bytes
+/// begin inside it.
+fn aligned(offset: u64, len: usize, align: usize) -> (u64, usize, usize) {
+    let a = align as u64;
+    let start = offset / a * a;
+    let end = (offset + len as u64).div_ceil(a) * a;
+    (start, (end - start) as usize, (offset - start) as usize)
+}
+
+/// Reads `len` bytes at `offset` into a buffer the block cache can keep. On a direct handle
+/// (#403) the read covers the aligned pages around them and the buffer keeps just them, in
+/// place: no copy (a block's offset and length are not aligned on disk).
+pub(crate) fn read_bytes(file: &FileRef, offset: u64, len: usize) -> Result<IoBuf> {
+    match file.direct_align() {
+        None => {
+            let mut buf = IoBuf::zeroed(len);
+            file.read_at(&mut buf, offset)?;
+            Ok(buf)
+        }
+        Some(a) => {
+            let (start, alen, head) = aligned(offset, len, a);
+            let mut buf = IoBuf::zeroed(alen);
+            file.read_at(&mut buf, start)?;
+            buf.keep(head..head + len);
+            Ok(buf)
+        }
+    }
+}
+
+/// Reads exactly `out.len()` bytes at `offset` into `out`, any slice: on a direct handle
+/// through an aligned bounce buffer (a copy; for small or piecewise reads).
+pub(crate) fn read_into(file: &FileRef, out: &mut [u8], offset: u64) -> Result<()> {
+    if file.direct_align().is_none() {
+        return Ok(file.read_at(out, offset)?);
+    }
+    let buf = read_bytes(file, offset, out.len())?;
+    out.copy_from_slice(&buf);
+    Ok(())
 }
 
 /// Checks a physical block and turns it into what the cache holds: the logical block. An
@@ -303,7 +362,7 @@ impl Reader {
                 }
             }
         } else {
-            file.read_at(&mut tail, base + limit)?;
+            read_into(&file, &mut tail, base + limit)?;
         }
         let footer = Footer::decode(&tail)?;
         let blocks = Blocks {
@@ -397,8 +456,7 @@ impl Blocks {
             return Ok(h);
         }
         crate::note_file_read();
-        let mut buf = IoBuf::zeroed(addr.len as usize);
-        self.file.read_at(&mut buf, self.base + addr.offset)?;
+        let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
         let data = decode_physical(buf, kind)?;
         Ok(self.admit(addr, data, fill_cache, priority))
     }
@@ -421,8 +479,7 @@ impl Blocks {
         priority: Priority,
     ) -> Result<BlockHandle> {
         crate::note_file_read();
-        let mut buf = IoBuf::zeroed(addr.len as usize);
-        self.file.read_at(&mut buf, self.base + addr.offset)?;
+        let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
         let data = decode_physical(buf, kind)?;
         Ok(self.admit(addr, data, fill_cache, priority))
     }
@@ -508,8 +565,7 @@ impl Blocks {
         let start = first.offset;
         let end = last.offset + u64::from(last.len);
         crate::note_file_read();
-        let mut buf = IoBuf::zeroed((end - start) as usize);
-        self.file.read_at(&mut buf, self.base + start)?;
+        let buf = read_bytes(&self.file, self.base + start, (end - start) as usize)?;
         addrs
             .iter()
             .map(|a| {
