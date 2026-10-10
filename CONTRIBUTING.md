@@ -55,6 +55,7 @@ Several agents often build and test on one machine, so local runs stay small:
   ```
   Each chunk sets `PIGEONHOLE_SEED`/`PIGEONHOLE_SEEDS`; a failing chunk's log names the seed. Reproduce that one seed locally.
 - Agent worktrees carry an untracked `.cargo/config.toml` that caps build jobs and test threads; don't override it.
+- Build through [`cargo-quota`](https://crates.io/crates/cargo-quota) (`cargo install cargo-quota`): `cargo quota build`, `cargo quota test`, and so on, or a shell wrapper that routes them. It prunes the least recently used build artifacts before each build, keeping every worktree's `target/` together under the budget in `[workspace.metadata.quota]` (2% of the disk, shared across worktrees). `cargo quota status` shows where things stand. Plain `cargo` still works; the next `cargo quota` run catches up.
 
 ### Test environment variables
 These are the only `PIGEONHOLE_*` variables the code reads. All of them are for tests, and only `PIGEONHOLE_TRACE`, `PIGEONHOLE_IO`, `PIGEONHOLE_DIRECT`, `PIGEONHOLE_READAHEAD` and `PIGEONHOLE_GROUP_SYNC_DEPTH` are read by library code. Add a new one here or not at all.

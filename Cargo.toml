@@ -66,6 +66,14 @@ proptest = "1"
 loom = "0.7"
 criterion = "0.8"
 
+# Local disk budget for target/ (cargo-quota; cargo ignores this table). One pool across
+# every git worktree of the repo, pruned least recently used first; anything used within
+# the last hour is kept. Not used by CI.
+[workspace.metadata.quota]
+percent = 2
+worktrees = true
+min-age = "1h"
+
 [workspace.lints.rust]
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "deny"
