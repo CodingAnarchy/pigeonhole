@@ -2251,7 +2251,7 @@ impl Inner {
                     reply: Reply::Commit(tx),
                     submitted_at,
                     validate,
-                    predicate,
+                    predicate: predicate.map(Box::new),
                     commit_ts: None,
                     map_version: view.tablets().version(),
                     attempts: 0,
@@ -2266,7 +2266,7 @@ impl Inner {
             let coordinator = shards[0];
             self.shared
                 .submitter(coordinator)
-                .submit(ShardMsg::Coordinate(CoordinateReq {
+                .submit(ShardMsg::Coordinate(Box::new(CoordinateReq {
                     parts,
                     durability,
                     reply: tx,
@@ -2276,7 +2276,7 @@ impl Inner {
                     commit_ts: None,
                     epoch: 0,
                     attempts: 0,
-                }))?;
+                })))?;
         }
         Ok(PendingCommit {
             waiter,
@@ -2339,7 +2339,7 @@ impl Inner {
                 reply: Reply::Check(tx),
                 submitted_at,
                 validate: None,
-                predicate: Some((table, row.to_vec(), predicate.clone())),
+                predicate: Some(Box::new((table, row.to_vec(), predicate.clone()))),
                 commit_ts: None,
                 map_version: view.tablets().version(),
                 attempts: 0,
