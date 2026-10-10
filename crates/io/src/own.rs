@@ -142,8 +142,8 @@ static ORPHANS: std::sync::Mutex<Vec<Weak<dyn OrphanIo>>> = std::sync::Mutex::ne
 /// Live entries of `ORPHANS` (checked without the lock by every blocked wait).
 static ORPHAN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Registers a backend no thread reaps; it stays registered until dropped.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Registers a backend no thread reaps (application-owned io_uring's shared ring; the
+/// simulator under deferred I/O); it stays registered until dropped.
 pub(crate) fn register_orphan(orphan: Weak<dyn OrphanIo>) {
     let mut o = ORPHANS
         .lock()

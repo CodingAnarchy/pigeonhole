@@ -32,3 +32,4 @@ It is the crate-private `reap_orphans` that `Completion::wait` already uses whil
 ## Callers
 
 - `pigeonhole-wal`: `Shared::durable_sync` and the held-header/rollover wait, through one `reap_for_wait` helper: own I/O first, then orphans, then the condvar.
+- **`pigeonhole-io`'s simulator** (#454's sweep hang; the stacked PR): under deferred I/O without owner reaping, `SimVfs` registers as an orphan backend. Its `reap_orphan` runs one deferred operation, chosen by the seed, but only for the thread that turned deferred I/O on (the harness), so tests sharing a process stay independent and seeds replay. An engine wait inside the harness's own turn, behind I/O only the harness completes (a shard's final sync behind cross-shard barrier syncs, #454 seed 213), now advances the device as a real one would, instead of waiting for ever.

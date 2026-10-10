@@ -244,6 +244,9 @@ struct SimState {
     /// Whether only the submitting thread completes a deferred operation (see
     /// [`SimVfs::set_owner_reaps`]).
     owner_reaps: bool,
+    /// The thread that turned deferred I/O on, once the simulator registered as a backend
+    /// no thread reaps ([`SimVfs::set_deferred_io`]): only its blocked waits run the device.
+    orphan_thread: Option<std::thread::ThreadId>,
     /// Deferred operations not yet completed, in submission order.
     in_flight: Vec<InFlight>,
     next_io: u64,
@@ -493,6 +496,7 @@ impl SimVfs {
                 nanos: 0,
                 deferred: false,
                 owner_reaps: false,
+                orphan_thread: None,
                 in_flight: Vec::new(),
                 next_io: 0,
                 io_rng: Rng(seed ^ 0x6A09_E667_F3BC_C908),
@@ -632,8 +636,24 @@ impl SimVfs {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Without [`SimVfs::set_owner_reaps`], the simulator is then a backend no thread reaps:
+    /// the thread that turned deferred I/O on (the harness, which completes the device's
+    /// operations between its steps) runs one deferred operation, chosen by the seed, each
+    /// time it blocks in a wait that reaps such backends (`Completion::wait` with no drive
+    /// of its own, or a WAL sync behind the stream's older syncs; ICR 0028), as a real
+    /// device finishes I/O on its own. Without it, an engine wait inside the harness's own
+    /// turn, behind I/O only the harness completes, would wait for ever. Other threads'
+    /// waits never run it, so tests sharing a process stay independent and seeds replay.
     pub fn set_deferred_io(&self, on: bool) {
-        self.state().deferred = on;
+        let mut st = self.state();
+        st.deferred = on;
+        if on && st.orphan_thread.is_none() {
+            st.orphan_thread = Some(std::thread::current().id());
+            drop(st);
+            let orphan: Weak<dyn crate::own::OrphanIo> = self.me.clone();
+            crate::own::register_orphan(orphan);
+        }
     }
 
     /// With deferred I/O, completes a deferred operation only on the thread that submitted
@@ -797,6 +817,29 @@ impl SimVfs {
             }
         }
         true
+    }
+}
+
+impl crate::own::OrphanIo for SimVfs {
+    /// One deferred operation (the seed picks which; held directory syncs stay held), for
+    /// the thread that turned deferred I/O on, while it blocks; nothing in owner-reaps mode.
+    fn reap_orphan(&self, wait: Duration) -> bool {
+        {
+            let st = self.state();
+            if !st.deferred
+                || st.owner_reaps
+                || st.orphan_thread != Some(std::thread::current().id())
+            {
+                return false;
+            }
+        }
+        if self.complete(None) {
+            return true;
+        }
+        // Nothing to run (all held, or none in flight): wait as a device would, rather than
+        // spin the caller's loop.
+        std::thread::sleep(wait.min(Duration::from_millis(1)));
+        false
     }
 }
 
