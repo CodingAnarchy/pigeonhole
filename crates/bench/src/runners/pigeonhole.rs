@@ -27,6 +27,9 @@ pub(crate) struct Settings {
     pub(crate) tablet_changes: Option<bool>,
     /// Row cache bytes (`Options::row_cache`); 0, the library default, is off.
     pub(crate) row_cache: u64,
+    /// A shard's idle spin before it parks (`Options::shard_spin`, D198), in microseconds;
+    /// `None`: the library default.
+    pub(crate) shard_spin_micros: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -143,6 +146,21 @@ impl PigeonholeRunner {
         self.settings.row_cache = bytes;
         self
     }
+
+    /// A shard's idle spin before it parks, in microseconds (`Options::shard_spin`, D198);
+    /// the library default when not set.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("shard_spin"));
+    /// let r = PigeonholeRunner::default().shard_spin_micros(200);
+    /// assert!(r.describe().contains(" shard_spin=200us"));
+    /// ```
+    pub fn shard_spin_micros(mut self, micros: u64) -> Self {
+        self.settings.shard_spin_micros = Some(micros);
+        self
+    }
 }
 
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
@@ -165,6 +183,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     }
     if s.row_cache > 0 {
         options = options.row_cache(usize::try_from(s.row_cache).unwrap_or(usize::MAX));
+    }
+    if let Some(us) = s.shard_spin_micros {
+        options = options.shard_spin(Duration::from_micros(us));
     }
     options
 }
@@ -247,6 +268,9 @@ impl Runner for PigeonholeRunner {
             wal_inline_syncs: m.wal_inline_syncs,
             file_growths: m.file_growths.0,
             file_growth_nanos: m.file_growths.1,
+            shard_parks: m.shard_idle.0,
+            shard_wakes: m.shard_idle.1,
+            commit_parks: m.commit_parks,
         })
     }
 
@@ -270,7 +294,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.group_sync {
@@ -287,7 +311,9 @@ impl Runner for PigeonholeRunner {
                 format!(" rowcache={}MiB", s.row_cache >> 20)
             } else {
                 String::new()
-            }
+            },
+            s.shard_spin_micros
+                .map_or_else(String::new, |us| format!(" shard_spin={us}us"))
         )
     }
 }

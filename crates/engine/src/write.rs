@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use pigeonhole_compaction::ValuePredicate;
@@ -472,13 +473,29 @@ pub(crate) fn wait_reply<T: Send>(
             Poll::Pending => Err(Error::WouldDeadlock),
         };
     }
+    park_for_reply(shared, waiter)
+}
+
+/// Parks until the shard's reply arrives, counting the wait in `Metrics::commit_parks` if it
+/// parks at all (ICR 0027).
+fn park_for_reply<T: Send>(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<T>>,
+) -> crate::Result<T> {
     let waker = crate::waker::thread_waker();
     let mut cx = Context::from_waker(&waker);
+    let mut parked = false;
     loop {
         match Pin::new(&mut *waiter).poll(&mut cx) {
             Poll::Ready(Some(r)) => return r,
             Poll::Ready(None) => return Err(Error::Closed),
-            Poll::Pending => std::thread::park(),
+            Poll::Pending => {
+                if !parked {
+                    parked = true;
+                    shared.commit_parks.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::park();
+            }
         }
     }
 }
@@ -513,15 +530,7 @@ fn wait_reply_spinning<T: Send>(
         Some(Poll::Ready(None)) => return Err(Error::Closed),
         _ => {}
     }
-    let waker = crate::waker::thread_waker();
-    let mut cx = Context::from_waker(&waker);
-    loop {
-        match Pin::new(&mut *waiter).poll(&mut cx) {
-            Poll::Ready(Some(r)) => return r,
-            Poll::Ready(None) => return Err(Error::Closed),
-            Poll::Pending => std::thread::park(),
-        }
-    }
+    park_for_reply(shared, waiter)
 }
 
 /// Blocks until `seqno` is visible (D19), parked on the shards' watermark publishes. Fails

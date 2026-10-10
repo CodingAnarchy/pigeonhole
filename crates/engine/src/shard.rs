@@ -310,6 +310,8 @@ pub(crate) struct Shared {
     pub view: ArcSwap<View>,
     /// Reads inside async calls that went to the file synchronously (D196; `Metrics`).
     pub async_sync_reads: AtomicU64,
+    /// Blocking waits for a commit's reply that parked their thread (ICR 0027; `Metrics`).
+    pub commit_parks: AtomicU64,
     /// Serializes view publishers (shards creating memtables, manifest commits) and holds
     /// the last published version.
     pub view_lock: Mutex<u64>,

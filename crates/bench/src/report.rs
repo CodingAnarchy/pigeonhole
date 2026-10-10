@@ -355,6 +355,17 @@ pub struct Stalls {
     pub file_growths: u64,
     /// See [`Stalls::file_growths`].
     pub file_growth_nanos: u64,
+    /// Idle parks of the shards' threads after their spin, wakes of a parked shard, and
+    /// blocking commit waits that parked (ICR 0027): per commit, how often the commit
+    /// path pays a thread wakeup (D198). Absent from results written before them.
+    #[serde(default)]
+    pub shard_parks: u64,
+    /// See [`Stalls::shard_parks`].
+    #[serde(default)]
+    pub shard_wakes: u64,
+    /// See [`Stalls::shard_parks`].
+    #[serde(default)]
+    pub commit_parks: u64,
 }
 
 impl Stalls {
@@ -371,6 +382,9 @@ impl Stalls {
             wal_inline_syncs: d(before.wal_inline_syncs, after.wal_inline_syncs),
             file_growths: d(before.file_growths, after.file_growths),
             file_growth_nanos: d(before.file_growth_nanos, after.file_growth_nanos),
+            shard_parks: d(before.shard_parks, after.shard_parks),
+            shard_wakes: d(before.shard_wakes, after.shard_wakes),
+            commit_parks: d(before.commit_parks, after.commit_parks),
         }
     }
 }
@@ -706,13 +720,14 @@ impl Suite {
             .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)))
             .collect();
         if !stalled.is_empty() {
-            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms |\n");
-            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
+            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op |\n");
+            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
             for (r, st) in stalled {
                 let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
+                let per_op = |n: u64| format!("{:.2}", n as f64 / r.operations.max(1) as f64);
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} |",
                     r.workload,
                     r.store,
                     r.threads,
@@ -725,6 +740,9 @@ impl Suite {
                     st.wal_inline_syncs,
                     st.file_growths,
                     ms(st.file_growth_nanos),
+                    per_op(st.shard_parks),
+                    per_op(st.shard_wakes),
+                    per_op(st.commit_parks),
                 );
             }
         }
