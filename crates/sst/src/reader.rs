@@ -261,6 +261,37 @@ pub(crate) fn read_into(file: &FileRef, out: &mut [u8], offset: u64) -> Result<(
     Ok(())
 }
 
+/// Writes `bytes` at `offset`, any range: on a direct handle (#403) through aligned pages,
+/// reading back the pages it only partly covers (the bytes around the range stay as they
+/// are). For writers without a page-sized buffer of their own (the blob writer).
+pub(crate) fn write_any(file: &FileRef, bytes: &[u8], offset: u64) -> Result<()> {
+    let Some(a) = file.direct_align() else {
+        return Ok(file.write_at(bytes, offset)?);
+    };
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let (start, len, head) = aligned(offset, bytes.len(), a);
+    let mut buf = IoBuf::zeroed(len);
+    if head != 0 {
+        file.read_at(&mut buf[..a], start)?;
+    }
+    let last = len - a;
+    if !(head + bytes.len()).is_multiple_of(a) && !(last == 0 && head != 0) {
+        file.read_at(&mut buf[last..], start + last as u64)?;
+    }
+    buf[head..head + bytes.len()].copy_from_slice(bytes);
+    Ok(file.write_at(&buf, start)?)
+}
+
+/// Writes `bytes` (a whole number of aligned pages, or the last pages of an SST padded with
+/// zeros) at an aligned `offset` from an aligned copy, as a direct handle needs.
+pub(crate) fn write_padded(file: &FileRef, bytes: &[u8], offset: u64, align: usize) -> Result<()> {
+    let mut buf = IoBuf::zeroed(bytes.len().div_ceil(align) * align);
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Ok(file.write_at(&buf, offset)?)
+}
+
 /// Checks a physical block and turns it into what the cache holds: the logical block. An
 /// uncompressed block keeps its I/O buffer (trimmed of the trailer); a compressed one is
 /// decompressed into a heap buffer.
