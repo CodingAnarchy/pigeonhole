@@ -127,6 +127,11 @@ impl Recovery {
         // cache's length longer than the disk's. The grid (and the blank slots the stream
         // adopts) come from that length, and appends sync with `sync_data`: make it durable.
         file.sync_all()?;
+        // Likewise its directory entry: an open no longer waits for the directory sync of
+        // the stream files it creates (#158, D203), so a process that died before that sync
+        // finished left this file's name in the page cache only. The stream is adopted and
+        // appended to, and its new commits would vanish with the name in a power loss.
+        crate::sync_parent(vfs, &path)?;
         let grid = Grid::read(&file, stream, db_id)?;
         let start = match &grid {
             Some(g) if checkpoint.epoch() == 0 => g

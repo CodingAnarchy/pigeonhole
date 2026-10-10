@@ -112,6 +112,34 @@ fn harness_regressions_from_the_seed_sweep() {
     for seed in [114, 274] {
         check(seed, &read_error_txn_config());
     }
+    // Seeds 99, 132 and 164 with deferred I/O (#454's first sweep): an open left its new
+    // stream files' directory sync in flight (D203), a process crash dropped it, the next
+    // open adopted the files and acknowledged commits in them, and a power loss then took
+    // the files' names. Recovery now syncs an adopted stream's directory entry.
+    for shards in 1..=8 {
+        let mut cfg = Config::standard(250);
+        cfg.shards = shards;
+        cfg.deferred_io = true;
+        for seed in [132, 164] {
+            check(seed, &cfg);
+        }
+    }
+    for level in [
+        Durability::None,
+        Durability::Buffered,
+        Durability::GroupSync,
+        Durability::Sync,
+    ] {
+        let mut cfg = Config::standard(200);
+        cfg.durability = Some(level);
+        cfg.crash_ppm = 40_000;
+        cfg.mid_commit_crash_ppm = 60_000;
+        cfg.shards = 3;
+        cfg.deferred_io = true;
+        for seed in [99, 132] {
+            check(seed, &cfg);
+        }
+    }
 }
 
 /// Transactions under frequent injected read errors, no crash armed.
