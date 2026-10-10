@@ -1,6 +1,6 @@
 # 0021: `Vfs::submit_sync_dir`
 
-**Status:** Approved (coordinator, 2026-10-10; #158, D203). `Completion::fan_out` added the same day, after the first sweep of #454 hung (pending the coordinator's OK).
+**Status:** Approved (coordinator, 2026-10-10; #158, D203). Amended the same day with `Completion::fan_out`, after the first sweep of #454 hung (approved, coordinator, 2026-10-10: additive io API that avoids one directory fsync per stream).
 
 ## Change
 
