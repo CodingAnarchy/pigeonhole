@@ -349,6 +349,23 @@ impl Drop for EnterShard {
     }
 }
 
+/// A small id for the calling thread, nonzero: cheaper to compare each turn than
+/// `thread::current().id()`, which counts a reference.
+fn thread_token() -> u64 {
+    thread_local! {
+        static TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    TOKEN.with(|t| match t.get() {
+        0 => {
+            let v = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            t.set(v);
+            v
+        }
+        v => v,
+    })
+}
+
 /// The shard loop, shared by both embedding modes.
 struct ShardCore<H: ShardHandler> {
     id: ShardId,
@@ -363,10 +380,12 @@ struct ShardCore<H: ShardHandler> {
     /// The clock when the loop last went idle with sleeping tasks: if it reads the same at
     /// the next pass, the clock is not moving on its own and sleepers run early to notice.
     idle_at: Option<u64>,
-    /// Whether the thread was given its own I/O ring yet (`Vfs::attach_thread`, at the first
-    /// turn), and whether it got one: a turn reaps only then, so a backend without rings
-    /// costs a turn nothing (#402).
-    attached: bool,
+    /// The thread ([`thread_token`]) last given its own I/O ring (`Vfs::attach_thread`, at
+    /// its first turn of this shard; 0: none yet), and whether it got one: a turn reaps only
+    /// then, so a backend without rings costs a turn nothing (#402). Per thread, not once: an
+    /// application may move a shard to another thread, which needs a ring of its own, or its
+    /// I/O would go to a ring no thread reaps (the #473 scaling hang).
+    attached: u64,
     own_ring: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
@@ -527,7 +546,7 @@ impl<H: ShardHandler> ShardCore<H> {
         // A backend with a ring per driving thread (#402) gives the first thread to run this
         // shard its own; what completed on it resolves now, so the work it unblocks runs this
         // turn. Without a ring, a turn pays one branch.
-        if !self.attached {
+        if self.attached != thread_token() {
             self.attach();
         }
         if self.own_ring {
@@ -565,10 +584,10 @@ impl<H: ShardHandler> ShardCore<H> {
         more
     }
 
-    /// Gives the calling thread its own I/O ring if the backend has them, once.
+    /// Gives the calling thread its own I/O ring if the backend has them, once per thread.
     #[cold]
     fn attach(&mut self) {
-        self.attached = true;
+        self.attached = thread_token();
         self.vfs.attach_thread();
         self.own_ring = pigeonhole_io::own_io_waker().is_some();
     }
@@ -700,7 +719,7 @@ fn build<H: ShardHandler>(
             vfs: Arc::clone(&config.vfs),
             time_slice: config.slice_nanos(),
             idle_at: None,
-            attached: false,
+            attached: 0,
             own_ring: false,
             spin: IdleSpin::new(config.idle_spin),
         })

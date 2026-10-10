@@ -153,6 +153,20 @@ pub(crate) fn register_orphan(orphan: Weak<dyn OrphanIo>) {
     ORPHAN_COUNT.store(o.len(), std::sync::atomic::Ordering::Release);
 }
 
+/// Reaps every backend no thread reaps (application-owned io_uring's shared ring, #408),
+/// waiting up to `wait` for something to complete: for a thread blocked on an outcome chained
+/// after I/O it holds no completion of, such as a WAL sync waiting for the stream's older
+/// syncs (ICR 0028), which would otherwise wait for ever. `None` when no such backend is
+/// registered (one relaxed load: then wait as usual); otherwise whether anything completed.
+///
+/// ```
+/// // With no reaper-less backend in the process, nothing to do.
+/// assert_eq!(pigeonhole_io::reap_orphan_io(std::time::Duration::ZERO), None);
+/// ```
+pub fn reap_orphan_io(wait: Duration) -> Option<bool> {
+    reap_orphans(wait)
+}
+
 /// What a blocked [`Completion::wait`](crate::Completion::wait) with no drive of its own does
 /// while it waits (#408): reaps every registered orphan backend, so a completion chained after
 /// their operations (a WAL's ordered sync, say) resolves without a reaper thread. `None` when
