@@ -140,6 +140,11 @@ fn harness_regressions_from_the_seed_sweep() {
             check(seed, &cfg);
         }
     }
+    // Seed 213 with deferred I/O (#454's second sweep): closing after the last reopen, a
+    // shard's final sync waited, inside the harness's own turn, for cross-shard barrier
+    // syncs that only the harness completes. The simulator's device now runs for the
+    // harness thread's blocked waits (ICR 0028).
+    identical_across_shard_counts_under_faults(213, Some(true));
 }
 
 /// Transactions under frequent injected read errors, no crash armed.
@@ -512,20 +517,29 @@ fn results_are_identical_across_shard_counts_under_faults() {
     // commit survives only if a stronger commit on its own stream writes it or a flush
     // persists it, which depends on the shard count (decision #50).
     for seed in seeds() {
-        let mut cfg = Config::standard(250);
-        deterministic_compactions(&mut cfg);
-        cfg.crash_every = Some(60);
-        cfg.durability = Some(Durability::Buffered);
-        cfg.shards = 1;
-        let reference = final_dump(seed, &cfg);
-        for shards in [2, 3, 5, 8] {
-            cfg.shards = shards;
-            let dump = final_dump(seed, &cfg);
-            assert_eq!(
-                dump, reference,
-                "seed {seed}: {shards} shards differ from 1 shard"
-            );
-        }
+        identical_across_shard_counts_under_faults(seed, None);
+    }
+}
+
+/// [`results_are_identical_across_shard_counts_under_faults`] for one seed, with deferred I/O
+/// forced on or off (`None`: as `PIGEONHOLE_DEFERRED_IO` says).
+fn identical_across_shard_counts_under_faults(seed: u64, deferred_io: Option<bool>) {
+    let mut cfg = Config::standard(250);
+    deterministic_compactions(&mut cfg);
+    cfg.crash_every = Some(60);
+    cfg.durability = Some(Durability::Buffered);
+    if let Some(on) = deferred_io {
+        cfg.deferred_io = on;
+    }
+    cfg.shards = 1;
+    let reference = final_dump(seed, &cfg);
+    for shards in [2, 3, 5, 8] {
+        cfg.shards = shards;
+        let dump = final_dump(seed, &cfg);
+        assert_eq!(
+            dump, reference,
+            "seed {seed}: {shards} shards differ from 1 shard"
+        );
     }
 }
 
