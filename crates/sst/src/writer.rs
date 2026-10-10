@@ -40,6 +40,9 @@ pub(crate) struct Writer {
     /// Sealed bytes not yet written, starting at SST offset `flushed`.
     out: Vec<u8>,
     flushed: u64,
+    /// On a direct-I/O handle (#403), the alignment its writes keep: `flushed` stays a
+    /// multiple of it and a partial last page waits in `out` until `finish` pads it.
+    direct: Option<usize>,
     /// Sealed index partitions, laid out after the data blocks at finish.
     index_out: Vec<u8>,
     /// `(last separator, offset within index_out, physical length)` per sealed partition.
@@ -74,6 +77,7 @@ impl std::fmt::Debug for Writer {
 
 impl Writer {
     pub(crate) fn new(file: FileRef, extent: ExtentRef, id: SstId, opts: SstWriterOptions) -> Self {
+        let direct = file.direct_align();
         let props = Properties {
             table: opts.table,
             family: opts.family,
@@ -93,6 +97,7 @@ impl Writer {
             index: BlockBuilder::index(),
             out: Vec::new(),
             flushed: 0,
+            direct,
             index_out: Vec::new(),
             partitions: Vec::new(),
             pending: None,
@@ -281,10 +286,23 @@ impl Writer {
         if self.out.is_empty() {
             return Ok(());
         }
-        self.file
-            .write_at(&self.out, self.extent.offset() + self.flushed)?;
-        self.flushed += self.out.len() as u64;
-        self.out.clear();
+        let at = self.extent.offset() + self.flushed;
+        match self.direct {
+            None => {
+                self.file.write_at(&self.out, at)?;
+                self.flushed += self.out.len() as u64;
+                self.out.clear();
+            }
+            Some(a) => {
+                // Whole pages only; the partial last page stays for later.
+                let n = self.out.len() / a * a;
+                if n > 0 {
+                    crate::reader::write_padded(&self.file, &self.out[..n], at, a)?;
+                    self.flushed += n as u64;
+                    self.out.drain(..n);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -386,8 +404,23 @@ impl Writer {
         // The footer goes last, in its own write: an interrupted build never leaves a footer
         // in front of missing blocks unless the disk reorders unsynced writes, and then the
         // block checksums catch it.
-        self.file
-            .write_at(&footer.encode(), self.extent.offset() + footer_at)?;
+        match self.direct {
+            None => {
+                self.file
+                    .write_at(&footer.encode(), self.extent.offset() + footer_at)?;
+            }
+            Some(a) => {
+                // The partial last page, padded, then that page again with the footer after
+                // it (padded within the extent, a whole number of pages): the write that
+                // carries the footer is still the last.
+                let at = self.extent.offset() + self.flushed;
+                if !self.out.is_empty() {
+                    crate::reader::write_padded(&self.file, &self.out, at, a)?;
+                }
+                self.out.extend_from_slice(&footer.encode());
+                crate::reader::write_padded(&self.file, &self.out, at, a)?;
+            }
+        }
 
         Ok(SstMeta {
             id: self.id,

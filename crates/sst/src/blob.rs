@@ -117,7 +117,7 @@ impl Writer {
             blob_file: self.blob_file,
             extent_index: self.extents.len() as u32,
         };
-        self.file.write_at(&header.encode(), extent.offset())?;
+        crate::reader::write_any(&self.file, &header.encode(), extent.offset())?;
         self.extents.push(extent);
         Ok(())
     }
@@ -131,7 +131,7 @@ impl Writer {
         let header = encode_record_header(value);
         for (at, bytes) in [(offset, &header[..]), (offset + header.len() as u64, value)] {
             for_each_piece(&self.extents, self.payload, at, bytes.len(), |_, abs, r| {
-                Ok(self.file.write_at(&bytes[r], abs)?)
+                crate::reader::write_any(&self.file, &bytes[r], abs)
             })?;
         }
         self.pos += (BLOB_RECORD_HEADER_LEN + value.len()) as u64;
