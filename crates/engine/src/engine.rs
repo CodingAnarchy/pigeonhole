@@ -148,6 +148,16 @@ pub struct Metrics {
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
+    /// Async commit polls that found their seqno not yet visible and registered as waiters
+    /// on the global visibility list (D19, ICR 0023), and the list entries those
+    /// registrations scanned for a duplicate. Waits per commit near 0 mean the watermark
+    /// is not what commits wait on (#154).
+    pub visibility_waits: (u64, u64),
+    /// Wake passes over that list (a watermark publish that found waiters), and the
+    /// waiters they woke.
+    pub visibility_wakes: (u64, u64),
+    /// Registrations and wake passes that found the list's lock held by another thread.
+    pub visibility_contended: u64,
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -1742,6 +1752,16 @@ impl Engine {
                 m.shard_idle.1 += wakes;
             }
         }
+        let w = &shared.waiters;
+        m.visibility_waits = (
+            w.waits.load(Ordering::Relaxed),
+            w.scanned.load(Ordering::Relaxed),
+        );
+        m.visibility_wakes = (
+            w.passes.load(Ordering::Relaxed),
+            w.woken.load(Ordering::Relaxed),
+        );
+        m.visibility_contended = w.contended.load(Ordering::Relaxed);
         m
     }
 
