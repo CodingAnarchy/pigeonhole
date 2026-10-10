@@ -74,7 +74,7 @@ machine = {
     "scale": scale,
     "kernel": kernel,
     "os": sh("grep PRETTY_NAME /etc/os-release | cut -d= -f2"),
-    "cpu": sh("lscpu | grep 'Model name' | sed 's/.*: *//'"),
+    "cpu": sh("lscpu | grep -m1 'Model name' | sed 's/.*: *//'"),
     "cpus": os.cpu_count(),
     "smt": read("/sys/devices/system/cpu/smt/control"),
     "governors": sorted(governors),

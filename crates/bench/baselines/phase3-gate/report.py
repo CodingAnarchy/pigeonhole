@@ -71,7 +71,8 @@ def verdict(ok):
 rows = []  # (target, measured, verdict, source)
 
 # Point get in memory: p50 < 2 µs, p99 < 10 µs (ycsb-c gets).
-got = [op(r, "get") for r in results("latency-ycsb-c.json", "pigeonhole")]
+# ycsb-c's gets are recorded as row reads (one family, one cell).
+got = [op(r, "get") or op(r, "row read") for r in results("latency-ycsb-c.json", "pigeonhole")]
 got = [g for g in got if g]
 if got:
     g = got[0]
@@ -95,9 +96,14 @@ try:
                 seek[name] = float(m.group(1)) * UNITS.get(m.group(2), 1.0)
 except OSError:
     pass
-hit_1m = next((v for k, v in seek.items() if k.startswith("seek/1M/hit")), None)
+def is_1m_hit(k):
+    # `seek/1M entries/hit (get)`: the size label, then the probe.
+    parts = k.split("/")
+    return len(parts) >= 3 and parts[1].startswith("1M") and parts[2].startswith("hit")
+
+hit_1m = next((v for k, v in seek.items() if is_1m_hit(k)), None)
 if hit_1m is not None:
-    others = ", ".join(f"{k.split('/', 1)[1]} {v:.0f} ns" for k, v in seek.items() if not k.startswith("seek/1M/hit"))
+    others = ", ".join(f"{k.split('/', 1)[1]} {v:.0f} ns" for k, v in seek.items() if not is_1m_hit(k))
     rows.append(("Memtable point lookup at 1M entries: ≤ 300 ns (#17)", f"1M hit {hit_1m:.0f} ns ({others})",
                  verdict(hit_1m <= 300), "memtable-lookup.txt"))
 else:
@@ -250,10 +256,11 @@ if any(r for _, r in ya):
     print("|---|--:|--:|--:|---|")
     for n, rs in ya:
         for r in rs:
-            # ICR 0027's per-operation counters, whatever #480 names them in the detail.
-            parks = ", ".join(f"{k} {v:.2f}" if isinstance(v, float) else f"{k} {v}"
-                              for k, v in sorted(r.get("detail", {}).items())
-                              if any(w in k for w in ("park", "wake", "idle")))
+            # ICR 0027's counters (#480): run totals in the stall detail, per operation here.
+            stalls = r.get("detail", {}).get("stalls", {})
+            ops = max(r.get("operations", 0), 1)
+            parks = ", ".join(f"{k} {stalls[k] / ops:.2f}"
+                              for k in ("shard_parks", "shard_wakes", "commit_parks") if k in stalls)
             print(f"| {n} | {r['throughput']:.0f} | {us(r['p50_ns']):.1f} | {us(r['p99_ns']):.1f} | {parks or '-'} |")
     for r in rk:
         print(f"| RocksDB | {r['throughput']:.0f} | {us(r['p50_ns']):.1f} | {us(r['p99_ns']):.1f} | - |")
