@@ -172,8 +172,7 @@ impl Options {
     }
 
     /// How long a thread waiting for its buffered (or non-durable) commit polls for the
-    /// result before it sleeps (default zero for now; D198's 15 µs default lands with its
-    /// follow-up). A shard usually answers within a few
+    /// result before it sleeps (default 15 µs). A shard usually answers within a few
     /// microseconds, and putting the thread to sleep and waking it costs that again or more
     /// (D198). A durable commit waits for a disk sync and sleeps at once. A wait that keeps
     /// finding nothing polls less often. `Duration::ZERO` always sleeps at once: for
@@ -192,8 +191,7 @@ impl Options {
     }
 
     /// How long a shard thread that just handled a commit keeps polling for the next one
-    /// before it sleeps (default zero for now; D198's 50 µs default lands with its
-    /// follow-up), so a steady stream of commits is taken
+    /// before it sleeps (default 50 µs, D198), so a steady stream of commits is taken
     /// without waking the thread each time. An idle database never polls, and polls that
     /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
     /// by application-owned shards, whose loop the application runs.
