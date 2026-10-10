@@ -17,8 +17,8 @@
 //! next 10,000 stay in the memtable, so a read merges the memtable, L0 and the last level as
 //! in a running store. Row reads of every record, in key order, warm the block cache.
 //!
-//! The setup is deterministic: its writes take explicit timestamps from a counter, and the
-//! warm-up reads in a fixed order (see `SETUP_TS` and the warm-up). Two runs of one binary
+//! The shapes are deterministic: every write takes an explicit timestamp from a counter, and
+//! the warm-up reads in a fixed order (see `WRITE_TS` and the warm-up). Two runs of one binary
 //! count within about 0.002%; before, they differed by up to 1%. The operations come from
 //! the bench's own generator (`pigeonhole_bench::Workload`, seed `0x5EED`), the same
 //! streams `phdb-bench` runs.
@@ -58,16 +58,17 @@ fn config(kind: WorkloadKind, operations: usize) -> WorkloadConfig {
     }
 }
 
-/// The setup's writes take explicit timestamps from this counter, below any wall-clock
-/// time, so the store's bytes are the same on every run: with commit timestamps from the
-/// clock, adjacent versions of a column share a varying number of key bytes, block cuts
-/// move, and the reads' instruction counts with them (about 0.2%). The measured updates of
-/// `ycsb-a` keep commit timestamps, as `phdb-bench` writes them; they are the newest.
-static SETUP_TS: AtomicU64 = AtomicU64::new(1_700_000_000_000_000);
+/// Every write takes an explicit timestamp from this counter, so the store's bytes are the
+/// same on every run: with commit timestamps from the clock, adjacent versions of a column
+/// share a varying number of key bytes, block cuts move, and the reads' instruction counts
+/// with them (about 0.2% for `ycsb-c`, 0.5% for `ycsb-a`). The counter only rises, so each
+/// write is the newest version, as a commit timestamp would make it. The difference from
+/// `phdb-bench`'s puts: the commit takes no clock reading for its timestamp.
+static WRITE_TS: AtomicU64 = AtomicU64::new(1_700_000_000_000_000);
 
-/// One operation through the public API, as `phdb-bench`'s Pigeonhole runner does it
-/// (with `setup`, a put takes the next setup timestamp). Returns the cells read.
-fn execute(t: &Table, op: &BenchOp, setup: bool) -> usize {
+/// One operation through the public API, as `phdb-bench`'s Pigeonhole runner does it,
+/// except that a put takes the next [`WRITE_TS`]. Returns the cells read.
+fn execute(t: &Table, op: &BenchOp) -> usize {
     match op {
         BenchOp::GetRow { row, family } => {
             let row = t.row(row).family(family).read().unwrap();
@@ -81,11 +82,7 @@ fn execute(t: &Table, op: &BenchOp, setup: bool) -> usize {
         BenchOp::Put { row, family, cells } => {
             let mut m = t.mutate(row);
             for (q, v) in cells {
-                m = if setup {
-                    m.put_at(family, q, SETUP_TS.fetch_add(1, Ordering::Relaxed), v)
-                } else {
-                    m.put(family, q, v)
-                };
+                m = m.put_at(family, q, WRITE_TS.fetch_add(1, Ordering::Relaxed), v);
             }
             m.commit().unwrap();
             0
@@ -99,7 +96,7 @@ fn shape_ycsb(t: &Table, ops: &[BenchOp]) -> usize {
     let _measured = Measured::start();
     let mut cells = 0;
     for op in ops {
-        cells += execute(t, op, false);
+        cells += execute(t, op);
     }
     std::hint::black_box(cells);
     ops.len()
@@ -134,17 +131,17 @@ fn main() {
         WARM_FLUSHED + WARM_MEMTABLE + POOL,
     ));
     for op in a.load_ops() {
-        execute(&t, &op, true);
+        execute(&t, &op);
     }
     db.flush().unwrap();
     db.compact().unwrap();
     let mut stream = a.run_ops();
     for op in stream.by_ref().take(WARM_FLUSHED) {
-        execute(&t, &op, true);
+        execute(&t, &op);
     }
     db.flush().unwrap();
     for op in stream.by_ref().take(WARM_MEMTABLE) {
-        execute(&t, &op, true);
+        execute(&t, &op);
     }
     let pool: Vec<BenchOp> = match kind {
         WorkloadKind::YcsbA => stream.collect(),
@@ -157,7 +154,7 @@ fn main() {
     // its blocks are not the ones the reads look up).
     for op in Workload::new(config(WorkloadKind::YcsbC, 0)).load_ops() {
         if let BenchOp::Put { row, family, .. } = op {
-            execute(&t, &BenchOp::GetRow { row, family }, true);
+            execute(&t, &BenchOp::GetRow { row, family });
         }
     }
     eprintln!("setup done");
