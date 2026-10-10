@@ -131,6 +131,18 @@ pub struct EngineOptions {
     /// that nothing announced (a snapshot dropped on another thread, a reader process's
     /// unpin): nanoseconds, default 1 ms, doubling up to 100 times this. Mostly for tests.
     pub room_recheck_nanos: u64,
+    /// How long a thread waiting for its buffered (or non-durable) commit polls for the
+    /// result before it parks: nanoseconds, default 0 for now (D198 sets 15 µs once its
+    /// follow-up lands). A durable commit waits for
+    /// a sync and parks at once. Zero always parks (battery-powered or CPU-constrained
+    /// hosts). A poll that finds nothing backs off on that thread.
+    pub commit_spin_nanos: u64,
+    /// How long an engine-owned shard thread that just handled a message keeps polling its
+    /// queue before it parks: nanoseconds, default 0 for now (D198 sets 50 µs once its
+    /// follow-up lands). An idle shard never polls.
+    /// Zero always parks. Application-owned shards are driven by the application and ignore
+    /// it.
+    pub shard_spin_nanos: u64,
 }
 
 impl EngineOptions {
@@ -166,6 +178,8 @@ impl EngineOptions {
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,
+            commit_spin_nanos: 0,
+            shard_spin_nanos: 0,
         }
     }
 }

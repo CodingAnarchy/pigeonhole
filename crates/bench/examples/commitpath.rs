@@ -8,7 +8,8 @@
 //!
 //! | Mode | The shard runs on | The client waits by |
 //! |---|---|---|
-//! | `threads` | the engine's own shard thread (`Engine::open`, as `phdb-bench` runs) | parking (`Engine::commit`) |
+//! | `threads` | the engine's own shard thread (`Engine::open`, as `phdb-bench` runs), with D198's spin before parking (50 µs) | `Engine::commit`: D198's spin (15 µs), then parking |
+//! | `threads-nospin` | as `threads`, with both spin windows 0 (the engine before D198) | parking |
 //! | `park` | an application thread that parks between groups, woken by the engine | parking |
 //! | `spin` | an application thread that never parks | spinning on the commit's future |
 //! | `spin-shard` | an application thread that never parks | parking |
@@ -37,8 +38,12 @@ use pigeonhole_engine::{
 const ROWS: u64 = 50_000;
 const VALUE: [u8; 100] = [7; 100];
 
-fn options() -> EngineOptions {
+/// The engine's defaults, except one shard, a memtable no run fills, and the spin windows:
+/// D198's (15 µs on the client, 50 µs on the shard) with `spins`, else none. The modes
+/// that spin by hand turn the engine's own spinning off.
+fn options(spins: bool) -> EngineOptions {
     let mut o = EngineOptions::new(pigeonhole_io::pread::PreadVfs::new(0));
+    (o.commit_spin_nanos, o.shard_spin_nanos) = if spins { (15_000, 50_000) } else { (0, 0) };
     o.create_if_missing = true;
     o.shards = 1;
     o.tablet_changes = false;
@@ -95,7 +100,8 @@ fn measure(t: &TableInfo, commits: usize, mut commit: impl FnMut(WriteBatch)) ->
     lat
 }
 
-fn report(mode: &str, lat: &[Duration]) {
+/// Prints a row and returns the p50.
+fn report(mode: &str, lat: &[Duration]) -> Duration {
     let at = |q: f64| lat[((lat.len() as f64 * q) as usize).min(lat.len() - 1)];
     let mean = lat.iter().sum::<Duration>() / lat.len() as u32;
     let us = |d: Duration| d.as_secs_f64() * 1e6;
@@ -106,6 +112,7 @@ fn report(mode: &str, lat: &[Duration]) {
         us(at(0.999)),
         us(mean)
     );
+    at(0.50)
 }
 
 fn create(db: &Engine) -> Arc<TableInfo> {
@@ -133,8 +140,10 @@ fn poll_until<F: std::future::Future + Unpin>(mut f: F, mut between: impl FnMut(
     }
 }
 
-fn engine_threads(dir: &Path, commits: usize) {
-    let db = Engine::open(&dir.join("threads.phdb"), options()).unwrap();
+/// Returns the p50.
+fn engine_threads(dir: &Path, commits: usize, spins: bool) -> Duration {
+    let mode = if spins { "threads" } else { "threads-nospin" };
+    let db = Engine::open(&dir.join(format!("{mode}.phdb")), options(spins)).unwrap();
     let t = create(&db);
     load(&t, |wb| {
         db.commit(wb, None).unwrap();
@@ -142,8 +151,9 @@ fn engine_threads(dir: &Path, commits: usize) {
     let lat = measure(&t, commits, |wb| {
         db.commit(wb, None).unwrap();
     });
-    report("threads", &lat);
+    let p50 = report(mode, &lat);
     db.close().unwrap();
+    p50
 }
 
 /// A shard on its own thread that parks between groups unless `shard_spins`; the client
@@ -156,7 +166,7 @@ fn driven(dir: &Path, commits: usize, shard_spins: bool, client_spins: bool) {
         (false, true) => "spin-client",
     };
     let (db, mut shards) =
-        Engine::open_application_owned(&dir.join(format!("{mode}.phdb")), options()).unwrap();
+        Engine::open_application_owned(&dir.join(format!("{mode}.phdb")), options(false)).unwrap();
     let spin = shard_spins;
     let mut shard: EngineShard = shards.remove(0);
     let stop = Arc::new(AtomicBool::new(false));
@@ -196,7 +206,7 @@ fn driven(dir: &Path, commits: usize, shard_spins: bool, client_spins: bool) {
 /// The client runs the shard itself after each submit.
 fn inline(dir: &Path, commits: usize) {
     let (db, mut shards) =
-        Engine::open_application_owned(&dir.join("inline.phdb"), options()).unwrap();
+        Engine::open_application_owned(&dir.join("inline.phdb"), options(false)).unwrap();
     let mut shard = shards.remove(0);
     while shard.run_once(u64::MAX) {}
     let t = create(&db);
@@ -226,11 +236,22 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("create the store directory");
     println!("| mode | p50 µs | p99 µs | p99.9 µs | mean µs |");
     println!("|---|--:|--:|--:|--:|");
-    engine_threads(&dir, commits);
+    let spinning = engine_threads(&dir, commits, true);
+    let parking = engine_threads(&dir, commits, false);
     driven(&dir, commits, false, false);
     driven(&dir, commits, true, true);
     driven(&dir, commits, true, false);
     driven(&dir, commits, false, true);
     inline(&dir, commits);
     std::fs::remove_dir_all(&dir).ok();
+    // The one wall-clock check of D198's spin: with its windows, a buffered commit's
+    // median must not be clearly worse than without spinning. The margin
+    // allows for a shared runner's noise.
+    let (s, p) = (spinning.as_secs_f64() * 1e6, parking.as_secs_f64() * 1e6);
+    println!();
+    if s > p * 1.25 {
+        println!("FAIL: p50 {s:.2} µs with D198's spin against {p:.2} µs without");
+        std::process::exit(1);
+    }
+    println!("ok: p50 {s:.2} µs with D198's spin against {p:.2} µs without");
 }

@@ -141,6 +141,12 @@ pub struct RuntimeConfig {
     pub compaction_threads: usize,
     /// Longest a background task runs before yielding.
     pub time_slice: Duration,
+    /// Engine-owned mode: how long a shard thread that just handled a message keeps
+    /// polling its queue before it parks (D198). A message that arrives meanwhile is
+    /// handled without the producer waking the thread. Zero (the default) parks at once.
+    /// A poll that finds nothing backs off: the thread skips the next 1, 2, 4, ... up to 64
+    /// polls, and an idle shard (no message since its last park) never polls.
+    pub idle_spin: Duration,
     /// Clock source (simulated under test).
     pub vfs: VfsRef,
 }
@@ -153,6 +159,7 @@ impl RuntimeConfig {
             pin_threads: true,
             compaction_threads: 0,
             time_slice: Duration::from_micros(500),
+            idle_spin: Duration::ZERO,
             vfs,
         }
     }
@@ -352,6 +359,55 @@ struct ShardCore<H: ShardHandler> {
     /// costs a turn nothing (#402).
     attached: bool,
     own_ring: bool,
+    /// Polling the queue before parking (D198; engine-owned mode only).
+    spin: IdleSpin,
+}
+
+/// An engine-owned shard's poll of its queue before it parks (D198).
+#[derive(Debug)]
+struct IdleSpin {
+    window: Duration,
+    /// A message was handled since the thread last parked or polled.
+    worked: bool,
+    /// Polls still to skip after one found nothing, and the backoff exponent.
+    skip: u32,
+    level: u32,
+}
+
+impl IdleSpin {
+    /// The most polls skipped after polls kept finding nothing.
+    const MAX_SKIP: u32 = 64;
+
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            worked: false,
+            skip: 0,
+            level: 0,
+        }
+    }
+
+    /// Whether to poll before parking now; consumes the "handled a message" mark.
+    fn due(&mut self) -> bool {
+        if self.window.is_zero() || !std::mem::take(&mut self.worked) {
+            return false;
+        }
+        if self.skip > 0 {
+            self.skip -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// Records a poll's outcome: a hit resets the backoff, a miss doubles it.
+    fn record(&mut self, hit: bool) {
+        if hit {
+            self.level = 0;
+        } else {
+            self.level = (self.level + 1).min(Self::MAX_SKIP.trailing_zeros());
+            self.skip = 1 << (self.level - 1);
+        }
+    }
 }
 
 impl<H: ShardHandler> ShardCore<H> {
@@ -408,8 +464,52 @@ impl<H: ShardHandler> ShardCore<H> {
         }
         if n > 0 {
             handler.end_batch(&mut ctx);
+            self.spin.worked = true;
         }
         n
+    }
+
+    /// Before parking (engine-owned mode, D198): polls the queue for up to the spin window
+    /// if a message was handled since the last park, so a client's next message is taken
+    /// without a wakeup. Returns whether work arrived (the loop runs again at once). The
+    /// window is measured on the real clock: a simulated clock may not move while polling.
+    fn spin_before_park(&mut self) -> bool {
+        if !self.spin.due() {
+            return false;
+        }
+        // Awake while polling, so a producer does not wake the thread (on a ring backend
+        // that is a syscall); sleep is announced again, and checked once more, on a miss.
+        self.signal().awake();
+        let end = std::time::Instant::now() + self.spin.window;
+        let mut polls = 0u32;
+        let mut hit = loop {
+            if self.stash.is_none() {
+                self.stash = self.rx.try_recv().ok();
+            }
+            if self.stash.is_some() || self.signal().task_woken() || self.inbox().is_closed() {
+                break true;
+            }
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(64) {
+                if std::time::Instant::now() >= end {
+                    break false;
+                }
+                // Let another runnable thread in (an oversubscribed machine).
+                thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        };
+        if !hit {
+            // The sleep handshake again: whatever a producer published before it read the
+            // flag is found here, and anything later wakes the thread.
+            hit = self.check_before_sleep();
+        }
+        self.spin.record(hit);
+        if hit {
+            self.signal().awake();
+        }
+        hit
     }
 
     fn run_once(&mut self, deadline: u64) -> bool {
@@ -512,6 +612,11 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
             core.finish();
             return core.handler;
         }
+        // No spin while I/O only this thread reaps is in flight: it waits on that below.
+        if !more && !(core.own_ring && pigeonhole_io::own_io_in_flight()) && core.spin_before_park()
+        {
+            continue;
+        }
         if !more {
             if core.own_ring && pigeonhole_io::own_io_in_flight() {
                 // I/O only this thread completes (its ring, #402): wait on it rather than
@@ -587,6 +692,7 @@ fn build<H: ShardHandler>(
             idle_at: None,
             attached: false,
             own_ring: false,
+            spin: IdleSpin::new(config.idle_spin),
         })
         .collect();
     (submitters, cores)
