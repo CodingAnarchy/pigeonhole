@@ -296,8 +296,9 @@ pub struct PendingCommit {
     pub(crate) shared: Arc<crate::shard::Shared>,
     /// Resolved by the shard; waiting for visibility (async polling).
     pub(crate) resolved: Option<CommitInfo>,
-    /// How long `wait` polls before it parks (D198): 0 for a durable commit.
-    pub(crate) spin_nanos: u64,
+    /// Whether `wait` may poll before it parks (D198): not for a durable commit, which
+    /// waits for a sync. The window is the engine's `commit_spin_nanos`.
+    pub(crate) spins: bool,
 }
 
 impl PendingCommit {
@@ -312,13 +313,18 @@ impl PendingCommit {
     /// [`Error::WouldDeadlock`]: the commit was submitted and will apply, but its outcome
     /// must be awaited from the event loop (poll this future there) or another thread.
     pub fn wait(mut self) -> crate::Result<CommitInfo> {
-        if self.spin_nanos == 0 {
+        let window = if self.spins {
+            self.shared.commit_spin_nanos
+        } else {
+            0
+        };
+        if window == 0 {
             // No spin: exactly the parking wait.
             let info = wait_reply(&self.shared, &mut self.waiter)?;
             wait_visible(&self.shared, info.seqno)?;
             return Ok(info);
         }
-        let mut spin = SpinWait::new(self.spin_nanos);
+        let mut spin = SpinWait::new(window);
         let info = wait_reply_spinning(&self.shared, &mut self.waiter, &mut spin)?;
         wait_visible_spinning(&self.shared, info.seqno, &mut spin)?;
         Ok(info)

@@ -2299,10 +2299,7 @@ impl Inner {
             shared: Arc::clone(&self.shared),
             resolved: None,
             // A durable commit waits for a sync: polling for it would only burn the CPU.
-            spin_nanos: match durability {
-                Durability::None | Durability::Buffered => self.shared.commit_spin_nanos,
-                _ => 0,
-            },
+            spins: matches!(durability, Durability::None | Durability::Buffered),
         })
     }
 
@@ -3054,7 +3051,7 @@ impl EngineShard {
             waiter,
             shared: Arc::clone(&engine.shared),
             resolved: None,
-            spin_nanos: 0,
+            spins: false,
         })
     }
 
