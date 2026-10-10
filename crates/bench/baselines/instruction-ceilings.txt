@@ -68,6 +68,10 @@
 # from four identical runs (the instructions workflow's base and head sides on PR #467, run
 # 38052048487, and a scratch callgrind run, 38051428167), which agreed exactly (1440, 1417,
 # 1327), with 0.3% headroom.
+#
+# Re-baselined after #483, #497, #498 and #500 (main 07a0fe2): lowered with
+# `instruction-ceilings.py lower` from the higher of this PR's base and head counts (run
+# pending); counter keeps its permanent 0.5% headroom.
 as-written 2051 0.3
 flushed 1867 0.3
 compacted 1259 0.3
