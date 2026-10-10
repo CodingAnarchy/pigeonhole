@@ -40,6 +40,17 @@ pub trait Cursor {
         self.seek(target)
     }
 
+    /// Moves past the current entry and possibly more entries of `column` (an internal key
+    /// without its suffix), never past an entry outside it, and returns `true`; or returns
+    /// `false` without moving, when the cursor has no faster way than [`Cursor::next`]. The
+    /// cursor must be valid and on an entry of `column`. A memtable with a stale-tail index
+    /// overrides it to pass a column's superseded versions in one jump (D194, ICR 0013); the
+    /// default returns `false`.
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool, Self::Error> {
+        let _ = column;
+        Ok(false)
+    }
+
     /// Advances past every remaining entry of the current row. Sources with a row-start table
     /// override this to skip without decoding; the default steps with [`Cursor::next`].
     fn skip_row(&mut self) -> Result<(), Self::Error> {

@@ -81,8 +81,11 @@ use pigeonhole_format::{Cursor, Seqno};
 use pigeonhole_io::SharedRegion;
 
 mod mem;
+mod tail;
 
 use mem::{Mem, Ordering};
+use pigeonhole_format::key::SUFFIX_LEN;
+use tail::TailIndex;
 
 #[cfg(all(test, loom))]
 mod loom_tests;
@@ -164,12 +167,16 @@ const STEP_SLACK: usize = MAX_HEIGHT + 16;
 /// Also carries the writer's process-local knowledge of the memtable (ICR 0020): whether a
 /// delete marker was ever inserted. A pin a reader process makes for a root it found in a
 /// view has no writer behind it, so it answers "maybe" ([`MemtableReader::may_have_markers`]).
+/// And it holds the memtable's stale-tail index (D194), set by `with_tail_index`: every
+/// handle reaches it through the pin it already holds, at no extra reference count.
 #[derive(Debug)]
 struct Pin {
     /// Made by this memtable's writer (`Memtable::create`), so `markers` is kept.
     writer: bool,
     /// A delete marker was inserted (set before the marker is linked, Release).
     markers: AtomicBool,
+    /// The stale-tail index, when the writer keeps one (D194).
+    tails: std::sync::OnceLock<TailIndex>,
 }
 
 impl Pin {
@@ -177,6 +184,7 @@ impl Pin {
         Self {
             writer: true,
             markers: AtomicBool::new(false),
+            tails: std::sync::OnceLock::new(),
         }
     }
 
@@ -184,6 +192,7 @@ impl Pin {
         Self {
             writer: false,
             markers: AtomicBool::new(true),
+            tails: std::sync::OnceLock::new(),
         }
     }
 }
@@ -604,6 +613,8 @@ pub struct Memtable {
     /// removed, so the splice stays exact.
     splice: [u32; MAX_HEIGHT],
     pin: Arc<Pin>,
+    /// The arena's chunk size (for the stale-tail index).
+    chunk_size: usize,
 }
 
 impl Memtable {
@@ -661,7 +672,49 @@ impl Memtable {
             rng: 0x9E37_79B9_7F4A_7C15 ^ (root as u64),
             splice: [head as u32; MAX_HEIGHT],
             pin,
+            chunk_size: arena.chunk_size,
         })
+    }
+
+    /// Keeps a stale-tail index (D194, ICR 0013): for each entry inserted in front of an
+    /// older entry of its column, a later entry of that column, so a reader that has finished
+    /// the column passes its superseded versions in one jump ([`Cursor::skip_column`]). The
+    /// index is process memory: readers from [`Memtable::reader`] share it, and readers from
+    /// [`MemtableReader::open`] (other processes) have none. Call before the first insert.
+    ///
+    /// ```
+    /// use pigeonhole_format::{Cursor, Kind, encode_key};
+    /// use pigeonhole_memtable::{ArenaRegion, Memtable, ShardArena};
+    ///
+    /// let mut arena = ShardArena::new(ArenaRegion::heap(1 << 20), 64 * 1024);
+    /// let mut m = Memtable::create(&mut arena)?.with_tail_index();
+    /// let key = |q: &[u8], ts| {
+    ///     let mut k = Vec::new();
+    ///     encode_key(&mut k, b"row", q, ts, ts, Kind::Put).unwrap();
+    ///     k
+    /// };
+    /// for ts in 1..=5 {
+    ///     m.insert(&mut arena, &key(b"a", ts), b"\x00v")?;
+    /// }
+    /// m.insert(&mut arena, &key(b"b", 1), b"\x00v")?;
+    /// let column = &key(b"a", 0)[..key(b"a", 0).len() - 17];
+    /// let mut it = m.reader().iter();
+    /// it.seek_to_first()?;
+    /// it.next()?; // on version 4 of `a`, after reading version 5
+    /// assert!(it.skip_column(column)?); // past versions 4..1 in one jump
+    /// assert_eq!(it.key(), &key(b"b", 1)[..]);
+    /// # Ok::<(), pigeonhole_memtable::Error>(())
+    /// ```
+    ///
+    /// # Panics
+    /// If the memtable already holds entries.
+    pub fn with_tail_index(self) -> Self {
+        assert_eq!(self.count, 0, "with_tail_index on a memtable with entries");
+        let index = TailIndex::new(self.region.len(), self.chunk_size);
+        if self.pin.tails.set(index).is_err() {
+            unreachable!("a new memtable's pin has no index yet");
+        }
+        self
     }
 
     /// Inserts one entry. `key` is a full internal key (unique: it contains the seqno);
@@ -737,13 +790,24 @@ impl Memtable {
         mem.write_u32(off + layout::N_KEY_LEN, key_len);
         mem.write_u32(off + layout::N_VALUE_LEN, value_len);
         mem.write(off + layout::N_HEIGHT, &[height as u8, 0, 0, 0]);
-        for (level, &p) in prev.iter().enumerate().take(height) {
-            let next = mem.load_u32(tower(p, level), Ordering::Relaxed);
+        // Level 0 first: its successor is the stale-tail index's too.
+        let next0 = mem.load_u32(tower(prev[0], 0), Ordering::Relaxed);
+        mem.write_u32(tower(node, 0), next0);
+        // An index loop: the iterator form (`enumerate().take(height).skip(1)` over the
+        // array) compiled to an out-of-line adapter, about 38 instructions per insert.
+        #[allow(clippy::needless_range_loop)]
+        for level in 1..height {
+            let next = mem.load_u32(tower(prev[level], level), Ordering::Relaxed);
             mem.write_u32(tower(node, level), next);
         }
         let key_off = off + layout::N_TOWER + 4 * height;
         mem.write(key_off, key);
         mem.write(key_off + key.len(), value);
+        // Before the node is linked, so a reader that reaches it sees its entry. An insert in
+        // key order (no successor) tests one word.
+        if next0 != NULL && self.pin.tails.get().is_some() {
+            self.record_tail(node, next0, key);
+        }
 
         // Publish: link bottom-up, each with release so a reader that acquires the link
         // sees the whole node.
@@ -796,6 +860,41 @@ impl Memtable {
         let height = mem.read_u8(off + layout::N_HEIGHT) as usize;
         let key_len = mem.read_u32(off + layout::N_KEY_LEN) as usize;
         mem.cmp(off + layout::N_TOWER + 4 * height, key_len, key)
+    }
+
+    /// Records `node`'s stale tail (D194) when its successor `next` is in its column. Out of
+    /// line, so `insert` keeps its shape for the inserts that need none.
+    #[inline(never)]
+    fn record_tail(&self, node: u32, next: u32, key: &[u8]) {
+        let Some(tails) = self.pin.tails.get() else {
+            return;
+        };
+        if self.same_column(next, key) {
+            let tail = match tails.get(next) {
+                NULL => next,
+                t => t,
+            };
+            tails.set(node, tail);
+        }
+    }
+
+    /// Whether the (writer-trusted) node at `node` is in the column of internal key `key`.
+    fn same_column(&self, node: u32, key: &[u8]) -> bool {
+        let mem = &self.region.mem;
+        let off = node as usize;
+        let height = mem.read_u8(off + layout::N_HEIGHT) as usize;
+        let key_len = mem.read_u32(off + layout::N_KEY_LEN) as usize;
+        let column = key.len() - SUFFIX_LEN;
+        if key_len != key.len() {
+            return false;
+        }
+        let start = off + layout::N_TOWER + 4 * height;
+        // Neighbouring rows usually differ near the end of the row (sequential ids, time
+        // keys), past a long shared prefix: the column's last word settles most misses.
+        if column >= 8 && mem.cmp(start + column - 8, 8, &key[column - 8..column]) != Cmp::Equal {
+            return false;
+        }
+        mem.cmp(start, column, &key[..column]) == Cmp::Equal
     }
 
     /// A geometric height with ratio 1/4, from a private xorshift generator.
@@ -1241,6 +1340,44 @@ pub struct MemIter {
 }
 
 impl MemIter {
+    /// Whether [`Cursor::skip_column`] can jump here: the memtable has a stale-tail index
+    /// (D194) and holds entries. A reader can leave the skip off for a read whose sources
+    /// have no such memtable, so it never pays for a try that cannot succeed.
+    pub fn skips_columns(&self) -> bool {
+        self.reader.pin.tails.get().is_some() && !self.reader.is_empty()
+    }
+
+    /// [`Cursor::skip_column`]'s jump: from the tail `at`, steps while the key is still in
+    /// `column` (following later tails), and stops on the first entry past it.
+    fn jump(&mut self, mut at: u32, column: &[u8]) -> Result<bool> {
+        loop {
+            self.steps += 1;
+            if self.steps > self.budget {
+                self.budget = self.reader.len() + STEP_SLACK;
+                if self.steps > self.budget {
+                    return Err(Error::Corrupt("link cycle"));
+                }
+            }
+            let next = self.reader.successor(at)?;
+            match next {
+                Some(n)
+                    if n.key_len == column.len() + SUFFIX_LEN
+                        && self.reader.region.mem.cmp(n.key_off, column.len(), column)
+                            == Cmp::Equal =>
+                {
+                    at = match self.reader.pin.tails.get().map_or(NULL, |t| t.get(n.off)) {
+                        NULL => n.off,
+                        t => t,
+                    };
+                }
+                _ => {
+                    self.set(next);
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     /// The current value as an [`ArenaSlice`] that outlives the cursor, so a caller can hand
     /// out a large value without copying it (it must also hold the view pin that keeps the
     /// memtable from being reclaimed).
@@ -1379,6 +1516,20 @@ impl Cursor for MemIter {
         self.steps = 0;
         self.set(found);
         Ok(())
+    }
+
+    /// With a stale-tail index (D194): jumps to the tail recorded for the current entry,
+    /// then steps inside the memtable while the key is still in `column`.
+    #[inline]
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
+        let (Some(tails), Some(node)) = (self.reader.pin.tails.get(), self.node) else {
+            return Ok(false);
+        };
+        let at = tails.get(node.off);
+        if at == NULL {
+            return Ok(false);
+        }
+        self.jump(at, column)
     }
 
     fn next(&mut self) -> Result<()> {
