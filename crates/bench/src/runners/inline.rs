@@ -28,6 +28,23 @@ pub const INLINE_IN_FLIGHT: usize = 16;
 /// Longest the warmup runs while waiting for the balancer to spread the table (D204).
 const SPREAD_CAP: Duration = Duration::from_secs(30);
 
+/// How long the table must go without a split, merge or move before the warmup ends: longer
+/// than the balancer's dwell (10 passes of 100 ms, D146), so a quiet stretch means the
+/// balancer settled, not that it is waiting out a dwell.
+const SETTLED: Duration = Duration::from_secs(2);
+
+/// Sleeps until the shard's wakeup or completion fires, but no longer than its
+/// [`next_wakeup`](Shard::next_wakeup) or `cap`: with `IoBackend::Uring` a shard's I/O
+/// completes only when its thread runs it again, and `next_wakeup` is zero while any is in
+/// flight, so a loop that slept anyway would sleep through its own WAL writes (the #154
+/// Linux anomaly).
+fn idle(shard: &Shard, cap: Duration) {
+    let wait = shard.next_wakeup().unwrap_or(cap).min(cap);
+    if !wait.is_zero() {
+        std::thread::park_timeout(wait);
+    }
+}
+
 /// How long a shard thread's turn may run before it polls its commits again.
 const TURN: Duration = Duration::from_micros(50);
 
@@ -113,7 +130,7 @@ fn pipeline(
         let more = shard.run_once(TURN);
         if !progressed && !more {
             // Woken by a commit's completion or by the shard's wakeup callback.
-            std::thread::park_timeout(Duration::from_micros(200));
+            idle(shard, Duration::from_micros(200));
         }
     }
 }
@@ -131,7 +148,7 @@ fn with_drivers<T>(shards: Vec<Shard>, f: impl FnOnce() -> T) -> (Vec<Shard>, T)
                 shard.set_wakeup(Box::new(move || me.unpark()));
                 while !stop.load(Ordering::Acquire) {
                     if !shard.run_once(Duration::from_millis(1)) {
-                        std::thread::park_timeout(Duration::from_micros(500));
+                        idle(&shard, Duration::from_micros(500));
                     }
                 }
                 shard
@@ -184,7 +201,7 @@ fn phase(
                     // between turns until one arrives (the wakeup unparks this thread).
                     while done.load(Ordering::Acquire) < n {
                         if !shard.run_once(TURN) {
-                            std::thread::park_timeout(Duration::from_micros(200));
+                            idle(&shard, Duration::from_micros(200));
                         }
                     }
                     r.map(|()| (shard, hist))
@@ -244,11 +261,13 @@ impl PigeonholeRunner {
         let load = load_start.elapsed();
         let run = writes(workload.run_ops())?;
         let (warm, measured) = run.split_at((warmup as usize).min(run.len()));
-        // Warm up until the balancer has spread the table: every shard owns a tablet and a
-        // pass changes nothing (a fixed warmup can end before the first split, and the
-        // measured phase would then be one tablet on one shard). Passes repeat the warmup
-        // writes; the cap bounds a table that never spreads, reported as a warning.
+        // Warm up until the balancer has spread the table and settled: every shard owns a
+        // tablet and nothing split, merged or moved for `SETTLED` (a fixed warmup can end
+        // before the first split, and the measured phase would then be one tablet on one
+        // shard). Passes repeat the warmup writes; the cap bounds a table that never settles,
+        // reported as a warning.
         let started = Instant::now();
+        let mut last_change = started;
         let mut shards = shards;
         loop {
             let before = db.shard_stats();
@@ -258,8 +277,11 @@ impl PigeonholeRunner {
                 .iter()
                 .zip(&after)
                 .any(|(b, a)| (a.splits, a.merges, a.moves) != (b.splits, b.merges, b.moves));
+            if changed {
+                last_change = Instant::now();
+            }
             let spread = after.iter().all(|s| s.tablets > 0);
-            if (spread && !changed) || warm.is_empty() {
+            if (spread && last_change.elapsed() >= SETTLED) || warm.is_empty() {
                 break;
             }
             if started.elapsed() > SPREAD_CAP {
