@@ -69,6 +69,38 @@ pub fn blob_cache_file(id: BlobFileId) -> u64 {
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+thread_local! {
+    /// While `counting_file_reads` runs on this thread: the block reads made from the file.
+    static FILE_READS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f`, counting the block reads it makes from the file on this thread (an async
+/// scan's step, whose unpredicted misses are read synchronously and counted: D196, #398).
+/// Cache hits are not counted, and only the miss paths pay for the count.
+pub fn counting_file_reads<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FILE_READS.with(|c| c.set(self.0));
+        }
+    }
+    let restore = Restore(FILE_READS.with(|c| c.replace(Some(0))));
+    let out = f();
+    let n = FILE_READS.with(std::cell::Cell::get).unwrap_or(0);
+    drop(restore);
+    (out, n)
+}
+
+/// Counts a block read from the file, if `counting_file_reads` is running.
+#[cold]
+pub(crate) fn note_file_read() {
+    FILE_READS.with(|c| {
+        if let Some(n) = c.get() {
+            c.set(Some(n + 1));
+        }
+    });
+}
+
 /// SST errors.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -386,6 +418,31 @@ impl SstReader {
     /// adds; a point get probes both. `true` if the SST has no filter.
     pub fn may_contain_column(&self, column_hash: u64) -> bool {
         self.inner.may_contain_column(column_hash)
+    }
+
+    /// The first block a fresh cursor's first read loads past the pinned top index (the first
+    /// index partition, then its first data block), if the cache does not hold it: an async
+    /// scan fetches it before a level cursor moves into this SST (D196).
+    pub fn first_fetch(&self, priority: Priority) -> Option<Fetch> {
+        use pigeonhole_format::block::{Block, BlockAddr, BlockKind};
+        use pigeonhole_format::cursor::Cursor as _;
+        let blocks = &self.inner.blocks;
+        let mut top = Block::new(self.inner.top.clone()).ok()?.into_cursor();
+        top.seek_to_first().ok()?;
+        if !top.valid() {
+            return None;
+        }
+        let addr = BlockAddr::decode_varint(top.value()).ok()?;
+        match blocks.lookup(addr) {
+            Ok(None) => Some(blocks.fetch(addr, BlockKind::Index, priority)),
+            Ok(Some(h)) => {
+                let mut it = Block::new(h).ok()?.into_cursor();
+                it.seek_to_first().ok()?;
+                let first = BlockAddr::decode_varint(it.value()).ok()?;
+                blocks.fetch_if_missing(first, BlockKind::Data, priority)
+            }
+            Err(_) => None,
+        }
     }
 
     /// A cursor applying `filter`; unpositioned until a seek. Owns a clone of the `Arc`.

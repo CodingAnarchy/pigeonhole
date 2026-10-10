@@ -497,6 +497,46 @@ impl<'t> Scan<'t> {
             _table: std::marker::PhantomData,
         })
     }
+
+    /// The scan as a [`Stream`](futures_core::Stream) of owned [`Row`]s, in key order (see
+    /// [`nonblocking`](crate::nonblocking)): each tablet is positioned without blocking, and
+    /// the blocks each step will read are fetched asynchronously first, only as the stream
+    /// is polled. A block a step reads that was not predicted is read synchronously and
+    /// counted ([`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads); D196,
+    /// #398). An error setting the scan up is the stream's first item.
+    #[cfg(feature = "async")]
+    pub fn stream(mut self) -> crate::nonblocking::RowStream<'t> {
+        let limit_zero = self.limit == Some(0);
+        let started = (|| {
+            let (info, snapshot, families) = self.sel.start(self.core)?;
+            let mut spec = ScanSpec::new(self.start, self.end);
+            spec.read = self.sel.spec;
+            spec.read.families = families.into_vec();
+            spec.limit = self.limit.unwrap_or(0);
+            let cursor = self
+                .core
+                .db
+                .engine
+                .scan_async(&snapshot, self.core.info.id, spec)?;
+            Ok((cursor, RowBuf::new(info, 0)))
+        })();
+        crate::nonblocking::RowStream::new(started, limit_zero)
+    }
+}
+
+/// Reads the cells of the row `cursor` is on into `buf` (cleared first).
+#[cfg(feature = "async")]
+pub(crate) fn fill_row(cursor: &mut ScanCursor, buf: &mut RowBuf) -> Result<()> {
+    buf.clear();
+    buf.key.extend_from_slice(cursor.row());
+    loop {
+        let start = buf.qualifiers.len();
+        let Some(family) = cursor.next_cell_into(&mut buf.qualifiers)? else {
+            return Ok(());
+        };
+        let end = buf.qualifiers.len();
+        cursor.push_current(family, start..end, buf);
+    }
 }
 
 /// Rows of a scan, in key order. As an [`Iterator`] it yields owned [`Row`]s (cheap: values

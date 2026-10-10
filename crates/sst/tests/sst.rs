@@ -422,3 +422,82 @@ fn skip_row_seeks_past_a_row_spanning_many_blocks() {
         assert_eq!(row_of(it.key()), &rows[2][..]);
     }
 }
+
+#[test]
+fn upcoming_names_the_next_uncached_blocks_in_order() {
+    // ICR 0017: the one prediction of what a scan reads next, shared by async scans
+    // (`max = 1`) and the sync readahead hint (more).
+    let mut m = Model::new();
+    for i in 0..400u32 {
+        let mut k = Vec::new();
+        encode_key(
+            &mut k,
+            format!("row{i:05}").as_bytes(),
+            b"q",
+            1,
+            1,
+            Kind::Put,
+        )
+        .unwrap();
+        m.insert(k, b"\x00value-value-value".to_vec());
+    }
+    let l = Layout {
+        block_size: 64,
+        restart_interval: 2,
+        compression: pigeonhole_format::compress::Compression::None,
+        compression_level: 3,
+        bloom_bits: 0,
+    };
+    let (_vfs, file) = sim_file(11, EXTENT);
+    let meta = write_sst(&file, EXTENT, &m, &l);
+    let r = open(&file, &meta);
+    assert!(r.properties().data_blocks >= 50);
+    let mut it = r.iter(ScanFilter::all(), ReadOptions::default());
+    it.seek_to_first().unwrap();
+    let mut first = Vec::new();
+    it.upcoming(3, &mut first);
+    // Up to three data blocks, plus the fetch of an uncached next index partition, which
+    // ends the walk (the blocks past it cannot be named without it).
+    assert!(
+        !first.is_empty() && first.len() <= 4,
+        "{} upcoming",
+        first.len()
+    );
+    // Fetching and admitting what it names makes progress: a cached block is skipped, and
+    // once the next three blocks are cached it names none of them.
+    let mut named = std::collections::BTreeSet::new();
+    let mut out = first;
+    for round in 0.. {
+        assert!(
+            round < 20,
+            "upcoming never ran out of uncached blocks ahead"
+        );
+        if out.is_empty() {
+            break;
+        }
+        for f in &out {
+            assert!(
+                named.insert(format!("{f:?}")),
+                "a cached block named again: {f:?}"
+            );
+            let buf = f.submit().wait().unwrap();
+            f.admit(buf).unwrap();
+            assert!(f.is_kept());
+        }
+        out.clear();
+        it.upcoming(3, &mut out);
+    }
+    assert!(named.len() >= 3, "{} blocks named", named.len());
+    // Unbounded, it still names blocks further on.
+    let mut more = Vec::new();
+    it.upcoming(usize::MAX, &mut more);
+    assert!(!more.is_empty());
+    // On the last block nothing follows.
+    let mut last = Vec::new();
+    encode_key(&mut last, b"row00399", b"q", 1, 1, Kind::Put).unwrap();
+    it.seek(&last).unwrap();
+    assert!(it.at_last_block());
+    let mut none = Vec::new();
+    it.upcoming(10, &mut none);
+    assert!(none.is_empty());
+}

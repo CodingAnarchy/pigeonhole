@@ -133,6 +133,83 @@ impl SstIter {
         }
     }
 
+    /// Switches cache-only reads on or off ([`ReadOptions::cache_only`]): an async scan
+    /// positions its cursors cache-only, then steps them reading normally (ICR 0014).
+    pub fn set_cache_only(&mut self, on: bool) {
+        self.options.cache_only = on;
+    }
+
+    /// The blocks the cursor reads next, past its current data block, that the cache does
+    /// not hold: up to `max` of the following data blocks its index names, in order, appended
+    /// to `out` as fetches. Cached blocks are skipped. The walk stops at the SST's end, or at
+    /// a next index partition that is not cached (its fetch is the last one appended: the
+    /// blocks after it cannot be named without it). Read-only (it peeks a copy of the index
+    /// cursor), and nothing if the cursor is not positioned.
+    ///
+    /// The one prediction of what a scan reads next (ICR 0017): an async scan fetches
+    /// `max = 1` ahead before each step (D196), and a sync scan's readahead hint
+    /// (#402) fetches more from its miss path.
+    pub fn upcoming(&self, max: usize, out: &mut Vec<crate::Fetch>) {
+        let blocks = &self.reader.inner.blocks;
+        let priority = self.options.priority;
+        let Some(index) = self.index.as_ref().filter(|i| i.valid()) else {
+            return;
+        };
+        let mut index = index.clone();
+        let mut top = self.top.clone();
+        let mut seen = 0;
+        while seen < max {
+            if index.next().is_err() {
+                return;
+            }
+            if !index.valid() {
+                // The next index partition, if there is one.
+                let Some(t) = top.as_mut() else { return };
+                if t.next().is_err() || !t.valid() {
+                    return;
+                }
+                let Ok(addr) = BlockAddr::decode_varint(t.value()) else {
+                    return;
+                };
+                match blocks.lookup(addr) {
+                    Ok(Some(h)) => match Block::new(h) {
+                        Ok(b) => {
+                            index = b.into_cursor();
+                            if index.seek_to_first().is_err() || !index.valid() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    },
+                    Ok(None) => {
+                        out.push(blocks.fetch(addr, BlockKind::Index, priority));
+                        return;
+                    }
+                    Err(_) => return,
+                }
+            }
+            let Ok(addr) = BlockAddr::decode_varint(index.value()) else {
+                return;
+            };
+            seen += 1;
+            if let Some(fetch) = blocks.fetch_if_missing(addr, BlockKind::Data, priority) {
+                out.push(fetch);
+            }
+        }
+    }
+
+    /// Whether the current data block is the SST's last: the cursor's next block is past the
+    /// SST (a level cursor moves on to its next one).
+    pub fn at_last_block(&self) -> bool {
+        let next = |slot: &Option<BlockIter<BlockHandle>>| {
+            slot.as_ref().is_some_and(|it| {
+                let mut peek = it.clone();
+                peek.next().is_ok() && peek.valid()
+            })
+        };
+        self.data.is_some() && !next(&self.index) && !next(&self.top)
+    }
+
     /// The current value as a pinned [`Cell`] that outlives the cursor (no copy). Empty if
     /// the cursor is not valid.
     pub fn value_cell(&self) -> Cell {

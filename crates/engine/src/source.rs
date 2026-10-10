@@ -145,6 +145,21 @@ impl Deref for Pinned {
 }
 
 impl Source {
+    /// Switches an SST source's cache-only reads on or off (async scans, ICR 0014).
+    pub(crate) fn set_cache_only(&mut self, on: bool) {
+        if let Source::Sst(s) = self {
+            s.set_cache_only(on);
+        }
+    }
+
+    /// The uncached blocks an SST source's next steps read, up to `max`, appended to `out`
+    /// ([`SstSource::upcoming`]; nothing for other sources).
+    pub(crate) fn upcoming(&self, max: usize, out: &mut Vec<pigeonhole_sst::Fetch>) {
+        if let Source::Sst(s) = self {
+            s.upcoming(max, out);
+        }
+    }
+
     /// The current value, pinned without a copy where the source allows it.
     ///
     /// # Panics
@@ -202,7 +217,7 @@ fn read_options(priority: Priority, scan: bool, cache_only: bool) -> ReadOptions
 /// SST sources for a scan of `[start, end)` (row prefixes), newest first: one per SST of
 /// level 0 (they overlap), and one per deeper level (its SSTs are sorted and disjoint, so a
 /// [`LevelIter`] opens and seeks only the ones the scan reaches).
-pub(crate) fn sst_sources_range(
+pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     fam: &FamilySsts,
     set: &Arc<SstSet>,
     filter: &ScanFilter,
@@ -211,12 +226,19 @@ pub(crate) fn sst_sources_range(
     priority: Priority,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, true, false);
+    let opts = read_options(priority, true, CACHE_ONLY);
+    let reader = |sst: &OpenSst| {
+        if CACHE_ONLY {
+            sst.reader_cache_only(set, priority)
+        } else {
+            sst.reader(set, priority)
+        }
+    };
     for (level, files) in fam.levels.iter().enumerate() {
         let mut picked = files.iter().filter(|sst| overlaps_range(sst, start, end));
         if level == 0 {
             for sst in picked {
-                let reader = sst.reader(set, priority)?;
+                let reader = reader(sst)?;
                 out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
             }
             continue;
@@ -226,7 +248,7 @@ pub(crate) fn sst_sources_range(
         };
         let rest: Vec<_> = picked.cloned().collect();
         if rest.is_empty() {
-            let reader = first.reader(set, priority)?;
+            let reader = reader(first)?;
             out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
             continue;
         }
@@ -361,13 +383,51 @@ impl From<SstIter> for SstSource {
 impl Level {
     /// The cursor of the SST at `i`, unpositioned; `at` moves only if it opened.
     fn open(&mut self, i: usize) -> Result<SstIter> {
-        let reader = self.files[i].reader(&self.set, self.opts.priority)?;
+        let reader = if self.opts.cache_only {
+            self.files[i].reader_cache_only(&self.set, self.opts.priority)?
+        } else {
+            self.files[i].reader(&self.set, self.opts.priority)?
+        };
         self.at = i;
         Ok(reader.iter(self.filter.clone(), self.opts))
     }
 }
 
 impl SstSource {
+    /// Switches cache-only reads on or off for the open SST and the ones the level opens
+    /// next (an async scan positions cache-only, then steps reading normally; ICR 0014).
+    pub(crate) fn set_cache_only(&mut self, on: bool) {
+        self.iter.set_cache_only(on);
+        if let Some(level) = &mut self.level {
+            level.opts.cache_only = on;
+        }
+    }
+
+    /// The uncached blocks the next steps past the current one read, up to `max` of the open
+    /// SST's ([`SstIter::upcoming`]), appended to `out`; on the open SST's last block, what
+    /// opening the level's next SST and reading its first block need (ICR 0017).
+    pub(crate) fn upcoming(&self, max: usize, out: &mut Vec<pigeonhole_sst::Fetch>) {
+        let before = out.len();
+        self.iter.upcoming(max, out);
+        if out.len() > before {
+            return;
+        }
+        let Some(level) = self.level.as_ref().filter(|l| l.positioned) else {
+            return;
+        };
+        if !self.iter.at_last_block() {
+            return;
+        }
+        let Some(next) = level.files.get(level.at + 1) else {
+            return;
+        };
+        match next.reader_cache_only(&level.set, level.opts.priority) {
+            Ok(reader) => out.extend(reader.first_fetch(level.opts.priority)),
+            Err(Error::WouldBlock(fetch)) => out.push(*fetch),
+            Err(_) => {}
+        }
+    }
+
     /// The cursor of a level's `files` (in key order, at least one), with the first opened.
     fn level(
         files: Vec<Arc<OpenSst>>,
@@ -624,13 +684,13 @@ impl View {
         end: Option<&[u8]>,
     ) -> Result<Vec<Source>> {
         let mut out = Vec::new();
-        self.scan_sources_into(shard, tablet, family, filter, start, end, &mut out)?;
+        self.scan_sources_into::<false>(shard, tablet, family, filter, start, end, &mut out)?;
         Ok(out)
     }
 
     /// [`View::scan_sources`] appended to `out` (a reused source list).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn scan_sources_into(
+    pub(crate) fn scan_sources_into<const CACHE_ONLY: bool>(
         &self,
         shard: ShardId,
         tablet: TabletId,
@@ -645,7 +705,7 @@ impl View {
             mem_sources(set, filter, out);
         }
         if let Some(fam) = l.ssts {
-            sst_sources_range(fam, &self.ssts, filter, start, end, l.priority, out)?;
+            sst_sources_range::<CACHE_ONLY>(fam, &self.ssts, filter, start, end, l.priority, out)?;
         }
         Ok(())
     }
@@ -997,7 +1057,7 @@ mod level_tests {
         for (start, end, sources, levels) in cases {
             let (start, end) = (start.map(prefix), end.map(prefix));
             let mut out = Vec::new();
-            sst_sources_range(
+            sst_sources_range::<false>(
                 &fam,
                 &set,
                 &ScanFilter::all(),
