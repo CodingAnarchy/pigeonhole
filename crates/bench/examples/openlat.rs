@@ -201,6 +201,11 @@ impl Vfs for TimedVfs {
     fn sync_dir(&self, dir: &Path) -> Result<()> {
         self.clock.0.time("sync_dir", || self.inner.sync_dir(dir))
     }
+    fn submit_sync_dir(&self, dir: &Path) -> Completion<()> {
+        self.clock
+            .0
+            .submitted("submit_sync_dir", self.inner.submit_sync_dir(dir))
+    }
     fn open_shared(
         &self,
         name: &str,

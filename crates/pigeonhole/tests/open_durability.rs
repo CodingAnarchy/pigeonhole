@@ -320,7 +320,8 @@ fn the_first_durable_commit_after_a_clean_reopen_waits_for_the_streams_directory
     };
     // Held: the commit is written and its own sync completes, but it is not acknowledged.
     assert!(
-        rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        rx.recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
         "a GroupSync commit was acknowledged before the streams' directory sync"
     );
     // A power loss now loses nothing that was acknowledged.
@@ -353,7 +354,10 @@ fn the_first_durable_commit_after_a_clean_reopen_waits_for_the_streams_directory
             let _ = tx.send(r.is_ok());
         })
     };
-    assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err());
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(300))
+            .is_err()
+    );
     vfs.hold_dir_syncs(false);
     assert_eq!(
         rx.recv_timeout(std::time::Duration::from_secs(10)),
