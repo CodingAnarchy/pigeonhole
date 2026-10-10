@@ -498,6 +498,24 @@ where
         self.seek_marker_then_column(|col| col.extend_from_slice(qualifier))
     }
 
+    /// As [`CellResolver::seek_column_encoded`], for a caller that knows none of the cursor's
+    /// sources holds a family or row delete marker (ICR 0020: a memtable whose writer never
+    /// inserted one): one seek straight to the column, with no marker seek before it.
+    /// Called when a source might hold a marker, it would miss that marker's deletes.
+    pub fn seek_column_encoded_unmarked(
+        &mut self,
+        column_prefix: &[u8],
+        row_len: usize,
+    ) -> Result<(), C::Error> {
+        self.reset_position();
+        self.row.extend_from_slice(&column_prefix[..row_len]);
+        self.col.extend_from_slice(column_prefix);
+        self.column_bound = true;
+        self.note_row_bound();
+        self.note_column_bound();
+        self.cursor.seek(&self.col)
+    }
+
     /// The rest of a column seek, with the row prefix in `row`: the marker seek, then the
     /// column seek, `column` appending the escaped qualifier and terminator to the row
     /// prefix.

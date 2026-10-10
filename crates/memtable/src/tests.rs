@@ -681,3 +681,26 @@ fn largest_free_run_is_the_largest_contiguous_free_space() {
         [2, 1, 1, 0, 0]
     );
 }
+
+/// ICR 0020: the writer knows whether a memtable holds a delete marker, and so does every
+/// handle sharing its pin.
+#[test]
+fn may_have_markers_is_known_only_to_the_writer() {
+    let mut arena = ShardArena::new(ArenaRegion::heap(1 << 20), 64 * 1024);
+    let mut mt = Memtable::create(&mut arena).unwrap();
+    let reader = mt.reader();
+    assert!(!reader.may_have_markers());
+    // Opened by root while the writer lives: the same pin, the same knowledge.
+    let by_root = MemtableReader::open(arena.region().clone(), mt.root()).unwrap();
+    assert!(!by_root.may_have_markers());
+    mt.note_marker();
+    let mut k = Vec::new();
+    pigeonhole_format::encode_key(&mut k, b"r", b"", 1, 1, pigeonhole_format::Kind::Put).unwrap();
+    mt.insert(&mut arena, &k, b"").unwrap();
+    assert!(reader.may_have_markers() && by_root.may_have_markers());
+    // A handle without the writer's pin (a reader process's, opened from a published view)
+    // always answers "maybe": `Pin::foreign`.
+    drop((reader, by_root));
+    let retired = mt.retire();
+    arena.reclaim(retired);
+}
