@@ -71,7 +71,7 @@ use std::fmt;
 use std::hash::Hasher;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 
 use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
 use pigeonhole_format::{FormatVersion, ManifestVersion, PAGE_SIZE};
@@ -284,6 +284,7 @@ impl OpenedPager {
         Ok(Pager {
             inner: Arc::new(Inner {
                 file: self.file,
+                data_file: OnceLock::new(),
                 writable: self.writable,
                 db_id: self.superblock.db_id,
                 alloc: Mutex::new(alloc),
@@ -339,6 +340,9 @@ pub struct Pager {
 #[derive(Debug)]
 struct Inner {
     file: FileRef,
+    /// A second handle on the same file for SST and blob extents, opened for direct I/O
+    /// (#403); set once at open, `file` otherwise.
+    data_file: OnceLock<FileRef>,
     writable: bool,
     db_id: [u8; 16],
     alloc: Mutex<Alloc>,
@@ -636,9 +640,22 @@ impl Pager {
         })
     }
 
-    /// The file handle (SST and blob readers read extents through it directly).
+    /// The file handle: superblocks, the manifest, and the copies `shrink` and `backup` make.
     pub fn file(&self) -> &FileRef {
         &self.inner.file
+    }
+
+    /// The handle SST and blob extents are read and written through: the direct-I/O handle
+    /// set by [`Pager::set_data_file`] (#403), or [`Pager::file`].
+    pub fn data_file(&self) -> &FileRef {
+        self.inner.data_file.get().unwrap_or(&self.inner.file)
+    }
+
+    /// Sets the handle for SST and blob extents: a second handle on the same file, opened
+    /// for direct I/O (#403). Only the first call takes effect; call it at open, before any
+    /// extent is read or written.
+    pub fn set_data_file(&self, file: FileRef) {
+        let _ = self.inner.data_file.set(file);
     }
 
     /// The database id.

@@ -105,6 +105,10 @@ impl Vfs for FailingReads {
 }
 
 impl pigeonhole_io::File for FailingFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.inner.direct_align()
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
         self.check(buf.len())?;
         self.inner.read_at(buf, offset)

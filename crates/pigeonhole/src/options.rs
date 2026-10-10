@@ -46,6 +46,7 @@ pub struct Options {
     allow_unregistered_merge_operators: bool,
     allow_fuse: bool,
     io_backend: Option<IoBackend>,
+    direct_io: Option<bool>,
     vfs: Option<VfsRef>,
     wal_segment_size: Option<u64>,
     tablet_changes: bool,
@@ -71,6 +72,7 @@ impl Default for Options {
             allow_unregistered_merge_operators: false,
             allow_fuse: false,
             io_backend: None,
+            direct_io: None,
             vfs: None,
             wal_segment_size: None,
             tablet_changes: true,
@@ -273,6 +275,17 @@ impl Options {
         self
     }
 
+    /// Read and write SST and blob extents with direct I/O (#403): `O_DIRECT` on Linux,
+    /// `F_NOCACHE` on macOS, `FILE_FLAG_NO_BUFFERING` on Windows, through a second handle on
+    /// the file, so the block cache is their only cache. Superblocks, the manifest and the
+    /// WAL stay buffered. A file system that refuses direct I/O keeps buffered I/O. Default
+    /// off; with it on, size [`Options::block_cache`] for the working set, since the OS no
+    /// longer caches SST blocks.
+    pub fn direct_io(mut self, yes: bool) -> Self {
+        self.direct_io = Some(yes);
+        self
+    }
+
     /// Let a table's tablets split, merge and move between shards (default on), so the
     /// writes of one table spread over every shard. Off, each table is one tablet on one
     /// shard: writes to a single table use one shard thread whatever [`shards`](Self::shards)
@@ -340,6 +353,7 @@ pub struct ReaderOptions {
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     allow_fuse: bool,
     io_backend: Option<IoBackend>,
+    direct_io: Option<bool>,
     vfs: Option<VfsRef>,
 }
 
@@ -372,6 +386,12 @@ impl ReaderOptions {
     /// The I/O backend, as [`Options::io_backend`] (default [`IoBackend::Pread`]).
     pub fn io_backend(mut self, backend: IoBackend) -> Self {
         self.io_backend = Some(backend);
+        self
+    }
+
+    /// Direct I/O for SST and blob extents, as [`Options::direct_io`] (default off).
+    pub fn direct_io(mut self, yes: bool) -> Self {
+        self.direct_io = Some(yes);
         self
     }
 
@@ -588,7 +608,9 @@ impl Options {
             Some(v) => Arc::clone(v),
             None => backend_vfs(self.io_backend)?,
         };
+        let direct_io = self.direct_io.unwrap_or_else(env_direct_io);
         let mut o = EngineOptions::new(vfs);
+        o.direct_io = direct_io;
         o.create_if_missing = self.create_if_missing;
         o.shards = self.shards;
         o.compaction_threads = self.compaction_cores;
@@ -635,7 +657,9 @@ impl ReaderOptions {
             Some(v) => Arc::clone(v),
             None => backend_vfs(self.io_backend)?,
         };
+        let direct_io = self.direct_io.unwrap_or_else(env_direct_io);
         let mut o = EngineOptions::new(vfs);
+        o.direct_io = direct_io;
         if let Some(bytes) = self.block_cache {
             o.block_cache_bytes = bytes;
         }
@@ -686,6 +710,12 @@ fn backend_vfs(backend: Option<IoBackend>) -> Result<VfsRef, pigeonhole_engine::
         )),
         IoBackend::Auto => Ok(uring_vfs().unwrap_or_else(pread)),
     }
+}
+
+/// `PIGEONHOLE_DIRECT=1` (a test variable) turns direct I/O on where the options leave it
+/// unset.
+fn env_direct_io() -> bool {
+    std::env::var("PIGEONHOLE_DIRECT").as_deref() == Ok("1")
 }
 
 /// An io_uring backend, if the kernel offers one.

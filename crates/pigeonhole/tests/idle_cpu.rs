@@ -104,6 +104,10 @@ impl Vfs for FailingReads {
 }
 
 impl pigeonhole_io::File for FailingFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.inner.direct_align()
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
         self.check(buf.len())?;
         self.inner.read_at(buf, offset)
@@ -209,7 +213,10 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
         .shards(1)
         .memtable_budget(256 << 10)
         .block_cache(0)
-        .wal_segment_size(256 << 10);
+        .wal_segment_size(256 << 10)
+        // The injected failure targets reads of 1 KiB and more, which only compaction makes
+        // on buffered handles; direct I/O reads whole pages (#403), so every read would fail.
+        .direct_io(false);
     let (db, shards) = Pigeonhole::open_application_owned(DB, options).unwrap();
     // The documented loop: run until idle, then sleep until work arrives or background work
     // is due.

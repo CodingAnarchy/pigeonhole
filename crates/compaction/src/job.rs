@@ -430,7 +430,7 @@ impl Sink {
             let need = (key.len() + value.len()) as u64 * 2 + (64 << 10);
             let extent = self.pager.allocate(self.extent_bytes(need))?;
             let id = SstId(self.sst_ids.fetch_add(1, Ordering::Relaxed));
-            let file = self.pager.file().clone();
+            let file = self.pager.data_file().clone();
             self.open = Some(Open {
                 writer: SstWriter::new(file, extent, id, self.options.clone()),
                 extent,

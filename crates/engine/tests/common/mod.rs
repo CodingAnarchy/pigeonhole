@@ -609,6 +609,9 @@ impl Drop for Store {
 
 pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineOptions {
     let mut o = EngineOptions::new(vfs);
+    // `PIGEONHOLE_DIRECT=1`: SST and blob extents through a direct handle (#403), which the
+    // simulator holds to aligned I/O.
+    o.direct_io = std::env::var("PIGEONHOLE_DIRECT").as_deref() == Ok("1");
     o.create_if_missing = true;
     o.shards = shards;
     o.pin_threads = false;

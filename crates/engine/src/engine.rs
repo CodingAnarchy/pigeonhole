@@ -471,6 +471,7 @@ impl Engine {
         let mut live = manifest_extents;
         live.extend(catalog.data_extents());
         let pager = Arc::new(opened.finish(live)?);
+        open_data_file(&vfs, path, &pager, options.direct_io, true)?;
         if catalog.has_unknown_merge && !options.allow_unregistered_merge {
             let name = catalog
                 .tables()
@@ -520,7 +521,7 @@ impl Engine {
             mems: (0..shards)
                 .map(|_| Arc::new(ShardMems::default()))
                 .collect(),
-            ssts: Arc::new(SstSet::empty(pager.file().clone(), Arc::clone(&cache))),
+            ssts: Arc::new(SstSet::empty(pager.data_file().clone(), Arc::clone(&cache))),
             _pin: None,
         });
         let shared = Arc::new(Shared {
@@ -901,7 +902,7 @@ impl Engine {
             &catalog,
             None,
             &mut no_readers,
-            pager.file().clone(),
+            pager.data_file().clone(),
             Arc::clone(&cache),
         ));
         let first_view = Arc::new(View {
@@ -1018,6 +1019,7 @@ impl Engine {
         let manifest_version = opened.root().manifest_version;
         let manifest_file = opened.file().clone();
         let pager = Arc::new(opened.finish([])?);
+        open_data_file(&vfs, path, &pager, options.direct_io, false)?;
         let cache = block_cache(options.block_cache_bytes, shards);
         // The read-only pager is kept by the manifest writer (which never commits here).
         let empty_view = Arc::new(View {
@@ -1028,7 +1030,7 @@ impl Engine {
             mems: (0..shards)
                 .map(|_| Arc::new(ShardMems::default()))
                 .collect(),
-            ssts: Arc::new(SstSet::empty(pager.file().clone(), Arc::clone(&cache))),
+            ssts: Arc::new(SstSet::empty(pager.data_file().clone(), Arc::clone(&cache))),
             _pin: None,
         });
         let shared = Arc::new(Shared {
@@ -2611,7 +2613,7 @@ impl Inner {
             r.hooks.before_manifest_load.run();
             let (catalog, _) =
                 manifest::load_root(pager.file(), &root, r.shards, Arc::clone(&r.registry))?;
-            *cached = (version, Arc::new(catalog), pager.file().clone());
+            *cached = (version, Arc::new(catalog), pager.data_file().clone());
         }
         Ok(Some((Arc::clone(&cached.1), cached.2.clone())))
     }
@@ -3084,4 +3086,32 @@ fn shard_panicked(panic: &(dyn std::any::Any + Send)) -> Error {
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic".to_owned());
     crate::error::io_other("shard thread panicked", msg)
+}
+
+/// With `direct`, opens `path` again for direct I/O (#403) as the pager's handle for SST and
+/// blob extents. A file system that refuses direct I/O keeps the buffered handle.
+fn open_data_file(
+    vfs: &pigeonhole_io::VfsRef,
+    path: &Path,
+    pager: &Pager,
+    direct: bool,
+    write: bool,
+) -> Result<()> {
+    if !direct {
+        return Ok(());
+    }
+    let mut opts = OpenOptions::read();
+    opts.write = write;
+    opts.direct = true;
+    match vfs.open(path, opts) {
+        Ok(f) => {
+            pager.set_data_file(f);
+            Ok(())
+        }
+        Err(e) if e.kind == ErrorKind::Unsupported => {
+            crate::shard::trace!("direct I/O unavailable here ({e}); SSTs stay buffered");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }

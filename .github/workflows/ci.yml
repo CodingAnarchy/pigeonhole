@@ -90,6 +90,15 @@ jobs:
           cargo test -p pigeonhole-pager --all-features --test api
         env:
           PIGEONHOLE_IO: uring
+      # Direct I/O for SST and blob extents (#403): the simulated model check with direct
+      # handles (every SST read and write must be aligned there) and the real-file model
+      # check with O_DIRECT, on io_uring.
+      - name: tests with direct I/O
+        run: |
+          cargo test -p pigeonhole-engine --all-features --test model_check
+          PIGEONHOLE_REAL_FS=1 PIGEONHOLE_IO=uring cargo test -p pigeonhole --all-features --test model
+        env:
+          PIGEONHOLE_DIRECT: "1"
       - run: cargo deny check
       - name: semver checks (published crates only)
         shell: bash

@@ -685,7 +685,7 @@ impl CompactionWork {
                     readers.push((
                         meta.id,
                         Arc::new(SstReader::open(
-                            self.shared.pager.file().clone(),
+                            self.shared.pager.data_file().clone(),
                             &meta,
                             Arc::clone(&self.shared.cache),
                             priority,

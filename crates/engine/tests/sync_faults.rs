@@ -64,6 +64,10 @@ struct FaultFile {
 }
 
 impl File for FaultFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.inner.direct_align()
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.inner.read_at(buf, offset)
     }

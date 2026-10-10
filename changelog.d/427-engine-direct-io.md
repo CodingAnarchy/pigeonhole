@@ -1,0 +1,2 @@
+### Added
+- `Options::direct_io` and `ReaderOptions::direct_io` (default off; #403) read and write SST and blob extents through a second handle on the database file, opened for direct I/O, so the block cache is their only cache; superblocks, the manifest and the WAL stay buffered, and a file system that refuses direct I/O keeps buffered I/O. Size `block_cache` for the working set with it on. `pigeonhole-pager` adds `Pager::data_file` and `Pager::set_data_file`; `pigeonhole-engine` adds `EngineOptions::direct_io`.

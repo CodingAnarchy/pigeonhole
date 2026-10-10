@@ -233,7 +233,7 @@ impl BlobSink {
             let id = BlobFileId(self.blob_ids.fetch_add(1, Ordering::Relaxed));
             self.open = Some(OpenFile {
                 id,
-                writer: BlobWriter::new(self.pager.file().clone(), id, class),
+                writer: BlobWriter::new(self.pager.data_file().clone(), id, class),
                 extents: Vec::new(),
                 payload: (MIN_EXTENT << class)
                     - pigeonhole_format::blob::BLOB_EXTENT_HEADER_LEN as u64,
