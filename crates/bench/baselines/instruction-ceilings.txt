@@ -58,6 +58,11 @@
 # blocked #458 on a shape it does not touch. Temporary until #472 finds and fixes the
 # variation and lowers it back.
 
+#
+# scan-narrow, scan-small and scan-wide (crates/bench/examples/scanrate.rs, #29) were added
+# from four identical runs (the instructions workflow's base and head sides on PR #467, run
+# 38052048487, and a scratch callgrind run, 38051428167), which agreed exactly (1440, 1417,
+# 1327), with 0.3% headroom.
 as-written 2058 0.3
 flushed 1867 0.3
 compacted 1259 0.3
@@ -80,3 +85,6 @@ ycsb-c 47371 1.0
 ycsb-a 29487 1.0
 commit-overwrite 11929 0.5
 commit-at 10885 0.3
+scan-narrow 1445 0.3
+scan-small 1422 0.3
+scan-wide 1331 0.3

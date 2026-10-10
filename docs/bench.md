@@ -144,6 +144,7 @@ Each result row gives the workload, store, store settings, size, client threads,
 | Model value | 2 | `sparse-wide --engine pigeonhole,sqlite,rocksdb` | Pigeonhole beats SQLite EAV and RocksDB on throughput and p99 |
 | Latency | 3 | `ycsb-c` (point get), `ycsb-a`/`skewed-multi-shard` (writes), `group-commit --engine pigeonhole,rocksdb` (durable commits at 1, 4 and 16 threads), `adjacency`/`ycsb-e` (scans) | Goals table: get p50 < 2 µs, p99 < 10 µs; `group-commit` p99 < 200 µs; within 1.5× of RocksDB |
 | Scaling | 1 onward | `scaling --shards N` (N up to the core count), then `compare` against a stored `scaling.json` | Application-owned, each shard thread writing inline (D204): N-shard write throughput ≥ 0.8 × N × single-shard (`efficiency` ≥ 0.8), and single-shard p99 does not regress |
+| Scan rate | 3 | `cargo run --release -p pigeonhole-bench --example scanrate -- rate` (one thread; `scan-rate.sh` on the reference machine) | D205: the `narrow` shape (100-byte values, 8-cell rows), compacted and cached, scans > 1 GB/s decoded (row key + qualifier + value) on one core; `small`, `wide`, `large` and the memtable runs are reported |
 | Reproducibility | all | Two runs, then `compare a.json b.json` | Every result within tolerance |
 
 **What the scaling gate runs (D204).** The gate measures the spec's thread-per-core embedding:
@@ -165,6 +166,8 @@ Before D204 the gate ran N synchronous clients on N engine-owned shards. That's 
 **Scaling needs tablet changes** (on by default). With `--no-tablet-changes` a table is one tablet on one shard, so the skewed workload's writes all land on one shard whatever N is, and `scaling` fails by construction. With them on, the balancer splits the table under write skew and spreads the pieces over the shards. That takes about a second of writes on the machine below, longer than the `small` preset's load plus a 5% warmup, so `scaling` warms up as long as it measures (`--warmup 1.0`) unless `--warmup` says otherwise.
 
 **Where the writes went.** For Pigeonhole, each result also reports every shard's share of the measured phase: commits applied, tablets owned at its start and end, and splits, merges and moves completed. JSON has it in `detail.shards`; the markdown prints a `Shard | Commits | Share` table. A scaling run whose N-shard result shows one shard with all the commits measured one tablet, not N shards.
+
+**Scan rate (#29).** `examples/scanrate.rs rate` builds a table per shape, in the memtable or compacted with every block cached, and times whole-table scans of one family on one thread. Decoded bytes are the row key, qualifier and value of every returned cell. Shapes: `narrow` (8 cells of 100 B per row), `wide` (1,000 cells of 100 B), `small` (8 cells of 16 B) and `large` (4 cells of 1 KiB). Rows of small cells are the hardest case, because the cost is mostly per cell rather than per byte. The Goals target is judged on `narrow`, compacted (D205); the other shapes are reported. On the reference machine, `crates/bench/baselines/phase3-io/scan-rate.sh` runs it pinned to one core, three times, and prints the medians. The same binary is a callgrind shape binary too: `scan-narrow`, `scan-small` and `scan-wide` count instructions per returned cell on a compacted table, one source and one version per column, on every PR.
 
 ### Reproducibility tolerance
 
