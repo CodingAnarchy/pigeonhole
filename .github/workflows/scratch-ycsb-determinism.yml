@@ -1,0 +1,26 @@
+name: scratch ycsb determinism
+on:
+  push:
+    branches: [scratch/ycsb-determinism]
+permissions:
+  contents: read
+jobs:
+  runs:
+    strategy:
+      matrix:
+        job: [a, b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - run: cargo build --release -p pigeonhole-bench --example ycsb --example hotrow
+      - name: both shapes, twice
+        shell: bash
+        run: |
+          set -eu
+          echo "RUNNER cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+          T=target/release/examples
+          for r in 1 2; do scripts/instructions-per-cell.sh $T/hotrow $T/ycsb:ycsb-c,ycsb-a 2>/dev/null | grep ycsb | sed "s/^/RUN $r /" || true; done
