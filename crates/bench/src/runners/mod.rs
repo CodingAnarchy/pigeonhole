@@ -1,6 +1,7 @@
 //! Store runners and the hand-written wide-column key encoding the key-value
 //! comparison runners share.
 
+pub(crate) mod inline;
 pub(crate) mod pigeonhole;
 
 #[cfg(feature = "fjall")]

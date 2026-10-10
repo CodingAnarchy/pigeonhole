@@ -136,8 +136,22 @@ Each result row gives the workload, store, store settings, size, client threads,
 | RocksDB gap | 1 (reported) | `all --engine pigeonhole,rocksdb` | Reported, not gated |
 | Model value | 2 | `sparse-wide --engine pigeonhole,sqlite,rocksdb` | Pigeonhole beats SQLite EAV and RocksDB on throughput and p99 |
 | Latency | 3 | `ycsb-c` (point get), `ycsb-a`/`skewed-multi-shard` (writes), `group-commit --engine pigeonhole,rocksdb` (durable commits at 1, 4 and 16 threads), `adjacency`/`ycsb-e` (scans) | Goals table: get p50 < 2 µs, p99 < 10 µs; `group-commit` p99 < 200 µs; within 1.5× of RocksDB |
-| Scaling | 1 onward | `scaling --shards N`, then `compare` against a stored `scaling.json` | N-shard write throughput ≥ 0.8 × N × single-shard (`efficiency` ≥ 0.8), and single-shard p99 does not regress |
+| Scaling | 1 onward | `scaling --shards N` (N up to the core count), then `compare` against a stored `scaling.json` | Application-owned, each shard thread writing inline (D204): N-shard write throughput ≥ 0.8 × N × single-shard (`efficiency` ≥ 0.8), and single-shard p99 does not regress |
 | Reproducibility | all | Two runs, then `compare a.json b.json` | Every result within tolerance |
+
+**What the scaling gate runs (D204).** The gate measures the spec's thread-per-core embedding:
+- Pigeonhole opens **application-owned**, with one thread per shard.
+- Each thread drives its own shard and commits the writes to rows its shard owns (`Table::shard_of`, ICR 0022), so its writes run on its own shard with no handoff. A row the balancer moves mid-phase is still committed correctly, routed to its new owner.
+- Each thread keeps 16 commits in flight (`commit_async`; `INLINE_IN_FLIGHT`) and gives its shard a turn between polls.
+- No client thread competes with the shards for cores, so the gate runs at N up to the core count.
+- The load goes through the blocking API first. Then the warm-up (as long as the measured part, unrecorded) and the measured writes run inline.
+- A commit's latency is from submission to resolution, so it includes the time it waited behind the other commits in flight.
+- The warm-up runs until the balancer has spread the table: every shard owns a tablet and a pass of the warm-up writes changes nothing, capped at 30 s with a warning. A fixed warm-up can end before the first split.
+- **The run must be spread.** If one shard took more than 2/N of the measured commits, the gate fails as skewed whatever its efficiency. The busiest share is printed with the verdict, and each shard's share is printed in every result.
+
+**Reported beside it, not gating:** the engine-owned shape, with synchronous client threads (four per shard) at half the gate's shards, so the clients have cores of their own. `scaling` prints both, and the JSON carries the second as `scaling_sync`.
+
+Before D204 the gate ran N synchronous clients on N engine-owned shards. That's 2N busy threads, which can't reach 0.8 × N at N = cores (#154). A `scaling.json` from before D204 is not a baseline for the p99 half: the first run after it starts a new one.
 
 **The scaling gate has two halves, checked differently.** Each `scaling` run evaluates only the efficiency half and prints pass or fail. The other half, "no regression in single-shard p99", needs a baseline: compare this run's `scaling.json` against a stored one with `phdb-bench compare old/scaling.json new/scaling.json`, which checks the single-shard p99 within the p99 tolerance. The weekly `bench.yml` uploads `scaling.json` with every run, so each run leaves the baseline for the next.
 

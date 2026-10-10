@@ -441,6 +441,11 @@ pub struct Scaling {
     /// Single-shard p99 in nanoseconds (the gate also needs no regression here,
     /// checked by [`compare`] against a baseline).
     pub single_shard_p99_ns: u64,
+    /// The largest share of the N-shard run's commits on one shard (0 when the run did not
+    /// report shares). Above [`Scaling::max_share_allowed`] the table was not spread and
+    /// the run fails as skewed whatever its efficiency (D204).
+    #[serde(default)]
+    pub max_share: f64,
 }
 
 impl Scaling {
@@ -450,18 +455,43 @@ impl Scaling {
     /// Builds the gate result from a one-shard and an N-shard record.
     pub fn new(shards: usize, single: &RunRecord, multi: &RunRecord) -> Self {
         let efficiency = multi.throughput / (shards as f64 * single.throughput);
+        let total: u64 = multi.detail.shards.iter().map(|s| s.commits).sum();
+        let top = multi
+            .detail
+            .shards
+            .iter()
+            .map(|s| s.commits)
+            .max()
+            .unwrap_or(0);
         Self {
             shards,
             single_shard_throughput: single.throughput,
             multi_shard_throughput: multi.throughput,
             efficiency,
             single_shard_p99_ns: single.p99_ns,
+            max_share: if total == 0 {
+                0.0
+            } else {
+                top as f64 / total as f64
+            },
         }
     }
 
-    /// Whether the scaling target is met.
+    /// The largest share of commits one shard may take for the run to count: twice an even
+    /// share (`2 / shards`), or everything with one shard.
+    pub fn max_share_allowed(&self) -> f64 {
+        (2.0 / self.shards.max(1) as f64).min(1.0)
+    }
+
+    /// Whether the N-shard run's commits were spread (no shard over
+    /// [`max_share_allowed`](Self::max_share_allowed)).
+    pub fn spread(&self) -> bool {
+        self.max_share <= self.max_share_allowed()
+    }
+
+    /// Whether the scaling target is met: efficiency at the gate, on a spread table.
     pub fn passes(&self) -> bool {
-        self.efficiency >= Self::GATE
+        self.efficiency >= Self::GATE && self.spread()
     }
 }
 
@@ -483,8 +513,12 @@ pub struct Suite {
     pub environment: Environment,
     /// One record per (workload, store, settings).
     pub results: Vec<RunRecord>,
-    /// The scaling gate, when measured.
+    /// The scaling gate, when measured: application-owned shards writing inline (D204).
     pub scaling: Option<Scaling>,
+    /// The engine-owned check reported beside the gate, not gating (D204): synchronous
+    /// clients, four per shard, at half the gate's shards.
+    #[serde(default)]
+    pub scaling_sync: Option<Scaling>,
 }
 
 fn us(ns: u64) -> String {
@@ -520,6 +554,7 @@ impl Suite {
             environment,
             results: Vec::new(),
             scaling: None,
+            scaling_sync: None,
         }
     }
 
@@ -697,13 +732,34 @@ impl Suite {
             let _ = writeln!(
                 s,
                 "\n**Scaling gate:** {} shards reach {} ops/s against {} ops/s on one shard: \
-                 efficiency {:.2} (gate ≥ {:.1}) — {}.",
+                 efficiency {:.2} (gate ≥ {:.1}); the busiest shard took {:.0}% of the commits \
+                 (at most {:.0}%) — {}.",
                 sc.shards,
                 ops(sc.multi_shard_throughput),
                 ops(sc.single_shard_throughput),
                 sc.efficiency,
                 Scaling::GATE,
-                if sc.passes() { "pass" } else { "fail" }
+                100.0 * sc.max_share,
+                100.0 * sc.max_share_allowed(),
+                if !sc.spread() {
+                    "fail: skewed, the table was not spread"
+                } else if sc.passes() {
+                    "pass"
+                } else {
+                    "fail"
+                }
+            );
+        }
+        if let Some(sc) = &self.scaling_sync {
+            let _ = writeln!(
+                s,
+                "\n**Engine-owned, synchronous clients (reported, not gating; D204):** {} \
+                 shards with 4 clients each reach {} ops/s against {} ops/s on one shard: \
+                 efficiency {:.2}.",
+                sc.shards,
+                ops(sc.multi_shard_throughput),
+                ops(sc.single_shard_throughput),
+                sc.efficiency,
             );
         }
         s

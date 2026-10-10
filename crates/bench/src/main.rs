@@ -35,7 +35,9 @@ WORKLOADS:
               (group-commit: durable commits, GroupSync on Pigeonhole and fsync on
               the others whatever --sync says; without --threads it runs at 1, 4
               and 16 client threads)
-    scaling   the scaling gate: skewed-multi-shard on Pigeonhole at 1 and N shards
+    scaling   the scaling gate (D204): skewed-multi-shard on Pigeonhole at 1 and N shards,
+              application-owned with each shard thread writing inline (16 in flight);
+              then, reported only, synchronous clients (4 per shard) at N/2 shards
 
 OPTIONS:
     --engine LIST          pigeonhole,rocksdb,sqlite,fjall or all [default: pigeonhole]
@@ -238,6 +240,32 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
 }
 
 /// Runs one measurement in a fresh directory under `root`, removed afterwards.
+/// One inline run of the scaling gate (D204) in a fresh directory.
+fn one_inline(
+    a: &Args,
+    root: &Path,
+    seq: &mut u32,
+    runner: &PigeonholeRunner,
+    config: &WorkloadConfig,
+) -> Result<RunRecord, String> {
+    *seq += 1;
+    let dir = root.join(format!("{}-inline-{}", config.kind.name(), *seq));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    eprintln!(
+        "running {} inline on pigeonhole ({}) ...",
+        config.kind.name(),
+        runner.describe()
+    );
+    let options = RunOptions {
+        warmup: a.warmup.unwrap_or(SCALING_WARMUP),
+    };
+    let result = runner
+        .run_inline(config, &dir, &options)
+        .map_err(|e| format!("{} inline: {e}", config.kind.name()));
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
 fn one(
     a: &Args,
     root: &Path,
@@ -280,12 +308,22 @@ fn bench(a: &Args) -> Result<Suite, String> {
     let mut seq = 0;
     let result = (|| -> Result<(), String> {
         if a.command == "scaling" {
+            // The gate (D204): application-owned shards, each thread writing its share
+            // inline, at 1 shard and at N (up to the core count).
             let n = a.shards.unwrap_or(suite.environment.cores);
-            let mut c = config(a, WorkloadKind::SkewedMultiShard)?;
-            c.threads = a.threads.unwrap_or(n);
-            let single = one(a, &root, &mut seq, &mut pigeonhole(a, Some(1)), &c)?;
-            let multi = one(a, &root, &mut seq, &mut pigeonhole(a, Some(n)), &c)?;
+            let c = config(a, WorkloadKind::SkewedMultiShard)?;
+            let single = one_inline(a, &root, &mut seq, &pigeonhole(a, Some(1)), &c)?;
+            let multi = one_inline(a, &root, &mut seq, &pigeonhole(a, Some(n)), &c)?;
             suite.scaling = Some(Scaling::new(n, &single, &multi));
+            suite.results.extend([single, multi]);
+            // Reported beside it, not gating (D204): engine-owned with synchronous clients,
+            // four per shard, at half the shards, so the clients have cores of their own.
+            let half = (n / 2).max(1);
+            let mut c = c;
+            c.threads = a.threads.unwrap_or(4 * half);
+            let single = one(a, &root, &mut seq, &mut pigeonhole(a, Some(1)), &c)?;
+            let multi = one(a, &root, &mut seq, &mut pigeonhole(a, Some(half)), &c)?;
+            suite.scaling_sync = Some(Scaling::new(half, &single, &multi));
             suite.results.extend([single, multi]);
             return Ok(());
         }
@@ -435,8 +473,18 @@ mod tests {
             dir.display()
         ));
         let suite = bench(&a).unwrap();
-        assert_eq!(suite.results.len(), 2);
+        // The gate's inline runs at 1 and 2 shards (D204), then the engine-owned synchronous
+        // runs it reports at 1 and 2 / 2 = 1 shards.
+        assert_eq!(suite.results.len(), 4);
         assert!(suite.scaling.is_some());
+        assert!(suite.scaling_sync.is_some());
+        assert!(
+            suite.results[..2]
+                .iter()
+                .all(|r| r.store_config.contains("inline"))
+        );
+        assert!(suite.to_markdown().contains("reported, not gating"));
+        assert!(suite.to_markdown().contains("the busiest shard took"));
         assert!(
             suite
                 .results
@@ -444,7 +492,7 @@ mod tests {
                 .all(|r| r.store_config.contains("tablets=on"))
         );
         // Every measured put is one commit on one shard; the report shows where they went.
-        for (r, shards) in suite.results.iter().zip([1, 2]) {
+        for (r, shards) in suite.results.iter().zip([1, 2, 1, 1]) {
             assert_eq!(
                 r.warmup_ops, r.operations,
                 "scaling warms up as long as it measures"
