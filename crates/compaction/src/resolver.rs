@@ -298,6 +298,9 @@ pub struct CellResolver<C> {
     last: Option<Out>,
     /// Stop at keys `>= upper`.
     upper: Option<Vec<u8>>,
+    /// The bound's buffer while there is no bound, kept for the next one (a row read sets a
+    /// bound per read on a resolver it reuses, #320).
+    spare_upper: Vec<u8>,
 
     /// A pending run of merge operands (no base found yet).
     run: bool,
@@ -387,6 +390,7 @@ where
             peek: None,
             last: None,
             upper: None,
+            spare_upper: Vec::new(),
             run: false,
             run_ts: 0,
             run_key: Vec::new(),
@@ -411,11 +415,17 @@ where
     pub fn set_upper_bound(&mut self, end: Option<&[u8]>) {
         match end {
             Some(e) => {
-                let u = self.upper.get_or_insert_with(Vec::new);
+                let u = self
+                    .upper
+                    .get_or_insert_with(|| std::mem::take(&mut self.spare_upper));
                 u.clear();
                 u.extend_from_slice(e);
             }
-            None => self.upper = None,
+            None => {
+                if let Some(u) = self.upper.take() {
+                    self.spare_upper = u;
+                }
+            }
         }
         self.col_below_upper = false;
         self.row_below_upper = false;
@@ -648,6 +658,7 @@ where
             peek,
             last,
             upper,
+            spare_upper,
             run,
             run_ts,
             run_key,
@@ -678,7 +689,9 @@ where
         *row_below_upper = false;
         *peek = None;
         *last = None;
-        *upper = None;
+        if let Some(u) = upper.take() {
+            *spare_upper = u;
+        }
         *run = false;
         *run_ts = 0;
         run_key.clear();
@@ -718,6 +731,8 @@ where
             peek,
             last,
             upper,
+            // A kept allocation, like the buffers' capacity.
+            spare_upper: _,
             run,
             run_ts,
             run_key,
