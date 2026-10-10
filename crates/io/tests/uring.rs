@@ -430,3 +430,101 @@ fn the_completion_fd_turns_readable_before_any_reap() {
     assert!(!readable(fd, 0), "the reap reset it");
     assert!(thread::spawn(own_io_fd).join().unwrap().is_none());
 }
+
+// ---- application-owned mode: no reaper thread (#408) ----
+
+/// The threads of this process the library named (`pigeonhole-*`; `/proc` keeps the first
+/// 15 bytes of a name). Other threads come and go with the test harness.
+fn threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .filter(|name| name.starts_with("pigeonhole"))
+        .count()
+}
+
+#[test]
+fn the_application_owned_backend_starts_no_thread() {
+    let _serial = serial();
+    let before = threads();
+    let app = Backend::uring_application_owned("uring-app-threads");
+    assert_eq!(
+        threads(),
+        before,
+        "an application-owned backend started a thread"
+    );
+    let engine = Backend::uring("uring-engine-threads");
+    assert_eq!(threads(), before + 1, "the engine-owned backend's reaper");
+    drop((app, engine));
+}
+
+#[test]
+fn a_client_threads_io_completes_through_a_driving_threads_fd() {
+    // The shared ring has no reaper: a thread that drives shards, waiting only on its
+    // completion fd, takes the completions of I/O a thread without a ring submitted.
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-app-client");
+    let f = b.create("f");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let driver = {
+        let (vfs, stop) = (Arc::clone(&b.vfs), Arc::clone(&stop));
+        thread::spawn(move || {
+            vfs.attach_thread();
+            let fd = own_io_fd().expect("a completion fd");
+            let mut wakes = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                if readable(fd, 100) {
+                    wakes += 1;
+                }
+                reap_own_io(None);
+            }
+            wakes
+        })
+    };
+    // Let the driver attach and arm its poll before the client submits.
+    thread::sleep(Duration::from_millis(50));
+    for i in 0..20u64 {
+        // Polled, never waited for: only the driver can complete it.
+        let write = f.submit_write(filled(4096, i as u8), i * 4096);
+        let started = std::time::Instant::now();
+        while !write.is_ready() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the client write never completed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        write.wait().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let wakes = driver.join().unwrap();
+    assert!(
+        wakes > 0,
+        "the driver's fd never fired for client completions"
+    );
+    // A blocked wait on a client operation reaps the shared ring itself (no driver now).
+    let got = f.submit_read(IoBuf::zeroed(4096), 0).wait().unwrap();
+    assert!(got.iter().all(|&x| x == 0));
+}
+
+#[test]
+fn a_blocked_wait_on_a_completion_chained_after_the_shared_ring_completes_with_no_reaper() {
+    // #443's hang: an open waits on a WAL sync wrapped in its own completion (a plain
+    // `Completion::pair`, no drive), resolved by a continuation of a shared-ring operation.
+    // With no reaper and no driving thread, the waiting thread must reap the ring itself.
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-app-chained");
+    let f = b.create("f");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (done, resolver) = pigeonhole_io::Completion::<()>::pair();
+        drop(f.submit_sync_data().map(move |r| {
+            resolver.resolve(r);
+            Ok(())
+        }));
+        tx.send(done.wait()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the chained completion resolved")
+        .unwrap();
+}

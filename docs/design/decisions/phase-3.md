@@ -258,7 +258,10 @@ The internal interface change is ICR 0019.
 - A loop that never asks for the fd keeps the old behavior. #442's first CI run showed why this matters: the `open_application_owned` doctest's loop parks for `next_wakeup` and never polls the fd, and it hung.
 
 **No reaper in application-owned mode (#443).** The shared ring, for threads without a ring of their own, has no reaper thread there:
-- Each driving thread's ring polls the shared ring's eventfd, so client completions also turn its fd readable.
-- A blocked wait reaps the shared ring itself.
+- **Every reap takes the shared ring's completions too.** Each driving thread's reap looks at the shared ring's completion queue (no system call) and takes what is there.
+- **The fd covers both rings.** A driving thread's fd is an epoll descriptor over its own ring's eventfd and the shared ring's, so client completions also turn it readable.
+- **Not an io_uring poll of the shared ring's eventfd.** #443's first version used one, and hung on CI after the first client completion: the kernel does not let an eventfd that io_uring signals wake another io_uring poll reliably (`EPOLL_URING_WAKE`).
+- **A blocked wait with nobody else to reap for it** reaps the shared ring itself. That covers a blocked wait on one of the shared ring's completions, and on a completion chained after them, such as a WAL's ordered sync. The shared ring registers as an orphan in `pigeonhole-io`, and `Completion::wait` reaps orphans in 1 ms slices.
+  - #443's first version hung at open on such a chained wait.
 - **The limitation:** a client thread's *async* I/O (an executor's `get_async`) then completes promptly only if the driving loop waits on `io_fd`. Otherwise it completes at the loop's next timed turn. Documented in the async guide.
 

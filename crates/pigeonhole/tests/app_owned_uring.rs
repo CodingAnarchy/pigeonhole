@@ -9,6 +9,37 @@ use std::time::{Duration, Instant};
 
 use pigeonhole::{Family, IoBackend, Options, Pigeonhole, Shard};
 
+/// Fails the test binary instead of hanging it (#443): aborts the process once `secs` pass
+/// without the guard being dropped, naming `what` and the last step reached.
+/// Dropping it (the sender) disarms the watchdog.
+struct Watchdog(#[allow(dead_code)] std::sync::mpsc::Sender<()>);
+
+static STEP: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
+
+/// Records the step the test is on (printed if the watchdog fires).
+fn step(what: &'static str) {
+    *STEP.lock().unwrap() = what;
+    eprintln!("step: {what}");
+}
+
+impl Watchdog {
+    fn new(what: &'static str, secs: u64) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if rx.recv_timeout(Duration::from_secs(secs))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                eprintln!(
+                    "{what}: still running after {secs} s at step '{}': aborting",
+                    STEP.lock().unwrap()
+                );
+                std::process::abort();
+            }
+        });
+        Watchdog(tx)
+    }
+}
+
 /// A temporary directory, removed on drop.
 struct TempDir(std::path::PathBuf);
 
@@ -106,18 +137,35 @@ fn drive(mut shard: Shard) -> (u64, u64) {
     (sleeps, zero)
 }
 
+/// The threads of this process the library named (`pigeonhole-*`: shard, compaction, pool
+/// and reaper threads). `/proc` keeps the first 15 bytes of a name.
+fn library_threads() -> Vec<String> {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| name.starts_with("pigeonhole"))
+        .collect()
+}
+
 #[test]
 fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
+    let _watchdog = Watchdog::new("an_event_loop_waiting_on_the_completion_fd", 60);
     let dir = TempDir::new("loop");
     let options = Options::default()
         .shards(1)
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
     let (db, mut shards) =
-        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
+        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options.clone())
+            .expect("io_uring");
+    // The engine starts no threads in application-owned mode (#408): not even io_uring's
+    // reaper.
+    assert_eq!(library_threads(), Vec::<String>::new());
     let shard = shards.pop().unwrap();
     let driver = std::thread::spawn(move || drive(shard));
     let started = Instant::now();
+    step("create table");
     let t = db
         .table("t")
         .unwrap()
@@ -127,20 +175,56 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
     // Commits (WAL appends and syncs), a flush and a compaction: SST writes and reads, all
     // submitted on the driving thread's ring.
     for round in 0..3u32 {
+        step("commits");
         for i in 0..200u32 {
             t.mutate(format!("row{round}-{i:04}").as_bytes())
                 .put("f", b"q", &[7u8; 512])
                 .commit()
                 .unwrap();
         }
+        step("flush");
         db.flush().unwrap();
     }
+    step("compact");
     db.compact().unwrap();
+    step("scan");
     let n = t.scan_prefix(b"row").iter().unwrap().count();
     assert_eq!(n, 600);
     drop(t);
+    step("close");
     db.close().unwrap();
+    step("join driver");
     let (sleeps, zero) = driver.join().unwrap();
+    // Reopened with a cold cache, an async get from this thread (which has no ring) fetches
+    // its blocks through the shared ring, which has no reaper: the driving thread's fd fires
+    // for those completions and its next turn takes them.
+    #[cfg(feature = "async")]
+    {
+        step("reopen");
+        let (db, mut shards) =
+            Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).unwrap();
+        let driver = std::thread::spawn({
+            let shard = shards.pop().unwrap();
+            move || drive(shard)
+        });
+        let t = db.table("t").unwrap().open().unwrap();
+        step("async get");
+        let cell = pigeonhole::doc_support::block_on(t.get_async(b"row1-0100", "f", b"q"))
+            .unwrap()
+            .expect("the row is there");
+        assert_eq!(cell.value(), &[7u8; 512]);
+        assert_eq!(
+            db.async_sync_reads(),
+            0,
+            "every block was fetched asynchronously"
+        );
+        assert_eq!(library_threads(), Vec::<String>::new());
+        drop(t);
+        step("close after the async get");
+        db.close().unwrap();
+        step("join the second driver");
+        driver.join().unwrap();
+    }
     // The loop slept on its fds rather than spinning: `next_wakeup` was zero only now and
     // then (a write stall's pacing, say), not once per I/O in flight.
     assert!(

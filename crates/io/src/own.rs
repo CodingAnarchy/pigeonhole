@@ -127,3 +127,54 @@ pub fn own_io_waker() -> Option<OwnIoWaker> {
 pub fn own_io_fd() -> Option<i32> {
     backends().iter().find_map(|b| b.fd_here())
 }
+
+// ---- rings no thread reaps on its own (#408) ----
+
+/// A backend whose completions no thread of its own takes (an io_uring shared ring without a
+/// reaper, in application-owned mode): any thread blocked on a completion may take them.
+pub(crate) trait OrphanIo: Send + Sync {
+    /// Takes what has completed, waiting up to `wait` for something to when nothing has.
+    /// Returns whether an operation completed.
+    fn reap_orphan(&self, wait: Duration) -> bool;
+}
+
+static ORPHANS: std::sync::Mutex<Vec<Weak<dyn OrphanIo>>> = std::sync::Mutex::new(Vec::new());
+/// Live entries of `ORPHANS` (checked without the lock by every blocked wait).
+static ORPHAN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Registers a backend no thread reaps; it stays registered until dropped.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn register_orphan(orphan: Weak<dyn OrphanIo>) {
+    let mut o = ORPHANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    o.retain(|w| w.strong_count() > 0);
+    o.push(orphan);
+    ORPHAN_COUNT.store(o.len(), std::sync::atomic::Ordering::Release);
+}
+
+/// What a blocked [`Completion::wait`](crate::Completion::wait) with no drive of its own does
+/// while it waits (#408): reaps every registered orphan backend, so a completion chained after
+/// their operations (a WAL's ordered sync, say) resolves without a reaper thread. `None` when
+/// none is registered (wait as usual); otherwise whether anything completed.
+pub(crate) fn reap_orphans(wait: Duration) -> Option<bool> {
+    if ORPHAN_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    let live: Vec<Arc<dyn OrphanIo>> = {
+        let mut o = ORPHANS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        o.retain(|w| w.strong_count() > 0);
+        ORPHAN_COUNT.store(o.len(), std::sync::atomic::Ordering::Release);
+        o.iter().filter_map(Weak::upgrade).collect()
+    };
+    if live.is_empty() {
+        return None;
+    }
+    let mut any = false;
+    for orphan in live {
+        any |= orphan.reap_orphan(wait);
+    }
+    Some(any)
+}

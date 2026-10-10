@@ -43,6 +43,9 @@ type Then<T> = Box<dyn FnOnce(Result<T>) + Send>;
 /// ring owned by the waiting thread reaps it (#402). Returns whether calling it again may
 /// make more progress (`false`: wait for another thread to resolve it). Calling it when the
 /// operation already completed does nothing.
+/// How long a blocked wait with no drive reaps orphan rings, or sleeps between reaps (#408).
+const ORPHAN_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+
 pub(crate) type Drive = Arc<dyn Fn() -> bool + Send + Sync>;
 
 struct Shared<T> {
@@ -154,10 +157,30 @@ impl<T: Send + 'static> Completion<T> {
                         state = shared.lock();
                         continue;
                     }
-                    state = shared
-                        .cond
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner);
+                    // No drive: with rings no thread reaps in this process (application-owned
+                    // io_uring, #408), take their completions while waiting, in short slices.
+                    drop(state);
+                    let reaped = crate::own::reap_orphans(ORPHAN_SLICE);
+                    state = shared.lock();
+                    if reaped == Some(true) {
+                        continue;
+                    }
+                    if !matches!(*state, State::Pending { .. }) {
+                        continue;
+                    }
+                    state = match reaped {
+                        None => shared
+                            .cond
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner),
+                        Some(_) => {
+                            shared
+                                .cond
+                                .wait_timeout(state, ORPHAN_SLICE)
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .0
+                        }
+                    };
                 }
                 State::Taken => unreachable!("completion result taken twice"),
             }

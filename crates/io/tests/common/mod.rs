@@ -70,6 +70,20 @@ impl Backend {
         }
     }
 
+    /// [`Backend::uring`] for application-owned mode: no reaper thread (#408).
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub fn uring_application_owned(tag: &str) -> Self {
+        let dir = TempDir::new(tag);
+        Self {
+            name: "uring-app",
+            vfs: pigeonhole_io::uring::UringVfs::new_application_owned()
+                .expect("io_uring is available"),
+            root: dir.0.clone(),
+            _dir: Some(dir),
+        }
+    }
+
     pub fn sim(seed: u64) -> Self {
         Self::sim_from(SimVfs::new(seed))
     }
