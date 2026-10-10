@@ -11,10 +11,6 @@
 #   scripts/instructions-per-cell.sh target/release/examples/hotrow \
 #       target/release/examples/readshapes:get-mem,get-sst,row
 #
-# Commit spinning (D198) is off in the shape binaries (`Options::commit_spin(ZERO)`): a waiting
-# client's poll count depends on thread timing. crates/bench/examples/commitpath.rs checks the
-# default spin on wall time.
-#
 # A shape binary (crates/bench/examples/readshapes.rs is one):
 # - runs as `BINARY SHAPE ITERATIONS DIR`, its work proportional to ITERATIONS;
 # - does its measured work only while a `Measured` guard (crates/bench/examples/support/

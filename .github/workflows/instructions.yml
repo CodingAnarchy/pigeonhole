@@ -42,10 +42,6 @@ env:
   # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
   # the head's sources of these files, so a new or changed example still has a baseline.
   EXAMPLES: hotrow readshapes writepath ycsb
-  # The write shapes run with `Options::commit_spin(ZERO)` (crates/bench/examples/support/
-  # shards.rs): how often a waiting client polls depends on thread timing (D198), so counting
-  # it would make the shapes nondeterministic. The default spin's effect is checked on wall
-  # time instead, by crates/bench/examples/commitpath.rs (commit-latency.yml).
   # Shape binaries and their shapes, `EXAMPLE:shape,shape,...` (space-separated), in the
   # contract of scripts/instructions-per-cell.sh. Add a shape here and it is reported and
   # checked for regressions on every PR.

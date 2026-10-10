@@ -8,7 +8,7 @@
 //!
 //! | Mode | The shard runs on | The client waits by |
 //! |---|---|---|
-//! | `threads` | the engine's own shard thread (`Engine::open`, as `phdb-bench` runs), with its default spin before parking (D198) | `Engine::commit`: its default spin, then parking |
+//! | `threads` | the engine's own shard thread (`Engine::open`, as `phdb-bench` runs), with D198's spin before parking (50 µs) | `Engine::commit`: D198's spin (15 µs), then parking |
 //! | `threads-nospin` | as `threads`, with both spin windows 0 (the engine before D198) | parking |
 //! | `park` | an application thread that parks between groups, woken by the engine | parking |
 //! | `spin` | an application thread that never parks | spinning on the commit's future |
@@ -38,14 +38,12 @@ use pigeonhole_engine::{
 const ROWS: u64 = 50_000;
 const VALUE: [u8; 100] = [7; 100];
 
-/// The engine's defaults, except one shard and a memtable no run fills. The modes that
-/// spin by hand turn the engine's own spinning off (`spins: false`).
+/// The engine's defaults, except one shard, a memtable no run fills, and the spin windows:
+/// D198's (15 µs on the client, 50 µs on the shard) with `spins`, else none. The modes
+/// that spin by hand turn the engine's own spinning off.
 fn options(spins: bool) -> EngineOptions {
     let mut o = EngineOptions::new(pigeonhole_io::pread::PreadVfs::new(0));
-    if !spins {
-        o.commit_spin_nanos = 0;
-        o.shard_spin_nanos = 0;
-    }
+    (o.commit_spin_nanos, o.shard_spin_nanos) = if spins { (15_000, 50_000) } else { (0, 0) };
     o.create_if_missing = true;
     o.shards = 1;
     o.tablet_changes = false;
@@ -246,15 +244,14 @@ fn main() {
     driven(&dir, commits, false, true);
     inline(&dir, commits);
     std::fs::remove_dir_all(&dir).ok();
-    // The one wall-clock check of the default spin (D198; the instruction shapes run with
-    // the client's spin off, since its poll count depends on timing): with the defaults, a
-    // buffered commit's median must not be clearly worse than without spinning. The margin
+    // The one wall-clock check of D198's spin: with its windows, a buffered commit's
+    // median must not be clearly worse than without spinning. The margin
     // allows for a shared runner's noise.
     let (s, p) = (spinning.as_secs_f64() * 1e6, parking.as_secs_f64() * 1e6);
     println!();
     if s > p * 1.25 {
-        println!("FAIL: p50 {s:.2} µs with the default spin against {p:.2} µs without (D198)");
+        println!("FAIL: p50 {s:.2} µs with D198's spin against {p:.2} µs without");
         std::process::exit(1);
     }
-    println!("ok: p50 {s:.2} µs with the default spin against {p:.2} µs without (D198)");
+    println!("ok: p50 {s:.2} µs with D198's spin against {p:.2} µs without");
 }

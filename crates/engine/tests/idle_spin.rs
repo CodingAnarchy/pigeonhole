@@ -53,10 +53,9 @@ fn spinning_stops_when_the_database_goes_idle() {
     o.create_if_missing = true;
     o.shards = 2;
     o.durability = Durability::Buffered;
-    assert!(
-        o.commit_spin_nanos > 0 && o.shard_spin_nanos > 0,
-        "spin on by default"
-    );
+    // D198's windows (the defaults once its follow-up lands).
+    o.commit_spin_nanos = 15_000;
+    o.shard_spin_nanos = 50_000;
     let db = Engine::open(&dir.join("idle.phdb"), o).unwrap();
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])

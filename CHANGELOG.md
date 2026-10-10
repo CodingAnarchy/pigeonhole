@@ -7,7 +7,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ## [Unreleased]
 
 ### Added
-- `Options::commit_spin` and `Options::shard_spin` (D198, ICR 0016): how long a waiting client, and an engine-owned shard that just handled a commit, poll before they sleep. The defaults are 15 µs and 50 µs; `Duration::ZERO` turns either off, for battery-powered or CPU-constrained hosts. Engine: `EngineOptions::commit_spin_nanos` and `shard_spin_nanos`. Runtime: `RuntimeConfig::idle_spin`.
+- `Options::commit_spin` and `Options::shard_spin` (D198, ICR 0016): how long a waiting client, and an engine-owned shard that just handled a commit, poll before they sleep. Both are off (zero) for now; D198's defaults of 15 µs and 50 µs come in a follow-up. `Duration::ZERO` turns either off, for battery-powered or CPU-constrained hosts. Engine: `EngineOptions::commit_spin_nanos` and `shard_spin_nanos`. Runtime: `RuntimeConfig::idle_spin`.
 - Stall counters (ICR 0015, #64):
   - `pigeonhole-engine`: `Metrics::wal_inline_syncs` and `Metrics::file_growths`;
   - `pigeonhole-pager`: `PagerStats::growths` and `growth_nanos`;
@@ -26,9 +26,6 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ### Changed (breaking)
 - `pigeonhole-sst`: `ReadOptions` gains the public field `cache_only`, so building it with a struct literal no longer compiles; start from `ReadOptions::default()` and set fields.
-
-### Changed
-- **Buffered commits wait with a short spin before parking** (D198, #64). With the default 15 µs on the client and 50 µs on engine-owned shards, a buffered commit's median latency on a Linux CI runner fell from 32.9 µs to 4.1 µs, and p99 from 46.1 µs to 10.5 µs. Durable commits, idle databases and application-owned shards do not spin. A poll that finds nothing backs off, so a sparse client pays little.
 
 ## [0.2.0] - 2026-10-09
 The **Phase 2 wide-column model**: counter families, large values and blob separation, per-family compaction styles and zstd, a file at rest near its live size, and the read- and write-path work that met the Phase 2 gate as amended by [D193](docs/design/decisions/phase-2.md#d193). Counters change in a breaking way, and the file format is version 2; see [Migrating from 0.1.0](#migrating-from-010). Every published crate moves to 0.2.0 together.
