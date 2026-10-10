@@ -1,0 +1,2 @@
+### Added
+- `Shard::release()` (and `EngineShard::release`): call it before handing an application-owned shard to another thread (#492, ICR 0029). With io_uring, only the thread that submitted I/O to its ring can complete it, so a shard moved with I/O still on a thread that then stops running turns would wait for ever; `release()` drains it first. A no-op on the pread backend and in engine-owned mode; debug builds panic on a move that skipped it.

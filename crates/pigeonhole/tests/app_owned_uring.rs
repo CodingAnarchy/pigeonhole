@@ -236,14 +236,20 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
     );
 }
 
-/// Drives `shard` on this thread until `stop` is set, then hands it back.
+/// Drives `shard` on this thread until `stop` is set, then hands it back, released.
 fn drive_until(mut shard: Shard, stop: Arc<AtomicBool>) -> Shard {
+    drive_until_unreleased(&mut shard, &stop);
+    shard.release();
+    shard
+}
+
+/// [`drive_until`] without the release.
+fn drive_until_unreleased(shard: &mut Shard, stop: &AtomicBool) {
     while !stop.load(Ordering::Acquire) {
         if !shard.run_once(Duration::from_millis(1)) {
             std::thread::sleep(Duration::from_micros(200));
         }
     }
-    shard
 }
 
 #[test]
@@ -294,4 +300,199 @@ fn a_shard_moved_to_another_thread_gets_a_ring_there_and_its_durable_commits_com
     db.close().unwrap();
     step("join the last driver");
     driver.join().unwrap();
+}
+
+#[test]
+fn a_released_shard_moves_off_a_thread_that_stays_alive_and_its_io_completes() {
+    // #492: the old thread stays alive but stops running turns, which strands any I/O still
+    // on its ring. `release()` drains it first, so the shard's commits and its close complete
+    // on the new thread.
+    let _watchdog = Watchdog::new("a_released_shard_moves_off_a_live_thread", 60);
+    let dir = TempDir::new("released");
+    let options = Options::default()
+        .shards(1)
+        .memtable_budget(4 << 20)
+        .io_backend(IoBackend::Uring);
+    let (db, mut shards) =
+        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
+    db.set_default_durability(Durability::GroupSync);
+    let shard = shards.pop().unwrap();
+    let (hand_over, take) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let stop = Arc::new(AtomicBool::new(false));
+    // Thread A drives, then releases and hands the shard over, then stays alive (blocked)
+    // until the end of the test.
+    let a = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let shard = drive_until(shard, stop);
+            hand_over.send(shard).unwrap();
+            let _ = release_rx.recv();
+        }
+    });
+    step("create table and commit on thread A");
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for i in 0..20u32 {
+        t.mutate(format!("a{i:03}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    let shard = take.recv().unwrap();
+    step("commit and close on thread B, A still alive");
+    let b = std::thread::spawn(move || drive(shard));
+    for i in 0..20u32 {
+        t.mutate(format!("b{i:03}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    drop(t);
+    db.close().unwrap();
+    b.join().unwrap();
+    release_tx.send(()).unwrap();
+    a.join().unwrap();
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn release_drains_a_sync_in_flight_on_the_old_threads_ring_before_the_shard_moves() {
+    // #492, with I/O actually left behind: a durable commit's sync is in flight on this
+    // thread's ring when the shard moves. This thread stays alive and runs no more turns, so
+    // without `release()` nothing reaps that sync and the commit never resolves on thread B.
+    let _watchdog = Watchdog::new("release_drains_a_sync_in_flight", 60);
+    let dir = TempDir::new("release-drains");
+    let options = Options::default()
+        .shards(1)
+        .memtable_budget(4 << 20)
+        .io_backend(IoBackend::Uring);
+    let (db, mut shards) =
+        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
+    db.set_default_durability(Durability::GroupSync);
+    let mut shard = shards.pop().unwrap();
+    let t = {
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || drive_until(shard, stop)
+        });
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        stop.store(true, Ordering::Release);
+        shard = driver.join().unwrap();
+        t
+    };
+    step("leave a sync in flight on this thread's ring");
+    let pending = t.mutate(b"r").put("f", b"q", b"v").commit_async();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !pigeonhole_io::own_io_in_flight() {
+        shard.run_once(Duration::from_millis(1));
+    }
+    assert!(
+        pigeonhole_io::own_io_in_flight(),
+        "no I/O in flight to leave behind"
+    );
+    shard.release();
+    step("thread B resolves the commit, this thread alive and idle");
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let r = pigeonhole::doc_support::block_on(pending);
+        let _ = done_tx.send(r.is_ok());
+    });
+    let b = std::thread::spawn(move || drive(shard));
+    assert_eq!(
+        done.recv_timeout(Duration::from_secs(10)),
+        Ok(true),
+        "the commit whose sync was in flight at the move did not resolve on the new thread"
+    );
+    waiter.join().unwrap();
+    step("close on thread B");
+    drop(t);
+    db.close().unwrap();
+    b.join().unwrap();
+}
+
+#[cfg(all(debug_assertions, feature = "async"))]
+#[test]
+fn debug_builds_reject_a_shard_moved_with_its_io_left_on_the_old_thread() {
+    // #492's detector: the old thread's last turn left I/O on its ring and nothing released
+    // it; the new thread's first turn panics instead of the shard hanging later.
+    let _watchdog = Watchdog::new("debug_builds_reject_an_unreleased_move", 60);
+    let dir = TempDir::new("unreleased");
+    let options = Options::default()
+        .shards(1)
+        .memtable_budget(4 << 20)
+        .io_backend(IoBackend::Uring);
+    let (db, mut shards) =
+        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
+    db.set_default_durability(Durability::GroupSync);
+    let mut shard = shards.pop().unwrap();
+    let t = {
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                drive_until_unreleased(&mut shard, &stop);
+                shard
+            }
+        });
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        stop.store(true, Ordering::Release);
+        shard = driver.join().unwrap();
+        t
+    };
+    // A durable commit queued, then one turn on this thread submits its sync to this
+    // thread's ring and leaves it in flight; the shard then moves, unreleased.
+    let pending = t.mutate(b"r").put("f", b"q", b"v").commit_async();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        shard.run_once(Duration::from_millis(1));
+        if pigeonhole_io::own_io_in_flight() {
+            break;
+        }
+    }
+    assert!(
+        pigeonhole_io::own_io_in_flight(),
+        "no I/O in flight to leave behind"
+    );
+    // Borrowed by the other thread, so its panic does not drop the shard there (whose final
+    // sync would then wait on this thread's ring).
+    let moved = std::thread::scope(|s| {
+        s.spawn(|| {
+            shard.run_once(Duration::from_millis(1));
+        })
+        .join()
+    });
+    let message = moved
+        .expect_err("the unreleased move was accepted")
+        .downcast::<String>()
+        .map(|s| *s)
+        .unwrap_or_default();
+    assert!(message.contains("#492"), "{message}");
+    // This thread still owns the ring: it finishes the commit and the close. One turn first
+    // makes it the shard's driver again (the other thread's turn took that before it
+    // panicked), so `close` returns at once instead of waiting for a driver.
+    step("close on the old thread");
+    shard.run_once(Duration::from_millis(1));
+    drop(t);
+    db.close().unwrap();
+    while shard.closed().is_none() {
+        shard.run_once(Duration::from_millis(1));
+    }
+    drop(pending);
 }
