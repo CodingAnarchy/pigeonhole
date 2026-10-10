@@ -218,11 +218,6 @@ fn overlaps_range(sst: &OpenSst, start: Option<&[u8]>, end: Option<&[u8]>) -> bo
     start.is_none_or(|s| sst.last_row() >= s) && end.is_none_or(|e| sst.first_row() < e)
 }
 
-/// Whether an SST's range covers `row` (a row prefix).
-fn covers_row(sst: &OpenSst, row: &[u8]) -> bool {
-    sst.first_row() <= row && row <= sst.last_row()
-}
-
 /// Data blocks a scan fetches ahead (`ReadOptions::readahead_blocks`), and whether adjacent
 /// ones go as one read: 4 and no, unless `PIGEONHOLE_READAHEAD=N[,merge]` (a bench and test
 /// variable, read once per process) says otherwise, until #431 decides both from the gate
@@ -630,6 +625,9 @@ impl Probe {
 /// SST sources for a point read of one column: every SST of a level whose range covers the
 /// row (decision D78) and whose filters admit the row and either the column or the row's
 /// family markers (decision D9), newest first.
+// Out of line: a read's per-cell loop (`read_row_into`, `get`) inlines the resolver's key
+// helpers, and this once-per-read walk inlined there pushed them out (+16 per cell, #406).
+#[inline(never)]
 pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
     fam: &FamilySsts,
     set: &SstSet,
@@ -644,28 +642,39 @@ pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
     // The filter probe (three hashes) only once an SST covers the row: a get of a row no
     // SST holds does not pay for it.
     let mut probe: Option<Probe> = None;
-    for sst in fam.iter() {
-        if !covers_row(sst, &key.buf[..key.row_len]) {
-            continue;
+    // As `FamilySsts::covering`, written out: building the probe appends to the key's buffer
+    // (past the row prefix, which stays as it is), so the row is sliced afresh per SST.
+    for l in 0..fam.levels.len() {
+        let (from, search) = fam.level_start(l, &key.buf[..key.row_len]);
+        for sst in &fam.levels[l][from..] {
+            let row = &key.buf[..key.row_len];
+            if search && sst.first_row() > row {
+                break;
+            }
+            if !(sst.first_row() <= row && row <= sst.last_row()) {
+                continue;
+            }
+            let probe = &*probe.get_or_insert_with(|| Probe::new(key));
+            let reader = if CACHE_ONLY {
+                sst.reader_cache_only(set, priority)?
+            } else {
+                sst.reader(set, priority)?
+            };
+            if !reader.may_contain_row(probe.row)
+                || !(reader.may_contain_column(probe.column)
+                    || reader.may_contain_column(probe.marker))
+            {
+                continue;
+            }
+            out.push(Source::Sst(reader.iter(ScanFilter::all(), opts).into()));
         }
-        let probe = &*probe.get_or_insert_with(|| Probe::new(key));
-        let reader = if CACHE_ONLY {
-            sst.reader_cache_only(set, priority)?
-        } else {
-            sst.reader(set, priority)?
-        };
-        if !reader.may_contain_row(probe.row)
-            || !(reader.may_contain_column(probe.column) || reader.may_contain_column(probe.marker))
-        {
-            continue;
-        }
-        out.push(Source::Sst(reader.iter(ScanFilter::all(), opts).into()));
     }
     Ok(())
 }
 
 /// SST sources for reading one whole row (the row filter applies), newest first.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)] // As `sst_sources_point`.
 pub(crate) fn sst_sources_row<const CACHE_ONLY: bool>(
     fam: &FamilySsts,
     set: &SstSet,
@@ -677,19 +686,25 @@ pub(crate) fn sst_sources_row<const CACHE_ONLY: bool>(
 ) -> Result<()> {
     let opts = read_options(priority, false, CACHE_ONLY);
     let hash = row_hash(escaped_row);
-    for sst in fam.iter() {
-        if !covers_row(sst, row_prefix) {
-            continue;
+    for l in 0..fam.levels.len() {
+        let (from, search) = fam.level_start(l, row_prefix);
+        for sst in &fam.levels[l][from..] {
+            if search && sst.first_row() > row_prefix {
+                break;
+            }
+            if !(sst.first_row() <= row_prefix && row_prefix <= sst.last_row()) {
+                continue;
+            }
+            let reader = if CACHE_ONLY {
+                sst.reader_cache_only(set, priority)?
+            } else {
+                sst.reader(set, priority)?
+            };
+            if !reader.may_contain_row(hash) {
+                continue;
+            }
+            out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
         }
-        let reader = if CACHE_ONLY {
-            sst.reader_cache_only(set, priority)?
-        } else {
-            sst.reader(set, priority)?
-        };
-        if !reader.may_contain_row(hash) {
-            continue;
-        }
-        out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
     }
     Ok(())
 }
@@ -1089,9 +1104,7 @@ mod level_tests {
             .collect();
         let (set, files) = ssts(&[&all[0..2], &all[2..4], &all[4..6]]);
         let l0 = ssts(&[&all[0..6]]).1;
-        let fam = FamilySsts {
-            levels: vec![l0, files],
-        };
+        let fam = FamilySsts::new(vec![l0, files]);
         // (start, end) -> (sources, of which levels)
         let cases: [RangeCase<'_>; 6] = [
             (None, None, 2, 1),

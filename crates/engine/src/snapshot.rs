@@ -194,6 +194,10 @@ impl ShardMems {
 pub(crate) struct OpenSst {
     pub meta: Arc<SstMeta>,
     reader: OnceLock<Arc<SstReader>>,
+    /// The row prefixes' lengths in the smallest and largest keys, parsed once: every point
+    /// or row read compares them (#406).
+    first_row_len: usize,
+    last_row_len: usize,
 }
 
 impl std::fmt::Debug for OpenSst {
@@ -211,17 +215,24 @@ impl OpenSst {
         if let Some(r) = reader {
             let _ = slot.set(r);
         }
-        Self { meta, reader: slot }
+        let first_row_len = row_of(&meta.smallest_key).len();
+        let last_row_len = row_of(&meta.largest_key).len();
+        Self {
+            meta,
+            reader: slot,
+            first_row_len,
+            last_row_len,
+        }
     }
 
     /// The row prefix of the smallest key.
     pub(crate) fn first_row(&self) -> &[u8] {
-        row_of(&self.meta.smallest_key)
+        &self.meta.smallest_key[..self.first_row_len]
     }
 
     /// The row prefix of the largest key.
     pub(crate) fn last_row(&self) -> &[u8] {
-        row_of(&self.meta.largest_key)
+        &self.meta.largest_key[..self.last_row_len]
     }
 
     /// The reader, opened through `set` if this is its first use.
@@ -302,9 +313,69 @@ pub(crate) fn row_of(key: &[u8]) -> &[u8] {
 #[derive(Debug, Default)]
 pub(crate) struct FamilySsts {
     pub levels: Vec<Vec<Arc<OpenSst>>>,
+    /// Per level, whether its SSTs are sorted by key and disjoint, checked when the set is
+    /// built rather than assumed: a read searches such a level and walks any other (level 0
+    /// always).
+    disjoint: Vec<bool>,
 }
 
 impl FamilySsts {
+    /// The levels as given (level 0 newest first, deeper levels sorted by smallest key).
+    pub(crate) fn new(levels: Vec<Vec<Arc<OpenSst>>>) -> Self {
+        let disjoint = levels
+            .iter()
+            .enumerate()
+            .map(|(l, files)| {
+                l > 0
+                    && files
+                        .windows(2)
+                        .all(|w| w[0].meta.largest_key < w[1].meta.smallest_key)
+            })
+            .collect::<Vec<_>>();
+        Self { levels, disjoint }
+    }
+
+    /// Whether every level below 0 is disjoint (or holds fewer than two SSTs).
+    fn deeper_levels_disjoint(&self) -> bool {
+        self.levels
+            .iter()
+            .zip(&self.disjoint)
+            .skip(1)
+            .all(|(files, d)| *d || files.len() < 2)
+    }
+
+    /// Where level `l`'s walk for `row` (a row prefix) starts, and whether it stops at the
+    /// first SST starting past the row: a disjoint level of more than a few SSTs is searched
+    /// on its last rows (sorted and disjoint, so they rise with the first rows); level 0,
+    /// small levels and any level that is not disjoint are walked from the start.
+    #[inline]
+    pub(crate) fn level_start(&self, l: usize, row: &[u8]) -> (usize, bool) {
+        const WALK_MAX: usize = 4;
+        let files = &self.levels[l];
+        if files.len() > WALK_MAX && self.disjoint.get(l).copied().unwrap_or(false) {
+            (files.partition_point(|s| s.last_row() < row), true)
+        } else {
+            (0, false)
+        }
+    }
+
+    /// The SSTs whose row range covers `row` (a row prefix), in [`FamilySsts::iter`]'s order:
+    /// level 0 by a walk, each disjoint deeper level by a binary search on the last row
+    /// (then the one SST, or the few a row spans when it continues across an SST boundary).
+    /// (The reads write this loop out; the equivalence test checks it against a walk.)
+    #[cfg(test)]
+    pub(crate) fn covering<'s, 'r>(
+        &'s self,
+        row: &'r [u8],
+    ) -> impl Iterator<Item = &'s Arc<OpenSst>> + use<'s, 'r> {
+        self.levels.iter().enumerate().flat_map(move |(l, files)| {
+            let (from, search) = self.level_start(l, row);
+            files[from..]
+                .iter()
+                .take_while(move |s| !search || s.first_row() <= row)
+                .filter(move |s| s.first_row() <= row && row <= s.last_row())
+        })
+    }
     /// The picker's view of the levels.
     pub(crate) fn levels_meta(&self) -> Levels {
         Levels {
@@ -410,7 +481,16 @@ impl SstSet {
                     files.sort_by(|a, b| a.meta.smallest_key.cmp(&b.meta.smallest_key));
                 }
             }
-            map.insert(*key, Arc::new(FamilySsts { levels }));
+            let fam = FamilySsts::new(levels);
+            // Every path that installs SSTs below level 0 keeps the level disjoint:
+            // compaction replaces a level's overlapping run, a trivial move goes only where
+            // nothing overlaps, a merge refuses overlapping levels, a split takes a subset. A
+            // level that was not would still read correctly, by a walk.
+            debug_assert!(
+                fam.deeper_levels_disjoint(),
+                "{key:?}: a level below 0 holds overlapping SSTs"
+            );
+            map.insert(*key, Arc::new(fam));
         }
         let blobs = catalog
             .blob_files
@@ -820,6 +900,117 @@ impl Snapshot {
             view: Arc::clone(&self.view),
             _live: self._live.clone(),
             _pin: self._pin.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod covering_tests {
+    use std::sync::Arc;
+
+    use pigeonhole_format::SstId;
+    use pigeonhole_format::key::{Kind, encode_key, encode_row_prefix};
+    use pigeonhole_format::manifest::SstMeta;
+    use pigeonhole_format::superblock::ExtentRef;
+    use pigeonhole_sim::Rng;
+
+    use super::{FamilySsts, OpenSst};
+
+    fn key(row: &[u8], q: &[u8]) -> Vec<u8> {
+        let mut k = Vec::new();
+        encode_key(&mut k, row, q, 1, 1, Kind::Put).unwrap();
+        k
+    }
+
+    fn sst(id: u64, lo: Vec<u8>, hi: Vec<u8>) -> Arc<OpenSst> {
+        Arc::new(OpenSst::new(
+            Arc::new(SstMeta {
+                id: SstId(id),
+                extent: ExtentRef {
+                    page: 0,
+                    size_class: 0,
+                },
+                len: 0,
+                smallest_key: lo,
+                largest_key: hi,
+                seqno_range: (1, 1),
+                ts_range: (1, 1),
+                entries: 1,
+                deletes: 0,
+            }),
+            None,
+        ))
+    }
+
+    fn row(i: u64) -> Vec<u8> {
+        format!("r{i:02}").into_bytes()
+    }
+
+    /// A random layout: level 0 with overlapping SSTs, deeper levels cut into disjoint SSTs
+    /// whose edges may split a row (largest key and next smallest key in one row).
+    fn layout(rng: &mut Rng, next: &mut u64) -> Vec<Vec<Arc<OpenSst>>> {
+        let mut levels = Vec::new();
+        let mut l0 = Vec::new();
+        for _ in 0..rng.below(4) {
+            let a = rng.below(20);
+            let b = a + rng.below(20 - a);
+            *next += 1;
+            l0.push(sst(*next, key(&row(a), b"a"), key(&row(b), b"z")));
+        }
+        levels.push(l0);
+        for _ in 0..1 + rng.below(3) {
+            let mut files = Vec::new();
+            let mut r = rng.below(4);
+            // The previous SST ended part way through row `r`.
+            let mut mid = false;
+            while r < 20 && rng.below(6) != 0 {
+                let end = (r + rng.below(4)).min(19);
+                let lo = key(&row(r), if mid { b"m" } else { b"b" });
+                let split = rng.below(3) == 0 && !(mid && end == r);
+                let hi = key(&row(end), if split { b"f" } else { b"z" });
+                *next += 1;
+                files.push(sst(*next, lo, hi));
+                if split {
+                    (r, mid) = (end, true);
+                } else {
+                    (r, mid) = (end + 1 + rng.below(2), false);
+                }
+            }
+            levels.push(files);
+        }
+        levels
+    }
+
+    /// `covering` finds exactly the SSTs, in order, that a walk of every SST checking each
+    /// one's row range finds, for rows inside, between and outside the SSTs; and so does a
+    /// level that is not disjoint, which it walks.
+    #[test]
+    fn covering_finds_what_a_walk_finds() {
+        for seed in 0..if cfg!(miri) { 20 } else { 2000 } {
+            let mut rng = Rng::new(seed);
+            let mut next = 0;
+            let mut levels = layout(&mut rng, &mut next);
+            if seed % 5 == 0 {
+                // An overlapping deeper level (never installed, but read correctly).
+                let a = rng.below(10);
+                levels.push(vec![
+                    sst(1000, key(&row(a), b"a"), key(&row(a + 5), b"a")),
+                    sst(1001, key(&row(a + 2), b"a"), key(&row(a + 8), b"a")),
+                ]);
+            }
+            let fam = FamilySsts::new(levels);
+            assert_eq!(fam.deeper_levels_disjoint(), seed % 5 != 0, "seed {seed}");
+            for i in 0..22 {
+                let mut prefix = Vec::new();
+                encode_row_prefix(&mut prefix, &row(i)).unwrap();
+                let got: Vec<SstId> = fam.covering(&prefix).map(|s| s.meta.id).collect();
+                let want: Vec<SstId> = fam
+                    .iter()
+                    .filter(|s| s.first_row() <= &prefix[..] && &prefix[..] <= s.last_row())
+                    .map(|s| s.meta.id)
+                    .collect();
+                assert_eq!(got, want, "seed {seed} row {i}");
+            }
         }
     }
 }
