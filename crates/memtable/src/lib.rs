@@ -167,12 +167,16 @@ const STEP_SLACK: usize = MAX_HEIGHT + 16;
 /// Also carries the writer's process-local knowledge of the memtable (ICR 0020): whether a
 /// delete marker was ever inserted. A pin a reader process makes for a root it found in a
 /// view has no writer behind it, so it answers "maybe" ([`MemtableReader::may_have_markers`]).
+/// And it holds the memtable's stale-tail index (D194), set by `with_tail_index`: every
+/// handle reaches it through the pin it already holds, at no extra reference count.
 #[derive(Debug)]
 struct Pin {
     /// Made by this memtable's writer (`Memtable::create`), so `markers` is kept.
     writer: bool,
     /// A delete marker was inserted (set before the marker is linked, Release).
     markers: AtomicBool,
+    /// The stale-tail index, when the writer keeps one (D194).
+    tails: std::sync::OnceLock<TailIndex>,
 }
 
 impl Pin {
@@ -180,6 +184,7 @@ impl Pin {
         Self {
             writer: true,
             markers: AtomicBool::new(false),
+            tails: std::sync::OnceLock::new(),
         }
     }
 
@@ -187,6 +192,7 @@ impl Pin {
         Self {
             writer: false,
             markers: AtomicBool::new(true),
+            tails: std::sync::OnceLock::new(),
         }
     }
 }
@@ -609,8 +615,6 @@ pub struct Memtable {
     pin: Arc<Pin>,
     /// The arena's chunk size (for the stale-tail index).
     chunk_size: usize,
-    /// The stale-tail index (D194), if [`Memtable::with_tail_index`] asked for one.
-    tails: Option<Arc<TailIndex>>,
 }
 
 impl Memtable {
@@ -669,7 +673,6 @@ impl Memtable {
             splice: [head as u32; MAX_HEIGHT],
             pin,
             chunk_size: arena.chunk_size,
-            tails: None,
         })
     }
 
@@ -705,9 +708,12 @@ impl Memtable {
     ///
     /// # Panics
     /// If the memtable already holds entries.
-    pub fn with_tail_index(mut self) -> Self {
+    pub fn with_tail_index(self) -> Self {
         assert_eq!(self.count, 0, "with_tail_index on a memtable with entries");
-        self.tails = Some(Arc::new(TailIndex::new(self.region.len(), self.chunk_size)));
+        let index = TailIndex::new(self.region.len(), self.chunk_size);
+        if self.pin.tails.set(index).is_err() {
+            unreachable!("a new memtable's pin has no index yet");
+        }
         self
     }
 
@@ -787,8 +793,11 @@ impl Memtable {
         // Level 0 first: its successor is the stale-tail index's too.
         let next0 = mem.load_u32(tower(prev[0], 0), Ordering::Relaxed);
         mem.write_u32(tower(node, 0), next0);
-        for (level, &p) in prev.iter().enumerate().take(height).skip(1) {
-            let next = mem.load_u32(tower(p, level), Ordering::Relaxed);
+        // An index loop: the iterator form (`enumerate().take(height).skip(1)` over the
+        // array) compiled to an out-of-line adapter, about 38 instructions per insert.
+        #[allow(clippy::needless_range_loop)]
+        for level in 1..height {
+            let next = mem.load_u32(tower(prev[level], level), Ordering::Relaxed);
             mem.write_u32(tower(node, level), next);
         }
         let key_off = off + layout::N_TOWER + 4 * height;
@@ -796,7 +805,7 @@ impl Memtable {
         mem.write(key_off + key.len(), value);
         // Before the node is linked, so a reader that reaches it sees its entry. An insert in
         // key order (no successor) tests one word.
-        if next0 != NULL && self.tails.is_some() {
+        if next0 != NULL && self.pin.tails.get().is_some() {
             self.record_tail(node, next0, key);
         }
 
@@ -857,7 +866,7 @@ impl Memtable {
     /// line, so `insert` keeps its shape for the inserts that need none.
     #[inline(never)]
     fn record_tail(&self, node: u32, next: u32, key: &[u8]) {
-        let Some(tails) = &self.tails else {
+        let Some(tails) = self.pin.tails.get() else {
             return;
         };
         if self.same_column(next, key) {
@@ -953,7 +962,6 @@ impl Memtable {
             root: self.root,
             head: self.head,
             pin: Arc::clone(&self.pin),
-            tails: self.tails.clone(),
         }
     }
 
@@ -1016,8 +1024,6 @@ pub struct MemtableReader {
     /// Keeps the memtable's chunks from being reused while this handle lives (writer
     /// process only; in a reader process it pins nothing).
     pin: Arc<Pin>,
-    /// The writer's stale-tail index (D194); `None` in reader processes.
-    tails: Option<Arc<TailIndex>>,
 }
 
 impl MemtableReader {
@@ -1064,7 +1070,6 @@ impl MemtableReader {
             root,
             head,
             pin,
-            tails: None,
         };
         let node = reader.node(head)?;
         if node.height != MAX_HEIGHT || node.key_len != 0 || node.value_len != 0 {
@@ -1331,7 +1336,7 @@ impl MemIter {
     /// (D194) and holds entries. A reader can leave the skip off for a read whose sources
     /// have no such memtable, so it never pays for a try that cannot succeed.
     pub fn skips_columns(&self) -> bool {
-        self.reader.tails.is_some() && !self.reader.is_empty()
+        self.reader.pin.tails.get().is_some() && !self.reader.is_empty()
     }
 
     /// [`Cursor::skip_column`]'s jump: from the tail `at`, steps while the key is still in
@@ -1352,7 +1357,7 @@ impl MemIter {
                         && self.reader.region.mem.cmp(n.key_off, column.len(), column)
                             == Cmp::Equal =>
                 {
-                    at = match self.reader.tails.as_ref().map_or(NULL, |t| t.get(n.off)) {
+                    at = match self.reader.pin.tails.get().map_or(NULL, |t| t.get(n.off)) {
                         NULL => n.off,
                         t => t,
                     };
@@ -1509,7 +1514,7 @@ impl Cursor for MemIter {
     /// then steps inside the memtable while the key is still in `column`.
     #[inline]
     fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
-        let (Some(tails), Some(node)) = (&self.reader.tails, self.node) else {
+        let (Some(tails), Some(node)) = (self.reader.pin.tails.get(), self.node) else {
             return Ok(false);
         };
         let at = tails.get(node.off);

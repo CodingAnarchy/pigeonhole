@@ -723,7 +723,9 @@ fn skip_column_lands_on_the_next_column() {
         };
         let mut arena = ShardArena::new(ArenaRegion::heap(4 << 20), 64 * 1024);
         let mut mt = Memtable::create(&mut arena).unwrap().with_tail_index();
-        let plain_reader = MemtableReader::open(arena.region().clone(), mt.root()).unwrap();
+        // Opened by root in the writer's process: it shares the writer's pin, and with it the
+        // index. (A reader process's registry has no pin for the root, so it has none.)
+        let by_root = MemtableReader::open(arena.region().clone(), mt.root()).unwrap();
         let mut seqno = 0;
         for _ in 0..if cfg!(miri) { 120 } else { 600 } {
             let row = [b'r', b'0' + rand(4) as u8];
@@ -761,10 +763,21 @@ fn skip_column_lands_on_the_next_column() {
             } else {
                 assert_eq!(it.key(), &k[..], "seed {seed}: a refused skip moved");
             }
-            // A reader process's cursor has no index.
-            let mut plain = plain_reader.iter();
-            plain.seek(k).unwrap();
-            assert!(!plain.skip_column(&col).unwrap(), "seed {seed}");
+            // A reader opened by root lands where the writer's own does.
+            let mut other = by_root.iter();
+            other.seek(k).unwrap();
+            let mut own = mt.reader().iter();
+            own.seek(k).unwrap();
+            assert_eq!(
+                other.skip_column(&col).unwrap(),
+                own.skip_column(&col).unwrap(),
+                "seed {seed}"
+            );
+            assert_eq!(
+                other.valid().then(|| other.key().to_vec()),
+                own.valid().then(|| own.key().to_vec()),
+                "seed {seed}"
+            );
         }
         assert!(
             jumps > if cfg!(miri) { 10 } else { 100 },
