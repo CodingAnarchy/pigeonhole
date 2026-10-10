@@ -117,6 +117,24 @@ impl Cursor for Source {
             Source::Vec(it) => Ok(it.skip_row()?),
         }
     }
+
+    /// A memtable with a stale-tail index jumps (D194); an SST steps as before.
+    #[inline]
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
+        match self {
+            Source::Mem(it) => {
+                let skipped = it.skip_column(column)?;
+                #[cfg(feature = "test-hooks")]
+                if skipped {
+                    crate::shard::TAIL_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(skipped)
+            }
+            Source::Sst(_) => Ok(false),
+            #[cfg(test)]
+            Source::Vec(it) => Ok(it.skip_column(column)?),
+        }
+    }
 }
 
 /// A value pinned in its storage, outliving the cursor position it came from.

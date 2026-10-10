@@ -237,3 +237,38 @@ fn loom_a_visible_marker_is_never_missed() {
         assert!(reader.may_have_markers());
     });
 }
+
+/// D194: a reader skipping a column while the writer links newer versions of it (each with
+/// a stale-tail entry) lands on the next column, never on a phantom or a version of the
+/// skipped column, and sees every tail entry's target fully written.
+#[test]
+fn loom_skip_column_with_a_concurrent_writer() {
+    fn version(q: u8, ts: u64) -> Vec<u8> {
+        let mut k = Vec::new();
+        encode_key(&mut k, b"r", &[q], ts, ts, Kind::Put).unwrap();
+        k
+    }
+    model().check(|| {
+        let mut arena = ShardArena::new(ArenaRegion::heap(4096), 1024);
+        let mut mt = Memtable::create(&mut arena).unwrap().with_tail_index();
+        mt.insert(&mut arena, &version(b'a', 1), b"1").unwrap();
+        mt.insert(&mut arena, &version(b'b', 1), b"b").unwrap();
+        let reader = mt.reader();
+        let column = {
+            let k = version(b'a', 0);
+            k[..k.len() - pigeonhole_format::key::SUFFIX_LEN].to_vec()
+        };
+        let r = thread::spawn(move || {
+            let mut it = reader.iter();
+            it.seek_to_first().unwrap();
+            assert_eq!(&it.key()[..column.len()], &column[..]);
+            if it.skip_column(&column).unwrap() {
+                assert_eq!(it.key(), &version(b'b', 1)[..]);
+                assert_eq!(it.value(), b"b");
+            }
+        });
+        mt.insert(&mut arena, &version(b'a', 2), b"2").unwrap();
+        mt.insert(&mut arena, &version(b'a', 3), b"3").unwrap();
+        r.join().unwrap();
+    });
+}

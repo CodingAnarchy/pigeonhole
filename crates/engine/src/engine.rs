@@ -560,6 +560,7 @@ impl Engine {
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             room_recheck_nanos: options.room_recheck_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
+            tail_index: options.memtable_tail_index,
             locks: Mutex::new(Some(Locks {
                 _writer: writer_lock,
                 presence,
@@ -1071,6 +1072,7 @@ impl Engine {
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             room_recheck_nanos: options.room_recheck_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
+            tail_index: false,
             locks: Mutex::new(None),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),

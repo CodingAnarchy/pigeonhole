@@ -151,6 +151,12 @@ pub struct EngineOptions {
     /// Zero always parks. Application-owned shards are driven by the application and ignore
     /// it.
     pub shard_spin_nanos: u64,
+    /// The writer keeps a process-local stale-tail index beside each memtable, and row reads
+    /// and scans pass a finished column's superseded memtable versions in one jump (D194,
+    /// on by default per D199). Same results either way. It costs a write that overwrites a
+    /// column about 200 instructions (D199). Reader processes have no index and step.
+    /// `PIGEONHOLE_TAIL_INDEX=0` sets the default to off, for A/B runs.
+    pub memtable_tail_index: bool,
 }
 
 impl EngineOptions {
@@ -191,6 +197,7 @@ impl EngineOptions {
             room_recheck_nanos: 1_000_000,
             commit_spin_nanos: 15_000,
             shard_spin_nanos: 50_000,
+            memtable_tail_index: std::env::var_os("PIGEONHOLE_TAIL_INDEX").is_none_or(|v| v != "0"),
         }
     }
 }

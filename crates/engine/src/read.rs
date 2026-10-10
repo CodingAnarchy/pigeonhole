@@ -970,6 +970,7 @@ impl ScanCursor {
                 give_back(resolver);
                 return Err(e);
             }
+            opts.skip_columns = skips_columns(resolver.cursor_mut().sources());
             resolver.cursor_mut().reset();
             resolver.reset(opts);
             resolver.set_upper_bound(end);
@@ -1485,6 +1486,7 @@ fn read_row_with(
         if cursor.sources().is_empty() {
             continue;
         }
+        opts.skip_columns = skips_columns(cursor.sources());
         cursor.reset();
         resolver.reset(opts);
         resolver.set_upper_bound(Some(&past));
@@ -1637,6 +1639,19 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
         Ok(Some(got)) => got,
         _ => (run.take().expect("not run yet"))(&mut point_resolver()),
     }
+}
+
+/// Whether a read over `sources` should pass finished columns with `skip_column` (D194):
+/// only when the index is on and a memtable source can jump, so a read of SSTs alone never
+/// pays for a try that cannot succeed.
+fn skips_columns(sources: &[Source]) -> bool {
+    #[cfg(feature = "test-hooks")]
+    if crate::shard::READS_STEP.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    sources
+        .iter()
+        .any(|s| matches!(s, Source::Mem(m) if m.inner().skips_columns()))
 }
 
 /// A point get's resolver options: as `ReadSpec { versions: 1, .. }.resolve_opts`, built

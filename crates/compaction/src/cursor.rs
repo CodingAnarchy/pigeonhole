@@ -236,6 +236,32 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
         Ok(())
     }
 
+    /// Only the top source moves, then the heap settles as after [`Cursor::next`].
+    #[inline]
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool, C::Error> {
+        let Some(&top) = self.heap.first() else {
+            return Ok(false);
+        };
+        if !self.sources[top].skip_column(column)? {
+            return Ok(false);
+        }
+        if !self.sources[top].valid() {
+            let last = self.heap.len() - 1;
+            self.heap.swap(0, last);
+            self.heap.pop();
+            self.sift_down(0);
+        } else {
+            let r = self.runner;
+            if r == 0 || self.less(top, self.heap[r]) {
+                return Ok(true);
+            }
+            self.heap.swap(0, r);
+            self.sift_down(r);
+        }
+        self.set_runner();
+        Ok(true)
+    }
+
     fn skip_row(&mut self) -> Result<(), C::Error> {
         if !self.valid() {
             return Ok(());
@@ -379,6 +405,15 @@ impl<C: Cursor> Cursor for FilteredCursor<C> {
     fn skip_row(&mut self) -> Result<(), C::Error> {
         self.inner.skip_row()?;
         self.settle()
+    }
+
+    #[inline]
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool, C::Error> {
+        if !self.inner.skip_column(column)? {
+            return Ok(false);
+        }
+        self.settle()?;
+        Ok(true)
     }
 }
 
