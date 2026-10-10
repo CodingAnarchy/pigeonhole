@@ -12,7 +12,7 @@ SQLite's deployment model (one file, a library, no server).
 > ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The
 > on-disk format and the API may change before 1.0
 > ([`FORMAT.md`](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md)). The
-> latency work (Phase 3) is still to come. Pigeonhole is **not recommended for production use
+> latency work (Phase 3) is in progress. Pigeonhole is **not recommended for production use
 > yet**. See the
 > [status and roadmap](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md).
 
