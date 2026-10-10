@@ -13,12 +13,14 @@
 //! when the caller drops its [`Completion`]; and the ring is torn down only after every
 //! operation in flight has completed.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
+use std::time::Duration;
 
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 
@@ -63,6 +65,13 @@ impl fmt::Debug for UringVfs {
 }
 
 impl Vfs for UringVfs {
+    /// Gives the calling thread a ring of its own: what it submits from then on goes there,
+    /// and it reaps the completions itself (in its turns and its waits). Where the kernel
+    /// lacks what such a ring needs, the thread keeps using the shared ring.
+    fn attach_thread(&self) {
+        ThreadRing::attach(self.ring.id());
+    }
+
     fn open(&self, path: &Path, opts: OpenOptions) -> Result<FileRef> {
         Ok(Arc::new(UringFile {
             file: self.files.open_file(path, opts)?,
@@ -129,6 +138,31 @@ impl fmt::Debug for UringFile {
     }
 }
 
+impl UringFile {
+    /// Submits the operation `kind` builds: to the calling thread's own ring for this
+    /// backend if it attached one (completed when it reaps), else to the shared ring.
+    fn submit<T: Send + 'static>(&self, kind: impl FnOnce(Resolver<T>) -> Kind) -> Completion<T> {
+        match ThreadRing::current(self.ring.id()) {
+            Some(ring) => {
+                let (done, resolver) = Completion::driven_pair(Some(ring.drive()));
+                ring.submit(Op {
+                    file: Arc::clone(&self.file),
+                    kind: kind(resolver),
+                });
+                done
+            }
+            None => {
+                let (done, resolver) = Completion::pair();
+                self.ring.ring.submit(Op {
+                    file: Arc::clone(&self.file),
+                    kind: kind(resolver),
+                });
+                done
+            }
+        }
+    }
+}
+
 impl File for UringFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.file.read_at(buf, offset)
@@ -139,31 +173,21 @@ impl File for UringFile {
     }
 
     fn submit_read(&self, buf: IoBuf, offset: u64) -> Completion {
-        let (done, resolver) = Completion::pair();
-        self.ring.ring.submit(Op {
-            file: Arc::clone(&self.file),
-            kind: Kind::Read {
-                buf,
-                offset,
-                done: 0,
-                resolver,
-            },
-        });
-        done
+        self.submit(|resolver| Kind::Read {
+            buf,
+            offset,
+            done: 0,
+            resolver,
+        })
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
-        let (done, resolver) = Completion::pair();
-        self.ring.ring.submit(Op {
-            file: Arc::clone(&self.file),
-            kind: Kind::Write {
-                buf,
-                offset,
-                done: 0,
-                resolver,
-            },
-        });
-        done
+        self.submit(|resolver| Kind::Write {
+            buf,
+            offset,
+            done: 0,
+            resolver,
+        })
     }
 
     fn sync_data(&self) -> Result<()> {
@@ -171,15 +195,10 @@ impl File for UringFile {
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
-        let (done, resolver) = Completion::pair();
-        self.ring.ring.submit(Op {
-            file: Arc::clone(&self.file),
-            kind: Kind::Sync {
-                data_only: true,
-                resolver,
-            },
-        });
-        done
+        self.submit(|resolver| Kind::Sync {
+            data_only: true,
+            resolver,
+        })
     }
 
     fn sync_all(&self) -> Result<()> {
@@ -187,15 +206,10 @@ impl File for UringFile {
     }
 
     fn submit_sync_all(&self) -> Completion<()> {
-        let (done, resolver) = Completion::pair();
-        self.ring.ring.submit(Op {
-            file: Arc::clone(&self.file),
-            kind: Kind::Sync {
-                data_only: false,
-                resolver,
-            },
-        });
-        done
+        self.submit(|resolver| Kind::Sync {
+            data_only: false,
+            resolver,
+        })
     }
 
     fn len(&self) -> Result<u64> {
@@ -552,6 +566,11 @@ struct RingHandle {
 }
 
 impl RingHandle {
+    /// Identifies the backend this handle belongs to (for a thread's own rings).
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     fn start() -> Result<Arc<Self>> {
         let ring = Arc::new(Ring::probe()?);
         let r = Arc::clone(&ring);
@@ -580,6 +599,301 @@ impl Drop for RingHandle {
             && let Some(r) = reaper
         {
             let _ = r.join();
+        }
+    }
+}
+
+/// The `user_data` of the poll that wakes a thread's ring wait.
+const WAKE: u64 = u64::MAX - 1;
+
+/// Longest a waiting [`Completion`] on a ring's owner thread reaps before it checks its
+/// result again.
+const DRIVE_SLICE: Duration = Duration::from_millis(1);
+
+thread_local! {
+    /// The rings this thread attached, one per backend.
+    static THREAD_RINGS: RefCell<Vec<Arc<ThreadRing>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A ring owned by one thread (a shard's, #402): only that thread submits to it and reaps
+/// it, in its turns ([`crate::reap_own_io`] without waiting), in its idle waits and while it
+/// blocks on one of its completions. Other threads wake its waits through an eventfd the
+/// ring polls ([`crate::OwnIoWaker`]).
+struct ThreadRing {
+    uring: IoUring,
+    table: Mutex<Table>,
+    owner: ThreadId,
+    /// The backend ([`RingHandle::id`]) the ring belongs to.
+    backend: usize,
+    wake: Arc<EventFd>,
+}
+
+/// An eventfd, closed on drop.
+struct EventFd(std::os::fd::OwnedFd);
+
+impl EventFd {
+    fn new() -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain syscall; a non-negative result is a descriptor we now own.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by `eventfd` and is owned by nobody else.
+        Ok(Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn raw(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.0.as_raw_fd()
+    }
+
+    /// Adds one to the counter (wakes a poll on it).
+    fn signal(&self) {
+        let one = 1u64;
+        // SAFETY: writes 8 bytes from a live `u64` to a descriptor this value owns. A full
+        // counter (EAGAIN) means the poll is already due, which is all a wake needs.
+        let _ = unsafe { libc::write(self.raw(), std::ptr::from_ref(&one).cast(), 8) };
+    }
+
+    /// Resets the counter.
+    fn drain(&self) {
+        let mut n = 0u64;
+        // SAFETY: reads 8 bytes into a live `u64`; EAGAIN (already zero) is fine.
+        let _ = unsafe { libc::read(self.raw(), std::ptr::from_mut(&mut n).cast(), 8) };
+    }
+}
+
+impl ThreadRing {
+    /// The calling thread's ring for `backend`, if it attached one.
+    fn current(backend: usize) -> Option<Arc<Self>> {
+        THREAD_RINGS
+            .try_with(|r| r.borrow().iter().find(|t| t.backend == backend).cloned())
+            .ok()
+            .flatten()
+    }
+
+    /// Gives the calling thread a ring for `backend` (once). Without the kernel support it
+    /// needs (timed waits), the thread keeps using the shared ring.
+    fn attach(backend: usize) {
+        if Self::current(backend).is_some() {
+            return;
+        }
+        let Some(ring) = Self::new(backend) else {
+            return;
+        };
+        let own: std::sync::Weak<dyn crate::own::OwnIo> = Arc::downgrade(&ring) as _;
+        crate::own::register(own);
+        let _ = THREAD_RINGS.try_with(|r| r.borrow_mut().push(ring));
+    }
+
+    fn new(backend: usize) -> Option<Arc<Self>> {
+        // Completions run only when this thread enters the ring (no work on other threads),
+        // where the kernel offers it (6.1); a plain ring otherwise. The task-run flag tells
+        // a non-waiting reap that deferred completions are pending, so its enter carries
+        // GETEVENTS and runs them (without it, only a waiting enter would: a busy shard, or
+        // an application loop that never waits, would never see its completions).
+        let uring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_defer_taskrun()
+            .setup_taskrun_flag()
+            .setup_cqsize(RING_ENTRIES * 2)
+            .build(RING_ENTRIES)
+            .or_else(|_| {
+                IoUring::builder()
+                    .setup_cqsize(RING_ENTRIES * 2)
+                    .build(RING_ENTRIES)
+            })
+            .ok()?;
+        if !uring.params().is_feature_ext_arg() {
+            return None;
+        }
+        let mut probe = Probe::new();
+        uring.submitter().register_probe(&mut probe).ok()?;
+        if !probe.is_supported(opcode::PollAdd::CODE) {
+            return None;
+        }
+        let ring = Arc::new(Self {
+            uring,
+            table: Mutex::new(Table::default()),
+            owner: thread::current().id(),
+            backend,
+            wake: Arc::new(EventFd::new().ok()?),
+        });
+        ring.arm_wake().ok()?;
+        Some(ring)
+    }
+
+    /// Polls the eventfd, so a signal ends the ring's wait.
+    fn arm_wake(&self) -> io::Result<()> {
+        let poll = opcode::PollAdd::new(types::Fd(self.wake.raw()), libc::POLLIN as u32)
+            .build()
+            .user_data(WAKE);
+        self.push(&poll)
+    }
+
+    /// Pushes `entry` and hands it to the kernel. Only the owner thread calls this.
+    fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
+        debug_assert_eq!(thread::current().id(), self.owner);
+        loop {
+            // SAFETY: only the owner thread borrows this ring's submission queue, and never
+            // re-entrantly (no callback runs during the borrow). The entry's buffer and
+            // descriptor belong to an operation in `self.table` until its completion is
+            // reaped.
+            let pushed = unsafe {
+                let mut sq = self.uring.submission_shared();
+                let r = sq.push(entry);
+                sq.sync();
+                r
+            };
+            match pushed {
+                Ok(()) => break,
+                Err(_) => {
+                    self.uring.submit()?;
+                }
+            }
+        }
+        self.uring.submit().map(drop)
+    }
+
+    fn submit(&self, op: Op) {
+        let mut table = lock(&self.table);
+        let user_data = table.insert(op);
+        let entry = table.ops[user_data as usize]
+            .as_mut()
+            .expect("inserted above")
+            .entry(user_data);
+        drop(table);
+        if let Err(e) = self.push(&entry)
+            && let Some(op) = lock(&self.table).take(user_data)
+        {
+            fail(op, e);
+        }
+    }
+
+    /// What a blocked [`Completion::wait`] on one of this ring's operations calls: reaps
+    /// while on the owner thread, and leaves the wait to the condvar elsewhere.
+    fn drive(self: &Arc<Self>) -> crate::completion::Drive {
+        let ring = Arc::downgrade(self);
+        let owner = self.owner;
+        Arc::new(move || {
+            if thread::current().id() != owner {
+                return false;
+            }
+            match ring.upgrade() {
+                Some(r) => {
+                    r.reap(Some(DRIVE_SLICE));
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// Takes the finished completions, waiting up to `wait` for one when none has (`None`:
+    /// do not wait). Returns whether an operation completed.
+    fn reap(&self, wait: Option<Duration>) -> bool {
+        debug_assert_eq!(thread::current().id(), self.owner);
+        let entered = match wait {
+            Some(t) if lock(&self.table).live > 0 || !t.is_zero() => {
+                let ts = types::Timespec::new()
+                    .sec(t.as_secs())
+                    .nsec(t.subsec_nanos());
+                let args = types::SubmitArgs::new().timespec(&ts);
+                self.uring.submitter().submit_with_args(1, &args)
+            }
+            // Runs this thread's deferred completion work without waiting.
+            _ => self
+                .uring
+                .submitter()
+                .submit_with_args(0, &types::SubmitArgs::new()),
+        };
+        if let Err(e) = entered
+            && !matches!(
+                e.raw_os_error(),
+                Some(libc::ETIME | libc::EINTR | libc::EBUSY)
+            )
+        {
+            // The ring is unusable: fail what is in flight rather than hang.
+            let ops: Vec<Op> = {
+                let mut table = lock(&self.table);
+                let n = table.ops.len() as u64;
+                (0..n).filter_map(|i| table.take(i)).collect()
+            };
+            let any = !ops.is_empty();
+            for op in ops {
+                fail(op, io::Error::other("io_uring failed"));
+            }
+            return any;
+        }
+        let mut done = Vec::new();
+        let mut again = Vec::new();
+        let mut woke = false;
+        {
+            // SAFETY: only the owner thread borrows this ring's completion queue, and the
+            // borrow ends before any completion's continuation runs.
+            let mut cq = unsafe { self.uring.completion_shared() };
+            cq.sync();
+            let mut table = lock(&self.table);
+            for cqe in &mut cq {
+                if cqe.user_data() == WAKE {
+                    woke = true;
+                    continue;
+                }
+                let Some(op) = table.take(cqe.user_data()) else {
+                    continue;
+                };
+                match op.complete(cqe.result()) {
+                    Step::Done(resolve) => done.push(resolve),
+                    Step::Again(op) => again.push(op),
+                }
+            }
+        }
+        if woke {
+            self.wake.drain();
+            // Re-armed for the next wake; a failure leaves waits to their timeouts.
+            let _ = self.arm_wake();
+        }
+        for op in again {
+            self.submit(op);
+        }
+        let any = !done.is_empty();
+        for resolve in done {
+            resolve();
+        }
+        any
+    }
+}
+
+impl crate::own::OwnIo for ThreadRing {
+    fn in_flight_here(&self) -> bool {
+        thread::current().id() == self.owner && lock(&self.table).live > 0
+    }
+
+    fn reap_here(&self, wait: Option<Duration>) -> bool {
+        thread::current().id() == self.owner && self.reap(wait)
+    }
+
+    fn waker_here(&self) -> Option<crate::OwnIoWaker> {
+        if thread::current().id() != self.owner {
+            return None;
+        }
+        let wake = Arc::clone(&self.wake);
+        Some(crate::OwnIoWaker(Arc::new(move || wake.signal())))
+    }
+}
+
+impl Drop for ThreadRing {
+    /// The owner thread is ending (its thread-local rings go): completes what is still in
+    /// flight before the ring, and the buffers the kernel writes into, go.
+    fn drop(&mut self) {
+        if thread::current().id() != self.owner {
+            // Only the owner can reap a single-issuer ring. The last strong handle is
+            // the owner's thread-local one, so this is unreachable in practice.
+            return;
+        }
+        while lock(&self.table).live > 0 {
+            self.reap(Some(Duration::from_millis(10)));
         }
     }
 }

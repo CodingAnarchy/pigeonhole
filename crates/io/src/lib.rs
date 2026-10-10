@@ -9,7 +9,8 @@
 //! - [`sim::SimVfs`]: in-memory, deterministic from a seed, with torn writes, reordered
 //!   fsyncs, ENOSPC and crashes. With [`sim::FaultPlan::none`] it is the plain in-memory mock
 //!   other crates test against.
-//! - [`uring::UringVfs`] (Linux): real files with submitted I/O on io_uring (#402).
+//! - `uring::UringVfs` (Linux only, so not linked here): real files with submitted I/O on
+//!   io_uring (#402).
 //!
 //! This crate also owns the other OS-facing `unsafe` the engine needs: shared-memory mappings
 //! ([`SharedRegion`]), byte-range locks, thread pinning and NUMA binding ([`sys`]).
@@ -36,6 +37,6 @@ pub use buf::IoBuf;
 pub use completion::{Completion, Resolver};
 pub use error::{Error, ErrorKind, Result};
 pub use file::{File, FileRef, Locality, LockMode, OpenOptions};
-pub use own::{own_io_in_flight, reap_own_io};
+pub use own::{OwnIoWaker, own_io_in_flight, own_io_waker, reap_own_io};
 pub use shared::{SharedOpen, SharedRegion};
 pub use vfs::{FileIdentity, ProcessId, Vfs, VfsRef};

@@ -17,6 +17,9 @@ pub(crate) enum WakeTarget {
     None,
     /// An engine-owned thread parked in its loop.
     Thread(Thread),
+    /// An engine-owned thread that may instead wait on its own I/O ring (#402): unparked,
+    /// and its ring wait interrupted.
+    ThreadRing(Thread, pigeonhole_io::OwnIoWaker),
     /// The application's event-loop wakeup.
     Callback(Arc<dyn Fn() + Send + Sync>),
 }
@@ -94,16 +97,22 @@ impl Signal {
     fn wake_target(&self) {
         enum Act {
             Thread(Thread),
+            ThreadRing(Thread, pigeonhole_io::OwnIoWaker),
             Callback(Arc<dyn Fn() + Send + Sync>),
         }
         // Clone the target out so the callback runs without the lock held.
         let act = match &*self.target.lock().unwrap_or_else(PoisonError::into_inner) {
             WakeTarget::None => return,
             WakeTarget::Thread(t) => Act::Thread(t.clone()),
+            WakeTarget::ThreadRing(t, w) => Act::ThreadRing(t.clone(), w.clone()),
             WakeTarget::Callback(f) => Act::Callback(Arc::clone(f)),
         };
         match act {
             Act::Thread(t) => t.unpark(),
+            Act::ThreadRing(t, w) => {
+                t.unpark();
+                w.wake();
+            }
             Act::Callback(f) => f(),
         }
     }

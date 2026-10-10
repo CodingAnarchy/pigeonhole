@@ -81,6 +81,14 @@ pub trait Vfs: Send + Sync + Debug {
     /// Whether `process` is still running (pid present and start time unchanged).
     fn process_alive(&self, process: ProcessId) -> bool;
 
+    /// Gives the calling thread an I/O queue of its own, if this backend has them (an
+    /// io_uring ring per shard thread, #402): operations it submits from then on go there,
+    /// and it completes them by reaping ([`reap_own_io`](crate::reap_own_io)), in its turns
+    /// and in its waits. Called by threads that drive shards; calling it again does nothing.
+    /// The default, for backends whose completions arrive on threads of their own, does
+    /// nothing.
+    fn attach_thread(&self) {}
+
     /// A random 64-bit value, for identifiers that must be unique (a new database's id).
     ///
     /// The default mixes the standard library's per-process random hash keys (`RandomState`,

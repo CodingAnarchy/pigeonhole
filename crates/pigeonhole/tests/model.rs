@@ -34,11 +34,18 @@
 //! thread completes it in an order the seed picks, so WAL group syncs and root commits stay
 //! in flight while the shard threads go on. The OS schedules those threads, so such a run
 //! does not replay exactly.
+//!
+//! `PIGEONHOLE_REAL_FS=1` runs the store on real files in a temporary directory, through the
+//! backend `PIGEONHOLE_IO` names (`uring` for io_uring, #402; `pread` otherwise), with the
+//! run's simulated clock still driving timestamps and TTLs. Crashes cannot reach real files,
+//! so a crash is the store dropped without a clean close and checked as a process crash
+//! (the WAL replays what the OS holds); fault plans and in-commit power losses are off, and
+//! the tests built on a scheduled power loss skip.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::ops::Bound;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -50,9 +57,10 @@ use pigeonhole_sim::{
     StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive, recovered_from_records,
 };
 
-const DB: &str = "/db/model.phdb";
+/// The store's file name, in the run's directory (`/db`, or a temporary directory).
+const DB: &str = "model.phdb";
 /// A file whose handle dies with every other one at a crash: the liveness probe.
-const PROBE: &str = "/db/probe";
+const PROBE: &str = "probe";
 
 /// Rows are spread over several tables (deterministically by row) so batches span shards.
 const TABLES: [&str; 4] = ["t0", "t1", "t2", "t3"];
@@ -255,7 +263,14 @@ struct Stats {
 
 struct Run {
     cfg: Config,
+    /// The simulator: the store's files, or with `PIGEONHOLE_REAL_FS` only its clock.
     vfs: Arc<SimVfs>,
+    /// What the store runs on: `vfs`, or real files (`PIGEONHOLE_REAL_FS`).
+    store: Arc<dyn Vfs>,
+    /// The directory of the store and the probe.
+    root: PathBuf,
+    /// The temporary directory of a real-files run, removed with the run.
+    _real: Option<RealDir>,
     db: Option<(Pigeonhole, Vec<Table>)>,
     /// Reopened with the store; its handle dies with the store's at a crash.
     probe: Option<FileRef>,
@@ -411,9 +426,120 @@ fn first_diff(got: &Rows, want: &Rows) -> Option<String> {
     None
 }
 
+/// Whether this run uses real files (`PIGEONHOLE_REAL_FS=1`).
+fn real_fs() -> bool {
+    std::env::var("PIGEONHOLE_REAL_FS").as_deref() == Ok("1")
+}
+
+/// A temporary directory, removed on drop.
+struct RealDir(PathBuf);
+
+impl RealDir {
+    fn new(seed: u64) -> Self {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("phdb-model-{}-{seed}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the run's directory");
+        Self(dir)
+    }
+}
+
+impl Drop for RealDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Real files through the backend `PIGEONHOLE_IO` names, on the run's simulated clock: the
+/// model needs the store's commit timestamps and TTLs to follow the clock it advances.
+#[derive(Debug)]
+struct RealFs {
+    files: Arc<dyn Vfs>,
+    clock: Arc<SimVfs>,
+}
+
+impl RealFs {
+    fn new(clock: Arc<SimVfs>) -> Self {
+        let files: Arc<dyn Vfs> = match std::env::var("PIGEONHOLE_IO").as_deref() {
+            #[cfg(target_os = "linux")]
+            Ok("uring") => pigeonhole_io::uring::UringVfs::new().expect("io_uring is available"),
+            #[cfg(not(target_os = "linux"))]
+            Ok("uring") => panic!("PIGEONHOLE_IO=uring needs Linux"),
+            _ => pigeonhole_io::pread::PreadVfs::new(0),
+        };
+        Self { files, clock }
+    }
+}
+
+impl Vfs for RealFs {
+    fn open(&self, path: &Path, opts: OpenOptions) -> pigeonhole_io::Result<FileRef> {
+        self.files.open(path, opts)
+    }
+    fn remove(&self, path: &Path) -> pigeonhole_io::Result<()> {
+        self.files.remove(path)
+    }
+    fn exists(&self, path: &Path) -> pigeonhole_io::Result<bool> {
+        self.files.exists(path)
+    }
+    fn list_dir(&self, dir: &Path) -> pigeonhole_io::Result<Vec<PathBuf>> {
+        self.files.list_dir(dir)
+    }
+    fn sync_dir(&self, dir: &Path) -> pigeonhole_io::Result<()> {
+        self.files.sync_dir(dir)
+    }
+    fn open_shared(
+        &self,
+        name: &str,
+        dir: Option<&Path>,
+        len: u64,
+        mode: pigeonhole_io::SharedOpen,
+    ) -> pigeonhole_io::Result<pigeonhole_io::SharedRegion> {
+        self.files.open_shared(name, dir, len, mode)
+    }
+    fn remove_shared(&self, name: &str, dir: Option<&Path>) -> pigeonhole_io::Result<()> {
+        self.files.remove_shared(name, dir)
+    }
+    fn now_micros(&self) -> u64 {
+        self.clock.now_micros()
+    }
+    fn monotonic_nanos(&self) -> u64 {
+        self.clock.monotonic_nanos()
+    }
+    fn clock_is_simulated(&self) -> bool {
+        true
+    }
+    fn current_process(&self) -> pigeonhole_io::ProcessId {
+        self.files.current_process()
+    }
+    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
+        self.files.process_alive(process)
+    }
+    fn attach_thread(&self) {
+        self.files.attach_thread();
+    }
+    fn random_u64(&self) -> u64 {
+        self.clock.random_u64()
+    }
+}
+
 impl Run {
-    fn new(seed: u64, cfg: Config) -> Result<Self, String> {
+    fn new(seed: u64, mut cfg: Config) -> Result<Self, String> {
         let vfs = SimVfs::new(seed);
+        let (store, root, real): (Arc<dyn Vfs>, PathBuf, Option<RealDir>) = if real_fs() {
+            // Faults and scheduled power losses need the simulator's files.
+            cfg.faults = FaultPlan::none();
+            cfg.mid_commit_crash_ppm = 0;
+            cfg.deferred_io = false;
+            let dir = RealDir::new(seed);
+            (
+                Arc::new(RealFs::new(Arc::clone(&vfs))),
+                dir.0.clone(),
+                Some(dir),
+            )
+        } else {
+            (Arc::clone(&vfs) as _, PathBuf::from("/db"), None)
+        };
         if cfg.deferred_io {
             vfs.set_deferred_io(true);
             // Ends with the `SimVfs`.
@@ -423,6 +549,9 @@ impl Run {
         let mut run = Run {
             cfg,
             vfs,
+            store,
+            root,
+            _real: real,
             db: None,
             probe: None,
             model: new_model(),
@@ -440,7 +569,7 @@ impl Run {
 
     fn open(&mut self) -> Result<(), String> {
         let mut options = Options::default()
-            .vfs(Arc::clone(&self.vfs) as _)
+            .vfs(Arc::clone(&self.store))
             .shards(self.cfg.shards)
             .memtable_budget(self.cfg.memtable_budget)
             .wal_segment_size(256 << 10)
@@ -450,7 +579,7 @@ impl Run {
             // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
             options = options.tablet_balance(Duration::from_micros(15), 3, 8 << 10);
         }
-        let db = Pigeonhole::open(DB, options).map_err(|e| format!("open: {e}"))?;
+        let db = Pigeonhole::open(self.root.join(DB), options).map_err(|e| format!("open: {e}"))?;
         let mut tables = Vec::new();
         for name in TABLES {
             let mut builder = db.table(name).map_err(|e| e.to_string())?;
@@ -465,8 +594,8 @@ impl Run {
         }
         self.db = Some((db, tables));
         self.probe = Some(
-            self.vfs
-                .open(Path::new(PROBE), OpenOptions::read_write_create())
+            self.store
+                .open(&self.root.join(PROBE), OpenOptions::read_write_create())
                 .map_err(|e| format!("probe: {e}"))?,
         );
         Ok(())
@@ -872,12 +1001,18 @@ impl Run {
     /// `Buffered` commits the power loss was allowed to drop (issue #56).
     fn crash_and_recover(&mut self, kind: CrashKind, already: bool) -> Result<(), String> {
         let kind = if self.armed { CrashKind::Power } else { kind };
+        // Real files: the store is dropped without a clean close, as a process crash.
+        let kind = if self._real.is_some() {
+            CrashKind::Process
+        } else {
+            kind
+        };
         self.stats.crashes += 1;
         self.trace.push(format!(
             "CRASH {kind:?}{}",
             if already { " mid-commit" } else { "" }
         ));
-        if !already {
+        if !already && self._real.is_none() {
             self.vfs.crash(kind);
         }
         self.armed = false;
@@ -1202,8 +1337,8 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
     match result {
         Ok(()) => {
             if let Ok(f) = run
-                .vfs
-                .open(Path::new(DB), OpenOptions::read_write_create())
+                .store
+                .open(&run.root.join(DB), OpenOptions::read_write_create())
             {
                 run.stats.file_len = f.len().unwrap_or(0);
             }
@@ -1346,6 +1481,10 @@ fn every_durability_level_under_crashes() {
 
 #[test]
 fn a_crash_while_a_power_loss_is_armed_is_that_power_loss() {
+    if real_fs() {
+        eprintln!("skipped with PIGEONHOLE_REAL_FS: a scheduled power loss needs the simulator");
+        return;
+    }
     // Issue #56: the scheduled power loss fired after an acknowledged `Buffered` commit's
     // WAL write (no error seen), then a random process crash was checked at the process
     // floor and demanded the dropped commit. Fire the power loss directly so the test does
@@ -1425,6 +1564,10 @@ fn scan_all() -> Op {
 
 #[test]
 fn a_read_after_a_background_fired_crash_is_that_crash() {
+    if real_fs() {
+        eprintln!("skipped with PIGEONHOLE_REAL_FS: a scheduled power loss needs the simulator");
+        return;
+    }
     // Issue #62: a power loss is armed on the next mutating operation and a
     // `Durability::None` commit (which writes nothing itself) fills the memtable, so a
     // shard's background flush fires the crash with no client call in progress. The next
@@ -1489,6 +1632,10 @@ fn a_read_after_a_background_fired_crash_is_that_crash() {
 
 #[test]
 fn an_io_error_while_an_unfired_crash_is_armed_is_not_that_crash() {
+    if real_fs() {
+        eprintln!("skipped with PIGEONHOLE_REAL_FS: a scheduled power loss needs the simulator");
+        return;
+    }
     // Issue #62's other half: armed alone is never sufficient. A power loss is armed far in
     // the future (it does not fire) and every read fails with an injected I/O error: the
     // scan's error is a real failure, not the crash, and the run must report it rather

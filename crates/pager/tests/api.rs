@@ -201,7 +201,7 @@ fn submit_commit_root_on_real_files() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("data.phdb");
     let _ = std::fs::remove_file(&file);
-    let vfs: VfsRef = pigeonhole_io::pread::PreadVfs::new(1);
+    let vfs: VfsRef = real_vfs();
     let pager = Pager::create(&vfs, &file).unwrap();
     let e = pager.allocate(1 << 20).unwrap();
     pager.write(e, 0, &[7; 4096]).unwrap();
@@ -544,4 +544,16 @@ fn a_released_region_frees_what_it_held() {
         pager.relocate_into(big, clearing.region),
         Err(Error::NoSpace)
     ));
+}
+
+/// Real files through the backend `PIGEONHOLE_IO` names: `uring` runs on io_uring (Linux;
+/// fails where it is unavailable, #402), anything else on `pread`.
+fn real_vfs() -> pigeonhole_io::VfsRef {
+    match std::env::var("PIGEONHOLE_IO").as_deref() {
+        #[cfg(target_os = "linux")]
+        Ok("uring") => pigeonhole_io::uring::UringVfs::new().expect("io_uring is available"),
+        #[cfg(not(target_os = "linux"))]
+        Ok("uring") => panic!("PIGEONHOLE_IO=uring needs Linux"),
+        _ => pigeonhole_io::pread::PreadVfs::new(2),
+    }
 }
