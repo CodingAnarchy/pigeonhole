@@ -301,3 +301,23 @@ The #406 checklist's scaling item reads: "Thread-per-core scaling (D204: applica
 **What follows.** #29 is met pending the reference-machine run. A direct single-source scan path, which would cut the cursor-stack cost per cell, isn't pursued now.
 
 The #406 checklist's scan item reads: "Ordered row scan, single family: > 1 GB/s decoded per core from cache — #29 — measured as decoded bytes on the default 100 B / 8-cell shape; small and wide shapes reported (owner decision, D205)."
+
+## D206 — WAL pin passes run in bounded slices; the WAL bound may be exceeded by what is logged while a pass runs (coordinator decision, 2026-10-10; engine, #474, #175; amends D155)
+**Decision.**
+- **A pass runs in slices.** A pass (a shard's own past `wal_pin_bytes`, or one served for another shard's `Unpin`) does at most `PIN_SLICE` units of work per shard turn (1,024: a record indexed, a slot examined, a cross-shard record examined or an ask pair processed, one unit each; an internal constant). So no pass blocks the shard thread for more than a slice.
+  - Its slots are forced and its requests sent as its slices complete.
+  - It selects the needed records logged before it started. Later ones are the next pass's.
+  - A pass asked for while another runs waits. Served requests waiting merge into the highest `through`, which covers each of them.
+- **The bound is amended.** The stream may exceed `wal_pin_bytes` by what the shard logs while a pass is in progress: one pass's worth of slices. Measured at the default sizes (64 MiB budget, 100-byte values, 4 shards, 10% cross-shard commits; Apple M5), a pass spreads ~4–13 ms of shard time over ~95–480 slices. That's a few MB of writes at most at high write rates, against a 128 MiB bound. The bound then holds as before.
+- **Indexing never runs on the commit path.** The passes find what pins the checkpoint from an index of the log (per slot, the single-shard records that wrote it; cross-shard records by position and by seqno) instead of a scan of the whole log. The index is built in the same slices, and only while the unindexed log exceeds an eighth of the limit (internal), so a log that never comes near the limit is never indexed.
+- **Asks are bounded.** A pass keeps one `through` per shard (O(shards)), applying `asked` per record as it goes, instead of building every (shard, seqno) pair. Forwarding stays once per record and shard, and the own pass always re-asks (D155).
+
+**Why.** #175 measured each pass scanning the shard's whole log on the shard thread: ~11 ms per own pass and ~6 ms per served pass at the default sizes, and served passes are ~13× as frequent as own ones when commits cross shards. That's far past the 200 µs commit-p99 goal.
+- An index alone halves that, but the cross-shard work left (~38–59k still-needed records at ~43 ns each, plus the asks) is 2–4 ms per pass whatever the index does.
+- Keeping the index current on the commit path cost +1.0–1.4% on every commit shape (~135 instructions per logged commit), paid by workloads that never reach the limit.
+
+**Checked.** Debug builds compare every pass with a scan of the whole log:
+- the slots it forced were pinning when it started, and every slot pinning when it ends was forced;
+- likewise the requests it saw.
+
+What a pass forces is otherwise unchanged; the mixed-temperature harness gives main's pass and small-flush counts within one, and the same largest WAL.

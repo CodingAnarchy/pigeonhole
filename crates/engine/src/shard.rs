@@ -1074,6 +1074,9 @@ pub(crate) enum ShardMsg {
     Start,
     /// Nothing: forces a drain so deferred members form a group.
     Kick,
+    /// Run the next slice of WAL pin work: the pass in progress, or background indexing
+    /// (D206, #474).
+    PinSlice,
     /// A failed background compaction's backoff passed (on a moving clock): retry.
     RetryCompaction,
     /// A refused checkpoint's backoff passed (on a moving clock): retry.
@@ -1854,6 +1857,89 @@ enum LoggedKind {
     Commit { participants: Vec<ShardId> },
 }
 
+/// A slot's single-shard records in the checkpoint log (#175): their log indices in log
+/// order (the records that left `log`, or whose writes to the slot are in SSTs, are dropped
+/// from the front when a pass looks), and whether their seqnos rose with them.
+#[derive(Debug, Default)]
+struct SlotLog {
+    at: VecDeque<u64>,
+    last_seqno: Seqno,
+    /// A record arrived with a lower seqno than the one before it: a pass asking for the
+    /// records at or below a seqno scans this slot's instead of reading the front.
+    unordered: bool,
+}
+
+/// Work units one WAL pin slice does per shard turn (D206, #474): records indexed, slots
+/// examined, cross-shard records examined and ask pairs processed, each one unit. About
+/// 40-60 µs on an Apple M5; a count rather than a clock, so runs stay deterministic.
+const PIN_SLICE: usize = 1024;
+
+/// A WAL pin pass in progress (D206): it selects the needed records logged before it
+/// started (`end`) that `which` takes, and works through them a slice per shard turn.
+#[derive(Debug)]
+struct PinPass {
+    which: Pinning,
+    /// The shard's own pass (it asks every shard again), or one served for an `Unpin`.
+    origin: bool,
+    /// The log index of the first record logged after the pass started.
+    end: u64,
+    stage: PinStage,
+    /// The highest seqno to ask each shard about.
+    asks: BTreeMap<ShardId, Seqno>,
+    /// Debug builds: what a scan of the whole log found when the pass started, and what
+    /// the pass forced and saw (`check_pin_pass`); empty otherwise.
+    check: PinCheck,
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Debug, Default)]
+struct PinCheck;
+
+/// Slots and (shard, seqno) asks, as sets (the debug cross-check's).
+#[cfg(debug_assertions)]
+type PinSets = (BTreeSet<(TabletId, FamilyId)>, BTreeSet<(ShardId, Seqno)>);
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Default)]
+struct PinCheck {
+    start: PinSets,
+    forced: BTreeSet<(TabletId, FamilyId)>,
+    seen: BTreeSet<(ShardId, Seqno)>,
+}
+
+#[derive(Debug)]
+enum PinStage {
+    /// Indexing the records logged before the pass started.
+    Index,
+    /// Examining the slots of `slot_log` (listed when the stage began) from `at`.
+    Slots {
+        keys: Vec<(TabletId, FamilyId)>,
+        at: usize,
+    },
+    /// Examining the selected cross-shard records past `after` (a log index for `Below`,
+    /// a seqno and log index for `Through`).
+    Cross { after: Option<(Seqno, u64)> },
+}
+
+/// The needed records a WAL pin pass forces (#137): those logged below a position (the
+/// shard's own pass) or those at or below a seqno (another shard's `Unpin`).
+#[derive(Debug, Clone, Copy)]
+enum Pinning {
+    Below(u64),
+    Through(Seqno),
+}
+
+impl Pinning {
+    /// Whether a scan of the whole log takes `l` (the debug cross-check's).
+    #[cfg(debug_assertions)]
+    fn selects(self, l: &Logged) -> bool {
+        match self {
+            Pinning::Below(pos) => l.pos < pos,
+            Pinning::Through(seqno) => l.seqno <= seqno,
+        }
+    }
+}
+
 /// A share this shard applied whose coordinator has not yet been told it is in SSTs.
 #[derive(Debug)]
 struct UnreportedShare {
@@ -2036,6 +2122,31 @@ pub(crate) struct ShardState {
     /// Bytes logged since open (record payloads plus a fixed overhead each): positions for
     /// the WAL pin limit (#137).
     log_bytes: u64,
+    /// The log index of `log`'s front: records popped or cleared since open. A record keeps
+    /// its index for as long as it is in `log`.
+    log_base: u64,
+    /// Per slot, the single-shard records that wrote it, so a WAL pin pass finds the slots
+    /// pinning the checkpoint without scanning `log` (#175). Built lazily: a pass first
+    /// indexes the records logged since the last one (`index_tail`), so logging a commit
+    /// costs nothing more.
+    slot_log: FastMap<(TabletId, FamilyId), SlotLog>,
+    /// The log index up to which `slot_log`, `cross_log` and `cross_seqnos` are built.
+    indexed_upto: u64,
+    /// The WAL pin pass in progress (D206), and the passes asked for meanwhile: this
+    /// shard's own (its position) and served ones (the highest `through` received).
+    pin_pass: Option<PinPass>,
+    pin_queued_own: Option<u64>,
+    pin_queued_through: Option<Seqno>,
+    /// A `PinSlice` is queued to this shard.
+    pin_slice_queued: bool,
+    /// `log_bytes` below which background indexing cannot be due yet: one comparison per
+    /// group until then.
+    index_check_at: u64,
+    /// The log indices of the cross-shard records (PREPAREs and COMMITs) still needed when
+    /// a pass last looked, in log order, and by seqno (an `Unpin` served asks for the ones
+    /// at or below a seqno). A record no longer needed never is again, so a pass drops it.
+    cross_log: BTreeSet<u64>,
+    cross_seqnos: BTreeSet<(Seqno, u64)>,
     /// Slots flushed because their records pinned the checkpoint, whatever their size,
     /// until their active memtable freezes.
     unpin: BTreeSet<(TabletId, FamilyId)>,
@@ -2225,6 +2336,16 @@ impl ShardState {
             dropped: HashSet::new(),
             log: VecDeque::new(),
             log_bytes: 0,
+            log_base: 0,
+            slot_log: FastMap::default(),
+            indexed_upto: 0,
+            pin_pass: None,
+            pin_queued_own: None,
+            pin_queued_through: None,
+            pin_slice_queued: false,
+            index_check_at: 0,
+            cross_log: BTreeSet::new(),
+            cross_seqnos: BTreeSet::new(),
             unpin: BTreeSet::new(),
             unpin_upto: 0,
             unpin_at: 0,
@@ -2415,7 +2536,7 @@ impl ShardState {
     pub(crate) fn log_replayed(&mut self, end: Lsn, seqno: Seqno, kind: ReplayedKind) {
         self.last_end = Some(self.last_end.map_or(end, |l| l.max(end)));
         match kind {
-            ReplayedKind::Single { slots } => self.log.push_back(Logged {
+            ReplayedKind::Single { slots } => self.push_logged(Logged {
                 end,
                 pos: self.log_bytes,
                 seqno,
@@ -2437,7 +2558,7 @@ impl ShardState {
                 } else {
                     self.aborted.insert(seqno);
                 }
-                self.log.push_back(Logged {
+                self.push_logged(Logged {
                     end,
                     pos: self.log_bytes,
                     seqno,
@@ -2452,7 +2573,7 @@ impl ShardState {
                     self.aborted.insert(seqno);
                 }
                 self.share_reports.entry(seqno).or_insert((0, 0)).1 = participants.len();
-                self.log.push_back(Logged {
+                self.push_logged(Logged {
                     end,
                     pos: self.log_bytes,
                     seqno,
@@ -2483,7 +2604,15 @@ impl ShardState {
                 self.arena.reclaim(retired);
             }
         }
+        self.log_base += self.log.len() as u64;
+        self.indexed_upto = self.log_base;
+        self.pin_pass = None;
+        self.pin_queued_own = None;
+        self.pin_queued_through = None;
         self.log.clear();
+        self.slot_log.clear();
+        self.cross_log.clear();
+        self.cross_seqnos.clear();
         self.asked.clear();
         self.unreported.clear();
         self.share_reports.clear();
@@ -3141,6 +3270,8 @@ impl ShardState {
                         roots.remove(&(self.id.0, item.root));
                     }
                 }
+                let landed: Vec<(TabletId, FamilyId)> =
+                    items.iter().map(|i| (i.tablet, i.family)).collect();
                 for item in items {
                     let key = (item.tablet, item.family);
                     let e = self.flushed.entry(key).or_insert(0);
@@ -3164,6 +3295,7 @@ impl ShardState {
                 // would churn a fresh chunk per slot each cycle, and a reader process's pin
                 // keeps every retired chunk (#104). They retire under arena pressure only.
                 self.reclaim_retired();
+                self.prune_flushed_slots(&landed);
                 self.report_shares_flushed(ctx);
                 self.advance_checkpoint(ctx);
             }
@@ -4378,6 +4510,7 @@ impl ShardState {
             }
         }
         self.limit_wal_pin(ctx);
+        self.maybe_index(ctx);
         if self.freeze(false).is_err() {
             self.poisoned = true;
         }
@@ -4414,12 +4547,51 @@ impl ShardState {
         self.last_end = Some(end);
         let pos = self.log_bytes;
         self.log_bytes += len as u64 + LOGGED_OVERHEAD;
-        self.log.push_back(Logged {
+        self.push_logged(Logged {
             end,
             pos,
             seqno,
             kind,
         });
+    }
+
+    /// Appends `l` to `log` (indexed by the next pass, `index_tail`).
+    fn push_logged(&mut self, l: Logged) {
+        self.log.push_back(l);
+    }
+
+    /// Drops the record just popped from `log`'s front from the indexes: it is the oldest
+    /// record of each of its slots, and of `cross_log`, unless a pass dropped it already.
+    fn unindex_front(&mut self, l: &Logged) {
+        let i = self.log_base;
+        self.log_base += 1;
+        if i >= self.indexed_upto {
+            return;
+        }
+        match &l.kind {
+            LoggedKind::Single { slots } => {
+                for s in slots {
+                    if let Some(sl) = self.slot_log.get_mut(s) {
+                        if sl.at.front() == Some(&i) {
+                            sl.at.pop_front();
+                        }
+                        if sl.at.is_empty() {
+                            self.slot_log.remove(s);
+                        }
+                    }
+                }
+            }
+            LoggedKind::Prepare { .. } | LoggedKind::Commit { .. } => {
+                self.cross_log.remove(&i);
+                self.cross_seqnos.remove(&(l.seqno, i));
+            }
+        }
+    }
+
+    /// The record at log index `i`, if it is still in `log`.
+    fn logged(&self, i: u64) -> Option<&Logged> {
+        let k = usize::try_from(i.checked_sub(self.log_base)?).ok()?;
+        self.log.get(k)
     }
 
     /// Bounds the bytes the checkpoint cannot pass (#137). A slot written once and never
@@ -4452,73 +4624,499 @@ impl ShardState {
         self.shared.metrics[usize::from(self.id.0)]
             .unpin_passes
             .fetch_add(1, Ordering::Relaxed);
-        self.force_pinning(|l| l.pos < upto, true, ctx);
+        self.start_pin_pass(Pinning::Below(upto), true, ctx);
     }
 
-    /// Marks for flushing every unflushed slot of the needed records `which` selects, and
-    /// sends `Unpin` to the shards their cross-shard commits wait for: always from this
-    /// shard's own pass (`origin`), and only to shards not yet asked about that record when
-    /// answering another shard's `Unpin`, so the requests between a coordinator and its
-    /// participants stop after one round.
-    fn force_pinning(
+    /// Starts a pass over the needed records `which` selects: its slots are marked for
+    /// flushing, and `Unpin` goes to the shards its cross-shard commits wait for, always from
+    /// this shard's own pass (`origin`) and only to shards not yet asked about a record when
+    /// serving another shard's `Unpin`, so the requests between a coordinator and its
+    /// participants stop after one round. The pass runs a slice of at most `PIN_SLICE`
+    /// units per shard turn (D206, #474); one asked for while another runs waits, and the
+    /// served ones waiting merge into the highest `through`, which covers each of them.
+    fn start_pin_pass(
         &mut self,
-        which: impl Fn(&Logged) -> bool,
+        which: Pinning,
         origin: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        if self.pin_pass.is_some() {
+            match which {
+                Pinning::Below(pos) => self.pin_queued_own = Some(pos),
+                Pinning::Through(seqno) => {
+                    let q = self.pin_queued_through.get_or_insert(seqno);
+                    *q = (*q).max(seqno);
+                }
+            }
+            return;
+        }
+        let end = self.log_base + self.log.len() as u64;
+        self.pin_pass = Some(PinPass {
+            which,
+            origin,
+            end,
+            stage: PinStage::Index,
+            asks: BTreeMap::new(),
+            #[cfg(debug_assertions)]
+            check: PinCheck {
+                start: self.scan_pinning(which, end),
+                ..PinCheck::default()
+            },
+            #[cfg(not(debug_assertions))]
+            check: PinCheck,
+        });
+        self.pin_slice(ctx);
+    }
+
+    /// One slice of WAL pin work: the pass in progress (starting a waiting one when it
+    /// ends), or else background indexing while the unindexed log is over an eighth of
+    /// the limit. Queues the next slice if work remains.
+    fn pin_slice(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.closing {
+            self.pin_pass = None;
+            return;
+        }
+        let Some(mut pass) = self.pin_pass.take() else {
+            if self.index_due() {
+                let end = self.log_base + self.log.len() as u64;
+                self.index_tail(end, PIN_SLICE);
+                self.queue_pin_slice(ctx);
+            }
+            return;
+        };
         let Ok(view) = self.checkpoint_view() else {
+            self.pin_pass = Some(pass);
+            self.queue_pin_slice(ctx);
             return;
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
-        let mut wanted: Vec<(ShardId, Seqno)> = Vec::new();
-        let mut slots = Vec::new();
-        for l in self.log.iter().filter(|l| which(l)) {
+        let forced_before = self.unpin.len();
+        let done = self.advance_pin_pass(&mut pass, catalog, PIN_SLICE);
+        if self.unpin.len() != forced_before {
+            if self.freeze(false).is_err() {
+                self.poisoned = true;
+            }
+            self.spawn_flush(ctx);
+        }
+        if !done {
+            self.pin_pass = Some(pass);
+            self.queue_pin_slice(ctx);
+            return;
+        }
+        #[cfg(debug_assertions)]
+        self.check_pin_pass(&pass);
+        for (shard, through) in std::mem::take(&mut pass.asks) {
+            self.send(shard, ShardMsg::Unpin { through }, ctx);
+        }
+        if let Some(pos) = self.pin_queued_own.take() {
+            self.start_pin_pass(Pinning::Below(pos), true, ctx);
+        } else if let Some(seqno) = self.pin_queued_through.take() {
+            self.start_pin_pass(Pinning::Through(seqno), false, ctx);
+        }
+    }
+
+    fn queue_pin_slice(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if !self.pin_slice_queued {
+            self.pin_slice_queued = true;
+            let _ = ctx.submitter(self.id).submit(ShardMsg::PinSlice);
+        }
+    }
+
+    /// Whether the records not yet indexed span more than an eighth of `wal_pin_bytes`:
+    /// then the shard indexes them in background slices, so no pass has a long catch-up.
+    /// A log that never comes near the limit is never indexed (D206).
+    fn index_due(&self) -> bool {
+        let limit = self.shared.wal_pin_bytes;
+        let from = self.indexed_upto.max(self.log_base);
+        limit != 0
+            && self
+                .logged(from)
+                .is_some_and(|l| self.log_bytes - l.pos > limit / 8)
+    }
+
+    /// Queues background indexing if it is due (called after each group).
+    fn maybe_index(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.log_bytes < self.index_check_at {
+            return;
+        }
+        if self.pin_pass.is_none() && !self.pin_slice_queued && self.index_due() {
+            self.queue_pin_slice(ctx);
+            return;
+        }
+        // Not due before the oldest unindexed record lies an eighth of the limit back.
+        let from = self.indexed_upto.max(self.log_base);
+        self.index_check_at = match self.logged(from) {
+            Some(l) => l.pos + self.shared.wal_pin_bytes / 8 + 1,
+            None => self.log_bytes + self.shared.wal_pin_bytes / 8 + 1,
+        };
+    }
+
+    /// Runs up to `budget` units of `pass`; true when it is done.
+    fn advance_pin_pass(
+        &mut self,
+        pass: &mut PinPass,
+        catalog: Option<&Catalog>,
+        mut budget: usize,
+    ) -> bool {
+        loop {
+            match &mut pass.stage {
+                PinStage::Index => {
+                    budget -= self.index_tail(pass.end, budget);
+                    if self.indexed_upto < pass.end {
+                        return false;
+                    }
+                    pass.stage = PinStage::Slots {
+                        keys: self.slot_log.keys().copied().collect(),
+                        at: 0,
+                    };
+                }
+                PinStage::Slots { keys, at } => {
+                    while *at < keys.len() {
+                        if budget == 0 {
+                            return false;
+                        }
+                        budget -= 1;
+                        let s = keys[*at];
+                        let (pinned, used) =
+                            self.slot_pinned(catalog, &s, pass.which, pass.end, budget);
+                        budget -= used;
+                        let Some(pinned) = pinned else {
+                            return false;
+                        };
+                        *at += 1;
+                        if pinned {
+                            self.unpin.insert(s);
+                            #[cfg(debug_assertions)]
+                            pass.check.forced.insert(s);
+                        }
+                    }
+                    pass.stage = PinStage::Cross { after: None };
+                }
+                PinStage::Cross { after } => {
+                    let (done, used) = self.pin_cross(
+                        catalog,
+                        pass.which,
+                        pass.origin,
+                        pass.end,
+                        after,
+                        &mut pass.asks,
+                        budget,
+                        &mut pass.check,
+                    );
+                    let _ = used;
+                    return done;
+                }
+            }
+        }
+    }
+
+    /// Indexes up to `budget` records logged before log index `end` that are not indexed
+    /// yet: by slot for a single-shard record, by log index and seqno for a cross-shard one
+    /// (#175). Returns the records indexed.
+    fn index_tail(&mut self, end: u64, budget: usize) -> usize {
+        let from = self.indexed_upto.max(self.log_base);
+        let to = end.min(from + budget as u64);
+        for i in from..to {
+            let l = &self.log[(i - self.log_base) as usize];
+            match &l.kind {
+                LoggedKind::Single { slots } => {
+                    for s in slots {
+                        let sl = self.slot_log.entry(*s).or_default();
+                        if !sl.at.is_empty() && l.seqno < sl.last_seqno {
+                            sl.unordered = true;
+                        }
+                        sl.last_seqno = sl.last_seqno.max(l.seqno);
+                        if sl.at.back() != Some(&i) {
+                            sl.at.push_back(i);
+                        }
+                    }
+                }
+                LoggedKind::Prepare { .. } | LoggedKind::Commit { .. } => {
+                    self.cross_log.insert(i);
+                    self.cross_seqnos.insert((l.seqno, i));
+                }
+            }
+        }
+        self.indexed_upto = self.indexed_upto.max(to);
+        (to.saturating_sub(from)) as usize
+    }
+
+    /// Whether slot `s` has an unflushed single-shard record logged before `end` that
+    /// `which` selects. Prunes the slot's front first (`prune_slot_log`).
+    /// `None` when `budget` ran out while pruning (look at the slot again next slice);
+    /// the units used either way.
+    fn slot_pinned(
+        &mut self,
+        catalog: Option<&Catalog>,
+        s: &(TabletId, FamilyId),
+        which: Pinning,
+        end: u64,
+        budget: usize,
+    ) -> (Option<bool>, usize) {
+        let Some(mut sl) = self.slot_log.remove(s) else {
+            return (Some(false), 0);
+        };
+        let (pruned, used) = self.prune_slot_log(catalog, s, &mut sl, budget);
+        if !pruned {
+            self.slot_log.insert(*s, sl);
+            return (None, used);
+        }
+        let pinned = match sl.at.front().copied() {
+            None => false,
+            Some(i) if i >= end => false,
+            Some(i) => {
+                let front = self.logged(i).expect("pruned");
+                match which {
+                    // Log order is position order.
+                    Pinning::Below(pos) => front.pos < pos,
+                    // With seqnos rising in log order, the front has the lowest unflushed one.
+                    Pinning::Through(seqno) if !sl.unordered => front.seqno <= seqno,
+                    Pinning::Through(seqno) => sl.at.iter().any(|&i| {
+                        i < end
+                            && self.logged(i).is_some_and(|l| {
+                                l.seqno <= seqno && !self.slot_flushed(catalog, s, l.seqno)
+                            })
+                    }),
+                }
+            }
+        };
+        if !sl.at.is_empty() {
+            self.slot_log.insert(*s, sl);
+        }
+        (Some(pinned), used)
+    }
+
+    /// Examines up to `budget` units of the cross-shard records logged before `end` that
+    /// `which` selects, past `after`: a needed PREPARE's unflushed slots are marked, and the
+    /// shards needed records wait for go into `asks` (deduped per record and shard by
+    /// `asked`, except on the shard's own pass). A record no longer needed never is again,
+    /// so it leaves the index. Returns whether the stage is done and the units used.
+    #[allow(clippy::too_many_arguments)]
+    fn pin_cross(
+        &mut self,
+        catalog: Option<&Catalog>,
+        which: Pinning,
+        origin: bool,
+        end: u64,
+        after: &mut Option<(Seqno, u64)>,
+        asks: &mut BTreeMap<ShardId, Seqno>,
+        budget: usize,
+        check: &mut PinCheck,
+    ) -> (bool, usize) {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let mut used = 0;
+        let mut finished = true;
+        // The next batch of candidates, in order (`after` resumes it).
+        let candidates: Vec<(Seqno, u64)> = match which {
+            Pinning::Below(pos) => {
+                let lo = after.map_or(Unbounded, |(_, i)| Excluded(i));
+                let mut out = Vec::new();
+                for &i in self.cross_log.range((lo, Unbounded)) {
+                    let Some(l) = self.logged(i) else { continue };
+                    if i >= end || l.pos >= pos {
+                        break;
+                    }
+                    if out.len() == budget {
+                        finished = false;
+                        break;
+                    }
+                    out.push((l.seqno, i));
+                }
+                out
+            }
+            Pinning::Through(seqno) => {
+                let lo = after.map_or(Unbounded, Excluded);
+                let mut out = Vec::new();
+                for &(q, i) in self.cross_seqnos.range((lo, Included((seqno, u64::MAX)))) {
+                    if out.len() == budget {
+                        finished = false;
+                        break;
+                    }
+                    if i < end {
+                        out.push((q, i));
+                    } else {
+                        // Logged after the pass started: the next pass's, but resume past it.
+                        *after = Some((q, i));
+                        used += 1;
+                        if used >= budget {
+                            finished = false;
+                            break;
+                        }
+                    }
+                }
+                out
+            }
+        };
+        let mut done = Vec::new();
+        for (q, i) in candidates {
+            *after = Some((q, i));
+            used += 1;
+            let Some(l) = self.logged(i) else {
+                continue;
+            };
             if !self.needed(catalog, l) {
+                done.push((q, i));
                 continue;
             }
+            let mut pairs: smallvec::SmallVec<[(ShardId, Seqno); 4]> = smallvec::SmallVec::new();
+            let mut forced: smallvec::SmallVec<[(TabletId, FamilyId); 4]> =
+                smallvec::SmallVec::new();
             match &l.kind {
-                LoggedKind::Single { slots: s } => slots.extend(
-                    s.iter()
-                        .filter(|s| !self.slot_flushed(catalog, s, l.seqno))
-                        .copied(),
-                ),
-                LoggedKind::Prepare {
-                    slots: s,
-                    coordinator,
-                } => {
-                    slots.extend(
-                        s.iter()
+                LoggedKind::Prepare { slots, coordinator } => {
+                    forced.extend(
+                        slots
+                            .iter()
                             .filter(|s| !self.slot_flushed(catalog, s, l.seqno))
                             .copied(),
                     );
                     // The coordinator's checkpoint must pass the COMMIT too.
-                    wanted.push((*coordinator, l.seqno));
+                    pairs.push((*coordinator, l.seqno));
                 }
                 LoggedKind::Commit { participants } => {
-                    wanted.extend(participants.iter().map(|&p| (p, l.seqno)));
+                    pairs.extend(participants.iter().map(|&p| (p, l.seqno)));
                 }
+                LoggedKind::Single { .. } => {}
             }
-        }
-        self.unpin.extend(slots);
-        let mut asks: BTreeMap<ShardId, Seqno> = BTreeMap::new();
-        for (shard, seqno) in wanted {
-            if shard == self.id {
-                continue;
+            used += pairs.len();
+            #[cfg(not(debug_assertions))]
+            let _ = &check;
+            for s in forced {
+                self.unpin.insert(s);
+                #[cfg(debug_assertions)]
+                check.forced.insert(s);
             }
-            let sent = self.asked.entry(seqno).or_default();
-            if sent.contains(&shard) {
-                if !origin {
+            for (shard, seqno) in pairs {
+                #[cfg(debug_assertions)]
+                check.seen.insert((shard, seqno));
+                if shard == self.id {
                     continue;
                 }
-            } else {
-                sent.push(shard);
+                let sent = self.asked.entry(seqno).or_default();
+                if sent.contains(&shard) {
+                    if !origin {
+                        continue;
+                    }
+                } else {
+                    sent.push(shard);
+                }
+                let through = asks.entry(shard).or_insert(seqno);
+                *through = (*through).max(seqno);
             }
-            let through = asks.entry(shard).or_insert(seqno);
-            *through = (*through).max(seqno);
         }
-        for (shard, through) in asks {
-            self.send(shard, ShardMsg::Unpin { through }, ctx);
+        for (q, i) in done {
+            self.cross_log.remove(&i);
+            self.cross_seqnos.remove(&(q, i));
         }
+        (finished, used)
+    }
+
+    /// What a scan of the whole log selects for `which` among the records before `end`:
+    /// the unflushed slots of needed records, and the (shard, seqno) pairs their
+    /// cross-shard commits wait for. Debug builds check passes against it.
+    #[cfg(debug_assertions)]
+    fn scan_pinning(&self, which: Pinning, end: u64) -> PinSets {
+        let mut slots = BTreeSet::new();
+        let mut pairs = BTreeSet::new();
+        let Ok(view) = self.checkpoint_view() else {
+            return (slots, pairs);
+        };
+        let catalog = view.as_ref().map(|v| &*v.catalog);
+        for (k, l) in self.log.iter().enumerate() {
+            if self.log_base + k as u64 >= end || !which.selects(l) || !self.needed(catalog, l) {
+                continue;
+            }
+            let unflushed = |s: &&(TabletId, FamilyId)| !self.slot_flushed(catalog, s, l.seqno);
+            match &l.kind {
+                LoggedKind::Single { slots: s } => slots.extend(s.iter().filter(unflushed)),
+                LoggedKind::Prepare {
+                    slots: s,
+                    coordinator,
+                } => {
+                    slots.extend(s.iter().filter(unflushed));
+                    pairs.insert((*coordinator, l.seqno));
+                }
+                LoggedKind::Commit { participants } => {
+                    pairs.extend(participants.iter().map(|&p| (p, l.seqno)));
+                }
+            }
+        }
+        (slots, pairs)
+    }
+
+    /// Debug builds: a finished pass forced only slots a full scan found pinning when it
+    /// started, and every slot a full scan finds pinning now; likewise for the pairs it saw.
+    /// (Slots stop pinning as their flushes land, never the other way round.)
+    #[cfg(debug_assertions)]
+    fn check_pin_pass(&self, pass: &PinPass) {
+        let (now_slots, now_pairs) = self.scan_pinning(pass.which, pass.end);
+        let c = &pass.check;
+        let id = self.id.0;
+        let which = pass.which;
+        assert!(
+            c.forced.is_subset(&c.start.0),
+            "shard {id} {which:?}: forced {:?} not pinning at the start",
+            c.forced.difference(&c.start.0).collect::<Vec<_>>()
+        );
+        assert!(
+            now_slots.is_subset(&c.forced),
+            "shard {id} {which:?}: {:?} still pinning, not forced",
+            now_slots.difference(&c.forced).collect::<Vec<_>>()
+        );
+        assert!(
+            c.seen.is_subset(&c.start.1),
+            "shard {id} {which:?}: asked {:?} not waiting at the start",
+            c.seen.difference(&c.start.1).collect::<Vec<_>>()
+        );
+        assert!(
+            now_pairs.is_subset(&c.seen),
+            "shard {id} {which:?}: {:?} still waiting, not asked",
+            now_pairs.difference(&c.seen).collect::<Vec<_>>()
+        );
+    }
+
+    /// Drops up to `max` records from the front of `sl` that left `log` or whose writes
+    /// to slot `s` are in SSTs: they never pin the slot again, and once this returns
+    /// `true` the front is the oldest record that still does. Returns whether it got
+    /// there, and the records dropped.
+    fn prune_slot_log(
+        &self,
+        catalog: Option<&Catalog>,
+        s: &(TabletId, FamilyId),
+        sl: &mut SlotLog,
+        max: usize,
+    ) -> (bool, usize) {
+        let mut dropped = 0;
+        while let Some(&i) = sl.at.front() {
+            match self.logged(i) {
+                Some(l) if !self.slot_flushed(catalog, s, l.seqno) => return (true, dropped),
+                _ if dropped == max => return (false, dropped),
+                _ => {
+                    sl.at.pop_front();
+                    dropped += 1;
+                }
+            }
+        }
+        (true, dropped)
+    }
+
+    /// Prunes the slots a flush just put in SSTs (`prune_slot_log`), so a later pass finds
+    /// their fronts without first dropping every record the flush covered.
+    fn prune_flushed_slots(&mut self, slots: &[(TabletId, FamilyId)]) {
+        let Ok(view) = self.checkpoint_view() else {
+            return;
+        };
+        let catalog = view.as_ref().map(|v| &*v.catalog);
+        let mut slot_log = std::mem::take(&mut self.slot_log);
+        for s in slots {
+            if let Some(sl) = slot_log.get_mut(s) {
+                // Bounded like a slice; a pass drops the rest.
+                self.prune_slot_log(catalog, s, sl, PIN_SLICE);
+                if sl.at.is_empty() {
+                    slot_log.remove(s);
+                }
+            }
+        }
+        self.slot_log = slot_log;
     }
 
     /// Another shard's checkpoint waits for cross-shard commits up to `through`. Every
@@ -4531,7 +5129,7 @@ impl ShardState {
         self.shared.metrics[usize::from(self.id.0)]
             .unpin_passes
             .fetch_add(1, Ordering::Relaxed);
-        self.force_pinning(|l| l.seqno <= through, false, ctx);
+        self.start_pin_pass(Pinning::Through(through), false, ctx);
         let shares: Vec<(TabletId, FamilyId)> = self
             .unreported
             .iter()
@@ -5363,6 +5961,7 @@ impl ShardState {
                 break;
             }
             let l = self.log.pop_front().expect("checked");
+            self.unindex_front(&l);
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
             self.aborted.remove(&l.seqno);
             self.asked.remove(&l.seqno);
@@ -6496,6 +7095,10 @@ impl ShardState {
                 self.maintain(ctx);
             }
             ShardMsg::Kick => {}
+            ShardMsg::PinSlice => {
+                self.pin_slice_queued = false;
+                self.pin_slice(ctx);
+            }
             ShardMsg::RetryFlush => {
                 // Only the current backoff timer's firing ends the backoff.
                 if self.flush_retry.as_ref().is_some_and(|t| t.fired()) {

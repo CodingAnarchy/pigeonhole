@@ -96,6 +96,12 @@ A `WriteBatch` whose rows live on different shards is atomic across them (two-ph
 
 Throughput note: `GroupSync` costs about one fsync per group, not per commit. Many concurrent committers, or one large `WriteBatch`, amortize it.
 
+## WAL size
+
+Each shard's WAL sidecar holds at most twice `memtable_budget` of writes past the oldest one not yet in the file (128 MiB per shard at the defaults; D155). Past that, the shard flushes the memtables holding the old writes, small ones included, so the WAL and the next open's replay stay bounded however long the process runs.
+
+That flushing work runs in short slices between commits (D206), so a WAL can briefly grow past the bound by what is written while it runs: a few MB at most at the defaults. When sizing disk space for the sidecars, allow per shard the bound plus that margin, and plus a spare segment.
+
 ## Failure modes
 - `ErrorCode::NoSpace`: the device filled; the commit did not apply.
 - `ErrorCode::RecordTooLarge`: the commit exceeds one WAL record. Split it into several batches (they are then atomic only individually).
