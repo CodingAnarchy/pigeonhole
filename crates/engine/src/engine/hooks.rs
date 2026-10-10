@@ -777,6 +777,20 @@ impl Engine {
             .store(ts, Ordering::Release);
     }
 
+    /// With `on` false, reads in this process step over superseded memtable versions even
+    /// where a memtable's stale-tail index could skip them (D194), so a test can read the
+    /// same data both ways; `true` restores skipping. Test hook.
+    #[doc(hidden)]
+    pub fn set_tail_index(on: bool) {
+        crate::shard::READS_STEP.store(!on, Ordering::Relaxed);
+    }
+
+    /// Memtable jumps reads have taken in this process (D194). Test hook.
+    #[doc(hidden)]
+    pub fn tail_skips() -> u64 {
+        crate::shard::TAIL_SKIPS.load(Ordering::Relaxed)
+    }
+
     /// Breaks the flush GC on purpose (#287), so a test can check the oracle catches it;
     /// [`FlushGcMutation::None`] restores it.
     #[doc(hidden)]

@@ -681,3 +681,71 @@ fn largest_free_run_is_the_largest_contiguous_free_space() {
         [2, 1, 1, 0, 0]
     );
 }
+
+/// D194: wherever `skip_column` jumps, it lands on the first entry after the current one
+/// that is outside the current column, in a memtable built in random order (versions
+/// inserted newest last, oldest last, and interleaved, so tails go stale). Prints the seed
+/// on failure.
+#[test]
+fn skip_column_lands_on_the_next_column() {
+    // Miri checks the index's unsafe code on a few seeds; the rest are for the logic.
+    let seeds = if cfg!(miri) { 2 } else { 40u64 };
+    for seed in 1..=seeds {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut rand = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut arena = ShardArena::new(ArenaRegion::heap(4 << 20), 64 * 1024);
+        let mut mt = Memtable::create(&mut arena).unwrap().with_tail_index();
+        let plain_reader = MemtableReader::open(arena.region().clone(), mt.root()).unwrap();
+        let mut seqno = 0;
+        for _ in 0..if cfg!(miri) { 120 } else { 600 } {
+            let row = [b'r', b'0' + rand(4) as u8];
+            let qual = [b'q', b'0' + rand(5) as u8];
+            // Mostly newer timestamps (the overwrite pattern), sometimes older or equal.
+            let ts = match rand(10) {
+                0 => rand(50),
+                _ => 50 + seqno,
+            };
+            seqno += 1;
+            let kind = match rand(20) {
+                0 => Kind::CellDelete,
+                1 => Kind::Merge,
+                _ => Kind::Put,
+            };
+            let mut k = Vec::new();
+            encode_key(&mut k, &row, &qual, ts, seqno, kind).unwrap();
+            mt.insert(&mut arena, &k, b"\x00v").unwrap();
+        }
+        let all: Vec<Vec<u8>> = scan(&mt.reader()).into_iter().map(|(k, _)| k).collect();
+        let column = |k: &[u8]| k[..k.len() - SUFFIX_LEN].to_vec();
+        let mut jumps = 0;
+        for (i, k) in all.iter().enumerate() {
+            let col = column(k);
+            let want = all[i + 1..].iter().find(|n| column(n) != col);
+            let mut it = mt.reader().iter();
+            it.seek(k).unwrap();
+            if it.skip_column(&col).unwrap() {
+                jumps += 1;
+                assert_eq!(
+                    it.valid().then(|| it.key().to_vec()).as_ref(),
+                    want,
+                    "seed {seed}, entry {i}"
+                );
+            } else {
+                assert_eq!(it.key(), &k[..], "seed {seed}: a refused skip moved");
+            }
+            // A reader process's cursor has no index.
+            let mut plain = plain_reader.iter();
+            plain.seek(k).unwrap();
+            assert!(!plain.skip_column(&col).unwrap(), "seed {seed}");
+        }
+        assert!(
+            jumps > if cfg!(miri) { 10 } else { 100 },
+            "seed {seed}: only {jumps} jumps"
+        );
+    }
+}

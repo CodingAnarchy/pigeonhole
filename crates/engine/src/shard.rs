@@ -285,6 +285,24 @@ impl FreezeWaiters {
 }
 
 /// Engine-wide state every shard and every caller shares.
+/// Test hook: reads step over superseded memtable versions even where a memtable's
+/// stale-tail index could skip them (D194), so a test reads the same data both ways.
+#[cfg(feature = "test-hooks")]
+pub(crate) static READS_STEP: AtomicBool = AtomicBool::new(false);
+
+/// Memtable jumps taken by reads (test hook).
+#[cfg(feature = "test-hooks")]
+pub(crate) static TAIL_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A slot's new active memtable, with a stale-tail index if `tail_index` (D194, D199).
+fn new_memtable(
+    arena: &mut ShardArena,
+    tail_index: bool,
+) -> std::result::Result<Memtable, pigeonhole_memtable::Error> {
+    let m = Memtable::create(arena)?;
+    Ok(if tail_index { m.with_tail_index() } else { m })
+}
+
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,
@@ -341,6 +359,8 @@ pub(crate) struct Shared {
     pub room_recheck_nanos: u64,
     /// `EngineOptions::commit_spin_nanos` (D198).
     pub commit_spin_nanos: u64,
+    /// The writer keeps a stale-tail index beside each memtable (D194, D199).
+    pub tail_index: bool,
     pub locks: Mutex<Option<Locks>>,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
@@ -1400,11 +1420,12 @@ fn slot_of<'a>(
     arena: &mut ShardArena,
     view_dirty: &mut bool,
     key: (TabletId, FamilyId),
+    tail_index: bool,
 ) -> Result<&'a mut MemSlot> {
     match memtables.entry(key) {
         std::collections::btree_map::Entry::Occupied(e) => Ok(e.into_mut()),
         std::collections::btree_map::Entry::Vacant(e) => {
-            let active = MemEntry::new(Memtable::create(arena)?);
+            let active = MemEntry::new(new_memtable(arena, tail_index)?);
             *view_dirty = true;
             Ok(e.insert(MemSlot {
                 active,
@@ -2825,7 +2846,7 @@ impl ShardState {
                 );
                 None
             } else {
-                Memtable::create(&mut self.arena).ok()
+                new_memtable(&mut self.arena, self.shared.tail_index).ok()
             };
             let Some(fresh) = fresh else {
                 trace!(
@@ -3625,6 +3646,7 @@ impl ShardState {
                 &mut self.arena,
                 &mut self.view_dirty,
                 (tablet, m.family),
+                self.shared.tail_index,
             ) {
                 Ok(s) => s,
                 Err(e) => {
