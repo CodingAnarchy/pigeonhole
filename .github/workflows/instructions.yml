@@ -41,7 +41,7 @@ env:
   CARGO_TERM_COLOR: always
   # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
   # the head's sources of these files, so a new or changed example still has a baseline.
-  EXAMPLES: hotrow readshapes writepath ycsb
+  EXAMPLES: hotrow readshapes writepath ycsb scanrate
   # The write shapes run with `Options::commit_spin(ZERO)` (crates/bench/examples/support/
   # shards.rs): how often a waiting client polls depends on thread timing (D198), so counting
   # it would make the shapes nondeterministic. The default spin is checked on wall time
@@ -53,6 +53,7 @@ env:
     readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans
     writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,flush,compact
     ycsb:ycsb-c,ycsb-a
+    scanrate:scan-narrow,scan-small,scan-wide
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
   # run-to-run noise on identical code (#354): within 0.1% for the hot-row states and read

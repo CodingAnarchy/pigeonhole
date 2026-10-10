@@ -288,3 +288,16 @@ Counters for the visibility and queue waits come first, so each change shows on 
 
 The #406 checklist's scaling item reads: "Thread-per-core scaling (D204: application-owned inline, N up to cores): efficiency ≥ 0.8, single-shard p99 not regressed; the engine-owned synchronous shape reported."
 
+## D205 — The scan target counts decoded bytes on the bench's default shape (owner decision, 2026-10-10; bench, #29; amends the spec's Goals scan line and the #406 checklist)
+**Decision.**
+- **"> 1 GB/s decoded per core from cache" counts decoded bytes:** the row key, qualifier and value of every cell an ordered single-family scan returns, on one thread.
+- **It's measured on the bench's default shape** (100-byte values, 8-cell rows; `scanrate rate`'s `narrow`), with the table compacted and every block cached, on the reference machine (`crates/bench/baselines/phase3-io/scan-rate.sh`, #405). `docs/bench.md` defines it.
+- **The small-cell (16 B values) and wide-row (1,000 cells) shapes are reported, not gating,** and so are the memtable-resident runs.
+
+**Why.** The spec didn't say which cell size counts, and the cost is per cell (about 45–50 ns on an Apple M5, almost independent of size), so the cell size decides the result.
+- On the M5 (non-reference), the default shape scans at 2.2 GB/s, 16-byte cells at 0.6 GB/s, and 1 KiB cells at 8.2 GB/s.
+- Two attempts to cut the per-cell cost were measured and dropped (#29: a group-end hint, +11.6% instructions per cell; a faster unescape, no gain).
+
+**What follows.** #29 is met pending the reference-machine run. A direct single-source scan path, which would cut the cursor-stack cost per cell, isn't pursued now.
+
+The #406 checklist's scan item reads: "Ordered row scan, single family: > 1 GB/s decoded per core from cache — #29 — measured as decoded bytes on the default 100 B / 8-cell shape; small and wide shapes reported (owner decision, D205)."

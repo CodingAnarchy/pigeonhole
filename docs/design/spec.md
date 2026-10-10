@@ -36,7 +36,7 @@ The design optimizes for one machine, one process, many threads, and data larger
 |---|---|
 | Point get of one cell or one family | p50 < 2 µs, p99 < 10 µs in memory; one I/O on cold data |
 | Batched writes, durable at group commit | > 1M cells/s across cores; p99 commit < 200 µs with `fsync` batching |
-| Ordered row scan, single family | > 1 GB/s decoded per core from cache |
+| Ordered row scan, single family | > 1 GB/s decoded per core from cache (row key + qualifier + value, on 100-byte values in 8-cell rows; D205) |
 | Open to first read | < 5 ms, no full-file recovery scan |
 | Footprint | One file at rest (plus per-shard WAL files and a shared-memory region while open); zero required config |
 | Embeddability | Rust crate first, with sync and async APIs; the sync API needs no async runtime; core shaped so a C ABI can wrap it later |
