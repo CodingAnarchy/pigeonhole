@@ -90,7 +90,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Method | Meaning |
 |---|---|
 | `durability(Durability)` | Writer default (default `GroupSync`). |
-| `shards(usize)` | Shard threads (default CPUs available). `1` is valid. |
+| `shards(usize)` | Shard threads (default CPUs available). `1` is valid. With few concurrent writing threads, set it to about that number: thinly spread writes pay a shard wakeup per commit (see [Getting started](getting-started.md)). |
 | `compaction_cores(usize)` | Extra threads for flush/compaction (pinned with `pin_threads`). Engine-owned mode only (D40). |
 | `pin_threads(bool)` | Pin shard `i` (and compaction threads) to the `i`-th CPU of the opener's affinity set (default off). Engine-owned mode only. Turn on only when this database owns those CPUs: two pinned databases, quota-limited containers or a pinned opener stack shards on the same cores. |
 | `memtable_budget(u64)` | Arena bytes per shard (default 64 MiB). The shm region is `memtable_budget × shards` (each arena rounded up to 2 MiB) plus about 10 MiB for views and reader slots, filled as memtables grow; open fails with `ShmUnavailable` if its filesystem lacks that much free space. Something else filling that tmpfs after open can still crash the process with `SIGBUS`. |
