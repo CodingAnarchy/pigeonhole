@@ -328,11 +328,9 @@ impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
         let r = this.reading.poll_read(cx, |view, seqno, now, cache_only| {
             sink.clone_from(empty);
             let families = crate::engine::families_in_order(view, table, families)?;
-            if cache_only {
-                read::read_row_into::<true>(view, seqno, table, row, &families, spec, now, sink)
-            } else {
-                read::read_row_into::<false>(view, seqno, table, row, &families, spec, now, sink)
-            }
+            read::read_row_into(
+                view, seqno, table, row, &families, spec, now, cache_only, sink,
+            )
         });
         match r {
             Poll::Pending => Poll::Pending,

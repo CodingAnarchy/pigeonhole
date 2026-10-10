@@ -1354,7 +1354,7 @@ impl Engine {
     ) -> Result<bool> {
         let families = families_in_order(&snapshot.view, table, families)?;
         let now = self.inner.shared.vfs.now_micros();
-        snapshot.checked(read::read_row_into::<false>(
+        snapshot.checked(read::read_row_into(
             &snapshot.view,
             snapshot.seqno,
             table,
@@ -1362,6 +1362,7 @@ impl Engine {
             &families,
             spec,
             now,
+            false,
             sink,
         ))
     }
@@ -1468,8 +1469,8 @@ impl Engine {
         if let Some((view, seqno)) = inner.latest_view() {
             let families = families_in_order(&view, table, families)?;
             let now = inner.shared.vfs.now_micros();
-            return read::read_row_into::<false>(
-                &view, seqno, table, row, &families, spec, now, sink,
+            return read::read_row_into(
+                &view, seqno, table, row, &families, spec, now, false, sink,
             );
         }
         let snapshot = inner.snapshot()?;

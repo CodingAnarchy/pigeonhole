@@ -25,6 +25,7 @@ sqlite = ["dep:rusqlite"]
 fjall = ["dep:fjall"]
 
 [dependencies]
+# Default features (async included): the instruction counts measure what users get.
 pigeonhole = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
