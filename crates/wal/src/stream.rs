@@ -192,6 +192,21 @@ struct Pool {
     blank: Vec<usize>,
     /// Slots the stream can recycle (below its checkpoint), published by the stream.
     recyclable: usize,
+    /// The last preparation failed (a full disk, say): the stream stops waiting for spares
+    /// and rolls over inline, which reports the failure (#19).
+    prepare_failed: bool,
+    /// Called when a preparation ends: a stream held back waiting for a spare (#19).
+    waiters: Waiters,
+}
+
+/// Wake-ups waiting for a spare slot.
+#[derive(Default)]
+struct Waiters(Vec<Box<dyn FnOnce() + Send>>);
+
+impl fmt::Debug for Waiters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} waiting", self.0.len())
+    }
 }
 
 /// A stream's shard-thread stall counters ([`WalStream::counters`], ICR 0015): shared, so a
@@ -312,6 +327,7 @@ impl RolloverSync {
     /// Blocks until the sync finished (the rare wait [`WalCounters::rollover_waits`]
     /// counts), reaping I/O only this thread completes meanwhile (#207).
     fn wait(&self) -> bool {
+        crate::foreground::may_block("a wait for a WAL rollover sync");
         let mut st = self.lock();
         loop {
             if let Some(ok) = st.done {
@@ -391,6 +407,7 @@ impl Shared {
     /// Runs `sync`, a sync of the stream file no commit waits on (growing or preparing a
     /// slot): a failure poisons the stream.
     fn side_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
+        crate::foreground::may_block("a blocking WAL sync");
         let ticket = self.start_sync();
         let r = sync();
         let ready = {
@@ -405,6 +422,7 @@ impl Shared {
     /// Runs `sync`, a blocking sync that makes records durable, and returns once it counts:
     /// after every sync started before it finished, and only if none failed.
     fn durable_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
+        crate::foreground::may_block("a blocking WAL sync");
         let ticket = self.start_sync();
         let r = sync();
         let (ready, barrier) = {
@@ -574,7 +592,9 @@ impl SpareSegments {
     pub fn prepare(&self, n: u32) -> Result<u32> {
         let (mut to_fill, old_total, grown) = {
             let mut pool = self.shared.pool();
-            let have = pool.recyclable + pool.ready.len() + pool.blank.len();
+            // Blank slots are not ready (a segment there needs its zero-fill first), so they
+            // count as needing preparation, not as spares.
+            let have = pool.recyclable + pool.ready.len();
             let need = (n as usize).saturating_sub(have);
             // Blank slots are zero-filled first; the rest are new slots at the file's end.
             let from_blank = need.min(pool.blank.len());
@@ -600,7 +620,9 @@ impl SpareSegments {
             self.shared.side_sync(|| self.file.sync_all())
         })();
         let mut pool = self.shared.pool();
-        match result {
+        pool.prepare_failed = result.is_err();
+        let waiters = std::mem::take(&mut pool.waiters.0);
+        let out = match result {
             Ok(()) => {
                 let filled = to_fill.len() as u32;
                 pool.ready.append(&mut to_fill);
@@ -619,7 +641,12 @@ impl SpareSegments {
                 pool.blank.sort_unstable();
                 Err(e)
             }
+        };
+        drop(pool);
+        for wake in waiters {
+            wake();
         }
+        out
     }
 }
 
@@ -985,6 +1012,13 @@ impl WalStream {
         Arc::clone(&self.shared.counters)
     }
 
+    /// Whether the current segment's header still waits for the previous rollover's sync.
+    fn header_waits(&self) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(|h| h.synced.done().is_none())
+    }
+
     /// Whether the next segment can start in a recyclable or prepared slot.
     fn spare_ready(&self) -> bool {
         (0..self.slots.len()).any(|i| self.is_recyclable(i)) || !self.shared.pool().ready.is_empty()
@@ -1037,7 +1071,7 @@ impl WalStream {
                         .fetch_add(1, Ordering::Relaxed);
                     self.file
                         .allocate(slot as u64 * self.segment_size, self.segment_size)?;
-                    self.shared.side_sync(|| self.file.sync_all())?;
+                    crate::foreground::exempt(|| self.shared.side_sync(|| self.file.sync_all()))?;
                     (slot, SlotSource::Blank)
                 }
             }
@@ -1125,7 +1159,7 @@ impl WalStream {
                 .counters
                 .rollover_waits
                 .fetch_add(1, Ordering::Relaxed);
-            held.synced.wait();
+            crate::foreground::exempt(|| held.synced.wait());
         }
         self.write_buf()?;
         let end = Lsn::new(self.epoch, self.written_off as u32);
@@ -1154,7 +1188,10 @@ impl WalStream {
             });
             return Ok(());
         } else {
-            self.shared.durable_sync(|| self.file.sync_data())?;
+            // D30's remaining fallback, counted: no recyclable or prepared slot was ready
+            // although `blocked` held the engine back for one (a group larger than the
+            // segment's last quarter, or a failed preparation).
+            crate::foreground::exempt(|| self.shared.durable_sync(|| self.file.sync_data()))?;
             self.shared.durable.fetch_max(end.0, Ordering::Release);
             self.shared
                 .counters
@@ -1252,6 +1289,7 @@ impl Wal for WalStream {
     }
 
     fn append(&mut self, record: &WalRecord<'_>, durability: Durability) -> Result<CommitTicket> {
+        let _fg = crate::foreground::Foreground::enter();
         self.check_poisoned()?;
         self.scratch.clear();
         record.encode(&mut self.scratch);
@@ -1268,6 +1306,7 @@ impl Wal for WalStream {
     }
 
     fn write(&mut self) -> Result<Lsn> {
+        let _fg = crate::foreground::Foreground::enter();
         self.check_poisoned()?;
         let r = self.write_buf();
         self.poison_on_err(r)?;
@@ -1287,6 +1326,7 @@ impl Wal for WalStream {
     }
 
     fn submit_sync(&mut self) -> Result<Completion<Lsn>> {
+        let _fg = crate::foreground::Foreground::enter();
         let lsn = self.write()?;
         let Some(held) = &self.held else {
             let shared = Arc::clone(&self.shared);
@@ -1363,27 +1403,38 @@ impl Wal for WalStream {
     }
 
     fn blocked(&self) -> bool {
-        // The current segment's header still waits for the previous rollover's sync, and a
-        // quarter of the segment or less is left: filling it would have to wait for that
-        // sync on this thread (#19).
-        self.held
-            .as_ref()
-            .is_some_and(|h| h.synced.done().is_none())
-            && self.segment_size - self.append_pos() <= self.segment_size / 4
+        // A quarter of the segment or less is left, and the rollover that filling it brings
+        // could not run off this thread (#19): the segment's own header still waits for the
+        // previous rollover's sync, or no recyclable or prepared slot is ready for the next
+        // segment (a rollover would grow the file and sync inline). A failed preparation
+        // stops the wait for spares: the inline rollover then reports the failure.
+        self.segment_size - self.append_pos() <= self.segment_size / 4
+            && (self.header_waits() || !self.spare_ready() && !self.shared.pool().prepare_failed)
     }
 
     fn notify_unblocked(&self, wake: Box<dyn FnOnce() + Send>) {
-        match &self.held {
-            Some(h) if h.synced.done().is_none() => {
-                // One call per time the engine holds a group back (`blocked`): counted.
+        if let Some(h) = self.held.as_ref().filter(|_| self.header_waits()) {
+            // One call per time the engine holds a group back (`blocked`): counted.
+            self.shared
+                .counters
+                .rollover_blocks
+                .fetch_add(1, Ordering::Relaxed);
+            h.synced.then(move |_| wake());
+            return;
+        }
+        if !self.spare_ready() {
+            let mut pool = self.shared.pool();
+            // Checked again under the pool lock: a preparation ending meanwhile wakes us.
+            if pool.ready.is_empty() && !pool.prepare_failed {
                 self.shared
                     .counters
                     .rollover_blocks
                     .fetch_add(1, Ordering::Relaxed);
-                h.synced.then(move |_| wake());
+                pool.waiters.0.push(wake);
+                return;
             }
-            _ => wake(),
         }
+        wake();
     }
 
     fn remove(self: Box<Self>) -> Result<()> {

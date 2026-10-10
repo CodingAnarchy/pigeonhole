@@ -588,3 +588,45 @@ fn buffered_none_records_roll_segments_over() {
     let (got, _) = replay(&vfs, Lsn::default()).unwrap();
     assert_eq!(got.seqnos(), (1..=61).collect::<Vec<_>>());
 }
+
+#[test]
+fn a_stream_held_back_while_a_spare_is_prepared_never_rolls_over_inline() {
+    // #19, D200: the engine checks `blocked` before each group and, held back, prepares a
+    // spare and waits for `notify_unblocked`. Then no rollover syncs or grows the file on the
+    // stream's thread, and the debug guard (a strict foreground scope) never fires.
+    let vfs = sim(23);
+    let opts = opts(4, 2);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    let spares = wal.spares();
+    let _strict = pigeonhole_wal::StrictForeground::enter();
+    let mut seqno = 0;
+    let mut holds = 0;
+    while wal.written().epoch() < 7 {
+        if wal.blocked() {
+            holds += 1;
+            let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let w = std::sync::Arc::clone(&woken);
+            wal.notify_unblocked(Box::new(move || {
+                w.store(true, std::sync::atomic::Ordering::Release);
+            }));
+            // The engine's background task.
+            spares.prepare(spares.target()).unwrap();
+            assert!(
+                woken.load(std::sync::atomic::Ordering::Acquire),
+                "the preparation woke the stream"
+            );
+            assert!(!wal.blocked(), "a spare is ready");
+        }
+        seqno += 1;
+        wal.append(&batch(seqno, 20_000).record(), Durability::GroupSync)
+            .unwrap();
+        let synced = wal.submit_sync().unwrap();
+        synced.wait().unwrap();
+    }
+    assert!(holds > 0, "the stream never waited for a spare");
+    assert_eq!(wal.inline_grows(), 0);
+    assert_eq!(wal.inline_rollover_syncs(), 0);
+    let c = wal.counters();
+    assert_eq!(c.rollover_waits(), 0);
+    assert_eq!(c.rollover_blocks(), holds);
+}

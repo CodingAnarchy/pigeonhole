@@ -3719,6 +3719,8 @@ impl ShardState {
             wal.notify_unblocked(Box::new(move || {
                 let _ = submitter.submit(ShardMsg::Kick);
             }));
+            // Held back for want of a spare: prepare one now.
+            self.maybe_prepare_spares(ctx);
         }
         true
     }
@@ -3824,6 +3826,8 @@ impl ShardState {
             self.pending.len(),
             self.stall.score
         );
+        // The group commit's WAL calls never block on a sync (#19, D200); debug builds check.
+        let _strict = pigeonhole_wal::StrictForeground::enter();
         if self.wal_held_back(ctx) || self.stalled(ctx) {
             return;
         }
@@ -4543,9 +4547,12 @@ impl ShardState {
         // Not before the stream is half way through the segment it opened in: a small
         // database never pays for spares, and a busy one has half a segment of writes to
         // prepare them in before the first rollover needs one (#143).
+        // A stream holding groups back for want of a spare (#19) needs one now.
         let due = self.wal.as_ref().is_some_and(|w| {
             let at = w.written();
-            at.epoch() != self.open_epoch || 2 * u64::from(at.offset()) >= spares.segment_size()
+            at.epoch() != self.open_epoch
+                || 2 * u64::from(at.offset()) >= spares.segment_size()
+                || w.blocked()
         });
         if !due
             || spares.ready() >= spares.target()
