@@ -62,9 +62,7 @@ env:
   # (runs 37900128944 and 37901737150). If a shape proves noisier on CI, report it rather
   # than raising its threshold silently.
   # The YCSB shapes get 1.0%: identical code varied by up to 0.54% across runs.
-  # commit-overwrite gets 1.5% while D194's stale-tail index costs each overwrite about
-  # 1-1.6%, which D199 accepts; it returns to 1.0% when #449 trims that cost.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.5
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0
 
 jobs:
   instructions:
