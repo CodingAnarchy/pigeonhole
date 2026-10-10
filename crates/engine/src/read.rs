@@ -1034,8 +1034,16 @@ impl ScanCursor {
 
     /// Drops the rest of the current row in every lane.
     fn skip_current_row(&mut self) -> Result<()> {
+        // A column of the current row starts with its escaped row and the terminator (which
+        // never occurs inside an escaped row): a prefix compare, no walk to find the row.
+        let row_len = self.row_esc.len() + TERMINATOR.len();
         for lane in &mut self.lanes {
-            if lane.pending && row_of(lane.col()) == self.row_esc {
+            let col = if lane.pending { lane.col() } else { &[] };
+            if lane.pending
+                && col.len() >= row_len
+                && col.starts_with(&self.row_esc)
+                && col[self.row_esc.len()..row_len] == TERMINATOR
+            {
                 lane.pending = false;
                 lane.resolver.skip_row()?;
             }
@@ -1108,7 +1116,7 @@ impl ScanCursor {
             self.row_esc.clear();
             self.row_esc.extend_from_slice(best);
             self.row.clear();
-            Escaped::new(&self.row_esc).unescape_into(&mut self.row);
+            Escaped::new(&self.row_esc).unescape_long_into(&mut self.row);
             if matches!(&self.spec.start, Bound::Excluded(s) if s.as_slice() == self.row.as_slice())
             {
                 self.skip_current_row()?;
