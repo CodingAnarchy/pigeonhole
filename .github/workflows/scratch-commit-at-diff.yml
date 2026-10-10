@@ -1,0 +1,40 @@
+name: scratch index vs main diff
+on:
+  push:
+    branches: [scratch/commit-at-diff]
+permissions:
+  contents: read
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build head and base
+        shell: bash
+        run: |
+          set -eu
+          cargo build --release -p pigeonhole-bench --example writepath --example readshapes
+          cp target/release/examples/writepath /tmp/wp-head; cp target/release/examples/readshapes /tmp/rs-head
+          git worktree add -q /tmp/base 3f8e947702fded2de22dee1fc33d17d7a02779bf
+          cp -R crates/bench/examples/support crates/bench/examples/writepath.rs crates/bench/examples/readshapes.rs /tmp/base/crates/bench/examples/
+          (cd /tmp/base && cargo build --release -p pigeonhole-bench --example writepath --example readshapes --target-dir $GITHUB_WORKSPACE/target)
+          cp target/release/examples/writepath /tmp/wp-base; cp target/release/examples/readshapes /tmp/rs-base
+      - name: per function, base vs head
+        shell: bash
+        run: |
+          set -eu
+          for spec in wp:commit-sixteen rs:get-miss; do
+            bin=${spec%%:*}; shape=${spec#*:}
+            for side in base head; do
+              env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 valgrind --tool=callgrind --collect-atstart=no --callgrind-out-file=/tmp/cg-$side.out /tmp/$bin-$side $shape 4 /tmp >/dev/null 2>/tmp/err-$side
+              callgrind_annotate --auto=no --inclusive=no --threshold=100 /tmp/cg-$side.out 2>/dev/null | awk '/^ *[0-9,]+ +\(/ { n=$1; gsub(",", "", n); sub(/^ *[0-9,]+ +\([^)]*\) +/, ""); sub(/ \[[^]]*\]$/, ""); gsub("/tmp/base/", ""); gsub("/home/runner/work/pigeonhole/pigeonhole/", ""); print n "\t" $0 }' > /tmp/f-$side.tsv
+            done
+            echo "=== $shape: functions changed by more than 1000 (base -> head)"
+            awk -F'\t' 'NR==FNR { a[$2]+=$1; next } { b[$2]+=$1 } END { for (k in a) if (!(k in b)) b[k]=0; for (k in b) { d=b[k]-a[k]; if (d > 1000 || d < -1000) printf "%+d\t%d\t%d\t%s\n", d, a[k], b[k], k } }' /tmp/f-base.tsv /tmp/f-head.tsv | sort -n || true
+          done
