@@ -96,7 +96,14 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
         # The environment goes before valgrind: callgrind does not follow `env`'s exec. A fixed
         # mmap threshold stops glibc moving it whenever any thread frees a large block, which
         # decided by thread timing whether a growing buffer's realloc copied (#354).
-        env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072 $env_set \
+        # An unbounded tcache keeps a block freed on another thread (a commit's batch buffer,
+        # allocated by the client and freed by the shard after its reply) in the freeing
+        # thread's cache. A full cache sends it back to the allocating thread's arena, where
+        # thread timing decided the next malloc's bin work: commit-one, commit-at and
+        # commit-overwrite varied by 0.26-0.43% on identical code, 0.05% or less with this.
+        # The cross-thread free itself is a cost to remove, not to count (#320).
+        env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.tcache_count=65535 \
+            $env_set \
             valgrind --tool=callgrind --collect-atstart=no \
             --callgrind-out-file="$work/cg.out" "$@" </dev/null >/dev/null 2>"$work/err"
         sed -n 's/^summary: \([0-9]*\).*/\1/p' "$work/cg.out"
