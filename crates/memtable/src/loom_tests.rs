@@ -187,3 +187,53 @@ fn loom_forward_seek_sees_an_entry_linked_after_the_finger() {
         seeker.join().unwrap();
     });
 }
+
+/// The has-markers flag (ICR 0020): the writer notes a marker (Release) before linking it,
+/// then publishes (the engine's visibility watermark, modelled as one flag). A reader that
+/// takes its read point (the publish) or finds the marker itself, then loads the flag, sees
+/// it set: a marker a read can see is never skipped.
+#[test]
+fn loom_a_visible_marker_is_never_missed() {
+    use loom::sync::atomic::{AtomicBool, Ordering};
+
+    model().check(|| {
+        let mut arena = ShardArena::new(ArenaRegion::heap(2048), 1024);
+        let mut mt = Memtable::create(&mut arena).unwrap();
+        let reader = mt.reader();
+        assert!(!reader.may_have_markers());
+        let published = Arc::new(AtomicBool::new(false));
+        let marker = key(1, 1);
+
+        let writer = {
+            let (published, marker) = (Arc::clone(&published), marker.clone());
+            thread::spawn(move || {
+                mt.note_marker();
+                mt.insert(&mut arena, &marker, b"").unwrap();
+                published.store(true, Ordering::Release);
+                (mt, arena)
+            })
+        };
+        let by_read_point = {
+            let (reader, published) = (reader.clone(), Arc::clone(&published));
+            thread::spawn(move || {
+                if published.load(Ordering::Acquire) {
+                    assert!(reader.may_have_markers(), "a published marker was skipped");
+                }
+            })
+        };
+        let by_search = {
+            let reader = reader.clone();
+            thread::spawn(move || {
+                let mut it = reader.iter();
+                it.seek(&marker).unwrap();
+                if it.valid() {
+                    assert!(reader.may_have_markers(), "a found marker was skipped");
+                }
+            })
+        };
+        by_read_point.join().unwrap();
+        by_search.join().unwrap();
+        let _ = writer.join().unwrap();
+        assert!(reader.may_have_markers());
+    });
+}

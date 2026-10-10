@@ -3640,6 +3640,11 @@ impl ShardState {
                     break;
                 }
             };
+            if m.kind == Kind::FamilyDelete {
+                // Before the marker is linked, so a read that can see it knows to look for
+                // markers (ICR 0020).
+                slot.active.table.note_marker();
+            }
             if let Err(e) = slot.active.table.insert(&mut self.arena, &key_buf, m.value) {
                 result = Err(e.into());
                 break;

@@ -69,6 +69,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
+#[cfg(loom)]
+use loom::sync::atomic::AtomicBool;
+#[cfg(not(loom))]
+use std::sync::atomic::AtomicBool;
+
 use pigeonhole_format::key::split_suffix;
 use pigeonhole_format::shm::memtable as layout;
 use pigeonhole_format::version::MEMTABLE_MAGIC;
@@ -155,8 +160,33 @@ const STEP_SLACK: usize = MAX_HEIGHT + 16;
 /// One strong reference per live in-process handle of a memtable (the writer, each reader,
 /// cursor and slice, and the `Retired` token). `ShardArena::reclaim` reuses the chunks only
 /// once the token holds the last reference.
+///
+/// Also carries the writer's process-local knowledge of the memtable (ICR 0020): whether a
+/// delete marker was ever inserted. A pin a reader process makes for a root it found in a
+/// view has no writer behind it, so it answers "maybe" ([`MemtableReader::may_have_markers`]).
 #[derive(Debug)]
-struct Pin;
+struct Pin {
+    /// Made by this memtable's writer (`Memtable::create`), so `markers` is kept.
+    writer: bool,
+    /// A delete marker was inserted (set before the marker is linked, Release).
+    markers: AtomicBool,
+}
+
+impl Pin {
+    fn writer() -> Self {
+        Self {
+            writer: true,
+            markers: AtomicBool::new(false),
+        }
+    }
+
+    fn foreign() -> Self {
+        Self {
+            writer: false,
+            markers: AtomicBool::new(true),
+        }
+    }
+}
 
 /// Shared by every clone of an [`ArenaRegion`]: the pins of the memtables this process
 /// created, by root, so a reader opened by root in the writer process pins the same memtable.
@@ -180,7 +210,7 @@ impl Registry {
         self.lock()
             .get(&root)
             .and_then(Weak::upgrade)
-            .unwrap_or_else(|| Arc::new(Pin))
+            .unwrap_or_else(|| Arc::new(Pin::foreign()))
     }
 
     fn forget(&self, root: u32, pin: &Arc<Pin>) {
@@ -613,7 +643,7 @@ impl Memtable {
             mem.write_u32(tower(head as u32, level), NULL);
         }
 
-        let pin = Arc::new(Pin);
+        let pin = Arc::new(Pin::writer());
         region.registry.register(root as u32, &pin);
         Ok(Memtable {
             region,
@@ -825,6 +855,14 @@ impl Memtable {
         self.root
     }
 
+    /// Records that a delete marker (a family or row delete) is about to be inserted. Call
+    /// it before the marker's [`Memtable::insert`]: the store (Release) comes before the
+    /// marker is linked, so a reader that can see the marker sees this too
+    /// ([`MemtableReader::may_have_markers`], ICR 0020).
+    pub fn note_marker(&self) {
+        self.pin.markers.store(true, Ordering::Release);
+    }
+
     /// A reader for other threads. While it (or a cursor or slice taken from it) is alive,
     /// the memtable's chunks are not reused.
     pub fn reader(&self) -> MemtableReader {
@@ -898,6 +936,15 @@ pub struct MemtableReader {
 }
 
 impl MemtableReader {
+    /// Whether the memtable may hold a delete marker (ICR 0020). `false` only in the writer
+    /// process, for a memtable whose writer never called [`Memtable::note_marker`]. Load it
+    /// after taking the read point: a marker visible at that point was linked after its
+    /// note (Acquire pairs with the note's Release), so it is never missed.
+    #[inline]
+    pub fn may_have_markers(&self) -> bool {
+        !self.pin.writer || self.pin.markers.load(Ordering::Acquire)
+    }
+
     /// Opens the memtable whose header is at `root` in `region` (reader processes use the
     /// root from the published view). Validates the header. In the writer process the
     /// reader pins the memtable like [`Memtable::reader`] does, provided `region` is a clone

@@ -1684,10 +1684,11 @@ fn get_with<const CACHE_ONLY: bool>(
     let mut key = ColumnKey::new(row, qualifier);
     // The caller clears the sources afterwards, whatever this returns.
     let sources = resolver.cursor_mut().sources_mut();
-    let filled = view.point_sources::<CACHE_ONLY>(shard, tablet, family, &mut key, sources);
-    if filled.is_err() || sources.is_empty() {
-        return filled.map(|()| None);
-    }
+    let markers = match view.point_sources::<CACHE_ONLY>(shard, tablet, family, &mut key, sources) {
+        Ok(_) if sources.is_empty() => return Ok(None),
+        Ok(markers) => markers,
+        Err(e) => return Err(e),
+    };
     let mut opts = point_opts(meta, seqno, now);
     let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
     resolver.cursor_mut().reset();
@@ -1702,6 +1703,7 @@ fn get_with<const CACHE_ONLY: bool>(
         meta,
         resolver_blobs.as_ref(),
         &key,
+        markers,
         (&mut key_buf, &mut key_vec, &mut key_len),
         &mut pin,
     );
@@ -1747,11 +1749,17 @@ fn resolve_point<P: FnOnce() -> Arc<View>>(
     meta: &FamilyMeta,
     resolver_blobs: Option<&Arc<ResolverBlobs>>,
     column: &ColumnKey,
+    markers: bool,
     key: (&mut [u8; 512], &mut Vec<u8>, &mut usize),
     pin: &mut Option<P>,
 ) -> Result<Resolved> {
     let (key_buf, key_vec, key_len) = key;
-    resolver.seek_column_encoded(column.prefix(), column.row_len())?;
+    if markers {
+        resolver.seek_column_encoded(column.prefix(), column.row_len())?;
+    } else {
+        // No source can hold a delete marker: straight to the column (ICR 0020).
+        resolver.seek_column_encoded_unmarked(column.prefix(), column.row_len())?;
+    }
     let (ts, refind) = {
         let next = resolver.next_cell();
         ResolverBlobs::check(resolver_blobs)?;

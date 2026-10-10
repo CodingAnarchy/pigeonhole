@@ -731,7 +731,10 @@ impl View {
         Ok(())
     }
 
-    /// Sources for a point read of one column, newest first.
+    /// Sources for a point read of one column, newest first. Returns whether one of them may
+    /// hold a family or row delete marker (ICR 0020): an SST, or a memtable whose writer
+    /// noted one. Taken after the read point, so a marker visible to the read is never
+    /// missed.
     pub(crate) fn point_sources<const CACHE_ONLY: bool>(
         &self,
         shard: ShardId,
@@ -739,7 +742,7 @@ impl View {
         family: FamilyId,
         key: &mut ColumnKey,
         out: &mut Vec<Source>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let l = self.locate(shard, tablet, family);
         // Room for the memtables and a couple of SSTs: a source is about 1 KiB, and a `Vec`
         // grown from empty would hold four (#46). `out` is normally a reused buffer that
@@ -748,16 +751,20 @@ impl View {
         let ssts = l.ssts.map_or(0, |fam| fam.iter().take(2).count());
         out.reserve(mems + ssts);
         let all = ScanFilter::all();
+        let mut markers = false;
         if let Some(set) = l.mems {
+            markers = set.readers.iter().any(MemtableReader::may_have_markers);
             mem_sources(set, &all, out);
         }
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
             let probe = Probe::new(key)?;
+            let before = out.len();
             sst_sources_point::<CACHE_ONLY>(fam, &self.ssts, &probe, l.priority, out)?;
+            markers |= out.len() > before;
         }
-        Ok(())
+        Ok(markers)
     }
 
     /// Sources for reading one row, newest first, appended to `out` (a reused source list).
