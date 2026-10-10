@@ -101,7 +101,7 @@ impl SstSink {
         options: SstWriterOptions,
         estimate: u64,
     ) -> Self {
-        let file = pager.file().clone();
+        let file = pager.data_file().clone();
         Self {
             pager,
             file,

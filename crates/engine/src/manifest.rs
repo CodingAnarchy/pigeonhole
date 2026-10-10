@@ -936,7 +936,7 @@ pub(crate) fn end(
             &catalog,
             Some(&cur.ssts),
             &mut readers,
-            shared.pager.file().clone(),
+            shared.pager.data_file().clone(),
             Arc::clone(&shared.cache),
         ));
         View {

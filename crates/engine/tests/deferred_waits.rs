@@ -218,6 +218,10 @@ impl Vfs for Dev {
 }
 
 impl pigeonhole_io::File for DevFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.inner.direct_align()
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
         self.inner.read_at(buf, offset)
     }

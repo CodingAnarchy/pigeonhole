@@ -108,6 +108,12 @@ pub struct EngineOptions {
     /// local to one host, so two hosts could both open it as writers, and a sync may not
     /// reach stable storage. Network and cluster filesystems stay refused. Default off.
     pub allow_fuse: bool,
+    /// Read and write SST and blob extents through a second handle opened for direct I/O
+    /// (#403): `O_DIRECT` on Linux, `F_NOCACHE` on macOS, `FILE_FLAG_NO_BUFFERING` on
+    /// Windows, so the block cache is their only cache. A file system that refuses it keeps
+    /// the buffered handle. Superblocks, the manifest and the WAL stay buffered. Default
+    /// off.
+    pub direct_io: bool,
     /// Compaction tuning (L0 trigger, level sizes, output SST size). The L0 trigger also
     /// drives write stalls.
     pub compaction: PickerOptions,
@@ -172,6 +178,7 @@ impl EngineOptions {
             merge_operators: MergeRegistry::default(),
             allow_unregistered_merge: false,
             allow_fuse: false,
+            direct_io: false,
             compaction: PickerOptions::default(),
             write_stall_timeout_nanos: 30_000_000_000,
             arena_chunk_bytes: None,

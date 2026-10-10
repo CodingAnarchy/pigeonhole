@@ -519,7 +519,7 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
                     SstSet::priority(m.options.cache_priority)
                 });
             let r = SstReader::open(
-                shared.pager.file().clone(),
+                shared.pager.data_file().clone(),
                 &new_meta,
                 Arc::clone(&shared.cache),
                 priority,
