@@ -34,6 +34,90 @@ pub struct IoBuf {
     /// drop; which slot follows from `ptr`) or the heap. One word, so heap buffers, the
     /// common case, stay as small as before.
     pool: Option<Arc<SlotPool>>,
+    /// The [`BufPool`] a heap buffer goes back to when dropped (ICR 0026), if any.
+    recycle: Option<Arc<BufPool>>,
+}
+
+/// A bounded pool of heap [`IoBuf`]s (ICR 0026): a buffer taken from it goes back when it is
+/// dropped, wherever that happens, unless the pool is full. A reader that decodes block after
+/// block reuses a few allocations instead of allocating and zero-filling one per block
+/// (#372).
+///
+/// ```
+/// use pigeonhole_io::BufPool;
+///
+/// let pool = BufPool::new(2);
+/// let mut a = pool.take(100);
+/// a.fill(7);
+/// let p = a.as_ptr();
+/// drop(a);
+/// // The same allocation, its bytes as the last user left them, for the caller to overwrite.
+/// let b = pool.take(50);
+/// assert_eq!(b.as_ptr(), p);
+/// assert!(b.iter().all(|&x| x == 7));
+/// // Extended past its old length, only the new bytes are zeroed.
+/// drop(b);
+/// let c = pool.take(120);
+/// assert!(c[..50].iter().all(|&x| x == 7) && c[50..].iter().all(|&x| x == 0));
+/// ```
+pub struct BufPool {
+    max: usize,
+    free: Mutex<Vec<IoBuf>>,
+}
+
+impl BufPool {
+    /// A pool keeping at most `max` buffers.
+    pub fn new(max: usize) -> Arc<BufPool> {
+        Arc::new(Self {
+            max,
+            free: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A buffer of `len` bytes that goes back to this pool when dropped: a recycled one
+    /// truncated or extended to `len` (only the extension is zero-filled), or a new zeroed
+    /// one when the pool has none. Its bytes are initialized (zeros, or what a previous user
+    /// wrote), for the caller to overwrite.
+    pub fn take(self: &Arc<Self>, len: usize) -> IoBuf {
+        let recycled = self
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let mut buf = match recycled {
+            Some(mut b) => {
+                b.resize(len);
+                b
+            }
+            None => IoBuf::zeroed(len),
+        };
+        buf.recycle = Some(Arc::clone(self));
+        buf
+    }
+
+    /// Takes back `buf` (its handle already cleared, so the pool never holds an `Arc` of
+    /// itself), or lets it go if the pool is full.
+    fn put(&self, buf: IoBuf) {
+        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        if free.len() < self.max {
+            free.push(buf);
+        }
+    }
+
+    /// Buffers held now.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl fmt::Debug for BufPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufPool").field("max", &self.max).finish()
+    }
 }
 
 /// One aligned region of equal slots, which a backend registers with the kernel once
@@ -102,6 +186,7 @@ impl SlotPool {
             cap: self.slot_len,
             head: 0,
             pool: Some(Arc::clone(self)),
+            recycle: None,
         })
     }
 
@@ -159,6 +244,7 @@ impl IoBuf {
             len,
             cap,
             pool: None,
+            recycle: None,
         }
     }
 
@@ -293,6 +379,15 @@ fn allocate(cap: usize) -> NonNull<u8> {
 
 impl Drop for IoBuf {
     fn drop(&mut self) {
+        // A pooled heap buffer goes back whole: swapped for an empty buffer (which owns no
+        // allocation, so the rest of this drop frees nothing), its handle cleared. A buffer
+        // with a kept prefix is freed instead: a pooled buffer must start at its allocation.
+        if let Some(recycle) = self.recycle.take()
+            && self.head == 0
+        {
+            recycle.put(std::mem::replace(self, IoBuf::zeroed(0)));
+            return;
+        }
         if let Some(pool) = self.pool.take() {
             pool.give_back(pool.index_of(self.ptr));
             return;
@@ -335,6 +430,46 @@ impl fmt::Debug for IoBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_buf_pool_keeps_at_most_its_bound() {
+        let pool = BufPool::new(2);
+        let bufs: Vec<_> = (0..4).map(|_| pool.take(10)).collect();
+        assert_eq!(pool.held(), 0);
+        drop(bufs);
+        assert_eq!(pool.held(), 2, "the rest are freed");
+        let again: Vec<_> = (0..3).map(|_| pool.take(10)).collect();
+        assert_eq!(pool.held(), 0);
+        drop(again);
+        assert_eq!(pool.held(), 2);
+    }
+
+    #[test]
+    fn a_pooled_buffer_with_a_kept_prefix_is_freed_not_pooled() {
+        let pool = BufPool::new(4);
+        let mut b = pool.take(8192);
+        b.keep(100..200);
+        drop(b);
+        assert_eq!(pool.held(), 0);
+    }
+
+    #[test]
+    fn a_pooled_buffer_goes_back_from_another_thread_and_grows_past_its_capacity() {
+        let pool = BufPool::new(4);
+        let b = pool.take(100);
+        std::thread::spawn(move || drop(b)).join().unwrap();
+        assert_eq!(pool.held(), 1);
+        // Recycled, then grown past its page: reallocated, old bytes kept, the rest zero.
+        let mut c = pool.take(10);
+        c.fill(9);
+        c.resize(IoBuf::ALIGN + 1);
+        assert!(c[..10].iter().all(|&x| x == 9) && c[10..].iter().all(|&x| x == 0));
+        drop(c);
+        assert_eq!(pool.held(), 1);
+        // A plain buffer never joins a pool.
+        drop(IoBuf::zeroed(10));
+        assert_eq!(pool.held(), 1);
+    }
 
     #[test]
     fn zero_length_buffer() {

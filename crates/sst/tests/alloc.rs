@@ -1,5 +1,7 @@
 //! A point lookup on hot blocks allocates nothing: a counting global allocator watches the
-//! engine's per-get sequence (filter probes, a fresh cursor, a seek, a pinned value cell).
+//! engine's per-get sequence (filter probes, a fresh cursor, a seek, a pinned value cell). And
+//! a scan that does not fill the cache recycles its decompression buffers (#372): it makes
+//! no zeroed allocation per block for them.
 //!
 //! The counting allocator needs `unsafe` (`GlobalAlloc`); it lives in this test binary only,
 //! as in `pigeonhole-cache`'s `tests/alloc.rs`. The library itself forbids `unsafe`.
@@ -22,6 +24,7 @@ struct Counting;
 
 thread_local! {
     static ALLOCS: StdCell<u64> = const { StdCell::new(0) };
+    static ZEROED: StdCell<u64> = const { StdCell::new(0) };
 }
 
 fn bump() {
@@ -39,6 +42,7 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         bump();
+        let _ = ZEROED.try_with(|n| n.set(n.get() + 1));
         // SAFETY: as for `alloc`.
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -64,6 +68,13 @@ fn allocations(f: impl FnOnce()) -> u64 {
     let before = ALLOCS.with(StdCell::get);
     f();
     ALLOCS.with(StdCell::get) - before
+}
+
+/// Zero-filled allocations made by `f` on this thread.
+fn zeroed_allocations(f: impl FnOnce()) -> u64 {
+    let before = ZEROED.with(StdCell::get);
+    f();
+    ZEROED.with(StdCell::get) - before
 }
 
 #[test]
@@ -130,4 +141,81 @@ fn hot_point_lookup_allocates_nothing() {
 fn counter_sees_allocations() {
     let n = allocations(|| drop(std::hint::black_box(vec![0u8; 16])));
     assert_eq!(n, 2);
+}
+
+/// An SST of `n` cells in LZ4-compressed blocks (the default family options), and its file.
+fn compressed_sst(n: u32) -> (pigeonhole_io::FileRef, pigeonhole_format::manifest::SstMeta) {
+    let vfs = SimVfs::new(2);
+    let file = vfs
+        .open("/db".as_ref(), OpenOptions::read_write_create())
+        .unwrap();
+    let options = SstWriterOptions::for_family(
+        &FamilyOptions::default(),
+        TableId(1),
+        FamilyId(1),
+        TabletId(1),
+    );
+    let extent = ExtentRef {
+        page: 1024,
+        size_class: 6,
+    };
+    let mut w = SstWriter::new(file.clone(), extent, SstId(1), options);
+    for i in 0..n {
+        let mut k = Vec::new();
+        encode_key(
+            &mut k,
+            format!("row:{i:08}").as_bytes(),
+            b"c",
+            7,
+            1,
+            Kind::Put,
+        )
+        .unwrap();
+        w.add(&k, format!("\x00value-value-value-value-{i}").as_bytes())
+            .unwrap();
+    }
+    (file, w.finish().unwrap())
+}
+
+#[test]
+fn a_scan_that_does_not_fill_the_cache_recycles_its_decompression_buffers() {
+    let n = if cfg!(miri) { 2_000 } else { 50_000u32 };
+    let (file, meta) = compressed_sst(n);
+    // The synchronous path, readahead, and readahead that merges adjacent blocks.
+    for (ahead, merge) in [(0, false), (4, false), (4, true)] {
+        let scan = |fill: bool| {
+            let cache = Arc::new(BlockCache::new(64 << 20, 0));
+            let sst = Arc::new(SstReader::open(file.clone(), &meta, cache, Priority::Low).unwrap());
+            let blocks = u64::from(sst.properties().data_blocks);
+            let mut o = ReadOptions::default();
+            o.fill_cache = fill;
+            o.readahead_blocks = ahead;
+            o.readahead_merge = merge;
+            let zeroed = zeroed_allocations(|| {
+                let mut it = sst.iter(ScanFilter::all(), o);
+                it.seek_to_first().unwrap();
+                let mut cells = 0;
+                while it.valid() {
+                    cells += 1;
+                    it.next().unwrap();
+                }
+                assert_eq!(cells, n);
+            });
+            (blocks, zeroed)
+        };
+        let (blocks, filled) = scan(true);
+        let (_, uncached) = scan(false);
+        // Filling the cache: a read buffer and a decompression buffer per block, so the
+        // blocks are compressed and the test measures what it claims.
+        assert!(
+            filled >= 2 * blocks,
+            "ahead {ahead} merge {merge}: {filled} zeroed for {blocks} blocks"
+        );
+        // Not filling it: the read buffers only (fewer when merged), and the pool's first
+        // few decompression buffers.
+        assert!(
+            uncached <= blocks + 16,
+            "ahead {ahead} merge {merge}: {uncached} zeroed for {blocks} blocks"
+        );
+    }
 }

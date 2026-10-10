@@ -33,7 +33,7 @@ pub mod sys;
 pub mod uring;
 mod vfs;
 
-pub use buf::IoBuf;
+pub use buf::{BufPool, IoBuf};
 pub use completion::{Completion, Resolver};
 pub use error::{Error, ErrorKind, Result};
 pub use file::{File, FileRef, Locality, LockMode, OpenOptions};

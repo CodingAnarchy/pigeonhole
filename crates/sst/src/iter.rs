@@ -432,7 +432,7 @@ impl SstIter {
                         if let Ok(buf) = read {
                             for (addr, fetch) in &run {
                                 let at = (addr.offset - first.offset) as usize;
-                                let mut piece = pigeonhole_io::IoBuf::zeroed(addr.len as usize);
+                                let mut piece = fetch.buffer(addr.len as usize);
                                 piece.copy_from_slice(&buf[at..at + addr.len as usize]);
                                 if let Ok(Some(h)) = fetch.admit(piece) {
                                     lock(&arrived).push((addr.offset, h));
