@@ -217,7 +217,9 @@ impl CommitTicket {
         }
         match self.durability {
             Durability::None => true,
-            Durability::Buffered => self.end <= written,
+            // Durable implies handed to the kernel: a group resolved through a sync while a
+            // segment header was held back (#19) is durable before `written` moves.
+            Durability::Buffered => self.end <= written.max(durable),
             Durability::GroupSync | Durability::Sync => self.end <= durable,
         }
     }
@@ -285,6 +287,19 @@ pub trait Wal: Send + fmt::Debug {
     /// has segments to prepare (`None` for mocks).
     fn spares(&self) -> Option<SpareSegments> {
         None
+    }
+
+    /// Whether appending more now could make the stream wait on its own thread (#19): the
+    /// engine then holds its next group back until [`Wal::notify_unblocked`] calls back.
+    /// `false` by default.
+    fn blocked(&self) -> bool {
+        false
+    }
+
+    /// Calls `wake` (from any thread) once [`Wal::blocked`] may have turned false: at once by
+    /// default.
+    fn notify_unblocked(&self, wake: Box<dyn FnOnce() + Send>) {
+        wake();
     }
 
     /// Removes this stream's files (clean close by the last process, after checkpoint).
