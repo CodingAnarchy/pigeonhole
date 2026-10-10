@@ -211,6 +211,19 @@ if rc_rows:
     print("|---|---|---|---|")
     for w, a, b in rc_rows:
         print(f"| {w} | {a['throughput']:.0f} → {b['throughput']:.0f} | {us(a['p50_ns']):.2f} → {us(b['p50_ns']):.2f} µs | {us(a['p99_ns']):.1f} → {us(b['p99_ns']):.1f} µs |")
+# The group sync depth (D207).
+depth_rows = {d: results(f"group-sync-depth-{d}.json", "pigeonhole") for d in ("1", "2", "0")}
+if any(depth_rows.values()):
+    print("\n**Group sync depth (D207):** durable group commits, ops/s and p99 per client count.\n")
+    print("| Depth | " + " | ".join(f"{t} clients" for t in (1, 4, 16)) + " |")
+    print("|---|---|---|---|")
+    for d, label in (("1", "1"), ("2", "2"), ("0", "unlimited")):
+        by_threads = {r["threads"]: r for r in depth_rows[d]}
+        cells = [
+            f"{by_threads[t]['throughput']:.0f} ops/s, p99 {us(by_threads[t]['p99_ns']):.0f} µs" if t in by_threads else "-"
+            for t in (1, 4, 16)
+        ]
+        print(f"| {label} | " + " | ".join(cells) + " |")
 # The I/O backend's default (#402 PR 6).
 pu = {r["workload"]: r for r in results("all-uring-1.json", "pigeonhole")}
 pp = {r["workload"]: r for r in results("all-pread.json", "pigeonhole")}

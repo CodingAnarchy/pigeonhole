@@ -20,6 +20,7 @@
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2)         90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
 #   latency        ycsb-c, group-commit (1/4/16 threads) vs RocksDB, ycsb-a, skewed   45
+#   group-sync-depth  group-commit at group sync depth 1, 2 and unlimited (D207)      15
 #   row-cache      ycsb-c and ycsb-a with the row cache on (D201's default)           30
 #   scaling        scaling gate (D204) at 1, 4, 8, 16 shards                          30
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
@@ -28,7 +29,7 @@
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 9 hours unattended at full scale.
+# Total: about 9.5 hours unattended at full scale.
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
 # it back with the `scp` line the last step prints, and commit it from there.
@@ -55,10 +56,10 @@ mkdir -p "$data" "$results/logs"
 data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
-steps=(setup build phase2-gate all-uring-1 all-uring-2 all-pread latency row-cache scaling
-    open-latency cold-get cold-scan scan-cache report)
+steps=(setup build phase2-gate all-uring-1 all-uring-2 all-pread latency group-sync-depth
+    row-cache scaling open-latency cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [phase2-gate]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=45 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
+    [all-pread]=90 [latency]=45 [group-sync-depth]=15 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
     [cold-scan]=45 [scan-cache]=10 [report]=1)
 
 bench="$root/target/release/phdb-bench"
@@ -153,6 +154,19 @@ step_latency() {
     PIGEONHOLE_IO=uring "$bench" group-commit --engine pigeonhole,rocksdb --scale "$scale" \
         --dir "$data/bench" --json "$results/latency-group-commit.json"
     rm -r "$data/bench"
+}
+
+# The group sync depth (D207): durable group commits at 1, 4 and 16 clients with at most 1, 2
+# or unlimited (0) group syncs in flight per stream. The interim default is 1 on macOS and 2
+# elsewhere; this run decides it.
+step_group-sync-depth() {
+    local d
+    for d in 1 2 0; do
+        PIGEONHOLE_IO=uring PIGEONHOLE_GROUP_SYNC_DEPTH="$d" "$bench" group-commit \
+            --engine pigeonhole --scale "$scale" --dir "$data/bench" \
+            --json "$results/group-sync-depth-$d.json"
+        rm -r "$data/bench"
+    done
 }
 
 step_row-cache() {
