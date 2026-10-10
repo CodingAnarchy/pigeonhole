@@ -12,7 +12,7 @@ pigeonhole = "0.2"
 
 This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). Upgrading from 0.1.0: the [changelog](../../CHANGELOG.md) lists every difference and how to migrate (counter families, the version 2 file format, the FUSE opt-in). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
 
-Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature (Phase 3) is off by default and currently gates an empty module.
+Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature is on by default on `main` (off in 0.2.0) and adds an async form of every data operation (see [Async](async.md)); `default-features = false` drops it.
 
 ## Open a database
 ```rust
@@ -326,13 +326,9 @@ Reopening after a crash with fewer shards or a smaller `memtable_budget` than be
 |---|---|
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
 
-Later phases:
-
-| Feature | Phase |
-|---|---|
-| `async` front door (`get_async`, `Scan::stream`, `commit_async`) | 3 |
+Async gaps (Phase 3, being closed): `RowMutation::commit_if`, `Transaction::get`, `flush` and `compact` have no async form yet (see [Async](async.md#sync-only-calls)).
 
 Available ahead of their phase: `Transaction` and reader processes (`open_reader`) (P4).
 
 ## Next
-[Durability](durability.md) · [Scans and filters](scans-and-filters.md) · [Data modeling](data-modeling.md) · [Errors](errors.md) · [Agent reference](agent-reference.md)
+[Durability](durability.md) · [Async](async.md) · [Scans and filters](scans-and-filters.md) · [Data modeling](data-modeling.md) · [Errors](errors.md) · [Agent reference](agent-reference.md)

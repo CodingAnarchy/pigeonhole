@@ -12,8 +12,10 @@ categories.workspace = true
 readme = "README.md"
 
 [features]
-# Phase 3: the async front door (`get_async`, `commit_async`, scan streams). Becomes
-# default-on when it is implemented, per the spec's "Sync and async" section.
+# The async front door (`get_async`, `commit_async`, scan streams), default-on per the
+# spec's "Sync and async" section (D17). `default-features = false` drops it and its
+# `futures-core` dependency; the blocking API is unchanged either way.
+default = ["async"]
 async = ["dep:futures-core"]
 # Phase 3: optional Tokio conveniences, never requirements.
 tokio = ["async"]

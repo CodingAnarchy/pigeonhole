@@ -53,6 +53,8 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `RowMutation`, `WriteBatch`, `Transaction` | Writes; `Transaction` is P4, early. |
 | `CommitInfo { seqno: u64, durability: Durability }` | Commit result. |
 | `RowRead`, `Scan`, `RowIter` | Read builders; scan iterator. |
+| `CommitTicket` | A submitted commit to wait on or check later (`commit_with_ticket`). |
+| `nonblocking::{GetFuture, RowFuture, RowStream, CommitFuture}` | Async results (feature `async`, default on). |
 | `ValueFilter`, `Condition` | Value predicate; `commit_if` condition. |
 | `CellRef<'a>`, `Cell`, `Row`, `RowRef<'a>`, `CellEntry<'a>`, `Value<'a>` | Borrowed and owned results. |
 | `Error`, `ErrorCode`, `Result<T>` | Errors. |
@@ -214,10 +216,22 @@ Cells within a row: ordered by family (creation order, or the order the read lis
 ## Error codes (`ErrorCode`, `#[non_exhaustive]`, `repr(u32)`)
 `Io`=1 `Corruption`=2 `WriterLocked`=3 `ShmVersionMismatch`=4 `ShmUnavailable`=5 `UnsupportedFormat`=6 `NetworkFilesystem`=7 `TableNotFound`=8 `TableExists`=9 `FamilyNotFound`=10 `FamilyExists`=11 `UnknownMergeOperator`=12 `MergeFailed`=13 `Conflict`=14 `ReadOnly`=15 `KeyTooLarge`=16 `ValueTooLarge`=17 `NoSpace`=18 `InvalidArgument`=19 `Unsupported`=20 `Closed`=21 `NoReaderSlot`=22 `RecordTooLarge`=23 `Busy`=24 `SnapshotExpired`=25 `WouldDeadlock`=26 `BatchTooLarge`=27. Causes and fixes: [`errors.md`](errors.md). `Error::code()`, `Error::message()`.
 
-## Not yet available
-| Feature | Phase |
+## Async (feature `async`, default on; module `nonblocking`)
+Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [`async.md`](async.md).
+
+| Signature | Semantics |
 |---|---|
-| `get_async`, `Scan::stream`, `commit_async`, `commit_with_ticket` (module `nonblocking`, feature `async`) | P3 |
+| `Table::get_async(&self, row, family, qualifier) -> GetFuture` / `get_at_async(&self, &Snapshot, ..)` | `Output = Result<Option<Cell>>`. Also on `ReadTable`. Read point taken on first poll; cache hits ready on first poll. |
+| `RowRead::read_async(self) -> RowFuture` | `Output = Result<Option<Row>>`. |
+| `Scan::stream(self) -> RowStream<'t>` | `futures_core::Stream<Item = Result<Row>>`, key order; setup error is the first item. Fetches the next step's blocks only as polled. |
+| `RowMutation::commit_async(self) -> CommitFuture` | `Output = Result<CommitInfo>`. Submitted at the call; resolves when durable and visible. |
+| `WriteBatch::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | As above. |
+| `Transaction::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | `Conflict` on a conflicting commit. |
+| `WriteBatch::commit_with_ticket(self, Durability) -> Result<CommitTicket>` | No feature needed. `CommitTicket`: `wait(self)`, `try_result(&mut self) -> Option<Result<CommitInfo>>`, `seqno(&mut self) -> Option<u64>`; `IntoFuture` with `async`. |
+| `Pigeonhole::async_sync_reads(&self) -> u64` (also `PigeonholeReader`) | Reads an async call did synchronously (oversized blob, uncacheable block, unpredicted scan block; #398). |
+
+Dropping a read future or stream: always safe. Dropping a commit future or ticket: the commit still lands or fails atomically.
+Not async yet (next async release): `RowMutation::commit_if`, `Transaction::get`, `flush`, `compact`. Sync-only by design (D196): `backup`, `shrink` (long-running; run on your executor's blocking pool), and open, close, table create/open/drop (short).
 
 ## Recipes
 ### 1. Open, create table, write, read

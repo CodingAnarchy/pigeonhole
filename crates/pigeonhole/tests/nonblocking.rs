@@ -675,3 +675,25 @@ fn dropping_a_scan_stream_mid_io_is_safe() {
     assert_eq!(t.scan_prefix(b"r").iter().unwrap().count(), 500);
     db.close().unwrap();
 }
+
+/// Multi-threaded executors (Tokio's `spawn`) need `Send` futures; a scan stream borrows its
+/// table, so it is `Send` whenever the borrow is.
+#[test]
+fn futures_and_streams_are_send() {
+    fn send<T: Send>(_: &T) {}
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("send.phdb"), Options::default()).unwrap();
+    let t = table(&db);
+    send(&t.get_async(b"r", "f", b"q"));
+    send(&t.row(b"r").read_async());
+    send(&t.scan_prefix(b"r").stream());
+    send(&t.mutate(b"r").put("f", b"q", b"v").commit_async());
+    let mut wb = db.write_batch();
+    wb.put(&t, b"r", "f", b"q", b"v");
+    send(
+        &wb.commit_with_ticket(Durability::Sync)
+            .unwrap()
+            .into_future(),
+    );
+    db.close().unwrap();
+}

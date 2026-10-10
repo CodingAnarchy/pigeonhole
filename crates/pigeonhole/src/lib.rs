@@ -75,8 +75,10 @@
 //!
 //! # Sync and async
 //!
-//! Phase 1 ships the blocking API, which needs no async runtime. The async front door
-//! (Phase 3) lives behind the `async` feature in the `nonblocking` module.
+//! Every data operation has a blocking form, which needs no async runtime, and an async
+//! form with the same semantics over the same engine (the [`nonblocking`] module, behind
+//! the default-on `async` feature). `backup`, `shrink`, open, close and schema calls are
+//! blocking only (D196).
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
@@ -109,6 +111,9 @@ mod guide {
     struct AgentReference;
     #[doc = include_str!("../../../docs/guide/concepts.md")]
     struct Concepts;
+    #[cfg(feature = "async")]
+    #[doc = include_str!("../../../docs/guide/async.md")]
+    struct Async;
     #[doc = include_str!("../README.md")]
     struct CrateReadme;
     #[doc = include_str!("../../../README.md")]

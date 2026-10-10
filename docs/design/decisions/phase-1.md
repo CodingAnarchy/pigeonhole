@@ -542,6 +542,10 @@ Checked against the spec's "Language scope":
   can export one mutation vocabulary.
 - Errors are `#[repr(u32)]` codes plus a message; merge operators are identified by name in
   the file.
+- `CommitTicket` (D196) is the exportable form of "submit now, learn the outcome later": an
+  owned handle with `wait`, `try_result` and `seqno`, available without the `async` feature.
+  The async futures and `RowStream` are Rust-only; a C ABI uses the ticket and the cursor
+  forms instead.
 - Two frozen signatures take Rust-only types by nature: `Shard::set_wakeup(Box<dyn Fn>)` (a
   C ABI wraps a function pointer and context in the box) and
   `Options::merge_operator(Arc<dyn MergeOperator>)` (a C ABI would provide a vtable struct).
