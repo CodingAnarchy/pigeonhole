@@ -1127,7 +1127,7 @@ enum MemberKind {
 /// commit, so a second one in flight keeps the device busy.
 const GROUP_SYNC_DEPTH: u32 = if cfg!(target_os = "macos") { 1 } else { 2 };
 
-/// [`GROUP_SYNC_DEPTH`], or `PIGEONHOLE_GROUP_SYNC_DEPTH` (a measurement variable, as
+/// `GROUP_SYNC_DEPTH`, or `PIGEONHOLE_GROUP_SYNC_DEPTH` (a measurement variable, as
 /// `PIGEONHOLE_IO`: `0` is unlimited, as before D207), read once per process.
 pub fn group_sync_depth() -> u32 {
     static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
