@@ -243,3 +243,22 @@ An entry holds only the newest visible version of each cell of one family row, c
 Measured on Linux callgrind (hot-row states, ycsb-c and ycsb-a, the write shapes with the cache on) and on the gate machine's wall clock. The default stays off unless a hit clearly beats the D199 index's miss path and ycsb-a isn't made worse. If it never pays off, `Options::row_cache` is removed rather than kept as a no-op (owner decision).
 
 The internal interface change is ICR 0019.
+
+<a id="d202"></a>
+## D202 — Application-owned io_uring loops wait on a completion fd: a deferred-taskrun ring signals its registered eventfd before its owner reaps, and the fd is an opt-in (coordinator decision, 2026-10-10; io, pigeonhole, #408)
+**The fd.** Each io_uring thread ring registers a `notify` eventfd (`IORING_REGISTER_EVENTFD`), signalled on every completion and drained by each reap. It is exposed as `pigeonhole_io::own_io_fd` and `Shard::io_fd`, so an application-owned loop can wait in its own `poll`/`epoll` instead of polling.
+
+**The DEFER_TASKRUN question, settled on CI.**
+- Thread rings are `SINGLE_ISSUER | DEFER_TASKRUN | TASKRUN_FLAG`: their completion work runs only when the owner enters the ring. If the kernel signalled the eventfd only once that work ran, a loop waiting on the fd would sleep through its own I/O.
+- It does signal earlier: on the Linux CI kernel, `the_completion_fd_turns_readable_before_any_reap` (#442) turned the fd readable in `poll()` with no reap.
+- So application-owned rings keep `DEFER_TASKRUN`. The fallback, dropping it while keeping `SINGLE_ISSUER`, was not needed.
+
+**The fd is an opt-in.**
+- `Shard::next_wakeup` treats a thread's in-flight I/O as due now (`Some(0)`, #402) until the application has taken the descriptor (`Shard::io_fd` returned `Some`). Only then does it report background deadlines alone.
+- A loop that never asks for the fd keeps the old behavior. #442's first CI run showed why this matters: the `open_application_owned` doctest's loop parks for `next_wakeup` and never polls the fd, and it hung.
+
+**No reaper in application-owned mode (#443).** The shared ring, for threads without a ring of their own, has no reaper thread there:
+- Each driving thread's ring polls the shared ring's eventfd, so client completions also turn its fd readable.
+- A blocked wait reaps the shared ring itself.
+- **The limitation:** a client thread's *async* I/O (an executor's `get_async`) then completes promptly only if the driving loop waits on `io_fd`. Otherwise it completes at the loop's next timed turn. Documented in the async guide.
+

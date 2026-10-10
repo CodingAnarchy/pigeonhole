@@ -32,6 +32,11 @@ pub(crate) trait OwnIo: Send + Sync {
     fn waker_here(&self) -> Option<OwnIoWaker> {
         None
     }
+    /// A descriptor that turns readable when the calling thread has completions to reap
+    /// (#408), if the backend has one.
+    fn fd_here(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// Interrupts its thread's wait in [`reap_own_io`] (an io_uring ring's wait for completions,
@@ -112,4 +117,13 @@ pub fn reap_own_io(wait: Option<Duration>) -> bool {
 /// scheduler then parks the thread as usual).
 pub fn own_io_waker() -> Option<OwnIoWaker> {
     backends().iter().find_map(|b| b.waker_here())
+}
+
+/// A file descriptor that turns readable when the calling thread has completions to reap
+/// (an io_uring ring's registered eventfd, #408), for a thread that waits in its own event
+/// loop (`poll`, `epoll`) rather than in [`reap_own_io`]: wait until it is readable, then
+/// reap. Reaping resets it. `None` when the thread's backends offer no such descriptor (the
+/// thread then has to reap again soon while [`own_io_in_flight`] says it has I/O in flight).
+pub fn own_io_fd() -> Option<i32> {
+    backends().iter().find_map(|b| b.fd_here())
 }

@@ -864,6 +864,10 @@ struct ThreadRing {
     /// The backend ([`RingHandle::id`]) the ring belongs to.
     backend: usize,
     wake: Arc<EventFd>,
+    /// Registered with the ring (`IORING_REGISTER_EVENTFD`): signalled on each completion,
+    /// for a thread that waits on it in its own event loop ([`crate::own_io_fd`], #408).
+    /// `None` if the kernel refused the registration.
+    notify: Option<EventFd>,
 }
 
 /// An eventfd, closed on drop.
@@ -951,6 +955,12 @@ impl ThreadRing {
         if !probe.is_supported(opcode::PollAdd::CODE) {
             return None;
         }
+        // Signalled on each completion, for an application's own event loop (#408). Kept off
+        // `wake`, which the ring itself polls: a registered eventfd the ring also polled
+        // would signal itself with every poll completion.
+        let notify = EventFd::new()
+            .ok()
+            .filter(|e| uring.submitter().register_eventfd(e.raw()).is_ok());
         let ring = Arc::new(Self {
             uring,
             counted: Counted::new(counts),
@@ -959,6 +969,7 @@ impl ThreadRing {
             owner: thread::current().id(),
             backend,
             wake: Arc::new(EventFd::new().ok()?),
+            notify,
         });
         ring.arm_wake().ok()?;
         Some(ring)
@@ -1034,6 +1045,10 @@ impl ThreadRing {
     /// do not wait). Returns whether an operation completed.
     fn reap(&self, wait: Option<Duration>) -> bool {
         debug_assert_eq!(thread::current().id(), self.owner);
+        // Reset before taking completions: one that finishes after this signals it again.
+        if let Some(notify) = &self.notify {
+            notify.drain();
+        }
         let entered = match wait {
             Some(t) if lock(&self.table).live > 0 || !t.is_zero() => {
                 let ts = types::Timespec::new()
@@ -1120,6 +1135,12 @@ impl crate::own::OwnIo for ThreadRing {
         }
         let wake = Arc::clone(&self.wake);
         Some(crate::OwnIoWaker(Arc::new(move || wake.signal())))
+    }
+
+    fn fd_here(&self) -> Option<i32> {
+        (thread::current().id() == self.owner)
+            .then(|| self.notify.as_ref().map(EventFd::raw))
+            .flatten()
     }
 }
 
