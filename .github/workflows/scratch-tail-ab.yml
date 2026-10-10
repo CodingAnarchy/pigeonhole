@@ -1,0 +1,25 @@
+name: scratch tail-index A/B
+on:
+  push:
+    branches: [scratch/tail-index-ab]
+permissions:
+  contents: read
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - run: cargo build --release -p pigeonhole-bench --example hotrow --example readshapes --example writepath --example ycsb
+      - name: every shape with the D194 index off, then on
+        shell: bash
+        run: |
+          set -euo pipefail
+          T=target/release/examples
+          for mode in 0 1; do
+            PIGEONHOLE_EXPERIMENTAL_TAIL_INDEX=$mode scripts/instructions-per-cell.sh $T/hotrow $T/readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans $T/writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,flush,compact $T/ycsb:ycsb-c,ycsb-a > mode$mode.txt
+          done
+          paste mode0.txt mode1.txt | awk '{ printf "| %s | %s | %s | %+.2f%% |\n", $1, $2, $4, 100 * ($4 - $2) / $2 }' | tee -a "$GITHUB_STEP_SUMMARY"
