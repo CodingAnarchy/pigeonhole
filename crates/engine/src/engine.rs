@@ -288,11 +288,14 @@ fn arena_chunk_size(arena_len: usize, placed_slots: usize) -> usize {
     chunk.max(1024) & !63
 }
 
-fn block_cache(bytes: usize, shards: usize) -> Arc<BlockCache> {
+fn block_cache(bytes: usize, _shards: usize) -> Arc<BlockCache> {
     Arc::new(if bytes == 0 {
         BlockCache::disabled()
     } else {
-        BlockCache::new(bytes, shards.clamp(1, 64))
+        // The cache's own default (up to 64 shards of at least 256 KiB), not one per engine
+        // shard: every reader thread reads through it, so one engine shard meant one lock
+        // for all of them (#18).
+        BlockCache::new(bytes, 0)
     })
 }
 
