@@ -33,6 +33,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |
 | `--no-tablet-changes` | Pigeonhole: keep each table one tablet on one shard (`Options::tablet_changes(false)`; by default tablets split, merge and move between shards, so one table's writes spread over every shard) |
+| `--row-cache B` | Pigeonhole: a row cache of B bytes (`Options::row_cache`, D201; off by default). The gate window (#405) runs `ycsb-c` and `ycsb-a` with it on to decide its default |
 | `--json PATH`, `--markdown PATH` | Write results |
 | `--tolerance T` | `compare`: ±T on throughput and p50, ±2T on p99 (default 0.20) |
 

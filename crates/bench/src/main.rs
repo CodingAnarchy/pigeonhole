@@ -63,6 +63,7 @@ OPTIONS:
     --sync                 fsync every commit on every engine [default: buffered]
     --no-tablet-changes    Pigeonhole: keep each table one tablet on one shard (tablets
                            split, merge and move between shards by default)
+    --row-cache B          Pigeonhole: row cache bytes (D201) [default: 0, off]
     --dir DIR              where stores are created [default: system temp dir]
     --json PATH            write results as JSON
     --markdown PATH        write the markdown summary
@@ -87,6 +88,7 @@ struct Args {
     cache: Option<u64>,
     sync: bool,
     no_tablet_changes: bool,
+    row_cache: Option<u64>,
     dir: Option<PathBuf>,
     json: Option<PathBuf>,
     markdown: Option<PathBuf>,
@@ -125,6 +127,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
             "--sync" => a.sync = true,
             "--no-tablet-changes" => a.no_tablet_changes = true,
+            "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
             "--tablet-changes" => a.no_tablet_changes = false,
             "--dir" => a.dir = Some(parse(&arg, it.next())?),
@@ -186,7 +189,8 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     let mut r = PigeonholeRunner::default()
         .sync(a.sync)
         .memory(memory(a))
-        .tablet_changes(!a.no_tablet_changes);
+        .tablet_changes(!a.no_tablet_changes)
+        .row_cache(a.row_cache.unwrap_or(0));
     if let Some(n) = shards.or(a.shards) {
         r = r.shards(n);
     }
@@ -437,6 +441,14 @@ mod tests {
         assert!(args("scaling --no-tablet-changes").no_tablet_changes);
         assert_eq!(args("all --engine all").engines.len(), 4);
         assert_eq!(args("").command, "help");
+        let rc = args("ycsb-c --row-cache 1048576");
+        assert_eq!(rc.row_cache, Some(1 << 20));
+        assert!(pigeonhole(&rc, None).describe().contains(" rowcache=1MiB"));
+        assert!(
+            !pigeonhole(&args("ycsb-c"), None)
+                .describe()
+                .contains("rowcache")
+        );
         assert!(parse_args(["--bogus".to_owned()]).is_err());
         assert!(parse_args(["--records".to_owned()]).is_err());
         let c = config(&args("x --scale smoke"), WorkloadKind::YcsbC).unwrap();
