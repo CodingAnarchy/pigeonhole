@@ -281,6 +281,19 @@ impl Vfs for UringVfs {
         self.files.sync_dir(dir)
     }
 
+    fn submit_sync_dir(&self, dir: &Path) -> Completion<()> {
+        // An `fsync` of the directory's descriptor, through the ring (ICR 0021); the
+        // operation keeps the descriptor open until it completes.
+        match self.files.open_file(dir, OpenOptions::read()) {
+            Ok(file) => UringFile {
+                file,
+                ring: Arc::clone(&self.ring),
+            }
+            .submit_sync_all(),
+            Err(_) => Completion::ready(self.files.sync_dir(dir)),
+        }
+    }
+
     fn open_shared(
         &self,
         name: &str,

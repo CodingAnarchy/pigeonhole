@@ -700,6 +700,14 @@ impl Vfs for PreadVfs {
         os::sync_dir(dir)
     }
 
+    fn submit_sync_dir(&self, dir: &Path) -> Completion<()> {
+        let (done, resolver) = Completion::pair();
+        let dir = dir.to_path_buf();
+        self.pool
+            .submit(Box::new(move || resolver.resolve(os::sync_dir(&dir))));
+        done
+    }
+
     fn open_shared(
         &self,
         name: &str,

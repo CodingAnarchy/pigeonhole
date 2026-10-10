@@ -13,7 +13,7 @@ use pigeonhole_format::wal::{
 use pigeonhole_format::{Durability, FormatVersion, Lsn, StreamId};
 use pigeonhole_io::{Completion, FileRef, OpenOptions, VfsRef};
 
-use crate::{CommitTicket, Error, Result, Wal, WalOptions, stream_path, sync_parent};
+use crate::{CommitTicket, Error, Result, Wal, WalOptions, parent_dir, stream_path, sync_parent};
 
 /// Frame size as a file offset.
 pub(crate) const FRAME: u64 = FRAME_SIZE as u64;
@@ -662,6 +662,22 @@ impl SpareSegments {
     }
 }
 
+/// `n` completions that each resolve with `c`'s outcome (one sync whose result several
+/// streams' orderings wait for).
+fn fan_out(c: Completion<()>, n: usize) -> Vec<Completion<()>> {
+    let (done, resolvers): (Vec<_>, Vec<_>) = (0..n).map(|_| Completion::pair()).unzip();
+    drop(c.map(move |r| {
+        for resolver in resolvers {
+            resolver.resolve(match &r {
+                Ok(()) => Ok(()),
+                Err(e) => Err(pigeonhole_io::Error::new(e.kind, "directory sync failed")),
+            });
+        }
+        r
+    }));
+    done
+}
+
 /// The sidecar-file implementation: one file per stream, made of preallocated segments that
 /// are recycled after checkpoint.
 ///
@@ -827,25 +843,38 @@ impl WalStream {
         db_id: [u8; 16],
         opts: WalOptions,
     ) -> Result<Vec<WalStream>> {
-        // Every header first, then every sync submitted before any is waited for: on a real
-        // filesystem they overlap.
+        // Every header first, then every sync submitted, and none waited for (#158, D203): the
+        // streams' files and their directory entries are made durable in the background, and
+        // each sync takes a ticket in its stream's ordering, so the stream's first durable
+        // sync (a group commit) counts only once they have finished, and a failed one poisons
+        // the stream. A read never needs them.
         let mut created = Vec::with_capacity(streams.len());
         for &s in streams {
             let mut w = Self::create_unsynced(vfs, db_path, s, db_id, opts)?;
             let lsn = w.begin_open_segment(0, 0)?;
             created.push((w, lsn));
         }
-        let syncs: Vec<_> = created
-            .iter()
-            .map(|(w, _)| w.shared.submit_durable(|| w.file.submit_sync_all()))
-            .collect();
+        let dir_synced = match created.first() {
+            Some((w, _)) => fan_out(vfs.submit_sync_dir(parent_dir(&w.path)), created.len()),
+            None => Vec::new(),
+        };
         let mut out = Vec::with_capacity(created.len());
-        for ((w, lsn), sync) in created.into_iter().zip(syncs) {
-            w.finish_open_segment(lsn, sync.wait().map_err(Error::from))?;
+        for ((w, lsn), dir_synced) in created.into_iter().zip(dir_synced) {
+            let shared = Arc::clone(&w.shared);
+            // The file's own sync covers its header and length: then the segment start is
+            // durable.
+            drop(
+                w.shared
+                    .submit_durable(|| w.file.submit_sync_all())
+                    .map(move |r| {
+                        if r.is_ok() {
+                            shared.durable.fetch_max(lsn.0, Ordering::Release);
+                        }
+                        r
+                    }),
+            );
+            drop(w.shared.submit_durable(move || dir_synced));
             out.push(w);
-        }
-        if let Some(s) = out.first() {
-            sync_parent(&s.vfs, &s.path)?;
         }
         Ok(out)
     }

@@ -269,7 +269,16 @@ impl OpenedPager {
         // The allocator is sized from the length the page cache shows, which a process that
         // died between a growth's `fallocate` and its `sync_all` left longer than the disk's.
         // Make it durable before handing out that tail: root commits sync with `sync_data`.
-        if self.writable {
+        // Skipped when the file is exactly as long as the last committed root recorded and
+        // that root came from a clean close (#158, D203): that length was made durable by the
+        // growth or truncation that set it (each syncs before it is used) or by an earlier
+        // open. A length that differs either way (a growth or a truncation interrupted by a
+        // crash) is synced as before. A clean flag left stale by a crash in a session that
+        // committed nothing is harmless here: such a session neither grew nor truncated
+        // durably past the recorded length without the length differing.
+        let recorded = self.superblock.file_pages * PAGE_SIZE as u64;
+        let settled = self.clean_shutdown() && self.file.len()? == recorded;
+        if self.writable && !settled {
             self.file.sync_all()?;
         }
         let frontier = self.file.len()?.div_ceil(UNIT_BYTES);
