@@ -111,10 +111,20 @@ pub(crate) struct TabletLoad {
     prev_writes: u64,
     /// Rows seen by the reservoir this interval.
     seen: u64,
-    /// A uniform sample of the rows written this interval.
+    /// A uniform sample of the rows written this interval: the first `sampled`. Buffers past
+    /// it are earlier intervals' rows, kept for reuse so a new interval's samples do not
+    /// allocate (#320).
     samples: Vec<Vec<u8>>,
+    sampled: usize,
     /// Moving average of `writes` over intervals (`LOAD_ALPHA`).
     ewma: f64,
+}
+
+impl TabletLoad {
+    /// This interval's row samples.
+    fn live_samples(&self) -> &[Vec<u8>] {
+        &self.samples[..self.sampled]
+    }
 }
 
 /// The balancer settings, copied from `EngineOptions` at open.
@@ -948,8 +958,15 @@ impl ShardState {
         let l = self.loads.entry(tablet).or_default();
         l.writes += 1;
         l.seen += 1;
-        if l.samples.len() < SAMPLES {
-            l.samples.push(row.to_vec());
+        if l.sampled < SAMPLES {
+            match l.samples.get_mut(l.sampled) {
+                Some(s) => {
+                    s.clear();
+                    s.extend_from_slice(row);
+                }
+                None => l.samples.push(row.to_vec()),
+            }
+            l.sampled += 1;
         } else {
             let j = (r % l.seen) as usize;
             if j < SAMPLES {
@@ -1064,7 +1081,7 @@ impl ShardState {
             l.prev_writes = l.writes;
             l.writes = 0;
             l.seen = 0;
-            l.samples.clear();
+            l.sampled = 0;
         }
         let decision_none = decision.is_none();
         match decision {
@@ -1499,7 +1516,7 @@ impl ShardState {
             return Vec::new();
         };
         let mut rows: Vec<&[u8]> = load
-            .samples
+            .live_samples()
             .iter()
             .map(Vec::as_slice)
             .filter(|r| inside(t, r))
@@ -1524,7 +1541,7 @@ impl ShardState {
             }
         }
         if let Some(l) = self.loads.get(&t.id) {
-            rows.extend(l.samples.iter().cloned());
+            rows.extend(l.live_samples().iter().cloned());
         }
         let mut rows: Vec<&[u8]> = rows
             .iter()

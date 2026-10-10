@@ -929,6 +929,7 @@ name = "pigeonhole-runtime"
 version = "0.2.0"
 dependencies = [
  "criterion",
+ "loom",
  "pigeonhole-io",
  "pigeonhole-sim",
  "proptest",

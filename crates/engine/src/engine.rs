@@ -2453,7 +2453,7 @@ impl Inner {
             }
         }
         let submitted_at = self.shared.vfs.monotonic_nanos();
-        let (tx, waiter) = completion();
+        let (tx, waiter) = crate::write::commit_completion();
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::commit_succeeded);
         }
@@ -3222,7 +3222,7 @@ impl EngineShard {
         }
         let (builder, large) = engine.separate_large(builder)?;
         let submitted_at = engine.shared.vfs.monotonic_nanos();
-        let (tx, waiter) = completion();
+        let (tx, waiter) = crate::write::commit_completion();
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::commit_succeeded);
         }
