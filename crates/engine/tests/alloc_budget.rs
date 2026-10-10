@@ -478,6 +478,8 @@ fn commits(out: &mut Vec<Row>) {
 }
 
 /// A put above the inline limit (192 KiB here): separated into a blob file as it commits.
+/// Its allocation count includes `SimVfs`'s one copy per write (about 38 allocations and
+/// 1 MB per put; a real file makes none).
 fn large_put(out: &mut Vec<Row>) -> f64 {
     let mut rig = Rig::open("large");
     let value = vec![1u8; 1 << 20];
@@ -575,6 +577,10 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("commit, 1 cell", "commit", 5.0),
     ("commit, 16 cells", "commit", 4.0),
     ("commit, 16 cells, 8 per group", "commit", 7.0),
+    // Includes SimVfs's copy of every write, kept for crash simulation: about 38 allocations
+    // and 1 MB per put that a real file does not make (#499). Most of the rest is the
+    // manifest commit a separated put makes before its WAL record (D16).
+    ("commit, one 1 MiB put (separated)", "commit", 130.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];
