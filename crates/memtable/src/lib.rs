@@ -885,8 +885,16 @@ impl Memtable {
         let height = mem.read_u8(off + layout::N_HEIGHT) as usize;
         let key_len = mem.read_u32(off + layout::N_KEY_LEN) as usize;
         let column = key.len() - SUFFIX_LEN;
-        key_len == key.len()
-            && mem.cmp(off + layout::N_TOWER + 4 * height, column, &key[..column]) == Cmp::Equal
+        if key_len != key.len() {
+            return false;
+        }
+        let start = off + layout::N_TOWER + 4 * height;
+        // Neighbouring rows usually differ near the end of the row (sequential ids, time
+        // keys), past a long shared prefix: the column's last word settles most misses.
+        if column >= 8 && mem.cmp(start + column - 8, 8, &key[column - 8..column]) != Cmp::Equal {
+            return false;
+        }
+        mem.cmp(start, column, &key[..column]) == Cmp::Equal
     }
 
     /// A geometric height with ratio 1/4, from a private xorshift generator.
