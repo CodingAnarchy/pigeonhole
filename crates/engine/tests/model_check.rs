@@ -112,6 +112,39 @@ fn harness_regressions_from_the_seed_sweep() {
     for seed in [114, 274] {
         check(seed, &read_error_txn_config());
     }
+    // Seeds 99, 132 and 164 with deferred I/O (#454's first sweep): an open left its new
+    // stream files' directory sync in flight (D203), a process crash dropped it, the next
+    // open adopted the files and acknowledged commits in them, and a power loss then took
+    // the files' names. Recovery now syncs an adopted stream's directory entry.
+    for shards in 1..=8 {
+        let mut cfg = Config::standard(250);
+        cfg.shards = shards;
+        cfg.deferred_io = true;
+        for seed in [132, 164] {
+            check(seed, &cfg);
+        }
+    }
+    for level in [
+        Durability::None,
+        Durability::Buffered,
+        Durability::GroupSync,
+        Durability::Sync,
+    ] {
+        let mut cfg = Config::standard(200);
+        cfg.durability = Some(level);
+        cfg.crash_ppm = 40_000;
+        cfg.mid_commit_crash_ppm = 60_000;
+        cfg.shards = 3;
+        cfg.deferred_io = true;
+        for seed in [99, 132] {
+            check(seed, &cfg);
+        }
+    }
+    // Seed 213 with deferred I/O (#454's second sweep): closing after the last reopen, a
+    // shard's final sync waited, inside the harness's own turn, for cross-shard barrier
+    // syncs that only the harness completes. The simulator's device now runs for the
+    // harness thread's blocked waits (ICR 0028).
+    identical_across_shard_counts_under_faults(213, Some(true));
 }
 
 /// Transactions under frequent injected read errors, no crash armed.
@@ -484,20 +517,29 @@ fn results_are_identical_across_shard_counts_under_faults() {
     // commit survives only if a stronger commit on its own stream writes it or a flush
     // persists it, which depends on the shard count (decision #50).
     for seed in seeds() {
-        let mut cfg = Config::standard(250);
-        deterministic_compactions(&mut cfg);
-        cfg.crash_every = Some(60);
-        cfg.durability = Some(Durability::Buffered);
-        cfg.shards = 1;
-        let reference = final_dump(seed, &cfg);
-        for shards in [2, 3, 5, 8] {
-            cfg.shards = shards;
-            let dump = final_dump(seed, &cfg);
-            assert_eq!(
-                dump, reference,
-                "seed {seed}: {shards} shards differ from 1 shard"
-            );
-        }
+        identical_across_shard_counts_under_faults(seed, None);
+    }
+}
+
+/// [`results_are_identical_across_shard_counts_under_faults`] for one seed, with deferred I/O
+/// forced on or off (`None`: as `PIGEONHOLE_DEFERRED_IO` says).
+fn identical_across_shard_counts_under_faults(seed: u64, deferred_io: Option<bool>) {
+    let mut cfg = Config::standard(250);
+    deterministic_compactions(&mut cfg);
+    cfg.crash_every = Some(60);
+    cfg.durability = Some(Durability::Buffered);
+    if let Some(on) = deferred_io {
+        cfg.deferred_io = on;
+    }
+    cfg.shards = 1;
+    let reference = final_dump(seed, &cfg);
+    for shards in [2, 3, 5, 8] {
+        cfg.shards = shards;
+        let dump = final_dump(seed, &cfg);
+        assert_eq!(
+            dump, reference,
+            "seed {seed}: {shards} shards differ from 1 shard"
+        );
     }
 }
 

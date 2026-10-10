@@ -372,10 +372,14 @@ pub fn discover_streams(vfs: &VfsRef, db_path: &Path) -> Result<Vec<StreamId>> {
 
 /// Syncs the directory holding `path` (after creating or removing a stream file).
 fn sync_parent(vfs: &VfsRef, path: &Path) -> Result<()> {
-    let dir = match path.parent() {
+    vfs.sync_dir(parent_dir(path))?;
+    Ok(())
+}
+
+/// The directory holding `path` (`.` for a bare file name).
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
-    };
-    vfs.sync_dir(dir)?;
-    Ok(())
+    }
 }

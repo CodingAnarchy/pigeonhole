@@ -13,7 +13,7 @@ use pigeonhole_format::wal::{
 use pigeonhole_format::{Durability, FormatVersion, Lsn, StreamId};
 use pigeonhole_io::{Completion, FileRef, OpenOptions, VfsRef};
 
-use crate::{CommitTicket, Error, Result, Wal, WalOptions, stream_path, sync_parent};
+use crate::{CommitTicket, Error, Result, Wal, WalOptions, parent_dir, stream_path, sync_parent};
 
 /// Frame size as a file offset.
 pub(crate) const FRAME: u64 = FRAME_SIZE as u64;
@@ -138,6 +138,9 @@ struct Shared {
     syncs: Mutex<Syncs>,
     /// Signalled whenever a sync finishes.
     sync_done: Condvar,
+    /// The open-time syncs still in flight (a new stream's file and directory syncs, #158):
+    /// a blocking wait drives them first (see [`Shared::drive_open_io`]).
+    open_io: Mutex<Vec<Completion<()>>>,
 }
 
 /// Told, once a durable sync settles, whether the stream is still unpoisoned.
@@ -389,6 +392,18 @@ impl Shared {
         self.syncs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Waits for the open-time syncs still in flight, making progress on their I/O as a
+    /// blocking wait on each does. The waits below sleep on the ordering's condvar, where
+    /// I/O that only a waiter completes (the simulator's deferred device, #158) never would.
+    /// Their outcome reaches the ordering on its own (a failure poisons the stream).
+    fn drive_open_io(&self) {
+        let pending =
+            std::mem::take(&mut *self.open_io.lock().unwrap_or_else(PoisonError::into_inner));
+        for c in pending {
+            let _ = c.wait();
+        }
+    }
+
     /// Registers a sync about to be issued.
     fn start_sync(&self) -> u64 {
         let mut syncs = self.syncs();
@@ -435,6 +450,7 @@ impl Shared {
     /// after every sync started before it finished, and only if none failed.
     fn durable_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
         crate::foreground::may_block("a blocking WAL sync");
+        self.drive_open_io();
         let ticket = self.start_sync();
         let r = sync();
         let (ready, barrier) = {
@@ -800,8 +816,10 @@ impl WalStream {
     }
 
     /// [`WalStream::create`] for several streams, one after the other, with one directory
-    /// sync for all of them at the end (an open creating a stream per shard pays one rather
-    /// than one per shard, #143).
+    /// sync for all of them (an open creating a stream per shard pays one rather than one
+    /// per shard, #143). Unlike `create`, it waits for none of the syncs (#158, D203): a
+    /// stream's first durable sync counts only once its file's and the directory's have
+    /// finished, and a blocking sync waits for them.
     ///
     /// ```
     /// use std::path::Path;
@@ -827,25 +845,52 @@ impl WalStream {
         db_id: [u8; 16],
         opts: WalOptions,
     ) -> Result<Vec<WalStream>> {
-        // Every header first, then every sync submitted before any is waited for: on a real
-        // filesystem they overlap.
+        // Every header first, then every sync submitted, and none waited for (#158, D203): the
+        // streams' files and their directory entries are made durable in the background, and
+        // each sync takes a ticket in its stream's ordering, so the stream's first durable
+        // sync (a group commit) counts only once they have finished, and a failed one poisons
+        // the stream. A read never needs them.
         let mut created = Vec::with_capacity(streams.len());
         for &s in streams {
             let mut w = Self::create_unsynced(vfs, db_path, s, db_id, opts)?;
             let lsn = w.begin_open_segment(0, 0)?;
             created.push((w, lsn));
         }
-        let syncs: Vec<_> = created
-            .iter()
-            .map(|(w, _)| w.shared.submit_durable(|| w.file.submit_sync_all()))
-            .collect();
-        let mut out = Vec::with_capacity(created.len());
-        for ((w, lsn), sync) in created.into_iter().zip(syncs) {
-            w.finish_open_segment(lsn, sync.wait().map_err(Error::from))?;
-            out.push(w);
+        // One directory sync covers every new file. Each sync goes to its stream's ordering,
+        // and a second handle on it to `open_io`, so a blocking wait drives it.
+        let n = created.len();
+        let mut dir_synced = match created.first() {
+            Some((w, _)) => vfs.submit_sync_dir(parent_dir(&w.path)).fan_out(2 * n),
+            None => Vec::new(),
         }
-        if let Some(s) = out.first() {
-            sync_parent(&s.vfs, &s.path)?;
+        .into_iter();
+        let mut out = Vec::with_capacity(n);
+        for (w, lsn) in created {
+            let mut file_synced = w.file.submit_sync_all().fan_out(2).into_iter();
+            let (Some(file), Some(file_drive), Some(dir), Some(dir_drive)) = (
+                file_synced.next(),
+                file_synced.next(),
+                dir_synced.next(),
+                dir_synced.next(),
+            ) else {
+                unreachable!("two handles per stream");
+            };
+            let shared = Arc::clone(&w.shared);
+            // The file's own sync covers its header and length: then the segment start is
+            // durable.
+            drop(w.shared.submit_durable(move || file).map(move |r| {
+                if r.is_ok() {
+                    shared.durable.fetch_max(lsn.0, Ordering::Release);
+                }
+                r
+            }));
+            drop(w.shared.submit_durable(move || dir));
+            w.shared
+                .open_io
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend([file_drive, dir_drive]);
+            out.push(w);
         }
         Ok(out)
     }
@@ -925,6 +970,7 @@ impl WalStream {
                 counters: Arc::default(),
                 syncs: Mutex::new(Syncs::default()),
                 sync_done: Condvar::new(),
+                open_io: Mutex::default(),
             }),
         }
     }
@@ -1171,6 +1217,7 @@ impl WalStream {
                 .counters
                 .rollover_waits
                 .fetch_add(1, Ordering::Relaxed);
+            self.shared.drive_open_io();
             crate::foreground::exempt(|| held.synced.wait());
         }
         self.write_buf()?;
@@ -1328,6 +1375,7 @@ impl Wal for WalStream {
     fn sync(&mut self) -> Result<Lsn> {
         // Blocking by contract (tests, shutdown): a held header waits for its rollover sync.
         if let Some(held) = &self.held {
+            self.shared.drive_open_io();
             held.synced.wait();
         }
         let lsn = self.write()?;

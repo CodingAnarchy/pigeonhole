@@ -55,6 +55,13 @@ pub trait Vfs: Send + Sync + Debug {
     /// Makes directory entries (creations, removals) durable.
     fn sync_dir(&self, dir: &Path) -> Result<()>;
 
+    /// [`Vfs::sync_dir`], submitted (ICR 0021): the completion resolves once the directory's
+    /// entries are durable. The default runs `sync_dir` on the calling thread and returns a
+    /// completion already resolved; backends with I/O threads or a ring run it there.
+    fn submit_sync_dir(&self, dir: &Path) -> crate::Completion<()> {
+        crate::Completion::ready(self.sync_dir(dir))
+    }
+
     /// Opens or creates a shared-memory region named `name` of exactly `len` bytes. `dir`
     /// overrides the default memory-backed location (`/dev/shm`, POSIX `shm_open`, or a
     /// pagefile-backed mapping) with a file in that directory.

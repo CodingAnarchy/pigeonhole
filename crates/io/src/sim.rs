@@ -257,6 +257,11 @@ struct SimState {
     io_pins: HashMap<u64, u32>,
     /// Handles dropped while pinned by in-flight I/O: closed when it completes.
     closing: HashSet<u64>,
+    /// Crashes so far (a deferred file-system operation submitted before one never runs).
+    crashes: u64,
+    /// Deferred file-system operations (directory syncs) are not picked by `complete_io`
+    /// or the background device while set ([`SimVfs::hold_dir_syncs`]).
+    hold_vfs: bool,
 }
 
 /// A deferred operation: `job` runs it on its file and resolves its completion.
@@ -264,11 +269,25 @@ struct InFlight {
     id: u64,
     /// The submitting thread, in owner-reaps mode: the only one that completes it.
     owner: Option<std::thread::ThreadId>,
-    node: u64,
-    handle: u64,
-    writable: bool,
-    job: Box<dyn FnOnce(&SimFile) + Send>,
+    target: Target,
 }
+
+/// What a deferred operation runs on.
+enum Target {
+    /// A file's operation, run on a handle the operation pins open.
+    File {
+        node: u64,
+        handle: u64,
+        writable: bool,
+        job: Box<dyn FnOnce(&SimFile) + Send>,
+    },
+    /// A file-system operation (a directory sync, ICR 0021), told whether the simulator
+    /// crashed since it was submitted: then it never happened.
+    Vfs { crashes: u64, job: VfsJob },
+}
+
+/// A deferred file-system operation, told whether the simulator is still alive.
+type VfsJob = Box<dyn FnOnce(&SimVfs, bool) + Send>;
 
 #[derive(Default)]
 struct Node {
@@ -411,7 +430,15 @@ impl SimState {
         self.gc();
     }
 
+    /// Whether an in-flight operation may be picked by the device (not a held directory sync).
+    fn has_eligible_io(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|op| !(self.hold_vfs && matches!(op.target, Target::Vfs { .. })))
+    }
+
     fn crash(&mut self, kind: CrashKind) {
+        self.crashes += 1;
         for node in self.nodes.values_mut() {
             node.open.clear();
             node.locks.clear();
@@ -502,6 +529,8 @@ impl SimVfs {
                 io_rng: Rng(seed ^ 0x6A09_E667_F3BC_C908),
                 io_pins: HashMap::new(),
                 closing: HashSet::new(),
+                crashes: 0,
+                hold_vfs: false,
             }),
             io_submitted: Condvar::new(),
         })
@@ -605,11 +634,12 @@ impl SimVfs {
         CURRENT_PROCESS.with(|m| m.borrow_mut().insert(self.id, process));
     }
 
-    /// Defers I/O submitted from now on (`submit_read`, `submit_write`, `submit_sync_data`):
-    /// each operation stays in flight until [`SimVfs::complete_io`] (or a blocking
-    /// [`Completion::wait`] on it) runs it, so a simulated run has I/O in flight across its
-    /// scheduling points, as on a real device. Off (the default), submitted I/O completes
-    /// before `submit_*` returns. Turning it off leaves operations already in flight there.
+    /// Defers I/O submitted from now on (`submit_read`, `submit_write`, `submit_sync_data`,
+    /// `submit_sync_all`, `submit_sync_dir`): each operation stays in flight until
+    /// [`SimVfs::complete_io`] (or a blocking [`Completion::wait`] on it) runs it, so a
+    /// simulated run has I/O in flight across its scheduling points, as on a real device. Off
+    /// (the default), submitted I/O completes before `submit_*` returns. Turning it off
+    /// leaves operations already in flight there.
     ///
     /// Someone must complete deferred I/O: the scheduler (`pigeonhole-sim`'s `Sim` does it
     /// as one more task), the harness, or [`SimVfs::complete_io_in_background`] for code
@@ -688,6 +718,14 @@ impl SimVfs {
         self.state().owner_reaps = on;
     }
 
+    /// Holds deferred directory syncs ([`Vfs::submit_sync_dir`]) back while `on`: neither
+    /// [`SimVfs::complete_io`] nor the background device picks them (a thread blocked on one
+    /// still runs it). A test hook for ordering after a directory sync (#158, D203).
+    pub fn hold_dir_syncs(&self, on: bool) {
+        self.state().hold_vfs = on;
+        self.io_submitted.notify_all();
+    }
+
     /// Deferred operations in flight.
     pub fn io_in_flight(&self) -> usize {
         self.state().in_flight.len()
@@ -720,11 +758,11 @@ impl SimVfs {
                         let (st, _) = vfs
                             .io_submitted
                             .wait_timeout_while(vfs.state(), Duration::from_millis(1), |st| {
-                                st.in_flight.is_empty()
+                                !st.has_eligible_io()
                             })
                             .unwrap_or_else(PoisonError::into_inner);
                         let mut st = st;
-                        (!st.in_flight.is_empty()).then(|| st.io_rng.below(8))
+                        st.has_eligible_io().then(|| st.io_rng.below(8))
                     };
                     if let Some(yields) = yields {
                         for _ in 0..yields {
@@ -770,10 +808,54 @@ impl SimVfs {
         st.in_flight.push(InFlight {
             id,
             owner,
-            node: file.node,
-            handle: file.handle,
-            writable: file.writable,
-            job: Box::new(move |file| resolver.resolve(run(file))),
+            target: Target::File {
+                node: file.node,
+                handle: file.handle,
+                writable: file.writable,
+                job: Box::new(move |file| resolver.resolve(run(file))),
+            },
+        });
+        drop(st);
+        self.io_submitted.notify_all();
+        done
+    }
+
+    /// A deferred file-system operation (no file handle): as [`SimVfs::submit`].
+    fn submit_vfs<T: Send + 'static>(
+        &self,
+        run: impl FnOnce(&SimVfs) -> Result<T> + Send + 'static,
+    ) -> Completion<T> {
+        let mut st = self.state();
+        if !st.deferred {
+            drop(st);
+            return Completion::ready(run(self));
+        }
+        let id = st.next_io;
+        st.next_io += 1;
+        let owner = st.owner_reaps.then(|| std::thread::current().id());
+        if owner.is_some() {
+            let own: Weak<dyn crate::own::OwnIo> = self.me.clone();
+            crate::own::register(own);
+        }
+        let me = self.me.clone();
+        let (done, resolver) = Completion::driven_pair(Some(Arc::new(move || {
+            if owner.is_none_or(|o| o == std::thread::current().id())
+                && let Some(vfs) = me.upgrade()
+            {
+                vfs.complete(Some(id));
+            }
+            false
+        })));
+        let crashes = st.crashes;
+        st.in_flight.push(InFlight {
+            id,
+            owner,
+            target: Target::Vfs {
+                crashes,
+                job: Box::new(move |vfs, alive| {
+                    resolver.resolve(if alive { run(vfs) } else { Err(crashed()) });
+                }),
+            },
         });
         drop(st);
         self.io_submitted.notify_all();
@@ -787,10 +869,20 @@ impl SimVfs {
             let mut st = self.state();
             let i = match id {
                 Some(id) => st.in_flight.iter().position(|op| op.id == id),
-                None if st.in_flight.is_empty() => None,
                 None => {
-                    let n = st.in_flight.len() as u64;
-                    Some(st.io_rng.below(n) as usize)
+                    // While directory syncs are held, the device picks among the rest.
+                    let held = st.hold_vfs;
+                    let eligible: Vec<usize> = (0..st.in_flight.len())
+                        .filter(|&i| {
+                            !(held && matches!(st.in_flight[i].target, Target::Vfs { .. }))
+                        })
+                        .collect();
+                    if eligible.is_empty() {
+                        None
+                    } else {
+                        let n = eligible.len() as u64;
+                        Some(eligible[st.io_rng.below(n) as usize])
+                    }
                 }
             };
             match i {
@@ -798,22 +890,35 @@ impl SimVfs {
                 None => return false,
             }
         };
+        let (node, handle, writable, job) = match op.target {
+            Target::File {
+                node,
+                handle,
+                writable,
+                job,
+            } => (node, handle, writable, job),
+            Target::Vfs { crashes, job } => {
+                let alive = self.state().crashes == crashes;
+                job(self, alive);
+                return true;
+            }
+        };
         let file = SimFile {
             vfs: self.me.upgrade().expect("SimVfs is alive while borrowed"),
-            node: op.node,
-            handle: op.handle,
-            writable: op.writable,
+            node,
+            handle,
+            writable,
             direct: false,
             owner: false,
         };
-        (op.job)(&file);
+        job(&file);
         let mut st = self.state();
-        let pins = st.io_pins.get_mut(&op.handle).expect("pinned by its I/O");
+        let pins = st.io_pins.get_mut(&handle).expect("pinned by its I/O");
         *pins -= 1;
         if *pins == 0 {
-            st.io_pins.remove(&op.handle);
-            if st.closing.remove(&op.handle) {
-                st.close(op.node, op.handle);
+            st.io_pins.remove(&handle);
+            if st.closing.remove(&handle) {
+                st.close(node, handle);
             }
         }
         true
@@ -1086,6 +1191,10 @@ impl File for SimFile {
         self.sync(true)
     }
 
+    fn submit_sync_all(&self) -> Completion<()> {
+        self.vfs.submit(self, SimFile::sync_all)
+    }
+
     fn len(&self) -> Result<u64> {
         self.with(|st| Ok(st.node(self.node).data.len() as u64))
     }
@@ -1204,6 +1313,14 @@ impl Vfs for SimVfs {
             .filter(|p| p.parent() == Some(dir))
             .cloned()
             .collect())
+    }
+
+    fn submit_sync_dir(&self, dir: &Path) -> Completion<()> {
+        // Deferred like any submitted operation (ICR 0021): the directory's entries become
+        // durable only when the simulated device completes it, and a crash before then
+        // means it never happened.
+        let dir = dir.to_path_buf();
+        self.submit_vfs(move |vfs| vfs.sync_dir(&dir))
     }
 
     fn sync_dir(&self, dir: &Path) -> Result<()> {

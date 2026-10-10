@@ -1980,6 +1980,8 @@ fn flush_recovered(
     // On any error below, dropping `spill` gives back every SST's extent.
     spill_recovered(shared, catalog, states, &mut spill)?;
     let flushed = std::mem::take(&mut spill.flushed);
+    let before = catalog.counters;
+    let nothing_recovered = flushed.is_empty() && spill.edits.is_empty() && recoveries.is_empty();
     let edits = &mut spill.edits;
     for ((tablet, family), seqno) in flushed {
         edits.push(Edit::SetFlushed {
@@ -2001,6 +2003,13 @@ fn flush_recovered(
     }
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.seqno_ceiling = shared.shm.next_seqno();
+    if nothing_recovered && catalog.counters == before {
+        // A clean reopen (#158, D203): no stream to replay, nothing spilled, and the
+        // counters are what the manifest holds. The commit would publish nothing; skipping
+        // it saves the open two flushes. The clean flag stays set until the next commit
+        // (informational only, D57).
+        return Ok(());
+    }
     edits.push(catalog.counters_edit());
     for e in edits.iter() {
         catalog.apply(e, shards)?;
