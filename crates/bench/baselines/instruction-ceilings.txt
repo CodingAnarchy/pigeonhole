@@ -33,26 +33,33 @@
 # and with the ycsb shapes deterministic (#434), from this PR's head run on main f9056a1 (run
 # 38025169628)
 # (`instruction-ceilings.py lower`; nothing raised).
+#
+# D194's stale-tail index (#439, on by default): the read shapes it improves are lowered from
+# its head run on main f853a34 (run 38035094091) with `instruction-ceilings.py lower`
+# (as-written, row, rows, scan, short-scans, ycsb-c, ycsb-a). Raised by D199 (owner decision,
+# 2026-10-10, which accepts the index's write cost): commit-overwrite 12147 -> 12307, that run's
+# count (12185) times (1 + headroom). commit-at needed no raise. #449 trims the cost and
+# lowers it again.
 
-as-written 2544 0.3
+as-written 2075 0.3
 flushed 1882 0.3
 compacted 1279 0.3
 get-mem 7269 0.3
 get-sst 17516 0.5
 get-miss 4628 0.3
-row 2545 1.0
-scan 1436 0.3
+row 2532 1.0
+scan 1432 0.3
 scan-filtered 7422 0.3
 versions 5728 0.3
 counter 9767 0.3
-rows 20214 0.3
+rows 20108 0.3
 level-scans 14984 0.6
-short-scans 14462 0.3
+short-scans 14424 0.3
 commit-one 10176 0.6
 commit-sixteen 52301 0.3
 flush 2199 0.3
 compact 2867 0.5
-ycsb-c 83316 1.0
-ycsb-a 46022 1.0
-commit-overwrite 12147 1.0
+ycsb-c 47832 1.0
+ycsb-a 29910 1.0
+commit-overwrite 12307 1.0
 commit-at 11186 0.3
