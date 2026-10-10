@@ -53,10 +53,11 @@
 # commit-at -1.1%, commit-overwrite -1.0%, commit-sixteen -3.3%, ycsb-a -0.3%) from its head
 # run on main f6f4125 (run 38054911220) with `instruction-ceilings.py lower`.
 #
-# Raised by owner decision (2026-10-10): counter 9451 -> 9502 (9454 times 1.005, headroom
-# 0.3% -> 0.5%). Main's own code measured 9422-9454 (0.35%), above 0.3% headroom, which
-# blocked #458 on a shape it does not touch. Temporary until #472 finds and fixes the
-# variation and lowers it back.
+# Raised by owner decision (2026-10-10): counter 9451 -> 9502 (9454 times 1.005), headroom
+# 0.3% -> 0.5%, kept permanently by a second owner decision the same day. #472 found counter
+# deterministic outside the instructions job (about 70 runs at 9430-9432, across CPUs, build
+# directories and the full script sequence), but 2 of about 16 samples inside it ran about
+# 0.2% high on unchanged code, which 0.3% headroom does not absorb.
 
 #
 # scan-narrow, scan-small and scan-wide (crates/bench/examples/scanrate.rs, #29) were added
