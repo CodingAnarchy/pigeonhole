@@ -543,14 +543,18 @@ impl<H: ShardHandler> ShardCore<H> {
     fn run_once(&mut self, deadline: u64) -> bool {
         let _shard = EnterShard::new(self.id);
         self.signal().awake();
-        // A backend with a ring per driving thread (#402) gives the first thread to run this
-        // shard its own; what completed on it resolves now, so the work it unblocks runs this
-        // turn. Without a ring, a turn pays one branch.
-        if self.attached != thread_token() {
-            self.attach();
-        }
+        // A backend with a ring per driving thread (#402) gives each thread that runs this
+        // shard its own (a shard moved to another thread needs one there, #473); what
+        // completed on it resolves now, so the work it unblocks runs this turn. Without rings
+        // nothing depends on the thread: a turn pays the two branches it always did, and only
+        // a ring backend reads the thread token (#485's instruction ceilings).
         if self.own_ring {
+            if self.attached != thread_token() {
+                self.attach();
+            }
             pigeonhole_io::reap_own_io(None);
+        } else if self.attached == 0 {
+            self.attach();
         }
         self.drain();
         self.spawner.local.collect_woken();
