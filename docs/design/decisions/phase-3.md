@@ -321,3 +321,36 @@ The #406 checklist's scan item reads: "Ordered row scan, single family: > 1 GB/s
 - likewise the requests it saw.
 
 What a pass forces is otherwise unchanged; the mixed-temperature harness gives main's pass and small-flush counts within one, and the same largest WAL.
+
+<a id="d207"></a>
+## D207 — A shard keeps a bounded number of group syncs in flight per stream; groups that need one meanwhile batch behind them (coordinator decision, 2026-10-10; engine, #412; the depth is decided on the reference machine, #405)
+
+**Measured** (#412; scratch counters through the `commit-latency` workflow on a Linux runner, fdatasync on ext4 on a VM disk; and macOS, `F_FULLFSYNC`). `run_group` started a sync for every group with an unsynced `GroupSync` member, whatever was in flight:
+- **A third of the syncs overlapped one already running** at 4 and 16 clients.
+- **Arrivals waited only 8–128 µs to be grouped,** then mostly got a sync of their own: about 2 commits per sync at 4 clients, and 4.5 at 16.
+- **D58 counts a sync once every older one finished,** so overlapping syncs buy no earlier acknowledgment.
+- **On macOS,** where `F_FULLFSYNC` serializes, 83% of syncs covered one commit. 16 clients reached 578 ops/s with a p99 of 33 ms.
+
+**Now:**
+- **The cap:** a shard keeps at most *depth* group syncs in flight per WAL stream. A group that needs one beyond that gets no sync of its own; it waits in `unresolved`.
+- **The batch:** when a group sync completes and groups wait, the shard starts one sync covering all of them. It resolves them through the newest group's id, as any sync resolves the groups up to it.
+- **No timer:** the syncs in flight are the window, so a lone client never waits behind another sync.
+- **Unchanged:** a group with a `Sync` member's own sync doesn't batch (that sync covers only the records before it), and rollover and side syncs (D200) are separate.
+
+**The depth.** The measured A/B:
+
+| | 16 clients ops/s | p99 | 4 clients ops/s |
+|---|--:|--:|--:|
+| Linux, depth 1 | 22.6K / 24.8K | 1,491 / 1,196 µs | 11.1K |
+| Linux, depth 2 | 31.0K / 31.9K | 1,057 / 930 µs | 12.8K |
+| Linux, unlimited (before) | 29.5K | 1,458 µs | 11.4K |
+| macOS, depth 1 | 2.2K | 11.6 ms | 619 |
+| macOS, depth 2 | 1.7K | 16.0 ms | 434 |
+| macOS, unlimited (before) | 578 | 33.0 ms | 337 |
+
+- **Linux file systems fold concurrent `fdatasync`s of one file into one journal commit,** so a second sync in flight keeps the device busy. `F_FULLFSYNC` serializes, so there a second one only queues.
+- **Interim defaults:** 1 on macOS, 2 elsewhere. They're an internal constant, with `PIGEONHOLE_GROUP_SYNC_DEPTH` (a measurement variable; 0 is unlimited, the behavior before D207) so the gate run on the reference machine (#405) can compare 1, 2 and unlimited. That run decides the default (#476), and the variable is then removed or becomes an option.
+
+**Checked by:**
+- **`engine/tests/group_sync_batch.rs`:** 16 clients committing one at a time with the platform's depth. The first *depth* groups each start a sync; the rest batch. No commit is acknowledged before a sync that covers it. There are *depth* + 1 syncs in all. Mutation-checked: without the batching, it fails.
+- **The crash sweeps:** `model_check` with and without deferred I/O, and the pigeonhole `model`. They're merge gates.
