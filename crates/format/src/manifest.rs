@@ -418,6 +418,33 @@ impl FamilyOptions {
     }
 }
 
+/// Writes the length of the body that follows `at + 1` as a varint at `at`, where one byte
+/// was reserved: a body of 128 bytes or more moves right to make room. The result is what
+/// `varint::put_bytes` writes for the same body.
+fn set_body_len(out: &mut Vec<u8>, at: usize) {
+    let len = out.len() - at - 1;
+    if len < 0x80 {
+        out[at] = len as u8;
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let n = {
+        let mut v = len as u64;
+        let mut i = 0;
+        while v >= 0x80 {
+            buf[i] = (v as u8) | 0x80;
+            v >>= 7;
+            i += 1;
+        }
+        buf[i] = v as u8;
+        i + 1
+    };
+    let end = out.len();
+    out.resize(end + n - 1, 0);
+    out.copy_within(at + 1..end, at + n);
+    out[at..at + n].copy_from_slice(&buf[..n]);
+}
+
 fn put_extent(out: &mut Vec<u8>, e: &ExtentRef) {
     out.extend_from_slice(&e.page.to_le_bytes());
     out.push(e.size_class);
@@ -618,10 +645,14 @@ pub enum Edit {
 }
 
 impl Edit {
-    /// Appends the tagged encoding of this edit.
+    /// Appends the tagged encoding of this edit: the tag, the body's length as a varint, then
+    /// the body. The body is written in place (#499): a one-byte length is reserved and
+    /// widened afterwards if the body turned out longer, so no edit allocates a body of its
+    /// own.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let mut body = Vec::new();
-        let b = &mut body;
+        let tag_at = out.len();
+        out.extend_from_slice(&[0, 0]);
+        let b: &mut Vec<u8> = out;
         let tag = match self {
             Edit::CreateTable { table, name } => {
                 b.extend_from_slice(&table.0.to_le_bytes());
@@ -752,8 +783,8 @@ impl Edit {
                 12
             }
         };
-        out.push(tag);
-        crate::varint::put_bytes(out, &body);
+        out[tag_at] = tag;
+        set_body_len(out, tag_at + 1);
     }
 
     /// Decodes one edit from the front of `input`; returns it and the bytes consumed.
@@ -870,5 +901,45 @@ impl Edit {
             }
         };
         Ok((edit, outer.pos()))
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    /// The in-place length is what `varint::put_bytes` writes, at every varint width (#499).
+    #[test]
+    fn in_place_body_length_matches_put_bytes() {
+        for len in [0usize, 1, 127, 128, 129, 300, 16_383, 16_384, 20_000] {
+            let body: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut expected = vec![7u8];
+            crate::varint::put_bytes(&mut expected, &body);
+            let mut out = vec![7u8, 0];
+            out.extend_from_slice(&body);
+            set_body_len(&mut out, 1);
+            assert_eq!(out, expected, "body of {len} bytes");
+        }
+    }
+
+    /// A blob file of many extents (a body of about 18 KB, a 3-byte length) round-trips.
+    #[test]
+    fn a_long_edit_round_trips() {
+        let edit = Edit::PutBlobFile {
+            blob_file: BlobFileId(9),
+            family: FamilyId(2),
+            extents: (0..2_000)
+                .map(|i| ExtentRef {
+                    // 64 KiB extents (class 0, 16 pages), each page-aligned to its size.
+                    page: crate::superblock::FIRST_DATA_PAGE + i * 16,
+                    size_class: 0,
+                })
+                .collect(),
+            total_bytes: 1 << 30,
+            live_bytes: 1 << 29,
+        };
+        let mut out = vec![0xAA];
+        edit.encode(&mut out);
+        assert_eq!(Edit::decode(&out[1..]).unwrap(), (edit, out.len() - 1));
     }
 }

@@ -296,7 +296,8 @@ pub fn edit() -> impl Strategy<Value = Edit> {
         (
             any::<u32>(),
             any::<u32>(),
-            vec(extent(), 0..5),
+            // Up to 40 extents: bodies past 127 bytes, whose length takes two varint bytes.
+            vec(extent(), 0..40),
             any::<u64>(),
             any::<u64>()
         )
@@ -312,7 +313,7 @@ pub fn edit() -> impl Strategy<Value = Edit> {
         any::<u32>().prop_map(|b| Edit::DropBlobFile {
             blob_file: BlobFileId(b)
         }),
-        (any::<u64>(), vec((any::<u32>(), any::<u64>()), 0..5)).prop_map(|(s, refs)| {
+        (any::<u64>(), vec((any::<u32>(), any::<u64>()), 0..30)).prop_map(|(s, refs)| {
             Edit::SstBlobRefs {
                 sst: SstId(s),
                 refs: refs.into_iter().map(|(b, n)| (BlobFileId(b), n)).collect(),
