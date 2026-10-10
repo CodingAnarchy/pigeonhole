@@ -1,6 +1,6 @@
 //! Opening an SST and reading its blocks through the block cache.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use pigeonhole_cache::{BlockCache, BlockData, BlockHandle, BlockKey, Priority};
 use pigeonhole_format::Error as FormatError;
@@ -10,7 +10,7 @@ use pigeonhole_format::compress::{Compression, decompress};
 use pigeonhole_format::filter::Filter;
 use pigeonhole_format::manifest::SstMeta;
 use pigeonhole_format::sst::{FOOTER_LEN, Footer, Properties};
-use pigeonhole_io::{FileRef, IoBuf};
+use pigeonhole_io::{BufPool, FileRef, IoBuf};
 
 use crate::Result;
 
@@ -40,6 +40,9 @@ enum Then {
         key: BlockKey,
         kind: BlockKind,
         priority: Priority,
+        /// For a block that does not fill the cache: the reader's pool its buffers come from
+        /// and go back to (#372).
+        pool: Option<Arc<BufPool>>,
     },
     /// An SST's footer, cached as its raw bytes for a cache-only open.
     Footer {
@@ -184,6 +187,18 @@ impl Fetch {
         }
     }
 
+    /// A buffer of `len` bytes for this fetch's bytes to be copied into (a piece of a merged
+    /// readahead run): from the reader's pool for a block that does not fill the cache, as
+    /// its decoded bytes are (#372).
+    pub(crate) fn buffer(&self, len: usize) -> IoBuf {
+        match &self.then {
+            Then::Block {
+                pool: Some(pool), ..
+            } => pool.take(len),
+            _ => IoBuf::zeroed(len),
+        }
+    }
+
     /// Verifies and keeps the bytes `submit` read, returning a pinned handle when there is
     /// one (a block or record; hold it until the read that missed has run again).
     pub fn admit(&self, buf: IoBuf) -> Result<Option<BlockHandle>> {
@@ -193,7 +208,8 @@ impl Fetch {
                 key,
                 kind,
                 priority,
-            } => Some(cache.insert(*key, decode_physical(buf, *kind)?, *priority)),
+                pool,
+            } => Some(cache.insert(*key, decode_physical(buf, *kind, pool.as_ref())?, *priority)),
             Then::Footer {
                 cache,
                 key,
@@ -301,9 +317,14 @@ pub(crate) fn write_padded(file: &FileRef, bytes: &[u8], offset: u64, align: usi
 
 /// Checks a physical block and turns it into what the cache holds: the logical block. An
 /// uncompressed block keeps its I/O buffer (trimmed of the trailer); a compressed one is
-/// decompressed into a heap buffer.
-pub(crate) fn decode_physical(mut buf: IoBuf, kind: BlockKind) -> Result<BlockData> {
-    match decode_slice(&buf, kind)? {
+/// decompressed into an exact-size heap buffer, or, for a block that does not fill the cache,
+/// into a buffer from `pool` that goes back to it when the block is dropped (#372).
+pub(crate) fn decode_physical(
+    mut buf: IoBuf,
+    kind: BlockKind,
+    pool: Option<&Arc<BufPool>>,
+) -> Result<BlockData> {
+    match decode_slice(&buf, kind, pool)? {
         Some(data) => Ok(data),
         None => {
             let n = buf.len() - TRAILER_LEN;
@@ -316,20 +337,36 @@ pub(crate) fn decode_physical(mut buf: IoBuf, kind: BlockKind) -> Result<BlockDa
 
 /// [`decode_physical`] over borrowed bytes: the decompressed block, or `None` if the block
 /// is stored uncompressed (its logical bytes are the payload, which the caller keeps).
-fn decode_slice(physical: &[u8], kind: BlockKind) -> Result<Option<BlockData>> {
+fn decode_slice(
+    physical: &[u8],
+    kind: BlockKind,
+    pool: Option<&Arc<BufPool>>,
+) -> Result<Option<BlockData>> {
     let (trailer, payload) = verify(physical)?;
     if trailer.kind != kind {
         return Err(corrupt("block kind"));
     }
-    match trailer.compression {
-        Compression::None => Ok(None),
-        codec => {
-            let mut out = vec![0; trailer.uncompressed_len as usize];
+    let len = trailer.uncompressed_len as usize;
+    match (trailer.compression, pool) {
+        (Compression::None, _) => Ok(None),
+        // A recycled buffer holds a previous block's bytes: `decompress` fails unless the
+        // codec wrote all `len` of them, so none of those reach a reader.
+        (codec, Some(pool)) => {
+            let mut out = pool.take(len);
+            decompress(codec, payload, &mut out)?;
+            Ok(Some(BlockData::Io(out)))
+        }
+        (codec, None) => {
+            let mut out = vec![0; len];
             decompress(codec, payload, &mut out)?;
             Ok(Some(BlockData::from(out)))
         }
     }
 }
+
+/// Buffers a reader's pool keeps (#372): compaction's readahead of 4 blocks, the block its
+/// cursor is on, and the one being decoded.
+const RECYCLED: usize = 6;
 
 /// The open state of one SST; see [`crate::SstReader`].
 pub(crate) struct Reader {
@@ -351,6 +388,9 @@ pub(crate) struct Blocks {
     pub(crate) cache: Arc<BlockCache>,
     /// Hands out unshared handles for reads that must not fill the cache.
     uncached: Arc<BlockCache>,
+    /// Buffers for the blocks of reads that do not fill the cache (#372): made on the first
+    /// such read, so a reader that only serves cached reads holds none.
+    recycled: OnceLock<Arc<BufPool>>,
 }
 
 impl std::fmt::Debug for Reader {
@@ -411,6 +451,7 @@ impl Reader {
             limit,
             cache,
             uncached: Arc::new(BlockCache::disabled()),
+            recycled: OnceLock::new(),
         };
         // A cache-only open reads only from the cache, and fills it with what it fetches
         // (the properties block too), so its retry finds everything.
@@ -496,7 +537,7 @@ impl Blocks {
         }
         crate::note_file_read();
         let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
-        let data = decode_physical(buf, kind)?;
+        let data = decode_physical(buf, kind, self.pool(fill_cache))?;
         Ok(self.admit(addr, data, fill_cache, priority))
     }
 
@@ -519,7 +560,7 @@ impl Blocks {
     ) -> Result<BlockHandle> {
         crate::note_file_read();
         let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
-        let data = decode_physical(buf, kind)?;
+        let data = decode_physical(buf, kind, self.pool(fill_cache))?;
         Ok(self.admit(addr, data, fill_cache, priority))
     }
 
@@ -576,6 +617,7 @@ impl Blocks {
                 key: self.key(addr),
                 kind,
                 priority,
+                pool: self.pool(fill_cache).cloned(),
             },
         )
     }
@@ -599,6 +641,12 @@ impl Blocks {
             Ok(None) => Some(self.fetch_with(addr, kind, priority, fill_cache)),
             _ => None,
         }
+    }
+
+    /// The pool of buffers for a read that does not fill the cache (`None` for one that does:
+    /// a cached block keeps an exact-size buffer, as the cache charges capacity).
+    fn pool(&self, fill_cache: bool) -> Option<&Arc<BufPool>> {
+        (!fill_cache).then(|| self.recycled.get_or_init(|| BufPool::new(RECYCLED)))
     }
 
     /// Hands out a decoded block, inserting it into the cache if asked.
