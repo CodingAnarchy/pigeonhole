@@ -506,3 +506,25 @@ fn a_client_threads_io_completes_through_a_driving_threads_fd() {
     let got = f.submit_read(IoBuf::zeroed(4096), 0).wait().unwrap();
     assert!(got.iter().all(|&x| x == 0));
 }
+
+#[test]
+fn a_blocked_wait_on_a_completion_chained_after_the_shared_ring_completes_with_no_reaper() {
+    // #443's hang: an open waits on a WAL sync wrapped in its own completion (a plain
+    // `Completion::pair`, no drive), resolved by a continuation of a shared-ring operation.
+    // With no reaper and no driving thread, the waiting thread must reap the ring itself.
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-app-chained");
+    let f = b.create("f");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (done, resolver) = pigeonhole_io::Completion::<()>::pair();
+        drop(f.submit_sync_data().map(move |r| {
+            resolver.resolve(r);
+            Ok(())
+        }));
+        tx.send(done.wait()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the chained completion resolved")
+        .unwrap();
+}

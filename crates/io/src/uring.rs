@@ -217,10 +217,11 @@ impl UringVfs {
 
     /// As [`UringVfs::new`], for application-owned mode (#408), where the engine starts no
     /// threads: the shared ring, for threads with no ring of their own, has no reaper. The
-    /// threads that drive shards ([`Vfs::attach_thread`]) reap it: each one's ring polls the
-    /// shared ring's eventfd, so a completion there also turns every driving thread's
-    /// completion fd ([`crate::own_io_fd`]) readable, and that thread's next reap takes it. A
-    /// thread blocked on one of the shared ring's completions reaps it itself.
+    /// threads that drive shards ([`Vfs::attach_thread`]) take its completions on every reap,
+    /// and each one's completion fd ([`crate::own_io_fd`], an epoll descriptor over its own
+    /// ring's eventfd and the shared ring's) turns readable for them too. A thread blocked on
+    /// a completion nobody else reaps (one of the shared ring's, or one chained after them)
+    /// reaps the shared ring itself.
     pub fn new_application_owned() -> Result<Arc<Self>> {
         let ring = RingHandle::start(true)?;
         Ok(Arc::new(Self {
@@ -661,7 +662,7 @@ struct Ring {
     /// Set when the last handle goes: the reaper ends once nothing is in flight.
     shutdown: AtomicBool,
     /// Without a reaper (application-owned mode, #408): registered with the ring, so each
-    /// completion signals it; the driving threads' rings poll it.
+    /// completion signals it; the driving threads' completion fds (epoll) include it.
     notify: Option<EventFd>,
 }
 
@@ -811,6 +812,15 @@ impl Ring {
         })
     }
 
+    /// Whether the completion queue holds entries (a look, no system call).
+    fn has_completions(&self) -> bool {
+        let _cq = lock(&self.cq);
+        // SAFETY: `self.cq` is held, so this is the only borrow of the completion queue.
+        let mut cq = unsafe { self.uring.completion_shared() };
+        cq.sync();
+        !cq.is_empty()
+    }
+
     /// Takes the completions the ring holds and resolves them (outside any lock, so their
     /// continuations may submit or reap again). Returns whether an operation completed.
     fn take_completions(&self) -> bool {
@@ -858,6 +868,12 @@ impl Ring {
     }
 }
 
+impl crate::own::OrphanIo for Ring {
+    fn reap_orphan(&self, wait: Duration) -> bool {
+        self.reap_now(Some(wait))
+    }
+}
+
 /// Resolves `op` with `e`.
 fn fail(op: Op, e: io::Error) {
     match op.kind {
@@ -887,6 +903,10 @@ impl RingHandle {
         let counts = Arc::new(RingCounts::default());
         let ring = Arc::new(Ring::probe(&counts, application_owned)?);
         if application_owned {
+            // No reaper: any thread blocked on a completion chained after this ring's
+            // operations takes their completions (#408).
+            let orphan: std::sync::Weak<dyn crate::own::OrphanIo> = Arc::downgrade(&ring) as _;
+            crate::own::register_orphan(orphan);
             return Ok(Arc::new(Self {
                 ring,
                 counts,
@@ -936,9 +956,6 @@ impl Drop for RingHandle {
 /// The `user_data` of the poll that wakes a thread's ring wait.
 const WAKE: u64 = u64::MAX - 1;
 
-/// The `user_data` of a thread ring's poll of the reaper-less shared ring's eventfd (#408).
-const CLIENT: u64 = u64::MAX - 2;
-
 /// Longest a waiting [`Completion`] on a ring's owner thread reaps before it checks its
 /// result again.
 const DRIVE_SLICE: Duration = Duration::from_millis(1);
@@ -968,8 +985,42 @@ struct ThreadRing {
     /// `None` if the kernel refused the registration.
     notify: Option<EventFd>,
     /// The backend's shared ring when it has no reaper (application-owned mode, #408): this
-    /// ring polls its eventfd and reaps it when that fires.
+    /// thread's reaps take its completions too.
     client: Option<Arc<Ring>>,
+    /// With `client`: an epoll descriptor over `notify` and the shared ring's eventfd, the
+    /// thread's completion fd (`own_io_fd`), readable when either ring has completions. Not
+    /// an io_uring poll of the shared ring's eventfd: the kernel does not let an eventfd that
+    /// io_uring signals wake another io_uring poll reliably (`EPOLL_URING_WAKE`), and #443's
+    /// first version hung on that.
+    epoll: Option<std::os::fd::OwnedFd>,
+}
+
+/// An epoll descriptor readable when any of `fds` is (`None` if `wanted` is false, an fd is
+/// missing, or the kernel refuses).
+fn epoll_over(fds: [Option<&EventFd>; 2], wanted: bool) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if !wanted {
+        return None;
+    }
+    // SAFETY: plain syscall; a non-negative result is a descriptor we now own.
+    let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if ep < 0 {
+        return None;
+    }
+    // SAFETY: `ep` was just returned by `epoll_create1` and is owned by nobody else.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(ep) };
+    for fd in fds {
+        let fd = fd?.raw();
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fd as u64,
+        };
+        // SAFETY: a live epoll descriptor, a live eventfd and a live event.
+        if unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
+            return None;
+        }
+    }
+    Some(owned)
 }
 
 /// An eventfd, closed on drop.
@@ -1075,11 +1126,17 @@ impl ThreadRing {
             owner: thread::current().id(),
             backend,
             wake: Arc::new(EventFd::new().ok()?),
+            epoll: epoll_over(
+                [
+                    notify.as_ref(),
+                    client.as_ref().and_then(|c| c.notify.as_ref()),
+                ],
+                client.is_some(),
+            ),
             notify,
             client,
         });
         ring.arm_wake().ok()?;
-        ring.arm_client().ok()?;
         Some(ring)
     }
 
@@ -1088,24 +1145,6 @@ impl ThreadRing {
         let poll = opcode::PollAdd::new(types::Fd(self.wake.raw()), libc::POLLIN as u32)
             .build()
             .user_data(WAKE);
-        self.push(&poll)
-    }
-
-    /// Polls the reaper-less shared ring's eventfd (multishot: one arm serves every signal),
-    /// so a completion there ends this ring's waits and signals its completion fd.
-    fn arm_client(&self) -> io::Result<()> {
-        let Some(fd) = self
-            .client
-            .as_ref()
-            .and_then(|c| c.notify.as_ref())
-            .map(EventFd::raw)
-        else {
-            return Ok(());
-        };
-        let poll = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32)
-            .multi(true)
-            .build()
-            .user_data(CLIENT);
         self.push(&poll)
     }
 
@@ -1210,7 +1249,6 @@ impl ThreadRing {
         let mut done = Vec::new();
         let mut again = Vec::new();
         let mut woke = false;
-        let (mut client_due, mut client_rearm) = (false, false);
         {
             // SAFETY: only the owner thread borrows this ring's completion queue, and the
             // borrow ends before any completion's continuation runs.
@@ -1220,12 +1258,6 @@ impl ThreadRing {
             for cqe in &mut cq {
                 if cqe.user_data() == WAKE {
                     woke = true;
-                    continue;
-                }
-                if cqe.user_data() == CLIENT {
-                    client_due = true;
-                    // A multishot poll that ended (no more to come) must be armed again.
-                    client_rearm |= !io_uring::cqueue::more(cqe.flags());
                     continue;
                 }
                 let Some(op) = table.take(cqe.user_data()) else {
@@ -1242,9 +1274,6 @@ impl ThreadRing {
             // Re-armed for the next wake; a failure leaves waits to their timeouts.
             let _ = self.arm_wake();
         }
-        if client_rearm {
-            let _ = self.arm_client();
-        }
         for op in again {
             self.submit(op);
         }
@@ -1252,8 +1281,16 @@ impl ThreadRing {
         for resolve in done {
             resolve();
         }
-        if client_due && let Some(client) = &self.client {
-            any |= client.reap_now(None);
+        // The reaper-less shared ring (#408): taken on every turn when it holds completions
+        // (a look at its completion queue, no system call). Its eventfd is drained first, so
+        // a completion that lands in between is seen now or signals again.
+        if let Some(client) = &self.client {
+            if let Some(n) = &client.notify {
+                n.drain();
+            }
+            if client.has_completions() {
+                any |= client.take_completions();
+            }
         }
         any
     }
@@ -1277,9 +1314,14 @@ impl crate::own::OwnIo for ThreadRing {
     }
 
     fn fd_here(&self) -> Option<i32> {
-        (thread::current().id() == self.owner)
-            .then(|| self.notify.as_ref().map(EventFd::raw))
-            .flatten()
+        use std::os::fd::AsRawFd;
+        if thread::current().id() != self.owner {
+            return None;
+        }
+        match &self.epoll {
+            Some(e) => Some(e.as_raw_fd()),
+            None => self.notify.as_ref().map(EventFd::raw),
+        }
     }
 }
 
