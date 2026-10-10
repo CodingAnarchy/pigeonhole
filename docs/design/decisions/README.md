@@ -216,6 +216,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D200](phase-3.md#d200) — A WAL rollover never waits on the shard thread for the full segment's sync: only the successor's header waits (FORMAT §10.1 rule 1 now allows its records first); Buffered groups in that window resolve through a sync; with no spare slot ready the engine holds its group back while one is prepared, dropping D30's inline exception · coordinator decision, #19 · amends D30
 - [D201](phase-3.md#d201) — The row cache: per-row write watermarks as epochs, latest newest-version reads only, gets consult without filling · cache, engine, pigeonhole, #404 · default decided by measurement (D197)
 - [D202](phase-3.md#d202) — Application-owned io_uring loops wait on a completion fd (`Shard::io_fd`): a DEFER_TASKRUN ring signals its registered eventfd before its owner reaps (settled on CI); the fd is an opt-in, so loops that never take it keep polling · coordinator decision, #408
+- [D204](phase-3.md#d204) — The scaling gate measures application-owned shards writing inline (N up to cores); engine-owned synchronous clients are reported · owner decision, bench, #154 · amends the spec Goals scaling definition and the #406 checklist
 
 ## Open questions
 _None._

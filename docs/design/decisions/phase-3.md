@@ -265,3 +265,26 @@ The internal interface change is ICR 0019.
   - #443's first version hung at open on such a chained wait.
 - **The limitation:** a client thread's *async* I/O (an executor's `get_async`) then completes promptly only if the driving loop waits on `io_fd`. Otherwise it completes at the loop's next timed turn. Documented in the async guide.
 
+<a id="d204"></a>
+## D204 — The scaling gate measures application-owned shards writing inline; engine-owned synchronous clients are reported (owner decision, 2026-10-10; bench, #154; amends the spec's Goals scaling definition and the #406 checklist)
+**Decision.**
+- **The thread-per-core scaling target is measured with Pigeonhole application-owned, at N shards up to the core count.** Each shard thread drives its own shard and commits the `skewed-multi-shard` writes to rows its shard owns (`Table::shard_of`, ICR 0022; owner routing approved by the coordinator) inline, with 16 commits in flight (`commit_async`). The target is unchanged: N-shard write throughput ≥ 0.8 × N × single-shard, with no single-shard p99 regression. `phdb-bench scaling` runs it, and `docs/bench.md` defines it.
+- **The engine-owned shape is reported, not gated:** synchronous client threads, at least four per shard, at N ≤ cores/2.
+
+**Why.** The old gate ran N synchronous clients against N engine-owned shards: 2N busy threads.
+- At N = cores the clients have no cores. Per-commit handoffs (two cross-thread wakes, a `pwrite`, the visibility wait) and spin-before-park polling (D198) dominate, so N shards ran no faster than one.
+- Measured on main 7c0335a (`scaling_modes`, local): 0.60 at 2 shards with 2 clients on a 4-core Linux runner, 0.31 at 4; on macOS 0.17 at 4 and 0.11 at 8.
+- With cores to spare, the same engine scales: 0.98 at 2 shards with 8 clients on Linux. The application-owned inline shape reached 0.73 at 2 shards on Linux, with no client threads at all.
+- The spec's own thread-per-core model is the application-owned embedding (a writer on the owning shard runs with no handoff). That's the shape that can meet 0.8 × N at N = cores, so it's the one the gate holds the engine to.
+
+**What follows.** The engine work toward the target is measured on this gate (#154). The first corrected profiles point at:
+- the per-group `pwrite` on small groups;
+- the global visibility watermark and its shared waiter list;
+- cross-shard commits when a thread writes rows other shards own;
+- tablet balance under skew;
+- spin-before-park polling when cores are oversubscribed (a D198 follow-up).
+
+Counters for the visibility and queue waits come first, so each change shows on the gate.
+
+The #406 checklist's scaling item reads: "Thread-per-core scaling (D204: application-owned inline, N up to cores): efficiency ≥ 0.8, single-shard p99 not regressed; the engine-owned synchronous shape reported."
+

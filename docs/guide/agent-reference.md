@@ -141,6 +141,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `Table::scan<K: AsRef<[u8]> + ?Sized>(&self, range: impl RangeBounds<&K>) -> Scan<'_>` | Row range. Both ends same type (use slices). |
 | `Table::scan_prefix(&self, prefix: &[u8]) -> Scan<'_>` | Rows starting with prefix. |
 | `Table::scan_bounds(&self, Bound<&[u8]>, Bound<&[u8]>) -> Scan<'_>` | Explicit bounds. |
+| `Table::shard_of(&self, row: &[u8]) -> Option<usize>` | The shard owning `row` now (`Shard::index`): a routing hint for application-owned mode (commit owned rows inline); may change after a split or move; commits are correct either way (ICR 0022). |
 
 `ReadTable` (P4, early) has `name`, `get`, `get_at`, `row`, `scan`, `scan_prefix`, `scan_bounds` with the same signatures.
 

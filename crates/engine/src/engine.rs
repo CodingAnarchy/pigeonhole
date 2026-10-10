@@ -1629,6 +1629,17 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// The shard that owns `row` of `table` in the current tablet map, or `None` if the
+    /// table does not exist (ICR 0022). A routing hint for application-owned mode: it may
+    /// change after a split, merge or move, and a commit from any thread is correct whatever
+    /// shard owns its rows.
+    pub fn shard_of(&self, table: TableId, row: &[u8]) -> Option<usize> {
+        let view = self.inner.shared.view.load();
+        view.tablets()
+            .route(table, row)
+            .map(|(_, shard)| usize::from(shard.0))
+    }
+
     /// Tablet changes refused for lack of room, summed over shards since open, as
     /// `(slot budget, view size)`: splits and moves a shard's memtable slots could not take
     /// (a size split the balancer found due but skipped counts once per balancer pass), and

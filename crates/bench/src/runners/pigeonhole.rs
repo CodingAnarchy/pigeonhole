@@ -58,7 +58,7 @@ fn retry_busy<T>(
     }
 }
 
-fn err(e: pigeonhole::Error) -> String {
+pub(crate) fn err(e: pigeonhole::Error) -> String {
     format!("{:?}: {}", e.code(), e.message())
 }
 
@@ -128,40 +128,49 @@ impl PigeonholeRunner {
     }
 }
 
+/// The store's options for `s` (shared by the runner and the inline scaling driver).
+pub(crate) fn options(s: &Settings) -> Options {
+    let mut options = Options::default()
+        .durability(if s.group_sync {
+            Durability::GroupSync
+        } else if s.sync {
+            Durability::Sync
+        } else {
+            Durability::Buffered
+        })
+        .memtable_budget(s.memory.write_buffer)
+        .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
+    if let Some(yes) = s.tablet_changes {
+        options = options.tablet_changes(yes);
+    }
+    if let Some(n) = s.shards {
+        options = options.shards(n);
+    }
+    options
+}
+
+/// The bench table with every workload's families.
+pub(crate) fn create_table(db: &Pigeonhole) -> Result<Table, String> {
+    let mut builder = db.table("bench").map_err(err)?;
+    for family in FAMILIES {
+        let mut f = Family::default().max_versions(1).bloom_bits(BLOOM_BITS);
+        if family == METRIC_FAMILY {
+            // Whole SSTs drop once their newest point expires (D163, #236).
+            f = f.ttl(TIME_SERIES_TTL).compaction(Compaction::FifoByTime);
+        }
+        builder = builder.family(family, f);
+    }
+    builder.create_if_missing().map_err(err)
+}
+
 impl Runner for PigeonholeRunner {
     fn name(&self) -> &'static str {
         "pigeonhole"
     }
 
     fn open(&mut self, dir: &Path) -> Result<(), String> {
-        let s = &self.settings;
-        let mut options = Options::default()
-            .durability(if s.group_sync {
-                Durability::GroupSync
-            } else if s.sync {
-                Durability::Sync
-            } else {
-                Durability::Buffered
-            })
-            .memtable_budget(s.memory.write_buffer)
-            .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
-        if let Some(yes) = s.tablet_changes {
-            options = options.tablet_changes(yes);
-        }
-        if let Some(n) = s.shards {
-            options = options.shards(n);
-        }
-        let db = Pigeonhole::open(dir.join("bench.phdb"), options).map_err(err)?;
-        let mut builder = db.table("bench").map_err(err)?;
-        for family in FAMILIES {
-            let mut f = Family::default().max_versions(1).bloom_bits(BLOOM_BITS);
-            if family == METRIC_FAMILY {
-                // Whole SSTs drop once their newest point expires (D163, #236).
-                f = f.ttl(TIME_SERIES_TTL).compaction(Compaction::FifoByTime);
-            }
-            builder = builder.family(family, f);
-        }
-        let table = builder.create_if_missing().map_err(err)?;
+        let db = Pigeonhole::open(dir.join("bench.phdb"), options(&self.settings)).map_err(err)?;
+        let table = create_table(&db)?;
         self.open = Some(Open {
             db,
             table,

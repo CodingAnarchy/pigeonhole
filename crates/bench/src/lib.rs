@@ -43,6 +43,7 @@ pub use report::{
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
+pub use runners::inline::INLINE_IN_FLIGHT;
 pub use runners::pigeonhole::DEFAULT_MEMTABLE_BUDGET;
 #[cfg(feature = "rocksdb")]
 pub use runners::rocksdb::RocksDbRunner;
@@ -493,7 +494,7 @@ impl Default for RunOptions {
 }
 
 impl RunOptions {
-    fn warmup_ops(&self, config: &WorkloadConfig) -> u64 {
+    pub(crate) fn warmup_ops(&self, config: &WorkloadConfig) -> u64 {
         (config.operations as f64 * self.warmup.max(0.0)).round() as u64
     }
 }

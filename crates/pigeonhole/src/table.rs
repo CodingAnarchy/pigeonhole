@@ -350,6 +350,35 @@ impl Table {
         self.core.get(Some(snapshot), row, family, qualifier)
     }
 
+    /// The shard that owns `row` right now ([`Shard::index`](crate::Shard::index)), for
+    /// application-owned mode: a thread driving a shard can commit the rows that shard owns,
+    /// so its writes run on its own shard with no handoff (the spec's inline local writes).
+    /// A routing hint only (ICR 0022):
+    /// - it reflects the current tablet map, which can change at any time after a split,
+    ///   merge or move;
+    /// - a commit from any thread is correct whatever shard owns its rows, merely routed
+    ///   there.
+    ///
+    /// `None` if the table was dropped.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(2))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// let shard = t.shard_of(b"user:1").expect("the table exists");
+    /// assert!(shard < 2);
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn shard_of(&self, row: &[u8]) -> Option<usize> {
+        self.core.db.engine.shard_of(self.core.info.id, row)
+    }
+
     /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): memtable
     /// and cache hits resolve on the first poll, and a block the cache does not hold is read
     /// asynchronously (see [`nonblocking`](crate::nonblocking)).
