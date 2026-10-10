@@ -211,6 +211,24 @@ if rc_rows:
     print("|---|---|---|---|")
     for w, a, b in rc_rows:
         print(f"| {w} | {a['throughput']:.0f} → {b['throughput']:.0f} | {us(a['p50_ns']):.2f} → {us(b['p50_ns']):.2f} µs | {us(a['p99_ns']):.1f} → {us(b['p99_ns']):.1f} µs |")
+# ycsb-a, one client, shard count and shard spin (D198 item 2, #478; ICR 0027's counters).
+ya = [(n, results(f"ycsb-a-{n}.json", "pigeonhole")) for n in
+      ("default", "shards1", "shards4", "spin100", "spin200", "spin500")]
+if any(r for _, r in ya):
+    rk = results("ycsb-a-default.json", "rocksdb")
+    print("\n**ycsb-a, one client (D198 item 2, #478):** Pigeonhole by shard count and shard spin, RocksDB alongside.\n")
+    print("| Run | ops/s | p50 µs | p99 µs | parks, wakes per op |")
+    print("|---|--:|--:|--:|---|")
+    for n, rs in ya:
+        for r in rs:
+            # ICR 0027's per-operation counters, whatever #480 names them in the detail.
+            parks = ", ".join(f"{k} {v:.2f}" if isinstance(v, float) else f"{k} {v}"
+                              for k, v in sorted(r.get("detail", {}).items())
+                              if any(w in k for w in ("park", "wake", "idle")))
+            print(f"| {n} | {r['throughput']:.0f} | {us(r['p50_ns']):.1f} | {us(r['p99_ns']):.1f} | {parks or '-'} |")
+    for r in rk:
+        print(f"| RocksDB | {r['throughput']:.0f} | {us(r['p50_ns']):.1f} | {us(r['p99_ns']):.1f} | - |")
+
 # The group sync depth (D207).
 depth_rows = {d: results(f"group-sync-depth-{d}.json", "pigeonhole") for d in ("1", "2", "0")}
 if any(depth_rows.values()):

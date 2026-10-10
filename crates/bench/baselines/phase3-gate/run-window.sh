@@ -20,6 +20,7 @@
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2)         90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
 #   latency        ycsb-c, group-commit (1/4/16 threads) vs RocksDB, ycsb-a, skewed   45
+#   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
 #   group-sync-depth  group-commit at group sync depth 1, 2 and unlimited (D207)      15
 #   row-cache      ycsb-c and ycsb-a with the row cache on (D201's default)           30
 #   scaling        scaling gate (D204) at 1, 4, 8, 16 shards                          30
@@ -29,7 +30,7 @@
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 9.5 hours unattended at full scale.
+# Total: about 9.75 hours unattended at full scale.
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
 # it back with the `scp` line the last step prints, and commit it from there.
@@ -56,10 +57,10 @@ mkdir -p "$data" "$results/logs"
 data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
-steps=(setup build phase2-gate all-uring-1 all-uring-2 all-pread latency group-sync-depth
-    row-cache scaling open-latency cold-get cold-scan scan-cache report)
+steps=(setup build phase2-gate all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
+    group-sync-depth row-cache scaling open-latency cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [phase2-gate]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=45 [group-sync-depth]=15 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
+    [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [group-sync-depth]=15 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
     [cold-scan]=45 [scan-cache]=10 [report]=1)
 
 bench="$root/target/release/phdb-bench"
@@ -89,15 +90,24 @@ run() {
     fi
     echo "== $name ($(date -u +%H:%MZ); about ${minutes[$name]} min; then about $(remaining "$name") min left)"
     start=$(date +%s)
-    if "step_$name" > >(tee "$results/logs/$name.log") 2>&1; then
+    local status=0
+    "step_$name" > >(tee "$results/logs/$name.log") 2>&1 || status=$?
+    if [[ $status == 0 ]]; then
         end=$(date +%s)
         printf '%s\t%d\t%s\n' "$name" $(((end - start) / 60)) "$scale" >> "$results/durations.tsv"
         touch "$results/$name.done"
+    elif [[ $status == "$SKIP" ]]; then
+        # A step whose feature the built binary lacks: not done, so a rerun after the
+        # rebuild runs it; the window goes on.
+        echo "== $name skipped (log: $results/logs/$name.log)"
     else
         echo "== $name FAILED (log: $results/logs/$name.log); fix and rerun: done steps are skipped" >&2
         exit 1
     fi
 }
+
+# The exit status of a step that skips itself (EX_TEMPFAIL).
+SKIP=75
 
 step_setup() {
     python3 "$here/machine.py" "$data" "$results/machine.json" "$scale"
@@ -156,6 +166,30 @@ step_latency() {
     rm -r "$data/bench"
 }
 
+# ycsb-a's write gap (perf287; ICR 0027; D198 item 2, #478): one client at the default shard
+# count, at 1 and 4 shards, and at the default with longer shard spins, beside RocksDB. The
+# stall table and JSON carry shard parks, wakes and commit parks per operation.
+step_ycsb-a-shards() {
+    if ! "$bench" --help | grep -q -- --shard-spin; then
+        echo "phdb-bench has no --shard-spin yet (#480); skipped, not marked done" >&2
+        return "$SKIP"
+    fi
+    run_one() { # NAME, phdb-bench arguments after the workload
+        local name="$1"
+        shift
+        PIGEONHOLE_IO=uring "$bench" ycsb-a --scale "$scale" --dir "$data/bench" \
+            --json "$results/ycsb-a-$name.json" --markdown "$results/ycsb-a-$name.md" "$@"
+        rm -r "$data/bench"
+    }
+    run_one default --engine pigeonhole,rocksdb
+    run_one shards1 --engine pigeonhole --shards 1
+    run_one shards4 --engine pigeonhole --shards 4
+    local us
+    for us in 100 200 500; do
+        run_one "spin$us" --engine pigeonhole --shard-spin "$us"
+    done
+}
+
 # The group sync depth (D207): durable group commits at 1, 4 and 16 clients with at most 1, 2
 # or unlimited (0) group syncs in flight per stream. The interim default is 1 on macOS and 2
 # elsewhere; this run decides it.
@@ -172,7 +206,7 @@ step_group-sync-depth() {
 step_row-cache() {
     if ! "$bench" --help | grep -q -- --row-cache; then
         echo "phdb-bench has no --row-cache yet (a bench PR); skipped, not marked done" >&2
-        return 1
+        return "$SKIP"
     fi
     local w
     for w in ycsb-c ycsb-a; do
@@ -212,7 +246,7 @@ step_cold-scan() {
 step_scan-cache() {
     if ! grep -q 'warm' "$root/crates/bench/examples/coldscan.rs"; then
         echo "coldscan has no warm mode yet (a bench PR); skipped, not marked done" >&2
-        return 1
+        return "$SKIP"
     fi
     [[ -e "$data/scancache/cold.phdb" ]] || "$examples/coldscan" load "$data/scancache" "$scan_cache_mib"
     PIGEONHOLE_IO=uring "$examples/coldscan" warm "$data/scancache" | tee "$results/scan-cache.jsonl"

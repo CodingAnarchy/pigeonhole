@@ -1,6 +1,6 @@
 # Phase 3 gate window (#405, #406)
 
-The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 9.5 hours at full scale. It is resumable, and it leaves one tarball to copy back.
+The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 9.75 hours at full scale. It is resumable, and it leaves one tarball to copy back.
 
 ## Before renting
 
@@ -37,13 +37,15 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
   3. `phase2-gate`: the D193 floors.
   4. `all` against RocksDB, three times: twice on io_uring (the reproducibility pair) and once on pread (the backend decision).
   5. `latency`: point gets and durable group commit.
-  6. `group-sync-depth`: durable group commits at a group sync depth of 1, 2 and unlimited (D207's default).
-  7. `row-cache`: the row cache's default.
-  8. `scaling`: D204, at 1, 4, 8 and 16 shards.
-  9. `open-latency`, `cold-get` and `cold-scan`: the `phase3-io` steps.
-  10. `scan-cache`: the ordered scan from cache.
-  11. `report`.
+  6. `ycsb-a-shards`: ycsb-a with one client, at the default shard count against 1 and 4 shards and longer shard spins, beside RocksDB (D198 item 2, #478).
+  7. `group-sync-depth`: durable group commits at a group sync depth of 1, 2 and unlimited (D207's default).
+  8. `row-cache`: the row cache's default.
+  9. `scaling`: D204, at 1, 4, 8 and 16 shards.
+  10. `open-latency`, `cold-get` and `cold-scan`: the `phase3-io` steps.
+  11. `scan-cache`: the ordered scan from cache.
+  12. `report`.
 - **Each step logs** to `RESULTS/logs/STEP.log`, and its real duration goes to `durations.tsv`.
+- **A step whose feature the built binary lacks skips itself** (not marked done), and the window goes on.
 - **A failed step stops the run.** Fix the cause and rerun the same command: finished steps (`RESULTS/STEP.done`) are skipped. A target that is missed is not a failed step; it is a verdict in the summary.
 - **To rerun a step,** delete its `.done` file.
 
