@@ -301,6 +301,8 @@ pub(crate) struct Shared {
     pub manifest_busy: AtomicBool,
     pub pager: Arc<Pager>,
     pub cache: Arc<BlockCache>,
+    /// The row cache (D201): writer process only, `None` when off.
+    pub row_cache: Option<crate::row_cache::RowCaches>,
     pub sst_ids: Arc<AtomicU64>,
     pub blob_ids: Arc<AtomicU32>,
     pub live_views: Arc<LiveViews>,
@@ -3583,6 +3585,12 @@ impl ShardState {
                     last_route = Some((m.table, m.row, id));
                     if track {
                         self.note_write(id, m.row);
+                    }
+                    // Before the write is inserted, so before it can be visible (D201).
+                    if let Some(rc) = &self.shared.row_cache
+                        && !self.replaying
+                    {
+                        rc.note_write(m.table, m.row, seqno);
                     }
                     id
                 }

@@ -192,6 +192,18 @@ impl CellData {
         Self { ts, value }
     }
 
+    /// A copy of `stored` at `ts` (the row cache's hits, D201).
+    pub(crate) fn copied(ts: Timestamp, stored: &[u8]) -> Self {
+        let mut data = Self::EMPTY;
+        if stored.len() <= Self::INLINE_MAX {
+            data.set_inline(ts, stored);
+        } else {
+            data.ts = ts;
+            data.value = CellValue::Owned(stored.to_vec());
+        }
+        data
+    }
+
     /// Timestamp of this version.
     pub fn timestamp(&self) -> Timestamp {
         self.ts
@@ -400,6 +412,19 @@ pub trait RowSink {
         data.set_inline(ts, stored);
         self.push(family, qualifier, data);
     }
+
+    /// How many cells this sink holds, for the row cache to read back what a read pushed
+    /// (D201). `None` (the default): the sink cannot report them, and its reads are not
+    /// stored in the row cache.
+    fn cell_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Cell `i`: its qualifier and data (see [`RowSink::cell_count`]).
+    fn cell(&self, i: usize) -> Option<(&[u8], &CellData)> {
+        let _ = i;
+        None
+    }
 }
 
 impl RowSink for RowData {
@@ -430,6 +455,15 @@ impl RowSink for RowData {
         if let Some(c) = self.cells.last_mut() {
             c.data.set_inline(ts, stored);
         }
+    }
+
+    fn cell_count(&self) -> Option<usize> {
+        Some(self.cells.len())
+    }
+
+    fn cell(&self, i: usize) -> Option<(&[u8], &CellData)> {
+        let c = self.cells.get(i)?;
+        Some((self.qualifier(c), &c.data))
     }
 }
 

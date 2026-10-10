@@ -111,7 +111,8 @@ fn open(path: &Path) -> (Pigeonhole, Vec<thread::JoinHandle<()>>, Arc<Ctl>) {
             .block_cache(256 << 20)
             // A waiting client's poll (D198) runs a number of times that depends on thread
             // timing: counted, it would make the commit shapes nondeterministic.
-            .commit_spin(std::time::Duration::ZERO),
+            .commit_spin(std::time::Duration::ZERO)
+            .row_cache(row_cache()),
     )
     .expect("open");
     let ctl = Arc::new(Ctl {
@@ -202,4 +203,12 @@ fn shape_run_shard(shard: &mut Shard) {
 #[inline(never)]
 fn run_shard(shard: &mut Shard) {
     while shard.run_once(Duration::from_micros(1000)) {}
+}
+
+/// `ROW_CACHE=bytes`: the shapes with the row cache on (#404, D201); off by default.
+fn row_cache() -> usize {
+    std::env::var("ROW_CACHE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }

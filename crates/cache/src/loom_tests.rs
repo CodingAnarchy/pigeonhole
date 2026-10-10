@@ -160,3 +160,78 @@ fn loom_get_races_erase_file_and_eviction() {
         }
     });
 }
+
+/// The row cache's epoch protocol (D201): a writer raises the row's watermark, then writes,
+/// then publishes visibility; a filler stores the row it read at its read point under the
+/// epoch it loaded after that point; a reader hits only on an equal epoch at or below its
+/// own read point. Whatever the interleaving, a hit returns the row as of the reader's read
+/// point. The row's state at seqno `s` is `s` itself (the write at seqno 2 replaces the
+/// state at 1), so a stale hit would return 1 to a reader at 2.
+///
+/// The entry stands for `RowCache`'s (one entry per row, exact epoch match), packed into one
+/// atomic `epoch << 32 | state` that is replaced whole: the cache's own concurrency is
+/// modelled above, and its shards and locks would only multiply the interleavings.
+#[test]
+fn loom_row_epochs_never_serve_a_stale_row() {
+    use loom::sync::atomic::{AtomicU64, Ordering};
+
+    // Bounded as the memtable's models are: the stale-hit schedules need two preemptions.
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+        let epochs = Arc::new(RowEpochs::new(1));
+        // The cached entry: `(epoch, row state)`. The state at seqno 1 is cached already.
+        let entry = Arc::new(AtomicU64::new(1 << 32 | 1));
+        let unpack = |v: u64| (v >> 32, v & 0xffff_ffff);
+        let visible = Arc::new(AtomicU64::new(1));
+        let h = 7;
+        epochs.note_write(h, 1);
+
+        let writer = {
+            let (epochs, visible) = (Arc::clone(&epochs), Arc::clone(&visible));
+            thread::spawn(move || {
+                epochs.note_write(h, 2);
+                visible.store(2, Ordering::Release);
+            })
+        };
+        let filler = {
+            let (epochs, entry, visible) = (
+                Arc::clone(&epochs),
+                Arc::clone(&entry),
+                Arc::clone(&visible),
+            );
+            thread::spawn(move || {
+                let s = visible.load(Ordering::Acquire);
+                if let Some(e) = epochs.epoch(h, s) {
+                    entry.store(e << 32 | s, Ordering::SeqCst);
+                }
+            })
+        };
+        let reader = {
+            let (epochs, entry, visible) = (
+                Arc::clone(&epochs),
+                Arc::clone(&entry),
+                Arc::clone(&visible),
+            );
+            thread::spawn(move || {
+                let s = visible.load(Ordering::Acquire);
+                if let Some(e) = epochs.epoch(h, s) {
+                    let (epoch, state) = unpack(entry.load(Ordering::SeqCst));
+                    if epoch == e {
+                        assert_eq!(state, s, "a stale row served at read point {s}");
+                    }
+                }
+            })
+        };
+        writer.join().unwrap();
+        filler.join().unwrap();
+        reader.join().unwrap();
+        // Once the write is visible, a hit is the new state.
+        let s = visible.load(Ordering::Acquire);
+        let e = epochs.epoch(h, s).expect("visible");
+        let (epoch, state) = unpack(entry.load(Ordering::SeqCst));
+        if epoch == e {
+            assert_eq!(state, 2);
+        }
+    });
+}

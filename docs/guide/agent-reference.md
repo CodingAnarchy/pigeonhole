@@ -72,6 +72,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `drop_table(&self, name: &str) -> Result<()>` | Drop table and data. |
 | `write_batch(&self) -> WriteBatch` | New multi-row batch. |
 | `transaction(&self) -> Result<Transaction>` | P4, early. Optimistic transaction. |
+| `row_cache_stats(&self) -> RowCacheStats` | Row cache `hits`, `misses`, `fills` since open (all 0 when off). |
 | `snapshot(&self) -> Result<Snapshot>` | Consistent view of everything committed. |
 | `default_durability(&self) -> Durability` | Writer default. |
 | `set_default_durability(&self, Durability)` | Applies to later commits. |
@@ -95,7 +96,9 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `memtable_budget(u64)` | Arena bytes per shard (default 64 MiB). The shm region is `memtable_budget × shards` (each arena rounded up to 2 MiB) plus about 10 MiB for views and reader slots, filled as memtables grow; open fails with `ShmUnavailable` if its filesystem lacks that much free space. Something else filling that tmpfs after open can still crash the process with `SIGBUS`. |
 | `write_stall_timeout(Duration)` | How long a stalled write, `flush` or `compact` waits before `Busy` (default 30 s; `Duration::ZERO` refuses at once). |
 | `block_cache(usize)` | Block cache bytes (default 256 MiB; each reader process has its own). |
-| `row_cache(usize)` | Row cache bytes (default 0 = off). |
+| `row_cache(usize)` | Row cache bytes on top of the block cache (default 0 = off; D201). Serves latest row reads of the newest version (no time range; qualifier, column-limit and value filters applied to the cached row) and point gets from cached family rows; results equal uncached reads, and a write makes the row's copy miss at once. Writer process only. |
+| `row_cache_max_row(usize)` | Largest family row stored, encoded bytes (default 4 KiB). |
+| `row_cache_family(&str, &str)` | Serve only this `(table, family)`; call once per family (default: every family). |
 | `shm_dir(impl Into<PathBuf>)` | Shared-memory file directory (e.g. a tmpfs), instead of `/dev/shm` (Linux), `shm_open` (macOS/BSD) or the pagefile (Windows). Must exist. |
 | `create_if_missing(bool)` | Default true. |
 | `merge_operator(Arc<dyn MergeOperator>)` | Register a custom operator (families name it). |

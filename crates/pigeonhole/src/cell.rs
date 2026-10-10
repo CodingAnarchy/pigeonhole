@@ -199,7 +199,9 @@ impl pigeonhole_engine::RowSink for RowBuf {
         RowBuf::push(self, family, qualifier, data);
     }
 
-    #[inline]
+    // Inlined into the row read's per-cell loop: with the row cache's hit path as a second
+    // caller, a plain `#[inline]` stopped being honored there (#404, +0.7% on ycsb-a).
+    #[inline(always)]
     fn push_inline(&mut self, family: FamilyId, qualifier: Range<usize>, ts: u64, stored: &[u8]) {
         let family = self.family_index(family);
         self.cells.push(RowCell {
@@ -212,6 +214,15 @@ impl pigeonhole_engine::RowSink for RowBuf {
         if let Some(c) = self.cells.last_mut() {
             c.cell.data.set_inline(ts, stored);
         }
+    }
+
+    fn cell_count(&self) -> Option<usize> {
+        Some(self.cells.len())
+    }
+
+    fn cell(&self, i: usize) -> Option<(&[u8], &CellData)> {
+        let c = self.cells.get(i)?;
+        Some((self.qualifiers.get(c.qualifier.clone())?, &c.cell.data))
     }
 }
 

@@ -49,8 +49,12 @@ pub struct EngineOptions {
     pub memtable_freeze_bytes: u64,
     /// Block cache capacity in bytes.
     pub block_cache_bytes: usize,
-    /// Row cache capacity in bytes (0 disables it).
+    /// Row cache capacity in bytes (0 disables it; writer process only, D201).
     pub row_cache_bytes: usize,
+    /// Largest encoded family row the row cache stores (default 4 KiB).
+    pub row_cache_max_row: usize,
+    /// `(table, family)` names the row cache serves; empty means every family.
+    pub row_cache_families: Vec<(String, String)>,
     /// Directory for the shared-memory file instead of the memory-backed default.
     pub shm_dir: Option<PathBuf>,
     /// Reader slots in the shared-memory region.
@@ -164,6 +168,8 @@ impl EngineOptions {
             memtable_freeze_bytes: memtable_budget / 4,
             block_cache_bytes: 256 << 20,
             row_cache_bytes: 0,
+            row_cache_max_row: 4 << 10,
+            row_cache_families: Vec::new(),
             shm_dir: None,
             reader_slots: 126,
             wal: WalOptions::default(),

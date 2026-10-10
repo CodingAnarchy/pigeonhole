@@ -2,7 +2,11 @@
 //! (`loom` is a dev-dependency, so only the `--cfg loom` test build switches.)
 
 #[cfg(all(loom, test))]
+pub(crate) use loom::sync::atomic::AtomicU64;
+#[cfg(all(loom, test))]
 pub(crate) use loom::sync::{Arc, Mutex, MutexGuard};
+#[cfg(not(all(loom, test)))]
+pub(crate) use std::sync::atomic::AtomicU64;
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
 

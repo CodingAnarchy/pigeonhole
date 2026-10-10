@@ -27,7 +27,8 @@ impl Driver {
             options
                 .shards(1)
                 .tablet_changes(false)
-                .memtable_budget(1 << 30),
+                .memtable_budget(1 << 30)
+                .row_cache(row_cache()),
         )
         .expect("open");
         let busy = Arc::new(AtomicUsize::new(0));
@@ -84,4 +85,12 @@ fn drive(mut shard: Shard, busy: &AtomicUsize) {
         }
         busy.fetch_add(1, Ordering::AcqRel);
     }
+}
+
+/// `ROW_CACHE=bytes`: the shapes with the row cache on (#404, D201); off by default.
+fn row_cache() -> usize {
+    std::env::var("ROW_CACHE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
