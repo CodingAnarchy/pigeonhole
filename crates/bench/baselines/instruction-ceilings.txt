@@ -42,26 +42,32 @@
 # 0.2% (12162-12185). commit-at 11186 -> 11252, run 38037293572's count (11196) times 1.005:
 # main's own commit-at now varies by 0.37% (11128-11169), which the commit-shape bisect
 # investigates; both tighten when it is fixed. #449 trims the cost and lowers them again.
+#
+# Re-baselined after #453, which runs the counts with glibc.malloc.tcache_count=65535 (commit
+# shapes about -2.5% and deterministic): every ceiling lowered from main eb3ba0c's counts
+# (run 38047108839, the higher of its base and head counts, identical code) with
+# `instruction-ceilings.py lower`. commit-one and commit-at return to 0.3% headroom.
+# commit-sixteen and flush were already within theirs; nothing rose.
 
-as-written 2075 0.3
-flushed 1882 0.3
-compacted 1279 0.3
-get-mem 7269 0.3
-get-sst 17516 0.5
-get-miss 4628 0.3
-row 2532 1.0
-scan 1432 0.3
-scan-filtered 7422 0.3
-versions 5728 0.3
-counter 9767 0.3
-rows 20108 0.3
-level-scans 14984 0.6
-short-scans 14424 0.3
-commit-one 10176 0.6
+as-written 2058 0.3
+flushed 1867 0.3
+compacted 1259 0.3
+get-mem 5770 0.3
+get-sst 17339 0.5
+get-miss 4269 0.3
+row 2486 1.0
+scan 1413 0.3
+scan-filtered 7400 0.3
+versions 5609 0.3
+counter 9451 0.3
+rows 19745 0.3
+level-scans 14683 0.6
+short-scans 14092 0.3
+commit-one 9959 0.3
 commit-sixteen 52301 0.3
 flush 2199 0.3
-compact 2867 0.5
-ycsb-c 47832 1.0
-ycsb-a 29910 1.0
-commit-overwrite 12246 0.5
-commit-at 11252 0.5
+compact 2698 0.5
+ycsb-c 47371 1.0
+ycsb-a 29547 1.0
+commit-overwrite 12046 0.5
+commit-at 11001 0.3
