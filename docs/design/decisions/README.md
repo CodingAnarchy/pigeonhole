@@ -215,6 +215,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D199](phase-3.md#d199) — The stale-tail index is on by default; its write cost (commit-overwrite +1.57%, commit-at +0.88%) is accepted for its read gains (ycsb-a −35%, ycsb-c −43%, hot row −19%) · owner decision, #387 · amends D194
 - [D200](phase-3.md#d200) — A WAL rollover never waits on the shard thread for the full segment's sync: only the successor's header waits (FORMAT §10.1 rule 1 now allows its records first); Buffered groups in that window resolve through a sync; with no spare slot ready the engine holds its group back while one is prepared, dropping D30's inline exception · coordinator decision, #19 · amends D30
 - [D201](phase-3.md#d201) — The row cache: per-row write watermarks as epochs, latest newest-version reads only, gets consult without filling · cache, engine, pigeonhole, #404 · default decided by measurement (D197)
+- [D202](phase-3.md#d202) — Application-owned io_uring loops wait on a completion fd (`Shard::io_fd`): a DEFER_TASKRUN ring signals its registered eventfd before its owner reaps (settled on CI); the fd is an opt-in, so loops that never take it keep polling · coordinator decision, #408
 
 ## Open questions
 _None._
