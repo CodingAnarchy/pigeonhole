@@ -571,9 +571,10 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("scan, SST, cached", "extra cell", 0.0),
     ("scan, memtable", "scan", 10.0),
     ("scan, SST, cached", "scan", 10.0),
-    ("commit, 1 cell", "commit", 6.0),
-    ("commit, 16 cells", "commit", 8.0),
-    ("commit, 16 cells, 8 per group", "commit", 7.5),
+    // A commit's batch buffer comes back with the reply for the thread's next batch (#320).
+    ("commit, 1 cell", "commit", 5.0),
+    ("commit, 16 cells", "commit", 4.0),
+    ("commit, 16 cells, 8 per group", "commit", 7.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];

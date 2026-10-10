@@ -48,6 +48,15 @@
 # (run 38047108839, the higher of its base and head counts, identical code) with
 # `instruction-ceilings.py lower`. commit-one and commit-at return to 0.3% headroom.
 # commit-sixteen and flush were already within theirs; nothing rose.
+#
+# Lowered after #458 (a commit's batch buffer comes back with the reply: commit-one -1.2%,
+# commit-at -1.1%, commit-overwrite -1.0%, commit-sixteen -3.3%, ycsb-a -0.3%) from its head
+# run on main f6f4125 (run 38054911220) with `instruction-ceilings.py lower`.
+#
+# Raised by owner decision (2026-10-10): counter 9451 -> 9502 (9454 times 1.005, headroom
+# 0.3% -> 0.5%). Main's own code measured 9422-9454 (0.35%), above 0.3% headroom, which
+# blocked #458 on a shape it does not touch. Temporary until #472 finds and fixes the
+# variation and lowers it back.
 
 as-written 2058 0.3
 flushed 1867 0.3
@@ -59,15 +68,15 @@ row 2486 1.0
 scan 1413 0.3
 scan-filtered 7400 0.3
 versions 5609 0.3
-counter 9451 0.3
+counter 9502 0.5
 rows 19745 0.3
 level-scans 14683 0.6
 short-scans 14092 0.3
-commit-one 9959 0.3
-commit-sixteen 52301 0.3
+commit-one 9842 0.3
+commit-sixteen 50577 0.3
 flush 2199 0.3
 compact 2698 0.5
 ycsb-c 47371 1.0
-ycsb-a 29547 1.0
-commit-overwrite 12046 0.5
-commit-at 11001 0.3
+ycsb-a 29487 1.0
+commit-overwrite 11929 0.5
+commit-at 10885 0.3

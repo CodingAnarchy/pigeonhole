@@ -187,7 +187,7 @@ impl Drop for LargeValues {
 }
 
 /// Whether a commit's outcome says its batch was applied.
-pub(crate) fn commit_succeeded(outcome: Option<&Result<CommitInfo>>) -> bool {
+pub(crate) fn commit_succeeded(outcome: Option<&Result<crate::write::Settled>>) -> bool {
     matches!(outcome, Some(Ok(_)))
 }
 

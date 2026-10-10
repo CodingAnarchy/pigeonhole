@@ -1445,3 +1445,44 @@ fn real_vfs() -> pigeonhole_io::VfsRef {
         _ => pigeonhole_io::pread::PreadVfs::new(2),
     }
 }
+
+// ---- #320 ----
+
+/// A committed batch's buffer comes back with the reply and the thread's next batch reuses
+/// it: that batch starts empty, and only its own mutations are written.
+#[test]
+fn a_reused_batch_buffer_starts_empty() {
+    let vfs = SimVfs::new(4);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..4u8 {
+        let mut wb = WriteBatch::new();
+        assert!(wb.is_empty(), "commit {i}");
+        // Each batch larger than the last, so a reused buffer holds stale bytes past the
+        // new batch's end.
+        for c in 0..=i {
+            put(&mut wb, &t, "f", &[b'r', i], &[b'q', c], &[i; 40]);
+        }
+        assert_eq!(wb.len(), usize::from(i) + 1);
+        db.commit(wb, None).unwrap();
+    }
+    // A smaller batch after the larger ones: none of their mutations ride along.
+    let mut wb = WriteBatch::new();
+    assert!(wb.is_empty());
+    put(&mut wb, &t, "f", b"last", b"q", b"v");
+    assert_eq!(wb.len(), 1);
+    db.commit(wb, None).unwrap();
+    for i in 0..4u8 {
+        for c in 0..=i {
+            assert_eq!(
+                get_bytes(&db, &t, "f", &[b'r', i], &[b'q', c]),
+                Some(vec![i; 40])
+            );
+        }
+        assert_eq!(get_bytes(&db, &t, "f", &[b'r', i], &[b'q', i + 1]), None);
+    }
+    assert_eq!(get_bytes(&db, &t, "f", b"last", b"q"), Some(b"v".to_vec()));
+    db.close().unwrap();
+}

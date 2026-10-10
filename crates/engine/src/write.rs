@@ -54,10 +54,53 @@ pub struct WriteBatch {
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
 const INITIAL_BATCH_BYTES: usize = 256;
 
+/// The largest batch whose buffer a thread keeps for its next batch (#320): a thread that
+/// once committed a large batch does not hold that much memory for good.
+const RECYCLED_BATCH_MAX: usize = 64 << 10;
+
+thread_local! {
+    /// A committed batch's buffer, handed back by its shard with the reply ([`Settled`]), for
+    /// this thread's next [`WriteBatch`]: a commit's buffer is then neither allocated per
+    /// commit nor freed on the shard's thread (#320).
+    static RECYCLED_BATCH: std::cell::Cell<Option<BatchBuilder>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Keeps `batch`'s buffer for this thread's next batch, unless it grew large.
+fn recycle(batch: Option<BatchBuilder>) {
+    if let Some(batch) = batch
+        && batch.batch().as_bytes().len() <= RECYCLED_BATCH_MAX
+    {
+        RECYCLED_BATCH.with(|slot| slot.set(Some(batch)));
+    }
+}
+
+/// A shard's reply to a single-shard commit: its outcome, and the batch's buffer handed back
+/// to the committing side for reuse ([`recycle`]). Cross-shard and internal commits return
+/// none.
+#[derive(Debug)]
+pub(crate) struct Settled {
+    pub(crate) info: CommitInfo,
+    pub(crate) batch: Option<BatchBuilder>,
+}
+
+impl From<CommitInfo> for Settled {
+    fn from(info: CommitInfo) -> Self {
+        Self { info, batch: None }
+    }
+}
+
 impl Default for WriteBatch {
     fn default() -> Self {
+        let builder = match RECYCLED_BATCH.with(std::cell::Cell::take) {
+            Some(mut b) => {
+                b.clear();
+                b
+            }
+            None => BatchBuilder::with_capacity(INITIAL_BATCH_BYTES),
+        };
         Self {
-            builder: BatchBuilder::with_capacity(INITIAL_BATCH_BYTES),
+            builder,
             row_deletes: Vec::new(),
             value_buf: Vec::new(),
         }
@@ -291,7 +334,7 @@ pub enum Predicate {
 #[derive(Debug)]
 #[must_use = "dropping a pending commit does not cancel it, but its result is lost"]
 pub struct PendingCommit {
-    pub(crate) waiter: Waiter<crate::Result<CommitInfo>>,
+    pub(crate) waiter: Waiter<crate::Result<Settled>>,
     /// The engine, for registering an async waker on the global watermark.
     pub(crate) shared: Arc<crate::shard::Shared>,
     /// Resolved by the shard; waiting for visibility (async polling).
@@ -320,12 +363,15 @@ impl PendingCommit {
         };
         if window == 0 {
             // No spin: exactly the parking wait.
-            let info = wait_reply(&self.shared, &mut self.waiter)?;
+            let Settled { info, batch } = wait_reply(&self.shared, &mut self.waiter)?;
+            recycle(batch);
             wait_visible(&self.shared, info.seqno)?;
             return Ok(info);
         }
         let mut spin = SpinWait::new(window);
-        let info = wait_reply_spinning(&self.shared, &mut self.waiter, &mut spin)?;
+        let Settled { info, batch } =
+            wait_reply_spinning(&self.shared, &mut self.waiter, &mut spin)?;
+        recycle(batch);
         wait_visible_spinning(&self.shared, info.seqno, &mut spin)?;
         Ok(info)
     }
@@ -537,7 +583,8 @@ impl Future for PendingCommit {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(Err(Error::Closed)),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
-                Poll::Ready(Some(Ok(info))) => {
+                Poll::Ready(Some(Ok(Settled { info, batch }))) => {
+                    recycle(batch);
                     this.resolved = Some(info);
                     info
                 }
