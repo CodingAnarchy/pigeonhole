@@ -71,11 +71,11 @@ use std::fmt;
 use std::hash::Hasher;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 
 use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
 use pigeonhole_format::{FormatVersion, ManifestVersion, PAGE_SIZE};
-use pigeonhole_io::{Completion, ErrorKind, FileRef, OpenOptions, VfsRef};
+use pigeonhole_io::{Completion, ErrorKind, FileRef, IoBuf, OpenOptions, VfsRef};
 
 use crate::alloc::{Alloc, LoadError, UNIT_BYTES, UNIT_PAGES};
 
@@ -281,6 +281,7 @@ impl OpenedPager {
             };
             Error::Format(pigeonhole_format::Error::Corrupt { what })
         })?;
+        let frontier = alloc.frontier();
         Ok(Pager {
             inner: Arc::new(Inner {
                 file: self.file,
@@ -297,6 +298,8 @@ impl OpenedPager {
                 committing: AtomicBool::new(false),
                 growths: AtomicU64::new(0),
                 growth_nanos: AtomicU64::new(0),
+                side: SideSyncs::default(),
+                frontier: AtomicU64::new(frontier),
             }),
         })
     }
@@ -352,6 +355,96 @@ struct Inner {
     /// File growths, and the nanoseconds they held the allocator (ICR 0015).
     growths: AtomicU64,
     growth_nanos: AtomicU64,
+    /// Growth and truncation syncs in flight, which a commit must see the outcome of before
+    /// it publishes (D58), without holding the allocator lock (#182).
+    side: SideSyncs,
+    /// The allocator's frontier (units), kept beside it so a commit reads it for the
+    /// superblock without taking the allocator lock, which a growth holds across its sync
+    /// (#182). Updated under that lock whenever the frontier moves.
+    frontier: AtomicU64,
+}
+
+/// Commit steps a finished side sync resumes; [`Parked::run`] them with no pager lock held.
+#[must_use]
+struct Parked(Vec<Box<dyn FnOnce() + Send>>);
+
+impl Parked {
+    fn run(self) {
+        for step in self.0 {
+            step();
+        }
+    }
+}
+
+impl fmt::Debug for SideSyncs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SideSyncs")
+            .field("in_flight", &lock(&self.state).in_flight)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The growths' and truncations' `sync_all`s in flight (#182). A commit's sync may succeed
+/// only because one of them was handed the error for the same pages (D58), so before a
+/// commit publishes, every side sync that may have overlapped it must have finished: a
+/// failed one poisons the pager first. A submitted commit never waits for that on the I/O
+/// backend's thread: it parks its next step, and the side sync that finishes last
+/// resubmits it.
+#[derive(Default)]
+struct SideSyncs {
+    state: Mutex<SideState>,
+    /// Signalled when the count reaches zero (for a blocking commit).
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct SideState {
+    in_flight: u32,
+    /// Commits' next steps, parked until no side sync is in flight.
+    parked: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+impl SideSyncs {
+    /// Counts a side sync in flight until [`SideSyncs::finish`].
+    fn start(&self) {
+        lock(&self.state).in_flight += 1;
+    }
+
+    /// Ends a side sync: `poisoned` has already been set if it failed. Returns the parked
+    /// commit steps when it was the last one in flight, for the caller to run once it holds
+    /// no pager lock (a step can end its commit, which takes the allocator lock). Their steps
+    /// only submit I/O, so the thread running them (an allocating shard or compaction
+    /// thread) does not wait for it.
+    fn finish(&self) -> Parked {
+        let mut st = lock(&self.state);
+        st.in_flight -= 1;
+        if st.in_flight != 0 {
+            return Parked(Vec::new());
+        }
+        let parked = std::mem::take(&mut st.parked);
+        drop(st);
+        self.idle.notify_all();
+        Parked(parked)
+    }
+
+    /// Runs `step` now if no side sync is in flight, else when the last one finishes.
+    fn after(&self, step: impl FnOnce() + Send + 'static) {
+        let mut st = lock(&self.state);
+        if st.in_flight != 0 {
+            st.parked.push(Box::new(step));
+            return;
+        }
+        drop(st);
+        step();
+    }
+
+    /// Waits until no side sync is in flight (a blocking commit, on its caller's thread).
+    fn wait_idle(&self) {
+        let mut st = lock(&self.state);
+        while st.in_flight != 0 {
+            st = self.idle.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -469,7 +562,7 @@ impl Inner {
         let sequence = st.sequence + 1;
         let slot = st.slot ^ 1;
         drop(st);
-        let file_pages = lock(&self.alloc).frontier() * UNIT_PAGES;
+        let file_pages = self.frontier.load(Ordering::Acquire) * UNIT_PAGES;
         let sb = Superblock {
             version: FormatVersion::CURRENT,
             page_size: PAGE_SIZE as u32,
@@ -494,28 +587,26 @@ impl Inner {
     }
 
     /// Fails if a growth's or truncation's sync failed. A commit calls it after each of its
-    /// own syncs succeeded: that sync may have succeeded only because a concurrent one was
-    /// handed the error for the same pages. Those syncs run under the allocator lock and
-    /// poison before releasing it, so taking the lock waits for one in flight. That wait can
-    /// be a whole growth's `fallocate` and `sync_all` (up to 64 MiB), and for a submitted
-    /// commit it happens on the I/O backend's thread, which then serves no reads meanwhile
-    /// (bounded; issue #182).
+    /// own syncs succeeded, once no side sync is in flight ([`SideSyncs`]): that sync may
+    /// have succeeded only because a concurrent one was handed the error for the same pages,
+    /// and a failed side sync poisons before it stops counting as in flight.
     fn check_syncs(&self) -> pigeonhole_io::Result<()> {
-        let _alloc = lock(&self.alloc);
         if lock(&self.state).poisoned {
             return Err(poisoned_error());
         }
         Ok(())
     }
 
-    /// Writes the superblock once the first sync succeeded and no other sync failed.
+    /// Writes the superblock once the first sync succeeded and no other sync failed
+    /// (blocking: waits for side syncs in flight).
     fn write_superblock(&self, p: &PendingCommit) -> pigeonhole_io::Result<()> {
+        self.side.wait_idle();
         self.check_syncs()?;
         self.file.write_at(&p.page[..], p.slot * PAGE_SIZE as u64)
     }
 
     /// Ends a commit: on success the new root is current; on failure (or if another sync
-    /// failed meanwhile) the pager is poisoned.
+    /// failed meanwhile) the pager is poisoned. No side sync may be in flight.
     fn end(
         &self,
         p: PendingCommit,
@@ -551,11 +642,13 @@ impl Inner {
             .sync_data()
             .and_then(|()| self.write_superblock(&p))
             .and_then(|()| self.file.sync_data());
+        self.side.wait_idle();
         self.end(p, result)
     }
 
-    /// The same steps with both syncs submitted to the I/O backend. The superblock write (one
-    /// 4 KiB page into the page cache) runs on the thread that resolves the first sync.
+    /// The same steps, all submitted to the I/O backend: sync, superblock write, sync. No
+    /// step waits on the thread that resolves the one before (#182): one that must wait for a
+    /// side sync in flight is parked ([`SideSyncs::after`]) and submitted when it finishes.
     fn submit_commit(self: Arc<Self>, root: Root) -> Completion<()> {
         let p = match self.begin(root, false) {
             Ok(p) => p,
@@ -563,21 +656,46 @@ impl Inner {
         };
         let (done, resolver) = Completion::pair();
         let first = self.file.submit_sync_data();
-        // The continuation's own completion is not needed: `resolver` reports the outcome.
+        // The continuations' own completions are not needed: `resolver` reports the outcome.
         let _chained = first.map(move |synced| {
-            match synced.and_then(|()| self.write_superblock(&p)) {
-                Err(e) => resolver.resolve(self.end(p, Err(e))),
-                Ok(()) => {
-                    let second = self.file.submit_sync_data();
-                    let _chained = second.map(move |synced| {
-                        resolver.resolve(self.end(p, synced));
-                        Ok(())
-                    });
-                }
-            }
+            let inner = Arc::clone(&self);
+            self.side
+                .after(move || inner.submit_superblock(p, synced, resolver));
             Ok(())
         });
         done
+    }
+
+    /// A submitted commit's second step, with no side sync in flight: writes the superblock
+    /// (if the first sync and every side sync succeeded) and submits the second sync.
+    fn submit_superblock(
+        self: Arc<Self>,
+        p: PendingCommit,
+        synced: pigeonhole_io::Result<()>,
+        resolver: pigeonhole_io::Resolver<()>,
+    ) {
+        if let Err(e) = synced.and_then(|()| self.check_syncs()) {
+            resolver.resolve(self.end(p, Err(e)));
+            return;
+        }
+        let mut page = IoBuf::zeroed(PAGE_SIZE);
+        page.copy_from_slice(&p.page[..]);
+        let written = self.file.submit_write(page, p.slot * PAGE_SIZE as u64);
+        let _chained = written.map(move |r| {
+            let r = r.map(drop);
+            if let Err(e) = r {
+                resolver.resolve(self.end(p, Err(e)));
+                return Ok(());
+            }
+            let second = self.file.submit_sync_data();
+            let _chained = second.map(move |synced| {
+                let inner = Arc::clone(&self);
+                self.side
+                    .after(move || resolver.resolve(inner.end(p, synced)));
+                Ok(())
+            });
+            Ok(())
+        });
     }
 }
 
@@ -713,17 +831,27 @@ impl Pager {
             .allocate(from, end * UNIT_BYTES - from)
             .map_err(grow_error)?;
         // A failed sync poisons (decision D58): it may have been handed the error for pages
-        // a flush wrote, which the next commit's sync would then not report.
-        if let Err(e) = self.inner.file.sync_all() {
+        // a flush wrote, which the next commit's sync would then not report. A commit whose
+        // sync overlaps this one waits for its outcome before publishing (#182).
+        self.inner.side.start();
+        let synced = self.inner.file.sync_all();
+        if synced.is_err() {
             lock(&self.inner.state).poisoned = true;
-            return Err(e.into());
         }
+        let parked = self.inner.side.finish();
+        let grown = synced.map(|()| alloc.alloc_grown(class));
+        self.inner
+            .frontier
+            .store(alloc.frontier(), Ordering::Release);
+        drop(alloc);
+        parked.run();
+        let grown = grown?;
         self.inner.growths.fetch_add(1, Ordering::Relaxed);
         self.inner.growth_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        Ok(alloc.alloc_grown(class))
+        Ok(grown)
     }
 
     /// Returns an extent that was allocated but never published in a root (an abandoned
@@ -1025,12 +1153,18 @@ impl Pager {
             }
             self.inner.file.set_len(end * UNIT_BYTES)?;
             alloc.truncate(end);
+            self.inner.frontier.store(end, Ordering::Release);
             // Synced under the allocator lock, poisoning on failure, as in `allocate`: every
-            // allocation (and a commit's `check_syncs`) waits for this sync meanwhile.
-            if let Err(e) = self.inner.file.sync_all() {
+            // allocation waits for this sync meanwhile, and a commit's next step after it.
+            self.inner.side.start();
+            let synced = self.inner.file.sync_all();
+            if synced.is_err() {
                 lock(&self.inner.state).poisoned = true;
-                return Err(e.into());
             }
+            let parked = self.inner.side.finish();
+            drop(alloc);
+            parked.run();
+            synced?;
             (frontier - end) * UNIT_BYTES
         };
         Ok(released)
