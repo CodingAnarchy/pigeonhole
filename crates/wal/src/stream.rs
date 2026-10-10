@@ -333,10 +333,10 @@ impl RolloverSync {
             if let Some(ok) = st.done {
                 return ok;
             }
-            if pigeonhole_io::own_io_in_flight() {
-                drop(st);
-                pigeonhole_io::reap_own_io(Some(OWN_IO_SLICE));
-                st = self.lock();
+            drop(st);
+            let reaped = reap_for_wait();
+            st = self.lock();
+            if reaped || st.done.is_some() {
                 continue;
             }
             st = self
@@ -367,6 +367,18 @@ struct HeldHeader {
 /// How long a thread with I/O only it completes waits on that I/O before it checks the
 /// stream's syncs again (#207).
 const OWN_IO_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Makes progress, for a blocked wait, on I/O nothing else would complete: this thread's own
+/// (a shard driver's ring, #207), or, without any, the rings no thread reaps (application-owned
+/// io_uring's shared ring, #408, ICR 0028), for up to [`OWN_IO_SLICE`]. `false` when there is
+/// neither, so the caller sleeps on its condvar as before.
+fn reap_for_wait() -> bool {
+    if pigeonhole_io::own_io_in_flight() {
+        pigeonhole_io::reap_own_io(Some(OWN_IO_SLICE));
+        return true;
+    }
+    pigeonhole_io::reap_orphan_io(OWN_IO_SLICE).is_some()
+}
 
 impl Shared {
     fn pool(&self) -> MutexGuard<'_, Pool> {
@@ -434,13 +446,13 @@ impl Shared {
         r?;
         let mut syncs = self.syncs();
         while !syncs.drained(barrier) {
-            if pigeonhole_io::own_io_in_flight() {
-                // An older sync may be I/O only this thread completes (a shard driver's
-                // ring, #207): reap it, outside the lock its completion takes, rather than
-                // wait for ever.
-                drop(syncs);
-                pigeonhole_io::reap_own_io(Some(OWN_IO_SLICE));
-                syncs = self.syncs();
+            // An older sync may be I/O only this thread, or no thread, completes: reap it,
+            // outside the lock its completion takes, rather than wait for ever. Then re-check
+            // before sleeping: it may have finished while the lock was released.
+            drop(syncs);
+            let reaped = reap_for_wait();
+            syncs = self.syncs();
+            if reaped || syncs.drained(barrier) {
                 continue;
             }
             syncs = self

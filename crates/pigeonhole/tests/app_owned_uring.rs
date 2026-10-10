@@ -5,9 +5,11 @@
 //! pass without it.
 #![cfg(target_os = "linux")]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use pigeonhole::{Family, IoBackend, Options, Pigeonhole, Shard};
+use pigeonhole::{Durability, Family, IoBackend, Options, Pigeonhole, Shard};
 
 /// Fails the test binary instead of hanging it (#443): aborts the process once `secs` pass
 /// without the guard being dropped, naming `what` and the last step reached.
@@ -232,4 +234,64 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
         "{zero} of {sleeps} sleeps timed out at once (a spin) in {:?}",
         started.elapsed()
     );
+}
+
+/// Drives `shard` on this thread until `stop` is set, then hands it back.
+fn drive_until(mut shard: Shard, stop: Arc<AtomicBool>) -> Shard {
+    while !stop.load(Ordering::Acquire) {
+        if !shard.run_once(Duration::from_millis(1)) {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+    shard
+}
+
+#[test]
+fn a_shard_moved_to_another_thread_gets_a_ring_there_and_its_durable_commits_complete() {
+    // The #473 scaling hang: a shard handed to a new thread kept submitting to the ring of no
+    // thread (its runtime attached a ring once, on the first thread), so its group syncs
+    // never completed there.
+    let _watchdog = Watchdog::new("a_shard_moved_to_another_thread", 60);
+    let dir = TempDir::new("moved");
+    let options = Options::default()
+        .shards(1)
+        .memtable_budget(4 << 20)
+        .io_backend(IoBackend::Uring);
+    let (db, mut shards) =
+        Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
+    db.set_default_durability(Durability::GroupSync);
+    let mut shard = shards.pop().unwrap();
+    let mut table = None;
+    for phase in 0..3u32 {
+        // Each phase drives the shard on a new thread, as phdb-bench's inline runner does.
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || drive_until(shard, stop)
+        });
+        step("create table");
+        let t = table.get_or_insert_with(|| {
+            db.table("t")
+                .unwrap()
+                .family("f", Family::default())
+                .create_if_missing()
+                .unwrap()
+        });
+        step("durable commits");
+        for i in 0..50u32 {
+            t.mutate(format!("row{phase}-{i:03}").as_bytes())
+                .put("f", b"q", b"v")
+                .commit()
+                .unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        step("hand the shard back");
+        shard = driver.join().unwrap();
+    }
+    let driver = std::thread::spawn(move || drive(shard));
+    drop(table);
+    step("close");
+    db.close().unwrap();
+    step("join the last driver");
+    driver.join().unwrap();
 }

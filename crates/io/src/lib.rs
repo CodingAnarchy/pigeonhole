@@ -37,6 +37,6 @@ pub use buf::{BufPool, IoBuf};
 pub use completion::{Completion, Resolver};
 pub use error::{Error, ErrorKind, Result};
 pub use file::{File, FileRef, Locality, LockMode, OpenOptions};
-pub use own::{OwnIoWaker, own_io_fd, own_io_in_flight, own_io_waker, reap_own_io};
+pub use own::{OwnIoWaker, own_io_fd, own_io_in_flight, own_io_waker, reap_orphan_io, reap_own_io};
 pub use shared::{SharedOpen, SharedRegion};
 pub use vfs::{FileIdentity, ProcessId, RingStats, Vfs, VfsRef};
