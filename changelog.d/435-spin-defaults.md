@@ -1,0 +1,2 @@
+### Changed
+- **Buffered commits wait with a short spin before parking, by default** (D198, #64): 15 µs on the client and 50 µs on engine-owned shards (`Options::commit_spin`, `Options::shard_spin`). On a Linux CI runner a buffered commit's median latency fell from 32.9 µs to 4.1 µs, and p99 from 46.1 µs to 10.5 µs. Durable commits, idle databases and application-owned shards do not spin, and a poll that finds nothing backs off. `Duration::ZERO` turns either window off.

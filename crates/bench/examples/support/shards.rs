@@ -108,7 +108,10 @@ fn open(path: &Path) -> (Pigeonhole, Vec<thread::JoinHandle<()>>, Arc<Ctl>) {
             .tablet_changes(false)
             .durability(Durability::Buffered)
             .memtable_budget(1 << 30)
-            .block_cache(256 << 20),
+            .block_cache(256 << 20)
+            // A waiting client's poll (D198) runs a number of times that depends on thread
+            // timing: counted, it would make the commit shapes nondeterministic.
+            .commit_spin(std::time::Duration::ZERO),
     )
     .expect("open");
     let ctl = Arc::new(Ctl {
