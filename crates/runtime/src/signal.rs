@@ -7,7 +7,7 @@
 //! fence and one relaxed load: no lock, no syscall.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::Thread;
 
@@ -28,6 +28,10 @@ pub(crate) struct Signal {
     sleeping: AtomicBool,
     task_woken: AtomicBool,
     target: Mutex<WakeTarget>,
+    /// Times the consumer's engine-owned thread parked idle (ICR 0027).
+    parks: AtomicU64,
+    /// Notifies that found the consumer announced asleep and woke it (ICR 0027).
+    wakes: AtomicU64,
 }
 
 impl fmt::Debug for Signal {
@@ -45,6 +49,8 @@ impl Signal {
             sleeping: AtomicBool::new(false),
             task_woken: AtomicBool::new(false),
             target: Mutex::new(WakeTarget::None),
+            parks: AtomicU64::new(0),
+            wakes: AtomicU64::new(0),
         }
     }
 
@@ -56,6 +62,7 @@ impl Signal {
     pub(crate) fn notify(&self) {
         fence(Ordering::SeqCst);
         if self.sleeping.load(Ordering::Relaxed) && self.sleeping.swap(false, Ordering::AcqRel) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
             self.wake_target();
         }
     }
@@ -82,6 +89,20 @@ impl Signal {
     /// Consumer side: back to work (producers need not wake us).
     pub(crate) fn awake(&self) {
         self.sleeping.store(false, Ordering::Relaxed);
+    }
+
+    /// Consumer side: counts a park of an engine-owned thread with nothing to do.
+    pub(crate) fn parked(&self) {
+        self.parks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(parks, wakes)` since the signal was made: see [`Signal::parked`] and
+    /// [`Signal::notify`].
+    pub(crate) fn idle_counts(&self) -> (u64, u64) {
+        (
+            self.parks.load(Ordering::Relaxed),
+            self.wakes.load(Ordering::Relaxed),
+        )
     }
 
     /// Whether some task was woken since the last call (clears the flag).

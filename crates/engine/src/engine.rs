@@ -140,6 +140,14 @@ pub struct Metrics {
     /// cache (D196, #398), a block the cache could not keep, or a read that missed too
     /// often. Zero when async reads never block their executor thread.
     pub async_sync_reads: u64,
+    /// Idle parks of the shards' engine-owned threads (after their idle spin, D198), and
+    /// submits or notifications that found a shard asleep and woke it, summed over shards
+    /// (ICR 0027). Per commit, they show how often a commit pays a shard wakeup. An
+    /// application-owned shard sleeps in the application's loop: only its wakes count.
+    pub shard_idle: (u64, u64),
+    /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
+    /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
+    pub commit_parks: u64,
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -538,6 +546,7 @@ impl Engine {
             shards,
             view: ArcSwap::new(empty_view),
             async_sync_reads: AtomicU64::new(0),
+            commit_parks: AtomicU64::new(0),
             view_lock: Mutex::new(0),
             manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
             manifest_queue: Default::default(),
@@ -1053,6 +1062,7 @@ impl Engine {
             shards,
             view: ArcSwap::new(empty_view),
             async_sync_reads: AtomicU64::new(0),
+            commit_parks: AtomicU64::new(0),
             view_lock: Mutex::new(0),
             manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
             manifest_queue: Default::default(),
@@ -1724,6 +1734,14 @@ impl Engine {
         m.file_growths = (pager.growths, pager.growth_nanos);
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
         m.block_cache = shared.cache.hits_and_misses();
+        m.commit_parks = shared.commit_parks.load(Ordering::Relaxed);
+        if let Some(subs) = shared.submitters.get() {
+            for sub in subs.iter() {
+                let (parks, wakes) = sub.idle_counts();
+                m.shard_idle.0 += parks;
+                m.shard_idle.1 += wakes;
+            }
+        }
         m
     }
 

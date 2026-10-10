@@ -303,6 +303,15 @@ impl<M: Send + 'static> Submitter<M> {
         self.inbox.shard
     }
 
+    /// `(parks, wakes)` of the target shard since the runtime started (ICR 0027): times its
+    /// engine-owned thread parked with nothing to do (after its idle spin), and submits or
+    /// notifications that found it announced asleep and woke it. An application-owned
+    /// shard's loop sleeps in the application, so only its wakes are counted. Relaxed: a
+    /// reading taken while the shard runs may lag it.
+    pub fn idle_counts(&self) -> (u64, u64) {
+        self.inbox.signal.idle_counts()
+    }
+
     /// Enqueues `msg`. Fails only after shutdown.
     pub fn submit(&self, msg: M) -> Result<()> {
         let inbox = &*self.inbox;
@@ -634,6 +643,7 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
             // Until the next message, or the earliest sleeping task's deadline (re-checked
             // sooner while the clock has not shown it keeps real time: a simulated clock
             // moves without waking anyone).
+            core.signal().parked();
             match core.next_deadline() {
                 None => thread::park(),
                 Some(d) => idle_park.park(&*core.vfs, d),
