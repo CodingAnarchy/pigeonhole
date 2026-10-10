@@ -122,8 +122,9 @@ fn main() {
             // Three L0 SSTs, below the compaction trigger (4): nothing compacts before the
             // measured compaction.
             let rows = rows("six", 125 * iters);
+            let mut ts = 1_700_000_000_000_000;
             for part in rows.chunks(rows.len().div_ceil(3)) {
-                commit_sixteen(&t, part, &quals);
+                commit_sixteen_at(&t, part, &quals, &mut ts);
                 db.flush().unwrap();
             }
             measure(&mut || shape_compact(&db));
@@ -172,6 +173,21 @@ fn commit_sixteen(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>]) {
         for q in quals {
             m = m.put("f", q, &VALUE);
         }
+        m.commit().unwrap();
+    }
+}
+
+/// [`commit_sixteen`] with explicit timestamps from `ts` on, one per row: the setup of a
+/// shape whose measured work reads what it wrote. Commit timestamps come from the clock, and
+/// their bytes in the keys set how well the blocks compress: the `compact` shape varied by
+/// 1.4% with them, all in decompressing the same 66 blocks.
+fn commit_sixteen_at(t: &Table, rows: &[Vec<u8>], quals: &[Vec<u8>], ts: &mut u64) {
+    for row in rows {
+        let mut m = t.mutate(row);
+        for q in quals {
+            m = m.put_at("f", q, *ts, &VALUE);
+        }
+        *ts += 1;
         m.commit().unwrap();
     }
 }
