@@ -601,19 +601,16 @@ impl SstSource {
 
 /// The filter probes of a point read: hashes of the row, the column and the row's marker
 /// key (FORMAT §6), computed once per read from its [`ColumnKey`].
-pub(crate) struct Probe<'a> {
-    /// The row prefix (escaped row and terminator).
-    pub row_prefix: &'a [u8],
+pub(crate) struct Probe {
     row: u64,
     column: u64,
     marker: u64,
 }
 
-impl<'a> Probe<'a> {
-    pub(crate) fn new(key: &'a mut ColumnKey) -> Result<Self> {
-        if key.oversized {
-            return Err(pigeonhole_format::Error::KeyTooLarge.into());
-        }
+impl Probe {
+    /// Hashes `key` (appending its marker key to its buffer, past the column prefix and the
+    /// row prefix callers read). `key` must not be oversized.
+    pub(crate) fn new(key: &mut ColumnKey) -> Self {
         let (row_len, len) = (key.row_len, key.len);
         let row = row_hash(&key.buf[..row_len - TERMINATOR.len()]);
         let column = column_hash(&key.buf[..len]);
@@ -622,13 +619,11 @@ impl<'a> Probe<'a> {
         key.buf.extend_from_within(..row_len);
         key.buf.extend_from_slice(&MARKER_QUALIFIER);
         let marker = column_hash(&key.buf[len..]);
-        let key: &'a ColumnKey = key;
-        Ok(Self {
-            row_prefix: &key.buf[..row_len],
+        Self {
             row,
             column,
             marker,
-        })
+        }
     }
 }
 
@@ -638,15 +633,22 @@ impl<'a> Probe<'a> {
 pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
     fam: &FamilySsts,
     set: &SstSet,
-    probe: &Probe<'_>,
+    key: &mut ColumnKey,
     priority: Priority,
     out: &mut Vec<Source>,
 ) -> Result<()> {
+    if key.oversized {
+        return Err(pigeonhole_format::Error::KeyTooLarge.into());
+    }
     let opts = read_options(priority, false, CACHE_ONLY);
+    // The filter probe (three hashes) only once an SST covers the row: a get of a row no
+    // SST holds does not pay for it.
+    let mut probe: Option<Probe> = None;
     for sst in fam.iter() {
-        if !covers_row(sst, probe.row_prefix) {
+        if !covers_row(sst, &key.buf[..key.row_len]) {
             continue;
         }
+        let probe = &*probe.get_or_insert_with(|| Probe::new(key));
         let reader = if CACHE_ONLY {
             sst.reader_cache_only(set, priority)?
         } else {
@@ -777,9 +779,8 @@ impl View {
         if let Some(fam) = l.ssts
             && !fam.is_empty()
         {
-            let probe = Probe::new(key)?;
             let before = out.len();
-            sst_sources_point::<CACHE_ONLY>(fam, &self.ssts, &probe, l.priority, out)?;
+            sst_sources_point::<CACHE_ONLY>(fam, &self.ssts, key, l.priority, out)?;
             markers |= out.len() > before;
         }
         Ok(markers)

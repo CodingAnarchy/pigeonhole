@@ -1341,15 +1341,22 @@ impl Engine {
             if inner.shared.shm.visible_seqno() != seqno {
                 continue;
             }
-            let now = inner.shared.vfs.now_micros();
+            let clock = || inner.shared.vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
                 && let Some(hit) = crate::row_cache::get_cached(
-                    rc, &view, seqno, now, table, family, row, qualifier,
+                    rc,
+                    &view,
+                    seqno,
+                    clock(),
+                    table,
+                    family,
+                    row,
+                    qualifier,
                 )
             {
                 return Ok(hit);
             }
-            return get_in::<false>(&view, seqno, now, table, family, row, qualifier, || {
+            return get_in::<false>(&view, seqno, clock, table, family, row, qualifier, || {
                 Arc::clone(&view)
             });
         }
@@ -2557,11 +2564,10 @@ impl Inner {
         row: &[u8],
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
-        let now = self.shared.vfs.now_micros();
         snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,
-            now,
+            || self.shared.vfs.now_micros(),
             table,
             family,
             row,
