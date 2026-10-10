@@ -16,7 +16,9 @@ use std::task::Waker;
 
 use arc_swap::ArcSwap;
 use pigeonhole_cache::BlockCache;
-use pigeonhole_compaction::{CompactionPicker, MergingCursor, PickerOptions, ResolveOptions};
+use pigeonhole_compaction::{
+    CompactionPicker, Levels, MergingCursor, PickerOptions, ResolveOptions,
+};
 use pigeonhole_format::hash::{FastBuildHasher, FastMap, FastSet};
 use pigeonhole_format::key::{
     compare, encode_key_after_row, encode_marker_after_row, encode_row_prefix, split_suffix,
@@ -2253,6 +2255,11 @@ pub(crate) struct ShardState {
     /// nanoseconds) before which no background compaction picks them again, so one slot
     /// that keeps failing does not stop compaction for the rest of the shard (issue #141).
     slot_backoff: HashMap<(TabletId, FamilyId), (u32, u64)>,
+    /// The slots `maintain` scans, kept from one scan to the next so the scan does not
+    /// allocate its list each time (#499).
+    scan_slots: Vec<(TabletId, FamilyId)>,
+    /// Each slot's levels for the pickers, refilled per slot by `maintain` (#499).
+    scan_levels: Levels,
     /// Checkpoints refused in a row (a full disk), and the timer that retries the last one
     /// on a moving clock (an idle shard has no other event to retry it on).
     checkpoint_failures: u32,
@@ -2425,6 +2432,8 @@ impl ShardState {
             due_backing_off: false,
             backoff_timer: None,
             slot_backoff: HashMap::new(),
+            scan_slots: Vec::new(),
+            scan_levels: Levels::default(),
             checkpoint_failures: 0,
             checkpoint_timer: None,
             stall: Stall::default(),
@@ -6218,16 +6227,20 @@ impl ShardState {
     /// The families of the tablets this shard owns, with their SSTs in `view`.
     fn owned_slots(&self, view: &View) -> Vec<(TabletId, FamilyId)> {
         let mut out = Vec::new();
+        self.owned_slots_into(view, &mut out);
+        out
+    }
+
+    /// [`ShardState::owned_slots`] into `out` (cleared first), reusing its buffer (#499).
+    fn owned_slots_into(&self, view: &View, out: &mut Vec<(TabletId, FamilyId)>) {
+        out.clear();
         for t in view.tablets.iter() {
             // A tablet being split, merged or moved starts no compaction.
             if t.shard != self.id || self.moving.contains(&t.id) {
                 continue;
             }
-            for f in view.catalog.family_ids_of(t.table) {
-                out.push((t.id, f));
-            }
+            out.extend(view.catalog.families_of(t.table).map(|f| (t.id, f)));
         }
-        out
     }
 
     /// Whether the test hooks record history (`Engine::record_history`; never without the
@@ -6266,7 +6279,11 @@ impl ShardState {
         let mut due: Vec<(f64, (TabletId, FamilyId))> = Vec::new();
         // The earliest future expiry of a FIFO-by-time slot's SST (#232).
         let mut next_expiry: Option<Timestamp> = None;
-        for key in self.owned_slots(&view) {
+        // The slot list is the shard's, reused from scan to scan (#499).
+        let mut slots = std::mem::take(&mut self.scan_slots);
+        let mut levels = std::mem::take(&mut self.scan_levels);
+        self.owned_slots_into(&view, &mut slots);
+        for &key in &slots {
             let Some(fam) = view.ssts.family(key.0, key.1) else {
                 continue;
             };
@@ -6277,7 +6294,7 @@ impl ShardState {
                 continue;
             }
             let picker = self.picker(meta.options.compaction);
-            let levels = fam.levels_meta();
+            fam.levels_meta_into(&mut levels);
             let s = picker.score_at(&levels, now, meta.options.ttl_micros);
             score = score.max(picker.stall_score(&levels));
             if let Some(at) = picker.next_expiry(&levels, meta.options.ttl_micros)
@@ -6289,6 +6306,11 @@ impl ShardState {
                 due.push((s, key));
             }
         }
+        self.scan_slots = slots;
+        // Keep the buffers, not the SSTs: a dropped SST's metadata is not held until the next
+        // scan.
+        levels.levels.iter_mut().for_each(Vec::clear);
+        self.scan_levels = levels;
         due.sort_by(|a, b| b.0.total_cmp(&a.0));
         let now_nanos = ctx.now_nanos();
         // Backoffs of slots this shard no longer has (a dropped table, a tablet merged away

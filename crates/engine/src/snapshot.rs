@@ -378,12 +378,18 @@ impl FamilySsts {
     }
     /// The picker's view of the levels.
     pub(crate) fn levels_meta(&self) -> Levels {
-        Levels {
-            levels: self
-                .levels
-                .iter()
-                .map(|l| l.iter().map(|s| Arc::clone(&s.meta)).collect())
-                .collect(),
+        let mut out = Levels::default();
+        self.levels_meta_into(&mut out);
+        out
+    }
+
+    /// [`FamilySsts::levels_meta`] into `out`, reusing its buffers (#499): no allocation once
+    /// `out` has held a slot this deep.
+    pub(crate) fn levels_meta_into(&self, out: &mut Levels) {
+        out.levels.resize_with(self.levels.len(), Vec::new);
+        for (o, l) in out.levels.iter_mut().zip(&self.levels) {
+            o.clear();
+            o.extend(l.iter().map(|s| Arc::clone(&s.meta)));
         }
     }
 

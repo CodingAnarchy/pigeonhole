@@ -522,6 +522,73 @@ fn large_put(out: &mut Vec<Row>) -> f64 {
     bytes / value.len() as f64
 }
 
+/// A flush of one cell: its manifest commit, against the tiny catalog of a fresh store and
+/// against a catalog of 64 tables × 4 families × 8 SSTs (2,048 SSTs). Every manifest commit
+/// (flush, compaction, separated put) starts from a copy of the catalog (#499).
+fn catalog_size(out: &mut Vec<Row>) {
+    let value = [5u8; 100];
+    for (path, tables) in [
+        ("flush of one cell, small catalog", 0usize),
+        ("flush of one cell, 2,048-SST catalog", 64),
+    ] {
+        let mut rig = Rig::open(if tables == 0 {
+            "catalog-small"
+        } else {
+            "catalog-large"
+        });
+        let families: Vec<(String, FamilyOptions)> = (0..4)
+            .map(|f| (format!("f{f}"), FamilyOptions::default()))
+            .collect();
+        let made: Vec<TableInfo> = (0..tables)
+            .map(|i| (*rig.db.create_table(&format!("c{i}"), &families).unwrap()).clone())
+            .collect();
+        for round in 0..8u32 {
+            for t in &made {
+                for f in &t.families {
+                    let mut wb = WriteBatch::new();
+                    wb.put(
+                        t.id,
+                        f.id,
+                        &round.to_be_bytes(),
+                        b"q",
+                        None,
+                        ValueRef::Bytes(&value),
+                    )
+                    .unwrap();
+                    rig.commit(wb);
+                }
+            }
+            if tables > 0 {
+                rig.flush();
+            }
+        }
+        let flushes = 4u32;
+        let (mut allocs, mut bytes, mut nanos) = (0u64, 0u64, 0u128);
+        for i in 0..=flushes {
+            rig.put_rows(10_000 + i..10_001 + i, 1, &value);
+            let start = std::time::Instant::now();
+            let (a, b, ()) = counted(|| rig.flush());
+            // The first flush warms up.
+            if i > 0 {
+                allocs += a;
+                bytes += b;
+                nanos += start.elapsed().as_nanos();
+            }
+        }
+        println!(
+            "{path}: {:.1} µs per flush (wall clock, release, simulated file)",
+            nanos as f64 / f64::from(flushes) / 1e3
+        );
+        out.push(Row {
+            path,
+            unit: "flush",
+            allocs: allocs as f64 / f64::from(flushes),
+            bytes: bytes as f64 / f64::from(flushes),
+        });
+        rig.close();
+    }
+}
+
 /// Flush and full compaction, per entry written.
 fn maintenance(out: &mut Vec<Row>) {
     let mut rig = Rig::open("maint");
@@ -582,6 +649,10 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     // and 1 MB per put that a real file does not make (#499). Most of the rest is the
     // manifest commit a separated put makes before its WAL record (D16).
     ("commit, one 1 MiB put (separated)", "commit", 130.0),
+    // A flush's manifest commit and the maintenance scan after it, at two catalog sizes
+    // (#499). The large catalog's budget only goes down.
+    ("flush of one cell, small catalog", "flush", 300.0),
+    ("flush of one cell, 2,048-SST catalog", "flush", 3900.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];
@@ -612,6 +683,7 @@ fn allocations_per_operation() {
     commits(&mut out);
     let large_copies = large_put(&mut out);
     maintenance(&mut out);
+    catalog_size(&mut out);
     println!("| Path | Per | Allocations | Bytes |");
     println!("|---|---|--:|--:|");
     for r in &out {
