@@ -1,9 +1,20 @@
 //! The async front door (Phase 3, #42): the same operations as the sync API, over the same
-//! engine, as futures. Built so far: commits. Gets, row reads and scan streams follow.
+//! engine, as futures. Built so far: commits, gets and row reads. Scan streams follow.
 //!
 //! Futures depend only on `std::task`, so they run on any executor (Tokio, smol, a custom
 //! one); none of them spawns a thread or uses `spawn_blocking`. A commit future is woken by
-//! the shard that applies it and by the watermark that makes it visible.
+//! the shard that applies it and by the watermark that makes it visible; a read future by
+//! the completion of the block read it is waiting for.
+//!
+//! **Reads.** [`Table::get_async`](crate::Table::get_async) and
+//! [`RowRead::read_async`](crate::RowRead::read_async) resolve to owned results
+//! ([`Cell`], [`Row`]), safe to hold across `.await`. Memtable and
+//! cache hits resolve on the first poll, as cheaply as the sync calls. A block the cache
+//! does not hold is read through the VFS's asynchronous reads, and the read runs again once
+//! it is cached; the read point is taken on the first poll, so every attempt sees the same
+//! data. Dropping a read future is always safe. Two cases read synchronously inside the
+//! future, counted by [`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads)
+//! (D196, #398): a separated value, and a block the cache cannot keep (a cache of size 0).
 //!
 //! **Commits.** `commit_async` and `commit_with_async` submit at the call, then resolve when
 //! the record meets the requested durability and is visible, exactly when the sync `commit`
@@ -33,8 +44,11 @@ use std::task::{Context, Poll};
 
 use pigeonhole_format::Durability;
 
+use crate::cell::RowBuf;
 use crate::write::{Submitted, TicketState};
-use crate::{CommitInfo, CommitTicket, Error, Result, RowMutation, Transaction, WriteBatch};
+use crate::{
+    Cell, CommitInfo, CommitTicket, Error, Result, Row, RowMutation, Transaction, WriteBatch,
+};
 
 /// A submitted commit's result, as a future: resolves when the commit meets its durability
 /// level and is visible (see the [module docs](self)). Dropping it does not roll the commit
@@ -137,4 +151,76 @@ impl Transaction {
     pub fn commit_with_async(self, durability: Durability) -> CommitFuture {
         CommitFuture::new(self.submit(Some(durability)))
     }
+}
+
+/// A get as a future, resolving to an owned [`Cell`] ([`Table::get_async`](crate::Table::get_async)).
+#[derive(Debug)]
+#[must_use = "a read does nothing unless polled"]
+pub struct GetFuture {
+    inner: std::result::Result<pigeonhole_engine::GetFuture, Option<Error>>,
+}
+
+impl GetFuture {
+    pub(crate) fn new(started: Result<pigeonhole_engine::GetFuture>) -> Self {
+        Self {
+            inner: started.map_err(Some),
+        }
+    }
+}
+
+impl Future for GetFuture {
+    type Output = Result<Option<Cell>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.inner {
+            Ok(f) => Pin::new(f)
+                .poll(cx)
+                .map(|r| r.map(|c| c.map(Cell::from_data)).map_err(Error::from)),
+            Err(e) => Poll::Ready(Err(e.take().unwrap_or_else(polled_after_done))),
+        }
+    }
+}
+
+/// A row read as a future, resolving to an owned [`Row`], or `None` if the row has no
+/// matching cell ([`RowRead::read_async`](crate::RowRead::read_async)).
+#[derive(Debug)]
+#[must_use = "a read does nothing unless polled"]
+pub struct RowFuture {
+    inner: std::result::Result<pigeonhole_engine::RowFuture<RowBuf>, Option<Error>>,
+    key: Vec<u8>,
+}
+
+impl RowFuture {
+    pub(crate) fn new(started: Result<pigeonhole_engine::RowFuture<RowBuf>>, key: Vec<u8>) -> Self {
+        Self {
+            inner: started.map_err(Some),
+            key,
+        }
+    }
+}
+
+impl Future for RowFuture {
+    type Output = Result<Option<Row>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        match &mut this.inner {
+            Ok(f) => Pin::new(f).poll(cx).map(|r| match r {
+                Ok(Some(mut buf)) => {
+                    buf.key = std::mem::take(&mut this.key);
+                    Ok(Some(Row::new(buf)))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.into()),
+            }),
+            Err(e) => Poll::Ready(Err(e.take().unwrap_or_else(polled_after_done))),
+        }
+    }
+}
+
+fn polled_after_done() -> Error {
+    Error::new(
+        crate::ErrorCode::InvalidArgument,
+        "a read future polled after it resolved",
+    )
 }

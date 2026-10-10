@@ -367,6 +367,43 @@ impl<'t> RowRead<'t> {
     }
 }
 
+#[cfg(feature = "async")]
+impl RowRead<'_> {
+    /// [`read`](RowRead::read) as a future resolving to an owned [`Row`]: memtable and cache
+    /// hits resolve on the first poll, and a block the cache does not hold is read
+    /// asynchronously (see [`nonblocking`](crate::nonblocking)).
+    pub fn read_async(mut self) -> crate::nonblocking::RowFuture {
+        let started = (|| {
+            let latest = match self.sel.snapshot {
+                None => self.sel.start_latest(self.core)?,
+                Some(_) => None,
+            };
+            let (engine, table) = (&self.core.db.engine, self.core.info.id);
+            Ok(match latest {
+                Some((info, families)) => engine.read_row_latest_async(
+                    table,
+                    &self.row,
+                    &families,
+                    &self.sel.spec,
+                    RowBuf::new(info, 0),
+                ),
+                None => {
+                    let (info, snapshot, families) = self.sel.start(self.core)?;
+                    engine.read_row_async(
+                        &snapshot,
+                        table,
+                        &self.row,
+                        &families,
+                        &self.sel.spec,
+                        RowBuf::new(info, 0),
+                    )
+                }
+            })
+        })();
+        crate::nonblocking::RowFuture::new(started, self.row)
+    }
+}
+
 /// An ordered scan under construction. Finish with [`Scan::iter`].
 ///
 /// ```

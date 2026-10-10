@@ -131,6 +131,10 @@ pub struct Metrics {
     /// File growths and the nanoseconds they held the page allocator across a `fallocate`
     /// and a `sync_all` (#28, #182).
     pub file_growths: (u64, u64),
+    /// File reads made synchronously inside async reads: a separated value (D196, #398), a
+    /// block the cache could not keep, or a read that missed too often. Zero when async
+    /// reads never block their executor thread.
+    pub async_sync_reads: u64,
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -524,6 +528,7 @@ impl Engine {
             shm: shm.clone(),
             shards,
             view: ArcSwap::new(empty_view),
+            async_sync_reads: AtomicU64::new(0),
             view_lock: Mutex::new(0),
             manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
             manifest_queue: Default::default(),
@@ -1029,6 +1034,7 @@ impl Engine {
             shm: shm.clone(),
             shards,
             view: ArcSwap::new(empty_view),
+            async_sync_reads: AtomicU64::new(0),
             view_lock: Mutex::new(0),
             manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
             manifest_queue: Default::default(),
@@ -1296,7 +1302,7 @@ impl Engine {
                 continue;
             }
             let now = inner.shared.vfs.now_micros();
-            return get_in(&view, seqno, now, table, family, row, qualifier, || {
+            return get_in::<false>(&view, seqno, now, table, family, row, qualifier, || {
                 Arc::clone(&view)
             });
         }
@@ -1345,7 +1351,7 @@ impl Engine {
     ) -> Result<bool> {
         let families = families_in_order(&snapshot.view, table, families)?;
         let now = self.inner.shared.vfs.now_micros();
-        snapshot.checked(read::read_row_into(
+        snapshot.checked(read::read_row_into::<false>(
             &snapshot.view,
             snapshot.seqno,
             table,
@@ -1355,6 +1361,81 @@ impl Engine {
             now,
             sink,
         ))
+    }
+
+    /// [`Engine::get_latest`] as a future that never blocks on a block the cache does not
+    /// hold: it fetches what it misses through the VFS's asynchronous reads and reads again
+    /// (D196, ICR 0014). Memtable and cache hits resolve on the first poll.
+    pub fn get_latest_async(
+        &self,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+    ) -> crate::GetFuture {
+        crate::GetFuture::new(Arc::clone(&self.inner), None, table, family, row, qualifier)
+    }
+
+    /// [`Engine::get`] (at `snapshot`) as a future, as [`Engine::get_latest_async`].
+    pub fn get_async(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+    ) -> crate::GetFuture {
+        crate::GetFuture::new(
+            Arc::clone(&self.inner),
+            Some(snapshot.clone()),
+            table,
+            family,
+            row,
+            qualifier,
+        )
+    }
+
+    /// [`Engine::read_row_latest_into`] as a future, as [`Engine::get_latest_async`]: it
+    /// resolves to `sink` holding the row, or `None` if the row has no visible cell.
+    pub fn read_row_latest_async<S: read::RowSink + Clone + Unpin>(
+        &self,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: S,
+    ) -> crate::RowFuture<S> {
+        crate::RowFuture::new(
+            Arc::clone(&self.inner),
+            None,
+            table,
+            row,
+            families,
+            spec,
+            sink,
+        )
+    }
+
+    /// [`Engine::read_row_into_families`] (at `snapshot`) as a future, as
+    /// [`Engine::read_row_latest_async`].
+    pub fn read_row_async<S: read::RowSink + Clone + Unpin>(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: S,
+    ) -> crate::RowFuture<S> {
+        crate::RowFuture::new(
+            Arc::clone(&self.inner),
+            Some(snapshot.clone()),
+            table,
+            row,
+            families,
+            spec,
+            sink,
+        )
     }
 
     /// As [`Engine::read_row_into_families`], as of now and without creating a snapshot:
@@ -1384,7 +1465,9 @@ impl Engine {
         if let Some((view, seqno)) = inner.latest_view() {
             let families = families_in_order(&view, table, families)?;
             let now = inner.shared.vfs.now_micros();
-            return read::read_row_into(&view, seqno, table, row, &families, spec, now, sink);
+            return read::read_row_into::<false>(
+                &view, seqno, table, row, &families, spec, now, sink,
+            );
         }
         let snapshot = inner.snapshot()?;
         self.read_row_into_families(&snapshot, table, row, families, spec, sink)
@@ -1526,6 +1609,7 @@ impl Engine {
         }
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);
+        m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
         m
     }
 
@@ -1808,7 +1892,7 @@ fn replay_error(e: Error) -> Error {
 /// The families of `table` to read: in creation order, or as listed (duplicates and unknown
 /// ids dropped), decision D39.
 /// Inline for up to four families, so a row read allocates nothing for them (#287).
-fn families_in_order(
+pub(crate) fn families_in_order(
     view: &View,
     table: TableId,
     listed: &[FamilyId],
@@ -2278,7 +2362,11 @@ impl Inner {
     /// `Engine::get_latest` writes the same loop out (see there).
     // Inlined: called out of line, a row read paid for the call and the returned guard.
     #[inline(always)]
-    fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, Seqno)> {
+    pub(crate) fn is_reader(&self) -> bool {
+        self.role == Role::Reader
+    }
+
+    pub(crate) fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, Seqno)> {
         for _ in 0..GET_LATEST_TRIES {
             let seqno = self.shared.shm.visible_seqno();
             #[cfg(feature = "test-hooks")]
@@ -2321,7 +2409,7 @@ impl Inner {
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
         let now = self.shared.vfs.now_micros();
-        snapshot.checked(get_in(
+        snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,
             now,

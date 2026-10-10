@@ -199,6 +199,35 @@ impl TableCore {
         Ok(data.map(CellRef::owned))
     }
 
+    /// A get as a future; errors found before any read (closed, unknown family, a snapshot
+    /// of another database) resolve on the first poll.
+    #[cfg(feature = "async")]
+    pub(crate) fn get_async(
+        &self,
+        snapshot: Option<&Snapshot>,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> crate::nonblocking::GetFuture {
+        let started = self.db.check_open().and_then(|()| {
+            let family = self.family_id(family)?;
+            let table = self.info.id;
+            Ok(match snapshot {
+                None => self
+                    .db
+                    .engine
+                    .get_latest_async(table, family, row, qualifier),
+                Some(s) => {
+                    self.db.check_snapshot(s)?;
+                    self.db
+                        .engine
+                        .get_async(&s.inner, table, family, row, qualifier)
+                }
+            })
+        });
+        crate::nonblocking::GetFuture::new(started)
+    }
+
     fn scan(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Scan<'_> {
         Scan::new(self, start.map(<[u8]>::to_vec), end.map(<[u8]>::to_vec))
     }
@@ -321,6 +350,31 @@ impl Table {
         self.core.get(Some(snapshot), row, family, qualifier)
     }
 
+    /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): memtable
+    /// and cache hits resolve on the first poll, and a block the cache does not hold is read
+    /// asynchronously (see [`nonblocking`](crate::nonblocking)).
+    #[cfg(feature = "async")]
+    pub fn get_async(
+        &self,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> crate::nonblocking::GetFuture {
+        self.core.get_async(None, row, family, qualifier)
+    }
+
+    /// [`get_at`](Self::get_at) as a future, as [`get_async`](Self::get_async).
+    #[cfg(feature = "async")]
+    pub fn get_at_async(
+        &self,
+        snapshot: &Snapshot,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> crate::nonblocking::GetFuture {
+        self.core.get_async(Some(snapshot), row, family, qualifier)
+    }
+
     /// Starts a row read.
     pub fn row<'t>(&'t self, row: &[u8]) -> RowRead<'t> {
         RowRead::new(&self.core, row)
@@ -373,6 +427,31 @@ impl ReadTable {
         qualifier: &[u8],
     ) -> Result<Option<CellRef<'_>>> {
         self.core.get(Some(snapshot), row, family, qualifier)
+    }
+
+    /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): memtable
+    /// and cache hits resolve on the first poll, and a block the cache does not hold is read
+    /// asynchronously (see [`nonblocking`](crate::nonblocking)).
+    #[cfg(feature = "async")]
+    pub fn get_async(
+        &self,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> crate::nonblocking::GetFuture {
+        self.core.get_async(None, row, family, qualifier)
+    }
+
+    /// [`get_at`](Self::get_at) as a future, as [`get_async`](Self::get_async).
+    #[cfg(feature = "async")]
+    pub fn get_at_async(
+        &self,
+        snapshot: &Snapshot,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> crate::nonblocking::GetFuture {
+        self.core.get_async(Some(snapshot), row, family, qualifier)
     }
 
     /// Starts a row read.

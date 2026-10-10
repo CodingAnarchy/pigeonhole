@@ -246,3 +246,214 @@ fn a_commit_future_resolves_on_its_shards_own_event_loop() {
         shard.run_once(Duration::from_millis(1));
     }
 }
+
+// ---- Async reads (#42 PR 2a, D196, ICR 0014) ----
+
+/// A waker that counts its wakes.
+struct Count(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for Count {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Polls `fut` to completion with the simulated device deferring I/O: returns the result,
+/// how many polls returned `Pending`, and whether the waker was woken before each re-poll.
+fn drive_deferred<F: Future + Unpin>(vfs: &SimVfs, mut fut: F) -> (F::Output, usize) {
+    let count = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let mut pending = 0;
+    loop {
+        if let Poll::Ready(out) = Pin::new(&mut fut).poll(&mut cx) {
+            return (out, pending);
+        }
+        pending += 1;
+        assert!(pending < 1000, "the read never resolved");
+        assert!(vfs.io_in_flight() > 0, "pending with no I/O in flight");
+        let woken = count.0.load(Ordering::Relaxed);
+        vfs.complete_all_io();
+        assert!(
+            count.0.load(Ordering::Relaxed) > woken,
+            "the completion did not wake the read"
+        );
+    }
+}
+
+/// A database with `rows` rows in SSTs only (flushed, then reopened: the block cache is
+/// cold and no SST is open yet), and a family `big` whose values are separated.
+fn cold_db(vfs: &Arc<SimVfs>, path: &str, rows: u32, options: Options) -> Pigeonhole {
+    {
+        let db = Pigeonhole::open(path, options.clone()).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .family("big", Family::default().blob_threshold(64))
+            .create_if_missing()
+            .unwrap();
+        for i in 0..rows {
+            let row = format!("r{i:04}");
+            t.mutate(row.as_bytes())
+                .put("f", b"q", &i.to_le_bytes())
+                .put("f", b"z", b"zz")
+                .put("big", b"v", &[i as u8; 200])
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+    let _ = vfs;
+    Pigeonhole::open(path, options).unwrap()
+}
+
+#[test]
+fn a_memtable_or_cache_hit_resolves_on_the_first_poll() {
+    let vfs = SimVfs::new(4207);
+    let db = Pigeonhole::open("/db/h.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    t.mutate(b"r").put("f", b"q", b"mem").commit().unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut get = t.get_async(b"r", "f", b"q");
+    match Pin::new(&mut get).poll(&mut cx) {
+        Poll::Ready(Ok(Some(c))) => assert_eq!(c.value(), b"mem"),
+        other => panic!("a memtable hit must resolve at once: {other:?}"),
+    }
+    let mut miss = t.get_async(b"absent", "f", b"q");
+    assert!(matches!(
+        Pin::new(&mut miss).poll(&mut cx),
+        Poll::Ready(Ok(None))
+    ));
+    let mut row = t.row(b"r").read_async();
+    match Pin::new(&mut row).poll(&mut cx) {
+        Poll::Ready(Ok(Some(r))) => assert_eq!(r.get("f", b"q").unwrap().value(), b"mem"),
+        other => panic!("a memtable row must resolve at once: {other:?}"),
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn a_cold_get_waits_on_io_and_reads_what_the_sync_get_reads() {
+    let vfs = SimVfs::new(4208);
+    let db = cold_db(&vfs, "/db/c.phdb", 300, sim_options(&vfs));
+    let t = db.table("t").unwrap().open().unwrap();
+    vfs.set_deferred_io(true);
+    let (got, pending) = drive_deferred(&vfs, t.get_async(b"r0123", "f", b"q"));
+    assert!(pending > 0, "a cold get resolved without waiting on I/O");
+    assert_eq!(got.unwrap().unwrap().value(), &123u32.to_le_bytes());
+    // Now cached: the same get resolves at once, and a missing column too.
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut again = t.get_async(b"r0123", "f", b"q");
+    assert!(matches!(
+        Pin::new(&mut again).poll(&mut cx),
+        Poll::Ready(Ok(Some(_)))
+    ));
+    let (none, _) = drive_deferred(&vfs, t.get_async(b"r0123", "f", b"absent"));
+    assert!(none.unwrap().is_none());
+    // Every row through both paths agrees.
+    for i in (0..300).step_by(37) {
+        let row = format!("r{i:04}");
+        let (a, _) = drive_deferred(&vfs, t.get_async(row.as_bytes(), "f", b"q"));
+        let a = a.unwrap().map(|c| c.value().to_vec());
+        vfs.set_deferred_io(false);
+        let s = t
+            .get(row.as_bytes(), "f", b"q")
+            .unwrap()
+            .map(|c| c.value().to_vec());
+        vfs.set_deferred_io(true);
+        assert_eq!(a, s, "row {row}");
+    }
+    assert_eq!(db.async_sync_reads(), 0, "no block was read synchronously");
+    vfs.set_deferred_io(false);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_cold_row_read_waits_on_io_and_matches_the_sync_read() {
+    let vfs = SimVfs::new(4209);
+    let db = cold_db(&vfs, "/db/rr.phdb", 300, sim_options(&vfs));
+    let t = db.table("t").unwrap().open().unwrap();
+    vfs.set_deferred_io(true);
+    let (row, pending) = drive_deferred(&vfs, t.row(b"r0200").family("f").read_async());
+    assert!(pending > 0);
+    let row = row.unwrap().unwrap();
+    vfs.set_deferred_io(false);
+    let sync = t.row(b"r0200").family("f").read().unwrap().unwrap();
+    let cells = |r: &pigeonhole::Row| {
+        r.view()
+            .iter()
+            .map(|e| {
+                (
+                    e.family.to_owned(),
+                    e.qualifier.to_vec(),
+                    e.cell.value().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let sync_cells: Vec<_> = sync
+        .iter()
+        .map(|e| {
+            (
+                e.family.to_owned(),
+                e.qualifier.to_vec(),
+                e.cell.value().to_vec(),
+            )
+        })
+        .collect();
+    assert_eq!(cells(&row), sync_cells);
+    assert_eq!(row.key(), b"r0200");
+    assert_eq!(db.async_sync_reads(), 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn dropping_a_read_future_mid_io_is_safe() {
+    let vfs = SimVfs::new(4210);
+    let db = cold_db(&vfs, "/db/dr.phdb", 100, sim_options(&vfs));
+    let t = db.table("t").unwrap().open().unwrap();
+    vfs.set_deferred_io(true);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut get = t.get_async(b"r0042", "f", b"q");
+    assert!(Pin::new(&mut get).poll(&mut cx).is_pending());
+    let mut row = t.row(b"r0043").read_async();
+    assert!(Pin::new(&mut row).poll(&mut cx).is_pending());
+    drop((get, row));
+    vfs.complete_all_io();
+    vfs.set_deferred_io(false);
+    // The database is unaffected, and closes (no view or block left pinned).
+    assert_eq!(
+        t.get(b"r0042", "f", b"q").unwrap().unwrap().value(),
+        &42u32.to_le_bytes()
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn a_separated_value_and_a_cache_that_keeps_nothing_read_synchronously_and_count() {
+    let vfs = SimVfs::new(4211);
+    let db = cold_db(&vfs, "/db/sv.phdb", 50, sim_options(&vfs));
+    let t = db.table("t").unwrap().open().unwrap();
+    // A separated value: read synchronously inside the future, counted (D196, #398).
+    let before = db.async_sync_reads();
+    let v = block_on(t.get_async(b"r0007", "big", b"v"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(v.value(), &[7u8; 200]);
+    assert!(
+        db.async_sync_reads() > before,
+        "the synchronous blob read was not counted"
+    );
+    db.close().unwrap();
+    // A cache that keeps nothing: the fetched block is not found again, so the read goes
+    // synchronous once (counted) instead of fetching forever.
+    let vfs = SimVfs::new(4212);
+    let db = cold_db(&vfs, "/db/nc.phdb", 50, sim_options(&vfs).block_cache(0));
+    let t = db.table("t").unwrap().open().unwrap();
+    let got = block_on(t.get_async(b"r0011", "f", b"q")).unwrap().unwrap();
+    assert_eq!(got.value(), &11u32.to_le_bytes());
+    assert!(db.async_sync_reads() > 0);
+    db.close().unwrap();
+}

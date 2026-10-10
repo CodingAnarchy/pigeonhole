@@ -107,10 +107,13 @@ fn valid(slot: &Option<BlockIter<BlockHandle>>) -> bool {
 /// The loaded cursor in `slot`. Every caller loads it first, so `None` never happens; it is
 /// an error rather than a panic all the same.
 fn loaded(slot: &mut Option<BlockIter<BlockHandle>>) -> Result<&mut BlockIter<BlockHandle>> {
-    slot.as_mut()
-        .ok_or(Error::Format(pigeonhole_format::Error::Corrupt {
+    // Built only if it happens: an `Error` built eagerly (`ok_or`) is dropped on every call,
+    // and its drop is not free since `Error::WouldBlock` holds a box (ICR 0014).
+    slot.as_mut().ok_or_else(|| {
+        Error::Format(pigeonhole_format::Error::Corrupt {
             what: "sst cursor state",
-        }))
+        })
+    })
 }
 
 impl SstIter {
@@ -141,12 +144,10 @@ impl SstIter {
 
     fn load_partition(&mut self) -> Result<()> {
         let addr = BlockAddr::decode_varint(loaded(&mut self.top)?.value())?;
-        let h = self.reader.inner.blocks.read_block(
-            addr,
-            BlockKind::Index,
-            self.options.fill_cache,
-            self.options.priority,
-        )?;
+        let h = match self.reader.inner.blocks.lookup(addr)? {
+            Some(h) => h,
+            None => self.load_missed(addr, BlockKind::Index)?,
+        };
         load(&mut self.index, h)
     }
 
@@ -157,14 +158,25 @@ impl SstIter {
         let h = match self.take_prefetched(addr) {
             Some(h) => h,
             None if ahead && self.options.readahead_blocks > 0 => self.read_ahead(addr)?,
-            None => self.reader.inner.blocks.read_block(
-                addr,
-                BlockKind::Data,
-                self.options.fill_cache,
-                self.options.priority,
-            )?,
+            None => match self.reader.inner.blocks.lookup(addr)? {
+                Some(h) => h,
+                None => self.load_missed(addr, BlockKind::Data)?,
+            },
         };
         load(&mut self.data, h)
+    }
+
+    /// A block `lookup` did not find: read from the file, or, in cache-only mode, the
+    /// `Error::WouldBlock` that names it (ICR 0014). Out of line, so a hit never reads the
+    /// mode.
+    #[cold]
+    #[inline(never)]
+    fn load_missed(&self, addr: BlockAddr, kind: BlockKind) -> Result<BlockHandle> {
+        let blocks = &self.reader.inner.blocks;
+        if self.options.cache_only {
+            return Err(blocks.would_block(addr, kind, self.options.priority));
+        }
+        blocks.read_uncached(addr, kind, self.options.fill_cache, self.options.priority)
     }
 
     fn take_prefetched(&mut self, addr: BlockAddr) -> Option<BlockHandle> {
@@ -186,6 +198,9 @@ impl SstIter {
         let blocks = &self.reader.inner.blocks;
         if let Some(h) = blocks.cached(addr) {
             return Ok(h);
+        }
+        if self.options.cache_only {
+            return Err(blocks.would_block(addr, BlockKind::Data, self.options.priority));
         }
         self.run.clear();
         self.run.push(addr);
@@ -213,9 +228,11 @@ impl SstIter {
                 self.prefetched.push_back((a.offset, h));
             }
         }
-        first.ok_or(Error::Format(pigeonhole_format::Error::Corrupt {
-            what: "sst readahead",
-        }))
+        first.ok_or_else(|| {
+            Error::Format(pigeonhole_format::Error::Corrupt {
+                what: "sst readahead",
+            })
+        })
     }
 
     /// Positions on the first entry `>= target` (or the first entry), ignoring the filter.

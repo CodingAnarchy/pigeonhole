@@ -277,6 +277,14 @@ impl Pigeonhole {
         self.db.engine.metrics()
     }
 
+    /// File reads made synchronously inside async reads since open (D196, #398): a
+    /// separated value, or a block the cache could not keep. Zero means no async read
+    /// blocked its executor thread on the file.
+    #[cfg(feature = "async")]
+    pub fn async_sync_reads(&self) -> u64 {
+        self.db.engine.metrics().async_sync_reads
+    }
+
     /// The writer default durability.
     pub fn default_durability(&self) -> Durability {
         self.db.engine.default_durability()
@@ -492,6 +500,14 @@ pub struct PigeonholeReader {
 }
 
 impl PigeonholeReader {
+    /// File reads made synchronously inside async reads since open (D196, #398): a
+    /// separated value, or a block the cache could not keep. Zero means no async read
+    /// blocked its executor thread on the file.
+    #[cfg(feature = "async")]
+    pub fn async_sync_reads(&self) -> u64 {
+        self.db.engine.metrics().async_sync_reads
+    }
+
     /// Opens an existing table for reading.
     pub fn table(&self, name: &str) -> Result<ReadTable> {
         let info = self

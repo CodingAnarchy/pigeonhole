@@ -215,6 +215,21 @@ impl Reader {
         Ok(())
     }
 
+    /// The record's value if its record is cached (a lookup only: never reads the file).
+    pub(crate) fn cached(&self, ptr: &BlobPointer) -> Option<Cell> {
+        if ptr.blob_file != self.blob_file {
+            return None;
+        }
+        let key = BlockKey {
+            file: crate::blob_cache_file(self.blob_file),
+            offset: ptr.offset,
+        };
+        let start = BLOB_RECORD_HEADER_LEN as u32;
+        let end = start.checked_add(ptr.len)?;
+        let h = self.cache.get(key)?;
+        (h.len() == end as usize).then(|| Cell::in_block(h, start..end))
+    }
+
     /// Reads a record (header and value), verified, into the cache unless it is large; hits skip
     /// verification.
     pub(crate) fn read(&self, ptr: &BlobPointer) -> Result<Cell> {

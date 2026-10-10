@@ -37,6 +37,10 @@ pub(crate) fn relay(context: &'static str, e: &Error) -> Error {
 pub enum Error {
     /// An I/O failure.
     Io(pigeonhole_io::Error),
+    /// A cache-only read (an async read's poll) missed the block it names. Internal to the
+    /// async read futures, which fetch it and read again; no call returns it (ICR 0014).
+    #[doc(hidden)]
+    WouldBlock(Box<pigeonhole_sst::Fetch>),
     /// On-disk or shared-memory data failed validation.
     Corruption(String),
     /// Another process holds the writer lock.
@@ -105,6 +109,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "I/O error: {e}"),
+            Error::WouldBlock(fetch) => write!(f, "a cache-only read missed ({fetch:?})"),
             Error::Corruption(what) => write!(f, "corruption: {what}"),
             Error::WriterLocked => f.write_str("another process holds the writer lock"),
             Error::ShmVersionMismatch { found, expected } => write!(
@@ -171,6 +176,7 @@ impl Error {
                     .map(|s| std::io::Error::new(s.kind(), s.to_string())),
             }),
             Error::Corruption(s) => Error::Corruption(s.clone()),
+            Error::WouldBlock(f) => Error::WouldBlock(f.clone()),
             Error::WriterLocked => Error::WriterLocked,
             Error::ShmVersionMismatch { found, expected } => Error::ShmVersionMismatch {
                 found: *found,
@@ -323,6 +329,7 @@ impl From<pigeonhole_sst::Error> for Error {
         match e {
             S::Io(e) => e.into(),
             S::Format(e) => e.into(),
+            S::WouldBlock(fetch) => Error::WouldBlock(fetch),
             _ => Error::Corruption(format!("sst: {e:?}")),
         }
     }

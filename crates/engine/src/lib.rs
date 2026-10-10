@@ -29,6 +29,7 @@ mod flush;
 mod large;
 mod maintenance;
 mod manifest;
+mod nonblocking;
 mod options;
 mod read;
 mod shard;
@@ -41,6 +42,7 @@ pub use engine::{
     CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats, TableInfo,
 };
 pub use error::{Error, Result};
+pub use nonblocking::{GetFuture, RowFuture};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 #[doc(hidden)]
