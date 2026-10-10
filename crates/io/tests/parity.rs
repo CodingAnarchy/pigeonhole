@@ -50,6 +50,7 @@ parity!(
     identity_and_locality,
     shared_memory_in_a_directory,
     clocks_and_processes,
+    direct_io,
 );
 
 fn open_modes(b: &Backend) {
@@ -412,4 +413,55 @@ fn clocks_and_processes(b: &Backend) {
     let me = b.vfs.current_process();
     assert_eq!(me, b.vfs.current_process());
     assert!(b.vfs.process_alive(me));
+}
+
+/// Direct I/O (#403): aligned reads and writes round-trip; a misaligned offset, length or
+/// buffer fails with `Misaligned` on every backend (the simulator enforces what O_DIRECT
+/// demands; the real backends check before the kernel does, so macOS's `F_NOCACHE` fails it
+/// too). A file system that refuses direct I/O (tmpfs) skips the case.
+fn direct_io(b: &Backend) {
+    let path = b.path("direct");
+    drop(b.create("direct"));
+    let mut opts = OpenOptions::read_write_create();
+    opts.direct = true;
+    let f = match b.vfs.open(&path, opts) {
+        Ok(f) => f,
+        Err(e) if e.kind == ErrorKind::Unsupported => {
+            eprintln!("{}: direct I/O unsupported here ({e}); skipped", b.name);
+            return;
+        }
+        Err(e) => panic!("{}: {e}", b.name),
+    };
+    let a = f.direct_align().expect("a direct handle has an alignment");
+    assert!(
+        a >= 512 && a.is_power_of_two() && 4096 % a == 0,
+        "{}: {a}",
+        b.name
+    );
+    assert_eq!(b.create("buffered").direct_align(), None, "{}", b.name);
+
+    // Aligned: synchronous and submitted.
+    let mut buf = IoBuf::zeroed(8192);
+    buf.fill(0x3C);
+    f.write_at(&buf, 4096).unwrap();
+    let mut back = IoBuf::zeroed(8192);
+    f.read_at(&mut back, 4096).unwrap();
+    assert!(back.iter().all(|&x| x == 0x3C), "{}", b.name);
+    let w = f.submit_write(buf, 12288).wait().unwrap();
+    assert_eq!(w.len(), 8192);
+    let r = f.submit_read(IoBuf::zeroed(4096), 12288).wait().unwrap();
+    assert!(r.iter().all(|&x| x == 0x3C), "{}", b.name);
+    f.submit_sync_data().wait().unwrap();
+
+    // Misaligned offset, length and buffer address.
+    let misaligned = |e: pigeonhole_io::Error| {
+        assert_eq!(e.kind, ErrorKind::Misaligned, "{}: {e}", b.name);
+    };
+    let mut page = IoBuf::zeroed(8192);
+    misaligned(f.read_at(&mut page[..4096], 100).unwrap_err());
+    misaligned(f.read_at(&mut page[..100], 0).unwrap_err());
+    misaligned(f.read_at(&mut page[1..4097], 0).unwrap_err());
+    misaligned(f.write_at(&page[..4096], 512 + 1).unwrap_err());
+    misaligned(f.submit_read(IoBuf::zeroed(100), 0).wait().unwrap_err());
+    misaligned(f.submit_write(IoBuf::zeroed(4096), 7).wait().unwrap_err());
 }

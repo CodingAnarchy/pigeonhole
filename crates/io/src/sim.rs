@@ -783,6 +783,7 @@ impl SimVfs {
             node: op.node,
             handle: op.handle,
             writable: op.writable,
+            direct: false,
             owner: false,
         };
         (op.job)(&file);
@@ -846,6 +847,9 @@ struct SimFile {
     node: u64,
     handle: u64,
     writable: bool,
+    /// Opened for direct I/O: every read and write must be aligned to [`SIM_DIRECT_ALIGN`],
+    /// as the kernel demands of `O_DIRECT` (#403), so a misaligned path fails in simulation.
+    direct: bool,
     /// Whether dropping this closes the handle (`false` for the view a deferred operation
     /// runs on).
     owner: bool,
@@ -932,8 +936,31 @@ impl Drop for SimFile {
     }
 }
 
+/// The direct-I/O alignment the simulator enforces (the common device and page size).
+pub const SIM_DIRECT_ALIGN: usize = 4096;
+
+impl SimFile {
+    /// On a direct handle, fails an I/O whose offset, length or buffer is not aligned.
+    fn check_aligned(&self, ptr: *const u8, len: usize, offset: u64) -> Result<()> {
+        let a = SIM_DIRECT_ALIGN;
+        if self.direct
+            && (!offset.is_multiple_of(a as u64)
+                || !len.is_multiple_of(a)
+                || !(ptr as usize).is_multiple_of(a))
+        {
+            return Err(Error::new(ErrorKind::Misaligned, "direct I/O"));
+        }
+        Ok(())
+    }
+}
+
 impl File for SimFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.direct.then_some(SIM_DIRECT_ALIGN)
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        self.check_aligned(buf.as_ptr(), buf.len(), offset)?;
         self.with(|st| {
             if buf.is_empty() {
                 return Ok(());
@@ -953,6 +980,7 @@ impl File for SimFile {
 
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
         self.check_writable("write: file not opened for writing")?;
+        self.check_aligned(buf.as_ptr(), buf.len(), offset)?;
         self.with(|st| {
             if buf.is_empty() {
                 return Ok(());
@@ -988,11 +1016,17 @@ impl File for SimFile {
     }
 
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
+        if let Err(e) = self.check_aligned(buf.as_ptr(), buf.len(), offset) {
+            return Completion::ready(Err(e));
+        }
         self.vfs
             .submit(self, move |f| f.read_at(&mut buf, offset).map(|()| buf))
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
+        if let Err(e) = self.check_aligned(buf.as_ptr(), buf.len(), offset) {
+            return Completion::ready(Err(e));
+        }
         self.vfs
             .submit(self, move |f| f.write_at(&buf, offset).map(|()| buf))
     }
@@ -1100,6 +1134,7 @@ impl Vfs for SimVfs {
             node: id,
             handle,
             writable: opts.write || opts.create || opts.create_new,
+            direct: opts.direct,
             owner: true,
         }))
     }
