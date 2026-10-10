@@ -19,6 +19,9 @@ pigeonhole-sim = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 name = "round_trip"
 harness = false

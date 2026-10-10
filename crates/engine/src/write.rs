@@ -9,7 +9,7 @@ use pigeonhole_format::Kind;
 use pigeonhole_format::value::{ValueRef, ValueTag, encode_value};
 use pigeonhole_format::wal::{BatchBuilder, BatchRef};
 use pigeonhole_format::{Durability, FamilyId, TableId, Timestamp};
-use pigeonhole_runtime::Waiter;
+use pigeonhole_runtime::{Notifier, SlotCache, Waiter, completion, completion_from};
 
 use crate::engine::Inner;
 use crate::{CellData, CommitInfo, Error, Snapshot};
@@ -343,6 +343,31 @@ pub struct PendingCommit {
     /// Whether `wait` may poll before it parks (D198): not for a durable commit, which
     /// waits for a sync. The window is the engine's `commit_spin_nanos`.
     pub(crate) spins: bool,
+}
+
+thread_local! {
+    /// This thread's spare completion slots for its commits (#320): a commit reuses one
+    /// instead of allocating its reply slot (and, on macOS, the slot's lock). Freed when the
+    /// thread exits.
+    static COMMIT_SLOTS: SlotCache<crate::Result<Settled>> = const { SlotCache::new() };
+}
+
+/// A commit's completion, reusing one of this thread's spare slots when it has one (#320).
+pub(crate) fn commit_completion() -> (
+    Notifier<crate::Result<Settled>>,
+    Waiter<crate::Result<Settled>>,
+) {
+    COMMIT_SLOTS
+        .try_with(completion_from)
+        .unwrap_or_else(|_| completion())
+}
+
+impl Drop for PendingCommit {
+    fn drop(&mut self) {
+        // The shard has released the slot once it replied (or dropped the reply): it goes
+        // back to the thread this commit is dropped on, reset.
+        let _ = COMMIT_SLOTS.try_with(|c| self.waiter.recycle_into(c));
+    }
 }
 
 impl PendingCommit {

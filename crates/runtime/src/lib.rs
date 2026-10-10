@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use pigeonhole_io::{ErrorKind, Vfs, VfsRef};
 
-pub use completion::{Notifier, Waiter, completion};
+pub use completion::{Notifier, SlotCache, Waiter, completion, completion_from};
 pub use sched::{Task, TaskPoll, TaskWaker};
 
 use sched::{PoolShared, Scheduler, Spawner};

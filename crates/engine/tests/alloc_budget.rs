@@ -573,10 +573,11 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("scan, SST, cached", "extra cell", 0.0),
     ("scan, memtable", "scan", 10.0),
     ("scan, SST, cached", "scan", 10.0),
-    // A commit's batch buffer comes back with the reply for the thread's next batch (#320).
-    ("commit, 1 cell", "commit", 5.0),
-    ("commit, 16 cells", "commit", 4.0),
-    ("commit, 16 cells, 8 per group", "commit", 7.0),
+    // A commit's batch buffer comes back with the reply for the thread's next batch, and its
+    // completion slot (with, on macOS, the slot's lock) is reused from the thread's (#320).
+    ("commit, 1 cell", "commit", 3.0),
+    ("commit, 16 cells", "commit", 2.0),
+    ("commit, 16 cells, 8 per group", "commit", 5.0),
     // Includes SimVfs's copy of every write, kept for crash simulation: about 38 allocations
     // and 1 MB per put that a real file does not make (#499). Most of the rest is the
     // manifest commit a separated put makes before its WAL record (D16).
