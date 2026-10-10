@@ -578,6 +578,15 @@ impl Catalog {
     }
 
     /// The families of `table` in creation order.
+    /// [`Catalog::family_ids_of`] without collecting them (#499): the scans over every slot
+    /// that run after each flush allocate nothing per table.
+    pub(crate) fn families_of(&self, table: TableId) -> impl Iterator<Item = FamilyId> + '_ {
+        self.tables
+            .get(&table)
+            .into_iter()
+            .flat_map(|t| t.families.iter().map(|f| f.id))
+    }
+
     pub(crate) fn family_ids_of(&self, table: TableId) -> Vec<FamilyId> {
         self.tables
             .get(&table)
