@@ -57,7 +57,7 @@ Several agents often build and test on one machine, so local runs stay small:
 - Agent worktrees carry an untracked `.cargo/config.toml` that caps build jobs and test threads; don't override it.
 
 ### Test environment variables
-These are the only `PIGEONHOLE_*` variables the code reads. All of them are for tests, and only `PIGEONHOLE_TRACE`, `PIGEONHOLE_IO`, `PIGEONHOLE_DIRECT` and `PIGEONHOLE_READAHEAD` are read by library code. Add a new one here or not at all.
+These are the only `PIGEONHOLE_*` variables the code reads. All of them are for tests, and only `PIGEONHOLE_TRACE`, `PIGEONHOLE_IO`, `PIGEONHOLE_DIRECT`, `PIGEONHOLE_READAHEAD` and `PIGEONHOLE_GROUP_SYNC_DEPTH` are read by library code. Add a new one here or not at all.
 
 | Variable | Read by | Effect |
 |---|---|---|
@@ -70,6 +70,7 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 | `PIGEONHOLE_IO` | pigeonhole library (`Options` and `ReaderOptions` with no `io_backend` set) | `uring` runs on io_uring and fails to open where it is unavailable, `auto` uses it where available, anything else `pread`. The Linux CI job sets `uring` so the suites cover the io_uring backend (#402). |
 | `PIGEONHOLE_DIRECT` | pigeonhole library (`Options` and `ReaderOptions` with no `direct_io` set), engine harness | `1` reads and writes SST and blob extents through a direct-I/O handle (#403); on `SimVfs` every such I/O must be aligned, so the simulated suites check the direct path. |
 | `PIGEONHOLE_READAHEAD` | engine library (scan read options), `coldscan` example | `N` sets the data blocks a scan fetches ahead (default 4; `0` turns readahead off), and `N,merge` also submits each run of adjacent blocks as one read. Read once per process; unset changes nothing. For the gate measurement only: #431 decides depth and merging from the #405 run, then removes the variable. |
+| `PIGEONHOLE_GROUP_SYNC_DEPTH` | engine library (shard group commit) | `N` sets the group syncs a shard keeps in flight per WAL stream before later groups batch behind them (D207; default 1 on macOS, 2 elsewhere; `0` is unlimited, the behavior before D207). Read once per process; unset changes nothing. For the gate measurement only: the #405 run decides the default, then the variable is removed or becomes an option (#476). |
 | `PIGEONHOLE_TRACE` | engine library and engine harness | The engine logs its close, checkpoint, manifest, flush and tablet-change steps to stderr (`shard::trace!`), and the harness logs each operation. The engine writes to the stderr handle itself, so a test harness's output capture does not hide it; `pigeonhole_engine::set_tracing` turns it on or off at run time. |
 | `PIGEONHOLE_TRACE_LINES` | engine harness | Trace lines a checker failure prints (default 40). |
 | `PIGEONHOLE_SEED_TIMEOUT` | pigeonhole `model` | Seconds one seed may run before the watchdog reports it hung (test, seed, configuration and the step it was on), turns on the engine's trace for 5 s to show what the shards do, and aborts (default 120; #244). |

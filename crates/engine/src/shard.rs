@@ -1017,6 +1017,8 @@ pub(crate) enum ShardMsg {
     SyncDone {
         group: u64,
         result: std::result::Result<Lsn, pigeonhole_io::Error>,
+        /// A group sync (D207): the one in flight, behind which later groups batch.
+        group_sync: bool,
     },
     /// Freeze every non-empty active memtable and reply once everything frozen so far is
     /// in the manifest (`Engine::flush`).
@@ -1117,6 +1119,26 @@ enum MemberKind {
 }
 
 /// One record of a group: a commit, a participant's PREPARE, or a coordinator's COMMIT.
+/// Group syncs a shard keeps in flight per stream before later groups batch behind them
+/// (D207). Interim defaults, from the Linux runner and macOS (#412); the gate run on the
+/// reference machine (#405) compares 1, 2 and unlimited and decides it. macOS: 1, since
+/// `F_FULLFSYNC` serializes on the device, so a second sync in flight only queues. Elsewhere:
+/// 2, since Linux file systems fold concurrent `fdatasync`s of one file into one journal
+/// commit, so a second one in flight keeps the device busy.
+const GROUP_SYNC_DEPTH: u32 = if cfg!(target_os = "macos") { 1 } else { 2 };
+
+/// `GROUP_SYNC_DEPTH`, or `PIGEONHOLE_GROUP_SYNC_DEPTH` (a measurement variable, as
+/// `PIGEONHOLE_IO`: `0` is unlimited, as before D207), read once per process.
+pub fn group_sync_depth() -> u32 {
+    static DEPTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("PIGEONHOLE_GROUP_SYNC_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(GROUP_SYNC_DEPTH)
+    })
+}
+
 #[derive(Debug)]
 struct Member {
     kind: MemberKind,
@@ -2032,6 +2054,14 @@ pub(crate) struct ShardState {
     member_bufs: Vec<Vec<Member>>,
     /// Groups whose sync is in flight, oldest first.
     unresolved: VecDeque<Group>,
+    /// Group syncs in flight (D207). Once there are `group_sync_depth` of them, a group that
+    /// needs one batches behind them instead of starting its own, and the next sync covers
+    /// every such group.
+    group_syncs_in_flight: u32,
+    /// [`group_sync_depth`], read once.
+    group_sync_depth: u32,
+    /// Groups batched behind the in-flight group sync wait in `unresolved` for the next.
+    sync_wanted: bool,
     next_group: u64,
     /// Cross-shard seqnos this shard coordinates, not yet applied everywhere.
     held: BTreeSet<Seqno>,
@@ -2297,6 +2327,9 @@ impl ShardState {
             pending: Vec::new(),
             member_bufs: Vec::new(),
             unresolved: VecDeque::new(),
+            group_syncs_in_flight: 0,
+            group_sync_depth: group_sync_depth(),
+            sync_wanted: false,
             next_group: 1,
             held: BTreeSet::new(),
             coord: HashMap::new(),
@@ -4303,6 +4336,8 @@ impl ShardState {
         let mut appended = false;
         let mut unsynced = false;
         let mut last_sync: Option<pigeonhole_io::Completion<Lsn>> = None;
+        // The group's sync is a group sync (D207), or the group batches behind one.
+        let (mut group_sync, mut batched) = (false, false);
         // The end of the last Buffered record: `write` may not cover it while a segment
         // header is held back (#19).
         let mut buffered_end: Option<Lsn> = None;
@@ -4429,12 +4464,28 @@ impl ShardState {
                 && !(need_group_sync && unsynced)
                 && buffered_end.is_some_and(|end| end > wal.written());
             if (need_group_sync && unsynced) || held {
-                match wal.submit_sync() {
-                    Ok(c) => last_sync = Some(c),
-                    Err(_) => {
-                        self.poisoned = true;
-                        self.fail_all(group.members, ctx);
-                        return;
+                if last_sync.is_none()
+                    && self.group_sync_depth != 0
+                    && self.group_syncs_in_flight >= self.group_sync_depth
+                {
+                    // D207: as many group syncs as allowed are in flight. Another one would
+                    // contend on the file (D58 counts a sync once every older one finished),
+                    // so this group waits for the next sync, which covers every group
+                    // batched by then. A group with a `Sync` member's own sync does not
+                    // batch: that sync covers only the records before it.
+                    batched = true;
+                    self.sync_wanted = true;
+                } else {
+                    match wal.submit_sync() {
+                        Ok(c) => {
+                            last_sync = Some(c);
+                            group_sync = true;
+                        }
+                        Err(_) => {
+                            self.poisoned = true;
+                            self.fail_all(group.members, ctx);
+                            return;
+                        }
                     }
                 }
             }
@@ -4518,8 +4569,12 @@ impl ShardState {
         }
         self.spawn_flush(ctx);
 
-        // Resolution: now, or when the sync completes.
+        // Resolution: now, when its sync completes, or (batched) when the next one does.
         match last_sync {
+            None if batched => {
+                self.unresolved.push_back(group);
+                self.publish_watermark();
+            }
             None => {
                 self.publish_watermark();
                 self.resolve_group(group, Ok(()), ctx);
@@ -4528,16 +4583,10 @@ impl ShardState {
                 let id = group.id;
                 self.unresolved.push_back(group);
                 self.publish_watermark();
-                let submitter = ctx.submitter(self.id).clone();
-                // Runs on the resolving thread (the I/O backend, or inline under the
-                // simulator); the dropped completion keeps the closure installed.
-                drop(completion.map(move |r| {
-                    let _ = submitter.submit(ShardMsg::SyncDone {
-                        group: id,
-                        result: r,
-                    });
-                    Ok(())
-                }));
+                if group_sync {
+                    self.group_syncs_in_flight += 1;
+                }
+                self.on_sync_done(completion, id, group_sync, ctx);
             }
         }
         self.reclaim_retired();
@@ -5172,6 +5221,58 @@ impl ShardState {
     }
 
     /// Resolves every unresolved group up to `through` (syncs cover everything before them).
+    /// Sends `SyncDone` for groups up to `through` when `completion` resolves (on the
+    /// resolving thread: the I/O backend, or inline under the simulator; the dropped
+    /// completion keeps the closure installed).
+    fn on_sync_done(
+        &self,
+        completion: pigeonhole_io::Completion<Lsn>,
+        through: u64,
+        group_sync: bool,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let submitter = ctx.submitter(self.id).clone();
+        drop(completion.map(move |r| {
+            let _ = submitter.submit(ShardMsg::SyncDone {
+                group: through,
+                result: r,
+                group_sync,
+            });
+            Ok(())
+        }));
+    }
+
+    /// The group sync for the groups batched behind the one that just finished (D207): one
+    /// sync covering every unresolved group, whose records are all written.
+    fn submit_batched_sync(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.sync_wanted = false;
+        // A later sync may already have resolved them.
+        let Some(through) = self.unresolved.back().map(|g| g.id) else {
+            return;
+        };
+        let Some(wal) = self.wal.as_mut() else {
+            return;
+        };
+        match wal.submit_sync() {
+            Ok(c) => {
+                self.group_syncs_in_flight += 1;
+                self.on_sync_done(c, through, true, ctx);
+            }
+            Err(e) => {
+                trace!("shard {} batched sync failed: {e}", self.id.0);
+                self.poisoned = true;
+                self.resolve_through(
+                    through,
+                    Err(pigeonhole_io::Error::new(
+                        ErrorKind::Other,
+                        "wal sync failed",
+                    )),
+                    ctx,
+                );
+            }
+        }
+    }
+
     fn resolve_through(
         &mut self,
         through: u64,
@@ -7007,7 +7108,19 @@ impl ShardState {
                 coordinator,
             } => self.on_decide(seqno, commit, coordinator, ctx),
             ShardMsg::Applied { seqno, from, error } => self.on_applied(seqno, from, error, ctx),
-            ShardMsg::SyncDone { group, result } => self.resolve_through(group, result, ctx),
+            ShardMsg::SyncDone {
+                group,
+                result,
+                group_sync,
+            } => {
+                if group_sync {
+                    self.group_syncs_in_flight = self.group_syncs_in_flight.saturating_sub(1);
+                }
+                self.resolve_through(group, result, ctx);
+                if group_sync && self.sync_wanted {
+                    self.submit_batched_sync(ctx);
+                }
+            }
             ShardMsg::FlushAll { reply } => {
                 if let Err(e) = self.freeze(true) {
                     reply.notify(Err(e));

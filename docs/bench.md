@@ -228,7 +228,7 @@ Each cell gives run 1 / run 2, in µs. The ratios divide Pigeonhole's worse run 
 | rocksdb | 16 | 121.1K | 122 | 230 | 397 |
 
 - **The stores are not comparable here.** On macOS Pigeonhole syncs with `F_FULLFSYNC`, a drive-cache flush of about 4 ms on this SSD. RocksDB's sync does not flush the cache, as its 20 µs shows.
-- **What the table does show is Pigeonhole's own scaling.** Commit latency grows with threads, because with tablets spread over 10 shards each shard syncs its own WAL, so concurrent commits rarely share a sync (#412).
+- **What the table does show is Pigeonhole's own scaling.** Commit latency grows with threads. This workload's 1,000-row table never splits, so every commit lands on one shard. Before D207 that shard started a sync for each small group whatever was in flight, so concurrent commits rarely shared a sync: about 2 per sync at 4 clients and 4.5 at 16 on a Linux runner (#412). D207 bounds the group syncs in flight per stream (1 on macOS, 2 elsewhere, until the gate run decides), and batches the groups that arrive meanwhile behind them.
 
 **Sparse-wide gate runs on this Mac are too noisy to compare single runs.** Three `--scale full` runs of the same binary in the same window ranged:
 

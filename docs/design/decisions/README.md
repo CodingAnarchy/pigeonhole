@@ -219,6 +219,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D204](phase-3.md#d204) — The scaling gate measures application-owned shards writing inline (N up to cores); engine-owned synchronous clients are reported · owner decision, bench, #154 · amends the spec Goals scaling definition and the #406 checklist
 - [D205](phase-3.md#d205) — The scan target counts decoded bytes (row key + qualifier + value) on the bench's default 100 B / 8-cell shape; small and wide shapes are reported · owner decision, bench, #29 · amends the spec Goals scan line and the #406 checklist
 - [D206](phase-3.md#d206) — WAL pin passes run in bounded slices from a lazily built log index; the WAL bound may be exceeded by what is logged while a pass runs · coordinator decision, engine, #474, #175 · amends D155
+- [D207](phase-3.md#d207) — A shard keeps a bounded number of group syncs in flight per WAL stream (interim: 1 on macOS, 2 elsewhere); groups that need one meanwhile batch behind them and share the next. 16 clients: Linux 29.5K → 31.5K ops/s, p99 1,458 → ~1,000 µs; macOS 578 → 2.2K ops/s, p99 33 → 11.6 ms · coordinator decision, #412 · default decided on #405
 
 ## Open questions
 _None._
