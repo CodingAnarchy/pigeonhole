@@ -2,14 +2,14 @@
 //! and forward readahead.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pigeonhole_cache::{BlockHandle, Cell};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::block::{Block, BlockAddr, BlockIter, BlockKind};
 use pigeonhole_format::key::row_prefix_len;
 
-use crate::{Error, ReadOptions, Result, ScanFilter, SstReader};
+use crate::{Error, Fetch, ReadOptions, Result, ScanFilter, SstReader};
 
 /// A zero-copy cursor over one SST, from [`SstReader::iter`].
 ///
@@ -86,9 +86,87 @@ pub struct SstIter {
     hint: Vec<u8>,
     /// The row being skipped.
     row: Vec<u8>,
-    /// Read-ahead blocks kept for a read that must not fill the cache, ascending by offset.
-    prefetched: VecDeque<(u64, BlockHandle)>,
-    run: Vec<BlockAddr>,
+    /// Readahead submitted from the miss path (#402); `None` until the first one, so a scan
+    /// that never misses pays one check per block.
+    ahead: Option<Box<Ahead>>,
+}
+
+/// A cursor's readahead (#402): fetches it submitted from its miss path for the blocks it
+/// reads next ([`SstIter::upcoming`]), each admitted by its completion's continuation, so the
+/// scan thread never waits for them unless it reaches a block still in flight.
+#[derive(Default)]
+struct Ahead {
+    /// Blocks whose fetch completed, by offset, in completion order. Pinned until the cursor
+    /// reaches or passes them: for a cursor that must not fill the cache, the only copy.
+    arrived: Arc<Mutex<Vec<(u64, BlockHandle)>>>,
+    /// Fetches still in flight, in submission order (ascending: `upcoming` order): the first
+    /// and last block offsets each covers (one block, or a merged run of adjacent ones).
+    in_flight: VecDeque<(u64, u64, pigeonhole_io::Completion<()>)>,
+    /// Blocks submitted and not yet taken or dropped; zero skips the lock.
+    unclaimed: usize,
+}
+
+impl std::fmt::Debug for Ahead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ahead")
+            .field("in_flight", &self.in_flight.len())
+            .field("unclaimed", &self.unclaimed)
+            .finish()
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Ahead {
+    /// The block at `offset` if its readahead arrived, waiting for its fetch if it is still in
+    /// flight. Blocks before it are dropped: the cursor only moves forward between seeks.
+    fn take(&mut self, offset: u64) -> Option<BlockHandle> {
+        if self.unclaimed == 0 {
+            return None;
+        }
+        while self
+            .in_flight
+            .front()
+            .is_some_and(|(first, ..)| *first <= offset)
+        {
+            let (_, last, done) = self.in_flight.pop_front()?;
+            if offset <= last {
+                // Reached while still in flight: wait (its continuation admits it) rather
+                // than read it a second time.
+                if !done.is_ready() {
+                    crate::note_readahead(|c| c.waited += 1);
+                }
+                let _ = done.wait();
+            }
+            // A fetch the cursor passed completes on its own; its block is dropped below or
+            // at the next seek.
+        }
+        let mut arrived = lock(&self.arrived);
+        let mut found = None;
+        arrived.retain(|(o, h)| {
+            if *o == offset && found.is_none() {
+                found = Some(h.clone());
+            }
+            *o > offset
+        });
+        self.unclaimed = arrived.len() + self.in_flight.len();
+        if found.is_some() {
+            crate::note_readahead(|c| c.used += 1);
+        }
+        found
+    }
+
+    /// Forgets everything (a seek): fetches still in flight complete into a queue no cursor
+    /// reads any more.
+    fn clear(&mut self) {
+        if self.unclaimed != 0 || !self.in_flight.is_empty() {
+            self.arrived = Arc::default();
+            self.in_flight.clear();
+            self.unclaimed = 0;
+        }
+    }
 }
 
 /// Points `slot` at `block`, reusing the cursor (and its key buffer) if there is one.
@@ -128,8 +206,7 @@ impl SstIter {
             data: None,
             hint: Vec::new(),
             row: Vec::new(),
-            prefetched: VecDeque::new(),
-            run: Vec::new(),
+            ahead: None,
         }
     }
 
@@ -150,6 +227,22 @@ impl SstIter {
     /// `max = 1` ahead before each step (D196), and a sync scan's readahead hint
     /// (#402) fetches more from its miss path.
     pub fn upcoming(&self, max: usize, out: &mut Vec<crate::Fetch>) {
+        self.upcoming_with(max, true, false, |_, fetch| out.push(fetch));
+    }
+
+    /// [`SstIter::upcoming`], each fetch handed to `f` with its block's address. With
+    /// `fill_cache` false the fetches hand their blocks out unshared. With `read_partitions`,
+    /// an uncached next index partition is read synchronously (into the cache as
+    /// `fill_cache` says) and the walk goes on through it, instead of ending at its fetch: the
+    /// sync readahead, whose scan reads that partition next anyway, then names all `max`
+    /// blocks even when partitions are small.
+    pub(crate) fn upcoming_with(
+        &self,
+        max: usize,
+        fill_cache: bool,
+        read_partitions: bool,
+        mut f: impl FnMut(BlockAddr, Fetch),
+    ) {
         let blocks = &self.reader.inner.blocks;
         let priority = self.options.priority;
         let Some(index) = self.index.as_ref().filter(|i| i.valid()) else {
@@ -171,19 +264,26 @@ impl SstIter {
                 let Ok(addr) = BlockAddr::decode_varint(t.value()) else {
                     return;
                 };
-                match blocks.lookup(addr) {
-                    Ok(Some(h)) => match Block::new(h) {
-                        Ok(b) => {
-                            index = b.into_cursor();
-                            if index.seek_to_first().is_err() || !index.valid() {
-                                return;
-                            }
+                let h = match blocks.lookup(addr) {
+                    Ok(Some(h)) => h,
+                    Ok(None) if read_partitions => {
+                        match blocks.read_uncached(addr, BlockKind::Index, fill_cache, priority) {
+                            Ok(h) => h,
+                            Err(_) => return,
                         }
-                        Err(_) => return,
-                    },
+                    }
                     Ok(None) => {
-                        out.push(blocks.fetch(addr, BlockKind::Index, priority));
+                        f(addr, blocks.fetch(addr, BlockKind::Index, priority));
                         return;
+                    }
+                    Err(_) => return,
+                };
+                match Block::new(h) {
+                    Ok(b) => {
+                        index = b.into_cursor();
+                        if index.seek_to_first().is_err() || !index.valid() {
+                            return;
+                        }
                     }
                     Err(_) => return,
                 }
@@ -192,8 +292,10 @@ impl SstIter {
                 return;
             };
             seen += 1;
-            if let Some(fetch) = blocks.fetch_if_missing(addr, BlockKind::Data, priority) {
-                out.push(fetch);
+            if let Some(fetch) =
+                blocks.fetch_if_missing(addr, BlockKind::Data, priority, fill_cache)
+            {
+                f(addr, fetch);
             }
         }
     }
@@ -232,12 +334,16 @@ impl SstIter {
     /// scans only, never for seeks).
     fn load_data(&mut self, ahead: bool) -> Result<()> {
         let addr = BlockAddr::decode_varint(loaded(&mut self.index)?.value())?;
-        let h = match self.take_prefetched(addr) {
+        let h = match self.ahead.as_mut().and_then(|a| a.take(addr.offset)) {
             Some(h) => h,
-            None if ahead && self.options.readahead_blocks > 0 => self.read_ahead(addr)?,
             None => match self.reader.inner.blocks.lookup(addr)? {
                 Some(h) => h,
-                None => self.load_missed(addr, BlockKind::Data)?,
+                None => {
+                    if ahead && self.options.readahead_blocks > 0 && !self.options.cache_only {
+                        self.read_ahead();
+                    }
+                    self.load_missed(addr, BlockKind::Data)?
+                }
             },
         };
         load(&mut self.data, h)
@@ -256,67 +362,97 @@ impl SstIter {
         blocks.read_uncached(addr, kind, self.options.fill_cache, self.options.priority)
     }
 
-    fn take_prefetched(&mut self, addr: BlockAddr) -> Option<BlockHandle> {
-        while let Some((offset, _)) = self.prefetched.front() {
-            if *offset > addr.offset {
-                return None;
-            }
-            let (offset, h) = self.prefetched.pop_front()?;
-            if offset == addr.offset {
-                return Some(h);
-            }
+    /// Submits fetches for up to `readahead_blocks` of the blocks past the current one that
+    /// the cache lacks ([`SstIter::upcoming`], the one prediction of what a scan reads next),
+    /// unless this cursor's previous ones are still in flight: one batch at a time. A failed
+    /// fetch is dropped; the block is read when the cursor reaches it.
+    #[cold]
+    #[inline(never)]
+    fn read_ahead(&mut self) {
+        let ahead = self.ahead.get_or_insert_with(Box::default);
+        ahead.in_flight.retain(|(.., done)| !done.is_ready());
+        if !ahead.in_flight.is_empty() {
+            return;
         }
-        None
-    }
-
-    /// Reads `addr` and up to `readahead_blocks` adjacent uncached blocks of the same
-    /// partition in one I/O.
-    fn read_ahead(&mut self, addr: BlockAddr) -> Result<BlockHandle> {
-        let blocks = &self.reader.inner.blocks;
-        if let Some(h) = blocks.cached(addr) {
-            return Ok(h);
-        }
-        if self.options.cache_only {
-            return Err(blocks.would_block(addr, BlockKind::Data, self.options.priority));
-        }
-        self.run.clear();
-        self.run.push(addr);
-        let mut peek = loaded(&mut self.index)?.clone();
-        while self.run.len() <= self.options.readahead_blocks as usize {
-            peek.next()?;
-            if !peek.valid() {
-                break;
-            }
-            let a = BlockAddr::decode_varint(peek.value())?;
-            let prev = self.run[self.run.len() - 1];
-            if a.offset != prev.offset + u64::from(prev.len) || blocks.cached(a).is_some() {
-                break;
-            }
-            self.run.push(a);
-        }
-        let datas = blocks.read_run(&self.run, BlockKind::Data)?;
-        let (fill, priority) = (self.options.fill_cache, self.options.priority);
-        let mut first = None;
-        for (a, d) in self.run.iter().zip(datas) {
-            let h = blocks.admit(*a, d, fill, priority);
-            if first.is_none() {
-                first = Some(h);
-            } else if !fill {
-                self.prefetched.push_back((a.offset, h));
+        let mut fetches = Vec::new();
+        self.upcoming_with(
+            self.options.readahead_blocks as usize,
+            self.options.fill_cache,
+            // A partition read for a cursor that does not fill the cache would be read again
+            // when the scan reaches it: such a walk ends there instead (partitions hold
+            // about 100 blocks at the default sizes, so that is rare).
+            self.options.fill_cache,
+            |addr, fetch| fetches.push((addr, fetch)),
+        );
+        // Runs of blocks adjacent on disk, each one submission when merging.
+        let mut runs: Vec<Vec<(BlockAddr, Fetch)>> = Vec::new();
+        for (addr, fetch) in fetches {
+            match runs.last_mut() {
+                Some(run)
+                    if self.options.readahead_merge
+                        && run.last().is_some_and(|(prev, _)| {
+                            prev.offset + u64::from(prev.len) == addr.offset
+                        }) =>
+                {
+                    run.push((addr, fetch));
+                }
+                _ => runs.push(vec![(addr, fetch)]),
             }
         }
-        first.ok_or_else(|| {
-            Error::Format(pigeonhole_format::Error::Corrupt {
-                what: "sst readahead",
-            })
-        })
+        let reader = Arc::clone(&self.reader);
+        let Some(ahead) = self.ahead.as_mut() else {
+            return;
+        };
+        for run in runs {
+            let (Some((first, _)), Some((last, _))) = (run.first(), run.last()) else {
+                continue;
+            };
+            let (first, last) = (*first, *last);
+            crate::note_readahead(|c| c.issued += run.len() as u64);
+            ahead.unclaimed += run.len();
+            let arrived = Arc::clone(&ahead.arrived);
+            let done = if let [(addr, fetch)] = run.as_slice() {
+                let (offset, fetch) = (addr.offset, fetch.clone());
+                fetch.submit().map(move |read| {
+                    if let Ok(buf) = read
+                        && let Ok(Some(h)) = fetch.admit(buf)
+                    {
+                        lock(&arrived).push((offset, h));
+                    }
+                    Ok(())
+                })
+            } else {
+                // One read of the whole run, split into its blocks (one copy each).
+                let len = (last.offset + u64::from(last.len) - first.offset) as usize;
+                reader
+                    .inner
+                    .blocks
+                    .submit_run(first.offset, len)
+                    .map(move |read| {
+                        if let Ok(buf) = read {
+                            for (addr, fetch) in &run {
+                                let at = (addr.offset - first.offset) as usize;
+                                let mut piece = pigeonhole_io::IoBuf::zeroed(addr.len as usize);
+                                piece.copy_from_slice(&buf[at..at + addr.len as usize]);
+                                if let Ok(Some(h)) = fetch.admit(piece) {
+                                    lock(&arrived).push((addr.offset, h));
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+            };
+            ahead.in_flight.push_back((first.offset, last.offset, done));
+        }
     }
 
     /// Positions on the first entry `>= target` (or the first entry), ignoring the filter.
     fn position(&mut self, target: Option<&[u8]>) -> Result<()> {
-        // Read-ahead blocks are only useful in front of a forward scan; a seek (possibly
-        // backwards) drops their pins.
-        self.prefetched.clear();
+        // Readahead is only useful in front of a forward scan; a seek (possibly backwards)
+        // drops its pins.
+        if let Some(ahead) = self.ahead.as_mut() {
+            ahead.clear();
+        }
         if self.top.is_none() {
             load(&mut self.top, self.reader.inner.top.clone())?;
         }

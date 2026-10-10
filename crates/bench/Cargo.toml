@@ -41,6 +41,8 @@ proptest = { workspace = true }
 # The `commitpath` example drives the engine's shards directly.
 pigeonhole-engine = { workspace = true }
 pigeonhole-io = { workspace = true }
+# The `coldscan` example counts what the scan readahead did.
+pigeonhole-sst = { workspace = true }
 
 [[example]]
 name = "hotrow_runners"
