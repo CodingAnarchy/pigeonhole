@@ -1,0 +1,2 @@
+### Changed
+- A submitted root commit (`Pager::submit_commit_root`) no longer waits on the I/O backend's thread for a file growth's or truncation's `sync_all` in flight (#182): its next step is parked and resubmitted when that sync finishes, so reads queued on the backend are not stalled behind a growth. Submitting a commit no longer takes the allocator lock either. A failed growth or truncation sync still fails an overlapping commit before its superblock (D58), and the superblock is now written with a submitted write.

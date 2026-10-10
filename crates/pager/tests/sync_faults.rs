@@ -10,7 +10,7 @@ mod common;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use pigeonhole_io::sim::SimVfs;
 use pigeonhole_io::{
@@ -45,13 +45,17 @@ fn take_one(n: &AtomicU32) -> bool {
 }
 
 /// Fails the next `fail_sync_all` calls of `sync_all`, fails `allocate` with `NoSpace` while
-/// `no_space` is set, and holds submitted syncs while `hold` is set.
+/// `no_space` is set, holds submitted syncs while `hold` is set, and holds `sync_all` itself
+/// while the gate is closed.
 #[derive(Debug, Default)]
 struct Faults {
     fail_sync_all: AtomicU32,
     no_space: AtomicBool,
     hold: AtomicBool,
     held: Mutex<VecDeque<(FileRef, Resolver<()>)>>,
+    /// Closed: `sync_all` waits for it to open (a growth's sync in flight). Whether one waits.
+    gate: Mutex<(bool, bool)>,
+    gate_moved: Condvar,
 }
 
 impl Faults {
@@ -63,6 +67,33 @@ impl Faults {
 
     fn held(&self) -> usize {
         self.held.lock().unwrap().len()
+    }
+
+    fn close_gate(&self) {
+        self.gate.lock().unwrap().0 = true;
+    }
+
+    /// Waits until a `sync_all` waits at the closed gate.
+    fn wait_at_gate(&self) {
+        let mut g = self.gate.lock().unwrap();
+        while !g.1 {
+            g = self.gate_moved.wait(g).unwrap();
+        }
+    }
+
+    fn open_gate(&self) {
+        self.gate.lock().unwrap().0 = false;
+        self.gate_moved.notify_all();
+    }
+
+    fn pass_gate(&self) {
+        let mut g = self.gate.lock().unwrap();
+        while g.0 {
+            g.1 = true;
+            self.gate_moved.notify_all();
+            g = self.gate_moved.wait(g).unwrap();
+        }
+        g.1 = false;
     }
 }
 
@@ -111,6 +142,7 @@ impl File for FaultFile {
         done
     }
     fn sync_all(&self) -> Result<()> {
+        self.faults.pass_gate();
         if take_one(&self.faults.fail_sync_all) {
             return Err(pigeonhole_io::Error::new(
                 ErrorKind::Other,
@@ -264,6 +296,62 @@ fn a_growth_sync_failing_during_a_commit_fails_the_commit_before_its_superblock(
     assert!(pager.commit_root(root(3)).is_err());
     drop(pager);
     assert_eq!(reopened_root(&vfs), root(1));
+}
+
+#[test]
+fn a_commit_never_waits_for_a_growth_sync_on_the_thread_that_completes_its_sync() {
+    // #182: a growth's `sync_all` is in flight on another thread when the commit's first sync
+    // completes. The thread resolving that sync (the I/O backend's) must not wait for the
+    // growth: the commit's next step parks, and the growth resumes it when its sync ends.
+    // If that sync failed, the commit fails before its superblock (D58).
+    for fail in [false, true] {
+        let (vfs, faults, pager) = setup();
+        let pager = Arc::new(pager);
+        let sst = pager.allocate(64 << 10).unwrap();
+        pager.write(sst, 0, &[7; 4096]).unwrap();
+        faults.close_gate();
+        if fail {
+            faults.fail_sync_all.store(1, Ordering::Release);
+        }
+        let grower = std::thread::spawn({
+            let pager = Arc::clone(&pager);
+            move || pager.allocate(256 << 10).map(drop)
+        });
+        faults.wait_at_gate();
+        faults.hold.store(true, Ordering::Release);
+        let done = pager.submit_commit_root(root(2));
+        assert_eq!(faults.held(), 1, "the first sync");
+        // Resolved on another thread, as the backend's would be: it must return while the
+        // growth is still held (before #182 it waited for the growth's sync).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let faults = Arc::clone(&faults);
+            move || {
+                faults.release_one();
+                let _ = tx.send(());
+            }
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the thread resolving the commit's sync waited for the growth");
+        assert!(
+            !done.is_ready(),
+            "fail {fail}: the commit went on past a growth in flight"
+        );
+        assert_eq!(
+            faults.held(),
+            0,
+            "fail {fail}: no second sync before the growth ends"
+        );
+        faults.hold.store(false, Ordering::Release);
+        faults.open_gate();
+        assert_eq!(grower.join().unwrap().is_err(), fail);
+        let r = done.wait();
+        assert_eq!(r.is_err(), fail, "fail {fail}: {r:?}");
+        let want = if fail { root(1) } else { root(2) };
+        assert_eq!(pager.root(), want);
+        drop(pager);
+        assert_eq!(reopened_root(&vfs), want);
+    }
 }
 
 #[test]
