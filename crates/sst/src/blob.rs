@@ -200,7 +200,7 @@ impl Reader {
             return Ok(());
         }
         let mut b = [0; BLOB_EXTENT_HEADER_LEN];
-        self.file.read_at(&mut b, self.extents[i].offset())?;
+        crate::reader::read_into(&self.file, &mut b, self.extents[i].offset())?;
         self.check_header(i, &b)
     }
 
@@ -353,7 +353,7 @@ impl Reader {
             self.payload,
             ptr.offset,
             total,
-            |_, abs, r| Ok(self.file.read_at(&mut buf[r], abs)?),
+            |_, abs, r| crate::reader::read_into(&self.file, &mut buf[r], abs),
         )?;
         let (header, value) = buf.split_at(BLOB_RECORD_HEADER_LEN);
         verify_record(header, value, ptr.len)?;
