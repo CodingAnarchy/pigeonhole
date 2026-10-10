@@ -1,5 +1,7 @@
 //! The async front door (Phase 3, #42): the same operations as the sync API, over the same
-//! engine, as futures: commits, gets, row reads and scan streams.
+//! engine, as futures: commits, gets, row reads and scan streams. It is behind the `async`
+//! feature, which is on by default (D17). The user guide's Async page lists the calls that
+//! are blocking only.
 //!
 //! Futures depend only on `std::task`, so they run on any executor (Tokio, smol, a custom
 //! one); none of them spawns a thread or uses `spawn_blocking`. A commit future is woken by

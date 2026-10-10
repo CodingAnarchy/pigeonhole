@@ -90,6 +90,10 @@ jobs:
             srcs+=("crates/bench/examples/$e.rs")
           done
           mkdir -p /tmp/bin-head /tmp/bin-base
+          # Default features of every crate, always: the counts must be what a user of the
+          # published crates gets (#430: `pigeonhole`'s default-on `async` adds a second,
+          # cache-only instance of the read paths). Never pass --no-default-features or
+          # --features here, and keep the bench's dependencies on their default features.
           cargo build --release -p pigeonhole-bench "${flags[@]}"
           for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-head/; done
           git worktree add -q /tmp/base "$base"

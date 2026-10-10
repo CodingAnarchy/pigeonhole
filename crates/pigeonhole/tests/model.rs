@@ -198,6 +198,31 @@ struct Config {
     fast_balancer: bool,
     /// Defer submitted I/O to a device thread. Defaults to `PIGEONHOLE_DEFERRED_IO`.
     deferred_io: bool,
+    /// Which front door commits, gets, row reads and scans go through (#42's parity suite):
+    /// sync, async, or mixed per operation. Defaults to `PIGEONHOLE_FRONT` (`sync`, `async`
+    /// or `mixed`), else sync.
+    front: Front,
+}
+
+/// The front door a run's operations use. Every result is checked against the model either
+/// way, so a run through `Async` or `Mixed` is the sync/async parity check: both paths must
+/// read and write exactly what the model does (#42).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Front {
+    Sync,
+    Async,
+    /// Each operation picks one (seeded), so both paths interleave on one database.
+    Mixed,
+}
+
+impl Front {
+    fn from_env() -> Self {
+        match std::env::var("PIGEONHOLE_FRONT").as_deref() {
+            Ok("async") => Front::Async,
+            Ok("mixed") => Front::Mixed,
+            _ => Front::Sync,
+        }
+    }
 }
 
 impl Config {
@@ -224,6 +249,7 @@ impl Config {
             tablet_changes: std::env::var("PIGEONHOLE_TABLET_CHANGES").as_deref() != Ok("0"),
             fast_balancer: true,
             deferred_io: std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1"),
+            front: Front::from_env(),
         }
     }
 
@@ -631,8 +657,26 @@ impl Run {
         self.vfs.now_micros()
     }
 
-    /// Applies `ops` through the public API. Returns the commit result.
-    fn commit(&self, ops: &[ModelOp], durability: Durability) -> pigeonhole::Result<()> {
+    /// Whether the next operation goes through the async front door (see [`Front`]).
+    fn async_front(&self, rng: &mut Rng) -> bool {
+        if !cfg!(feature = "async") {
+            return false;
+        }
+        match self.cfg.front {
+            Front::Sync => false,
+            Front::Async => true,
+            Front::Mixed => rng.chance(500_000),
+        }
+    }
+
+    /// Applies `ops` through the public API (`async_front`: the async commits). Returns the
+    /// commit result.
+    fn commit(
+        &self,
+        ops: &[ModelOp],
+        durability: Durability,
+        async_front: bool,
+    ) -> pigeonhole::Result<()> {
         let key = |op: &ModelOp| -> (usize, Vec<u8>) {
             let row = match op {
                 ModelOp::Put { row, .. }
@@ -690,7 +734,7 @@ impl Run {
                     ModelOp::DeleteRow { .. } => m.delete_row(),
                 };
             }
-            m.commit().map(|_| ())
+            front::commit_mutation(m, async_front).map(|_| ())
         } else {
             let mut wb = self.db().write_batch();
             for op in ops {
@@ -757,7 +801,7 @@ impl Run {
                 };
             }
             assert_eq!(wb.len(), ops.len());
-            wb.commit_with(durability).map(|_| ())
+            front::commit_batch(wb, durability, async_front).map(|_| ())
         }
     }
 
@@ -1077,7 +1121,8 @@ impl Run {
                     ops.iter().map(show).collect::<Vec<_>>().join("; "),
                     if armed { " (crash armed)" } else { "" }
                 ));
-                let mut result = self.commit(&ops, durability);
+                let async_front = self.async_front(rng);
+                let mut result = self.commit(&ops, durability, async_front);
                 if let Err(e) = &result
                     && e.code() == ErrorCode::Busy
                     && armed
@@ -1101,7 +1146,7 @@ impl Run {
                     self.trace.push("BUSY: snapshots dropped".into());
                     self.compare_dump("after a commit refused with Busy")?;
                     self.snaps.clear();
-                    result = self.commit(&ops, durability);
+                    result = self.commit(&ops, durability, async_front);
                 }
                 match result {
                     Ok(()) => {
@@ -1139,20 +1184,25 @@ impl Run {
                 let ti = table_index(&row);
                 let snap = self.pick_snapshot(rng);
                 let t = self.table(ti);
-                let got = match &snap {
-                    Some((s, _)) => t.get_at(s, &row, &family, &qualifier),
-                    None => t.get(&row, &family, &qualifier),
-                };
+                let async_front = self.async_front(rng);
+                let got = front::get(
+                    t,
+                    snap.as_ref().map(|s| &s.0),
+                    &row,
+                    &family,
+                    &qualifier,
+                    async_front,
+                );
                 let ms = snap.as_ref().map_or(self.model.snapshot(), |s| s.1);
                 let want = self
                     .model
                     .try_get(TABLES[ti], &row, &family, &qualifier, ms, now);
                 let got = got.map(|c| {
-                    c.map(|c| ModelCell {
+                    c.map(|(ts, value)| ModelCell {
                         family: family.clone(),
                         qualifier: qualifier.clone(),
-                        ts: c.timestamp(),
-                        value: c.value().to_vec(),
+                        ts,
+                        value,
                     })
                 });
                 match (got, want) {
@@ -1176,8 +1226,8 @@ impl Run {
                     if let Some((s, _)) = &snap {
                         r = r.snapshot(s);
                     }
-                    r.read()
-                        .map(|r| r.map(|r| owned_cells(&r.to_owned())).unwrap_or_default())
+                    front::read_row(r, async_front)
+                        .map(|r| r.map(|r| owned_cells(&r)).unwrap_or_default())
                 };
                 let want = self.model.try_read_row(TABLES[ti], &row, &[], 0, ms, now);
                 match (row_read, want) {
@@ -1200,6 +1250,7 @@ impl Run {
                 let snap = self.pick_snapshot(rng);
                 let ms = snap.as_ref().map_or(self.model.snapshot(), |s| s.1);
                 let lending = rng.chance(500_000);
+                let async_front = self.async_front(rng);
                 for (i, name) in TABLES.iter().enumerate() {
                     let mut scan = self
                         .table(i)
@@ -1207,20 +1258,24 @@ impl Run {
                     if let Some((s, _)) = &snap {
                         scan = scan.snapshot(s);
                     }
-                    let got: pigeonhole::Result<Rows> = scan.iter().and_then(|mut it| {
-                        let mut rows = Vec::new();
-                        if lending {
-                            while let Some(r) = it.next_ref()? {
-                                rows.push((r.key().to_vec(), ref_cells(&r)));
+                    let got: pigeonhole::Result<Rows> = if async_front {
+                        front::scan(scan)
+                    } else {
+                        scan.iter().and_then(|mut it| {
+                            let mut rows = Vec::new();
+                            if lending {
+                                while let Some(r) = it.next_ref()? {
+                                    rows.push((r.key().to_vec(), ref_cells(&r)));
+                                }
+                            } else {
+                                for r in it {
+                                    let r = r?;
+                                    rows.push((r.key().to_vec(), owned_cells(&r)));
+                                }
                             }
-                        } else {
-                            for r in it {
-                                let r = r?;
-                                rows.push((r.key().to_vec(), owned_cells(&r)));
-                            }
-                        }
-                        Ok(rows)
-                    });
+                            Ok(rows)
+                        })
+                    };
                     let want = self.model.try_scan(
                         name,
                         Bound::Included(&start),
@@ -1447,6 +1502,38 @@ fn crashes_and_reopens_match_a_durable_prefix() {
     check(&Config::crashing(1000));
 }
 
+/// The sync/async parity suite (#42): every commit, get, row read and scan through the async
+/// front door, checked against the same model the sync runs are.
+#[cfg(feature = "async")]
+#[test]
+fn quiet_runs_through_the_async_front_door_match_the_model() {
+    for shards in [1, 4] {
+        let mut cfg = Config::quiet(1000, shards);
+        cfg.front = Front::Async;
+        check(&cfg);
+    }
+}
+
+/// Both front doors interleaved on one database (each operation picks one), so the two paths
+/// read each other's writes.
+#[cfg(feature = "async")]
+#[test]
+fn quiet_runs_mixing_both_front_doors_match_the_model() {
+    for shards in [1, 4] {
+        let mut cfg = Config::quiet(1000, shards);
+        cfg.front = Front::Mixed;
+        check(&cfg);
+    }
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn crashes_mixing_both_front_doors_match_a_durable_prefix() {
+    let mut cfg = Config::crashing(1000);
+    cfg.front = Front::Mixed;
+    check(&cfg);
+}
+
 #[test]
 fn quiet_runs_with_tablet_changes_off_match_the_model() {
     for shards in [1, 2, 4, 8] {
@@ -1657,4 +1744,102 @@ fn an_io_error_while_an_unfired_crash_is_armed_is_not_that_crash() {
     );
     let e = result.expect_err("the injected read error was not reported");
     assert!(e.contains("scan of"), "seed {seed}: {e}");
+}
+
+/// The two front doors the model's operations go through (#42): the sync calls, and the
+/// async ones driven by `block_on`. The async ones exist only with the `async` feature.
+mod front {
+    use pigeonhole::{
+        Durability, Result, Row, RowMutation, RowRead, Scan, Snapshot, Table, WriteBatch,
+    };
+
+    use super::Rows;
+
+    pub fn commit_mutation(
+        m: RowMutation<'_>,
+        async_front: bool,
+    ) -> Result<pigeonhole::CommitInfo> {
+        #[cfg(feature = "async")]
+        if async_front {
+            return pigeonhole::doc_support::block_on(m.commit_async());
+        }
+        let _ = async_front;
+        m.commit()
+    }
+
+    pub fn commit_batch(
+        wb: WriteBatch,
+        durability: Durability,
+        async_front: bool,
+    ) -> Result<pigeonhole::CommitInfo> {
+        #[cfg(feature = "async")]
+        if async_front {
+            return pigeonhole::doc_support::block_on(wb.commit_with_async(durability));
+        }
+        let _ = async_front;
+        wb.commit_with(durability)
+    }
+
+    /// A get's version as `(timestamp, value)`.
+    pub fn get(
+        t: &Table,
+        snap: Option<&Snapshot>,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        async_front: bool,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        #[cfg(feature = "async")]
+        if async_front {
+            let cell = match snap {
+                Some(s) => {
+                    pigeonhole::doc_support::block_on(t.get_at_async(s, row, family, qualifier))
+                }
+                None => pigeonhole::doc_support::block_on(t.get_async(row, family, qualifier)),
+            };
+            return cell.map(|c| c.map(|c| (c.timestamp(), c.value().to_vec())));
+        }
+        let _ = async_front;
+        let cell = match snap {
+            Some(s) => t.get_at(s, row, family, qualifier),
+            None => t.get(row, family, qualifier),
+        };
+        cell.map(|c| c.map(|c| (c.timestamp(), c.value().to_vec())))
+    }
+
+    pub fn read_row(r: RowRead<'_>, async_front: bool) -> Result<Option<Row>> {
+        #[cfg(feature = "async")]
+        if async_front {
+            return pigeonhole::doc_support::block_on(r.read_async());
+        }
+        let _ = async_front;
+        r.read().map(|r| r.map(|r| r.to_owned()))
+    }
+
+    /// The scan's rows through its stream.
+    #[cfg(feature = "async")]
+    pub fn scan(scan: Scan<'_>) -> Result<Rows> {
+        use super::owned_cells;
+        use std::future::poll_fn;
+        use std::pin::Pin;
+        let mut stream = scan.stream();
+        let mut rows = Vec::new();
+        loop {
+            let next = pigeonhole::doc_support::block_on(poll_fn(|cx| {
+                futures_core::Stream::poll_next(Pin::new(&mut stream), cx)
+            }));
+            match next {
+                Some(r) => {
+                    let r = r?;
+                    rows.push((r.key().to_vec(), owned_cells(&r)));
+                }
+                None => return Ok(rows),
+            }
+        }
+    }
+
+    #[cfg(not(feature = "async"))]
+    pub fn scan(_scan: Scan<'_>) -> Result<Rows> {
+        unreachable!("the async front door needs the `async` feature")
+    }
 }

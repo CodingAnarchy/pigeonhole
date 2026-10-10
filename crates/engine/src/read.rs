@@ -1308,7 +1308,7 @@ pub(crate) fn read_row(
         row: row.to_vec(),
         ..RowData::default()
     };
-    let any = read_row_into::<false>(
+    let any = read_row_into(
         &snapshot.view,
         snapshot.seqno,
         table,
@@ -1316,6 +1316,7 @@ pub(crate) fn read_row(
         families,
         spec,
         now,
+        false,
         &mut out,
     )?;
     Ok(any.then_some(out))
@@ -1333,7 +1334,12 @@ thread_local! {
 /// Reads one row through `view` at `seqno` into `sink`: every family in `families` order.
 /// Returns whether any cell was found. A value pinned rather than copied pins `view`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn read_row_into<const CACHE_ONLY: bool>(
+///
+/// `cache_only` (an async read, ICR 0014) changes only how each family's sources are
+/// gathered, so it is a runtime flag rather than a second instance: with two instances the
+/// per-cell loop stopped inlining `CellResolver::next_cell` into the sync one (#430, +2%
+/// instructions per row).
+pub(crate) fn read_row_into(
     view: &Arc<View>,
     seqno: Seqno,
     table: TableId,
@@ -1341,6 +1347,7 @@ pub(crate) fn read_row_into<const CACHE_ONLY: bool>(
     families: &[FamilyId],
     spec: &ReadSpec,
     now: Timestamp,
+    cache_only: bool,
     sink: &mut impl RowSink,
 ) -> Result<bool> {
     let mut resolver = ROW_RESOLVER
@@ -1349,7 +1356,7 @@ pub(crate) fn read_row_into<const CACHE_ONLY: bool>(
         .flatten()
         .unwrap_or_else(point_resolver);
     let mut large = false;
-    let read = read_row_with::<CACHE_ONLY>(
+    let read = read_row_with(
         &mut resolver,
         view,
         seqno,
@@ -1358,6 +1365,7 @@ pub(crate) fn read_row_into<const CACHE_ONLY: bool>(
         families,
         spec,
         now,
+        cache_only,
         sink,
         &mut large,
     );
@@ -1380,7 +1388,7 @@ pub(crate) fn read_row_into<const CACHE_ONLY: bool>(
 // Inlined into `read_row_into`: called through a separate frame, a hot row's per-cell loop
 // measured about 1.5% more instructions.
 #[inline(always)]
-fn read_row_with<const CACHE_ONLY: bool>(
+fn read_row_with(
     resolver: &mut Resolver,
     view: &Arc<View>,
     seqno: Seqno,
@@ -1389,6 +1397,7 @@ fn read_row_with<const CACHE_ONLY: bool>(
     families: &[FamilyId],
     spec: &ReadSpec,
     now: Timestamp,
+    cache_only: bool,
     sink: &mut impl RowSink,
     large: &mut bool,
 ) -> Result<bool> {
@@ -1419,14 +1428,26 @@ fn read_row_with<const CACHE_ONLY: bool>(
         let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let cursor = resolver.cursor_mut();
         cursor.sources_mut().clear();
-        view.row_sources_into::<CACHE_ONLY>(
-            shard,
-            tablet,
-            family,
-            &filter,
-            &prefix,
-            cursor.sources_mut(),
-        )?;
+        if cache_only {
+            row_sources_cache_only(
+                view,
+                shard,
+                tablet,
+                family,
+                &filter,
+                &prefix,
+                cursor.sources_mut(),
+            )?;
+        } else {
+            view.row_sources_into::<false>(
+                shard,
+                tablet,
+                family,
+                &filter,
+                &prefix,
+                cursor.sources_mut(),
+            )?;
+        }
         if cursor.sources().is_empty() {
             continue;
         }
@@ -1487,6 +1508,22 @@ fn read_row_with<const CACHE_ONLY: bool>(
         }
     }
     Ok(any)
+}
+
+/// A row read's sources for one family, gathered cache-only (an async read): out of the
+/// sync row read's way.
+#[cold]
+#[inline(never)]
+fn row_sources_cache_only(
+    view: &View,
+    shard: pigeonhole_runtime::ShardId,
+    tablet: pigeonhole_format::TabletId,
+    family: FamilyId,
+    filter: &ScanFilter,
+    prefix: &[u8],
+    out: &mut Vec<Source>,
+) -> Result<()> {
+    view.row_sources_into::<true>(shard, tablet, family, filter, prefix, out)
 }
 
 #[cfg(feature = "test-hooks")]

@@ -20,8 +20,8 @@ SQLite's deployment model (one file, a library, no server).
 > write-ahead log: memtables flush into the file and compact, so data is bounded by the disk,
 > not memory (`Options::memtable_budget` only sizes the per-shard write buffer). A clean close
 > leaves one file. A table's tablets split and move between shards, so one table's writes
-> spread over them (`Options::tablet_changes`, on by default). The async API arrives in
-> Phase 3 behind the `async` feature.
+> spread over them (`Options::tablet_changes`, on by default). The async API (`get_async`,
+> `Scan::stream`, `commit_async`) is on by default through the `async` feature.
 
 ## Install
 
