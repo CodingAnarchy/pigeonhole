@@ -47,7 +47,7 @@ use crate::write::{COUNTER_TS, ReadKey};
 pub(crate) type Shards = smallvec::SmallVec<[ShardId; 4]>;
 use crate::{
     CellData, EngineOptions, Error, PendingCheck, PendingCommit, Predicate, ReadSpec, Result,
-    RowData, ScanCursor, ScanSpec, Snapshot, Txn, WriteBatch,
+    RowCacheStats, RowData, ScanCursor, ScanSpec, Snapshot, Txn, WriteBatch,
 };
 
 /// Whether this handle may write.
@@ -536,6 +536,11 @@ impl Engine {
             manifest_busy: AtomicBool::new(false),
             pager: Arc::clone(&pager),
             cache: Arc::clone(&cache),
+            row_cache: crate::row_cache::RowCaches::new(
+                options.row_cache_bytes,
+                options.row_cache_max_row,
+                options.row_cache_families.clone(),
+            ),
             sst_ids: Arc::new(AtomicU64::new(catalog.counters.next_sst.max(1))),
             blob_ids: Arc::new(AtomicU32::new(catalog.counters.next_blob_file.max(1))),
             live_views: Arc::clone(&live_views),
@@ -1045,6 +1050,8 @@ impl Engine {
             manifest_busy: AtomicBool::new(false),
             pager: Arc::clone(&pager),
             cache: Arc::clone(&cache),
+            // Reader processes have no write watermarks, so no row cache (D201).
+            row_cache: None,
             sst_ids: Arc::new(AtomicU64::new(0)),
             blob_ids: Arc::new(AtomicU32::new(0)),
             live_views: Arc::new(LiveViews::default()),
@@ -1326,6 +1333,13 @@ impl Engine {
                 continue;
             }
             let now = inner.shared.vfs.now_micros();
+            if let Some(rc) = &inner.shared.row_cache
+                && let Some(hit) = crate::row_cache::get_cached(
+                    rc, &view, seqno, now, table, family, row, qualifier,
+                )
+            {
+                return Ok(hit);
+            }
             return get_in::<false>(&view, seqno, now, table, family, row, qualifier, || {
                 Arc::clone(&view)
             });
@@ -1490,6 +1504,13 @@ impl Engine {
         if let Some((view, seqno)) = inner.latest_view() {
             let families = families_in_order(&view, table, families)?;
             let now = inner.shared.vfs.now_micros();
+            if let Some(rc) = &inner.shared.row_cache
+                && crate::row_cache::serves_spec(spec)
+            {
+                return crate::row_cache::read_row_cached(
+                    rc, &view, seqno, table, row, &families, spec, now, false, sink,
+                );
+            }
             return read::read_row_into(
                 &view, seqno, table, row, &families, spec, now, false, sink,
             );
@@ -1579,6 +1600,17 @@ impl Engine {
         }
         let _guard = inner.enter_maintenance()?;
         crate::maintenance::shrink(&inner.shared)
+    }
+
+    /// What the row cache did since open (D201); all zero when it is off or in a reader
+    /// process. A method rather than [`Metrics`] fields, which would break struct literals.
+    pub fn row_cache_stats(&self) -> RowCacheStats {
+        self.inner
+            .shared
+            .row_cache
+            .as_ref()
+            .map(|rc| rc.stats())
+            .unwrap_or_default()
     }
 
     /// Tablet changes refused for lack of room, summed over shards since open, as

@@ -40,6 +40,8 @@ pub struct Options {
     memtable_budget: u64,
     block_cache: Option<usize>,
     row_cache: usize,
+    row_cache_max_row: Option<usize>,
+    row_cache_families: Vec<(String, String)>,
     shm_dir: Option<PathBuf>,
     create_if_missing: bool,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
@@ -66,6 +68,8 @@ impl Default for Options {
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: 0,
+            row_cache_max_row: None,
+            row_cache_families: Vec::new(),
             shm_dir: None,
             create_if_missing: true,
             merge_operators: Vec::new(),
@@ -206,9 +210,30 @@ impl Options {
         self
     }
 
-    /// Row cache capacity in bytes (default 0: disabled).
+    /// Row cache capacity in bytes (default 0: disabled), on top of the block cache. The row
+    /// cache keeps the newest version of each cell of small, hot family rows and serves
+    /// latest row reads (newest version, no time range) and point gets from it, without
+    /// merging the row's sources. A family row is stored the second time a read misses it,
+    /// so rows read once are never stored. Results are identical to uncached reads; a write
+    /// to a row makes its cached copy miss at once (D201). Writer process only; snapshot
+    /// reads, scans and multi-version reads bypass it.
     pub fn row_cache(mut self, bytes: usize) -> Self {
         self.row_cache = bytes;
+        self
+    }
+
+    /// Largest family row the row cache stores, in encoded bytes (about the qualifiers and
+    /// values plus 16 bytes a cell; default 4 KiB). Larger rows are read as usual.
+    pub fn row_cache_max_row(mut self, bytes: usize) -> Self {
+        self.row_cache_max_row = Some(bytes);
+        self
+    }
+
+    /// Serve only these families from the row cache: call once per `(table, family)`.
+    /// Without any call, every family is served. Process-local, not stored in the file.
+    pub fn row_cache_family(mut self, table: &str, family: &str) -> Self {
+        self.row_cache_families
+            .push((table.to_owned(), family.to_owned()));
         self
     }
 
@@ -620,6 +645,10 @@ impl Options {
             o.block_cache_bytes = bytes;
         }
         o.row_cache_bytes = self.row_cache;
+        if let Some(bytes) = self.row_cache_max_row {
+            o.row_cache_max_row = bytes;
+        }
+        o.row_cache_families = self.row_cache_families.clone();
         o.shm_dir.clone_from(&self.shm_dir);
         o.allow_unregistered_merge = self.allow_unregistered_merge_operators;
         o.allow_fuse = self.allow_fuse;

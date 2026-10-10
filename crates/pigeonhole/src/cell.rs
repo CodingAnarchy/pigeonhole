@@ -213,6 +213,15 @@ impl pigeonhole_engine::RowSink for RowBuf {
             c.cell.data.set_inline(ts, stored);
         }
     }
+
+    fn cell_count(&self) -> Option<usize> {
+        Some(self.cells.len())
+    }
+
+    fn cell(&self, i: usize) -> Option<(&[u8], &CellData)> {
+        let c = self.cells.get(i)?;
+        Some((self.qualifiers.get(c.qualifier.clone())?, &c.cell.data))
+    }
 }
 
 impl RowBuf {

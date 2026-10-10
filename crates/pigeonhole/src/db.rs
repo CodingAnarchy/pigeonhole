@@ -282,6 +282,12 @@ impl Pigeonhole {
         self.db.engine.shard_stats()
     }
 
+    /// What the row cache did since open: hits, misses and fills (D201). All zero when
+    /// [`Options::row_cache`](crate::Options::row_cache) is 0.
+    pub fn row_cache_stats(&self) -> crate::RowCacheStats {
+        self.db.engine.row_cache_stats()
+    }
+
     /// The engine's counters since open: commits, flushes, compactions, write stalls, WAL
     /// unpin passes, inline WAL syncs and file growths. A bench hook (ICR 0015) that shows
     /// what stalled during a run; take two readings and subtract for a phase.

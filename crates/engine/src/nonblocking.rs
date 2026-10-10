@@ -247,7 +247,18 @@ impl Future for GetFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
         let (table, family, row, qualifier) = (this.table, this.family, &this.row, &this.qualifier);
+        // A latest get consults the row cache, as the sync one does (D201).
+        let row_cache = (!this.reading.given && this.reading.inner.shared.row_cache.is_some())
+            .then(|| Arc::clone(&this.reading.inner));
         this.reading.poll_read(cx, |view, seqno, now, cache_only| {
+            if let Some(inner) = &row_cache
+                && let Some(rc) = &inner.shared.row_cache
+                && let Some(hit) = crate::row_cache::get_cached(
+                    rc, view, seqno, now, table, family, row, qualifier,
+                )
+            {
+                return Ok(hit);
+            }
             if cache_only {
                 get_in::<true>(view, seqno, now, table, family, row, qualifier, || {
                     Arc::clone(view)
@@ -325,9 +336,23 @@ impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
             &this.spec,
             &this.empty,
         );
+        // A latest read goes through the row cache, as the sync one does (D201).
+        let row_cache = match &this.reading.inner.shared.row_cache {
+            Some(rc) if !this.reading.given && crate::row_cache::serves_spec(spec) => {
+                Some(Arc::clone(&this.reading.inner))
+            }
+            _ => None,
+        };
         let r = this.reading.poll_read(cx, |view, seqno, now, cache_only| {
             sink.clone_from(empty);
             let families = crate::engine::families_in_order(view, table, families)?;
+            if let Some(inner) = &row_cache
+                && let Some(rc) = &inner.shared.row_cache
+            {
+                return crate::row_cache::read_row_cached(
+                    rc, view, seqno, table, row, &families, spec, now, cache_only, sink,
+                );
+            }
             read::read_row_into(
                 view, seqno, table, row, &families, spec, now, cache_only, sink,
             )

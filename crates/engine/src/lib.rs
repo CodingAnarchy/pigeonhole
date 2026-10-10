@@ -32,6 +32,7 @@ mod manifest;
 mod nonblocking;
 mod options;
 mod read;
+mod row_cache;
 mod shard;
 mod snapshot;
 mod source;
@@ -46,6 +47,7 @@ pub use error::{Error, Result};
 pub use nonblocking::{GetFuture, RowFuture};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
+pub use row_cache::RowCacheStats;
 #[doc(hidden)]
 pub use shard::set_tracing;
 pub use snapshot::{Snapshot, TabletMap, View};

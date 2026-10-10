@@ -202,6 +202,10 @@ struct Config {
     /// sync, async, or mixed per operation. Defaults to `PIGEONHOLE_FRONT` (`sync`, `async`
     /// or `mixed`), else sync.
     front: Front,
+    /// `Options::row_cache` bytes (0: off), with a small per-row cap so some family rows are
+    /// never stored (D201). Defaults to `PIGEONHOLE_ROW_CACHE` (`1`: a 64 KiB cache, small
+    /// enough to evict), else off.
+    row_cache: usize,
 }
 
 /// The front door a run's operations use. Every result is checked against the model either
@@ -250,6 +254,11 @@ impl Config {
             fast_balancer: true,
             deferred_io: std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1"),
             front: Front::from_env(),
+            row_cache: if std::env::var("PIGEONHOLE_ROW_CACHE").is_ok_and(|v| v == "1") {
+                ROW_CACHE
+            } else {
+                0
+            },
         }
     }
 
@@ -285,6 +294,8 @@ struct Stats {
     busy: usize,
     /// The database file's length at the end of the run.
     file_len: u64,
+    /// Row cache hits over the run's handles (D201).
+    row_cache_hits: u64,
 }
 
 struct Run {
@@ -600,7 +611,9 @@ impl Run {
             .memtable_budget(self.cfg.memtable_budget)
             .wal_segment_size(256 << 10)
             .block_cache(self.cfg.block_cache)
-            .tablet_changes(self.cfg.tablet_changes);
+            .tablet_changes(self.cfg.tablet_changes)
+            .row_cache(self.cfg.row_cache)
+            .row_cache_max_row(ROW_CACHE_MAX_ROW);
         if self.cfg.fast_balancer {
             // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
             options = options.tablet_balance(Duration::from_micros(15), 3, 8 << 10);
@@ -1061,6 +1074,7 @@ impl Run {
         }
         self.armed = false;
         // Dropping the handles closes the engine against the crashed files; errors ignored.
+        self.note_row_cache();
         self.db = None;
         self.vfs.set_faults(self.cfg.faults.clone());
         self.recover(Some(kind))
@@ -1084,10 +1098,18 @@ impl Run {
         self.stats.reopens += 1;
         self.trace.push("REOPEN".into());
         self.snaps.clear();
+        self.note_row_cache();
         let (db, tables) = self.db.take().expect("open");
         drop(tables);
         db.close().map_err(|e| format!("close: {e}"))?;
         self.recover(None)
+    }
+
+    /// Adds the open handle's row cache hits to the run's.
+    fn note_row_cache(&mut self) {
+        if let Some((db, _)) = &self.db {
+            self.stats.row_cache_hits += db.row_cache_stats().hits;
+        }
     }
 
     fn compare_dump(&self, when: &str) -> Result<(), String> {
@@ -1242,6 +1264,41 @@ impl Run {
                             "row read {} (model seqno {ms}): store {g:?} vs model {w:?}",
                             text(&row)
                         ));
+                    }
+                }
+                // Latest-version reads of the get's family, then of every family: the reads
+                // the row cache serves when it is on (D201), and fills, so the get above can
+                // hit next time. No randomness, so a seed's operations are unchanged.
+                for families in [std::slice::from_ref(&family), &[][..]] {
+                    let row_read = {
+                        let mut r = t.row(&row);
+                        for f in families {
+                            r = r.family(f);
+                        }
+                        if let Some((s, _)) = &snap {
+                            r = r.snapshot(s);
+                        }
+                        front::read_row(r, async_front)
+                            .map(|r| r.map(|r| owned_cells(&r)).unwrap_or_default())
+                    };
+                    let names: Vec<&str> = families.iter().map(String::as_str).collect();
+                    let want = self
+                        .model
+                        .try_read_row(TABLES[ti], &row, &names, 1, ms, now);
+                    match (row_read, want) {
+                        (Ok(g), Ok(w)) if g == w => {}
+                        (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
+                            if e.code() == ErrorCode::MergeFailed => {}
+                        (Err(e), _) if self.armed && self.fired() => {
+                            return self.recover_fired(&e);
+                        }
+                        (g, w) => {
+                            return Err(format!(
+                                "latest row read {} {names:?} (model seqno {ms}): store {g:?} \
+                                 vs model {w:?}",
+                                text(&row)
+                            ));
+                        }
                     }
                 }
             }
@@ -1399,9 +1456,13 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
             {
                 run.stats.file_len = f.len().unwrap_or(0);
             }
+            run.note_row_cache();
             if let Some((db, tables)) = run.db.take() {
                 drop(tables);
                 db.close().map_err(|e| format!("final close: {e}"))?;
+            }
+            if run.cfg.row_cache > 0 && run.stats.reads > 100 && run.stats.row_cache_hits == 0 {
+                return Err(format!("seed {seed}: the row cache never hit"));
             }
             Ok(run.stats)
         }
@@ -1532,6 +1593,40 @@ fn quiet_runs_mixing_both_front_doors_match_the_model() {
 #[test]
 fn crashes_mixing_both_front_doors_match_a_durable_prefix() {
     let mut cfg = Config::crashing(1000);
+    cfg.front = Front::Mixed;
+    check(&cfg);
+}
+
+/// The row cache's runs (D201): small enough to evict, with a per-row cap some family rows
+/// exceed.
+const ROW_CACHE: usize = 64 << 10;
+const ROW_CACHE_MAX_ROW: usize = 512;
+
+/// Every row read and get may be served from the row cache, and every result must still be
+/// the model's: writes, flushes, compactions, TTL expiry, reopens and tablet changes in
+/// between (#404, D201).
+#[test]
+fn quiet_runs_with_the_row_cache_match_the_model() {
+    for shards in [1, 4] {
+        let mut cfg = Config::quiet(1000, shards);
+        cfg.row_cache = ROW_CACHE;
+        check(&cfg);
+    }
+}
+
+#[test]
+fn crashes_with_the_row_cache_match_a_durable_prefix() {
+    let mut cfg = Config::crashing(1000);
+    cfg.row_cache = ROW_CACHE;
+    check(&cfg);
+}
+
+/// Async row reads and gets hit and fill the same cache as sync ones.
+#[cfg(feature = "async")]
+#[test]
+fn quiet_runs_mixing_front_doors_with_the_row_cache_match_the_model() {
+    let mut cfg = Config::quiet(1000, 4);
+    cfg.row_cache = ROW_CACHE;
     cfg.front = Front::Mixed;
     check(&cfg);
 }

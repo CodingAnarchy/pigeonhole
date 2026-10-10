@@ -134,6 +134,7 @@ pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
 /// The engine's counters, for [`Pigeonhole::engine_metrics`] (a bench hook, ICR 0015).
 #[doc(hidden)]
 pub use pigeonhole_engine::Metrics as EngineMetrics;
+pub use pigeonhole_engine::RowCacheStats;
 #[doc(hidden)]
 pub use pigeonhole_engine::ShardStats;
 pub use pigeonhole_engine::{MergeError, MergeOperator};
