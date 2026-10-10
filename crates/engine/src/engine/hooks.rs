@@ -340,7 +340,7 @@ impl Engine {
         catalog
             .ssts
             .values()
-            .flatten()
+            .flat_map(|l| l.iter())
             .map(|(level, meta)| (*level, meta.len, meta.extent.size_class))
             .collect()
     }
@@ -351,7 +351,7 @@ impl Engine {
     pub fn sst_extents(&self) -> Vec<(TableId, u64, u8)> {
         let catalog = Arc::clone(&self.inner.shared.view.load().catalog);
         let mut out = Vec::new();
-        for ((tablet, _), list) in &catalog.ssts {
+        for ((tablet, _), list) in catalog.ssts.iter() {
             let Some(entry) = catalog.tablet(*tablet) else {
                 continue;
             };
@@ -368,7 +368,7 @@ impl Engine {
     pub fn sst_levels(&self) -> Vec<(TableId, u8, u64)> {
         let catalog = Arc::clone(&self.inner.shared.view.load().catalog);
         let mut out = Vec::new();
-        for ((tablet, _), list) in &catalog.ssts {
+        for ((tablet, _), list) in catalog.ssts.iter() {
             let Some(entry) = catalog.tablet(*tablet) else {
                 continue;
             };
@@ -534,7 +534,7 @@ impl Engine {
         }
         // A large value's file whose commit has not settled (or whose release has not
         // committed) may have nothing pointing into it yet (#230).
-        for (id, b) in &catalog.blob_files {
+        for (id, b) in catalog.blob_files.iter() {
             if pending.contains(id) {
                 continue;
             }
@@ -1075,8 +1075,8 @@ impl Engine {
         let (catalog, _) = manifest::load(&opened, 1, Arc::new(MergeRegistry::default()))?;
         Ok(ManifestInfo {
             version: opened.root().manifest_version,
-            checkpoints: catalog.checkpoints.clone(),
-            flushed: catalog.flushed.clone(),
+            checkpoints: (*catalog.checkpoints).clone(),
+            flushed: (*catalog.flushed).clone(),
             tablets: catalog.tablets().iter().map(|t| (t.id, t.table)).collect(),
             tablet_ranges: catalog
                 .tablets()

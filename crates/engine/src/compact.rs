@@ -262,7 +262,7 @@ impl BlobGc {
     ) -> Option<(Slot, CompactionTask)> {
         let catalog = &view.catalog;
         let mut candidates: HashMap<FamilyId, Vec<BlobFileId>> = HashMap::new();
-        for (id, b) in &catalog.blob_files {
+        for (id, b) in catalog.blob_files.iter() {
             let stat = BlobFileStat {
                 id: *id,
                 total_bytes: b.total_bytes,
@@ -1192,7 +1192,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan(&c), None);
         // An SST without a record may point anywhere.
-        c.blob_refs.remove(&SstId(20));
+        Arc::make_mut(&mut c.blob_refs).remove(&SstId(20));
         assert_eq!(plan(&c).map(|p| p.0), Some((TabletId(2), family)));
         // Records of SSTs no tablet references go at the end of a batch.
         c.apply(

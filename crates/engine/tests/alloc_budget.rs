@@ -652,7 +652,7 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     // A flush's manifest commit and the maintenance scan after it, at two catalog sizes
     // (#499). The large catalog's budget only goes down.
     ("flush of one cell, small catalog", "flush", 300.0),
-    ("flush of one cell, 2,048-SST catalog", "flush", 3900.0),
+    ("flush of one cell, 2,048-SST catalog", "flush", 3050.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];

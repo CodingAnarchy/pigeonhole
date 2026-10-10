@@ -799,11 +799,11 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);
-    catalog.prune_blob_refs();
+    catalog.prune_blob_refs_since(&old);
     #[cfg(feature = "test-hooks")]
     if shared.hooks.omit_blob_refs.load(Ordering::Acquire) {
         edits.retain(|e| !matches!(e, Edit::SstBlobRefs { .. }));
-        catalog.blob_refs.clear();
+        std::sync::Arc::make_mut(&mut catalog.blob_refs).clear();
     }
     #[cfg(feature = "test-hooks")]
     let refused = shared.hooks.refuse_checkpoints.load(Ordering::Acquire)
@@ -973,7 +973,7 @@ pub(crate) fn end(
             .cache
             .erase_files(&[pigeonhole_sst::sst_cache_file(meta.id)]);
     }
-    for (id, blob) in &old.blob_files {
+    for (id, blob) in old.blob_files.iter() {
         match catalog.blob_files.get(id) {
             None => {
                 for e in &blob.extents {

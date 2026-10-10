@@ -454,9 +454,9 @@ impl SstSet {
     ) -> Self {
         let mut by_id: FastMap<SstId, Arc<OpenSst>> = FastMap::default();
         let mut map = FastMap::default();
-        for (key, list) in &catalog.ssts {
+        for (key, list) in catalog.ssts.iter() {
             let mut levels: Vec<Vec<Arc<OpenSst>>> = Vec::new();
-            for (level, meta) in list {
+            for (level, meta) in list.iter() {
                 let open = match by_id.get(&meta.id) {
                     Some(o) => Arc::clone(o),
                     None => {

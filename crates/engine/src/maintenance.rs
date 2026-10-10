@@ -424,8 +424,8 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         // Every SST by extent, with a family that references it (for its cache priority).
         // Where it is referenced is decided again at commit time (`Moves::edits`).
         let mut by_extent: HashMap<(u64, u8), (FamilyId, Arc<SstMeta>)> = HashMap::new();
-        for ((_, family), list) in &catalog.ssts {
-            for (_, meta) in list {
+        for ((_, family), list) in catalog.ssts.iter() {
+            for (_, meta) in list.iter() {
                 by_extent
                     .entry((meta.extent.page, meta.extent.size_class))
                     .or_insert_with(|| (*family, Arc::clone(meta)));
@@ -435,7 +435,7 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         shared.hooks.before_shrink_relocates.run();
         // Every blob extent by extent: its file and position in the file's extent list.
         let mut blob_by_extent: HashMap<(u64, u8), (BlobFileId, usize)> = HashMap::new();
-        for (id, b) in &catalog.blob_files {
+        for (id, b) in catalog.blob_files.iter() {
             for (i, e) in b.extents.iter().enumerate() {
                 blob_by_extent.insert((e.page, e.size_class), (*id, i));
             }
