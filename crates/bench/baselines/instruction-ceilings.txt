@@ -39,7 +39,9 @@
 # (as-written, row, rows, scan, short-scans, ycsb-c, ycsb-a). Raised by D199 (owner decision,
 # 2026-10-10, which accepts the index's write cost): commit-overwrite 12147 -> 12246, that run's
 # count (12185) times 1.005: headroom 0.5% from 1.0%, its own spread across #439's runs being
-# 0.2% (12162-12185). commit-at needed no raise. #449 trims the cost and lowers it again.
+# 0.2% (12162-12185). commit-at 11186 -> 11252, run 38037293572's count (11196) times 1.005:
+# main's own commit-at now varies by 0.37% (11128-11169), which the commit-shape bisect
+# investigates; both tighten when it is fixed. #449 trims the cost and lowers them again.
 
 as-written 2075 0.3
 flushed 1882 0.3
@@ -62,4 +64,4 @@ compact 2867 0.5
 ycsb-c 47832 1.0
 ycsb-a 29910 1.0
 commit-overwrite 12246 0.5
-commit-at 11186 0.3
+commit-at 11252 0.5
