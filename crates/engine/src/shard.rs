@@ -4138,6 +4138,9 @@ impl ShardState {
         let mut appended = false;
         let mut unsynced = false;
         let mut last_sync: Option<pigeonhole_io::Completion<Lsn>> = None;
+        // The end of the last Buffered record: `write` may not cover it while a segment
+        // header is held back (#19).
+        let mut buffered_end: Option<Lsn> = None;
         for m in &mut group.members {
             if m.failed.is_some() {
                 continue;
@@ -4198,6 +4201,9 @@ impl ShardState {
             match result {
                 Ok(t) => {
                     m.ticket = Some(t);
+                    if m.durability == Durability::Buffered {
+                        buffered_end = Some(t.end);
+                    }
                     // Every ticketed PREPARE or COMMIT counts, even one whose group fails
                     // below (`fail_all`): a COMMIT with a ticket still decides commit, so
                     // peers' barriers must wait for it to be durable.
@@ -4253,11 +4259,10 @@ impl ShardState {
             // A Buffered ticket `write` did not cover: its record is in a segment whose
             // header still waits for the previous rollover's sync (#19). Resolve the group
             // through a sync then, which writes that header first.
+            // Only a group with Buffered records and no sync of its own asks (one call).
             let held = last_sync.is_none()
-                && group
-                    .members
-                    .iter()
-                    .any(|m| m.ticket.is_some_and(|t| !wal.satisfies(&t)));
+                && !(need_group_sync && unsynced)
+                && buffered_end.is_some_and(|end| end > wal.written());
             if (need_group_sync && unsynced) || held {
                 match wal.submit_sync() {
                     Ok(c) => last_sync = Some(c),

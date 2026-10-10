@@ -1173,18 +1173,28 @@ impl WalStream {
     /// its own error first (its caller learns why, e.g. `Crashed`).
     /// Refuses work on a poisoned stream. A rollover sync whose failure poisoned it reports
     /// its own error first (its caller learns why, e.g. `Crashed`).
+    #[inline]
     fn check_poisoned(&mut self) -> Result<()> {
         if self.shared.poisoned.load(Ordering::Acquire) {
-            if let Some(e) = self.held.as_ref().and_then(|h| h.synced.take_error()) {
-                return Err(e.into());
-            }
-            return Err(Error::Poisoned);
+            return Err(self.poisoned_error());
         }
         Ok(())
     }
 
+    /// The error a poisoned stream reports (out of line: the commit path never takes it).
+    #[cold]
+    #[inline(never)]
+    fn poisoned_error(&mut self) -> Error {
+        match self.held.as_ref().and_then(|h| h.synced.take_error()) {
+            Some(e) => e.into(),
+            None => Error::Poisoned,
+        }
+    }
+
     /// Writes the held header once the previous segment's sync is durable; leaves it held
     /// while that sync is in flight (never waits). A failed sync has poisoned the stream.
+    #[cold]
+    #[inline(never)]
     fn release_header(&mut self) -> Result<()> {
         let Some(held) = &self.held else {
             return Ok(());
@@ -1211,8 +1221,11 @@ impl WalStream {
         r
     }
 
+    #[inline]
     fn write_buf(&mut self) -> Result<()> {
-        self.release_header()?;
+        if self.held.is_some() {
+            self.release_header()?;
+        }
         if !self.buf.is_empty() {
             let at = self.slot as u64 * self.segment_size + self.written_off;
             self.file.write_at(&self.buf, at)?;
