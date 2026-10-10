@@ -763,3 +763,53 @@ fn a_background_thread_completes_deferred_io() {
     drop(vfs);
     device.join().unwrap();
 }
+
+/// A completion chained after a deferred sync, with no drive of its own (as a WAL's ordered
+/// sync is), and the deferred sync itself.
+fn chained_sync(vfs: &Arc<SimVfs>) -> pigeonhole_io::Completion<()> {
+    let f = vfs
+        .open(&path("chained"), OpenOptions::read_write_create())
+        .unwrap();
+    let (done, resolver) = pigeonhole_io::Completion::<()>::pair();
+    drop(f.submit_sync_data().map(move |r| {
+        resolver.resolve(r);
+        Ok(())
+    }));
+    done
+}
+
+#[test]
+fn a_blocked_wait_on_the_thread_that_deferred_the_io_runs_the_device() {
+    // Under deferred I/O without owner reaping the simulator is a backend no thread reaps
+    // (ICR 0028): the harness thread, blocked on an outcome chained after I/O only it
+    // completes, runs the device instead of waiting for ever.
+    let vfs = SimVfs::new(29);
+    vfs.set_deferred_io(true);
+    let done = chained_sync(&vfs);
+    assert_eq!(vfs.io_in_flight(), 1);
+    done.wait().unwrap();
+    assert_eq!(vfs.io_in_flight(), 0);
+}
+
+#[test]
+fn another_threads_blocked_wait_never_runs_the_device() {
+    // Tests share a process: only the thread that turned deferred I/O on runs its device,
+    // so another thread's wait leaves it to that thread and seeds replay.
+    let vfs = SimVfs::new(30);
+    vfs.set_deferred_io(true);
+    let done = chained_sync(&vfs);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        done.wait().unwrap();
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "another thread ran the device"
+    );
+    assert_eq!(vfs.io_in_flight(), 1);
+    vfs.complete_all_io();
+    rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    waiter.join().unwrap();
+}
