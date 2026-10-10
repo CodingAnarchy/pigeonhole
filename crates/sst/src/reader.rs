@@ -115,11 +115,13 @@ impl Fetch {
     /// pages around them, and the buffer it resolves to keeps just them, in place.
     fn submit_piece(&self, offset: u64, len: usize) -> pigeonhole_io::Completion {
         match self.file.direct_align() {
-            None => self.file.submit_read(IoBuf::zeroed(len), offset),
+            // A registered slot where the backend has one (#402): slots are page-aligned, so
+            // they serve a direct handle's aligned read too.
+            None => self.file.submit_read(self.file.read_buf(len), offset),
             Some(a) => {
                 let (start, alen, head) = aligned(offset, len, a);
                 self.file
-                    .submit_read(IoBuf::zeroed(alen), start)
+                    .submit_read(self.file.read_buf(alen), start)
                     .map(move |r| {
                         r.map(|mut b| {
                             b.keep(head..head + len);
@@ -301,7 +303,8 @@ pub(crate) fn decode_physical(mut buf: IoBuf, kind: BlockKind) -> Result<BlockDa
         None => {
             let n = buf.len() - TRAILER_LEN;
             buf.resize(n);
-            Ok(BlockData::Io(buf))
+            // Kept by the cache: a registered buffer slot goes back to its pool (#402).
+            Ok(BlockData::Io(buf.detached()))
         }
     }
 }

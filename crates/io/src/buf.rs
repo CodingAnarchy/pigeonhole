@@ -2,6 +2,7 @@ use std::alloc::{self, Layout};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// An owned, page-aligned (4096-byte) buffer for file I/O.
 ///
@@ -29,6 +30,115 @@ pub struct IoBuf {
     head: usize,
     len: usize,
     cap: usize,
+    /// Where the memory comes from: a slot of this registered pool (`Some`, given back on
+    /// drop; which slot follows from `ptr`) or the heap. One word, so heap buffers, the
+    /// common case, stay as small as before.
+    pool: Option<Arc<SlotPool>>,
+}
+
+/// One aligned region of equal slots, which a backend registers with the kernel once
+/// (io_uring's fixed buffers, #402): a read or write into a slot skips pinning its pages.
+/// A slot-backed [`IoBuf`] gives its slot back when dropped. Such buffers are meant to be
+/// short-lived (the buffer of one I/O); one kept longer ([`IoBuf::detached`]) moves to the
+/// heap so the pool does not run dry.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct SlotPool {
+    base: NonNull<u8>,
+    slot_len: usize,
+    slots: u32,
+    free: Mutex<Vec<u32>>,
+}
+
+// SAFETY: the region is owned by the pool and only ever handed out one slot per buffer; the
+// free list is behind a mutex.
+unsafe impl Send for SlotPool {}
+// SAFETY: as above.
+unsafe impl Sync for SlotPool {}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl SlotPool {
+    /// `slots` slots of `slot_len` bytes (a multiple of [`IoBuf::ALIGN`]), zeroed.
+    pub(crate) fn new(slots: u32, slot_len: usize) -> Arc<Self> {
+        assert!(slot_len > 0 && slot_len.is_multiple_of(IoBuf::ALIGN) && slots > 0);
+        let total = slot_len * slots as usize;
+        Arc::new(Self {
+            base: allocate(total),
+            slot_len,
+            slots,
+            free: Mutex::new((0..slots).rev().collect()),
+        })
+    }
+
+    /// The start of slot `index` and the length of every slot (to register them).
+    pub(crate) fn slot_ptr(&self, index: u32) -> *mut u8 {
+        assert!(index < self.slots);
+        // SAFETY: `index < slots`, so the offset is within the region.
+        unsafe { self.base.as_ptr().add(index as usize * self.slot_len) }
+    }
+
+    pub(crate) fn slot_len(&self) -> usize {
+        self.slot_len
+    }
+
+    pub(crate) fn slots(&self) -> u32 {
+        self.slots
+    }
+
+    /// A buffer of `len` bytes in a free slot, or `None` when `len` exceeds a slot or none is
+    /// free. Its bytes are whatever the slot last held (initialized: the region starts
+    /// zeroed), for a read to overwrite.
+    pub(crate) fn take(self: &Arc<Self>, len: usize) -> Option<IoBuf> {
+        if len > self.slot_len {
+            return None;
+        }
+        let index = self
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()?;
+        Some(IoBuf {
+            ptr: NonNull::new(self.slot_ptr(index)).expect("inside the region"),
+            len,
+            cap: self.slot_len,
+            head: 0,
+            pool: Some(Arc::clone(self)),
+        })
+    }
+
+    /// The slot holding `ptr` (a pointer into the region).
+    fn index_of(&self, ptr: NonNull<u8>) -> u32 {
+        let offset = ptr.as_ptr() as usize - self.base.as_ptr() as usize;
+        (offset / self.slot_len) as u32
+    }
+
+    fn give_back(&self, index: u32) {
+        self.free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(index);
+    }
+
+    /// Slots free now.
+    #[cfg(test)]
+    fn free_slots(&self) -> usize {
+        self.free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl Drop for SlotPool {
+    fn drop(&mut self) {
+        // SAFETY: the region was allocated with exactly this layout, and no buffer holds a
+        // slot any more (each holds an `Arc` of the pool).
+        unsafe {
+            alloc::dealloc(
+                self.base.as_ptr(),
+                layout(self.slot_len * self.slots as usize),
+            )
+        };
+    }
 }
 
 // SAFETY: `IoBuf` uniquely owns its allocation, exactly like `Vec<u8>`.
@@ -48,6 +158,7 @@ impl IoBuf {
             head: 0,
             len,
             cap,
+            pool: None,
         }
     }
 
@@ -80,6 +191,33 @@ impl IoBuf {
         self.len = range.end - range.start;
     }
 
+    /// This buffer, kept beyond the I/O it was read into (a block cached as read, say): a
+    /// buffer in a registered slot is copied to the heap and its slot given back, so the
+    /// pool does not run dry; a heap buffer is returned as is.
+    pub fn detached(self) -> IoBuf {
+        if self.pool.is_none() {
+            return self;
+        }
+        let mut heap = IoBuf::zeroed(self.len);
+        heap.copy_from_slice(&self);
+        heap
+    }
+
+    /// Whether the buffer lives in a slot a backend registered with the kernel (a test
+    /// hook).
+    #[doc(hidden)]
+    pub fn is_registered(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// The registered pool and slot of this buffer, if any.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn slot_of(&self) -> Option<(&Arc<SlotPool>, u32)> {
+        self.pool
+            .as_ref()
+            .map(|pool| (pool, pool.index_of(self.ptr)))
+    }
+
     /// Length in bytes.
     pub fn len(&self) -> usize {
         self.len
@@ -98,8 +236,10 @@ impl IoBuf {
     /// Changes the length within capacity; new bytes are zero. Growing past the capacity
     /// reallocates (keeping the alignment and the existing bytes).
     pub fn resize(&mut self, len: usize) {
-        if self.head > 0 && len > self.cap - self.head {
-            // Past the end of a kept range's allocation: move to a fresh buffer.
+        if len > self.cap - self.head && (self.head > 0 || self.pool.is_some()) {
+            // Past the end of a kept range's allocation, or of a registered slot (which
+            // cannot grow): move to a fresh heap buffer (a slot goes back when the old buffer
+            // is dropped).
             let mut fresh = IoBuf::zeroed(len);
             fresh[..self.len].copy_from_slice(self);
             *self = fresh;
@@ -153,6 +293,10 @@ fn allocate(cap: usize) -> NonNull<u8> {
 
 impl Drop for IoBuf {
     fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.give_back(pool.index_of(self.ptr));
+            return;
+        }
         if self.cap != 0 {
             // SAFETY: the allocation starts `head` bytes before `ptr` and was allocated with
             // exactly `layout(self.cap)`.
@@ -183,6 +327,7 @@ impl fmt::Debug for IoBuf {
         f.debug_struct("IoBuf")
             .field("len", &self.len)
             .field("capacity", &self.cap)
+            .field("registered", &self.pool.is_some())
             .finish()
     }
 }
@@ -230,6 +375,48 @@ mod tests {
         b.resize(3 * IoBuf::ALIGN);
         assert_eq!(b.as_ptr() as usize % IoBuf::ALIGN, 0);
         assert_eq!(&b[..5], &[10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn slots_are_taken_given_back_and_never_grow() {
+        let pool = SlotPool::new(2, 2 * IoBuf::ALIGN);
+        let mut a = pool.take(100).unwrap();
+        assert!(a.is_registered() && a.len() == 100);
+        assert_eq!(a.as_ptr() as usize % IoBuf::ALIGN, 0);
+        let b = pool.take(2 * IoBuf::ALIGN).unwrap();
+        assert!(pool.take(1).is_none(), "both slots are taken");
+        assert!(pool.take(3 * IoBuf::ALIGN).is_none(), "longer than a slot");
+        drop(b);
+        assert_eq!(pool.free_slots(), 1);
+        // Growing past the slot moves to the heap and gives the slot back.
+        a.fill(3);
+        a.resize(3 * IoBuf::ALIGN);
+        assert!(!a.is_registered());
+        assert!(a[..100].iter().all(|&x| x == 3) && a[100..].iter().all(|&x| x == 0));
+        assert_eq!(pool.free_slots(), 2);
+        // Detaching copies out and gives the slot back.
+        let mut c = pool.take(10).unwrap();
+        c.fill(9);
+        let d = c.detached();
+        assert!(!d.is_registered() && d.iter().all(|&x| x == 9));
+        assert_eq!(pool.free_slots(), 2);
+        // A slot buffer kept to a range (direct I/O) still finds its slot: on drop, and when
+        // it grows past the slot's end.
+        let mut k = pool.take(2 * IoBuf::ALIGN).unwrap();
+        k[100..200].fill(5);
+        k.keep(100..200);
+        assert!(k.is_registered() && k.iter().all(|&x| x == 5));
+        drop(k);
+        assert_eq!(pool.free_slots(), 2);
+        let mut k = pool.take(2 * IoBuf::ALIGN).unwrap();
+        k.keep(IoBuf::ALIGN..IoBuf::ALIGN + 10);
+        k.resize(2 * IoBuf::ALIGN);
+        assert!(!k.is_registered() && k.len() == 2 * IoBuf::ALIGN);
+        assert_eq!(pool.free_slots(), 2);
+        // A buffer can outlive the pool's other owners.
+        let e = pool.take(10).unwrap();
+        drop(pool);
+        drop(e);
     }
 
     #[test]

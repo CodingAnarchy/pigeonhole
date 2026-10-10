@@ -17,13 +17,14 @@ use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 
+use crate::buf::SlotPool;
 use crate::completion::Resolver;
 use crate::pread::{PreadFile, PreadVfs};
 use crate::{
@@ -33,6 +34,163 @@ use crate::{
 
 /// Submission queue entries of the shared ring (completions get twice as many).
 const RING_ENTRIES: u32 = 256;
+
+/// Registered buffer slots per ring (64 KiB each: an SST block or a run of them), at most:
+/// 1 MiB a ring.
+const POOL_SLOTS: u32 = 16;
+const POOL_SLOT_LEN: usize = 64 << 10;
+
+/// Bytes of registered pools this process holds now (see [`memlock_budget`]).
+static REGISTERED: AtomicUsize = AtomicUsize::new(0);
+
+/// The most this process registers as pools, in bytes: half its locked-memory limit.
+///
+/// Registered buffers are pinned pages, charged to the user's locked-memory limit
+/// (RLIMIT_MEMLOCK, often 8 MiB, shared by every ring of every process of the user) unless the
+/// process has CAP_IPC_LOCK. Since Linux 5.12 a ring's own memory is charged to the memory
+/// cgroup instead, but kernels that allocate rings as accounted regions charge it to
+/// RLIMIT_MEMLOCK again: pools that took the whole limit would leave no room to create a
+/// ring at all. So pools take at most half, and the other half stays for rings.
+fn memlock_budget() -> usize {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid `rlimit` to fill.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+        return 0;
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return usize::MAX;
+    }
+    usize::try_from(limit.rlim_cur / 2).unwrap_or(usize::MAX)
+}
+
+/// A backend's rings now, and how many have a registered pool ([`Vfs::ring_stats`]).
+#[derive(Default)]
+struct RingCounts {
+    rings: AtomicUsize,
+    pooled: AtomicUsize,
+}
+
+/// One ring's place in its backend's [`RingCounts`], given back when the ring goes.
+struct Counted {
+    counts: Arc<RingCounts>,
+}
+
+impl Counted {
+    fn new(counts: &Arc<RingCounts>) -> Self {
+        counts.rings.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counts: Arc::clone(counts),
+        }
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.counts.rings.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A ring's pool, registered on first use ([`File::read_buf`]): pinned memory only in
+/// processes that read through it. Pinning at ring creation instead made every process with
+/// a ring hold pools, and the user's processes together then left none of the shared
+/// locked-memory limit for other processes to create rings in.
+#[derive(Default)]
+struct LazyPool(OnceLock<Option<Registered>>);
+
+impl LazyPool {
+    /// The pool, registering it with `uring` on the first call. On a thread's ring, called
+    /// only by its owner (a single-issuer ring takes registrations from its owner alone).
+    fn get_or_register(&self, uring: &IoUring, counts: &Arc<RingCounts>) -> Option<&Arc<SlotPool>> {
+        self.0
+            .get_or_init(|| register_pool(uring, counts))
+            .as_ref()
+            .map(|r| &r.pool)
+    }
+
+    /// The pool if it was registered, without registering it (to submit with).
+    fn registered(&self) -> Option<&Arc<SlotPool>> {
+        self.0.get().and_then(|r| r.as_ref()).map(|r| &r.pool)
+    }
+}
+
+/// A pool registered with a ring, counted in [`REGISTERED`] and in its backend's
+/// [`RingCounts`] until the ring holding it goes.
+struct Registered {
+    pool: Arc<SlotPool>,
+    bytes: usize,
+    counts: Arc<RingCounts>,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        REGISTERED.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.counts.pooled.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Takes up to `slots` slots' worth of the budget; returns how many it took.
+fn reserve(slots: u32) -> u32 {
+    let budget = memlock_budget();
+    let mut held = REGISTERED.load(Ordering::Relaxed);
+    loop {
+        let room = budget.saturating_sub(held) / POOL_SLOT_LEN;
+        let taken = slots.min(u32::try_from(room).unwrap_or(u32::MAX));
+        // Fails only when another ring reserved meanwhile: retry with the new total.
+        match REGISTERED.compare_exchange_weak(
+            held,
+            held + taken as usize * POOL_SLOT_LEN,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return taken,
+            Err(now) => held = now,
+        }
+    }
+}
+
+/// A pool of buffer slots registered with `uring` (fixed buffers), as many as the budget
+/// ([`memlock_budget`]) and the kernel allow up to [`POOL_SLOTS`], or `None` where they allow
+/// none: reads and writes then use plain buffers.
+fn register_pool(uring: &IoUring, counts: &Arc<RingCounts>) -> Option<Registered> {
+    let mut slots = reserve(POOL_SLOTS);
+    let reserved = slots;
+    let registered = loop {
+        if slots == 0 {
+            break None;
+        }
+        let pool = SlotPool::new(slots, POOL_SLOT_LEN);
+        let iovecs: Vec<libc::iovec> = (0..pool.slots())
+            .map(|i| libc::iovec {
+                iov_base: pool.slot_ptr(i).cast(),
+                iov_len: pool.slot_len(),
+            })
+            .collect();
+        // SAFETY: every iovec names a slot of `pool`'s region, which the ring holding `pool`
+        // keeps alive until after the ring itself (and so the registration) is gone.
+        match unsafe { uring.submitter().register_buffers(&iovecs) } {
+            Ok(()) => break Some(pool),
+            // The limit is shared with other processes of the user: fewer slots.
+            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => slots /= 2,
+            Err(_) => slots = 0,
+        }
+    };
+    // Give back what the pool did not use.
+    REGISTERED.fetch_sub(
+        (reserved - slots) as usize * POOL_SLOT_LEN,
+        Ordering::Relaxed,
+    );
+    registered.map(|pool| {
+        counts.pooled.fetch_add(1, Ordering::Relaxed);
+        Registered {
+            pool,
+            bytes: slots as usize * POOL_SLOT_LEN,
+            counts: Arc::clone(counts),
+        }
+    })
+}
 
 /// The `user_data` of the no-op that wakes the reaper to shut down.
 const SHUTDOWN: u64 = u64::MAX;
@@ -69,7 +227,15 @@ impl Vfs for UringVfs {
     /// and it reaps the completions itself (in its turns and its waits). Where the kernel
     /// lacks what such a ring needs, the thread keeps using the shared ring.
     fn attach_thread(&self) {
-        ThreadRing::attach(self.ring.id());
+        ThreadRing::attach(self.ring.id(), &self.ring.counts);
+    }
+
+    fn ring_stats(&self) -> Option<crate::RingStats> {
+        let counts = &self.ring.counts;
+        Some(crate::RingStats {
+            rings: counts.rings.load(Ordering::Relaxed),
+            pooled: counts.pooled.load(Ordering::Relaxed),
+        })
     }
 
     fn open(&self, path: &Path, opts: OpenOptions) -> Result<FileRef> {
@@ -139,6 +305,23 @@ impl fmt::Debug for UringFile {
 }
 
 impl UringFile {
+    /// The registered pool of the ring this thread's operations go to, if it has one
+    /// (registering it on first use).
+    fn pool(&self) -> Option<Arc<SlotPool>> {
+        match ThreadRing::current(self.ring.id()) {
+            Some(ring) => ring
+                .pool
+                .get_or_register(&ring.uring, &ring.counted.counts)
+                .cloned(),
+            None => {
+                let ring = &self.ring.ring;
+                ring.pool
+                    .get_or_register(&ring.uring, &ring.counted.counts)
+                    .cloned()
+            }
+        }
+    }
+
     /// Submits the operation `kind` builds: to the calling thread's own ring for this
     /// backend if it attached one (completed when it reaps), else to the shared ring.
     fn submit<T: Send + 'static>(&self, kind: impl FnOnce(Resolver<T>) -> Kind) -> Completion<T> {
@@ -166,6 +349,17 @@ impl UringFile {
 impl File for UringFile {
     fn direct_align(&self) -> Option<usize> {
         self.file.direct_align()
+    }
+
+    /// A slot of the registered pool of the ring this thread submits to (a fixed buffer,
+    /// read without pinning its pages), or a plain buffer when none is free.
+    fn read_buf(&self, len: usize) -> IoBuf {
+        if len > POOL_SLOT_LEN {
+            return IoBuf::zeroed(len);
+        }
+        self.pool()
+            .and_then(|p| p.take(len))
+            .unwrap_or_else(|| IoBuf::zeroed(len))
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
@@ -284,25 +478,44 @@ enum Kind {
 }
 
 impl Op {
-    /// The submission entry for the rest of the operation, tagged `user_data`.
-    fn entry(&mut self, user_data: u64) -> squeue::Entry {
+    /// The submission entry for the rest of the operation, tagged `user_data`. A buffer in a
+    /// slot of `pool` (the submitting ring's registered pool) goes as a fixed buffer.
+    fn entry(&mut self, user_data: u64, pool: Option<&Arc<SlotPool>>) -> squeue::Entry {
         let fd = types::Fd(self.file.raw_fd());
+        let fixed = |buf: &IoBuf| match (buf.slot_of(), pool) {
+            (Some((p, index)), Some(ring)) if Arc::ptr_eq(p, ring) => u16::try_from(index).ok(),
+            _ => None,
+        };
         match &mut self.kind {
             Kind::Read {
                 buf, offset, done, ..
             } => {
+                let index = fixed(buf);
                 let rest = &mut buf[*done..];
-                opcode::Read::new(fd, rest.as_mut_ptr(), chunk(rest.len()))
-                    .offset(*offset + *done as u64)
-                    .build()
+                let at = *offset + *done as u64;
+                match index {
+                    Some(i) => opcode::ReadFixed::new(fd, rest.as_mut_ptr(), chunk(rest.len()), i)
+                        .offset(at)
+                        .build(),
+                    None => opcode::Read::new(fd, rest.as_mut_ptr(), chunk(rest.len()))
+                        .offset(at)
+                        .build(),
+                }
             }
             Kind::Write {
                 buf, offset, done, ..
             } => {
+                let index = fixed(buf);
                 let rest = &buf[*done..];
-                opcode::Write::new(fd, rest.as_ptr(), chunk(rest.len()))
-                    .offset(*offset + *done as u64)
-                    .build()
+                let at = *offset + *done as u64;
+                match index {
+                    Some(i) => opcode::WriteFixed::new(fd, rest.as_ptr(), chunk(rest.len()), i)
+                        .offset(at)
+                        .build(),
+                    None => opcode::Write::new(fd, rest.as_ptr(), chunk(rest.len()))
+                        .offset(at)
+                        .build(),
+                }
             }
             Kind::Sync { data_only, .. } => {
                 let flags = if *data_only {
@@ -413,6 +626,11 @@ impl Table {
 /// One ring and its table of operations in flight.
 struct Ring {
     uring: IoUring,
+    /// Its registered buffer slots, once used (dropped after `uring`, which unregisters
+    /// them).
+    pool: LazyPool,
+    /// Its place in the backend's ring counts.
+    counted: Counted,
     /// Held while pushing to the submission queue (one pusher at a time).
     sq: Mutex<()>,
     table: Mutex<Table>,
@@ -426,7 +644,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Ring {
     /// A ring whose kernel supports every operation this backend submits.
-    fn probe() -> Result<Self> {
+    fn probe(counts: &Arc<RingCounts>) -> Result<Self> {
         let unsupported = |e: io::Error| Error {
             kind: ErrorKind::Unsupported,
             context: "io_uring",
@@ -452,6 +670,8 @@ impl Ring {
         }
         Ok(Self {
             uring,
+            counted: Counted::new(counts),
+            pool: LazyPool::default(),
             sq: Mutex::new(()),
             table: Mutex::new(Table::default()),
             shutdown: AtomicBool::new(false),
@@ -465,7 +685,7 @@ impl Ring {
         let entry = table.ops[user_data as usize]
             .as_mut()
             .expect("inserted above")
-            .entry(user_data);
+            .entry(user_data, self.pool.registered());
         drop(table);
         if let Err(e) = self.push(&entry)
             && let Some(op) = lock(&self.table).take(user_data)
@@ -571,6 +791,8 @@ fn fail(op: Op, e: io::Error) {
 /// everything in flight has completed.
 struct RingHandle {
     ring: Arc<Ring>,
+    /// This backend's rings: the shared one and the threads' own.
+    counts: Arc<RingCounts>,
     reaper: Mutex<Option<JoinHandle<()>>>,
     reaper_id: ThreadId,
 }
@@ -582,7 +804,8 @@ impl RingHandle {
     }
 
     fn start() -> Result<Arc<Self>> {
-        let ring = Arc::new(Ring::probe()?);
+        let counts = Arc::new(RingCounts::default());
+        let ring = Arc::new(Ring::probe(&counts)?);
         let r = Arc::clone(&ring);
         let reaper = thread::Builder::new()
             .name("pigeonhole-uring".into())
@@ -591,6 +814,7 @@ impl RingHandle {
         Ok(Arc::new(Self {
             reaper_id: reaper.thread().id(),
             ring,
+            counts,
             reaper: Mutex::new(Some(reaper)),
         }))
     }
@@ -631,6 +855,10 @@ thread_local! {
 /// ring polls ([`crate::OwnIoWaker`]).
 struct ThreadRing {
     uring: IoUring,
+    /// Its registered buffer slots, once used (dropped after `uring`).
+    pool: LazyPool,
+    /// Its place in the backend's ring counts.
+    counted: Counted,
     table: Mutex<Table>,
     owner: ThreadId,
     /// The backend ([`RingHandle::id`]) the ring belongs to.
@@ -685,11 +913,11 @@ impl ThreadRing {
 
     /// Gives the calling thread a ring for `backend` (once). Without the kernel support it
     /// needs (timed waits), the thread keeps using the shared ring.
-    fn attach(backend: usize) {
+    fn attach(backend: usize, counts: &Arc<RingCounts>) {
         if Self::current(backend).is_some() {
             return;
         }
-        let Some(ring) = Self::new(backend) else {
+        let Some(ring) = Self::new(backend, counts) else {
             return;
         };
         let own: std::sync::Weak<dyn crate::own::OwnIo> = Arc::downgrade(&ring) as _;
@@ -697,7 +925,7 @@ impl ThreadRing {
         let _ = THREAD_RINGS.try_with(|r| r.borrow_mut().push(ring));
     }
 
-    fn new(backend: usize) -> Option<Arc<Self>> {
+    fn new(backend: usize, counts: &Arc<RingCounts>) -> Option<Arc<Self>> {
         // Completions run only when this thread enters the ring (no work on other threads),
         // where the kernel offers it (6.1); a plain ring otherwise. The task-run flag tells
         // a non-waiting reap that deferred completions are pending, so its enter carries
@@ -725,6 +953,8 @@ impl ThreadRing {
         }
         let ring = Arc::new(Self {
             uring,
+            counted: Counted::new(counts),
+            pool: LazyPool::default(),
             table: Mutex::new(Table::default()),
             owner: thread::current().id(),
             backend,
@@ -772,7 +1002,7 @@ impl ThreadRing {
         let entry = table.ops[user_data as usize]
             .as_mut()
             .expect("inserted above")
-            .entry(user_data);
+            .entry(user_data, self.pool.registered());
         drop(table);
         if let Err(e) = self.push(&entry)
             && let Some(op) = lock(&self.table).take(user_data)

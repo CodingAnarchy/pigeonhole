@@ -299,7 +299,10 @@ impl Reader {
             file: crate::blob_cache_file(self.blob_file),
             offset: ptr.offset,
         };
-        Ok(self.cache.insert(key, BlockData::Io(buf), Priority::Low))
+        // Kept by the cache: a registered buffer slot goes back to its pool (#402).
+        Ok(self
+            .cache
+            .insert(key, BlockData::Io(buf.detached()), Priority::Low))
     }
 
     /// The record's value if its record is cached (a lookup only: never reads the file).
