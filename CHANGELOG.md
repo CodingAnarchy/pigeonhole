@@ -7,7 +7,6 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ## [Unreleased]
 
 ### Added
-- `Options::commit_spin` and `Options::shard_spin` (D198, ICR 0016): how long a waiting client, and an engine-owned shard that just handled a commit, poll before they sleep. Both are off (zero) for now; D198's defaults of 15 µs and 50 µs come in a follow-up. `Duration::ZERO` turns either off, for battery-powered or CPU-constrained hosts. Engine: `EngineOptions::commit_spin_nanos` and `shard_spin_nanos`. Runtime: `RuntimeConfig::idle_spin`.
 - Stall counters (ICR 0015, #64):
   - `pigeonhole-engine`: `Metrics::wal_inline_syncs` and `Metrics::file_growths`;
   - `pigeonhole-pager`: `PagerStats::growths` and `growth_nanos`;

@@ -1,0 +1,2 @@
+### Added
+- `Options::commit_spin` and `Options::shard_spin` (D198, ICR 0016): how long a waiting client, and an engine-owned shard that just handled a commit, poll before they sleep. Both are off (zero) for now; D198's defaults of 15 µs and 50 µs come in a follow-up. `Duration::ZERO` turns either off, for battery-powered or CPU-constrained hosts. Engine: `EngineOptions::commit_spin_nanos` and `shard_spin_nanos`. Runtime: `RuntimeConfig::idle_spin`.
