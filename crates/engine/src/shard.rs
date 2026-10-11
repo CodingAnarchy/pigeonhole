@@ -51,6 +51,7 @@ use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWr
 use crate::purge_guard::PurgeGuard;
 use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
 use crate::source::{ColumnKey, Resolver, Source, mem_sources_from, sst_sources_point};
+use crate::timer_state::TimerState;
 use crate::write::{ReadKey, Settled};
 use crate::{CommitInfo, Error, Predicate, Result};
 
@@ -1515,59 +1516,6 @@ impl Task for SpareTask {
     }
 }
 
-/// A clock timer's state, shared between the shard and the timer task.
-#[derive(Debug)]
-struct TimerState {
-    /// Set by the shard to cancel the timer.
-    cancel: AtomicBool,
-    /// Set by the timer when it fired or gave up.
-    done: AtomicBool,
-    /// The clock reading at which the timer gave up because the clock stopped moving
-    /// (`u64::MAX`: it did not give up).
-    frozen_at: AtomicU64,
-    /// The timer task's waker while it sleeps, so a cancel ends the sleep at once.
-    waker: Mutex<Option<TaskWaker>>,
-}
-
-impl TimerState {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            cancel: AtomicBool::new(false),
-            done: AtomicBool::new(false),
-            frozen_at: AtomicU64::new(u64::MAX),
-            waker: Mutex::new(None),
-        })
-    }
-
-    fn cancel(&self) {
-        self.cancel.store(true, Ordering::Release);
-        let waker = self
-            .waker
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-
-    /// The timer is no longer running.
-    fn finished(&self) -> bool {
-        self.done.load(Ordering::Acquire) || self.cancel.load(Ordering::Acquire)
-    }
-
-    /// The timer fired (its deadline passed).
-    fn fired(&self) -> bool {
-        self.done.load(Ordering::Acquire) && self.frozen_at.load(Ordering::Acquire) == u64::MAX
-    }
-
-    /// The timer gave up on a stopped clock and the clock still reads `now`: only events
-    /// can end the wait (the frozen-clock fallbacks of issue #70 apply).
-    fn frozen(&self, now: u64) -> bool {
-        self.frozen_at.load(Ordering::Acquire) == now
-    }
-}
-
 /// Sends its message to the shard once a deadline on the VFS clock passes (unless
 /// cancelled).
 ///
@@ -1614,19 +1562,14 @@ impl ClockTimer {
 
 impl Task for ClockTimer {
     fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
-        if self.state.cancel.load(Ordering::Acquire) {
+        if self.state.cancelled() {
             return TaskPoll::Done;
         }
         let now = self.vfs.monotonic_nanos();
         if now < self.release_at && !self.vfs.clock_is_simulated() {
             // A real clock always moves on, however coarse its ticks: sleep until the
             // deadline, never taking it as stopped (#263).
-            *self
-                .state
-                .waker
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
-            if self.state.cancel.load(Ordering::Acquire) {
+            if !self.state.sleep_with(waker.clone()) {
                 return TaskPoll::Done;
             }
             return TaskPoll::SleepUntil(self.release_at);
@@ -1640,12 +1583,7 @@ impl Task for ClockTimer {
                     return TaskPoll::Pending;
                 }
                 // The clock moves on its own: sleep until the deadline.
-                *self
-                    .state
-                    .waker
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
-                if self.state.cancel.load(Ordering::Acquire) {
+                if !self.state.sleep_with(waker.clone()) {
                     return TaskPoll::Done;
                 }
                 return TaskPoll::SleepUntil(self.release_at);
@@ -1654,12 +1592,11 @@ impl Task for ClockTimer {
             if self.frozen_polls < STALL_TIMER_FROZEN_POLLS {
                 return TaskPoll::Pending;
             }
-            self.state.frozen_at.store(now, Ordering::Release);
-            self.state.done.store(true, Ordering::Release);
+            self.state.give_up(now);
             let _ = self.submitter.submit(ShardMsg::Kick);
             return TaskPoll::Done;
         }
-        self.state.done.store(true, Ordering::Release);
+        self.state.fire();
         if let Some(msg) = self.fire.take() {
             let _ = self.submitter.submit(msg);
         }
@@ -7482,15 +7419,14 @@ mod tests {
         assert!(!wait.stopped(50));
         // The timeout timer sleeps; the re-check timer gave up with the clock at 50.
         let recheck = TimerState::new();
-        recheck.frozen_at.store(50, Ordering::Release);
-        recheck.done.store(true, Ordering::Release);
+        recheck.give_up(50);
         wait.recheck = Some(recheck);
         assert!(wait.stopped(50));
         // Once the clock moves on, it is not stopped any more.
         assert!(!wait.stopped(51));
         // The timeout timer giving up counts as before.
         let wait = RoomWait::new(10, TimerState::new());
-        wait.timer.frozen_at.store(60, Ordering::Release);
+        wait.timer.give_up(60);
         assert!(wait.stopped(60));
     }
 

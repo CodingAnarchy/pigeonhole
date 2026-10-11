@@ -39,6 +39,7 @@ mod row_cache;
 mod shard;
 mod snapshot;
 mod source;
+mod timer_state;
 mod waker;
 mod watermark_waiters;
 mod write;
