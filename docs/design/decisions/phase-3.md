@@ -522,11 +522,18 @@ The note this replaces was `docs/design/questions/engine.md` (#538).
 
 **Decided:** the gate measures the Goals table's batched durable write target (> 1M cells/s across cores, p99 commit < 200 µs) with `phdb-bench group-commit`'s D213 shape:
 - **N shards = cores**, application-owned.
-- **The table is split up front.** It's cut at the quantiles of its rows, one piece per shard, before the load (`PigeonholeRunner::presplit`, through a doc-hidden `Table::split_over_shards` that issues one tablet split with an owner per piece). Every shard owns rows from the first commit. The balancer is not relied on: the 1,000-row table never splits on size and need not spread within a warmup.
+- **The table is split up front, and the placement stays fixed.** It's cut at the quantiles of its rows, one piece per shard, before the load (`PigeonholeRunner::presplit`, through a doc-hidden `Table::split_over_shards` that issues one tablet split with an owner per piece). Every shard owns rows from the first commit. The balancer is not relied on, and it doesn't run:
+  - The run opens with `tablet_balance(Duration::MAX, u64::MAX, u64::MAX)`. No pass falls due, and no skew or size threshold is ever reached. Tablet changes stay on for the split itself, and commits still track their tablets' load as by default, so the commit path is the default one.
+  - The run fails unless every shard owns exactly one tablet after the split and again before the measured phase.
+  - Splits, merges and moves during the measured phase are reported (`GroupCommit::tablet_changes`). Any of them makes `phdb-bench` exit non-zero after writing its files, and `report.py` marks the result invalid.
+  - **Amended 2026-10-11.** The first version left the balancer on. On the AX102, the measured phase saw 65 moves, 4 merges and 1 split. A cold piece moved to its left neighbour's shard before the load, the spread check timed out, and the run had a 5.47 s max. The gate measures commits, not balancer churn.
 - **Commits stay in flight inline**, the D204 driver: each shard's thread keeps `INLINE_IN_FLIGHT` (16) `commit_async` commits in flight on the rows its shard owns, between turns of its shard.
 - **The commits are as before:** 4-cell `GroupSync` row mutations over 1,000 rows, 200,000 at `full`.
 
-The report gives cells/s in total and per core, commit p50 and p99, and the busiest shard's share (`Suite::group_commit`). The 1, 4 and 16 synchronous-client runs stay as a reported secondary, beside RocksDB, and aren't judged.
+The report gives cells/s in total and per core, commit p50 and p99, and the busiest shard's share (`Suite::group_commit`). It also gives a per-stage breakdown:
+- the engine's part of each commit, submission to resolution on its shard (`EngineCommit`, from the engine's own histograms, diffed over the measured phase);
+- WAL rollover blocks and inline WAL syncs;
+- tablet changes while measuring. The 1, 4 and 16 synchronous-client runs stay as a reported secondary, beside RocksDB, and aren't judged.
 
 The window's setup step (`machine.py`) also times the data drive's raw fdatasync: 2,000 syncs, each after a 4 KiB write. `report.py` shows the p50 and p99 beside the 200 µs target, as the floor under any durable commit. It's measured there rather than in `setup.sh`, which runs before the data drive is formatted and mounted.
 

@@ -38,8 +38,9 @@ mod workload;
 
 pub use histogram::Histogram;
 pub use report::{
-    Comparison, Delta, Environment, GroupCommit, LatencyStats, OpTypeStats, ReadSplit, RunDetail,
-    RunRecord, SUITE_FORMAT, Scaling, ShardShare, Stalls, Suite, Tolerance, compare,
+    Comparison, Delta, EngineCommit, Environment, GroupCommit, LatencyStats, OpTypeStats,
+    ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling, ShardShare, Stalls, Suite, Tolerance,
+    compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -580,6 +581,7 @@ pub fn run_detailed(
             by_type,
             shards,
             stalls,
+            engine_commit: None,
         },
     })
 }

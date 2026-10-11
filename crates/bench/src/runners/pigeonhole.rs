@@ -167,7 +167,9 @@ impl PigeonholeRunner {
     /// `true`: [`run_inline`](Self::run_inline) splits the table at the loaded rows'
     /// quantiles and hands one piece to each shard before loading it, so every shard owns
     /// rows from the start instead of waiting for the balancer to spread them (D213's
-    /// group-commit shape).
+    /// group-commit shape). The balancer then never runs, so the placement holds: the run
+    /// fails if the split did not leave one tablet per shard, or if it changed before the
+    /// measured phase.
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
@@ -203,6 +205,12 @@ pub(crate) fn options(s: &Settings) -> Options {
     }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
+    }
+    if s.presplit {
+        // The pre-split placement stays fixed (D213): no balancer pass ever falls due, and no
+        // load or size threshold is reached, while tablet changes stay on for the split
+        // itself and commits still track their tablets' load as by default.
+        options = options.tablet_balance(Duration::MAX, u64::MAX, u64::MAX);
     }
     options
 }
@@ -431,6 +439,7 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         visibility_wake_passes: m.visibility_wakes.0,
         visibility_woken: m.visibility_wakes.1,
         visibility_contended: m.visibility_contended,
+        wal_rollover_blocks: m.wal_rollover_blocks,
         slot_refusals: db.tablet_refusals().0,
     }
 }

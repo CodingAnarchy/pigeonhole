@@ -423,6 +423,16 @@ fn main_inner() -> Result<ExitCode, String> {
             print!("{md}");
             write(&a.json, &suite.to_json())?;
             write(&a.markdown, &md)?;
+            // D213: a group-commit result measured while tablets changed is not the target's
+            // measurement. The files are written; the run still fails.
+            if let Some(gc) = suite.group_commit.as_ref().filter(|g| g.tablet_changes > 0) {
+                eprintln!(
+                    "phdb-bench: {} tablet changes during the D213 group-commit measurement; \
+                     the placement must stay fixed",
+                    gc.tablet_changes
+                );
+                return Ok(ExitCode::from(1));
+            }
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -562,9 +572,19 @@ mod tests {
             gate.store_config
         );
         assert_eq!(gate.threads, 2);
-        assert!(gate.detail.shards.iter().all(|s| s.tablets_start > 0));
+        // The placement stays fixed: one tablet per shard, and no change while measuring.
+        assert!(
+            gate.detail
+                .shards
+                .iter()
+                .all(|s| (s.tablets_start, s.tablets_end) == (1, 1))
+        );
         let gc = suite.group_commit.as_ref().expect("the D213 result");
         assert_eq!(gc.shards, 2);
+        assert_eq!(gc.tablet_changes, 0);
+        let engine = gc.engine.expect("the engine's commit latency");
+        assert_eq!(engine.durability, 2, "group sync");
+        assert!(engine.commits > 0 && engine.p50_ns <= engine.p99_ns);
         assert!(gc.cells_per_sec > 0.0);
         assert!(suite.to_markdown().contains("Durable group commit (D213)"));
         // Then the client-thread sweep.

@@ -297,6 +297,21 @@ impl Pigeonhole {
         self.db.engine.metrics()
     }
 
+    /// Commit latency histograms per durability level since open, summed over shards: a
+    /// bench hook (D213). Bucket `b` starts at
+    /// [`commit_latency_floor(b)`](Self::commit_latency_floor) nanoseconds; subtract two readings for a phase.
+    #[doc(hidden)]
+    pub fn commit_latency_buckets(&self) -> [[u64; 64]; 4] {
+        self.db.engine.commit_latency_buckets()
+    }
+
+    /// The lower bound in nanoseconds of [`commit_latency_buckets`](Self::commit_latency_buckets)'
+    /// bucket `b`.
+    #[doc(hidden)]
+    pub fn commit_latency_floor(b: usize) -> u64 {
+        pigeonhole_engine::Engine::commit_latency_floor(b)
+    }
+
     /// Tablet changes refused for lack of room since open, as `(slot budget, view size)`:
     /// see the engine's `tablet_refusals`. A bench hook (#123).
     #[doc(hidden)]

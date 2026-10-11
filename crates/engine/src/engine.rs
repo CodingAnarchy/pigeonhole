@@ -1766,6 +1766,32 @@ impl Engine {
             .wait()
     }
 
+    /// Commit latency histograms per durability level (indexed by `Durability as usize`),
+    /// summed over shards since open: half-power-of-two buckets of the time from a commit's
+    /// submission to its resolution on its shard, bucket `b` starting at
+    /// [`commit_latency_floor(b)`](Self::commit_latency_floor). A bench hook (D213): two
+    /// readings, subtracted, give a phase's engine-side commit latency, which
+    /// [`Metrics::commit_latency_nanos`] (since open) cannot.
+    #[doc(hidden)]
+    pub fn commit_latency_buckets(&self) -> [[u64; 64]; 4] {
+        let mut out = [[0u64; 64]; 4];
+        for s in &self.inner.shared.metrics {
+            for (d, hist) in out.iter_mut().enumerate() {
+                for (b, h) in hist.iter_mut().enumerate() {
+                    *h += s.latency[d][b].load(Ordering::Relaxed);
+                }
+            }
+        }
+        out
+    }
+
+    /// The lower bound in nanoseconds of [`commit_latency_buckets`](Self::commit_latency_buckets)'
+    /// bucket `b`.
+    #[doc(hidden)]
+    pub fn commit_latency_floor(b: usize) -> u64 {
+        bucket_floor(b)
+    }
+
     /// Tablet changes refused for lack of room, summed over shards since open, as
     /// `(slot budget, view size)`: splits and moves a shard's memtable slots could not take
     /// (a size split the balancer found due but skipped counts once per balancer pass), and
