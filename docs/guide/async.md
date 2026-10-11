@@ -134,7 +134,7 @@ Making scan steps resumable, so the last case never blocks, is tracked in [#398]
 ## Application-owned mode
 With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `compact` refuse to run on a thread that drives a shard, because they could wait on that same shard (D88). The async forms are how you call them from the event loop: submit with `commit_async`, `commit_if_async`, `flush_async` or `compact_async` and await the future there.
 
-**With `IoBackend::Uring`, wait on each shard's `Shard::io_fd`** in your event loop (`poll`/`epoll`, readable), as well as on the `set_wakeup` callback and `next_wakeup` (D202):
+**With io_uring (the default on Linux: `IoBackend::Auto`, D218), wait on each shard's `Shard::io_fd`** in your event loop (`poll`/`epoll`, readable), as well as on the `set_wakeup` callback and `next_wakeup` (D202):
 - **Why.** In application-owned mode the engine starts no threads, so nothing in the background completes I/O. A read an async call submits from a thread that drives no shard (an executor's `get_async` that misses the cache) completes when a driving thread's turn takes it, and the driving threads' `io_fd` turns readable for exactly that.
 - **If your loop doesn't wait on `io_fd`,** such an async read still completes, but only at the loop's next timed turn: up to `next_wakeup` later, which can be seconds when idle.
 - **Blocking calls are unaffected:** a thread blocked on its own read completes it itself.

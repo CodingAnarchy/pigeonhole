@@ -641,3 +641,27 @@ The p50 target is met only with the row cache. `ycsb-a` costs about +0.3 µs at 
 - **Follow-up:** the hit-path work. Its instruction shapes would run with `ROW_CACHE` set, as separate shapes.
 
 **Not changed:** the row cache's semantics (D201), `row_cache_max_row` (4 KiB), the other targets' steps, and the RocksDB configuration. RocksDB gets the same 2 GiB block cache on `ycsb-c` and no row cache.
+
+## D218 — io_uring is the default I/O backend where the kernel offers it: `IoBackend::Auto` (owner decision, 2026-10-12; pigeonhole, io, #402)
+
+**Decided:**
+- **`IoBackend::default()` is `Auto`:** io_uring where the kernel offers it (Linux with io_uring enabled), the `pread` pool otherwise. That covers other systems, old kernels and containers that block io_uring, and it never fails the open. `IoBackend::Pread` and `IoBackend::Uring` still force a backend.
+- **The test variable `PIGEONHOLE_IO`** keeps forcing a backend (`pread`, `uring`, `auto`); unset, it no longer means `pread`.
+- **Application-owned mode on Linux therefore starts no I/O threads by default** (D202). A driving thread completes its own ring's I/O, so an event loop should wait on `Shard::io_fd`. A loop that never takes it keeps polling while I/O is in flight (`next_wakeup` reports it as due now). Engine-owned mode needs nothing from the application.
+
+**Why.** #402's "done when" asks for io_uring on by default on Linux, measured against `pread` on the reference hardware. The first gate run (2026-10-11) had io_uring behind `pread` on write-heavy workloads (skewed-multi-shard 0.80× throughput, p99 1.45×; ycsb-a and ycsb-f 0.86–0.88×). The cause was in our code, not in io_uring's I/O:
+- A shard turn made two system calls with nothing to reap (#555).
+- Every wake wrote the ring's eventfd (#556).
+- The bench's D213 driver spun instead of waiting on the completion fd (#554, #559).
+
+With those fixed, io_uring matches or beats `pread` everywhere measured (AX102, 2026-10-12):
+
+| workload | io_uring before | io_uring after | pread |
+|---|---|---|---|
+| ycsb-a | 113–114K ops/s | 131–134K | 129–134K |
+| ycsb-f | 89–90K | 97–100K | 97–98K |
+| time-series-ttl | 161–162K | 175–182K | 176–178K |
+| skewed-multi-shard | 302–315K, p99 22–25 µs | 380–383K, p99 17 | 376–379K, p99 16–17 |
+| durable group commit, D213, 32 shards | p99 1,065–1,794 µs | p99 330–352 | p99 252–336 |
+
+Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).

@@ -337,7 +337,7 @@ impl Pigeonhole {
         self.db.engine.metrics().async_sync_reads
     }
 
-    /// With [`IoBackend::Uring`](crate::IoBackend::Uring) (#402): how many io_uring rings the
+    /// With io_uring (#402; the default on Linux, D218): how many io_uring rings the
     /// database has now (a shared one, plus one per shard thread that got its own) and how
     /// many got a registered buffer pool (a ring registers one on the first read that can
     /// use it: today, an async read's block fetch). `None` on other backends.
@@ -667,7 +667,7 @@ impl Shard {
     /// Call before handing this shard to another thread: drives it until the calling
     /// thread has none of its I/O in flight (#492, ICR 0029).
     ///
-    /// With [`IoBackend::Uring`](crate::IoBackend::Uring) in application-owned mode each
+    /// With io_uring (the default on Linux, D218) in application-owned mode each
     /// driving thread has its own I/O ring, and only that thread can complete what was
     /// submitted to it. A shard moved with I/O still on the old thread's ring would wait on
     /// it for ever once that thread stops running turns. So: `release()` on the old thread,
@@ -723,7 +723,7 @@ impl Shard {
     /// pending, so this is never `None`; it is bounded by the balancer's current interval:
     /// 100 ms after a write or a tablet change, doubling with each idle pass up to 10 s.
     ///
-    /// With [`IoBackend::Uring`](crate::IoBackend::Uring), I/O the shard submitted goes to
+    /// With io_uring (the default on Linux, D218), I/O the shard submitted goes to
     /// a ring of the thread that drives it and completes only when that thread runs a shard
     /// again, so this is `Some(Duration::ZERO)` while any is in flight (#402), unless the
     /// application waits on [`io_fd`](Shard::io_fd), which turns readable when some has

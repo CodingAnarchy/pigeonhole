@@ -287,10 +287,11 @@ impl Options {
         self
     }
 
-    /// The I/O backend (default [`IoBackend::Pread`]). With [`IoBackend::Uring`] the open
-    /// fails with [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) where io_uring
-    /// is unavailable (not Linux, an old kernel, a container that blocks it);
-    /// [`IoBackend::Auto`] uses `pread` there instead.
+    /// The I/O backend (default [`IoBackend::Auto`]: io_uring where the kernel offers it,
+    /// `pread` elsewhere, D218). With [`IoBackend::Uring`] the open fails with
+    /// [`ErrorCode::Unsupported`](crate::ErrorCode::Unsupported) where io_uring is unavailable
+    /// (not Linux, an old kernel, a container that blocks it); [`IoBackend::Pread`] forces the
+    /// thread pool everywhere.
     ///
     /// ```
     /// use pigeonhole::{IoBackend, Options};
@@ -411,7 +412,7 @@ impl ReaderOptions {
         self
     }
 
-    /// The I/O backend, as [`Options::io_backend`] (default [`IoBackend::Pread`]).
+    /// The I/O backend, as [`Options::io_backend`] (default [`IoBackend::Auto`]).
     pub fn io_backend(mut self, backend: IoBackend) -> Self {
         self.io_backend = Some(backend);
         self
@@ -724,14 +725,13 @@ impl Family {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum IoBackend {
-    /// A pool of threads serving submitted I/O with `pread` and `pwrite`, on every platform
-    /// (the default).
-    #[default]
+    /// A pool of threads serving submitted I/O with `pread` and `pwrite`, on every platform.
     Pread,
     /// io_uring (Linux): submitted I/O goes through a ring instead of a thread pool. Opening
     /// fails where it is unavailable.
     Uring,
-    /// io_uring where it is available, `pread` otherwise.
+    /// io_uring where it is available, `pread` otherwise (the default, D218).
+    #[default]
     Auto,
 }
 
@@ -746,16 +746,16 @@ pub struct IoRings {
 }
 
 /// The backend `backend` names; unset, the one `PIGEONHOLE_IO` names (a test variable:
-/// `pread`, `uring` or `auto`), else [`IoBackend::Pread`]. For an application-owned open,
+/// `pread`, `uring` or `auto`), else [`IoBackend::Auto`] (D218). For an application-owned open,
 /// an io_uring backend without a reaper thread.
 fn backend_vfs(
     backend: Option<IoBackend>,
     application_owned: bool,
 ) -> Result<VfsRef, pigeonhole_engine::Error> {
     let backend = backend.unwrap_or_else(|| match std::env::var("PIGEONHOLE_IO").as_deref() {
+        Ok("pread") => IoBackend::Pread,
         Ok("uring") => IoBackend::Uring,
-        Ok("auto") => IoBackend::Auto,
-        _ => IoBackend::Pread,
+        _ => IoBackend::Auto,
     });
     let pread = || -> VfsRef { pigeonhole_io::pread::PreadVfs::new(0) };
     match backend {

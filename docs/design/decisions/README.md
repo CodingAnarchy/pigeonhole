@@ -229,6 +229,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D214](phase-3.md#d214) — The balancer acts on write skew only after 10 consecutive skewed passes (newest interval weighted 0.2), keeps shedding load after each dwell while above 1.1× the mean, and splits a dominant tablet into about load/mean children · owner direction, tablets, #547 · amends D134, D146
 - [D215](phase-3.md#d215) — The gate's cold-get step runs with a block cache of at least 1% of the table (1/64, `COLDGET_CACHE_MIB`), so the pinned top indexes and filters and the index partitions stay cached; the engine reports the pinned metadata bytes and warns past about 50% of the block cache · owner decision, bench, engine, #87, #406
 - [D216](phase-3.md#d216) — "Point get in memory" is measured block-cache resident and warmed (ycsb-c with a 2 GiB cache and a full warmup); the row cache is on by default at 64 MiB (`row_cache(0)` turns it off), the gate's row-cache step measures it off; the CI instruction shapes pin it off · owner decision, bench, pigeonhole, #406 · amends D201
+- [D218](phase-3.md#d218) — io_uring is the default I/O backend where the kernel offers it (`IoBackend::Auto`; `pread` elsewhere, never failing the open), so application-owned mode on Linux starts no I/O threads by default and event loops wait on `Shard::io_fd` · owner decision, pigeonhole, io, #402
 
 ## Open questions
 _None._
