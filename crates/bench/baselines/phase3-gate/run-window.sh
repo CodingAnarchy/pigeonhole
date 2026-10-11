@@ -62,6 +62,16 @@ done
 [[ "$scale" == full || "$scale" == small ]] || usage
 [[ "$(uname)" == Linux ]] || { echo "run-window.sh: Linux only" >&2; exit 2; }
 [[ "$(id -u)" == 0 ]] || { echo "run-window.sh: run as root" >&2; exit 2; }
+# setup.sh installs the toolchain with rustup, which puts cargo on PATH only in login shells:
+# a fresh tmux pane may not have ~/.cargo/bin.
+if ! command -v cargo >/dev/null && [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+fi
+command -v cargo >/dev/null || {
+    echo "run-window.sh: cargo not found on PATH or in $HOME/.cargo/env; run setup.sh, or 'source ~/.cargo/env' first" >&2
+    exit 2
+}
 mkdir -p "$data" "$results/logs"
 data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
