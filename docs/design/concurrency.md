@@ -31,17 +31,17 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 
 ## Counts
 
-**155 primitives** (`main` after #134 step 2's close gate; 159 before):
+**153 primitives** (`main` after #134 step 2's close gate and watermark-waiter registry; 159 before):
 
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
-| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 71 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
+| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 66 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
 | `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 26 | `Hooks` 20, `ShardCounters` 4, `ReaderHooks` 2 |
-| other `engine/src` files | 34 | | 10 of them thread-locals (per-thread scratch and caches) |
+| other `engine/src` files | 37 | | 10 of them thread-locals (per-thread scratch and caches) |
 | `runtime/src` | 16 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
-| **Total** | **155** | | |
+| **Total** | **153** | | |
 
-A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityWaiters::{waits, scanned, contended, passes, woken}`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
+A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityCounts::{waits, scanned, passes, woken}` and `WatermarkWaiters::contended`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
 
 ## Lock order
 
@@ -63,7 +63,7 @@ Every observed nesting, outer → inner. The **manifest exclusion** (`manifest_b
 9. **Lock plus atomic:** `ts_raisers[i]` is held while `ts_raises[i].fetch_max` runs (tablets.rs `commit_op`).
 
 **Callbacks under locks.** These are where a new nesting could appear without anyone writing a second `lock()`:
-- `Shared::wake_visible` calls `Waker::wake()` while holding `VisibilityWaiters::list`. Whatever the waker does nests inside it: the runtime's `Signal::target` lock, or an async executor's locks.
+- *(Removed by #134 step 2: `wake_visible` runs wakes after releasing the watermark waiters' lock.)*
 - `Inner::reader_catalog` holds `ReaderState::catalog` across the root reload and manifest read, and `reader_view` holds `view` while it builds a view (long work under one lock).
 - `flushed_roots` is held across `view.load_full()` in `read_latest`. That's not a lock, but the read relies on the ordering (#131).
 
@@ -81,8 +81,7 @@ These are the protocols the primitives implement, and whether a loom model check
 | **Manifest exclusion and pump.** One writer, at most one commit in flight; any thread may finish a pump's completed commit (`take_done`); a blocked caller reaps its own ring, then orphan rings, then parks (#135, #166, #207, ICR 0028, #306). | `manifest_busy`, `ManifestQueue::reqs`, `Shared::manifest`, `Flight::{state, threads, thread_count}` | manifest.rs; appendix C has the full description | none |
 | **Final close.** The last shard to report makes the close pending. Whoever then finds maintenance empty and the exclusion free (the last reporter, the last thread out of maintenance, or the thread releasing the exclusion) runs it, and the `Engine::close` caller is answered once. One lock decides (`close_gate`), with no fences (#78, #81, #134). | `CloseState` (`CloseGate`), `manifest_busy` | close_gate.rs; shard.rs `report_closed`, `try_final_close`, `MaintenanceGuard`; manifest.rs `release` | **yes** (close_gate.rs: the close runs exactly once; the caller is answered exactly once) |
 | **View publication.** Built under `view_lock`, published by `ArcSwap` store; readers load without locks; superseded views are pinned until released (`LiveViews`), then extents are reclaimed. | `view_lock`, `view`, `view_record`, `view_versions`, `flushed_roots`, `LiveViews::versions` | shard.rs `publish_view`; snapshot.rs | none |
-| **Watermark and visibility waits.** Shards publish the visible seqno. Async commits register `(seqno, waker)`; a count lets publishers skip the lock; a SeqCst fence pairs registration with publication. | `VisibilityWaiters::{count, list}`, `shm` watermark | shard.rs `wait_visible`, `wake_visible`, `publish_watermark` | none |
-| **Freeze waiters.** A shard defers a memtable freeze until the watermark passes it. `min_needed` lets publishers skip the lock; SeqCst fences pair `register` and `take_ready` (#97). | `FreezeWaiters::{min_needed, list}` | shard.rs | none (a stress test covers the lost-registration race) |
+| **Watermark waiters.** Shards publish the visible seqno. Async commits register `(seqno, waker)` and shards with a deferred freeze `(seqno, shard)` in one registry; `min_needed` lets a publisher skip the lock unless someone is ready; a SeqCst fence after registration pairs with one before the publisher's load. Wakes run outside the lock (#41, #97, #134). | `WatermarkWaiters::{min_needed, list}`, `shm` watermark | watermark_waiters.rs; shard.rs `wait_visible`, `wake_visible`, `publish_watermark`, the freeze's registration | **yes** (watermark_waiters.rs: a waiter registering as the watermark passes is never lost; a raised registration still wakes) |
 | **Purge guards.** A flush or bottommost compaction's purge races the shard admitting a delete: three-state CAS (`IN_FLIGHT` → `VOIDED` by the shard, or → `INSTALLING` by the pump under the writer mutex) (D191, D192). | `ShardState::guarded` atomics, `CompactionGuard::state` | shard.rs `admit_against_guards`; flush.rs, compact.rs catalog closures | none |
 | **Clock timers.** Cancel against fire: the shard stores `cancel` and takes the waker; the task stores its waker and re-checks `cancel`; `frozen_at` is published before `done` (#84, #93). | `TimerState::{cancel, done, frozen_at, waker}` | shard.rs `ClockTimer` | none |
 | **Tablet load publication.** A shard publishes its write rate (`writes`, then `at` with Release); others read `at` (Acquire), then `writes`. Slot reservations for in-flight changes use RMW (#97, #103, #128). | `LoadSlot::{writes, at, reserved}` | shard/tablets.rs | none |
@@ -99,9 +98,9 @@ These are the protocols the primitives implement, and whether a loom model check
 These observations come from the inventory. They aren't decisions.
 
 - **Counters are most of the count.** Separate them (Relaxed, read only by metrics) from coordinating primitives before measuring a reduction.
-- **Several protocols end in a "skip the lock if nobody waits" counter plus a SeqCst fence:** visibility waiters, freeze waiters and final close. They're the subtlest code here, and none has a loom model. They're the first candidates for either a loom model or the one per-shard event path #134 proposes.
+- **Several protocols end in a "skip the lock if nobody waits" counter plus a SeqCst fence:** visibility waiters, freeze waiters and final close (step 2 replaced the close's with one lock, and merged the two waiter lists into one registry, both loom-modelled). They're the subtlest code here, and none has a loom model. They're the first candidates for either a loom model or the one per-shard event path #134 proposes.
 - **The manifest exclusion has many exits:** pump, client thread, `take_done` handover, final close, abandon on drop. Collapsing them is the largest simplification available. It's also where Phase 1's bugs clustered (#78, #81, #135, #166, #207).
-- **Wakers run under locks** (`wake_visible`). That's harmless with the runtime's waker, but an application executor's waker runs there too.
+- **Wakers run under locks** (`wake_visible`). *(Fixed by #134 step 2: they run after the lock is released.)*
 
 ## Appendices: the inventory
 
@@ -146,24 +145,17 @@ Every counter in this struct has one writer, its own shard thread, and the reade
 | `CloseState` (`CloseGate`, close_gate.rs) shard.rs:199 | `Mutex<Gate>`: shards to report, maintenance count, stage (`Open`, `Pending`, `Running`, `Done(outcome)`), the `Engine::close` waiter | Who runs the final close, and when; its outcome | shard threads: `report_closed` (`report`); app threads: `MaintenanceGuard` (`enter_maintenance`/`leave_maintenance`), `Engine::close` (`register`); whoever runs `try_final_close` (`try_start`, `finish`), including `manifest::release` | `EngineShard::closed` (`outcome`); test hook `final_close_pending` | One lock. `try_start` try-claims the manifest exclusion under it (never blocks); the final close runs outside it. Replaced five primitives, `Shared::maintenance` and three SeqCst fence pairings (#134 step 2) | #41, #78, #81, #117, #135, #166; #134 |
 | `CloseGate::failed` close_gate.rs | `AtomicBool` | The close is unclean: a shard's final sync, flush or checkpoint failed, or a shard died | `fail_close` (`fail`, a swap: the first failure is told) | `visibility_ended` on every async commit poll, `try_finish_close`, and `try_start` under the gate's lock (`failed`) | SeqCst. Outside the lock so a poll costs one load. A shard fails the close before it reports under the lock, so the starter sees it | #41; #134 |
 
-### `VisibilityWaiters` (shard.rs:207), `Shared::waiters`
+### `WatermarkWaiters` (watermark_waiters.rs, `Shared::waiters`, shard.rs:342) and `VisibilityCounts` (shard.rs:221, `Shared::visibility`)
 
 | Name | Type | Protects / means | Writers | Readers | Ordering | Why / history |
 |---|---|---|---|---|---|---|
-| `VisibilityWaiters::count` shard.rs:209 | `AtomicUsize` | Length of `list`, so a publisher can skip the lock when nobody waits | stored under `list`: `wait_visible` (483), `wake_all_visible` (508), `wake_visible` (563) | `wake_visible` (547) on the shard thread after a watermark publish | stores Release, load Acquire. After the store, `wait_visible` issues a SeqCst fence that pairs with the SeqCst fence in `FreezeWaiters::take_ready`, which runs first in `wake_visible` | c9700de (#41) |
-| `VisibilityWaiters::list` shard.rs:210 | `Mutex<Vec<(Seqno, Waker)>>` | Async commits waiting for the global watermark to reach their seqno | app/async threads: `wait_visible` (via write.rs `wait_visible` and the `PendingCommit` polls); shard threads: `wake_visible` after `publish_watermark` (3560); `wake_all_visible` from `shard_died` and `try_final_close` | same | Taken through `VisibilityWaiters::lock` (`try_lock` first, counts contention). No other engine lock is held while it is taken. `wake_visible` calls `Waker::wake()` **while holding it** (shard.rs:556); `wake_all_visible` wakes after releasing it | c9700de (#41) |
-| `VisibilityWaiters::waits` shard.rs:214 | `AtomicU64` | Registrations that found their seqno not yet visible | `wait_visible` (475) | `Engine::metrics` (engine.rs:1751) | Relaxed | ICR 0023, #154; f8af55d (#463) |
-| `VisibilityWaiters::scanned` shard.rs:215 | `AtomicU64` | List entries scanned by registrations | `wait_visible` (478) | engine.rs:1752 | Relaxed | ICR 0023, #154 |
-| `VisibilityWaiters::contended` shard.rs:216 | `AtomicU64` | Lock acquisitions that found `list` held | `VisibilityWaiters::lock` (228) | engine.rs:1758 | Relaxed | ICR 0023, #154 |
-| `VisibilityWaiters::passes` shard.rs:217 | `AtomicU64` | Wake passes that took the lock | `wake_visible` (552) | engine.rs:1755 | Relaxed | ICR 0023, #154 |
-| `VisibilityWaiters::woken` shard.rs:218 | `AtomicU64` | Waiters woken | `wake_visible` (558) | engine.rs:1756 | Relaxed | ICR 0023, #154 |
-
-### `FreezeWaiters` (shard.rs:240), `Shared::freeze_waiters`
-
-| Name | Type | Protects / means | Writers | Readers | Ordering | Why / history |
-|---|---|---|---|---|---|---|
-| `FreezeWaiters::min_needed` shard.rs:243 | `AtomicU64` | Smallest seqno any registered shard waits for (`u64::MAX` = none). A publish below it skips the lock | under `list`: `register` (shard thread in `freeze`, 3134), `take_ready` (any shard thread in `wake_visible`) | `take_ready` (lock-free check) | SeqCst store and load, plus SeqCst fences: after the store in `register`, and before the load in `take_ready` | c1b02a2 (#97). The field `freeze_waiters` dates from 939440e (#63) in an earlier shape |
-| `FreezeWaiters::list` shard.rs:244 | `Mutex<Vec<(u16, Seqno)>>` | Shards with a freeze deferred until the watermark passes their memtable | `register`, `take_ready` | same | No nesting. It is released before `wake_visible` takes `waiters.list` | c1b02a2 (#97); test `a_freeze_waiter_registering_during_a_take_is_never_lost` (7632) |
+| `WatermarkWaiters::min_needed` watermark_waiters.rs:36 | `AtomicU64` | Smallest registered seqno (`u64::MAX` = none), or lower after a registration raised its seqno, until a pass recomputes it. A publish below it takes no lock | under `list`: `register` (74; async commits in `wait_visible`, shard.rs:396; shards in `freeze`, 3047), `wake_ready` (100), `wake_all` (134) | `wake_ready` (lock-free check) | SeqCst store and load. `register` stores it even when unchanged, then fences SeqCst after releasing the lock; `wake_ready` fences SeqCst before loading it. Pairs with the watermark store (`publish_pending`, Release) and the registrant's re-read: either the publisher sees the registration or the registrant sees the watermark. Loom-modelled | #41, #97 (c1b02a2); merged by #134 step 2 |
+| `WatermarkWaiters::list` watermark_waiters.rs:37 | `Mutex<Vec<(Seqno, Wake)>>` | Async commits (`Wake::Task(Waker)`) waiting for their seqno to become visible, and shards (`Wake::Shard(id)`, kicked) with a freeze deferred until the watermark passes their memtable | `register`, `wake_ready`, `wake_all` (`shard_died`, `try_final_close` via `wake_all_visible`) | same | Taken through `lock` (`try_lock` first, counts contention). No other engine lock is held while it is taken, and nothing is called under it: wakes (`Waker::wake`, the shard kick) run after it is released | #41, #97; #134 step 2 |
+| `WatermarkWaiters::contended` watermark_waiters.rs:39 | `AtomicU64` | Lock acquisitions that found `list` held | `lock` (54) | `Engine::metrics` (`contended()`, engine.rs:1838) | Relaxed | ICR 0023, #154 |
+| `VisibilityCounts::waits` shard.rs:221 | `AtomicU64` | Async-commit registrations that found their seqno not yet visible | `wait_visible` (396) | `Engine::metrics` (engine.rs:1838) | Relaxed | ICR 0023, #154; f8af55d (#463) |
+| `VisibilityCounts::scanned` | `AtomicU64` | List entries those registrations scanned | `wait_visible` | engine.rs:1838 | Relaxed | ICR 0023, #154 |
+| `VisibilityCounts::passes` | `AtomicU64` | Wake passes that took the lock (since #134 step 2: only when a waiter's seqno was reached) | `wake_visible` (463) | engine.rs:1838 | Relaxed | ICR 0023, #154 |
+| `VisibilityCounts::woken` | `AtomicU64` | Async commits woken (shard kicks are not counted) | `wake_visible` | engine.rs:1838 | Relaxed | ICR 0023, #154 |
 
 ### Statics
 
@@ -259,7 +251,7 @@ Order is outer → inner. "Exclusion" means the `manifest_busy` flag claimed thr
 9. *(Removed by #134 step 2: the gate has one lock.)*
 10. **`large_logged` → `large_dropped` → `large_pending`** in `LargeValues::settle_on` (large.rs:105–117), run on whichever thread resolves the commit notifier. `note_logged` takes `large_pending` then `large_logged`, but in sequence: it drops `pending` first (large.rs:221). That avoids an inversion against `settle_on`.
 11. **`ts_raisers[i]` held while `ts_raises[i].fetch_max` runs** in tablets.rs `commit_op` (823–834). This is a lock plus an atomic, not two locks.
-12. **`waiters.list` held while `Waker::wake()` runs** in `Shared::wake_visible` (shard.rs:551–563). The wake callback runs under the lock. Whatever the waker does (runtime or executor locks) nests inside it.
+12. *(Removed by #134 step 2: `wake_visible` runs wakes after releasing `waiters.list`.)*
 13. **`flushed_roots` held across `view.load_full()`** in `read_latest` (shard.rs:3645–3659). `ArcSwap` is not a lock, but the ordering is relied on (#131).
 
 No `Condvar` is declared in these files. Blocking waits go through runtime `Notifier`/`completion`, which are out of scope.
@@ -364,7 +356,7 @@ Not counted. Sites listed are only those in my two files; other writers/readers 
 | `Shared::submitters` (shard.rs:421) | `OnceLock<Vec<Submitter<ShardMsg>>>` | `open_writer` `set` (995, 1004) before the runtime lock store / before shards are handed out; `get` in `metrics` (1750), `close` (2711), `Shared::submitter` (expects set). | OnceLock. |
 | `Shared::async_sync_reads`, `commit_parks` (shard.rs:326, 338) | `AtomicU64` | `Engine::metrics` `load(Relaxed)` (1747, 1749). | Relaxed. D196, ICR 0027. |
 | `Shared::metrics[i].*` counters, `.wal` (ShardMetrics) | atomics, `OnceLock` (`wal`, inferred from `.set`/`.get`) | `metrics` loads all `Relaxed` (1712-1744); `tablet_refusals` (1674); `shard_stats` (1688); `open_writer` `wal.set(...)` (854, 878, 910). | Relaxed. |
-| `Shared::waiters.{waits,scanned,passes,woken,contended}` (VisibilityWaiters) | atomics | `metrics` `load(Relaxed)` (1757-1766). | Relaxed. |
+| `Shared::visibility.{waits,scanned,passes,woken}` (VisibilityCounts), `Shared::waiters.contended()` (WatermarkWaiters) | atomics | `metrics` `load(Relaxed)` (1838-1848). | Relaxed. |
 | `Shared::live_seqnos` | `Arc<LiveSeqnos>` (has internal locks, not checked) | `Inner::snapshot` `SeqnoPin::pin_visible` (2607-2608). | Internal. |
 | `Shared::drivers` | `waker::Drivers` (internals not checked) | `EngineShard::run_once` `enter` (3176), `Drop for EngineShard` `dropped` (3280-3283), `close` `driven_elsewhere` (2720). | Internal. |
 

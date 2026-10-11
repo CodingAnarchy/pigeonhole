@@ -203,99 +203,26 @@ pub(crate) type CloseState = crate::close_gate::CloseGate<Result<()>, Notifier<R
 #[repr(align(64))]
 pub(crate) struct Padded(pub AtomicU64);
 
-/// Commits waiting for the global watermark to reach their seqno (async `PendingCommit`).
+/// What a watermark waiter is: an async commit waiting for its seqno to become visible, or
+/// a shard whose freeze is deferred until the watermark passes its memtable (kicked).
+#[derive(Debug)]
+pub(crate) enum Wake {
+    Task(Waker),
+    Shard(u16),
+}
+
+/// Everything waiting for the watermark (`watermark_waiters`).
+pub(crate) type WatermarkWaiters = crate::watermark_waiters::WatermarkWaiters<Wake>;
+
+/// Counters of async commits' visibility waits (ICR 0023, #154): registrations that found
+/// their seqno not yet visible, list entries they scanned, wake passes that took the lock,
+/// and commits woken. Contention is the registry's (`WatermarkWaiters::contended`).
 #[derive(Debug, Default)]
-pub(crate) struct VisibilityWaiters {
-    pub count: AtomicUsize,
-    pub list: Mutex<Vec<(Seqno, Waker)>>,
-    /// Counters (ICR 0023, #154): registrations that found their seqno not yet visible, list entries
-    /// they scanned, registrations and wake passes that found the lock held, wake passes
-    /// that took the lock, and waiters woken.
+pub(crate) struct VisibilityCounts {
     pub waits: AtomicU64,
     pub scanned: AtomicU64,
-    pub contended: AtomicU64,
     pub passes: AtomicU64,
     pub woken: AtomicU64,
-}
-
-impl VisibilityWaiters {
-    /// The list, locked; a lock already held counts as contention.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(Seqno, Waker)>> {
-        match self.list.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.contended.fetch_add(1, Ordering::Relaxed);
-                self.list.lock().unwrap_or_else(PoisonError::into_inner)
-            }
-        }
-    }
-}
-
-/// Shards waiting for the watermark to pass a deferred freeze, each with the seqno its
-/// freeze needs visible. A publisher wakes (and forgets) only the shards whose seqno is
-/// visible, so a watermark that did not move far enough wakes nobody, and a shard that
-/// defers again registers again.
-#[derive(Debug)]
-pub(crate) struct FreezeWaiters {
-    /// The smallest seqno any registered shard waits for (`u64::MAX` when none): a publish
-    /// below it skips the lock.
-    min_needed: AtomicU64,
-    list: Mutex<Vec<(u16, Seqno)>>,
-}
-
-impl Default for FreezeWaiters {
-    fn default() -> Self {
-        Self {
-            min_needed: AtomicU64::new(u64::MAX),
-            list: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl FreezeWaiters {
-    /// Registers `shard` as waiting until `needed` is visible (replacing an earlier
-    /// registration). The caller re-reads the visible seqno afterwards: a watermark
-    /// published before the registration landed may have missed it.
-    pub(crate) fn register(&self, shard: u16, needed: Seqno) {
-        let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
-        match list.iter_mut().find(|(s, _)| *s == shard) {
-            Some(entry) => entry.1 = needed,
-            None => list.push((shard, needed)),
-        }
-        let min = list.iter().map(|(_, n)| *n).min().unwrap_or(u64::MAX);
-        self.min_needed.store(min, Ordering::SeqCst);
-        drop(list);
-        // Pairs with the fence in `take_ready`: either the publisher sees this registration
-        // or the caller's re-read sees the publisher's watermark.
-        std::sync::atomic::fence(Ordering::SeqCst);
-    }
-
-    /// Takes the shards whose needed seqno is at or below what `visible` reads (one load and
-    /// no lock when none is ready).
-    pub(crate) fn take_ready(&self, visible: impl Fn() -> Seqno) -> Vec<u16> {
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let min = self.min_needed.load(Ordering::SeqCst);
-        if min == u64::MAX {
-            return Vec::new();
-        }
-        let visible = visible();
-        if visible < min {
-            return Vec::new();
-        }
-        let mut list = self.list.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut ready = Vec::new();
-        list.retain(|&(s, needed)| {
-            let keep = needed > visible;
-            if !keep {
-                ready.push(s);
-            }
-            keep
-        });
-        let min = list.iter().map(|(_, n)| *n).min().unwrap_or(u64::MAX);
-        self.min_needed.store(min, Ordering::SeqCst);
-        ready
-    }
 }
 
 /// Engine-wide state every shard and every caller shares.
@@ -411,16 +338,15 @@ pub(crate) struct Shared {
     /// Full compactions (`Engine::compact`) in progress: the balancer starts no change
     /// meanwhile, so a tablet does not move past the shards' rounds (issue #94).
     pub full_compactions: AtomicUsize,
-    pub waiters: VisibilityWaiters,
+    /// Async commits and deferred freezes waiting for the watermark.
+    pub waiters: WatermarkWaiters,
+    pub visibility: VisibilityCounts,
     /// A shard died (`Shared::shard_died`).
     pub shard_died: AtomicBool,
     /// The manifest pump's root commit in flight, which a blocked thread may finish.
     pub manifest_flight: manifest::Flight,
     /// Which thread drives each application-owned shard (empty in engine-owned mode).
     pub drivers: crate::waker::Drivers,
-    /// Shards with a freeze deferred until the watermark passes their memtable (kicked by
-    /// whoever publishes a watermark).
-    pub freeze_waiters: FreezeWaiters,
     pub memtable_freeze_bytes: u64,
     /// Bytes a stream may hold past its oldest needed record before the slots pinning it
     /// are flushed (`EngineOptions::wal_pin_bytes`, resolved; #137).
@@ -471,21 +397,16 @@ impl Shared {
         if self.shm.visible_seqno() >= seqno {
             return true;
         }
-        {
-            self.waiters.waits.fetch_add(1, Ordering::Relaxed);
-            let mut list = self.waiters.lock();
-            self.waiters
-                .scanned
-                .fetch_add(list.len() as u64, Ordering::Relaxed);
-            if !list.iter().any(|(s, w)| *s == seqno && w.will_wake(waker)) {
-                list.push((seqno, waker.clone()));
-            }
-            self.waiters.count.store(list.len(), Ordering::Release);
-        }
-        // The shards check the count after each watermark publish (behind a SeqCst fence,
-        // `FreezeWaiters::take_ready`); this fence orders our count store before the second
-        // look, so either the publisher sees us registered or we see its watermark.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        self.visibility.waits.fetch_add(1, Ordering::Relaxed);
+        let scanned = self.waiters.register(
+            seqno,
+            || Wake::Task(waker.clone()),
+            |s, w| s == seqno && matches!(w, Wake::Task(w) if w.will_wake(waker)),
+        );
+        self.visibility
+            .scanned
+            .fetch_add(scanned as u64, Ordering::Relaxed);
+        // A publish that missed the registration is seen here (`watermark_waiters`).
         self.shm.visible_seqno() >= seqno
     }
 
@@ -499,17 +420,16 @@ impl Shared {
     /// Wakes every visibility waiter whatever its seqno, after `visibility_ended` became
     /// true: each re-checks and ends.
     pub(crate) fn wake_all_visible(&self) {
-        let woken = {
-            let mut list = self
-                .waiters
-                .list
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.waiters.count.store(0, Ordering::Release);
-            std::mem::take(&mut *list)
-        };
-        for (_, w) in woken {
-            w.wake();
+        self.waiters.wake_all(|w| self.wake(w));
+    }
+
+    /// Runs a watermark waiter's wake.
+    fn wake(&self, w: Wake) {
+        match w {
+            Wake::Task(w) => w.wake(),
+            Wake::Shard(s) => {
+                let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
+            }
         }
     }
 
@@ -538,29 +458,21 @@ impl Shared {
         Ok(())
     }
 
-    /// Wakes every registered waiter whose seqno is visible now. Called by shards after a
-    /// watermark publish, and only when someone is registered (one relaxed load otherwise).
+    /// Wakes, outside the lock, every watermark waiter whose seqno is visible now. Called by
+    /// shards after a watermark publish (one fence and one load when nobody waits).
     pub(crate) fn wake_visible(&self) {
-        for s in self.freeze_waiters.take_ready(|| self.shm.visible_seqno()) {
-            let _ = self.submitter(ShardId(s)).submit(ShardMsg::Kick);
+        let passed = self.waiters.wake_ready(
+            || self.shm.visible_seqno(),
+            |w| {
+                if matches!(w, Wake::Task(_)) {
+                    self.visibility.woken.fetch_add(1, Ordering::Relaxed);
+                }
+                self.wake(w);
+            },
+        );
+        if passed {
+            self.visibility.passes.fetch_add(1, Ordering::Relaxed);
         }
-        if self.waiters.count.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        let visible = self.shm.visible_seqno();
-        let mut list = self.waiters.lock();
-        self.waiters.passes.fetch_add(1, Ordering::Relaxed);
-        let mut i = 0;
-        while i < list.len() {
-            if list[i].0 <= visible {
-                let (_, w) = list.swap_remove(i);
-                w.wake();
-                self.waiters.woken.fetch_add(1, Ordering::Relaxed);
-            } else {
-                i += 1;
-            }
-        }
-        self.waiters.count.store(list.len(), Ordering::Release);
     }
 
     /// Publishes a new view built by `f` from the current one, in shared memory too. The
@@ -3131,7 +3043,12 @@ impl ShardState {
             // would wake it). A watermark published since `visible` was read may have missed
             // the registration: look again.
             self.freeze_deferred = true;
-            self.shared.freeze_waiters.register(self.id.0, needed);
+            let id = self.id.0;
+            self.shared.waiters.register(
+                needed,
+                || Wake::Shard(id),
+                |_, w| matches!(w, Wake::Shard(s) if *s == id),
+            );
             if self.shared.shm.visible_seqno() >= needed
                 && let Some(subs) = self.shared.submitters.get()
             {
@@ -7604,64 +7521,6 @@ mod tests {
         // A tie with a raise only when every shard that raised it is the commit's own.
         assert!(preset_fits(10, &own, c, 9, (10, 0b011)));
         assert!(!preset_fits(10, &own, c, 9, (10, 0b101)));
-    }
-
-    #[test]
-    fn a_freeze_waiter_wakes_only_once_its_seqno_is_visible() {
-        let w = FreezeWaiters::default();
-        w.register(3, 10);
-        w.register(1, 5);
-        // A watermark that did not reach either seqno wakes nobody.
-        assert!(w.take_ready(|| 4).is_empty());
-        assert_eq!(w.take_ready(|| 7), [1]);
-        assert!(w.take_ready(|| 9).is_empty());
-        // Registering again replaces the seqno.
-        w.register(3, 12);
-        assert!(w.take_ready(|| 10).is_empty());
-        assert_eq!(w.take_ready(|| 12), [3]);
-        assert!(w.take_ready(|| u64::MAX - 1).is_empty());
-        // A shard that defers again after its wake is woken again.
-        w.register(3, 20);
-        assert_eq!(w.take_ready(|| 20), [3]);
-    }
-
-    #[test]
-    fn a_freeze_waiter_registering_during_a_take_is_never_lost() {
-        // Registrants race a taker while a checker looks: under the lock the published
-        // minimum always equals the list's smallest needed seqno, so a registration racing a
-        // take is never hidden from later publishers.
-        const SHARDS: u16 = 4;
-        let w = FreezeWaiters::default();
-        let stop = AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for id in 0..SHARDS {
-                let (w, stop) = (&w, &stop);
-                s.spawn(move || {
-                    let mut n = 0u64;
-                    while stop.load(Ordering::Acquire) == 0 {
-                        n += 1;
-                        w.register(id, n);
-                    }
-                });
-            }
-            s.spawn(|| {
-                let mut v = 0u64;
-                while stop.load(Ordering::Acquire) == 0 {
-                    v += 1;
-                    let _ = w.take_ready(|| v);
-                }
-            });
-            for _ in 0..200_000 {
-                let list = w.list.lock().unwrap_or_else(PoisonError::into_inner);
-                let min = w.min_needed.load(Ordering::SeqCst);
-                let want = list.iter().map(|(_, n)| *n).min().unwrap_or(u64::MAX);
-                if min != want {
-                    stop.store(1, Ordering::Release);
-                    panic!("published minimum {min} with {:?} registered", *list);
-                }
-            }
-            stop.store(1, Ordering::Release);
-        });
     }
 
     #[test]

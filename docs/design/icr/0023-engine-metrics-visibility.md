@@ -2,6 +2,8 @@
 
 **Status:** Approved (coordinator, 2026-10-10; #154, D204).
 
+*Amended by #134 step 2 (#528; approved, coordinator, 2026-10-11): `visibility_wakes.0` counts only the wake passes that reached a registered seqno. A watermark publish below every waiter's seqno no longer takes the list's lock, so it is not a pass, and `visibility_contended` counts fewer acquisitions. The list also holds shards with a deferred freeze: their registrations and kicks are not counted in `visibility_waits.0` or `visibility_wakes.1`, though their entries count as scanned and their lock acquisitions as contended. So `visibility_wakes.1 <= visibility_waits.0` still holds.*
+
 ## Change
 
 `pigeonhole-engine`, additive (`Metrics` is `#[non_exhaustive]`):
