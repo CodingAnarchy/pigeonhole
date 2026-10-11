@@ -1,6 +1,6 @@
 # Phase 3 gate window (#405, #406)
 
-The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 9.8 hours at full scale. It is resumable, and it leaves one tarball to copy back.
+The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 10.1 hours at full scale. It is resumable, and it leaves one tarball to copy back.
 
 ## Before renting
 
@@ -34,7 +34,7 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
 - **The steps:**
   1. `setup`: records the machine, and refuses a setup that would not count.
   2. `build`, then `memtable-lookup`: the memtable's 1M- and 10k-entry point lookup (#17; criterion, pinned to one core).
-  3. `phase2-gate`: the D193 floors.
+  3. `phase2-gate`, twice (`phase2-gate-2`): the D193 floors. The second run is there because #387's row-read p99 is close to 1.5× SQLite EAV's (1.58× on the Mac), and one run varies by about 5%. The first runs here should become the new D193 baseline, an owner decision, since the current one is from the Mac.
   4. `all` against RocksDB, three times: twice on io_uring (the reproducibility pair) and once on pread (the backend decision).
   5. `latency`: point gets and durable group commit.
   6. `ycsb-a-shards`: ycsb-a with one client, at the default shard count against 1 and 4 shards and longer shard spins, beside RocksDB (D198 item 2, #478).

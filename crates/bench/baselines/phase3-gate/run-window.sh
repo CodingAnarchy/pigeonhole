@@ -21,6 +21,8 @@
 #   build          phdb-bench (rocksdb, sqlite) and the examples                      10
 #   memtable-lookup  memtable 1M/10k point lookup (#17; criterion)                    5
 #   phase2-gate    D193 sparse-wide gate against SQLite and RocksDB (run-gate.sh)     40
+#   phase2-gate-2  the same again: #387's row-read p99 sits near 1.5x SQLite's, and one
+#                  run varies by about 5%                                             40
 #   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring               90
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2)         90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
@@ -35,7 +37,7 @@
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 9.75 hours unattended at full scale.
+# Total: about 10.1 hours unattended at full scale (the sum of the estimates above).
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
 # it back with the `scp` line the last step prints, and commit it from there.
@@ -62,9 +64,9 @@ mkdir -p "$data" "$results/logs"
 data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
-steps=(setup build memtable-lookup phase2-gate all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
+steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     group-sync-depth row-cache scaling open-latency cold-get cold-scan scan-cache report)
-declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [all-uring-1]=90 [all-uring-2]=90
+declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
     [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [group-sync-depth]=15 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
     [cold-scan]=45 [scan-cache]=10 [report]=1)
 
@@ -180,7 +182,8 @@ step_memtable-lookup() {
     cp -r "$root/target/criterion" "$results/memtable-criterion"
 }
 
-step_phase2-gate() {
+# The D193 sparse-wide gate into $1.json (run-gate.sh, with check.py's verdict in $1.status).
+phase2_gate() {
     if [[ "$scale" == small ]]; then
         echo "phase2-gate runs at full scale only (its baselines are full-scale runs); skipped"
         return
@@ -189,10 +192,13 @@ step_phase2-gate() {
     # produced no result stops the window.
     local status=0
     TMPDIR="$data" "$root/crates/bench/baselines/phase2-gate/run-gate.sh" \
-        "$results/phase2-gate.json" || status=$?
-    [[ -s "$results/phase2-gate.json" ]] || return 1
-    echo "$status" > "$results/phase2-gate.status"
+        "$results/$1.json" || status=$?
+    [[ -s "$results/$1.json" ]] || return 1
+    echo "$status" > "$results/$1.status"
 }
+
+step_phase2-gate() { phase2_gate phase2-gate; }
+step_phase2-gate-2() { phase2_gate phase2-gate-2; }
 
 # `phdb-bench all` against RocksDB, stores under DATA_DIR, on backend $1, into $2.json.
 all_vs_rocksdb() {

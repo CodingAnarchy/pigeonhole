@@ -200,9 +200,36 @@ rows.append(("Within 1.5× of RocksDB on every workload",
 rep = status("all-uring-compare.status")
 rows.append(("Reproducibility: run 1 and run 2 within tolerance", "", verdict(None if rep is None else rep == 0),
              "all-uring-compare.txt"))
-p2 = status("phase2-gate.status")
-rows.append(("Phase 2 floors hold (D193 sparse-wide gate)", "", verdict(None if p2 is None else p2 == 0),
-             "phase2-gate.json, logs/phase2-gate.log"))
+p2 = [status(f"{n}.status") for n in ("phase2-gate", "phase2-gate-2")]
+rows.append(("Phase 2 floors hold (D193 sparse-wide gate, both runs)", "",
+             verdict(None if None in p2 else all(s == 0 for s in p2)),
+             "phase2-gate.json, phase2-gate-2.json, logs/phase2-gate*.log"))
+
+
+def eav_ratios(name):
+    """Pigeonhole's row-read and scan p99 over SQLite EAV's in one gate run (#387)."""
+    run = load(f"{name}.json")
+    if not run:
+        return None
+    p99 = {}
+    for r in run.get("results", []):
+        by = {t["op"]: t["stats"]["p99_ns"] for t in (r.get("detail") or {}).get("by_type", [])}
+        p99[r["store"]] = by
+    ph, eav = p99.get("pigeonhole"), p99.get("sqlite-eav")
+    if not ph or not eav:
+        return None
+    return {op: ph[op] / eav[op] for op in ("row read", "scan") if op in ph and op in eav}
+
+
+ratios = [eav_ratios(n) for n in ("phase2-gate", "phase2-gate-2")]
+if any(ratios):
+    shown = "; ".join(
+        f"run {i + 1}: row read {r['row read']:.2f}×, scan {r['scan']:.2f}×"
+        for i, r in enumerate(ratios) if r and "row read" in r and "scan" in r)
+    worst = max((v for r in ratios if r for v in r.values()), default=None)
+    rows.append(("#387: row-read and scan p99 within 1.5× of SQLite EAV", shown,
+                 verdict(None if worst is None else worst < 1.5),
+                 "phase2-gate.json, phase2-gate-2.json"))
 rows.append(("D193 instruction ceilings", "measured by CI's instructions job, not here", "see CI", "-"))
 
 machine = load("machine.json") or {}
