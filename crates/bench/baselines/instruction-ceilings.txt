@@ -69,6 +69,10 @@
 # 38052048487, and a scratch callgrind run, 38051428167), which agreed exactly (1440, 1417,
 # 1327), with 0.3% headroom.
 #
+# scan-narrow-q1, scan-wide-q10 and scan-wide-q1 (scanrate's filtered scans, #29) were added
+# from the base side of PR #PR's instructions run (main's code with the new shapes), with
+# 0.3% headroom.
+#
 # Re-baselined after #483, #497, #498 and #500 (main 07a0fe2): lowered with
 # `instruction-ceilings.py lower` from the higher of this PR's base and head counts (run
 # 38092917766); counter keeps its permanent 0.5% headroom. Nothing rose.
@@ -102,3 +106,6 @@ scan-narrow 1435 0.3
 scan-small 1411 0.3
 scan-wide 1331 0.3
 commit-async 10061 0.3
+scan-narrow-q1 8051 0.3
+scan-wide-q10 1860 0.3
+scan-wide-q1 17509 0.3
