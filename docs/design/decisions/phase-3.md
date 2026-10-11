@@ -571,3 +571,26 @@ The hysteresis is the issue's form (start at 1.25, stop below a lower bound). Th
 **Tests.**
 - `a_skewed_shard_keeps_shedding_tablets_until_balanced`: 12 tablets, 9 on one shard. It must make six moves, one per dwell, to reach 3 per shard, then nothing more.
 - `a_short_burst_of_skew_changes_no_tablet`: 4 passes at 3 times the mean change nothing. Under the old rule they split the hot tablet.
+
+<a id="d215"></a>
+## D215 — The cold-get target is measured with a block cache that holds the table's index; the engine reports pinned metadata and warns when it crowds the cache (owner decision, 2026-10-11; bench, engine, #87, #406)
+
+**Decided:**
+- **The gate's cold-get step** (`phase3-io/cold-get.sh`, `examples/coldget.rs`) runs with a block cache of **at least 1% of the table**: `COLDGET_CACHE_MIB`, which `run-window.sh` sets to 1/64 of the table (1024 MiB for the 64 GiB table, at least 64 MiB). Each result line records the cache size.
+- **The engine reports pinned metadata:** the bytes of SST top indexes and filters pinned in the block cache, in its metrics. It logs a warning when they pass about **50% of the block cache**, because past that the index partitions and data blocks the reads need no longer stay cached.
+
+**Why.** The first gate run (2026-10-11) measured 2.09 device reads per cold get against a target of 1. The second read is the get's index partition:
+- **Capped mode** (buffered reads, 8 GiB memory cap) had the same 2.09 block-cache misses per get but 1.087 device reads: the partitions sat in the page cache.
+- **The cause is the cache's size.** An open SST pins its top index and both filters in the block cache, counted against its capacity. That is about 2.9 MiB per GiB of table at coldget's row shape (1 KiB cells), so about 185 MiB for the 64 GiB table, inside a 64 MiB cache. The cache was always over capacity, and every index partition read was evicted at once.
+- **Raising index partitions' cache priority changes nothing:** S3-FIFO already keeps re-hit blocks, and there was no room to keep them in.
+- **The spec's claim** (a cold get is one data-block I/O) already assumes index and filters pinned. RocksDB's default keeps them outside its block cache, in table-reader memory, which holds the same bytes.
+
+The AX102, 16 GiB table, direct I/O, pread, one thread:
+
+| block cache | device reads per get | p50 | p99 |
+|---|--:|--:|--:|
+| 16 MiB (the first run's 1:1024) | 2.092 | 162 µs | 326 µs |
+| 256 MiB (1.6%) | 1.072 | 85.5 µs | 187 µs |
+| 512 MiB (3.1%) | 1.055 | 86 µs | 188 µs |
+
+The remaining 0.05–0.07 reads come from filter false positives across levels. On a 1 GiB table (macOS, cache misses only), 1% of the table gave 1.12–1.14 block reads per get and 1.6% gave 1.065, so the gate uses 1/64 (1.56%).

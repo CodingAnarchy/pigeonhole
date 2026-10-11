@@ -117,8 +117,10 @@ if cg:
     p50 = statistics.median(l["p50_us"] for l in cg)
     p99 = statistics.median(l["p99_us"] for l in cg)
     ok = reads <= 1.1 and misses <= 1.1
+    cache = cg[0].get("cache_mib")
+    cache = f"; block cache {cache} MiB" if cache is not None else ""
     rows.append(("Point get on cold data: one I/O",
-                 f"{reads:.3f} device reads, {misses:.3f} cache misses per get; p50 {p50:.0f} µs, p99 {p99:.0f} µs",
+                 f"{reads:.3f} device reads, {misses:.3f} cache misses per get; p50 {p50:.0f} µs, p99 {p99:.0f} µs{cache}",
                  verdict(ok), "cold-get.jsonl"))
 else:
     rows.append(("Point get on cold data: one I/O", "", verdict(None), "cold-get.jsonl"))

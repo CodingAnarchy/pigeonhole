@@ -14,6 +14,10 @@
 #   - capped: buffered reads in a cgroup v2 scope of `COLDGET_CAP` memory (default 8G, swap
 #     off), page cache emptied first, so most of the table cannot be cached: the default
 #     path's cost.
+# The block cache is `COLDGET_CACHE_MIB` (default 1/64 of the table, at least 64 MiB): one I/O
+# per get needs every SST's pinned top index and filters plus its index partitions cached,
+# about 0.5-0.7% of the data (D215; 1% still measured 1.12-1.14 block reads per get, 1/64
+# 1.06-1.07).
 # Each `get` runs 100,000 warm-up gets, 1,000,000 cold gets of present rows and 1,000,000 of
 # absent rows, on 1 thread (the latency target) and 16 (latency under concurrent reads).
 # Each line of OUT.jsonl is one phase of one run, as `examples/coldget.rs` prints it, plus
@@ -33,6 +37,8 @@ data="${1:?usage: cold-get.sh DATA_DIR [OUT.jsonl] [MIB]}"
 out="${2:-cold-get-$(date +%Y%m%d-%H%M%S).jsonl}"
 mib="${3:-65536}"
 cap="${COLDGET_CAP:-8G}"
+cache_mib="${COLDGET_CACHE_MIB:-$(( mib / 64 > 64 ? mib / 64 : 64 ))}"
+export COLDGET_CACHE_MIB="$cache_mib"
 [[ "$(uname)" == Linux ]] || { echo "cold-get.sh: Linux only (page cache, cgroups)" >&2; exit 2; }
 [[ "$(id -u)" == 0 ]] || { echo "cold-get.sh: run as root (page cache, cgroups)" >&2; exit 2; }
 command -v systemd-run >/dev/null || { echo "cold-get.sh: needs systemd-run" >&2; exit 2; }

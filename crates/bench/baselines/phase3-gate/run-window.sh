@@ -105,6 +105,9 @@ if [[ "$scale" == full ]]; then
 else
     cold_get_mib=256 cold_scan_mib=256 scan_cache_mib=128
 fi
+# The cold-get block cache: 1/64 of the table, at least 64 MiB (D215: at least 1%, so the
+# pinned top indexes and filters and the index partitions stay cached and a get is one I/O).
+cold_get_cache_mib=$(( cold_get_mib / 64 > 64 ? cold_get_mib / 64 : 64 ))
 
 remaining() { # minutes left after step $1
     local after=0 m=0
@@ -338,8 +341,8 @@ step_cold-get() {
     if [[ "$scale" == small ]]; then
         export COLDGET_GETS=20000 COLDGET_WARMUP=2000 COLDGET_QUIET_SECS=5
     fi
-    "$root/crates/bench/baselines/phase3-io/cold-get.sh" "$data/coldget" \
-        "$results/cold-get.jsonl" "$cold_get_mib"
+    COLDGET_CACHE_MIB=$cold_get_cache_mib "$root/crates/bench/baselines/phase3-io/cold-get.sh" \
+        "$data/coldget" "$results/cold-get.jsonl" "$cold_get_mib"
 }
 
 step_cold-scan() {
