@@ -899,6 +899,7 @@ dependencies = [
  "criterion",
  "io-uring",
  "libc",
+ "loom",
  "pigeonhole-format",
  "proptest",
  "windows-sys",

@@ -163,3 +163,9 @@ jobs:
         env:
           RUSTFLAGS: --cfg engine_loom
           CARGO_TARGET_DIR: target/loom-engine
+      # The io crate's model (the ring wake, #402) likewise has a cfg of its own.
+      - name: loom (io)
+        run: cargo test --release -p pigeonhole-io --lib loom
+        env:
+          RUSTFLAGS: --cfg io_loom
+          CARGO_TARGET_DIR: target/loom-io

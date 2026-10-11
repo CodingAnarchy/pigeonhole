@@ -27,6 +27,7 @@ use io_uring::{IoUring, Probe, opcode, squeue, types};
 use crate::buf::SlotPool;
 use crate::completion::Resolver;
 use crate::pread::{PreadFile, PreadVfs};
+use crate::ring_wake::RingWake;
 use crate::{
     Completion, Error, ErrorKind, File, FileIdentity, FileRef, IoBuf, Locality, LockMode,
     OpenOptions, ProcessId, Result, SharedOpen, SharedRegion, Vfs,
@@ -1000,6 +1001,8 @@ struct ThreadRing {
     /// Times a reap entered the kernel ([`crate::own_io_enters`]); only the owner writes it.
     enters: AtomicU64,
     wake: Arc<EventFd>,
+    /// Whether a wake must write `wake` (only while the owner waits in the ring).
+    ring_wake: Arc<RingWake>,
     /// Registered with the ring (`IORING_REGISTER_EVENTFD`): signalled on each completion,
     /// for a thread that waits on it in its own event loop ([`crate::own_io_fd`], #408).
     /// `None` if the kernel refused the registration.
@@ -1153,6 +1156,7 @@ impl ThreadRing {
             fd_taken: AtomicBool::new(false),
             enters: AtomicU64::new(0),
             wake: Arc::new(EventFd::new().ok()?),
+            ring_wake: Arc::default(),
             epoll: epoll_over(
                 [
                     notify.as_ref(),
@@ -1233,6 +1237,12 @@ impl ThreadRing {
         })
     }
 
+    /// Counts a kernel enter ([`crate::own_io_enters`]); only the owner calls it.
+    fn count_enter(&self) {
+        self.enters
+            .store(self.enters.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    }
+
     /// Whether a non-waiting reap has anything to take: completions already queued, or
     /// completion work the kernel deferred to this thread (flagged in the submission queue;
     /// on a ring without the flag, whenever anything is in flight).
@@ -1265,21 +1275,30 @@ impl ThreadRing {
         if watched && let Some(notify) = &self.notify {
             notify.drain();
         }
-        self.enters
-            .store(self.enters.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         let entered = match wait {
             Some(t) if lock(&self.table).live > 0 || !t.is_zero() => {
-                let ts = types::Timespec::new()
-                    .sec(t.as_secs())
-                    .nsec(t.subsec_nanos());
-                let args = types::SubmitArgs::new().timespec(&ts);
-                self.uring.submitter().submit_with_args(1, &args)
+                if self.ring_wake.begin_wait() {
+                    let ts = types::Timespec::new()
+                        .sec(t.as_secs())
+                        .nsec(t.subsec_nanos());
+                    let args = types::SubmitArgs::new().timespec(&ts);
+                    self.count_enter();
+                    let entered = self.uring.submitter().submit_with_args(1, &args);
+                    self.ring_wake.end_wait();
+                    entered
+                } else {
+                    // Woken since the turn: back to it, taking only what is already queued.
+                    self.ring_wake.end_wait();
+                    Ok(0)
+                }
             }
             // Runs this thread's deferred completion work without waiting.
-            _ => self
-                .uring
-                .submitter()
-                .submit_with_args(0, &types::SubmitArgs::new()),
+            _ => {
+                self.count_enter();
+                self.uring
+                    .submitter()
+                    .submit_with_args(0, &types::SubmitArgs::new())
+            }
         };
         if let Err(e) = entered
             && !matches!(
@@ -1362,8 +1381,14 @@ impl crate::own::OwnIo for ThreadRing {
         if thread::current().id() != self.owner {
             return None;
         }
-        let wake = Arc::clone(&self.wake);
-        Some(crate::OwnIoWaker(Arc::new(move || wake.signal())))
+        let (wake, ring_wake) = (Arc::clone(&self.wake), Arc::clone(&self.ring_wake));
+        // The eventfd only while the owner waits in the ring (`RingWake`): a parked owner is
+        // woken by the unpark beside this, and a running one finds the wake pending.
+        Some(crate::OwnIoWaker(Arc::new(move || {
+            if ring_wake.wake() {
+                wake.signal();
+            }
+        })))
     }
 
     fn fd_here(&self) -> Option<i32> {
