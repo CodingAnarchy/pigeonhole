@@ -206,7 +206,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D190](phase-2.md#d190) — `shrink` clears a region when a large extent has no hole below it · pager, engine, #314, #319 · amends D160
 - [D191](phase-2.md#d191) — Flush-time version GC, and a guarded purge of versions beyond `max_versions` · engine, compaction, sim, #287, #315 · refines D70, D74 · **refined by D192**
 - [D192](phase-2.md#d192) — A bottommost compaction's purge runs under the D191 guard, with a fallback after repeated voids · engine, #316, #328 · refines D70, D191
-- [D193](phase-2.md#d193) — The Phase 2 gate is amended: required measures, a documented gap (#387), and floors that may not regress · owner decision, #287, #387 · amends the spec Phase 2 gate
+- [D193](phase-2.md#d193) — The Phase 2 gate is amended: required measures, a documented gap (#387), and floors that may not regress · owner decision, #287, #387 · amends the spec Phase 2 gate · **amended by D195, D208**
 - [D194](phase-3.md#d194) — Reads skip superseded memtable versions through a writer-only, process-local stale-tail index; on by default (D199) · owner decision, #387 · in-node alternative deferred as #397 · **amended by D199**
 - [D195](phase-3.md#d195) — Three instruction ceilings are raised to main's counts (#384 raced the ceilings; get-sst placement drift); ceiling changes are measured on the current main · owner decision, bench, CI · amends D193
 - [D196](phase-3.md#d196) — The async front door: commit tickets are handles (seqno once resolved), misses wake on I/O through a cache-only read tier, a scan step's unpredicted miss reads synchronously (counted), which calls get async forms (owner: flush/compact yes, backup/shrink/open/close/schema sync-only) · pigeonhole, engine, sst, #42 · amends the spec's "Sync and async" · full scan fix deferred as #398
@@ -221,6 +221,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D205](phase-3.md#d205) — The scan target counts decoded bytes (row key + qualifier + value) on the bench's default 100 B / 8-cell shape; small and wide shapes are reported · owner decision, bench, #29 · amends the spec Goals scan line and the #406 checklist
 - [D206](phase-3.md#d206) — WAL pin passes run in bounded slices from a lazily built log index; the WAL bound may be exceeded by what is logged while a pass runs · coordinator decision, engine, #474, #175 · amends D155
 - [D207](phase-3.md#d207) — A shard keeps a bounded number of group syncs in flight per WAL stream (interim: 1 on macOS, 2 elsewhere); groups that need one meanwhile batch behind them and share the next. 16 clients: Linux 29.5K → 31.5K ops/s, p99 1,458 → ~1,000 µs; macOS 578 → 2.2K ops/s, p99 33 → 11.6 ms · coordinator decision, #412 · default decided on #405
+- [D208](phase-3.md#d208) — The Phase 2 gate's baseline moves to the reference machine: the AX102's first two official gate runs replace the Mac runs 5–6 once committed; #387's ratio to SQLite EAV is judged on them · owner decision, bench, #387, #405 · amends D193
 
 ## Open questions
 _None._

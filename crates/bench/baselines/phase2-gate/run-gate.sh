@@ -16,7 +16,11 @@ cargo build --release -p pigeonhole-bench --features sqlite,rocksdb --manifest-p
 bench="$root/target/release/phdb-bench"
 echo "load average: $(sysctl -n vm.loadavg 2>/dev/null || cat /proc/loadavg)"
 "$bench" sparse-wide --engine pigeonhole,sqlite,rocksdb --scale full --json "$out"
-for base in "$here"/gate2-run5.json "$here"/gate2-run6.json; do
+# The reference machine's two official runs once committed (D208); until then the Mac's (D193).
+bases=("$here"/gate2-run5.json "$here"/gate2-run6.json)
+[[ -f "$here/reference-run1.json" && -f "$here/reference-run2.json" ]] &&
+    bases=("$here"/reference-run1.json "$here"/reference-run2.json)
+for base in "${bases[@]}"; do
   echo "== phdb-bench compare $(basename "$base") $out --tolerance 0.20"
   "$bench" compare "$base" "$out" --tolerance 0.20 || true
 done
