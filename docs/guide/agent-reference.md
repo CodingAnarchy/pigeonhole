@@ -1,6 +1,6 @@
 # Agent reference
 
-> **Status:** describes `main`; crates.io has 0.2.0 (what `main` adds: [changelog](../../CHANGELOG.md), [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). **P2/P3/P4** mark the phase a feature ships in; "early" marks one that already works. If this page and the rustdoc disagree, the rustdoc wins.
+> **Status:** describes `main`; crates.io has 0.2.1 (what `main` adds: [changelog](../../CHANGELOG.md), [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). **P2/P3/P4** mark the phase a feature ships in; "early" marks one that already works. If this page and the rustdoc disagree, the rustdoc wins.
 
 Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Errors: [`errors.md`](errors.md).
 

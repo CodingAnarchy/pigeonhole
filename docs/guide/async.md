@@ -1,6 +1,6 @@
 # Async
 
-> **Not released yet:** this page describes `main`. In 0.2.0 on crates.io the `async` feature is off by default and gates an empty module.
+> **Not released yet:** this page describes `main`. In 0.2.1 on crates.io the `async` feature is off by default and gates an empty module.
 
 Every data operation has two forms over the same engine: a blocking method, and an async method with the same semantics. Pick per call site; one table handle serves both. The async forms are behind the `async` feature, which is **on by default**. To build without them and without their one dependency (`futures-core`), use `pigeonhole = { version = "0.2", default-features = false }`.
 

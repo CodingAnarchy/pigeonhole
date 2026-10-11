@@ -1,6 +1,6 @@
 # Durability
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.2.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics here come from the spec and decisions D12 and D19. The async commit forms are on `main`, not in 0.2.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.2.1, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics here come from the spec and decisions D12 and D19. The async commit forms are on `main`, not in 0.2.1 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every commit says how durable it must be before it returns. The default is the strongest batched level, so a commit that returns is on disk unless you asked for less.
 
