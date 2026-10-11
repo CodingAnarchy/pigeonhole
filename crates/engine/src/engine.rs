@@ -33,9 +33,9 @@ use crate::flush::{SstSink, write_memtable};
 use crate::manifest::{self, ManifestWriter, ReqKind};
 use crate::read::{self, get_in};
 use crate::shard::{
-    BalanceConfig, CloseState, CommitReq, CoordinateReq, FreezeWaiters, LoadSlot, Locks,
-    MaintenanceGuard, Padded, ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared,
-    VisibilityWaiters, bucket_floor, split_by_shard,
+    BalanceConfig, CloseState, CommitReq, CoordinateReq, LoadSlot, Locks, MaintenanceGuard, Padded,
+    ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared, VisibilityCounts,
+    WatermarkWaiters, bucket_floor, split_by_shard,
 };
 use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
@@ -153,8 +153,8 @@ pub struct Metrics {
     /// registrations scanned for a duplicate. Waits per commit near 0 mean the watermark
     /// is not what commits wait on (#154).
     pub visibility_waits: (u64, u64),
-    /// Wake passes over that list (a watermark publish that found waiters), and the
-    /// waiters they woke.
+    /// Wake passes over that list (a watermark publish that reached a registered seqno), and
+    /// the async commits they woke.
     pub visibility_wakes: (u64, u64),
     /// Registrations and wake passes that found the list's lock held by another thread.
     pub visibility_contended: u64,
@@ -636,7 +636,8 @@ impl Engine {
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
-            waiters: VisibilityWaiters::default(),
+            waiters: WatermarkWaiters::default(),
+            visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),
             drivers: if mode == Mode::ApplicationOwned {
@@ -644,7 +645,6 @@ impl Engine {
             } else {
                 Default::default()
             },
-            freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: freeze_bytes,
             wal_pin_bytes: match options.wal_pin_bytes {
                 0 => options.memtable_budget.saturating_mul(2),
@@ -1138,11 +1138,11 @@ impl Engine {
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
-            waiters: VisibilityWaiters::default(),
+            waiters: WatermarkWaiters::default(),
+            visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),
             drivers: Default::default(),
-            freeze_waiters: FreezeWaiters::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             wal_pin_bytes: 0,
             submitters: std::sync::OnceLock::new(),
@@ -1835,7 +1835,7 @@ impl Engine {
                 m.shard_idle.1 += wakes;
             }
         }
-        let w = &shared.waiters;
+        let w = &shared.visibility;
         m.visibility_waits = (
             w.waits.load(Ordering::Relaxed),
             w.scanned.load(Ordering::Relaxed),
@@ -1844,7 +1844,7 @@ impl Engine {
             w.passes.load(Ordering::Relaxed),
             w.woken.load(Ordering::Relaxed),
         );
-        m.visibility_contended = w.contended.load(Ordering::Relaxed);
+        m.visibility_contended = shared.waiters.contended();
         m
     }
 

@@ -39,6 +39,7 @@ mod shard;
 mod snapshot;
 mod source;
 mod waker;
+mod watermark_waiters;
 mod write;
 
 pub use admission::Admit;
