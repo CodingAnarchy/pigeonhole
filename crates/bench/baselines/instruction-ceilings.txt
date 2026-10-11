@@ -75,6 +75,10 @@
 # lowered scan-filtered and versions, which it improves, from the higher of the two head
 # counts (6516, 5459) with `instruction-ceilings.py lower`.
 #
+# Lowered after #530 (a filter's in-block hint is a forward seek, #29): scan-filtered,
+# scan-narrow-q1 and scan-wide-q1 from its head run (38133344600: 5862, 5331, 16287) with
+# `instruction-ceilings.py lower`.
+#
 # Re-baselined after #483, #497, #498 and #500 (main 07a0fe2): lowered with
 # `instruction-ceilings.py lower` from the higher of this PR's base and head counts (run
 # 38092917766); counter keeps its permanent 0.5% headroom. Nothing rose.
@@ -90,7 +94,7 @@ get-sst 17272 0.5
 get-miss 4165 0.3
 row 2475 1.0
 scan 1404 0.3
-scan-filtered 6536 0.3
+scan-filtered 5880 0.3
 versions 5476 0.3
 counter 9388 0.5
 rows 19655 0.3
@@ -108,6 +112,6 @@ scan-narrow 1435 0.3
 scan-small 1411 0.3
 scan-wide 1331 0.3
 commit-async 10061 0.3
-scan-narrow-q1 8050 0.3
+scan-narrow-q1 5347 0.3
 scan-wide-q10 1860 0.3
-scan-wide-q1 17511 0.3
+scan-wide-q1 16336 0.3

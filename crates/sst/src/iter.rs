@@ -528,7 +528,7 @@ impl SstIter {
 
     fn seek_forward(&mut self, target: &[u8]) -> Result<()> {
         let data = loaded(&mut self.data)?;
-        data.seek(target)?;
+        data.seek_forward(target)?;
         if !data.valid() {
             self.position(Some(target))?;
         }

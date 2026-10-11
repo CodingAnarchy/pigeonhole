@@ -103,6 +103,41 @@ proptest! {
         }
     }
 
+    /// A forward seek from any entry lands where a seek does, for every target at or past
+    /// the current key, and so does each following forward seek (#29).
+    #[test]
+    fn seek_forward_from_anywhere_equals_seek(
+        model in entries(),
+        interval in 1usize..20,
+        start in any::<prop::sample::Index>(),
+        targets in vec(cell().prop_map(|c| c.encode()), 1..sized(10, 3)),
+    ) {
+        prop_assume!(!model.is_empty());
+        let bytes = build_data(&model, interval);
+        let keys: Vec<&Vec<u8>> = model.keys().collect();
+        let first = keys[start.index(keys.len())].clone();
+        // Targets at or after the start, ascending, plus keys of the block itself.
+        let mut ts: Vec<Vec<u8>> = targets.into_iter().chain(keys.iter().map(|k| k.to_vec()))
+            .filter(|t| *t >= first).collect();
+        ts.sort();
+        let cursor = || Block::new(bytes.as_slice()).unwrap().into_cursor();
+        let mut fwd = cursor();
+        fwd.seek(&first).unwrap();
+        for t in ts.iter().step_by(1 + ts.len() / 12) {
+            if !fwd.valid() {
+                break;
+            }
+            fwd.seek_forward(t).unwrap();
+            let mut s = cursor();
+            s.seek(t).unwrap();
+            prop_assert_eq!(fwd.valid(), s.valid(), "target {:?}", t);
+            if s.valid() {
+                prop_assert_eq!(fwd.key(), s.key());
+                prop_assert_eq!(fwd.value(), s.value());
+            }
+        }
+    }
+
     #[test]
     fn index_block_matches_model(model in btree_map(vec(any::<u8>(), 0..12), vec(any::<u8>(), 0..10), 0..sized(60, 10)), targets in vec(vec(any::<u8>(), 0..12), 0..sized(10, 3))) {
         let mut b = BlockBuilder::index();
