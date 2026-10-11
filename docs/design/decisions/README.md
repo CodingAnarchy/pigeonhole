@@ -147,7 +147,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D131](phase-1.md#d131) — checkpoints compare slots against the catalog, not the shard · tablets, #97
 - [D132](phase-1.md#d132) — a commit routed through an older tablet map · tablets, #97 · **amended by D145**
 - [D133](phase-1.md#d133) — the default-timestamp floor of a moved tablet · tablets, #97
-- [D134](phase-1.md#d134) — what the balancer does, and its options · tablets, #97; stability work in #103 · **amended by D144, D146**
+- [D134](phase-1.md#d134) — what the balancer does, and its options · tablets, #97; stability work in #103 · **amended by D144, D146, D214**
 - [D135](phase-1.md#d135) — a split's children and the view buffer (D28) · tablets, #97
 - [D136](phase-1.md#d136) — arena room for many tablet slots · tablets, #97; refinement in #104 · **amended by D189**
 - [D137](phase-1.md#d137) — What does `Engine::compact` guarantee while tablets split, merge and move · engine
@@ -159,7 +159,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D143](phase-1.md#d143) — Should commits pipelined on one row keep their order during a move · engine
 - [D144](phase-1.md#d144) — Who rewrites a cold child's inherited SST so that the balancer can merge it back · tablets, #95 · amends D134
 - [D145](phase-1.md#d145) — How long may a commit wait on a tablet change, and when is a PREPARE routed with an older tablet map refused · tablets, #102 · amends D132
-- [D146](phase-1.md#d146) — How does the balancer avoid thrashing, oversubscribing a shard's slots and growing the tablet count without… · tablets, #103 · amends D134 · **amended by D154**
+- [D146](phase-1.md#d146) — How does the balancer avoid thrashing, oversubscribing a shard's slots and growing the tablet count without… · tablets, #103 · amends D134 · **amended by D154, D214**
 - [D147](phase-1.md#d147) — Does a prepared, undecided cross-shard share count as above a compaction's inputs · engine, #132 · amends D70
 - [D148](phase-1.md#d148) — Reader snapshots from before a writer restart expire with `SnapshotExpired` · process, #140 F7-1
 - [D149](phase-1.md#d149) — A reader builds a view only from the catalog of the record's own manifest version · process, #140 F7-2
@@ -226,6 +226,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D211](phase-3.md#d211) — No manifest checkpoint may name a WAL stream whose file creation is not durable: a shard holds its checkpoint back until the new stream's file and directory syncs finish (`Wal::created_durable`, ICR 0031) · coordinator decision, engine, wal, #520 · amends D203
 - [D212](phase-3.md#d212) — The manifest keeps today's exclusion protocol (loom-modelled, #536); no single writer task, which would refuse blocking catalog changes on the writer shard's driver (changing D150 (a)) and need async catalog APIs; revisit at the public API / C ABI review or on a new bug in these paths · owner decision, engine, #134
 - [D213](phase-3.md#d213) — The durable group-commit target (> 1M cells/s across cores, p99 < 200 µs) is measured with N shards = cores, the table split over every shard up front with the balancer off so the placement stays fixed (a tablet change while measuring fails the run), and 16 durable commits in flight inline per shard (the D204 driver); the report breaks out the engine's part of the commit and WAL rollover blocks; the 1/4/16-client sweep stays as a reported secondary, and the gate's setup step times the drive's raw fdatasync as the p99 floor · owner decision, bench, #64, #406
+- [D214](phase-3.md#d214) — The balancer acts on write skew only after 10 consecutive skewed passes (newest interval weighted 0.2), keeps shedding load after each dwell while above 1.1× the mean, and splits a dominant tablet into about load/mean children · owner direction, tablets, #547 · amends D134, D146
 
 ## Open questions
 _None._

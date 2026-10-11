@@ -1,0 +1,2 @@
+### Changed
+- The tablet balancer moves or splits tablets for write skew only after a shard's load has stayed skewed for 10 balancer passes (1 s by default), measured on a slower moving average. It then keeps shedding load until the shard is within 1.1× the mean (D214, #547). A skew split makes about as many pieces as the shard's load divided by the mean. Short-term noise under uniform write load no longer moves tablets. Reacting to a real, sustained skew takes about 1–3 s longer.

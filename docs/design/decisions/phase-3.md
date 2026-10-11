@@ -544,3 +544,29 @@ The window's setup step (`machine.py`) also times the data drive's raw fdatasync
 **Why inline committers rather than async client threads:** it's the scaling gate's style (D204). No client thread competes with the shards for cores, so the result is the engine's, at the thread-per-core embedding the spec targets. Each shard's 16 commits in flight form its fsync groups. The commit latency is submit to durable resolution, the same as the scaling gate measures it.
 
 **Not changed:** the target, the commit size, the row count, and the secondary sweep's numbers, which stay comparable with earlier runs.
+
+<a id="d214"></a>
+## D214 — The balancer acts on write skew only once it persists, and keeps acting until the shard is balanced (owner direction, 2026-10-11; tablets, #547; amends D134 and D146)
+
+**Decided:** write skew (D134 item 2, D146) moves or splits a tablet only when it is sustained:
+- **Persistence.** A shard starts acting on write skew after its load has been above `balance_skew` (1.25) times the mean, and at least `balance_min_writes`, on **10 consecutive balancer passes** (1 s at the default interval). Any pass below resets the count. The count runs on every pass, dwell or not.
+- **Slower average.** The moving averages of write load (a shard's, published for the others, and each tablet's) weigh the newest interval **0.2**, not 0.5.
+- **Hysteresis.** Once acting, a shard keeps moving or splitting after each 10-pass dwell (D146) while its load stays above **1.1 times the mean** (`1 + 0.4 × (balance_skew − 1)`). It stops when its load falls below that or below `balance_min_writes`, and then needs 10 skewed passes again. A first move that leaves the shard skewed doesn't end the balancing: a shard at 3 times the mean with several tablets sheds one per dwell until it is below 1.1 times the mean.
+- **Proportional skew split.** When one tablet dominates and splits for skew, it makes about `my / mean` children: `round(my / mean)`, at least 2 and at most one more than the shards below the mean. The children go to the coldest of those shards. A shard at 1.3 times the mean sheds into one other shard. A single tablet carrying all of a table's load (the scaling gate's skewed-multi-shard start, about N times the mean) still splits over every shard in one step.
+- **Not changed.** Dwell (10 passes per shard after a move or split over shards, and per arrived tablet), size splits, merges, consolidation, slot reservations and idle backoff. The constants are internal; no option is added.
+
+**Why.** On the AX102, a uniform D213 write load over 32 shards caused 11–65 tablet moves in a 10 s measured phase (#547). #547's step 1 reproduced it on the Mac: the D213 driver with a pre-split table, Buffered so the per-shard rates reach `balance_min_writes` (GroupSync on the Mac's fsync stays below it), 60 s per run:
+- **Changes under uniform load:** about 35 moves/min at 4 shards, 256 at 16 and 211 at 32. 32 shards also made 66 splits/min and ended with 21–51 tablets per shard.
+- **Throughput cost:** 0.52–0.69 M commits/s, against 1.16–1.39 M with decisions logged but not executed.
+- **Where the noise comes from:** per-shard writes per 100 ms pass vary by 42–57% (coefficient of variation). With weight 0.5 a shard's average sat above 1.25 times the mean on 4–10% of passes.
+- **How it cascades:** one trigger on a shard with a single tablet split it into one child per shard below the mean, up to 16 at 32 shards. The change itself then made real imbalance, which the balancer chased.
+
+Replaying candidate rules on the logged per-shard loads showed that persistence is what separates noise from a real shift. A slower average or a higher threshold alone did not:
+- **Noise-triggered changes under uniform load:** from 59 / 60 / 221 per minute at 4 / 16 / 32 shards to 1 / 0 / 0.
+- **Reaction to a real skew shift:** a quarter of the threads move to one shard's range, about 1.33 times the mean. Reaction went from 0.5 / 5.1 / 0.8 s to 3.7 / 6.0 / 1.8 s.
+
+The hysteresis is the issue's form (start at 1.25, stop below a lower bound). The proposed form ("don't count again until below 1.1") would have left a shard that is still skewed after its first move stuck.
+
+**Tests.**
+- `a_skewed_shard_keeps_shedding_tablets_until_balanced`: 12 tablets, 9 on one shard. It must make six moves, one per dwell, to reach 3 per shard, then nothing more.
+- `a_short_burst_of_skew_changes_no_tablet`: 4 passes at 3 times the mean change nothing. Under the old rule they split the hot tablet.

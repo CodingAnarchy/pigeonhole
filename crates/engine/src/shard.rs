@@ -2150,6 +2150,11 @@ pub(crate) struct ShardState {
     arrived: HashMap<TabletId, u64>,
     /// The pass at which the balancer last started a move or a split over shards.
     skew_pass: Option<u64>,
+    /// Consecutive balancer passes this shard's load was skewed (D214).
+    skew_run: u64,
+    /// Whether this shard acts on write skew: from `SKEW_PERSIST` skewed passes until its
+    /// load falls below the stop ratio (D214).
+    skew_active: bool,
     /// Wakes the shard for its next balancer pass (#103).
     balance_timer: Option<Arc<TimerState>>,
     /// The current balancer interval: the base `balance_interval_nanos`, doubled after each
@@ -2303,6 +2308,8 @@ impl ShardState {
             balance_pass: 0,
             arrived: HashMap::new(),
             skew_pass: None,
+            skew_run: 0,
+            skew_active: false,
             balance_timer: None,
             balance_interval: 0,
             balance_epoch: 0,

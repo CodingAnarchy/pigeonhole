@@ -359,9 +359,10 @@ fn a_tables_writes_spread_across_shards_after_splits() {
         o.balance_min_writes = 10;
     });
     let mut written = 0u64;
-    // One table, one hot tablet on one shard: the balancer splits it over the idle shards.
-    for _ in 0..4 {
-        for _ in 0..300 {
+    // One table, one hot tablet on one shard: once the skew has held for 10 passes (D214),
+    // the balancer splits it over the idle shards.
+    for _ in 0..14 {
+        for _ in 0..100 {
             db.put(&key(written), b"v");
             written += 1;
         }
@@ -387,6 +388,135 @@ fn a_tables_writes_spread_across_shards_after_splits() {
     }
     let (splits, _, _) = tablet_changes(&db.engine);
     assert!(splits > 0);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Row `i` of tablet `t` in [`tablets_on`]'s layout (split at `t01`, `t02`, ...).
+fn tablet_row(t: usize, i: u64) -> Vec<u8> {
+    format!("t{t:02}-{i:08}").into_bytes()
+}
+
+/// Splits the table into `n` tablets (`tablet_row(t, _)` lands in tablet `t`) and moves
+/// tablet `t` to `owner(t)`.
+fn tablets_on(db: &mut Db, n: usize, owner: impl Fn(usize) -> u16) {
+    let id = db.table.id;
+    for t in 1..n {
+        let m = db
+            .engine
+            .split_tablet_pending(id, format!("t{t:02}").as_bytes())
+            .unwrap();
+        db.drive(m).unwrap();
+    }
+    for t in 0..n {
+        let row = tablet_row(t, 0);
+        let from = db
+            .ranges()
+            .into_iter()
+            .find(|(_, _, start, end)| {
+                row.as_slice() >= start.as_slice()
+                    && end.as_deref().is_none_or(|e| row.as_slice() < e)
+            })
+            .unwrap()
+            .1;
+        if from != owner(t) {
+            let m = db.engine.move_tablet_pending(id, &row, owner(t)).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    assert_eq!(db.ranges().len(), n);
+}
+
+/// Tablets per shard.
+fn tablets_per_shard(db: &Db, shards: usize) -> Vec<usize> {
+    let mut out = vec![0; shards];
+    for (_, s, ..) in db.ranges() {
+        out[usize::from(s)] += 1;
+    }
+    out
+}
+
+/// One balancer pass, driven to completion, after `rows(t)` writes to each tablet `t`.
+fn write_and_balance(db: &mut Db, n: usize, rows: impl Fn(usize) -> u64, written: &mut u64) {
+    for t in 0..n {
+        for _ in 0..rows(t) {
+            db.put(&tablet_row(t, *written), b"v");
+            *written += 1;
+        }
+    }
+    let m = db.engine.balance_pending().unwrap();
+    db.drive(m).unwrap();
+}
+
+/// A shard at about 3x the mean with several tablets keeps shedding them, one move per dwell,
+/// until it is below 1.1x the mean, then the balancer stops (D214's hysteresis: a first
+/// move that leaves the shard skewed does not end the balancing).
+#[test]
+fn a_skewed_shard_keeps_shedding_tablets_until_balanced() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX; // only the explicit balancer passes below
+        o.balance_min_writes = 10;
+    });
+    // 12 equally written tablets: 9 on shard 0, one on each other shard.
+    let n = 12;
+    tablets_on(&mut db, n, |t| if t < 9 { 0 } else { (t - 8) as u16 });
+    assert_eq!(tablets_per_shard(&db, shards), vec![9, 1, 1, 1]);
+    let setup = tablet_changes(&db.engine);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, shards) != vec![3, 3, 3, 3] && passes < 300 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    let changes = (after.0 - setup.0, after.1 - setup.1, after.2 - setup.2);
+    assert_eq!(
+        tablets_per_shard(&db, shards),
+        vec![3, 3, 3, 3],
+        "after {passes} passes, (splits, merges, moves) {changes:?}"
+    );
+    // Six moves, the first after the 10-pass persistence and one per dwell after it.
+    assert_eq!(changes, (0, 0, 6), "after {passes} passes");
+    // Balanced (every shard at the mean): nothing changes any more.
+    for _ in 0..60 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+    }
+    assert_eq!(tablet_changes(&db.engine), after);
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A burst of skew shorter than the persistence (10 passes, D214) moves and splits nothing:
+/// before D214 one skewed pass split the hot shard's tablet over the others.
+#[test]
+fn a_short_burst_of_skew_changes_no_tablet() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    let n = 4;
+    tablets_on(&mut db, n, |t| t as u16);
+    let before = tablet_changes(&db.engine);
+    let mut written = 0;
+    for pass in 0..40 {
+        // Passes 10..14: tablet 0 (shard 0) takes 3x the writes of the others.
+        let burst = (10..14).contains(&pass);
+        write_and_balance(
+            &mut db,
+            n,
+            |t| if burst && t == 0 { 60 } else { 20 },
+            &mut written,
+        );
+    }
+    assert_eq!(tablet_changes(&db.engine), before);
+    assert_eq!(tablets_per_shard(&db, shards), vec![1, 1, 1, 1]);
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();

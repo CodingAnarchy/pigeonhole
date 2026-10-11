@@ -810,7 +810,7 @@ The spec gives the triggers (size, sustained write skew, small and cold) but no 
 
 `balance_interval_nanos`, `balance_min_writes` and `balance_skew` are new, additive `EngineOptions` fields. The test hooks `split_tablet_pending`, `merge_tablets_pending`, `move_tablet_pending`, `balance_pending`, `tablet_changes`, `max_ts_floor` and `TabletMap::ranges` sit behind `test-hooks`, like the other hooks. With `tablet_changes` off the balancer never runs (D129).
 
-*History: Amended by D144 (cleanup rewrites so a cold child can merge back; #95), D146 (smoothed load, dwell, reservations, consolidation, idle wake-ups; #103) and, through it, D154 (an idle shard's balancer backs off to 10 s; #168).*
+*History: Amended by D144 (cleanup rewrites so a cold child can merge back; #95), D146 (smoothed load, dwell, reservations, consolidation, idle wake-ups; #103) and, through it, D154 (an idle shard's balancer backs off to 10 s; #168), and D214 (write skew acts only once it persists; #547).*
 
 <a id="d135"></a>
 ## D135 — a split's children and the view buffer (D28) (approved; tablets, #97)
@@ -933,7 +933,7 @@ Proposed amendment to D134: replace "The same rule applies to memtable bytes…"
 
 **Coordinator:** confirmed.
 
-*History: Amended by D154 (an idle shard's balancer backs off to 10 s; #168).*
+*History: Amended by D154 (an idle shard's balancer backs off to 10 s; #168) and D214 (write skew acts only once it persists, with a slower average and hysteresis; #547).*
 
 <a id="d147"></a>
 ## D147 — Does a prepared, undecided cross-shard share count as above a compaction's inputs (approved; engine, #132; amends D70)

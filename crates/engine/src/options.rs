@@ -99,8 +99,9 @@ pub struct EngineOptions {
     /// `tablet_changes` is on.
     pub balance_min_writes: u64,
     /// A shard whose write load (a moving average over intervals) exceeds this multiple of
-    /// the mean over all shards is skewed (default 1.25). Only read when `tablet_changes` is
-    /// on.
+    /// the mean over all shards is skewed (default 1.25). It acts on the skew after 10
+    /// skewed passes in a row, and keeps acting until its load falls below
+    /// `1 + 0.4 × (skew − 1)` times the mean (D214). Only read when `tablet_changes` is on.
     pub balance_skew: f64,
     /// Merge operators available to this process.
     pub merge_operators: MergeRegistry,
