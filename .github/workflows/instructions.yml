@@ -53,7 +53,7 @@ env:
     readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans
     writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,flush,compact
     ycsb:ycsb-c,ycsb-a
-    scanrate:scan-narrow,scan-small,scan-wide
+    scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
   # The largest increase (percent of the base) a state or shape may show before the job fails,
   # `name=percent` (space-separated), with `default` for the rest. Set from callgrind's
   # run-to-run noise on identical code (#354): within 0.1% for the hot-row states and read

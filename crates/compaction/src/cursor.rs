@@ -3,7 +3,7 @@
 
 use pigeonhole_format::Cursor;
 use pigeonhole_format::key::{compare, row_prefix_len};
-use pigeonhole_format::scan::ScanFilter;
+use pigeonhole_format::scan::{CompiledFilter, ScanFilter, Verdict};
 
 /// A k-way merge of cursors into one ordered cursor. Sources are ordered newest first; since
 /// internal keys are unique (they contain the seqno), ties cannot occur (if they do, the
@@ -288,9 +288,10 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
     }
 }
 
-/// Applies a [`ScanFilter`] to any cursor with [`ScanFilter::admits`], so sources without
-/// built-in pushdown (memtables) filter exactly like `SstIter` does. Excluded qualifiers are
-/// skipped with a seek to [`ScanFilter::next_admissible`], not stepped over.
+/// Applies a [`ScanFilter`] to any cursor, compiled ([`ScanFilter::compile`]) as `SstIter`
+/// compiles it, so sources without built-in pushdown (memtables) filter exactly like
+/// `SstIter` does. Excluded qualifiers are skipped with a seek to the filter's hint, not
+/// stepped over.
 ///
 /// ```
 /// use pigeonhole_compaction::{FilteredCursor, VecCursor};
@@ -315,7 +316,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
 #[derive(Debug)]
 pub struct FilteredCursor<C> {
     inner: C,
-    filter: ScanFilter,
+    filter: CompiledFilter,
     all: bool,
     hint: Vec<u8>,
 }
@@ -325,8 +326,8 @@ impl<C: Cursor> FilteredCursor<C> {
     pub fn new(inner: C, filter: ScanFilter) -> Self {
         Self {
             all: filter.is_all(),
+            filter: filter.into_compiled(),
             inner,
-            filter,
             hint: Vec::new(),
         }
     }
@@ -348,18 +349,13 @@ impl<C: Cursor> FilteredCursor<C> {
     }
 
     fn settle_filtered(&mut self) -> Result<(), C::Error> {
-        while self.inner.valid() && !self.filter.admits(self.inner.key()) {
-            self.hint.clear();
-            if !self
-                .filter
-                .next_admissible(self.inner.key(), &mut self.hint)
-            {
+        while self.inner.valid() {
+            match self.filter.check(self.inner.key(), &mut self.hint) {
+                Verdict::Admit => break,
                 // Nothing later in this row can be admitted.
-                self.inner.skip_row()?;
-            } else if self.hint.as_slice() > self.inner.key() {
-                self.inner.seek(&self.hint)?;
-            } else {
-                self.inner.next()?;
+                Verdict::SkipRow => self.inner.skip_row()?,
+                Verdict::Seek => self.inner.seek(&self.hint)?,
+                Verdict::Next => self.inner.next()?,
             }
         }
         Ok(())

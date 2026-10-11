@@ -10,6 +10,7 @@ use pigeonhole_format::block::{Block, BlockAddr, BlockIter, BlockKind};
 use pigeonhole_format::key::row_prefix_len;
 
 use crate::{Error, Fetch, ReadOptions, Result, ScanFilter, SstReader};
+use pigeonhole_format::scan::{CompiledFilter, Verdict};
 
 /// A zero-copy cursor over one SST, from [`SstReader::iter`].
 ///
@@ -19,8 +20,9 @@ use crate::{Error, Fetch, ReadOptions, Result, ScanFilter, SstReader};
 /// cursor.
 ///
 /// The cursor only ever stops on entries its [`ScanFilter`] admits: excluded qualifiers are
-/// skipped with seeks ([`ScanFilter::next_admissible`]), so a filtered scan returns exactly
-/// the unfiltered entries for which [`ScanFilter::admits`] holds (decision D22).
+/// skipped with seeks (the compiled filter's hints, [`ScanFilter::compile`]), so a filtered
+/// scan returns exactly the unfiltered entries for which [`ScanFilter::admits`] holds
+/// (decision D22).
 /// [`Cursor::skip_row`] uses each block's row-start table and crosses into the next block only
 /// if the row continues there.
 ///
@@ -76,7 +78,7 @@ use crate::{Error, Fetch, ReadOptions, Result, ScanFilter, SstReader};
 #[derive(Debug)]
 pub struct SstIter {
     reader: Arc<SstReader>,
-    filter: ScanFilter,
+    filter: CompiledFilter,
     filter_all: bool,
     options: ReadOptions,
     top: Option<BlockIter<BlockHandle>>,
@@ -195,11 +197,12 @@ fn loaded(slot: &mut Option<BlockIter<BlockHandle>>) -> Result<&mut BlockIter<Bl
 }
 
 impl SstIter {
+    #[inline]
     pub(crate) fn new(reader: Arc<SstReader>, filter: ScanFilter, options: ReadOptions) -> Self {
         Self {
             reader,
             filter_all: filter.is_all(),
-            filter,
+            filter: filter.into_compiled(),
             options,
             top: None,
             index: None,
@@ -576,20 +579,16 @@ impl SstIter {
             return Ok(());
         }
         while let Some(data) = self.data.as_ref().filter(|d| d.valid()) {
-            let key = data.key();
-            if self.filter.admits(key) {
-                return Ok(());
-            }
-            self.hint.clear();
-            if !self.filter.next_admissible(key, &mut self.hint) {
-                self.skip_row_raw()?;
-            } else if self.hint.as_slice() > key {
-                let hint = std::mem::take(&mut self.hint);
-                let r = self.seek_forward(&hint);
-                self.hint = hint;
-                r?;
-            } else {
-                self.next_raw()?;
+            match self.filter.check(data.key(), &mut self.hint) {
+                Verdict::Admit => return Ok(()),
+                Verdict::SkipRow => self.skip_row_raw()?,
+                Verdict::Seek => {
+                    let hint = std::mem::take(&mut self.hint);
+                    let r = self.seek_forward(&hint);
+                    self.hint = hint;
+                    r?;
+                }
+                Verdict::Next => self.next_raw()?,
             }
         }
         Ok(())
