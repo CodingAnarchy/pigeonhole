@@ -476,7 +476,7 @@ pub(crate) struct CompactionWork {
     record: Option<CompactionRecord>,
     /// A bottommost purge's guard (#316): its commit installs only if no write below its
     /// `min_ts_above` voided it since the plan (see `Shard::admit_against_guards`).
-    pub guard: Option<Arc<std::sync::atomic::AtomicU8>>,
+    pub guard: Option<Arc<crate::purge_guard::PurgeGuard>>,
     /// Test hook (`Engine::hold_compactions`): held before the first slice, then released.
     #[cfg(feature = "test-hooks")]
     hold: (bool, bool),
@@ -802,19 +802,9 @@ impl CompactionWork {
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
                 // A bottommost purge installs only if no write below its bound arrived
                 // since the plan; from here on such writes wait for this commit (#316).
-                if let Some(g) = &guard {
-                    use crate::shard::{GUARD_IN_FLIGHT, GUARD_INSTALLING};
-                    use std::sync::atomic::Ordering;
-                    match g.compare_exchange(
-                        GUARD_IN_FLIGHT,
-                        GUARD_INSTALLING,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        // A re-run of this closure finds its own claim.
-                        Ok(_) | Err(GUARD_INSTALLING) => {}
-                        Err(_) => return Err(Error::Busy),
-                    }
+                // A re-run of this closure finds its own claim (`PurgeGuard::claim`).
+                if guard.as_ref().is_some_and(|g| !g.claim()) {
+                    return Err(Error::Busy);
                 }
                 let mut edits = edits;
                 if !blobs.is_empty() {
@@ -940,9 +930,7 @@ impl Task for CompactionWork {
                     }
                     // A write voided the purge (#316): the commit would be refused, so stop
                     // now rather than finish the rewrite.
-                    if self.guard.as_ref().is_some_and(|g| {
-                        g.load(std::sync::atomic::Ordering::Acquire) == crate::shard::GUARD_VOIDED
-                    }) {
+                    if self.guard.as_ref().is_some_and(|g| g.voided()) {
                         if let Some(job) = self.job.take() {
                             job.abort();
                         }

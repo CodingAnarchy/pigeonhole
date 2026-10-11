@@ -54,7 +54,7 @@ pub(crate) struct FlushItem {
     /// slot could hold a delete, so versions beyond `max_versions` may be purged. Its state
     /// (`shard::GUARD_*`) is shared with the shard: the commit installs the purge only if no
     /// delete in the family voided it meanwhile.
-    pub guard: Option<Arc<std::sync::atomic::AtomicU8>>,
+    pub guard: Option<Arc<crate::purge_guard::PurgeGuard>>,
     pub options: FamilyOptions,
 }
 
@@ -641,7 +641,7 @@ impl FlushTask {
         // installs only if no delete in its family voided it since the memtable was queued;
         // from here on such deletes wait for this commit's outcome (#287).
         let deltas = std::mem::take(&mut self.blob_deltas);
-        let guards: Vec<Arc<std::sync::atomic::AtomicU8>> =
+        let guards: Vec<Arc<crate::purge_guard::PurgeGuard>> =
             self.items.iter().filter_map(|i| i.guard.clone()).collect();
         #[cfg(feature = "test-hooks")]
         let install_seqnos = std::mem::take(&mut self.install_seqnos);
@@ -656,21 +656,9 @@ impl FlushTask {
             #[cfg(feature = "test-hooks")]
             let shared = Arc::downgrade(&self.shared);
             manifest::ReqKind::Catalog(Box::new(move |catalog: &mut Catalog| {
-                use crate::shard::{GUARD_IN_FLIGHT, GUARD_INSTALLING};
-                use std::sync::atomic::Ordering;
-                for g in &guards {
-                    match g.compare_exchange(
-                        GUARD_IN_FLIGHT,
-                        GUARD_INSTALLING,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        // A re-run of this closure finds its own claim.
-                        Ok(_) | Err(GUARD_INSTALLING) => {}
-                        Err(_) => {
-                            return Err(Error::Busy);
-                        }
-                    }
+                // A re-run of this closure finds its own claim (`PurgeGuard::claim`).
+                if !guards.iter().all(|g| g.claim()) {
+                    return Err(Error::Busy);
                 }
                 #[cfg(feature = "test-hooks")]
                 for s in &install_seqnos {
