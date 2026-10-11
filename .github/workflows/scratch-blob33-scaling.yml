@@ -1,0 +1,33 @@
+name: scratch blob33 alloc (temporary)
+on:
+  push:
+    branches: [scratch/blob33-scaling]
+permissions:
+  contents: read
+jobs:
+  alloc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: alloc rows at each commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for c in $(cat ab-shapes.txt); do
+            git checkout -q "$c"
+            git checkout -q ${GITHUB_SHA} -- .github/workflows/scratch-blob33-scaling.yml ab-shapes.txt
+            cargo test -q --release -p pigeonhole-engine --test alloc_budget -- --nocapture > out/$c.txt 2>&1 || true
+            echo "== $c" >> out/summary.md
+            grep -E "^\| (commit|flush|compaction)" out/$c.txt >> out/summary.md || true
+          done
+          cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alloc-out
+          path: out/
