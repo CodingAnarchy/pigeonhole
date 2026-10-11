@@ -499,7 +499,17 @@ fn foreground_latency_bounded_real(mode: Mode) {
         stop: Arc::clone(&stop),
     };
     h.submitter(0).submit(Msg::Spawn(Box::new(busy))).unwrap();
-    let mut lat = Vec::new();
+    // A plain thread answering the same round trips, interleaved with the shard's: how long
+    // this machine takes to get a thread to answer right now. A loaded runner can hold any
+    // thread off its CPU for tens of milliseconds (main's macOS CI: a p99 of 98 ms), which is
+    // not the shard holding a foreground message behind its background task.
+    let (ask, asked) = std::sync::mpsc::channel::<(u64, Notifier<u64>)>();
+    let reference = thread::spawn(move || {
+        for (i, n) in asked {
+            n.notify(i);
+        }
+    });
+    let (mut lat, mut reference_lat) = (Vec::new(), Vec::new());
     for i in 0..200 {
         let (n, w) = completion();
         let t = Instant::now();
@@ -507,15 +517,33 @@ fn foreground_latency_bounded_real(mode: Mode) {
         assert_eq!(w.wait(), Some(i));
         lat.push(t.elapsed());
         thread::sleep(Duration::from_micros(300));
+        let (n, w) = completion();
+        let t = Instant::now();
+        ask.send((i, n)).unwrap();
+        assert_eq!(w.wait(), Some(i));
+        reference_lat.push(t.elapsed());
+        thread::sleep(Duration::from_micros(300));
     }
+    drop(ask);
+    reference.join().unwrap();
     stop.store(true, Ordering::Relaxed);
     h.finish(|_| ());
-    lat.sort();
-    let p50 = lat[lat.len() / 2];
-    let p99 = lat[lat.len() * 99 / 100];
-    // One 1 ms slice bounds the wait; the margins absorb CI scheduling noise.
-    assert!(p50 < Duration::from_millis(5), "p50 {p50:?}");
-    assert!(p99 < Duration::from_millis(50), "p99 {p99:?}");
+    let quantiles = |lat: &mut Vec<Duration>| {
+        lat.sort();
+        (lat[lat.len() / 2], lat[lat.len() * 99 / 100])
+    };
+    let (p50, p99) = quantiles(&mut lat);
+    let (ref_p50, ref_p99) = quantiles(&mut reference_lat);
+    // One 1 ms slice bounds the wait; the margins absorb CI scheduling noise beyond what the
+    // plain thread saw.
+    assert!(
+        p50 < Duration::from_millis(5) + ref_p50,
+        "p50 {p50:?} (a plain thread: {ref_p50:?})"
+    );
+    assert!(
+        p99 < Duration::from_millis(50) + ref_p99,
+        "p99 {p99:?} (a plain thread: {ref_p99:?})"
+    );
 }
 
 fn shutdown_handles_queued_then_refuses(mode: Mode) {
