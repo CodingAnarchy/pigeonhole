@@ -903,8 +903,9 @@ pub(crate) fn end(
             return;
         }
     };
-    let tablets = catalog.tablets();
-    let live: std::collections::HashSet<_> = tablets.iter().map(|t| t.id).collect();
+    // Only a commit that changed tablets needs a new tablet map (#499: no list built for
+    // the others).
+    let tablets = tablets_changed.then(|| catalog.tablets());
     // Memtables whose SSTs this commit adds leave this view and, through
     // `Shared::flushed_roots`, every later one until their shards retire them. The roots join
     // `flushed_roots` only with the view stored: a failed publish keeps the old view, which
@@ -918,23 +919,27 @@ pub(crate) fn end(
                 let shard = i as u16;
                 let dropped = |root: u32| flushed_roots.contains(&(shard, root));
                 let piece = piece.without(&dropped).unwrap_or_else(|| Arc::clone(piece));
-                if piece.map.keys().all(|k| live.contains(&k.0)) {
+                // Memtables of a tablet that is gone leave the view (a lookup per slot, no set).
+                let live = |t: TabletId| catalog.tablet(t).is_some();
+                if piece.map.keys().all(|k| live(k.0)) {
                     piece
                 } else {
                     Arc::new(ShardMems {
                         map: piece
                             .map
                             .iter()
-                            .filter(|(k, _)| live.contains(&k.0))
+                            .filter(|(k, _)| live(k.0))
                             .map(|(k, v)| (*k, Arc::clone(v)))
                             .collect(),
                     })
                 }
             })
             .collect();
-        let ssts = Arc::new(SstSet::build(
+        let ssts = Arc::new(SstSet::rebuild(
             &catalog,
-            Some(&cur.ssts),
+            &old,
+            &cur.ssts,
+            sst_changed,
             &mut readers,
             shared.pager.data_file().clone(),
             Arc::clone(&shared.cache),
@@ -942,10 +947,9 @@ pub(crate) fn end(
         View {
             version: view_version,
             manifest_version: version,
-            tablets: if tablets_changed {
-                Arc::new(TabletMap::build(cur.tablets.version() + 1, &tablets))
-            } else {
-                Arc::clone(&cur.tablets)
+            tablets: match &tablets {
+                Some(tablets) => Arc::new(TabletMap::build(cur.tablets.version() + 1, tablets)),
+                None => Arc::clone(&cur.tablets),
             },
             catalog: Arc::clone(&catalog),
             mems,

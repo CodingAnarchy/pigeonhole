@@ -114,18 +114,6 @@ impl TabletMap {
     pub(crate) fn entry(&self, id: TabletId) -> Option<&TabletEntry> {
         self.iter().find(|t| t.id == id)
     }
-
-    pub(crate) fn to_view_tablets(&self) -> Vec<ViewTablet> {
-        self.iter()
-            .map(|t| ViewTablet {
-                tablet: t.id,
-                table: t.table,
-                shard: t.shard.0,
-                start: t.start.clone(),
-                end: t.end.clone(),
-            })
-            .collect()
-    }
 }
 
 /// The memtables of one `(tablet, family)` as a view sees them: the active one first, then
@@ -415,10 +403,12 @@ impl FamilySsts {
 pub(crate) struct SstSet {
     pub file: FileRef,
     pub cache: Arc<BlockCache>,
-    pub map: FastMap<(TabletId, FamilyId), Arc<FamilySsts>>,
-    by_id: FastMap<SstId, Arc<OpenSst>>,
+    /// Each part is shared with the previous version when a commit left it unchanged
+    /// (`SstSet::rebuild`): most manifest commits change no SST (#499).
+    pub map: Arc<FastMap<(TabletId, FamilyId), Arc<FamilySsts>>>,
+    by_id: Arc<FastMap<SstId, Arc<OpenSst>>>,
     /// The blob files of this manifest version.
-    blobs: FastMap<BlobFileId, Arc<OpenBlob>>,
+    blobs: Arc<FastMap<BlobFileId, Arc<OpenBlob>>>,
 }
 
 impl std::fmt::Debug for SstSet {
@@ -437,9 +427,9 @@ impl SstSet {
         Self {
             file,
             cache,
-            map: FastMap::default(),
-            by_id: FastMap::default(),
-            blobs: FastMap::default(),
+            map: Arc::default(),
+            by_id: Arc::default(),
+            blobs: Arc::default(),
         }
     }
 
@@ -452,6 +442,88 @@ impl SstSet {
         file: FileRef,
         cache: Arc<BlockCache>,
     ) -> Self {
+        let (map, by_id) = Self::build_ssts(catalog, prev, readers);
+        Self {
+            file,
+            cache,
+            map: Arc::new(map),
+            by_id: Arc::new(by_id),
+            blobs: Arc::new(Self::build_blobs(catalog, prev)),
+        }
+    }
+
+    /// The set of `catalog`, committed on top of `old` (whose set is `prev`): the SST part is
+    /// shared with `prev` when the commit changed no SST (`sst_changed` false, and no slot
+    /// dropped with a tablet), and the blob part when the blob files are the same, so a
+    /// commit of a separated value or a checkpoint copies nothing (#499).
+    pub(crate) fn rebuild(
+        catalog: &Catalog,
+        old: &Catalog,
+        prev: &SstSet,
+        sst_changed: bool,
+        readers: &mut HashMap<SstId, Arc<SstReader>>,
+        file: FileRef,
+        cache: Arc<BlockCache>,
+    ) -> Self {
+        // A slot appears only through an `AddSst` (which sets `sst_changed`); one goes with a
+        // dropped tablet without it, and then the count differs.
+        let ssts_same = !sst_changed && catalog.ssts.len() == old.ssts.len();
+        let (map, by_id) = if ssts_same {
+            (Arc::clone(&prev.map), Arc::clone(&prev.by_id))
+        } else {
+            let (map, by_id) = Self::build_ssts(catalog, Some(prev), readers);
+            (Arc::new(map), Arc::new(by_id))
+        };
+        let blobs = if catalog.blob_files == old.blob_files {
+            Arc::clone(&prev.blobs)
+        } else {
+            Arc::new(Self::build_blobs(catalog, Some(prev)))
+        };
+        let set = Self {
+            file,
+            cache,
+            map,
+            by_id,
+            blobs,
+        };
+        #[cfg(debug_assertions)]
+        assert!(
+            set.matches(catalog),
+            "a reused SST set differs from the catalog's"
+        );
+        set
+    }
+
+    /// Debug builds: whether this set holds exactly the catalog's slots, SSTs and blob files.
+    #[cfg(debug_assertions)]
+    fn matches(&self, catalog: &Catalog) -> bool {
+        self.map.len() == catalog.ssts.len()
+            && catalog.ssts.iter().all(|(key, list)| {
+                self.map.get(key).is_some_and(|fam| {
+                    let mut got: Vec<SstId> = fam.iter().map(|s| s.meta.id).collect();
+                    let mut want: Vec<SstId> = list.iter().map(|(_, m)| m.id).collect();
+                    got.sort_unstable();
+                    want.sort_unstable();
+                    got == want
+                })
+            })
+            && self.blobs.len() == catalog.blob_files.len()
+            && catalog
+                .blob_files
+                .iter()
+                .all(|(id, b)| self.blobs.get(id).is_some_and(|o| o.extents == b.extents))
+    }
+
+    /// The slots and SSTs of `catalog`.
+    #[allow(clippy::type_complexity)]
+    fn build_ssts(
+        catalog: &Catalog,
+        prev: Option<&SstSet>,
+        readers: &mut HashMap<SstId, Arc<SstReader>>,
+    ) -> (
+        FastMap<(TabletId, FamilyId), Arc<FamilySsts>>,
+        FastMap<SstId, Arc<OpenSst>>,
+    ) {
         let mut by_id: FastMap<SstId, Arc<OpenSst>> = FastMap::default();
         let mut map = FastMap::default();
         for (key, list) in catalog.ssts.iter() {
@@ -498,7 +570,12 @@ impl SstSet {
             );
             map.insert(*key, Arc::new(fam));
         }
-        let blobs = catalog
+        (map, by_id)
+    }
+
+    /// The blob files of `catalog`.
+    fn build_blobs(catalog: &Catalog, prev: Option<&SstSet>) -> FastMap<BlobFileId, Arc<OpenBlob>> {
+        catalog
             .blob_files
             .iter()
             .map(|(id, b)| {
@@ -517,14 +594,7 @@ impl SstSet {
                     });
                 (*id, open)
             })
-            .collect();
-        Self {
-            file,
-            cache,
-            map,
-            by_id,
-            blobs,
-        }
+            .collect()
     }
 
     /// The reader of blob file `id`, if this version names it.
@@ -799,13 +869,34 @@ impl View {
 
     /// The record published in shared memory for this view.
     pub(crate) fn to_record(&self) -> ViewRecord {
-        let mut memtables = Vec::new();
-        let mut entries: Vec<(&(TabletId, FamilyId), &Arc<MemSet>)> =
-            self.all_memtables().collect();
-        entries.sort_by_key(|(k, _)| **k);
-        for (key, set) in entries {
+        let mut cache = RecordCache::default();
+        self.fill_record(&mut cache);
+        cache.record
+    }
+
+    /// Fills `cache` with this view's record, reusing its buffers: the tablet list only
+    /// changes with the tablet map, and the memtable list is refilled in place, so publishing
+    /// the view after a manifest commit allocates nothing for it (#499).
+    pub(crate) fn fill_record(&self, cache: &mut RecordCache) {
+        let rec = &mut cache.record;
+        rec.view_version = self.version;
+        rec.manifest_version = self.manifest_version;
+        let tablets = (Arc::as_ptr(&self.tablets) as usize, self.tablets.version());
+        if cache.tablets != Some(tablets) {
+            rec.tablets.clear();
+            rec.tablets.extend(self.tablets.iter().map(|t| ViewTablet {
+                tablet: t.id,
+                table: t.table,
+                shard: t.shard.0,
+                start: t.start.clone(),
+                end: t.end.clone(),
+            }));
+            cache.tablets = Some(tablets);
+        }
+        rec.memtables.clear();
+        for (key, set) in self.all_memtables() {
             for (age, root) in set.roots.iter().enumerate() {
-                memtables.push(ViewMemtable {
+                rec.memtables.push(ViewMemtable {
                     tablet: key.0,
                     family: key.1,
                     shard: set.shard.0,
@@ -814,13 +905,18 @@ impl View {
                 });
             }
         }
-        ViewRecord {
-            view_version: self.version,
-            manifest_version: self.manifest_version,
-            tablets: self.tablets.to_view_tablets(),
-            memtables,
-        }
+        // By slot, then age (a slot's memtables arrive in age order; slots are unique).
+        rec.memtables
+            .sort_unstable_by_key(|m| (m.tablet, m.family, m.age));
     }
+}
+
+/// A view record kept between publishes ([`View::fill_record`]), with the tablet map it
+/// holds the tablets of (its address and version).
+#[derive(Debug, Default)]
+pub(crate) struct RecordCache {
+    pub record: ViewRecord,
+    tablets: Option<(usize, u64)>,
 }
 
 /// Counts the live snapshots of a reader process: when it drops to zero the reader moves
