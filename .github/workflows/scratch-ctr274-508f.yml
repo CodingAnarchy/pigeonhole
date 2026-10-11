@@ -1,0 +1,50 @@
+name: scratch ctr274 508 fixed
+on:
+  push:
+    branches: [scratch/ctr274-508-fixed]
+permissions:
+  contents: read
+jobs:
+  loop:
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        run: |
+          cargo test --release --all-features -p pigeonhole-engine --test model_check --no-run 2>&1 | tail -2
+          cp "$(ls -t target/release/deps/model_check-* | grep -v '\.d$' | head -1)" /tmp/mc
+      - name: loop recovery_with_a_changed_shard_count, deferred, traced (3 loops in parallel)
+        run: |
+          mkdir -p /tmp/fail
+          loop() {
+            local lane=$1 base=$2 n=0 f=0 seed
+            local end=$(( $(date +%s) + 3900 ))
+            seed=$base
+            while [ "$(date +%s)" -lt "$end" ]; do
+              out=/tmp/o-$lane
+              if ! PIGEONHOLE_DEFERRED_IO=1 PIGEONHOLE_TRACE=1 PIGEONHOLE_TRACE_LINES=2000 \
+                   PIGEONHOLE_SEED=$seed PIGEONHOLE_SEEDS=1 timeout 300 /tmp/mc --test-threads=1 \
+                   recovery_with_a_changed_shard_count > "$out" 2>&1; then
+                f=$((f+1)); cp "$out" "/tmp/fail/seed-$seed.log"
+                echo "lane $lane FAILED seed $seed: $(grep -m1 -E 'checker failure|panicked' "$out")"
+              fi
+              n=$((n+1)); seed=$((seed+1))
+            done
+            echo "lane $lane: $n seeds from $base, $f failed"
+          }
+          w=${{ matrix.worker }}
+          for lane in 1 2 3; do loop "$w.$lane" $(( w * 1000000 + lane * 100000 )) & done
+          wait
+          ls /tmp/fail
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fail-${{ matrix.worker }}
+          path: /tmp/fail
+          if-no-files-found: ignore
