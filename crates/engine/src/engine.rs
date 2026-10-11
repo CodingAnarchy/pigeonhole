@@ -121,6 +121,17 @@ pub struct Metrics {
     /// Block cache lookups that hit and that missed since open (#57). A miss is a block read
     /// from the file; with the cache disabled (`block_cache_bytes` 0) nothing is counted.
     pub block_cache: (u64, u64),
+    /// Bytes of SST top indexes and filters pinned in the block cache by open SST readers
+    /// (D215). They count against the capacity and are never evicted: past about half of it,
+    /// index partitions and data blocks no longer stay cached and a cold get costs two reads
+    /// rather than one. Size `block_cache_bytes` to at least twice this.
+    pub block_cache_pinned: u64,
+    /// The block cache's capacity in bytes (`EngineOptions::block_cache_bytes`).
+    pub block_cache_capacity: u64,
+    /// Times `block_cache_pinned` rose past half of `block_cache_capacity` since open: a
+    /// warning that the cache is too small for the open SSTs' metadata (D215). Counted at
+    /// most once until the pinned bytes fall below 40% of the capacity again.
+    pub block_cache_pinned_warnings: u64,
     /// Passes that flushed slots pinning a WAL checkpoint (a shard's own, past
     /// `EngineOptions::wal_pin_bytes`, or at another shard's request), and the memtables
     /// they froze below the size threshold (#137). Flushes per pass is the cost of the
@@ -1875,6 +1886,9 @@ impl Engine {
         m.file_growths = (pager.growths, pager.growth_nanos);
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
         m.block_cache = shared.cache.hits_and_misses();
+        m.block_cache_pinned = shared.cache.pinned() as u64;
+        m.block_cache_capacity = shared.cache.capacity() as u64;
+        m.block_cache_pinned_warnings = shared.cache.pinned_warnings();
         m.commit_parks = shared.commit_parks.load(Ordering::Relaxed);
         if let Some(subs) = shared.submitters.get() {
             for sub in subs.iter() {

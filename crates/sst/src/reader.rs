@@ -375,6 +375,15 @@ pub(crate) struct Reader {
     row_filter: Option<Filter<BlockHandle>>,
     column_filter: Option<Filter<BlockHandle>>,
     pub(crate) properties: Properties,
+    /// Bytes of the top index and filters, counted in the cache's pinned bytes while this
+    /// reader is open (D215).
+    pinned: usize,
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.blocks.cache.sub_pinned(self.pinned);
+    }
 }
 
 /// Block access for one SST: the file, where the SST sits in it, and the cache.
@@ -465,23 +474,28 @@ impl Reader {
         let top = read(footer.top_index, BlockKind::TopIndex, true)?;
         // Checked once here, so every cursor can trust the top index's tables.
         Block::new(top.clone())?.validate()?;
-        let filter = |addr: BlockAddr| -> Result<Option<Filter<BlockHandle>>> {
+        // Each filter, and the bytes it pins.
+        let filter = |addr: BlockAddr| -> Result<(Option<Filter<BlockHandle>>, usize)> {
             if addr.len == 0 {
-                return Ok(None);
+                return Ok((None, 0));
             }
             let h = read(addr, BlockKind::Filter, true)?;
-            Ok(Some(Filter::new(h)?))
+            let charge = h.charge();
+            Ok((Some(Filter::new(h)?), charge))
         };
-        let row_filter = filter(footer.row_filter)?;
-        let column_filter = filter(footer.column_filter)?;
+        let (row_filter, row_bytes) = filter(footer.row_filter)?;
+        let (column_filter, column_bytes) = filter(footer.column_filter)?;
         let props = read(footer.properties, BlockKind::Properties, false)?;
         let properties = Properties::decode(&props)?;
+        let pinned = top.charge() + row_bytes + column_bytes;
+        blocks.cache.add_pinned(pinned);
         Ok(Self {
             blocks,
             top,
             row_filter,
             column_filter,
             properties,
+            pinned,
         })
     }
 

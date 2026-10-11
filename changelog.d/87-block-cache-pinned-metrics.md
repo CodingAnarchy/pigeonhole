@@ -1,0 +1,2 @@
+### Added
+- `engine_metrics()` reports the SST top indexes and filters pinned in the block cache: `block_cache_pinned` bytes, `block_cache_capacity`, and `block_cache_pinned_warnings`, which counts each time the pinned bytes passed half the cache (D215, ICR 0032). Past that, index partitions no longer stay cached and a cold point get costs two reads instead of one. Size `block_cache` to at least twice `block_cache_pinned`. `pigeonhole-cache` adds `BlockCache::{add_pinned, sub_pinned, pinned, pinned_warnings}` and `BlockHandle::charge`.

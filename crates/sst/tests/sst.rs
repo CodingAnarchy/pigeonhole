@@ -363,6 +363,62 @@ fn value_cells_outlive_everything() {
     assert_eq!(&cell[..], b"\x00pinned");
 }
 
+/// An open reader counts its top index and filters in the cache's pinned bytes (D215, ICR
+/// 0032), and dropping it ends the count; a cache too small for them counts a warning.
+#[test]
+fn a_reader_counts_its_pinned_metadata_while_open() {
+    let mut m = Model::new();
+    for i in 0..2000u32 {
+        let mut k = Vec::new();
+        encode_key(
+            &mut k,
+            format!("row{i:06}").as_bytes(),
+            b"q",
+            1,
+            1,
+            Kind::Put,
+        )
+        .unwrap();
+        m.insert(k, b"\x00value".to_vec());
+    }
+    let (_vfs, file) = sim_file(12, EXTENT);
+    let pinned = |bloom_bits| {
+        let l = Layout {
+            block_size: 256,
+            restart_interval: 16,
+            compression: Default::default(),
+            compression_level: 3,
+            bloom_bits,
+        };
+        let meta = write_sst(&file, EXTENT, &m, &l);
+        let cache = Arc::new(BlockCache::new(8 << 20, 1));
+        let r = SstReader::open(file.clone(), &meta, cache.clone(), Priority::Normal).unwrap();
+        let one = cache.pinned();
+        assert!(
+            one > 0 && one <= cache.usage(),
+            "{one} of {}",
+            cache.usage()
+        );
+        // A second reader of the same SST pins the same blocks again (racing openers).
+        let r2 = SstReader::open(file.clone(), &meta, cache.clone(), Priority::Normal).unwrap();
+        assert_eq!(cache.pinned(), 2 * one);
+        drop(r);
+        assert_eq!(cache.pinned(), one);
+        drop(r2);
+        assert_eq!((cache.pinned(), cache.pinned_warnings()), (0, 0));
+
+        // A cache smaller than twice the metadata: opening counts one warning.
+        let small = Arc::new(BlockCache::new(one, 1));
+        let r = SstReader::open(file.clone(), &meta, small.clone(), Priority::Normal).unwrap();
+        assert_eq!((small.pinned(), small.pinned_warnings()), (one, 1));
+        drop(r);
+        assert_eq!(small.pinned(), 0);
+        one
+    };
+    // The filters are most of it.
+    assert!(pinned(10) > pinned(0));
+}
+
 /// A row spanning many 64-byte blocks: `skip_row` leaves the first block, finds the row
 /// continuing in the next one with no later row start there, and seeks past the row with
 /// `escaped row ++ 00 02` through the index.
