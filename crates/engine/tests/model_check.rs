@@ -158,6 +158,32 @@ fn harness_regressions_from_the_seed_sweep() {
     check(41, &cfg);
 }
 
+#[test]
+fn deferred_io_runs_take_the_commit_time_separation_path() {
+    // #306: with deferred I/O the harness thread is the device, and a commit separating a
+    // large value (#230) waits on the manifest writer; that wait runs the device (ICR 0028)
+    // instead of parking, so deferred runs separate values as plain runs do.
+    for seed in seeds() {
+        let share = |deferred: bool| {
+            let mut cfg = Config::standard(250);
+            cfg.shards = 3;
+            cfg.deferred_io = deferred;
+            let s = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+            assert!(s.large_puts > 0, "seed {seed}: no large puts");
+            eprintln!(
+                "seed {seed} deferred={deferred}: {} blob files for {} large puts",
+                s.blob_files, s.large_puts
+            );
+            s.blob_files as f64 / s.large_puts as f64
+        };
+        let (plain, deferred) = (share(false), share(true));
+        assert!(
+            plain > 0.0 && deferred >= plain / 2.0 && deferred <= plain * 2.0,
+            "seed {seed}: blob files per large put {deferred:.2} deferred, {plain:.2} plain"
+        );
+    }
+}
+
 /// Transactions under frequent injected read errors, no crash armed.
 fn read_error_txn_config() -> Config {
     let mut cfg = Config::standard(250);
@@ -269,10 +295,17 @@ fn a_seed_replays_the_same_io_trace() {
             _ => false,
         })
     };
-    for (seed, cfg, spare) in seeds()
-        .into_iter()
-        .flat_map(|seed| [(seed, &cfg, false), (seed, &spares, true)])
-    {
+    // And with deferred I/O, whose device the harness thread runs, including in the waits
+    // of commits that separate large values (#306).
+    let mut deferred = cfg.clone();
+    deferred.deferred_io = true;
+    for (seed, cfg, spare) in seeds().into_iter().flat_map(|seed| {
+        [
+            (seed, &cfg, false),
+            (seed, &spares, true),
+            (seed, &deferred, false),
+        ]
+    }) {
         let traced = |cfg: &Config| {
             let (result, ops) = run_traced(seed, cfg);
             if let Err(f) = result {

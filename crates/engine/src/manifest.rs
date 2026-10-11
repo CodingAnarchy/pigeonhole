@@ -1255,6 +1255,11 @@ pub(crate) fn commit_req_from_thread(
             pigeonhole_io::reap_own_io(Some(OWN_IO_SLICE));
             continue;
         }
+        // Else I/O no thread reaps (application-owned rings with no reaper, a simulator's
+        // deferred device; ICR 0028), as the WAL's blocked waits do.
+        if pigeonhole_io::reap_orphan_io(OWN_IO_SLICE).is_some() {
+            continue;
+        }
         std::thread::park();
     }
 }

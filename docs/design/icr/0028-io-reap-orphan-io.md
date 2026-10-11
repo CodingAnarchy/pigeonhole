@@ -33,3 +33,9 @@ It is the crate-private `reap_orphans` that `Completion::wait` already uses whil
 
 - `pigeonhole-wal`: `Shared::durable_sync` and the held-header/rollover wait, through one `reap_for_wait` helper: own I/O first, then orphans, then the condvar.
 - **`pigeonhole-io`'s simulator** (#454's sweep hang; the stacked PR): under deferred I/O without owner reaping, `SimVfs` registers as an orphan backend. Its `reap_orphan` runs one deferred operation, chosen by the seed, but only for the thread that turned deferred I/O on (the harness), so tests sharing a process stay independent and seeds replay. An engine wait inside the harness's own turn, behind I/O only the harness completes (a shard's final sync behind cross-shard barrier syncs, #454 seed 213), now advances the device as a real one would, instead of waiting for ever.
+- **`pigeonhole-engine`'s manifest wait** (#306; under this ICR, coordinator 2026-10-11). `manifest::commit_req_from_thread` blocks a thread on the manifest writer while another holds it: a catalog change, `shrink`, or a commit separating a large value (#230), behind a pump's root commit. It reaped only the thread's own ring before parking. It now follows the WAL's order:
+  1. its own I/O;
+  2. else `reap_orphan_io(1 ms)`;
+  3. else park.
+
+  Under the simulator's deferred I/O that runs the device on the harness thread, so the model harness sets the small inline limit in deferred runs too. The effect is limited to processes with an orphan backend registered, which is only application-owned io_uring with no reaper (#443). There, a thread waiting on the manifest writer reaps orphan rings in 1 ms slices instead of parking, as the WAL's waits already do.
