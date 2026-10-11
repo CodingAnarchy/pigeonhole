@@ -33,7 +33,7 @@ use pigeonhole_runtime::{ShardId, TaskWaker, Waiter, completion};
 pub use super::PendingMaintenance;
 pub use crate::compact::CompactionRecord;
 
-use super::{Engine, Inner, Role};
+use super::Engine;
 use crate::manifest;
 use crate::shard::ShardMsg;
 use crate::snapshot::{Snapshot, TabletMap};
@@ -223,41 +223,6 @@ pub struct ManifestInfo {
     pub tablet_ranges: Vec<TabletRange>,
     /// Whether the last close was clean.
     pub clean: bool,
-}
-
-impl Inner {
-    /// The tablet of `table` holding `row` and its owner.
-    fn tablet_at(&self, table: TableId, row: &[u8]) -> Result<(TabletId, ShardId)> {
-        self.check_open()?;
-        self.shared
-            .view
-            .load()
-            .tablets()
-            .route(table, row)
-            .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))
-    }
-
-    /// Sends a tablet change to `shard`, the tablets' owner.
-    fn tablet_op(
-        &self,
-        shard: ShardId,
-        op: crate::shard::TabletOpKind,
-    ) -> Result<PendingMaintenance> {
-        if self.role != Role::Writer {
-            return Err(Error::ReadOnly);
-        }
-        self.check_open()?;
-        let (tx, rx) = completion();
-        self.shared.submitter(shard).submit(ShardMsg::TabletOp {
-            op,
-            reply: Some(tx),
-        })?;
-        Ok(PendingMaintenance {
-            waiters: vec![rx],
-            rounds: None,
-            failed: None,
-        })
-    }
 }
 
 impl Engine {

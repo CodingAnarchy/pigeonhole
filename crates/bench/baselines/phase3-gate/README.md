@@ -10,18 +10,21 @@ The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated 
 
 ## Setting up the machine
 
-1. **Install the OS on one NVMe only.** In Hetzner's `installimage`, choose Ubuntu 24.04 and turn software RAID off (`SWRAID 0`). Install to `nvme0n1` and leave `nvme1n1` out of the drive list. Hetzner's default mirrors both drives (RAID1), which puts every measured write through md. The second NVMe stays raw for the data.
+1. **Install the OS on one NVMe only.** In Hetzner's `installimage`, choose Ubuntu 24.04 and turn software RAID off (`SWRAID 0`). Install to one drive and leave the other out of the drive list. Hetzner's default mirrors both drives (RAID1), which puts every measured write through md. The other NVMe stays raw for the data. **Don't rely on kernel names:** `nvme0n1` and `nvme1n1` can swap across reboots and reinstalls (on the AX102 the OS has landed on `nvme1n1`). Step 3 names the data disk by `/dev/disk/by-id`.
 2. **Log in as root and clone the repository at the chosen commit:**
    ```sh
    git clone https://github.com/CodingAnarchy/pigeonhole && cd pigeonhole && git checkout COMMIT
    crates/bench/baselines/phase3-gate/setup.sh
    ```
    `setup.sh` installs the build packages, `nvme-cli`, `xfsprogs` and the Rust toolchain. It turns io_uring on, sets the `performance` governor, and lifts root's memlock limit. Log in again afterwards, so the memlock limit applies.
-3. **Make the data file system on the second NVMe** (this erases it; check the device with `nvme list` first):
+3. **Make the data file system on the empty NVMe, named by id.** `data-disk.sh` never takes a kernel name. Before it formats anything, it prints the disk and a check. It refuses a disk with partitions, anything mounted or used as swap, the root file system, md RAID or device-mapper, or any file-system or RAID signature. Without `--format` it only prints the check.
    ```sh
-   mkfs.xfs -f /dev/nvme1n1 && mkdir -p /data && mount -o noatime /dev/nvme1n1 /data
+   crates/bench/baselines/phase3-gate/data-disk.sh                     # list the NVMe disks by id, with their partitions and mounts
+   crates/bench/baselines/phase3-gate/data-disk.sh /dev/disk/by-id/nvme-MODEL_SERIAL            # the check only: read it
+   crates/bench/baselines/phase3-gate/data-disk.sh /dev/disk/by-id/nvme-MODEL_SERIAL --format   # check again, then mkfs.xfs and mount on /data
    ```
-4. **Check the drive.** `nvme id-ctrl /dev/nvme1n1 | grep -E '^(mn|fr|vwc)'` shows the model, firmware and write cache. A Datacenter Edition drive has power-loss protection. The setup step records this in `machine.json`, and warns if the write cache is volatile.
+   Use the by-id name the listing shows with no partitions and nothing mounted. **Never type `mkfs` on a `/dev/nvmeXn1` name by hand.** After a reboot, mount it by the same id: `mount -o noatime /dev/disk/by-id/nvme-MODEL_SERIAL /data`.
+4. **Check the drive.** `nvme id-ctrl "$(readlink -f /dev/disk/by-id/nvme-MODEL_SERIAL)" | grep -E '^(mn|fr|vwc)'` shows the model, firmware and write cache. A Datacenter Edition drive has power-loss protection. The setup step records this in `machine.json`, and warns if the write cache is volatile.
 
 ## Running
 
@@ -36,7 +39,7 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
   2. `build`, then `memtable-lookup`: the memtable's 1M- and 10k-entry point lookup (#17; criterion, pinned to one core).
   3. `phase2-gate`, twice (`phase2-gate-2`): the D193 floors. The second run is there because #387's row-read p99 is close to 1.5× SQLite EAV's (1.58× on the Mac), and one run varies by about 5%. Per D208, the first window's two runs will become the Phase 2 gate's reference baseline: copy `phase2-gate.json` and `phase2-gate-2.json` to `crates/bench/baselines/phase2-gate/reference-run1.json` and `reference-run2.json` and commit them, and `check.py` and `run-gate.sh` then use them.
   4. `all` against RocksDB, three times: twice on io_uring (the reproducibility pair) and once on pread (the backend decision).
-  5. `latency`: point gets and durable group commit.
+  5. `latency`: point gets, and durable group commit in the D213 shape (one shard per core, the table split over every shard, commits in flight inline) plus 1/4/16 client threads, then the D213 shape again on pread (reported, not judged: it decides the io_uring default). The setup step also times the data drive's raw fdatasync, shown beside the group commit p99.
   6. `ycsb-a-shards`: ycsb-a with one client, at the default shard count against 1 and 4 shards and longer shard spins, beside RocksDB (D198 item 2, #478).
   7. `group-sync-depth`: durable group commits at a group sync depth of 1, 2 and unlimited (D207's default).
   8. `row-cache`: the row cache's default.

@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pigeonhole_bench::{
-    Environment, GROUP_COMMIT_THREADS, MemoryBudget, PigeonholeRunner, RunOptions, RunRecord,
-    Runner, Scaling, Suite, Tolerance, WorkloadConfig, WorkloadKind, compare, run_detailed,
+    Environment, GROUP_COMMIT_THREADS, GroupCommit, MemoryBudget, PigeonholeRunner, RunOptions,
+    RunRecord, Runner, Scaling, Suite, Tolerance, WorkloadConfig, WorkloadKind, compare,
+    run_detailed,
 };
 
 /// Default warmup of `scaling`, as a fraction of the measured ops. The balancer needs about
@@ -345,6 +346,17 @@ fn bench(a: &Args) -> Result<Suite, String> {
         };
         for kind in kinds {
             let c = config(a, kind)?;
+            if kind == WorkloadKind::GroupCommit && a.engines.iter().any(|e| e == "pigeonhole") {
+                // The target's shape (D213): one shard per core, the table split over all of
+                // them, each shard's thread keeping commits in flight inline (D204's driver).
+                // The client-thread sweep below stays as a secondary report.
+                let cores = suite.environment.cores;
+                let n = a.shards.unwrap_or(cores);
+                let r = pigeonhole(a, Some(n)).group_sync(true).presplit(true);
+                let run = one_inline(a, &root, &mut seq, &r, &c)?;
+                suite.group_commit = Some(GroupCommit::new(n, cores, &run));
+                suite.results.push(run);
+            }
             let threads = match (kind, a.threads) {
                 (WorkloadKind::GroupCommit, None) => GROUP_COMMIT_THREADS.to_vec(),
                 _ => vec![c.threads],
@@ -542,7 +554,21 @@ mod tests {
             dir.display()
         ));
         let suite = bench(&a).unwrap();
-        let threads: Vec<usize> = suite.results.iter().map(|r| r.threads).collect();
+        // First the D213 shape: the table split over both shards, commits in flight inline.
+        let (gate, clients) = suite.results.split_first().unwrap();
+        assert!(
+            gate.store_config.contains(" presplit inline"),
+            "{}",
+            gate.store_config
+        );
+        assert_eq!(gate.threads, 2);
+        assert!(gate.detail.shards.iter().all(|s| s.tablets_start > 0));
+        let gc = suite.group_commit.as_ref().expect("the D213 result");
+        assert_eq!(gc.shards, 2);
+        assert!(gc.cells_per_sec > 0.0);
+        assert!(suite.to_markdown().contains("Durable group commit (D213)"));
+        // Then the client-thread sweep.
+        let threads: Vec<usize> = clients.iter().map(|r| r.threads).collect();
         assert_eq!(threads, GROUP_COMMIT_THREADS);
         assert!(
             suite
@@ -550,12 +576,12 @@ mod tests {
                 .iter()
                 .all(|r| r.store_config.contains(" group-sync"))
         );
-        // `--threads` picks one count.
+        // `--threads` picks one count for the sweep.
         let a = args(&format!(
             "group-commit --scale smoke --ops 64 --threads 2 --shards 2 --write-buffer 16777216 --dir {}",
             dir.display()
         ));
-        assert_eq!(bench(&a).unwrap().results.len(), 1);
+        assert_eq!(bench(&a).unwrap().results.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

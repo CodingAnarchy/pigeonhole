@@ -76,6 +76,23 @@ fn writes(ops: impl Iterator<Item = BenchOp>) -> Result<Vec<Write>, String> {
     .collect()
 }
 
+/// Keys that cut the loaded rows into `pieces` runs of about equal size (D213): the
+/// `i * len / pieces`-th distinct row, for `i` in `1..pieces`.
+fn split_keys(load: &[Write], pieces: usize) -> Vec<Vec<u8>> {
+    let mut rows: Vec<&[u8]> = load.iter().map(|w| w.row.as_slice()).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.len() < 2 {
+        return Vec::new();
+    }
+    let mut keys: Vec<Vec<u8>> = (1..pieces)
+        .map(|i| rows[i * rows.len() / pieces].to_vec())
+        .filter(|k| !k.is_empty())
+        .collect();
+    keys.dedup();
+    keys
+}
+
 fn submit(t: &Table, w: &Write) -> CommitFuture {
     let mut m = t.mutate(&w.row);
     for (q, v) in &w.cells {
@@ -251,8 +268,17 @@ impl PigeonholeRunner {
         let n = shards.len();
         let load_ops = writes(workload.load_ops())?;
         let load_start = Instant::now();
+        let presplit = self.settings.presplit;
         let (shards, setup) = with_drivers(shards, || -> Result<Table, String> {
             let t = create_table(&db)?;
+            let keys = if presplit && n > 1 {
+                split_keys(&load_ops, n)
+            } else {
+                Vec::new()
+            };
+            if !keys.is_empty() {
+                t.split_over_shards(keys).map_err(err)?;
+            }
             for w in &load_ops {
                 let mut m = t.mutate(&w.row);
                 for (q, v) in &w.cells {

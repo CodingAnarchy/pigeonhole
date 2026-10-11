@@ -26,7 +26,9 @@
 #   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring               90
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2)         90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
-#   latency        ycsb-c, group-commit (1/4/16 threads) vs RocksDB, ycsb-a, skewed   45
+#   latency        ycsb-c, ycsb-a, skewed vs RocksDB; group-commit: the D213 shape (one
+#                  shard per core, table split over all, commits in flight inline), then
+#                  1/4/16 client threads vs RocksDB; the same on pread, reported        55
 #   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
 #   group-sync-depth  group-commit at group sync depth 1, 2 and unlimited (D207)      15
 #   row-cache      ycsb-c and ycsb-a with the row cache on (D201's default)           30
@@ -37,7 +39,7 @@
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 10.1 hours unattended at full scale (the sum of the estimates above).
+# Total: about 10.3 hours unattended at full scale (the sum of the estimates above).
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
 # it back with the `scp` line the last step prints, and commit it from there.
@@ -227,9 +229,17 @@ step_latency() {
             --dir "$data/bench" --json "$results/latency-$w.json"
         rm -r "$data/bench"
     done
-    # Durable commits at 1, 4 and 16 client threads (GroupSync; RocksDB fsyncs).
+    # Durable 4-cell commits (GroupSync; RocksDB fsyncs). Pigeonhole first runs the target's
+    # shape (D213): one shard per core, the table split over every shard, each shard's thread
+    # keeping commits in flight inline; then, reported beside it, 1, 4 and 16 client threads.
     PIGEONHOLE_IO=uring "$bench" group-commit --engine pigeonhole,rocksdb --scale "$scale" \
         --dir "$data/bench" --json "$results/latency-group-commit.json"
+    rm -r "$data/bench"
+    # The same on the pread backend, reported beside the judged io_uring run (D213): on a
+    # Linux runner the D213 shape reached 3x the cells/s on pread, with a p99.9 near 1 ms
+    # against 0.6-0.8 s on io_uring. The comparison decides the io_uring default.
+    PIGEONHOLE_IO=pread "$bench" group-commit --engine pigeonhole --scale "$scale" \
+        --dir "$data/bench" --json "$results/latency-group-commit-pread.json"
     rm -r "$data/bench"
 }
 

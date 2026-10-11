@@ -4,8 +4,9 @@
 #
 #   crates/bench/baselines/phase3-gate/setup.sh
 #
-# It does not touch the data drive: formatting is one explicit command in README.md, so a
-# mistyped device never erases anything from a script.
+# It does not touch the data drive. Formatting is a separate, explicit step (README.md step 3,
+# data-disk.sh): the disk is named by /dev/disk/by-id, since NVMe kernel names change across
+# reboots, and it is checked to be empty and unmounted before mkfs.
 set -euo pipefail
 [[ "$(id -u)" == 0 ]] || { echo "setup.sh: run as root" >&2; exit 2; }
 

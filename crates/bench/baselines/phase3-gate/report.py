@@ -123,17 +123,37 @@ if cg:
 else:
     rows.append(("Point get on cold data: one I/O", "", verdict(None), "cold-get.jsonl"))
 
-# Batched durable writes: > 1M cells/s across cores; p99 commit < 200 µs (group commit).
-gc = results("latency-group-commit.json", "pigeonhole")
-if gc:
-    best = max(r["throughput"] for r in gc) * GROUP_COMMIT_CELLS
-    worst_p99 = max(us(r["p99_ns"]) for r in gc)
-    detail = ", ".join(f"{r['threads']} thr: p99 {us(r['p99_ns']):.0f} µs" for r in sorted(gc, key=lambda r: r["threads"]))
-    rows.append(("Durable group commit: > 1M cells/s; p99 < 200 µs",
-                 f"best {best / 1e6:.2f}M cells/s; {detail}", verdict(best > 1e6 and worst_p99 < 200),
-                 "latency-group-commit.json"))
+# Batched durable writes: > 1M cells/s across cores; p99 commit < 200 µs (group commit). The
+# D213 shape: one shard per core, the table split over every shard, each shard's thread
+# keeping commits in flight (phdb-bench's `group_commit`). The client-thread sweep (1, 4, 16
+# synchronous clients) is reported beside it, not judged. The disk's raw fdatasync, from
+# machine.json, is the floor under any durable commit's p99.
+fs = (load("machine.json") or {}).get("fdatasync_4k_us") or {}
+floor = f"; disk fdatasync p50 {fs['p50']:.0f} µs, p99 {fs['p99']:.0f} µs" if "p99" in fs else ""
+gcd = load("latency-group-commit.json") or {}
+g = gcd.get("group_commit")
+if g:
+    cells, per_core = g["cells_per_sec"], g["cells_per_sec"] / max(g["cores"], 1)
+    rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)",
+                 f"{cells / 1e6:.2f}M cells/s at {g['shards']} shards ({per_core / 1e3:.0f}K per core); "
+                 f"p50 {us(g['p50_ns']):.0f} µs, p99 {us(g['p99_ns']):.0f} µs; busiest shard "
+                 f"{100 * g['max_share']:.0f}%{floor}",
+                 verdict(cells > 1e6 and us(g["p99_ns"]) < 200), "latency-group-commit.json"))
 else:
-    rows.append(("Durable group commit: > 1M cells/s; p99 < 200 µs", "", verdict(None), "latency-group-commit.json"))
+    rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)", floor.lstrip("; "),
+                 verdict(None), "latency-group-commit.json"))
+gp = (load("latency-group-commit-pread.json") or {}).get("group_commit")
+if gp:
+    rows.append(("Durable group commit on pread (reported, not judged; D213: decides the io_uring default)",
+                 f"{gp['cells_per_sec'] / 1e6:.2f}M cells/s at {gp['shards']} shards "
+                 f"({gp['cells_per_sec'] / max(gp['cores'], 1) / 1e3:.0f}K per core); p50 {us(gp['p50_ns']):.0f} µs, "
+                 f"p99 {us(gp['p99_ns']):.0f} µs", "-", "latency-group-commit-pread.json"))
+clients = [r for r in results("latency-group-commit.json", "pigeonhole") if "inline" not in r.get("store_config", "")]
+if clients:
+    detail = ", ".join(f"{r['threads']} thr: {r['throughput'] * GROUP_COMMIT_CELLS / 1e3:.0f}K cells/s, "
+                       f"p99 {us(r['p99_ns']):.0f} µs" for r in sorted(clients, key=lambda r: r["threads"]))
+    rows.append(("Durable group commit, synchronous clients (reported, not judged; D213)", detail, "-",
+                 "latency-group-commit.json"))
 
 # Ordered scan from cache: > 1 GB/s decoded per core.
 sc = lines("scan-cache.jsonl")
