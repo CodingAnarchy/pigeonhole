@@ -632,3 +632,50 @@ fn a_stream_held_back_while_a_spare_is_prepared_never_rolls_over_inline() {
     assert_eq!(c.rollover_waits(), 0);
     assert_eq!(c.rollover_blocks(), holds);
 }
+
+#[test]
+fn a_new_streams_creation_is_durable_once_its_file_and_directory_syncs_finish() {
+    // D211 (ICR 0031): `create_all` submits a new stream's file and directory syncs without
+    // waiting (D203). Until both have finished no checkpoint may name the stream, and a wake
+    // registered meanwhile runs once they have.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let sim = pigeonhole_io::sim::SimVfs::new(211);
+    sim.set_deferred_io(true);
+    sim.hold_dir_syncs(true);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    let w = WalStream::create_all(&vfs, db(), &[STREAM], DB_ID, opts(4, 1))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(w.created_durable(), None);
+    let woke = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&woke);
+    w.notify_created(Box::new(move || flag.store(true, Ordering::SeqCst)));
+    // The file's sync completes; the directory's is held.
+    sim.complete_all_io();
+    assert_eq!(
+        w.created_durable(),
+        None,
+        "the directory entry is not durable yet"
+    );
+    assert!(!woke.load(Ordering::SeqCst));
+    sim.hold_dir_syncs(false);
+    sim.complete_all_io();
+    assert_eq!(w.created_durable(), Some(true));
+    assert!(woke.load(Ordering::SeqCst), "the wake ran");
+    // Settled: a later registration runs at once.
+    let again = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&again);
+    w.notify_created(Box::new(move || flag.store(true, Ordering::SeqCst)));
+    assert!(again.load(Ordering::SeqCst));
+    drop(w);
+
+    // A stream recovery opens was synced into its directory first: durable at once.
+    let (_, r) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(
+        r.into_stream(opts(4, 1)).unwrap().created_durable(),
+        Some(true)
+    );
+}

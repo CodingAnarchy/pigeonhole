@@ -145,6 +145,11 @@ fn results_identical_across_shard_counts_regressions() {
 
 /// Crashes `seed` after every `PIGEONHOLE_SWEEP_STEP`-th (default 2nd) mutating operation.
 fn crash_sweep(seed: u64) {
+    crash_sweep_with(seed, None);
+}
+
+/// [`crash_sweep`], with deferred I/O forced on or off (`None`: `PIGEONHOLE_DEFERRED_IO`).
+fn crash_sweep_with(seed: u64, deferred_io: Option<bool>) {
     // Short runs full of splits, merges and moves (requested and the balancer's) among
     // cross-shard batches, tiny memtables and frequent flushes: every mutating operation is a
     // crash point, so the sweep crosses every step of a change (the freeze and flush, the
@@ -159,6 +164,9 @@ fn crash_sweep(seed: u64) {
     cfg.tablet_changes = true;
     cfg.tablet_ops_ppm = 400_000;
     cfg.balance_fast = true;
+    if let Some(d) = deferred_io {
+        cfg.deferred_io = d;
+    }
     let step: u64 = std::env::var("PIGEONHOLE_SWEEP_STEP")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -195,6 +203,11 @@ fn crash_at_every_write_point_of_tablet_changes_regressions() {
     for _ in 0..8 {
         crash_sweep(170);
     }
+    // #520: with deferred I/O, a checkpoint was committed before the new stream files'
+    // directory sync completed (D203); a power loss took the files' names, the reopen created
+    // stream 0 afresh under the stale checkpoint, and a later crash lost an acknowledged
+    // commit. No checkpoint names a stream before its creation is durable now (D211).
+    crash_sweep_with(273, Some(true));
 }
 
 // ---------------------------------------------------------------------------------------
