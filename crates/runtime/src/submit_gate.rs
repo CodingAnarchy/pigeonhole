@@ -71,6 +71,25 @@ mod loom_tests {
     use loom::sync::{Arc, Mutex};
     use loom::thread;
 
+    /// Why the gate holds, which this model would check if loom could: loom documents
+    /// that it does not fully model `SeqCst` accesses (it treats them as `AcqRel`), so it
+    /// reports store buffering here. A plain store-buffering test with four `SeqCst`
+    /// accesses fails under loom 0.7.2, and the same with `SeqCst` fences passes.
+    ///
+    /// The argument. The submitter's `inflight.fetch_add` and its `closed.load`, and
+    /// shutdown's `closed.store` and its `inflight.load` in `wait_drained`, are all
+    /// `SeqCst`, so all four lie in one total order consistent with each thread's program
+    /// order:
+    /// - If the submitter's load comes before shutdown's store in that order, the
+    ///   submitter's `fetch_add` comes before shutdown's `inflight.load`. That load
+    ///   therefore sees the increment, or something later in `inflight`'s modification
+    ///   order. `wait_drained` keeps loading until it reads 0, which needs this
+    ///   submitter's `leave`, a `Release` decrement after its send. So shutdown drains
+    ///   after the send.
+    /// - Otherwise the store comes before the load, which then reads `closed == true`,
+    ///   and the submitter refuses (`Error::Closed`) without sending.
+    ///
+    /// Either way no message is accepted and left unhandled.
     #[test]
     #[ignore = "loom models SeqCst accesses as AcqRel, so it finds store buffering the C++ \
                 model forbids here (it does with SeqCst fences); kept as the protocol's model"]
