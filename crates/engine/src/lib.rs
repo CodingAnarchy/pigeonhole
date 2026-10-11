@@ -30,6 +30,7 @@ mod error;
 mod flush;
 mod flushed_roots;
 mod large;
+mod large_settle;
 mod load_slot;
 mod maintenance;
 mod manifest;

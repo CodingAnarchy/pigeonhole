@@ -596,10 +596,8 @@ impl Engine {
             live_seqnos: Arc::new(LiveSeqnos::default()),
             flushed_roots: Default::default(),
             busy_ssts: Mutex::new(HashSet::new()),
-            large_pending: Mutex::new(HashSet::new()),
+            large: Default::default(),
             large_open: AtomicUsize::new(0),
-            large_logged: Mutex::new(HashSet::new()),
-            large_dropped: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
@@ -1109,10 +1107,8 @@ impl Engine {
             live_seqnos: Arc::new(LiveSeqnos::default()),
             flushed_roots: Default::default(),
             busy_ssts: Mutex::new(HashSet::new()),
-            large_pending: Mutex::new(HashSet::new()),
+            large: Default::default(),
             large_open: AtomicUsize::new(0),
-            large_logged: Mutex::new(HashSet::new()),
-            large_dropped: Mutex::new(HashSet::new()),
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),

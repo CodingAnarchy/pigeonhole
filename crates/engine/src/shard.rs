@@ -281,20 +281,12 @@ pub(crate) struct Shared {
     pub flushed_roots: crate::flushed_roots::FlushedRoots<(u16, u32)>,
     /// SSTs a running compaction or relocation reads or replaces.
     pub busy_ssts: Mutex<HashSet<SstId>>,
-    /// Blob files of values separated at commit time whose commit has not settled yet, or
-    /// whose release (`DropBlobFile`) has not committed yet (#230): published, but nothing
-    /// may point into them yet.
-    pub large_pending: Mutex<HashSet<pigeonhole_format::BlobFileId>>,
+    /// Commit-time blob files until their commits settle: pending, logged and dropped
+    /// (`large_settle`, #230).
+    pub large: crate::large_settle::LargeSettlement,
     /// How many `LargeValues` guards are alive: while it is zero, shards skip looking for
     /// pointers in the batches they log.
     pub large_open: AtomicUsize,
-    /// Blob files of values separated at commit time whose batch reached its commit point:
-    /// its record was handed to the WAL (single-shard batch, or a cross-shard PREPARE). From
-    /// there the batch may be applied, or replayed, so its files are never released (#230).
-    pub large_logged: Mutex<HashSet<pigeonhole_format::BlobFileId>>,
-    /// Blob files of values separated at commit time that the same-commit collapse (D34)
-    /// dropped at apply, for the commit's settle hook to release (#230).
-    pub large_dropped: Mutex<HashSet<pigeonhole_format::BlobFileId>>,
     /// Published view version -> manifest version, to map reader-slot pins to extents.
     pub view_versions: Mutex<BTreeMap<u64, ManifestVersion>>,
     /// Test hooks (`engine::hooks`); none of them is set or read unless a test asks.
@@ -3632,11 +3624,7 @@ impl ShardState {
                     && m.kind == Kind::Put
                     && let Some(p) = pigeonhole_compaction::blob_pointer(m.value)
                 {
-                    self.shared
-                        .large_dropped
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(p.blob_file);
+                    self.shared.large.note_dropped(p.blob_file);
                 }
                 continue;
             }
