@@ -1001,9 +1001,10 @@ impl WalStream {
     /// header and syncs data and length together.
     ///
     /// Only a blank slot is zero-filled first: it may hold frames of a segment whose header
-    /// write was torn, under the epoch the new segment takes. A recycled slot holds only
-    /// lower epochs, and a slot allocated past the file's end was never written, so it reads
-    /// as zeros. That last one is what every open after a clean close uses, so an open writes
+    /// write was torn, under the epoch the new segment takes. A recycled slot may hold frames
+    /// of a successor whose header never reached the disk, but under an epoch below the new
+    /// segment's, since recovery skips past them (FORMAT §10.1 rule 2, D209), and a slot
+    /// allocated past the file's end was never written, so it reads as zeros. That last one is what every open after a clean close uses, so an open writes
     /// one frame per stream instead of a segment (#143). The price is that the first
     /// segment's syncs also mark its blocks written (an unwritten-extent conversion), which
     /// D35's zero-filled spares avoid for every later segment.

@@ -14,6 +14,18 @@ use crate::{Result, WalOptions, WalStream, stream_path};
 /// Frames read from the file at a time.
 const CHUNK_FRAMES: u64 = 32;
 
+/// How far above the largest epoch recovery saw (every header and the replayed end) a
+/// reopened stream's first segment starts (FORMAT §10.1 rule 2, D209). At most two headers
+/// are ever not durable at once, because a header is written only after its predecessor is
+/// durable: when segment S1 fills, its own header (written once S0's sync completed) waits on
+/// S1's sync, and S2's header is held back for that same sync while S2's records are written
+/// (rule 1). A power loss that keeps S2's frames and drops both headers leaves frames two
+/// epochs above the largest header on disk, in a recycled slot the reopened stream may take;
+/// starting three above means it never takes their epoch (#508). The reopened segment's own
+/// header is synced before anything is appended, so a later recovery's max seen is at least
+/// its epoch and skipped epochs are never reached again.
+const REOPEN_EPOCH_GAP: u32 = 3;
+
 /// Replays one stream from its checkpoint. A lending reader: each record borrows the reader's
 /// buffer until the next call.
 ///
@@ -331,8 +343,13 @@ impl Recovery {
                     .collect();
                 // Above every header, and above the recovered end even when its segment
                 // never reached the disk, so the new segment never shares its epoch with the
-                // position it chains to.
-                let max_epoch = grid.max_epoch().max(end.epoch());
+                // position it chains to; and above every epoch whose frames a power loss may
+                // have kept without their header (FORMAT §10.1 rule 2, D209, #508).
+                let max_epoch = grid
+                    .max_epoch()
+                    .max(end.epoch())
+                    .checked_add(REOPEN_EPOCH_GAP - 1)
+                    .ok_or_else(|| crate::stream::corrupt("wal epochs exhausted"))?;
                 let mut s = WalStream::blank(
                     vfs,
                     file,
