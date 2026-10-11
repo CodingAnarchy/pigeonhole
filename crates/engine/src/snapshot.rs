@@ -527,16 +527,17 @@ impl SstSet {
         (Arc::new(map), Arc::new(by_id))
     }
     /// Debug builds: whether this set holds exactly the catalog's slots, SSTs and blob files.
+    /// Allocates nothing, so the allocation budgets (#320) measure the release path.
     #[cfg(debug_assertions)]
     fn matches(&self, catalog: &Catalog) -> bool {
         self.map.len() == catalog.ssts.len()
             && catalog.ssts.iter().all(|(key, list)| {
+                // SST ids are unique, so equal counts and every listed SST present suffice.
                 self.map.get(key).is_some_and(|fam| {
-                    let mut got: Vec<SstId> = fam.iter().map(|s| s.meta.id).collect();
-                    let mut want: Vec<SstId> = list.iter().map(|(_, m)| m.id).collect();
-                    got.sort_unstable();
-                    want.sort_unstable();
-                    got == want
+                    fam.iter().count() == list.iter().count()
+                        && list
+                            .iter()
+                            .all(|(_, m)| fam.iter().any(|s| s.meta.id == m.id))
                 })
             })
             && self.blobs.len() == catalog.blob_files.len()
