@@ -31,9 +31,20 @@ use crate::snapshot::TabletEntry;
 /// Row samples kept per tablet and balancer interval (split points for write skew).
 const SAMPLES: usize = 64;
 
-/// Weight of the newest interval in the moving averages of write load (#103): one interval's
-/// noise never decides a move on its own.
-const LOAD_ALPHA: f64 = 0.5;
+/// Weight of the newest interval in the moving averages of write load (#103, D214): one
+/// interval's noise never decides a move on its own.
+const LOAD_ALPHA: f64 = 0.2;
+
+/// Consecutive balancer passes a shard's load must stay skewed (above `balance_skew` times
+/// the mean, and at least `balance_min_writes`) before it starts acting on write skew
+/// (D214): short-term noise never moves a tablet.
+const SKEW_PERSIST: u64 = 10;
+
+/// Where a shard that is acting on write skew stops (D214): it keeps shedding load after
+/// each dwell until its load falls below `1 + SKEW_STOP * (balance_skew - 1)` times the mean
+/// (1.1 at the default skew of 1.25), then needs `SKEW_PERSIST` skewed passes to start
+/// again.
+const SKEW_STOP: f64 = 0.4;
 
 /// Balancer passes a shard waits after starting a move or a skew split, and a tablet stays
 /// put after it arrived on a shard, before write skew moves or splits again (#103): the
@@ -1037,6 +1048,7 @@ impl ShardState {
         let (_, mem_per) = self.mem_bytes();
         self.shared.loads[usize::from(self.id.0)]
             .publish(self.load_ewma.round() as u64, now.max(1));
+        self.track_skew(now);
         let idle = self.op.is_none()
             && self.op_queue.is_empty()
             && !self.closing
@@ -1129,6 +1141,64 @@ impl ShardState {
         for t in owned {
             self.arrived.entry(t).or_insert(pass);
         }
+    }
+
+    /// Updates whether this shard acts on write skew (D214, with hysteresis): it starts after
+    /// `SKEW_PERSIST` consecutive passes above `balance_skew` times the mean (and at least
+    /// `balance_min_writes`), and stops once its load falls below the stop ratio or
+    /// `balance_min_writes`. Counted on every pass, dwell or not.
+    fn track_skew(&mut self, now: u64) {
+        let cfg = self.shared.balance;
+        let Some((my, mean)) = self.shard_loads(now) else {
+            self.skew_run = 0;
+            self.skew_active = false;
+            return;
+        };
+        let min = cfg.min_writes.max(1) as f64;
+        if self.skew_active {
+            if my < min || my < Self::skew_stop(cfg.skew) * mean {
+                self.skew_active = false;
+                self.skew_run = 0;
+            }
+            return;
+        }
+        if my >= min && my > cfg.skew * mean {
+            self.skew_run += 1;
+        } else {
+            self.skew_run = 0;
+        }
+        if self.skew_run >= SKEW_PERSIST {
+            self.skew_active = true;
+        }
+    }
+
+    /// The load ratio below which a shard acting on write skew stops (D214).
+    fn skew_stop(skew: f64) -> f64 {
+        1.0 + SKEW_STOP * (skew - 1.0)
+    }
+
+    /// The published write loads of every shard (stale ones count as 0), or `None` with a
+    /// single shard.
+    fn published_loads(&self, now: u64) -> Option<Vec<u64>> {
+        let n = self.shared.shards;
+        if n < 2 {
+            return None;
+        }
+        let stale = self.shared.balance.interval_nanos.saturating_mul(3).max(1);
+        Some(
+            self.shared
+                .loads
+                .iter()
+                .map(|slot| slot.read_fresh(now, stale).unwrap_or(0))
+                .collect(),
+        )
+    }
+
+    /// This shard's published load and the mean over shards.
+    fn shard_loads(&self, now: u64) -> Option<(f64, f64)> {
+        let loads = self.published_loads(now)?;
+        let mean = loads.iter().sum::<u64>() as f64 / loads.len() as f64;
+        Some((loads[usize::from(self.id.0)] as f64, mean))
     }
 
     /// Whether write skew may move or split `t` this pass (it has dwelt here long enough).
@@ -1309,20 +1379,16 @@ impl ShardState {
             }
         }
         // 2. Skew across shards, on the moving averages of write load (#103; memtable bytes
-        //    swing with every flush and no longer count). Not during the shard's dwell after
-        //    its last move, and only for tablets that dwelt here long enough.
-        let n = self.shared.shards;
+        //    swing with every flush and no longer count). Only once the skew persisted
+        //    (`track_skew`, D214), not during the shard's dwell after its last move, and only
+        //    for tablets that dwelt here long enough.
         let dwelling = self
             .skew_pass
             .is_some_and(|p| p + DWELL_PASSES > self.balance_pass);
-        if n > 1 && !dwelling {
-            let stale = cfg.interval_nanos.saturating_mul(3).max(1);
-            let mut writes = vec![0u64; n];
-            for (i, slot) in self.shared.loads.iter().enumerate() {
-                if let Some(w) = slot.read_fresh(now, stale) {
-                    writes[i] = w;
-                }
-            }
+        if self.skew_active
+            && !dwelling
+            && let Some(writes) = self.published_loads(now)
+        {
             let settled: Vec<TabletEntry> = owned
                 .iter()
                 .filter(|t| self.settled(t.id))
@@ -1341,8 +1407,15 @@ impl ShardState {
                 }
                 _ => true,
             };
-            if let Some(op) = self.skew_op(&view, &settled, &writes, &tablet_writes, cfg.min_writes)
-                && splits_ok(&op)
+            let ratio = Self::skew_stop(cfg.skew);
+            if let Some(op) = self.skew_op(
+                &view,
+                &settled,
+                &writes,
+                &tablet_writes,
+                cfg.min_writes,
+                ratio,
+            ) && splits_ok(&op)
             {
                 return Some(op);
             }
@@ -1429,13 +1502,13 @@ impl ShardState {
         loads: &[u64],
         per_tablet: &HashMap<TabletId, u64>,
         min: u64,
+        ratio: f64,
     ) -> Option<TabletOpKind> {
-        let cfg = self.shared.balance;
         let me = usize::from(self.id.0);
         let my = loads[me];
         let total: u64 = loads.iter().sum();
         let mean = total as f64 / loads.len() as f64;
-        if my < min.max(1) || (my as f64) <= cfg.skew * mean {
+        if my < min.max(1) || (my as f64) <= ratio * mean {
             return None;
         }
         let (cold, low) = loads
@@ -1465,7 +1538,9 @@ impl ShardState {
         {
             return Some(TabletOpKind::Move { tablet: *t, to });
         }
-        // One tablet dominates: split it over this shard and the shards below the mean.
+        // One tablet dominates: split it over this shard and the coldest shards below the
+        // mean, about `my / mean` children (D214): a shard at 1.3x the mean sheds into one
+        // other shard, one carrying all the load into every shard.
         let (hot, _) = *tablets.first()?;
         let entry = owned.iter().find(|t| t.id == hot)?;
         let mut targets: Vec<(u64, usize)> = loads
@@ -1475,8 +1550,14 @@ impl ShardState {
             .map(|(i, l)| (*l, i))
             .collect();
         targets.sort_unstable();
+        let parts = ((my as f64 / mean.max(1.0)).round() as usize).clamp(2, targets.len() + 1);
         let mut owners = vec![self.id];
-        owners.extend(targets.iter().map(|(_, i)| ShardId(*i as u16)));
+        owners.extend(
+            targets
+                .iter()
+                .take(parts - 1)
+                .map(|(_, i)| ShardId(*i as u16)),
+        );
         let keys = self.skew_split_keys(entry, owners.len());
         if keys.is_empty() {
             return None;
