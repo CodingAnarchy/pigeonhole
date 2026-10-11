@@ -26,7 +26,7 @@ use pigeonhole_io::IoBuf;
 
 use crate::hash::hash_of;
 use crate::s3fifo::Sharded;
-use crate::sync::{Arc, AtomicU64, lock, read};
+use crate::sync::{Arc, AtomicU8, AtomicU64, lock, read};
 
 /// Identifies a cached block: a namespace (an SST id or a blob file id, tagged by the caller
 /// so the two never collide) and the block's offset within it.
@@ -122,6 +122,14 @@ impl From<Vec<u8>> for BlockData {
 /// ```
 pub struct BlockCache {
     shards: Sharded<BlockKey, BlockData>,
+    /// Bytes of blocks their readers keep pinned for as long as they are open (an SST's top
+    /// index and filters; [`add_pinned`](Self::add_pinned)), D215.
+    pinned: AtomicU64,
+    /// 1 while the next rise of `pinned` past half the capacity counts a warning; re-armed
+    /// once `pinned` falls below 40% of it.
+    pinned_armed: AtomicU8,
+    /// Rises of `pinned` past half the capacity.
+    pinned_warnings: AtomicU64,
 }
 
 impl BlockCache {
@@ -131,15 +139,20 @@ impl BlockCache {
     /// A cache holding up to `capacity` bytes across `shards` shards (0 picks a default:
     /// up to 64, at least 256 KiB each).
     pub fn new(capacity: usize, shards: usize) -> Self {
-        Self {
-            shards: Sharded::new(capacity, shards, Self::MIN_SHARD_BYTES),
-        }
+        Self::with_shards(Sharded::new(capacity, shards, Self::MIN_SHARD_BYTES))
     }
 
     /// A cache that stores nothing: every insert returns an unshared handle.
     pub fn disabled() -> Self {
+        Self::with_shards(Sharded::empty())
+    }
+
+    fn with_shards(shards: Sharded<BlockKey, BlockData>) -> Self {
         Self {
-            shards: Sharded::empty(),
+            shards,
+            pinned: AtomicU64::new(0),
+            pinned_armed: AtomicU8::new(1),
+            pinned_warnings: AtomicU64::new(0),
         }
     }
 
@@ -222,6 +235,53 @@ impl BlockCache {
         }
     }
 
+    /// Counts `bytes` of blocks a reader keeps pinned while it is open (an SST's top index
+    /// and filters), until a matching [`sub_pinned`](Self::sub_pinned). Pinned blocks count
+    /// against the capacity and are never evicted, so once they pass half of it the blocks
+    /// reads come back for (index partitions, data) no longer stay cached (D215): such a rise
+    /// counts a warning ([`pinned_warnings`](Self::pinned_warnings)), at most once until the
+    /// pinned bytes fall below 40% of the capacity again.
+    ///
+    /// ```
+    /// use pigeonhole_cache::BlockCache;
+    ///
+    /// let cache = BlockCache::new(1 << 20, 1);
+    /// cache.add_pinned(400 << 10);
+    /// assert_eq!((cache.pinned(), cache.pinned_warnings()), (400 << 10, 0));
+    /// cache.add_pinned(200 << 10); // past half of 1 MiB
+    /// cache.add_pinned(100 << 10);
+    /// assert_eq!(cache.pinned_warnings(), 1);
+    /// cache.sub_pinned(400 << 10); // below 40%: the next rise counts again
+    /// cache.add_pinned(300 << 10);
+    /// assert_eq!(cache.pinned_warnings(), 2);
+    /// ```
+    pub fn add_pinned(&self, bytes: usize) {
+        let after = self.pinned.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+        let cap = self.capacity() as u64;
+        if cap > 0 && after > cap / 2 && self.pinned_armed.swap(0, Ordering::Relaxed) == 1 {
+            self.pinned_warnings.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Ends the count of `bytes` an [`add_pinned`](Self::add_pinned) began.
+    pub fn sub_pinned(&self, bytes: usize) {
+        let after = self.pinned.fetch_sub(bytes as u64, Ordering::Relaxed) - bytes as u64;
+        if after < self.capacity() as u64 / 10 * 4 {
+            self.pinned_armed.store(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes counted by [`add_pinned`](Self::add_pinned) and not yet ended.
+    pub fn pinned(&self) -> usize {
+        self.pinned.load(Ordering::Relaxed) as usize
+    }
+
+    /// Times the pinned bytes rose past half the capacity
+    /// ([`add_pinned`](Self::add_pinned)).
+    pub fn pinned_warnings(&self) -> u64 {
+        self.pinned_warnings.load(Ordering::Relaxed)
+    }
+
     /// Bytes currently cached.
     pub fn usage(&self) -> usize {
         self.shards.usage()
@@ -259,6 +319,12 @@ pub struct BlockHandle {
 }
 
 impl BlockHandle {
+    /// Bytes the block counts against a cache's capacity (an aligned I/O buffer's capacity,
+    /// a heap buffer's length).
+    pub fn charge(&self) -> usize {
+        self.block.charge()
+    }
+
     /// The block's bytes.
     #[inline]
     pub fn bytes(&self) -> &[u8] {

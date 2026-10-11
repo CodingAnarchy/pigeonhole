@@ -1,4 +1,5 @@
-//! Block-cache hits and misses in the engine's metrics (#57, ICR 0024).
+//! Block-cache hits and misses (#57, ICR 0024) and pinned SST metadata (D215, ICR 0032) in the
+//! engine's metrics.
 
 use std::sync::Arc;
 
@@ -61,5 +62,37 @@ fn a_disabled_block_cache_counts_nothing() {
     let db = reopened(0);
     read(&db);
     read(&db);
-    assert_eq!(db.engine_metrics().block_cache, (0, 0));
+    let m = db.engine_metrics();
+    assert_eq!(m.block_cache, (0, 0));
+    assert_eq!(
+        m.block_cache_pinned_warnings, 0,
+        "no capacity to warn about"
+    );
+}
+
+/// The bytes the open SST readers pin (top index, filters): none before any read opens one.
+fn pinned_after_a_read(db: &Pigeonhole) -> u64 {
+    assert_eq!(db.engine_metrics().block_cache_pinned, 0);
+    read(db);
+    db.engine_metrics().block_cache_pinned
+}
+
+#[test]
+fn open_ssts_count_their_pinned_metadata() {
+    let db = reopened(1 << 20);
+    let pinned = pinned_after_a_read(&db);
+    let m = db.engine_metrics();
+    assert!(pinned > 0, "the read opened an SST reader");
+    assert_eq!(m.block_cache_capacity, 1 << 20);
+    assert_eq!(m.block_cache_pinned_warnings, 0, "far below half the cache");
+}
+
+#[test]
+fn a_cache_too_small_for_the_metadata_warns_once() {
+    let pinned = pinned_after_a_read(&reopened(1 << 20));
+    // Under twice the metadata: opening the readers takes the pinned bytes past half.
+    let db = reopened(pinned as usize * 3 / 2);
+    assert_eq!(pinned_after_a_read(&db), pinned);
+    read(&db);
+    assert_eq!(db.engine_metrics().block_cache_pinned_warnings, 1);
 }
