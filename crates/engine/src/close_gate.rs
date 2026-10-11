@@ -154,6 +154,7 @@ impl<T, W> CloseGate<T, W> {
     }
 
     /// Whether the final close is pending (test hook).
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn pending(&self) -> bool {
         matches!(self.lock().stage, Stage::Pending)
     }
