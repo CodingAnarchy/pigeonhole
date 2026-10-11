@@ -278,7 +278,7 @@ pub(crate) struct Shared {
     /// adds their SSTs (`publish_view`): a shard building its memtable piece (under
     /// `view_lock`) or reading its memtables beside the view's SSTs (loading the view while
     /// holding this lock) sees both or neither.
-    pub flushed_roots: Mutex<HashSet<(u16, u32)>>,
+    pub flushed_roots: crate::flushed_roots::FlushedRoots<(u16, u32)>,
     /// SSTs a running compaction or relocation reads or replaces.
     pub busy_ssts: Mutex<HashSet<SstId>>,
     /// Blob files of values separated at commit time whose commit has not settled yet, or
@@ -525,14 +525,8 @@ impl Shared {
                 vv.insert(k, v);
             }
         }
-        {
-            let mut roots = self
-                .flushed_roots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            roots.extend(flushed.iter().copied());
-            self.view.store(Arc::clone(&view));
-        }
+        self.flushed_roots
+            .publish(flushed, || self.view.store(Arc::clone(&view)));
         *last = version;
         Ok(view)
     }
@@ -2392,15 +2386,12 @@ impl ShardState {
 
     /// The memtable sets of this shard, for a view.
     pub(crate) fn mem_sets(&self) -> Vec<((TabletId, FamilyId), Arc<MemSet>)> {
-        let flushed = self
-            .shared
-            .flushed_roots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        self.memtables
-            .iter()
-            .map(|(k, slot)| (*k, slot.set(self.id, &flushed)))
-            .collect()
+        self.shared.flushed_roots.read(|flushed| {
+            self.memtables
+                .iter()
+                .map(|(k, slot)| (*k, slot.set(self.id, flushed)))
+                .collect()
+        })
     }
 
     /// Applies a replayed record at open (before the shards run).
@@ -3191,16 +3182,9 @@ impl ShardState {
                 metrics.flushes.fetch_add(1, Ordering::Relaxed);
                 metrics.flush_nanos.fetch_add(nanos, Ordering::Relaxed);
                 let version = self.shared.view.load().version;
-                {
-                    let mut roots = self
-                        .shared
-                        .flushed_roots
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    for item in &items {
-                        roots.remove(&(self.id.0, item.root));
-                    }
-                }
+                self.shared
+                    .flushed_roots
+                    .retire(items.iter().map(|item| (self.id.0, item.root)));
                 let landed: Vec<(TabletId, FamilyId)> =
                     items.iter().map(|i| (i.tablet, i.family)).collect();
                 for item in items {
@@ -3490,21 +3474,16 @@ impl ShardState {
         // The view is loaded and the memtables picked while `flushed_roots` is held: a
         // manifest commit adds a flushed memtable's root and stores the view with its SST
         // under that lock (issue #131), so the two never both hold its data, nor both miss it.
-        let (view, mems) = {
-            let flushed = self
-                .shared
-                .flushed_roots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+        let (view, mems) = self.shared.flushed_roots.read(|flushed| {
             let view = self.shared.view.load_full();
             let mems = view
                 .tablets()
                 .route(table, row)
                 .and_then(|(tablet, _)| self.memtables.get(&(tablet, family)))
-                .map(|slot| slot.readers(self.id, &flushed))
+                .map(|slot| slot.readers(self.id, flushed))
                 .unwrap_or_default();
             (view, mems)
-        };
+        });
         let Some((tablet, _)) = view.tablets().route(table, row) else {
             return Ok(None);
         };
@@ -3567,23 +3546,20 @@ impl ShardState {
         let prefix = std::mem::take(&mut self.key_buf);
         let mut found = false;
         if let Some(slot) = self.memtables.get(&(tablet, read.family)) {
-            let flushed = self
-                .shared
-                .flushed_roots
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            'outer: for reader in slot.readers(self.id, &flushed) {
-                let mut it = reader.iter();
-                it.seek(&prefix)?;
-                while it.valid() && it.key().starts_with(&prefix) {
-                    let (_, _, seqno, _) = split_suffix(it.key())?;
-                    if seqno > snapshot {
-                        found = true;
-                        break 'outer;
+            found = self.shared.flushed_roots.read(|flushed| -> Result<bool> {
+                for reader in slot.readers(self.id, flushed) {
+                    let mut it = reader.iter();
+                    it.seek(&prefix)?;
+                    while it.valid() && it.key().starts_with(&prefix) {
+                        let (_, _, seqno, _) = split_suffix(it.key())?;
+                        if seqno > snapshot {
+                            return Ok(true);
+                        }
+                        it.next()?;
                     }
-                    it.next()?;
                 }
-            }
+                Ok(false)
+            })?;
         }
         if !found {
             let view = self.shared.view.load();
