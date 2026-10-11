@@ -33,6 +33,7 @@ mod maintenance;
 mod manifest;
 mod nonblocking;
 mod options;
+mod purge_guard;
 mod read;
 mod row_cache;
 mod shard;

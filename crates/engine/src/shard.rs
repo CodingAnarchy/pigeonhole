@@ -48,6 +48,7 @@ use crate::catalog::{Catalog, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
 use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
+use crate::purge_guard::PurgeGuard;
 use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
 use crate::source::{ColumnKey, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::write::{ReadKey, Settled};
@@ -1250,21 +1251,14 @@ fn flush_guard(
     mems && shares && ssts
 }
 
-/// Guard states of a queued flush (#287): it may install its purge (`IN_FLIGHT`), a delete in
-/// its family arrived first (`VOIDED`: the commit is refused and the memtable flushed again
-/// without the guard), or its commit took the purge (`INSTALLING`: deletes in the family wait
-/// until the shard learns the outcome, so they become visible only after the install).
-pub(crate) const GUARD_IN_FLIGHT: u8 = 0;
-pub(crate) const GUARD_VOIDED: u8 = 1;
-pub(crate) const GUARD_INSTALLING: u8 = 2;
-
-/// A fresh guard state for the flush of memtable `root` of `family`, tracked in `guarded`.
+/// A fresh purge guard (`purge_guard`, #287) for the flush of memtable `root` of `family`,
+/// tracked in `guarded`.
 fn guard_state(
-    guarded: &mut Vec<(u32, FamilyId, Arc<AtomicU8>)>,
+    guarded: &mut Vec<(u32, FamilyId, Arc<PurgeGuard>)>,
     root: u32,
     family: FamilyId,
-) -> Arc<AtomicU8> {
-    let state = Arc::new(AtomicU8::new(GUARD_IN_FLIGHT));
+) -> Arc<PurgeGuard> {
+    let state = Arc::new(PurgeGuard::new());
     guarded.retain(|g| g.0 != root);
     guarded.push((root, family, Arc::clone(&state)));
     state
@@ -1283,7 +1277,7 @@ struct CompactionGuard {
     family: FamilyId,
     min_ts_above: Timestamp,
     max_ts: Timestamp,
-    state: Arc<AtomicU8>,
+    state: Arc<PurgeGuard>,
 }
 
 /// The memtables of one `(tablet, family)` on this shard.
@@ -2020,7 +2014,7 @@ pub(crate) struct ShardState {
     /// Queued or running flushes that may purge versions under the guard (#287), as
     /// `(memtable root, family, state)`: a delete in the family voids one before it installs,
     /// and waits while one installs.
-    guarded: Vec<(u32, FamilyId, Arc<AtomicU8>)>,
+    guarded: Vec<(u32, FamilyId, Arc<PurgeGuard>)>,
     /// Roots whose guarded flush a delete voided: flushed again without the guard.
     voided_roots: HashSet<u32>,
     /// The running compaction's purge guard (#316), when it is bottommost and purges
@@ -2953,7 +2947,7 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let item = |m: &MemEntry, guard: Option<Arc<AtomicU8>>| FlushItem {
+            let item = |m: &MemEntry, guard: Option<Arc<PurgeGuard>>| FlushItem {
                 table: meta.table,
                 tablet: key.0,
                 family: key.1,
@@ -3229,7 +3223,7 @@ impl ShardState {
             if !items.iter().any(|i| i.root == *root) {
                 return true;
             }
-            if state.load(Ordering::Acquire) == GUARD_VOIDED {
+            if state.voided() {
                 voided = true;
                 self.voided_roots.insert(*root);
             }
@@ -5386,14 +5380,8 @@ impl ShardState {
             .filter(|_| below)
             .map(|g| &g.state);
         for state in flushes.chain(compaction) {
-            match state.compare_exchange(
-                GUARD_IN_FLIGHT,
-                GUARD_VOIDED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) | Err(GUARD_VOIDED) => {}
-                Err(_) => return false,
+            if !state.void() {
+                return false;
             }
         }
         true
@@ -6705,7 +6693,7 @@ impl ShardState {
                 .map(|s| s.meta.ts_range.1)
                 .max()
                 .unwrap_or(u64::MAX),
-            state: Arc::new(AtomicU8::new(GUARD_IN_FLIGHT)),
+            state: Arc::new(PurgeGuard::new()),
         });
         let work = match CompactionWork::new(
             Arc::clone(&self.shared),
@@ -6763,7 +6751,7 @@ impl ShardState {
         let voided = self
             .compaction_guard
             .take()
-            .is_some_and(|g| g.state.load(Ordering::Acquire) == GUARD_VOIDED);
+            .is_some_and(|g| g.state.voided());
         trace!(
             "shard {} compaction done: {:?} ({nanos} ns)",
             self.id.0,
