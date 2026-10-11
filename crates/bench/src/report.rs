@@ -382,6 +382,10 @@ pub struct Stalls {
     /// Visibility registrations and wake passes that found the waiter list locked.
     #[serde(default)]
     pub visibility_contended: u64,
+    /// Tablet splits and moves refused because a shard's memtable arena serves no more
+    /// slots (a size split found due counts once per balancer pass; #123).
+    #[serde(default)]
+    pub slot_refusals: u64,
 }
 
 impl Stalls {
@@ -406,6 +410,7 @@ impl Stalls {
             visibility_wake_passes: d(before.visibility_wake_passes, after.visibility_wake_passes),
             visibility_woken: d(before.visibility_woken, after.visibility_woken),
             visibility_contended: d(before.visibility_contended, after.visibility_contended),
+            slot_refusals: d(before.slot_refusals, after.slot_refusals),
         }
     }
 }
@@ -749,14 +754,14 @@ impl Suite {
             .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)))
             .collect();
         if !stalled.is_empty() {
-            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) |\n");
-            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
+            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) | Slot refusals |\n");
+            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
             for (r, st) in stalled {
                 let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
                 let per_op = |n: u64| format!("{:.2}", n as f64 / r.operations.max(1) as f64);
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} ({}) |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} ({}) | {} |",
                     r.workload,
                     r.store,
                     r.threads,
@@ -774,6 +779,7 @@ impl Suite {
                     per_op(st.commit_parks),
                     st.visibility_waits,
                     st.visibility_contended,
+                    st.slot_refusals,
                 );
             }
         }
