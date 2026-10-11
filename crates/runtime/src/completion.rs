@@ -55,7 +55,12 @@ impl<T> Slot<T> {
         let (hook, settle) = {
             let mut s = self.lock();
             s.resolving = true;
-            (s.hook.take(), s.settle.take())
+            let settle = if s.settle.is_some() {
+                s.settle.take()
+            } else {
+                None
+            };
+            (s.hook.take(), settle)
         };
         if let Some(hook) = hook {
             hook(value.as_ref());
@@ -274,19 +279,16 @@ impl<T> Waiter<T> {
         }
         // Taken out under the lock and dropped after it: a value's or waker's drop may run
         // arbitrary code.
-        let (value, waker, hook, settle) = {
+        let (value, waker, hook) = {
             let mut s = self.slot.lock();
+            // The resolution took it, or `on_settled` ran it at once: never left behind.
+            debug_assert!(s.settle.is_none());
             s.done = false;
             s.resolving = false;
             s.blocked = false;
-            (
-                s.value.take(),
-                s.waker.take(),
-                s.hook.take(),
-                s.settle.take(),
-            )
+            (s.value.take(), s.waker.take(), s.hook.take())
         };
-        drop((value, waker, hook, settle));
+        drop((value, waker, hook));
         slots.push(Arc::clone(&self.slot));
     }
 }
