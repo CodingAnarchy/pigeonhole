@@ -10,7 +10,8 @@ Pigeonhole is an embedded, single-file, wide-column store in Rust: BigTable's da
 2. Read your crate's brief and the spec sections it names.
 3. Read the [decisions index](docs/design/decisions/README.md), then the decisions that touch your crate (they win over the spec). Don't read every decision file.
 4. Read [`FORMAT.md`](FORMAT.md) if you touch bytes on disk or in shared memory.
-5. Check [`docs/status.md`](docs/status.md) for what exists and what is in flight.
+5. Read [`docs/design/concurrency.md`](docs/design/concurrency.md) if you add, remove or change shared state in `pigeonhole-engine` or `pigeonhole-runtime` (a lock, atomic, `ArcSwap`, shared queue or cross-thread protocol). Follow its lock order, and update its inventory in the same PR.
+6. Check [`docs/status.md`](docs/status.md) for what exists and what is in flight.
 
 ## Commands
 Builds go through [`cargo-quota`](https://crates.io/crates/cargo-quota), which keeps every worktree's `target/` under one shared disk budget (see `CONTRIBUTING.md`):
