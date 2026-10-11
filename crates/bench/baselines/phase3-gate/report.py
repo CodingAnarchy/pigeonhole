@@ -366,11 +366,15 @@ if cs:
 try:
     with open(path("durations.tsv")) as f:
         steps = [l.rstrip("\n").split("\t") for l in f if l.strip()]
+    # name, minutes, scale, and (since the resume fix) the commit the step ran at.
+    commits = sorted({s[3] for s in steps if len(s) > 3} | ({"(not recorded)"} if any(len(s) < 4 for s in steps) else set()))
+    if len(commits) > 1:
+        print(f"\n**Mixed commits:** the steps ran at {', '.join(commits)} (a resumed window); see the table below.")
     print("\n## Step durations\n")
-    print("| Step | Minutes |")
-    print("|---|---:|")
-    for name, mins, _ in steps:
-        print(f"| {name} | {mins} |")
-    print(f"| **total** | **{sum(int(m) for _, m, _ in steps)}** |")
+    print("| Step | Minutes | Commit |")
+    print("|---|---:|---|")
+    for s in steps:
+        print(f"| {s[0]} | {s[1]} | {s[3] if len(s) > 3 else '(not recorded)'} |")
+    print(f"| **total** | **{sum(int(s[1]) for s in steps)}** | |")
 except OSError:
     pass

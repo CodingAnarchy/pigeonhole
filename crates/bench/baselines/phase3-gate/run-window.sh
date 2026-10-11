@@ -7,7 +7,8 @@
 # Linux 6.x, as root (the cold steps empty the page cache and start cgroup scopes), with
 # nothing else running. DATA_DIR is on the NVMe under test (not the OS drive); RESULTS_DIR
 # collects every JSON, log and the summary. Each step writes RESULTS_DIR/STEP.done when it
-# finishes, so a rerun (after a reboot, or a fix) skips what is done; delete a .done file to
+# finishes (holding the commit it ran at), so a rerun (after a reboot, or a fix) skips what
+# is done; delete a .done file to
 # run that step again. `--scale small` runs everything at small sizes: the dry run, on any
 # Linux box or CI runner, that catches script bugs before rented hours do.
 #
@@ -81,6 +82,20 @@ steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uri
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
     [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [group-sync-depth]=15 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
     [cold-scan]=45 [scan-cache]=10 [report]=1)
+
+# The checkout's commit ("-dirty" with local changes), recorded with each finished step.
+commit="$(git -C "$root" rev-parse --short=12 HEAD)"
+[[ -z "$(git -C "$root" status --porcelain --untracked-files=no)" ]] || commit="$commit-dirty"
+# A resumed window must not run a binary built at another commit: build.done records the
+# commit it built, and a different checkout refuses until build.done is deleted (rebuild).
+if [[ -s "$results/build.done" && "$(cat "$results/build.done")" != "$commit" ]]; then
+    echo "run-window.sh: the binaries were built at $(cat "$results/build.done"), the checkout is at $commit;" \
+        "delete $results/build.done so the build step rebuilds them" >&2
+    exit 2
+fi
+if [[ -e "$results/build.done" && ! -s "$results/build.done" ]]; then
+    echo "warning: build.done does not say which commit it built; delete it to rebuild at $commit" >&2
+fi
 
 bench="$root/target/release/phdb-bench"
 examples="$root/target/release/examples"
@@ -161,8 +176,10 @@ run() {
     wait "$pid" || status=$?
     if [[ $status == 0 ]]; then
         end=$(date +%s)
-        printf '%s\t%d\t%s\n' "$name" $(((end - start) / 60)) "$scale" >> "$results/durations.tsv"
-        touch "$results/$name.done"
+        # The commit each step measured: a window resumed after a fix runs its later steps on
+        # a newer commit, and the report lists the commits per step.
+        printf '%s\t%d\t%s\t%s\n' "$name" $(((end - start) / 60)) "$scale" "$commit" >> "$results/durations.tsv"
+        echo "$commit" > "$results/$name.done"
     elif [[ $status == "$SKIP" ]]; then
         # A step whose feature the built binary lacks: not done, so a rerun after the
         # rebuild runs it; the window goes on.
