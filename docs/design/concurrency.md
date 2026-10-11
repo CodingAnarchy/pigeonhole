@@ -31,15 +31,15 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 
 ## Counts
 
-**154 primitives** (`main` after #134 step 2's close gate; 159 before):
+**155 primitives** (`main` after #134 step 2's close gate; 159 before):
 
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
-| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 70 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
+| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 71 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
 | `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 26 | `Hooks` 20, `ShardCounters` 4, `ReaderHooks` 2 |
 | other `engine/src` files | 34 | | 10 of them thread-locals (per-thread scratch and caches) |
 | `runtime/src` | 16 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
-| **Total** | **154** | | |
+| **Total** | **155** | | |
 
 A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityWaiters::{waits, scanned, contended, passes, woken}`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
 
@@ -55,7 +55,7 @@ Every observed nesting, outer → inner. The **manifest exclusion** (`manifest_b
    - Under `view_lock`, `ViewPin::new` takes `LiveViews::versions`.
    - `ShardState::publish_memtables` also takes `view_lock` → `flushed_roots` (through `mem_sets`), releasing it before `publish_view` takes it again.
 3. **Manifest exclusion → `Shared::locks`**, in `try_final_close` → `final_close`.
-4. **`CloseState` (the close gate's lock) → manifest exclusion, as a try-lock only**, in `try_final_close` (`CloseGate::try_start`). The final close itself then runs with the exclusion held and the gate's lock released. A thread that holds the exclusion may take the gate's lock (`fail_close`): the opposite direction, but safe, since the gate's side never blocks on the exclusion.
+4. **`CloseState` (the close gate's lock) → manifest exclusion, as a try-lock only**, in `try_final_close` (`CloseGate::try_start`). The final close itself then runs with the exclusion held and the gate's lock released. A thread that holds the exclusion may take the gate's lock (`manifest::release` runs `try_final_close`) only after it stored the exclusion free, so it never waits on the gate's lock while holding it.
 5. *(Removed by #134 step 2: `CloseState::outcome` → `done` is gone; the gate has one lock.)*
 6. **`large_logged` → `large_dropped` → `large_pending`**, in `LargeValues::settle_on`'s resolve callback (large.rs), on the completion thread. `note_logged` takes `large_pending` then `large_logged` in sequence, never together.
 7. **`ReaderState::shm` → { `ReaderState::view`, `ReaderState::catalog` }**, in `reader_snapshot`'s re-attach branch. `view` and `catalog` are never held together.
@@ -143,7 +143,8 @@ Every counter in this struct has one writer, its own shard thread, and the reade
 
 | Name | Type | Protects / means | Writers | Readers | Ordering | Why / history |
 |---|---|---|---|---|---|---|
-| `CloseState` (`CloseGate`, close_gate.rs) shard.rs:199 | `Mutex<Gate>`: shards to report, `failed`, maintenance count, stage (`Open`, `Pending`, `Running`, `Done(outcome)`), the `Engine::close` waiter | Who runs the final close, and when; whether the close is unclean; its outcome | shard threads: `report_closed` (`report`), `fail_close` (`fail`); app threads: `MaintenanceGuard` (`enter_maintenance`/`leave_maintenance`), `Engine::close` (`register`); whoever runs `try_final_close` (`try_start`, `finish`), including `manifest::release` | `visibility_ended`, `try_finish_close` (`failed`); `EngineShard::closed` (`outcome`); test hook `final_close_pending` | One lock. `try_start` try-claims the manifest exclusion under it (never blocks); the final close runs outside it. Replaced five primitives, `Shared::maintenance` and three SeqCst fence pairings (#134 step 2) | #41, #78, #81, #117, #135, #166; #134 |
+| `CloseState` (`CloseGate`, close_gate.rs) shard.rs:199 | `Mutex<Gate>`: shards to report, maintenance count, stage (`Open`, `Pending`, `Running`, `Done(outcome)`), the `Engine::close` waiter | Who runs the final close, and when; its outcome | shard threads: `report_closed` (`report`); app threads: `MaintenanceGuard` (`enter_maintenance`/`leave_maintenance`), `Engine::close` (`register`); whoever runs `try_final_close` (`try_start`, `finish`), including `manifest::release` | `EngineShard::closed` (`outcome`); test hook `final_close_pending` | One lock. `try_start` try-claims the manifest exclusion under it (never blocks); the final close runs outside it. Replaced five primitives, `Shared::maintenance` and three SeqCst fence pairings (#134 step 2) | #41, #78, #81, #117, #135, #166; #134 |
+| `CloseGate::failed` close_gate.rs | `AtomicBool` | The close is unclean: a shard's final sync, flush or checkpoint failed, or a shard died | `fail_close` (`fail`, a swap: the first failure is told) | `visibility_ended` on every async commit poll, `try_finish_close`, and `try_start` under the gate's lock (`failed`) | SeqCst. Outside the lock so a poll costs one load. A shard fails the close before it reports under the lock, so the starter sees it | #41; #134 |
 
 ### `VisibilityWaiters` (shard.rs:207), `Shared::waiters`
 

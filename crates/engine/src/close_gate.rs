@@ -12,12 +12,17 @@
 //! try-lock taken under it: a releaser stores the exclusion free before it takes this lock,
 //! so whichever of the releaser and the reporter (or the leaving maintainer) takes the lock
 //! second sees the other's step and runs the close. The final close itself runs outside the
-//! lock, under the exclusion.
+//! lock, under the exclusion. Only whether the close failed lives outside the lock, an
+//! atomic every async commit's poll reads; a shard sets it before it reports.
 //!
 //! Generic over the outcome `T` and the waiter `W`, so the loom models below run it alone.
 
 #[cfg(engine_loom)]
+use loom::sync::atomic::{AtomicBool, Ordering};
+#[cfg(engine_loom)]
 use loom::sync::{Mutex, MutexGuard};
+#[cfg(not(engine_loom))]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(engine_loom))]
 use std::sync::{Mutex, MutexGuard};
 
@@ -40,9 +45,6 @@ enum Stage<T> {
 struct Gate<T, W> {
     /// Shards that have not reported.
     remaining: usize,
-    /// A shard's final sync, flush or checkpoint failed, or a shard died: the close is not
-    /// clean.
-    failed: bool,
     /// Application threads inside maintenance.
     maintenance: usize,
     stage: Stage<T>,
@@ -54,6 +56,11 @@ struct Gate<T, W> {
 #[derive(Debug)]
 pub(crate) struct CloseGate<T, W> {
     state: Mutex<Gate<T, W>>,
+    /// A shard's final sync, flush or checkpoint failed, or a shard died: the close is not
+    /// clean. Outside the lock: every async commit's poll reads it (`visibility_ended`). A
+    /// shard fails the close before it reports, so the thread that starts the final close
+    /// (after the last report, under the lock) sees it.
+    failed: AtomicBool,
 }
 
 impl<T, W> CloseGate<T, W> {
@@ -62,11 +69,11 @@ impl<T, W> CloseGate<T, W> {
         Self {
             state: Mutex::new(Gate {
                 remaining: shards,
-                failed: false,
                 maintenance: 0,
                 stage: Stage::Open,
                 waiter: None,
             }),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -76,13 +83,12 @@ impl<T, W> CloseGate<T, W> {
 
     /// Marks the close unclean; returns whether this was the first time.
     pub(crate) fn fail(&self) -> bool {
-        let mut g = self.lock();
-        !std::mem::replace(&mut g.failed, true)
+        !self.failed.swap(true, Ordering::SeqCst)
     }
 
-    /// Whether the close is unclean.
+    /// Whether the close is unclean (one load, no lock).
     pub(crate) fn failed(&self) -> bool {
-        self.lock().failed
+        self.failed.load(Ordering::SeqCst)
     }
 
     /// A shard reports its part of the close done. A second report of the same shard (a
@@ -122,7 +128,7 @@ impl<T, W> CloseGate<T, W> {
             return None;
         }
         g.stage = Stage::Running;
-        Some(g.failed)
+        Some(self.failed())
     }
 
     /// Records the final close's outcome; returns the waiter to answer, if one registered.
@@ -176,6 +182,7 @@ mod loom_tests {
         gate: CloseGate<u32, u32>,
         busy: Mutex<bool>,
         runs: AtomicUsize,
+        unclean: AtomicUsize,
         answered: AtomicUsize,
     }
 
@@ -193,6 +200,7 @@ mod loom_tests {
                 gate: CloseGate::new(shards),
                 busy: Mutex::new(busy),
                 runs: AtomicUsize::new(0),
+                unclean: AtomicUsize::new(0),
                 answered: AtomicUsize::new(0),
             })
         }
@@ -208,10 +216,12 @@ mod loom_tests {
         }
 
         fn try_final_close(&self) {
-            if self.gate.try_start(|| self.claim()).is_none() {
+            let Some(failed) = self.gate.try_start(|| self.claim()) else {
                 return;
-            }
+            };
             self.runs.fetch_add(1, Ordering::Relaxed);
+            self.unclean
+                .fetch_add(usize::from(failed), Ordering::Relaxed);
             let waiter = self.gate.finish(7);
             self.release();
             if waiter.is_some() {
@@ -222,20 +232,23 @@ mod loom_tests {
 
     #[test]
     fn loom_the_final_close_runs_exactly_once_whoever_finishes_last() {
-        // Two shards report, a thread holding the manifest exclusion releases it, and an
-        // application thread passes through maintenance, in every interleaving: the final
-        // close runs exactly once.
+        // Two shards report (the first after failing its part), a thread holding the
+        // manifest exclusion releases it, and an application thread passes through
+        // maintenance, in every interleaving: the final close runs exactly once, and unclean.
         model(|| {
             let e = Engine::new(2, true);
-            let report = |e: Arc<Engine>| {
+            let report = |e: Arc<Engine>, fail: bool| {
                 thread::spawn(move || {
+                    if fail {
+                        e.gate.fail();
+                    }
                     if e.gate.report() {
                         e.try_final_close();
                     }
                 })
             };
-            let a = report(Arc::clone(&e));
-            let b = report(Arc::clone(&e));
+            let a = report(Arc::clone(&e), true);
+            let b = report(Arc::clone(&e), false);
             let holder = {
                 let e = Arc::clone(&e);
                 thread::spawn(move || e.release())
@@ -251,6 +264,7 @@ mod loom_tests {
                 1,
                 "the final close ran once"
             );
+            assert_eq!(e.unclean.load(Ordering::Relaxed), 1, "and saw the failure");
             assert_eq!(e.gate.outcome(|o| *o), Some(7));
         });
     }
