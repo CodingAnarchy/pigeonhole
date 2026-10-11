@@ -38,6 +38,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install libclang (bindgen for librocksdb-sys) and nvme-cli
         run: sudo apt-get update && sudo apt-get install -y libclang-dev clang nvme-cli gdb elfutils
+      - name: data-disk.sh refuses a disk in use
+        # Read-only (no --format): the listing, then the check on the disks behind / and
+        # /mnt, which must be refused (partitions, mounts). Never formats anything.
+        run: |
+          sudo crates/bench/baselines/phase3-gate/data-disk.sh
+          for m in / /mnt; do
+            disk="$(lsblk -ndo PKNAME "$(findmnt -nvo SOURCE "$m")")"
+            id=""
+            for l in /dev/disk/by-id/*; do
+              [[ "$(readlink -f "$l")" == "/dev/$disk" ]] && { id="$l"; break; }
+            done
+            if [[ -z "$id" ]]; then
+              echo "no by-id link for /dev/$disk ($m); skipped"
+              continue
+            fi
+            if sudo crates/bench/baselines/phase3-gate/data-disk.sh "$id"; then
+              echo "::error::data-disk.sh passed $id, which backs $m"
+              exit 1
+            fi
+          done
       - name: Run every step at small scale
         # As root (the cold steps empty the page cache and start cgroup scopes), with the
         # runner's toolchain. /mnt is the runner's larger scratch disk.

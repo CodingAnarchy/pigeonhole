@@ -10,18 +10,21 @@ The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated 
 
 ## Setting up the machine
 
-1. **Install the OS on one NVMe only.** In Hetzner's `installimage`, choose Ubuntu 24.04 and turn software RAID off (`SWRAID 0`). Install to `nvme0n1` and leave `nvme1n1` out of the drive list. Hetzner's default mirrors both drives (RAID1), which puts every measured write through md. The second NVMe stays raw for the data.
+1. **Install the OS on one NVMe only.** In Hetzner's `installimage`, choose Ubuntu 24.04 and turn software RAID off (`SWRAID 0`). Install to one drive and leave the other out of the drive list. Hetzner's default mirrors both drives (RAID1), which puts every measured write through md. The other NVMe stays raw for the data. **Don't rely on kernel names:** `nvme0n1` and `nvme1n1` can swap across reboots and reinstalls (on the AX102 the OS has landed on `nvme1n1`). Step 3 names the data disk by `/dev/disk/by-id`.
 2. **Log in as root and clone the repository at the chosen commit:**
    ```sh
    git clone https://github.com/CodingAnarchy/pigeonhole && cd pigeonhole && git checkout COMMIT
    crates/bench/baselines/phase3-gate/setup.sh
    ```
    `setup.sh` installs the build packages, `nvme-cli`, `xfsprogs` and the Rust toolchain. It turns io_uring on, sets the `performance` governor, and lifts root's memlock limit. Log in again afterwards, so the memlock limit applies.
-3. **Make the data file system on the second NVMe** (this erases it; check the device with `nvme list` first):
+3. **Make the data file system on the empty NVMe, named by id.** `data-disk.sh` never takes a kernel name. Before it formats anything, it prints the disk and a check. It refuses a disk with partitions, anything mounted or used as swap, the root file system, md RAID or device-mapper, or any file-system or RAID signature. Without `--format` it only prints the check.
    ```sh
-   mkfs.xfs -f /dev/nvme1n1 && mkdir -p /data && mount -o noatime /dev/nvme1n1 /data
+   crates/bench/baselines/phase3-gate/data-disk.sh                     # list the NVMe disks by id, with their partitions and mounts
+   crates/bench/baselines/phase3-gate/data-disk.sh /dev/disk/by-id/nvme-MODEL_SERIAL            # the check only: read it
+   crates/bench/baselines/phase3-gate/data-disk.sh /dev/disk/by-id/nvme-MODEL_SERIAL --format   # check again, then mkfs.xfs and mount on /data
    ```
-4. **Check the drive.** `nvme id-ctrl /dev/nvme1n1 | grep -E '^(mn|fr|vwc)'` shows the model, firmware and write cache. A Datacenter Edition drive has power-loss protection. The setup step records this in `machine.json`, and warns if the write cache is volatile.
+   Use the by-id name the listing shows with no partitions and nothing mounted. **Never type `mkfs` on a `/dev/nvmeXn1` name by hand.** After a reboot, mount it by the same id: `mount -o noatime /dev/disk/by-id/nvme-MODEL_SERIAL /data`.
+4. **Check the drive.** `nvme id-ctrl "$(readlink -f /dev/disk/by-id/nvme-MODEL_SERIAL)" | grep -E '^(mn|fr|vwc)'` shows the model, firmware and write cache. A Datacenter Edition drive has power-loss protection. The setup step records this in `machine.json`, and warns if the write cache is volatile.
 
 ## Running
 
