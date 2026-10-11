@@ -379,6 +379,21 @@ impl Table {
         self.core.db.engine.shard_of(self.core.info.id, row)
     }
 
+    /// Splits this table's row space at `keys` (sorted) and spreads the pieces over the
+    /// shards, piece `i` to shard `i % shards`, waiting until done. A bench hook (D213): the
+    /// gate's group-commit table starts on every shard instead of waiting for the balancer.
+    /// The balancer may still move the pieces later.
+    #[doc(hidden)]
+    pub fn split_over_shards(&self, keys: Vec<Vec<u8>>) -> Result<()> {
+        let shards = self.core.db.engine.shard_stats().len().max(1);
+        let owners: Vec<u16> = (0..=keys.len()).map(|i| (i % shards) as u16).collect();
+        self.core
+            .db
+            .engine
+            .split_table(self.core.info.id, keys, &owners)
+            .map_err(Into::into)
+    }
+
     /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): memtable
     /// and cache hits resolve on the first poll, and a block the cache does not hold is read
     /// asynchronously (see [`nonblocking`](crate::nonblocking)).

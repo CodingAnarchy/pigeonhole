@@ -225,6 +225,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D210](phase-3.md#d210) — Async commits wait for room before they submit: half `memtable_budget` per shard of async commits in flight, waiters in arrival order; a commit future dropped before it submitted writes nothing · owner decision, engine, pigeonhole, runtime, #149 · amends D196
 - [D211](phase-3.md#d211) — No manifest checkpoint may name a WAL stream whose file creation is not durable: a shard holds its checkpoint back until the new stream's file and directory syncs finish (`Wal::created_durable`, ICR 0031) · coordinator decision, engine, wal, #520 · amends D203
 - [D212](phase-3.md#d212) — The manifest keeps today's exclusion protocol (loom-modelled, #536); no single writer task, which would refuse blocking catalog changes on the writer shard's driver (changing D150 (a)) and need async catalog APIs; revisit at the public API / C ABI review or on a new bug in these paths · owner decision, engine, #134
+- [D213](phase-3.md#d213) — The durable group-commit target (> 1M cells/s across cores, p99 < 200 µs) is measured with N shards = cores, the table split over every shard up front, and 16 durable commits in flight inline per shard (the D204 driver); the 1/4/16-client sweep stays as a reported secondary, and the gate's setup step times the drive's raw fdatasync as the p99 floor · owner decision, bench, #64, #406
 
 ## Open questions
 _None._

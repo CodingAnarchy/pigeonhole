@@ -30,6 +30,8 @@ pub(crate) struct Settings {
     /// A shard's idle spin before it parks (`Options::shard_spin`, D198), in microseconds;
     /// `None`: the library default.
     pub(crate) shard_spin_micros: Option<u64>,
+    /// The inline driver splits the table over every shard before loading it (D213).
+    pub(crate) presplit: bool,
 }
 
 #[derive(Debug)]
@@ -161,6 +163,21 @@ impl PigeonholeRunner {
         self.settings.shard_spin_micros = Some(micros);
         self
     }
+
+    /// `true`: [`run_inline`](Self::run_inline) splits the table at the loaded rows'
+    /// quantiles and hands one piece to each shard before loading it, so every shard owns
+    /// rows from the start instead of waiting for the balancer to spread them (D213's
+    /// group-commit shape).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(PigeonholeRunner::default().presplit(true).describe().contains(" presplit"));
+    /// ```
+    pub fn presplit(mut self, yes: bool) -> Self {
+        self.settings.presplit = yes;
+        self
+    }
 }
 
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
@@ -280,7 +297,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.group_sync {
@@ -299,7 +316,8 @@ impl Runner for PigeonholeRunner {
                 String::new()
             },
             s.shard_spin_micros
-                .map_or_else(String::new, |us| format!(" shard_spin={us}us"))
+                .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
+            if s.presplit { " presplit" } else { "" }
         )
     }
 }

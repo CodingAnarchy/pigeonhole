@@ -1744,6 +1744,32 @@ impl Engine {
             .map(|(_, shard)| usize::from(shard.0))
     }
 
+    /// Splits the tablet of `table` holding `keys[0]` at `keys` (sorted, all inside that
+    /// tablet), handing child `i` to shard `owners[i]`, and waits until the change is done.
+    /// A bench hook (D213): a gate workload's table spread over every shard before it is
+    /// measured, instead of waiting for the balancer to split and move it. Fails as a
+    /// tablet change does (`InvalidArgument` for keys or owners that do not fit,
+    /// `Unsupported` past a shard's slot budget).
+    #[doc(hidden)]
+    pub fn split_table(&self, table: TableId, keys: Vec<Vec<u8>>, owners: &[u16]) -> Result<()> {
+        self.inner.shared.refuse_blocking_on_driver("split_table")?;
+        let first = keys
+            .first()
+            .ok_or_else(|| Error::InvalidArgument("no split keys".to_owned()))?;
+        let (tablet, shard) = self.inner.tablet_at(table, first)?;
+        let owners = owners.iter().map(|&s| ShardId(s)).collect();
+        self.inner
+            .tablet_op(
+                shard,
+                crate::shard::TabletOpKind::Split {
+                    tablet,
+                    keys,
+                    owners,
+                },
+            )?
+            .wait()
+    }
+
     /// Tablet changes refused for lack of room, summed over shards since open, as
     /// `(slot budget, view size)`: splits and moves a shard's memtable slots could not take
     /// (a size split the balancer found due but skipped counts once per balancer pass), and
@@ -2246,6 +2272,39 @@ impl PendingMaintenance {
 }
 
 impl Inner {
+    /// The tablet of `table` holding `row` and its owner.
+    fn tablet_at(&self, table: TableId, row: &[u8]) -> Result<(TabletId, ShardId)> {
+        self.check_open()?;
+        self.shared
+            .view
+            .load()
+            .tablets()
+            .route(table, row)
+            .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))
+    }
+
+    /// Sends a tablet change to `shard`, the tablets' owner.
+    fn tablet_op(
+        &self,
+        shard: ShardId,
+        op: crate::shard::TabletOpKind,
+    ) -> Result<PendingMaintenance> {
+        if self.role != Role::Writer {
+            return Err(Error::ReadOnly);
+        }
+        self.check_open()?;
+        let (tx, rx) = completion();
+        self.shared.submitter(shard).submit(ShardMsg::TabletOp {
+            op,
+            reply: Some(tx),
+        })?;
+        Ok(PendingMaintenance {
+            waiters: vec![rx],
+            rounds: None,
+            failed: None,
+        })
+    }
+
     pub(crate) fn admit(&self, batch: &WriteBatch) -> crate::Admit {
         self.admit_routed(None, batch)
     }

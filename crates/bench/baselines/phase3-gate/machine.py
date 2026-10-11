@@ -9,8 +9,12 @@ system as / (the OS drive); less free space under DATA_DIR than the run needs; a
 machine (1-minute load above 1.0). At `--scale small` (the dry run) only the first two and
 the free space are enforced. Warnings (printed, kept in the JSON): CPU frequency governor
 not `performance`; DATA_DIR on md RAID or device-mapper; a drive whose write cache is
-volatile (no power-loss protection); transparent hugepages `always`."""
-import json, os, platform, shutil, subprocess, sys
+volatile (no power-loss protection); transparent hugepages `always`.
+
+It also times the data drive's raw fdatasync (4 KiB writes, then fdatasync, 2,000 times, in
+DATA_DIR): the floor under any durable commit, which report.py shows beside the group
+commit p99 target (D213)."""
+import json, os, platform, shutil, subprocess, sys, time
 
 data, out, scale = sys.argv[1:4]
 full = scale == "full"
@@ -69,6 +73,32 @@ thp = read("/sys/kernel/mm/transparent_hugepage/enabled") or ""
 if "[always]" in thp:
     warnings.append("transparent hugepages are 'always'; 'madvise' is the usual server setting")
 
+def fdatasync_us(directory, n=2000):
+    """Raw fdatasync latency under `directory`: p50, p99 and max in µs over `n` syncs, each
+    after a 4 KiB write (D213)."""
+    p = os.path.join(directory, "fdatasync-probe.bin")
+    fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        block = os.urandom(4096)
+        sync = getattr(os, "fdatasync", os.fsync)  # fsync where there is none (macOS)
+        t = []
+        for i in range(n):
+            os.pwrite(fd, block, (i % 256) * 4096)
+            s = time.perf_counter_ns()
+            sync(fd)
+            t.append((time.perf_counter_ns() - s) / 1000)
+    finally:
+        os.close(fd)
+        os.unlink(p)
+    t.sort()
+    return {"p50": round(t[n // 2], 1), "p99": round(t[n * 99 // 100], 1), "max": round(t[-1], 1)}
+
+
+try:
+    fdatasync = fdatasync_us(data)
+except OSError as e:
+    fdatasync = {"error": str(e)}
+
 machine = {
     "machine": True,
     "scale": scale,
@@ -87,6 +117,7 @@ machine = {
     "nvme_list": sh("nvme list 2>/dev/null"),
     "mount": sh(f"findmnt -no FSTYPE,OPTIONS -T {data}"),
     "free_gb": round(free_gb),
+    "fdatasync_4k_us": fdatasync,
     "io_uring_disabled": uring,
     "memlock": sh("ulimit -l"),
     "load": sh("cat /proc/loadavg"),
@@ -98,6 +129,7 @@ machine = {
 }
 with open(out, "w") as f:
     json.dump(machine, f, indent=1)
+print(f"fdatasync 4 KiB on {data}: {fdatasync}")
 for w in warnings:
     print(f"warning: {w}")
 for e in failures:

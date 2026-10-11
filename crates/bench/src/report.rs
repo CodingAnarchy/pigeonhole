@@ -543,6 +543,82 @@ impl Scaling {
     }
 }
 
+/// The durable group-commit target (D213): 4-cell `GroupSync` commits at N shards (one per
+/// core), the table split over every shard up front, each shard's thread keeping
+/// [`INLINE_IN_FLIGHT`](crate::INLINE_IN_FLIGHT) commits in flight (the D204 driver).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupCommit {
+    /// Shards in the run.
+    pub shards: usize,
+    /// Cores of the machine ([`Environment::cores`]).
+    pub cores: usize,
+    /// Cells committed per second, over every shard.
+    pub cells_per_sec: f64,
+    /// Commit latency (submit to durable resolution), nanoseconds.
+    pub p50_ns: u64,
+    /// See [`GroupCommit::p50_ns`].
+    pub p99_ns: u64,
+    /// The largest share of the run's commits on one shard (as [`Scaling::max_share`]).
+    pub max_share: f64,
+}
+
+impl GroupCommit {
+    /// Cells per second the target asks for, across cores.
+    pub const CELLS_PER_SEC: f64 = 1e6;
+    /// The p99 commit latency the target allows, nanoseconds.
+    pub const P99_NS: u64 = 200_000;
+
+    /// Builds the result from the D213 run's record: its throughput times
+    /// [`GROUP_COMMIT_CELLS`](crate::GROUP_COMMIT_CELLS) cells per commit.
+    pub fn new(shards: usize, cores: usize, run: &RunRecord) -> Self {
+        let total: u64 = run.detail.shards.iter().map(|s| s.commits).sum();
+        let top = run
+            .detail
+            .shards
+            .iter()
+            .map(|s| s.commits)
+            .max()
+            .unwrap_or(0);
+        Self {
+            shards,
+            cores,
+            cells_per_sec: run.throughput * crate::GROUP_COMMIT_CELLS as f64,
+            p50_ns: run.p50_ns,
+            p99_ns: run.p99_ns,
+            max_share: if total == 0 {
+                0.0
+            } else {
+                top as f64 / total as f64
+            },
+        }
+    }
+
+    /// Cells per second per core.
+    ///
+    /// ```
+    /// use pigeonhole_bench::GroupCommit;
+    ///
+    /// let gc = GroupCommit {
+    ///     shards: 8,
+    ///     cores: 8,
+    ///     cells_per_sec: 1.2e6,
+    ///     p50_ns: 80_000,
+    ///     p99_ns: 150_000,
+    ///     max_share: 0.13,
+    /// };
+    /// assert_eq!(gc.cells_per_core(), 150_000.0);
+    /// assert!(gc.passes());
+    /// ```
+    pub fn cells_per_core(&self) -> f64 {
+        self.cells_per_sec / self.cores.max(1) as f64
+    }
+
+    /// Whether the target is met: more than 1M cells/s and p99 under 200 µs.
+    pub fn passes(&self) -> bool {
+        self.cells_per_sec > Self::CELLS_PER_SEC && self.p99_ns < Self::P99_NS
+    }
+}
+
 /// Every result of one invocation, as written to `--json`.
 ///
 /// ```
@@ -567,6 +643,9 @@ pub struct Suite {
     /// clients, four per shard, at half the gate's shards.
     #[serde(default)]
     pub scaling_sync: Option<Scaling>,
+    /// The durable group-commit target (D213), when `group-commit` ran on Pigeonhole.
+    #[serde(default)]
+    pub group_commit: Option<GroupCommit>,
 }
 
 fn us(ns: u64) -> String {
@@ -603,6 +682,7 @@ impl Suite {
             results: Vec::new(),
             scaling: None,
             scaling_sync: None,
+            group_commit: None,
         }
     }
 
@@ -804,6 +884,24 @@ impl Suite {
                 } else {
                     "fail"
                 }
+            );
+        }
+        if let Some(gc) = &self.group_commit {
+            let _ = writeln!(
+                s,
+                "\n**Durable group commit (D213):** {} shards on {} cores, the table split over \
+                 every shard, {} commits in flight per shard: {} cells/s ({} per core), commit \
+                 p50 {} µs, p99 {} µs (target > 1M cells/s, p99 < 200 µs); the busiest shard \
+                 took {:.0}% of the commits — {}.",
+                gc.shards,
+                gc.cores,
+                crate::INLINE_IN_FLIGHT,
+                ops(gc.cells_per_sec),
+                ops(gc.cells_per_core()),
+                us(gc.p50_ns),
+                us(gc.p99_ns),
+                100.0 * gc.max_share,
+                if gc.passes() { "pass" } else { "fail" }
             );
         }
         if let Some(sc) = &self.scaling_sync {

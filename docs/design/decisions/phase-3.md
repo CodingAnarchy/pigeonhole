@@ -516,3 +516,24 @@ The redesign's gain doesn't justify changing a public guarantee and adding API s
 - **A new bug lands in these paths.**
 
 The note this replaces was `docs/design/questions/engine.md` (#538).
+
+<a id="d213"></a>
+## D213 — The durable group-commit target is measured on a table split over every shard, with commits in flight inline (owner decision, 2026-10-11; bench, #64, #406)
+
+**Decided:** the gate measures the Goals table's batched durable write target (> 1M cells/s across cores, p99 commit < 200 µs) with `phdb-bench group-commit`'s D213 shape:
+- **N shards = cores**, application-owned.
+- **The table is split up front.** It's cut at the quantiles of its rows, one piece per shard, before the load (`PigeonholeRunner::presplit`, through a doc-hidden `Table::split_over_shards` that issues one tablet split with an owner per piece). Every shard owns rows from the first commit. The balancer is not relied on: the 1,000-row table never splits on size and need not spread within a warmup.
+- **Commits stay in flight inline**, the D204 driver: each shard's thread keeps `INLINE_IN_FLIGHT` (16) `commit_async` commits in flight on the rows its shard owns, between turns of its shard.
+- **The commits are as before:** 4-cell `GroupSync` row mutations over 1,000 rows, 200,000 at `full`.
+
+The report gives cells/s in total and per core, commit p50 and p99, and the busiest shard's share (`Suite::group_commit`). The 1, 4 and 16 synchronous-client runs stay as a reported secondary, beside RocksDB, and aren't judged.
+
+The window's setup step (`machine.py`) also times the data drive's raw fdatasync: 2,000 syncs, each after a 4 KiB write. `report.py` shows the p50 and p99 beside the 200 µs target, as the floor under any durable commit. It's measured there rather than in `setup.sh`, which runs before the data drive is formatted and mounted.
+
+**Why.** #64's pre-rental measurement found the old step failing by construction:
+- **One shard.** All 200k commits went to one shard: one tablet, never split or spread. "Across cores" was never measured.
+- **Synchronous clients.** At 16 clients, 1M cells/s needs 64 µs per durable commit, fsync included. On a CI runner that's about one fdatasync (p50 63 µs).
+
+**Why inline committers rather than async client threads:** it's the scaling gate's style (D204). No client thread competes with the shards for cores, so the result is the engine's, at the thread-per-core embedding the spec targets. Each shard's 16 commits in flight form its fsync groups. The commit latency is submit to durable resolution, the same as the scaling gate measures it.
+
+**Not changed:** the target, the commit size, the row count, and the secondary sweep's numbers, which stay comparable with earlier runs.

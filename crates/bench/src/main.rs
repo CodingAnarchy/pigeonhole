@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pigeonhole_bench::{
-    Environment, GROUP_COMMIT_THREADS, MemoryBudget, PigeonholeRunner, RunOptions, RunRecord,
-    Runner, Scaling, Suite, Tolerance, WorkloadConfig, WorkloadKind, compare, run_detailed,
+    Environment, GROUP_COMMIT_THREADS, GroupCommit, MemoryBudget, PigeonholeRunner, RunOptions,
+    RunRecord, Runner, Scaling, Suite, Tolerance, WorkloadConfig, WorkloadKind, compare,
+    run_detailed,
 };
 
 /// Default warmup of `scaling`, as a fraction of the measured ops. The balancer needs about
@@ -345,6 +346,17 @@ fn bench(a: &Args) -> Result<Suite, String> {
         };
         for kind in kinds {
             let c = config(a, kind)?;
+            if kind == WorkloadKind::GroupCommit && a.engines.iter().any(|e| e == "pigeonhole") {
+                // The target's shape (D213): one shard per core, the table split over all of
+                // them, each shard's thread keeping commits in flight inline (D204's driver).
+                // The client-thread sweep below stays as a secondary report.
+                let cores = suite.environment.cores;
+                let n = a.shards.unwrap_or(cores);
+                let r = pigeonhole(a, Some(n)).group_sync(true).presplit(true);
+                let run = one_inline(a, &root, &mut seq, &r, &c)?;
+                suite.group_commit = Some(GroupCommit::new(n, cores, &run));
+                suite.results.push(run);
+            }
             let threads = match (kind, a.threads) {
                 (WorkloadKind::GroupCommit, None) => GROUP_COMMIT_THREADS.to_vec(),
                 _ => vec![c.threads],
