@@ -231,6 +231,44 @@ fn a_waker_ends_a_ring_wait_from_another_thread() {
 }
 
 #[test]
+fn a_wake_while_the_owner_runs_ends_its_next_wait_at_once() {
+    let _serial = serial();
+    let b = Backend::uring("uring-own-wake-early");
+    b.vfs.attach_thread();
+    let waker = own_io_waker().expect("a thread ring");
+    thread::spawn(move || waker.wake()).join().unwrap();
+    let started = std::time::Instant::now();
+    reap_own_io(Some(Duration::from_secs(10)));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a wake before the wait was lost"
+    );
+}
+
+#[test]
+fn a_wake_while_the_owner_runs_costs_its_ring_nothing() {
+    let _serial = serial();
+    // The eventfd the ring polls is written only while the owner waits in the ring: a wake
+    // while it runs (the common case on a busy shard) must not make its next turns enter
+    // the kernel to drain the eventfd and re-arm the poll.
+    let b = Backend::uring("uring-own-wake-busy");
+    b.vfs.attach_thread();
+    let waker = own_io_waker().expect("a thread ring");
+    reap_own_io(None);
+    thread::spawn(move || waker.wake()).join().unwrap();
+    let before = own_io_enters();
+    for _ in 0..100 {
+        thread::sleep(Duration::from_micros(100));
+        reap_own_io(None);
+    }
+    assert_eq!(
+        own_io_enters(),
+        before,
+        "a wake while running cost the ring an enter"
+    );
+}
+
+#[test]
 fn a_thread_ending_with_io_in_flight_completes_it() {
     let _serial = serial();
     let b = Backend::uring("uring-own-exit");

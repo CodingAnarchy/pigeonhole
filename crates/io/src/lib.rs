@@ -26,6 +26,8 @@ mod file;
 mod os;
 mod own;
 pub mod pread;
+#[cfg(any(target_os = "linux", io_loom))]
+mod ring_wake;
 mod shared;
 pub mod sim;
 pub mod sys;
