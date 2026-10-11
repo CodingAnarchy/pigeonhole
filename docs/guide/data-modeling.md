@@ -1,6 +1,6 @@
 # Data modeling
 
-> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.2.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole is a sorted map. Good models make the reads you do most **one point get or one contiguous scan**. Everything below follows from three facts:
 
@@ -182,11 +182,12 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 **Deletes and version limits are not permanent for writes with older timestamps** (HBase semantics). Until compaction purges them, a delete keeps hiding any later write at or below its timestamp, and `max_versions` only limits what reads return. Once a compaction at the bottom of the tree has run with no open snapshot that still needs them, the delete markers and the versions beyond `max_versions` are gone for good. After that, a write with an older explicit timestamp (`put_at`, `delete_cell`) behaves as if they never existed: a `put_at` below a purged delete becomes visible, and deleting the newest version does not bring back a purged older one. Writes with default timestamps are never affected, because their timestamps are newer than anything a purge removes. If you rewrite history with explicit timestamps, write the replacement at a timestamp newer than the delete instead of relying on the delete to keep hiding it.
 
 ## Wide, overwritten rows
-An overwrite adds a version; it does not replace the old one in place. Older versions stay in the tree until a flush or compaction drops them, and a read steps over every version it passes. A row that is wide (thousands of columns), overwritten often and read whole therefore has a higher read tail than a store that updates in place: on the Phase 2 benchmark, whose hot rows are like this, the row-read p99 is about twice SQLite's and the scan p99 about 1.6 times ([D193](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-2.md#d193), work tracked in [#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). To keep it down:
+An overwrite adds a version; it does not replace the old one in place. Older versions stay in the tree until a flush or compaction drops them. In the writer process, reads pass a column's older versions in the memtable in one jump (D194, D199), but in SSTs not yet compacted a read still steps over every version it passes, and it merges the row from each memtable and SST that holds part of it. A row that is wide (thousands of columns), overwritten often and read whole therefore has a higher read tail than a store that updates in place. This is the Phase 2 gate's documented gap ([D193](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-2.md#d193), [#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)), judged against SQLite on the reference machine ([D208](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-3.md#d208)). To keep it down:
 
 - **Read only the columns you need.** `get` for one cell, or `qualifier_prefix` / `qualifier_range` on a row read or scan, seeks past the rest of the row instead of stepping through it.
 - **Set `max_versions`.** The default, 0, keeps every version, so not even compaction drops them. `max_versions(1)` lets flushes and compactions drop the older ones (unless an open snapshot still needs them).
 - **Let compaction run.** After a bulk load or a burst of overwrites, and before a read-heavy phase, `compact()` rewrites the trees so reads step over current versions only.
+- **The row cache does not help wide rows by default.** It stores family rows up to `Options::row_cache_max_row` (4 KiB encoded by default), so it suits small, hot rows (see [Getting started](getting-started.md#open-a-database)), not rows of thousands of columns.
 
 ```rust
 # use pigeonhole::*;

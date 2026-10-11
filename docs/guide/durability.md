@@ -1,6 +1,6 @@
 # Durability
 
-> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Semantics here come from the spec and decisions D12 and D19. Async commit forms are Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.2.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics here come from the spec and decisions D12 and D19. The async commit forms are on `main`, not in 0.2.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every commit says how durable it must be before it returns. The default is the strongest batched level, so a commit that returns is on disk unless you asked for less.
 
@@ -73,7 +73,7 @@ pub struct CommitInfo {
 }
 ```
 
-Log or assert on `info.durability` if your correctness depends on it. Per-level commit counts and latencies are exposed in engine metrics.
+Log or assert on `info.durability` if your correctness depends on it.
 
 ## Read-your-writes (D19)
 A commit returns only once it is durable at its level **and** visible to readers, so a thread always reads its own write immediately after `commit()` returns.
@@ -94,7 +94,9 @@ A `WriteBatch` whose rows live on different shards is atomic across them (two-ph
 | is fine because you can rebuild | `None` |
 | is unacceptable and you cannot wait for a group | `Sync` (rarely right; it never shares an fsync) |
 
-Throughput note: `GroupSync` costs about one fsync per group, not per commit. Many concurrent committers, or one large `WriteBatch`, amortize it.
+Throughput note: `GroupSync` costs about one fsync per group, not per commit. Many concurrent committers, or one large `WriteBatch`, amortize it. A shard keeps only a bounded number of group syncs in flight per WAL stream; durable commits that arrive while those run batch behind them and share the next sync, so under many concurrent committers each fsync covers more commits (D207). The bound is interim (1 on macOS, 2 elsewhere) until the Phase 3 gate measurements decide it.
+
+Right after a clean reopen, the first `GroupSync` or `Sync` commit also waits for the new WAL files' and their directory's syncs, which the open no longer waits for itself (D203).
 
 ## WAL size
 

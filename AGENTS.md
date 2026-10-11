@@ -13,10 +13,11 @@ Pigeonhole is an embedded, single-file, wide-column store in Rust: BigTable's da
 5. Check [`docs/status.md`](docs/status.md) for what exists and what is in flight.
 
 ## Commands
+Builds go through [`cargo-quota`](https://crates.io/crates/cargo-quota), which keeps every worktree's `target/` under one shared disk budget (see `CONTRIBUTING.md`):
 ```sh
-cargo build --workspace
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo quota build --workspace
+cargo quota test --workspace --all-features
+cargo quota clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 cargo +nightly miri test -p <unsafe-crate>                 # io, cache, memtable
 RUSTFLAGS="--cfg loom" cargo test --release -p <crate> --lib loom
