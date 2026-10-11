@@ -1,6 +1,6 @@
 # Errors
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.2.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Codes are stable. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.2.1, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Codes are stable. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every fallible call returns `pigeonhole::Result<T>` = `Result<T, pigeonhole::Error>`.
 

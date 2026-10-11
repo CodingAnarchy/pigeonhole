@@ -1,6 +1,6 @@
 # Status
 
-> **Maturity: experimental 0.x.** [0.2.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.0) is on [crates.io](https://crates.io/crates/pigeonhole). The core engine (Phase 1) is complete and fault-tested in simulation. The wide-column model (Phase 2) is complete in 0.2.0; its gate is met as amended by [D193](design/decisions/phase-2.md#d193), with one documented gap ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The on-disk format and the API may change before 1.0 ([`FORMAT.md`](../FORMAT.md)). The latency work (Phase 3) is in progress. Not recommended for production use yet. Keep this note in sync with each release.
+> **Maturity: experimental 0.x.** [0.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.1) is on [crates.io](https://crates.io/crates/pigeonhole). The core engine (Phase 1) is complete and fault-tested in simulation. The wide-column model (Phase 2) is complete in 0.2.0; its gate is met as amended by [D193](design/decisions/phase-2.md#d193), with one documented gap ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The on-disk format and the API may change before 1.0 ([`FORMAT.md`](../FORMAT.md)). The latency work (Phase 3) is in progress. Not recommended for production use yet. Keep this note in sync with each release.
 
 Live progress against the [build plan](design/spec.md#build-plan). Updated by the coordinator as work lands.
 
