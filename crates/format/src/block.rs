@@ -771,6 +771,9 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
         self.load(at)
     }
 
+    /// Always inlined: `seek`'s binary search decodes one per step, and a second caller
+    /// (`seek_forward`) must not move it out of line.
+    #[inline(always)]
     fn restart_key(&self, i: usize) -> crate::Result<&[u8]> {
         let e = self.block.entry(self.block.restart(i)?)?;
         if e.shared != 0 {
@@ -864,6 +867,58 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
             return Ok(());
         }
         self.load(self.next)
+    }
+
+    /// Starts from the current entry: steps forward when `target` lies before the next
+    /// restart's key (a filter's hint a few entries on, #29), else searches only the restarts
+    /// after the current entry. An invalid cursor seeks.
+    #[inline(never)]
+    fn seek_forward(&mut self, target: &[u8]) -> crate::Result<()> {
+        if !self.valid() {
+            return self.seek(target);
+        }
+        if self.key() >= target {
+            return Ok(());
+        }
+        // The first restart after the current entry (offsets only, no key decoded).
+        let (mut lo, mut hi) = (0, self.block.restart_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let at = self.block.restart(mid);
+            if self.or_invalidate(at)? <= self.cur {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // The first restart at or after it whose key is >= target; scanning starts from the
+        // restart before that one, or from here if there is none in between.
+        let first = lo;
+        let below = |it: &Self, i: usize| it.restart_key(i).map(|k| k < target);
+        let last = self.block.restart_count.saturating_sub(1);
+        if first < self.block.restart_count && self.or_invalidate(below(self, first))? {
+            // A target past the last restart (often past the block: the hint leaves it)
+            // needs no search.
+            let from = if first == last || self.or_invalidate(below(self, last))? {
+                last
+            } else {
+                let (mut lo, mut hi) = (first + 1, last);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if self.or_invalidate(below(self, mid))? {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo - 1
+            };
+            self.load_restart(from)?;
+        }
+        while self.valid() && self.key() < target {
+            self.next()?;
+        }
+        Ok(())
     }
 
     /// Uses the row-start table: one binary search, no cell decoding. Becomes invalid if no
