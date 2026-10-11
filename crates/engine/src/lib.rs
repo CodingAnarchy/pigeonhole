@@ -21,6 +21,7 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod admission;
 mod catalog;
 mod compact;
 mod engine;
@@ -39,6 +40,8 @@ mod source;
 mod waker;
 mod write;
 
+pub use admission::Admit;
+pub use engine::AsyncSubmit;
 pub use engine::PendingMaintenance;
 pub use engine::{
     CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats, TableInfo,

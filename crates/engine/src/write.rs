@@ -771,6 +771,25 @@ impl Txn {
         &mut self.batch
     }
 
+    /// [`submit`](Self::submit) for an async commit (D210), as
+    /// [`Engine::submit_async`](crate::Engine::submit_async): the transaction comes back
+    /// when it has to wait for room.
+    pub fn submit_async(
+        self,
+        durability: Option<Durability>,
+    ) -> crate::Result<crate::AsyncSubmit<PendingCommit, Txn>> {
+        let charge = match self.engine.fast_admit(None, &self.batch) {
+            crate::engine::FastAdmit::Wait(admit) => {
+                return Ok(crate::AsyncSubmit::Wait(Box::new((self, admit))));
+            }
+            crate::engine::FastAdmit::Charged(charge) => charge,
+        };
+        let mut charge = charge;
+        let pending = self.submit(durability)?;
+        charge.attach(&pending.waiter);
+        Ok(crate::AsyncSubmit::Submitted(pending))
+    }
+
     /// Submits the transaction for validation and commit without waiting: the
     /// [`PendingCommit`] resolves as [`Txn::commit`] returns (an async caller polls it). It
     /// never blocks, so a thread that drives a shard may call it (D88).

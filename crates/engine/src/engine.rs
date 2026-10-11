@@ -223,6 +223,8 @@ pub(crate) struct Inner {
     /// longer put is separated into a blob file when it is routed (#230). Atomic so a test
     /// can shrink it (`Engine::set_inline_value_limit`).
     max_value: AtomicUsize,
+    /// Async commits' backpressure (D210); writer only.
+    admission: Option<Arc<crate::admission::Admission>>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -274,6 +276,25 @@ const GET_LATEST_TRIES: u32 = 4;
 #[derive(Debug)]
 pub struct Engine {
     inner: Arc<Inner>,
+}
+
+/// An async commit's submission (D210): submitted at once, or handed back with its place
+/// in its shard's queue.
+#[derive(Debug)]
+pub enum AsyncSubmit<P, B> {
+    /// Submitted; its charge comes back when it resolves.
+    Submitted(P),
+    /// Over the bound: submit `B` once the [`Admit`](crate::Admit) is ready, then attach
+    /// the admit to the submitted commit. Boxed: the rare case, kept out of the
+    /// submitted one's size.
+    Wait(Box<(B, crate::Admit)>),
+}
+
+/// [`Inner::fast_admit`]'s outcome: a charge (none when unbounded) to submit with, or the
+/// admission to wait on.
+pub(crate) enum FastAdmit {
+    Charged(crate::admission::Charge),
+    Wait(crate::Admit),
 }
 
 /// Which embedding mode an open uses.
@@ -971,6 +992,11 @@ impl Engine {
         config.pin_threads = options.pin_threads;
         config.compaction_threads = options.compaction_threads;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
+        let bound = match options.async_commit_bound {
+            0 => options.memtable_budget / 2,
+            b => b,
+        };
+        let admission = Some(Arc::new(crate::admission::Admission::new(shards, bound)));
         let inner = Arc::new(Inner {
             shared: Arc::clone(&shared),
             role: Role::Writer,
@@ -982,6 +1008,7 @@ impl Engine {
             closing: AtomicBool::new(false),
             reader: None,
             max_value: AtomicUsize::new(max_value),
+            admission,
         });
         let engine = Arc::new(Engine {
             inner: Arc::clone(&inner),
@@ -1158,6 +1185,7 @@ impl Engine {
             closing: AtomicBool::new(false),
             reader: Some(reader),
             max_value: AtomicUsize::new(0),
+            admission: None,
         });
         Ok(Arc::new(Engine { inner }))
     }
@@ -1216,6 +1244,25 @@ impl Engine {
             .shared
             .default_durability
             .store(durability as u8, Ordering::Relaxed);
+    }
+
+    /// An async commit's admission for `batch` (D210): charged to the shard of its first row
+    /// (a cross-shard batch's coordinator) at once when that shard has room and no earlier
+    /// async commit waits, otherwise queued. Submit once [`Admit::poll_admit`](crate::Admit::poll_admit) is ready,
+    /// then [`Admit::attach`](crate::Admit::attach) it to the submitted commit, which returns the charge when the
+    /// commit resolves. Blocking commits take no admission.
+    pub fn admit(&self, batch: &WriteBatch) -> crate::Admit {
+        self.inner.admit(batch)
+    }
+
+    /// Bytes of async commits charged to `shard` and not yet resolved (D210; tests and
+    /// benches).
+    #[doc(hidden)]
+    pub fn admission_inflight(&self, shard: usize) -> u64 {
+        self.inner
+            .admission
+            .as_ref()
+            .map_or(0, |a| a.inflight(shard))
     }
 
     /// Submits a batch: routes each row to its shard (inline if called on the owning shard),
@@ -1290,6 +1337,48 @@ impl Engine {
     ) -> Result<PendingCheck> {
         self.inner
             .submit_check_and_mutate(table, row, predicate, batch, durability)
+    }
+
+    /// [`submit`](Self::submit) for an async commit (D210): submitted at once while the
+    /// shards' async commits in flight leave room, with its charge returned when it
+    /// resolves; otherwise the batch comes back with its place in its shard's queue, to
+    /// submit once [`Admit::poll_admit`](crate::Admit::poll_admit) is ready.
+    pub fn submit_async(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<AsyncSubmit<PendingCommit, WriteBatch>> {
+        match self.inner.fast_admit(None, &batch) {
+            FastAdmit::Wait(admit) => Ok(AsyncSubmit::Wait(Box::new((batch, admit)))),
+            FastAdmit::Charged(mut charge) => {
+                // A failed submission drops the charge, which returns it.
+                let pending = self.inner.submit(batch, durability, None, None)?;
+                charge.attach(&pending.waiter);
+                Ok(AsyncSubmit::Submitted(pending))
+            }
+        }
+    }
+
+    /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) for an async commit, as
+    /// [`submit_async`](Self::submit_async).
+    pub fn submit_check_and_mutate_async(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<AsyncSubmit<PendingCheck, WriteBatch>> {
+        let mut charge = match self.inner.fast_admit(Some((table, row)), &batch) {
+            FastAdmit::Wait(admit) => return Ok(AsyncSubmit::Wait(Box::new((batch, admit)))),
+            FastAdmit::Charged(charge) => charge,
+        };
+        // A failed submission drops the charge, which returns it.
+        let pending = self
+            .inner
+            .submit_check_and_mutate(table, row, predicate, batch, durability)?;
+        charge.attach(&pending.waiter);
+        Ok(AsyncSubmit::Submitted(pending))
     }
 
     /// Starts an optimistic transaction (Phase 4).
@@ -2165,6 +2254,58 @@ impl PendingMaintenance {
 }
 
 impl Inner {
+    pub(crate) fn admit(&self, batch: &WriteBatch) -> crate::Admit {
+        self.admit_routed(None, batch)
+    }
+
+    /// The async fast path (D210): a charge on the engine-wide count when it fits and no
+    /// one waits, else the routed admission to wait on.
+    #[inline]
+    pub(crate) fn fast_admit(
+        &self,
+        row: Option<(TableId, &[u8])>,
+        batch: &WriteBatch,
+    ) -> FastAdmit {
+        let Some(a) = &self.admission else {
+            return FastAdmit::Charged(crate::admission::Charge::none());
+        };
+        match a.try_fast(crate::admission::batch_bytes(batch)) {
+            Some(arg) => FastAdmit::Charged(crate::admission::Charge::new(a, arg)),
+            None => FastAdmit::Wait(self.admit_routed(row, batch)),
+        }
+    }
+
+    /// Admits `batch` on the shard of `row` when given, else of the batch's first row.
+    pub(crate) fn admit_routed(
+        &self,
+        row: Option<(TableId, &[u8])>,
+        batch: &WriteBatch,
+    ) -> crate::Admit {
+        let shard = match &self.admission {
+            Some(a) if a.sharded() => {
+                let view = self.shared.view.load();
+                let route = |t: TableId, r: &[u8]| view.tablets().route(t, r);
+                let routed = match row {
+                    Some((t, r)) => route(t, r),
+                    None => match batch.builder.batch().iter().next().and_then(|m| m.ok()) {
+                        Some(m) => route(m.table, m.row),
+                        None => batch
+                            .row_deletes
+                            .first()
+                            .and_then(|d| route(d.table, &d.row)),
+                    },
+                };
+                routed.map_or(0, |(_, s)| usize::from(s.0))
+            }
+            _ => 0,
+        };
+        crate::Admit::new(
+            self.admission.as_ref(),
+            shard,
+            crate::admission::batch_bytes(batch),
+        )
+    }
+
     /// Enters application-thread maintenance: refused once the engine is closing, and the
     /// final close waits until the guard is dropped (7 F7-4).
     fn enter_maintenance(&self) -> Result<MaintenanceGuard<'_>> {
@@ -2680,6 +2821,9 @@ impl Inner {
         }
         if self.closing.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        if let Some(a) = &self.admission {
+            a.close();
         }
         let (tx, rx) = completion();
         *self

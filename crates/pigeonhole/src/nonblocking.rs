@@ -19,11 +19,24 @@
 //! (D196, #398): a separated value too large to cache (above an eighth of the block cache,
 //! at most 1 MiB), and a block the cache cannot keep (a cache of size 0).
 //!
-//! **Commits.** `commit_async` and `commit_with_async` submit at the call, then resolve when
-//! the record meets the requested durability and is visible, exactly when the sync `commit`
-//! would return. Async and sync committers join the same commit groups. Dropping the future
-//! after the call does **not** roll the commit back: it lands or fails atomically either
-//! way. A [`CommitTicket`] is also a future (`ticket.await`).
+//! **Commits.** `commit_async` and `commit_with_async` submit at the call when the commit's
+//! shard has room, then resolve when the record meets the requested durability and is
+//! visible, exactly when the sync `commit` would return. Async and sync committers join the
+//! same commit groups. A [`CommitTicket`] is also a future (`ticket.await`).
+//!
+//! **Backpressure (D210).** Each shard holds at most half `memtable_budget` of async
+//! commits submitted and not yet resolved. Over that bound a commit future waits, in
+//! arrival order, and submits when earlier commits resolve; polling it is what submits it.
+//! Blocking commits are never held.
+//!
+//! **Dropping a commit future:**
+//! - **Once submitted,** dropping does **not** roll the commit back: it lands or fails
+//!   atomically either way.
+//! - **Dropped while it still waits for room, it writes nothing.**
+//!
+//! So fire and forget (`let _ = t.mutate(..).commit_async();`) can lose the commit when the
+//! shard is over its bound. Await the future, or use the blocking `commit` or
+//! [`WriteBatch::commit_with_ticket`] if you need the commit without waiting for it.
 //!
 //! ```
 //! use pigeonhole::{Durability, Family, Options, Pigeonhole};
@@ -48,29 +61,59 @@ use std::task::{Context, Poll};
 use pigeonhole_format::Durability;
 
 use crate::cell::RowBuf;
-use crate::write::{Submitted, SubmittedCheck, TicketState};
+use crate::write::{AsyncCommit, Submitted, SubmittedCheck, TicketState};
 use crate::{
     Cell, CommitInfo, CommitTicket, Condition, Error, Pigeonhole, Result, Row, RowMutation,
     Transaction, WriteBatch,
 };
-use pigeonhole_engine::ScanCursor;
+use pigeonhole_engine::{Admit, ScanCursor};
 
-/// A submitted commit's result, as a future: resolves when the commit meets its durability
-/// level and is visible (see the [module docs](self)). Dropping it does not roll the commit
-/// back.
+/// An async commit, as a future: it submits when its shard has room and resolves when the
+/// commit meets its durability level and is visible (see the [module docs](self)). Dropped
+/// once submitted, it does not roll the commit back; dropped while it still waits for room
+/// (D210), it writes nothing.
 #[derive(Debug)]
-#[must_use = "dropping a commit future does not cancel the commit, but its result is lost"]
+#[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
 pub struct CommitFuture {
     state: State,
 }
 
 #[derive(Debug)]
 enum State {
+    /// Waiting for room on its shard before it submits (D210).
+    Waiting(Box<Waiting<Submitted>>),
     /// Submitted, not resolved.
     Pending(Submitted),
     /// Resolved without waiting (refused before submission, or a ticket already done);
     /// `None` once taken.
     Ready(Option<Result<CommitInfo>>),
+}
+
+/// A commit waiting for admission (D210): its place in its shard's queue and the
+/// submission to run once admitted.
+struct Waiting<S> {
+    admit: Admit,
+    submit: Option<Box<dyn FnOnce() -> Result<S> + Send>>,
+}
+
+impl<S> std::fmt::Debug for Waiting<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waiting")
+            .field("admit", &self.admit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> Waiting<S> {
+    /// Ready with the submission's result once admitted.
+    fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<(Admit, Result<S>)> {
+        if self.admit.poll_admit(cx).is_pending() {
+            return Poll::Pending;
+        }
+        let submit = self.submit.take().expect("a waiting commit submits once");
+        let admit = std::mem::take(&mut self.admit);
+        Poll::Ready((admit, submit()))
+    }
 }
 
 impl CommitFuture {
@@ -82,6 +125,30 @@ impl CommitFuture {
             },
         }
     }
+
+    /// An async commit's submission as a future: submitted, or waiting for room (D210).
+    fn from_async(r: Result<AsyncCommit<Submitted>>) -> Self {
+        match r {
+            Ok(AsyncCommit::Submitted(s)) => Self::new(Ok(s)),
+            Ok(AsyncCommit::Wait(wait)) => {
+                let (admit, submit) = *wait;
+                Self {
+                    state: State::Waiting(Box::new(Waiting {
+                        admit,
+                        submit: Some(submit),
+                    })),
+                }
+            }
+            Err(e) => Self::new(Err(e)),
+        }
+    }
+
+    fn submitted(admit: Option<Admit>, submitted: Result<Submitted>) -> Self {
+        if let (Some(admit), Ok(s)) = (admit, &submitted) {
+            admit.attach(&s.pending);
+        }
+        Self::new(submitted)
+    }
 }
 
 impl Future for CommitFuture {
@@ -89,6 +156,7 @@ impl Future for CommitFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.state {
+            State::Waiting(_) => self.poll_waiting(cx),
             State::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
                 Poll::Ready(r) => {
                     let out = s.outcome(r);
@@ -107,6 +175,23 @@ impl Future for CommitFuture {
     }
 }
 
+impl CommitFuture {
+    /// Polls a commit still waiting for room (D210): once admitted, it submits and goes on
+    /// as a submitted commit. Out of line: the uncommon state.
+    #[cold]
+    #[inline(never)]
+    fn poll_waiting(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<CommitInfo>> {
+        let State::Waiting(w) = &mut self.state else {
+            unreachable!("only called while waiting");
+        };
+        let Poll::Ready((admit, submitted)) = w.poll_submit(cx) else {
+            return Poll::Pending;
+        };
+        *self = Self::submitted(Some(admit), submitted);
+        self.poll(cx)
+    }
+}
+
 impl IntoFuture for CommitTicket {
     type Output = Result<CommitInfo>;
     type IntoFuture = CommitFuture;
@@ -122,22 +207,34 @@ impl IntoFuture for CommitTicket {
 }
 
 impl RowMutation<'_> {
-    /// [`commit`](RowMutation::commit), as a future: submits now, resolves when the commit is
-    /// durable at its level and visible. Dropping the future does not roll it back.
+    /// [`commit`](RowMutation::commit), as a future: submits now when its shard has room,
+    /// else once earlier async commits resolve (D210), and resolves when the commit is
+    /// durable at its level and visible. Dropped once submitted, the future does not roll
+    /// the commit back. **Dropped while it still waits for room, it writes nothing**, so
+    /// `let _ = ...commit_async();` can lose the commit (see the [module docs](self)).
     pub fn commit_async(self) -> CommitFuture {
-        CommitFuture::new(self.submit())
+        CommitFuture::from_async(self.submit_async())
     }
 }
 
 impl RowMutation<'_> {
-    /// [`commit_if`](RowMutation::commit_if), as a future: submits now, resolves to `None` if
-    /// the condition failed, or to the commit once it is durable at its level and visible.
-    /// Dropping the future does not roll it back: the check and the write happen
-    /// atomically on the row's shard either way.
+    /// [`commit_if`](RowMutation::commit_if), as a future: submits when its shard has room
+    /// (D210), resolves to `None` if the condition failed, or to the commit once it is
+    /// durable at its level and visible. Dropped once submitted, the future does not roll
+    /// it back: the check and the write happen atomically on the row's shard either way.
+    /// **Dropped while it still waits for room, it writes nothing** (see the
+    /// [module docs](self)).
     pub fn commit_if_async(self, condition: &Condition) -> CheckFuture {
         CheckFuture {
-            state: match self.submit_if(condition) {
-                Ok(s) => CheckState::Pending(s),
+            state: match self.submit_if_async(condition) {
+                Ok(AsyncCommit::Submitted(s)) => CheckState::Pending(s),
+                Ok(AsyncCommit::Wait(wait)) => {
+                    let (admit, submit) = *wait;
+                    CheckState::Waiting(Box::new(Waiting {
+                        admit,
+                        submit: Some(submit),
+                    }))
+                }
                 Err(e) => CheckState::Ready(Some(Err(e))),
             },
         }
@@ -145,54 +242,92 @@ impl RowMutation<'_> {
 }
 
 impl WriteBatch {
-    /// [`commit`](WriteBatch::commit), as a future (writer default durability). Dropping the
-    /// future does not roll it back.
+    /// [`commit`](WriteBatch::commit), as a future (writer default durability), submitted
+    /// when its shard has room (D210). Dropped once submitted, the future does not roll it
+    /// back. **Dropped while it still waits for room, it writes nothing** (see the
+    /// [module docs](self)).
     pub fn commit_async(self) -> CommitFuture {
-        CommitFuture::new(self.submit(None))
+        self.async_commit(None)
     }
 
-    /// [`commit_with`](WriteBatch::commit_with), as a future. Dropping the future does not
-    /// roll it back.
+    /// [`commit_with`](WriteBatch::commit_with), as a future, submitted when its shard has
+    /// room (D210). Dropped once submitted, the future does not roll it back. **Dropped
+    /// while it still waits for room, it writes nothing** (see the [module docs](self)).
     pub fn commit_with_async(self, durability: Durability) -> CommitFuture {
-        CommitFuture::new(self.submit(Some(durability)))
+        self.async_commit(Some(durability))
+    }
+
+    fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
+        CommitFuture::from_async(self.submit_async(durability))
     }
 }
 
 impl Transaction {
-    /// [`commit`](Transaction::commit), as a future; resolves to
-    /// [`ErrorCode::Conflict`](crate::ErrorCode::Conflict) on a conflicting commit. Dropping
-    /// the future does not roll it back: it commits or aborts atomically either way.
+    /// [`commit`](Transaction::commit), as a future, submitted when its shard has room
+    /// (D210); resolves to [`ErrorCode::Conflict`](crate::ErrorCode::Conflict) on a
+    /// conflicting commit. Dropped once submitted, the future does not roll it back: it
+    /// commits or aborts atomically either way. **Dropped while it still waits for room, it
+    /// writes nothing** (see the [module docs](self)).
     pub fn commit_async(self) -> CommitFuture {
-        CommitFuture::new(self.submit(None))
+        self.async_commit(None)
     }
 
-    /// [`commit_with`](Transaction::commit_with), as a future. Dropping the future does not
-    /// roll it back.
+    /// [`commit_with`](Transaction::commit_with), as a future, submitted when its shard has
+    /// room (D210). Dropped once submitted, the future does not roll it back. **Dropped
+    /// while it still waits for room, it writes nothing** (see the [module docs](self)).
     pub fn commit_with_async(self, durability: Durability) -> CommitFuture {
-        CommitFuture::new(self.submit(Some(durability)))
+        self.async_commit(Some(durability))
+    }
+
+    fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
+        CommitFuture::from_async(self.submit_async(durability))
     }
 }
 
-/// A conditional commit's result, as a future ([`RowMutation::commit_if_async`]): `None` if
-/// the condition failed. Dropping it does not roll the commit back.
+/// A conditional commit, as a future ([`RowMutation::commit_if_async`]): `None` if the
+/// condition failed. Dropped once submitted, it does not roll the commit back; dropped while
+/// it still waits for room (D210), it writes nothing.
 #[derive(Debug)]
-#[must_use = "dropping a commit future does not cancel the commit, but its result is lost"]
+#[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
 pub struct CheckFuture {
     state: CheckState,
 }
 
 #[derive(Debug)]
 enum CheckState {
+    /// Waiting for room on its shard before it submits (D210).
+    Waiting(Box<Waiting<SubmittedCheck>>),
     Pending(SubmittedCheck),
     /// Refused before submission; `None` once taken.
     Ready(Option<Result<Option<CommitInfo>>>),
+}
+
+impl CheckFuture {
+    fn submitted(admit: Option<Admit>, submitted: Result<SubmittedCheck>) -> Self {
+        if let (Some(admit), Ok(s)) = (admit, &submitted) {
+            admit.attach_check(&s.pending);
+        }
+        Self {
+            state: match submitted {
+                Ok(s) => CheckState::Pending(s),
+                Err(e) => CheckState::Ready(Some(Err(e))),
+            },
+        }
+    }
 }
 
 impl Future for CheckFuture {
     type Output = Result<Option<CommitInfo>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let CheckState::Waiting(w) = &mut self.state {
+            let Poll::Ready((admit, submitted)) = w.poll_submit(cx) else {
+                return Poll::Pending;
+            };
+            *self = Self::submitted(Some(admit), submitted);
+        }
         match &mut self.state {
+            CheckState::Waiting(_) => unreachable!("submitted above"),
             CheckState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
                 Poll::Ready(r) => {
                     let out = s.outcome(r);

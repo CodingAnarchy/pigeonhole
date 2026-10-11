@@ -10,7 +10,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 1. [Concepts](concepts.md): tables, rows, families (compaction styles, compression, blob separation), qualifiers, timestamps, values, deletes.
 2. [Getting started](getting-started.md): install, open, create a table, write, read, scan, batches, conditional writes and transactions, close, maintenance.
 3. [Durability](durability.md): the four levels, how they resolve, what each survives, mixed levels, commit results.
-4. [Async](async.md): the async front door (on by default): futures and streams for every data operation, cancellation, the sync-only calls.
+4. [Async](async.md): the async front door (on by default): futures and streams for every data operation, cancellation, backpressure on async commits, the sync-only calls.
 5. [Scans and filters](scans-and-filters.md): row, prefix and range scans, projection, versions, time ranges, snapshots, pushdown semantics.
 6. [Data modeling](data-modeling.md): row-key design, family split, time series with TTL, adjacency lists, counters, versions, anti-patterns.
 7. [Errors](errors.md): every `ErrorCode` with cause and remedy.

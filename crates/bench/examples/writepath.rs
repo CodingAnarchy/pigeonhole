@@ -10,6 +10,7 @@
 //! | `commit-one` | 500 commits of one 100-byte cell | commits |
 //! | `commit-sixteen` | 125 commits of 16 cells in one row | commits |
 //! | `commit-overwrite` | 500 commits of one 100-byte cell over one of 2,000 existing rows (`ycsb-a`'s write) | commits |
+//! | `commit-async` | 500 commits of one 100-byte cell through `commit_async`, each awaited (an uncontended async commit, D210) | commits |
 //! | `commit-at` | 500 timestamped appends of one 100-byte cell to a new row of a family with a TTL (`time-series-ttl`'s write) | commits |
 //! | `flush` | 2,000 entries flushed from the memtable to one SST | entries |
 //! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level | entries |
@@ -69,6 +70,11 @@ fn main() {
         "commit-one" => {
             let rows = rows("one", 500 * iters);
             measure(&mut || shape_commit_one(&t, &rows));
+            rows.len()
+        }
+        "commit-async" => {
+            let rows = rows("asy", 500 * iters);
+            measure(&mut || shape_commit_async(&t, &rows));
             rows.len()
         }
         "commit-sixteen" => {
@@ -132,7 +138,7 @@ fn main() {
         }
         other => panic!(
             "unknown shape {other}: commit-one, commit-sixteen, commit-overwrite, commit-at, \
-             flush or compact"
+             commit-async, flush or compact"
         ),
     };
     eprintln!("units {}", if setup_only { 0 } else { units });
@@ -147,6 +153,15 @@ fn shape_commit_one(t: &Table, rows: &[Vec<u8>]) {
     let _measured = Measured::start();
     for row in rows {
         t.mutate(row).put("f", b"q", &VALUE).commit().unwrap();
+    }
+}
+
+#[inline(never)]
+fn shape_commit_async(t: &Table, rows: &[Vec<u8>]) {
+    let _measured = Measured::start();
+    for row in rows {
+        pigeonhole::doc_support::block_on(t.mutate(row).put("f", b"q", &VALUE).commit_async())
+            .unwrap();
     }
 }
 

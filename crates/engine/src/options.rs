@@ -157,6 +157,9 @@ pub struct EngineOptions {
     /// column about 200 instructions (D199). Reader processes have no index and step.
     /// `PIGEONHOLE_TAIL_INDEX=0` sets the default to off, for A/B runs.
     pub memtable_tail_index: bool,
+    /// Bytes of async commits a shard holds submitted and not yet resolved before the next
+    /// one waits to submit (D210). 0 (the default) means half `memtable_budget`.
+    pub async_commit_bound: u64,
 }
 
 impl EngineOptions {
@@ -198,6 +201,7 @@ impl EngineOptions {
             commit_spin_nanos: 15_000,
             shard_spin_nanos: 50_000,
             memtable_tail_index: std::env::var_os("PIGEONHOLE_TAIL_INDEX").is_none_or(|v| v != "0"),
+            async_commit_bound: 0,
         }
     }
 }

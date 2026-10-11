@@ -235,7 +235,7 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 | `Table::get_async(&self, row, family, qualifier) -> GetFuture` / `get_at_async(&self, &Snapshot, ..)` | `Output = Result<Option<Cell>>`. Also on `ReadTable`. Read point taken on first poll; cache hits ready on first poll. |
 | `RowRead::read_async(self) -> RowFuture` | `Output = Result<Option<Row>>`. |
 | `Scan::stream(self) -> RowStream<'t>` | `futures_core::Stream<Item = Result<Row>>`, key order; setup error is the first item. Fetches the next step's blocks only as polled. |
-| `RowMutation::commit_async(self) -> CommitFuture` | `Output = Result<CommitInfo>`. Submitted at the call; resolves when durable and visible. |
+| `RowMutation::commit_async(self) -> CommitFuture` | `Output = Result<CommitInfo>`. Submitted at the call when its shard has room, else when polled with room (D210); resolves when durable and visible. |
 | `WriteBatch::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | As above. |
 | `Transaction::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | `Conflict` on a conflicting commit. |
 | `RowMutation::commit_if_async(self, &Condition) -> CheckFuture` | `Output = Result<Option<CommitInfo>>`; `None` if the condition failed. |
@@ -244,7 +244,8 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 | `WriteBatch::commit_with_ticket(self, Durability) -> Result<CommitTicket>` | No feature needed. `CommitTicket`: `wait(self)`, `try_result(&mut self) -> Option<Result<CommitInfo>>`, `seqno(&mut self) -> Option<u64>`; `IntoFuture` with `async`. |
 | `Pigeonhole::async_sync_reads(&self) -> u64` (also `PigeonholeReader`) | Reads an async call did synchronously (oversized blob, uncacheable block, unpredicted scan block; #398). |
 
-Dropping a read future or stream: always safe. Dropping a commit future or ticket: the commit still lands or fails atomically.
+Backpressure (D210): each shard holds at most ½ `memtable_budget` of async commits submitted and not yet resolved; over it, a commit future waits (arrival order) and submits when polled with room. Blocking commits and `commit_with_ticket` are never held or counted.
+Dropping a read future or stream: always safe. Dropping a ticket, or a commit future that has submitted: the commit still lands or fails atomically. **Dropping a commit future still waiting for room writes nothing** (fire-and-forget `let _ = ..commit_async()` can lose the commit over the bound; use `commit_with_ticket` to submit without awaiting).
 Sync-only by design (D196): `backup`, `shrink` (long-running; run on your executor's blocking pool), and open, close, table create/open/drop (short).
 
 ## Recipes

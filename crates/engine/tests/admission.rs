@@ -1,0 +1,113 @@
+//! Async commit admission (D210) at the engine: a commit larger than the bound goes alone,
+//! one queued behind it waits for it to resolve, and a closing engine admits every waiter.
+
+mod common;
+
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
+use pigeonhole_engine::{Engine, FamilyOptions, ValueRef, WriteBatch};
+use pigeonhole_format::Durability;
+use pigeonhole_io::sim::SimVfs;
+
+const DB: &str = "/db/admission.phdb";
+
+fn open(
+    seed: u64,
+    bound: u64,
+) -> (
+    std::sync::Arc<Engine>,
+    std::sync::Arc<pigeonhole_engine::TableInfo>,
+) {
+    let vfs = SimVfs::new(seed);
+    let mut o = common::options(vfs, 1, 1 << 20);
+    o.async_commit_bound = bound;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    (db, t)
+}
+
+fn batch(t: &pigeonhole_engine::TableInfo, row: &[u8], len: usize) -> WriteBatch {
+    let mut wb = WriteBatch::new();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        row,
+        b"q",
+        None,
+        ValueRef::Bytes(&vec![7u8; len]),
+    )
+    .unwrap();
+    wb
+}
+
+/// Polls `admit` until it is admitted, with a real waker (the shards run on their own
+/// threads here).
+fn admitted(admit: &mut pigeonhole_engine::Admit) {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..10_000 {
+        if admit.poll_admit(&mut cx).is_ready() {
+            return;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(10));
+    }
+    panic!("never admitted");
+}
+
+#[test]
+fn a_commit_larger_than_the_bound_goes_alone() {
+    let (db, t) = open(2201, 1_000);
+    // 4 KiB against a 1,000-byte bound: admitted at once, since the shard holds nothing.
+    let big = batch(&t, b"big", 4096);
+    let admit = db.admit(&big);
+    assert!(admit.is_admitted());
+    assert!(db.admission_inflight(0) > 4096);
+    // Anything after it waits until it resolves.
+    let small = batch(&t, b"small", 8);
+    let mut waiting = db.admit(&small);
+    assert!(!waiting.is_admitted());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(waiting.poll_admit(&mut cx).is_pending());
+    let pending = db.submit(big, Some(Durability::Buffered)).unwrap();
+    admit.attach(&pending);
+    let mut pending = Box::pin(pending);
+    admitted(&mut waiting);
+    // The big commit resolved (its charge came back) before the small one was admitted.
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut cx),
+        Poll::Ready(Ok(_))
+    ));
+    let pending = db.submit(small, Some(Durability::Buffered)).unwrap();
+    waiting.attach(&pending);
+    pending.wait().unwrap();
+    assert_eq!(db.admission_inflight(0), 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn closing_admits_every_waiter_and_their_submissions_fail_closed() {
+    let (db, t) = open(2202, 1_000);
+    // A charge held without submitting keeps the next one waiting.
+    let held = db.admit(&batch(&t, b"held", 900));
+    assert!(held.is_admitted());
+    let second = batch(&t, b"second", 900);
+    let mut waiting = db.admit(&second);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(waiting.poll_admit(&mut cx).is_pending());
+    db.close().unwrap();
+    assert!(waiting.poll_admit(&mut cx).is_ready());
+    assert!(db.submit(second, Some(Durability::Buffered)).is_err());
+    drop(held);
+    assert_eq!(db.admission_inflight(0), 0, "a dropped charge comes back");
+}
