@@ -706,11 +706,16 @@ impl SstSet {
     }
 }
 
+/// The registry's lock (loom's in the `engine_loom` models).
+#[cfg(engine_loom)]
+type RegistryLock<T> = loom::sync::Mutex<T>;
+#[cfg(not(engine_loom))]
+type RegistryLock<T> = Mutex<T>;
+
 /// The manifest versions of every live in-process view, so the pager reclaims only extents
-/// no view can reach (decision D61).
-#[derive(Default)]
+/// no view can reach (decision D61). Loom-modelled (`loom_tests` below).
 pub(crate) struct LiveViews {
-    versions: Mutex<BTreeMap<ManifestVersion, u32>>,
+    versions: RegistryLock<BTreeMap<ManifestVersion, u32>>,
     /// Run when the last in-process view of the oldest version goes (the writer reclaims,
     /// without waiting for a busy pager): otherwise what that view alone kept retired would
     /// wait for the next manifest commit, however idle the database (a view a shard held for
@@ -724,6 +729,15 @@ impl std::fmt::Debug for LiveViews {
         f.debug_struct("LiveViews")
             .field("versions", &self.versions)
             .finish_non_exhaustive()
+    }
+}
+
+impl Default for LiveViews {
+    fn default() -> Self {
+        Self {
+            versions: RegistryLock::new(BTreeMap::new()),
+            on_oldest_released: OnceLock::new(),
+        }
     }
 }
 
@@ -1162,5 +1176,83 @@ mod covering_tests {
                 assert_eq!(got, want, "seed {seed} row {i}");
             }
         }
+    }
+}
+
+#[cfg(all(test, engine_loom))]
+mod loom_tests {
+    use super::{LiveViews, ViewPin};
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    use loom::thread;
+    use std::sync::Arc;
+
+    #[test]
+    fn loom_the_last_view_of_the_oldest_version_reclaims_once() {
+        // Two threads hold views of manifest version 1; a publish registers version 2's
+        // view. They drop their pins at once: the reclaim callback runs exactly once, when
+        // the last view of version 1 goes, and while a version-1 view lives the registry
+        // never reports anything newer as the oldest (so reclaim cannot free what it uses).
+        loom::model(|| {
+            let live = Arc::new(LiveViews::default());
+            let reclaims = Arc::new(AtomicUsize::new(0));
+            {
+                let reclaims = Arc::clone(&reclaims);
+                live.on_oldest_released(Box::new(move || {
+                    reclaims.fetch_add(1, Ordering::Relaxed);
+                }));
+            }
+            let pins = [ViewPin::new(&live, 1), ViewPin::new(&live, 1)];
+            let current = {
+                let live = Arc::clone(&live);
+                thread::spawn(move || ViewPin::new(&live, 2))
+            };
+            let holders: Vec<_> = pins
+                .into_iter()
+                .map(|pin| {
+                    let live = Arc::clone(&live);
+                    thread::spawn(move || {
+                        assert_eq!(live.oldest(), Some(1), "a version-1 view lives");
+                        drop(pin);
+                    })
+                })
+                .collect();
+            for h in holders {
+                h.join().unwrap();
+            }
+            let current = current.join().unwrap();
+            assert_eq!(live.oldest(), Some(2));
+            assert_eq!(reclaims.load(Ordering::Relaxed), 1, "reclaimed once");
+            drop(current);
+            assert_eq!(live.oldest(), None);
+        });
+    }
+
+    #[test]
+    fn loom_a_newer_version_released_first_does_not_reclaim() {
+        // A version-2 view goes while a version-1 view lives: nothing that only version 2
+        // kept can be freed before version 1 goes too, so the reclaim waits for the oldest.
+        loom::model(|| {
+            let live = Arc::new(LiveViews::default());
+            let reclaims = Arc::new(AtomicUsize::new(0));
+            {
+                let reclaims = Arc::clone(&reclaims);
+                live.on_oldest_released(Box::new(move || {
+                    reclaims.fetch_add(1, Ordering::Relaxed);
+                }));
+            }
+            let old = ViewPin::new(&live, 1);
+            let newer = ViewPin::new(&live, 2);
+            let t = thread::spawn(move || drop(newer));
+            assert_eq!(live.oldest(), Some(1));
+            t.join().unwrap();
+            assert_eq!(
+                reclaims.load(Ordering::Relaxed),
+                0,
+                "reclaimed past a live view"
+            );
+            drop(old);
+            assert_eq!(reclaims.load(Ordering::Relaxed), 1);
+            assert_eq!(live.oldest(), None);
+        });
     }
 }
