@@ -428,3 +428,216 @@ fn a_slot_grown_before_a_process_crash_survives_a_later_power_loss() {
     assert_eq!(got.end, t2.end);
     assert!(t2.end > t1.end);
 }
+
+#[test]
+fn a_successor_whose_header_was_lost_over_a_recycled_slot_never_replays_after_a_reopen() {
+    // #508's power-loss form, in 0.2.0 too: a successor's header frame and first records go
+    // out in one unsynced write into a recycled slot, and a power loss keeps the records'
+    // sectors but not the header's (a device does not order the sectors of one write). This
+    // builds that outcome (the slot's old header frame put back) and kills the process; the
+    // reopened stream must not take the lost header's epoch in that slot (D209).
+    let opts = opts(4, 1);
+    let seg = opts.segment_size;
+    let mut hits = 0;
+    for seed in 0..64u64 {
+        let sim = SimVfs::new(seed);
+        let vfs: VfsRef = sim.clone();
+        let mut rng = Rng(seed);
+        let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+        let mut checkpoint = Lsn::default();
+        let mut found = None;
+        for seqno in 1..=300u64 {
+            let before = headers(&vfs, seg);
+            let f = vfs.open(&path(), OpenOptions::read()).unwrap();
+            let old: Vec<Vec<u8>> = (0..before.len() as u64)
+                .map(|slot| {
+                    let mut b = vec![0u8; FRAME_SIZE];
+                    f.read_at(&mut b, slot * seg).unwrap();
+                    b
+                })
+                .collect();
+            drop(f);
+            let rec = batch(seqno, rng.below(20_000) as usize);
+            let t = wal.append(&rec.record(), Durability::Buffered).unwrap();
+            wal.write().unwrap();
+            let after = headers(&vfs, seg);
+            let recycled = (0..before.len()).find(|&i| match (&before[i], after.get(i)) {
+                (Some(b), Some(Some(a))) => a.epoch > b.epoch,
+                _ => false,
+            });
+            if let Some(slot) = recycled
+                && wal.written().offset() as usize > FRAME_SIZE
+            {
+                found = Some((slot, old[slot].clone()));
+                break;
+            }
+            wal.sync().unwrap();
+            if rng.below(2) == 0 {
+                wal.checkpoint(t.end).unwrap();
+                checkpoint = t.end;
+            }
+        }
+        let Some((slot, old)) = found else { continue };
+        hits += 1;
+        let mut rw = OpenOptions::read();
+        rw.write = true;
+        let f = vfs.open(&path(), rw).unwrap();
+        f.write_at(&old, slot as u64 * seg).unwrap();
+        drop(f);
+        sim.crash(CrashKind::Process);
+        drop(wal);
+        let ctx = format!("seed {seed}, successor in slot {slot}");
+        let (got, r) = replay(&vfs, checkpoint).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+        drop(r.into_stream(opts).unwrap_or_else(|e| panic!("{ctx}: {e}")));
+        let (again, _) = replay(&vfs, checkpoint).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+        assert_eq!(
+            again.records.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            got.records.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            "{ctx}: records appeared after a reopen that appended nothing"
+        );
+    }
+    assert!(hits > 0, "no successor started in a recycled slot");
+}
+
+/// Loads `fixtures/NAME` (the stream file's length, then `(offset u64, len u32, bytes)` for
+/// each run of non-zero bytes) as the stream file.
+fn load_fixture(vfs: &VfsRef, name: &str) {
+    let dump = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name),
+    )
+    .unwrap();
+    let u64_at = |i: usize| u64::from_le_bytes(dump[i..i + 8].try_into().unwrap());
+    let f = vfs.open(&path(), OpenOptions::read_write_create()).unwrap();
+    f.set_len(u64_at(0)).unwrap();
+    let mut i = 8;
+    while i < dump.len() {
+        let offset = u64_at(i);
+        let len = u32::from_le_bytes(dump[i + 8..i + 12].try_into().unwrap()) as usize;
+        f.write_at(&dump[i + 12..i + 12 + len], offset).unwrap();
+        i += 12 + len;
+    }
+    f.sync_all().unwrap();
+    // The file's name too, as the database that wrote it had made it durable.
+    vfs.sync_dir(path().parent().unwrap()).unwrap();
+}
+
+#[test]
+fn a_stream_written_before_d209_recovers_and_reopens() {
+    // `wal_reopened_0_2.bin` was written by 0.2.0 (opts(4, 0) is not it: two-frame slots,
+    // no spares): records 1 to 3, a process kill, a reopen at max seen + 1 (epoch 2, the
+    // spacing before D209), records 4 to 10 rolling over to epoch 3, record 11, and a kill.
+    let opts = opts(2, 0);
+    let sim = SimVfs::new(1);
+    let vfs: VfsRef = sim.clone();
+    load_fixture(&vfs, "wal_reopened_0_2.bin");
+    let epochs = |vfs: &VfsRef| -> Vec<Option<u32>> {
+        headers(vfs, opts.segment_size)
+            .iter()
+            .map(|h| h.as_ref().map(|h| h.epoch))
+            .collect()
+    };
+    assert_eq!(epochs(&vfs), [Some(1), Some(2), Some(3)]);
+    let (got, r) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), (1..=11).collect::<Vec<_>>());
+    let mut wal = r.into_stream(opts).unwrap();
+    assert_eq!(wal.written().epoch(), 6, "max seen (3) + 3");
+    let t = wal
+        .append(&batch(12, 100).record(), Durability::GroupSync)
+        .unwrap();
+    wal.sync().unwrap();
+    drop(wal);
+    sim.crash(CrashKind::Power);
+    let (got, r) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), (1..=12).collect::<Vec<_>>());
+    assert_eq!(got.end, t.end);
+    // And once more from a checkpoint inside the old file's segments.
+    drop(r.into_stream(opts).unwrap());
+    let (again, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(again.seqnos(), (1..=12).collect::<Vec<_>>());
+}
+
+/// Buffered appends until done or a crash: nothing syncs but the rollovers, so a segment's
+/// header and first records, written in one write, stay unsynced until the next rollover
+/// (#508). Checkpoints follow the durable position. Returns the last checkpoint.
+fn buffered_rollovers(sim: &std::sync::Arc<SimVfs>, opts: WalOptions, seed: u64) -> Lsn {
+    let vfs: VfsRef = sim.clone();
+    let mut rng = Rng(seed);
+    let mut checkpoint = Lsn::default();
+    let Ok(mut wal) = WalStream::create(&vfs, db(), STREAM, DB_ID, opts) else {
+        return checkpoint;
+    };
+    let mut ends = Vec::new();
+    for seqno in 1..=GROUPS * 6 {
+        let rec = batch(seqno, rng.below(30_000) as usize);
+        let Ok(t) = wal.append(&rec.record(), Durability::Buffered) else {
+            break;
+        };
+        if wal.write().is_err() {
+            break;
+        }
+        ends.push(t.end);
+        if rng.below(2) == 0
+            && let Some(&cp) = ends.iter().rev().find(|&&e| e <= wal.durable())
+            && cp > checkpoint
+        {
+            if wal.checkpoint(cp).is_err() {
+                break;
+            }
+            checkpoint = cp;
+        }
+    }
+    checkpoint
+}
+
+#[test]
+fn reordering_power_losses_amid_buffered_rollovers_never_replay_new_records_after_a_reopen() {
+    // #508: a power loss at every operation of a Buffered workload, unsynced writes reordered
+    // (and torn): a segment's header may be lost while its records survive.
+    // Recovery, a reopen that appends nothing, and a second replay must agree.
+    let opts = opts(4, 1);
+    let mut cases = 0;
+    // A seed range of its own under the sweep workflow (`PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS`);
+    // by default a few seeds and 361, whose torn header-and-records write reproduced #508 here.
+    let env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
+    let seeds: Vec<u64> = match (env("PIGEONHOLE_SEED"), env("PIGEONHOLE_SEEDS")) {
+        (None, None) => (0..6).chain([361]).collect(),
+        (first, n) => {
+            let first = first.unwrap_or(0);
+            (first..first + n.unwrap_or(6)).collect()
+        }
+    };
+    for seed in seeds {
+        let dry = SimVfs::new(seed);
+        buffered_rollovers(&dry, opts, seed);
+        let total = dry.mutating_ops();
+        for n in 1..=total {
+            for torn in [false, true] {
+                let mut plan = FaultPlan::none();
+                plan.torn_writes = torn;
+                plan.reorder_unsynced = true;
+                plan.crash_after_ops = Some(n);
+                let sim = SimVfs::with_faults(seed, plan);
+                let checkpoint = buffered_rollovers(&sim, opts, seed);
+                let vfs: VfsRef = sim.clone();
+                if sim.mutating_ops() < n || !vfs.exists(&path()).unwrap() {
+                    continue;
+                }
+                sim.set_faults(FaultPlan::none());
+                let ctx = format!("seed {seed} power loss after op {n} torn={torn}");
+                let (got, r) = replay(&vfs, checkpoint).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                drop(r.into_stream(opts).unwrap_or_else(|e| panic!("{ctx}: {e}")));
+                let (again, _) = replay(&vfs, checkpoint).unwrap_or_else(|e| panic!("{ctx}: {e}"));
+                cases += 1;
+                assert_eq!(
+                    again.records.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                    got.records.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                    "{ctx}: records appeared after a reopen that appended nothing"
+                );
+            }
+        }
+    }
+    assert!(cases > 0);
+    eprintln!("{cases} crash cases");
+}

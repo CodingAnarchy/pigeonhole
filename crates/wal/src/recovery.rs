@@ -14,6 +14,16 @@ use crate::{Result, WalOptions, WalStream, stream_path};
 /// Frames read from the file at a time.
 const CHUNK_FRAMES: u64 = 32;
 
+/// How far above the largest epoch recovery saw (every header and the replayed end) a
+/// reopened stream's first segment starts (FORMAT §10.1 rule 2, D209). A segment's header and
+/// first records go out in one write, and a power loss may keep the records' sectors but not
+/// the header's: those frames, in a recycled slot the reopened stream may take, carry an epoch
+/// above the largest header on disk, and must never be the reopened segment's (#508). Here a
+/// header is never written before its predecessor is durable, so one header at most is not
+/// durable and two would be enough; three is the bound releases that write a successor's
+/// records before its header need, and FORMAT has one rule.
+const REOPEN_EPOCH_GAP: u32 = 3;
+
 /// Replays one stream from its checkpoint. A lending reader: each record borrows the reader's
 /// buffer until the next call.
 ///
@@ -326,8 +336,13 @@ impl Recovery {
                     .collect();
                 // Above every header, and above the recovered end even when its segment
                 // never reached the disk, so the new segment never shares its epoch with the
-                // position it chains to.
-                let max_epoch = grid.max_epoch().max(end.epoch());
+                // position it chains to; and above every epoch whose frames a power loss may
+                // have kept without their header (FORMAT §10.1 rule 2, D209, #508).
+                let max_epoch = grid
+                    .max_epoch()
+                    .max(end.epoch())
+                    .checked_add(REOPEN_EPOCH_GAP - 1)
+                    .ok_or_else(|| corrupt("wal epochs exhausted"))?;
                 let mut s = WalStream::blank(
                     vfs,
                     file,
