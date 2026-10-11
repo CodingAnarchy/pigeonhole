@@ -267,7 +267,7 @@ The internal interface change is ICR 0019.
 - **Moving a shard between threads** (#492, ICR 0029): call `Shard::release()` on the old thread first. It drains that thread's ring, which only it can reap, and debug builds panic on a move that skipped it. Then take `io_fd` again on the new thread.
 
 <a id="d203"></a>
-## D203 — Open does no blocking flush on a clean reopen; the first durable commit waits for the flushes a read does not need (coordinator decision, 2026-10-10; engine, pager, wal, io, #158; ICR 0021)
+## D203 — Open does no blocking flush on a clean reopen; the first durable commit waits for the flushes a read does not need (coordinator decision, 2026-10-10; engine, pager, wal, io, #158; ICR 0021; amended by D211)
 **Measured** (`examples/openlat.rs`, #450): on a clean reopen of a small database the open waited for five flushes in a row. A read needs none of them:
 1. the pager's `finish` `sync_all`;
 2. a manifest root commit (2 `sync_data`) that published nothing;
@@ -287,6 +287,7 @@ The internal interface change is ICR 0019.
 - **The new WAL streams' file syncs and their directory sync are submitted, not waited for** (`Vfs::submit_sync_dir`, ICR 0021).
   - Each takes a ticket in its stream's sync ordering (D58), so the stream's first durable sync (a GroupSync or Sync commit) counts only once they have finished, and a failed one poisons the stream.
   - Buffered commits need no flush.
+  - **No manifest checkpoint names a new stream until both have finished (D211).** A shard holds its checkpoint back until then.
   - **Recovery syncs the directory entry of every stream it adopts** (`Recovery::open`, beside its existing length sync). A process can now die before its creating open's directory sync runs. The next open adopts the file and acknowledges commits in it, and a power loss would then take the file's name. #454's first deferred-I/O sweep found exactly that: a process crash, then a recovering open, then a power loss, losing acknowledged commits. A clean reopen adopts nothing (its streams are new), so it still waits for no flush.
 - **The cost of a clean reopen** that stays on the open path is opens, locks, shared memory and thread start: about 1 ms on macOS.
 
@@ -298,6 +299,8 @@ The internal interface change is ICR 0019.
 - `wal/tests/open_io.rs`: a blocking sync right after `create_all`, with nothing else completing I/O, drives the open-time syncs to completion rather than waiting for ever (the hang the first sweep found). Mutation-checked: without the drive, or with fanned-out handles that lose it, it hangs. A second test runs a creating open whose directory sync a process crash drops, then an adopting open with a durable commit, then a power loss, and the commit survives. Without recovery's directory sync the stream file is gone.
 - `engine/tests/model_check.rs` (`harness_regressions_from_the_seed_sweep`): seeds 99, 132 and 164 with deferred I/O, the sweep's lost acknowledged commits, as regressions.
 - `pager/tests/open_sync.rs`: a clean close at the recorded length skips the length sync. An unclean close, or a length longer or shorter than recorded, syncs. Each condition is mutation-checked.
+
+*History: Amended by D211 (a checkpoint for a new stream waits for its creation syncs; #520).*
 
 <a id="d204"></a>
 ## D204 — The scaling gate measures application-owned shards writing inline; engine-owned synchronous clients are reported (owner decision, 2026-10-10; bench, #154; amends the spec's Goals scaling definition and the #406 checklist)
@@ -401,3 +404,39 @@ What a pass forces is otherwise unchanged; the mixed-temperature harness gives m
 - **#387's ratio to SQLite EAV** (row-read and scan p99, the documented gap) is judged on the same two runs. On the Mac at main 2d6b6ed it was 1.58× and 1.27× (D193: about 2.0× and 1.6×).
 
 *Checked by:* the first gate window's report (`report.py`), whose Phase 2 rows read both runs.
+
+<a id="d211"></a>
+## D211 — No manifest checkpoint may name a WAL stream whose file creation is not durable (coordinator decision, 2026-10-11; engine, wal, #520; ICR 0031; amends D203)
+
+**Why.** D203 stopped open from waiting for new WAL stream files' file and directory syncs. The stream's own durable syncs were ordered behind them, but a manifest checkpoint was not.
+- A shard could commit a checkpoint for its stream while the directory sync was still in flight. It does so as soon as records stop being needed: a refused attempt's PREPARE, a dropped table's rows, or a flush.
+- A power loss then kept the manifest and lost the file's name.
+- The reopen created the stream afresh, again at epoch 1, but kept the stale checkpoint. Replay and later checkpoints started past the new stream's first records, and the next crash lost acknowledged commits.
+- #517's deferred-I/O tablets sweep found it (seed 273); #454 introduced it.
+- 0.2.x isn't affected: its `create_all` syncs the directory before open returns (0 of 200 seeds failed on release/0.2.x).
+
+**The invariant:** no manifest checkpoint may reference a stream whose file creation is not durable.
+
+**Now:**
+- **The WAL tracks it.** `Wal::created_durable` and `Wal::notify_created` (ICR 0031): a stream `create_all` made is pending until its file sync and its directory sync have both finished, then durable, or failed if either failed.
+  - Streams recovery opens are durable at once, because `Recovery::open` syncs an adopted stream's directory entry first (D203).
+  - Streams `WalStream::create` makes are durable at once, because it syncs before returning.
+- **The shard holds its checkpoint back while pending** (`advance_checkpoint`). It arms one wake (`ShardMsg::Created`) that retries the checkpoint and the close once the creation settles. It never checkpoints a stream whose creation failed: the stream is poisoned anyway.
+  - Nothing else waits: commits, flushes and reads go on, and a held-back checkpoint only keeps WAL records a little longer.
+- **A debug assertion** where the `WalCheckpoint` edit is built.
+- **Not chosen:**
+  - *Waiting for the directory sync at open* (0.2.x's way): a clean close removes the stream files, so every clean reopen creates them afresh, and this would put a directory fsync back on every reopen, undoing D203.
+  - *A recovery repair of stale checkpoints*: not needed while the invariant holds.
+
+**Checked by:**
+- `engine/tests/checkpoint_creation.rs`, deterministic, with the directory sync held:
+  1. a fresh database's dropped-table rows make the stream's records unneeded;
+  2. no checkpoint is committed;
+  3. a power loss takes the stream file's name;
+  4. the reopen takes Sync commits;
+  5. a second power loss loses none of them.
+
+  Without the gate a checkpoint is committed, and the end-to-end variant loses an acknowledged Sync commit.
+- `wal/tests/stream.rs`: a created stream is pending until both syncs finish, and its wake runs then; a recovered stream is durable.
+- `engine/tests/tablets.rs` (`crash_at_every_write_point_of_tablet_changes_regressions`): seed 273 with deferred I/O.
+- **Sweeps:** deferred `tablets` joins the standard sweep set for engine, WAL and I/O changes (CONTRIBUTING).

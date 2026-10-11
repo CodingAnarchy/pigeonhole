@@ -304,6 +304,22 @@ pub trait Wal: Send + fmt::Debug {
         wake();
     }
 
+    /// Whether this stream's file and its directory entry are durable (ICR 0031, D211):
+    /// `None` while a new stream's creation syncs are in flight
+    /// ([`WalStream::create_all`] submits them without waiting, D203), `Some(false)` if one
+    /// failed. No manifest checkpoint may name the stream before `Some(true)`: a power loss
+    /// could take the file's name and leave the checkpoint to a stream created afresh.
+    /// `Some(true)` by default, and for a stream recovery opened (its entry is synced first).
+    fn created_durable(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    /// Calls `wake` (from any thread) once [`Wal::created_durable`] is settled: at once if it
+    /// is, and by default (ICR 0031).
+    fn notify_created(&self, wake: Box<dyn FnOnce() + Send>) {
+        wake();
+    }
+
     /// Removes this stream's files (clean close by the last process, after checkpoint).
     fn remove(self: Box<Self>) -> Result<()>;
 }

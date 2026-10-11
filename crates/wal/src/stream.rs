@@ -141,6 +141,49 @@ struct Shared {
     /// The open-time syncs still in flight (a new stream's file and directory syncs, #158):
     /// a blocking wait drives them first (see [`Shared::drive_open_io`]).
     open_io: Mutex<Vec<Completion<()>>>,
+    /// Whether the stream's file and directory entry are durable ([`Wal::created_durable`],
+    /// D211).
+    creation: Mutex<Creation>,
+}
+
+/// A stream's creation (D211): durable, or its file and directory syncs still in flight
+/// (`create_all`), or failed.
+enum Creation {
+    Durable,
+    Pending {
+        /// Syncs still in flight (the file's and the directory's).
+        left: u8,
+        /// Called once it settles.
+        waiters: Vec<Box<dyn FnOnce() + Send>>,
+    },
+    Failed,
+}
+
+impl Shared {
+    /// One of a new stream's creation syncs finished (`ok`): the creation settles once both
+    /// have, durable only if both succeeded. Its waiters run outside the lock.
+    fn creation_synced(&self, ok: bool) {
+        let waiters = {
+            let mut c = self.creation.lock().unwrap_or_else(PoisonError::into_inner);
+            let Creation::Pending { left, waiters } = &mut *c else {
+                return;
+            };
+            *left -= 1;
+            if ok && *left > 0 {
+                return;
+            }
+            let waiters = std::mem::take(waiters);
+            *c = if ok {
+                Creation::Durable
+            } else {
+                Creation::Failed
+            };
+            waiters
+        };
+        for w in waiters {
+            w();
+        }
+    }
 }
 
 /// Told, once a durable sync settles, whether the stream is still unpoisoned.
@@ -876,15 +919,29 @@ impl WalStream {
                 unreachable!("two handles per stream");
             };
             let shared = Arc::clone(&w.shared);
+            // The stream's creation is durable once both syncs have succeeded (D211): until
+            // then no checkpoint may name it.
+            *w.shared
+                .creation
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Creation::Pending {
+                left: 2,
+                waiters: Vec::new(),
+            };
             // The file's own sync covers its header and length: then the segment start is
             // durable.
             drop(w.shared.submit_durable(move || file).map(move |r| {
                 if r.is_ok() {
                     shared.durable.fetch_max(lsn.0, Ordering::Release);
                 }
+                shared.creation_synced(r.is_ok());
                 r
             }));
-            drop(w.shared.submit_durable(move || dir));
+            let shared = Arc::clone(&w.shared);
+            drop(w.shared.submit_durable(move || dir).map(move |r| {
+                shared.creation_synced(r.is_ok());
+                r
+            }));
             w.shared
                 .open_io
                 .lock()
@@ -971,6 +1028,7 @@ impl WalStream {
                 syncs: Mutex::new(Syncs::default()),
                 sync_done: Condvar::new(),
                 open_io: Mutex::default(),
+                creation: Mutex::new(Creation::Durable),
             }),
         }
     }
@@ -1471,6 +1529,34 @@ impl Wal for WalStream {
         // stops the wait for spares: the inline rollover then reports the failure.
         self.segment_size - self.append_pos() <= self.segment_size / 4
             && (self.header_waits() || !self.spare_ready() && !self.shared.pool().prepare_failed)
+    }
+
+    fn created_durable(&self) -> Option<bool> {
+        match *self
+            .shared
+            .creation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Creation::Durable => Some(true),
+            Creation::Pending { .. } => None,
+            Creation::Failed => Some(false),
+        }
+    }
+
+    fn notify_created(&self, wake: Box<dyn FnOnce() + Send>) {
+        {
+            let mut c = self
+                .shared
+                .creation
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Creation::Pending { waiters, .. } = &mut *c {
+                waiters.push(wake);
+                return;
+            }
+        }
+        wake();
     }
 
     fn notify_unblocked(&self, wake: Box<dyn FnOnce() + Send>) {

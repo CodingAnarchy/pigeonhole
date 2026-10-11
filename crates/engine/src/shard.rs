@@ -1076,6 +1076,9 @@ pub(crate) enum ShardMsg {
     CommitCheckpointed {
         seqno: Seqno,
     },
+    /// This shard's WAL stream's creation settled (D211): a checkpoint held back for it may
+    /// be submitted.
+    Created,
     /// Another shard's checkpoint is pinned by cross-shard commits up to `through`: flush
     /// whatever this shard holds of them (#137).
     Unpin {
@@ -2267,6 +2270,8 @@ pub(crate) struct ShardState {
     checkpoint_candidate: Lsn,
     checkpoint_inflight: bool,
     checkpoint_dirty: bool,
+    /// A wake is armed for the stream's creation to settle (D211, `advance_checkpoint`).
+    creation_wake: bool,
     /// COMMIT records the candidate passed: participants are told once the edit is durable.
     passed_commits: Vec<(Seqno, Vec<ShardId>)>,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
@@ -2465,6 +2470,7 @@ impl ShardState {
             checkpoint_candidate: Lsn::default(),
             checkpoint_inflight: false,
             checkpoint_dirty: false,
+            creation_wake: false,
             passed_commits: Vec::new(),
             aborted: HashSet::new(),
             commit_ckpt: HashSet::new(),
@@ -6170,6 +6176,27 @@ impl ShardState {
         if self.checkpoint_candidate <= self.checkpoint && self.passed_commits.is_empty() {
             return;
         }
+        // D211: no checkpoint may name a stream whose file creation is not durable. A new
+        // stream's file and directory syncs are not waited for at open (D203); a power loss
+        // before they finish could take the file's name and leave the checkpoint to the
+        // stream the reopen creates afresh, skipping its records (#520). Held back until they
+        // finish (a wake retries it); never if they failed (the stream is poisoned).
+        if let Some(wal) = self.wal.as_ref() {
+            match wal.created_durable() {
+                Some(true) => {}
+                Some(false) => return,
+                None => {
+                    if !self.creation_wake {
+                        self.creation_wake = true;
+                        let submitter = ctx.submitter(self.id).clone();
+                        wal.notify_created(Box::new(move || {
+                            let _ = submitter.submit(ShardMsg::Created);
+                        }));
+                    }
+                    return;
+                }
+            }
+        }
         if self.checkpoint_inflight {
             self.checkpoint_dirty = true;
             return;
@@ -6183,6 +6210,13 @@ impl ShardState {
         let commits = std::mem::take(&mut self.passed_commits);
         let submitter = ctx.submitter(self.id).clone();
         let stream = StreamId(u32::from(self.id.0));
+        debug_assert!(
+            self.wal
+                .as_ref()
+                .is_none_or(|w| w.created_durable() == Some(true)),
+            "D211: a checkpoint for stream {} before its creation is durable",
+            stream.0
+        );
         let req = ManifestReq::edits(vec![Edit::WalCheckpoint { stream, lsn }], move |result| {
             let _ = submitter.submit(ShardMsg::Checkpointed {
                 lsn,
@@ -7226,6 +7260,11 @@ impl ShardState {
                 // The COMMIT record may not be logged yet (a participant flushed before the
                 // coordinator's group ran): the count waits for it.
                 self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
+                self.advance_checkpoint(ctx);
+                self.try_finish_close(ctx);
+            }
+            ShardMsg::Created => {
+                self.creation_wake = false;
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
