@@ -156,6 +156,11 @@ pub struct Metrics {
     /// (ICR 0027). Per commit, they show how often a commit pays a shard wakeup. An
     /// application-owned shard sleeps in the application's loop: only its wakes count.
     pub shard_idle: (u64, u64),
+    /// Nanoseconds the shards' engine-owned threads spent in work turns (handling messages,
+    /// running their tasks; not spinning or parked), summed over shards (D217, ICR 0033).
+    /// Its rise over an interval, divided by the interval, is how many shards' worth of
+    /// work the store did. Application-owned shards count nothing.
+    pub shard_busy_nanos: u64,
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
@@ -186,6 +191,10 @@ pub struct ShardStats {
     pub merges: u64,
     /// See [`ShardStats::splits`].
     pub moves: u64,
+    /// Nanoseconds the shard's engine-owned thread spent in work turns, not spinning or
+    /// parked (D217, ICR 0033); zero for an application-owned shard. Its rise over a phase,
+    /// divided by the phase's length, is the fraction of the time the shard was busy.
+    pub busy_nanos: u64,
 }
 
 /// The lock-page byte range of the superblock-less file check (decision D59).
@@ -1833,8 +1842,14 @@ impl Engine {
                 splits: m.splits.load(Ordering::Relaxed),
                 merges: m.merges.load(Ordering::Relaxed),
                 moves: m.moves.load(Ordering::Relaxed),
+                busy_nanos: 0,
             })
             .collect();
+        if let Some(subs) = shared.submitters.get() {
+            for (s, sub) in out.iter_mut().zip(subs.iter()) {
+                s.busy_nanos = sub.busy_nanos();
+            }
+        }
         for t in shared.view.load().tablets().iter() {
             if let Some(s) = out.get_mut(usize::from(t.shard.0)) {
                 s.tablets += 1;
@@ -1895,6 +1910,7 @@ impl Engine {
                 let (parks, wakes) = sub.idle_counts();
                 m.shard_idle.0 += parks;
                 m.shard_idle.1 += wakes;
+                m.shard_busy_nanos += sub.busy_nanos();
             }
         }
         let w = &shared.visibility;

@@ -476,6 +476,7 @@ impl PigeonholeRunner {
                 splits: a.splits - b.splits,
                 merges: a.merges - b.merges,
                 moves: a.moves - b.moves,
+                busy_nanos: a.busy_nanos - b.busy_nanos,
             })
             .collect();
         drop(t);

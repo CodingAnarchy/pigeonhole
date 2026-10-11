@@ -520,6 +520,11 @@ pub struct ShardShare {
     pub merges: u64,
     /// Tablet moves the shard completed.
     pub moves: u64,
+    /// Nanoseconds the shard's engine-owned thread spent in work turns (D217); divided by the
+    /// phase's length, the fraction of it the shard was busy. Zero for application-owned
+    /// shards.
+    #[serde(default)]
+    pub busy_nanos: u64,
 }
 
 impl ShardShare {
@@ -533,6 +538,7 @@ impl ShardShare {
             splits: after.splits.saturating_sub(before.splits),
             merges: after.merges.saturating_sub(before.merges),
             moves: after.moves.saturating_sub(before.moves),
+            busy_nanos: after.busy_nanos.saturating_sub(before.busy_nanos),
         }
     }
 }
