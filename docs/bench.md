@@ -135,7 +135,7 @@ Latency is the wall time of one `execute` call, recorded in an HDR-style log-lin
 
 Each result row gives the workload, store, store settings, size, client threads, throughput, and p50/p99/p99.9 latency in microseconds. The JSON (`Suite`) adds the seed, value size, load time, mean and max latency, and an environment fingerprint: CPU, cores, memory, OS, architecture, filesystem of the benchmark directory, build profile and git revision.
 
-**Reference hardware.** Gates are defined on enterprise NVMe with power-loss protection, Linux 6.x and io_uring (spec, Goals). No such machine is attached yet (D5), so every result is labeled `non-reference (D5)`. Non-reference numbers are reported in every run and never gate a phase. A run is labeled reference only when an operator sets `PHDB_BENCH_REFERENCE=1` on Linux; the bench never infers it.
+**Reference hardware.** Gates are defined on enterprise NVMe with power-loss protection, Linux 6.x and io_uring (spec, Goals). The reference machine is a Hetzner AX102, rented only for the Phase 3 gate window ([`crates/bench/baselines/phase3-gate`](../crates/bench/baselines/phase3-gate/README.md), #405); until its runs, every result is labeled `non-reference (D5)`. Its first two Phase 2 gate runs become that gate's baseline, replacing the Mac runs 5–6 (D208). Non-reference numbers are reported in every run and never gate a phase. A run is labeled reference only when an operator sets `PHDB_BENCH_REFERENCE=1` on Linux; the bench never infers it.
 
 ## Gates
 

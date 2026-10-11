@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Features from later phases are labeled.
+> **Status:** this guide describes `main`; the current release on crates.io is 0.2.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Features from later phases are labeled.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 
@@ -68,7 +68,7 @@ One writer process and any number of reader processes on the same host can open 
 A reader's snapshot survives the writer closing. Once a new writer opens, though, reads through snapshots taken before the restart fail with `SnapshotExpired`, because the new writer may reuse the space those snapshots read. Take a new snapshot and redo the read. Snapshots taken after the restart read normally.
 
 ## Platform and process notes
-- **Block cache.** Each process that opens the file has its own block cache, **256 MiB by default** (`Options::block_cache`, `ReaderOptions::block_cache`). The writer and every reader process each add their own, on top of the memtable arenas (`memtable_budget` per shard). Set it explicitly on small devices.
+- **Block cache.** Each process that opens the file has its own block cache, **256 MiB by default** (`Options::block_cache`, `ReaderOptions::block_cache`). The writer and every reader process each add their own, on top of the memtable arenas (`memtable_budget` per shard). The writer's row cache (`Options::row_cache`, off by default) adds its size on top of that. Set them explicitly on small devices.
 - **Never open the file yourself on macOS or BSD.** The writer lock is a POSIX `fcntl` lock, and on those systems closing *any* descriptor of the file drops *all* of the process's locks on it. Pigeonhole guards against this between its own handles, but not against yours: a plain `std::fs::File::open` and drop of the `.phdb` inside the process (to hash it, `fs::copy` it, or from a file watcher) releases the writer lock, and a second process can then open the file as a writer and corrupt it. Use `backup` to copy a live database. On Linux the locks belong to the open file description and this does not happen.
 - **Readers must share the writer's PID namespace.** Reader liveness is checked by process id, so a writer in a different PID namespace (another container that shares only the volume and shared memory) sees a live reader as dead, reclaims its slot and can free space the reader is still reading. Run the writer and its readers in the same PID namespace.
 - **Long backups.** `backup` copies its snapshot's memtables first (writing at most one arena's worth of data to the copy) and then releases them, keeping only the snapshot's SST files for the long copy. Writers therefore keep the whole arena while a large backup runs; what the backup holds meanwhile is file space (old SSTs a compaction replaced are freed once it finishes). The copy can be up to about one arena larger than a freshly compacted file; `shrink` on the copy reclaims it.

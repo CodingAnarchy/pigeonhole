@@ -29,11 +29,11 @@ Anything left for later is a GitHub issue titled `[crate] summary`, labeled with
 
 ## Workflow
 1. Work on a branch (`crate/<name>-<topic>`), ideally in its own git worktree.
-2. Before pushing, run locally:
+2. Before pushing, run locally (builds go through `cargo quota`; see [local resources](#seed-sweeps-and-local-resources)):
    ```sh
    cargo fmt --all
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
-   cargo test --workspace --all-features
+   cargo quota clippy --workspace --all-targets --all-features -- -D warnings
+   cargo quota test --workspace --all-features
    ```
    Crates with `unsafe` also run `cargo +nightly miri test -p <crate>`; crates with concurrency run `RUSTFLAGS="--cfg loom" cargo test --release -p <crate> --lib loom`.
 3. Clean up before the PR is ready: remove temporary diagnostics, debug prints, commented-out code and probe tests from the diff; keep a test hook only if a committed test uses it; delete scratch files (logs, traces, copied binaries) you created outside `target/`; stop any background processes you started. Leave deferred work as a milestoned issue, not a TODO.

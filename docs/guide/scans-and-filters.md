@@ -1,6 +1,6 @@
 # Scans and filters
 
-> **Status:** this guide describes `main`, which will be released as 0.2.0; crates.io has 0.1.0, and the [changelog](../../CHANGELOG.md) lists what changed. Semantics come from the spec and decision D22. `Scan::stream` (async) is Phase 3. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.2.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics come from the spec and decision D22. `Scan::stream` (async) is on `main`, not in 0.2.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Both `Table::row(key)` (a `RowRead`) and `Table::scan*` (a `Scan`) are builders. Nothing happens until you call `.read()` or `.iter()`. They share most of their methods.
 
