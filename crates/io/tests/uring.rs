@@ -187,7 +187,7 @@ fn the_last_handle_can_go_on_the_reaper_thread() {
 
 // ---- a thread's own ring (#402 PR 3) ----
 
-use pigeonhole_io::{own_io_in_flight, own_io_waker, reap_own_io};
+use pigeonhole_io::{own_io_enters, own_io_in_flight, own_io_waker, reap_own_io};
 
 #[test]
 fn an_attached_thread_completes_its_own_io_by_reaping() {
@@ -274,6 +274,45 @@ fn a_non_waiting_reap_takes_finished_completions() {
         "a non-waiting reap never took the completion"
     );
     write.wait().unwrap();
+}
+
+#[test]
+fn a_turn_with_nothing_to_take_stays_out_of_the_kernel() {
+    let _serial = serial();
+    // A shard thread reaps without waiting on every turn. With nothing in flight, or nothing
+    // finished, that turn must cost no system call: two a turn cost write-heavy workloads
+    // 15-20% against pread on the AX102 (Phase 3 gate analysis).
+    let b = Backend::uring("uring-own-quiet");
+    b.vfs.attach_thread();
+    let f = b.create("f");
+    let before = own_io_enters();
+    for _ in 0..1000 {
+        reap_own_io(None);
+    }
+    assert_eq!(own_io_enters(), before, "an idle turn entered the kernel");
+    // Something finished: the turn enters and takes it.
+    let write = f.submit_write(filled(4096, 7), 0);
+    for _ in 0..2000 {
+        if write.is_ready() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+        reap_own_io(None);
+    }
+    write.wait().unwrap();
+    assert!(
+        own_io_enters() > before,
+        "the completion was taken without entering"
+    );
+    // A thread that took the completion fd waits on it: every reap keeps it current.
+    let _fd = pigeonhole_io::own_io_fd().expect("a thread ring offers a completion fd");
+    let watched = own_io_enters();
+    reap_own_io(None);
+    assert_eq!(
+        own_io_enters(),
+        watched + 1,
+        "a watched ring's reap skipped the kernel"
+    );
 }
 
 // ---- registered buffers (#402 PR 4) ----

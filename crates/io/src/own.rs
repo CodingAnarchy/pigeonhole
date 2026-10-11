@@ -37,6 +37,10 @@ pub(crate) trait OwnIo: Send + Sync {
     fn fd_here(&self) -> Option<i32> {
         None
     }
+    /// Times the calling thread's reaps on this backend entered the kernel.
+    fn enters_here(&self) -> u64 {
+        0
+    }
 }
 
 /// Interrupts its thread's wait in [`reap_own_io`] (an io_uring ring's wait for completions,
@@ -110,6 +114,13 @@ pub fn reap_own_io(wait: Option<Duration>) -> bool {
         any |= b.reap_here(wait);
     }
     any
+}
+
+/// Times the calling thread's reaps ([`reap_own_io`]) entered the kernel, over every backend:
+/// a measure for tests and benchmarks, not an API.
+#[doc(hidden)]
+pub fn own_io_enters() -> u64 {
+    backends().iter().map(|b| b.enters_here()).sum()
 }
 
 /// A handle that interrupts the calling thread's waits in [`reap_own_io`], from the first of
