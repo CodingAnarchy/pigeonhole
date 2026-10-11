@@ -3177,6 +3177,20 @@ impl EngineShard {
         d.run_once(deadline_nanos)
     }
 
+    /// Before handing this shard to another thread: drives it until the calling thread has
+    /// none of its I/O in flight (#492, ICR 0029). With io_uring in application-owned mode
+    /// each driving thread has its own ring, and only that thread can complete what was
+    /// submitted to it: a shard moved with I/O still on the old thread's ring waits on it
+    /// for ever once that thread stops running turns. Call it on the old thread, then move
+    /// the shard. A no-op on the pread and synchronous backends (no per-thread rings), and
+    /// in engine-owned mode (shards never move). Debug builds panic when a shard turns up on
+    /// another thread with I/O left on the old one unreleased.
+    pub fn release(&mut self) {
+        if let Some(d) = self.driver.as_mut() {
+            d.release();
+        }
+    }
+
     /// The outcome of the database's close once it has finished (every shard closed and
     /// the last one recorded the clean close), or `None` before. After [`Engine::close`],
     /// keep driving the shard until this is `Some`, then drop it. Every shard reports the

@@ -387,6 +387,13 @@ struct ShardCore<H: ShardHandler> {
     /// I/O would go to a ring no thread reaps (the #473 scaling hang).
     attached: u64,
     own_ring: bool,
+    /// Debug builds: whether the thread's ring still had I/O in flight when its last turn of
+    /// this shard ended, and whether `release` ran since. A shard that turns up on another
+    /// thread with I/O left behind unreleased is a bug (#492).
+    #[cfg(debug_assertions)]
+    left_io: bool,
+    #[cfg(debug_assertions)]
+    released: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
 }
@@ -541,6 +548,35 @@ impl<H: ShardHandler> ShardCore<H> {
     }
 
     fn run_once(&mut self, deadline: u64) -> bool {
+        let more = self.run_turn(deadline);
+        #[cfg(debug_assertions)]
+        {
+            self.left_io = self.own_ring && pigeonhole_io::own_io_in_flight();
+        }
+        more
+    }
+
+    /// Hands the shard over cleanly: drives it until the calling thread's ring has nothing
+    /// in flight, so nothing of the shard's waits on a ring only this thread may reap (#492,
+    /// ICR 0029). Without per-thread rings it returns at once.
+    fn release(&mut self) {
+        if !self.own_ring || self.attached != thread_token() {
+            return;
+        }
+        let slice = std::time::Duration::from_millis(1);
+        while pigeonhole_io::own_io_in_flight() {
+            pigeonhole_io::reap_own_io(Some(slice));
+            let deadline = self.vfs.monotonic_nanos().saturating_add(1_000_000);
+            self.run_turn(deadline);
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.left_io = false;
+            self.released = true;
+        }
+    }
+
+    fn run_turn(&mut self, deadline: u64) -> bool {
         let _shard = EnterShard::new(self.id);
         self.signal().awake();
         // A backend with a ring per driving thread (#402) gives each thread that runs this
@@ -550,6 +586,16 @@ impl<H: ShardHandler> ShardCore<H> {
         // a ring backend reads the thread token (#485's instruction ceilings).
         if self.own_ring {
             if self.attached != thread_token() {
+                #[cfg(debug_assertions)]
+                {
+                    assert!(
+                        !self.left_io || self.released,
+                        "shard {} moved to another thread while its I/O was in flight on the \
+                         old thread's ring: call release() on the old thread first (#492)",
+                        self.id.0
+                    );
+                    self.released = false;
+                }
                 self.attach();
             }
             pigeonhole_io::reap_own_io(None);
@@ -724,6 +770,10 @@ fn build<H: ShardHandler>(
             time_slice: config.slice_nanos(),
             idle_at: None,
             attached: 0,
+            #[cfg(debug_assertions)]
+            left_io: false,
+            #[cfg(debug_assertions)]
+            released: false,
             own_ring: false,
             spin: IdleSpin::new(config.idle_spin),
         })
@@ -1023,6 +1073,16 @@ impl<H: ShardHandler> ShardDriver<H> {
     /// by [`next_deadline`](ShardDriver::next_deadline) even if no wakeup arrives.
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
         self.core.run_once(deadline_nanos)
+    }
+
+    /// Before handing this shard to another thread: drives it until the calling thread's
+    /// I/O ring has nothing in flight (#492, ICR 0029). A backend with a ring per driving
+    /// thread (io_uring in application-owned mode) lets only that thread complete what was
+    /// submitted to it, so a shard moved with I/O still there would wait on it for ever if
+    /// this thread stopped running turns. Returns at once without such rings (the pread
+    /// and synchronous backends), or on a thread that has not run this shard.
+    pub fn release(&mut self) {
+        self.core.release();
     }
 
     /// The earliest deadline (VFS `monotonic_nanos`) of a background task sleeping on this

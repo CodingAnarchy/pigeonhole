@@ -632,6 +632,45 @@ impl Shard {
         usize::from(self.inner.index())
     }
 
+    /// Call before handing this shard to another thread: drives it until the calling
+    /// thread has none of its I/O in flight (#492, ICR 0029).
+    ///
+    /// With [`IoBackend::Uring`](crate::IoBackend::Uring) in application-owned mode each
+    /// driving thread has its own I/O ring, and only that thread can complete what was
+    /// submitted to it. A shard moved with I/O still on the old thread's ring would wait on
+    /// it for ever once that thread stops running turns. So: `release()` on the old thread,
+    /// then move the shard, and take [`io_fd`](Shard::io_fd) again on the new thread (the
+    /// descriptor belongs to the thread's ring).
+    ///
+    /// A no-op on the pread backend (completions arrive on its pool threads) and in
+    /// engine-owned mode (shards never move). Debug builds panic when a shard turns up on
+    /// another thread with I/O left on the old one unreleased.
+    ///
+    /// ```
+    /// use pigeonhole::{Options, Pigeonhole};
+    ///
+    /// let dir = std::env::temp_dir().join(format!("phdb-release-{}", std::process::id()));
+    /// std::fs::create_dir_all(&dir).unwrap();
+    /// let (db, mut shards) =
+    ///     Pigeonhole::open_application_owned(dir.join("db.phdb"), Options::default().shards(1))?;
+    /// let mut shard = shards.pop().unwrap();
+    /// shard.run_once(std::time::Duration::from_millis(1));
+    /// // Hand the shard to another thread.
+    /// shard.release();
+    /// let driver = std::thread::spawn(move || {
+    ///     while shard.closed().is_none() {
+    ///         shard.run_once(std::time::Duration::from_millis(1));
+    ///     }
+    /// });
+    /// db.close()?;
+    /// driver.join().unwrap();
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// # Ok::<(), pigeonhole::Error>(())
+    /// ```
+    pub fn release(&mut self) {
+        self.inner.release();
+    }
+
     /// Runs queued writes, group commit and background work for up to `budget`. Returns
     /// whether work remains.
     ///

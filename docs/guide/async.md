@@ -116,6 +116,7 @@ With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `
 - **If your loop doesn't wait on `io_fd`,** such an async read still completes, but only at the loop's next timed turn: up to `next_wakeup` later, which can be seconds when idle.
 - **Blocking calls are unaffected:** a thread blocked on its own read completes it itself.
 - **Asking for `io_fd` is also the opt-in** that lets `next_wakeup` stop reporting in-flight I/O as due now. A loop that never takes it keeps polling while I/O is in flight.
+- **Moving a shard to another thread: call `Shard::release()` on the old thread first** (#492). Each driving thread has its own ring, and only that thread can complete what was submitted to it, so a shard moved with I/O still on the old thread's ring would wait on it for ever once that thread stops running turns. `release()` drives the shard until the thread has nothing in flight. Then take `io_fd` again on the new thread (the descriptor belongs to the thread's ring). Debug builds panic on a move that skipped it. On the pread backend and in engine-owned mode, `release()` does nothing.
 
 ## Sync-only calls
 These calls have no async form (owner decision recorded in [D196](../design/decisions/phase-3.md#d196)):

@@ -264,6 +264,7 @@ The internal interface change is ICR 0019.
 - **A blocked wait with nobody else to reap for it** reaps the shared ring itself. That covers a blocked wait on one of the shared ring's completions, and on a completion chained after them, such as a WAL's ordered sync. The shared ring registers as an orphan in `pigeonhole-io`, and `Completion::wait` reaps orphans in 1 ms slices.
   - #443's first version hung at open on such a chained wait.
 - **The limitation:** a client thread's *async* I/O (an executor's `get_async`) then completes promptly only if the driving loop waits on `io_fd`. Otherwise it completes at the loop's next timed turn. Documented in the async guide.
+- **Moving a shard between threads** (#492, ICR 0029): call `Shard::release()` on the old thread first. It drains that thread's ring, which only it can reap, and debug builds panic on a move that skipped it. Then take `io_fd` again on the new thread.
 
 <a id="d203"></a>
 ## D203 — Open does no blocking flush on a clean reopen; the first durable commit waits for the flushes a read does not need (coordinator decision, 2026-10-10; engine, pager, wal, io, #158; ICR 0021)

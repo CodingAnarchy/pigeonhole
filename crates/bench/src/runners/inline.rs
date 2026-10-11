@@ -151,6 +151,9 @@ fn with_drivers<T>(shards: Vec<Shard>, f: impl FnOnce() -> T) -> (Vec<Shard>, T)
                         idle(&shard, Duration::from_micros(500));
                     }
                 }
+                // Handed back to the caller's next phase: nothing of the shard's may stay on
+                // this thread's ring (#492).
+                shard.release();
                 shard
             })
         })
@@ -204,6 +207,8 @@ fn phase(
                             idle(&shard, Duration::from_micros(200));
                         }
                     }
+                    // The next phase drives it on another thread (#492).
+                    shard.release();
                     r.map(|()| (shard, hist))
                 })
             })
