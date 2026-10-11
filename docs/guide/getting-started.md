@@ -46,12 +46,12 @@ let db = Pigeonhole::open(
         .shards(1)                        // shard threads; default is the CPUs available
         .memtable_budget(16 << 20)        // write buffer per shard; shm = budget × shards
         .block_cache(256 << 20)           // bytes; 256 MiB is the default
-        .row_cache(0),                    // bytes; 0 (default) disables
+        .row_cache(64 << 20),             // bytes; 64 MiB is the default, 0 disables
 )?;
 # Ok::<(), pigeonhole::Error>(())
 ```
 
-**Row cache.** `Options::row_cache(bytes)` (off by default) keeps the newest version of each cell of small, hot family rows in memory, and serves latest row reads and point gets from them without merging the row's memtables and SSTs. A family row is stored the second time a read misses it, so rows read once are never stored. It returns exactly what an uncached read would: any write to a row makes its cached copy miss at once. Consider it when the same small rows are read again and again with few writes in between. Snapshot reads, multi-version and time-range reads, scans and reader processes do not use it, and a family row larger than `Options::row_cache_max_row` (encoded bytes, default 4 KiB) is read as usual. `Options::row_cache_family(table, family)` limits it to the families that benefit. Check `Pigeonhole::row_cache_stats()`: if hits stay low next to misses, the cache only costs memory. Its default is decided by the Phase 3 gate measurements (D201).
+**Row cache.** `Options::row_cache(bytes)` (64 MiB by default; 0 turns it off) keeps the newest version of each cell of small, hot family rows in memory, and serves latest row reads and point gets from them without merging the row's memtables and SSTs. A family row is stored the second time a read misses it, so rows read once are never stored. It returns exactly what an uncached read would: any write to a row makes its cached copy miss at once. It pays off when the same small rows are read again and again with few writes in between; each write pays one atomic per row it touches. Snapshot reads, multi-version and time-range reads, scans and reader processes do not use it, and a family row larger than `Options::row_cache_max_row` (encoded bytes, default 4 KiB) is read as usual. `Options::row_cache_family(table, family)` limits it to the families that benefit. Check `Pigeonhole::row_cache_stats()`: if hits stay low next to misses, the cache only costs memory, and `row_cache(0)` gives it back. It is on by default since D216.
 
 ## Create a table with families
 Only families are declared. Qualifiers (columns) are created on write.

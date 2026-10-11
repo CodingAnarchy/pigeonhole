@@ -25,8 +25,9 @@ pub(crate) struct Settings {
     pub(crate) group_sync: bool,
     /// `None`: the library default (on).
     pub(crate) tablet_changes: Option<bool>,
-    /// Row cache bytes (`Options::row_cache`); 0, the library default, is off.
-    pub(crate) row_cache: u64,
+    /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
+    /// turns it off.
+    pub(crate) row_cache: Option<u64>,
     /// A shard's idle spin before it parks (`Options::shard_spin`, D198), in microseconds;
     /// `None`: the library default.
     pub(crate) shard_spin_micros: Option<u64>,
@@ -134,8 +135,9 @@ impl PigeonholeRunner {
         self
     }
 
-    /// Row cache bytes (`Options::row_cache`, D201); 0 (the default) leaves it off. The
-    /// gate window measures reads with it on and off to decide its default (#405).
+    /// Row cache bytes (`Options::row_cache`, D201); 0 turns it off. Without a call the
+    /// library default applies (on, D216), and the description names no row cache, so runs
+    /// stay comparable with results from before D216 under the same key.
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
@@ -143,9 +145,10 @@ impl PigeonholeRunner {
     /// assert!(!PigeonholeRunner::default().describe().contains("rowcache"));
     /// let r = PigeonholeRunner::default().row_cache(64 << 20);
     /// assert!(r.describe().contains(" rowcache=64MiB"));
+    /// assert!(PigeonholeRunner::default().row_cache(0).describe().contains(" rowcache=off"));
     /// ```
     pub fn row_cache(mut self, bytes: u64) -> Self {
-        self.settings.row_cache = bytes;
+        self.settings.row_cache = Some(bytes);
         self
     }
 
@@ -200,8 +203,8 @@ pub(crate) fn options(s: &Settings) -> Options {
     if let Some(n) = s.shards {
         options = options.shards(n);
     }
-    if s.row_cache > 0 {
-        options = options.row_cache(usize::try_from(s.row_cache).unwrap_or(usize::MAX));
+    if let Some(bytes) = s.row_cache {
+        options = options.row_cache(usize::try_from(bytes).unwrap_or(usize::MAX));
     }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
@@ -319,10 +322,10 @@ impl Runner for PigeonholeRunner {
             } else {
                 " tablets=on"
             },
-            if s.row_cache > 0 {
-                format!(" rowcache={}MiB", s.row_cache >> 20)
-            } else {
-                String::new()
+            match s.row_cache {
+                None => String::new(),
+                Some(0) => " rowcache=off".to_owned(),
+                Some(bytes) => format!(" rowcache={}MiB", bytes >> 20),
             },
             s.shard_spin_micros
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
@@ -422,6 +425,7 @@ fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, Str
 /// ICR 0023).
 pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
     let m = db.engine_metrics();
+    let rc = db.row_cache_stats();
     crate::Stalls {
         write_stalls: m.stalls.0,
         write_stall_nanos: m.stalls.1,
@@ -442,6 +446,9 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         visibility_contended: m.visibility_contended,
         wal_rollover_blocks: m.wal_rollover_blocks,
         slot_refusals: db.tablet_refusals().0,
+        row_cache_hits: rc.hits,
+        row_cache_misses: rc.misses,
+        row_cache_fills: rc.fills,
     }
 }
 

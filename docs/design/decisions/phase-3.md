@@ -228,7 +228,7 @@ An entry holds only the newest visible version of each cell of one family row, c
 - **Reader processes** have no watermarks, so no row cache. Like D194, this is writer-only and process-local.
 
 ### Options and cost
-- `Options::row_cache(bytes)` (0, the default, means off), `row_cache_max_row(bytes)`, and `row_cache_family(table, family)`, called once per family; without any call, every family is served. All are process-local, with no FORMAT change. A stored per-family switch can come later if users ask.
+- `Options::row_cache(bytes)` (0 means off; the default was 0, and is 64 MiB since [D216](#d216)), `row_cache_max_row(bytes)`, and `row_cache_family(table, family)`, called once per family; without any call, every family is served. All are process-local, with no FORMAT change. A stored per-family switch can come later if users ask.
 - **Cache off:** no watermark table, one predictable branch on the commit apply path and on latest row reads and gets. Every shape must be flat with the cache off.
 - **Cache on:** a hit copies the cached cells into the caller's row. A write pays one `fetch_max` per row it touches.
 - **Linux callgrind, same binary, off vs. on:**
@@ -594,3 +594,50 @@ The AX102, 16 GiB table, direct I/O, pread, one thread:
 | 512 MiB (3.1%) | 1.055 | 86 µs | 188 µs |
 
 The remaining 0.05–0.07 reads come from filter false positives across levels. On a 1 GiB table (macOS, cache misses only), 1% of the table gave 1.12–1.14 block reads per get and 1.6% gave 1.065, so the gate uses 1/64 (1.56%).
+
+<a id="d216"></a>
+## D216 — "In memory" means block-cache resident and warmed; the row cache is on by default, 64 MiB (owner decision, 2026-10-11; bench, pigeonhole, #406; amends D201)
+
+**Decided:**
+- **"Point get in memory" (#406: p50 < 2 µs, p99 < 10 µs)** is measured on reads that the cache serves. The gate's `latency` step runs `ycsb-c` with every engine's block cache at 2 GiB, which holds the whole table, and with a warmup as long as the measured phase (`--cache 2147483648 --warmup 1.0`). Before this, the step used the 256 MiB default cache and a 5% warmup, so many "in-memory" gets missed the cache and decoded blocks from the page cache.
+- **The row cache is on by default** (`Options::row_cache`, D201): **64 MiB**, a quarter of the default block cache. `row_cache(0)` turns it off. Only the public `Options` changes: the engine's `EngineOptions` stays at 0, a lower-level API whose callers opt in.
+- **The gate's `row-cache` step reverses.** It now runs `ycsb-c` (same cache and warmup) and `ycsb-a` with `--row-cache 0`, against the latency step's default. `report.py` shows off → on with the hit rate. `phdb-bench --row-cache` keeps the library default unless given, and a run's description names the row cache only when the flag sets it (`rowcache=off`, `rowcache=NMiB`). So the default run's result key is unchanged, and `compare` against earlier results shows the default's change as a change.
+- **The bench reports the row cache's hits, misses and fills** for each measured phase (`Stalls::row_cache_hits`, `row_cache_misses`, `row_cache_fills`).
+
+**Why on.** On the AX102 (blob33, 2026-10-11, the 2 GiB warmed `ycsb-c`):
+- **Off:** p50 2.91 µs, p99 5.5 µs.
+- **On:** p50 0.67 µs, p99 6.7 µs.
+
+The p50 target is met only with the row cache. `ycsb-a` costs about +0.3 µs at p50. Writes pay one `fetch_max` per row they touch; D201 measured commit-overwrite at +0.6% instructions.
+
+**Why 64 MiB.** The sweep ran on the Mac (M-series, 10 cores, under other load) at `full` scale: 1M rows, 2 GiB block cache, full warmup. Hit rates don't depend on load; throughput and latency do.
+
+| Row cache | ycsb-c hits | ycsb-c ops/s | ycsb-c p50 / p99 | ycsb-a hits |
+|---|---|---|---|---|
+| off | — | 393K | 2.34 / 4.8 µs | — |
+| 8 MiB | 58% | 584K | 0.54 / 5.1 µs | 25% |
+| 16 MiB | 63% | 567K | 0.59 / 6.6 µs | 28% |
+| 32 MiB | 68% | 636K | 0.54 / 5.6 µs | 32% |
+| 64 MiB | 74% | 709K | 0.54 / 5.6 µs | 35% |
+| 128 MiB | 81% | 829K | 0.54 / 5.3 µs | 37% |
+| 256 MiB | 84% | 875K | 0.50 / 5.0 µs | 39% |
+
+- **p50 doesn't depend on the size.** It reaches hit speed from 8 MiB on, because zipfian gets are mostly to a few hot rows.
+- **p99 doesn't depend on the size either.** It is set by the misses, which pay the lookup on top of the uncached read; that hit path is a follow-up.
+- **More memory buys throughput slowly.** Each doubling past 64 MiB adds 3–7 points of hits.
+- **The cost of the row cache:**
+  - **The cache itself:** up to its full size, filled only by rows that missed twice. Rows read once are never stored.
+  - **Write watermarks:** three 8-byte slots per 256 bytes of cache (the watermark table, its present tags and its ghost tags), so about 9%, or 6 MiB at 64 MiB. They are allocated and zeroed at open.
+  - **Totals:** a writer's default caches come to 256 + 64 + 6 MiB.
+  - **Reader processes** have no row cache (D201), so nothing changes for them.
+- **At 256 MiB**, the gain over 64 MiB is +10 points of hits on `ycsb-c` and +4 on `ycsb-a`. The cost is +192 MiB, and +18 MiB zeroed at every open. "Open to first read < 5 ms" (#406) already measured 3.08 ms, p99 4.06 ms, on the AX102.
+- **At 64 MiB on the Mac, open to first read** was within run-to-run noise of `row_cache(0)`: 1.1–2.5 ms either way, over three alternating fresh-directory runs of 30 opens each. Allocating the watermark tables lazily, zeroed by the OS, is a follow-up if the gate's open step shows a cost.
+
+**The instruction shapes stay off.** The CI callgrind shapes count the engine's read and write paths, and D193's ceilings are set on them. With the row cache on, `readshapes`' repeated gets and row reads, and `hotrow`'s states, would count a cache hit instead of the read path, so the head would not be comparable with any base.
+- **Pinned off:** `hotrow`, `readshapes` and `scanrate` now call `row_cache(0)`. Scans bypass the row cache, but the scan shapes' setup writes would pay the watermark `fetch_max`.
+- **Already off:** `ycsb` and `writepath` use `support/`, whose `ROW_CACHE` variable defaults to 0.
+- **Allocation budgets:** `pigeonhole/tests/alloc.rs` (#287) pins it off too. Its budgets are the read and write paths' own, and a read that fills the row cache allocates the copy it keeps: the 1-cell row read went from at most 10 allocator calls to 20.
+- **Not pinned:** `coldget`, `coldscan` and `openlat` measure the user's default. A cold get never hits, and its I/O count is unchanged. Open now includes the watermark allocation.
+- **Follow-up:** the hit-path work. Its instruction shapes would run with `ROW_CACHE` set, as separate shapes.
+
+**Not changed:** the row cache's semantics (D201), `row_cache_max_row` (4 KiB), the other targets' steps, and the RocksDB configuration. RocksDB gets the same 2 GiB block cache on `ycsb-c` and no row cache.

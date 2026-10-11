@@ -101,7 +101,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `shard_spin(Duration)` | How long an engine-owned shard that just handled a commit polls for the next one (default 50 µs; D198). Idle databases never poll; ignored by application-owned shards. `Duration::ZERO` never polls. |
 | `write_stall_timeout(Duration)` | How long a stalled write, `flush` or `compact` waits before `Busy` (default 30 s; `Duration::ZERO` refuses at once). |
 | `block_cache(usize)` | Block cache bytes (default 256 MiB; each reader process has its own). |
-| `row_cache(usize)` | Row cache bytes on top of the block cache (default 0 = off; D201). Serves latest row reads of the newest version (no time range; qualifier, column-limit and value filters applied to the cached row) and point gets from cached family rows; results equal uncached reads, and a write makes the row's copy miss at once. Writer process only. |
+| `row_cache(usize)` | Row cache bytes on top of the block cache (default 64 MiB, D216; 0 = off; D201). Serves latest row reads of the newest version (no time range; qualifier, column-limit and value filters applied to the cached row) and point gets from cached family rows; results equal uncached reads, and a write makes the row's copy miss at once. Writer process only. |
 | `row_cache_max_row(usize)` | Largest family row stored, encoded bytes (default 4 KiB). |
 | `row_cache_family(&str, &str)` | Serve only this `(table, family)`; call once per family (default: every family). |
 | `io_backend(IoBackend)` | I/O backend (default `IoBackend::Pread`). `Uring` fails the open with `Unsupported` where io_uring is unavailable; `Auto` falls back to `Pread`. |
