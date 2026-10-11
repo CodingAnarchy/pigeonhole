@@ -494,10 +494,15 @@ impl RowMutation<'_> {
         self.builder.submit(&self.table.db, self.durability)
     }
 
-    /// The async commit's admission (D210).
+    /// The async commit's admission (D210), routed by this mutation's row.
     #[cfg(feature = "async")]
     pub(crate) fn admit(&self) -> Option<pigeonhole_engine::Admit> {
-        self.builder.admit(&self.table.db)
+        self.builder.error.is_none().then(|| {
+            self.table
+                .db
+                .engine
+                .admit_row(self.table.info.id, &self.row, &self.builder.batch)
+        })
     }
 
     /// The submission, owned, for a commit that waits for admission.

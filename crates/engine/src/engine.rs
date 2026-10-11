@@ -1229,11 +1229,17 @@ impl Engine {
 
     /// An async commit's admission for `batch` (D210): charged to the shard of its first row
     /// (a cross-shard batch's coordinator) at once when that shard has room and no earlier
-    /// async commit waits, otherwise queued. Submit once [`Admit::poll_admit`] is ready,
-    /// then [`Admit::attach`] it to the submitted commit, which returns the charge when the
+    /// async commit waits, otherwise queued. Submit once [`Admit::poll_admit`](crate::Admit::poll_admit) is ready,
+    /// then [`Admit::attach`](crate::Admit::attach) it to the submitted commit, which returns the charge when the
     /// commit resolves. Blocking commits take no admission.
     pub fn admit(&self, batch: &WriteBatch) -> crate::Admit {
         self.inner.admit(batch)
+    }
+
+    /// [`admit`](Self::admit) for a batch whose rows are all `row` of `table` (a row
+    /// mutation): routed by that row, without decoding the batch.
+    pub fn admit_row(&self, table: TableId, row: &[u8], batch: &WriteBatch) -> crate::Admit {
+        self.inner.admit_routed(Some((table, row)), batch)
     }
 
     /// Bytes of async commits charged to `shard` and not yet resolved (D210; tests and
@@ -2194,20 +2200,33 @@ impl PendingMaintenance {
 
 impl Inner {
     pub(crate) fn admit(&self, batch: &WriteBatch) -> crate::Admit {
-        let shard = self.admission.as_ref().map_or(0, |_| {
-            let view = self.shared.view.load();
-            let first = batch
-                .builder
-                .batch()
-                .iter()
-                .next()
-                .and_then(|m| m.ok())
-                .map(|m| (m.table, m.row.to_vec()))
-                .or_else(|| batch.row_deletes.first().map(|d| (d.table, d.row.clone())));
-            first
-                .and_then(|(t, row)| view.tablets().route(t, &row))
-                .map_or(0, |(_, s)| usize::from(s.0))
-        });
+        self.admit_routed(None, batch)
+    }
+
+    /// Admits `batch` on the shard of `row` when given, else of the batch's first row.
+    pub(crate) fn admit_routed(
+        &self,
+        row: Option<(TableId, &[u8])>,
+        batch: &WriteBatch,
+    ) -> crate::Admit {
+        let shard = match &self.admission {
+            Some(a) if a.sharded() => {
+                let view = self.shared.view.load();
+                let route = |t: TableId, r: &[u8]| view.tablets().route(t, r);
+                let routed = match row {
+                    Some((t, r)) => route(t, r),
+                    None => match batch.builder.batch().iter().next().and_then(|m| m.ok()) {
+                        Some(m) => route(m.table, m.row),
+                        None => batch
+                            .row_deletes
+                            .first()
+                            .and_then(|d| route(d.table, &d.row)),
+                    },
+                };
+                routed.map_or(0, |(_, s)| usize::from(s.0))
+            }
+            _ => 0,
+        };
         crate::Admit::new(
             self.admission.as_ref(),
             shard,

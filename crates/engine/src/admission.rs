@@ -99,9 +99,21 @@ impl Admission {
         }
     }
 
+    /// Whether more than one shard can be charged (else every commit is shard 0's).
+    pub(crate) fn sharded(&self) -> bool {
+        self.shards.len() > 1
+    }
+
     /// Charged bytes in flight on `shard` (tests).
     pub(crate) fn inflight(&self, shard: usize) -> u64 {
         self.shards[shard].inflight.load(Ordering::Acquire)
+    }
+}
+
+/// A resolved commit returns its charge: `arg` is the shard (top 16 bits) and the bytes.
+impl pigeonhole_runtime::Settle for Admission {
+    fn settled(&self, arg: u64) {
+        self.release((arg >> 48) as usize, arg & ((1 << 48) - 1));
     }
 }
 
@@ -211,27 +223,28 @@ impl Admit {
         Poll::Pending
     }
 
-    /// The charge, if any, to return once the commit resolves.
-    fn take_charge(&mut self) -> Option<(Arc<Admission>, usize, u64)> {
+    /// The charge, if any, to return once the commit resolves: the admission and the
+    /// shard and bytes packed for [`Admission::settled`](pigeonhole_runtime::Settle).
+    fn take_charge(&mut self) -> Option<(Arc<Admission>, u64)> {
         if self.state != AdmitState::Charged {
             return None;
         }
         self.state = AdmitState::Done;
-        let a = Arc::clone(self.admission.as_ref()?);
-        Some((a, self.shard, self.bytes))
+        let a = self.admission.take()?;
+        Some((a, (self.shard as u64) << 48 | self.bytes.min((1 << 48) - 1)))
     }
 
     /// Hands the charge to a submitted commit: returned when the shard resolves it.
     pub fn attach(mut self, pending: &PendingCommit) {
-        if let Some((a, shard, bytes)) = self.take_charge() {
-            pending.waiter.on_settled(move || a.release(shard, bytes));
+        if let Some((a, arg)) = self.take_charge() {
+            pending.waiter.on_settled(a, arg);
         }
     }
 
     /// [`attach`](Self::attach) for a conditional commit.
     pub fn attach_check(mut self, pending: &PendingCheck) {
-        if let Some((a, shard, bytes)) = self.take_charge() {
-            pending.waiter.on_settled(move || a.release(shard, bytes));
+        if let Some((a, arg)) = self.take_charge() {
+            pending.waiter.on_settled(a, arg);
         }
     }
 }

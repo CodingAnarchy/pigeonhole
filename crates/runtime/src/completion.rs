@@ -15,6 +15,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 /// A callback that sees the outcome before the waiter does ([`Notifier::on_resolve`]).
 type Hook<T> = Box<dyn FnOnce(Option<&T>) + Send>;
 
+/// Told when a completion resolves ([`Waiter::on_settled`]), with the argument it was
+/// registered with: cleanup the waiting side owns, without an allocation per completion.
+pub trait Settle: Send + Sync {
+    /// The completion resolved (or its notifier was dropped).
+    fn settled(&self, arg: u64);
+}
+
 /// One lock for everything, and the condition variable signalled only when a thread blocks
 /// on it: on platforms whose locks are boxed lazily (macOS), a completion then allocates
 /// one lock and nothing else (#320).
@@ -28,7 +35,11 @@ struct SlotState<T> {
     done: bool,
     waker: Option<Waker>,
     hook: Option<Hook<T>>,
-    /// The resolution has begun: its hook (if any) is taken, so a later one runs at once.
+    /// [`Waiter::on_settled`]'s callee and argument.
+    /// A std `Arc` under loom too (its `Arc` does not coerce to a trait object).
+    settle: Option<(std::sync::Arc<dyn Settle>, u64)>,
+    /// The resolution has begun: its hook and settle (if any) are taken, so a later settle
+    /// runs at once.
     resolving: bool,
     /// A thread waits on `cv` (`Waiter::wait`).
     blocked: bool,
@@ -41,13 +52,16 @@ impl<T> Slot<T> {
 
     fn resolve(&self, value: Option<T>) {
         // The hook runs outside the lock, before the value is visible.
-        let hook = {
+        let (hook, settle) = {
             let mut s = self.lock();
             s.resolving = true;
-            s.hook.take()
+            (s.hook.take(), s.settle.take())
         };
         if let Some(hook) = hook {
             hook(value.as_ref());
+        }
+        if let Some((callee, arg)) = settle {
+            callee.settled(arg);
         }
         let (waker, blocked) = {
             let mut s = self.lock();
@@ -90,6 +104,7 @@ fn new_slot<T>() -> Arc<Slot<T>> {
             done: false,
             waker: None,
             hook: None,
+            settle: None,
             resolving: false,
             blocked: false,
         }),
@@ -259,60 +274,61 @@ impl<T> Waiter<T> {
         }
         // Taken out under the lock and dropped after it: a value's or waker's drop may run
         // arbitrary code.
-        let (value, waker, hook) = {
+        let (value, waker, hook, settle) = {
             let mut s = self.slot.lock();
             s.done = false;
             s.resolving = false;
             s.blocked = false;
-            (s.value.take(), s.waker.take(), s.hook.take())
+            (
+                s.value.take(),
+                s.waker.take(),
+                s.hook.take(),
+                s.settle.take(),
+            )
         };
-        drop((value, waker, hook));
+        drop((value, waker, hook, settle));
         slots.push(Arc::clone(&self.slot));
     }
 }
 
-impl<T: Send + 'static> Waiter<T> {
-    /// Calls `f` once the completion resolves (or its notifier is dropped): on the resolving
-    /// thread, or at once on this one if the resolution has begun. Its order against a hook
-    /// the notifier set is unspecified. For cleanup the
-    /// waiting side owns, such as releasing what a submission was charged, which must not
-    /// wait for anyone to poll or drop the waiter.
+impl<T: Send> Waiter<T> {
+    /// Calls `callee.settled(arg)` once the completion resolves (or its notifier is
+    /// dropped): on the resolving thread, or at once on this one if the resolution has
+    /// begun. For cleanup the waiting side owns, such as returning what a submission was
+    /// charged, which must not wait for anyone to poll or drop the waiter. One per
+    /// completion (a later one replaces it). Its order against a hook the notifier set is
+    /// unspecified.
     ///
     /// ```
-    /// use std::sync::atomic::{AtomicU32, Ordering};
+    /// use std::sync::atomic::{AtomicU64, Ordering};
     /// use std::sync::Arc;
+    /// use pigeonhole_runtime::Settle;
     ///
-    /// let runs = Arc::new(AtomicU32::new(0));
+    /// struct Sum(AtomicU64);
+    /// impl Settle for Sum {
+    ///     fn settled(&self, arg: u64) {
+    ///         self.0.fetch_add(arg, Ordering::Relaxed);
+    ///     }
+    /// }
+    /// let sum = Arc::new(Sum(AtomicU64::new(0)));
     /// let (notifier, waiter) = pigeonhole_runtime::completion::<u32>();
-    /// let r = Arc::clone(&runs);
-    /// waiter.on_settled(move || {
-    ///     r.fetch_add(1, Ordering::Relaxed);
-    /// });
-    /// assert_eq!(runs.load(Ordering::Relaxed), 0);
+    /// waiter.on_settled(Arc::clone(&sum) as _, 5);
+    /// assert_eq!(sum.0.load(Ordering::Relaxed), 0);
     /// notifier.notify(7);
-    /// assert_eq!(runs.load(Ordering::Relaxed), 1);
+    /// assert_eq!(sum.0.load(Ordering::Relaxed), 5);
     /// let (notifier, waiter) = pigeonhole_runtime::completion::<u32>();
     /// drop(notifier);
-    /// let r = Arc::clone(&runs);
-    /// waiter.on_settled(move || {
-    ///     r.fetch_add(1, Ordering::Relaxed);
-    /// }); // already resolved: runs now
-    /// assert_eq!(runs.load(Ordering::Relaxed), 2);
+    /// waiter.on_settled(Arc::clone(&sum) as _, 2); // already resolved: runs now
+    /// assert_eq!(sum.0.load(Ordering::Relaxed), 7);
     /// ```
-    pub fn on_settled(&self, f: impl FnOnce() + Send + 'static) {
+    pub fn on_settled(&self, callee: std::sync::Arc<dyn Settle>, arg: u64) {
         let mut s = self.slot.lock();
         if s.resolving || s.done {
             drop(s);
-            f();
+            callee.settled(arg);
             return;
         }
-        s.hook = Some(match s.hook.take() {
-            None => Box::new(move |_| f()),
-            Some(earlier) => Box::new(move |v| {
-                earlier(v);
-                f();
-            }),
-        });
+        s.settle = Some((callee, arg));
     }
 }
 
@@ -584,22 +600,28 @@ mod loom_tests {
     /// side gets there first.
     #[test]
     fn loom_on_settled_races_the_resolution() {
-        use loom::sync::atomic::{AtomicU32, Ordering};
+        use loom::sync::atomic::{AtomicU64, Ordering};
+        struct Runs(AtomicU64);
+        impl Settle for Runs {
+            fn settled(&self, arg: u64) {
+                self.0.fetch_add(arg, Ordering::SeqCst);
+            }
+        }
         loom::model(|| {
-            let runs = Arc::new(AtomicU32::new(0));
+            let runs = std::sync::Arc::new(Runs(AtomicU64::new(0)));
             let (n, w) = completion::<u32>();
-            let h = Arc::clone(&runs);
+            let h = std::sync::Arc::clone(&runs);
             n.on_resolve(move |_| {
-                h.fetch_add(10, Ordering::SeqCst);
+                h.0.fetch_add(10, Ordering::SeqCst);
             });
             let notifier = thread::spawn(move || n.notify(1));
-            let r = Arc::clone(&runs);
-            w.on_settled(move || {
-                r.fetch_add(1, Ordering::SeqCst);
-            });
+            w.on_settled(
+                std::sync::Arc::clone(&runs) as std::sync::Arc<dyn Settle>,
+                1,
+            );
             notifier.join().unwrap();
             assert_eq!(w.wait_ref(), Some(1));
-            assert_eq!(runs.load(Ordering::SeqCst), 11);
+            assert_eq!(runs.0.load(Ordering::SeqCst), 11);
         });
     }
 }
