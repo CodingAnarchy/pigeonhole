@@ -151,7 +151,7 @@ jobs:
           PROPTEST_CASES: 8
           MIRIFLAGS: -Zmiri-disable-isolation
       - name: loom
-        run: cargo test --release -p pigeonhole-memtable -p pigeonhole-cache --lib loom
+        run: cargo test --release -p pigeonhole-memtable -p pigeonhole-cache -p pigeonhole-runtime --lib loom
         env:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: 3

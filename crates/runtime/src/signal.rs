@@ -7,9 +7,17 @@
 //! fence and one relaxed load: no lock, no syscall.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::thread::Thread;
+
+#[cfg(loom)]
+use loom::sync::Mutex;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+#[cfg(not(loom))]
+use std::sync::Mutex;
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
 /// How to wake a sleeping consumer.
 pub(crate) enum WakeTarget {
@@ -136,5 +144,161 @@ impl Signal {
             }
             Act::Callback(f) => f(),
         }
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::{Signal, WakeTarget};
+    use loom::sync::{Condvar, Mutex};
+    use loom::thread;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    /// `thread::park`/`unpark` with a token (the consumer's wake target). Loom's own park
+    /// drops an unpark that reaches a thread blocked on a loom `Mutex`.
+    #[derive(Default)]
+    struct Parker {
+        token: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl Parker {
+        fn park(&self) {
+            let mut t = self.token.lock().unwrap();
+            while !*t {
+                t = self.cv.wait(t).unwrap();
+            }
+            *t = false;
+        }
+
+        fn unpark(&self) {
+            *self.token.lock().unwrap() = true;
+            self.cv.notify_one();
+        }
+    }
+
+    /// A shard's queue and its signal, as `Inbox` and `ShardCore` hold them.
+    struct Shard {
+        signal: Signal,
+        queue: Mutex<VecDeque<u32>>,
+    }
+
+    impl Shard {
+        fn new() -> (std::sync::Arc<Shard>, std::sync::Arc<Parker>) {
+            let parker = std::sync::Arc::new(Parker::default());
+            let shard = std::sync::Arc::new(Shard {
+                signal: Signal::new(),
+                queue: Mutex::new(VecDeque::new()),
+            });
+            let p = std::sync::Arc::clone(&parker);
+            shard
+                .signal
+                .set_target(WakeTarget::Callback(Arc::new(move || p.unpark())));
+            (shard, parker)
+        }
+
+        /// `Submitter::submit`: send, then notify.
+        fn submit(&self, msg: u32) {
+            self.queue.lock().unwrap().push_back(msg);
+            self.signal.notify();
+        }
+
+        /// `ShardCore::check_before_sleep`.
+        fn check_before_sleep(&self) -> bool {
+            self.signal.prepare_sleep();
+            if !self.queue.lock().unwrap().is_empty() || self.signal.task_woken() {
+                self.signal.awake();
+                return true;
+            }
+            false
+        }
+
+        /// One poll of `spin_before_park` (D198), awake, then the handshake on a miss.
+        fn spin_once(&self) -> bool {
+            self.signal.awake();
+            if !self.queue.lock().unwrap().is_empty() || self.signal.task_woken() {
+                return true;
+            }
+            let hit = self.check_before_sleep();
+            if hit {
+                self.signal.awake();
+            }
+            hit
+        }
+
+        /// `shard_main`: runs turns (`run_turn` is awake, drain, collect the woken task)
+        /// until it has handled `msgs` messages and one task wake, parking when idle.
+        fn run(&self, parker: &Parker, msgs: usize, spin: bool) {
+            let (mut handled, mut task) = (0, false);
+            loop {
+                self.signal.awake();
+                while self.queue.lock().unwrap().pop_front().is_some() {
+                    handled += 1;
+                }
+                task |= self.signal.take_task_woken();
+                if handled == msgs && task {
+                    return;
+                }
+                if self.check_before_sleep() || (spin && self.spin_once()) {
+                    continue;
+                }
+                self.signal.parked();
+                parker.park();
+            }
+        }
+    }
+
+    fn model(f: impl Fn() + Sync + Send + 'static) {
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = Some(3);
+        b.check(f);
+    }
+
+    #[test]
+    #[ignore = "loom 0.7.2 lets an RMW read past a store (tokio-rs/loom#254; `notify`'s swap): \
+                passes with tokio-rs/loom#391 patched in; un-ignore with #533"]
+    fn loom_a_message_or_task_wake_never_finds_the_shard_asleep_unwoken() {
+        // A submit and a background task's wake race the shard going idle: it never parks
+        // for good with a message queued or a task woken.
+        model(|| {
+            let (shard, parker) = Shard::new();
+            let producer = {
+                let shard = std::sync::Arc::clone(&shard);
+                thread::spawn(move || shard.submit(1))
+            };
+            let task = {
+                let shard = std::sync::Arc::clone(&shard);
+                thread::spawn(move || shard.signal.notify_task())
+            };
+            shard.run(&parker, 1, false);
+            producer.join().unwrap();
+            task.join().unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "loom 0.7.2 lets an RMW read past a store (tokio-rs/loom#254; `notify`'s swap): \
+                passes with tokio-rs/loom#391 patched in; un-ignore with #533"]
+    fn loom_the_idle_spin_keeps_the_handshake() {
+        // As above with D198's poll before parking: awake while it polls, then the same
+        // handshake on a miss.
+        model(|| {
+            let (shard, parker) = Shard::new();
+            let producer = {
+                let shard = std::sync::Arc::clone(&shard);
+                thread::spawn(move || {
+                    shard.submit(1);
+                    shard.submit(2);
+                })
+            };
+            let task = {
+                let shard = std::sync::Arc::clone(&shard);
+                thread::spawn(move || shard.signal.notify_task())
+            };
+            shard.run(&parker, 2, true);
+            producer.join().unwrap();
+            task.join().unwrap();
+        });
     }
 }
