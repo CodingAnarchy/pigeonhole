@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_compaction::MergeRegistry;
@@ -73,6 +73,9 @@ pub(crate) struct Hooks {
     /// `Engine::probe_manifest_release_window`), and the waiter of the request it pushed.
     pub manifest_race: AtomicBool,
     pub manifest_race_waiter: Mutex<Option<Waiter<Result<ManifestVersion>>>>,
+    /// Threads that parked in `manifest::commit_req_from_thread`, counted after their last
+    /// look and just before `park` (`Engine::manifest_thread_parks`).
+    pub manifest_thread_parks: AtomicUsize,
     /// Runs at the start of the next `publish_view`, before the publish lock
     /// (`Engine::before_next_view_publish`).
     pub before_view_publish: Once,
@@ -1008,6 +1011,25 @@ impl Engine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_some()
+    }
+
+    /// Threads that parked waiting for the manifest writer (`commit_req_from_thread`):
+    /// counted after their last look at the exclusion and the pump's commit, so from then
+    /// on only a wake (a release, a root commit's completion, their own request's answer)
+    /// unparks them (test hook).
+    #[doc(hidden)]
+    pub fn manifest_thread_parks(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .manifest_thread_parks
+            .load(Ordering::Acquire)
+    }
+
+    /// Whether a manifest pump's root commit is in flight, not yet completed (test hook).
+    #[doc(hidden)]
+    pub fn manifest_commit_in_flight(&self) -> bool {
+        self.inner.shared.manifest_flight.in_flight()
     }
 
     /// Whether a background manifest commit is parked (test hook).

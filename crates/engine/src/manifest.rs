@@ -1026,140 +1026,13 @@ pub(crate) fn release(shared: &Shared) {
 /// Outcome of a pump's root commit (`Pager::submit_commit_root`).
 type RootResult = std::result::Result<(), pigeonhole_io::Error>;
 
-/// The pump's commit in flight, held in `Shared` rather than by the pump, so that a thread
-/// blocked on the exclusion can finish it once its root commit completes. Otherwise the
-/// exclusion would stay held until the pump's shard runs again, which never happens when
-/// the blocked thread is the one that drives it (application-owned mode, issue #135).
-#[derive(Default)]
-pub(crate) struct Flight {
-    state: Mutex<FlightState>,
-    /// Threads blocked in [`commit_req_from_thread`] (woken by a root commit's completion
-    /// and by every release of the exclusion).
-    threads: Mutex<Vec<std::task::Waker>>,
-    thread_count: std::sync::atomic::AtomicUsize,
-}
+mod flight;
 
-#[derive(Default)]
-struct FlightState {
-    /// Bumped per commit started, so a pump recognizes its own.
-    generation: u64,
-    commit: Option<Commit>,
-    result: Option<RootResult>,
-}
+use flight::Stage;
 
-/// Where a pump's commit is.
-enum Stage {
-    /// The root commit has not completed.
-    Pending,
-    /// It completed: the taker finishes it.
-    Done(Box<Commit>, RootResult),
-    /// Someone else finished it.
-    Gone,
-}
-
-impl std::fmt::Debug for Flight {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Flight").finish_non_exhaustive()
-    }
-}
-
-impl Flight {
-    fn lock(&self) -> std::sync::MutexGuard<'_, FlightState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Records `commit` (whose root commit is about to be submitted); returns its generation.
-    fn start(&self, commit: Commit) -> u64 {
-        let mut st = self.lock();
-        debug_assert!(
-            st.commit.is_none(),
-            "one manifest commit in flight at a time"
-        );
-        st.generation += 1;
-        st.commit = Some(commit);
-        st.result = None;
-        st.generation
-    }
-
-    /// The root commit of `generation` completed.
-    fn complete(&self, generation: u64, result: RootResult) {
-        {
-            let mut st = self.lock();
-            if st.generation == generation && st.commit.is_some() {
-                st.result = Some(result);
-            }
-        }
-        self.wake_threads();
-    }
-
-    /// Takes the pump's commit `generation` if its root commit completed.
-    fn stage(&self, generation: u64) -> Stage {
-        let mut st = self.lock();
-        if st.generation != generation || st.commit.is_none() {
-            return Stage::Gone;
-        }
-        match st.result.take() {
-            Some(r) => Stage::Done(Box::new(st.commit.take().expect("checked")), r),
-            None => Stage::Pending,
-        }
-    }
-
-    /// Takes whatever commit is in flight if its root commit completed (a blocked thread
-    /// finishing it for a pump that has not run).
-    fn take_done(&self, shared: &Shared) -> Option<(Commit, RootResult)> {
-        let _ = shared;
-        let mut st = self.lock();
-        let commit = st.commit.as_ref()?;
-        st.result.as_ref()?;
-        #[cfg(feature = "test-hooks")]
-        if parks(shared, commit) {
-            return None;
-        }
-        let _ = commit;
-        Some((
-            st.commit.take().expect("checked"),
-            st.result.take().expect("checked"),
-        ))
-    }
-
-    /// Takes the pump's commit `generation` whatever its state (the pump is being dropped).
-    fn abandon(&self, generation: u64) -> Option<(Commit, Option<RootResult>)> {
-        let mut st = self.lock();
-        if st.generation != generation {
-            return None;
-        }
-        let commit = st.commit.take()?;
-        Some((commit, st.result.take()))
-    }
-
-    fn register(&self, waker: &std::task::Waker) {
-        let mut list = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
-        if !list.iter().any(|w| w.will_wake(waker)) {
-            list.push(waker.clone());
-        }
-        self.thread_count.store(list.len(), Ordering::SeqCst);
-    }
-
-    fn wake_threads(&self) {
-        if self.thread_count.load(Ordering::SeqCst) == 0 {
-            return;
-        }
-        let woken = {
-            let mut list = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
-            self.thread_count.store(0, Ordering::SeqCst);
-            std::mem::take(&mut *list)
-        };
-        for w in woken {
-            w.wake();
-        }
-    }
-
-    /// Whether a completed commit waits to be finished.
-    fn ready(&self) -> bool {
-        let st = self.lock();
-        st.commit.is_some() && st.result.is_some()
-    }
-}
+/// The pump's manifest commit in flight and the threads blocked on the exclusion
+/// (`flight`).
+pub(crate) type Flight = flight::Flight<Commit, RootResult>;
 
 /// Commits `kind` on a thread that already holds the exclusion: drains the queue (what is
 /// queued commits first, ahead of or with `kind`) and returns `kind`'s outcome.
@@ -1229,7 +1102,10 @@ pub(crate) fn commit_req_from_thread(
                     break;
                 }
             }
-        } else if let Some((commit, result)) = shared.manifest_flight.take_done(shared) {
+        } else if let Some((commit, result)) = shared
+            .manifest_flight
+            .take_done(|c| held_by_hook(shared, c))
+        {
             // A pump's root commit completed and its shard has not run since: finish it
             // here (taking it hands its exclusion over), then look again.
             end(shared, commit, result);
@@ -1259,6 +1135,11 @@ pub(crate) fn commit_req_from_thread(
         if pigeonhole_io::reap_orphan_io(OWN_IO_SLICE).is_some() {
             continue;
         }
+        #[cfg(feature = "test-hooks")]
+        shared
+            .hooks
+            .manifest_thread_parks
+            .fetch_add(1, Ordering::AcqRel);
         std::thread::park();
     }
 }
@@ -1284,12 +1165,9 @@ fn race_window(shared: &Shared) {
 /// once committed over it, issue #78).
 #[cfg(feature = "test-hooks")]
 fn parked(shared: &Shared, generation: u64, waker: &TaskWaker) -> bool {
-    let parks = {
-        let st = shared.manifest_flight.lock();
-        st.generation == generation
-            && st.result.is_some()
-            && st.commit.as_ref().is_some_and(|c| parks(shared, c))
-    };
+    let parks = shared
+        .manifest_flight
+        .completed(generation, |c| parks(shared, c));
     if parks {
         *shared
             .hooks
@@ -1306,6 +1184,17 @@ fn parks(shared: &Shared, commit: &Commit) -> bool {
     shared.hooks.manifest_park.load(Ordering::Acquire)
         && commit.sst_changed
         && commit.flushed_roots.is_empty()
+}
+
+/// Whether a test hook holds `commit` back from a blocked thread's `take_done` (`parks`).
+fn held_by_hook(shared: &Shared, commit: &Commit) -> bool {
+    #[cfg(feature = "test-hooks")]
+    return parks(shared, commit);
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        let _ = (shared, commit);
+        false
+    }
 }
 
 /// Submits `req` from a shard or task: queues it and makes sure a pump runs on `shard`.
