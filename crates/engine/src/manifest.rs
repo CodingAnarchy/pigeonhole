@@ -910,6 +910,9 @@ pub(crate) fn end(
     // `Shared::flushed_roots`, every later one until their shards retire them. The roots join
     // `flushed_roots` only with the view stored: a failed publish keeps the old view, which
     // still needs them.
+    // The SSTs this commit dropped from every tablet: the new view's SST set drops them, and
+    // their extents retire below.
+    let removed = catalog.removed_since(&old);
     let published = shared.publish_view(&flushed_roots, |cur, view_version| {
         let mems = cur
             .mems
@@ -939,7 +942,7 @@ pub(crate) fn end(
             &catalog,
             &old,
             &cur.ssts,
-            sst_changed,
+            &removed,
             &mut readers,
             shared.pager.data_file().clone(),
             Arc::clone(&shared.cache),
@@ -971,7 +974,7 @@ pub(crate) fn end(
     }
     // Extents no tablet references any more are reclaimable once no view older than this
     // version lives (decision D61).
-    for meta in catalog.removed_since(&old) {
+    for meta in removed {
         shared.pager.retire(meta.extent, version);
         shared
             .cache

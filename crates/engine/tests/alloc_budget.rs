@@ -650,9 +650,10 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     // manifest commit a separated put makes before its WAL record (D16).
     ("commit, one 1 MiB put (separated)", "commit", 130.0),
     // A flush's manifest commit and the maintenance scan after it, at two catalog sizes
-    // (#499). The large catalog's budget only goes down.
+    // (#499). The large catalog's budget only goes down: 3,050 until the view stopped
+    // rebuilding the slots a commit left alone (322 on Linux, 331 on macOS).
     ("flush of one cell, small catalog", "flush", 300.0),
-    ("flush of one cell, 2,048-SST catalog", "flush", 3050.0),
+    ("flush of one cell, 2,048-SST catalog", "flush", 360.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];

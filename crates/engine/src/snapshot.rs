@@ -21,7 +21,7 @@ use pigeonhole_runtime::ShardId;
 use pigeonhole_shm::ShmRegion;
 use pigeonhole_sst::{BlobReader, SstReader};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, SstList};
 use crate::{Error, Result};
 
 /// One tablet of the routing table: a contiguous row range of one table and its owner.
@@ -452,27 +452,26 @@ impl SstSet {
         }
     }
 
-    /// The set of `catalog`, committed on top of `old` (whose set is `prev`): the SST part is
-    /// shared with `prev` when the commit changed no SST (`sst_changed` false, and no slot
-    /// dropped with a tablet), and the blob part when the blob files are the same, so a
-    /// commit of a separated value or a checkpoint copies nothing (#499).
+    /// The set of `catalog`, committed on top of `old` (whose set is `prev`), sharing what
+    /// the commit left alone (#499): the whole SST part when no slot changed, else every
+    /// slot whose SST list is the one `old` has ([`Catalog::same_ssts`]), so a flush or
+    /// compaction rebuilds only its own slots; and the blob part when the blob files are the
+    /// same. `removed` lists the SSTs the commit dropped from every tablet
+    /// ([`Catalog::removed_since`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rebuild(
         catalog: &Catalog,
         old: &Catalog,
         prev: &SstSet,
-        sst_changed: bool,
+        removed: &[Arc<SstMeta>],
         readers: &mut HashMap<SstId, Arc<SstReader>>,
         file: FileRef,
         cache: Arc<BlockCache>,
     ) -> Self {
-        // A slot appears only through an `AddSst` (which sets `sst_changed`); one goes with a
-        // dropped tablet without it, and then the count differs.
-        let ssts_same = !sst_changed && catalog.ssts.len() == old.ssts.len();
-        let (map, by_id) = if ssts_same {
+        let (map, by_id) = if Arc::ptr_eq(&catalog.ssts, &old.ssts) {
             (Arc::clone(&prev.map), Arc::clone(&prev.by_id))
         } else {
-            let (map, by_id) = Self::build_ssts(catalog, Some(prev), readers);
-            (Arc::new(map), Arc::new(by_id))
+            Self::rebuild_ssts(catalog, old, prev, removed, readers)
         };
         let blobs = if catalog.blob_files == old.blob_files {
             Arc::clone(&prev.blobs)
@@ -494,17 +493,51 @@ impl SstSet {
         set
     }
 
+    /// The SST part of [`SstSet::rebuild`] when some slot changed: the open SSTs carried over
+    /// (less the removed ones), the unchanged slots shared, the changed ones built.
+    #[allow(clippy::type_complexity)]
+    fn rebuild_ssts(
+        catalog: &Catalog,
+        old: &Catalog,
+        prev: &SstSet,
+        removed: &[Arc<SstMeta>],
+        readers: &mut HashMap<SstId, Arc<SstReader>>,
+    ) -> (
+        Arc<FastMap<(TabletId, FamilyId), Arc<FamilySsts>>>,
+        Arc<FastMap<SstId, Arc<OpenSst>>>,
+    ) {
+        let mut by_id = (*prev.by_id).clone();
+        for m in removed {
+            by_id.remove(&m.id);
+        }
+        // Grown as `build_ssts` grows it, so lookups probe the same table shape.
+        let mut map = FastMap::default();
+        for (key, list) in catalog.ssts.iter() {
+            if catalog.same_ssts(old, *key)
+                && let Some(fam) = prev.map.get(key)
+            {
+                map.insert(*key, Arc::clone(fam));
+                continue;
+            }
+            map.insert(
+                *key,
+                Arc::new(Self::slot(key, list, &mut by_id, None, readers)),
+            );
+        }
+        (Arc::new(map), Arc::new(by_id))
+    }
     /// Debug builds: whether this set holds exactly the catalog's slots, SSTs and blob files.
+    /// Allocates nothing, so the allocation budgets (#320) measure the release path.
     #[cfg(debug_assertions)]
     fn matches(&self, catalog: &Catalog) -> bool {
         self.map.len() == catalog.ssts.len()
             && catalog.ssts.iter().all(|(key, list)| {
+                // SST ids are unique, so equal counts and every listed SST present suffice.
                 self.map.get(key).is_some_and(|fam| {
-                    let mut got: Vec<SstId> = fam.iter().map(|s| s.meta.id).collect();
-                    let mut want: Vec<SstId> = list.iter().map(|(_, m)| m.id).collect();
-                    got.sort_unstable();
-                    want.sort_unstable();
-                    got == want
+                    fam.iter().count() == list.iter().count()
+                        && list
+                            .iter()
+                            .all(|(_, m)| fam.iter().any(|s| s.meta.id == m.id))
                 })
             })
             && self.blobs.len() == catalog.blob_files.len()
@@ -527,50 +560,65 @@ impl SstSet {
         let mut by_id: FastMap<SstId, Arc<OpenSst>> = FastMap::default();
         let mut map = FastMap::default();
         for (key, list) in catalog.ssts.iter() {
-            let mut levels: Vec<Vec<Arc<OpenSst>>> = Vec::new();
-            for (level, meta) in list.iter() {
-                let open = match by_id.get(&meta.id) {
-                    Some(o) => Arc::clone(o),
-                    None => {
-                        let o = prev
-                            .and_then(|p| p.by_id.get(&meta.id))
-                            .map(Arc::clone)
-                            .unwrap_or_else(|| {
-                                Arc::new(OpenSst::new(Arc::clone(meta), readers.remove(&meta.id)))
-                            });
-                        by_id.insert(meta.id, Arc::clone(&o));
-                        o
-                    }
-                };
-                let l = usize::from(*level);
-                if levels.len() <= l {
-                    levels.resize_with(l + 1, Vec::new);
-                }
-                levels[l].push(open);
-            }
-            for (l, files) in levels.iter_mut().enumerate() {
-                if l == 0 {
-                    // Newest first: by largest seqno, then by id.
-                    files.sort_by(|a, b| {
-                        (b.meta.seqno_range.1, b.meta.id.0)
-                            .cmp(&(a.meta.seqno_range.1, a.meta.id.0))
-                    });
-                } else {
-                    files.sort_by(|a, b| a.meta.smallest_key.cmp(&b.meta.smallest_key));
-                }
-            }
-            let fam = FamilySsts::new(levels);
-            // Every path that installs SSTs below level 0 keeps the level disjoint:
-            // compaction replaces a level's overlapping run, a trivial move goes only where
-            // nothing overlaps, a merge refuses overlapping levels, a split takes a subset. A
-            // level that was not would still read correctly, by a walk.
-            debug_assert!(
-                fam.deeper_levels_disjoint(),
-                "{key:?}: a level below 0 holds overlapping SSTs"
+            map.insert(
+                *key,
+                Arc::new(Self::slot(key, list, &mut by_id, prev, readers)),
             );
-            map.insert(*key, Arc::new(fam));
         }
         (map, by_id)
+    }
+
+    /// The levels of one slot: each SST found in `by_id` (this set's, being built), else in
+    /// `prev`'s, else opened with the reader in `readers` (an SST just written); added to
+    /// `by_id`.
+    fn slot(
+        key: &(TabletId, FamilyId),
+        list: &SstList,
+        by_id: &mut FastMap<SstId, Arc<OpenSst>>,
+        prev: Option<&SstSet>,
+        readers: &mut HashMap<SstId, Arc<SstReader>>,
+    ) -> FamilySsts {
+        let mut levels: Vec<Vec<Arc<OpenSst>>> = Vec::new();
+        for (level, meta) in list.iter() {
+            let open = match by_id.get(&meta.id) {
+                Some(o) => Arc::clone(o),
+                None => {
+                    let o = prev
+                        .and_then(|p| p.by_id.get(&meta.id))
+                        .map(Arc::clone)
+                        .unwrap_or_else(|| {
+                            Arc::new(OpenSst::new(Arc::clone(meta), readers.remove(&meta.id)))
+                        });
+                    by_id.insert(meta.id, Arc::clone(&o));
+                    o
+                }
+            };
+            let l = usize::from(*level);
+            if levels.len() <= l {
+                levels.resize_with(l + 1, Vec::new);
+            }
+            levels[l].push(open);
+        }
+        for (l, files) in levels.iter_mut().enumerate() {
+            if l == 0 {
+                // Newest first: by largest seqno, then by id.
+                files.sort_by(|a, b| {
+                    (b.meta.seqno_range.1, b.meta.id.0).cmp(&(a.meta.seqno_range.1, a.meta.id.0))
+                });
+            } else {
+                files.sort_by(|a, b| a.meta.smallest_key.cmp(&b.meta.smallest_key));
+            }
+        }
+        let fam = FamilySsts::new(levels);
+        // Every path that installs SSTs below level 0 keeps the level disjoint: compaction
+        // replaces a level's overlapping run, a trivial move goes only where nothing
+        // overlaps, a merge refuses overlapping levels, a split takes a subset. A level that
+        // was not would still read correctly, by a walk.
+        debug_assert!(
+            fam.deeper_levels_disjoint(),
+            "{key:?}: a level below 0 holds overlapping SSTs"
+        );
+        fam
     }
 
     /// The blob files of `catalog`.
