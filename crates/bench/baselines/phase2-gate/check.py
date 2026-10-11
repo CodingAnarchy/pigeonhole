@@ -2,7 +2,11 @@
 """Compares a sparse-wide gate run with the Phase 2 baseline (D193): Pigeonhole's
 throughput, overall p99 and p99.9, and get, put, row-read and scan p99.
 
-    check.py CANDIDATE.json [BASELINE.json ...]   (default: gate2-run5.json gate2-run6.json here)
+    check.py CANDIDATE.json [BASELINE.json ...]
+
+The default baseline is the reference machine's two official runs, reference-run1.json and
+reference-run2.json here, once committed (D208); until then the Mac's gate2-run5.json and
+gate2-run6.json (D193).
 
 A measure fails when it is worse than the baselines' worst value by more than its noise
 allowance below; each allowance covers the spread of same-code official runs (README).
@@ -38,7 +42,11 @@ def measures(path):
     sys.exit(f"{path}: no Pigeonhole sparse-wide result")
 
 cand, env = measures(sys.argv[1])
-bases = [measures(p)[0] for p in (sys.argv[2:] or [os.path.join(HERE, f) for f in ("gate2-run5.json", "gate2-run6.json")])]
+REFERENCE = [os.path.join(HERE, f) for f in ("reference-run1.json", "reference-run2.json")]
+MAC = [os.path.join(HERE, f) for f in ("gate2-run5.json", "gate2-run6.json")]
+default = REFERENCE if all(os.path.exists(p) for p in REFERENCE) else MAC
+bases = [measures(p)[0] for p in (sys.argv[2:] or default)]
+print(f"baseline: {', '.join(os.path.basename(p) for p in (sys.argv[2:] or default))}")
 print(f"candidate: {env.get('git_rev')} load {env.get('load_average')}")
 print("| measure | baseline (worst) | limit | candidate | |")
 print("|---|--:|--:|--:|---|")

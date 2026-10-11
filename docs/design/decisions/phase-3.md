@@ -387,3 +387,16 @@ What a pass forces is otherwise unchanged; the mixed-temperature harness gives m
 **Checked by:**
 - **`engine/tests/group_sync_batch.rs`:** 16 clients committing one at a time with the platform's depth. The first *depth* groups each start a sync; the rest batch. No commit is acknowledged before a sync that covers it. There are *depth* + 1 syncs in all. Mutation-checked: without the batching, it fails.
 - **The crash sweeps:** `model_check` with and without deferred I/O, and the pigeonhole `model`. They're merge gates.
+
+<a id="d208"></a>
+## D208 — The Phase 2 gate's baseline moves to the reference machine: the AX102's two official gate runs (owner decision, 2026-10-10; bench, #387, #405; amends D193)
+
+**Why.** D193 made the Mac's official runs 5–6 the baseline that every later official gate run is compared with. But the Phase 3 gate and every release are judged on the reference machine (D5, #405), and run-to-run limits don't transfer across machines. A Linux runner's gate run "fails" `check.py` against the Mac baseline (#387, run 38098364056) on code that passes it on the Mac.
+
+**Now:**
+- **The reference baseline:** the two official `phase2-gate` runs of the first AX102 gate window (`run-window.sh` steps `phase2-gate` and `phase2-gate-2`, #509), committed beside the Mac runs in `crates/bench/baselines/phase2-gate/`. From then on, `run-gate.sh` compares and `check.py` checks against them.
+- **Until they're committed,** the Mac runs 5–6 stay the baseline. They remain in the repository as the Phase 2 record.
+- **D193's other rules are unchanged:** the same gated measures and noise allowances (re-derived from the AX102's pair if its spread differs, with the owner's agreement, as D193 requires for any widening), and the same "fixed or accepted by the owner" rule.
+- **#387's ratio to SQLite EAV** (row-read and scan p99, the documented gap) is judged on the same two runs. On the Mac at main 2d6b6ed it was 1.58× and 1.27× (D193: about 2.0× and 1.6×).
+
+*Checked by:* the first gate window's report (`report.py`), whose Phase 2 rows read both runs.

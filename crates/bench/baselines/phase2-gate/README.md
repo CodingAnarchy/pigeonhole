@@ -1,6 +1,8 @@
-# Phase 2 gate baseline (D193)
+# Phase 2 gate baseline (D193, D208)
 
 The official quiet runs 5 and 6 of the amended Phase 2 gate. Under D193 they're the baseline that every later official gate run (the Phase 3 gate, and before each release) must not regress from.
+
+**Moving to the reference machine (D208).** The first gate window on the reference machine (#405) runs the gate twice (`phase2-gate`, `phase2-gate-2` in `../phase3-gate/run-window.sh`). Those two runs will become the baseline: commit them here as `reference-run1.json` and `reference-run2.json`. From then on `run-gate.sh` and `check.py` use them by default. These Mac runs stay as the Phase 2 record.
 
 | | |
 |---|---|
