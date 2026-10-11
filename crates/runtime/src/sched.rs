@@ -97,9 +97,15 @@ pub struct TaskWaker {
     cell: Arc<TaskCell>,
 }
 
+/// A task's woken flag (loom's in the `loom` models).
+#[cfg(loom)]
+type WokenFlag = loom::sync::atomic::AtomicBool;
+#[cfg(not(loom))]
+type WokenFlag = AtomicBool;
+
 #[derive(Debug)]
 struct TaskCell {
-    woken: AtomicBool,
+    woken: WokenFlag,
     signal: Arc<Signal>,
 }
 
@@ -170,7 +176,7 @@ impl Scheduler {
     pub(crate) fn spawn(&mut self, task: Box<dyn Task>) {
         let waker = TaskWaker {
             cell: Arc::new(TaskCell {
-                woken: AtomicBool::new(false),
+                woken: WokenFlag::new(false),
                 signal: Arc::clone(&self.signal),
             }),
         };
@@ -426,5 +432,92 @@ impl Spawner {
             self.next = self.next.wrapping_add(1);
             p.submit(task);
         }
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::{TaskCell, TaskWaker, WokenFlag};
+    use crate::signal::{Signal, WakeTarget};
+    use loom::sync::{Condvar, Mutex};
+    use loom::thread;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// The shard thread's park, with a token.
+    #[derive(Default)]
+    struct Parker {
+        token: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl Parker {
+        fn park(&self) {
+            let mut t = self.token.lock().unwrap();
+            while !*t {
+                t = self.cv.wait(t).unwrap();
+            }
+            *t = false;
+        }
+    }
+
+    #[test]
+    #[ignore = "loom 0.7.2 lets an RMW read past a store (tokio-rs/loom#254; the woken flag's \
+                swap): passes with tokio-rs/loom#391 patched in; un-ignore with #533"]
+    fn loom_a_wake_during_a_slice_keeps_the_task_runnable() {
+        // A task blocks waiting for an event; another thread publishes the event and wakes
+        // it, at any point of the task's slice (`run_one`: the woken flag is cleared, the
+        // task runs, then a wake that raced the slice keeps it runnable) or of the shard's
+        // idle handshake (`collect_woken`, then the sleep re-check): the task always runs
+        // again and sees the event.
+        loom::model(|| {
+            let parker = Arc::new(Parker::default());
+            let signal = Arc::new(Signal::new());
+            {
+                let p = Arc::clone(&parker);
+                signal.set_target(WakeTarget::Callback(Arc::new(move || {
+                    *p.token.lock().unwrap() = true;
+                    p.cv.notify_one();
+                })));
+            }
+            let waker = TaskWaker {
+                cell: Arc::new(TaskCell {
+                    woken: WokenFlag::new(false),
+                    signal: Arc::clone(&signal),
+                }),
+            };
+            let event = Arc::new(Mutex::new(false));
+            let other = {
+                let (waker, event) = (waker.clone(), Arc::clone(&event));
+                thread::spawn(move || {
+                    *event.lock().unwrap() = true;
+                    waker.wake();
+                })
+            };
+            let cell = &waker.cell;
+            loop {
+                // `run_one`: one slice of the task.
+                cell.woken.store(false, Ordering::Relaxed);
+                if *event.lock().unwrap() {
+                    break;
+                }
+                if cell.woken.swap(false, Ordering::Acquire) {
+                    continue;
+                }
+                // Blocked: the shard runs its loop until `collect_woken` finds it woken.
+                loop {
+                    signal.awake();
+                    if signal.take_task_woken() && cell.woken.swap(false, Ordering::Acquire) {
+                        break;
+                    }
+                    signal.prepare_sleep();
+                    if signal.task_woken() {
+                        continue;
+                    }
+                    parker.park();
+                }
+            }
+            other.join().unwrap();
+        });
     }
 }

@@ -57,11 +57,11 @@
 mod completion;
 mod sched;
 mod signal;
+mod submit_gate;
 
 use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -256,20 +256,19 @@ impl<M: Send + 'static> ShardContext<'_, M> {
 struct Inbox<M> {
     shard: ShardId,
     tx: Sender<M>,
-    closed: AtomicBool,
-    /// Submits between their closed check and their send; shutdown waits for zero.
-    inflight: AtomicUsize,
+    /// Submits against shutdown (`submit_gate`).
+    gate: submit_gate::SubmitGate,
     signal: Arc<Signal>,
 }
 
 impl<M> Inbox<M> {
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.gate.close();
         self.signal.force_wake();
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.gate.is_closed()
     }
 }
 
@@ -315,15 +314,13 @@ impl<M: Send + 'static> Submitter<M> {
     /// Enqueues `msg`. Fails only after shutdown.
     pub fn submit(&self, msg: M) -> Result<()> {
         let inbox = &*self.inbox;
-        // `SeqCst` on both sides: either shutdown sees our increment and waits for the send,
-        // or we see `closed` and refuse.
-        inbox.inflight.fetch_add(1, Ordering::SeqCst);
-        if inbox.closed.load(Ordering::SeqCst) {
-            inbox.inflight.fetch_sub(1, Ordering::Release);
+        // Either shutdown sees us enter and waits for the send, or we see it closed and
+        // refuse (`submit_gate`).
+        if !inbox.gate.enter() {
             return Err(Error::Closed);
         }
         let sent = inbox.tx.send(msg);
-        inbox.inflight.fetch_sub(1, Ordering::Release);
+        inbox.gate.leave();
         sent.map_err(|_| Error::Closed)?;
         inbox.signal.notify();
         Ok(())
@@ -662,9 +659,7 @@ impl<H: ShardHandler> ShardCore<H> {
 
     /// Shutdown: wait out in-flight submits, then handle everything queued.
     fn finish(&mut self) {
-        while self.inbox().inflight.load(Ordering::SeqCst) != 0 {
-            thread::yield_now();
-        }
+        self.inbox().gate.wait_drained();
         while self.drain() > 0 {}
     }
 }
@@ -745,8 +740,7 @@ fn build<H: ShardHandler>(
                 inbox: Arc::new(Inbox {
                     shard: ShardId(i as u16),
                     tx,
-                    closed: AtomicBool::new(false),
-                    inflight: AtomicUsize::new(0),
+                    gate: submit_gate::SubmitGate::new(),
                     signal: Arc::new(Signal::new()),
                 }),
             }
@@ -1035,7 +1029,7 @@ struct CloseOnDrop<M>(Submitter<M>);
 
 impl<M> Drop for CloseOnDrop<M> {
     fn drop(&mut self) {
-        self.0.inbox.closed.store(true, Ordering::SeqCst);
+        self.0.inbox.gate.close();
     }
 }
 
@@ -1177,7 +1171,7 @@ impl<H: ShardHandler> ShardDriver<H> {
     pub fn shutdown(self) -> H {
         let ShardDriver { mut core, _close } = self;
         let _shard = EnterShard::new(core.id);
-        core.inbox().closed.store(true, Ordering::SeqCst);
+        core.inbox().gate.close();
         core.finish();
         core.handler
     }
