@@ -31,10 +31,21 @@ mod driver;
 mod measure;
 use measure::Measured;
 
+use std::ops::Bound;
 use std::path::Path;
 use std::time::Instant;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole, Table};
+
+/// The qualifier selection a scan pushes down (D22).
+#[derive(Clone, Copy)]
+enum Filter {
+    None,
+    /// Qualifiers starting with these bytes.
+    Prefix(&'static [u8]),
+    /// Qualifiers below these bytes.
+    Below(&'static [u8]),
+}
 
 #[derive(Clone, Copy)]
 struct Shape {
@@ -42,60 +53,137 @@ struct Shape {
     rows: u32,
     cells: u32,
     value: usize,
+    filter: Filter,
 }
 
-const RATE_SHAPES: [Shape; 4] = [
+const RATE_SHAPES: [Shape; 9] = [
     Shape {
         name: "narrow",
         rows: 200_000,
         cells: 8,
         value: 100,
+        filter: Filter::None,
     },
     Shape {
         name: "wide",
         rows: 2_000,
         cells: 1_000,
         value: 100,
+        filter: Filter::None,
     },
     Shape {
         name: "small",
         rows: 400_000,
         cells: 8,
         value: 16,
+        filter: Filter::None,
     },
     Shape {
         name: "large",
         rows: 50_000,
         cells: 4,
         value: 1024,
+        filter: Filter::None,
+    },
+    Shape {
+        name: "narrow-q1",
+        rows: 200_000,
+        cells: 8,
+        value: 100,
+        filter: Filter::Prefix(b"q0003"),
+    },
+    Shape {
+        name: "narrow-half",
+        rows: 200_000,
+        cells: 8,
+        value: 100,
+        filter: Filter::Below(b"q0004"),
+    },
+    Shape {
+        name: "wide-q10",
+        rows: 2_000,
+        cells: 1_000,
+        value: 100,
+        filter: Filter::Prefix(b"q01"),
+    },
+    Shape {
+        name: "wide-q1",
+        rows: 2_000,
+        cells: 1_000,
+        value: 100,
+        filter: Filter::Prefix(b"q0500"),
+    },
+    Shape {
+        name: "wide-half",
+        rows: 2_000,
+        cells: 1_000,
+        value: 100,
+        filter: Filter::Below(b"q0500"),
     },
 ];
 
-const COUNT_SHAPES: [Shape; 3] = [
+const COUNT_SHAPES: [Shape; 7] = [
     Shape {
         name: "scan-narrow",
         rows: 5_000,
         cells: 8,
         value: 100,
+        filter: Filter::None,
     },
     Shape {
         name: "scan-small",
         rows: 5_000,
         cells: 8,
         value: 16,
+        filter: Filter::None,
     },
     Shape {
         name: "scan-wide",
         rows: 40,
         cells: 1_000,
         value: 100,
+        filter: Filter::None,
+    },
+    Shape {
+        name: "scan-narrow-q1",
+        rows: 5_000,
+        cells: 8,
+        value: 100,
+        filter: Filter::Prefix(b"q0003"),
+    },
+    Shape {
+        name: "scan-narrow-half",
+        rows: 5_000,
+        cells: 8,
+        value: 100,
+        filter: Filter::Below(b"q0004"),
+    },
+    Shape {
+        name: "scan-wide-q10",
+        rows: 40,
+        cells: 1_000,
+        value: 100,
+        filter: Filter::Prefix(b"q01"),
+    },
+    Shape {
+        name: "scan-wide-q1",
+        rows: 40,
+        cells: 1_000,
+        value: 100,
+        filter: Filter::Prefix(b"q0500"),
     },
 ];
 
-/// One full scan: decoded bytes and cells.
-fn scan(t: &Table) -> (u64, u64) {
+/// One full scan with `filter` pushed down: decoded bytes and cells.
+fn scan(t: &Table, filter: Filter) -> (u64, u64) {
     let (mut bytes, mut cells) = (0u64, 0u64);
-    let mut it = t.scan_prefix(b"").family("f").iter().unwrap();
+    let mut scan = t.scan_prefix(b"").family("f");
+    scan = match filter {
+        Filter::None => scan,
+        Filter::Prefix(p) => scan.qualifier_prefix(p),
+        Filter::Below(b) => scan.qualifier_bounds(Bound::Unbounded, Bound::Excluded(b)),
+    };
+    let mut it = scan.iter().unwrap();
     while let Some(r) = it.next_ref().unwrap() {
         let key = r.key().len() as u64;
         for c in r.iter() {
@@ -108,9 +196,9 @@ fn scan(t: &Table) -> (u64, u64) {
 
 /// One measured full scan (callgrind counts only this); its returned cells.
 #[inline(never)]
-fn shape_scan(t: &Table) -> usize {
+fn shape_scan(t: &Table, filter: Filter) -> usize {
     let _measured = Measured::start();
-    scan(t).1 as usize
+    scan(t, filter).1 as usize
 }
 
 /// A store holding `shape` in table `t`, family `f` (one version per column): compacted when
@@ -145,7 +233,7 @@ fn build(dir: &Path, shape: Shape, compact: bool) -> (Pigeonhole, driver::Driver
         db.compact().unwrap();
     }
     driver.wait_idle();
-    scan(&t); // every block in the cache
+    scan(&t, Filter::None); // every block in the cache
     driver.wait_idle();
     (db, driver, t)
 }
@@ -167,10 +255,10 @@ fn rate(shape: Shape, place: &str, passes: usize) {
     let (db, driver, t) = build(&dir, shape, place == "sst");
     let (mut secs, (bytes, cells)) = driver::on_fresh_thread(|| {
         let mut secs = Vec::with_capacity(passes);
-        let mut out = scan(&t);
+        let mut out = scan(&t, shape.filter);
         for _ in 0..passes {
             let start = Instant::now();
-            out = scan(&t);
+            out = scan(&t, shape.filter);
             secs.push(start.elapsed().as_secs_f64());
         }
         (secs, out)
@@ -180,7 +268,7 @@ fn rate(shape: Shape, place: &str, passes: usize) {
     println!(
         "{{\"shape\":\"{}\",\"place\":\"{place}\",\"rows\":{},\"cells_per_row\":{},\
          \"value_len\":{},\"decoded_bytes\":{bytes},\"cells\":{cells},\"passes\":{passes},\
-         \"best_gb_s\":{:.3},\"median_gb_s\":{:.3},\"median_cells_s\":{:.0}}}",
+         \"best_gb_s\":{:.3},\"median_gb_s\":{:.3},\"median_cells_s\":{:.0},\"median_ms\":{:.2}}}",
         shape.name,
         shape.rows,
         shape.cells,
@@ -188,6 +276,7 @@ fn rate(shape: Shape, place: &str, passes: usize) {
         bytes as f64 / best / 1e9,
         bytes as f64 / median / 1e9,
         cells as f64 / median,
+        median * 1e3,
     );
     close(db, driver, t, &dir);
 }
@@ -239,7 +328,11 @@ fn main() {
     } else {
         iters
     };
-    let units = driver::on_fresh_thread(|| (0..iters).map(|_| shape_scan(&t)).sum::<usize>());
+    let units = driver::on_fresh_thread(|| {
+        (0..iters)
+            .map(|_| shape_scan(&t, shape.filter))
+            .sum::<usize>()
+    });
     eprintln!("units {units}");
     close(db, driver, t, &dir);
 }
