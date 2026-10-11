@@ -207,28 +207,34 @@ rows.append(("Phase 2 floors hold (D193 sparse-wide gate, both runs)", "",
 
 
 def eav_ratios(name):
-    """Pigeonhole's row-read and scan p99 over SQLite EAV's in one gate run (#387)."""
+    """Pigeonhole's row-read and scan p99 over SQLite EAV's in one sparse-wide gate run
+    (#387), or None if the run did not produce both."""
     run = load(f"{name}.json")
     if not run:
         return None
     p99 = {}
     for r in run.get("results", []):
-        by = {t["op"]: t["stats"]["p99_ns"] for t in (r.get("detail") or {}).get("by_type", [])}
-        p99[r["store"]] = by
+        if r.get("workload") != "sparse-wide":
+            continue
+        p99[r["store"]] = {t["op"]: t["stats"]["p99_ns"]
+                           for t in (r.get("detail") or {}).get("by_type", [])}
     ph, eav = p99.get("pigeonhole"), p99.get("sqlite-eav")
-    if not ph or not eav:
+    if not ph or not eav or not all(op in ph and op in eav for op in ("row read", "scan")):
         return None
-    return {op: ph[op] / eav[op] for op in ("row read", "scan") if op in ph and op in eav}
+    return {op: ph[op] / eav[op] for op in ("row read", "scan")}
 
 
+# A verdict needs both runs: one run varies by about 5%, and #387 sits near the line.
 ratios = [eav_ratios(n) for n in ("phase2-gate", "phase2-gate-2")]
-if any(ratios):
-    shown = "; ".join(
-        f"run {i + 1}: row read {r['row read']:.2f}×, scan {r['scan']:.2f}×"
-        for i, r in enumerate(ratios) if r and "row read" in r and "scan" in r)
-    worst = max((v for r in ratios if r for v in r.values()), default=None)
+if all(ratios):
+    shown = "; ".join(f"run {i + 1}: row read {r['row read']:.2f}×, scan {r['scan']:.2f}×"
+                      for i, r in enumerate(ratios))
+    worst = max(v for r in ratios for v in r.values())
     rows.append(("#387: row-read and scan p99 within 1.5× of SQLite EAV", shown,
-                 verdict(None if worst is None else worst < 1.5),
+                 verdict(worst < 1.5), "phase2-gate.json, phase2-gate-2.json"))
+else:
+    rows.append(("#387: row-read and scan p99 within 1.5× of SQLite EAV",
+                 "not run (needs both gate runs)", verdict(None),
                  "phase2-gate.json, phase2-gate-2.json"))
 rows.append(("D193 instruction ceilings", "measured by CI's instructions job, not here", "see CI", "-"))
 
