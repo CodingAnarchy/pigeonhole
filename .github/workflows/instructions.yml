@@ -62,10 +62,7 @@ env:
   # (runs 37900128944 and 37901737150). If a shape proves noisier on CI, report it rather
   # than raising its threshold silently.
   # The YCSB shapes get 1.0%: identical code varied by up to 0.54% across runs.
-  # commit-async gets 2.5% for #521 only: D210's backpressure costs an uncontended async
-  # commit +2.4% against a base without it, which the owner accepted (2026-10-11, #523). It
-  # returns to the default once #521 is on main and the base includes D210.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 commit-async=2.5
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0
 
 jobs:
   instructions:
