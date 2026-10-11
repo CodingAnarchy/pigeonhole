@@ -1135,6 +1135,11 @@ pub(crate) fn commit_req_from_thread(
         if pigeonhole_io::reap_orphan_io(OWN_IO_SLICE).is_some() {
             continue;
         }
+        #[cfg(feature = "test-hooks")]
+        shared
+            .hooks
+            .manifest_thread_parks
+            .fetch_add(1, Ordering::AcqRel);
         std::thread::park();
     }
 }

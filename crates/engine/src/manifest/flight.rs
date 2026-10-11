@@ -163,6 +163,13 @@ impl<C, R> Flight<C, R> {
         st.commit.is_some() && st.result.is_some()
     }
 
+    /// Whether a commit's root commit is in flight, not yet completed (test hook).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn in_flight(&self) -> bool {
+        let st = self.lock();
+        st.commit.is_some() && st.result.is_none()
+    }
+
     /// Whether commit `generation`'s root commit completed and `f` holds for it (test hook).
     #[cfg(feature = "test-hooks")]
     pub(crate) fn completed(&self, generation: u64, f: impl FnOnce(&C) -> bool) -> bool {

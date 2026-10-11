@@ -36,7 +36,7 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
 | `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 66 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
-| `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 26 | `Hooks` 20, `ShardCounters` 4, `ReaderHooks` 2 |
+| `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 27 | `Hooks` 21, `ShardCounters` 4, `ReaderHooks` 2 |
 | other `engine/src` files | 37 | | 10 of them thread-locals (per-thread scratch and caches) |
 | `runtime/src` | 16 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
 | **Total** | **153** | | |
@@ -303,6 +303,7 @@ Other structs in `engine.rs` with no primitive fields: `Engine` (Arc<Inner>), `C
 | `Hooks::appended` (hooks.rs:71) | `Mutex<Vec<AppendedRecord>>` | Every WAL record appended, per-stream append order. | Shard thread after each WAL append (shard.rs:4427-4433). | `Engine::take_appended` (hooks.rs:845-852). | Taken alone (not checked whether a shard-internal lock is held at shard.rs:4427; shard state there is `&mut self`, no Mutex seen). | Milestone B (#63). |
 | `Hooks::manifest_race` (hooks.rs:74) | `AtomicBool` | Arms the manifest queue's release-window probe. | `Engine::probe_manifest_release_window` `store(true, Release)` (hooks.rs:1051); `manifest::race_window` `swap(false, AcqRel)` (manifest.rs:1147). | `race_window` (swap). | Release / AcqRel. | Milestone B (#63). |
 | `Hooks::manifest_race_waiter` (hooks.rs:75) | `Mutex<Option<Waiter<Result<ManifestVersion>>>>` | Waiter of the request `race_window` pushed. | `race_window` (manifest.rs:1150-1154), after `manifest_queue.push`. | `probe_manifest_release_window` takes it (hooks.rs:1053-1058). | Taken alone. | Milestone B (#63). |
+| `Hooks::manifest_thread_parks` (hooks.rs:78) | `AtomicUsize` | Threads that parked in `commit_req_from_thread` after their last look (`Engine::manifest_thread_parks`, test `manifest_wake`). | `commit_req_from_thread` `fetch_add(AcqRel)` just before `park` (manifest.rs). | `manifest_thread_parks` `load(Acquire)`. | AcqRel / Acquire. | #134 step 2 (#536). |
 | `Hooks::before_view_publish` (hooks.rs:78) | `Once` | Callback at the start of the next `publish_view`. | `Engine::before_next_view_publish` (hooks.rs:889). | `Shared::publish_view` (shard.rs:579), **before** `view_lock` is taken. | Mutex released before callback. | #131 (5456f2f, PR #153). |
 | `Hooks::room_wait_once` (hooks.rs:81) | `AtomicBool` | Makes the next group's second member wait for arena room. | `Engine::force_room_wait_once` `store(true, Release)` (hooks.rs:572-578); shard thread `swap(false, AcqRel)` (shard.rs:4173-4177). | Same swap. | Release / AcqRel. | #315 review (c391e07, #287). |
 | `Hooks::before_snapshot_view_load` (hooks.rs:84) | `Once` | Callback between pinning a writer snapshot's seqno and loading the view. | `Engine::before_snapshot_view_load` (hooks.rs:585). | `Inner::snapshot` (engine.rs:2603), client thread, while holding a `SeqnoPin` (not a lock guard). | — | #315 review (c391e07). |
@@ -373,7 +374,7 @@ Not counted. Sites listed are only those in my two files; other writers/readers 
 
 Uncertainties: `Drivers`, `LiveSeqnos`, `MaintenanceGuard`, `Waiter`/`Notifier` internals were not inspected.
 
-**34 primitives** declared in these files: 8 production (`ReaderState` 4, `Attachment` 1, `Inner` 3) + 26 test-hook-only (`Hooks` 14 atomics/mutexes + 6 `Once`, `ShardCounters` 4, `ReaderHooks` 2 `Once`). `Shared` appendix rows (declared in shard.rs) are not counted.
+**35 primitives** declared in these files: 8 production (`ReaderState` 4, `Attachment` 1, `Inner` 3) + 27 test-hook-only (`Hooks` 15 atomics/mutexes + 6 `Once`, `ShardCounters` 4, `ReaderHooks` 2 `Once`). `Shared` appendix rows (declared in shard.rs) are not counted.
 
 
 ## Appendix C: The other `engine/src` files (manifest, snapshot, read path, flush, compaction, wakers)
