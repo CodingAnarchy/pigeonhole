@@ -23,7 +23,9 @@
 //! ```
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
-#![forbid(unsafe_code)]
+// One borrow of a raw fd (the inline driver's wait on `Shard::io_fd`) is allowed where it
+// is made; nothing else.
+#![deny(unsafe_code)]
 
 use std::path::Path;
 use std::str::FromStr;
