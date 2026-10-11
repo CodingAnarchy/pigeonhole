@@ -52,6 +52,10 @@ struct Sleeper {
     pending: AtomicBool,
     #[cfg(target_os = "linux")]
     event: Option<std::os::fd::OwnedFd>,
+    /// The thread waits on `event` (its shard has a completion fd): only then do wakes write
+    /// it. Elsewhere (pread) it parks, and the write would be a wasted system call.
+    #[cfg(target_os = "linux")]
+    polls: AtomicBool,
 }
 
 impl Sleeper {
@@ -66,6 +70,8 @@ impl Sleeper {
                 rustix::event::EventfdFlags::NONBLOCK | rustix::event::EventfdFlags::CLOEXEC,
             )
             .ok(),
+            #[cfg(target_os = "linux")]
+            polls: AtomicBool::new(false),
         })
     }
 
@@ -76,7 +82,9 @@ impl Sleeper {
             return;
         }
         #[cfg(target_os = "linux")]
-        if let Some(event) = &self.event {
+        if let Some(event) = &self.event
+            && self.polls.load(Ordering::SeqCst)
+        {
             let _ = rustix::io::write(event, &1u64.to_ne_bytes());
         }
         self.thread.unpark();
@@ -85,15 +93,24 @@ impl Sleeper {
     /// Sleeps until a wake, the shard's I/O completion, its [`next_wakeup`](Shard::next_wakeup)
     /// or `cap`, whichever comes first.
     fn idle(&self, shard: &Shard, cap: Duration) {
+        // `io_fd` first: taking it is what stops `next_wakeup` reporting in-flight I/O as due
+        // now. `polls` is published before `pending` is checked (each side stores, then
+        // loads the other's flag, SeqCst), so a wake either lands before the check or sees
+        // `polls` and writes the eventfd.
+        #[cfg(target_os = "linux")]
+        let ring = self
+            .event
+            .as_ref()
+            .and_then(|event| shard.io_fd().map(|fd| (fd, event)));
+        #[cfg(target_os = "linux")]
+        if ring.is_some() && !self.polls.load(Ordering::Relaxed) {
+            self.polls.store(true, Ordering::SeqCst);
+        }
         if self.pending.swap(false, Ordering::SeqCst) {
             return;
         }
         #[cfg(target_os = "linux")]
-        if let Some(event) = &self.event
-            && let Some(fd) = shard.io_fd()
-        {
-            // `io_fd` first: taking it is what stops `next_wakeup` reporting in-flight I/O
-            // as due now.
+        if let Some((fd, event)) = ring {
             let wait = shard.next_wakeup().unwrap_or(cap).min(cap);
             if !wait.is_zero() {
                 poll_ring(fd, event, wait);
