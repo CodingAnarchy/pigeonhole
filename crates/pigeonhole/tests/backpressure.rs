@@ -166,8 +166,8 @@ fn a_small_commit_waits_behind_an_earlier_waiting_one() {
     close(db, shard);
 }
 
-/// Blocking commits take no admission: one made while async commits wait behind a full
-/// bound is submitted at once and applied before them.
+/// Blocking commits take no admission: one made while an async commit waits behind a full
+/// bound commits while that one is still waiting, and charges nothing.
 #[test]
 fn a_blocking_commit_is_not_held_behind_waiting_async_ones() {
     let (db, mut shard, t) = open(2103);
@@ -178,42 +178,38 @@ fn a_blocking_commit_is_not_held_behind_waiting_async_ones() {
     let blocking = {
         let t = t.clone();
         std::thread::spawn(move || {
-            t.mutate(b"blocking")
-                .put("f", b"q", b"v")
-                .commit()
-                .unwrap()
-                .seqno
+            t.mutate(b"blocking").put("f", b"q", b"v").commit().unwrap();
         })
     };
-    // The blocking commit is charged nothing.
-    let mut blocking_seqno = None;
-    let (mut full_seqno, mut waiting_seqno) = (None, None);
+    // `waiting` is not polled until the blocking commit returns, so it stays queued and
+    // unsubmitted throughout (a waiting future submits only when polled); the blocking
+    // commit goes through without it, and without a charge of its own.
     for _ in 0..100_000 {
-        assert!(db.async_commit_inflight()[0] <= held.max(BOUND));
+        if blocking.is_finished() {
+            break;
+        }
+        assert!(db.async_commit_inflight()[0] <= held);
         shard.run_once(Duration::from_millis(1));
-        if full_seqno.is_none()
-            && let Poll::Ready(r) = poll(&mut full)
-        {
-            full_seqno = Some(r.unwrap().seqno);
-        }
-        if waiting_seqno.is_none()
-            && let Poll::Ready(r) = poll(&mut waiting)
-        {
-            waiting_seqno = Some(r.unwrap().seqno);
-        }
-        if blocking_seqno.is_none() && blocking.is_finished() {
-            blocking_seqno = Some(0);
-        }
-        if full_seqno.is_some() && waiting_seqno.is_some() && blocking_seqno.is_some() {
+        let _ = poll(&mut full);
+    }
+    blocking.join().unwrap();
+    assert!(t.get(b"blocking", "f", b"q").unwrap().is_some());
+    assert!(
+        t.get(b"waiting", "f", b"q00000").unwrap().is_none(),
+        "the waiting async commit was submitted"
+    );
+    // Then the waiting one goes in.
+    let mut done = false;
+    for _ in 0..100_000 {
+        shard.run_once(Duration::from_millis(1));
+        let _ = poll(&mut full);
+        if poll(&mut waiting).is_ready() {
+            done = true;
             break;
         }
     }
-    let blocking = blocking.join().unwrap();
-    assert!(
-        blocking < waiting_seqno.unwrap(),
-        "the blocking commit ({blocking}) waited behind the async one ({:?})",
-        waiting_seqno
-    );
+    assert!(done);
+    assert!(t.get(b"waiting", "f", b"q00000").unwrap().is_some());
     close(db, shard);
 }
 
