@@ -23,6 +23,7 @@
 
 mod admission;
 mod catalog;
+mod close_gate;
 mod compact;
 mod engine;
 mod error;

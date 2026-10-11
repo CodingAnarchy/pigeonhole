@@ -193,20 +193,10 @@ pub(crate) struct Locks {
     pub presence: Presence,
 }
 
-/// The close handshake: each shard reports when its WAL is checkpointed, synced and
-/// dropped; the last one runs the final steps and resolves `done`.
-#[derive(Debug, Default)]
-pub(crate) struct CloseState {
-    pub remaining: AtomicUsize,
-    pub done: Mutex<Option<Notifier<Result<()>>>>,
-    /// A shard's final WAL sync (or flush) failed: the close is not clean.
-    pub failed: AtomicBool,
-    /// Every shard has reported: the final close runs once it holds the manifest writer's
-    /// exclusion (whoever holds it then runs it when it releases).
-    pub final_pending: AtomicBool,
-    /// The final close's outcome once it ran (`EngineShard::closed`).
-    pub outcome: Mutex<Option<Result<()>>>,
-}
+/// The close handshake (`close_gate`): each shard reports when its WAL is checkpointed,
+/// synced and dropped; once all have, whoever finds maintenance empty and the manifest
+/// writer's exclusion free runs the final close and answers the `Engine::close` caller.
+pub(crate) type CloseState = crate::close_gate::CloseGate<Result<()>, Notifier<Result<()>>>;
 
 /// One cache line per shard, so shards never share a line through these counters.
 #[derive(Debug, Default)]
@@ -397,10 +387,6 @@ pub(crate) struct Shared {
     pub closed: AtomicBool,
     /// `Engine::close` has started: background compaction stops.
     pub closing: AtomicBool,
-    /// Application threads inside `shrink`, `backup` or a catalog change. The final close
-    /// waits for them (the last one out runs it): it marks the file clean and releases the
-    /// writer lock, after which nothing may commit or truncate (7 F7-4).
-    pub maintenance: AtomicUsize,
     /// A manifest (root) commit failed: the pager is poisoned (decision D58) and every later
     /// write fails until the database is reopened.
     pub pager_poisoned: AtomicBool,
@@ -464,7 +450,7 @@ impl Shared {
     /// for its peers' reports (`ShareFlushed`, `CommitCheckpointed`) stops waiting, since a
     /// shard that gave up will never send them (5-6 5.1).
     pub(crate) fn fail_close(&self) {
-        if !self.close.failed.swap(true, Ordering::AcqRel) {
+        if self.close.fail() {
             self.broadcast(|| ShardMsg::Kick);
         }
     }
@@ -507,7 +493,7 @@ impl Shared {
     /// thread panicked, or its `EngineShard` was dropped, which also fails the close). A
     /// visibility wait then ends with `Closed`.
     pub(crate) fn visibility_ended(&self) -> bool {
-        self.closed.load(Ordering::SeqCst) || self.close.failed.load(Ordering::SeqCst)
+        self.closed.load(Ordering::SeqCst) || self.close.failed()
     }
 
     /// Wakes every visibility waiter whatever its seqno, after `visibility_ended` became
@@ -679,10 +665,10 @@ impl Shared {
     /// The final close, run by the last shard to finish: records a clean close and, if this
     /// is the last process, removes the WAL files (every stream is checkpointed to its end
     /// by now) and the shared-memory region, so the database is one file at rest.
-    pub(crate) fn final_close(&self) -> Result<()> {
+    pub(crate) fn final_close(&self, failed: bool) -> Result<()> {
         // A failed final sync means the close is not clean: the flag stays clear so the next
         // open replays, and the caller learns about it.
-        let mut clean = if self.close.failed.load(Ordering::Acquire) {
+        let mut clean = if failed {
             Err(Error::Io(pigeonhole_io::Error::new(
                 ErrorKind::Other,
                 "a shard's final flush, checkpoint or WAL sync failed; the close is not clean",
@@ -748,49 +734,31 @@ impl Shared {
         manifest::commit_held(self, manifest::ReqKind::Catalog(Box::new(change))).map(|_| ())
     }
 
+    /// This shard's part of the close is done (a second report of a shard is a no-op).
     fn report_closed(&self) {
-        if self.close.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.close.final_pending.store(true, Ordering::SeqCst);
+        if self.close.report() {
             self.try_final_close();
         }
     }
 
     /// Runs the final close if it is pending, no application thread is inside maintenance
-    /// (`MaintenanceGuard`), and the manifest writer's exclusion is free.
+    /// (`MaintenanceGuard`), and the manifest writer's exclusion is free (`close_gate`).
     /// A background commit (a compaction's, say) may hold it with its root commit in
     /// flight; the final close's own commits must not interleave with it, or both would be
     /// prepared from the same writer state (issue #78). Its holder calls this again from
-    /// `manifest::release`. Never blocks, so it is safe on the shard thread that runs the
-    /// holder's pump.
+    /// `manifest::release`, as the last thread out of maintenance does. Never blocks, so it
+    /// is safe on the shard thread that runs the holder's pump.
     pub(crate) fn try_final_close(&self) {
-        // Pairs with the fence in `manifest::release`.
-        std::sync::atomic::fence(Ordering::SeqCst);
-        if !self.close.final_pending.load(Ordering::SeqCst)
-            || self.maintenance.load(Ordering::SeqCst) > 0
-            || !manifest::claim(self)
-        {
+        let Some(failed) = self.close.try_start(|| manifest::claim(self)) else {
             return;
-        }
-        if !self.close.final_pending.swap(false, Ordering::SeqCst) {
-            manifest::release(self);
-            return;
-        }
-        let result = self.final_close();
-        *self
+        };
+        let result = self.final_close(failed);
+        let waiter = self
             .close
-            .outcome
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) =
-            Some(result.as_ref().copied().map_err(Error::duplicate));
+            .finish(result.as_ref().copied().map_err(Error::duplicate));
         manifest::release(self);
         self.closed.store(true, Ordering::Release);
-        if let Some(n) = self
-            .close
-            .done
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+        if let Some(n) = waiter {
             n.notify(result);
         }
         // Application-owned shards that finished their part are idle, and their drivers
@@ -815,14 +783,13 @@ pub(crate) struct MaintenanceGuard<'a>(&'a Shared);
 
 impl<'a> MaintenanceGuard<'a> {
     /// Enters maintenance; `check_open` runs after the count is raised, so either it sees
-    /// the close or the final close sees the count.
+    /// the close or the final close sees the count (both under the close's lock).
     pub(crate) fn enter(
         shared: &'a Shared,
         check_open: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
-        shared.maintenance.fetch_add(1, Ordering::SeqCst);
+        shared.close.enter_maintenance();
         let guard = Self(shared);
-        std::sync::atomic::fence(Ordering::SeqCst);
         check_open()?;
         Ok(guard)
     }
@@ -830,9 +797,7 @@ impl<'a> MaintenanceGuard<'a> {
 
 impl Drop for MaintenanceGuard<'_> {
     fn drop(&mut self) {
-        // Pairs with the fence in `Shared::try_final_close`: either it sees the count, or
-        // this sees its pending flag.
-        self.0.maintenance.fetch_sub(1, Ordering::SeqCst);
+        self.0.close.leave_maintenance();
         self.0.try_final_close();
     }
 }
@@ -7062,9 +7027,7 @@ impl ShardState {
                 // Waiting for our own edit.
                 return;
             }
-            if (!self.log.is_empty() || self.checkpoint_dirty)
-                && !self.shared.close.failed.load(Ordering::Acquire)
-            {
+            if (!self.log.is_empty() || self.checkpoint_dirty) && !self.shared.close.failed() {
                 // Waiting for the other shards' flushes and checkpoints (ShareFlushed and
                 // CommitCheckpointed arrive as messages). Once the close is unclean, a shard
                 // that gave up flushing never sends its reports: stop waiting (the WAL keeps
@@ -7138,9 +7101,7 @@ impl ShardState {
         self.close_stage = CloseStage::Reported;
         self.final_sync();
         shared.shard_died();
-        if shared.close.remaining.load(Ordering::Acquire) > 0 {
-            shared.report_closed();
-        }
+        shared.report_closed();
     }
 
     /// The shard's thread is unwinding from a panic: report the shard closed (and the close
@@ -7153,9 +7114,7 @@ impl ShardState {
         self.closing = true;
         self.close_stage = CloseStage::Reported;
         self.shared.shard_died();
-        if self.shared.close.remaining.load(Ordering::Acquire) > 0 {
-            self.shared.report_closed();
-        }
+        self.shared.report_closed();
     }
 
     /// Commits inline on the shard's own thread (application-owned mode): the member joins

@@ -156,3 +156,10 @@ jobs:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: 3
           CARGO_TARGET_DIR: target/loom
+      # The engine's models (the close gate, #134) use a cfg of their own: `--cfg loom` would
+      # switch its dependencies' loom-only code too.
+      - name: loom (engine)
+        run: cargo test --release -p pigeonhole-engine --lib loom
+        env:
+          RUSTFLAGS: --cfg engine_loom
+          CARGO_TARGET_DIR: target/loom-engine

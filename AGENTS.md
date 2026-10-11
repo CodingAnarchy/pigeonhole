@@ -22,6 +22,7 @@ cargo quota clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 cargo +nightly miri test -p <unsafe-crate>                 # io, cache, memtable
 RUSTFLAGS="--cfg loom" cargo test --release -p <crate> --lib loom
+RUSTFLAGS="--cfg engine_loom" cargo test --release -p pigeonhole-engine --lib loom
 cargo deny check
 ```
 

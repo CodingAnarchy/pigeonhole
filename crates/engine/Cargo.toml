@@ -41,3 +41,9 @@ harness = false
 
 [lints]
 workspace = true
+
+# The close gate's loom models (`close_gate`): `RUSTFLAGS="--cfg engine_loom" cargo test
+# --release -p pigeonhole-engine --lib loom`. A cfg of its own, since `--cfg loom` would
+# switch the dependencies that have loom models of their own too.
+[target.'cfg(engine_loom)'.dependencies]
+loom = { workspace = true }
