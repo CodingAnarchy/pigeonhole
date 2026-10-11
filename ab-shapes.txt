@@ -1,0 +1,1 @@
+scanrate:scan-narrow scanrate:scan-narrow-q1 scanrate:scan-narrow-half scanrate:scan-wide scanrate:scan-wide-q10 scanrate:scan-wide-q1 readshapes:scan-filtered readshapes:scan

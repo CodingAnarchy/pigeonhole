@@ -1,0 +1,66 @@
+name: scratch blob33 callgrind A/B (temporary)
+on:
+  push:
+    branches: [scratch/blob33-ab]
+permissions:
+  contents: read
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build base and head
+        shell: bash
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD~1)   # the PR commit (HEAD is this scratch commit)
+          if [ -s ab-base.txt ]; then base=$(cat ab-base.txt); else base=$(git merge-base origin/main "$head"); fi
+          echo "base=$base head=$head" | tee out-refs.txt
+          git worktree add /tmp/base "$base"
+          git worktree add /tmp/head "$head"
+          for w in base head; do
+            (cd /tmp/$w && CARGO_TARGET_DIR=/tmp/target-$w CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release -p pigeonhole-bench --example readshapes --example writepath --example ycsb --example hotrow $(test -f crates/bench/examples/scanrate.rs && echo --example scanrate) $(test -f crates/bench/examples/gapshapes.rs && echo --example gapshapes))
+          done
+      - name: callgrind
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp out-refs.txt out/
+          echo "| shape | base | head | change |" > out/table.md
+          echo "|---|--:|--:|--:|" >> out/table.md
+          shapes='get-mem get-miss counter row get-sst scan scan-filtered versions'
+          if [ -s ab-shapes.txt ]; then shapes=$(cat ab-shapes.txt); fi
+          # Entry: shape | bin:shape | bin:shape:BOTH_ENV:HEAD_ENV (comma-separated, - for none).
+          for entry in $shapes; do
+            IFS=: read -r bin shape both headenv <<< "$entry"
+            if [ -z "${shape:-}" ]; then shape=$bin; bin=readshapes; fi
+            both=${both:--}; headenv=${headenv:--}
+            if [ "$both" = - ]; then both=""; fi
+            if [ "$headenv" = - ]; then headenv=""; fi
+            name="$bin-$shape${headenv:+-on}"
+            for w in base head; do
+              envs="GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.tcache_count=65535 ${both//,/ }"
+              if [ $w = head ]; then envs="$envs ${headenv//,/ }"; fi
+              if [ "$bin" = hotrow ]; then args="20 /tmp/rs-$name-$w"; else args="$shape 4 /tmp/rs-$name-$w"; fi
+              mkdir -p /tmp/rs-$name-$w
+              env $envs valgrind --tool=callgrind --collect-atstart=no \
+                --callgrind-out-file=out/$name.$w.cg /tmp/target-$w/release/examples/$bin $args </dev/null >/dev/null 2>out/$name.$w.err
+              callgrind_annotate --inclusive=yes out/$name.$w.cg > out/$name.$w.incl.txt
+            done
+            b=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' out/$name.base.cg)
+            h=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' out/$name.head.cg)
+            u=$(sed -nE 's/^(cells read|units) ([0-9]+)$/\2/p' out/$name.base.err)
+            awk -v s=$name -v b=$b -v h=$h -v u=$u 'BEGIN{printf "| %s | %d | %d | %+.1f%% |\n", s, b/u, h/u, (h-b)*100/b}' >> out/table.md
+          done
+          cat out/table.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: callgrind-ab
+          path: out/
