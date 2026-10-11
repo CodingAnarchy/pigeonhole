@@ -1,0 +1,300 @@
+{
+  "format": 1,
+  "environment": {
+    "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor",
+    "cores": 32,
+    "memory_bytes": 134514339840,
+    "os": "linux 6.8.0-139-generic",
+    "arch": "x86_64",
+    "filesystem": "xfs",
+    "reference": false,
+    "label": "non-reference (D5)",
+    "profile": "release",
+    "git_rev": "8f675ed0c433",
+    "started_unix": 1791749106,
+    "load_average": 2.7
+  },
+  "results": [
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=1 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on inline in-flight=16",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 2000000,
+      "value_len": 100,
+      "threads": 1,
+      "load_secs": 5.487293328,
+      "run_secs": 4.819139365,
+      "throughput": 415011.86177046783,
+      "p50_ns": 15423,
+      "p99_ns": 259071,
+      "p999_ns": 333823,
+      "mean_ns": 29730,
+      "max_ns": 3611249,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 0,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [],
+        "shards": [
+          {
+            "commits": 2000000,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 8189,
+          "write_stall_nanos": 1244263165,
+          "flushes": 21,
+          "compactions": 5,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "shard_parks": 0,
+          "shard_wakes": 115138,
+          "commit_parks": 0,
+          "visibility_waits": 0,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 21,
+          "visibility_woken": 0,
+          "visibility_contended": 0,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0
+        },
+        "engine_commit": {
+          "durability": 1,
+          "commits": 2000000,
+          "p50_ns": 12288,
+          "p99_ns": 196608,
+          "p999_ns": 262144
+        }
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=1 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on inline in-flight=16",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 2000000,
+      "value_len": 100,
+      "threads": 1,
+      "load_secs": 5.44899379,
+      "run_secs": 4.7815436479999995,
+      "throughput": 418274.9645789703,
+      "p50_ns": 15423,
+      "p99_ns": 259071,
+      "p999_ns": 335871,
+      "mean_ns": 29609,
+      "max_ns": 3502166,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 0,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [],
+        "shards": [
+          {
+            "commits": 2000000,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 8170,
+          "write_stall_nanos": 1222430988,
+          "flushes": 21,
+          "compactions": 5,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "shard_parks": 0,
+          "shard_wakes": 115275,
+          "commit_parks": 0,
+          "visibility_waits": 0,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 21,
+          "visibility_woken": 0,
+          "visibility_contended": 0,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0
+        },
+        "engine_commit": {
+          "durability": 1,
+          "commits": 2000000,
+          "p50_ns": 12288,
+          "p99_ns": 196608,
+          "p999_ns": 262144
+        }
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=1 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 2000000,
+      "value_len": 100,
+      "threads": 4,
+      "load_secs": 4.517645636,
+      "run_secs": 6.063511895,
+      "throughput": 329841.8531427652,
+      "p50_ns": 5663,
+      "p99_ns": 248831,
+      "p999_ns": 532479,
+      "mean_ns": 10778,
+      "max_ns": 3547900,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 469762048,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [
+          {
+            "op": "put",
+            "stats": {
+              "count": 2000000,
+              "p50_ns": 5663,
+              "p99_ns": 248831,
+              "p999_ns": 532479
+            },
+            "mean_ns": 10778
+          }
+        ],
+        "shards": [
+          {
+            "commits": 2000000,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 1277,
+          "write_stall_nanos": 300888505,
+          "flushes": 21,
+          "compactions": 5,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "shard_parks": 6,
+          "shard_wakes": 113948,
+          "commit_parks": 27332,
+          "visibility_waits": 0,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 21,
+          "visibility_woken": 0,
+          "visibility_contended": 0,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0
+        },
+        "engine_commit": null
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=1 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 2000000,
+      "value_len": 100,
+      "threads": 4,
+      "load_secs": 4.511410091,
+      "run_secs": 5.961167035,
+      "throughput": 335504.7741922568,
+      "p50_ns": 5695,
+      "p99_ns": 248831,
+      "p999_ns": 532479,
+      "mean_ns": 10716,
+      "max_ns": 3538615,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 469762048,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [
+          {
+            "op": "put",
+            "stats": {
+              "count": 2000000,
+              "p50_ns": 5695,
+              "p99_ns": 248831,
+              "p999_ns": 532479
+            },
+            "mean_ns": 10716
+          }
+        ],
+        "shards": [
+          {
+            "commits": 2000000,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 1241,
+          "write_stall_nanos": 291776228,
+          "flushes": 21,
+          "compactions": 5,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "shard_parks": 3,
+          "shard_wakes": 140375,
+          "commit_parks": 26619,
+          "visibility_waits": 0,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 21,
+          "visibility_woken": 0,
+          "visibility_contended": 0,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0
+        },
+        "engine_commit": null
+      }
+    }
+  ],
+  "scaling": {
+    "shards": 1,
+    "single_shard_throughput": 415011.86177046783,
+    "multi_shard_throughput": 418274.9645789703,
+    "efficiency": 1.007862673598248,
+    "single_shard_p99_ns": 259071,
+    "max_share": 1.0,
+    "visibility_waits_per_op": 0.0
+  },
+  "scaling_sync": {
+    "shards": 1,
+    "single_shard_throughput": 329841.8531427652,
+    "multi_shard_throughput": 335504.7741922568,
+    "efficiency": 1.0171685945720192,
+    "single_shard_p99_ns": 248831,
+    "max_share": 1.0,
+    "visibility_waits_per_op": 0.0
+  },
+  "group_commit": null
+}

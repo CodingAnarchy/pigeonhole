@@ -1,0 +1,18 @@
+setup	0	full
+build	2	full
+memtable-lookup	1	full
+phase2-gate	3	full
+phase2-gate-2	3	full
+all-uring-1	12	full
+all-uring-2	12	full
+all-pread	11	full
+build	0	full	8f675ed0c433
+latency	3	full	8f675ed0c433
+ycsb-a-shards	3	full	8f675ed0c433
+group-sync-depth	1	full	8f675ed0c433
+row-cache	0	full	8f675ed0c433
+scaling	5	full	8f675ed0c433
+open-latency	0	full	8f675ed0c433
+cold-get	52	full	8f675ed0c433
+cold-scan	23	full	8f675ed0c433
+scan-cache	0	full	8f675ed0c433
