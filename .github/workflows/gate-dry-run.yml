@@ -44,7 +44,12 @@ jobs:
         run: |
           sudo crates/bench/baselines/phase3-gate/data-disk.sh
           for m in / /mnt; do
-            disk="$(lsblk -ndo PKNAME "$(findmnt -nvo SOURCE "$m")")"
+            src="$(findmnt -nvo SOURCE -T "$m")"
+            disk="$(lsblk -ndo PKNAME "$src" 2>/dev/null || true)"
+            if [[ -z "$disk" ]]; then
+              echo "no disk behind $m ($src); skipped"
+              continue
+            fi
             id=""
             for l in /dev/disk/by-id/*; do
               [[ "$(readlink -f "$l")" == "/dev/$disk" ]] && { id="$l"; break; }

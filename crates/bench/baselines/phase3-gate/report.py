@@ -142,6 +142,12 @@ if g:
 else:
     rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)", floor.lstrip("; "),
                  verdict(None), "latency-group-commit.json"))
+gp = (load("latency-group-commit-pread.json") or {}).get("group_commit")
+if gp:
+    rows.append(("Durable group commit on pread (reported, not judged; D213: decides the io_uring default)",
+                 f"{gp['cells_per_sec'] / 1e6:.2f}M cells/s at {gp['shards']} shards "
+                 f"({gp['cells_per_sec'] / max(gp['cores'], 1) / 1e3:.0f}K per core); p50 {us(gp['p50_ns']):.0f} µs, "
+                 f"p99 {us(gp['p99_ns']):.0f} µs", "-", "latency-group-commit-pread.json"))
 clients = [r for r in results("latency-group-commit.json", "pigeonhole") if "inline" not in r.get("store_config", "")]
 if clients:
     detail = ", ".join(f"{r['threads']} thr: {r['throughput'] * GROUP_COMMIT_CELLS / 1e3:.0f}K cells/s, "

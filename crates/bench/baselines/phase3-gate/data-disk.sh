@@ -17,7 +17,8 @@ if [[ $# == 0 ]]; then
     echo "NVMe disks by id (whole disks, not partitions):"
     for l in /dev/disk/by-id/nvme-*; do
         [[ -e "$l" ]] || { echo "  (no NVMe disks by id)"; break; }
-        [[ "$l" == *-part* || "$l" == *_[0-9] ]] && continue
+        # Partitions, and the eui./nvme. aliases of a disk already listed by model and serial.
+        [[ "$l" == *-part* || "$l" == *_[0-9] || "$l" == */nvme-eui.* || "$l" == */nvme-nvme.* ]] && continue
         dev="$(readlink -f "$l")"
         echo "  $l -> $dev"
         lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS "$dev" | sed 's/^/      /'
