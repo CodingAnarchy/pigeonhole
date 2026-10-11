@@ -1764,7 +1764,7 @@ fn merged_ssts(
         let mut levels: BTreeMap<u8, Vec<Arc<SstMeta>>> = BTreeMap::new();
         for t in [l, r] {
             if let Some(list) = catalog.ssts.get(&(t.id, f)) {
-                for (level, meta) in list {
+                for (level, meta) in list.iter() {
                     let only_left = lids.contains(&meta.id) && !rids.contains(&meta.id);
                     let only_right = rids.contains(&meta.id) && !lids.contains(&meta.id);
                     if (only_left && overlaps(meta, &rs, re.as_deref()))
@@ -1843,7 +1843,7 @@ fn tablet_change(
                 out.push((id, owners[i]));
                 for &f in &families {
                     if let Some(list) = catalog.ssts.get(&(parent.id, f)) {
-                        for (level, meta) in list {
+                        for (level, meta) in list.iter() {
                             if overlaps(meta, &s, e.as_deref()) {
                                 edits.push(Edit::AddSst {
                                     tablet: id,

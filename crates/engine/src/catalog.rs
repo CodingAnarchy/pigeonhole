@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use pigeonhole_compaction::{MergeOperator, MergeRegistry};
-use pigeonhole_format::hash::FastMap;
+use pigeonhole_format::hash::{FastMap, FastSet};
 use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{
@@ -69,22 +69,30 @@ pub(crate) type SstList = Vec<(u8, Arc<SstMeta>)>;
 /// The persisted state of the database, as the manifest describes it. Immutable once built;
 /// a manifest commit produces a new `Catalog`.
 #[derive(Debug, Clone, Default)]
+///
+/// Its collections are shared copy-on-write (#499): cloning a catalog, which every manifest
+/// commit does, copies no collection, and an edit copies only the collections it changes
+/// (`Arc::make_mut`). `ssts` shares each slot's list too, so a commit copies the lists of the
+/// slots it changes and no others, and two catalogs' slots compare with `Arc::ptr_eq`.
 pub struct Catalog {
-    tables: BTreeMap<TableId, Arc<TableInfo>>,
-    by_name: HashMap<String, TableId>,
-    families: FastMap<FamilyId, FamilyMeta>,
-    tablets: BTreeMap<TabletId, TabletEntry>,
+    tables: Arc<BTreeMap<TableId, Arc<TableInfo>>>,
+    by_name: Arc<HashMap<String, TableId>>,
+    families: Arc<FastMap<FamilyId, FamilyMeta>>,
+    tablets: Arc<BTreeMap<TabletId, TabletEntry>>,
     pub(crate) counters: Counters,
-    pub(crate) checkpoints: BTreeMap<StreamId, Lsn>,
-    pub(crate) flushed: BTreeMap<(TabletId, FamilyId), Seqno>,
+    pub(crate) checkpoints: Arc<BTreeMap<StreamId, Lsn>>,
+    pub(crate) flushed: Arc<BTreeMap<(TabletId, FamilyId), Seqno>>,
     /// `(tablet, family) -> [(level, meta)]`, in manifest order.
-    pub(crate) ssts: BTreeMap<(TabletId, FamilyId), SstList>,
-    pub(crate) blob_files: BTreeMap<BlobFileId, BlobFile>,
+    pub(crate) ssts: Arc<BTreeMap<(TabletId, FamilyId), Arc<SstList>>>,
+    pub(crate) blob_files: Arc<BTreeMap<BlobFileId, BlobFile>>,
     /// Per SST, the blob files its puts point into and the bytes they reference
     /// (`SstBlobRefs`, #240). An SST without an entry (written by an older build) may point
     /// into any blob file of its family. Entries of SSTs no tablet references any more are
     /// dropped by [`Catalog::prune_blob_refs`] after each batch of edits.
-    pub(crate) blob_refs: HashMap<SstId, Vec<(BlobFileId, u64)>>,
+    pub(crate) blob_refs: Arc<HashMap<SstId, Vec<(BlobFileId, u64)>>>,
+    /// SSTs given blob references since the last prune: with the SSTs a commit removed, the
+    /// only entries [`Catalog::prune_blob_refs_since`] has to check.
+    refs_touched: Vec<SstId>,
     /// Whether any family names a merge operator this process cannot run.
     pub(crate) has_unknown_merge: bool,
     /// The operators this process knows (`EngineOptions::merge_operators`).
@@ -115,14 +123,15 @@ impl Catalog {
                     name: name.clone(),
                     families: Vec::new(),
                 });
-                self.by_name.insert(name.clone(), *table);
-                self.tables.insert(*table, info);
+                Arc::make_mut(&mut self.by_name).insert(name.clone(), *table);
+                Arc::make_mut(&mut self.tables).insert(*table, info);
             }
             Edit::DropTable { table } => {
-                if let Some(info) = self.tables.remove(table) {
-                    self.by_name.remove(&info.name);
+                if let Some(info) = Arc::make_mut(&mut self.tables).remove(table) {
+                    Arc::make_mut(&mut self.by_name).remove(&info.name);
+                    let families = Arc::make_mut(&mut self.families);
                     for f in &info.families {
-                        self.families.remove(&f.id);
+                        families.remove(&f.id);
                     }
                 }
                 let dropped: Vec<TabletId> = self
@@ -132,9 +141,7 @@ impl Catalog {
                     .map(|t| t.id)
                     .collect();
                 for id in dropped {
-                    self.tablets.remove(&id);
-                    self.flushed.retain(|k, _| k.0 != id);
-                    self.ssts.retain(|k, _| k.0 != id);
+                    self.drop_tablet(id);
                 }
             }
             Edit::PutFamily {
@@ -174,7 +181,7 @@ impl Catalog {
                         MergeKind::Unknown
                     }
                 };
-                self.families.insert(
+                Arc::make_mut(&mut self.families).insert(
                     *family,
                     FamilyMeta {
                         table: *table,
@@ -183,7 +190,7 @@ impl Catalog {
                         merge_op,
                     },
                 );
-                self.tables.insert(*table, Arc::new(info));
+                Arc::make_mut(&mut self.tables).insert(*table, Arc::new(info));
             }
             Edit::PutTablet {
                 tablet,
@@ -191,7 +198,7 @@ impl Catalog {
                 start,
                 end,
             } => {
-                self.tablets.insert(
+                Arc::make_mut(&mut self.tablets).insert(
                     *tablet,
                     TabletEntry {
                         id: *tablet,
@@ -202,29 +209,32 @@ impl Catalog {
                     },
                 );
             }
-            Edit::DropTablet { tablet } => {
-                self.tablets.remove(tablet);
-                self.flushed.retain(|k, _| k.0 != *tablet);
-                self.ssts.retain(|k, _| k.0 != *tablet);
-            }
+            Edit::DropTablet { tablet } => self.drop_tablet(*tablet),
             Edit::AddSst {
                 tablet,
                 family,
                 level,
                 meta,
             } => {
-                self.ssts
+                let list = Arc::make_mut(&mut self.ssts)
                     .entry((*tablet, *family))
-                    .or_default()
-                    .push((*level, Arc::new(meta.clone())));
+                    .or_default();
+                Arc::make_mut(list).push((*level, Arc::new(meta.clone())));
             }
             Edit::RemoveSst {
                 tablet,
                 family,
                 sst,
             } => {
-                if let Some(list) = self.ssts.get_mut(&(*tablet, *family)) {
-                    list.retain(|(_, m)| m.id != *sst);
+                // Only a slot that holds the SST is copied.
+                let key = (*tablet, *family);
+                if self
+                    .ssts
+                    .get(&key)
+                    .is_some_and(|l| l.iter().any(|(_, m)| m.id == *sst))
+                    && let Some(list) = Arc::make_mut(&mut self.ssts).get_mut(&key)
+                {
+                    Arc::make_mut(list).retain(|(_, m)| m.id != *sst);
                 }
             }
             Edit::SetFlushed {
@@ -232,11 +242,13 @@ impl Catalog {
                 family,
                 seqno,
             } => {
-                let e = self.flushed.entry((*tablet, *family)).or_default();
+                let e = Arc::make_mut(&mut self.flushed)
+                    .entry((*tablet, *family))
+                    .or_default();
                 *e = (*e).max(*seqno);
             }
             Edit::WalCheckpoint { stream, lsn } => {
-                self.checkpoints.insert(*stream, *lsn);
+                Arc::make_mut(&mut self.checkpoints).insert(*stream, *lsn);
             }
             Edit::PutBlobFile {
                 blob_file,
@@ -245,7 +257,7 @@ impl Catalog {
                 total_bytes,
                 live_bytes,
             } => {
-                self.blob_files.insert(
+                Arc::make_mut(&mut self.blob_files).insert(
                     *blob_file,
                     BlobFile {
                         family: *family,
@@ -256,10 +268,11 @@ impl Catalog {
                 );
             }
             Edit::DropBlobFile { blob_file } => {
-                self.blob_files.remove(blob_file);
+                Arc::make_mut(&mut self.blob_files).remove(blob_file);
             }
             Edit::SstBlobRefs { sst, refs } => {
-                self.blob_refs.insert(*sst, refs.clone());
+                Arc::make_mut(&mut self.blob_refs).insert(*sst, refs.clone());
+                self.refs_touched.push(*sst);
             }
             Edit::Counters {
                 next_table,
@@ -287,6 +300,17 @@ impl Catalog {
         Ok(())
     }
 
+    /// Removes a tablet and its slots (flushed seqnos and SST lists).
+    fn drop_tablet(&mut self, id: TabletId) {
+        Arc::make_mut(&mut self.tablets).remove(&id);
+        if self.flushed.keys().any(|k| k.0 == id) {
+            Arc::make_mut(&mut self.flushed).retain(|k, _| k.0 != id);
+        }
+        if self.ssts.keys().any(|k| k.0 == id) {
+            Arc::make_mut(&mut self.ssts).retain(|k, _| k.0 != id);
+        }
+    }
+
     /// Every edit needed to rebuild this catalog from empty (the manifest snapshot block).
     pub(crate) fn snapshot_edits(&self) -> Vec<Edit> {
         let mut edits = vec![self.counters_edit()];
@@ -312,8 +336,8 @@ impl Catalog {
                 end: t.end.clone(),
             });
         }
-        for ((tablet, family), list) in &self.ssts {
-            for (level, meta) in list {
+        for ((tablet, family), list) in self.ssts.iter() {
+            for (level, meta) in list.iter() {
                 edits.push(Edit::AddSst {
                     tablet: *tablet,
                     family: *family,
@@ -322,20 +346,20 @@ impl Catalog {
                 });
             }
         }
-        for ((tablet, family), seqno) in &self.flushed {
+        for ((tablet, family), seqno) in self.flushed.iter() {
             edits.push(Edit::SetFlushed {
                 tablet: *tablet,
                 family: *family,
                 seqno: *seqno,
             });
         }
-        for (stream, lsn) in &self.checkpoints {
+        for (stream, lsn) in self.checkpoints.iter() {
             edits.push(Edit::WalCheckpoint {
                 stream: *stream,
                 lsn: *lsn,
             });
         }
-        for (id, b) in &self.blob_files {
+        for (id, b) in self.blob_files.iter() {
             edits.push(Edit::PutBlobFile {
                 blob_file: *id,
                 family: b.family,
@@ -358,6 +382,7 @@ impl Catalog {
     /// Drops the blob references of SSTs no tablet references (call after a batch of edits:
     /// a trivial move removes and re-adds an SST within one batch).
     pub(crate) fn prune_blob_refs(&mut self) {
+        self.refs_touched.clear();
         if self.blob_refs.is_empty() {
             return;
         }
@@ -366,7 +391,68 @@ impl Catalog {
             .values()
             .flat_map(|l| l.iter().map(|(_, m)| m.id))
             .collect();
-        self.blob_refs.retain(|id, _| live.contains(id));
+        Arc::make_mut(&mut self.blob_refs).retain(|id, _| live.contains(id));
+    }
+
+    /// [`Catalog::prune_blob_refs`] for a catalog made from `old` (pruned) by a batch of
+    /// edits, checking only what the batch can have made stale (#499): the SSTs it removed,
+    /// and those it gave references. Equal to the full prune, without building a set of
+    /// every live SST on each manifest commit.
+    pub(crate) fn prune_blob_refs_since(&mut self, old: &Catalog) {
+        let mut check: Vec<SstId> = self.removed_since(old).iter().map(|m| m.id).collect();
+        check.append(&mut self.refs_touched);
+        if check.is_empty() || self.blob_refs.is_empty() {
+            return;
+        }
+        // An SST given references this batch is usually one it added, so in a changed slot.
+        let dead: Vec<SstId> = self.unreferenced(old, check);
+        if !dead.is_empty() {
+            let refs = Arc::make_mut(&mut self.blob_refs);
+            for id in dead {
+                refs.remove(&id);
+            }
+        }
+    }
+
+    /// The ids among `ids` that no slot references, looking first in the slots that differ
+    /// from `old`'s and over every slot only for those still unresolved.
+    fn unreferenced(&self, old: &Catalog, mut ids: Vec<SstId>) -> Vec<SstId> {
+        ids.sort_unstable();
+        ids.dedup();
+        let mut pending: FastSet<SstId> = ids.into_iter().collect();
+        for (key, list) in self.ssts.iter() {
+            if old.ssts.get(key).is_some_and(|o| Arc::ptr_eq(o, list)) {
+                continue;
+            }
+            for (_, m) in list.iter() {
+                pending.remove(&m.id);
+            }
+        }
+        if !pending.is_empty() {
+            for list in self.ssts.values() {
+                for (_, m) in list.iter() {
+                    pending.remove(&m.id);
+                }
+                if pending.is_empty() {
+                    break;
+                }
+            }
+        }
+        let mut dead: Vec<SstId> = pending.into_iter().collect();
+        dead.sort_unstable();
+        dead
+    }
+
+    /// Whether `(tablet, family)` holds the same SST list here as in `other`: the same shared
+    /// list, compared by pointer (#499). A catalog made from another by edits shares the
+    /// lists of the slots they did not change, so this finds the changed slots cheaply.
+    #[allow(dead_code)] // The view publish's first use is blob33's (#499 item 3).
+    pub(crate) fn same_ssts(&self, other: &Catalog, key: (TabletId, FamilyId)) -> bool {
+        match (self.ssts.get(&key), other.ssts.get(&key)) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// Whether SST `id` may hold a pointer into blob file `blob`: its references say so, or
@@ -434,7 +520,7 @@ impl Catalog {
     /// persisted: the manifest has no owner field, so an open re-derives every owner from the
     /// tablet id (see `docs/design/questions/engine.md`).
     pub(crate) fn set_shard(&mut self, id: TabletId, shard: ShardId) {
-        if let Some(t) = self.tablets.get_mut(&id) {
+        if let Some(t) = Arc::make_mut(&mut self.tablets).get_mut(&id) {
             t.shard = shard;
         }
     }
@@ -452,7 +538,7 @@ impl Catalog {
     pub(crate) fn sst_refs(&self) -> HashMap<SstId, usize> {
         let mut refs = HashMap::new();
         for list in self.ssts.values() {
-            for (_, m) in list {
+            for (_, m) in list.iter() {
                 *refs.entry(m.id).or_insert(0) += 1;
             }
         }
@@ -461,7 +547,7 @@ impl Catalog {
 
     /// Re-derives tablet ownership for `shards` shards (a reopen with another shard count).
     pub(crate) fn reassign(&mut self, shards: usize) {
-        for t in self.tablets.values_mut() {
+        for t in Arc::make_mut(&mut self.tablets).values_mut() {
             t.shard = shard_for(t.id, shards);
         }
     }
@@ -491,7 +577,7 @@ impl Catalog {
             .values()
             .map(|t| (t.id, t.families.len()))
             .collect();
-        for t in self.tablets.values_mut() {
+        for t in Arc::make_mut(&mut self.tablets).values_mut() {
             let width = widths.get(&t.table).copied().unwrap_or(0);
             let preferred = usize::from(shard_for(t.id, shards).0);
             let shard = if slots[preferred] + width <= max_slots {
@@ -525,7 +611,9 @@ impl Catalog {
 }
 
 impl Catalog {
-    /// Every SST id the catalog names.
+    /// Every SST id the catalog names (the full recompute the copy-on-write tests check
+    /// against).
+    #[cfg(test)]
     pub(crate) fn sst_ids(&self) -> HashSet<SstId> {
         self.ssts
             .values()
@@ -535,17 +623,35 @@ impl Catalog {
 
     /// The SSTs `old` names that this catalog no longer references from any tablet.
     pub(crate) fn removed_since(&self, old: &Catalog) -> Vec<Arc<SstMeta>> {
-        let live = self.sst_ids();
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for list in old.ssts.values() {
-            for (_, m) in list {
-                if !live.contains(&m.id) && seen.insert(m.id) {
-                    out.push(Arc::clone(m));
+        if Arc::ptr_eq(&self.ssts, &old.ssts) {
+            return Vec::new();
+        }
+        // Candidates: SSTs of `old`'s slots that changed or went, missing from the new slot.
+        // Slots this catalog still shares with `old` cannot have lost one (#499).
+        let mut candidates: Vec<Arc<SstMeta>> = Vec::new();
+        let mut seen: FastSet<SstId> = FastSet::default();
+        for (key, old_list) in old.ssts.iter() {
+            let new_list = self.ssts.get(key);
+            if new_list.is_some_and(|l| Arc::ptr_eq(l, old_list)) {
+                continue;
+            }
+            for (_, m) in old_list.iter() {
+                let kept = new_list.is_some_and(|l| l.iter().any(|(_, n)| n.id == m.id));
+                if !kept && seen.insert(m.id) {
+                    candidates.push(Arc::clone(m));
                 }
             }
         }
-        out
+        if candidates.is_empty() {
+            return candidates;
+        }
+        // A candidate another slot still holds (shared after a split, decision D13) stays.
+        let dead: FastSet<SstId> = self
+            .unreferenced(old, candidates.iter().map(|m| m.id).collect())
+            .into_iter()
+            .collect();
+        candidates.retain(|m| dead.contains(&m.id));
+        candidates
     }
 
     /// Whether `id` is referenced by more than one `(tablet, family)` (shared after a split,
@@ -598,4 +704,190 @@ impl Catalog {
 /// Deterministic tablet ownership: the same for every open with the same shard count.
 pub(crate) fn shard_for(tablet: TabletId, shards: usize) -> ShardId {
     ShardId((tablet.0 % shards.max(1) as u64) as u16)
+}
+
+#[cfg(test)]
+mod cow_tests {
+    use super::*;
+    use pigeonhole_format::manifest::FamilyOptions;
+    use pigeonhole_format::superblock::ExtentRef;
+
+    fn meta(id: u64) -> SstMeta {
+        SstMeta {
+            id: SstId(id),
+            extent: ExtentRef {
+                page: 16 * (id + 1),
+                size_class: 0,
+            },
+            len: 4096,
+            smallest_key: vec![1],
+            largest_key: vec![2],
+            seqno_range: (1, 2),
+            ts_range: (1, 2),
+            entries: 1,
+            deletes: 0,
+        }
+    }
+
+    /// The full recompute `removed_since` replaced: every SST `old` names that no slot of
+    /// `new` references.
+    fn removed_full(new: &Catalog, old: &Catalog) -> Vec<SstId> {
+        let live = new.sst_ids();
+        let mut out: Vec<SstId> = old
+            .sst_ids()
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// One slot and its list of `(level, id)`.
+    type SlotContents = ((TabletId, FamilyId), Vec<(u8, SstId)>);
+
+    /// Every slot's list, deep-copied (to check an edited clone leaves its source alone).
+    fn contents(c: &Catalog) -> Vec<SlotContents> {
+        c.ssts
+            .iter()
+            .map(|(k, l)| (*k, l.iter().map(|(lv, m)| (*lv, m.id)).collect()))
+            .collect()
+    }
+
+    /// Random batches of edits (#499): the slot-level `removed_since` and
+    /// `prune_blob_refs_since` equal the full recomputes, `same_ssts` only reports equal
+    /// lists, and editing a clone leaves the catalog it came from unchanged. Prints the seed
+    /// on failure.
+    #[test]
+    fn slot_diffs_equal_the_full_recompute() {
+        for seed in 1..=200u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rand = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let mut cur = Catalog::default();
+            for t in 1..=2u32 {
+                cur.apply(
+                    &Edit::CreateTable {
+                        table: TableId(t),
+                        name: format!("t{t}"),
+                    },
+                    4,
+                )
+                .unwrap();
+                for f in 0..2u32 {
+                    cur.apply(
+                        &Edit::PutFamily {
+                            table: TableId(t),
+                            family: FamilyId(t * 10 + f),
+                            name: format!("f{f}"),
+                            options: FamilyOptions::default(),
+                        },
+                        4,
+                    )
+                    .unwrap();
+                }
+            }
+            let tablet = |t: u64| Edit::PutTablet {
+                tablet: TabletId(t),
+                table: TableId(1 + (t % 2) as u32),
+                start: vec![t as u8],
+                end: None,
+            };
+            for t in 1..=6u64 {
+                cur.apply(&tablet(t), 4).unwrap();
+            }
+            let mut next_sst = 1u64;
+            for batch in 0..30 {
+                let old = cur.clone();
+                let before = contents(&old);
+                let mut new = old.clone();
+                for _ in 0..1 + rand(6) {
+                    let t = 1 + rand(6);
+                    let f = FamilyId((1 + (t % 2) as u32) * 10 + rand(2) as u32);
+                    let ids: Vec<SstId> = new.sst_ids().into_iter().collect();
+                    let edit = match rand(10) {
+                        0..=2 => {
+                            next_sst += 1;
+                            Edit::AddSst {
+                                tablet: TabletId(t),
+                                family: f,
+                                level: rand(3) as u8,
+                                meta: meta(next_sst),
+                            }
+                        }
+                        // An SST another slot holds too (shared after a split, D13).
+                        3 if !ids.is_empty() => {
+                            let id = ids[rand(ids.len() as u64) as usize];
+                            Edit::AddSst {
+                                tablet: TabletId(t),
+                                family: f,
+                                level: 0,
+                                meta: meta(id.0),
+                            }
+                        }
+                        4..=5 if !ids.is_empty() => {
+                            let id = ids[rand(ids.len() as u64) as usize];
+                            let (tablet, family) = *new
+                                .ssts
+                                .iter()
+                                .find(|(_, l)| l.iter().any(|(_, m)| m.id == id))
+                                .unwrap()
+                                .0;
+                            Edit::RemoveSst {
+                                tablet,
+                                family,
+                                sst: id,
+                            }
+                        }
+                        6..=7 => Edit::SstBlobRefs {
+                            sst: SstId(1 + rand(next_sst + 2)),
+                            refs: vec![(BlobFileId(1), rand(100))],
+                        },
+                        8 => Edit::DropTablet {
+                            tablet: TabletId(t),
+                        },
+                        _ => tablet(t),
+                    };
+                    new.apply(&edit, 4).unwrap();
+                }
+                let mut got: Vec<SstId> = new.removed_since(&old).iter().map(|m| m.id).collect();
+                got.sort_unstable();
+                assert_eq!(
+                    got,
+                    removed_full(&new, &old),
+                    "seed {seed}, batch {batch}: removed_since"
+                );
+                let mut full = new.clone();
+                full.prune_blob_refs();
+                let mut diffed = new.clone();
+                diffed.prune_blob_refs_since(&old);
+                assert_eq!(
+                    diffed.blob_refs, full.blob_refs,
+                    "seed {seed}, batch {batch}: prune"
+                );
+                for key in old.ssts.keys().chain(new.ssts.keys()) {
+                    if new.same_ssts(&old, *key) {
+                        assert_eq!(
+                            new.ssts
+                                .get(key)
+                                .map(|l| l.iter().map(|(_, m)| m.id).collect::<Vec<_>>()),
+                            old.ssts
+                                .get(key)
+                                .map(|l| l.iter().map(|(_, m)| m.id).collect::<Vec<_>>()),
+                            "seed {seed}, batch {batch}: same_ssts on different lists"
+                        );
+                    }
+                }
+                assert_eq!(
+                    contents(&old),
+                    before,
+                    "seed {seed}, batch {batch}: the source changed"
+                );
+                cur = diffed;
+            }
+        }
+    }
 }

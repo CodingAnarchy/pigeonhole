@@ -1912,8 +1912,8 @@ fn sweep_unreferenced_blobs(
 
     let mut keep: HashSet<BlobFileId> = HashSet::new();
     let mut unrecorded: HashSet<FamilyId> = HashSet::new();
-    for ((_, family), list) in &catalog.ssts {
-        for (_, meta) in list {
+    for ((_, family), list) in catalog.ssts.iter() {
+        for (_, meta) in list.iter() {
             match catalog.blob_refs.get(&meta.id) {
                 Some(refs) => keep.extend(refs.iter().map(|(id, _)| *id)),
                 None => {
