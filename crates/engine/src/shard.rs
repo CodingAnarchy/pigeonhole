@@ -2013,6 +2013,8 @@ struct Stall {
     last_refill: u64,
     /// The timer that kicks the shard once a token is due.
     timer: Option<Arc<TimerState>>,
+    /// When that timer's token is due (0 = no timer armed since the last refill after one).
+    due: u64,
     /// When the current stall started (0 = none).
     since: u64,
 }
@@ -2024,6 +2026,7 @@ impl Default for Stall {
             tokens: STALL_CAPACITY,
             last_refill: 0,
             timer: None,
+            due: 0,
             since: 0,
         }
     }
@@ -2034,6 +2037,41 @@ impl Stall {
         if let Some(t) = self.timer.take() {
             t.cancel();
         }
+        self.due = 0;
+    }
+
+    /// Adds the tokens the time since the last refill paid for at `rate` (groups per
+    /// second), up to the capacity, and takes one if there is one.
+    ///
+    /// A timed wait can end late: a park's timeout rounds up to the platform's timer tick,
+    /// about 15.6 ms on Windows, against the 250 µs a token takes at score 1. The refill
+    /// after a late wake may then hold every token the wait paid for (one, plus the
+    /// lateness at `rate`), and those stay until taken, so a stall admits at its designed
+    /// rate whatever the tick (#149). A capacity of 8 alone admitted 8 groups a tick there,
+    /// about a fifth of the designed rate. A wake on time changes nothing.
+    fn refill_and_take(&mut self, now: u64, rate: f64) -> bool {
+        let elapsed = now.saturating_sub(self.last_refill) as f64 / 1e9;
+        self.last_refill = now;
+        let mut cap = STALL_CAPACITY.max(self.tokens);
+        if self.due != 0 && now >= self.due {
+            let late = (now - self.due) as f64 / 1e9;
+            cap = cap.max(1.0 + late * rate);
+            self.due = 0;
+        }
+        self.tokens = (self.tokens + elapsed * rate).min(cap);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return true;
+        }
+        false
+    }
+
+    /// When the next token is due at `rate`, from `now` (at least 1 µs ahead); recorded
+    /// as the armed timer's deadline.
+    fn arm(&mut self, now: u64, rate: f64) -> u64 {
+        let wait = ((1.0 - self.tokens) / rate * 1e9) as u64;
+        self.due = now + wait.max(1_000);
+        self.due
     }
 }
 
@@ -3966,11 +4004,7 @@ impl ShardState {
             return false;
         }
         let rate = STALL_RATE / self.stall.score;
-        let elapsed = now.saturating_sub(self.stall.last_refill) as f64 / 1e9;
-        self.stall.last_refill = now;
-        self.stall.tokens = (self.stall.tokens + elapsed * rate).min(STALL_CAPACITY);
-        if self.stall.tokens >= 1.0 {
-            self.stall.tokens -= 1.0;
+        if self.stall.refill_and_take(now, rate) {
             self.stall.cancel_timer();
             if self.stall.since != 0 {
                 self.shared.metrics[usize::from(self.id.0)]
@@ -3996,10 +4030,10 @@ impl ShardState {
         {
             let state = TimerState::new();
             self.stall.timer = Some(Arc::clone(&state));
-            let wait = ((1.0 - self.stall.tokens) / rate * 1e9) as u64;
+            let due = self.stall.arm(now, rate);
             ctx.spawn(Box::new(ClockTimer::new(
                 &self.shared.vfs,
-                now + wait.max(1_000),
+                due,
                 state,
                 ctx.submitter(self.id).clone(),
                 ShardMsg::Kick,
@@ -7421,6 +7455,75 @@ impl ShardHandler for ShardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One committer against a stalled shard for two simulated seconds: it commits while
+    /// the bucket has a token, else waits for the timer, whose wake `wake` delays as the
+    /// platform's timed park does. Returns admissions per second.
+    fn stall_rate(score: f64, wake: impl Fn(u64) -> u64) -> f64 {
+        let rate = STALL_RATE / score;
+        let mut stall = Stall {
+            score,
+            ..Stall::default()
+        };
+        let (mut now, mut admitted) = (1_000_000_000u64, 0u64);
+        stall.last_refill = now;
+        let end = now + 2_000_000_000;
+        while now < end {
+            if stall.refill_and_take(now, rate) {
+                admitted += 1;
+                now += 2_000; // the commit itself
+            } else {
+                now = wake(stall.arm(now, rate));
+            }
+        }
+        admitted as f64 / 2.0
+    }
+
+    /// #149: a stall admits at its designed rate whether the timed park wakes on time
+    /// (Linux), a couple of milliseconds late (macOS timer coalescing) or on a 15.6 ms tick
+    /// (Windows), where a capacity of 8 alone admitted about a fifth of it.
+    #[test]
+    fn a_stall_admits_its_designed_rate_whatever_the_timer_tick() {
+        const TICK: u64 = 15_625_000;
+        let platforms: [(&str, &dyn Fn(u64) -> u64); 3] = [
+            ("linux", &|due| due + 70_000),
+            ("macos", &|due| due + 2_000_000),
+            ("windows", &|due| due.div_ceil(TICK) * TICK),
+        ];
+        for score in [1.0, 2.0, 4.0] {
+            let designed = STALL_RATE / score;
+            for (name, wake) in platforms {
+                let got = stall_rate(score, wake);
+                assert!(
+                    (got - designed).abs() <= designed * 0.1,
+                    "{name} at score {score}: {got:.0} admissions/s against {designed:.0}"
+                );
+            }
+        }
+    }
+
+    /// The lateness allowance applies only to the refill after a late timer: a bucket
+    /// left alone for seconds still holds at most its capacity.
+    #[test]
+    fn an_idle_stall_bucket_holds_at_most_its_capacity() {
+        let mut stall = Stall {
+            score: 1.0,
+            tokens: 0.0,
+            last_refill: 1_000,
+            ..Stall::default()
+        };
+        assert!(stall.refill_and_take(10_000_000_000, STALL_RATE));
+        assert_eq!(stall.tokens, STALL_CAPACITY - 1.0);
+        // A timer that fired 10 ms late: the wait paid for one token plus 40 at score 1.
+        stall.tokens = 0.0;
+        let due = stall.arm(20_000_000_000, STALL_RATE);
+        stall.last_refill = 20_000_000_000;
+        assert!(stall.refill_and_take(due + 10_000_000, STALL_RATE));
+        assert!((stall.tokens - 40.0).abs() < 0.01, "{}", stall.tokens);
+        // Kept until taken, not cut back to the capacity by the next refill.
+        assert!(stall.refill_and_take(due + 10_000_100, STALL_RATE));
+        assert!(stall.tokens > STALL_CAPACITY, "{}", stall.tokens);
+    }
 
     /// The D34 collapse finds the same losers whether a batch arrives strictly increasing
     /// (the sort is skipped), out of order, or with repeats inside an increasing run.
