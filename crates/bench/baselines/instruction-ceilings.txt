@@ -70,8 +70,10 @@
 # 1327), with 0.3% headroom.
 #
 # scan-narrow-q1, scan-wide-q10 and scan-wide-q1 (scanrate's filtered scans, #29) were added
-# from the base side of PR #PR's instructions run (main's code with the new shapes), with
-# 0.3% headroom.
+# from the base side of PR #525's instructions run (main's code with the new shapes; the
+# higher of two runs of run 38121002296: 8025, 1854, 17458), with 0.3% headroom. The same PR
+# lowered scan-filtered and versions, which it improves, from the higher of the two head
+# counts (6516, 5459) with `instruction-ceilings.py lower`.
 #
 # Re-baselined after #483, #497, #498 and #500 (main 07a0fe2): lowered with
 # `instruction-ceilings.py lower` from the higher of this PR's base and head counts (run
@@ -88,8 +90,8 @@ get-sst 17272 0.5
 get-miss 4165 0.3
 row 2475 1.0
 scan 1404 0.3
-scan-filtered 7335 0.3
-versions 5591 0.3
+scan-filtered 6536 0.3
+versions 5476 0.3
 counter 9388 0.5
 rows 19655 0.3
 level-scans 14439 0.6
@@ -106,6 +108,6 @@ scan-narrow 1435 0.3
 scan-small 1411 0.3
 scan-wide 1331 0.3
 commit-async 10061 0.3
-scan-narrow-q1 8051 0.3
+scan-narrow-q1 8050 0.3
 scan-wide-q10 1860 0.3
-scan-wide-q1 17509 0.3
+scan-wide-q1 17511 0.3
