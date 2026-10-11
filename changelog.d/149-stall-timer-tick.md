@@ -1,0 +1,2 @@
+### Fixed
+- A write stall (L0 too deep) admits commits at its designed rate on every platform (#149). The engine's timed wait for the next token wakes late where the timer is coarse: about 15.6 ms on Windows against the 250 µs a token takes, and a couple of milliseconds under macOS timer coalescing. The bucket now keeps every token a late wake paid for. Before, a single committer on Windows was throttled about 5× harder than designed. Linux, whose timer wakes on time, is unchanged.
