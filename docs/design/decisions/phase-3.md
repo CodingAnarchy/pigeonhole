@@ -463,3 +463,56 @@ The engine's `admission` tests cover a commit larger than the bound. The blockin
 - `wal/tests/stream.rs`: a created stream is pending until both syncs finish, and its wake runs then; a recovered stream is durable.
 - `engine/tests/tablets.rs` (`crash_at_every_write_point_of_tablet_changes_regressions`): seed 273 with deferred I/O.
 - **Sweeps:** deferred `tablets` joins the standard sweep set for engine, WAL and I/O changes (CONTRIBUTING).
+
+<a id="d212"></a>
+## D212 — The manifest keeps today's exclusion protocol; no single writer task (owner decision, 2026-10-11; engine, #134 step 2)
+
+**Decided:** keep today's manifest writer design: one exclusion (`manifest_busy`), any of three kinds of thread may hold it, and the pump's commit in flight is held in `Flight`. Don't replace it with one long-lived writer task. Revisit at the public API / C ABI review, or if a new bug lands in these paths.
+
+**Today** (`docs/design/concurrency.md`, "The manifest exclusion and pump"):
+- **Three paths take the exclusion:**
+  - the shard pump (flush, compaction, tablet changes, WAL checkpoints, large-value release);
+  - an application thread that drains the queue itself (catalog changes, `shrink`, large-value separation in `submit`/`commit`, #230);
+  - a thread that already holds it (the final close).
+- **Three rules hold it together:**
+  - whoever releases re-checks the queue;
+  - a blocked thread takes over a pump's completed commit (`Flight::take_done`, #135, #166);
+  - a blocked thread reaps its own I/O, then orphaned I/O (ICR 0028), and parks only after that, woken by releases, root-commit completions and its own request's answer.
+- **The take-over and self-progress rules carry D150 (a)'s promise:** catalog changes and `shrink` are not refused on a thread that drives a shard.
+
+**Why keep it.** The protocol was the riskiest coordination in the engine (#78, #81, #135, #166, #207, #306). It is now:
+- **Loom-modelled** around the real `Flight` (`manifest/flight.rs`, #536):
+  - one holder at a time and every request answered once;
+  - a request queued while a thread holds the exclusion is never stranded;
+  - a thread driving the pump's shard finishes its commit.
+
+  The exclusion is a `Mutex<bool>` stand-in until loom ships tokio-rs/loom#391 (#533).
+- **Pinned by mutation-checked engine tests:**
+  - `milestone_b`'s release window;
+  - the take-overs in `blocking_waits` and `deferred_waits`;
+  - `manifest_wake` (a root commit's completion wakes a parked thread).
+- **Documented** in `concurrency.md`.
+
+The redesign's gain doesn't justify changing a public guarantee and adding API surface outside the API review.
+
+**Rejected: one writer task.** It would own the manifest writer and the queue, and every other caller would only queue and wait.
+- **Gain:**
+  - about 5 primitives: `manifest_busy`, `Flight`'s three, and the `Shared::manifest` mutex;
+  - the release re-check, the take-over and the manifest park/wake protocol;
+  - the close gate's try-lock claim (the final close would become the writer's last message);
+  - about 300 lines and two test hooks.
+
+  Write commits never touch the manifest, so no commit shape would change.
+- **Cost:**
+  - **D150 (a) would change.** Application-owned mode runs no engine threads (`compaction_threads` must be 0; application-owned io_uring has no reaper), so the writer would live on an application-driven shard. A thread driving that shard can't block on the writer. So catalog changes and `shrink` would be refused there (`InvalidArgument`, before submitting). For a single-threaded event loop, which drives every shard, that means every blocking catalog call.
+  - **New API surface.** Async catalog and maintenance variants: an ICR and C ABI work.
+  - **Large-value separation in `submit`** (#230) would need restructuring. It can't block on the writer from the event loop, so the blob-file commit's reply would have to submit the batch.
+  - **A new rule for losing the writer's shard** (dropped, or its thread panicked): fail all later manifest work with `Closed`, or move the writer, which is more machinery.
+  - **Size:** about 3–4 PRs, each with loom models and the standard sweeps.
+- **Also rejected: a writer task in engine-owned mode only.** That's two designs to keep correct instead of one.
+
+**Revisit when:**
+- **The public API / C ABI review** wants async catalog calls anyway. Those are the expensive part of the redesign, so it would then cost little more.
+- **A new bug lands in these paths.**
+
+The note this replaces was `docs/design/questions/engine.md` (#538).
