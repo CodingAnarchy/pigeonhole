@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
@@ -992,6 +992,13 @@ struct ThreadRing {
     owner: ThreadId,
     /// The backend ([`RingHandle::id`]) the ring belongs to.
     backend: usize,
+    /// The kernel flags deferred completion work in the submission queue
+    /// (`IORING_SQ_TASKRUN`): without the flag, anything in flight may have completed.
+    taskrun_flag: bool,
+    /// The owner took the completion fd ([`crate::own_io_fd`]): reaps keep it current.
+    fd_taken: AtomicBool,
+    /// Times a reap entered the kernel ([`crate::own_io_enters`]); only the owner writes it.
+    enters: AtomicU64,
     wake: Arc<EventFd>,
     /// Registered with the ring (`IORING_REGISTER_EVENTFD`): signalled on each completion,
     /// for a thread that waits on it in its own event loop ([`crate::own_io_fd`], #408).
@@ -1105,18 +1112,22 @@ impl ThreadRing {
         // a non-waiting reap that deferred completions are pending, so its enter carries
         // GETEVENTS and runs them (without it, only a waiting enter would: a busy shard, or
         // an application loop that never waits, would never see its completions).
-        let uring = IoUring::builder()
+        let (uring, taskrun_flag) = match IoUring::builder()
             .setup_single_issuer()
             .setup_defer_taskrun()
             .setup_taskrun_flag()
             .setup_cqsize(RING_ENTRIES * 2)
             .build(RING_ENTRIES)
-            .or_else(|_| {
+        {
+            Ok(uring) => (uring, true),
+            Err(_) => (
                 IoUring::builder()
                     .setup_cqsize(RING_ENTRIES * 2)
                     .build(RING_ENTRIES)
-            })
-            .ok()?;
+                    .ok()?,
+                false,
+            ),
+        };
         if !uring.params().is_feature_ext_arg() {
             return None;
         }
@@ -1138,6 +1149,9 @@ impl ThreadRing {
             table: Mutex::new(Table::default()),
             owner: thread::current().id(),
             backend,
+            taskrun_flag,
+            fd_taken: AtomicBool::new(false),
+            enters: AtomicU64::new(0),
             wake: Arc::new(EventFd::new().ok()?),
             epoll: epoll_over(
                 [
@@ -1219,14 +1233,40 @@ impl ThreadRing {
         })
     }
 
+    /// Whether a non-waiting reap has anything to take: completions already queued, or
+    /// completion work the kernel deferred to this thread (flagged in the submission queue;
+    /// on a ring without the flag, whenever anything is in flight).
+    fn has_work(&self) -> bool {
+        // SAFETY: only the owner thread (the caller) borrows this ring's queues, and the
+        // borrows end here.
+        if !unsafe { self.uring.completion_shared() }.is_empty() {
+            return true;
+        }
+        if self.taskrun_flag {
+            // SAFETY: as above.
+            unsafe { self.uring.submission_shared() }.taskrun()
+        } else {
+            lock(&self.table).live > 0
+        }
+    }
+
     /// Takes the finished completions, waiting up to `wait` for one when none has (`None`:
     /// do not wait). Returns whether an operation completed.
     fn reap(&self, wait: Option<Duration>) -> bool {
         debug_assert_eq!(thread::current().id(), self.owner);
+        // A shard thread's turn, with nobody watching the completion fd and no shared ring to
+        // take completions from: with nothing to take, it stays out of the kernel (two system
+        // calls a turn otherwise, which cost write-heavy workloads 15-20% on the AX102).
+        let watched = self.client.is_some() || self.fd_taken.load(Ordering::Relaxed);
+        if wait.is_none() && !watched && !self.has_work() {
+            return false;
+        }
         // Reset before taking completions: one that finishes after this signals it again.
-        if let Some(notify) = &self.notify {
+        if watched && let Some(notify) = &self.notify {
             notify.drain();
         }
+        self.enters
+            .store(self.enters.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         let entered = match wait {
             Some(t) if lock(&self.table).live > 0 || !t.is_zero() => {
                 let ts = types::Timespec::new()
@@ -1331,10 +1371,18 @@ impl crate::own::OwnIo for ThreadRing {
         if thread::current().id() != self.owner {
             return None;
         }
+        self.fd_taken.store(true, Ordering::Relaxed);
         match &self.epoll {
             Some(e) => Some(e.as_raw_fd()),
             None => self.notify.as_ref().map(EventFd::raw),
         }
+    }
+
+    fn enters_here(&self) -> u64 {
+        if thread::current().id() != self.owner {
+            return 0;
+        }
+        self.enters.load(Ordering::Relaxed)
     }
 }
 
