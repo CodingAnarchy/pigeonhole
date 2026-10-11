@@ -138,19 +138,7 @@ pub(crate) struct BalanceConfig {
     pub split_bytes: u64,
 }
 
-/// One shard's load as of its last balancer interval, read by every other shard.
-#[derive(Debug, Default)]
-#[repr(align(64))]
-pub(crate) struct LoadSlot {
-    /// Moving average of the rows written per interval.
-    pub writes: AtomicU64,
-    /// `(tablet, family)` slots promised to changes in flight that will hand this shard
-    /// tablets: every change checks them with the slots in the view, so concurrent moves
-    /// never take a shard past `max_slots` (#103).
-    pub reserved: AtomicUsize,
-    /// When it was published (monotonic nanoseconds; 0 = never).
-    pub at: AtomicU64,
-}
+pub(crate) use crate::load_slot::LoadSlot;
 
 /// Where a member's rows live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,9 +694,7 @@ impl ShardState {
     /// Whether `shard` can take `extra` more slots under [`ShardState::max_slots`], counting
     /// the slots other changes reserved there.
     fn slots_fit(&self, view: &View, shard: ShardId, extra: usize) -> bool {
-        let reserved = self.shared.loads[usize::from(shard.0)]
-            .reserved
-            .load(Ordering::Acquire);
+        let reserved = self.shared.loads[usize::from(shard.0)].reserved();
         Self::slots_in(view, shard) + reserved + extra <= self.max_slots()
     }
 
@@ -720,8 +706,7 @@ impl ShardState {
             if n == 0 {
                 continue;
             }
-            let slot = &self.shared.loads[usize::from(shard.0)].reserved;
-            let before = slot.fetch_add(n, Ordering::AcqRel);
+            let before = self.shared.loads[usize::from(shard.0)].reserve(n);
             out.push((shard, n));
             if Self::slots_in(view, shard) + before + n > self.max_slots() {
                 self.release_slots(&out);
@@ -738,9 +723,7 @@ impl ShardState {
 
     fn release_slots(&self, reserved: &[(ShardId, usize)]) {
         for &(shard, n) in reserved {
-            self.shared.loads[usize::from(shard.0)]
-                .reserved
-                .fetch_sub(n, Ordering::AcqRel);
+            self.shared.loads[usize::from(shard.0)].release(n);
         }
     }
 
@@ -1052,10 +1035,8 @@ impl ShardState {
         }
         self.note_arrivals();
         let (_, mem_per) = self.mem_bytes();
-        let slot = &self.shared.loads[usize::from(self.id.0)];
-        slot.writes
-            .store(self.load_ewma.round() as u64, Ordering::Relaxed);
-        slot.at.store(now.max(1), Ordering::Release);
+        self.shared.loads[usize::from(self.id.0)]
+            .publish(self.load_ewma.round() as u64, now.max(1));
         let idle = self.op.is_none()
             && self.op_queue.is_empty()
             && !self.closing
@@ -1338,9 +1319,8 @@ impl ShardState {
             let stale = cfg.interval_nanos.saturating_mul(3).max(1);
             let mut writes = vec![0u64; n];
             for (i, slot) in self.shared.loads.iter().enumerate() {
-                let at = slot.at.load(Ordering::Acquire);
-                if at != 0 && now.saturating_sub(at) <= stale {
-                    writes[i] = slot.writes.load(Ordering::Relaxed);
+                if let Some(w) = slot.read_fresh(now, stale) {
+                    writes[i] = w;
                 }
             }
             let settled: Vec<TabletEntry> = owned
