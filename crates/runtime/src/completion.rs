@@ -28,6 +28,8 @@ struct SlotState<T> {
     done: bool,
     waker: Option<Waker>,
     hook: Option<Hook<T>>,
+    /// The resolution has begun: its hook (if any) is taken, so a later one runs at once.
+    resolving: bool,
     /// A thread waits on `cv` (`Waiter::wait`).
     blocked: bool,
 }
@@ -39,7 +41,11 @@ impl<T> Slot<T> {
 
     fn resolve(&self, value: Option<T>) {
         // The hook runs outside the lock, before the value is visible.
-        let hook = self.lock().hook.take();
+        let hook = {
+            let mut s = self.lock();
+            s.resolving = true;
+            s.hook.take()
+        };
         if let Some(hook) = hook {
             hook(value.as_ref());
         }
@@ -84,6 +90,7 @@ fn new_slot<T>() -> Arc<Slot<T>> {
             done: false,
             waker: None,
             hook: None,
+            resolving: false,
             blocked: false,
         }),
         cv: Condvar::new(),
@@ -255,11 +262,57 @@ impl<T> Waiter<T> {
         let (value, waker, hook) = {
             let mut s = self.slot.lock();
             s.done = false;
+            s.resolving = false;
             s.blocked = false;
             (s.value.take(), s.waker.take(), s.hook.take())
         };
         drop((value, waker, hook));
         slots.push(Arc::clone(&self.slot));
+    }
+}
+
+impl<T: Send + 'static> Waiter<T> {
+    /// Calls `f` once the completion resolves (or its notifier is dropped): on the resolving
+    /// thread, or at once on this one if the resolution has begun. Its order against a hook
+    /// the notifier set is unspecified. For cleanup the
+    /// waiting side owns, such as releasing what a submission was charged, which must not
+    /// wait for anyone to poll or drop the waiter.
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicU32, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// let runs = Arc::new(AtomicU32::new(0));
+    /// let (notifier, waiter) = pigeonhole_runtime::completion::<u32>();
+    /// let r = Arc::clone(&runs);
+    /// waiter.on_settled(move || {
+    ///     r.fetch_add(1, Ordering::Relaxed);
+    /// });
+    /// assert_eq!(runs.load(Ordering::Relaxed), 0);
+    /// notifier.notify(7);
+    /// assert_eq!(runs.load(Ordering::Relaxed), 1);
+    /// let (notifier, waiter) = pigeonhole_runtime::completion::<u32>();
+    /// drop(notifier);
+    /// let r = Arc::clone(&runs);
+    /// waiter.on_settled(move || {
+    ///     r.fetch_add(1, Ordering::Relaxed);
+    /// }); // already resolved: runs now
+    /// assert_eq!(runs.load(Ordering::Relaxed), 2);
+    /// ```
+    pub fn on_settled(&self, f: impl FnOnce() + Send + 'static) {
+        let mut s = self.slot.lock();
+        if s.resolving || s.done {
+            drop(s);
+            f();
+            return;
+        }
+        s.hook = Some(match s.hook.take() {
+            None => Box::new(move |_| f()),
+            Some(earlier) => Box::new(move |v| {
+                earlier(v);
+                f();
+            }),
+        });
     }
 }
 
@@ -523,6 +576,30 @@ mod loom_tests {
             });
             notifier.join().unwrap();
             other.join().unwrap();
+        });
+    }
+
+    /// `on_settled` set from the waiting side while the notifier resolves on another
+    /// thread (D210): the callback and the notifier's hook each run exactly once, whichever
+    /// side gets there first.
+    #[test]
+    fn loom_on_settled_races_the_resolution() {
+        use loom::sync::atomic::{AtomicU32, Ordering};
+        loom::model(|| {
+            let runs = Arc::new(AtomicU32::new(0));
+            let (n, w) = completion::<u32>();
+            let h = Arc::clone(&runs);
+            n.on_resolve(move |_| {
+                h.fetch_add(10, Ordering::SeqCst);
+            });
+            let notifier = thread::spawn(move || n.notify(1));
+            let r = Arc::clone(&runs);
+            w.on_settled(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+            });
+            notifier.join().unwrap();
+            assert_eq!(w.wait_ref(), Some(1));
+            assert_eq!(runs.load(Ordering::SeqCst), 11);
         });
     }
 }

@@ -97,7 +97,30 @@ An error setting up the scan (an unknown family, a closed database) arrives as t
 - **Reads and scans:** dropping the future or the stream is always safe. Nothing is left half done.
 - **Transaction reads:** `Transaction::get_async` records the read when you call it, not when it resolves. A read future dropped unpolled still counts when the transaction commits: a write to that cell since the snapshot makes the commit fail with `Conflict`. That is conservative: it can add a conflict, never miss one.
 - **Flushes and compactions:** dropping `flush_async` or `compact_async` does not stop the operation; you lose only its result.
-- **Commits:** dropping a commit future after `commit_async` (or `commit_if_async`) returned does **not** roll the commit back. The commit lands or fails atomically either way, and you lose only its result. To submit now and learn the outcome later, keep the future, or use `WriteBatch::commit_with_ticket(durability)`. That returns a `CommitTicket`, which works without the `async` feature: `wait()` blocks, `try_result()` checks without blocking, `seqno()` is `Some` once the commit succeeded, and with `async` it can be awaited.
+- **Commits:** a commit future submits at the call when its shard has room; otherwise it waits for room first (see [Backpressure](#backpressure)). Once submitted, dropping the future does **not** roll the commit back: the commit lands or fails atomically either way, and you lose only its result. To submit now and learn the outcome later, keep the future, or use `WriteBatch::commit_with_ticket(durability)`. That returns a `CommitTicket`, which works without the `async` feature: `wait()` blocks, `try_result()` checks without blocking, `seqno()` is `Some` once the commit succeeded, and with `async` it can be awaited. A ticket always submits at the call.
+
+## Backpressure
+A shard holds at most half `memtable_budget` (32 MiB at the defaults) of async commits that are submitted and not yet resolved (D210). This keeps an async producer that outruns its shard, during a long write stall for example, from queuing without limit inside the engine.
+
+- **Over the bound, a commit future waits before it submits.** It submits once earlier commits on its shard resolve. Waiting futures go in the order they were made: a later small commit does not overtake an earlier large one. A commit larger than the bound goes alone.
+- **Polling submits it.** A waiting future submits only when it is polled (your executor polls it when it is woken).
+- **A future dropped while it waits for room writes nothing.** Only a future that has already submitted keeps D196's "dropping does not roll back".
+- **So fire and forget can lose commits.** `let _ = t.mutate(..).commit_async();` is safe only while the shard is under its bound. To write without waiting for the result, use `WriteBatch::commit_with_ticket` (it always submits) or a blocking `commit` on another thread. Otherwise keep the future and await it.
+- **Blocking commits are never held.** `commit`, `commit_with`, `commit_if` and `commit_with_ticket` are not counted against the bound, because each waits on its own thread.
+- **The bound covers what the engine holds.** A waiting future keeps its own batch, so making many futures without awaiting them still holds their memory in your program. Bound your concurrency (for example, a limited `FuturesUnordered`) and the bound slows you down instead.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("bp.phdb"), Options::default())?;
+# let t = pigeonhole::doc_support::table(&db, "t", &["f"])?;
+// Each commit is awaited: under the bound it submits at once; over it, the await waits for room.
+for i in 0..100u32 {
+    let commit = t.mutate(&i.to_be_bytes()).put("f", b"q", b"v").commit_async();
+    pigeonhole::doc_support::block_on(commit)?;
+}
+# Ok::<(), pigeonhole::Error>(())
+```
 
 ## When an async read blocks
 A few rare cases still read synchronously inside the future. Each one is counted in `Pigeonhole::async_sync_reads()` (and on `PigeonholeReader`), so you can see whether your workload hits them:

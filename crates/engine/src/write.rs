@@ -771,6 +771,11 @@ impl Txn {
         &mut self.batch
     }
 
+    /// The transaction commit's admission (D210; see [`Engine::admit`](crate::Engine::admit)).
+    pub fn admit(&self) -> crate::Admit {
+        self.engine.admit(&self.batch)
+    }
+
     /// Submits the transaction for validation and commit without waiting: the
     /// [`PendingCommit`] resolves as [`Txn::commit`] returns (an async caller polls it). It
     /// never blocks, so a thread that drives a shard may call it (D88).

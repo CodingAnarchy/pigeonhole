@@ -223,6 +223,8 @@ pub(crate) struct Inner {
     /// longer put is separated into a blob file when it is routed (#230). Atomic so a test
     /// can shrink it (`Engine::set_inline_value_limit`).
     max_value: AtomicUsize,
+    /// Async commits' backpressure (D210); writer only.
+    admission: Option<Arc<crate::admission::Admission>>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -971,6 +973,11 @@ impl Engine {
         config.pin_threads = options.pin_threads;
         config.compaction_threads = options.compaction_threads;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
+        let bound = match options.async_commit_bound {
+            0 => options.memtable_budget / 2,
+            b => b,
+        };
+        let admission = Some(Arc::new(crate::admission::Admission::new(shards, bound)));
         let inner = Arc::new(Inner {
             shared: Arc::clone(&shared),
             role: Role::Writer,
@@ -982,6 +989,7 @@ impl Engine {
             closing: AtomicBool::new(false),
             reader: None,
             max_value: AtomicUsize::new(max_value),
+            admission,
         });
         let engine = Arc::new(Engine {
             inner: Arc::clone(&inner),
@@ -1158,6 +1166,7 @@ impl Engine {
             closing: AtomicBool::new(false),
             reader: Some(reader),
             max_value: AtomicUsize::new(0),
+            admission: None,
         });
         Ok(Arc::new(Engine { inner }))
     }
@@ -1216,6 +1225,25 @@ impl Engine {
             .shared
             .default_durability
             .store(durability as u8, Ordering::Relaxed);
+    }
+
+    /// An async commit's admission for `batch` (D210): charged to the shard of its first row
+    /// (a cross-shard batch's coordinator) at once when that shard has room and no earlier
+    /// async commit waits, otherwise queued. Submit once [`Admit::poll_admit`] is ready,
+    /// then [`Admit::attach`] it to the submitted commit, which returns the charge when the
+    /// commit resolves. Blocking commits take no admission.
+    pub fn admit(&self, batch: &WriteBatch) -> crate::Admit {
+        self.inner.admit(batch)
+    }
+
+    /// Bytes of async commits charged to `shard` and not yet resolved (D210; tests and
+    /// benches).
+    #[doc(hidden)]
+    pub fn admission_inflight(&self, shard: usize) -> u64 {
+        self.inner
+            .admission
+            .as_ref()
+            .map_or(0, |a| a.inflight(shard))
     }
 
     /// Submits a batch: routes each row to its shard (inline if called on the owning shard),
@@ -2165,6 +2193,28 @@ impl PendingMaintenance {
 }
 
 impl Inner {
+    pub(crate) fn admit(&self, batch: &WriteBatch) -> crate::Admit {
+        let shard = self.admission.as_ref().map_or(0, |_| {
+            let view = self.shared.view.load();
+            let first = batch
+                .builder
+                .batch()
+                .iter()
+                .next()
+                .and_then(|m| m.ok())
+                .map(|m| (m.table, m.row.to_vec()))
+                .or_else(|| batch.row_deletes.first().map(|d| (d.table, d.row.clone())));
+            first
+                .and_then(|(t, row)| view.tablets().route(t, &row))
+                .map_or(0, |(_, s)| usize::from(s.0))
+        });
+        crate::Admit::new(
+            self.admission.as_ref(),
+            shard,
+            crate::admission::batch_bytes(batch),
+        )
+    }
+
     /// Enters application-thread maintenance: refused once the engine is closing, and the
     /// final close waits until the guard is dropped (7 F7-4).
     fn enter_maintenance(&self) -> Result<MaintenanceGuard<'_>> {
@@ -2680,6 +2730,9 @@ impl Inner {
         }
         if self.closing.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        if let Some(a) = &self.admission {
+            a.close();
         }
         let (tx, rx) = completion();
         *self

@@ -45,7 +45,7 @@ In the common overwrite pattern (each new version has a newer timestamp, so it i
 **Process.** A PR that changes `crates/bench/baselines/instruction-ceilings.txt` merges only when its base is the current main, so its CI measured the code it sets the ceilings for. A PR whose base predates a change to that file is rebased before it merges. The coordinator's merge script enforces both. Any other raise still needs an owner decision (D193).
 
 <a id="d196"></a>
-## D196 — The async front door: a commit ticket is a handle, misses wake on I/O through a cache-only read tier, and a scan step's unpredicted miss reads synchronously (approved; coordinator and owner, 2026-10-09; pigeonhole, engine, sst, #42; amends the spec's "Sync and async"; full scan fix deferred as #398)
+## D196 — The async front door: a commit ticket is a handle, misses wake on I/O through a cache-only read tier, and a scan step's unpredicted miss reads synchronously (approved; coordinator and owner, 2026-10-09; pigeonhole, engine, sst, #42; amends the spec's "Sync and async"; full scan fix deferred as #398; amended by D210)
 The spec's "Sync and async" section is built over the existing engine (#42). Three points needed a decision.
 
 ### Commit tickets are handles (amends the spec line on `commit_with_ticket`)
@@ -404,6 +404,27 @@ What a pass forces is otherwise unchanged; the mixed-temperature harness gives m
 - **#387's ratio to SQLite EAV** (row-read and scan p99, the documented gap) is judged on the same two runs. On the Mac at main 2d6b6ed it was 1.58× and 1.27× (D193: about 2.0× and 1.6×).
 
 *Checked by:* the first gate window's report (`report.py`), whose Phase 2 rows read both runs.
+
+## D210 — Async commits wait for room before they submit: a per-shard bound on async commits in flight; a future dropped before it submitted writes nothing (owner decision, 2026-10-10; engine, pigeonhole, runtime, #149; amends D196)
+
+**Why.** D196 made `commit_async` submit at the call. A shard queues whatever is submitted, so an async producer that outruns its shard (a long write stall, an application-owned shard its loop stopped running) queued without limit. Measured on #149: 200,000 × 4 KiB `commit_async` calls against a stopped shard returned in 116 ms and grew the process to 1,081 MiB, about 5.4 KiB per queued commit. Blocking commits never had this problem, because each holds its thread.
+
+**Now:**
+- **The bound.** Each shard holds at most half `memtable_budget` (2 MiB per 4 MiB arena; 32 MiB at the defaults) of async commits submitted and not yet resolved. Bytes are the encoded batch. A cross-shard batch is charged to its coordinator, the shard of its first row. The bound follows `memtable_budget`; there is no separate option (an `EngineOptions` override exists for tests).
+- **Over the bound, an async commit waits before it submits.** `commit_async`, `commit_with_async`, `commit_if_async` and `Transaction::commit_async`/`commit_with_async` submit at the call when their shard has room and no earlier async commit waits. Otherwise the future waits in its shard's queue, in arrival order, and submits when it's first and fits. A commit larger than the bound goes alone once the shard holds nothing. A later commit never overtakes an earlier waiting one, even if it would fit.
+- **The charge is returned when the commit resolves,** on the resolving thread (a hook on the completion, `Waiter::on_settled` in `pigeonhole-runtime`), whether or not anyone polls the future.
+- **A future dropped before it submitted writes nothing** (amends D196, which said dropping a commit future never rolls it back). Once submitted, dropping still does not roll the commit back. So "fire and forget" (`let _ = t.mutate(..).commit_async();`) is safe only while the shard is under its bound. When it's over, the dropped commit is lost. Keep the future and await it, or use a blocking `commit` or `commit_with_ticket`.
+- **Blocking commits and `commit_with_ticket` are not charged and never wait for admission.** Their threads bound them, and their path is unchanged.
+- **What it bounds.** The memory a *shard* holds for async commits. A waiting future still holds its own batch, so a caller that makes many futures without awaiting them holds that memory itself. Producers that await, such as a bounded `FuturesUnordered` or a task per request, are slowed instead of queuing in the engine.
+- **On close,** every waiter is admitted and its submission fails with `Closed`.
+
+*Checked by:* `pigeonhole/tests/backpressure.rs`:
+- 200,000 commits against a stopped shard stay within the bound, and all commit in arrival order once it runs;
+- a small commit waits behind an earlier larger one;
+- a blocking commit is not held;
+- a dropped waiting commit writes nothing.
+
+The engine's `admission` tests cover a commit larger than the bound. The commit shapes' instruction counts are unchanged (blocking path).
 
 <a id="d211"></a>
 ## D211 — No manifest checkpoint may name a WAL stream whose file creation is not durable (coordinator decision, 2026-10-11; engine, wal, #520; ICR 0031; amends D203)

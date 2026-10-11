@@ -297,6 +297,16 @@ impl Pigeonhole {
         self.db.engine.metrics()
     }
 
+    /// Bytes of async commits each shard holds submitted and not yet resolved (D210): a
+    /// test hook. At most half `memtable_budget` a shard, or one commit larger than that
+    /// alone.
+    #[doc(hidden)]
+    pub fn async_commit_inflight(&self) -> Vec<u64> {
+        (0..self.db.engine.shard_stats().len())
+            .map(|s| self.db.engine.admission_inflight(s))
+            .collect()
+    }
+
     /// File reads made synchronously inside async reads since open (D196, #398): a
     /// separated value too large to cache, or a block the cache could not keep. Zero means
     /// no async read blocked its executor thread on the file.
