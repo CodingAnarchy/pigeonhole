@@ -24,7 +24,7 @@ The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated 
    crates/bench/baselines/phase3-gate/data-disk.sh /dev/disk/by-id/nvme-MODEL_SERIAL --format   # check again, then mkfs.xfs and mount on /data
    ```
    Use the by-id name the listing shows with no partitions and nothing mounted. **Never type `mkfs` on a `/dev/nvmeXn1` name by hand.** After a reboot, mount it by the same id: `mount -o noatime /dev/disk/by-id/nvme-MODEL_SERIAL /data`.
-4. **Check the drive.** `nvme id-ctrl "$(readlink -f /dev/disk/by-id/nvme-MODEL_SERIAL)" | grep -E '^(mn|fr|vwc)'` shows the model, firmware and write cache. A Datacenter Edition drive has power-loss protection. The setup step records this in `machine.json`, and warns if the write cache is volatile.
+4. **Check the drive.** `nvme id-ctrl "$(readlink -f /dev/disk/by-id/nvme-MODEL_SERIAL)" | grep -E '^(mn|fr|vwc)'` shows the model, firmware and write cache. A Datacenter Edition drive has power-loss protection. The setup step records this in `machine.json`, and warns if the write cache is volatile. **Expect that warning on the AX102:** its Samsung PM9A3 reports `vwc 0x6` (a volatile write cache present) although it has power-loss protection, so the warning is expected on data-center drives and doesn't invalidate the run.
 
 ## Running
 
@@ -33,6 +33,7 @@ tmux new -s gate
 crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date +%Y%m%d)
 ```
 
+- **cargo on PATH:** a fresh tmux shell isn't a login shell, so it may not have `~/.cargo/bin`, where `setup.sh`'s rustup puts cargo. `run-window.sh` sources `~/.cargo/env` when cargo isn't on PATH, and stops with a clear message if cargo is still missing. To run cargo by hand in the pane, `source ~/.cargo/env` first.
 - **Detach** (`Ctrl-b d`) and come back later. Nothing else should run on the machine meanwhile: the setup step refuses to start above a load of 1.0.
 - **The steps:**
   1. `setup`: records the machine, and refuses a setup that would not count.
