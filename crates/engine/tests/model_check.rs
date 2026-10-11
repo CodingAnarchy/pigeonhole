@@ -145,6 +145,17 @@ fn harness_regressions_from_the_seed_sweep() {
     // syncs that only the harness completes. The simulator's device now runs for the
     // harness thread's blocked waits (ICR 0028).
     identical_across_shard_counts_under_faults(213, Some(true));
+    // Seed 41 with deferred I/O (#508): a power loss during a rollover left a successor's
+    // records in a recycled slot without their header; the 8 -> 4 shard reopen took that
+    // header's epoch in the same slot, and the records (a PREPARE of a lost commit) replayed
+    // at the next check. Recovery now skips that epoch (D209). The failure depended on real
+    // threads' timing, so the seed reproduces it only sometimes; the WAL's own crash tests
+    // reproduce it deterministically.
+    let mut cfg = Config::standard(400);
+    cfg.shards = 3;
+    cfg.reopen_shards = vec![1, 5, 2, 8, 4];
+    cfg.deferred_io = true;
+    check(41, &cfg);
 }
 
 /// Transactions under frequent injected read errors, no crash armed.
