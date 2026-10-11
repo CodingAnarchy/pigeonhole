@@ -413,6 +413,7 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         visibility_wake_passes: m.visibility_wakes.0,
         visibility_woken: m.visibility_wakes.1,
         visibility_contended: m.visibility_contended,
+        slot_refusals: db.tablet_refusals().0,
     }
 }
 

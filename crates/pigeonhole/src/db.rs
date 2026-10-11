@@ -297,6 +297,13 @@ impl Pigeonhole {
         self.db.engine.metrics()
     }
 
+    /// Tablet changes refused for lack of room since open, as `(slot budget, view size)`:
+    /// see the engine's `tablet_refusals`. A bench hook (#123).
+    #[doc(hidden)]
+    pub fn tablet_refusals(&self) -> (u64, u64) {
+        self.db.engine.tablet_refusals()
+    }
+
     /// Bytes of async commits each shard holds submitted and not yet resolved (D210): a
     /// test hook. At most half `memtable_budget` a shard, or one commit larger than that
     /// alone.
