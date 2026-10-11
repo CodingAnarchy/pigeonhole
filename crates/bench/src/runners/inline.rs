@@ -291,6 +291,15 @@ impl PigeonholeRunner {
                 Vec::new()
             };
             if !keys.is_empty() {
+                // Every shard spends its one balancer pass now, before any piece arrives
+                // (D213). With the balancer off, a shard still runs a single pass at its
+                // first turn, and a pass that is a shard's first counts the tablets it then
+                // owns as settled: a shard idle until the split would see its cold piece as
+                // settled and consolidate it onto its left neighbour's shard, as on the AX102
+                // at 32 shards. A flush sends every shard a message, so each takes that turn
+                // here; the pause lets the last of them finish it.
+                db.flush().map_err(err)?;
+                std::thread::sleep(Duration::from_millis(100));
                 t.split_over_shards(keys).map_err(err)?;
                 one_tablet_each(&db, "after the pre-split")?;
             }
