@@ -130,12 +130,15 @@ impl CommitFuture {
     fn from_async(r: Result<AsyncCommit<Submitted>>) -> Self {
         match r {
             Ok(AsyncCommit::Submitted(s)) => Self::new(Ok(s)),
-            Ok(AsyncCommit::Wait(admit, submit)) => Self {
-                state: State::Waiting(Box::new(Waiting {
-                    admit,
-                    submit: Some(submit),
-                })),
-            },
+            Ok(AsyncCommit::Wait(wait)) => {
+                let (admit, submit) = *wait;
+                Self {
+                    state: State::Waiting(Box::new(Waiting {
+                        admit,
+                        submit: Some(submit),
+                    })),
+                }
+            }
             Err(e) => Self::new(Err(e)),
         }
     }
@@ -152,14 +155,8 @@ impl Future for CommitFuture {
     type Output = Result<CommitInfo>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let State::Waiting(w) = &mut self.state {
-            let Poll::Ready((admit, submitted)) = w.poll_submit(cx) else {
-                return Poll::Pending;
-            };
-            *self = Self::submitted(Some(admit), submitted);
-        }
         match &mut self.state {
-            State::Waiting(_) => unreachable!("submitted above"),
+            State::Waiting(_) => self.poll_waiting(cx),
             State::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
                 Poll::Ready(r) => {
                     let out = s.outcome(r);
@@ -175,6 +172,23 @@ impl Future for CommitFuture {
                 ))
             })),
         }
+    }
+}
+
+impl CommitFuture {
+    /// Polls a commit still waiting for room (D210): once admitted, it submits and goes on
+    /// as a submitted commit. Out of line: the uncommon state.
+    #[cold]
+    #[inline(never)]
+    fn poll_waiting(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<CommitInfo>> {
+        let State::Waiting(w) = &mut self.state else {
+            unreachable!("only called while waiting");
+        };
+        let Poll::Ready((admit, submitted)) = w.poll_submit(cx) else {
+            return Poll::Pending;
+        };
+        *self = Self::submitted(Some(admit), submitted);
+        self.poll(cx)
     }
 }
 
@@ -214,10 +228,13 @@ impl RowMutation<'_> {
         CheckFuture {
             state: match self.submit_if_async(condition) {
                 Ok(AsyncCommit::Submitted(s)) => CheckState::Pending(s),
-                Ok(AsyncCommit::Wait(admit, submit)) => CheckState::Waiting(Box::new(Waiting {
-                    admit,
-                    submit: Some(submit),
-                })),
+                Ok(AsyncCommit::Wait(wait)) => {
+                    let (admit, submit) = *wait;
+                    CheckState::Waiting(Box::new(Waiting {
+                        admit,
+                        submit: Some(submit),
+                    }))
+                }
                 Err(e) => CheckState::Ready(Some(Err(e))),
             },
         }

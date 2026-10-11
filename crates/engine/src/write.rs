@@ -778,20 +778,16 @@ impl Txn {
         self,
         durability: Option<Durability>,
     ) -> crate::Result<crate::AsyncSubmit<PendingCommit, Txn>> {
-        let arg = match self.engine.fast_admit(None, &self.batch) {
+        let charge = match self.engine.fast_admit(None, &self.batch) {
             crate::engine::FastAdmit::Wait(admit) => {
-                return Ok(crate::AsyncSubmit::Wait(self, admit));
+                return Ok(crate::AsyncSubmit::Wait(Box::new((self, admit))));
             }
-            crate::engine::FastAdmit::Charged(arg) => Some(arg),
-            crate::engine::FastAdmit::Unbounded => None,
+            crate::engine::FastAdmit::Charged(charge) => charge,
         };
-        let engine = Arc::clone(&self.engine);
-        let submitted = self.submit(durability);
-        Ok(crate::AsyncSubmit::Submitted(engine.settle_on(
-            arg,
-            submitted,
-            |p| &p.waiter,
-        )?))
+        let mut charge = charge;
+        let pending = self.submit(durability)?;
+        charge.attach(&pending.waiter);
+        Ok(crate::AsyncSubmit::Submitted(pending))
     }
 
     /// Submits the transaction for validation and commit without waiting: the

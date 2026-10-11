@@ -175,6 +175,37 @@ impl Admission {
     }
 }
 
+/// A fast-path charge (D210) on its way into a commit's completion: returned when the
+/// completion resolves, or here when the submission fails before it has one.
+pub(crate) struct Charge(Option<(Arc<Admission>, u64)>);
+
+impl Charge {
+    /// Nothing charged (a blocking commit, or no admission).
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    pub(crate) fn new(admission: &Arc<Admission>, arg: u64) -> Self {
+        Self(Some((Arc::clone(admission), arg)))
+    }
+
+    /// Hands the charge to a submitted commit's completion, which returns it when it
+    /// resolves.
+    pub(crate) fn attach<T: Send>(&mut self, waiter: &pigeonhole_runtime::Waiter<T>) {
+        if let Some((a, arg)) = self.0.take() {
+            waiter.on_settled(a, arg);
+        }
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some((a, arg)) = self.0.take() {
+            a.release_arg(arg);
+        }
+    }
+}
+
 /// A release argument's layout: the shard (or [`FAST`]) above the bytes.
 const SHARD_SHIFT: u32 = 48;
 const BYTES_MASK: u64 = (1 << SHARD_SHIFT) - 1;

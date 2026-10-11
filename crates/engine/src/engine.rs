@@ -285,14 +285,15 @@ pub enum AsyncSubmit<P, B> {
     /// Submitted; its charge comes back when it resolves.
     Submitted(P),
     /// Over the bound: submit `B` once the [`Admit`](crate::Admit) is ready, then attach
-    /// the admit to the submitted commit.
-    Wait(B, crate::Admit),
+    /// the admit to the submitted commit. Boxed: the rare case, kept out of the
+    /// submitted one's size.
+    Wait(Box<(B, crate::Admit)>),
 }
 
-/// [`Inner::fast_admit`]'s outcome.
+/// [`Inner::fast_admit`]'s outcome: a charge (none when unbounded) to submit with, or the
+/// admission to wait on.
 pub(crate) enum FastAdmit {
-    Unbounded,
-    Charged(u64),
+    Charged(crate::admission::Charge),
     Wait(crate::Admit),
 }
 
@@ -1347,17 +1348,15 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<AsyncSubmit<PendingCommit, WriteBatch>> {
-        let arg = match self.inner.fast_admit(None, &batch) {
-            FastAdmit::Wait(admit) => return Ok(AsyncSubmit::Wait(batch, admit)),
-            FastAdmit::Charged(arg) => Some(arg),
-            FastAdmit::Unbounded => None,
-        };
-        let submitted = self.inner.submit(batch, durability, None, None);
-        Ok(AsyncSubmit::Submitted(self.inner.settle_on(
-            arg,
-            submitted,
-            |p| &p.waiter,
-        )?))
+        match self.inner.fast_admit(None, &batch) {
+            FastAdmit::Wait(admit) => Ok(AsyncSubmit::Wait(Box::new((batch, admit)))),
+            FastAdmit::Charged(mut charge) => {
+                // A failed submission drops the charge, which returns it.
+                let pending = self.inner.submit(batch, durability, None, None)?;
+                charge.attach(&pending.waiter);
+                Ok(AsyncSubmit::Submitted(pending))
+            }
+        }
     }
 
     /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) for an async commit, as
@@ -1370,19 +1369,16 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<AsyncSubmit<PendingCheck, WriteBatch>> {
-        let arg = match self.inner.fast_admit(Some((table, row)), &batch) {
-            FastAdmit::Wait(admit) => return Ok(AsyncSubmit::Wait(batch, admit)),
-            FastAdmit::Charged(arg) => Some(arg),
-            FastAdmit::Unbounded => None,
+        let mut charge = match self.inner.fast_admit(Some((table, row)), &batch) {
+            FastAdmit::Wait(admit) => return Ok(AsyncSubmit::Wait(Box::new((batch, admit)))),
+            FastAdmit::Charged(charge) => charge,
         };
-        let submitted = self
+        // A failed submission drops the charge, which returns it.
+        let pending = self
             .inner
-            .submit_check_and_mutate(table, row, predicate, batch, durability);
-        Ok(AsyncSubmit::Submitted(self.inner.settle_on(
-            arg,
-            submitted,
-            |p| &p.waiter,
-        )?))
+            .submit_check_and_mutate(table, row, predicate, batch, durability)?;
+        charge.attach(&pending.waiter);
+        Ok(AsyncSubmit::Submitted(pending))
     }
 
     /// Starts an optimistic transaction (Phase 4).
@@ -2271,29 +2267,12 @@ impl Inner {
         batch: &WriteBatch,
     ) -> FastAdmit {
         let Some(a) = &self.admission else {
-            return FastAdmit::Unbounded;
+            return FastAdmit::Charged(crate::admission::Charge::none());
         };
         match a.try_fast(crate::admission::batch_bytes(batch)) {
-            Some(arg) => FastAdmit::Charged(arg),
+            Some(arg) => FastAdmit::Charged(crate::admission::Charge::new(a, arg)),
             None => FastAdmit::Wait(self.admit_routed(row, batch)),
         }
-    }
-
-    /// Hands a fast charge to the submitted commit (returned when it resolves), or back
-    /// at once when the submission failed.
-    pub(crate) fn settle_on<P, T: Send>(
-        &self,
-        arg: Option<u64>,
-        submitted: Result<P>,
-        waiter: impl FnOnce(&P) -> &pigeonhole_runtime::Waiter<T>,
-    ) -> Result<P> {
-        if let (Some(arg), Some(a)) = (arg, &self.admission) {
-            match &submitted {
-                Ok(p) => waiter(p).on_settled(Arc::clone(a) as _, arg),
-                Err(_) => a.release_arg(arg),
-            }
-        }
-        submitted
     }
 
     /// Admits `batch` on the shard of `row` when given, else of the batch's first row.

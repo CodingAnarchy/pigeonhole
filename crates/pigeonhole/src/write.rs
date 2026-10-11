@@ -173,17 +173,18 @@ impl Builder {
                 largest_value,
                 max_value,
             })),
-            Ok(AsyncSubmit::Wait(batch, admit)) => {
+            Ok(AsyncSubmit::Wait(wait)) => {
+                let (batch, admit) = *wait;
                 let db = Arc::clone(db);
                 let builder = Builder {
                     batch,
                     error: None,
                     largest_value,
                 };
-                Ok(AsyncCommit::Wait(
+                Ok(AsyncCommit::Wait(Box::new((
                     admit,
                     Box::new(move || builder.submit(&db, durability)),
-                ))
+                ))))
             }
             Err(e) => Err(commit_error(e, largest_value, max_value)),
         }
@@ -222,11 +223,17 @@ impl Builder {
 #[cfg(feature = "async")]
 pub(crate) enum AsyncCommit<S> {
     Submitted(S),
-    Wait(
-        pigeonhole_engine::Admit,
-        Box<dyn FnOnce() -> Result<S> + Send>,
-    ),
+    /// Boxed: the rare case, kept out of the submitted one's size.
+    Wait(Box<Deferred<S>>),
 }
+
+/// A commit waiting for room (D210): its admission and the submission to run once
+/// admitted.
+#[cfg(feature = "async")]
+pub(crate) type Deferred<S> = (
+    pigeonhole_engine::Admit,
+    Box<dyn FnOnce() -> Result<S> + Send>,
+);
 
 /// A commit handed to the engine and not yet resolved, with what its error needs: the base
 /// of async commits and of [`CommitTicket`].
@@ -561,9 +568,10 @@ impl RowMutation<'_> {
                 largest_value,
                 max_value,
             })),
-            Ok(AsyncSubmit::Wait(batch, admit)) => {
+            Ok(AsyncSubmit::Wait(wait)) => {
+                let (batch, admit) = *wait;
                 let (db, row) = (Arc::clone(db), self.row);
-                Ok(AsyncCommit::Wait(
+                Ok(AsyncCommit::Wait(Box::new((
                     admit,
                     Box::new(move || {
                         db.engine
@@ -575,7 +583,7 @@ impl RowMutation<'_> {
                             })
                             .map_err(|e| commit_error(e, largest_value, max_value))
                     }),
-                ))
+                ))))
             }
             Err(e) => Err(commit_error(e, largest_value, max_value)),
         }
@@ -1007,17 +1015,18 @@ impl Transaction {
                 largest_value,
                 max_value,
             })),
-            Ok(AsyncSubmit::Wait(txn, admit)) => {
+            Ok(AsyncSubmit::Wait(wait)) => {
+                let (txn, admit) = *wait;
                 let t = Transaction {
                     db,
                     txn,
                     error: None,
                     largest_value,
                 };
-                Ok(AsyncCommit::Wait(
+                Ok(AsyncCommit::Wait(Box::new((
                     admit,
                     Box::new(move || t.submit(durability)),
-                ))
+                ))))
             }
             Err(e) => Err(commit_error(e, largest_value, max_value)),
         }
