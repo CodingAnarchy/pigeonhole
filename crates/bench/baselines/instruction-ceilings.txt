@@ -72,6 +72,10 @@
 # Re-baselined after #483, #497, #498 and #500 (main 07a0fe2): lowered with
 # `instruction-ceilings.py lower` from the higher of this PR's base and head counts (run
 # 38092917766); counter keeps its permanent 0.5% headroom. Nothing rose.
+#
+# commit-async (writepath, D210: an uncontended `commit_async`, awaited) added with #521 from
+# its head's counts in scratch A/B run 38115353068: 10017-10030 (main before D210: 9782-9787),
+# so 10030 times 1.003.
 as-written 2051 0.3
 flushed 1865 0.3
 compacted 1257 0.3
@@ -97,3 +101,4 @@ commit-at 10725 0.3
 scan-narrow 1435 0.3
 scan-small 1411 0.3
 scan-wide 1331 0.3
+commit-async 10061 0.3
