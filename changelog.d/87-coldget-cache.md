@@ -1,0 +1,2 @@
+### Changed
+- The cold-get bench (`examples/coldget.rs`, `phase3-io/cold-get.sh`) takes its block cache from `COLDGET_CACHE_MIB` and records it in each result line. The gate window runs it at 1/64 of the table (1024 MiB for 64 GiB; D215), so the pinned top indexes and filters and the index partitions stay cached and a cold get is one I/O. The first gate run's 64 MiB cache measured about two I/Os per get; results from before this aren't comparable.

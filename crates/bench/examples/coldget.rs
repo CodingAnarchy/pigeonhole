@@ -11,14 +11,19 @@
 //! in a random key order, so background compaction builds the leveled tree a random-insert
 //! workload has (no final full compaction), then waits for compaction to go quiet.
 //!
-//! `get` reopens it with a 64 MiB block cache and runs, on `COLDGET_THREADS` threads
-//! (default 1), `COLDGET_WARMUP` warm-up gets (default 100,000), then `COLDGET_GETS` measured
-//! gets (default 1,000,000) of rows chosen uniformly from the whole table, then as many gets
-//! of absent rows. An absent row sorts between two present ones, so only a filter rules it
-//! out. It prints one JSON line per phase: latency percentiles, gets per second,
-//! block-cache misses per get (each miss is one block read from the file), and, when
-//! `COLDGET_BLOCKDEV` names a Linux block device (`nvme0n1`, `md0`), the device's completed
-//! reads per get from `/sys/block/DEV/stat`.
+//! `get` reopens it with a block cache of `COLDGET_CACHE_MIB` mebibytes (default 64) and runs,
+//! on `COLDGET_THREADS` threads (default 1), `COLDGET_WARMUP` warm-up gets (default 100,000),
+//! then `COLDGET_GETS` measured gets (default 1,000,000) of rows chosen uniformly from the
+//! whole table, then as many gets of absent rows. An absent row sorts between two present
+//! ones, so only a filter rules it out. It prints one JSON line per phase: latency
+//! percentiles, gets per second, block-cache misses per get (each miss is one block read from
+//! the file), the cache size, and, when `COLDGET_BLOCKDEV` names a Linux block device
+//! (`nvme0n1`, `md0`), the device's completed reads per get from `/sys/block/DEV/stat`.
+//!
+//! One I/O per get needs a cache that holds the table's index (D215): every SST's top index
+//! and filters stay pinned in the block cache, and the index partitions must stay cached
+//! beside them, about 0.5-0.7% of the data at this row shape. With less, each get also reads
+//! its index partition: about two I/Os.
 //!
 //! It measures nothing about the page cache: open with direct I/O (`PIGEONHOLE_DIRECT=1`),
 //! or cap the process's memory (a cgroup) and empty the page cache before each `get`, as
@@ -35,6 +40,7 @@ use pigeonhole_bench::Histogram;
 const VALUE: usize = 1024;
 /// Rows per batch while loading.
 const BATCH: u64 = 256;
+/// The block cache while loading, and `get`'s default.
 const CACHE: usize = 64 << 20;
 
 fn key(i: u64) -> Vec<u8> {
@@ -74,8 +80,8 @@ impl Rng {
     }
 }
 
-fn open(dir: &Path) -> Pigeonhole {
-    Pigeonhole::open(dir.join("cold.phdb"), Options::default().block_cache(CACHE)).unwrap()
+fn open(dir: &Path, cache: usize) -> Pigeonhole {
+    Pigeonhole::open(dir.join("cold.phdb"), Options::default().block_cache(cache)).unwrap()
 }
 
 fn rows_file(dir: &Path) -> std::path::PathBuf {
@@ -84,7 +90,7 @@ fn rows_file(dir: &Path) -> std::path::PathBuf {
 
 fn load(dir: &Path, mib: u64) {
     std::fs::create_dir_all(dir).unwrap();
-    let db = open(dir);
+    let db = open(dir, CACHE);
     db.set_default_durability(Durability::Buffered);
     let t = db
         .table("t")
@@ -218,7 +224,8 @@ fn get(dir: &Path) {
     let dev = std::env::var("COLDGET_BLOCKDEV").ok();
     let env = |k: &str| std::env::var(k).unwrap_or_default();
 
-    let db = open(dir);
+    let cache_mib = env_or("COLDGET_CACHE_MIB", (CACHE >> 20) as u64);
+    let db = open(dir, (cache_mib as usize) << 20);
     let t = db.table("t").unwrap().open().unwrap();
     run(&t, threads, warmup, rows, 1, key);
     for (phase, row, seed) in [
@@ -241,7 +248,8 @@ fn get(dir: &Path) {
             "{{\"phase\":\"{phase}\",\"rows\":{rows},\"threads\":{threads},\"gets\":{},\
              \"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"max_us\":{:.1},\
              \"found\":{:.4},\"gets_per_sec\":{:.0},\"cache_misses_per_get\":{:.3},\
-             \"device_reads_per_get\":{device},\"io\":\"{}\",\"direct\":\"{}\"}}",
+             \"device_reads_per_get\":{device},\"cache_mib\":{cache_mib},\"io\":\"{}\",\
+             \"direct\":\"{}\"}}",
             hist.count(),
             us(0.5),
             us(0.99),
