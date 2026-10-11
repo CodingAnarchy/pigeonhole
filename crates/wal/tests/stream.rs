@@ -155,13 +155,15 @@ fn recovery_starts_a_fresh_chained_segment() {
     let (got, r) = replay(&vfs, Lsn::default()).unwrap();
     assert_eq!(got.end, t1.end);
     let mut wal = r.into_stream(opts).unwrap();
-    assert_eq!(wal.written().epoch(), 2, "epoch above every header");
+    // Max seen (1) + 3: the epochs after it may be on stale frames of successors whose
+    // headers never reached the disk (FORMAT §10.1 rule 2, D209).
+    assert_eq!(wal.written().epoch(), 4, "epoch three above every header");
     assert!(
-        wal.durable() >= Lsn::new(2, FRAME_SIZE as u32),
+        wal.durable() >= Lsn::new(4, FRAME_SIZE as u32),
         "header is synced"
     );
     let hs = headers(&vfs, opts.segment_size);
-    let h = hs.iter().flatten().find(|h| h.epoch == 2).unwrap();
+    let h = hs.iter().flatten().find(|h| h.epoch == 4).unwrap();
     assert_eq!((h.prev_epoch, h.prev_end), (1, t1.end.offset()));
 
     let t2 = wal
@@ -174,16 +176,16 @@ fn recovery_starts_a_fresh_chained_segment() {
     assert_eq!(got.end, t2.end);
     // A third incarnation chains to the second.
     let wal = r.into_stream(opts).unwrap();
-    assert_eq!(wal.written().epoch(), 3);
+    assert_eq!(wal.written().epoch(), 7);
     let hs = headers(&vfs, opts.segment_size);
-    let h = hs.iter().flatten().find(|h| h.epoch == 3).unwrap();
-    assert_eq!((h.prev_epoch, h.prev_end), (2, t2.end.offset()));
+    let h = hs.iter().flatten().find(|h| h.epoch == 7).unwrap();
+    assert_eq!((h.prev_epoch, h.prev_end), (4, t2.end.offset()));
     // Replaying from the checkpoint at the recovered end finds nothing; the log ends at the
     // start of the empty segment chained there.
     drop(wal);
     let (got, _) = replay(&vfs, t2.end).unwrap();
     assert!(got.records.is_empty());
-    assert_eq!(got.end, Lsn::new(3, FRAME_SIZE as u32));
+    assert_eq!(got.end, Lsn::new(7, FRAME_SIZE as u32));
 }
 
 #[test]
@@ -481,11 +483,11 @@ fn checkpoint_in_a_segment_that_never_reached_disk() {
     let mut wal = r.into_stream(opts).unwrap();
     assert_eq!(
         wal.written().epoch(),
-        3,
-        "above the checkpoint's epoch, even if never on disk"
+        5,
+        "three above the checkpoint's epoch, even if never on disk (D209)"
     );
     let hs = headers(&vfs2, opts.segment_size);
-    let h = hs.iter().flatten().find(|h| h.epoch == 3).unwrap();
+    let h = hs.iter().flatten().find(|h| h.epoch == 5).unwrap();
     assert_eq!((h.prev_epoch, h.prev_end), (2, t2.end.offset()));
     let t3 = wal
         .append(&batch(3, 10).record(), Durability::GroupSync)

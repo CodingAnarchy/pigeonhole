@@ -6,6 +6,16 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-11
+A fix to WAL crash recovery. **Upgrade recommended** for every 0.2.0 user. The file format is unchanged, and files written by 0.2.0 open as before. Every published crate moves to 0.2.1 together.
+
+### Fixed
+- **Records the WAL had lost could come back after a later recovery** (#508, D209).
+  - **When:** a power loss (not a process crash) while a WAL segment was starting in a reused slot. The disk had to keep part of that write (the first records) and lose the rest (the segment's header). The database then had to reopen, write little or nothing more to that WAL stream, and recover again later.
+  - **What happened:** recovery correctly ignored those records the first time. But the reopened stream reused the lost header's numbering in the same slot, so at the next recovery the old records read as new ones.
+  - **Effect:** writes that a power loss should have discarded could reappear. Their sequence numbers could also be reused by newer commits, mixing old and new data in recovery. The records that come back are only ever ones that were never synced.
+  - **The fix:** recovery now starts a reopened stream three numbers above the largest it saw (FORMAT §10.1). Nothing reads or writes differently otherwise.
+
 ## [0.2.0] - 2026-10-09
 The **Phase 2 wide-column model**: counter families, large values and blob separation, per-family compaction styles and zstd, a file at rest near its live size, and the read- and write-path work that met the Phase 2 gate as amended by [D193](docs/design/decisions/phase-2.md#d193). Counters change in a breaking way, and the file format is version 2; see [Migrating from 0.1.0](#migrating-from-010). Every published crate moves to 0.2.0 together.
 
@@ -86,6 +96,7 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0
