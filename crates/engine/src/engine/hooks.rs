@@ -1026,11 +1026,7 @@ impl Engine {
     /// (test hook).
     #[doc(hidden)]
     pub fn final_close_pending(&self) -> bool {
-        self.inner
-            .shared
-            .close
-            .final_pending
-            .load(Ordering::Acquire)
+        self.inner.shared.close.pending()
     }
 
     /// Whether the final close has run (test hook: application-owned shards finish the close

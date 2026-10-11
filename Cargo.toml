@@ -77,7 +77,7 @@ min-age = "1h"
 [workspace.lints.rust]
 missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(pigeonhole_sim)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(engine_loom)", "cfg(pigeonhole_sim)"] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"

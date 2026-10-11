@@ -1016,10 +1016,9 @@ pub(crate) fn claim(shared: &Shared) -> bool {
 /// Releases the exclusion, then runs the close's final step if it was waiting for it, and
 /// wakes the threads waiting to claim it.
 pub(crate) fn release(shared: &Shared) {
+    // Stored before `try_final_close` takes the close's lock: a reporter that took it
+    // first and found the exclusion held is seen pending here (`close_gate`).
     shared.manifest_busy.store(false, Ordering::Release);
-    // Pairs with the fence in `Shared::try_final_close`: either it claims the exclusion
-    // released here, or this sees its pending flag.
-    std::sync::atomic::fence(Ordering::SeqCst);
     shared.try_final_close();
     shared.manifest_flight.wake_threads();
 }

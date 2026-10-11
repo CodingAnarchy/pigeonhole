@@ -617,15 +617,8 @@ impl Engine {
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
-            maintenance: AtomicUsize::new(0),
             pager_poisoned: AtomicBool::new(false),
-            close: CloseState {
-                remaining: AtomicUsize::new(shards),
-                done: Mutex::new(None),
-                failed: AtomicBool::new(false),
-                final_pending: AtomicBool::new(false),
-                outcome: Mutex::new(None),
-            },
+            close: CloseState::new(shards),
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             ts_floors: (0..shards)
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
@@ -1134,9 +1127,8 @@ impl Engine {
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
-            maintenance: AtomicUsize::new(0),
             pager_poisoned: AtomicBool::new(false),
-            close: CloseState::default(),
+            close: CloseState::new(0),
             metrics: Vec::new(),
             ts_floors: Vec::new(),
             ts_raises: Vec::new(),
@@ -2826,31 +2818,14 @@ impl Inner {
             a.close();
         }
         let (tx, rx) = completion();
-        *self
-            .shared
-            .close
-            .done
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
         // Every shard may have reported already (dropped, or its thread panicked) and the
-        // final close run before `done` was set: answer it here. The final close records
-        // its outcome before it takes `done`, so one of the two sides sees the other.
-        if let Some(outcome) = self
+        // final close run before this: then it is answered at once (`close_gate`).
+        if let Some((tx, outcome)) = self
             .shared
             .close
-            .outcome
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            && let Some(tx) = self
-                .shared
-                .close
-                .done
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
+            .register(tx, |o| o.as_ref().copied().map_err(Error::duplicate))
         {
-            tx.notify(outcome.as_ref().copied().map_err(Error::duplicate));
+            tx.notify(outcome);
         }
         if let Some(submitters) = self.shared.submitters.get() {
             for s in submitters {
@@ -3344,11 +3319,7 @@ impl EngineShard {
         self.engine
             .shared
             .close
-            .outcome
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|r| r.as_ref().copied().map_err(Error::duplicate))
+            .outcome(|r| r.as_ref().copied().map_err(Error::duplicate))
     }
 
     /// The earliest deadline (VFS `monotonic_nanos`) of background work sleeping on this
