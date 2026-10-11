@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError, Weak};
+use std::sync::{Arc, Weak};
 
 use pigeonhole_compaction::{BlobSink, NewBlobFile, blob_pointer, encode_blob_stored};
 use pigeonhole_format::key::Kind;
@@ -103,36 +103,8 @@ impl LargeValues {
                 guard.files.clear();
                 return;
             };
-            let mut logged = shared
-                .large_logged
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let mut dropped = shared
-                .large_dropped
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let mut pending = shared
-                .large_pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            guard.files.retain(|id| {
-                let was_logged = logged.remove(id);
-                if dropped.remove(id) {
-                    return true;
-                }
-                if succeeded {
-                    // Applied: the batch points into it.
-                    pending.remove(id);
-                } else if !was_logged {
-                    // Never logged: nothing points into it, now or after a replay.
-                    return true;
-                }
-                // Logged but failed (applied, half applied or not): kept, and left pending,
-                // so nothing counts on what points into it until the next open sweeps it
-                // or finds the replayed pointers.
-                false
-            });
-            drop((logged, dropped, pending));
+            // What stays and what is released (`large_settle`).
+            shared.large.settle(&mut guard.files, succeeded);
         });
     }
 
@@ -161,13 +133,7 @@ impl LargeValues {
             let Some(shared) = weak.upgrade() else {
                 return;
             };
-            let mut pending = shared
-                .large_pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for id in ids {
-                pending.remove(&id);
-            }
+            shared.large.remove_pending(ids);
         });
         let req = ManifestReq {
             kind: ReqKind::Catalog(Box::new(change)),
@@ -212,17 +178,7 @@ pub(crate) fn note_logged(shared: &Shared, batch: BatchRef<'_>) {
     if ids.is_empty() {
         return;
     }
-    let pending = shared
-        .large_pending
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    ids.retain(|id| pending.contains(id));
-    drop(pending);
-    shared
-        .large_logged
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .extend(ids);
+    shared.large.note_logged(ids);
 }
 
 /// Rewrites `builder` with every put whose stored value is longer than `limit` separated into
@@ -377,21 +333,11 @@ pub(crate) fn separate(
         .collect();
     // Pending before the commit publishes them: until a batch points into them, nothing
     // may count on what points into them (`check_blob_accounting`).
-    shared
-        .large_pending
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .extend(ids.iter().copied());
+    shared.large.add_pending(ids.iter().copied());
     // A refused commit frees the files' extents (`manifest::begin`); a failed one poisons
     // the pager, and the extents are free space at the next open (D8).
     if let Err(e) = manifest::commit_from_thread(shared, ReqKind::Edits(edits)) {
-        let mut pending = shared
-            .large_pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        for id in &ids {
-            pending.remove(id);
-        }
+        shared.large.remove_pending(ids.iter().copied());
         return Err(e);
     }
     Ok((out, Some(LargeValues::new(shared, ids))))

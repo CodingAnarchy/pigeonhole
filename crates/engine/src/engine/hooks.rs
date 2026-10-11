@@ -422,14 +422,7 @@ impl Engine {
         // it is published (so the set read before covers a view that still has it), and a
         // new file joins `large_pending` before the view with it is published (so the set
         // read after covers that).
-        let settling = || {
-            self.inner
-                .shared
-                .large_pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-        };
+        let settling = || self.inner.shared.large.pending();
         let mut pending = settling();
         let view = self.inner.shared.view.load_full();
         pending.extend(settling());
