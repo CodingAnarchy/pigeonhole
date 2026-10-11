@@ -3,6 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
+#[cfg(feature = "async")]
+use pigeonhole_engine::AsyncSubmit;
 use pigeonhole_engine::{FamilyId, PendingCommit, Predicate, TableId, Txn, ValueRef};
 use pigeonhole_format::Durability;
 use pigeonhole_format::key::MAX_KEY_PART;
@@ -153,10 +155,38 @@ impl Builder {
 
     /// Submits through `db` without waiting, reporting the first builder error instead if
     /// there was one.
-    /// The async commit's admission (D210), unless a builder error will refuse it anyway.
+    /// Submits an async commit (D210): at once while its shard has room, else handed back
+    /// as the submission to run once admitted.
     #[cfg(feature = "async")]
-    fn admit(&self, db: &Db) -> Option<pigeonhole_engine::Admit> {
-        self.error.is_none().then(|| db.engine.admit(&self.batch))
+    fn submit_async(
+        self,
+        db: &Arc<Db>,
+        durability: Option<Durability>,
+    ) -> Result<AsyncCommit<Submitted>> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let (largest_value, max_value) = (self.largest_value, db.max_value);
+        match db.engine.submit_async(self.batch, durability) {
+            Ok(AsyncSubmit::Submitted(pending)) => Ok(AsyncCommit::Submitted(Submitted {
+                pending,
+                largest_value,
+                max_value,
+            })),
+            Ok(AsyncSubmit::Wait(batch, admit)) => {
+                let db = Arc::clone(db);
+                let builder = Builder {
+                    batch,
+                    error: None,
+                    largest_value,
+                };
+                Ok(AsyncCommit::Wait(
+                    admit,
+                    Box::new(move || builder.submit(&db, durability)),
+                ))
+            }
+            Err(e) => Err(commit_error(e, largest_value, max_value)),
+        }
     }
 
     fn submit(self, db: &Db, durability: Option<Durability>) -> Result<Submitted> {
@@ -185,6 +215,17 @@ impl Builder {
             .map(CommitInfo::from)
             .map_err(|e| commit_error(e, largest, db.max_value))
     }
+}
+
+/// An async commit's submission (D210): submitted, or waiting for room with the
+/// submission to run once admitted.
+#[cfg(feature = "async")]
+pub(crate) enum AsyncCommit<S> {
+    Submitted(S),
+    Wait(
+        pigeonhole_engine::Admit,
+        Box<dyn FnOnce() -> Result<S> + Send>,
+    ),
 }
 
 /// A commit handed to the engine and not yet resolved, with what its error needs: the base
@@ -488,55 +529,56 @@ impl RowMutation<'_> {
         self.builder.commit(&self.table.db, self.durability)
     }
 
-    /// Submits without waiting (the async front door's commit).
+    /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
-    pub(crate) fn submit(self) -> Result<Submitted> {
-        self.builder.submit(&self.table.db, self.durability)
+    pub(crate) fn submit_async(self) -> Result<AsyncCommit<Submitted>> {
+        self.builder.submit_async(&self.table.db, self.durability)
     }
 
-    /// The async commit's admission (D210), routed by this mutation's row.
+    /// Submits as an async conditional commit (D210): the condition is resolved now; the
+    /// submission is handed back when it has to wait for room.
     #[cfg(feature = "async")]
-    pub(crate) fn admit(&self) -> Option<pigeonhole_engine::Admit> {
-        self.builder.error.is_none().then(|| {
-            self.table
-                .db
-                .engine
-                .admit_row(self.table.info.id, &self.row, &self.builder.batch)
-        })
-    }
-
-    /// The submission, owned, for a commit that waits for admission.
-    #[cfg(feature = "async")]
-    pub(crate) fn deferred(self) -> impl FnOnce() -> Result<Submitted> + Send + 'static {
-        let (db, builder, durability) = (Arc::clone(&self.table.db), self.builder, self.durability);
-        move || builder.submit(&db, durability)
-    }
-
-    /// The conditional submission, owned, for a commit that waits for admission: the
-    /// condition is checked now.
-    #[cfg(feature = "async")]
-    pub(crate) fn deferred_if(
+    pub(crate) fn submit_if_async(
         mut self,
         condition: &Condition,
-    ) -> Result<impl FnOnce() -> Result<SubmittedCheck> + Send + 'static> {
+    ) -> Result<AsyncCommit<SubmittedCheck>> {
         if let Some(e) = self.builder.error.take() {
             return Err(e);
         }
         let predicate = self.predicate(condition)?;
-        let (db, table, row) = (Arc::clone(&self.table.db), self.table.info.id, self.row);
-        let (batch, durability) = (self.builder.batch, self.durability);
-        let largest_value = self.builder.largest_value;
-        Ok(move || {
-            let max_value = db.max_value;
-            db.engine
-                .submit_check_and_mutate(table, &row, &predicate, batch, durability)
-                .map(|pending| SubmittedCheck {
-                    pending,
-                    largest_value,
-                    max_value,
-                })
-                .map_err(|e| commit_error(e, largest_value, max_value))
-        })
+        let (db, table) = (&self.table.db, self.table.info.id);
+        let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
+        let durability = self.durability;
+        match db.engine.submit_check_and_mutate_async(
+            table,
+            &self.row,
+            &predicate,
+            self.builder.batch,
+            durability,
+        ) {
+            Ok(AsyncSubmit::Submitted(pending)) => Ok(AsyncCommit::Submitted(SubmittedCheck {
+                pending,
+                largest_value,
+                max_value,
+            })),
+            Ok(AsyncSubmit::Wait(batch, admit)) => {
+                let (db, row) = (Arc::clone(db), self.row);
+                Ok(AsyncCommit::Wait(
+                    admit,
+                    Box::new(move || {
+                        db.engine
+                            .submit_check_and_mutate(table, &row, &predicate, batch, durability)
+                            .map(|pending| SubmittedCheck {
+                                pending,
+                                largest_value,
+                                max_value,
+                            })
+                            .map_err(|e| commit_error(e, largest_value, max_value))
+                    }),
+                ))
+            }
+            Err(e) => Err(commit_error(e, largest_value, max_value)),
+        }
     }
 
     /// Commits only if `condition` holds on this row, atomically (BigTable's
@@ -563,31 +605,6 @@ impl RowMutation<'_> {
         } else {
             None
         })
-    }
-
-    /// Submits [`commit_if`](RowMutation::commit_if) without waiting (the async front door).
-    #[cfg(feature = "async")]
-    pub(crate) fn submit_if(mut self, condition: &Condition) -> Result<SubmittedCheck> {
-        if let Some(e) = self.builder.error.take() {
-            return Err(e);
-        }
-        let predicate = self.predicate(condition)?;
-        let db = &self.table.db;
-        let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
-        db.engine
-            .submit_check_and_mutate(
-                self.table.info.id,
-                &self.row,
-                &predicate,
-                self.builder.batch,
-                self.durability,
-            )
-            .map(|pending| SubmittedCheck {
-                pending,
-                largest_value,
-                max_value,
-            })
-            .map_err(|e| commit_error(e, largest_value, max_value))
     }
 
     /// The engine's form of `condition`, on this row's table.
@@ -892,10 +909,13 @@ impl WriteBatch {
         self.builder.submit(&self.db, durability)
     }
 
-    /// The async commit's admission (D210).
+    /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
-    pub(crate) fn admit(&self) -> Option<pigeonhole_engine::Admit> {
-        self.builder.admit(&self.db)
+    pub(crate) fn submit_async(
+        self,
+        durability: Option<Durability>,
+    ) -> Result<AsyncCommit<Submitted>> {
+        self.builder.submit_async(&self.db, durability)
     }
 }
 
@@ -968,10 +988,39 @@ impl Transaction {
         self
     }
 
-    /// The async commit's admission (D210), unless an error will refuse it anyway.
+    /// Submits as an async commit (D210): at once while its shard has room, else handed
+    /// back as the submission to run once admitted.
     #[cfg(feature = "async")]
-    pub(crate) fn admit(&self) -> Option<pigeonhole_engine::Admit> {
-        self.error.is_none().then(|| self.txn.admit())
+    pub(crate) fn submit_async(
+        self,
+        durability: Option<Durability>,
+    ) -> Result<AsyncCommit<Submitted>> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        self.db.check_open()?;
+        let (db, largest_value) = (self.db, self.largest_value);
+        let max_value = db.max_value;
+        match self.txn.submit_async(durability) {
+            Ok(AsyncSubmit::Submitted(pending)) => Ok(AsyncCommit::Submitted(Submitted {
+                pending,
+                largest_value,
+                max_value,
+            })),
+            Ok(AsyncSubmit::Wait(txn, admit)) => {
+                let t = Transaction {
+                    db,
+                    txn,
+                    error: None,
+                    largest_value,
+                };
+                Ok(AsyncCommit::Wait(
+                    admit,
+                    Box::new(move || t.submit(durability)),
+                ))
+            }
+            Err(e) => Err(commit_error(e, largest_value, max_value)),
+        }
     }
 
     /// Submits without waiting (the async front door's commit), with the checks

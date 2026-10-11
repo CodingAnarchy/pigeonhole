@@ -51,7 +51,7 @@ env:
   # checked for regressions on every PR.
   SHAPES: >-
     readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans
-    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,flush,compact
+    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,flush,compact
     ycsb:ycsb-c,ycsb-a
     scanrate:scan-narrow,scan-small,scan-wide
   # The largest increase (percent of the base) a state or shape may show before the job fails,

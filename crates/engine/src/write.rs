@@ -771,9 +771,27 @@ impl Txn {
         &mut self.batch
     }
 
-    /// The transaction commit's admission (D210; see [`Engine::admit`](crate::Engine::admit)).
-    pub fn admit(&self) -> crate::Admit {
-        self.engine.admit(&self.batch)
+    /// [`submit`](Self::submit) for an async commit (D210), as
+    /// [`Engine::submit_async`](crate::Engine::submit_async): the transaction comes back
+    /// when it has to wait for room.
+    pub fn submit_async(
+        self,
+        durability: Option<Durability>,
+    ) -> crate::Result<crate::AsyncSubmit<PendingCommit, Txn>> {
+        let arg = match self.engine.fast_admit(None, &self.batch) {
+            crate::engine::FastAdmit::Wait(admit) => {
+                return Ok(crate::AsyncSubmit::Wait(self, admit));
+            }
+            crate::engine::FastAdmit::Charged(arg) => Some(arg),
+            crate::engine::FastAdmit::Unbounded => None,
+        };
+        let engine = Arc::clone(&self.engine);
+        let submitted = self.submit(durability);
+        Ok(crate::AsyncSubmit::Submitted(engine.settle_on(
+            arg,
+            submitted,
+            |p| &p.waiter,
+        )?))
     }
 
     /// Submits the transaction for validation and commit without waiting: the

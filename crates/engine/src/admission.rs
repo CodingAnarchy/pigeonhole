@@ -2,6 +2,11 @@
 //! submitted and not yet resolved. An async commit over it waits, before it submits, until
 //! the shard's earlier commits resolve; waiters are admitted in arrival order. Blocking
 //! commits are neither charged nor delayed (their threads bound them).
+//!
+//! **Fast path.** While the bytes in flight on *all* shards together fit the bound and no
+//! one waits, a commit is charged to that engine-wide count alone: one compare-and-add, no
+//! routing, and every shard is within the bound. Only past that is a commit routed to its
+//! shard and charged there, counting the unrouted bytes as possibly its shard's, or queued.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +20,12 @@ use crate::write::{PendingCheck, PendingCommit, WriteBatch};
 pub(crate) struct Admission {
     /// Bytes a shard may hold of async commits submitted and not yet resolved.
     bound: u64,
+    /// Bytes in flight on every shard together: the fast path's and the routed ones.
+    total: AtomicU64,
+    /// The routed share of `total` (the rest is the fast path's, on unknown shards).
+    routed: AtomicU64,
+    /// Waiters on every shard together (the fast path runs only when none wait).
+    queued: AtomicUsize,
     shards: Vec<ShardAdmission>,
     /// The engine is closing: every waiter is admitted, and its submission fails `Closed`.
     closed: AtomicBool,
@@ -49,6 +60,9 @@ impl Admission {
     pub(crate) fn new(shards: usize, bound: u64) -> Self {
         Self {
             bound: bound.max(1),
+            total: AtomicU64::new(0),
+            routed: AtomicU64::new(0),
+            queued: AtomicUsize::new(0),
             shards: (0..shards.max(1))
                 .map(|_| ShardAdmission::default())
                 .collect(),
@@ -69,13 +83,44 @@ impl Admission {
         }
     }
 
+    /// The fast path: charges `bytes` to the engine-wide count if no one waits and every
+    /// shard together holds less than the bound with it (or nothing). Returns the release
+    /// argument.
+    #[inline]
+    pub(crate) fn try_fast(&self, bytes: u64) -> Option<u64> {
+        if self.queued.load(Ordering::Acquire) != 0 || self.closed.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut cur = self.total.load(Ordering::Acquire);
+        loop {
+            if cur != 0 && cur + bytes > self.bound {
+                return None;
+            }
+            match self.total.compare_exchange_weak(
+                cur,
+                cur + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(FAST << SHARD_SHIFT | bytes.min(BYTES_MASK)),
+                Err(now) => cur = now,
+            }
+        }
+    }
+
     /// Charges `bytes` to `shard` if it fits: the shard holds less than the bound with it,
-    /// or holds nothing (a commit larger than the bound goes alone).
+    /// counting every unrouted byte as possibly its own, or holds nothing (a commit larger
+    /// than the bound goes alone).
     fn try_charge(&self, shard: usize, bytes: u64) -> bool {
         let s = &self.shards[shard];
         let mut cur = s.inflight.load(Ordering::Acquire);
         loop {
-            if cur != 0 && cur + bytes > self.bound {
+            let unrouted = self
+                .total
+                .load(Ordering::Acquire)
+                .saturating_sub(self.routed.load(Ordering::Acquire));
+            let held = cur + unrouted;
+            if held != 0 && held + bytes > self.bound {
                 return false;
             }
             match s.inflight.compare_exchange_weak(
@@ -84,36 +129,67 @@ impl Admission {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    self.routed.fetch_add(bytes, Ordering::AcqRel);
+                    self.total.fetch_add(bytes, Ordering::AcqRel);
+                    return true;
+                }
                 Err(now) => cur = now,
             }
         }
     }
 
-    /// Returns `bytes` to `shard` and wakes the first waiter.
-    fn release(&self, shard: usize, bytes: u64) {
-        let s = &self.shards[shard];
-        s.inflight.fetch_sub(bytes, Ordering::AcqRel);
-        if s.waiting.load(Ordering::Acquire) != 0 {
-            wake_first(s);
+    /// Returns a charge (`arg` from [`try_fast`](Self::try_fast) or a routed admission)
+    /// and, if anyone waits, wakes the first waiter of each shard that has one.
+    pub(crate) fn release_arg(&self, arg: u64) {
+        let (shard, bytes) = (arg >> SHARD_SHIFT, arg & BYTES_MASK);
+        if shard != FAST {
+            self.shards[shard as usize]
+                .inflight
+                .fetch_sub(bytes, Ordering::AcqRel);
+            self.routed.fetch_sub(bytes, Ordering::AcqRel);
         }
+        self.total.fetch_sub(bytes, Ordering::AcqRel);
+        if self.queued.load(Ordering::Acquire) != 0 {
+            for s in &self.shards {
+                if s.waiting.load(Ordering::Acquire) != 0 {
+                    wake_first(s);
+                }
+            }
+        }
+    }
+
+    /// Bytes that may be in flight on `shard`: its routed ones and every unrouted one
+    /// (tests).
+    pub(crate) fn inflight(&self, shard: usize) -> u64 {
+        let unrouted = self
+            .total
+            .load(Ordering::Acquire)
+            .saturating_sub(self.routed.load(Ordering::Acquire));
+        self.shards[shard].inflight.load(Ordering::Acquire) + unrouted
     }
 
     /// Whether more than one shard can be charged (else every commit is shard 0's).
     pub(crate) fn sharded(&self) -> bool {
         self.shards.len() > 1
     }
+}
 
-    /// Charged bytes in flight on `shard` (tests).
-    pub(crate) fn inflight(&self, shard: usize) -> u64 {
-        self.shards[shard].inflight.load(Ordering::Acquire)
-    }
+/// A release argument's layout: the shard (or [`FAST`]) above the bytes.
+const SHARD_SHIFT: u32 = 48;
+const BYTES_MASK: u64 = (1 << SHARD_SHIFT) - 1;
+/// The shard field of a fast-path charge.
+const FAST: u64 = 0xFFFF;
+
+/// The routed argument of `bytes` on `shard`.
+fn routed_arg(shard: usize, bytes: u64) -> u64 {
+    (shard as u64) << SHARD_SHIFT | bytes.min(BYTES_MASK)
 }
 
 /// A resolved commit returns its charge: `arg` is the shard (top 16 bits) and the bytes.
 impl pigeonhole_runtime::Settle for Admission {
     fn settled(&self, arg: u64) {
-        self.release((arg >> 48) as usize, arg & ((1 << 48) - 1));
+        self.release_arg(arg);
     }
 }
 
@@ -161,6 +237,7 @@ impl Admit {
             q.next_id += 1;
             q.waiters.push_back((id, None));
             s.waiting.fetch_add(1, Ordering::AcqRel);
+            a.queued.fetch_add(1, Ordering::AcqRel);
             AdmitState::Queued(id)
         };
         Self {
@@ -204,6 +281,7 @@ impl Admit {
                 q.waiters.remove(i);
             }
             s.waiting.fetch_sub(1, Ordering::AcqRel);
+            a.queued.fetch_sub(1, Ordering::AcqRel);
             if let Some((_, Some(w))) = q.waiters.front() {
                 w.wake_by_ref();
             }
@@ -231,7 +309,7 @@ impl Admit {
         }
         self.state = AdmitState::Done;
         let a = self.admission.take()?;
-        Some((a, (self.shard as u64) << 48 | self.bytes.min((1 << 48) - 1)))
+        Some((a, routed_arg(self.shard, self.bytes)))
     }
 
     /// Hands the charge to a submitted commit: returned when the shard resolves it.
@@ -262,7 +340,7 @@ impl Drop for Admit {
             return;
         };
         match self.state {
-            AdmitState::Charged => a.release(self.shard, self.bytes),
+            AdmitState::Charged => a.release_arg(routed_arg(self.shard, self.bytes)),
             AdmitState::Queued(id) => {
                 let s = &a.shards[self.shard];
                 let mut q = s.queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -271,6 +349,7 @@ impl Drop for Admit {
                     q.waiters.remove(i);
                 }
                 s.waiting.fetch_sub(1, Ordering::AcqRel);
+                a.queued.fetch_sub(1, Ordering::AcqRel);
                 if was_first && let Some((_, Some(w))) = q.waiters.front() {
                     w.wake_by_ref();
                 }

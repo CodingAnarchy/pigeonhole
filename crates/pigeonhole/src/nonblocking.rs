@@ -61,7 +61,7 @@ use std::task::{Context, Poll};
 use pigeonhole_format::Durability;
 
 use crate::cell::RowBuf;
-use crate::write::{Submitted, SubmittedCheck, TicketState};
+use crate::write::{AsyncCommit, Submitted, SubmittedCheck, TicketState};
 use crate::{
     Cell, CommitInfo, CommitTicket, Condition, Error, Pigeonhole, Result, Row, RowMutation,
     Transaction, WriteBatch,
@@ -126,13 +126,17 @@ impl CommitFuture {
         }
     }
 
-    /// A commit that waits for room on its shard before it submits (D210).
-    fn waiting(admit: Admit, submit: Box<dyn FnOnce() -> Result<Submitted> + Send>) -> Self {
-        Self {
-            state: State::Waiting(Box::new(Waiting {
-                admit,
-                submit: Some(submit),
-            })),
+    /// An async commit's submission as a future: submitted, or waiting for room (D210).
+    fn from_async(r: Result<AsyncCommit<Submitted>>) -> Self {
+        match r {
+            Ok(AsyncCommit::Submitted(s)) => Self::new(Ok(s)),
+            Ok(AsyncCommit::Wait(admit, submit)) => Self {
+                state: State::Waiting(Box::new(Waiting {
+                    admit,
+                    submit: Some(submit),
+                })),
+            },
+            Err(e) => Self::new(Err(e)),
         }
     }
 
@@ -195,12 +199,7 @@ impl RowMutation<'_> {
     /// the commit back. **Dropped while it still waits for room, it writes nothing**, so
     /// `let _ = ...commit_async();` can lose the commit (see the [module docs](self)).
     pub fn commit_async(self) -> CommitFuture {
-        let admit = self.admit();
-        if admit.as_ref().is_none_or(Admit::is_admitted) {
-            return CommitFuture::submitted(admit, self.submit());
-        }
-        let admit = admit.expect("queued above");
-        CommitFuture::waiting(admit, Box::new(self.deferred()))
+        CommitFuture::from_async(self.submit_async())
     }
 }
 
@@ -212,19 +211,14 @@ impl RowMutation<'_> {
     /// **Dropped while it still waits for room, it writes nothing** (see the
     /// [module docs](self)).
     pub fn commit_if_async(self, condition: &Condition) -> CheckFuture {
-        let admit = self.admit();
-        if admit.as_ref().is_none_or(Admit::is_admitted) {
-            return CheckFuture::submitted(admit, self.submit_if(condition));
-        }
-        match self.deferred_if(condition) {
-            Ok(submit) => CheckFuture {
-                state: CheckState::Waiting(Box::new(Waiting {
-                    admit: admit.expect("queued above"),
-                    submit: Some(Box::new(submit)),
+        CheckFuture {
+            state: match self.submit_if_async(condition) {
+                Ok(AsyncCommit::Submitted(s)) => CheckState::Pending(s),
+                Ok(AsyncCommit::Wait(admit, submit)) => CheckState::Waiting(Box::new(Waiting {
+                    admit,
+                    submit: Some(submit),
                 })),
-            },
-            Err(e) => CheckFuture {
-                state: CheckState::Ready(Some(Err(e))),
+                Err(e) => CheckState::Ready(Some(Err(e))),
             },
         }
     }
@@ -247,12 +241,7 @@ impl WriteBatch {
     }
 
     fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
-        let admit = self.admit();
-        if admit.as_ref().is_none_or(Admit::is_admitted) {
-            return CommitFuture::submitted(admit, self.submit(durability));
-        }
-        let admit = admit.expect("queued above");
-        CommitFuture::waiting(admit, Box::new(move || self.submit(durability)))
+        CommitFuture::from_async(self.submit_async(durability))
     }
 }
 
@@ -274,12 +263,7 @@ impl Transaction {
     }
 
     fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
-        let admit = self.admit();
-        if admit.as_ref().is_none_or(Admit::is_admitted) {
-            return CommitFuture::submitted(admit, self.submit(durability));
-        }
-        let admit = admit.expect("queued above");
-        CommitFuture::waiting(admit, Box::new(move || self.submit(durability)))
+        CommitFuture::from_async(self.submit_async(durability))
     }
 }
 

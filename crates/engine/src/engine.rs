@@ -278,6 +278,24 @@ pub struct Engine {
     inner: Arc<Inner>,
 }
 
+/// An async commit's submission (D210): submitted at once, or handed back with its place
+/// in its shard's queue.
+#[derive(Debug)]
+pub enum AsyncSubmit<P, B> {
+    /// Submitted; its charge comes back when it resolves.
+    Submitted(P),
+    /// Over the bound: submit `B` once the [`Admit`](crate::Admit) is ready, then attach
+    /// the admit to the submitted commit.
+    Wait(B, crate::Admit),
+}
+
+/// [`Inner::fast_admit`]'s outcome.
+pub(crate) enum FastAdmit {
+    Unbounded,
+    Charged(u64),
+    Wait(crate::Admit),
+}
+
 /// Which embedding mode an open uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -1236,12 +1254,6 @@ impl Engine {
         self.inner.admit(batch)
     }
 
-    /// [`admit`](Self::admit) for a batch whose rows are all `row` of `table` (a row
-    /// mutation): routed by that row, without decoding the batch.
-    pub fn admit_row(&self, table: TableId, row: &[u8], batch: &WriteBatch) -> crate::Admit {
-        self.inner.admit_routed(Some((table, row)), batch)
-    }
-
     /// Bytes of async commits charged to `shard` and not yet resolved (D210; tests and
     /// benches).
     #[doc(hidden)]
@@ -1324,6 +1336,53 @@ impl Engine {
     ) -> Result<PendingCheck> {
         self.inner
             .submit_check_and_mutate(table, row, predicate, batch, durability)
+    }
+
+    /// [`submit`](Self::submit) for an async commit (D210): submitted at once while the
+    /// shards' async commits in flight leave room, with its charge returned when it
+    /// resolves; otherwise the batch comes back with its place in its shard's queue, to
+    /// submit once [`Admit::poll_admit`](crate::Admit::poll_admit) is ready.
+    pub fn submit_async(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<AsyncSubmit<PendingCommit, WriteBatch>> {
+        let arg = match self.inner.fast_admit(None, &batch) {
+            FastAdmit::Wait(admit) => return Ok(AsyncSubmit::Wait(batch, admit)),
+            FastAdmit::Charged(arg) => Some(arg),
+            FastAdmit::Unbounded => None,
+        };
+        let submitted = self.inner.submit(batch, durability, None, None);
+        Ok(AsyncSubmit::Submitted(self.inner.settle_on(
+            arg,
+            submitted,
+            |p| &p.waiter,
+        )?))
+    }
+
+    /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) for an async commit, as
+    /// [`submit_async`](Self::submit_async).
+    pub fn submit_check_and_mutate_async(
+        &self,
+        table: TableId,
+        row: &[u8],
+        predicate: &Predicate,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<AsyncSubmit<PendingCheck, WriteBatch>> {
+        let arg = match self.inner.fast_admit(Some((table, row)), &batch) {
+            FastAdmit::Wait(admit) => return Ok(AsyncSubmit::Wait(batch, admit)),
+            FastAdmit::Charged(arg) => Some(arg),
+            FastAdmit::Unbounded => None,
+        };
+        let submitted = self
+            .inner
+            .submit_check_and_mutate(table, row, predicate, batch, durability);
+        Ok(AsyncSubmit::Submitted(self.inner.settle_on(
+            arg,
+            submitted,
+            |p| &p.waiter,
+        )?))
     }
 
     /// Starts an optimistic transaction (Phase 4).
@@ -2201,6 +2260,40 @@ impl PendingMaintenance {
 impl Inner {
     pub(crate) fn admit(&self, batch: &WriteBatch) -> crate::Admit {
         self.admit_routed(None, batch)
+    }
+
+    /// The async fast path (D210): a charge on the engine-wide count when it fits and no
+    /// one waits, else the routed admission to wait on.
+    #[inline]
+    pub(crate) fn fast_admit(
+        &self,
+        row: Option<(TableId, &[u8])>,
+        batch: &WriteBatch,
+    ) -> FastAdmit {
+        let Some(a) = &self.admission else {
+            return FastAdmit::Unbounded;
+        };
+        match a.try_fast(crate::admission::batch_bytes(batch)) {
+            Some(arg) => FastAdmit::Charged(arg),
+            None => FastAdmit::Wait(self.admit_routed(row, batch)),
+        }
+    }
+
+    /// Hands a fast charge to the submitted commit (returned when it resolves), or back
+    /// at once when the submission failed.
+    pub(crate) fn settle_on<P, T: Send>(
+        &self,
+        arg: Option<u64>,
+        submitted: Result<P>,
+        waiter: impl FnOnce(&P) -> &pigeonhole_runtime::Waiter<T>,
+    ) -> Result<P> {
+        if let (Some(arg), Some(a)) = (arg, &self.admission) {
+            match &submitted {
+                Ok(p) => waiter(p).on_settled(Arc::clone(a) as _, arg),
+                Err(_) => a.release_arg(arg),
+            }
+        }
+        submitted
     }
 
     /// Admits `batch` on the shard of `row` when given, else of the batch's first row.
