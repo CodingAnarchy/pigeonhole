@@ -339,6 +339,9 @@ pub(crate) struct Shared {
     /// Serializes view publishers (shards creating memtables, manifest commits) and holds
     /// the last published version.
     pub view_lock: Mutex<u64>,
+    /// The record last published in shared memory, refilled in place by the next publish
+    /// (under `view_lock`; #499).
+    pub view_record: Mutex<crate::snapshot::RecordCache>,
     pub manifest: Mutex<ManifestWriter>,
     pub manifest_queue: ManifestQueue,
     /// Held by whoever is committing a manifest batch.
@@ -596,7 +599,14 @@ impl Shared {
         let version = *last + 1;
         let view = Arc::new(f(&current, version));
         debug_assert_eq!(view.version, version);
-        self.shm.publish_view(&view.to_record())?;
+        {
+            let mut cache = self
+                .view_record
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            view.fill_record(&mut cache);
+            self.shm.publish_view(&cache.record)?;
+        }
         self.shm.set_manifest_version(view.manifest_version);
         {
             let mut vv = self

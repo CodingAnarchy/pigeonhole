@@ -69,7 +69,8 @@ pub(crate) struct Inner {
     config: ShmConfig,
     /// Serializes in-process publishers (`publish_view` writes the inactive buffer, then
     /// swaps). Across processes the writer lock already allows one publisher.
-    publish_lock: Mutex<()>,
+    /// Serializes view publishes; holds the encoding buffer they reuse (#499).
+    publish_lock: Mutex<Vec<u8>>,
 }
 
 impl Inner {
@@ -313,7 +314,7 @@ fn attach(
         db_id,
         identity,
         config: config.clone(),
-        publish_lock: Mutex::new(()),
+        publish_lock: Mutex::new(Vec::new()),
     })
 }
 
@@ -420,7 +421,7 @@ fn build(
         db_id,
         identity,
         config: config.clone(),
-        publish_lock: Mutex::new(()),
+        publish_lock: Mutex::new(Vec::new()),
     })
 }
 
@@ -515,7 +516,7 @@ impl ShmRegion {
                 db_id,
                 identity,
                 config: config.clone(),
-                publish_lock: Mutex::new(()),
+                publish_lock: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -655,7 +656,7 @@ impl ShmRegion {
     /// others), and within it a mutex serializes callers, so a second thread publishing
     /// concurrently waits rather than racing on the inactive buffer.
     pub fn publish_view(&self, view: &ViewRecord) -> Result<()> {
-        let _publishing = self
+        let mut bytes = self
             .inner
             .publish_lock
             .lock()
@@ -673,7 +674,8 @@ impl ShmRegion {
         if needed > capacity {
             return Err(Error::ViewTooLarge { needed, capacity });
         }
-        let mut bytes = Vec::with_capacity(needed);
+        bytes.clear();
+        bytes.reserve(needed);
         view.encode(&mut bytes);
         let index = if current == 0 { 0 } else { (current & 1) ^ 1 };
         self.inner.region.write(
