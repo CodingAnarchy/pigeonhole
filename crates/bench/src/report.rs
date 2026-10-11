@@ -321,6 +321,81 @@ pub struct RunDetail {
     /// results written before it existed.
     #[serde(default)]
     pub stalls: Option<Stalls>,
+    /// The measured phase's engine-side commit latency (Pigeonhole's inline driver only,
+    /// D213); `None` elsewhere and in results written before it existed.
+    #[serde(default)]
+    pub engine_commit: Option<EngineCommit>,
+}
+
+/// A measured phase's commit latency inside the engine, from its own histograms (D213):
+/// submission to resolution on the commit's shard, for the durability level most of the
+/// phase's commits used. Beside the run's latency (submit to the future's resolution), it
+/// splits a commit into the engine's part and the hand-back to the committer. Bucketed in
+/// half powers of two, so each value is its bucket's lower bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineCommit {
+    /// `Durability as usize`: 0 buffered, 1 sync, 2 group sync, 3 none.
+    pub durability: u8,
+    /// Commits counted.
+    pub commits: u64,
+    /// Median, nanoseconds.
+    pub p50_ns: u64,
+    /// 99th percentile, nanoseconds.
+    pub p99_ns: u64,
+    /// 99.9th percentile, nanoseconds.
+    pub p999_ns: u64,
+}
+
+impl EngineCommit {
+    /// The phase between two readings of Pigeonhole's `commit_latency_buckets`, with
+    /// `floor` giving each bucket's lower bound; `None` when no commit completed between
+    /// them.
+    ///
+    /// ```
+    /// use pigeonhole_bench::EngineCommit;
+    ///
+    /// let before = [[0u64; 64]; 4];
+    /// let mut after = [[0u64; 64]; 4];
+    /// after[2][10] = 98; // 98 group-sync commits in bucket 10, 2 in bucket 20
+    /// after[2][20] = 2;
+    /// let e = EngineCommit::between(&before, &after, |b| b as u64 * 100).unwrap();
+    /// assert_eq!((e.durability, e.commits, e.p50_ns, e.p99_ns), (2, 100, 1000, 2000));
+    /// ```
+    pub fn between(
+        before: &[[u64; 64]; 4],
+        after: &[[u64; 64]; 4],
+        floor: impl Fn(usize) -> u64,
+    ) -> Option<Self> {
+        let hist: Vec<[u64; 64]> = (0..4)
+            .map(|d| std::array::from_fn(|b| after[d][b].saturating_sub(before[d][b])))
+            .collect();
+        let (d, h) = hist
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, h)| h.iter().sum::<u64>())?;
+        let total: u64 = h.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let at = |q: f64| {
+            let target = ((total as f64 * q).ceil() as u64).max(1);
+            let mut seen = 0;
+            for (b, n) in h.iter().enumerate() {
+                seen += n;
+                if seen >= target {
+                    return floor(b);
+                }
+            }
+            floor(63)
+        };
+        Some(Self {
+            durability: d as u8,
+            commits: total,
+            p50_ns: at(0.5),
+            p99_ns: at(0.99),
+            p999_ns: at(0.999),
+        })
+    }
 }
 
 /// What a run's measured phase stalled on (Pigeonhole, from its engine metrics, ICR 0015):
@@ -382,6 +457,10 @@ pub struct Stalls {
     /// Visibility registrations and wake passes that found the waiter list locked.
     #[serde(default)]
     pub visibility_contended: u64,
+    /// Times a shard held a commit group back because its WAL segment was nearly full while
+    /// the next segment's header still waited for a sync (D213 exports it; expected near 0).
+    #[serde(default)]
+    pub wal_rollover_blocks: u64,
     /// Tablet splits and moves refused because a shard's memtable arena serves no more
     /// slots (a size split found due counts once per balancer pass; #123).
     #[serde(default)]
@@ -411,6 +490,7 @@ impl Stalls {
             visibility_woken: d(before.visibility_woken, after.visibility_woken),
             visibility_contended: d(before.visibility_contended, after.visibility_contended),
             slot_refusals: d(before.slot_refusals, after.slot_refusals),
+            wal_rollover_blocks: d(before.wal_rollover_blocks, after.wal_rollover_blocks),
         }
     }
 }
@@ -546,7 +626,7 @@ impl Scaling {
 /// The durable group-commit target (D213): 4-cell `GroupSync` commits at N shards (one per
 /// core), the table split over every shard up front, each shard's thread keeping
 /// [`INLINE_IN_FLIGHT`](crate::INLINE_IN_FLIGHT) commits in flight (the D204 driver).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GroupCommit {
     /// Shards in the run.
     pub shards: usize,
@@ -560,6 +640,19 @@ pub struct GroupCommit {
     pub p99_ns: u64,
     /// The largest share of the run's commits on one shard (as [`Scaling::max_share`]).
     pub max_share: f64,
+    /// Tablet splits, merges and moves during the measured phase: 0, or the run did not
+    /// measure the fixed placement D213 asks for (and `phdb-bench` exits non-zero).
+    #[serde(default)]
+    pub tablet_changes: u64,
+    /// The engine's part of the commit latency (submission to resolution on the shard).
+    #[serde(default)]
+    pub engine: Option<EngineCommit>,
+    /// WAL rollover blocks and inline WAL syncs during the measured phase.
+    #[serde(default)]
+    pub wal_rollover_blocks: u64,
+    /// See [`GroupCommit::wal_rollover_blocks`].
+    #[serde(default)]
+    pub wal_inline_syncs: u64,
 }
 
 impl GroupCommit {
@@ -579,6 +672,7 @@ impl GroupCommit {
             .map(|s| s.commits)
             .max()
             .unwrap_or(0);
+        let st = run.detail.stalls.unwrap_or_default();
         Self {
             shards,
             cores,
@@ -590,6 +684,15 @@ impl GroupCommit {
             } else {
                 top as f64 / total as f64
             },
+            tablet_changes: run
+                .detail
+                .shards
+                .iter()
+                .map(|s| s.splits + s.merges + s.moves)
+                .sum(),
+            engine: run.detail.engine_commit,
+            wal_rollover_blocks: st.wal_rollover_blocks,
+            wal_inline_syncs: st.wal_inline_syncs,
         }
     }
 
@@ -605,6 +708,7 @@ impl GroupCommit {
     ///     p50_ns: 80_000,
     ///     p99_ns: 150_000,
     ///     max_share: 0.13,
+    ///     ..Default::default()
     /// };
     /// assert_eq!(gc.cells_per_core(), 150_000.0);
     /// assert!(gc.passes());
@@ -613,9 +717,12 @@ impl GroupCommit {
         self.cells_per_sec / self.cores.max(1) as f64
     }
 
-    /// Whether the target is met: more than 1M cells/s and p99 under 200 µs.
+    /// Whether the target is met: more than 1M cells/s and p99 under 200 µs, measured on a
+    /// placement that did not change.
     pub fn passes(&self) -> bool {
-        self.cells_per_sec > Self::CELLS_PER_SEC && self.p99_ns < Self::P99_NS
+        self.tablet_changes == 0
+            && self.cells_per_sec > Self::CELLS_PER_SEC
+            && self.p99_ns < Self::P99_NS
     }
 }
 
@@ -834,14 +941,14 @@ impl Suite {
             .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)))
             .collect();
         if !stalled.is_empty() {
-            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) | Slot refusals |\n");
-            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
+            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | WAL rollover blocks | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) | Slot refusals |\n");
+            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
             for (r, st) in stalled {
                 let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
                 let per_op = |n: u64| format!("{:.2}", n as f64 / r.operations.max(1) as f64);
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} ({}) | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} |",
                     r.workload,
                     r.store,
                     r.threads,
@@ -852,6 +959,7 @@ impl Suite {
                     st.unpin_passes,
                     st.unpin_flushes,
                     st.wal_inline_syncs,
+                    st.wal_rollover_blocks,
                     st.file_growths,
                     ms(st.file_growth_nanos),
                     per_op(st.shard_parks),
@@ -892,7 +1000,8 @@ impl Suite {
                 "\n**Durable group commit (D213):** {} shards on {} cores, the table split over \
                  every shard, {} commits in flight per shard: {} cells/s ({} per core), commit \
                  p50 {} µs, p99 {} µs (target > 1M cells/s, p99 < 200 µs); the busiest shard \
-                 took {:.0}% of the commits — {}.",
+                 took {:.0}% of the commits; {} tablet changes while measuring{}; {} WAL \
+                 rollover blocks, {} inline WAL syncs — {}.",
                 gc.shards,
                 gc.cores,
                 crate::INLINE_IN_FLIGHT,
@@ -901,7 +1010,22 @@ impl Suite {
                 us(gc.p50_ns),
                 us(gc.p99_ns),
                 100.0 * gc.max_share,
-                if gc.passes() { "pass" } else { "fail" }
+                gc.tablet_changes,
+                gc.engine.map_or_else(String::new, |e| format!(
+                    "; inside the engine p50 {} µs, p99 {} µs, p99.9 {} µs",
+                    us(e.p50_ns),
+                    us(e.p99_ns),
+                    us(e.p999_ns)
+                )),
+                gc.wal_rollover_blocks,
+                gc.wal_inline_syncs,
+                if gc.tablet_changes > 0 {
+                    "invalid: the placement changed while measuring"
+                } else if gc.passes() {
+                    "pass"
+                } else {
+                    "fail"
+                }
             );
         }
         if let Some(sc) = &self.scaling_sync {

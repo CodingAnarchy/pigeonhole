@@ -18,8 +18,8 @@ use pigeonhole::{Pigeonhole, Shard, Table};
 
 use super::pigeonhole::{create_table, err, options};
 use crate::{
-    BenchOp, Histogram, PigeonholeRunner, RunDetail, RunOptions, RunRecord, Runner, ShardShare,
-    Stalls, Workload, WorkloadConfig,
+    BenchOp, EngineCommit, Histogram, PigeonholeRunner, RunDetail, RunOptions, RunRecord, Runner,
+    ShardShare, Stalls, Workload, WorkloadConfig,
 };
 
 /// Commits each shard thread keeps in flight (D204).
@@ -91,6 +91,20 @@ fn split_keys(load: &[Write], pieces: usize) -> Vec<Vec<u8>> {
         .collect();
     keys.dedup();
     keys
+}
+
+/// Fails unless every shard owns exactly one tablet (D213: the pre-split's placement, which
+/// the measured phase must run on unchanged).
+fn one_tablet_each(db: &Pigeonhole, when: &str) -> Result<(), String> {
+    let tablets: Vec<u64> = db.shard_stats().iter().map(|s| s.tablets).collect();
+    if tablets.iter().all(|&t| t == 1) {
+        Ok(())
+    } else {
+        Err(format!(
+            "D213: {when}, the shards own {tablets:?} tablets, not one each; the measured \
+             phase would not run on the pre-split placement"
+        ))
+    }
 }
 
 fn submit(t: &Table, w: &Write) -> CommitFuture {
@@ -278,6 +292,7 @@ impl PigeonholeRunner {
             };
             if !keys.is_empty() {
                 t.split_over_shards(keys).map_err(err)?;
+                one_tablet_each(&db, "after the pre-split")?;
             }
             for w in &load_ops {
                 let mut m = t.mutate(&w.row);
@@ -312,7 +327,8 @@ impl PigeonholeRunner {
                 last_change = Instant::now();
             }
             let spread = after.iter().all(|s| s.tablets > 0);
-            if (spread && last_change.elapsed() >= SETTLED) || warm.is_empty() {
+            // Pre-split, the balancer never runs (D213): one warmup pass is enough.
+            if presplit || (spread && last_change.elapsed() >= SETTLED) || warm.is_empty() {
                 break;
             }
             if started.elapsed() > SPREAD_CAP {
@@ -323,9 +339,18 @@ impl PigeonholeRunner {
                 break;
             }
         }
+        if presplit && n > 1 {
+            one_tablet_each(&db, "before the measured phase")?;
+        }
         let (before, stalls_before) = (db.shard_stats(), super::pigeonhole::stalls(&db));
+        let latency_before = db.commit_latency_buckets();
         let (shards, elapsed, hist) = phase(&t, shards, measured, INLINE_IN_FLIGHT, true)?;
         let (after, stalls_after) = (db.shard_stats(), super::pigeonhole::stalls(&db));
+        let engine_commit = EngineCommit::between(
+            &latency_before,
+            &db.commit_latency_buckets(),
+            Pigeonhole::commit_latency_floor,
+        );
         let detail_shards = before
             .iter()
             .zip(&after)
@@ -363,6 +388,7 @@ impl PigeonholeRunner {
             detail: RunDetail {
                 shards: detail_shards,
                 stalls: Some(Stalls::between(&stalls_before, &stalls_after)),
+                engine_commit,
                 ..RunDetail::default()
             },
         })

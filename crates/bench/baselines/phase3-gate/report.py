@@ -132,13 +132,24 @@ fs = (load("machine.json") or {}).get("fdatasync_4k_us") or {}
 floor = f"; disk fdatasync p50 {fs['p50']:.0f} µs, p99 {fs['p99']:.0f} µs" if "p99" in fs else ""
 gcd = load("latency-group-commit.json") or {}
 g = gcd.get("group_commit")
+def stages(g):
+    # The engine's part of the commit (submission to resolution on the shard), WAL rollover
+    # blocks and inline syncs, and tablet changes while measuring (must be 0; D213).
+    e = g.get("engine")
+    inside = f"; in the engine p50 {us(e['p50_ns']):.0f} µs, p99 {us(e['p99_ns']):.0f} µs, p99.9 {us(e['p999_ns']):.0f} µs" if e else ""
+    return (f"{inside}; WAL rollover blocks {g.get('wal_rollover_blocks', '?')}, inline syncs "
+            f"{g.get('wal_inline_syncs', '?')}; tablet changes while measuring {g.get('tablet_changes', '?')}")
+
+
 if g:
     cells, per_core = g["cells_per_sec"], g["cells_per_sec"] / max(g["cores"], 1)
+    fixed = g.get("tablet_changes", 1) == 0
     rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)",
                  f"{cells / 1e6:.2f}M cells/s at {g['shards']} shards ({per_core / 1e3:.0f}K per core); "
                  f"p50 {us(g['p50_ns']):.0f} µs, p99 {us(g['p99_ns']):.0f} µs; busiest shard "
-                 f"{100 * g['max_share']:.0f}%{floor}",
-                 verdict(cells > 1e6 and us(g["p99_ns"]) < 200), "latency-group-commit.json"))
+                 f"{100 * g['max_share']:.0f}%{stages(g)}{floor}"
+                 + ("" if fixed else " — INVALID: the placement changed while measuring"),
+                 verdict(fixed and cells > 1e6 and us(g["p99_ns"]) < 200), "latency-group-commit.json"))
 else:
     rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)", floor.lstrip("; "),
                  verdict(None), "latency-group-commit.json"))
@@ -147,7 +158,7 @@ if gp:
     rows.append(("Durable group commit on pread (reported, not judged; D213: decides the io_uring default)",
                  f"{gp['cells_per_sec'] / 1e6:.2f}M cells/s at {gp['shards']} shards "
                  f"({gp['cells_per_sec'] / max(gp['cores'], 1) / 1e3:.0f}K per core); p50 {us(gp['p50_ns']):.0f} µs, "
-                 f"p99 {us(gp['p99_ns']):.0f} µs", "-", "latency-group-commit-pread.json"))
+                 f"p99 {us(gp['p99_ns']):.0f} µs{stages(gp)}", "-", "latency-group-commit-pread.json"))
 clients = [r for r in results("latency-group-commit.json", "pigeonhole") if "inline" not in r.get("store_config", "")]
 if clients:
     detail = ", ".join(f"{r['threads']} thr: {r['throughput'] * GROUP_COMMIT_CELLS / 1e3:.0f}K cells/s, "
