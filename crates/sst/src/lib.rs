@@ -494,6 +494,7 @@ impl SstReader {
 
     /// A cursor applying `filter`; unpositioned until a seek. Owns a clone of the `Arc`.
     /// Allocation-free.
+    #[inline]
     pub fn iter(self: &Arc<Self>, filter: ScanFilter, options: ReadOptions) -> SstIter {
         SstIter::new(Arc::clone(self), filter, options)
     }
