@@ -725,6 +725,66 @@ fn catalog_changes_and_shrink_on_the_driver_reap_their_own_root_commit() {
     });
 }
 
+/// #306: as above, with the simulator an orphan backend (neither owner-reaped nor completed
+/// by another thread), as the model harness runs it. The driving thread's blocked manifest
+/// waits run the device (ICR 0028, #494) rather than park: a catalog change, and a commit
+/// that separates a large value into a blob file (#230), both blocked on the manifest
+/// writer behind the pump's in-flight root commit.
+#[test]
+fn manifest_waits_on_the_driver_run_an_orphan_device() {
+    each_seed(|seed| {
+        let mut rig = Rig::open(seed, 1);
+        let t = rig.table("t");
+        rig.db.set_inline_value_limit(64);
+
+        let mut flushed = vec![pump_commit_in_flight(&mut rig, &t, 0)];
+        assert!(!pigeonhole_io::own_io_in_flight(), "seed {seed}: owned");
+        let u = rig
+            .db
+            .create_table("u", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+
+        flushed.push(pump_commit_in_flight(&mut rig, &t, 1));
+        let large = vec![7u8; 200];
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t.id,
+            t.families[0].id,
+            b"large",
+            b"q",
+            None,
+            ValueRef::Bytes(&large),
+        )
+        .unwrap();
+        // Separation commits the blob file in the manifest before the batch is submitted.
+        drop(rig.db.submit(wb, Some(Durability::None)).unwrap());
+
+        rig.settle();
+        for mut f in flushed {
+            assert!(
+                matches!(poll(&mut f), Poll::Ready(Ok(()))),
+                "seed {seed}: a flush did not complete"
+            );
+        }
+        assert!(
+            !rig.db.blob_files().is_empty(),
+            "seed {seed}: not separated"
+        );
+        let got = rig
+            .db
+            .get_latest(t.id, t.families[0].id, b"large", b"q")
+            .unwrap()
+            .expect("the large value");
+        assert_eq!(got.value(), ValueRef::Bytes(&large), "seed {seed}");
+        assert_eq!(rig.db.table("u").map(|t| t.id), Some(u.id), "seed {seed}");
+        rig.db.close().unwrap();
+        rig.close_loop().unwrap();
+        let vfs = rig.vfs();
+        drop(rig);
+        assert!(Engine::inspect_manifest(&vfs, Path::new(DB)).unwrap().clean);
+    });
+}
+
 // ---- D151: the application-owned close ----
 
 /// Commits rows of every durability, some with their syncs still in flight.

@@ -33,7 +33,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::ops::Bound;
@@ -420,6 +420,13 @@ pub struct Stats {
     /// Reads at a held snapshot checked against the model rebuilt for its view, because a
     /// compaction published after it purged something (`World::model_at`).
     pub reads_at_older_views: usize,
+    /// Puts in acknowledged commits with a value above the inline limit (`LARGE_VALUE`).
+    pub large_puts: usize,
+    /// Blob files seen in the catalog after those commits: values separated at commit time
+    /// (#230) and blob GC's rewrites of them. Flushes never separate model values (the
+    /// families' blob threshold is far above them), so none exists without a commit-time
+    /// separation (#306).
+    pub blob_files: usize,
 }
 
 /// What kind of divergence the checker saw.
@@ -652,12 +659,8 @@ impl Store {
     /// Opens with the checker's options.
     pub fn open_cfg(vfs: &Arc<SimVfs>, shards: usize, cfg: &Config) -> Result<Self, Error> {
         let store = Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())?;
-        // Values above 120 bytes (of up to 160) are separated at commit time (#230). Not
-        // with deferred I/O: the commit waits for a manifest commit on the thread that must
-        // also complete the in-flight I/O a background manifest commit holds.
-        if !cfg.deferred_io {
-            store.engine.set_inline_value_limit(LARGE_VALUE);
-        }
+        // Values above 120 bytes (of up to 160) are separated at commit time (#230).
+        store.engine.set_inline_value_limit(LARGE_VALUE);
         Ok(store)
     }
 
@@ -894,6 +897,13 @@ impl Store {
 
 /// The payload length above which `Store::open_cfg` separates values at commit time.
 const LARGE_VALUE: usize = 120;
+
+/// Puts in `ops` with a value above [`LARGE_VALUE`].
+fn large_puts(ops: &[ModelOp]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op, ModelOp::Put { value, .. } if value.len() > LARGE_VALUE))
+        .count()
+}
 
 /// A put's value as the recovery oracle compares it: itself, or for a value above
 /// [`LARGE_VALUE`] (logged as a blob pointer when separated at commit time) its length.
@@ -1265,6 +1275,8 @@ struct World {
     /// Commit timestamps of the batch records the engine appended, by seqno, with the crash
     /// count when appended (seqnos are reused only across a crash).
     appended_ts: HashMap<Seqno, (usize, Timestamp)>,
+    /// Blob files seen in the catalog after a commit with a large value (`Stats::blob_files`).
+    blob_files_seen: HashSet<(FamilyId, u32)>,
     /// Bottommost compactions applied to the model, by manifest version.
     purges: Vec<PurgeEvent>,
     /// Compactions reported by the engine whose manifest version is not published yet.
@@ -1319,6 +1331,7 @@ impl World {
             stream_records: BTreeMap::new(),
             stream_epochs: BTreeMap::new(),
             appended_ts: HashMap::new(),
+            blob_files_seen: HashSet::new(),
             purges: Vec::new(),
             pending_purges: Vec::new(),
             compaction_floor: 0,
@@ -1386,6 +1399,23 @@ impl World {
             }
         }
         out
+    }
+
+    /// Counts an acknowledged commit's large puts and the blob files that appeared for them
+    /// (`Stats::large_puts`, `Stats::blob_files`).
+    fn note_separations(&mut self, large: usize) {
+        if large == 0 {
+            return;
+        }
+        self.stats.large_puts += large;
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        for (family, id, ..) in store.engine.blob_files() {
+            if self.blob_files_seen.insert((family, id)) {
+                self.stats.blob_files += 1;
+            }
+        }
     }
 
     fn trace_on(&self) -> bool {
@@ -3245,6 +3275,7 @@ impl World {
             c.commit_ts = Some(ts);
             c.acked = true;
             self.stats.commits += 1;
+            self.note_separations(large_puts(&c.ops));
             if c.shards.len() > 1 {
                 self.stats.cross_shard += 1;
             }
@@ -3743,6 +3774,7 @@ impl World {
         }
         self.engine_seqnos.push(info.seqno);
         self.stats.commits += 1;
+        self.note_separations(large_puts(&ops));
         let c = Committed {
             seqno: Some(info.seqno),
             ops,
