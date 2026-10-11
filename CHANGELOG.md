@@ -6,7 +6,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-10-10
+## [0.2.1] - 2026-10-11
 A fix to WAL crash recovery. **Upgrade recommended** for every 0.2.0 user. The file format is unchanged, and files written by 0.2.0 open as before. Every published crate moves to 0.2.1 together.
 
 ### Fixed
