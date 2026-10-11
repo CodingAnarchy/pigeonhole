@@ -530,7 +530,33 @@ impl SstIter {
         let data = loaded(&mut self.data)?;
         data.seek_forward(target)?;
         if !data.valid() {
-            self.position(Some(target))?;
+            self.seek_past_block(target)?;
+        }
+        Ok(())
+    }
+
+    /// Positions on the first entry `>= target`, which lies past the current data block
+    /// (#29): the index partition is walked forward from the current block, past every block
+    /// whose separator is below `target` (none of them is read), and only a target past the
+    /// partition goes back to the top index. Readahead is kept: it drops the blocks a forward
+    /// move passes.
+    fn seek_past_block(&mut self, target: &[u8]) -> Result<()> {
+        // Plain seeks, not forward ones: the target is usually blocks away, where a binary
+        // search over the partition (or the new block) is the cheapest way there.
+        let index = loaded(&mut self.index)?;
+        index.next()?;
+        if index.valid() && index.key() < target {
+            index.seek(target)?;
+        }
+        if !index.valid() {
+            return self.position(Some(target));
+        }
+        self.load_data(true)?;
+        let data = loaded(&mut self.data)?;
+        data.seek(target)?;
+        if !data.valid() {
+            // A separator may sort above the block's last key; the answer starts the next.
+            self.advance_block()?;
         }
         Ok(())
     }
@@ -548,29 +574,17 @@ impl SstIter {
         if data.valid() {
             return Ok(());
         }
-        self.advance_block()?;
-        let Some(data) = self
-            .data
-            .as_mut()
-            .filter(|d| d.valid() && d.key().starts_with(&self.row))
-        else {
-            return Ok(());
-        };
-        // The row continues into this block: skip within it, or, if it fills the block, seek
-        // past the row. `escaped row ++ 00 02` sorts after every key of the row and before
-        // every later row (a later row continues with `00 FF` or a byte >= 01 at that point,
-        // or differs earlier).
-        data.skip_row()?;
-        if !data.valid() {
-            let mut row = std::mem::take(&mut self.row);
-            if let Some(last) = row.last_mut() {
-                *last = 0x02;
-            }
-            let r = self.position(Some(&row));
-            self.row = row;
-            r?;
+        // The rest of the block is this row's. `escaped row ++ 00 02` sorts after every key
+        // of the row and before every later row (a later row continues with `00 FF` or a
+        // byte >= 01 at that point, or differs earlier): the blocks the row fills are passed
+        // through the index, unread.
+        let mut row = std::mem::take(&mut self.row);
+        if let Some(last) = row.last_mut() {
+            *last = 0x02;
         }
-        Ok(())
+        let r = self.seek_past_block(&row);
+        self.row = row;
+        r
     }
 
     /// Advances to the first admitted entry at or after the current one.
