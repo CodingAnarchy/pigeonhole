@@ -129,7 +129,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D113](phase-1.md#d113) — Time series: TTL never expires during a run · deferred to #54 (Phase 2)
 - [D114](phase-1.md#d114) — the recovery oracle also works on record lists · sim, #59; extends D93
 - [D115](phase-1.md#d115) — Which WAL streams must a flush sync before its SSTs become visible · engine Milestone B
-- [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B
+- [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B · **amended by D225**
 - [D117](phase-1.md#d117) — Is `SetFlushed` the memtable's max seqno, or the shard's visible seqno · engine Milestone B
 - [D118](phase-1.md#d118) — How conservative is `GcPolicy` about reader-process snapshots · engine Milestone B; precise per-slot pinning is #39
 - [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161, D166**
@@ -209,6 +209,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D193](phase-2.md#d193) — The Phase 2 gate is amended: required measures, a documented gap (#387), and floors that may not regress · owner decision, #287, #387 · amends the spec Phase 2 gate
 - [D194](phase-3.md#d194) — Reads skip superseded memtable versions through a writer-only, process-local stale-tail index; off until measured · owner decision, #387 · in-node alternative deferred as #397
 - [D195](phase-3.md#d195) — Three instruction ceilings are raised to main's counts (#384 raced the ceilings; get-sst placement drift); ceiling changes are measured on the current main · owner decision, bench, CI · amends D193
+- [D225](phase-3.md#d225) — A participant's PREPARE may be checkpointed once its commit is settled (every share in SSTs: `CommitSettled`), not once the coordinator checkpointed the COMMIT, which let crossed cross-shard commits pin each other's checkpoints and hang the close; a coordinator counts its own share without a message to itself · coordinator decision, engine, #585 · amends D116
 
 ## Open questions
 _None._

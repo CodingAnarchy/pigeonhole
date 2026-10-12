@@ -596,15 +596,29 @@ pub struct Store {
     pub woke: Arc<AtomicBool>,
     /// Completes deferred I/O between shard passes (see `Config::deferred_io`).
     pub vfs: Arc<SimVfs>,
+    /// Whether the run defers I/O: a drop turns it back on after its teardown.
+    deferred_io: bool,
 }
 
 impl Drop for Store {
     /// A dropped shard's final sync waits for its stream's older syncs (#190). A device
-    /// completes those while it waits; with deferred I/O this thread is the device, so it
-    /// completes everything in flight first (after a crash, the operations fail).
+    /// completes those while it waits; with deferred I/O this thread is the device, so the
+    /// shards drop under `immediate_io` (after a crash, the operations fail).
     fn drop(&mut self) {
-        self.vfs.complete_all_io();
+        immediate_io(&self.vfs);
+        self.shards.clear();
+        self.vfs.set_deferred_io(self.deferred_io);
     }
+}
+
+/// Completes the deferred I/O in flight and turns deferral off, for a teardown. A shard turn
+/// or drop that waits on its own WAL sync (a final sync while closing) waits for I/O only
+/// this thread completes: on main the wait reaps it itself (#494, ICR 0028), which 0.2.x
+/// does not have. With nothing in flight and every later operation completing at once, no
+/// such wait blocks, and the run stays the seed's.
+fn immediate_io(vfs: &SimVfs) {
+    vfs.complete_all_io();
+    vfs.set_deferred_io(false);
 }
 
 pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineOptions {
@@ -648,7 +662,9 @@ impl Store {
 
     /// Opens with the checker's options.
     pub fn open_cfg(vfs: &Arc<SimVfs>, shards: usize, cfg: &Config) -> Result<Self, Error> {
-        let store = Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())?;
+        let mut store =
+            Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())?;
+        store.deferred_io = cfg.deferred_io;
         // Values above 120 bytes (of up to 160) are separated at commit time (#230). Not
         // with deferred I/O: the commit waits for a manifest commit on the thread that must
         // also complete the in-flight I/O a background manifest commit holds.
@@ -700,6 +716,7 @@ impl Store {
             family_names,
             woke,
             vfs: Arc::clone(vfs),
+            deferred_io: false,
         })
     }
 
@@ -4260,16 +4277,52 @@ fn run_with(
         }
     }
     w.stats.reads_at_older_views = w.reads_at_older_views.get();
-    let result = match w.failure.take() {
+    let mut result = match w.failure.take() {
         Some(f) => Err(f),
         None => Ok(w.stats),
     };
-    // Tear down: close, then drive the shards so they finish the close.
+    // Tear down: close, then drive the shards until every one has finished the close. A
+    // passing run must close: a close that never finishes (#585, #591: logs that can never
+    // be checkpointed empty) fails it. A close may legitimately wait for a tablet change in
+    // progress, a failing flush's backoff, or parked commits until the write-stall timeout
+    // (30 s by default): the bound is simulated time past that timeout plus a margin, with a
+    // step cap as a backstop.
     w.in_flight.clear();
     if let Some(mut store) = w.store.take() {
+        immediate_io(&vfs);
         let _ = store.engine.close();
-        for _ in 0..4 {
+        const CLOSE_BOUND_NANOS: u64 = 90_000_000_000; // 30 s stall timeout + 60 s margin
+        const CLOSE_STEP_CAP: u32 = 2_000_000;
+        let deadline = vfs.monotonic_nanos().saturating_add(CLOSE_BOUND_NANOS);
+        let mut steps = 0u32;
+        while store.shards.iter().any(|s| s.closed().is_none()) {
+            if vfs.monotonic_nanos() >= deadline || steps == CLOSE_STEP_CAP {
+                if result.is_ok() {
+                    result = Err(Failure {
+                        seed,
+                        class: FailureClass::Protocol,
+                        op_index: w.op_index,
+                        message: format!(
+                            "the final close did not finish within {} s simulated ({steps} shard \
+                             steps); shards closed: {:?}",
+                            CLOSE_BOUND_NANOS / 1_000_000_000,
+                            store
+                                .shards
+                                .iter()
+                                .map(|s| s.closed().is_some())
+                                .collect::<Vec<_>>()
+                        ),
+                        trace: std::mem::take(&mut w.trace),
+                    });
+                }
+                break;
+            }
             store.step_shards(vfs.monotonic_nanos());
+            // Timers (a flush retry's backoff, a stall timeout) wait on the simulated clock.
+            if steps % 64 == 63 {
+                vfs.advance(10_000_000);
+            }
+            steps += 1;
         }
     }
     result
@@ -4656,6 +4709,7 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
             })
             .collect(),
     ));
+    immediate_io(&vfs);
     let _ = store.engine.close();
     for _ in 0..4 {
         store.step_shards(vfs.monotonic_nanos());

@@ -403,7 +403,7 @@ impl Shared {
     }
 
     /// Marks the close unclean. The first time, every shard is kicked: one waiting at close
-    /// for its peers' reports (`ShareFlushed`, `CommitCheckpointed`) stops waiting, since a
+    /// for its peers' reports (`ShareFlushed`, `CommitSettled`) stops waiting, since a
     /// shard that gave up will never send them (5-6 5.1).
     pub(crate) fn fail_close(&self) {
         if !self.close.failed.swap(true, Ordering::AcqRel) {
@@ -995,9 +995,9 @@ pub(crate) enum ShardMsg {
     ShareFlushed {
         seqno: Seqno,
     },
-    /// The coordinator's checkpoint passed the COMMIT record of `seqno`: the participant's
-    /// PREPARE is no longer needed.
-    CommitCheckpointed {
+    /// Every share of cross-shard commit `seqno` is in SSTs (the coordinator counted every
+    /// `ShareFlushed`): the participant's PREPARE is no longer needed (#585).
+    CommitSettled {
         seqno: Seqno,
     },
     /// Another shard's checkpoint is pinned by cross-shard commits up to `through`: flush
@@ -1008,7 +1008,6 @@ pub(crate) enum ShardMsg {
     /// A `WalCheckpoint` edit for this stream is durable (or failed).
     Checkpointed {
         lsn: Lsn,
-        commits: Vec<(Seqno, Vec<ShardId>)>,
         result: Result<ManifestVersion>,
     },
     /// The manifest changed: score the shard's slots for compaction, refresh stalls.
@@ -2010,15 +2009,15 @@ pub(crate) struct ShardState {
     checkpoint_candidate: Lsn,
     checkpoint_inflight: bool,
     checkpoint_dirty: bool,
-    /// COMMIT records the candidate passed: participants are told once the edit is durable.
-    passed_commits: Vec<(Seqno, Vec<ShardId>)>,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
     aborted: HashSet<Seqno>,
-    /// Commits whose coordinator checkpointed the COMMIT record.
+    /// Commits whose coordinator reported them settled: every share in SSTs (#585).
     commit_ckpt: HashSet<Seqno>,
     /// Coordinator: `(participants that reported their share flushed, participants)` per
     /// commit whose COMMIT record is in the log.
     share_reports: HashMap<Seqno, (usize, usize)>,
+    /// Coordinator: the participants to tell once each logged commit is settled.
+    settle_to: HashMap<Seqno, Vec<ShardId>>,
     /// Participant: applied shares whose flush has not been reported to the coordinator.
     unreported: Vec<UnreportedShare>,
 
@@ -2189,10 +2188,10 @@ impl ShardState {
             checkpoint_candidate: Lsn::default(),
             checkpoint_inflight: false,
             checkpoint_dirty: false,
-            passed_commits: Vec::new(),
             aborted: HashSet::new(),
             commit_ckpt: HashSet::new(),
             share_reports: HashMap::new(),
+            settle_to: HashMap::new(),
             unreported: Vec::new(),
             leveled,
             tiered,
@@ -2406,7 +2405,19 @@ impl ShardState {
                 if !complete {
                     self.aborted.insert(seqno);
                 }
+                // Replay runs before any shard starts (`ShardMsg::Start` reports the replayed
+                // shares), so no share of this commit has been counted yet: the settle check
+                // the live path makes after logging a COMMIT has nothing to find here.
+                debug_assert!(
+                    self.share_reports
+                        .get(&seqno)
+                        .is_none_or(|(reported, _)| *reported == 0),
+                    "a share of replayed commit {seqno} was counted before its COMMIT was logged"
+                );
                 self.share_reports.entry(seqno).or_insert((0, 0)).1 = participants.len();
+                if complete {
+                    self.settle_to.insert(seqno, participants.clone());
+                }
                 self.log.push_back(Logged {
                     end,
                     pos: self.log_bytes,
@@ -4264,10 +4275,13 @@ impl ShardState {
                 MemberKind::CommitRecord { participants } => {
                     if let Some(t) = m.ticket {
                         self.share_reports.entry(m.seqno).or_insert((0, 0)).1 = participants.len();
+                        self.settle_to.insert(m.seqno, participants.clone());
                         let kind = LoggedKind::Commit {
                             participants: participants.clone(),
                         };
                         self.log_record(t.end, m.seqno, 0, kind);
+                        // Every share may have reported before the record was logged.
+                        self.settle_if_done(m.seqno, ctx);
                     }
                 }
             }
@@ -5219,6 +5233,31 @@ impl ShardState {
         }
     }
 
+    /// Coordinator: once every participant's share of commit `seqno` is in SSTs (D24's
+    /// condition for its COMMIT), tells the other participants their PREPAREs are no longer
+    /// needed (#585). Telling them only once this shard's checkpoint passed the COMMIT made
+    /// each stream's checkpoint wait on another's: two commits in flight together whose
+    /// coordinators take part in each other log each other's PREPARE before their own
+    /// COMMIT, and neither checkpoint could pass. A replay that finds a participant's
+    /// PREPARE gone treats the commit as incomplete and applies none of it, which is right
+    /// once every share is in SSTs.
+    fn settle_if_done(&mut self, seqno: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let done = self
+            .share_reports
+            .get(&seqno)
+            .is_some_and(|(reported, total)| reported >= total);
+        if !done {
+            return;
+        }
+        if let Some(participants) = self.settle_to.remove(&seqno) {
+            for p in participants {
+                if p != self.id {
+                    self.send(p, ShardMsg::CommitSettled { seqno }, ctx);
+                }
+            }
+        }
+    }
+
     /// Tells coordinators about applied shares whose slots are all in SSTs now.
     fn report_shares_flushed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         let Ok(view) = self.checkpoint_view() else {
@@ -5238,11 +5277,25 @@ impl ShardState {
                 .all(|s| self.slot_flushed(catalog, s, u.seqno));
             if done {
                 let u = self.unreported.swap_remove(i);
-                self.send(
-                    u.coordinator,
-                    ShardMsg::ShareFlushed { seqno: u.seqno },
-                    ctx,
-                );
+                if u.coordinator == self.id {
+                    // Our own share of a commit we coordinate: counted here, not handled as
+                    // a message sent to ourselves. That handler would advance the checkpoint
+                    // and re-enter the close (which calls this), one stack frame per share:
+                    // a close with thousands of them overflowed the shard's stack (#585).
+                    // Every caller advances the checkpoint next, and the batch's `end_batch`
+                    // re-checks the close.
+                    self.share_reports
+                        .entry(u.seqno)
+                        .or_insert((0, usize::MAX))
+                        .0 += 1;
+                    self.settle_if_done(u.seqno, ctx);
+                } else {
+                    self.send(
+                        u.coordinator,
+                        ShardMsg::ShareFlushed { seqno: u.seqno },
+                        ctx,
+                    );
+                }
             } else {
                 i += 1;
             }
@@ -5262,17 +5315,26 @@ impl ShardState {
             }
             let l = self.log.pop_front().expect("checked");
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
-            self.aborted.remove(&l.seqno);
             self.asked.remove(&l.seqno);
             match l.kind {
-                LoggedKind::Commit { participants } => {
+                LoggedKind::Commit { .. } => {
+                    self.aborted.remove(&l.seqno);
                     self.share_reports.remove(&l.seqno);
-                    self.passed_commits.push((l.seqno, participants));
+                    self.settle_to.remove(&l.seqno);
                 }
                 LoggedKind::Prepare { .. } => {
+                    // A coordinator logs its own PREPARE before its COMMIT, under the same
+                    // seqno: while that COMMIT is still in the log (`share_reports` has it),
+                    // an aborted commit stays aborted, or its COMMIT would read as undecided
+                    // and be needed for ever (#591).
+                    if !self.share_reports.contains_key(&l.seqno) {
+                        self.aborted.remove(&l.seqno);
+                    }
                     self.commit_ckpt.remove(&l.seqno);
                 }
-                LoggedKind::Single { .. } => {}
+                LoggedKind::Single { .. } => {
+                    self.aborted.remove(&l.seqno);
+                }
             }
         }
         if self.log.is_empty() {
@@ -5290,7 +5352,7 @@ impl ShardState {
                 .min(wal.written())
                 .max(self.checkpoint);
         }
-        if self.checkpoint_candidate <= self.checkpoint && self.passed_commits.is_empty() {
+        if self.checkpoint_candidate <= self.checkpoint {
             return;
         }
         if self.checkpoint_inflight {
@@ -5303,15 +5365,10 @@ impl ShardState {
         self.checkpoint_inflight = true;
         self.checkpoint_dirty = false;
         let lsn = self.checkpoint_candidate;
-        let commits = std::mem::take(&mut self.passed_commits);
         let submitter = ctx.submitter(self.id).clone();
         let stream = StreamId(u32::from(self.id.0));
         let req = ManifestReq::edits(vec![Edit::WalCheckpoint { stream, lsn }], move |result| {
-            let _ = submitter.submit(ShardMsg::Checkpointed {
-                lsn,
-                commits,
-                result,
-            });
+            let _ = submitter.submit(ShardMsg::Checkpointed { lsn, result });
         });
         manifest::submit(&self.shared, self.id, req);
     }
@@ -5319,7 +5376,6 @@ impl ShardState {
     fn on_checkpointed(
         &mut self,
         lsn: Lsn,
-        commits: Vec<(Seqno, Vec<ShardId>)>,
         result: Result<ManifestVersion>,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
@@ -5338,17 +5394,10 @@ impl ShardState {
                 {
                     self.poisoned = true;
                 }
-                for (seqno, participants) in commits {
-                    for p in participants {
-                        self.send(p, ShardMsg::CommitCheckpointed { seqno }, ctx);
-                    }
-                }
             }
             Err(e) => {
-                // Retry at the next checkpoint event, or once a backoff passes; the commits
-                // passed stay queued.
+                // Retry at the next checkpoint event, or once a backoff passes.
                 trace!("shard {} checkpoint failed: {e}", self.id.0);
-                self.passed_commits.extend(commits);
                 self.checkpoint_dirty = true;
                 if self.closing {
                     self.shared.fail_close();
@@ -6027,7 +6076,8 @@ impl ShardState {
         trace!(
             "shard {} close: stage {:?} unresolved={} coord={} prepared={} pending={} flush_idle={} \
              flush_running={} queue={} frozen={} to_freeze={:?} deferred={} log={} ckpt_inflight={} \
-             dirty={} failed={} unreported={} share_reports={:?} commit_ckpt={:?} aborted={:?}",
+             dirty={} failed={} unreported={} op={} parked={} retries={} share_reports={:?} \
+             commit_ckpt={:?} aborted={:?}",
             self.id.0,
             self.close_stage,
             self.unresolved.len(),
@@ -6048,6 +6098,9 @@ impl ShardState {
             self.checkpoint_dirty,
             self.flush_failed,
             self.unreported.len(),
+            self.op.is_some(),
+            self.parked.len(),
+            self.retries.len(),
             self.share_reports,
             self.commit_ckpt,
             self.aborted,
@@ -6142,7 +6195,7 @@ impl ShardState {
                 && !self.shared.close.failed.load(Ordering::Acquire)
             {
                 // Waiting for the other shards' flushes and checkpoints (ShareFlushed and
-                // CommitCheckpointed arrive as messages). Once the close is unclean, a shard
+                // CommitSettled arrive as messages). Once the close is unclean, a shard
                 // that gave up flushing never sends its reports: stop waiting (the WAL keeps
                 // whatever the checkpoint did not pass, and the next open replays it).
                 return;
@@ -6324,20 +6377,17 @@ impl ShardState {
                 // The COMMIT record may not be logged yet (a participant flushed before the
                 // coordinator's group ran): the count waits for it.
                 self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
+                self.settle_if_done(seqno, ctx);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
-            ShardMsg::CommitCheckpointed { seqno } => {
+            ShardMsg::CommitSettled { seqno } => {
                 self.commit_ckpt.insert(seqno);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
             ShardMsg::Unpin { through } => self.on_unpin(through, ctx),
-            ShardMsg::Checkpointed {
-                lsn,
-                commits,
-                result,
-            } => self.on_checkpointed(lsn, commits, result, ctx),
+            ShardMsg::Checkpointed { lsn, result } => self.on_checkpointed(lsn, result, ctx),
             ShardMsg::Maintain => {
                 self.maintain(ctx);
                 if self.freeze_deferred || !self.to_freeze.is_empty() {
