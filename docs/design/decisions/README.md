@@ -239,6 +239,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D224](phase-3.md#d224) — Under a closed-loop write load the balancer ignores skew while the mean is falling (a phase's tail), corrects placement on ~10 s slow averages (one change per 10 s), claims the shards it hands load to, and treats a tablet as cold only after 100 unwritten passes · owner direction, tablets, #582 · amends D214, D134, D146
 - [D225](phase-3.md#d225) — A participant's PREPARE may be checkpointed once its commit is settled (every share in SSTs: `CommitSettled`), not once the coordinator checkpointed the COMMIT, which let crossed cross-shard commits pin each other's checkpoints and hang the close; a coordinator counts its own share without a message to itself · coordinator decision, engine, #585 · amends D116
 - [D226](phase-3.md#d226) — The durable group-commit p99 (< 200 µs) is judged on the bench side under full load: 16 shards, 16 commits in flight, the D223 driver, which measured about 320 µs against the old driver's 210 (engine side 131 µs both); 4 and 8 in flight are reported beside it (`--in-flight`), at 8 p99 about 165 µs for 30% less throughput · owner decision, bench, engine, #406 · amends D213
+- [D229](phase-3.md#d229) — `wal_pin_bytes` stays at 2× the memtable budget (the default, 0); 4× is not adopted: on the AX102 gate window 2× held throughput, kept the WAL ~190 MiB smaller and replayed ~20% faster, at the cost of 320 small flushes per 4M commits · owner decision, engine, bench, #527
 
 ## Open questions
 _None._

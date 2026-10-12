@@ -933,3 +933,21 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - The p99.9 hardly moves with the in-flight count: it comes from syncs and flush and compaction steps, not from queueing.
 
 **Work toward the judged row.** The first finding is a lost wake in `ShardDriver::wait` (#567). A commit that resolves during the driver's own `run_once` wakes the driver by setting the same flag the scheduler's `collect_woken` then clears, so the driver's next `wait` sleeps until the next I/O completion or its timeout. Its fix and the remaining attribution (the global watermark, D19; the group-sync wait, D207) are tracked separately and recorded here when they land.
+
+<a id="d229"></a>
+## D229 — `wal_pin_bytes` stays at twice the memtable budget (owner decision, 2026-10-12; engine, bench, #527)
+
+**Decided:** the default WAL pin bound (D155, D206) stays at 2× `memtable_budget`: `wal_pin_bytes` 0 means that, as before. 4× is not adopted. No code changes.
+
+**Measured** (the 2026-10-12 gate window on the AX102, `wal-pin` step: #175's mixed-temperature commits, 4 shards, 64 MiB budget, 4M commits, then a reopen after an exit without close; medians over 2 rounds; `crates/bench/baselines/phase3-gate/results/2026-10-12/wal-pin.jsonl`):
+
+| `wal_pin_bytes` | commits/s | unpin passes | small flushes | all flushes | WAL files at most | reopen (replay) | first read |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| 2× budget | 416,600 | 188 | 320 | 225 | 1,152 MiB | 460 ms | 1,535 µs |
+| 4× budget | 391,598 | 0 | 0 | 210 | 1,344 MiB | 573 ms | 1,304 µs |
+
+**Why:**
+- At 2×, the unpin passes and their small flushes cost no throughput. Commits/s was about 6% higher than at 4× in both rounds (408K and 425K against 383K and 400K). The passes run in slices (D206).
+- 2× keeps the WAL about 190 MiB smaller and the replay after a crash about 20% shorter (460 against 573 ms).
+- 4×'s gain is fewer small flushes (0 against 320; total flushes 210 against 225). That's write amplification compaction absorbs: compactions were 157–159 against 159–171.
+- The first read after reopen differed by a fraction of a millisecond either way.
