@@ -32,7 +32,16 @@ let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
 - **Threads are not pinned** to CPUs by default, so several databases or containers on one host share the CPUs cleanly. On a host or cpuset dedicated to one database, `Options::pin_threads(true)` pins shard `i` to the `i`-th CPU the opening thread may run on.
 - **How many shards.** The default is one shard thread per available CPU, which suits many threads writing at once. Each write is applied by the shard that owns its row, so with only a few writing threads their writes spread thinly over many shards: each shard sits idle between commits, and a commit that finds its shard asleep pays to wake it (a few microseconds on bare metal and macOS, tens on some virtual machines). If your application has few threads writing concurrently, set `Options::shards(n)` to about that number (at least 1), up to the CPU count. Reads do not depend on the shard count (they run on the calling thread), and fewer shards also means a smaller shared-memory region. Measure with your own workload; the default may change once adaptive behavior lands (#478).
 - **Waiting for a commit.** A thread waiting for a `Buffered` or `None` commit polls for up to 15 µs before it sleeps, and an engine-owned shard that just handled a commit polls for up to 50 µs for the next one (D198), because a shard usually answers faster than a sleep and wake. Durable commits and idle databases do not poll. On battery-powered or CPU-constrained hosts, `Options::commit_spin(Duration::ZERO)` and `Options::shard_spin(Duration::ZERO)` turn both off.
-- **I/O backend (Linux).** The default backend is `pread` with a pool of I/O threads. `Options::io_backend(IoBackend::Uring)` uses io_uring and fails to open where it is unavailable; `IoBackend::Auto` uses io_uring where available and `pread` elsewhere. `Options::direct_io(true)` reads and writes SST and blob extents without the OS page cache, so the block cache is their only cache: size `block_cache` for your working set if you turn it on. Both are off by default.
+- **I/O backend (Linux).** The default (`IoBackend::Auto`, D218) uses io_uring where the kernel offers it and a `pread` thread pool elsewhere. `IoBackend::Uring` fails the open where io_uring is unavailable; `IoBackend::Pread` forces the thread pool.
+- **Direct I/O.** `Options::direct_io(true)` reads and writes SST and blob extents without the OS page cache, so the block cache is their only cache. It is off by default, and that suits most databases: buffered reads use whatever memory is free as cache, while direct reads past the block cache go to the device. Turn it on when the data is much larger than RAM *and* `block_cache` holds at least about 1/64 of the data (the SST indexes and filters it pins plus the index partitions, D215). Cold gets then cost one device read each without the page cache's copy and eviction work. On the reference machine (AX102, 64 GiB table, 1 GiB block cache), cold gets measured:
+
+  | | direct | buffered |
+  |---|---|---|
+  | 1 thread, p50 / p99 | 88 / 205 µs | 92 / 264 µs |
+  | 16 threads, p99 | 293 µs | 447 µs |
+  | 16 threads, throughput | 130K gets/s | 122K gets/s |
+
+  With a small block cache, direct I/O is much slower: a sparse-wide workload whose data fit in memory ran at 3.3K ops/s with direct I/O and a 16 MiB block cache, against 19K buffered.
 
 Common options:
 

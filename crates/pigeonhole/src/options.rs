@@ -307,9 +307,16 @@ impl Options {
     /// Read and write SST and blob extents with direct I/O (#403): `O_DIRECT` on Linux,
     /// `F_NOCACHE` on macOS, `FILE_FLAG_NO_BUFFERING` on Windows, through a second handle on
     /// the file, so the block cache is their only cache. Superblocks, the manifest and the
-    /// WAL stay buffered. A file system that refuses direct I/O keeps buffered I/O. Default
-    /// off; with it on, size [`Options::block_cache`] for the working set, since the OS no
-    /// longer caches SST blocks.
+    /// WAL stay buffered. A file system that refuses direct I/O keeps buffered I/O.
+    ///
+    /// Default off, which suits most databases: buffered reads use whatever memory is free
+    /// as cache. Turn it on when the data is much larger than RAM and
+    /// [`Options::block_cache`] holds at least about 1/64 of the data (its pinned SST indexes
+    /// and filters plus the index partitions, D215): cold gets then cost one device read
+    /// each without the page cache's copy. On the reference machine (64 GiB table, 1 GiB block
+    /// cache) cold gets measured p99 205 µs direct against 264 µs buffered on one thread, and
+    /// 293 against 447 µs on 16. With a block cache much smaller than the working set,
+    /// direct I/O is far slower than buffered.
     pub fn direct_io(mut self, yes: bool) -> Self {
         self.direct_io = Some(yes);
         self
