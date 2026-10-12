@@ -26,6 +26,17 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ### Changed (breaking)
 - `pigeonhole-sst`: `ReadOptions` gains the public field `cache_only`, so building it with a struct literal no longer compiles; start from `ReadOptions::default()` and set fields.
 
+## [0.2.2] - 2026-10-12
+Fixes to closing a database after cross-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 and 0.2.1 open as before. Every published crate moves to 0.2.2 together.
+
+### Fixed
+- **Closing the database could hang forever after concurrent cross-shard commits** (#585, D225).
+  - **When:** two commits that each wrote rows on more than one shard were in flight together, and each was coordinated by a shard the other wrote to. Likelier with many shards and many threads writing at once.
+  - **What happened:** each shard's WAL checkpoint waited for the other's, so neither could move. `close` waited for them and never returned. While running, the WAL stopped being trimmed past those commits. With many such commits in flight, a shard thread could instead overflow its stack during the close and abort the process.
+  - **The fix:** a shard drops a cross-shard commit's record from its WAL once every shard's part of the commit is written to the file, without waiting for the coordinating shard's checkpoint (D225).
+- **Closing the database could hang forever after a crash during cross-shard commits** (#591). The reopen recovered correctly, but a commit the recovery had correctly discarded was later treated as undecided, and the close waited for it.
+- **Closing the database could hang forever after a tablet move** (#597): a shard was not told when another shard wrote its moved data to the file, so a commit never completed its bookkeeping.
+
 ## [0.2.1] - 2026-10-11
 A fix to WAL crash recovery. **Upgrade recommended** for every 0.2.0 user. The file format is unchanged, and files written by 0.2.0 open as before. Every published crate moves to 0.2.1 together.
 
@@ -116,7 +127,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0
