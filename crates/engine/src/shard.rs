@@ -5993,17 +5993,26 @@ impl ShardState {
             let l = self.log.pop_front().expect("checked");
             self.unindex_front(&l);
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
-            self.aborted.remove(&l.seqno);
             self.asked.remove(&l.seqno);
             match l.kind {
                 LoggedKind::Commit { .. } => {
+                    self.aborted.remove(&l.seqno);
                     self.share_reports.remove(&l.seqno);
                     self.settle_to.remove(&l.seqno);
                 }
                 LoggedKind::Prepare { .. } => {
+                    // A coordinator logs its own PREPARE before its COMMIT, under the same
+                    // seqno: while that COMMIT is still in the log (`share_reports` has it),
+                    // an aborted commit stays aborted, or its COMMIT would read as undecided
+                    // and be needed for ever (#591).
+                    if !self.share_reports.contains_key(&l.seqno) {
+                        self.aborted.remove(&l.seqno);
+                    }
                     self.commit_ckpt.remove(&l.seqno);
                 }
-                LoggedKind::Single { .. } => {}
+                LoggedKind::Single { .. } => {
+                    self.aborted.remove(&l.seqno);
+                }
             }
         }
         if self.log.is_empty() {

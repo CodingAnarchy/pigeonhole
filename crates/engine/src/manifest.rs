@@ -485,6 +485,9 @@ pub(crate) struct Commit {
     tablet_change: bool,
     sst_changed: bool,
     checkpoints_changed: bool,
+    /// A slot's flushed-through seqno moved without an SST (`SetFlushed`): shards waiting to
+    /// report a share it covers re-check (#597).
+    flushed_changed: bool,
 }
 
 impl std::fmt::Debug for Commit {
@@ -621,6 +624,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let mut tablet_change = false;
     let mut sst_changed = false;
     let mut checkpoints_changed = false;
+    let mut flushed_changed = false;
     let mut rewrite = false;
     // What the accepted requests wrote (freed if the whole batch is refused), and the
     // compactions they record (kept only once the batch is prepared).
@@ -744,6 +748,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         | Edit::DropTablet { .. } => tablets_changed = true,
                         Edit::AddSst { .. } | Edit::RemoveSst { .. } => sst_changed = true,
                         Edit::WalCheckpoint { .. } => checkpoints_changed = true,
+                        Edit::SetFlushed { .. } => flushed_changed = true,
                         _ => {}
                     }
                     if matches!(e, Edit::DropTable { .. }) {
@@ -860,6 +865,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 tablet_change,
                 sst_changed,
                 checkpoints_changed,
+                flushed_changed,
             })
         }
         Err(e) => {
@@ -903,6 +909,7 @@ pub(crate) fn end(
         tablet_change,
         sst_changed,
         checkpoints_changed,
+        flushed_changed,
     } = commit;
     let version = {
         let mut writer = shared
@@ -1025,7 +1032,9 @@ pub(crate) fn end(
     for (req, r) in reqs {
         (req.reply)(r.map(|()| version));
     }
-    if sst_changed || checkpoints_changed || tablet_change {
+    // Another shard's flush may cover a share a shard waits to report (moved tablets): any
+    // change to what is flushed tells every shard, an SST or not.
+    if sst_changed || checkpoints_changed || tablet_change || flushed_changed {
         shared.broadcast(|| ShardMsg::Maintain);
     }
 }
