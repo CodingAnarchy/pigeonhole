@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,9 @@ const SETTLED: Duration = Duration::from_secs(2);
 
 /// How long a shard thread's turn may run before it polls its commits again.
 const TURN: Duration = Duration::from_micros(50);
+
+/// Writes a shard thread checks for its rows between turns of its shard, as a phase starts.
+const PICK_CHUNK: usize = 1 << 16;
 
 /// One write of the stream: a row and its cells, in one family.
 struct Write {
@@ -187,21 +190,33 @@ fn phase(
 ) -> Result<(Vec<Shard>, Duration, Histogram), String> {
     let n = shards.len();
     let done = AtomicUsize::new(0);
-    let start = Instant::now();
+    let ready = Barrier::new(n + 1);
+    let mut start = Instant::now();
     let results: Vec<Result<(Shard, Histogram), String>> = std::thread::scope(|s| {
         let threads: Vec<_> = shards
             .into_iter()
             .map(|mut shard| {
-                let done = &done;
-                // The rows this thread's shard owns as the phase starts (D204): its writes
-                // then commit on its own shard. A row the balancer moves during the phase
-                // is still committed correctly, routed to its new owner.
-                let i = shard.index();
-                let mine: Vec<&Write> = writes
-                    .iter()
-                    .filter(|w| t.shard_of(&w.row).unwrap_or(0) == i)
-                    .collect();
+                let (done, ready) = (&done, &ready);
                 s.spawn(move || {
+                    // The rows this thread's shard owns as the phase starts (D204): its
+                    // writes then commit on its own shard. A row the balancer moves during
+                    // the phase is still committed correctly, routed to its new owner. Every
+                    // thread picks its rows, then they all start together: picked one shard
+                    // after another, the shards started (and finished) staggered, and the
+                    // balancer saw the idle ones' loads as skew (D223). The shard takes a turn
+                    // between chunks, so its balancer keeps publishing its load meanwhile (a
+                    // shard that misses its passes counts as idle).
+                    let i = shard.index();
+                    let mut mine: Vec<&Write> = Vec::new();
+                    for chunk in writes.chunks(PICK_CHUNK) {
+                        mine.extend(
+                            chunk
+                                .iter()
+                                .filter(|w| t.shard_of(&w.row).unwrap_or(0) == i),
+                        );
+                        shard.run_once(TURN);
+                    }
+                    ready.wait();
                     let mut hist = Histogram::new();
                     let r = pipeline(t, &mine, in_flight, &mut shard, record.then_some(&mut hist));
                     done.fetch_add(1, Ordering::AcqRel);
@@ -218,6 +233,8 @@ fn phase(
                 })
             })
             .collect();
+        ready.wait();
+        start = Instant::now();
         threads
             .into_iter()
             .map(|t| t.join().expect("a shard thread panicked"))

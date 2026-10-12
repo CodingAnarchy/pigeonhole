@@ -745,3 +745,25 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 - The spec already says one shard per physical core ([Thread-per-core execution](../spec.md#thread-per-core-execution)); the code counted logical CPUs.
 
 **Not changed:** an explicit `shards(n)`; D213's and D204's shapes. `Environment::cores` in the bench report stays the logical CPU count: it identifies the machine when comparing runs.
+
+<a id="d223"></a>
+## D223 — The scaling gate's placement check is a busiest share of at most 1.25/N, and the driver starts every shard together (owner decision, 2026-10-12; bench, tablets, #406; amends D204)
+
+**Decided:**
+- **The busiest shard may take at most 1.25/N of the measured commits** (`Scaling::MAX_SHARE`), down from 2/N. Above it the run fails as skewed, whatever its efficiency. The gate summary (`report.py`) checks the same bound.
+- **The D204 driver starts every shard together.** Each shard thread picks the rows its shard owns, taking a turn of its shard every 64K writes so the shard's balancer keeps publishing its load. All threads then start at a barrier, and the phase clock starts there.
+- **The balancer (D214) is tuned toward 1.25/N** under the scaling workload, keeping D214's damping. That's a separate change, recorded here when it lands.
+
+**Why the bound.** With equal per-shard rates, a phase lasts as long as its busiest shard, so efficiency is at most 1/(N × busiest share). Under 2/N, a placement that capped efficiency at 0.5 still passed, so the check didn't fit the 0.8 target. 1.25/N is the loosest bound that still allows 0.8. On the AX102, perf287 measured busiest shares of 1.2–1.5× the ideal at 8 and 16 shards.
+
+**Why the driver change.** Before, `phase()` picked each shard's rows on the main thread, one shard after another, before spawning that shard's thread. Each pick scans every write. So the shards started, and finished, staggered by the scan time. A shard waiting to start ran no balancer passes, so its published load went stale and counted as 0. The balancer then moved tablets toward phantom skew, sometimes back again. On the Mac at 4 shards, balancer decisions per run fell from 13–18 to 2–4. The old clock also counted the serial picks, which understated efficiency.
+
+**How far 1.25/N can go.** The best contiguous split of the `skewed-multi-shard` key distribution (Zipfian 0.99, scrambled, 1M rows) is computed from the workload's own key and rank functions:
+
+| N | 4 | 8 | 16 | 32 |
+|---|--:|--:|--:|--:|
+| Best busiest share | 25.2% | 12.8% | 6.6% | 6.5% |
+| As a multiple of ideal | 1.01× | 1.02× | 1.05× | 2.08× |
+| 1.25/N | 31.3% | 15.6% | 7.8% | 3.9% |
+
+The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 shards. The gate runs scaling at most at the physical core count (16 on the AX102, D220), where it can.
