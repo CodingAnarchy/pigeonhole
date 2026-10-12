@@ -339,23 +339,23 @@ fn layout_version_mismatch_is_refused_unless_alone() {
     let r = Proc::start(&sim, pid(11));
     let (rp, _shm_r, _slot) = r.open_reader();
 
-    // Pretend the live region was built by a build with layout version 2.
+    // Pretend the live region was built by a build with layout version 3.
     let (mapping, _, _) = shm.arena(0);
     mapping
         .atomic_u32(header::LAYOUT_VERSION)
-        .store(2, Ordering::Release);
+        .store(3, Ordering::Release);
     let dir_name = directory_name(w.identity.device, w.identity.inode);
     w.vfs
         .open_shared(&dir_name, None, directory::LEN as u64, SharedOpen::Attach)
         .unwrap()
         .atomic_u32(directory::LAYOUT_VERSION)
-        .store(2, Ordering::Release);
+        .store(3, Ordering::Release);
 
     // A new reader is refused.
     let r2 = Proc::start(&sim, pid(12));
     match r2.open(Role::Reader) {
         Err(Error::VersionMismatch { found, expected }) => {
-            assert_eq!((found, expected), (2, 1));
+            assert_eq!((found, expected), (3, 2));
         }
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
@@ -366,7 +366,7 @@ fn layout_version_mismatch_is_refused_unless_alone() {
     let w2 = Proc::start(&sim, pid(2));
     let lock2 = WriterLock::acquire(&w2.file).unwrap();
     match w2.open(Role::Writer) {
-        Err(Error::VersionMismatch { found, .. }) => assert_eq!(found, 2),
+        Err(Error::VersionMismatch { found, .. }) => assert_eq!(found, 3),
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
     // ...and rebuilds once it is alone. The probe ran with no presence lock held (D37) and

@@ -59,6 +59,14 @@ impl Db {
         })
     }
 
+    pub(crate) fn durable_snapshot(self: &Arc<Self>) -> Result<Snapshot> {
+        self.check_open()?;
+        Ok(Snapshot {
+            inner: self.engine.durable_snapshot()?,
+            db: Arc::downgrade(self),
+        })
+    }
+
     /// Refuses a snapshot taken from another database.
     #[inline]
     pub(crate) fn check_snapshot(self: &Arc<Self>, snapshot: &Snapshot) -> Result<()> {
@@ -271,9 +279,35 @@ impl Pigeonhole {
         ))
     }
 
-    /// A consistent snapshot of everything committed so far.
+    /// A consistent snapshot of everything committed so far. It sees a commit once the commit
+    /// is applied, possibly before its fsync (D227): a power loss can remove what it read.
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.db.snapshot()
+    }
+
+    /// A consistent snapshot that sees a commit only once it is durable at its level (D227,
+    /// ICR 0037): every value it reads survives a power loss. It may lag
+    /// [`snapshot`](Self::snapshot) by the fsyncs in flight (typically well under a
+    /// millisecond). Use it when what you read must never be undone: deriving a write on
+    /// another shard from it, or a cursor you persist.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"row").put("f", b"q", b"v").commit()?; // durable once it returns
+    /// let durable = db.durable_snapshot()?;
+    /// assert_eq!(t.get_at(&durable, b"row", "f", b"q")?.unwrap().value(), b"v");
+    /// # drop(t);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn durable_snapshot(&self) -> Result<Snapshot> {
+        self.db.durable_snapshot()
     }
 
     /// Per-shard commits, tablets and tablet changes since open, indexed by shard: a bench
@@ -462,6 +496,13 @@ impl Pigeonhole {
         Ok(self.db.engine.backup(dest.as_ref())?)
     }
 
+    /// As [`backup`](Self::backup), at a durable snapshot (D227, ICR 0037): the copy holds
+    /// only commits that are durable here, never one a power loss then removes from this
+    /// database.
+    pub fn backup_durable(&self, dest: impl AsRef<Path>) -> Result<()> {
+        Ok(self.db.engine.backup_durable(dest.as_ref())?)
+    }
+
     /// Returns free space at the end of the file to the filesystem and reports the bytes
     /// released. The file never shrinks by itself: space freed by compaction or by deleting
     /// rows is reused by later writes, but the file keeps its length. Call this after a
@@ -605,9 +646,16 @@ impl PigeonholeReader {
     }
 
     /// A consistent snapshot of what the writer has published. May do I/O: re-attach after
-    /// a writer restart and reload the manifest if it changed.
+    /// a writer restart and reload the manifest if it changed. It sees commits once applied,
+    /// possibly before their fsync (D227).
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.db.snapshot()
+    }
+
+    /// A snapshot that sees only commits durable at their level (D227, ICR 0037), as
+    /// [`Pigeonhole::durable_snapshot`]. May do I/O, as [`snapshot`](Self::snapshot).
+    pub fn durable_snapshot(&self) -> Result<Snapshot> {
+        self.db.durable_snapshot()
     }
 }
 

@@ -89,6 +89,10 @@ pub mod watermark {
     /// group's lower bound and every cross-shard commit seqno it coordinates and has not yet
     /// released; `u64::MAX` when idle.
     pub const PENDING: usize = 0;
+    /// `u64` atomic (layout version 2, D227): the lowest seqno this shard holds that is not
+    /// yet durable at its commit's level: `PENDING`'s seqnos and every applied group whose
+    /// sync has not returned; `u64::MAX` when idle. Durable snapshots read it.
+    pub const DURABLE: usize = 8;
 }
 
 /// Byte offsets within a reader slot.

@@ -2,7 +2,7 @@
 
 Every on-disk and shared-memory byte layout. Written during the interface freeze (build step 2). The executable form is the `pigeonhole-format` crate; where this file and the crate disagree, this file wins and the crate has a bug.
 
-Format version **1**, shared-memory layout version **1**. Nothing here is promised stable before 1.0 (spec: "promise forward compatibility only at 1.0"), but every structure carries a magic or a version so it can evolve.
+Format version **1**, shared-memory layout version **2**. Nothing here is promised stable before 1.0 (spec: "promise forward compatibility only at 1.0"), but every structure carries a magic or a version so it can evolve.
 
 ## 1. Conventions
 
@@ -411,7 +411,9 @@ A writer always builds a new generation: create the new region, store `state = a
 
 ### 11.2 Watermarks
 
-One 64-byte line per shard at `watermarks_off + 64 x shard`. Offset 0: `pending` u64, atomic: the lowest seqno this shard holds unapplied, or `u64::MAX` when idle (an idle shard never holds back snapshots). The rest of the line is padding (no false sharing).
+One 64-byte line per shard at `watermarks_off + 64 x shard`. The rest of the line is padding (no false sharing).
+- **Offset 0: `pending`,** u64, atomic. The lowest seqno this shard holds unapplied, or `u64::MAX` when idle (an idle shard never holds back snapshots).
+- **Offset 8: `durable`,** u64, atomic (layout version 2, D227). The lowest seqno this shard holds that is not yet durable at its commit's level: its cross-shard seqnos, and every applied group whose sync has not returned. `u64::MAX` when idle. A shard stores `durable` before `pending` whenever both change.
 
 ### 11.3 Seqno reservation and snapshot protocol
 
@@ -424,7 +426,7 @@ Each shard tracks `held`: the seqnos of cross-shard commits it coordinates that 
 
 Without the `min(held, ..)` in steps 1 and 3, a coordinator's next group would overwrite `pending` and expose half of a cross-shard commit.
 
-Snapshot (writer threads and reader processes alike): `n = next_seqno.load()` (Acquire), then `m = min over shards of pending.load()` (Acquire); the snapshot seqno is `min(n, m) - 1`. Every seqno below `n` was reserved by a `fetch_add` that published a lower bound first, so it is either applied or holds `m` at or below it.
+Snapshot (writer threads and reader processes alike): `n = next_seqno.load()` (Acquire), then `m = min over shards of pending.load()` (Acquire); the snapshot seqno is `min(n, m) - 1`. A *durable* snapshot (D227) loads each shard's `pending` and then its `durable` (Acquire both), and takes `min(n, every pending, every durable) - 1`. A shard stores `durable` first, so a reader that sees a raised `pending` also sees the `durable` covering what is applied but not yet synced. Every seqno below `n` was reserved by a `fetch_add` that published a lower bound first, so it is either applied or holds `m` at or below it.
 
 ### 11.4 View buffers
 
@@ -500,6 +502,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 ## 12. Evolution
 
 - A reader rejects a `FormatVersion` above what it supports and refuses a `ShmLayoutVersion` that differs at all.
+- **Shared-memory layout version 2** adds each shard's `durable` watermark (§11.2, D227). A version 1 process cannot attach to a version 2 region, nor the reverse, so writer and reader processes must run builds with the same layout.
 - **Version 2** adds blob files (§7): separated values, `PutBlobFile`/`DropBlobFile` edits in use, and the `Blob` value tag in SSTs. A version 1 build (0.1.0) would read a blob pointer as an empty value, so every structure is now written with version 2 and a version 1 build refuses the file (version 2 also covers zstd blocks, codec 2 in §4.1, which a version 1 build cannot decode). This build still reads version 1 files; a file it writes to (any commit rewrites the superblock) is version 2 from then on.
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.

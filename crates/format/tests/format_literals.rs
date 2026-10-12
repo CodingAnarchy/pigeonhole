@@ -320,7 +320,16 @@ fn shm_layout() {
     assert_eq!(&p[0..8], b"PHDBSHM\0");
     assert_eq!(
         (le32(&p, 8), le32(&p, 12), le64(&p, 16)),
-        (1, 4096, h.region_len)
+        (2, 4096, h.region_len)
+    );
+    // §11.2: each shard's 64-byte watermark line holds `pending` at 0 and `durable` at 8
+    // (layout version 2, D227).
+    assert_eq!(
+        (
+            pigeonhole_format::shm::watermark::PENDING,
+            pigeonhole_format::shm::watermark::DURABLE
+        ),
+        (0, 8)
     );
     assert_eq!(p[24..40], [0xD3; 16]);
     assert_eq!((le32(&p, 52), le32(&p, 56), le32(&p, 60)), (2, 3, 100));

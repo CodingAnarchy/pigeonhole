@@ -659,6 +659,8 @@ The manifest brief says `SetFlushed { tablet, family, seqno }` and replay skips 
 
 **Decision:** a shard freezes only when `active.max_seqno <= visible_seqno`, so every entry up to the memtable's max seqno is in it and `SetFlushed` is exactly that max. The freeze is deferred (`freeze_deferred`) until the condition holds, never skipped.
 
+*Since D227, the condition is the durable seqno, not the visible one: a frozen memtable holds only durable entries, so a flush never collapses a version a durable snapshot reads.*
+
 <a id="d118"></a>
 ## D118 — How conservative is `GcPolicy` about reader-process snapshots? (approved; engine Milestone B; precise per-slot pinning is #39)
 D70 narrows purge by `min_ts_above`; D74 purge needs the set of live snapshot seqnos. Reader processes only publish a reader-slot pin (a view version), not their snapshot seqnos.

@@ -665,6 +665,7 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             waiters: WatermarkWaiters::new(shards),
+            durable_waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),
@@ -1165,6 +1166,7 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             waiters: WatermarkWaiters::new(shards),
+            durable_waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),
@@ -1445,6 +1447,14 @@ impl Engine {
     /// manifest when its version changed (`Pager::reload_root`).
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.inner.snapshot()
+    }
+
+    /// A snapshot that sees a commit only once it is durable at its level on its shard (D227,
+    /// ICR 0037): what [`Engine::snapshot`] saw before D227. Every commit it reads is durable
+    /// at its level and survives a power loss; it may lag the visible state by the syncs in
+    /// flight. In a reader process it may do I/O, as `snapshot` does.
+    pub fn durable_snapshot(&self) -> Result<Snapshot> {
+        self.inner.snapshot_of(true)
     }
 
     /// The newest visible version of one cell.
@@ -1753,12 +1763,22 @@ impl Engine {
     /// not durable (D227): the copy can hold commits whose sync had not finished, which a
     /// power loss then removes from this database.
     pub fn backup(&self, dest: &Path) -> Result<()> {
+        self.backup_of(dest, false)
+    }
+
+    /// As [`Engine::backup`], at a durable snapshot ([`Engine::durable_snapshot`], D227, ICR
+    /// 0037): the copy holds only commits durable here, none a power loss can remove.
+    pub fn backup_durable(&self, dest: &Path) -> Result<()> {
+        self.backup_of(dest, true)
+    }
+
+    fn backup_of(&self, dest: &Path, durable: bool) -> Result<()> {
         let inner = &self.inner;
         if inner.role != Role::Writer {
             return Err(Error::ReadOnly);
         }
         let _guard = inner.enter_maintenance()?;
-        let snapshot = inner.snapshot()?;
+        let snapshot = inner.snapshot_of(durable)?;
         crate::maintenance::backup(&inner.shared, snapshot, dest)
     }
 
@@ -2895,14 +2915,24 @@ impl Inner {
     }
 
     pub(crate) fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_of(false)
+    }
+
+    /// A snapshot at the visible seqno, or (`durable`) at the durable one (D227, ICR 0037).
+    pub(crate) fn snapshot_of(&self, durable: bool) -> Result<Snapshot> {
         if self.reader.is_some() {
-            return self.reader_snapshot();
+            return self.reader_snapshot(durable);
         }
         // The seqno is pinned before the view loads (and read under the pin's lock), so a
         // flush GC that publishes in between keeps what it reads; still seqno before view: a
         // seqno is only visible once the view holding its memtables is published.
-        let pin =
-            SeqnoPin::pin_visible(&self.shared.live_seqnos, || self.shared.shm.visible_seqno());
+        let pin = SeqnoPin::pin_visible(&self.shared.live_seqnos, || {
+            if durable {
+                self.shared.shm.durable_seqno()
+            } else {
+                self.shared.shm.visible_seqno()
+            }
+        });
         let seqno = pin.seqno();
         #[cfg(feature = "test-hooks")]
         self.shared.hooks.before_snapshot_view_load.run();
@@ -3126,7 +3156,7 @@ impl Inner {
         Ok(Some(view))
     }
 
-    fn reader_snapshot(&self) -> Result<Snapshot> {
+    fn reader_snapshot(&self, durable: bool) -> Result<Snapshot> {
         let r = self.reader.as_ref().expect("reader");
         let deadline = std::time::Instant::now() + READER_VIEW_WAIT;
         let mut waits = 0u32;
@@ -3151,11 +3181,25 @@ impl Inner {
             // The pin protects the oldest live snapshot and every newer view. While snapshots
             // of this generation are alive it stays put; once none is left it moves forward to
             // this one, so a long-lived reader never blocks reclamation for ever.
-            let seqno = a.shm.visible_seqno();
+            let seqno = if durable {
+                a.shm.durable_seqno()
+            } else {
+                a.shm.visible_seqno()
+            };
             let seqno = if a.pinned && a.live.load(Ordering::Acquire) > 0 {
+                // A durable seqno may be below the pin newer snapshots set: lower it, keeping
+                // their view (D227).
+                if durable {
+                    a.slot.lower_pin(seqno);
+                }
                 seqno
             } else {
-                let (s, _) = a.slot.pin(seqno, a.shm.view_version());
+                let view = a.shm.view_version();
+                let (s, _) = if durable {
+                    a.slot.pin_durable(seqno, view)
+                } else {
+                    a.slot.pin(seqno, view)
+                };
                 a.pinned = true;
                 s
             };

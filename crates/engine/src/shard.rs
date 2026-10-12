@@ -340,6 +340,11 @@ pub(crate) struct Shared {
     pub full_compactions: AtomicUsize,
     /// Async commits and deferred freezes waiting for the watermark.
     pub waiters: WatermarkWaiters,
+    /// Shards whose deferred freeze waits for the durable seqno (D227, ICR 0037): a frozen
+    /// memtable holds only durable entries, so flush and compaction GC never collapse a
+    /// version a durable snapshot may still read. Woken from `publish_watermark` beside
+    /// `waiters`, against `ShmRegion::durable_seqno`.
+    pub durable_waiters: WatermarkWaiters,
     pub visibility: VisibilityCounts,
     /// A shard died (`Shared::shard_died`).
     pub shard_died: AtomicBool,
@@ -421,6 +426,7 @@ impl Shared {
     /// true: each re-checks and ends.
     pub(crate) fn wake_all_visible(&self) {
         self.waiters.wake_all(|w| self.wake(w));
+        self.durable_waiters.wake_all(|w| self.wake(w));
     }
 
     /// Runs a watermark waiter's wake.
@@ -473,6 +479,9 @@ impl Shared {
         if passed {
             self.visibility.passes.fetch_add(1, Ordering::Relaxed);
         }
+        // Deferred freezes wait for the durable seqno (D227).
+        self.durable_waiters
+            .wake_ready(|| self.shm.durable_seqno(), |w| self.wake(w));
     }
 
     /// Publishes a new view built by `f` from the current one, in shared memory too. The
@@ -2902,11 +2911,14 @@ impl ShardState {
             keys
         };
         let tablets_on = self.tablets_on();
-        let visible = self.shared.shm.visible_seqno();
+        // A memtable freezes once everything in it is durable, not only visible (D227):
+        // flush GC then never collapses versions a durable snapshot may still read, and
+        // compaction's inputs inherit the bound (ICR 0037).
+        let visible = self.shared.shm.durable_seqno();
         let view = self.shared.view.load();
         let mut deferred = false;
         let mut starved = false;
-        // The seqno that must be visible before every deferred memtable can freeze.
+        // The seqno that must be durable before every deferred memtable can freeze.
         let mut needed: Seqno = 0;
         for key in keys {
             let Some(slot) = self.memtables.get_mut(&key) else {
@@ -3029,12 +3041,12 @@ impl ShardState {
             // the registration: look again.
             self.freeze_deferred = true;
             let id = self.id.0;
-            self.shared.waiters.register(
+            self.shared.durable_waiters.register(
                 crate::watermark_waiters::shard_key(id),
                 needed,
                 Wake::Shard(id),
             );
-            if self.shared.shm.visible_seqno() >= needed
+            if self.shared.shm.durable_seqno() >= needed
                 && let Some(subs) = self.shared.submitters.get()
             {
                 let _ = subs[usize::from(self.id.0)].submit(ShardMsg::Kick);
@@ -3454,10 +3466,28 @@ impl ShardState {
         held.min(groups)
     }
 
+    /// The lowest seqno this shard holds that is not yet durable at its level: `held` and
+    /// every unresolved group, whose sync has not returned (D19's rule, which durable
+    /// snapshots keep; D227, ICR 0037).
+    fn durable_watermark(&self) -> Seqno {
+        let held = self.held.first().copied().unwrap_or(u64::MAX);
+        let groups = self
+            .unresolved
+            .iter()
+            .filter_map(|g| g.first)
+            .min()
+            .unwrap_or(u64::MAX);
+        held.min(groups)
+    }
+
     fn publish_watermark(&self) {
+        let shard = u32::from(self.id.0);
+        // Durable first: a reader that sees the raised pending watermark (Acquire) then sees
+        // the durable one covering what is applied but not yet synced.
         self.shared
             .shm
-            .publish_pending(u32::from(self.id.0), self.watermark());
+            .publish_durable(shard, self.durable_watermark());
+        self.shared.shm.publish_pending(shard, self.watermark());
         self.shared.wake_visible();
     }
 

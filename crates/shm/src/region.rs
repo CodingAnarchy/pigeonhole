@@ -92,6 +92,16 @@ impl Inner {
         self.region.atomic_u64(off + watermark::PENDING)
     }
 
+    fn durable(&self, shard: u32) -> &AtomicU64 {
+        assert!(
+            shard < self.header.shard_count,
+            "shard {shard} out of range (region has {} shards)",
+            self.header.shard_count
+        );
+        let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
+        self.region.atomic_u64(off + watermark::DURABLE)
+    }
+
     fn slot_off(&self, index: u32) -> usize {
         self.header.reader_slots_off as usize + READER_SLOT_LEN * index as usize
     }
@@ -113,6 +123,19 @@ impl Inner {
         let mut lowest = next;
         for shard in 0..self.header.shard_count {
             lowest = lowest.min(self.pending(shard).load(Ordering::Acquire));
+        }
+        lowest.saturating_sub(1)
+    }
+
+    /// As [`visible_seqno`](Self::visible_seqno), also below every shard's durable
+    /// watermark: never above the visible seqno.
+    fn durable_seqno(&self) -> Seqno {
+        let next = self.h64(header::NEXT_SEQNO).load(Ordering::Acquire);
+        let mut lowest = next;
+        for shard in 0..self.header.shard_count {
+            lowest = lowest
+                .min(self.pending(shard).load(Ordering::Acquire))
+                .min(self.durable(shard).load(Ordering::Acquire));
         }
         lowest.saturating_sub(1)
     }
@@ -186,9 +209,11 @@ fn init_region(
     region.write(0, &page);
     for shard in 0..h.shard_count {
         let off = h.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
-        region
-            .atomic_u64(off + watermark::PENDING)
-            .store(u64::MAX, Ordering::Relaxed);
+        for field in [watermark::PENDING, watermark::DURABLE] {
+            region
+                .atomic_u64(off + field)
+                .store(u64::MAX, Ordering::Relaxed);
+        }
     }
 }
 
@@ -638,6 +663,20 @@ impl ShmRegion {
         self.inner.visible_seqno()
     }
 
+    /// Publishes `shard`'s durable watermark with release ordering (D227): the lowest seqno
+    /// it holds that is not yet durable at its commit's level (never above its pending
+    /// watermark); `u64::MAX` when it holds nothing.
+    pub fn publish_durable(&self, shard: u32, durable: Seqno) {
+        self.inner.durable(shard).store(durable, Ordering::Release);
+    }
+
+    /// The highest seqno a durable snapshot may include (D227, ICR 0037): every commit at or
+    /// below it is applied on every shard and durable at its level. Never above
+    /// [`ShmRegion::visible_seqno`].
+    pub fn durable_seqno(&self) -> Seqno {
+        self.inner.durable_seqno()
+    }
+
     /// The next seqno [`ShmRegion::reserve_seqnos`] will hand out (acquire load). Step 1 of
     /// the protocol publishes this as the lower bound before reserving.
     pub fn next_seqno(&self) -> Seqno {
@@ -900,6 +939,16 @@ impl ReaderSlot {
     /// version. A pin protects its version and every newer one. The caller uses the returned
     /// pair, not the one it passed.
     pub fn pin(&self, seqno: Seqno, view_version: u64) -> (Seqno, u64) {
+        self.pin_from(seqno, view_version, false)
+    }
+
+    /// As [`ReaderSlot::pin`], for a durable snapshot (D227, ICR 0037): a retry takes its
+    /// fresh seqno from [`ShmRegion::durable_seqno`].
+    pub fn pin_durable(&self, seqno: Seqno, view_version: u64) -> (Seqno, u64) {
+        self.pin_from(seqno, view_version, true)
+    }
+
+    fn pin_from(&self, seqno: Seqno, view_version: u64, durable: bool) -> (Seqno, u64) {
         let inner = &self.region;
         let mut pair = (seqno, view_version);
         loop {
@@ -913,8 +962,24 @@ impl ReaderSlot {
             if current <= pair.1 {
                 return pair;
             }
-            pair = (inner.visible_seqno().max(pair.0), current);
+            let fresh = if durable {
+                inner.durable_seqno()
+            } else {
+                inner.visible_seqno()
+            };
+            pair = (fresh.max(pair.0), current);
         }
+    }
+
+    /// Lowers the pinned seqno to `seqno` if it is above it, keeping the pinned view (live
+    /// snapshots still read through it): a durable snapshot taken while newer snapshots hold
+    /// the pin (D227). Safe because every entry outside the memtables is at or below the
+    /// durable seqno it was frozen under, so nothing a snapshot at `seqno` reads has been
+    /// collapsed yet.
+    pub fn lower_pin(&self, seqno: Seqno) {
+        self.region
+            .slot64(self.index, reader_slot::PINNED_SEQNO)
+            .fetch_min(seqno, Ordering::SeqCst);
     }
 
     /// Clears the pin.
@@ -1011,7 +1076,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 1
+                expected: 2
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });
