@@ -582,7 +582,7 @@ pub struct Scaling {
     pub single_shard_p99_ns: u64,
     /// The largest share of the N-shard run's commits on one shard (0 when the run did not
     /// report shares). Above [`Scaling::max_share_allowed`] the table was not spread and
-    /// the run fails as skewed whatever its efficiency (D204).
+    /// the run fails as skewed whatever its efficiency (D204, D223).
     #[serde(default)]
     pub max_share: f64,
     /// The N-shard run's async commits that waited on the global visibility watermark, per
@@ -595,6 +595,11 @@ pub struct Scaling {
 impl Scaling {
     /// Minimum efficiency for the scaling gate (spec, Goals).
     pub const GATE: f64 = 0.8;
+
+    /// The busiest shard's share may be at most this times an even share (D223). At equal
+    /// per-shard rates, efficiency is at most `1 / (shards * max_share)`, so 1.25 is the
+    /// loosest bound that still lets the run reach [`GATE`](Self::GATE).
+    pub const MAX_SHARE: f64 = 1.25;
 
     /// Builds the gate result from a one-shard and an N-shard record.
     pub fn new(shards: usize, single: &RunRecord, multi: &RunRecord) -> Self {
@@ -624,10 +629,10 @@ impl Scaling {
         }
     }
 
-    /// The largest share of commits one shard may take for the run to count: twice an even
-    /// share (`2 / shards`), or everything with one shard.
+    /// The largest share of commits one shard may take for the run to count:
+    /// [`MAX_SHARE`](Self::MAX_SHARE) times an even share, or everything with one shard (D223).
     pub fn max_share_allowed(&self) -> f64 {
-        (2.0 / self.shards.max(1) as f64).min(1.0)
+        (Self::MAX_SHARE / self.shards.max(1) as f64).min(1.0)
     }
 
     /// Whether the N-shard run's commits were spread (no shard over
@@ -1374,6 +1379,26 @@ mod tests {
         assert!(md.contains("efficiency 0.90"));
         assert!(md.contains("pass"));
         assert!(Suite::from_json("{}").is_err());
+    }
+
+    #[test]
+    fn scaling_is_spread_only_within_a_quarter_over_an_even_share() {
+        // D223: at 8 shards an even share is 12.5%, so the busiest shard may take 15.6%.
+        let mut a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
+        let mut sc = Scaling::new(
+            8,
+            &rec("skewed-multi-shard", 1e5, 1000, 5000),
+            &rec("skewed-multi-shard", 7e5, 1000, 5000),
+        );
+        assert!((sc.max_share_allowed() - 0.15625).abs() < 1e-12);
+        sc.max_share = 0.15;
+        assert!(sc.passes());
+        // 18.9% (perf287's 8-shard run) passed the old 2/N bound but caps efficiency at 0.66.
+        sc.max_share = 0.189;
+        assert!(!sc.spread() && !sc.passes());
+        a.scaling = Some(sc);
+        assert!(a.to_markdown().contains("(at most 16%)"));
+        assert!(a.to_markdown().contains("fail: skewed"));
     }
 
     #[test]

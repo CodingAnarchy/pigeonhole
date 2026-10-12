@@ -206,7 +206,7 @@ if ol:
 else:
     rows.append(("Open to first read: < 5 ms", "", verdict(None), "open-latency.jsonl"))
 
-# Scaling (D204): efficiency >= 0.8, busiest shard <= 2/N, at every N > 1.
+# Scaling (D204): efficiency >= 0.8, busiest shard <= 1.25/N (D223), at every N > 1.
 scal = []
 for n in (4, 8, 16):
     d = load(f"scaling-{n}.json")
@@ -224,7 +224,7 @@ for n in (4, 8, 16):
                    f"{st.get('flushes', 0)} flushes, {st.get('compactions', 0)} compactions, "
                    f"max {multi['max_ns'] / 1e6:.1f} ms")
         scal.append((n, s["efficiency"], s["max_share"], brk,
-                     s["efficiency"] >= 0.8 and s["max_share"] <= 2 / n))
+                     s["efficiency"] >= 0.8 and s["max_share"] <= 1.25 / n))
 if scal:
     detail = "; ".join(f"N={n}: {e:.2f} (busiest {m:.0%}{b})" for n, e, m, b, _ in scal)
     rows.append(("Thread-per-core scaling: ≥ 0.8 × N", detail, verdict(all(ok for *_, ok in scal)), "scaling-N.json"))
