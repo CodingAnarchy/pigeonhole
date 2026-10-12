@@ -1,0 +1,2 @@
+### Fixed
+- **A close after concurrent cross-shard commits never returned** (or a shard thread overflowed its stack and aborted the process), and the WAL stopped being trimmed past such commits (#585; 0.2.1 has it too). Two cross-shard commits in flight together, each coordinated by a shard taking part in the other, pinned each other's WAL checkpoints. A participant now drops its PREPARE once every share of the commit is in SSTs, not once the coordinator's checkpoint passes the COMMIT (D225).
