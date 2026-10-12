@@ -208,14 +208,12 @@ impl FrameEncoder {
             header[4..8].copy_from_slice(&self.epoch.to_le_bytes());
             header[8..10].copy_from_slice(&(n as u16).to_le_bytes());
             header[10] = fragment_type(first, last) as u8;
-            let mut crc = crate::checksum::crc32c(&header[4..]);
             let at = out.len();
             out.extend_from_slice(&header);
             let mut take = n;
             while take > 0 {
                 let p = &parts[part][off..];
                 let k = p.len().min(take);
-                crc = crate::checksum::crc32c_append(crc, &p[..k]);
                 out.extend_from_slice(&p[..k]);
                 take -= k;
                 off += k;
@@ -224,6 +222,10 @@ impl FrameEncoder {
                     off = 0;
                 }
             }
+            // One checksum over the fragment as written (header after the CRC, then payload),
+            // not one per part: a record's head is a few bytes, and each call has a set-up
+            // cost.
+            let crc = crate::checksum::crc32c(&out[at + 4..]);
             out[at..at + 4].copy_from_slice(&crc.to_le_bytes());
             self.pos += (FRAGMENT_HEADER_LEN + n) as u64;
             left -= n;
