@@ -39,6 +39,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The pread backend, as the ceilings were set on: io_uring is the default on Linux since
+  # D218, and its work happens in the kernel, where callgrind does not count it (and valgrind
+  # runs its ring waits slowly). Base and head both read this.
+  PIGEONHOLE_IO: pread
   # Examples built at base and head (crates/bench/examples/NAME.rs). The base is built with
   # the head's sources of these files, so a new or changed example still has a baseline.
   EXAMPLES: hotrow readshapes writepath ycsb scanrate
