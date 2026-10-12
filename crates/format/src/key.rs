@@ -536,19 +536,9 @@ impl<'a> Escaped<'a> {
         !self.0.contains(&0)
     }
 
-    /// Appends the unescaped bytes to `out`. The runs between escapes are copied whole: a
-    /// row or qualifier rarely holds a `0x00`, so this is usually one copy (#287), not a step
-    /// per byte. Tolerates malformed input as [`Escaped`]'s comparisons do.
+    /// Appends the unescaped bytes to `out`.
     pub fn unescape_into(&self, out: &mut Vec<u8>) {
-        let mut rest = self.0;
-        while let Some(i) = rest.iter().position(|&b| b == 0) {
-            out.extend_from_slice(&rest[..=i]);
-            rest = &rest[i + 1..];
-            if let [0xFF, tail @ ..] = rest {
-                rest = tail;
-            }
-        }
-        out.extend_from_slice(rest);
+        out.extend(self.raw_bytes());
     }
 
     /// Like [`Escaped::unescape_into`], for a part that is often long (a scan's row key):

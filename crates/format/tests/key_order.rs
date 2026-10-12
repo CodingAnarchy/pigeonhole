@@ -265,9 +265,8 @@ proptest! {
 }
 
 proptest! {
-    /// `unescape_into` copies the runs between escapes whole (#287); it must still follow the
-    /// byte rule `Escaped`'s comparisons use, malformed input included: `00 FF` is `00`, and a
-    /// `00` not followed by `FF` is taken as is.
+    /// `unescape_into` follows the byte rule `Escaped`'s comparisons use, malformed input
+    /// included: `00 FF` is `00`, and a `00` not followed by `FF` is taken as is.
     #[test]
     fn unescape_follows_the_byte_rule(
         bytes in vec(prop_oneof![Just(0u8), Just(0xFFu8), any::<u8>()], 0..64),
