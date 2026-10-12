@@ -1111,11 +1111,11 @@ struct WaitWaker(Arc<Signal>);
 
 impl std::task::Wake for WaitWaker {
     fn wake(self: Arc<Self>) {
-        self.0.notify_task();
+        self.0.notify_app();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.notify_task();
+        self.0.notify_app();
     }
 }
 
@@ -1278,8 +1278,9 @@ impl<H: ShardHandler> ShardDriver<H> {
     }
 
     /// A waker that ends this shard's [`wait`](Self::wait) from any thread: for futures the
-    /// driving thread polls itself (a commit's future, resolved on another shard's
-    /// thread). Waking it when nobody waits only makes the next `wait` return at once.
+    /// driving thread polls itself (a commit's future, resolved on another shard's thread
+    /// or by this shard during [`run_once`](Self::run_once)). Waking it when nobody waits
+    /// only makes the next `wait` return at once, even if a turn ran in between (#592).
     pub fn waker(&self) -> std::task::Waker {
         std::task::Waker::from(Arc::new(WaitWaker(Arc::clone(&self.core.inbox().signal))))
     }

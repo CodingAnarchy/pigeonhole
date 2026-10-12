@@ -1063,6 +1063,45 @@ fn a_waker_ends_the_wait() {
     });
 }
 
+/// A background task that wakes the application's waker once, as a shard resolving a commit
+/// the driving thread polls does, during that thread's own turn.
+struct WakeTheDriver(Option<std::task::Waker>);
+
+impl Task for WakeTheDriver {
+    fn run(&mut self, _deadline_nanos: u64, _waker: &TaskWaker) -> TaskPoll {
+        if let Some(w) = self.0.take() {
+            w.wake();
+        }
+        TaskPoll::Done
+    }
+
+    fn name(&self) -> &'static str {
+        "wake-the-driver"
+    }
+}
+
+#[test]
+fn a_waker_wake_during_a_turn_ends_the_next_wait() {
+    // #592: the wake arrives inside `run_once`, which then collects woken background tasks
+    // (clearing their flag). The application's wake must survive that: the next wait returns
+    // at once, rather than sleeping until a completion or its timeout.
+    let (mut drivers, _) = app_drivers(1);
+    let mut d = drivers.remove(0);
+    assert!(!d.run_once(u64::MAX));
+    let w = d.waker();
+    d.with_handler(|_, ctx| ctx.spawn(Box::new(WakeTheDriver(Some(w)))));
+    d.run_once(u64::MAX);
+    let started = Instant::now();
+    d.wait(Duration::from_secs(30));
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_secs(5), "the wait ran {waited:?}");
+    // The wake is spent: an idle shard's next wait sleeps until its timeout.
+    assert!(!d.run_once(u64::MAX));
+    let started = Instant::now();
+    d.wait(Duration::from_millis(100));
+    assert!(started.elapsed() >= Duration::from_millis(90));
+}
+
 #[test]
 fn work_queued_before_the_wait_returns_it_at_once() {
     let (mut drivers, _) = app_drivers(1);
