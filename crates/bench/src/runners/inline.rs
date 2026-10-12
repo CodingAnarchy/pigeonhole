@@ -360,14 +360,16 @@ fn phase(
 impl PigeonholeRunner {
     /// Runs `config` (writes only) the way the scaling gate measures it (D204): application-
     /// owned shards, each thread issuing its shard's share of the writes inline with
-    /// [`INLINE_IN_FLIGHT`] commits in flight. The load is applied through the blocking API
-    /// first; the warmup and the measured writes run inline, the warmup unrecorded.
+    /// [`RunOptions::in_flight`] commits in flight ([`INLINE_IN_FLIGHT`] by default). The
+    /// load is applied through the blocking API first; the warmup and the measured writes
+    /// run inline, the warmup unrecorded.
     pub fn run_inline(
         &self,
         config: &WorkloadConfig,
         dir: &Path,
         options_: &RunOptions,
     ) -> Result<RunRecord, String> {
+        let in_flight = options_.in_flight.max(1);
         let warmup = options_.warmup_ops(config);
         let mut workload = Workload::new(WorkloadConfig {
             operations: config.operations + warmup,
@@ -423,7 +425,7 @@ impl PigeonholeRunner {
         let mut shards = shards;
         loop {
             let before = db.shard_stats();
-            shards = phase(&t, shards, warm, INLINE_IN_FLIGHT, false)?.0;
+            shards = phase(&t, shards, warm, in_flight, false)?.0;
             let after = db.shard_stats();
             let changed = before
                 .iter()
@@ -455,7 +457,7 @@ impl PigeonholeRunner {
         // compactions to show.
         let (mut shards, mut elapsed, mut hist) = (shards, Duration::ZERO, Histogram::new());
         loop {
-            let (s, e, h) = phase(&t, shards, measured, INLINE_IN_FLIGHT, true)?;
+            let (s, e, h) = phase(&t, shards, measured, in_flight, true)?;
             shards = s;
             elapsed += e;
             hist.merge(&h);
@@ -488,7 +490,7 @@ impl PigeonholeRunner {
         let ops = hist.count();
         Ok(RunRecord {
             store: self.name().to_owned(),
-            store_config: format!("{} inline in-flight={INLINE_IN_FLIGHT}", self.describe()),
+            store_config: format!("{} inline in-flight={in_flight}", self.describe()),
             workload: config.kind.name().to_owned(),
             seed: config.seed,
             records: config.records,

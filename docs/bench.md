@@ -31,6 +31,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--warmup F` | Unrecorded warmup, as a fraction of `--ops` (default 0.05; `scaling`: 1.0, see below) |
 | `--min-secs S` | Inline runs (`scaling`, and `group-commit`'s D213 run): repeat the measured writes until at least S seconds are measured (D219; default 0, once). A fixed count measures a faster store for less time, too short for its flushes and compactions to show |
 | `--inline-ops N` | `group-commit`: the D213 run's commits, apart from the client runs' `--ops` (D219; the gate judges it on 2M) |
+| `--in-flight N` | Inline runs: commits each shard's thread keeps in flight (default 16, the judged shape). Fewer trade throughput for latency: the gate reports 4 and 8 beside the judged 16 (D226), and a run at another count prints "reported, not judged" |
 | `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
 | `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |

@@ -491,6 +491,10 @@ pub struct RunOptions {
     /// commit, [`PigeonholeRunner::run_inline`]): its writes repeat until this much time
     /// has been measured (D219). Zero (the default) measures them once.
     pub min_measured: std::time::Duration,
+    /// Commits each shard's thread keeps in flight in an inline run (at least 1; default
+    /// [`INLINE_IN_FLIGHT`], the shape D213 and D226 judge). Fewer trade throughput for
+    /// latency: the gate reports 4 and 8 beside the judged 16 (D226).
+    pub in_flight: usize,
 }
 
 impl Default for RunOptions {
@@ -498,6 +502,7 @@ impl Default for RunOptions {
         Self {
             warmup: 0.05,
             min_measured: std::time::Duration::ZERO,
+            in_flight: INLINE_IN_FLIGHT,
         }
     }
 }

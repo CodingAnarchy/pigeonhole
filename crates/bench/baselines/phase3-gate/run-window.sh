@@ -30,8 +30,8 @@
 #   latency        ycsb-c (2 GiB cache, warmed: D216), ycsb-a, skewed vs RocksDB;
 #                  group-commit: the D213 shape (one shard per core, table split over
 #                  all, commits in flight inline) on 2M commits (D219), then 1/4/16
-#                  client threads vs RocksDB; the short 200K run and the same on
-#                  pread, reported                                                    55
+#                  client threads vs RocksDB; the short 200K run, the same on
+#                  pread, and 4 and 8 commits in flight (D226), reported              57
 #   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
 #   row-cache      ycsb-c and ycsb-a with the row cache off (D216: on by default)      30
 #   scaling        scaling gate (D204) at 1, 4, 8, 16 shards, 8 s or more each (D219)  45
@@ -81,7 +81,7 @@ results="$(cd "$results" && pwd)"
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     row-cache scaling open-latency cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [cold-get]=45
+    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [cold-get]=45
     [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
@@ -285,6 +285,15 @@ step_latency() {
         --inline-ops "$gc_inline_ops" --dir "$data/bench" \
         --json "$results/latency-group-commit.json"
     rm -r "$data/bench"
+    # The trade-off beside the judged row (D226): the same D213 run at 4 and 8 commits in
+    # flight per shard instead of 16, reported, not judged. One short client run each.
+    local f
+    for f in 4 8; do
+        PIGEONHOLE_IO=uring "$bench" group-commit --engine pigeonhole --scale "$scale" \
+            --threads 1 --ops 20000 --inline-ops "$gc_inline_ops" --in-flight "$f" \
+            --dir "$data/bench" --json "$results/latency-group-commit-inflight-$f.json"
+        rm -r "$data/bench"
+    done
     # The short D213 run (the preset's commits, D219), reported: the first window's length.
     PIGEONHOLE_IO=uring "$bench" group-commit --engine pigeonhole --scale "$scale" --threads 1 \
         --dir "$data/bench" --json "$results/latency-group-commit-short.json"

@@ -854,3 +854,29 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - Telling participants before the shares are settled fails that case with `LostAckedCommit`. A tablet change that commits before the moving tablet's frozen memtables are flushed (the `frozen.is_empty()` wait in `progress_op` dropped) fails its tablet loop.
 - `engine/tests/close_crossed.rs` closes after concurrent cross-shard commits on real files, under a watchdog.
 
+
+<a id="d226"></a>
+## D226 — The durable group-commit p99 is judged under full load: 16 shards, 16 commits in flight, the D223 driver; 4 and 8 in flight are reported beside it (owner decision, 2026-10-12; bench, engine, #406; amends D213)
+
+**Decided:**
+- **The judged row stays as D213 defines it:** p99 < 200 µs on the bench side (from the driver's submit to the driver seeing the commit done), at N shards = physical cores (D220; 16 on the AX102), with 16 commits in flight per shard, measured by the D223 driver. The engine has to meet it. A lower in-flight count does not count as meeting it.
+- **The trade-off is reported beside it:** the same D213 run at 4 and 8 commits in flight per shard (`phdb-bench --in-flight N`; `latency-group-commit-inflight-{4,8}.json`), reported, not judged.
+
+**Why.** D223's driver changed what the row measures. All shards now start together at a barrier, and the clock starts there, instead of shards starting staggered as their rows were picked and the clock counting the picks.
+- On the AX102 the same engine measured 4.7–4.9M cells/s with p99 207–210 µs on the old driver, and 7.3–7.4M cells/s with p99 327–331 µs on the new one. Its engine-side p99 was 131 µs on both.
+- The difference is concurrency the old driver never produced, not a regression.
+- The owner kept the target at full load rather than moving it to a lighter one.
+
+**The trade-off, measured** (AX102, 16 shards, uring, 2M commits, two runs each, 2026-10-12, before the work below):
+
+| in flight per shard | cells/s | vs 16 | p50 µs | p99 µs | p99.9 µs | engine p99 µs |
+|---|---|---|---|---|---|---|
+| 4 | 3.29–3.34M | −56% | 66–67 | 158–161 | 675–696 | 65 |
+| 8 | 5.17–5.25M | −30% | 80 | 164–168 | 745 | 98 |
+| 16 (judged) | 7.38–7.55M | — | 107–108 | 307–323 | 761–790 | 131 |
+
+- Every level clears the throughput half (> 1M cells/s) by 3× or more.
+- The p99 half holds at 8 or fewer in flight: halving 16 → 8 gives up 30% of the throughput for a p99 of about 165 µs, and 4 gains almost nothing more.
+- The p99.9 hardly moves with the in-flight count: it comes from syncs and flush and compaction steps, not from queueing.
+
+**Work toward the judged row.** The first finding is a lost wake in `ShardDriver::wait` (#567). A commit that resolves during the driver's own `run_once` wakes the driver by setting the same flag the scheduler's `collect_woken` then clears, so the driver's next `wait` sleeps until the next I/O completion or its timeout. Its fix and the remaining attribution (the global watermark, D19; the group-sync wait, D207) are tracked separately and recorded here when they land.
