@@ -1,0 +1,2 @@
+### Fixed
+- **A close after a crash during concurrent cross-shard commits never returned** (#591): a commit replayed as incomplete (a participant's PREPARE gone) read as undecided once its coordinator's own PREPARE was checkpointed, and its COMMIT was kept for ever. The WAL then stopped being trimmed past it too. It stays aborted now until its COMMIT is checkpointed. Since #587 such commits follow any crash before the coordinator's checkpoint passes the COMMIT; before, they needed a power loss.
