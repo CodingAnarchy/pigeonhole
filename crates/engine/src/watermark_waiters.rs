@@ -15,12 +15,22 @@
 //!   entries that are ready. An entry whose generation is no longer the key's (its seqno
 //!   was changed) is dropped when it surfaces;
 //! - `min_needed`, the heap's smallest seqno (`u64::MAX` when empty). A publish below it
-//!   takes no lock, and a publish with nobody registered costs one load per part.
+//!   takes no lock.
+//!
+//! Across the parts, `listed` has one bit per part, set while its heap is non-empty. A bit
+//! changes only under its part's lock, on the heap's empty/non-empty transitions, so a
+//! publish with nobody registered is one fence and one load (the first 64 parts' word is
+//! inline; more parts add a load per 64), and a publish visits only the parts that list
+//! someone (#564's per-part scan cost every commit).
 //!
 //! Registration pairs with publication through SeqCst fences: a registrant stores its
-//! part's `min_needed`, fences, then re-reads the watermark; a publisher stores the
-//! watermark, fences, then loads every part's `min_needed`. Either the publisher sees the
-//! registration or the registrant sees the watermark, so no wake is lost.
+//! part's `min_needed` (and sets its bit if the part was empty), fences, then re-reads the
+//! watermark; a publisher stores the watermark, fences, then loads `listed` and each listed
+//! part's `min_needed`. Either the publisher sees the registration or the registrant sees
+//! the watermark, so no wake is lost. A registrant joining a part that already lists
+//! someone sets no bit: the bit was set by an earlier registration under the same lock, so
+//! it happens before this registrant's fence, and a bit is cleared only while its part is
+//! empty, never while this registrant's entry is listed.
 //!
 //! Generic over the wake `W`, so the loom models below run it alone.
 
@@ -45,7 +55,18 @@ use smallvec::SmallVec;
 #[derive(Debug)]
 pub(crate) struct WatermarkWaiters<W> {
     parts: Box<[Part<W>]>,
+    /// Bit `i` of `listed` (parts 0-63), or bit `i % 64` of `more[i / 64 - 1]`: part `i`'s
+    /// heap is non-empty. Changed only under part `i`'s lock. The first word is inline, so
+    /// a publish with nobody registered loads it and returns.
+    listed: Listed,
+    more: Box<[Listed]>,
 }
+
+/// A word of [`WatermarkWaiters::listed`], on its own cache line (each bit flips on a
+/// part's empty/non-empty transition, from any thread).
+#[derive(Debug)]
+#[repr(align(64))]
+struct Listed(AtomicU64);
 
 /// One part of the registry, on its own cache line.
 #[derive(Debug)]
@@ -94,8 +115,13 @@ impl<W> Default for WatermarkWaiters<W> {
 impl<W> WatermarkWaiters<W> {
     /// A registry of `parts` parts (at least one): the engine makes one per shard.
     pub(crate) fn new(parts: usize) -> Self {
+        let parts = parts.max(1);
         Self {
-            parts: (0..parts.max(1))
+            listed: Listed(AtomicU64::new(0)),
+            more: (1..parts.div_ceil(64))
+                .map(|_| Listed(AtomicU64::new(0)))
+                .collect(),
+            parts: (0..parts)
                 .map(|_| Part {
                     min_needed: AtomicU64::new(u64::MAX),
                     list: Mutex::new(List::default()),
@@ -105,9 +131,29 @@ impl<W> WatermarkWaiters<W> {
         }
     }
 
-    fn part(&self, key: u64) -> &Part<W> {
+    fn part_index(&self, key: u64) -> usize {
         // A power-of-two count would make this a mask; shard counts are not always one.
-        &self.parts[(key % self.parts.len() as u64) as usize]
+        (key % self.parts.len() as u64) as usize
+    }
+
+    /// Word `w` of the `listed` bits.
+    fn word(&self, w: usize) -> &AtomicU64 {
+        match w {
+            0 => &self.listed.0,
+            _ => &self.more[w - 1].0,
+        }
+    }
+
+    /// Marks part `i` as listing someone or not. Call it under part `i`'s lock, on a
+    /// transition only.
+    fn mark(&self, i: usize, listed: bool) {
+        let word = self.word(i / 64);
+        let bit = 1u64 << (i % 64);
+        if listed {
+            word.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            word.fetch_and(!bit, Ordering::SeqCst);
+        }
     }
 
     /// Registrations and wake passes that found a part's lock held.
@@ -124,9 +170,11 @@ impl<W> WatermarkWaiters<W> {
     /// entries listed in the key's part before it. The caller then re-reads the watermark: a
     /// publish that missed this registration is seen there.
     pub(crate) fn register(&self, key: u64, seqno: Seqno, wake: W) -> usize {
-        let part = self.part(key);
+        let i = self.part_index(key);
+        let part = &self.parts[i];
         let mut list = part.lock();
         let listed = list.keys.len();
+        let was_empty = list.heap.is_empty();
         let generation = match list.keys.get_mut(&key) {
             Some(entry) if entry.0 == seqno => {
                 entry.2 = wake;
@@ -145,6 +193,9 @@ impl<W> WatermarkWaiters<W> {
         // Stored even when unchanged: the fence below pairs this store with the publisher's
         // load.
         part.min_needed.store(list.min(), Ordering::SeqCst);
+        if was_empty && !list.heap.is_empty() {
+            self.mark(i, true);
+        }
         drop(list);
         // Pairs with the fence in `wake_ready`: either the publisher sees this registration
         // or the caller's re-read sees its watermark.
@@ -154,52 +205,99 @@ impl<W> WatermarkWaiters<W> {
 
     /// After a watermark publish: hands `wake` every entry whose seqno is at or below what
     /// `visible` reads, forgotten, and runs it outside the locks. Returns whether the pass
-    /// took a lock. With nobody ready it is one fence and one load per part.
+    /// took a lock. With nobody registered it is one fence and one load of `listed` (plus
+    /// one per further 64 parts), and it visits only the parts that list someone.
     pub(crate) fn wake_ready(&self, visible: impl Fn() -> Seqno, mut wake: impl FnMut(W)) -> bool {
         // Pairs with the fence in `register`.
         fence(Ordering::SeqCst);
+        let first = self.listed.0.load(Ordering::SeqCst);
+        if first == 0 && self.more.is_empty() {
+            return false;
+        }
+        self.wake_listed(first, &visible, &mut wake)
+    }
+
+    /// `wake_ready` past its check: visits every part the `listed` bits mark, starting
+    /// from the first word's bits as `wake_ready` loaded them. Kept out of line, so a
+    /// publish with nobody registered stays a fence and a load.
+    #[inline(never)]
+    fn wake_listed(
+        &self,
+        first: u64,
+        visible: &impl Fn() -> Seqno,
+        wake: &mut impl FnMut(W),
+    ) -> bool {
         let mut visible_now = None;
         let mut passed = false;
-        for part in self.parts.iter() {
-            let min = part.min_needed.load(Ordering::SeqCst);
-            if min == u64::MAX {
-                continue;
+        let (mut bits, mut w) = (first, 0);
+        loop {
+            while bits != 0 {
+                let i = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                passed |= self.wake_part(i, &mut visible_now, visible, wake);
             }
-            let visible = *visible_now.get_or_insert_with(&visible);
-            if visible < min {
-                continue;
+            if w == self.more.len() {
+                return passed;
             }
-            passed = true;
-            let mut ready: SmallVec<[W; 8]> = SmallVec::new();
-            {
-                let mut list = part.lock();
-                while let Some(&Reverse((seqno, key, generation))) = list.heap.peek() {
-                    if seqno > visible {
-                        break;
-                    }
-                    list.heap.pop();
-                    if list.keys.get(&key).is_some_and(|e| e.1 == generation) {
-                        let (_, _, w) = list.keys.remove(&key).expect("checked");
-                        ready.push(w);
-                    }
+            bits = self.more[w].0.load(Ordering::SeqCst);
+            w += 1;
+        }
+    }
+
+    /// `wake_ready`'s pass over part `i`, which `listed` says lists someone. Returns
+    /// whether it took the part's lock.
+    fn wake_part(
+        &self,
+        i: usize,
+        visible_now: &mut Option<Seqno>,
+        visible: &impl Fn() -> Seqno,
+        wake: &mut impl FnMut(W),
+    ) -> bool {
+        let part = &self.parts[i];
+        let min = part.min_needed.load(Ordering::SeqCst);
+        if min == u64::MAX {
+            return false;
+        }
+        let visible = *visible_now.get_or_insert_with(visible);
+        if visible < min {
+            return false;
+        }
+        let mut ready: SmallVec<[W; 8]> = SmallVec::new();
+        {
+            let mut list = part.lock();
+            let was_empty = list.heap.is_empty();
+            while let Some(&Reverse((seqno, key, generation))) = list.heap.peek() {
+                if seqno > visible {
+                    break;
                 }
-                part.min_needed.store(list.min(), Ordering::SeqCst);
+                list.heap.pop();
+                if list.keys.get(&key).is_some_and(|e| e.1 == generation) {
+                    let (_, _, w) = list.keys.remove(&key).expect("checked");
+                    ready.push(w);
+                }
             }
-            for w in ready {
-                wake(w);
+            part.min_needed.store(list.min(), Ordering::SeqCst);
+            if !was_empty && list.heap.is_empty() {
+                self.mark(i, false);
             }
         }
-        passed
+        for w in ready {
+            wake(w);
+        }
+        true
     }
 
     /// Hands `wake` every entry, whatever its seqno, forgotten (visibility ended: each
     /// re-checks and ends), outside the locks.
     pub(crate) fn wake_all(&self, mut wake: impl FnMut(W)) {
-        for part in self.parts.iter() {
+        for (i, part) in self.parts.iter().enumerate() {
             let all = {
                 let mut list = part.list.lock().unwrap_or_else(PoisonError::into_inner);
                 part.min_needed.store(u64::MAX, Ordering::SeqCst);
-                list.heap.clear();
+                if !list.heap.is_empty() {
+                    list.heap.clear();
+                    self.mark(i, false);
+                }
                 std::mem::take(&mut list.keys)
             };
             all.into_values().map(|(_, _, w)| w).for_each(&mut wake);
@@ -207,12 +305,16 @@ impl<W> WatermarkWaiters<W> {
     }
 
     /// The smallest registered seqno as published, and as the lists say (test check).
+    /// Under each part's lock, also checks that its `listed` bit says whether its heap is
+    /// non-empty: the bit changes only under that lock.
     #[cfg(all(test, not(engine_loom)))]
     fn published_and_actual_min(&self) -> (Seqno, Seqno) {
         let mut published = u64::MAX;
         let mut actual = u64::MAX;
-        for part in self.parts.iter() {
+        for (i, part) in self.parts.iter().enumerate() {
             let list = part.list.lock().unwrap_or_else(PoisonError::into_inner);
+            let bit = self.word(i / 64).load(Ordering::SeqCst) >> (i % 64) & 1 == 1;
+            assert_eq!(bit, !list.heap.is_empty(), "part {i}'s listed bit");
             published = published.min(part.min_needed.load(Ordering::SeqCst));
             actual = actual.min(list.keys.values().map(|e| e.0).min().unwrap_or(u64::MAX));
         }
@@ -260,16 +362,16 @@ mod loom_tests {
     struct Shared {
         visible: AtomicU64,
         waiters: WatermarkWaiters<usize>,
-        woken: [AtomicUsize; 2],
+        woken: [AtomicUsize; 4],
     }
 
     impl Shared {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 visible: AtomicU64::new(0),
-                // Two parts: the two waiters (keys 0 and 1) register in different ones.
+                // Two parts: keys 0 and 2 register in part 0, keys 1 and 3 in part 1.
                 waiters: WatermarkWaiters::new(2),
-                woken: [AtomicUsize::new(0), AtomicUsize::new(0)],
+                woken: std::array::from_fn(|_| AtomicUsize::new(0)),
             })
         }
 
@@ -325,6 +427,59 @@ mod loom_tests {
     }
 
     #[test]
+    fn loom_a_waiter_joining_a_listed_part_is_never_lost() {
+        // Two waiters register into part 1 while a shard publishes 2: whichever comes
+        // second finds the part listed and sets no `listed` bit, relying on the first one's
+        // bit (set under the same lock, so before its own fence). Waiter 3 needs 2: it sees
+        // it visible or is woken. Waiter 1 needs 5 and is never woken.
+        model(|| {
+            let s = Shared::new();
+            let first = {
+                let s = Arc::clone(&s);
+                thread::spawn(move || s.wait(1, 5))
+            };
+            let publisher = {
+                let s = Arc::clone(&s);
+                thread::spawn(move || s.publish(2))
+            };
+            let saw = s.wait(3, 2);
+            assert!(!first.join().unwrap());
+            publisher.join().unwrap();
+            let woken = s.woken[3].load(Ordering::Relaxed);
+            assert!(woken <= 1, "waiter 3 woken {woken} times");
+            assert!(saw || woken == 1, "waiter 3 lost its wake");
+            assert_eq!(
+                s.woken[1].load(Ordering::Relaxed),
+                0,
+                "waiter 1 woken early"
+            );
+        });
+    }
+
+    #[test]
+    fn loom_a_part_drained_while_a_waiter_joins_it_still_wakes_the_waiter() {
+        // Waiter 1 needs 1; a shard publishes 1 (draining part 1 to empty, which clears its
+        // `listed` bit), then 2. Waiter 3 joins part 1 meanwhile, needing 2: whichever way
+        // the drain's clear and its registration interleave, the publish of 2 finds it.
+        model(|| {
+            let s = Shared::new();
+            assert!(!s.wait(1, 1));
+            let publisher = {
+                let s = Arc::clone(&s);
+                thread::spawn(move || {
+                    s.publish(1);
+                    s.publish(2);
+                })
+            };
+            let saw = s.wait(3, 2);
+            publisher.join().unwrap();
+            let woken = s.woken[3].load(Ordering::Relaxed);
+            assert!(saw || woken == 1, "waiter 3 lost its wake");
+            assert_eq!(s.woken[1].load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test]
     fn loom_a_waiter_registered_again_with_a_higher_seqno_still_wakes() {
         // A shard that defers again raises its seqno while a publish takes a pass: it is
         // woken once its new seqno is visible, however the pass and the raise interleave.
@@ -356,11 +511,20 @@ mod tests {
         let mut out = Vec::new();
         w.wake_ready(|| visible, |s| out.push(s));
         out.sort_unstable();
+        quiescent(w);
         out
     }
 
     fn register(w: &WatermarkWaiters<u16>, shard: u16, seqno: u64) {
         w.register(u64::from(shard), seqno, shard);
+        quiescent(w);
+    }
+
+    /// At rest, every part's `listed` bit says whether its heap is non-empty (checked in
+    /// `published_and_actual_min`), and the published minimum is the lists' own.
+    fn quiescent(w: &WatermarkWaiters<u16>) {
+        let (published, actual) = w.published_and_actual_min();
+        assert!(published <= actual, "published {published} above {actual}");
     }
 
     #[test]
@@ -413,6 +577,7 @@ mod tests {
         register(&w, 7, 4);
         let mut all = Vec::new();
         w.wake_all(|id| all.push(id));
+        quiescent(&w);
         assert_eq!(all.len(), 21);
         assert!(take(&w, u64::MAX - 1).is_empty());
     }
@@ -430,6 +595,28 @@ mod tests {
         assert_eq!(take(&w, 100), [11, 12, 13, 14, 15]);
         assert!(!w.wake_ready(|| 100, |_| unreachable!()), "all forgotten");
         assert_ne!(super::commit_key(5) >> 63, super::shard_key(0) >> 63);
+    }
+
+    #[test]
+    fn parts_past_the_first_listed_word_wake_too() {
+        // 130 parts: three `listed` words, the last one partly used.
+        let w = WatermarkWaiters::new(130);
+        for key in [0u16, 63, 64, 127, 128, 129] {
+            register(&w, key, 10 + u64::from(key));
+        }
+        assert!(!w.wake_ready(|| 9, |_| unreachable!()));
+        assert_eq!(take(&w, 73), [0, 63]);
+        assert_eq!(take(&w, 137), [64, 127]);
+        assert_eq!(take(&w, 139), [128, 129]);
+        assert!(
+            !w.wake_ready(|| u64::MAX - 1, |_| unreachable!()),
+            "all forgotten"
+        );
+        register(&w, 129, 200);
+        let mut all = Vec::new();
+        w.wake_all(|id| all.push(id));
+        quiescent(&w);
+        assert_eq!(all, [129]);
     }
 
     #[test]
