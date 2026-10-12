@@ -58,7 +58,9 @@ pub(crate) struct Counters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobFile {
     pub family: FamilyId,
-    pub extents: Vec<ExtentRef>,
+    /// Shared: every manifest commit that changes the blob-file map copies it, and with it
+    /// each file's entry (#499).
+    pub extents: Arc<[ExtentRef]>,
     pub total_bytes: u64,
     pub live_bytes: u64,
 }
@@ -261,7 +263,7 @@ impl Catalog {
                     *blob_file,
                     BlobFile {
                         family: *family,
-                        extents: extents.clone(),
+                        extents: extents.as_slice().into(),
                         total_bytes: *total_bytes,
                         live_bytes: *live_bytes,
                     },
@@ -363,7 +365,7 @@ impl Catalog {
             edits.push(Edit::PutBlobFile {
                 blob_file: *id,
                 family: b.family,
-                extents: b.extents.clone(),
+                extents: b.extents.to_vec(),
                 total_bytes: b.total_bytes,
                 live_bytes: b.live_bytes,
             });

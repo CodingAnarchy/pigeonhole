@@ -106,6 +106,15 @@ impl Writer {
         self.pos + (BLOB_RECORD_HEADER_LEN + len) as u64 > self.capacity()
     }
 
+    /// How many extents appending a value of `len` bytes needs first, with room reserved
+    /// for them in the extent list.
+    pub(crate) fn reserve_for(&mut self, len: usize) -> usize {
+        let end = self.pos + (BLOB_RECORD_HEADER_LEN + len) as u64;
+        let more = end.saturating_sub(self.capacity()).div_ceil(self.payload) as usize;
+        self.extents.reserve(more);
+        more
+    }
+
     pub(crate) fn add_extent(&mut self, extent: ExtentRef) -> Result<()> {
         if extent.size_class != self.size_class {
             return Err(Error::Format(FormatError::InvalidArgument {

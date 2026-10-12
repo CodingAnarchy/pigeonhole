@@ -128,7 +128,14 @@ pub(crate) struct ManifestWriter {
     /// D58) and the engine requires a reopen. A snapshot rewrite that finds no space for its
     /// extents writes nothing and leaves it clear.
     poisoned: bool,
+    /// The buffer blocks are encoded into, kept between commits (#499) unless it grew past
+    /// [`KEEP_BLOCK_BUFFER`].
+    block: Vec<u8>,
 }
+
+/// The largest block buffer a [`ManifestWriter`] keeps for the next commit: deltas and small
+/// snapshots reuse it; a large catalog's snapshot is not held on to.
+const KEEP_BLOCK_BUFFER: usize = 1 << 20;
 
 impl ManifestWriter {
     pub(crate) fn new(pager: Arc<Pager>) -> Self {
@@ -138,6 +145,7 @@ impl ManifestWriter {
             snapshot_len: root.snapshot_len,
             root,
             poisoned: false,
+            block: Vec::new(),
         }
     }
 
@@ -182,7 +190,8 @@ impl ManifestWriter {
             return Err(Self::poisoned_error());
         }
         let version = self.next_version();
-        let mut delta = Vec::new();
+        let mut delta = std::mem::take(&mut self.block);
+        delta.clear();
         encode_block(
             &ManifestHeader {
                 version: FormatVersion::CURRENT,
@@ -203,12 +212,17 @@ impl ManifestWriter {
                 }
                 _ => false,
             };
-        if fits_log {
+        let prepared = if fits_log {
             self.append_delta(&delta, version)
                 .inspect_err(|_| self.poisoned = true)
         } else {
-            self.write_snapshot(catalog, version)
+            delta.clear();
+            self.write_snapshot(catalog, version, &mut delta)
+        };
+        if delta.capacity() <= KEEP_BLOCK_BUFFER {
+            self.block = delta;
         }
+        prepared
     }
 
     fn append_delta(&mut self, delta: &[u8], version: ManifestVersion) -> Result<Prepared> {
@@ -225,8 +239,13 @@ impl ManifestWriter {
         })
     }
 
-    fn write_snapshot(&mut self, catalog: &Catalog, version: ManifestVersion) -> Result<Prepared> {
-        let mut block = Vec::new();
+    /// Writes a snapshot of `catalog`, encoded into `block` (empty).
+    fn write_snapshot(
+        &mut self,
+        catalog: &Catalog,
+        version: ManifestVersion,
+        block: &mut Vec<u8>,
+    ) -> Result<Prepared> {
         encode_block(
             &ManifestHeader {
                 version: FormatVersion::CURRENT,
@@ -236,7 +255,7 @@ impl ManifestWriter {
                 body_len: 0,
             },
             &catalog.snapshot_edits(),
-            &mut block,
+            block,
         );
         // Running out of space here leaves the writer usable; any other allocation failure
         // (a failed growth sync poisoned the pager) or a failed write poisons it. Lowest
@@ -262,7 +281,7 @@ impl ManifestWriter {
                 return Err(e);
             }
         };
-        if let Err(e) = self.pager.write(snapshot, 0, &block) {
+        if let Err(e) = self.pager.write(snapshot, 0, block) {
             self.poisoned = true;
             self.pager.abandon(snapshot);
             self.pager.abandon(log);
@@ -529,11 +548,14 @@ fn added_blobs(catalog: &Catalog, edits: &[Edit]) -> Vec<(BlobFileId, Vec<Extent
                 blob_file, extents, ..
             } => {
                 let known = catalog.blob_files.get(blob_file).map(|b| &b.extents);
-                let new: Vec<ExtentRef> = extents
-                    .iter()
-                    .filter(|x| known.is_none_or(|k| !k.contains(x)))
-                    .copied()
-                    .collect();
+                // Sized once: a separated value's file lists one extent per 64 KiB (#499).
+                let mut new = Vec::with_capacity(extents.len());
+                new.extend(
+                    extents
+                        .iter()
+                        .filter(|x| known.is_none_or(|k| !k.contains(x)))
+                        .copied(),
+                );
                 (!new.is_empty()).then_some((*blob_file, new))
             }
             _ => None,
@@ -983,7 +1005,7 @@ pub(crate) fn end(
     for (id, blob) in old.blob_files.iter() {
         match catalog.blob_files.get(id) {
             None => {
-                for e in &blob.extents {
+                for e in blob.extents.iter() {
                     shared.pager.retire(*e, version);
                 }
                 shared

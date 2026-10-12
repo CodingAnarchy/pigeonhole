@@ -263,7 +263,7 @@ impl OpenSst {
 /// never change once it is published, so versions share it by id.
 pub(crate) struct OpenBlob {
     id: BlobFileId,
-    extents: Vec<ExtentRef>,
+    extents: Arc<[ExtentRef]>,
     reader: OnceLock<Arc<BlobReader>>,
 }
 
@@ -284,7 +284,7 @@ impl OpenBlob {
             Arc::new(BlobReader::new(
                 set.file.clone(),
                 self.id,
-                self.extents.clone(),
+                self.extents.to_vec(),
                 Arc::clone(&set.cache),
             ))
         }))

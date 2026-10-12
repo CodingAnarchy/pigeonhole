@@ -243,6 +243,10 @@ impl BlobSink {
         let Some(f) = &mut self.open else {
             unreachable!("opened above");
         };
+        // Room for the value's extents in both lists at once, rather than growing them one
+        // extent at a time (a 1 MiB value spans 17 of 64 KiB; #499).
+        let more = f.writer.reserve_for(stored.len());
+        f.extents.reserve(more);
         while f.writer.needs_extent(stored.len()) {
             let extent = self.pager.allocate(f.payload + 1)?;
             f.extents.push(extent);

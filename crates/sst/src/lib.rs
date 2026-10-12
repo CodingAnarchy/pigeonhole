@@ -553,6 +553,7 @@ impl Default for ReadOptions {
 /// let mut w = BlobWriter::new(file.clone(), BlobFileId(4), 0);
 /// let big = vec![7u8; 100_000]; // larger than one 64 KiB extent: the record spans two
 /// let mut next_page = 16;
+/// assert_eq!(w.reserve_for(big.len()), 2);
 /// while w.needs_extent(big.len()) {
 ///     w.add_extent(ExtentRef { page: next_page, size_class: 0 })?;
 ///     next_page += 16;
@@ -582,6 +583,13 @@ impl BlobWriter {
     /// Whether appending a value of `len` bytes needs more extents first.
     pub fn needs_extent(&self, len: usize) -> bool {
         self.inner.needs_extent(len)
+    }
+
+    /// How many extents appending a value of `len` bytes needs first (as many
+    /// [`add_extent`](Self::add_extent) calls as [`needs_extent`](Self::needs_extent) asks
+    /// for), with room for them reserved, so adding them allocates nothing more.
+    pub fn reserve_for(&mut self, len: usize) -> usize {
+        self.inner.reserve_for(len)
     }
 
     /// Adds the next extent (writes its header). It must be of the writer's size class.
