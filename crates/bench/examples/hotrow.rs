@@ -63,7 +63,10 @@ fn main() {
         &dir.join("hot.phdb"),
         Options::default()
             .durability(Durability::Buffered)
-            .block_cache(256 << 20),
+            .block_cache(256 << 20)
+            // Pinned off (D216 turned it on by default): the shapes count the read path
+            // itself, comparable with every earlier base.
+            .row_cache(0),
     );
     let t = db
         .table("t")

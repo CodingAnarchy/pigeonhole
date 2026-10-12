@@ -40,10 +40,10 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
   2. `build`, then `memtable-lookup`: the memtable's 1M- and 10k-entry point lookup (#17; criterion, pinned to one core).
   3. `phase2-gate`, twice (`phase2-gate-2`): the D193 floors. The second run is there because #387's row-read p99 is close to 1.5× SQLite EAV's (1.58× on the Mac), and one run varies by about 5%. Per D208, the first window's two runs will become the Phase 2 gate's reference baseline: copy `phase2-gate.json` and `phase2-gate-2.json` to `crates/bench/baselines/phase2-gate/reference-run1.json` and `reference-run2.json` and commit them, and `check.py` and `run-gate.sh` then use them.
   4. `all` against RocksDB, three times: twice on io_uring (the reproducibility pair) and once on pread (the backend decision).
-  5. `latency`: point gets, and durable group commit in the D213 shape (one shard per core, the table split over every shard, commits in flight inline) plus 1/4/16 client threads, then the D213 shape again on pread (reported, not judged: it decides the io_uring default). The setup step also times the data drive's raw fdatasync, shown beside the group commit p99.
+  5. `latency`: point gets in memory (ycsb-c with every engine's block cache at 2 GiB, holding the table, and a warmup as long as the measured phase: D216), ycsb-a and skewed-multi-shard, and durable group commit in the D213 shape (one shard per core, the table split over every shard, commits in flight inline) plus 1/4/16 client threads, then the D213 shape again on pread (reported, not judged: it decides the io_uring default). The setup step also times the data drive's raw fdatasync, shown beside the group commit p99.
   6. `ycsb-a-shards`: ycsb-a with one client, at the default shard count against 1 and 4 shards and longer shard spins, beside RocksDB (D198 item 2, #478).
   7. `group-sync-depth`: durable group commits at a group sync depth of 1, 2 and unlimited (D207's default).
-  8. `row-cache`: the row cache's default.
+  8. `row-cache`: ycsb-c and ycsb-a with the row cache off, against the latency step's default (on, D216).
   9. `scaling`: D204, at 1, 4, 8 and 16 shards.
   10. `open-latency`, `cold-get` and `cold-scan`: the `phase3-io` steps.
   11. `scan-cache`: the ordered scan from cache.
@@ -55,6 +55,6 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
 
 ## Results
 
-The last step writes `RESULTS/summary.md`. For every #406 target it gives the measured value, a verdict and the file that shows it. It also gives the data for the decisions the window settles: the row cache's default (D201), the I/O backend's default (#402), and the scan readahead (#431). Then it packs `RESULTS.tar.gz` and prints the `scp` line to copy it back. There are no GitHub credentials on the rented machine (owner decision, 2026-10-10): the results are committed from a development machine. Then cancel the server.
+The last step writes `RESULTS/summary.md`. For every #406 target it gives the measured value, a verdict and the file that shows it. It also gives the data for the decisions the window settles: the row cache's effect (on by default since D216), the I/O backend's default (#402), and the scan readahead (#431). Then it packs `RESULTS.tar.gz` and prints the `scp` line to copy it back. There are no GitHub credentials on the rented machine (owner decision, 2026-10-10): the results are committed from a development machine. Then cancel the server.
 
 The instruction ceilings (D193) are not measured here: CI's instructions job on the same commit is their record.

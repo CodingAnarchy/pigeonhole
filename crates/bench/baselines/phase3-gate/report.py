@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The report step of the gate window (#405): summary.md from RESULTS_DIR, with every #406
 target (its measured value, a verdict, and the file that shows it), then the data for the
-decisions the window settles (the row cache's default, the I/O backend's default, the scan
+decisions the window settles (the row cache's effect, the I/O backend's default, the scan
 readahead) and each step's duration.
 
     report.py RESULTS_DIR > summary.md
@@ -70,7 +70,8 @@ def verdict(ok):
 
 rows = []  # (target, measured, verdict, source)
 
-# Point get in memory: p50 < 2 µs, p99 < 10 µs (ycsb-c gets).
+# Point get in memory: p50 < 2 µs, p99 < 10 µs (ycsb-c gets). "In memory" (D216): a 2 GiB
+# block cache holding the table, warmed, and the defaults (row cache on).
 # ycsb-c's gets are recorded as row reads (one family, one cell).
 got = [op(r, "get") or op(r, "row read") for r in results("latency-ycsb-c.json", "pigeonhole")]
 got = [g for g in got if g]
@@ -299,19 +300,24 @@ if gap_rows:
         print(f"| {run[:-5]} | {w} | {t:.2f} | {l:.2f} | {'yes' if ok else '**no**'} |")
 
 print("\n## Decisions this window settles\n")
-# The row cache's default (D201).
+# The row cache (D216: on by default, amending D201): off (row-cache step) against the
+# default (latency step). Hit rates from the measured phase's counters.
+def hit_rate(r):
+    st = r.get("detail", {}).get("stalls") or {}
+    h, m = st.get("row_cache_hits", 0), st.get("row_cache_misses", 0)
+    return f"{100 * h / (h + m):.0f}%" if h + m else "-"
 rc_rows = []
 for w in ("ycsb-c", "ycsb-a"):
-    off = results(f"latency-{w}.json", "pigeonhole")
-    on = results(f"row-cache-{w}.json", "pigeonhole")
+    on = results(f"latency-{w}.json", "pigeonhole")
+    off = results(f"row-cache-off-{w}.json", "pigeonhole")
     if off and on:
         rc_rows.append((w, off[0], on[0]))
 if rc_rows:
-    print("**Row cache (D201):** off (latency step) against on (256 MiB).\n")
-    print("| Workload | Throughput off → on | p50 off → on | p99 off → on |")
-    print("|---|---|---|---|")
+    print("**Row cache (D216):** off (row-cache step) against the default, on (latency step).\n")
+    print("| Workload | Throughput off → on | p50 off → on | p99 off → on | Hits (on) |")
+    print("|---|---|---|---|---|")
     for w, a, b in rc_rows:
-        print(f"| {w} | {a['throughput']:.0f} → {b['throughput']:.0f} | {us(a['p50_ns']):.2f} → {us(b['p50_ns']):.2f} µs | {us(a['p99_ns']):.1f} → {us(b['p99_ns']):.1f} µs |")
+        print(f"| {w} | {a['throughput']:.0f} → {b['throughput']:.0f} | {us(a['p50_ns']):.2f} → {us(b['p50_ns']):.2f} µs | {us(a['p99_ns']):.1f} → {us(b['p99_ns']):.1f} µs | {hit_rate(b)} |")
 # ycsb-a, one client, shard count and shard spin (D198 item 2, #478; ICR 0027's counters).
 ya = [(n, results(f"ycsb-a-{n}.json", "pigeonhole")) for n in
       ("default", "shards1", "shards4", "spin100", "spin200", "spin500")]

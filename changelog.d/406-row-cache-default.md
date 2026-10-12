@@ -1,0 +1,3 @@
+### Changed
+- The row cache is on by default: `Options::row_cache` defaults to 64 MiB instead of 0 (D216, amending D201). `row_cache(0)` turns it off. A writer's caches now default to 256 MiB of block cache plus 64 MiB of row cache, and about 6 MiB of per-row write watermarks zeroed at open; each write pays one atomic per row it touches. Reader processes are unchanged.
+- `phdb-bench --row-cache` keeps the library default when not given, and reports the row cache's hits, misses and fills per measured phase. The gate window's `latency` step runs `ycsb-c` with a 2 GiB block cache and a full warmup ("in memory", D216), and its `row-cache` step measures the row cache off.

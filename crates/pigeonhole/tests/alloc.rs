@@ -74,7 +74,10 @@ fn open(name: &str) -> (Pigeonhole, Table) {
             .vfs(Arc::clone(&vfs) as _)
             .shards(1)
             .memtable_budget(8 << 20)
-            .wal_segment_size(256 << 10),
+            .wal_segment_size(256 << 10)
+            // The budgets are the read and write paths' own (D216 turned the row cache on
+            // by default; a read that fills it allocates the copy it keeps).
+            .row_cache(0),
     )
     .expect("open");
     let t = db

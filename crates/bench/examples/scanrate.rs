@@ -212,7 +212,10 @@ fn build(dir: &Path, shape: Shape, compact: bool) -> (Pigeonhole, driver::Driver
         &dir.join("scan.phdb"),
         Options::default()
             .durability(Durability::Buffered)
-            .block_cache(2 << 30),
+            .block_cache(2 << 30)
+            // Pinned off (D216 turned it on by default): the shapes count the read path
+            // itself, comparable with every earlier base.
+            .row_cache(0),
     );
     let t = db
         .table("t")

@@ -27,12 +27,13 @@
 #   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring               90
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2)         90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
-#   latency        ycsb-c, ycsb-a, skewed vs RocksDB; group-commit: the D213 shape (one
-#                  shard per core, table split over all, commits in flight inline), then
-#                  1/4/16 client threads vs RocksDB; the same on pread, reported        55
+#   latency        ycsb-c (2 GiB cache, warmed: D216), ycsb-a, skewed vs RocksDB;
+#                  group-commit: the D213 shape (one shard per core, table split over
+#                  all, commits in flight inline), then 1/4/16 client threads vs
+#                  RocksDB; the same on pread, reported                               55
 #   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
 #   group-sync-depth  group-commit at group sync depth 1, 2 and unlimited (D207)      15
-#   row-cache      ycsb-c and ycsb-a with the row cache on (D201's default)           30
+#   row-cache      ycsb-c and ycsb-a with the row cache off (D216: on by default)      30
 #   scaling        scaling gate (D204) at 1, 4, 8, 16 shards                          30
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   cold-get       cold point gets, one I/O (#87; phase3-io/cold-get.sh)              45
@@ -252,11 +253,17 @@ step_all-uring-2() {
 }
 step_all-pread() { all_vs_rocksdb pread all-pread; }
 
+# "In memory" (D216): every engine's block cache holds the whole table (2 GiB) and the
+# warmup reads as many rows as the measured phase, so the gets measure cached reads.
+ycsb_c_memory=(--cache 2147483648 --warmup 1.0)
+
 step_latency() {
-    local w
+    local w extra
     for w in ycsb-c ycsb-a skewed-multi-shard; do
+        extra=()
+        [[ $w == ycsb-c ]] && extra=("${ycsb_c_memory[@]}")
         PIGEONHOLE_IO=uring "$bench" "$w" --engine pigeonhole,rocksdb --scale "$scale" \
-            --dir "$data/bench" --json "$results/latency-$w.json"
+            "${extra[@]}" --dir "$data/bench" --json "$results/latency-$w.json"
         rm -r "$data/bench"
     done
     # Durable 4-cell commits (GroupSync; RocksDB fsyncs). Pigeonhole first runs the target's
@@ -315,10 +322,14 @@ step_row-cache() {
         echo "phdb-bench has no --row-cache yet (a bench PR); skipped, not marked done" >&2
         return "$SKIP"
     fi
-    local w
+    # The latency step runs the default (row cache on, D216); this is the same with it off.
+    local w extra
     for w in ycsb-c ycsb-a; do
+        extra=()
+        [[ $w == ycsb-c ]] && extra=("${ycsb_c_memory[@]}")
         PIGEONHOLE_IO=uring "$bench" "$w" --engine pigeonhole --scale "$scale" \
-            --row-cache 268435456 --dir "$data/bench" --json "$results/row-cache-$w.json"
+            "${extra[@]}" --row-cache 0 --dir "$data/bench" \
+            --json "$results/row-cache-off-$w.json"
         rm -r "$data/bench"
     done
 }

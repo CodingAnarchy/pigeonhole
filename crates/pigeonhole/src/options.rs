@@ -58,6 +58,10 @@ pub struct Options {
     shard_spin: Option<Duration>,
 }
 
+/// The row cache's default capacity (D216): a quarter of the default block cache. On ycsb-c
+/// it answers about three gets in four from the cache; more memory buys few more hits.
+const DEFAULT_ROW_CACHE: usize = 64 << 20;
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -67,7 +71,7 @@ impl Default for Options {
             pin_threads: false,
             memtable_budget: 64 << 20,
             block_cache: None,
-            row_cache: 0,
+            row_cache: DEFAULT_ROW_CACHE,
             row_cache_max_row: None,
             row_cache_families: Vec::new(),
             shm_dir: None,
@@ -210,7 +214,8 @@ impl Options {
         self
     }
 
-    /// Row cache capacity in bytes (default 0: disabled), on top of the block cache. The row
+    /// Row cache capacity in bytes (default 64 MiB, D216; 0 turns it off), on top of the block
+    /// cache, plus about 9% of it for per-row write watermarks allocated at open. The row
     /// cache keeps the newest version of each cell of small, hot family rows and serves
     /// latest row reads (newest version, no time range) and point gets from it, without
     /// merging the row's sources. A family row is stored the second time a read misses it,

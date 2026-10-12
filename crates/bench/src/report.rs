@@ -465,6 +465,16 @@ pub struct Stalls {
     /// slots (a size split found due counts once per balancer pass; #123).
     #[serde(default)]
     pub slot_refusals: u64,
+    /// Row cache lookups answered from the cache, lookups that missed, and family rows
+    /// stored (D201, D216); all 0 with the row cache off.
+    #[serde(default)]
+    pub row_cache_hits: u64,
+    /// See [`Stalls::row_cache_hits`].
+    #[serde(default)]
+    pub row_cache_misses: u64,
+    /// See [`Stalls::row_cache_hits`].
+    #[serde(default)]
+    pub row_cache_fills: u64,
 }
 
 impl Stalls {
@@ -491,6 +501,9 @@ impl Stalls {
             visibility_contended: d(before.visibility_contended, after.visibility_contended),
             slot_refusals: d(before.slot_refusals, after.slot_refusals),
             wal_rollover_blocks: d(before.wal_rollover_blocks, after.wal_rollover_blocks),
+            row_cache_hits: d(before.row_cache_hits, after.row_cache_hits),
+            row_cache_misses: d(before.row_cache_misses, after.row_cache_misses),
+            row_cache_fills: d(before.row_cache_fills, after.row_cache_fills),
         }
     }
 }

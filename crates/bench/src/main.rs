@@ -64,7 +64,8 @@ OPTIONS:
     --sync                 fsync every commit on every engine [default: buffered]
     --no-tablet-changes    Pigeonhole: keep each table one tablet on one shard (tablets
                            split, merge and move between shards by default)
-    --row-cache B          Pigeonhole: row cache bytes (D201) [default: 0, off]
+    --row-cache B          Pigeonhole: row cache bytes; 0 turns it off (D201)
+                           [default: the library's, on (D216)]
     --shard-spin US        Pigeonhole: a shard's idle spin before it parks, in µs (D198)
                            [default: the library's]
     --dir DIR              where stores are created [default: system temp dir]
@@ -194,8 +195,10 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     let mut r = PigeonholeRunner::default()
         .sync(a.sync)
         .memory(memory(a))
-        .tablet_changes(!a.no_tablet_changes)
-        .row_cache(a.row_cache.unwrap_or(0));
+        .tablet_changes(!a.no_tablet_changes);
+    if let Some(bytes) = a.row_cache {
+        r = r.row_cache(bytes);
+    }
     if let Some(n) = shards.or(a.shards) {
         r = r.shards(n);
     }
