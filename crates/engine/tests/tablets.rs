@@ -492,6 +492,205 @@ fn a_skewed_shard_keeps_shedding_tablets_until_balanced() {
     }
 }
 
+/// One phase of a closed-loop load, as the scaling gate's driver runs it (D204): tablet `t`
+/// gets `demand[t]` new rows, each assigned at the start to the shard owning it, and every
+/// shard writes 20 of its rows per balancer pass until it is done, then idles until every
+/// shard is. Returns the passes the phase took.
+fn closed_loop_phase(db: &mut Db, demand: &[u64], written: &mut u64) -> usize {
+    let ranges = db.ranges();
+    let owner = |row: &[u8]| {
+        ranges
+            .iter()
+            .find(|(_, _, start, end)| {
+                row >= start.as_slice() && end.as_deref().is_none_or(|e| row < e)
+            })
+            .unwrap()
+            .1
+    };
+    let mut rows: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+    for (t, d) in demand.iter().enumerate() {
+        for _ in 0..*d {
+            let row = tablet_row(t, *written);
+            *written += 1;
+            rows[usize::from(owner(&row))].push(row);
+        }
+    }
+    let mut passes = 0;
+    while rows.iter().any(|r| !r.is_empty()) {
+        for mine in &mut rows {
+            for row in mine.drain(..mine.len().min(20)) {
+                db.put(&row, b"v");
+            }
+        }
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+        passes += 1;
+    }
+    passes
+}
+
+/// A closed-loop load settles (D224): every shard writes at the same rate while it has work,
+/// so skew shows only in each phase's tail, after the lighter shards finish. There, the busy
+/// shards read about 2x the mean only because the mean fell: that alone moves nothing. The
+/// real imbalance (shards 0 and 1 hold tablets with twice the work) is fixed on the slow
+/// averages, and then the placement stays put. Before, the busy shards shed tablets in every
+/// phase's tail.
+#[test]
+fn a_closed_loop_load_settles_instead_of_churning_every_tail() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // Two tablets per shard; tablets 0..4 (on shards 0 and 1) carry twice the work.
+    let n = 8;
+    tablets_on(&mut db, n, |t| (t / 2) as u16);
+    let demand: Vec<u64> = (0..n).map(|t| if t < 4 { 600 } else { 300 }).collect();
+    let mut written = 0;
+    let mut changes = Vec::new();
+    for _ in 0..12 {
+        let before = tablet_changes(&db.engine);
+        closed_loop_phase(&mut db, &demand, &mut written);
+        let after = tablet_changes(&db.engine);
+        changes.push(after.1 - before.1 + after.2 - before.2 + after.0 - before.0);
+    }
+    // Settled: nothing changes in the last six phases.
+    assert!(
+        changes[6..].iter().all(|c| *c == 0),
+        "changes per phase {changes:?}"
+    );
+    // Settled where the shards share the work evenly: each owns at most 1.25x the mean of the
+    // next phase's rows (the scaling gate's bound, D223).
+    let ranges = db.ranges();
+    let mut per = [0u64; 4];
+    for (t, d) in demand.iter().enumerate() {
+        for i in 0..*d {
+            let row = tablet_row(t, written + i);
+            let (_, s, ..) = ranges
+                .iter()
+                .find(|(_, _, start, end)| {
+                    row.as_slice() >= start.as_slice()
+                        && end.as_deref().is_none_or(|e| row.as_slice() < e)
+                })
+                .unwrap();
+            per[usize::from(*s)] += 1;
+        }
+    }
+    let mean = per.iter().sum::<u64>() as f64 / 4.0;
+    assert!(
+        per.iter().all(|p| *p as f64 <= 1.25 * mean),
+        "rows per shard {per:?}, changes per phase {changes:?}"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A standing imbalance still moves a tablet (D224): one shard at a steady 2x the mean from
+/// the start. The mean never falls, so the skew counts as D214 has it.
+#[test]
+fn a_standing_imbalance_still_moves_a_tablet() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // Shard 0 holds four tablets, the others one each, all written alike: shard 0 carries
+    // 4/7 of the writes, about 2.3x the mean.
+    let n = 7;
+    tablets_on(&mut db, n, |t| if t < 4 { 0 } else { (t - 3) as u16 });
+    let before = tablet_changes(&db.engine);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablet_changes(&db.engine) == before && passes < 100 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    assert_eq!(after.2 - before.2, 1, "a move after {passes} passes");
+    // The 10-pass persistence, as D214 has it: no later because of #582.
+    assert!(passes <= 12, "moved after {passes} passes");
+    assert_eq!(tablets_per_shard(&db, shards)[0], 3);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Two skewed shards acting on the same pass never both shed into the same cold shard
+/// (D224): the first claims it, and the second picks the next coldest. Before, both moved a
+/// tablet to the coldest shard, which became the hottest.
+#[test]
+fn skewed_shards_never_shed_into_the_same_cold_shard_at_once() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // Shards 0 and 1 hold three written tablets each; shard 2 one barely written, shard 3 one
+    // written like the others.
+    let n = 8;
+    tablets_on(&mut db, n, |t| match t {
+        0..3 => 0,
+        3..6 => 1,
+        6 => 2,
+        _ => 3,
+    });
+    let rows = |t: usize| if t == 6 { 2 } else { 20 };
+    let mut written = 0;
+    let before = tablets_per_shard(&db, shards);
+    let mut passes = 0;
+    while tablets_per_shard(&db, shards) == before && passes < 100 {
+        write_and_balance(&mut db, n, rows, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        tablets_per_shard(&db, shards),
+        vec![2, 2, 2, 2],
+        "the first moves after {passes} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Three skewed shards with one tablet each and a single cold shard: the first splits into
+/// the cold shard and claims it, and the others, finding every shard below the mean claimed,
+/// wait for a later pass instead of splitting with nowhere to go (D224).
+#[test]
+fn skewed_shards_wait_when_every_cold_shard_is_claimed() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    let n = 4;
+    tablets_on(&mut db, n, |t| t as u16);
+    let rows = |t: usize| if t == 3 { 2 } else { 40 };
+    let mut written = 0;
+    let before = tablet_changes(&db.engine);
+    let mut passes = 0;
+    while tablet_changes(&db.engine) == before && passes < 100 {
+        write_and_balance(&mut db, n, rows, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    assert_eq!(
+        (after.0 - before.0, after.2 - before.2),
+        (1, 0),
+        "one split into the cold shard after {passes} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// A burst of skew shorter than the persistence (10 passes, D214) moves and splits nothing:
 /// before D214 one skewed pass split the hot shard's tablet over the others.
 #[test]
@@ -741,6 +940,8 @@ fn a_tablet_splits_at_the_size_threshold_and_merges_when_small_and_cold() {
     let mut db = open(2, |o| {
         o.balance_interval_nanos = u64::MAX;
         o.tablet_split_bytes = 64 << 20;
+        // Cold as soon as a pass went by with no writes since the split arrived.
+        o.balance_cold_passes = Some(1);
     });
     for i in 0..50 {
         db.put(&key(i), b"x");
@@ -1168,6 +1369,7 @@ fn the_balancer_merges_cold_siblings_once_one_compacted_a_shared_sst() {
     // right child's SST before it can merge (#95). Every step waits for an event rather
     // than counting on time or a fixed number of passes.
     let mut db = open(1, |o| {
+        o.balance_cold_passes = Some(2); // cold after two unwritten passes
         o.balance_interval_nanos = u64::MAX; // only the explicit passes below
         o.tablet_split_bytes = 64 << 20;
         o.compaction.l0_trigger = 2;
@@ -1538,6 +1740,7 @@ fn a_busy_shard_still_rewrites_the_sst_blocking_a_cold_merge() {
     // always due for compaction when the balancer asks for the rewrite. Cleanups alternate
     // with due compactions, so the cold pair still merges.
     let mut db = open(1, |o| {
+        o.balance_cold_passes = Some(2); // cold after two unwritten passes
         o.balance_interval_nanos = u64::MAX;
         o.tablet_split_bytes = 64 << 20;
         o.compaction.l0_trigger = 2;
@@ -2124,7 +2327,10 @@ fn cold_tablets_spread_over_shards_consolidate_into_one() {
     // A table left in four small tablets alternating between two shards: neighbours never
     // share a shard, so merges alone never fire. Cold tablets move to their left
     // neighbour's shard and merge, until one tablet remains.
-    let mut db = open(2, |o| o.balance_interval_nanos = u64::MAX);
+    let mut db = open(2, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_cold_passes = Some(2); // cold after two unwritten passes
+    });
     for i in 0..40 {
         db.put(&key(i), b"v");
     }
@@ -2147,6 +2353,7 @@ fn an_idle_shard_still_merges_cold_tablets() {
     // No message reaches the shard after the split: its balancer's own wakeup runs the
     // passes that merge the two cold halves.
     let mut db = open(1, |o| {
+        o.balance_cold_passes = Some(2); // cold after two unwritten passes
         o.balance_interval_nanos = 1_000_000;
         ticking(o);
     });

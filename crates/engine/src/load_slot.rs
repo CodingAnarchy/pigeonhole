@@ -11,6 +11,12 @@
 //!   that returns what was reserved before, and gives them back if that would pass the
 //!   limit ([`LoadSlot::release`]). So concurrent changes never commit a shard past
 //!   `max_slots` together. The caller reserves on every receiving shard, all or none.
+//! - **Skew claims (D224).** A shard handing another load for write skew claims it first
+//!   ([`LoadSlot::claim`], a compare-and-swap), and the claim holds until the receiver has
+//!   published a dwell of balancer passes or that dwell of base intervals has gone by on the
+//!   clock, whichever comes first (an idle receiver backs off its passes). Two shards
+//!   balancing at once never both shed into the same cold shard: the second sees the claim
+//!   and picks another.
 
 #[cfg(engine_loom)]
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,20 +31,31 @@ pub(crate) struct LoadSlot {
     writes: AtomicU64,
     /// Moving average of the fraction of the time the shard was busy, in millionths (D217).
     busy: AtomicU64,
+    /// Slow moving average of the rows written per interval (D224).
+    writes_slow: AtomicU64,
     /// `(tablet, family)` slots promised to changes in flight that will hand this shard
     /// tablets: every change checks them with the slots in the view, so concurrent moves
     /// never take a shard past `max_slots` (#103).
     reserved: AtomicUsize,
     /// When it was published (monotonic nanoseconds; 0 = never).
     at: AtomicU64,
+    /// The owning shard's balancer passes as of its last publication.
+    passes: AtomicU64,
+    /// Until when a skew change handing the owning shard load holds it (D224): the owner's
+    /// pass (as `passes`, high 32 bits) or the clock in milliseconds (low 32 bits), whichever
+    /// comes first; until then no other skew change picks it. Both halves compare with
+    /// wraparound, so one compare-and-swap moves them together.
+    claimed: AtomicU64,
 }
 
 impl LoadSlot {
     /// The owning shard publishes its write rate and busy fraction (millionths, D217) as of
     /// `now` (nonzero).
-    pub(crate) fn publish(&self, writes: u64, busy: u64, now: u64) {
+    pub(crate) fn publish(&self, writes: u64, writes_slow: u64, busy: u64, now: u64, passes: u64) {
         self.writes.store(writes, Ordering::Relaxed);
+        self.writes_slow.store(writes_slow, Ordering::Relaxed);
         self.busy.store(busy, Ordering::Relaxed);
+        self.passes.store(passes, Ordering::Relaxed);
         self.at.store(now, Ordering::Release);
     }
 
@@ -48,11 +65,60 @@ impl LoadSlot {
         (at != 0 && now.saturating_sub(at) <= stale).then(|| self.writes.load(Ordering::Relaxed))
     }
 
+    /// The published slow write rate if it was published within `stale` of `now`: like
+    /// [`LoadSlot::read_fresh`], that publication's or a later one.
+    pub(crate) fn read_slow_fresh(&self, now: u64, stale: u64) -> Option<u64> {
+        let at = self.at.load(Ordering::Acquire);
+        (at != 0 && now.saturating_sub(at) <= stale)
+            .then(|| self.writes_slow.load(Ordering::Relaxed))
+    }
+
     /// The published busy fraction (millionths) if it was published within `stale` of
     /// `now`: like [`LoadSlot::read_fresh`], that publication's or a later one.
     pub(crate) fn read_busy_fresh(&self, now: u64, stale: u64) -> Option<u64> {
         let at = self.at.load(Ordering::Acquire);
         (at != 0 && now.saturating_sub(at) <= stale).then(|| self.busy.load(Ordering::Relaxed))
+    }
+
+    /// Whether a claim word has run out: the owner reached its pass, or the clock its
+    /// millisecond (`now_ms`).
+    fn expired(word: u64, passes: u64, now_ms: u32) -> bool {
+        let (pass, ms) = ((word >> 32) as u32, word as u32);
+        (passes as u32).wrapping_sub(pass) as i32 >= 0 || now_ms.wrapping_sub(ms) as i32 >= 0
+    }
+
+    /// The clock in the claim word's unit.
+    fn millis(now: u64) -> u32 {
+        (now / 1_000_000) as u32
+    }
+
+    /// Whether no skew change holds this shard at `now` (D224): a balancer may pick it.
+    pub(crate) fn claimable(&self, now: u64) -> bool {
+        let word = self.claimed.load(Ordering::Acquire);
+        Self::expired(word, self.passes.load(Ordering::Relaxed), Self::millis(now))
+    }
+
+    /// Claims this shard at `now` for a skew change handing it load, until it has published
+    /// `dwell` more passes or `dwell_nanos` have gone by. Fails while another claim holds
+    /// it, or when one lands first.
+    pub(crate) fn claim(&self, dwell: u64, dwell_nanos: u64, now: u64) -> bool {
+        let passes = self.passes.load(Ordering::Relaxed);
+        let held = self.claimed.load(Ordering::Acquire);
+        let now_ms = Self::millis(now);
+        if !Self::expired(held, passes, now_ms) {
+            return false;
+        }
+        // Keep both deadlines within half the wraparound, so they compare right.
+        let pass = (passes as u32).wrapping_add(dwell.min(1 << 30) as u32);
+        let ms = now_ms.wrapping_add((dwell_nanos / 1_000_000).clamp(1, 1 << 30) as u32);
+        self.claimed
+            .compare_exchange(
+                held,
+                (u64::from(pass) << 32) | u64::from(ms),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Slots reserved on this shard by changes in flight.
@@ -88,8 +154,8 @@ mod loom_tests {
             let owner = {
                 let slot = Arc::clone(&slot);
                 thread::spawn(move || {
-                    slot.publish(10, 0, 1);
-                    slot.publish(20, 0, 2);
+                    slot.publish(10, 0, 0, 1, 1);
+                    slot.publish(20, 0, 0, 2, 2);
                 })
             };
             for _ in 0..2 {
@@ -143,6 +209,29 @@ mod loom_tests {
             }
         });
     }
+
+    #[test]
+    fn loom_two_skew_changes_never_both_claim_one_shard() {
+        // Two shards balancing at once claim the same cold shard while it publishes a pass:
+        // at most one claim holds it until it has made a dwell of passes.
+        loom::model(|| {
+            let slot = Arc::new(LoadSlot::default());
+            let claimers: Vec<_> = (0..2)
+                .map(|_| {
+                    let slot = Arc::clone(&slot);
+                    thread::spawn(move || slot.claim(10, 1_000_000_000, 5_000_000))
+                })
+                .collect();
+            slot.publish(0, 0, 0, 1, 1);
+            let won = claimers
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|c| *c)
+                .count();
+            assert_eq!(won, 1, "{won} claims hold one shard");
+            assert!(!slot.claimable(5_000_000));
+        });
+    }
 }
 
 #[cfg(all(test, not(engine_loom)))]
@@ -153,12 +242,34 @@ mod tests {
     fn a_publication_is_read_while_fresh_and_reservations_count() {
         let slot = LoadSlot::default();
         assert_eq!(slot.read_fresh(5, 10), None, "never published");
-        slot.publish(7, 0, 5);
+        slot.publish(7, 0, 0, 5, 1);
         assert_eq!(slot.read_fresh(10, 10), Some(7));
         assert_eq!(slot.read_fresh(20, 10), None, "stale");
         assert_eq!(slot.reserve(2), 0);
         assert_eq!(slot.reserve(1), 2);
         slot.release(2);
         assert_eq!(slot.reserved(), 1);
+    }
+
+    #[test]
+    fn a_claim_holds_a_shard_for_a_dwell_of_its_passes_or_its_time() {
+        const MS: u64 = 1_000_000;
+        let slot = LoadSlot::default();
+        slot.publish(7, 0, 0, 5, 3);
+        assert!(slot.claimable(0));
+        // Ten passes or a second: the passes come first here.
+        assert!(slot.claim(10, 1_000 * MS, 0));
+        assert!(
+            !slot.claimable(0) && !slot.claim(10, 1_000 * MS, 0),
+            "held until pass 13"
+        );
+        slot.publish(7, 0, 0, 6, 12);
+        assert!(!slot.claimable(500 * MS));
+        slot.publish(7, 0, 0, 7, 13);
+        assert!(slot.claimable(500 * MS));
+        // An idle receiver makes no passes: the clock ends the claim.
+        assert!(slot.claim(10, 1_000 * MS, 2_000 * MS));
+        assert!(!slot.claimable(2_999 * MS));
+        assert!(slot.claimable(3_000 * MS) && slot.claim(10, 1_000 * MS, 3_000 * MS));
     }
 }
