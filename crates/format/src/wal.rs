@@ -184,7 +184,16 @@ impl FrameEncoder {
     /// next record, so the returned offset is exactly where the record's data ends: the
     /// `prev_end` a successor segment records when this segment fills up.
     pub fn encode(&mut self, record: &[u8], out: &mut Vec<u8>) -> u64 {
-        let mut rest = record;
+        self.encode_parts(&[record], out)
+    }
+
+    /// [`FrameEncoder::encode`] for a record given as consecutive `parts` (a record's head and
+    /// its batch, [`WalRecord::split`]), so a caller frames it without first copying it into
+    /// one buffer (#320). The bytes appended are those of encoding the parts' concatenation.
+    pub fn encode_parts(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> u64 {
+        let mut left: usize = parts.iter().map(|p| p.len()).sum();
+        // The next byte to frame: `parts[part][off]`.
+        let (mut part, mut off) = (0, 0);
         let mut first = true;
         loop {
             let room = frame_room(self.pos);
@@ -193,19 +202,31 @@ impl FrameEncoder {
                 self.pos += room as u64;
                 continue;
             }
-            let n = rest.len().min(room - FRAGMENT_HEADER_LEN);
-            let last = n == rest.len();
+            let n = left.min(room - FRAGMENT_HEADER_LEN);
+            let last = n == left;
             let mut header = [0u8; FRAGMENT_HEADER_LEN];
             header[4..8].copy_from_slice(&self.epoch.to_le_bytes());
             header[8..10].copy_from_slice(&(n as u16).to_le_bytes());
             header[10] = fragment_type(first, last) as u8;
-            let crc =
-                crate::checksum::crc32c_append(crate::checksum::crc32c(&header[4..]), &rest[..n]);
-            header[..4].copy_from_slice(&crc.to_le_bytes());
+            let mut crc = crate::checksum::crc32c(&header[4..]);
+            let at = out.len();
             out.extend_from_slice(&header);
-            out.extend_from_slice(&rest[..n]);
+            let mut take = n;
+            while take > 0 {
+                let p = &parts[part][off..];
+                let k = p.len().min(take);
+                crc = crate::checksum::crc32c_append(crc, &p[..k]);
+                out.extend_from_slice(&p[..k]);
+                take -= k;
+                off += k;
+                if off == parts[part].len() {
+                    part += 1;
+                    off = 0;
+                }
+            }
+            out[at..at + 4].copy_from_slice(&crc.to_le_bytes());
             self.pos += (FRAGMENT_HEADER_LEN + n) as u64;
-            rest = &rest[n..];
+            left -= n;
             first = false;
             if last {
                 return self.pos;
@@ -403,19 +424,33 @@ pub enum WalRecord<'a> {
     },
 }
 
+/// The longest record head [`WalRecord::split`] writes: a PREPARE's type, seqno, commit
+/// timestamp and coordinator stream.
+pub const RECORD_HEAD_MAX: usize = 1 + 8 + 8 + 4;
+
 impl WalRecord<'_> {
     /// Appends the record encoding.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        match self {
+        let mut head = [0u8; RECORD_HEAD_MAX];
+        let (head, body) = self.split(&mut head);
+        out.extend_from_slice(head);
+        out.extend_from_slice(body);
+    }
+
+    /// The record encoding as two parts, without copying the batch: its head (type, seqno,
+    /// and the type's other fixed fields), written into `head`, then its body (the batch, or a
+    /// COMMIT's participant list). [`FrameEncoder::encode_parts`] frames them as one record.
+    pub fn split<'b>(&'b self, head: &'b mut [u8; RECORD_HEAD_MAX]) -> (&'b [u8], &'b [u8]) {
+        let (len, body) = match self {
             WalRecord::Batch {
                 seqno,
                 commit_ts,
                 batch,
             } => {
-                out.push(RecordType::Batch as u8);
-                out.extend_from_slice(&seqno.to_le_bytes());
-                out.extend_from_slice(&commit_ts.to_le_bytes());
-                out.extend_from_slice(batch.as_bytes());
+                head[0] = RecordType::Batch as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                head[9..17].copy_from_slice(&commit_ts.to_le_bytes());
+                (17, batch.as_bytes())
             }
             WalRecord::Prepare {
                 seqno,
@@ -423,21 +458,22 @@ impl WalRecord<'_> {
                 coordinator,
                 batch,
             } => {
-                out.push(RecordType::Prepare as u8);
-                out.extend_from_slice(&seqno.to_le_bytes());
-                out.extend_from_slice(&commit_ts.to_le_bytes());
-                out.extend_from_slice(&coordinator.0.to_le_bytes());
-                out.extend_from_slice(batch.as_bytes());
+                head[0] = RecordType::Prepare as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                head[9..17].copy_from_slice(&commit_ts.to_le_bytes());
+                head[17..21].copy_from_slice(&coordinator.0.to_le_bytes());
+                (21, batch.as_bytes())
             }
             WalRecord::Commit {
                 seqno,
                 participants,
             } => {
-                out.push(RecordType::Commit as u8);
-                out.extend_from_slice(&seqno.to_le_bytes());
-                out.extend_from_slice(participants.bytes);
+                head[0] = RecordType::Commit as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                (9, participants.bytes)
             }
-        }
+        };
+        (&head[..len], body)
     }
 
     /// Decodes a record. Never panics.
