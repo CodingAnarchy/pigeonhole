@@ -480,6 +480,7 @@ pub struct Report {
 /// ```
 /// let opts = pigeonhole_bench::RunOptions::default();
 /// assert_eq!(opts.warmup, 0.05);
+/// assert_eq!(opts.min_measured, std::time::Duration::ZERO);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RunOptions {
@@ -488,11 +489,18 @@ pub struct RunOptions {
     /// the same seeded stream, executed on one thread, so caches, allocators and lazily
     /// built structures are warm when the clock starts.
     pub warmup: f64,
+    /// The shortest measured phase of an inline run (the scaling gate and D213's group
+    /// commit, [`PigeonholeRunner::run_inline`]): its writes repeat until this much time
+    /// has been measured (D219). Zero (the default) measures them once.
+    pub min_measured: std::time::Duration,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        Self { warmup: 0.05 }
+        Self {
+            warmup: 0.05,
+            min_measured: std::time::Duration::ZERO,
+        }
     }
 }
 

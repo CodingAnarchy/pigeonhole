@@ -29,6 +29,8 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--scale smoke\|small\|full\|larger-than-ram` | Preset size; `small` is the default, `smoke` is what `cargo test` runs, `full` is the spec's scale, `larger-than-ram` is `full` with a tiny memory budget (below) |
 | `--records N`, `--ops N`, `--value-len N`, `--threads N`, `--seed N` | Override the preset |
 | `--warmup F` | Unrecorded warmup, as a fraction of `--ops` (default 0.05; `scaling`: 1.0, see below) |
+| `--min-secs S` | Inline runs (`scaling`, and `group-commit`'s D213 run): repeat the measured writes until at least S seconds are measured (D219; default 0, once). A fixed count measures a faster store for less time, too short for its flushes and compactions to show |
+| `--inline-ops N` | `group-commit`: the D213 run's commits, apart from the client runs' `--ops` (D219; the gate judges it on 2M) |
 | `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
 | `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |

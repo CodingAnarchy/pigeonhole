@@ -144,13 +144,24 @@ def stages(g):
             f"{g.get('wal_inline_syncs', '?')}; tablet changes while measuring {g.get('tablet_changes', '?')}")
 
 
+def run_length(name):
+    # The D213 run's length and the flushes and compactions inside it (D219: the judged run
+    # is at least 2M commits, so they fall inside the measured phase).
+    r = next((r for r in results(name, "pigeonhole") if "presplit" in r.get("store_config", "")), None)
+    if not r:
+        return ""
+    st = r.get("detail", {}).get("stalls") or {}
+    return (f"; {r['operations'] / 1e6:.1f}M commits in {r['run_secs']:.1f} s, "
+            f"{st.get('flushes', 0)} flushes, {st.get('compactions', 0)} compactions")
+
+
 if g:
     cells, per_core = g["cells_per_sec"], g["cells_per_sec"] / max(g["cores"], 1)
     fixed = g.get("tablet_changes", 1) == 0
     rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)",
                  f"{cells / 1e6:.2f}M cells/s at {g['shards']} shards ({per_core / 1e3:.0f}K per core); "
                  f"p50 {us(g['p50_ns']):.0f} µs, p99 {us(g['p99_ns']):.0f} µs; busiest shard "
-                 f"{100 * g['max_share']:.0f}%{stages(g)}{floor}"
+                 f"{100 * g['max_share']:.0f}%{run_length('latency-group-commit.json')}{stages(g)}{floor}"
                  + ("" if fixed else " — INVALID: the placement changed while measuring"),
                  verdict(fixed and cells > 1e6 and us(g["p99_ns"]) < 200), "latency-group-commit.json"))
 else:
@@ -161,7 +172,14 @@ if gp:
     rows.append(("Durable group commit on pread (reported, not judged; D213: decides the io_uring default)",
                  f"{gp['cells_per_sec'] / 1e6:.2f}M cells/s at {gp['shards']} shards "
                  f"({gp['cells_per_sec'] / max(gp['cores'], 1) / 1e3:.0f}K per core); p50 {us(gp['p50_ns']):.0f} µs, "
-                 f"p99 {us(gp['p99_ns']):.0f} µs{stages(gp)}", "-", "latency-group-commit-pread.json"))
+                 f"p99 {us(gp['p99_ns']):.0f} µs{run_length('latency-group-commit-pread.json')}{stages(gp)}",
+                 "-", "latency-group-commit-pread.json"))
+gs = (load("latency-group-commit-short.json") or {}).get("group_commit")
+if gs:
+    rows.append(("Durable group commit, short run (reported, not judged; D219: the first window's length)",
+                 f"{gs['cells_per_sec'] / 1e6:.2f}M cells/s at {gs['shards']} shards; p50 {us(gs['p50_ns']):.0f} µs, "
+                 f"p99 {us(gs['p99_ns']):.0f} µs{run_length('latency-group-commit-short.json')}{stages(gs)}",
+                 "-", "latency-group-commit-short.json"))
 clients = [r for r in results("latency-group-commit.json", "pigeonhole") if "inline" not in r.get("store_config", "")]
 if clients:
     detail = ", ".join(f"{r['threads']} thr: {r['throughput'] * GROUP_COMMIT_CELLS / 1e3:.0f}K cells/s, "
@@ -194,9 +212,21 @@ for n in (4, 8, 16):
     d = load(f"scaling-{n}.json")
     if d and d.get("scaling"):
         s = d["scaling"]
-        scal.append((n, s["efficiency"], s["max_share"], s["efficiency"] >= 0.8 and s["max_share"] <= 2 / n))
+        # The stall breakdown (D219): the N-shard run's length, the share of its shard time
+        # spent in write stalls, its flushes and compactions, and its longest operation.
+        multi = next((r for r in d.get("results", []) if "inline" in r.get("store_config", "")
+                      and r.get("threads") == n), None)
+        brk = ""
+        if multi:
+            st = multi.get("detail", {}).get("stalls") or {}
+            stalled = st.get("write_stall_nanos", 0) / max(multi["run_secs"] * n * 1e9, 1)
+            brk = (f"; {multi['run_secs']:.1f} s, stalled {stalled:.0%} of shard time, "
+                   f"{st.get('flushes', 0)} flushes, {st.get('compactions', 0)} compactions, "
+                   f"max {multi['max_ns'] / 1e6:.1f} ms")
+        scal.append((n, s["efficiency"], s["max_share"], brk,
+                     s["efficiency"] >= 0.8 and s["max_share"] <= 2 / n))
 if scal:
-    detail = ", ".join(f"N={n}: {e:.2f} (busiest {m:.0%})" for n, e, m, _ in scal)
+    detail = "; ".join(f"N={n}: {e:.2f} (busiest {m:.0%}{b})" for n, e, m, b, _ in scal)
     rows.append(("Thread-per-core scaling: ≥ 0.8 × N", detail, verdict(all(ok for *_, ok in scal)), "scaling-N.json"))
 else:
     rows.append(("Thread-per-core scaling: ≥ 0.8 × N", "", verdict(None), "scaling-N.json"))

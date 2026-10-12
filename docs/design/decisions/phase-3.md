@@ -665,3 +665,19 @@ With those fixed, io_uring matches or beats `pread` everywhere measured (AX102, 
 | durable group commit, D213, 32 shards | p99 1,065–1,794 µs | p99 330–352 | p99 252–336 |
 
 Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
+
+<a id="d219"></a>
+## D219 — The gate judges durable group commit on at least 2M commits and measures scaling for at least 8 s, with a stall breakdown (owner decision, 2026-10-11; bench, #406; amends D213, D204)
+
+**Decided:**
+- **Durable group commit (D213's shape) is judged on at least 2M commits.** `phdb-bench group-commit --inline-ops N` sets the D213 run's commits apart from the client runs' `--ops`. The gate window's `latency` step passes 2,000,000 on io_uring and on pread. The preset's 200K-commit run, the first window's length, is still reported as `latency-group-commit-short.json`. The summary gives each run's length and the flushes and compactions inside it.
+- **The scaling gate (D204) is measured for at least 8 s at every shard count.** `--min-secs S` makes an inline run (scaling, and D213's) repeat its measured writes until S seconds are measured. The `scaling` step passes 8.
+- **The summary breaks each scaling run's stalls out:** its length, the share of shard time spent in write stalls, flushes, compactions, and the longest operation.
+- The small scale (the CI dry run) keeps both short: 50K commits and 1 s.
+
+**Why.** perf287's runs on the AX102 (2026-10-11, after the inline driver's io_fd fix):
+- **The first window's D213 run** measured 0.27–0.33 s and 200K commits. At 32 shards that's about 6K commits per shard: no flush or compaction fell inside it, and its p99 rested on about 2K samples.
+- **On 2M commits (3–4 s)**, each of the 32 shards flushed 3 times and compacted once inside the measured phase. Throughput fell from about 2.9M to 2.2M cells/s, and p99.9 went from 1.6–3 ms to about 29 ms. A user's sustained load is the long run.
+- **The scaling runs measured 1.1–1.3 s.** At 10M operations (8–10 s), efficiency at 4 shards was 0.76 rather than 1.03, because sustained writes reach the write-stall regime. Up to 3 s of stall in an 8 s run sat outside the short runs.
+
+**Not changed:** the targets, D213's shape (shards, pre-split placement, commits in flight) and D204's. The shard count is D220's.

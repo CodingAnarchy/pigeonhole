@@ -56,6 +56,10 @@ OPTIONS:
     --seed N               RNG seed
     --warmup F             unrecorded warmup, as a fraction of --ops [default: 0.05;
                            scaling: 1.0, so the balancer spreads the table first]
+    --min-secs S           inline runs (scaling, group-commit's D213 run): repeat the
+                           measured writes until at least S seconds are measured
+                           (D219) [default: 0, once]
+    --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
     --shards N             Pigeonhole shards (scaling: N, default all cores)
     --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
                            shard) [default: 64 MiB]
@@ -87,6 +91,8 @@ struct Args {
     threads: Option<usize>,
     seed: Option<u64>,
     warmup: Option<f64>,
+    min_secs: Option<f64>,
+    inline_ops: Option<u64>,
     shards: Option<usize>,
     write_buffer: Option<u64>,
     cache: Option<u64>,
@@ -126,6 +132,8 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--seed" => a.seed = Some(parse(&arg, it.next())?),
             "--shards" => a.shards = Some(parse(&arg, it.next())?),
             "--warmup" => a.warmup = Some(parse(&arg, it.next())?),
+            "--min-secs" => a.min_secs = Some(parse(&arg, it.next())?),
+            "--inline-ops" => a.inline_ops = Some(parse(&arg, it.next())?),
             "--write-buffer" | "--memtable-budget" => {
                 a.write_buffer = Some(parse(&arg, it.next())?)
             }
@@ -273,6 +281,7 @@ fn one_inline(
     );
     let options = RunOptions {
         warmup: a.warmup.unwrap_or(SCALING_WARMUP),
+        min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
     };
     let result = runner
         .run_inline(config, &dir, &options)
@@ -303,6 +312,7 @@ fn one(
         } else {
             RunOptions::default().warmup
         }),
+        ..RunOptions::default()
     };
     let result = run_detailed(runner, config, &dir, &options)
         .map_err(|e| format!("{} on {}: {e}", config.kind.name(), runner.name()));
@@ -356,7 +366,11 @@ fn bench(a: &Args) -> Result<Suite, String> {
                 let cores = suite.environment.cores;
                 let n = a.shards.unwrap_or(cores);
                 let r = pigeonhole(a, Some(n)).group_sync(true).presplit(true);
-                let run = one_inline(a, &root, &mut seq, &r, &c)?;
+                let inline = WorkloadConfig {
+                    operations: a.inline_ops.unwrap_or(c.operations),
+                    ..c.clone()
+                };
+                let run = one_inline(a, &root, &mut seq, &r, &inline)?;
                 suite.group_commit = Some(GroupCommit::new(n, cores, &run));
                 suite.results.push(run);
             }
@@ -605,6 +619,43 @@ mod tests {
             dir.display()
         ));
         assert_eq!(bench(&a).unwrap().results.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inline_runs_take_their_own_length() {
+        // D219: `--inline-ops` sets the D213 run's commits apart from the client runs', and
+        // `--min-secs` repeats an inline run's measured writes until that long is measured.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-len-{}", std::process::id()));
+        let a = args(&format!(
+            "group-commit --scale smoke --ops 64 --inline-ops 256 --threads 1 --shards 2 \
+             --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        assert_eq!((a.inline_ops, a.min_secs), (Some(256), None));
+        let suite = bench(&a).unwrap();
+        let ops: Vec<u64> = suite.results.iter().map(|r| r.operations).collect();
+        assert_eq!(ops, [256, 64], "the D213 run, then one client run");
+        let a = args(&format!(
+            "scaling --scale smoke --ops 64 --shards 2 --min-secs 0.2 --write-buffer 16777216 \
+             --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        let inline: Vec<&RunRecord> = suite
+            .results
+            .iter()
+            .filter(|r| r.store_config.contains("inline"))
+            .collect();
+        assert_eq!(inline.len(), 2, "one shard, then two");
+        for r in inline {
+            assert!(r.run_secs >= 0.2, "{} s measured", r.run_secs);
+            assert!(
+                r.operations > 64 && r.operations % 64 == 0,
+                "{} ops",
+                r.operations
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
