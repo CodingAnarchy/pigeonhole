@@ -1,6 +1,6 @@
 # Phase 3 gate window (#405, #406)
 
-The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 10.1 hours at full scale. It is resumable, and it leaves one tarball to copy back.
+The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 10.5 hours at full scale. It is resumable, and it leaves one tarball to copy back.
 
 ## Before renting
 
@@ -44,7 +44,7 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
   6. `ycsb-a-shards`: ycsb-a with one client, at the default shard count against 1 and 4 shards and longer shard spins, beside RocksDB (D198 item 2, #478).
   7. `row-cache`: ycsb-c and ycsb-a with the row cache off, against the latency step's default (on, D216).
   8. `scaling`: D204, at 1, 4, 8 and 16 shards, each measured for at least 8 s (D219). The summary gives each run's stall breakdown: the share of shard time in write stalls, flushes, compactions and the longest operation.
-  9. `open-latency`, `cold-get` and `cold-scan`: the `phase3-io` steps.
+  9. `open-latency`, `wal-pin`, `cold-get` and `cold-scan`: the `phase3-io` steps. `wal-pin` decides the `wal_pin_bytes` default (#527): 2× against 4× the memtable budget on #175's mixed-temperature workload, the write path (unpin passes, small flushes, the WAL's size on disk) and the open after an exit without close (the replay), two rounds of 4M commits each.
   10. `scan-cache`: the ordered scan from cache.
   11. `report`.
 - **Each step logs** to `RESULTS/logs/STEP.log`, and its real duration goes to `durations.tsv`.
@@ -54,6 +54,6 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
 
 ## Results
 
-The last step writes `RESULTS/summary.md`. For every #406 target it gives the measured value, a verdict and the file that shows it. It also gives the data for the decisions the window settles: the row cache's effect (on by default since D216), the I/O backend's default (#402), and the scan readahead (#431). Then it packs `RESULTS.tar.gz` and prints the `scp` line to copy it back. There are no GitHub credentials on the rented machine (owner decision, 2026-10-10): the results are committed from a development machine. Then cancel the server.
+The last step writes `RESULTS/summary.md`. For every #406 target it gives the measured value, a verdict and the file that shows it. It also gives the data for the decisions the window settles: the row cache's effect (on by default since D216), the I/O backend's default (#402), the scan readahead (#431), and the WAL pin bound (#527). Then it packs `RESULTS.tar.gz` and prints the `scp` line to copy it back. There are no GitHub credentials on the rented machine (owner decision, 2026-10-10): the results are committed from a development machine. Then cancel the server.
 
 The instruction ceilings (D193) are not measured here: CI's instructions job on the same commit is their record.

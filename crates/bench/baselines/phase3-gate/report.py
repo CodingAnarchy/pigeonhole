@@ -420,6 +420,28 @@ if cs:
         groups.setdefault((l["io"], l["direct"], l.get("readahead") or "16 (D222)"), []).append(l["mib_per_sec"])
     for (io, d, ra), v in sorted(groups.items()):
         print(f"| {io} | {d} | {ra} | {statistics.median(v):.0f} |")
+# The WAL pin bound's default (#527): wal_pin_bytes at 2x or 4x the memtable budget.
+wp = lines("wal-pin.jsonl")
+wp_w = [l for l in wp if l.get("mode") == "write"]
+wp_r = [l for l in wp if l.get("mode") == "reopen"]
+if wp_w:
+    print("\n**WAL pin bound (#527):** `wal_pin_bytes` at 2× or 4× the memtable budget; mixed-temperature "
+          "commits (#175's workload), then a reopen after an exit without close. Medians over rounds.\n")
+    print("| wal_pin_bytes | Commits/s | Unpin passes | Small flushes | All flushes | WAL files at most | "
+          "WAL at the crash | Reopen (replay) | First read |")
+    print("|---|--:|--:|--:|--:|--:|--:|--:|--:|")
+    med = lambda rows, k: statistics.median(r[k] for r in rows) if rows else float("nan")
+    mib = lambda b: f"{b / (1 << 20):.0f} MiB"
+    for mult in sorted({l["mult"] for l in wp_w}):
+        w = [l for l in wp_w if l["mult"] == mult]
+        r = [l for l in wp_r if l["mult"] == mult]
+        reopen = f"{med(r, 'open_ms'):.0f} ms" if r else "-"
+        first = f"{med(r, 'first_read_us'):.0f} µs" if r else "-"
+        print(f"| {mult}× budget | {med(w, 'commits_per_sec'):.0f} | {med(w, 'unpin_passes'):.0f} | "
+              f"{med(w, 'small_flushes'):.0f} | {med(w, 'flushes'):.0f} | {mib(med(w, 'max_wal_bytes'))} | "
+              f"{mib(med(w, 'wal_bytes_at_crash'))} | {reopen} | {first} |")
+    print("\nThe WAL files' size counts whole preallocated segments (the disk the WAL holds), not live "
+          "records; the reopen replays what the crash left past each stream's checkpoint.")
 
 try:
     with open(path("durations.tsv")) as f:

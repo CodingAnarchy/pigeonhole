@@ -36,12 +36,14 @@
 #   row-cache      ycsb-c and ycsb-a with the row cache off (D216: on by default)      30
 #   scaling        scaling gate (D204) at 1, 4, 8, 16 shards, 8 s or more each (D219)  45
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
+#   wal-pin        wal_pin_bytes 2x vs 4x the budget: write path, open after a crash
+#                  (#527; phase3-io/wal-pin.sh)                                        10
 #   cold-get       cold point gets, one I/O (#87; phase3-io/cold-get.sh)              45
 #   cold-scan      cold scans, direct vs buffered at D222's readahead (cold-scan.sh) 15
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 10.3 hours unattended at full scale (the sum of the estimates above).
+# Total: about 10.5 hours unattended at full scale (the sum of the estimates above).
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
 # it back with the `scp` line the last step prints, and commit it from there.
@@ -79,9 +81,9 @@ data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
-    row-cache scaling open-latency cold-get cold-scan scan-cache report)
+    row-cache scaling open-latency wal-pin cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [cold-get]=45
+    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [wal-pin]=10 [cold-get]=45
     [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
@@ -360,6 +362,17 @@ step_scaling() {
 step_open-latency() {
     "$root/crates/bench/baselines/phase3-io/open-latency.sh" "$data/openlat" \
         "$results/open-latency.jsonl"
+}
+
+# The wal_pin_bytes default (#527): 4M mixed-temperature commits per multiple, two rounds
+# (about 8 minutes); the small scale (the dry run) keeps it short.
+step_wal-pin() {
+    local commits=4000000 rounds=2
+    if [[ "$scale" == small ]]; then
+        commits=50000 rounds=1
+    fi
+    "$root/crates/bench/baselines/phase3-io/wal-pin.sh" "$data/walpin" "$results/wal-pin.jsonl" \
+        "$commits" "$rounds"
 }
 
 step_cold-get() {
