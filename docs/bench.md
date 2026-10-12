@@ -69,12 +69,12 @@ Memtables flush to SSTs, so no preset is bounded by memory. At `full` size the d
 
 **What this is not.** It bounds the *engine's* memory; it does not bound the machine's. The OS page cache (most of 24 GiB here) still holds the files, so a cold get usually costs a page-cache copy, not a device read. That makes the cold numbers a measure of the engine's miss path (index and filter lookup, block decode, a `pread`), not of NVMe latency. For a true device-bound number, raise `--records` until the store exceeds RAM, or run on reference hardware (D5). The preset exists so the miss path is exercised on any machine, and in CI, without a machine-sized file.
 
-**Device-bound cold gets (#87).** `examples/coldget.rs` and the gate-window step `baselines/phase3-io/cold-get.sh` measure the spec's cold-read target without a store larger than RAM. A 64 GiB table of 1 KiB cells, loaded in random key order so it has a real leveled tree, is read with a 64 MiB block cache:
+**Device-bound cold gets (#87).** `examples/coldget.rs` and the gate-window step `baselines/phase3-io/cold-get.sh` measure the spec's cold-read target without a store larger than RAM. A 64 GiB table of 1 KiB cells, loaded in random key order so it has a real leveled tree, is read with a block cache of 1/64 of the table (1 GiB; D215: the cache must hold the SST indexes and filters it pins plus the index partitions):
 
 - **with direct I/O** (`PIGEONHOLE_DIRECT=1`), so every block the cache misses is read from the device;
 - **buffered, in a cgroup v2 scope capped at 8 GiB** with the page cache emptied first, so most of the table cannot be cached: the default path's cost.
 
-Each run reports cold-get p50/p99/p99.9 for present rows and for absent ones (rows between two present ones, which only a filter rules out), block-cache misses per get, and the device's completed reads per get (`/sys/block/DEV/stat`). Both backends, 1 and 16 threads, three runs each: about 45 minutes on the reference machine (D5), including the load. On macOS, `F_NOCACHE` still serves pages the file system already caches (a just-written table is cached), so a local run checks the miss path, not device latency. The reference results go here after the gate window (#405).
+Each run reports cold-get p50/p99/p99.9 for present rows and for absent ones (rows between two present ones, which only a filter rules out), block-cache misses per get, and the device's completed reads per get (`/sys/block/DEV/stat`). Both backends, 1 and 16 threads, three runs each: about 45 minutes on the reference machine (D5), including the load. On macOS, `F_NOCACHE` still serves pages the file system already caches (a just-written table is cached), so a local run checks the miss path, not device latency. The reference results are in [Cold-get results](#cold-get-results-reference-machine-ax102).
 
 **Cold and hot gets.** Whenever a workload has gets, the report adds a second table (and `detail.reads` in the JSON). A get is **cold** when it is the first get of its row in the run (the warmup counts as earlier), **hot** when the row was read before. The classification is by row, decided before the clock starts, and is the same for every engine. It is an approximation: a "hot" row can have been evicted since, a "cold" row can share a block with a row read earlier, and the OS page cache can serve either. Under Zipfian access a minority of gets are cold (16% of gets in the `ycsb-c` run below); use a uniform workload or more records for more.
 
@@ -303,6 +303,34 @@ With N closed-loop clients, throughput is about N divided by commit latency. At 
 | skewed-multi-shard | pigeonhole | shards=default(10) memtable=64MiB cache=256MiB bloom=10 buffered | 50000 | 200000 | 4 | 234.8K | 14.5 | 34.0 | 532 |
 
 **Not measured:** the `full` preset (1M records) and the comparison engines at it. The machine was too loaded for the numbers to mean anything, so full-scale and four-engine comparisons are left to the weekly `bench.yml` workflow (`--scale full` is selectable there) and to reference hardware (D5). The only full-scale evidence so far is one run, n=1, of `sparse-wide --scale full` on Pigeonhole alone: 1,000,000 records and 1,000,000 operations completed without `Busy` at 22.4K ops/s (p50 6.17 µs, p99 786 µs), at machine load 8.9. It was built from `a007910` plus this branch's then-uncommitted `full` preset, so it names no branch commit; treat it as evidence that the size runs, not as a measurement.
+
+## Cold-get results (reference machine, AX102)
+
+**Reference hardware (D5, D197):** Hetzner AX102, AMD Ryzen 9 7950X3D (16 cores, 32 threads), 128 GiB, Linux 6.8, XFS on a Samsung PM9A3 NVMe (power-loss protected). `baselines/phase3-io/cold-get.sh`: a 64 GiB table of 1 KiB cells, 1,000,000 cold gets per phase after 100,000 warm-up gets, 3 runs per configuration. **Direct** is `PIGEONHOLE_DIRECT=1`; **buffered** runs in a cgroup capped at 8 GiB with the page cache dropped first. Device reads per get come from `/sys/block/nvme0n1/stat`. io_uring and pread measured the same to within 1% in every row, so one row stands for both.
+
+**Present rows, 2026-10-12** (`main` 8631bab, after D215: block cache 1 GiB = 1/64 of the table, issue #403's rerun):
+
+| Mode | Threads | Device reads/get | Block-cache misses/get | p50 µs | p99 µs | p99.9 µs | Gets/s |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| direct | 1 | 1.104 | 1.104 | 87.6 | 205 | 301 | 10.1K |
+| buffered | 1 | 1.092 | 1.104 | 91.6–92.2 | 264–266 | 375–377 | 10.3K |
+| direct | 16 | 1.105 | 1.104 | 105.5–106 | 293–295 | 416–434 | 129.5–130.0K |
+| buffered | 16 | 1.075 | 1.104 | 113.2–113.7 | 447–451 | 946–975 | 122.2–122.7K |
+
+**The spec's target is met:** a cold get costs one device read (1.09–1.10 per get; the rest is bloom-filter false positives across levels), at a p50 of 88–92 µs on one thread. That is above the spec's 20–80 µs device estimate by the PM9A3's own random-read latency plus the engine's miss path. With the block cache sized this way, direct I/O has the lower tail (p99 205 against 264 µs on one thread, 293 against 447 on 16) and about 6% more throughput at 16 threads. Buffered reads still win whenever the page cache can hold what the block cache cannot (see `Options::direct_io` and the guide), which is why direct I/O stays off by default (#403).
+
+**Absent rows** (a filter rules them out; 0.02 device reads per get): p50 1.0 µs, p99 88 µs direct and 92 µs buffered on one thread; p99 99 µs direct and 106 µs buffered on 16.
+
+**The first gate run, 2026-10-11** (f333d48, before D215: a 64 MiB block cache) missed the target with **2.09 block-cache misses per get**. The pinned indexes and filters (about 185 MiB) overflowed the cache, so every index partition was read again:
+
+| Mode | Threads | Device reads/get | p50 µs | p99 µs | p99.9 µs | Gets/s |
+|---|--:|--:|--:|--:|--:|--:|
+| direct | 1 | 2.092 | 172 | 326 | 447 | 5.4K |
+| buffered | 1 | 1.087 | 94.2–94.7 | 268–272 | 414–420 | 10.2K |
+| direct | 16 | 2.092 | 216–217 | 432–434 | 582–594 | 70.5K |
+| buffered | 16 | 1.055 | 115.7–116.2 | 373–375 | 971–1024 | 123.1–123.4K |
+
+Buffered reads hid the second miss there: the index partitions sat in the page cache. D215 sized the gate's block cache to hold them (1/64 of the table), and the engine now reports the pinned metadata and warns when it passes half the block cache.
 
 ## Larger-than-RAM results (this Mac, non-reference)
 
