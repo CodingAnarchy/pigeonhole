@@ -57,6 +57,15 @@ const MEAN_SLOW_ALPHA: f64 = 0.05;
 /// the skew counts again.
 const MEAN_FALL: f64 = 0.9;
 
+/// Weight of the newest interval in the slow moving averages of write load (#582): a time
+/// constant of about 10 s at the default interval, longer than a closed-loop load's phases, so
+/// a shard's slow load follows its share of the work rather than its rate while busy.
+const SLOW_ALPHA: f64 = 0.01;
+
+/// Balancer passes the slow skew path waits after a change before deciding again (#582):
+/// about the slow averages' time constant, so they show the change first.
+const SLOW_DWELL: u64 = 100;
+
 /// Balancer passes a shard waits after starting a move or a skew split, and a tablet stays
 /// put after it arrived on a shard, before write skew moves or splits again (#103): the
 /// moving averages catch up with a change before the next one is decided.
@@ -156,6 +165,8 @@ pub(crate) struct TabletLoad {
     sampled: usize,
     /// Moving average of `writes` over intervals (`LOAD_ALPHA`).
     ewma: f64,
+    /// Slow moving average of `writes` (`SLOW_ALPHA`, #582).
+    slow: f64,
 }
 
 impl TabletLoad {
@@ -1070,14 +1081,18 @@ impl ShardState {
         // each tablet's (#103). One interval's swing, or a flush, never decides a move.
         self.load_ewma =
             LOAD_ALPHA * self.window_writes as f64 + (1.0 - LOAD_ALPHA) * self.load_ewma;
+        self.load_slow =
+            SLOW_ALPHA * self.window_writes as f64 + (1.0 - SLOW_ALPHA) * self.load_slow;
         for l in self.loads.values_mut() {
             l.ewma = LOAD_ALPHA * l.writes as f64 + (1.0 - LOAD_ALPHA) * l.ewma;
+            l.slow = SLOW_ALPHA * l.writes as f64 + (1.0 - SLOW_ALPHA) * l.slow;
         }
         self.note_arrivals();
         let (_, mem_per) = self.mem_bytes();
         self.measure_busy(now);
         self.shared.loads[usize::from(self.id.0)].publish(
             self.load_ewma.round() as u64,
+            self.load_slow.round() as u64,
             (self.busy_ewma * 1e6).round() as u64,
             now.max(1),
         );
@@ -1120,6 +1135,9 @@ impl ShardState {
                     if owners.iter().all(|o| *o == self.id));
                 if !size_split {
                     self.skew_pass = Some(self.balance_pass);
+                }
+                if self.chose_slow.get() {
+                    self.slow_pass = Some(self.balance_pass);
                 }
                 self.request_tablet_op(kind, reply, ctx);
             }
@@ -1309,6 +1327,19 @@ impl ShardState {
     /// `balance_min_writes`. Counted on every pass, dwell or not.
     fn track_skew(&mut self, now: u64) {
         let cfg = self.shared.balance;
+        // The slow path (#582): skew on the slow averages, whatever the mean does.
+        self.slow_run = match self.published_slow_loads(now) {
+            Some(slow) => {
+                let my = slow[usize::from(self.id.0)] as f64;
+                let mean = slow.iter().sum::<u64>() as f64 / slow.len() as f64;
+                if my >= cfg.min_writes.max(1) as f64 && my > cfg.skew * mean {
+                    self.slow_run + 1
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
         let Some((my, mean)) = self.shard_loads(now) else {
             self.skew_run = 0;
             self.skew_active = false;
@@ -1353,6 +1384,25 @@ impl ShardState {
             self.shared.loads[..n]
                 .iter()
                 .map(|slot| slot.read_fresh(now, stale).unwrap_or(0))
+                .collect(),
+        )
+    }
+
+    /// The published slow write loads of the active shards (#582), as
+    /// [`published_loads`](Self::published_loads). A shard backing off while idle publishes
+    /// rarely, so a slow load stays current for twice the longest backoff.
+    fn published_slow_loads(&self, now: u64) -> Option<Vec<u64>> {
+        let n = self.active_shards();
+        if n < 2 || usize::from(self.id.0) >= n {
+            return None;
+        }
+        let stale = BALANCE_IDLE_CAP_NANOS
+            .max(self.shared.balance.interval_nanos)
+            .saturating_mul(2);
+        Some(
+            self.shared.loads[..n]
+                .iter()
+                .map(|slot| slot.read_slow_fresh(now, stale).unwrap_or(0))
                 .collect(),
         )
     }
@@ -1582,11 +1632,34 @@ impl ShardState {
         //    (`track_skew`, D214), not during the shard's dwell after its last move, and only
         //    for tablets that dwelt here long enough. Under packing, only among the active
         //    shards (D217).
-        if self.skew_active
-            && !dwelling
-            && !self.mean_falling
-            && let Some(writes) = self.published_loads(now)
-        {
+        //    The slow path (#582) acts on the slow averages instead, once per `SLOW_DWELL`:
+        //    under a closed-loop load the fast averages show skew only in each phase's tail
+        //    (where it doesn't count), the slow ones the shards' shares of the work.
+        self.chose_slow.set(false);
+        let slow_dwelling = self
+            .slow_pass
+            .is_some_and(|p| p + SLOW_DWELL > self.balance_pass);
+        for slow in [false, true] {
+            let (ready, loads) = if slow {
+                // Only while the fast averages agree this shard is above the stop ratio: once
+                // the fast path balanced it, the slow averages still show the old skew for a
+                // while, and acting on them would overshoot.
+                let agrees = self
+                    .shard_loads(now)
+                    .is_some_and(|(my, mean)| my > Self::skew_stop(cfg.skew) * mean);
+                (
+                    self.slow_run >= SKEW_PERSIST && !slow_dwelling && agrees,
+                    self.published_slow_loads(now),
+                )
+            } else {
+                (
+                    self.skew_active && !self.mean_falling,
+                    self.published_loads(now),
+                )
+            };
+            let Some(writes) = loads.filter(|_| ready && !dwelling) else {
+                continue;
+            };
             let settled: Vec<TabletEntry> = owned
                 .iter()
                 .filter(|t| self.settled(t.id))
@@ -1595,7 +1668,10 @@ impl ShardState {
             let tablet_writes: HashMap<TabletId, u64> = settled
                 .iter()
                 .map(|t| {
-                    let w = self.loads.get(&t.id).map_or(0.0, |l| l.ewma);
+                    let w = self
+                        .loads
+                        .get(&t.id)
+                        .map_or(0.0, |l| if slow { l.slow } else { l.ewma });
                     (t.id, w.round() as u64)
                 })
                 .collect();
@@ -1605,7 +1681,12 @@ impl ShardState {
                 }
                 _ => true,
             };
-            let ratio = Self::skew_stop(cfg.skew);
+            // The slow path makes one change per dwell, only past the trigger itself.
+            let ratio = if slow {
+                cfg.skew
+            } else {
+                Self::skew_stop(cfg.skew)
+            };
             if let Some(op) = self.skew_op(
                 &view,
                 &settled,
@@ -1615,6 +1696,7 @@ impl ShardState {
                 ratio,
             ) && splits_ok(&op)
             {
+                self.chose_slow.set(slow);
                 return Some(op);
             }
         }

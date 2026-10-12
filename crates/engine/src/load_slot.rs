@@ -25,6 +25,8 @@ pub(crate) struct LoadSlot {
     writes: AtomicU64,
     /// Moving average of the fraction of the time the shard was busy, in millionths (D217).
     busy: AtomicU64,
+    /// Slow moving average of the rows written per interval (#582).
+    writes_slow: AtomicU64,
     /// `(tablet, family)` slots promised to changes in flight that will hand this shard
     /// tablets: every change checks them with the slots in the view, so concurrent moves
     /// never take a shard past `max_slots` (#103).
@@ -36,8 +38,9 @@ pub(crate) struct LoadSlot {
 impl LoadSlot {
     /// The owning shard publishes its write rate and busy fraction (millionths, D217) as of
     /// `now` (nonzero).
-    pub(crate) fn publish(&self, writes: u64, busy: u64, now: u64) {
+    pub(crate) fn publish(&self, writes: u64, writes_slow: u64, busy: u64, now: u64) {
         self.writes.store(writes, Ordering::Relaxed);
+        self.writes_slow.store(writes_slow, Ordering::Relaxed);
         self.busy.store(busy, Ordering::Relaxed);
         self.at.store(now, Ordering::Release);
     }
@@ -46,6 +49,14 @@ impl LoadSlot {
     pub(crate) fn read_fresh(&self, now: u64, stale: u64) -> Option<u64> {
         let at = self.at.load(Ordering::Acquire);
         (at != 0 && now.saturating_sub(at) <= stale).then(|| self.writes.load(Ordering::Relaxed))
+    }
+
+    /// The published slow write rate if it was published within `stale` of `now`: like
+    /// [`LoadSlot::read_fresh`], that publication's or a later one.
+    pub(crate) fn read_slow_fresh(&self, now: u64, stale: u64) -> Option<u64> {
+        let at = self.at.load(Ordering::Acquire);
+        (at != 0 && now.saturating_sub(at) <= stale)
+            .then(|| self.writes_slow.load(Ordering::Relaxed))
     }
 
     /// The published busy fraction (millionths) if it was published within `stale` of
@@ -88,8 +99,8 @@ mod loom_tests {
             let owner = {
                 let slot = Arc::clone(&slot);
                 thread::spawn(move || {
-                    slot.publish(10, 0, 1);
-                    slot.publish(20, 0, 2);
+                    slot.publish(10, 0, 0, 1);
+                    slot.publish(20, 0, 0, 2);
                 })
             };
             for _ in 0..2 {
@@ -153,7 +164,7 @@ mod tests {
     fn a_publication_is_read_while_fresh_and_reservations_count() {
         let slot = LoadSlot::default();
         assert_eq!(slot.read_fresh(5, 10), None, "never published");
-        slot.publish(7, 0, 5);
+        slot.publish(7, 0, 0, 5);
         assert_eq!(slot.read_fresh(10, 10), Some(7));
         assert_eq!(slot.read_fresh(20, 10), None, "stale");
         assert_eq!(slot.reserve(2), 0);

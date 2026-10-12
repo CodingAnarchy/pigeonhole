@@ -2163,6 +2163,13 @@ pub(crate) struct ShardState {
     /// made (#582).
     mean_slow: f64,
     mean_falling: bool,
+    /// The slow skew path (#582): a slow moving average of `window_writes`, the consecutive
+    /// passes it was skewed, the pass of its last change, and whether this pass's decision
+    /// came from it.
+    load_slow: f64,
+    slow_run: u64,
+    slow_pass: Option<u64>,
+    chose_slow: std::cell::Cell<bool>,
     /// Packing (D217): this shard's busy time and clock at its last pass, the moving average
     /// of how busy it was, how many shards stay active (`0..pack_k`; 0 before the first
     /// decision), and the consecutive passes calling for more or fewer of them.
@@ -2328,6 +2335,10 @@ impl ShardState {
             skew_active: false,
             mean_slow: 0.0,
             mean_falling: false,
+            load_slow: 0.0,
+            slow_run: 0,
+            slow_pass: None,
+            chose_slow: std::cell::Cell::new(false),
             busy_mark: None,
             busy_ewma: 0.0,
             pack_k: 0,
