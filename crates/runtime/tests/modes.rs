@@ -1095,11 +1095,20 @@ fn a_waker_wake_during_a_turn_ends_the_next_wait() {
     d.wait(Duration::from_secs(30));
     let waited = started.elapsed();
     assert!(waited < Duration::from_secs(5), "the wait ran {waited:?}");
-    // The wake is spent: an idle shard's next wait sleeps until its timeout.
+    // The wake is spent. A wait may return early or spuriously (the OS timer, 15.6 ms on
+    // Windows), so wait out 100 ms in a loop: a wake left set would end every wait at once,
+    // thousands of times; a spent one lets each sleep, a handful of times.
     assert!(!d.run_once(u64::MAX));
-    let started = Instant::now();
-    d.wait(Duration::from_millis(100));
-    assert!(started.elapsed() >= Duration::from_millis(90));
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut waits = 0;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        d.wait(left);
+        waits += 1;
+    }
+    assert!(
+        waits < 100,
+        "{waits} waits in 100 ms: the wake was not spent"
+    );
 }
 
 #[test]
