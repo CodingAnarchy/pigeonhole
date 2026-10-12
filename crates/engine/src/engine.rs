@@ -41,7 +41,7 @@ use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
     TabletMap, View, ViewPin,
 };
-use crate::write::{COUNTER_TS, ReadKey};
+use crate::write::{COUNTER_TS, ReadKey, Submission};
 
 /// The shards a commit writes to: inline for up to four (no allocation per commit, #320).
 pub(crate) type Shards = smallvec::SmallVec<[ShardId; 4]>;
@@ -301,18 +301,6 @@ const GET_LATEST_TRIES: u32 = 4;
 #[derive(Debug)]
 pub struct Engine {
     inner: Arc<Inner>,
-}
-
-/// An async commit's submission (D210): submitted at once, or handed back with its place
-/// in its shard's queue.
-#[derive(Debug)]
-pub enum AsyncSubmit<P, B> {
-    /// Submitted; its charge comes back when it resolves.
-    Submitted(P),
-    /// Over the bound: submit `B` once the [`Admit`](crate::Admit) is ready, then attach
-    /// the admit to the submitted commit. Boxed: the rare case, kept out of the
-    /// submitted one's size.
-    Wait(Box<(B, crate::Admit)>),
 }
 
 /// [`Inner::fast_admit`]'s outcome: a charge (none when unbounded) to submit with, or the
@@ -1298,7 +1286,9 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<PendingCommit> {
-        self.inner.submit(batch, durability, None, None)
+        self.inner
+            .submit(batch, durability, None, None)
+            .map(PendingCommit::from)
     }
 
     /// Submits and waits. Returns once the commit meets its durability level **and** is
@@ -1322,7 +1312,7 @@ impl Engine {
     /// loop.
     pub fn commit(&self, batch: WriteBatch, durability: Option<Durability>) -> Result<CommitInfo> {
         self.inner.shared.refuse_blocking_on_driver("commit")?;
-        self.submit(batch, durability)?.wait()
+        self.inner.submit(batch, durability, None, None)?.wait()
     }
 
     /// Applies `batch` (which must touch only `row`) if `predicate` holds, atomically on the
@@ -1360,20 +1350,33 @@ impl Engine {
 
     /// [`submit`](Self::submit) for an async commit (D210): submitted at once while the
     /// shards' async commits in flight leave room, with its charge returned when it
-    /// resolves; otherwise the batch comes back with its place in its shard's queue, to
-    /// submit once [`Admit::poll_admit`](crate::Admit::poll_admit) is ready.
+    /// resolves; otherwise the pending commit holds the batch and its place in its shard's
+    /// queue, and submits it when polled once admitted. Dropped before then, it writes
+    /// nothing.
     pub fn submit_async(
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
-    ) -> Result<AsyncSubmit<PendingCommit, WriteBatch>> {
+    ) -> Result<PendingCommit> {
         match self.inner.fast_admit(None, &batch) {
-            FastAdmit::Wait(admit) => Ok(AsyncSubmit::Wait(Box::new((batch, admit)))),
+            FastAdmit::Wait(admit) => {
+                let inner = Arc::clone(&self.inner);
+                Ok(PendingCommit::waiting(
+                    Arc::clone(&self.inner.shared),
+                    admit,
+                    Box::new(move || {
+                        inner
+                            .submit(batch, durability, None, None)
+                            .map(PendingCommit::from)
+                    }),
+                ))
+            }
             FastAdmit::Charged(mut charge) => {
                 // A failed submission drops the charge, which returns it.
-                let pending = self.inner.submit(batch, durability, None, None)?;
-                charge.attach(&pending.waiter);
-                Ok(AsyncSubmit::Submitted(pending))
+                let pending =
+                    PendingCommit::from(self.inner.submit(batch, durability, None, None)?);
+                charge.attach(&pending.sub.waiter);
+                Ok(pending)
             }
         }
     }
@@ -1387,9 +1390,19 @@ impl Engine {
         predicate: &Predicate,
         batch: WriteBatch,
         durability: Option<Durability>,
-    ) -> Result<AsyncSubmit<PendingCheck, WriteBatch>> {
+    ) -> Result<PendingCheck> {
         let mut charge = match self.inner.fast_admit(Some((table, row)), &batch) {
-            FastAdmit::Wait(admit) => return Ok(AsyncSubmit::Wait(Box::new((batch, admit)))),
+            FastAdmit::Wait(admit) => {
+                let inner = Arc::clone(&self.inner);
+                let (row, predicate) = (row.to_vec(), predicate.clone());
+                return Ok(PendingCheck::waiting(
+                    Arc::clone(&self.inner.shared),
+                    admit,
+                    Box::new(move || {
+                        inner.submit_check_and_mutate(table, &row, &predicate, batch, durability)
+                    }),
+                ));
+            }
             FastAdmit::Charged(charge) => charge,
         };
         // A failed submission drops the charge, which returns it.
@@ -1397,7 +1410,7 @@ impl Engine {
             .inner
             .submit_check_and_mutate(table, row, predicate, batch, durability)?;
         charge.attach(&pending.waiter);
-        Ok(AsyncSubmit::Submitted(pending))
+        Ok(pending)
     }
 
     /// Starts an optimistic transaction (Phase 4).
@@ -2688,7 +2701,7 @@ impl Inner {
         durability: Option<Durability>,
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
-    ) -> Result<PendingCommit> {
+    ) -> Result<Submission> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -2752,10 +2765,9 @@ impl Inner {
                     attempts: 0,
                 })))?;
         }
-        Ok(PendingCommit {
+        Ok(Submission {
             waiter,
             shared: Arc::clone(&self.shared),
-            resolved: None,
             // A durable commit waits for a sync: polling for it would only burn the CPU.
             spins: matches!(durability, Durability::None | Durability::Buffered),
         })
@@ -2823,6 +2835,7 @@ impl Inner {
             waiter: rx,
             shared: Arc::clone(&self.shared),
             resolved: None,
+            deferred: None,
         })
     }
 
@@ -3493,7 +3506,9 @@ impl EngineShard {
             // Not ours: the regular path (a queue hop, or two-phase commit).
             let mut wb = WriteBatch::new();
             wb.builder = builder;
-            return engine.submit(wb, Some(durability), None, None);
+            return engine
+                .submit(wb, Some(durability), None, None)
+                .map(PendingCommit::from);
         }
         let (builder, large) = engine.separate_large(builder)?;
         let submitted_at = engine.shared.vfs.monotonic_nanos();
@@ -3517,12 +3532,11 @@ impl EngineShard {
                 ctx,
             )
         });
-        Ok(PendingCommit {
+        Ok(PendingCommit::from(Submission {
             waiter,
             shared: Arc::clone(&engine.shared),
-            resolved: None,
             spins: false,
-        })
+        }))
     }
 
     /// Registers a callback the engine calls when work arrives for this shard.

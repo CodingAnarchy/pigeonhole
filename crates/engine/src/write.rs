@@ -329,20 +329,121 @@ pub enum Predicate {
     },
 }
 
-/// A commit submitted to its shard(s) and not yet resolved. The basis of sync commits
-/// ([`PendingCommit::wait`]), async commits (`.await`) and ticket-style commits. Dropping it
-/// does not roll back: the commit lands or fails atomically either way.
+/// A commit submitted to its shard(s): what the engine's own blocking commits wait on
+/// ([`Submission::wait`]). [`PendingCommit`] wraps it for tickets and async commits, so the
+/// blocking path carries nothing of theirs (#523).
 #[derive(Debug)]
-#[must_use = "dropping a pending commit does not cancel it, but its result is lost"]
-pub struct PendingCommit {
+pub(crate) struct Submission {
     pub(crate) waiter: Waiter<crate::Result<Settled>>,
     /// The engine, for registering an async waker on the global watermark.
     pub(crate) shared: Arc<crate::shard::Shared>,
-    /// Resolved by the shard; waiting for visibility (async polling).
-    pub(crate) resolved: Option<CommitInfo>,
     /// Whether `wait` may poll before it parks (D198): not for a durable commit, which
     /// waits for a sync. The window is the engine's `commit_spin_nanos`.
     pub(crate) spins: bool,
+}
+
+/// A commit submitted to its shard(s) and not yet resolved, or an async commit still
+/// waiting for room to submit (D210). The basis of ticket-style commits
+/// ([`PendingCommit::wait`]) and async commits (`.await`). Dropping it does not roll back:
+/// a submitted commit lands or fails atomically either way; one still waiting writes
+/// nothing.
+#[derive(Debug)]
+#[must_use = "dropping a pending commit does not cancel it, but its result is lost"]
+pub struct PendingCommit {
+    pub(crate) sub: Submission,
+    /// Resolved by the shard; waiting for visibility (async polling).
+    pub(crate) resolved: Option<CommitInfo>,
+    /// An async commit still waiting for room on its shard (D210): submitted once
+    /// admitted. `sub` holds a placeholder waiter meanwhile.
+    pub(crate) deferred: Option<Box<Deferred<PendingCommit, crate::Result<Settled>>>>,
+}
+
+impl From<Submission> for PendingCommit {
+    fn from(sub: Submission) -> Self {
+        Self {
+            sub,
+            resolved: None,
+            deferred: None,
+        }
+    }
+}
+
+/// A conditional commit's reply: whether the batch applied, and its commit when it did.
+type CheckReply = crate::Result<(bool, Option<CommitInfo>)>;
+
+/// An async commit still waiting for room on its shard (D210): its admission and the
+/// submission to run once admitted. The waiting [`PendingCommit`] or [`PendingCheck`] holds
+/// it, beside a placeholder waiter whose notifier this keeps unresolved.
+pub(crate) struct Deferred<P, R> {
+    admit: crate::Admit,
+    submit: Box<dyn FnOnce() -> crate::Result<P> + Send + Sync>,
+    placeholder: Notifier<R>,
+}
+
+impl<P, R> std::fmt::Debug for Deferred<P, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deferred")
+            .field("admit", &self.admit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P, R: Send> Deferred<P, R> {
+    /// A deferral and the placeholder waiter its pending commit holds until it submits.
+    fn new(
+        admit: crate::Admit,
+        submit: Box<dyn FnOnce() -> crate::Result<P> + Send + Sync>,
+    ) -> (Box<Self>, Waiter<R>) {
+        let (placeholder, waiter) = completion();
+        (
+            Box::new(Self {
+                admit,
+                submit,
+                placeholder,
+            }),
+            waiter,
+        )
+    }
+
+    /// Submits once admitted: the submission and its admission, whose charge goes to the
+    /// submitted commit.
+    fn poll_submit(
+        slot: &mut Option<Box<Self>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<(crate::Admit, crate::Result<P>)> {
+        let d = slot.as_mut().expect("a deferred commit");
+        if d.admit.poll_admit(cx).is_pending() {
+            return Poll::Pending;
+        }
+        let Self {
+            admit,
+            submit,
+            placeholder,
+        } = *slot.take().expect("a deferred commit");
+        let submitted = submit();
+        // Dropped after the submission replaced it: nobody waits on the placeholder.
+        drop(placeholder);
+        Poll::Ready((admit, submitted))
+    }
+
+    /// [`poll_submit`](Self::poll_submit), parking the thread until admitted (a blocking
+    /// wait on an async commit that is still waiting for room).
+    fn submit_blocking(slot: &mut Option<Box<Self>>) -> (crate::Admit, crate::Result<P>) {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(r) = Self::poll_submit(slot, &mut cx) {
+                return r;
+            }
+            std::thread::park();
+        }
+    }
 }
 
 thread_local! {
@@ -362,7 +463,7 @@ pub(crate) fn commit_completion() -> (
         .unwrap_or_else(|_| completion())
 }
 
-impl Drop for PendingCommit {
+impl Drop for Submission {
     fn drop(&mut self) {
         // The shard has released the slot once it replied (or dropped the reply): it goes
         // back to the thread this commit is dropped on, reset.
@@ -382,6 +483,28 @@ impl PendingCommit {
     /// [`Error::WouldDeadlock`]: the commit was submitted and will apply, but its outcome
     /// must be awaited from the event loop (poll this future there) or another thread.
     pub fn wait(mut self) -> crate::Result<CommitInfo> {
+        if self.deferred.is_some() {
+            self = self.submit_deferred_blocking()?;
+        }
+        self.sub.wait()
+    }
+
+    /// A blocking wait on an async commit still waiting for room: parks until admitted,
+    /// then submits. Out of line: tickets never wait for room.
+    #[cold]
+    #[inline(never)]
+    fn submit_deferred_blocking(mut self) -> crate::Result<PendingCommit> {
+        let (admit, submitted) = Deferred::submit_blocking(&mut self.deferred);
+        let pending = submitted?;
+        admit.attach(&pending);
+        Ok(pending)
+    }
+}
+
+impl Submission {
+    /// [`PendingCommit::wait`] for a commit the engine submitted itself (a blocking
+    /// commit): never waiting for room.
+    pub(crate) fn wait(mut self) -> crate::Result<CommitInfo> {
         let window = if self.spins {
             self.shared.commit_spin_nanos
         } else {
@@ -606,14 +729,56 @@ fn wait_visible_spinning(
     Ok(())
 }
 
+impl PendingCommit {
+    /// An async commit that waits for room on its shard (D210) and runs `submit` once
+    /// admitted.
+    pub(crate) fn waiting(
+        shared: Arc<crate::shard::Shared>,
+        admit: crate::Admit,
+        submit: Box<dyn FnOnce() -> crate::Result<PendingCommit> + Send + Sync>,
+    ) -> Self {
+        let (deferred, waiter) = Deferred::new(admit, submit);
+        Self {
+            sub: Submission {
+                waiter,
+                shared,
+                spins: false,
+            },
+            resolved: None,
+            deferred: Some(deferred),
+        }
+    }
+
+    /// Polls a commit still waiting for room: once admitted, it submits and goes on as the
+    /// submitted commit. Out of line: the uncommon state.
+    #[cold]
+    #[inline(never)]
+    fn poll_deferred(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<CommitInfo>> {
+        let Poll::Ready((admit, submitted)) = Deferred::poll_submit(&mut self.deferred, cx) else {
+            return Poll::Pending;
+        };
+        match submitted {
+            Ok(pending) => {
+                admit.attach(&pending);
+                *self = pending;
+                Pin::new(self).poll(cx)
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
 impl Future for PendingCommit {
     type Output = crate::Result<CommitInfo>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        if this.deferred.is_some() {
+            return this.poll_deferred(cx);
+        }
         let info = match this.resolved {
             Some(info) => info,
-            None => match Pin::new(&mut this.waiter).poll(cx) {
+            None => match Pin::new(&mut this.sub.waiter).poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(Err(Error::Closed)),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
@@ -627,9 +792,9 @@ impl Future for PendingCommit {
         // Durable and applied on its shard; another shard's in-flight group may still hold
         // the global watermark below it (D19). The shards wake registered waiters when they
         // publish a watermark, so this never spins.
-        if this.shared.wait_visible(info.seqno, cx.waker()) {
+        if this.sub.shared.wait_visible(info.seqno, cx.waker()) {
             Poll::Ready(Ok(info))
-        } else if this.shared.visibility_ended() {
+        } else if this.sub.shared.visibility_ended() {
             Poll::Ready(Err(Error::Closed))
         } else {
             Poll::Pending
@@ -648,12 +813,19 @@ pub struct PendingCheck {
     pub(crate) shared: Arc<crate::shard::Shared>,
     /// Resolved by the shard; waiting for visibility (async polling).
     pub(crate) resolved: Option<(bool, Option<CommitInfo>)>,
+    /// As [`PendingCommit`]'s: still waiting for room (D210).
+    pub(crate) deferred: Option<Box<Deferred<PendingCheck, CheckReply>>>,
 }
 
 impl PendingCheck {
     /// Blocks until the check resolved and an applied commit is visible, as
     /// [`PendingCommit::wait`] does (including its refusal on a thread that drives a shard).
     pub fn wait(mut self) -> crate::Result<(bool, Option<CommitInfo>)> {
+        if self.deferred.is_some() {
+            let (admit, submitted) = Deferred::submit_blocking(&mut self.deferred);
+            self = submitted?;
+            admit.attach_check(&self);
+        }
         let (applied, info) = wait_reply(&self.shared, &mut self.waiter)?;
         if let Some(info) = info {
             wait_visible(&self.shared, info.seqno)?;
@@ -662,11 +834,51 @@ impl PendingCheck {
     }
 }
 
+impl PendingCheck {
+    /// [`PendingCommit::waiting`] for a conditional commit.
+    pub(crate) fn waiting(
+        shared: Arc<crate::shard::Shared>,
+        admit: crate::Admit,
+        submit: Box<dyn FnOnce() -> crate::Result<PendingCheck> + Send + Sync>,
+    ) -> Self {
+        let (deferred, waiter) = Deferred::new(admit, submit);
+        Self {
+            waiter,
+            shared,
+            resolved: None,
+            deferred: Some(deferred),
+        }
+    }
+
+    /// [`PendingCommit::poll_deferred`] for a conditional commit.
+    #[cold]
+    #[inline(never)]
+    fn poll_deferred(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<crate::Result<(bool, Option<CommitInfo>)>> {
+        let Poll::Ready((admit, submitted)) = Deferred::poll_submit(&mut self.deferred, cx) else {
+            return Poll::Pending;
+        };
+        match submitted {
+            Ok(pending) => {
+                admit.attach_check(&pending);
+                *self = pending;
+                Pin::new(self).poll(cx)
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
 impl Future for PendingCheck {
     type Output = crate::Result<(bool, Option<CommitInfo>)>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        if this.deferred.is_some() {
+            return this.poll_deferred(cx);
+        }
         let outcome = match this.resolved {
             Some(outcome) => outcome,
             None => match Pin::new(&mut this.waiter).poll(cx) {
@@ -772,28 +984,34 @@ impl Txn {
     }
 
     /// [`submit`](Self::submit) for an async commit (D210), as
-    /// [`Engine::submit_async`](crate::Engine::submit_async): the transaction comes back
-    /// when it has to wait for room.
-    pub fn submit_async(
-        self,
-        durability: Option<Durability>,
-    ) -> crate::Result<crate::AsyncSubmit<PendingCommit, Txn>> {
-        let charge = match self.engine.fast_admit(None, &self.batch) {
+    /// [`Engine::submit_async`](crate::Engine::submit_async): when it has to wait for room,
+    /// the pending commit submits the transaction once admitted.
+    pub fn submit_async(self, durability: Option<Durability>) -> crate::Result<PendingCommit> {
+        let mut charge = match self.engine.fast_admit(None, &self.batch) {
             crate::engine::FastAdmit::Wait(admit) => {
-                return Ok(crate::AsyncSubmit::Wait(Box::new((self, admit))));
+                let shared = Arc::clone(&self.engine.shared);
+                return Ok(PendingCommit::waiting(
+                    shared,
+                    admit,
+                    Box::new(move || self.submit(durability)),
+                ));
             }
             crate::engine::FastAdmit::Charged(charge) => charge,
         };
-        let mut charge = charge;
-        let pending = self.submit(durability)?;
-        charge.attach(&pending.waiter);
-        Ok(crate::AsyncSubmit::Submitted(pending))
+        let pending = PendingCommit::from(self.submission(durability)?);
+        charge.attach(&pending.sub.waiter);
+        Ok(pending)
     }
 
     /// Submits the transaction for validation and commit without waiting: the
     /// [`PendingCommit`] resolves as [`Txn::commit`] returns (an async caller polls it). It
     /// never blocks, so a thread that drives a shard may call it (D88).
     pub fn submit(self, durability: Option<Durability>) -> crate::Result<PendingCommit> {
+        self.submission(durability).map(PendingCommit::from)
+    }
+
+    /// [`submit`](Self::submit), as the engine's own [`Submission`].
+    pub(crate) fn submission(self, durability: Option<Durability>) -> crate::Result<Submission> {
         let Txn {
             engine,
             snapshot,
