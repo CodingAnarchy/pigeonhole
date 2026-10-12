@@ -165,9 +165,10 @@ pub struct Metrics {
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
     /// Async commit polls that found their seqno not yet visible and registered as waiters
-    /// on the global visibility list (D19, ICR 0023), and the list entries those
-    /// registrations scanned for a duplicate. Waits per commit near 0 mean the watermark
-    /// is not what commits wait on (#154).
+    /// on the global watermark (D19, ICR 0023), and the waiters already listed in the
+    /// registry part each registration joined (a queue depth: registration no longer scans
+    /// for a duplicate). Waits per commit near 0 mean the watermark is not what commits
+    /// wait on (#154).
     pub visibility_waits: (u64, u64),
     /// Wake passes over that list (a watermark publish that reached a registered seqno), and
     /// the async commits they woke.
@@ -654,7 +655,7 @@ impl Engine {
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
-            waiters: WatermarkWaiters::default(),
+            waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),
@@ -1154,7 +1155,7 @@ impl Engine {
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
-            waiters: WatermarkWaiters::default(),
+            waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
             manifest_flight: Default::default(),

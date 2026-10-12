@@ -1,0 +1,2 @@
+### Changed
+- Commits waiting for visibility register in a registry split into one part per shard, each with its own lock, keyed by waiter: registering again replaces the waiter's entry in place instead of scanning the list, and a wake pass pops only the waiters that are ready. `Metrics::visibility_waits.1` now counts the waiters already listed in the part a registration joined (a queue depth) rather than entries scanned, and `visibility_contended` sums the parts.

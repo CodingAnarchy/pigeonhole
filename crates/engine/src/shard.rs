@@ -217,8 +217,8 @@ pub(crate) enum Wake {
 pub(crate) type WatermarkWaiters = crate::watermark_waiters::WatermarkWaiters<Wake>;
 
 /// Counters of async commits' visibility waits (ICR 0023, #154): registrations that found
-/// their seqno not yet visible, list entries they scanned, wake passes that took the lock,
-/// and commits woken. Contention is the registry's (`WatermarkWaiters::contended`).
+/// their seqno not yet visible, the waiters already listed in their registry part, wake
+/// passes that took a lock, and commits woken. Contention is the registry's (`WatermarkWaiters::contended`).
 #[derive(Debug, Default)]
 pub(crate) struct VisibilityCounts {
     pub waits: AtomicU64,
@@ -385,17 +385,17 @@ impl Shared {
     }
 
     /// Registers an async waiter for `seqno` to become visible; returns true if it already is
-    /// (the caller then proceeds without waiting). A waker registered again for the same
-    /// seqno (a spurious wake) is not listed twice.
+    /// (the caller then proceeds without waiting). `seqno` is a commit's, which has one
+    /// waiter: registering again (a spurious wake, a new waker) replaces its wake in place.
     pub(crate) fn wait_visible(&self, seqno: Seqno, waker: &Waker) -> bool {
         if self.shm.visible_seqno() >= seqno {
             return true;
         }
         self.visibility.waits.fetch_add(1, Ordering::Relaxed);
         let scanned = self.waiters.register(
+            crate::watermark_waiters::commit_key(seqno),
             seqno,
-            || Wake::Task(waker.clone()),
-            |s, w| s == seqno && matches!(w, Wake::Task(w) if w.will_wake(waker)),
+            Wake::Task(waker.clone()),
         );
         self.visibility
             .scanned
@@ -2966,9 +2966,9 @@ impl ShardState {
             self.freeze_deferred = true;
             let id = self.id.0;
             self.shared.waiters.register(
+                crate::watermark_waiters::shard_key(id),
                 needed,
-                || Wake::Shard(id),
-                |_, w| matches!(w, Wake::Shard(s) if *s == id),
+                Wake::Shard(id),
             );
             if self.shared.shm.visible_seqno() >= needed
                 && let Some(subs) = self.shared.submitters.get()
