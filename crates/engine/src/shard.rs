@@ -2503,6 +2503,15 @@ impl ShardState {
                 if !complete {
                     self.aborted.insert(seqno);
                 }
+                // Replay runs before any shard starts (`ShardMsg::Start` reports the replayed
+                // shares), so no share of this commit has been counted yet: the settle check
+                // the live path makes after logging a COMMIT has nothing to find here.
+                debug_assert!(
+                    self.share_reports
+                        .get(&seqno)
+                        .is_none_or(|(reported, _)| *reported == 0),
+                    "a share of replayed commit {seqno} was counted before its COMMIT was logged"
+                );
                 self.share_reports.entry(seqno).or_insert((0, 0)).1 = participants.len();
                 if complete {
                     self.settle_to.insert(seqno, participants.clone());

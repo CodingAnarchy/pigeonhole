@@ -77,6 +77,15 @@ fn settled_commits_trimmed_by_participants_survive_crashes() {
         for seed in seeds() {
             check(seed, &cfg);
         }
+        // The same with tablets splitting, merging and moving while the commits run: a slot
+        // that moved, or a tablet retired by a split or merge, reads as flushed through the
+        // published catalog, and a participant may trim its PREPARE on that.
+        cfg.tablet_changes = true;
+        cfg.tablet_ops_ppm = 20_000;
+        cfg.balance_fast = true;
+        for seed in seeds() {
+            check(seed, &cfg);
+        }
     }
 }
 
