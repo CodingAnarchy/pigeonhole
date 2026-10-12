@@ -31,15 +31,15 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 
 ## Counts
 
-**153 primitives** (`main` after #134 step 2's close gate and watermark-waiter registry; 159 before):
+**151 primitives** (`main` after D221 and D222 replaced the `PIGEONHOLE_GROUP_SYNC_DEPTH` and `PIGEONHOLE_READAHEAD` statics with constants; 153 before, 159 before #134 step 2):
 
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
-| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 66 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
+| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 65 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
 | `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 27 | `Hooks` 21, `ShardCounters` 4, `ReaderHooks` 2 |
-| other `engine/src` files | 37 | | 10 of them thread-locals (per-thread scratch and caches) |
+| other `engine/src` files | 36 | | 10 of them thread-locals (per-thread scratch and caches) |
 | `runtime/src` | 16 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
-| **Total** | **153** | | |
+| **Total** | **151** | | |
 
 A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityCounts::{waits, scanned, passes, woken}` and `WatermarkWaiters::contended`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
 
@@ -165,7 +165,6 @@ The registry has one part per shard (`WatermarkWaiters::new(shards)`), each on i
 |---|---|---|---|---|---|---|
 | `static READS_STEP` shard.rs:305 (test-hooks) | `AtomicBool` | Reads step over superseded memtable versions instead of using the stale-tail index | test hook hooks.rs:732 | read.rs:1673 (read paths on any thread) | Relaxed | D194, D199; 2cb8a28 (#439) |
 | `static TAIL_SKIPS` shard.rs:309 (test-hooks) | `AtomicU64` | Memtable tail jumps taken by reads | source.rs:129 (readers) | hooks.rs:738 | Relaxed | D194, D199; 2cb8a28 (#439) |
-| `static DEPTH` (in `group_sync_depth`) shard.rs:1133 | `OnceLock<u32>` | `PIGEONHOLE_GROUP_SYNC_DEPTH`, read once per process | first caller of `group_sync_depth` (`get_or_init`) | all callers | OnceLock | D207, #412, #405; ef20207 (#477) |
 | `static TRACING` shard.rs:7366 | `AtomicU8` | `PIGEONHOLE_TRACE` state: unset, off or on | `tracing()` (CAS from unset), `set_tracing` (test hook, #244) | `tracing()`, on every thread that traces | Relaxed for all, including the CAS | #244; 25d95ad (#252) |
 
 `static ROWS` (shard.rs:1587) is a `LazyLock<FastBuildHasher>`. It is initialized once and is read-only after that. It is not counted, since `LazyLock` is not in the listed categories (#287, 79e1fa6).
@@ -259,7 +258,7 @@ Order is outer → inner. "Exclusion" means the `manifest_busy` flag claimed thr
 
 No `Condvar` is declared in these files. Blocking waits go through runtime `Notifier`/`completion`, which are out of scope.
 
-**75 primitives**
+**74 primitives**
 
 
 ## Appendix B: `engine/src/engine.rs` and `engine/hooks.rs`
@@ -388,7 +387,7 @@ waker.rs, write.rs. catalog.rs, error.rs, lib.rs, options.rs, large.rs, maintena
 nonblocking.rs declare no primitive of their own (large.rs, maintenance.rs and nonblocking.rs
 use `Shared` fields declared in shard.rs; see "Used here, declared elsewhere" below).
 
-**34 primitives** (24 struct fields / statics + 10 `thread_local!`s).
+**33 primitives** (23 struct fields / statics + 10 `thread_local!`s).
 
 ### Manifest commit path (manifest.rs)
 
@@ -415,7 +414,6 @@ use `Shared` fields declared in shard.rs; see "Used here, declared elsewhere" be
 | Name | Type | Protects / means | Writers | Readers | Ordering / nesting | Why / history |
 |---|---|---|---|---|---|---|
 | `ResolverBlobs::error` read.rs:281 | `Mutex<Option<Error>>` | First error a separated-value fetch hit during a resolve (the `BlobFetch` hook cannot return errors). | `BlobFetch::fetch` (read.rs:324) on the resolving thread. | `ResolverBlobs::check` after each resolver step (same thread). | Leaf. In practice single-threaded per read; the Mutex exists because `BlobFetch: Send + Sync` (compaction/src/blob.rs:314). | #33 via #235 (cbcfaf6). |
-| `static READAHEAD` source.rs:226 (fn-local in `scan_readahead`) | `OnceLock<(u32, bool)>` | Process-wide `PIGEONHOLE_READAHEAD` override (blocks, merge), parsed once. | `get_or_init` on first scan (any thread). | Every scan's `read_options`. | OnceLock. | #402 via #432 (5b9f496); to be decided by #431/#405. |
 | `RowCaches::present` row_cache.rs:50 | `Box<[AtomicU64]>` | Per slot, the tag of the family row filled last: a lookup whose tag differs misses without taking the cache's lock. A hint only. | `RowCaches::store` (`store`, Relaxed) after `cache.insert` (row-cache fill on a client thread or async read future: engine.rs:1361/1549, nonblocking.rs:256/366). | `RowCaches::get` (`load`, Relaxed). | Relaxed: correctness comes from the `RowCache` itself verifying family/row/epoch under its own lock and from the `RowEpochs` (`lw`) watermark protocol (fetch_max Release / load Acquire, in the cache crate). | #404, D201, ICR 0019 via #446 (e5f8359). |
 | `RowCaches::ghost` row_cache.rs:54 | `Box<[AtomicU64]>` | Per slot, the family row that missed last: a miss fills only on the second miss (admission). | `RowCaches::admit` (`swap`, Relaxed) on reading threads. | Same `swap`. | Relaxed; a lost update only costs an extra miss. | #404, D201. |
 | `RowCaches::hits` row_cache.rs:61 | `AtomicU64` | Row-cache hit counter. | `get` (`fetch_add`, Relaxed), reading threads. | `stats` (`load`, Relaxed) for `Engine::row_cache_stats` (engine.rs:1638). | Relaxed statistic. | #404, D201. |
