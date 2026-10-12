@@ -26,12 +26,12 @@ use crate::{
 pub const INLINE_IN_FLIGHT: usize = 16;
 
 /// Longest the warmup runs while waiting for the balancer to spread the table (D204).
-const SPREAD_CAP: Duration = Duration::from_secs(30);
+const SPREAD_CAP: Duration = Duration::from_secs(60);
 
 /// How long the table must go without a split, merge or move before the warmup ends: longer
-/// than the balancer's dwell (10 passes of 100 ms, D146), so a quiet stretch means the
-/// balancer settled, not that it is waiting out a dwell.
-const SETTLED: Duration = Duration::from_secs(2);
+/// than the balancer's longest dwell (the slow skew path's 100 passes of 100 ms, D224, D228),
+/// so a quiet stretch means the balancer settled, not that it is waiting out a dwell.
+const SETTLED: Duration = Duration::from_secs(12);
 
 /// How long a shard thread's turn may run before it polls its commits again.
 const TURN: Duration = Duration::from_micros(50);

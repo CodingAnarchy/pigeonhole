@@ -115,8 +115,11 @@ fn loop_runs(tag: &str) {
                     probe.report()
                 );
             }
+            // The warmup waits for 12 s without a tablet change (longer than the balancer's
+            // slow dwell, D228), so a healthy run takes about 13-15 s; a table that never
+            // spreads waits out the 60 s cap, and a write stall fails with `Busy` at 30 s.
             assert!(
-                took < Duration::from_secs(25),
+                took < Duration::from_secs(45),
                 "{tag} run {i}, {shards} shards took {took:?}\n{}",
                 probe.report()
             );
