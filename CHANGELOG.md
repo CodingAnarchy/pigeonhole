@@ -5,7 +5,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 > **Experimental 0.x.** Not recommended for production use yet. See [`docs/status.md`](docs/status.md).
 
 ## [Unreleased]
-Fixes to closing a database after cross-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged.
+
+## [0.2.2] - 2026-10-12
+Fixes to closing a database after cross-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 and 0.2.1 open as before. Every published crate moves to 0.2.2 together.
 
 ### Fixed
 - **Closing the database could hang forever after concurrent cross-shard commits** (#585, D225).
@@ -105,7 +107,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0
