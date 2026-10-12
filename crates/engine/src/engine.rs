@@ -651,6 +651,9 @@ impl Engine {
                 min_writes: options.balance_min_writes,
                 skew: options.balance_skew,
                 split_bytes: options.tablet_split_bytes.max(1),
+                // Application-owned shards report no busy time, so packing never acts on
+                // them (D217): D213's pinned placement stays.
+                pack: options.balance_pack,
             },
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),

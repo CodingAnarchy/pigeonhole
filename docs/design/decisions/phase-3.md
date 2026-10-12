@@ -642,6 +642,43 @@ The p50 target is met only with the row cache. `ycsb-a` costs about +0.3 µs at 
 
 **Not changed:** the row cache's semantics (D201), `row_cache_max_row` (4 KiB), the other targets' steps, and the RocksDB configuration. RocksDB gets the same 2 GiB block cache on `ycsb-c` and no row cache.
 
+<a id="d217"></a>
+## D217 — While writes are light, the balancer packs the written tablets onto as few shards as stay about half busy (owner decision, 2026-10-11; tablets, engine, #478; amends D134 and D214)
+
+**Decided:**
+- **Measure:** each engine-owned shard counts the time its thread spends handling work (`Submitter::busy_nanos`, ICR 0033). Every balancer pass publishes the shard's busy fraction as a moving average (weight 0.2, as write load) beside its write load.
+- **Active shards:** with `B` the summed busy fraction of all shards, every shard computes the same `k = ceil(B / 0.5)`, so each active shard has headroom before commits queue. `k` is never below `ceil(slots in use / max_slots)`, the shards the tablets' memtable slots need (one slot per tablet and family). Without that floor, the first full shard strands the rest of the written tablets across the inactive ones.
+- **Hysteresis:** `k` grows (by at least one, to the new `ceil(B / 0.5)`) after 10 consecutive passes (1 s) with `B / k > 0.75`, and shrinks after 50 passes (5 s) with `B / (k − 1) < 0.5`. It rises to the slot floor at once.
+- **Packing:** shards `k..` hand their written tablets, the most-written first, one per dwell, to the least busy active shard with slot room. Cold tablets stay: they cost no wakeups. The skew rule (D214) and consolidation act only among shards `0..k`.
+- **Never acts** while the store writes fewer than `balance_min_writes` rows per interval over all shards, or while no shard reports busy time (application-owned shards, the simulated clock).
+- **On by default.** `Options::tablet_packing(false)` (`EngineOptions::balance_pack`, ICR 0034) turns it off, and off is exactly the placement before D217.
+
+**Why.** A light writer spread over every shard pays a shard wakeup and park per commit. The Phase 3 gate run (2026-10-11) had time-series-ttl at 165K ops/s on 32 shards against 249–260K on 1–2 shards (RocksDB 251K), and skewed-multi-shard at 325K on 32 against 493K on 4 (RocksDB 568K). The shard count that wins depends on the load, so the balancer picks it from measured busy time instead of a fixed setting.
+
+The AX102, 32 shards, uring, `--scale full`, one run each, packing off → on (engine/217-packing before the slot floor):
+
+| workload | B | ops/s | p50 | shard parks per op |
+|---|--:|--:|--:|--:|
+| skewed-multi-shard | 1.43 | 374K → 464K (+24%) | 8.2 → 5.5 µs | 0.56 → 0.05 |
+| ycsb-a | 0.33 | 117K → 136K (+16%) | 8.3 → 5.8 µs | 0.49 → 0.11 |
+| time-series-ttl | 0.29 | 181K → 187K | 5.7 → 5.0 µs | 0.39 → 0.31 |
+| ycsb-f | 0.19 | 88.5K → 90.1K | 11.0 → 10.5 µs | 0.50 → 0.25 |
+| ycsb-c (reads only) | 0.00 | 218K → 213K (noise) | 3.5 → 3.5 µs | 0 |
+
+- **The targets stay at 0.5 and 0.75.** skewed-multi-shard's `B` of 1.43 gave `k = 3` (464K, against 418K on 2 shards and 493K on 4 fixed). Its busiest shard ran at 0.73 from key skew inside the active set, so a tighter target would saturate it.
+- **The slot floor came from this run.** The bench table has four families, so a shard holds at most 16 tablets. time-series-ttl (`k = 1`) filled shard 0 and left 18 written tablets one or two per shard across the rest; ycsb-f's gain is small for the same reason.
+
+With the slot floor (931c578, the same setup, two runs each, ranges):
+
+| workload | B (on) | ops/s off → on | p50 off → on | shard parks per op | shards written (on) |
+|---|--:|--:|--:|--:|--:|
+| time-series-ttl | 0.30–0.37 | 171–173K → 209–211K (+22%) | 5.7 → 3.8–4.1 µs | 0.40 → 0.05–0.14 | 2–3 |
+| ycsb-f | 0.24–0.27 | 97K → 104–107K (+9%) | 10.3 → 8.6–9.2 µs | 0.50 → 0.16–0.31 | 2–3 |
+| skewed-multi-shard | 1.24–1.28 | 346–355K → 382–412K (+13%) | 8.4–8.7 → 5.8–6.0 µs | 0.56–0.62 → 0.00–0.01 | 2 |
+
+- **time-series-ttl now packs fully** onto the shards its slots need (34 tablets, 2–3 shards) and gains 22%, against 3.5% without the floor.
+- **skewed-multi-shard settled on 2 shards** in both runs, against 3 in the first. `B / k` of 0.62–0.64 sits inside the hysteresis band (grow above 0.75, shrink below 0.5), so `k` stays where the load phase left it. With 3 active shards, the first run reached 464K.
+
 ## D218 — io_uring is the default I/O backend where the kernel offers it: `IoBackend::Auto` (owner decision, 2026-10-12; pigeonhole, io, #402)
 
 **Decided:**

@@ -103,6 +103,13 @@ pub struct EngineOptions {
     /// skewed passes in a row, and keeps acting until its load falls below
     /// `1 + 0.4 × (skew − 1)` times the mean (D214). Only read when `tablet_changes` is on.
     pub balance_skew: f64,
+    /// Packing (D217, default on): while writes are light, the balancer keeps tablets with
+    /// write load on as few shards as stay about half busy (the summed busy fraction of all
+    /// shards over 0.5, rounded up), so a commit seldom finds its shard asleep; it spreads
+    /// them again within about a second once those shards pass 75% busy. Application-owned
+    /// shards report no busy time, so it never acts on them. Off, tablets spread over every
+    /// shard as before. Only read when `tablet_changes` is on.
+    pub balance_pack: bool,
     /// Merge operators available to this process.
     pub merge_operators: MergeRegistry,
     /// Open even if a family names an unregistered merge operator: read-only, compaction
@@ -189,6 +196,7 @@ impl EngineOptions {
             balance_interval_nanos: 100_000_000,
             balance_min_writes: 2_000,
             balance_skew: 1.25,
+            balance_pack: true,
             merge_operators: MergeRegistry::default(),
             allow_unregistered_merge: false,
             allow_fuse: false,

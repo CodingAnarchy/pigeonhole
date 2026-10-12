@@ -25,6 +25,8 @@ pub(crate) struct Settings {
     pub(crate) group_sync: bool,
     /// `None`: the library default (on).
     pub(crate) tablet_changes: Option<bool>,
+    /// Packing (`Options::tablet_packing`, D217); on, the library default.
+    pub(crate) no_packing: bool,
     /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
     /// turns it off.
     pub(crate) row_cache: Option<u64>,
@@ -135,6 +137,20 @@ impl PigeonholeRunner {
         self
     }
 
+    /// `false` turns off packing a lightly written store's tablets onto few shards
+    /// ([`Options::tablet_packing`], D217; on by default).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().packing(false);
+    /// assert!(r.describe().contains("packing=off"));
+    /// ```
+    pub fn packing(mut self, yes: bool) -> Self {
+        self.settings.no_packing = !yes;
+        self
+    }
+
     /// Row cache bytes (`Options::row_cache`, D201); 0 turns it off. Without a call the
     /// library default applies (on, D216), and the description names no row cache, so runs
     /// stay comparable with results from before D216 under the same key.
@@ -199,6 +215,9 @@ pub(crate) fn options(s: &Settings) -> Options {
         .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
     if let Some(yes) = s.tablet_changes {
         options = options.tablet_changes(yes);
+    }
+    if s.no_packing {
+        options = options.tablet_packing(false);
     }
     if let Some(n) = s.shards {
         options = options.shards(n);
@@ -317,10 +336,10 @@ impl Runner for PigeonholeRunner {
             } else {
                 durability(s.sync)
             },
-            if s.tablet_changes == Some(false) {
-                ""
-            } else {
-                " tablets=on"
+            match (s.tablet_changes == Some(false), s.no_packing) {
+                (true, _) => "",
+                (false, false) => " tablets=on",
+                (false, true) => " tablets=on packing=off",
             },
             match s.row_cache {
                 None => String::new(),

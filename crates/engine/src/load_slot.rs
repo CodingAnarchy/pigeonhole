@@ -1,7 +1,8 @@
 //! One shard's published load and its slot reservations (#97, #103, #128; #134 step 3:
 //! loom-modelled).
 //!
-//! - **Load publication.** The owning shard stores its write rate, then the time it
+//! - **Load publication.** The owning shard stores its write rate and busy fraction (D217),
+//!   then the time it
 //!   published it with `Release` ([`LoadSlot::publish`]). A shard balancing reads the time
 //!   with `Acquire` and, when it is fresh, the rate ([`LoadSlot::read_fresh`]): what it
 //!   reads is that publication's rate or a later one, never an older one.
@@ -22,6 +23,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(crate) struct LoadSlot {
     /// Moving average of the rows written per interval.
     writes: AtomicU64,
+    /// Moving average of the fraction of the time the shard was busy, in millionths (D217).
+    busy: AtomicU64,
     /// `(tablet, family)` slots promised to changes in flight that will hand this shard
     /// tablets: every change checks them with the slots in the view, so concurrent moves
     /// never take a shard past `max_slots` (#103).
@@ -31,9 +34,11 @@ pub(crate) struct LoadSlot {
 }
 
 impl LoadSlot {
-    /// The owning shard publishes its write rate as of `now` (nonzero).
-    pub(crate) fn publish(&self, writes: u64, now: u64) {
+    /// The owning shard publishes its write rate and busy fraction (millionths, D217) as of
+    /// `now` (nonzero).
+    pub(crate) fn publish(&self, writes: u64, busy: u64, now: u64) {
         self.writes.store(writes, Ordering::Relaxed);
+        self.busy.store(busy, Ordering::Relaxed);
         self.at.store(now, Ordering::Release);
     }
 
@@ -41,6 +46,13 @@ impl LoadSlot {
     pub(crate) fn read_fresh(&self, now: u64, stale: u64) -> Option<u64> {
         let at = self.at.load(Ordering::Acquire);
         (at != 0 && now.saturating_sub(at) <= stale).then(|| self.writes.load(Ordering::Relaxed))
+    }
+
+    /// The published busy fraction (millionths) if it was published within `stale` of
+    /// `now`: like [`LoadSlot::read_fresh`], that publication's or a later one.
+    pub(crate) fn read_busy_fresh(&self, now: u64, stale: u64) -> Option<u64> {
+        let at = self.at.load(Ordering::Acquire);
+        (at != 0 && now.saturating_sub(at) <= stale).then(|| self.busy.load(Ordering::Relaxed))
     }
 
     /// Slots reserved on this shard by changes in flight.
@@ -76,8 +88,8 @@ mod loom_tests {
             let owner = {
                 let slot = Arc::clone(&slot);
                 thread::spawn(move || {
-                    slot.publish(10, 1);
-                    slot.publish(20, 2);
+                    slot.publish(10, 0, 1);
+                    slot.publish(20, 0, 2);
                 })
             };
             for _ in 0..2 {
@@ -141,7 +153,7 @@ mod tests {
     fn a_publication_is_read_while_fresh_and_reservations_count() {
         let slot = LoadSlot::default();
         assert_eq!(slot.read_fresh(5, 10), None, "never published");
-        slot.publish(7, 5);
+        slot.publish(7, 0, 5);
         assert_eq!(slot.read_fresh(10, 10), Some(7));
         assert_eq!(slot.read_fresh(20, 10), None, "stale");
         assert_eq!(slot.reserve(2), 0);
