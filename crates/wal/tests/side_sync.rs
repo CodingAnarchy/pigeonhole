@@ -20,7 +20,7 @@ use pigeonhole_io::{
     Completion, ErrorKind, File, FileIdentity, FileRef, IoBuf, LockMode, OpenOptions, ProcessId,
     Resolver, Result, SharedOpen, SharedRegion, Vfs, VfsRef,
 };
-use pigeonhole_wal::{Error, Wal, WalStream};
+use pigeonhole_wal::{Error, SpareSegments, Wal, WalStream};
 
 /// Takes one from `n` if it is positive (an armed fault fires once per unit).
 fn take_one(n: &AtomicU32) -> bool {
@@ -34,12 +34,16 @@ fn take_one(n: &AtomicU32) -> bool {
     false
 }
 
-/// Fails the next `fail_sync_all` calls of `sync_all`, fails `allocate` with `NoSpace` while
-/// `no_space` is set, and holds submitted syncs while `hold` is set.
+/// Fails the next `fail_sync_all` calls of `sync_all` and the next `fail_writes` submitted
+/// writes, fails `allocate` with `NoSpace` while `no_space` is set, and holds submitted
+/// syncs while `hold` is set. Counts submitted writes and allocations.
 #[derive(Debug, Default)]
 struct Faults {
     fail_sync_all: AtomicU32,
+    fail_writes: AtomicU32,
     no_space: AtomicBool,
+    submitted_writes: AtomicU32,
+    allocations: AtomicU32,
     hold: AtomicBool,
     held: Mutex<VecDeque<(FileRef, Resolver<()>)>>,
 }
@@ -97,6 +101,13 @@ impl File for FaultFile {
         self.inner.submit_read(buf, offset)
     }
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
+        self.faults.submitted_writes.fetch_add(1, Ordering::AcqRel);
+        if take_one(&self.faults.fail_writes) {
+            return Completion::ready(Err(pigeonhole_io::Error::new(
+                ErrorKind::Other,
+                "injected write failure",
+            )));
+        }
         self.inner.submit_write(buf, offset)
     }
     fn sync_data(&self) -> Result<()> {
@@ -130,6 +141,7 @@ impl File for FaultFile {
         self.inner.set_len(len)
     }
     fn allocate(&self, offset: u64, len: u64) -> Result<()> {
+        self.faults.allocations.fetch_add(1, Ordering::AcqRel);
         if self.faults.no_space.load(Ordering::Acquire) {
             return Err(pigeonhole_io::Error::new(ErrorKind::NoSpace, "allocate"));
         }
@@ -199,13 +211,63 @@ impl Vfs for FaultVfs {
 
 /// A stream (4 frames per segment, one spare) over a fault-injecting `SimVfs`.
 fn setup(seed: u64) -> (Arc<Faults>, WalStream) {
+    setup_with(seed, 4)
+}
+
+/// [`setup`] with `frames` frames per segment.
+fn setup_with(seed: u64, frames: u64) -> (Arc<Faults>, WalStream) {
     let faults = Arc::new(Faults::default());
     let vfs: VfsRef = Arc::new(FaultVfs {
         inner: SimVfs::new(seed),
         faults: Arc::clone(&faults),
     });
-    let wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts(4, 1)).unwrap();
+    let wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts(frames, 1)).unwrap();
     (faults, wal)
+}
+
+/// Counts wakes, for a test polling a future by hand.
+#[derive(Debug, Default)]
+struct CountWakes(AtomicU32);
+
+impl std::task::Wake for CountWakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Runs a stepped spare preparation ([`SpareSegments::start`]) to its end, as a background
+/// task would: it polls again only when woken. Asserts that no poll allocates more than one
+/// slot or submits more than four writes (a step stays short, D35), and returns the result
+/// and the number of polls.
+fn prepare_stepped(faults: &Faults, spares: &SpareSegments, n: u32) -> (Result<u32, Error>, u32) {
+    let wakes = Arc::new(CountWakes::default());
+    let waker = std::task::Waker::from(Arc::clone(&wakes));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut prep = std::pin::pin!(spares.start(n));
+    let mut polls = 0;
+    loop {
+        let (allocated, written) = (
+            faults.allocations.load(Ordering::Acquire),
+            faults.submitted_writes.load(Ordering::Acquire),
+        );
+        let woken = wakes.0.load(Ordering::Acquire);
+        polls += 1;
+        let poll = prep.as_mut().poll(&mut cx);
+        let allocated = faults.allocations.load(Ordering::Acquire) - allocated;
+        let written = faults.submitted_writes.load(Ordering::Acquire) - written;
+        assert!(
+            allocated <= 1 && written <= 4,
+            "poll {polls} allocated {allocated} slots and submitted {written} writes"
+        );
+        if let std::task::Poll::Ready(r) = poll {
+            return (r, polls);
+        }
+        // The simulator completes I/O at once: a pending poll has woken itself to yield.
+        assert!(
+            wakes.0.load(Ordering::Acquire) > woken,
+            "poll {polls} pending with no wake"
+        );
+    }
 }
 
 #[test]
@@ -356,4 +418,76 @@ fn a_group_sync_overlapping_a_failed_rollover_sync_does_not_count() {
     // The rollover's own failure is reported first, then the poison.
     assert!(matches!(wal.sync(), Err(Error::Io(_))));
     assert!(matches!(wal.sync(), Err(Error::Poisoned)));
+}
+
+#[test]
+fn a_stepped_spare_preparation_yields_between_short_steps() {
+    // 5 MiB slots: five zero-fill writes each, so three slots take several steps.
+    let frames = (5 << 20) / pigeonhole_format::wal::FRAME_SIZE as u64;
+    let (faults, wal) = setup_with(1397, frames);
+    let spares = wal.spares();
+    let (r, polls) = prepare_stepped(&faults, &spares, spares.target() + 2);
+    assert_eq!(r.unwrap(), 3);
+    assert_eq!(spares.ready(), 3);
+    assert_eq!(faults.submitted_writes.load(Ordering::Acquire), 15);
+    assert!(polls >= 4, "{polls} polls for 15 writes");
+    // Nothing left to prepare: ready at once.
+    assert_eq!(
+        prepare_stepped(&faults, &spares, spares.target())
+            .0
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_failed_stepped_spare_sync_poisons_the_stream() {
+    let (faults, mut wal) = setup(1398);
+    let t1 = wal
+        .append(&batch(1, 100).record(), Durability::GroupSync)
+        .unwrap();
+    wal.write().unwrap();
+    faults.fail_sync_all.store(1, Ordering::Release);
+    let spares = wal.spares();
+    assert!(
+        prepare_stepped(&faults, &spares, spares.target() + 2)
+            .0
+            .is_err()
+    );
+    assert_eq!(spares.ready(), 0);
+    assert!(matches!(wal.sync(), Err(Error::Poisoned)));
+    assert!(!wal.satisfies(&t1));
+}
+
+#[test]
+fn a_failed_stepped_spare_write_or_allocation_leaves_the_stream_usable() {
+    let (faults, mut wal) = setup(1399);
+    let t1 = wal
+        .append(&batch(1, 100).record(), Durability::GroupSync)
+        .unwrap();
+    let spares = wal.spares();
+    faults.fail_writes.store(1, Ordering::Release);
+    assert!(
+        prepare_stepped(&faults, &spares, spares.target() + 2)
+            .0
+            .is_err()
+    );
+    faults.no_space.store(true, Ordering::Release);
+    assert!(
+        prepare_stepped(&faults, &spares, spares.target() + 2)
+            .0
+            .is_err()
+    );
+    faults.no_space.store(false, Ordering::Release);
+    assert_eq!(spares.ready(), 0);
+    wal.sync().unwrap();
+    assert!(wal.satisfies(&t1));
+    // The slots went back: preparation succeeds.
+    assert_eq!(
+        prepare_stepped(&faults, &spares, spares.target() + 2)
+            .0
+            .unwrap(),
+        3
+    );
+    assert_eq!(spares.ready(), 3);
 }
