@@ -261,8 +261,9 @@ fn a_seed_replays_the_same_io_trace() {
     (spares.flush_ppm, spares.compact_ppm) = (0, 0);
     // The first freeze comes after half the arena of data, far past half a segment of WAL.
     spares.memtable_freeze_bytes = spares.memtable_budget / 2;
-    // `SpareSegments::prepare`'s I/O: grow the file by a slot, zero-fill it (one write: the
-    // harness's segments are 256 KiB), then `sync_all`, with nothing in between.
+    // A spare's preparation: grow the file by a slot, zero-fill it (one write: the
+    // harness's segments are 256 KiB), then `sync_all`, in that order. It runs in steps on
+    // the shard's background task (D35), so other I/O may come in between.
     let zeros = {
         let vfs = SimVfs::new(0);
         let f = vfs
@@ -273,26 +274,27 @@ fn a_seed_replays_the_same_io_trace() {
         vfs.recorded_ops().pop().expect("recorded")
     };
     let prepared_a_spare = |ops: &[SimOp]| {
-        ops.windows(3).any(|w| match (&w[0], &w[1], &w[2], &zeros) {
-            (
-                SimOp::SetLen { node, len },
-                SimOp::Write {
-                    node: n1,
-                    offset,
-                    len: l,
-                    digest,
-                },
-                SimOp::Sync {
-                    node: n2,
-                    metadata: true,
-                },
-                SimOp::Write {
-                    len: zl,
-                    digest: zd,
-                    ..
-                },
-            ) => node == n1 && node == n2 && offset + l == *len && (l, digest) == (zl, zd),
-            _ => false,
+        let SimOp::Write {
+            len: zl,
+            digest: zd,
+            ..
+        } = zeros
+        else {
+            unreachable!("a write was recorded")
+        };
+        ops.iter().enumerate().any(|(i, op)| {
+            let SimOp::SetLen { node, len } = *op else {
+                return false;
+            };
+            let filled = ops[i + 1..].iter().position(|w| {
+                matches!(*w, SimOp::Write { node: n, offset, len: l, digest }
+                    if n == node && offset + l == len && (l, digest) == (zl, zd))
+            });
+            filled.is_some_and(|j| {
+                ops[i + 1 + j + 1..]
+                    .iter()
+                    .any(|s| matches!(*s, SimOp::Sync { node: n, metadata: true } if n == node))
+            })
         })
     };
     // And with deferred I/O, whose device the harness thread runs, including in the waits
