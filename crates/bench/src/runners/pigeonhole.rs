@@ -450,6 +450,7 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         wal_inline_syncs: m.wal_inline_syncs,
         file_growths: m.file_growths.0,
         file_growth_nanos: m.file_growths.1,
+        file_growths_ahead: m.file_growths_ahead.0,
         shard_parks: m.shard_idle.0,
         shard_wakes: m.shard_idle.1,
         commit_parks: m.commit_parks,

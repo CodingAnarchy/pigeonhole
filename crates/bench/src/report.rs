@@ -430,6 +430,10 @@ pub struct Stalls {
     pub file_growths: u64,
     /// See [`Stalls::file_growths`].
     pub file_growth_nanos: u64,
+    /// File growths ahead of need, outside the page allocator's lock (gate analysis D1b).
+    /// Absent from results written before them.
+    #[serde(default)]
+    pub file_growths_ahead: u64,
     /// Idle parks of the shards' threads after their spin, wakes of a parked shard, and
     /// blocking commit waits that parked (ICR 0027): per commit, how often the commit
     /// path pays a thread wakeup (D198). Absent from results written before them.
@@ -491,6 +495,7 @@ impl Stalls {
             wal_inline_syncs: d(before.wal_inline_syncs, after.wal_inline_syncs),
             file_growths: d(before.file_growths, after.file_growths),
             file_growth_nanos: d(before.file_growth_nanos, after.file_growth_nanos),
+            file_growths_ahead: d(before.file_growths_ahead, after.file_growths_ahead),
             shard_parks: d(before.shard_parks, after.shard_parks),
             shard_wakes: d(before.shard_wakes, after.shard_wakes),
             commit_parks: d(before.commit_parks, after.commit_parks),

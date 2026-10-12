@@ -51,8 +51,13 @@ fn take_one(n: &AtomicU32) -> bool {
 struct Faults {
     fail_sync_all: AtomicU32,
     no_space: AtomicBool,
+    /// `allocate` calls refused for `no_space`.
+    refused: AtomicU32,
     hold: AtomicBool,
     held: Mutex<VecDeque<(FileRef, Resolver<()>)>>,
+    /// Holds submitted `sync_all`s (a growth ahead of need) while set.
+    hold_all: AtomicBool,
+    held_all: Mutex<VecDeque<(FileRef, Resolver<()>)>>,
     /// Closed: `sync_all` waits for it to open (a growth's sync in flight). Whether one waits.
     gate: Mutex<(bool, bool)>,
     gate_moved: Condvar,
@@ -67,6 +72,19 @@ impl Faults {
 
     fn held(&self) -> usize {
         self.held.lock().unwrap().len()
+    }
+
+    /// Runs the oldest held `sync_all` (honoring `fail_sync_all`) and resolves it.
+    fn release_sync_all(&self) {
+        let (file, resolver) = self.held_all.lock().unwrap().pop_front().expect("held");
+        resolver.resolve(if take_one(&self.fail_sync_all) {
+            Err(pigeonhole_io::Error::new(
+                ErrorKind::Other,
+                "injected sync_all failure",
+            ))
+        } else {
+            file.sync_all()
+        });
     }
 
     fn close_gate(&self) {
@@ -141,6 +159,18 @@ impl File for FaultFile {
             .push_back((Arc::clone(&self.inner), resolver));
         done
     }
+    fn submit_sync_all(&self) -> Completion<()> {
+        if !self.faults.hold_all.load(Ordering::Acquire) {
+            return Completion::ready(self.sync_all());
+        }
+        let (done, resolver) = Completion::pair();
+        self.faults
+            .held_all
+            .lock()
+            .unwrap()
+            .push_back((Arc::clone(&self.inner), resolver));
+        done
+    }
     fn sync_all(&self) -> Result<()> {
         self.faults.pass_gate();
         if take_one(&self.faults.fail_sync_all) {
@@ -159,6 +189,7 @@ impl File for FaultFile {
     }
     fn allocate(&self, offset: u64, len: u64) -> Result<()> {
         if self.faults.no_space.load(Ordering::Acquire) {
+            self.faults.refused.fetch_add(1, Ordering::AcqRel);
             return Err(pigeonhole_io::Error::new(ErrorKind::NoSpace, "allocate"));
         }
         self.inner.allocate(offset, len)
@@ -365,5 +396,149 @@ fn a_growth_without_space_leaves_the_pager_usable() {
     pager.write(e, 0, &[1; 4096]).unwrap();
     pager.commit_root(root(2)).unwrap();
     drop(pager);
+    assert_eq!(reopened_root(&vfs), root(2));
+}
+
+/// Growth ahead of need (gate analysis D1b): 1 MiB blocks from 2 MiB, so the simulator's
+/// in-memory file stays small.
+const BLOCK: u64 = 1 << 20;
+
+fn setup_ahead() -> (VfsRef, Arc<Faults>, Pager) {
+    let (vfs, faults, pager) = setup();
+    pager.set_grow_ahead(BLOCK, 2 * BLOCK).unwrap();
+    (vfs, faults, pager)
+}
+
+#[test]
+fn a_growing_file_grows_ahead_of_need_not_inline() {
+    let (vfs, _faults, pager) = setup_ahead();
+    // Below the threshold the file grows inline.
+    for _ in 0..3 {
+        pager.allocate(BLOCK).unwrap();
+    }
+    let warm = pager.stats();
+    assert!(warm.growths_ahead > 0, "{warm:?}");
+    // From here on every block-sized allocation finds a block grown ahead: no allocation
+    // grows the file under the allocator lock.
+    for i in 0..32 {
+        let e = pager.allocate(BLOCK).unwrap();
+        pager.write(e, 0, &[i as u8; 4096]).unwrap();
+    }
+    let s = pager.stats();
+    assert_eq!(s.growths, warm.growths, "inline growths: {s:?}");
+    assert_eq!(s.growths_ahead, warm.growths_ahead + 32, "{s:?}");
+    // The grown length is durable: a commit and a reopen see every extent.
+    pager.commit_root(root(2)).unwrap();
+    drop(pager);
+    assert_eq!(reopened_root(&vfs), root(2));
+}
+
+#[test]
+fn an_allocation_while_a_growth_ahead_is_in_flight_grows_inline_past_it() {
+    let (vfs, faults, pager) = setup_ahead();
+    // Inline growths sync with a blocking `sync_all`: only a growth ahead's is held. Once the
+    // file passes the threshold, a growth ahead starts and its sync stays in flight.
+    faults.hold_all.store(true, Ordering::Release);
+    let mut extents = Vec::new();
+    while faults.held_all.lock().unwrap().is_empty() {
+        assert!(extents.len() < 8, "no growth ahead started");
+        extents.push(pager.allocate(BLOCK).unwrap());
+    }
+    let before = pager.stats();
+    // The claimed block is not handed out before it is grown: the next allocation grows
+    // the file inline, past it.
+    let e = pager.allocate(BLOCK).unwrap();
+    assert_eq!(pager.stats().growths, before.growths + 1);
+    assert!(extents.iter().all(|x| x.page != e.page));
+    pager.write(e, 0, &[9; 4096]).unwrap();
+    // A root commit waits for the growth's sync (#182): parked until it is resolved.
+    let done = pager.submit_commit_root(root(2));
+    assert!(
+        !done.is_ready(),
+        "a commit went on past a growth ahead in flight"
+    );
+    faults.release_sync_all();
+    done.wait().unwrap();
+    // The block grown ahead is free now: the next allocation takes it without growing.
+    let s = pager.stats();
+    assert_eq!(s.growths_ahead, before.growths_ahead + 1);
+    pager.allocate(BLOCK).unwrap();
+    assert_eq!(pager.stats().growths, s.growths);
+    drop(pager);
+    assert_eq!(reopened_root(&vfs), root(2));
+}
+
+#[test]
+fn a_failed_growth_ahead_sync_poisons_later_commits() {
+    let (vfs, faults, pager) = setup_ahead();
+    faults.hold_all.store(true, Ordering::Release);
+    for _ in 0..8 {
+        let e = pager.allocate(BLOCK).unwrap();
+        pager.write(e, 0, &[7; 4096]).unwrap();
+        if !faults.held_all.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    faults.fail_sync_all.store(1, Ordering::Release);
+    faults.release_sync_all();
+    assert!(pager.commit_root(root(2)).is_err());
+    drop(pager);
+    assert_eq!(reopened_root(&vfs), root(1));
+}
+
+#[test]
+fn a_growth_ahead_without_space_gives_its_claim_back() {
+    let (vfs, faults, pager) = setup();
+    // Free space left, but no free block of the growth's size: the next allocation tries to
+    // grow ahead once that is on.
+    let e = pager.allocate(256 << 10).unwrap();
+    pager.abandon(e);
+    pager.set_grow_ahead(BLOCK, 0).unwrap();
+    let before = pager.stats();
+    // The next allocation is served from free space, then tries to grow ahead: no space.
+    faults.no_space.store(true, Ordering::Release);
+    let r = pager.allocate(64 << 10);
+    faults.no_space.store(false, Ordering::Release);
+    let s = pager.stats();
+    // Served from free space; the growth ahead failed and gave the tail back.
+    r.unwrap();
+    assert_eq!(
+        faults.refused.load(Ordering::Acquire),
+        1,
+        "a growth ahead was tried"
+    );
+    assert_eq!(s.file_bytes, before.file_bytes, "{s:?}");
+    assert_eq!(s.growths_ahead, before.growths_ahead);
+    // Space is back: allocation, growth ahead and commits work without a reopen.
+    for _ in 0..4 {
+        pager.allocate(BLOCK).unwrap();
+    }
+    assert!(pager.stats().growths_ahead > s.growths_ahead);
+    pager.commit_root(root(2)).unwrap();
+    drop(pager);
+    assert_eq!(reopened_root(&vfs), root(2));
+}
+
+#[test]
+fn a_blocking_commit_drives_a_growth_ahead_only_its_thread_completes() {
+    // The simulator's deferred device, like an io_uring ring the committing thread owns,
+    // completes the growth's sync only when a waiter drives it: the commit must, rather
+    // than wait on the side syncs' condvar for ever.
+    let sim = SimVfs::new(common::seed());
+    let vfs: VfsRef = sim.clone();
+    let pager = Pager::create(&vfs, path()).unwrap();
+    pager.set_grow_ahead(BLOCK, 2 * BLOCK).unwrap();
+    pager.commit_root(root(1)).unwrap();
+    sim.set_deferred_io(true);
+    sim.set_owner_reaps(true);
+    while pager.stats().file_bytes < 3 * BLOCK {
+        let e = pager.allocate(BLOCK).unwrap();
+        pager.write(e, 0, &[3; 4096]).unwrap();
+    }
+    assert!(sim.io_in_flight() > 0, "a growth's sync in flight");
+    pager.commit_root(root(2)).unwrap();
+    assert!(pager.stats().growths_ahead > 0);
+    drop(pager);
+    sim.set_deferred_io(false);
     assert_eq!(reopened_root(&vfs), root(2));
 }

@@ -627,6 +627,10 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
     o.reader_slots = 8;
     o.wal.segment_size = 8 * 32 * 1024;
     o.wal.spare_segments = 1;
+    // The page file grows ahead of need from 4 MiB, by 4 MiB blocks (64 MiB from 128 MiB by
+    // default, the largest extent), so crash runs cover those growths too. A block holds a
+    // flush's extent at the budgets these tests use.
+    o.grow_ahead = Some((4 << 20, 4 << 20));
     o
 }
 

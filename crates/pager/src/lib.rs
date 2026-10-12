@@ -18,9 +18,12 @@
 //!
 //! - [`Pager::allocate`], [`Pager::abandon`], [`Pager::retire`], [`Pager::reclaim`],
 //!   [`Pager::stats`], [`Pager::shrink_plan`] and [`Pager::clear_for`] only touch
-//!   memory, except that `allocate` preallocates more file (one `fallocate` of at most
-//!   64 MiB, under the allocator lock) when no free extent fits. They run per flush or
-//!   compaction output, never per write.
+//!   memory, except that `allocate` preallocates more file. Ahead of need, once no free
+//!   block of the largest class (64 MiB) is left: one `fallocate` on the caller's thread,
+//!   outside the allocator lock, with its `sync_all` submitted to the I/O backend. Inline,
+//!   only when no free extent fits (a growth ahead still in flight, or a file under
+//!   128 MiB): one `fallocate` and `sync_all` under the allocator lock. They run per flush
+//!   or compaction output, never per write.
 //! - [`Pager::read`] and [`Pager::write`] are positional I/O on the caller's thread.
 //! - [`Pager::commit_root`] and [`Pager::mark_clean`] block on two fsyncs. They must not run
 //!   on a shard's foreground loop (decision D30): the manifest task uses
@@ -307,6 +310,10 @@ impl OpenedPager {
                 committing: AtomicBool::new(false),
                 growths: AtomicU64::new(0),
                 growth_nanos: AtomicU64::new(0),
+                ahead: AtomicBool::new(false),
+                ahead_flight: Mutex::new(None),
+                growths_ahead: AtomicU64::new(0),
+                ahead_nanos: AtomicU64::new(0),
                 side: SideSyncs::default(),
                 frontier: AtomicU64::new(frontier),
             }),
@@ -364,6 +371,17 @@ struct Inner {
     /// File growths, and the nanoseconds they held the allocator (ICR 0015).
     growths: AtomicU64,
     growth_nanos: AtomicU64,
+    /// Set while a growth ahead of need is in flight (one at a time).
+    ahead: AtomicBool,
+    /// That growth's sync, with its continuation, until a blocking commit takes it to wait
+    /// on: the wait drives I/O only its thread or a waiter completes (an io_uring ring the
+    /// committing thread owns, the simulator's deferred device), which the side syncs'
+    /// condvar alone would wait for for ever.
+    ahead_flight: Mutex<Option<Completion<()>>>,
+    /// Growths ahead of need that completed, and the nanoseconds their `fallocate` took
+    /// on the allocating thread.
+    growths_ahead: AtomicU64,
+    ahead_nanos: AtomicU64,
     /// Growth and truncation syncs in flight, which a commit must see the outcome of before
     /// it publishes (D58), without holding the allocator lock (#182).
     side: SideSyncs,
@@ -392,6 +410,10 @@ impl fmt::Debug for SideSyncs {
             .finish_non_exhaustive()
     }
 }
+
+/// How often a blocking commit waiting for side syncs looks again for a growth's sync to
+/// drive ([`Inner::wait_side_idle`]).
+const SIDE_RECHECK: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// The growths' and truncations' `sync_all`s in flight (#182). A commit's sync may succeed
 /// only because one of them was handed the error for the same pages (D58), so before a
@@ -447,12 +469,14 @@ impl SideSyncs {
         step();
     }
 
-    /// Waits until no side sync is in flight (a blocking commit, on its caller's thread).
-    fn wait_idle(&self) {
-        let mut st = lock(&self.state);
-        while st.in_flight != 0 {
-            st = self.idle.wait(st).unwrap_or_else(PoisonError::into_inner);
-        }
+    /// Waits until no side sync is in flight, or `timeout` passes; returns whether none is.
+    fn wait_idle_for(&self, timeout: std::time::Duration) -> bool {
+        let st = lock(&self.state);
+        let (st, _) = self
+            .idle
+            .wait_timeout_while(st, timeout, |st| st.in_flight != 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        st.in_flight == 0
     }
 }
 
@@ -595,6 +619,22 @@ impl Inner {
         })
     }
 
+    /// Waits until no side sync is in flight (a blocking commit, on its caller's thread),
+    /// driving a growth ahead's sync if no other thread has taken it. A growth stores its
+    /// sync just after submitting it, so the wait looks for it again while it waits.
+    fn wait_side_idle(&self) {
+        loop {
+            let flight = lock(&self.ahead_flight).take();
+            if let Some(c) = flight {
+                // Its outcome reaches the pager through the continuation (a failure poisons).
+                let _ = c.wait();
+            }
+            if self.side.wait_idle_for(SIDE_RECHECK) {
+                return;
+            }
+        }
+    }
+
     /// Fails if a growth's or truncation's sync failed. A commit calls it after each of its
     /// own syncs succeeded, once no side sync is in flight ([`SideSyncs`]): that sync may
     /// have succeeded only because a concurrent one was handed the error for the same pages,
@@ -609,7 +649,7 @@ impl Inner {
     /// Writes the superblock once the first sync succeeded and no other sync failed
     /// (blocking: waits for side syncs in flight).
     fn write_superblock(&self, p: &PendingCommit) -> pigeonhole_io::Result<()> {
-        self.side.wait_idle();
+        self.wait_side_idle();
         self.check_syncs()?;
         self.file.write_at(&p.page[..], p.slot * PAGE_SIZE as u64)
     }
@@ -651,7 +691,7 @@ impl Inner {
             .sync_data()
             .and_then(|()| self.write_superblock(&p))
             .and_then(|()| self.file.sync_data());
-        self.side.wait_idle();
+        self.wait_side_idle();
         self.end(p, result)
     }
 
@@ -824,6 +864,7 @@ impl Pager {
             alloc.alloc_free(class)
         };
         if let Some(e) = free {
+            self.maybe_grow_ahead(alloc, lowest);
             return Ok(e);
         }
         // The allocator lock is held across this one `fallocate` and `sync_all` (at most
@@ -860,7 +901,77 @@ impl Pager {
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        self.maybe_grow_ahead(lock(&self.inner.alloc), lowest);
         Ok(grown)
+    }
+
+    /// After an allocation (not a relocation's `allocate_lowest`, which packs the file
+    /// toward its start): grows the file ahead of need if no free block of the largest class
+    /// is left ([`Alloc::wants_ahead`]) and no such growth is in flight, so the next large
+    /// allocation finds free space instead of growing the file inline, under the allocator
+    /// lock, on the thread that needs it.
+    ///
+    /// The tail is claimed under the lock (placeholders, so nothing is allocated there yet);
+    /// the `fallocate` runs on this thread after the lock is dropped, and the `sync_all`
+    /// that makes the new length durable is submitted to the I/O backend. Its completion
+    /// frees the claimed space, or poisons the pager if it failed (D58); root commits wait
+    /// for its outcome as for any side sync (#182). A failed `fallocate` (a full disk) gives
+    /// the claim back and reports nothing: the next inline growth reports it.
+    fn maybe_grow_ahead(&self, mut alloc: MutexGuard<'_, Alloc>, lowest: bool) {
+        if lowest || !alloc.wants_ahead() || self.inner.ahead.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (from, end) = alloc.claim_ahead();
+        drop(alloc);
+        let started = std::time::Instant::now();
+        let allocated = self
+            .inner
+            .file
+            .allocate(from * UNIT_BYTES, (end - from) * UNIT_BYTES);
+        self.inner.ahead_nanos.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if allocated.is_err() {
+            lock(&self.inner.alloc).release_ahead(from, end, false);
+            self.inner.ahead.store(false, Ordering::Release);
+            return;
+        }
+        self.inner.side.start();
+        let inner = Arc::clone(&self.inner);
+        let flight = self.inner.file.submit_sync_all().map(move |synced| {
+            let mut alloc = lock(&inner.alloc);
+            if synced.is_err() {
+                // Before the sync stops counting as in flight, as in `allocate_from`.
+                lock(&inner.state).poisoned = true;
+            }
+            alloc.release_ahead(from, end, synced.is_ok());
+            inner.frontier.store(alloc.frontier(), Ordering::Release);
+            let parked = inner.side.finish();
+            drop(alloc);
+            inner.ahead.store(false, Ordering::Release);
+            if synced.is_ok() {
+                inner.growths_ahead.fetch_add(1, Ordering::Relaxed);
+            }
+            parked.run();
+            Ok(())
+        });
+        // Kept for a blocking commit to drive (`Inner::wait_side_idle`); dropped once done.
+        if !flight.is_ready() {
+            *lock(&self.inner.ahead_flight) = Some(flight);
+        }
+    }
+
+    /// Sets the growth ahead of need ([`Pager::allocate`]): once no free block of at least
+    /// `block` bytes (rounded up to a size class) is left and the file is at least `from`
+    /// bytes long, an allocation grows the file by such a block outside the allocator lock.
+    /// The defaults are 64 MiB from 128 MiB. A test hook: tests on the simulator, which
+    /// keeps whole files in memory, set it small so they reach it.
+    #[doc(hidden)]
+    pub fn set_grow_ahead(&self, block: u64, from: u64) -> Result<()> {
+        let class = class_for(block)?;
+        lock(&self.inner.alloc).set_ahead(class, from.div_ceil(UNIT_BYTES));
+        Ok(())
     }
 
     /// Returns an extent that was allocated but never published in a root (an abandoned
@@ -1195,6 +1306,8 @@ impl Pager {
             retired_bytes: alloc.retired_units() * UNIT_BYTES,
             growths: self.inner.growths.load(Ordering::Relaxed),
             growth_nanos: self.inner.growth_nanos.load(Ordering::Relaxed),
+            growths_ahead: self.inner.growths_ahead.load(Ordering::Relaxed),
+            ahead_nanos: self.inner.ahead_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -1231,6 +1344,11 @@ pub struct PagerStats {
     pub growths: u64,
     /// Wall-clock nanoseconds those growths held the allocator.
     pub growth_nanos: u64,
+    /// File growths ahead of need since open (64 MiB each, outside the allocator lock, the
+    /// sync submitted to the I/O backend), once no free block of that size was left.
+    pub growths_ahead: u64,
+    /// Wall-clock nanoseconds their `fallocate`s took on the allocating thread.
+    pub ahead_nanos: u64,
 }
 
 #[cfg(test)]

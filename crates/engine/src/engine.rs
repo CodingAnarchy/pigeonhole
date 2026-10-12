@@ -147,6 +147,10 @@ pub struct Metrics {
     /// File growths and the nanoseconds they held the page allocator across a `fallocate`
     /// and a `sync_all` (#28, #182).
     pub file_growths: (u64, u64),
+    /// File growths ahead of need (64 MiB each, outside the allocator lock, the sync
+    /// submitted to the I/O backend), and the nanoseconds their `fallocate`s took on the
+    /// allocating thread.
+    pub file_growths_ahead: (u64, u64),
     /// File reads made synchronously inside async reads: a separated value too large to
     /// cache (D196, #398), a block the cache could not keep, or a read that missed too
     /// often. Zero when async reads never block their executor thread.
@@ -540,6 +544,9 @@ impl Engine {
         live.extend(catalog.data_extents());
         let pager = Arc::new(opened.finish(live)?);
         open_data_file(&vfs, path, &pager, options.direct_io, true)?;
+        if let Some((block, from)) = options.grow_ahead {
+            pager.set_grow_ahead(block, from)?;
+        }
         if catalog.has_unknown_merge && !options.allow_unregistered_merge {
             let name = catalog
                 .tables()
@@ -1903,6 +1910,7 @@ impl Engine {
         }
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);
+        m.file_growths_ahead = (pager.growths_ahead, pager.ahead_nanos);
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
         m.block_cache = shared.cache.hits_and_misses();
         m.block_cache_pinned = shared.cache.pinned() as u64;
