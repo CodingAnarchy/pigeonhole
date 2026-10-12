@@ -92,6 +92,11 @@
 # 11787, commit-at 10675, commit-async 9863) with `instruction-ceilings.py lower` on those
 # four counts.
 #
+# Lowered after #584 (#523, ICR 0036: an async commit waiting for room is one state of the
+# engine's pending commit; blocking commits wait on a leaner handle) from its head run
+# (38265305560: commit-async 9818, commit-one 9733, commit-overwrite 11781, commit-at 10661)
+# with `instruction-ceilings.py lower` on those four counts.
+#
 # Lowered after #531 (a skip past the current block walks the index forward, #29):
 # scan-wide-q1, scan-wide-q10, scan-narrow-q1 and scan-filtered from its head run
 # (38133347090: 14228, 1813, 5281, 5828) with `instruction-ceilings.py lower`.
@@ -117,18 +122,18 @@ counter 9388 0.5
 rows 19655 0.3
 level-scans 14439 0.6
 short-scans 13936 0.3
-commit-one 9771 0.3
+commit-one 9763 0.3
 commit-sixteen 50577 0.3
 flush 2199 0.3
 compact 2692 0.5
 ycsb-c 43293 1.0
 ycsb-a 27326 1.0
-commit-overwrite 11846 0.5
-commit-at 10708 0.3
+commit-overwrite 11840 0.5
+commit-at 10693 0.3
 scan-narrow 1435 0.3
 scan-small 1411 0.3
 scan-wide 1331 0.3
-commit-async 9893 0.3
+commit-async 9848 0.3
 scan-narrow-q1 5297 0.3
 scan-wide-q10 1819 0.3
 scan-wide-q1 14271 0.3
