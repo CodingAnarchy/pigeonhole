@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::Waker;
+use std::task::{Poll, Waker};
 
 use arc_swap::ArcSwap;
 use pigeonhole_cache::BlockCache;
@@ -52,6 +52,7 @@ use crate::purge_guard::PurgeGuard;
 use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
 use crate::source::{ColumnKey, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::timer_state::TimerState;
+use crate::waker::StdWaker;
 use crate::write::{ReadKey, Settled};
 use crate::{CommitInfo, Error, Predicate, Result};
 
@@ -1482,19 +1483,28 @@ fn hash_row(table: TableId, row: &[u8]) -> u64 {
     ROWS.hash_one((table.0, row))
 }
 
-/// Prepares spare WAL segments off the foreground loop (decision D35).
+/// Prepares spare WAL segments off the foreground loop (decision D35), in steps: the
+/// zero-fill and the sync go to the I/O backend, and no step allocates more than one slot
+/// or submits more than a few megabytes, so the task never holds its shard for long.
 struct SpareTask {
-    spares: SpareSegments,
+    prep: pigeonhole_wal::SparePrep,
+    waker: StdWaker,
     running: Arc<AtomicBool>,
 }
 
 impl Task for SpareTask {
-    fn run(&mut self, _deadline_nanos: u64, _waker: &TaskWaker) -> TaskPoll {
-        // A failed sync poisons the stream, and its next append or sync fails; a failed
-        // allocation or write leaves the slots blank for a later attempt.
-        let _ = self.spares.prepare(self.spares.target());
-        self.running.store(false, Ordering::Release);
-        TaskPoll::Done
+    fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        match self.waker.poll(waker, &mut self.prep) {
+            // A failed sync poisons the stream, and its next append or sync fails; a failed
+            // allocation or write leaves the slots blank for a later attempt.
+            Poll::Ready(_) => {
+                self.running.store(false, Ordering::Release);
+                TaskPoll::Done
+            }
+            // Woken by a write or the sync completing, or at once by the preparation itself
+            // when it yields between steps.
+            Poll::Pending => TaskPoll::Blocked,
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -5091,7 +5101,8 @@ impl ShardState {
             return;
         }
         ctx.spawn(Box::new(SpareTask {
-            spares: spares.clone(),
+            prep: spares.start(spares.target()),
+            waker: StdWaker::default(),
             running: Arc::clone(&self.spares_running),
         }));
     }

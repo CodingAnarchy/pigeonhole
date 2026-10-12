@@ -1,17 +1,20 @@
 //! The sidecar-file stream: one file per stream, made of preallocated slots that are recycled
 //! after checkpoint.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 
 use pigeonhole_format::wal::{
     FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameEncoder, SegmentHeader, WalRecord,
 };
 use pigeonhole_format::{Durability, FormatVersion, Lsn, StreamId};
-use pigeonhole_io::{Completion, FileRef, OpenOptions, VfsRef};
+use pigeonhole_io::{Completion, FileRef, IoBuf, OpenOptions, VfsRef};
 
 use crate::{CommitTicket, Error, Result, Wal, WalOptions, parent_dir, stream_path, sync_parent};
 
@@ -489,6 +492,26 @@ impl Shared {
         Ok(r?)
     }
 
+    /// [`Shared::side_sync`] with the sync submitted to the I/O backend (`submit` issues
+    /// it): the returned completion resolves with the sync's own outcome, and a failure
+    /// poisons the stream.
+    fn submit_side_sync(
+        self: &Arc<Self>,
+        submit: impl FnOnce() -> Completion<()>,
+    ) -> Completion<()> {
+        let ticket = self.start_sync();
+        let shared = Arc::clone(self);
+        submit().map(move |r| {
+            let ready = {
+                let mut syncs = shared.syncs();
+                shared.end_sync(&mut syncs, ticket, r.is_err());
+                syncs.settled()
+            };
+            shared.tell(ready);
+            r
+        })
+    }
+
     /// Runs `sync`, a blocking sync that makes records durable, and returns once it counts:
     /// after every sync started before it finished, and only if none failed.
     fn durable_sync(&self, sync: impl FnOnce() -> pigeonhole_io::Result<()>) -> Result<()> {
@@ -592,8 +615,9 @@ fn zero_fill(file: &FileRef, segment_size: u64, slot: usize, zeros: &[u8]) -> Re
 
 /// Prepares spare slots for a [`WalStream`] off the shard thread.
 ///
-/// Obtained from [`WalStream::spares`] (or [`Wal::spares`]); `Send + Sync`, so the engine
-/// runs [`SpareSegments::prepare`] on a background task. A prepared slot is allocated,
+/// Obtained from [`WalStream::spares`] (or [`Wal::spares`]); `Send + Sync`. The engine's
+/// background task polls [`SpareSegments::start`], which submits the I/O in short steps;
+/// [`SpareSegments::prepare`] does the same blocking, for a thread of its own. A prepared slot is allocated,
 /// zero-filled and synced, so a segment started in it needs no metadata update at its
 /// fdatasyncs. The stream's rollover takes a recyclable slot first, then a prepared one, and
 /// only grows the file inline when it has neither ([`WalStream::inline_grows`] counts those).
@@ -659,29 +683,15 @@ impl SpareSegments {
     /// Makes sure the stream has at least `n` free slots (recyclable, blank or prepared),
     /// zero-filling blank slots first and growing the file by whole slots after that, then
     /// syncs once. Returns how many slots it zero-filled. Blocking file I/O: run it on a
-    /// background task, never on a shard thread.
+    /// thread of its own, never on a shard thread; a background task on a shard runs
+    /// [`SpareSegments::start`] instead.
     pub fn prepare(&self, n: u32) -> Result<u32> {
-        let (mut to_fill, old_total, grown) = {
-            let mut pool = self.shared.pool();
-            // Blank slots are not ready (a segment there needs its zero-fill first), so they
-            // count as needing preparation, not as spares.
-            let have = pool.recyclable + pool.ready.len();
-            let need = (n as usize).saturating_sub(have);
-            // Blank slots are zero-filled first; the rest are new slots at the file's end.
-            let from_blank = need.min(pool.blank.len());
-            let mut to_fill: Vec<usize> = pool.blank.drain(..from_blank).collect();
-            let grow = need - from_blank;
-            let old_total = pool.total;
-            to_fill.extend(old_total..old_total + grow);
-            pool.total += grow;
-            (to_fill, old_total, grow)
-        };
-        if to_fill.is_empty() {
+        let Some(slots) = self.reserve(n) else {
             return Ok(0);
-        }
+        };
         let zeros = vec![0u8; ZERO_CHUNK.min(self.segment_size as usize)];
         let result = (|| {
-            for &slot in &to_fill {
+            for &slot in &slots.to_fill {
                 self.file
                     .allocate(slot as u64 * self.segment_size, self.segment_size)?;
                 zero_fill(&self.file, self.segment_size, slot, &zeros)?;
@@ -690,6 +700,86 @@ impl SpareSegments {
             // a failed sync poisons it.
             self.shared.side_sync(|| self.file.sync_all())
         })();
+        self.settle(slots, result)
+    }
+
+    /// [`SpareSegments::prepare`] in steps for a cooperative background task (D35): the
+    /// zero-fill and the sync are submitted to the I/O backend, and each poll of the
+    /// returned [`SparePrep`] allocates at most one slot and submits at most a few
+    /// megabytes, so no step holds its thread for long. It resolves to how many slots it
+    /// zero-filled; with nothing to prepare it is ready at once with 0.
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use pigeonhole_format::StreamId;
+    /// use pigeonhole_io::sim::SimVfs;
+    /// use pigeonhole_wal::{WalOptions, WalStream};
+    ///
+    /// # fn main() -> pigeonhole_wal::Result<()> {
+    /// let vfs: pigeonhole_io::VfsRef = SimVfs::new(1);
+    /// let mut opts = WalOptions::default();
+    /// opts.segment_size = 2 * 32 * 1024;
+    /// let wal = WalStream::create(&vfs, Path::new("/db/x.phdb"), StreamId(0), [0; 16], opts)?;
+    /// let spares = wal.spares();
+    /// // A background task polls it with its own waker, a step per poll.
+    /// let mut prep = std::pin::pin!(spares.start(spares.target()));
+    /// let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    /// let prepared = loop {
+    ///     if let std::task::Poll::Ready(r) = prep.as_mut().poll(&mut cx) {
+    ///         break r?;
+    ///     }
+    /// };
+    /// assert_eq!((prepared, spares.ready()), (2, 2));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start(&self, n: u32) -> SparePrep {
+        let slots = self.reserve(n);
+        SparePrep {
+            spares: self.clone(),
+            next_slot: 0,
+            next_offset: 0,
+            allocated: false,
+            writes: VecDeque::new(),
+            buffers: Vec::new(),
+            failed: None,
+            sync: None,
+            slots,
+        }
+    }
+
+    /// Claims the slots a preparation of `n` spares fills: blank slots first, then new slots
+    /// past the file's end (counted in the pool's total now, so no other preparation or
+    /// inline growth claims them). `None` if the stream has enough free slots.
+    fn reserve(&self, n: u32) -> Option<Reserved> {
+        let mut pool = self.shared.pool();
+        // Blank slots are not ready (a segment there needs its zero-fill first), so they
+        // count as needing preparation, not as spares.
+        let have = pool.recyclable + pool.ready.len();
+        let need = (n as usize).saturating_sub(have);
+        // Blank slots are zero-filled first; the rest are new slots at the file's end.
+        let from_blank = need.min(pool.blank.len());
+        let mut to_fill: Vec<usize> = pool.blank.drain(..from_blank).collect();
+        let grown = need - from_blank;
+        let old_total = pool.total;
+        to_fill.extend(old_total..old_total + grown);
+        pool.total += grown;
+        (!to_fill.is_empty()).then_some(Reserved {
+            to_fill,
+            old_total,
+            grown,
+        })
+    }
+
+    /// Ends a preparation with its outcome: the slots become ready, or go back (blank slots
+    /// stay blank; new slots are forgotten if nothing else extended the file meanwhile).
+    /// Wakes a stream waiting for a spare either way.
+    fn settle(&self, slots: Reserved, result: Result<()>) -> Result<u32> {
+        let Reserved {
+            mut to_fill,
+            old_total,
+            grown,
+        } = slots;
         let mut pool = self.shared.pool();
         pool.prepare_failed = result.is_err();
         let waiters = std::mem::take(&mut pool.waiters.0);
@@ -701,9 +791,8 @@ impl SpareSegments {
                 Ok(filled)
             }
             Err(e) => {
-                // Give back what was reserved: blank slots stay blank, and the new slots are
-                // forgotten if nothing else extended the file meanwhile (otherwise they stay
-                // as blank slots; the first write to one extends the file if it must).
+                // Otherwise they stay as blank slots; the first write to one extends the file
+                // if it must.
                 if pool.total == old_total + grown {
                     pool.total = old_total;
                     to_fill.truncate(to_fill.len() - grown);
@@ -718,6 +807,163 @@ impl SpareSegments {
             wake();
         }
         out
+    }
+}
+
+/// Slots a preparation claimed ([`SpareSegments::reserve`]).
+#[derive(Debug)]
+struct Reserved {
+    to_fill: Vec<usize>,
+    /// The pool's total before the claim, and how many slots it added past it.
+    old_total: usize,
+    grown: usize,
+}
+
+/// Zero-fill writes a [`SparePrep`] keeps in flight.
+const PREP_IN_FLIGHT: usize = 4;
+
+/// Zero-fill writes a [`SparePrep`] submits per poll before it yields.
+const PREP_WRITES_PER_POLL: usize = 4;
+
+/// A preparation of spare slots in steps ([`SpareSegments::start`]): a future resolving to
+/// how many slots it zero-filled. Each poll allocates at most one slot and submits at most
+/// four zero-fill writes; with more to submit it wakes itself and returns `Pending`, so a
+/// cooperative task polling it yields between steps.
+///
+/// Dropped before it resolves (at shutdown), it keeps its slots out of the pool: a write
+/// still in flight there must never land on a segment started in one later.
+pub struct SparePrep {
+    spares: SpareSegments,
+    /// `None` once settled (or when there was nothing to prepare).
+    slots: Option<Reserved>,
+    /// The slot being filled (an index into `to_fill`), and the next offset in it.
+    next_slot: usize,
+    next_offset: u64,
+    /// Whether `next_slot` has been allocated.
+    allocated: bool,
+    writes: VecDeque<Completion>,
+    /// Zero buffers back from completed writes, for the next ones.
+    buffers: Vec<IoBuf>,
+    /// The first failed allocation or write: no more are submitted, and the slots go back
+    /// once the writes in flight finish.
+    failed: Option<Error>,
+    sync: Option<Completion<()>>,
+}
+
+impl fmt::Debug for SparePrep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SparePrep")
+            .field("slots", &self.slots)
+            .field("next_slot", &self.next_slot)
+            .field("in_flight", &self.writes.len())
+            .field("syncing", &self.sync.is_some())
+            .finish()
+    }
+}
+
+impl SparePrep {
+    /// Whether every write has been submitted, or a failure stops them.
+    fn submitted_all(&self, to_fill: &[usize]) -> bool {
+        self.failed.is_some() || self.next_slot == to_fill.len()
+    }
+
+    /// Whether the next write needs its slot allocated first.
+    fn needs_allocation(&self) -> bool {
+        !self.allocated
+    }
+
+    /// Submits the next zero-fill write, allocating its slot first (the caller checked
+    /// [`SparePrep::submitted_all`]).
+    fn submit_next(&mut self, to_fill: &[usize]) {
+        let size = self.spares.segment_size;
+        let start = to_fill[self.next_slot] as u64 * size;
+        if !self.allocated {
+            if let Err(e) = self.spares.file.allocate(start, size) {
+                self.failed = Some(e.into());
+                return;
+            }
+            self.allocated = true;
+        }
+        let len = ZERO_CHUNK.min((size - self.next_offset) as usize);
+        let buf = match self.buffers.pop() {
+            Some(b) if b.len() == len => b,
+            _ => IoBuf::zeroed(len),
+        };
+        self.writes
+            .push_back(self.spares.file.submit_write(buf, start + self.next_offset));
+        self.next_offset += len as u64;
+        if self.next_offset == size {
+            self.next_slot += 1;
+            self.next_offset = 0;
+            self.allocated = false;
+        }
+    }
+}
+
+impl Future for SparePrep {
+    type Output = Result<u32>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<u32>> {
+        let this = &mut *self;
+        let Some(slots) = this.slots.take() else {
+            return Poll::Ready(Ok(0));
+        };
+        if let Some(sync) = &mut this.sync {
+            let Poll::Ready(r) = Pin::new(sync).poll(cx) else {
+                this.slots = Some(slots);
+                return Poll::Pending;
+            };
+            return Poll::Ready(this.spares.settle(slots, r.map_err(Error::from)));
+        }
+        let (mut submitted, mut allocated) = (0, false);
+        loop {
+            // Collect finished writes, oldest first.
+            while let Some(w) = this.writes.front_mut() {
+                match Pin::new(w).poll(cx) {
+                    Poll::Ready(Ok(buf)) => this.buffers.push(buf),
+                    Poll::Ready(Err(e)) => {
+                        this.failed.get_or_insert(e.into());
+                    }
+                    Poll::Pending => break,
+                }
+                this.writes.pop_front();
+            }
+            if this.writes.len() >= PREP_IN_FLIGHT {
+                this.slots = Some(slots);
+                return Poll::Pending;
+            }
+            if !this.submitted_all(&slots.to_fill) {
+                let allocates = this.needs_allocation();
+                if submitted == PREP_WRITES_PER_POLL || (allocates && allocated) {
+                    // A step's worth: yield, and run again at once.
+                    cx.waker().wake_by_ref();
+                    this.slots = Some(slots);
+                    return Poll::Pending;
+                }
+                this.submit_next(&slots.to_fill);
+                allocated |= allocates;
+                submitted += 1;
+                continue;
+            }
+            if !this.writes.is_empty() {
+                this.slots = Some(slots);
+                return Poll::Pending;
+            }
+            break;
+        }
+        if let Some(e) = this.failed.take() {
+            // A failed allocation or write leaves the stream usable (the slots stay blank).
+            return Poll::Ready(this.spares.settle(slots, Err(e)));
+        }
+        // A failed sync poisons the stream.
+        this.sync = Some(
+            this.spares
+                .shared
+                .submit_side_sync(|| this.spares.file.submit_sync_all()),
+        );
+        this.slots = Some(slots);
+        // The sync may already be done (a synchronous backend): poll it now.
+        Pin::new(this).poll(cx)
     }
 }
 
