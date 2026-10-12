@@ -849,7 +849,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
   - A shard whose slow load is above `balance_skew` times the mean of the slow loads, and at least `balance_min_writes`, for 10 passes in a row may make one move or skew split chosen on the slow loads. It then waits 100 passes.
   - It acts only while the fast averages also put the shard above D214's stop ratio. Once the fast path has balanced a shard, its slow average still shows the old skew for a while, and acting on that would overshoot.
 - **Skew changes claim their targets.**
-  - A move or skew split claims every shard it hands load to, with a compare-and-swap in the receiver's `LoadSlot`. The claim holds until the receiver has published 10 more passes (100 for a slow-path change).
+  - A move or skew split claims every shard it hands load to, with a compare-and-swap in the receiver's `LoadSlot`. The claim holds until the receiver has published 10 more passes (100 for a slow-path change), or as many base intervals have gone by on the clock, whichever comes first. An idle receiver backs off its passes, so the clock bounds a claim whose change was dropped or refused.
   - A claimed shard is no other skew change's target. Shards balancing at once never all shed into the same cold shard.
   - A target must also be below the mean. If none is, nothing is decided that pass.
 - **A tablet is cold (for merges and D146's consolidation) only after 100 unwritten passes, or 100 base intervals of clock, and as long on its shard.** Before, 2 unwritten passes were enough, so tablets idle only through a tail were merged or moved away. `EngineOptions::balance_cold_passes` (hidden) shortens it for tests.

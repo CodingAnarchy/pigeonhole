@@ -13,8 +13,10 @@
 //!   `max_slots` together. The caller reserves on every receiving shard, all or none.
 //! - **Skew claims (D224).** A shard handing another load for write skew claims it first
 //!   ([`LoadSlot::claim`], a compare-and-swap), and the claim holds until the receiver has
-//!   published a dwell's worth (10) more balancer passes. Two shards balancing at once
-//!   never both shed into the same cold shard: the second sees the claim and picks another.
+//!   published a dwell of balancer passes or that dwell of base intervals has gone by on the
+//!   clock, whichever comes first (an idle receiver backs off its passes). Two shards
+//!   balancing at once never both shed into the same cold shard: the second sees the claim
+//!   and picks another.
 
 #[cfg(engine_loom)]
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -39,8 +41,10 @@ pub(crate) struct LoadSlot {
     at: AtomicU64,
     /// The owning shard's balancer passes as of its last publication.
     passes: AtomicU64,
-    /// The pass (of the owning shard, as `passes`) until which a skew change handing it load
-    /// holds it (D224): until then, no other skew change picks it.
+    /// Until when a skew change handing the owning shard load holds it (D224): the owner's
+    /// pass (as `passes`, high 32 bits) or the clock in milliseconds (low 32 bits), whichever
+    /// comes first; until then no other skew change picks it. Both halves compare with
+    /// wraparound, so one compare-and-swap moves them together.
     claimed: AtomicU64,
 }
 
@@ -76,21 +80,45 @@ impl LoadSlot {
         (at != 0 && now.saturating_sub(at) <= stale).then(|| self.busy.load(Ordering::Relaxed))
     }
 
-    /// Whether no skew change holds this shard (D224): a balancer may pick it.
-    pub(crate) fn claimable(&self) -> bool {
-        self.passes.load(Ordering::Relaxed) >= self.claimed.load(Ordering::Acquire)
+    /// Whether a claim word has run out: the owner reached its pass, or the clock its
+    /// millisecond (`now_ms`).
+    fn expired(word: u64, passes: u64, now_ms: u32) -> bool {
+        let (pass, ms) = ((word >> 32) as u32, word as u32);
+        (passes as u32).wrapping_sub(pass) as i32 >= 0 || now_ms.wrapping_sub(ms) as i32 >= 0
     }
 
-    /// Claims this shard for a skew change handing it load, until it has published `dwell`
-    /// more passes. Fails while another claim holds it, or when one lands first.
-    pub(crate) fn claim(&self, dwell: u64) -> bool {
+    /// The clock in the claim word's unit.
+    fn millis(now: u64) -> u32 {
+        (now / 1_000_000) as u32
+    }
+
+    /// Whether no skew change holds this shard at `now` (D224): a balancer may pick it.
+    pub(crate) fn claimable(&self, now: u64) -> bool {
+        let word = self.claimed.load(Ordering::Acquire);
+        Self::expired(word, self.passes.load(Ordering::Relaxed), Self::millis(now))
+    }
+
+    /// Claims this shard at `now` for a skew change handing it load, until it has published
+    /// `dwell` more passes or `dwell_nanos` have gone by. Fails while another claim holds
+    /// it, or when one lands first.
+    pub(crate) fn claim(&self, dwell: u64, dwell_nanos: u64, now: u64) -> bool {
         let passes = self.passes.load(Ordering::Relaxed);
         let held = self.claimed.load(Ordering::Acquire);
-        passes >= held
-            && self
-                .claimed
-                .compare_exchange(held, passes + dwell, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        let now_ms = Self::millis(now);
+        if !Self::expired(held, passes, now_ms) {
+            return false;
+        }
+        // Keep both deadlines within half the wraparound, so they compare right.
+        let pass = (passes as u32).wrapping_add(dwell.min(1 << 30) as u32);
+        let ms = now_ms.wrapping_add((dwell_nanos / 1_000_000).clamp(1, 1 << 30) as u32);
+        self.claimed
+            .compare_exchange(
+                held,
+                (u64::from(pass) << 32) | u64::from(ms),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Slots reserved on this shard by changes in flight.
@@ -191,7 +219,7 @@ mod loom_tests {
             let claimers: Vec<_> = (0..2)
                 .map(|_| {
                     let slot = Arc::clone(&slot);
-                    thread::spawn(move || slot.claim(10))
+                    thread::spawn(move || slot.claim(10, 1_000_000_000, 5_000_000))
                 })
                 .collect();
             slot.publish(0, 0, 0, 1, 1);
@@ -201,7 +229,7 @@ mod loom_tests {
                 .filter(|c| *c)
                 .count();
             assert_eq!(won, 1, "{won} claims hold one shard");
-            assert!(!slot.claimable());
+            assert!(!slot.claimable(5_000_000));
         });
     }
 }
@@ -224,15 +252,24 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_holds_a_shard_for_a_dwell_of_its_passes() {
+    fn a_claim_holds_a_shard_for_a_dwell_of_its_passes_or_its_time() {
+        const MS: u64 = 1_000_000;
         let slot = LoadSlot::default();
         slot.publish(7, 0, 0, 5, 3);
-        assert!(slot.claimable());
-        assert!(slot.claim(10));
-        assert!(!slot.claimable() && !slot.claim(10), "held until pass 13");
+        assert!(slot.claimable(0));
+        // Ten passes or a second: the passes come first here.
+        assert!(slot.claim(10, 1_000 * MS, 0));
+        assert!(
+            !slot.claimable(0) && !slot.claim(10, 1_000 * MS, 0),
+            "held until pass 13"
+        );
         slot.publish(7, 0, 0, 6, 12);
-        assert!(!slot.claimable());
+        assert!(!slot.claimable(500 * MS));
         slot.publish(7, 0, 0, 7, 13);
-        assert!(slot.claimable() && slot.claim(10));
+        assert!(slot.claimable(500 * MS));
+        // An idle receiver makes no passes: the clock ends the claim.
+        assert!(slot.claim(10, 1_000 * MS, 2_000 * MS));
+        assert!(!slot.claimable(2_999 * MS));
+        assert!(slot.claimable(3_000 * MS) && slot.claim(10, 1_000 * MS, 3_000 * MS));
     }
 }

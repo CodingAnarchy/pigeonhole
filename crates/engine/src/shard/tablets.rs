@@ -1712,15 +1712,9 @@ impl ShardState {
             } else {
                 Self::skew_stop(cfg.skew)
             };
-            if let Some(op) = self.skew_op(
-                &view,
-                &settled,
-                &writes,
-                &tablet_writes,
-                cfg.min_writes,
-                ratio,
-            ) && splits_ok(&op)
-                && self.claim_targets(&op, if slow { SLOW_DWELL } else { DWELL_PASSES })
+            if let Some(op) = self.skew_op(&view, &settled, &writes, &tablet_writes, ratio, now)
+                && splits_ok(&op)
+                && self.claim_targets(&op, if slow { SLOW_DWELL } else { DWELL_PASSES }, now)
             {
                 self.chose_slow.set(slow);
                 return Some(op);
@@ -1808,10 +1802,12 @@ impl ShardState {
         None
     }
 
-    /// Claims every shard a skew change hands load to (D224), for `dwell` of their passes (the
-    /// slow path's dwell for its changes, D224). False if another change claimed one first:
-    /// the change waits for a later pass.
-    fn claim_targets(&self, op: &TabletOpKind, dwell: u64) -> bool {
+    /// Claims every shard a skew change hands load to (D224), for `dwell` of their passes or
+    /// as many base intervals of clock, whichever comes first (the slow path's dwell for its
+    /// changes). False if another change claimed one first: the change waits for a later pass.
+    /// A claim whose change is then dropped or refused simply runs out.
+    fn claim_targets(&self, op: &TabletOpKind, dwell: u64, now: u64) -> bool {
+        let dwell_nanos = self.shared.balance.interval_nanos.saturating_mul(dwell);
         let to: Vec<ShardId> = match op {
             TabletOpKind::Move { to, .. } => vec![*to],
             TabletOpKind::Split { owners, .. } => {
@@ -1820,7 +1816,7 @@ impl ShardState {
             _ => Vec::new(),
         };
         to.iter()
-            .all(|s| self.shared.loads[usize::from(s.0)].claim(dwell))
+            .all(|s| self.shared.loads[usize::from(s.0)].claim(dwell, dwell_nanos, now))
     }
 
     /// A move or split that evens out `loads` (per shard), given this shard's tablets'
@@ -1831,9 +1827,10 @@ impl ShardState {
         owned: &[TabletEntry],
         loads: &[u64],
         per_tablet: &HashMap<TabletId, u64>,
-        min: u64,
         ratio: f64,
+        now: u64,
     ) -> Option<TabletOpKind> {
+        let min = self.shared.balance.min_writes;
         let me = usize::from(self.id.0);
         let my = loads[me];
         let total: u64 = loads.iter().sum();
@@ -1844,7 +1841,7 @@ impl ShardState {
         // A shard another skew change just handed load is not a target until its published
         // load shows it (D224): shards balancing at once would otherwise all shed into the
         // same cold shard.
-        let open = |i: usize| self.shared.loads[i].claimable();
+        let open = |i: usize| self.shared.loads[i].claimable(now);
         let (cold, low) = loads
             .iter()
             .enumerate()
