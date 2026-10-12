@@ -144,6 +144,11 @@ pub struct EngineOptions {
     /// the simulator, which keeps whole files in memory, so they reach it.
     #[doc(hidden)]
     pub grow_ahead: Option<(u64, u64)>,
+    /// Overrides how many balancer passes (or as many base intervals of clock) a tablet must
+    /// go unwritten, and have been on its shard, before it counts as cold for merges and
+    /// consolidation (100 by default, #582). For tests of merges, which shorten it.
+    #[doc(hidden)]
+    pub balance_cold_passes: Option<u64>,
     /// How long a slot whose compaction failed waits before it is retried (nanoseconds,
     /// default 1 s), doubling with each failure in a row up to 60 times this. A refused WAL
     /// checkpoint retries on the same schedule. Mostly for tests, which shorten it.
@@ -211,6 +216,7 @@ impl EngineOptions {
             write_stall_timeout_nanos: 30_000_000_000,
             arena_chunk_bytes: None,
             grow_ahead: None,
+            balance_cold_passes: None,
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,

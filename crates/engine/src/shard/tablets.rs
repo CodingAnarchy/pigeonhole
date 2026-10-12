@@ -57,6 +57,13 @@ const MEAN_SLOW_ALPHA: f64 = 0.05;
 /// the skew counts again.
 const MEAN_FALL: f64 = 0.9;
 
+/// How long a tablet must go unwritten, and have been on its shard, before it counts as cold
+/// for merges and consolidation (#582): `COLD_PASSES` balancer passes or as many base
+/// intervals of clock (10 s at the default), whichever comes first, so an idle shard backing
+/// off its passes still merges. Longer than a closed-loop load's phases, so a tablet idle only
+/// through a phase's tail (its shard finished its work first) is not merged or moved away.
+pub(crate) const COLD_PASSES: u64 = 100;
+
 /// Weight of the newest interval in the slow moving averages of write load (#582): a time
 /// constant of about 10 s at the default interval, longer than a closed-loop load's phases, so
 /// a shard's slow load follows its share of the work rather than its rate while busy.
@@ -167,6 +174,8 @@ pub(crate) struct TabletLoad {
     ewma: f64,
     /// Slow moving average of `writes` (`SLOW_ALPHA`, #582).
     slow: f64,
+    /// The balancer pass and clock of the last interval with writes (#582).
+    last_write: (u64, u64),
 }
 
 impl TabletLoad {
@@ -187,6 +196,8 @@ pub(crate) struct BalanceConfig {
     pub split_bytes: u64,
     /// `EngineOptions::balance_pack`, engine-owned shards only (D217).
     pub pack: bool,
+    /// Unwritten passes before a tablet is cold (`EngineOptions::balance_cold_passes`, #582).
+    pub cold_passes: u64,
 }
 
 pub(crate) use crate::load_slot::LoadSlot;
@@ -1083,11 +1094,15 @@ impl ShardState {
             LOAD_ALPHA * self.window_writes as f64 + (1.0 - LOAD_ALPHA) * self.load_ewma;
         self.load_slow =
             SLOW_ALPHA * self.window_writes as f64 + (1.0 - SLOW_ALPHA) * self.load_slow;
+        let (pass, clock) = (self.balance_pass, now);
         for l in self.loads.values_mut() {
+            if l.writes > 0 {
+                l.last_write = (pass, clock);
+            }
             l.ewma = LOAD_ALPHA * l.writes as f64 + (1.0 - LOAD_ALPHA) * l.ewma;
             l.slow = SLOW_ALPHA * l.writes as f64 + (1.0 - SLOW_ALPHA) * l.slow;
         }
-        self.note_arrivals();
+        self.note_arrivals(now);
         let (_, mem_per) = self.mem_bytes();
         self.measure_busy(now);
         self.shared.loads[usize::from(self.id.0)].publish(
@@ -1180,7 +1195,7 @@ impl ShardState {
 
     /// Records the balancer pass at which each tablet this shard owns first appeared here
     /// (the tablets it held at its first pass count as settled).
-    fn note_arrivals(&mut self) {
+    fn note_arrivals(&mut self, now: u64) {
         let view = self.shared.view.load();
         let first = self.balance_pass <= 1;
         let pass = if first { 0 } else { self.balance_pass };
@@ -1191,7 +1206,11 @@ impl ShardState {
             .map(|t| t.id)
             .collect();
         self.arrived.retain(|t, _| owned.contains(t));
+        self.arrived_at.retain(|t, _| owned.contains(t));
         for t in owned {
+            self.arrived_at
+                .entry(t)
+                .or_insert(if first { 0 } else { now });
             self.arrived.entry(t).or_insert(pass);
         }
     }
@@ -1703,11 +1722,19 @@ impl ShardState {
             }
         }
         // 3. Merge two adjacent cold tablets of one table that are small together.
+        let cold_nanos = cfg.interval_nanos.saturating_mul(cfg.cold_passes);
+        let long_ago = |(pass, clock): (u64, u64)| {
+            pass + cfg.cold_passes <= self.balance_pass || clock.saturating_add(cold_nanos) <= now
+        };
         let cold = |id: TabletId| {
-            self.loads
-                .get(&id)
-                .is_none_or(|l| l.writes == 0 && l.prev_writes == 0)
-                && mem_per.get(&id).copied().unwrap_or(0) == 0
+            self.loads.get(&id).is_none_or(|l| {
+                l.writes == 0
+                    && l.prev_writes == 0
+                    && (l.last_write == (0, 0) || long_ago(l.last_write))
+            }) && long_ago((
+                self.arrived.get(&id).copied().unwrap_or(0),
+                self.arrived_at.get(&id).copied().unwrap_or(0),
+            )) && mem_per.get(&id).copied().unwrap_or(0) == 0
         };
         for pair in owned.windows(2) {
             let (l, r) = (&pair[0], &pair[1]);
@@ -1819,6 +1846,10 @@ impl ShardState {
             .filter(|(i, _)| *i != me && open(*i))
             .min_by_key(|(i, l)| (**l, *i))
             .map(|(i, l)| (i, *l))?;
+        // With the claimed shards left out, the coldest one left may not be cold at all.
+        if low as f64 >= mean {
+            return None;
+        }
         let gap = my - low;
         let mut tablets: Vec<(TabletId, u64)> = owned
             .iter()

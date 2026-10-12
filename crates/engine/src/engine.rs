@@ -33,9 +33,9 @@ use crate::flush::{SstSink, write_memtable};
 use crate::manifest::{self, ManifestWriter, ReqKind};
 use crate::read::{self, get_in};
 use crate::shard::{
-    BalanceConfig, CloseState, CommitReq, CoordinateReq, LoadSlot, Locks, MaintenanceGuard, Padded,
-    ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared, VisibilityCounts,
-    WatermarkWaiters, bucket_floor, split_by_shard,
+    BalanceConfig, COLD_PASSES, CloseState, CommitReq, CoordinateReq, LoadSlot, Locks,
+    MaintenanceGuard, Padded, ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared,
+    VisibilityCounts, WatermarkWaiters, bucket_floor, split_by_shard,
 };
 use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
@@ -661,6 +661,7 @@ impl Engine {
                 // Application-owned shards report no busy time, so packing never acts on
                 // them (D217): D213's pinned placement stays.
                 pack: options.balance_pack,
+                cold_passes: options.balance_cold_passes.unwrap_or(COLD_PASSES),
             },
             view_capacity: shm_config.view_buffer_bytes as usize,
             tablet_epoch: AtomicU64::new(0),

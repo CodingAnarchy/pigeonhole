@@ -42,7 +42,7 @@ use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 mod tablets;
 
 use tablets::{ActiveOp, TabletLoad};
-pub(crate) use tablets::{BalanceConfig, LoadSlot, TabletOpKind, split_by_shard};
+pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
 
 use crate::catalog::{Catalog, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
@@ -2151,6 +2151,8 @@ pub(crate) struct ShardState {
     balance_pass: u64,
     /// The pass at which each owned tablet arrived on this shard (0: held at the first pass).
     arrived: HashMap<TabletId, u64>,
+    /// The clock when each owned tablet arrived on this shard (0: held at the first pass).
+    arrived_at: HashMap<TabletId, u64>,
     /// The pass at which the balancer last started a move or a split over shards.
     skew_pass: Option<u64>,
     /// Consecutive balancer passes this shard's load was skewed (D214).
@@ -2330,6 +2332,7 @@ impl ShardState {
             load_ewma: 0.0,
             balance_pass: 0,
             arrived: HashMap::new(),
+            arrived_at: HashMap::new(),
             skew_pass: None,
             skew_run: 0,
             skew_active: false,
