@@ -981,7 +981,8 @@ fn dropping_a_shard_on_its_driver_reaps_the_wal_sync_in_flight() {
 
 // ---- D150: a visibility wait ends when the shard holding it dies or closes ----
 
-/// Shard 1's group sync is in flight (holding the global watermark) when another thread's
+/// Shard 1 coordinates a cross-shard commit whose sync is in flight (its seqno holds the
+/// global watermark) when another thread's
 /// commit on shard 0 waits for visibility. Shard 1 is dropped (its group never resolves):
 /// the wait ends with `Closed` instead of parking for ever, and the close is unclean.
 #[test]

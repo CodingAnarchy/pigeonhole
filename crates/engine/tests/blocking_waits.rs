@@ -199,8 +199,9 @@ fn a_catalog_change_finishes_a_pump_commit_whose_shard_is_not_run() {
 
 // ---- 1-2 F1 / 3-4 3.3: a blocking wait on a thread that drives a shard ----
 
-/// Thread X drives shard B, which has a `Sync` group in flight (holding the global
-/// watermark). X commits to a table on shard A (driven by thread Y) and waits: only X can
+/// Thread X drives shard B, which coordinates a cross-shard `Sync` commit whose sync is in
+/// flight (its seqno holds the global watermark; a single-shard group no longer does,
+/// D227). X commits to a table on shard A (driven by thread Y) and waits: only X can
 /// let B publish, so the wait used to spin for ever. Now (amended D88) calls that would
 /// submit and block are refused before submitting anything (`InvalidArgument`), and
 /// waiting on an already-submitted commit fails with `WouldDeadlock` while the commit
@@ -214,7 +215,7 @@ fn a_blocking_wait_on_a_thread_driving_another_shard_fails_instead_of_deadlockin
     let x = &drivers[1];
     gate.hold(&wal(1));
     let pending = db
-        .submit(put(&on_b, "held"), Some(Durability::Sync))
+        .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
         .unwrap();
     gate.wait_held(&wal(1));
 
