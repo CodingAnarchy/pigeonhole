@@ -596,15 +596,29 @@ pub struct Store {
     pub woke: Arc<AtomicBool>,
     /// Completes deferred I/O between shard passes (see `Config::deferred_io`).
     pub vfs: Arc<SimVfs>,
+    /// Whether the run defers I/O: a drop turns it back on after its teardown.
+    deferred_io: bool,
 }
 
 impl Drop for Store {
     /// A dropped shard's final sync waits for its stream's older syncs (#190). A device
-    /// completes those while it waits; with deferred I/O this thread is the device, so it
-    /// completes everything in flight first (after a crash, the operations fail).
+    /// completes those while it waits; with deferred I/O this thread is the device, so the
+    /// shards drop under `immediate_io` (after a crash, the operations fail).
     fn drop(&mut self) {
-        self.vfs.complete_all_io();
+        immediate_io(&self.vfs);
+        self.shards.clear();
+        self.vfs.set_deferred_io(self.deferred_io);
     }
+}
+
+/// Completes the deferred I/O in flight and turns deferral off, for a teardown. A shard turn
+/// or drop that waits on its own WAL sync (a final sync while closing) waits for I/O only
+/// this thread completes: on main the wait reaps it itself (#494, ICR 0028), which 0.2.x
+/// does not have. With nothing in flight and every later operation completing at once, no
+/// such wait blocks, and the run stays the seed's.
+fn immediate_io(vfs: &SimVfs) {
+    vfs.complete_all_io();
+    vfs.set_deferred_io(false);
 }
 
 pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineOptions {
@@ -648,7 +662,9 @@ impl Store {
 
     /// Opens with the checker's options.
     pub fn open_cfg(vfs: &Arc<SimVfs>, shards: usize, cfg: &Config) -> Result<Self, Error> {
-        let store = Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())?;
+        let mut store =
+            Self::open_with(vfs, options_for(Arc::clone(vfs), shards, cfg), &families())?;
+        store.deferred_io = cfg.deferred_io;
         // Values above 120 bytes (of up to 160) are separated at commit time (#230). Not
         // with deferred I/O: the commit waits for a manifest commit on the thread that must
         // also complete the in-flight I/O a background manifest commit holds.
@@ -700,6 +716,7 @@ impl Store {
             family_names,
             woke,
             vfs: Arc::clone(vfs),
+            deferred_io: false,
         })
     }
 
@@ -4272,6 +4289,7 @@ fn run_with(
     // step cap as a backstop.
     w.in_flight.clear();
     if let Some(mut store) = w.store.take() {
+        immediate_io(&vfs);
         let _ = store.engine.close();
         const CLOSE_BOUND_NANOS: u64 = 90_000_000_000; // 30 s stall timeout + 60 s margin
         const CLOSE_STEP_CAP: u32 = 2_000_000;
@@ -4691,6 +4709,7 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
             })
             .collect(),
     ));
+    immediate_io(&vfs);
     let _ = store.engine.close();
     for _ in 0..4 {
         store.step_shards(vfs.monotonic_nanos());
