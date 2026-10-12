@@ -1028,7 +1028,7 @@ enum MemberKind {
 /// unlimited at 16 clients (p99 191 against 188 µs), and 1 lost 6% (p99 248 µs).
 const GROUP_SYNC_DEPTH: u32 = if cfg!(target_os = "macos") { 1 } else { 2 };
 
-/// The group syncs a shard keeps in flight per stream ([`GROUP_SYNC_DEPTH`], D221).
+/// The group syncs a shard keeps in flight per stream: 2, or 1 on macOS (D207, D221).
 pub fn group_sync_depth() -> u32 {
     GROUP_SYNC_DEPTH
 }
