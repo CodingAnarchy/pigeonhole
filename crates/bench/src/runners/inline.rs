@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -95,14 +95,124 @@ fn submit(t: &Table, w: &Write) -> CommitFuture {
     m.commit_async()
 }
 
+/// The threads of one phase (#578): they start together, and if one of them panics the
+/// others stop at once instead of waiting for it (its shard is gone, so commits routed to it
+/// never resolve).
+struct Crew {
+    threads: usize,
+    started: AtomicUsize,
+    done: AtomicUsize,
+    failed: AtomicBool,
+}
+
+/// What a crew thread that stopped because another one failed returns.
+const ANOTHER_FAILED: &str = "another shard thread failed";
+
+impl Crew {
+    fn new(threads: usize) -> Self {
+        Self {
+            threads,
+            started: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    /// Waits until every thread and the caller are ready to start. False if a thread failed
+    /// meanwhile.
+    fn start(&self) -> bool {
+        self.started.fetch_add(1, Ordering::AcqRel);
+        while self.started.load(Ordering::Acquire) <= self.threads {
+            if self.failed() {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        !self.failed()
+    }
+
+    /// Whether a thread of the crew panicked.
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// This thread's own work is done.
+    fn finish(&self) {
+        self.done.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Every thread's own work is done, or one failed: nobody needs this thread's shard.
+    fn over(&self) -> bool {
+        self.done.load(Ordering::Acquire) >= self.threads || self.failed()
+    }
+}
+
+/// Marks the crew failed if its thread unwinds.
+struct FailOnPanic<'a>(&'a Crew);
+
+impl Drop for FailOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.failed.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Runs `body` on a thread per item, as a [`Crew`], and returns the results and when the
+/// crew started (every thread ready). A panicking thread fails the whole run with its
+/// message, promptly: the others see the crew failed and stop.
+fn run_crew<I: Send, R: Send>(
+    items: Vec<I>,
+    body: impl Fn(I, &Crew) -> R + Sync,
+) -> Result<(Vec<R>, Instant), String> {
+    let crew = Crew::new(items.len());
+    let mut start = Instant::now();
+    let joined: Vec<std::thread::Result<R>> = std::thread::scope(|s| {
+        let threads: Vec<_> = items
+            .into_iter()
+            .map(|item| {
+                let (crew, body) = (&crew, &body);
+                s.spawn(move || {
+                    let _guard = FailOnPanic(crew);
+                    body(item, crew)
+                })
+            })
+            .collect();
+        crew.start();
+        start = Instant::now();
+        threads.into_iter().map(|t| t.join()).collect()
+    });
+    let mut results = Vec::with_capacity(joined.len());
+    let mut panicked = None;
+    for (i, r) in joined.into_iter().enumerate() {
+        match r {
+            Ok(r) => results.push(r),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(no message)".to_owned());
+                panicked.get_or_insert(format!("shard thread {i} panicked: {msg}"));
+            }
+        }
+    }
+    match panicked {
+        Some(e) => Err(e),
+        None => Ok((results, start)),
+    }
+}
+
 /// Pipelines `writes` (up to `in_flight` at a time), giving `shard` a turn between polls;
-/// records each commit's latency (submit to resolution) in `hist` when given.
+/// records each commit's latency (submit to resolution) in `hist` when given. Stops with an
+/// error if another thread of `crew` fails.
 fn pipeline(
     t: &Table,
     writes: &[&Write],
     in_flight: usize,
     shard: &mut Shard,
     mut hist: Option<&mut Histogram>,
+    crew: &Crew,
 ) -> Result<(), String> {
     // A commit can resolve on another shard's thread: its wake must end this thread's wait.
     let waker = shard.waker();
@@ -138,6 +248,9 @@ fn pipeline(
         });
         if let Some(e) = failed {
             return Err(e);
+        }
+        if crew.failed() {
+            return Err(ANOTHER_FAILED.to_owned());
         }
         let more = shard.run_once(TURN);
         if !progressed && !more {
@@ -188,60 +301,53 @@ fn phase(
     in_flight: usize,
     record: bool,
 ) -> Result<(Vec<Shard>, Duration, Histogram), String> {
-    let n = shards.len();
-    let done = AtomicUsize::new(0);
-    let ready = Barrier::new(n + 1);
-    let mut start = Instant::now();
-    let results: Vec<Result<(Shard, Histogram), String>> = std::thread::scope(|s| {
-        let threads: Vec<_> = shards
-            .into_iter()
-            .map(|mut shard| {
-                let (done, ready) = (&done, &ready);
-                s.spawn(move || {
-                    // The rows this thread's shard owns as the phase starts (D204): its
-                    // writes then commit on its own shard. A row the balancer moves during
-                    // the phase is still committed correctly, routed to its new owner. Every
-                    // thread picks its rows, then they all start together: picked one shard
-                    // after another, the shards started (and finished) staggered, and the
-                    // balancer saw the idle ones' loads as skew (D223). The shard takes a turn
-                    // between chunks, so its balancer keeps publishing its load meanwhile (a
-                    // shard that misses its passes counts as idle).
-                    let i = shard.index();
-                    let mut mine: Vec<&Write> = Vec::new();
-                    for chunk in writes.chunks(PICK_CHUNK) {
-                        mine.extend(
-                            chunk
-                                .iter()
-                                .filter(|w| t.shard_of(&w.row).unwrap_or(0) == i),
-                        );
-                        shard.run_once(TURN);
-                    }
-                    ready.wait();
-                    let mut hist = Histogram::new();
-                    let r = pipeline(t, &mine, in_flight, &mut shard, record.then_some(&mut hist));
-                    done.fetch_add(1, Ordering::AcqRel);
-                    // Other threads' commits may still need this shard: serve them, waiting
-                    // between turns until one arrives.
-                    while done.load(Ordering::Acquire) < n {
-                        if !shard.run_once(TURN) {
-                            shard.wait(Duration::from_micros(200));
-                        }
-                    }
-                    // The next phase drives it on another thread (#492).
-                    shard.release();
-                    r.map(|()| (shard, hist))
-                })
-            })
-            .collect();
-        ready.wait();
-        start = Instant::now();
-        threads
-            .into_iter()
-            .map(|t| t.join().expect("a shard thread panicked"))
-            .collect()
-    });
+    let (results, start) = run_crew(shards, |mut shard, crew| {
+        // The rows this thread's shard owns as the phase starts (D204): its writes then
+        // commit on its own shard. A row the balancer moves during the phase is still
+        // committed correctly, routed to its new owner. Every thread picks its rows, then
+        // they all start together: picked one shard after another, the shards started (and
+        // finished) staggered, and the balancer saw the idle ones' loads as skew (D223). The
+        // shard takes a turn between chunks, so its balancer keeps publishing its load
+        // meanwhile (a shard that misses its passes counts as idle).
+        let i = shard.index();
+        let mut mine: Vec<&Write> = Vec::new();
+        for chunk in writes.chunks(PICK_CHUNK) {
+            mine.extend(
+                chunk
+                    .iter()
+                    .filter(|w| t.shard_of(&w.row).unwrap_or(0) == i),
+            );
+            shard.run_once(TURN);
+        }
+        if !crew.start() {
+            return Err(ANOTHER_FAILED.to_owned());
+        }
+        let mut hist = Histogram::new();
+        let r = pipeline(
+            t,
+            &mine,
+            in_flight,
+            &mut shard,
+            record.then_some(&mut hist),
+            crew,
+        );
+        crew.finish();
+        // Other threads' commits may still need this shard: serve them, waiting between
+        // turns until one arrives.
+        while !crew.over() {
+            if !shard.run_once(TURN) {
+                shard.wait(Duration::from_micros(200));
+            }
+        }
+        if crew.failed() {
+            return Err(ANOTHER_FAILED.to_owned());
+        }
+        // The next phase drives it on another thread (#492).
+        shard.release();
+        r.map(|()| (shard, hist))
+    })?;
     let elapsed = start.elapsed();
-    let mut shards = Vec::with_capacity(n);
+    let mut shards = Vec::with_capacity(results.len());
     let mut hist = Histogram::new();
     for r in results {
         let (shard, h) = r?;
@@ -405,5 +511,68 @@ impl PigeonholeRunner {
                 ..RunDetail::default()
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ANOTHER_FAILED, run_crew};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Runs `f` on a thread and fails the test if it takes longer than a few seconds: the
+    /// bug was a hang, so a hang must fail rather than stall the suite.
+    fn promptly<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || tx.send(f()).unwrap());
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the crew hung instead of failing")
+    }
+
+    /// A worker like a phase's: starts with the crew, does its own work (`work`), then
+    /// serves the others until the crew is over.
+    fn worker(
+        i: usize,
+        panic_at: Option<(usize, bool)>,
+        crew: &super::Crew,
+    ) -> Result<usize, String> {
+        if panic_at == Some((i, false)) {
+            panic!("worker {i} broke before the start");
+        }
+        if !crew.start() {
+            return Err(ANOTHER_FAILED.to_owned());
+        }
+        if panic_at == Some((i, true)) {
+            panic!("worker {i} broke mid-phase");
+        }
+        crew.finish();
+        while !crew.over() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(i)
+    }
+
+    #[test]
+    fn a_crew_runs_every_worker_and_returns_their_results() {
+        let (results, _) = promptly(|| run_crew((0..4).collect(), |i, c| worker(i, None, c)))
+            .expect("no worker failed");
+        assert_eq!(results, [Ok(0), Ok(1), Ok(2), Ok(3)]);
+    }
+
+    #[test]
+    fn a_worker_panicking_mid_phase_fails_the_run_with_its_message() {
+        let err = promptly(|| run_crew((0..4).collect(), |i, c| worker(i, Some((2, true)), c)))
+            .expect_err("a worker panicked");
+        assert_eq!(err, "shard thread 2 panicked: worker 2 broke mid-phase");
+    }
+
+    #[test]
+    fn a_worker_panicking_before_the_start_fails_the_run_with_its_message() {
+        let err = promptly(|| run_crew((0..4).collect(), |i, c| worker(i, Some((1, false)), c)))
+            .expect_err("a worker panicked");
+        assert_eq!(
+            err,
+            "shard thread 1 panicked: worker 1 broke before the start"
+        );
     }
 }
