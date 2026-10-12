@@ -840,7 +840,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 ## D224 — Under a closed-loop write load the balancer ignores tail skew, corrects placement on slow averages and claims its targets, and a tablet is cold only after 100 unwritten passes (owner direction, 2026-10-12; tablets, #582; amends D214, D134, D146; follows D223)
 
 **Decided:**
-- **Skew while the mean is falling doesn't count.** Each shard keeps a slow average of the mean write load over the active shards (newest pass weighted 0.05, about 2 s). While the mean is below 0.9 times that average, a skewed pass doesn't count toward D214's persistence, and no skew change is made.
+- **Skew while the mean is falling doesn't count.** Each shard keeps a slow average of the mean write load over the active shards (newest pass weighted 0.05, about 2 s). While the mean is below 0.9 times that average, a pass neither counts toward D214's persistence nor resets it, and no skew change is made. A bursty load whose mean dips between bursts still reaches the persistence.
   - A shard looks skewed beside others that just went idle. That's the tail of a closed-loop load, where the lighter shards finished their work first.
   - A standing imbalance, emerging skew and a table's first load all leave the mean steady or rising, so they count as D214 has it.
   - If the others' load stays down, the slow average catches up within a few seconds and the skew counts again.

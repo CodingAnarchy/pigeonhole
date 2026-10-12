@@ -50,11 +50,11 @@ const SKEW_STOP: f64 = 0.4;
 const MEAN_SLOW_ALPHA: f64 = 0.05;
 
 /// The mean write load is falling while it is below this fraction of its slow average
-/// (D224). Skew that appears because other shards' load fell, not because this shard's rose,
-/// is the tail of a closed-loop load: the lighter shards finished their work, and the busy
-/// ones look skewed only beside them. It neither counts toward `SKEW_PERSIST` nor moves a
-/// tablet. If the others' load stays down, the slow average catches up in a few seconds and
-/// the skew counts again.
+/// (D224, #582). Skew that appears because other shards' load fell, not because this shard's
+/// rose, is the tail of a closed-loop load: the lighter shards finished their work, and the
+/// busy ones look skewed only beside them. Such a pass neither counts toward
+/// `SKEW_PERSIST` nor resets it, and moves no tablet. If the others' load stays down, the
+/// slow average catches up in a few seconds and the skew counts again.
 const MEAN_FALL: f64 = 0.9;
 
 /// How long a tablet must go unwritten, and have been on its shard, before it counts as cold
@@ -1376,10 +1376,15 @@ impl ShardState {
             }
             return;
         }
-        if !self.mean_falling && my >= min && my > cfg.skew * mean {
-            self.skew_run += 1;
-        } else {
-            self.skew_run = 0;
+        // A pass while the mean is falling neither counts nor resets the persistence (D224):
+        // under a closed-loop load it is a phase's tail, which must not trigger, and a bursty
+        // load whose mean dips between bursts must still reach `SKEW_PERSIST`.
+        if !self.mean_falling {
+            if my >= min && my > cfg.skew * mean {
+                self.skew_run += 1;
+            } else {
+                self.skew_run = 0;
+            }
         }
         if self.skew_run >= SKEW_PERSIST {
             self.skew_active = true;
