@@ -1083,17 +1083,18 @@ struct Wakes {
 
 impl Wakes {
     /// The wake target: the callback, then the waiting thread (its ring's waker and an
-    /// unpark: it waits in one or the other).
+    /// unpark: it waits in one or the other). Without a callback, the waiting thread is the
+    /// engine-owned thread's own target, so a commit's wake costs no closure call.
     fn target(&self) -> WakeTarget {
         let callback = self.callback.clone();
         let waiter = self.waiter.clone();
         match (callback, waiter) {
             (None, None) => WakeTarget::None,
             (Some(cb), None) => WakeTarget::Callback(cb),
-            (callback, Some((thread, ring))) => WakeTarget::Callback(Arc::new(move || {
-                if let Some(cb) = &callback {
-                    cb();
-                }
+            (None, Some((thread, None))) => WakeTarget::Thread(thread),
+            (None, Some((thread, Some(ring)))) => WakeTarget::ThreadRing(thread, ring),
+            (Some(cb), Some((thread, ring))) => WakeTarget::Callback(Arc::new(move || {
+                cb();
                 if let Some(ring) = &ring {
                     ring.wake();
                 }

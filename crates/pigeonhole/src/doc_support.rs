@@ -72,7 +72,12 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         }
     }
 
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    thread_local! {
+        // One waker per thread, as an executor keeps one per task: a waker made per call
+        // would put a cross-thread allocation on every awaited call (#572).
+        static WAKER: Waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    }
+    let waker = WAKER.with(Waker::clone);
     let mut cx = Context::from_waker(&waker);
     let mut fut = std::pin::pin!(fut);
     loop {
