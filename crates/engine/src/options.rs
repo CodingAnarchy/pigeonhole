@@ -65,7 +65,9 @@ pub struct EngineOptions {
     /// before the shard flushes the memtables that record (and the ones after it) wrote,
     /// however small they are (#137). Without it one write to a slot that is never written
     /// again would keep the stream's checkpoint, and so the WAL and the next open's replay,
-    /// growing for the life of the process. 0 (the default) means twice `memtable_budget`.
+    /// growing for the life of the process. 0 (the default) means twice `memtable_budget`,
+    /// which the 2026-10-12 gate measured against four times: as fast, with a smaller WAL and
+    /// a shorter replay after a crash (decision D229).
     pub wal_pin_bytes: u64,
     /// Tablet split threshold in bytes of live data (default 256 MiB). A tablet whose SSTs
     /// hold at least this much splits in two; two adjacent cold tablets on one shard holding
