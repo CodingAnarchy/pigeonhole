@@ -492,6 +492,72 @@ fn a_skewed_shard_keeps_shedding_tablets_until_balanced() {
     }
 }
 
+/// The tail of a closed-loop load changes no tablet (#582): every shard writes at the same
+/// rate, then half of them finish their work and go idle while the others keep writing. The
+/// busy shards read 2x the mean only because the mean fell. Before, they shed tablets after
+/// the 10-pass persistence, in every phase's tail.
+#[test]
+fn the_tail_of_a_closed_loop_load_changes_no_tablet() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // Two tablets per shard, so a skewed shard could shed one by a move.
+    let n = 8;
+    tablets_on(&mut db, n, |t| (t / 2) as u16);
+    let before = tablet_changes(&db.engine);
+    let mut written = 0;
+    for phase in 0..3 {
+        // All shards busy, then a tail of 30 passes (3 s at the default interval) where
+        // shards 2 and 3 are done.
+        for _ in 0..30 {
+            write_and_balance(&mut db, n, |_| 20, &mut written);
+        }
+        for _ in 0..30 {
+            write_and_balance(&mut db, n, |t| if t < 4 { 20 } else { 0 }, &mut written);
+        }
+        assert_eq!(tablet_changes(&db.engine), before, "phase {phase}");
+    }
+    assert_eq!(tablets_per_shard(&db, shards), vec![2, 2, 2, 2]);
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A standing imbalance still moves a tablet (#582): one shard at a steady 2x the mean from
+/// the start. The mean never falls, so the skew counts as D214 has it.
+#[test]
+fn a_standing_imbalance_still_moves_a_tablet() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // Shard 0 holds four tablets, the others one each, all written alike: shard 0 carries
+    // 4/7 of the writes, about 2.3x the mean.
+    let n = 7;
+    tablets_on(&mut db, n, |t| if t < 4 { 0 } else { (t - 3) as u16 });
+    let before = tablet_changes(&db.engine);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablet_changes(&db.engine) == before && passes < 100 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    assert_eq!(after.2 - before.2, 1, "a move after {passes} passes");
+    // The 10-pass persistence, as D214 has it: no later because of #582.
+    assert!(passes <= 12, "moved after {passes} passes");
+    assert_eq!(tablets_per_shard(&db, shards)[0], 3);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// A burst of skew shorter than the persistence (10 passes, D214) moves and splits nothing:
 /// before D214 one skewed pass split the hot shard's tablet over the others.
 #[test]

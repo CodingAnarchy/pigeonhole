@@ -46,6 +46,17 @@ const SKEW_PERSIST: u64 = 10;
 /// again.
 const SKEW_STOP: f64 = 0.4;
 
+/// Weight of the newest pass in the slow moving average of the mean write load (#582).
+const MEAN_SLOW_ALPHA: f64 = 0.05;
+
+/// The mean write load is falling while it is below this fraction of its slow average
+/// (#582). Skew that appears because other shards' load fell, not because this shard's rose,
+/// is the tail of a closed-loop load: the lighter shards finished their work, and the busy
+/// ones look skewed only beside them. It neither counts toward `SKEW_PERSIST` nor moves a
+/// tablet. If the others' load stays down, the slow average catches up in a few seconds and
+/// the skew counts again.
+const MEAN_FALL: f64 = 0.9;
+
 /// Balancer passes a shard waits after starting a move or a skew split, and a tablet stays
 /// put after it arrived on a shard, before write skew moves or splits again (#103): the
 /// moving averages catch up with a change before the next one is decided.
@@ -1301,8 +1312,11 @@ impl ShardState {
         let Some((my, mean)) = self.shard_loads(now) else {
             self.skew_run = 0;
             self.skew_active = false;
+            self.mean_falling = false;
             return;
         };
+        self.mean_slow = MEAN_SLOW_ALPHA * mean + (1.0 - MEAN_SLOW_ALPHA) * self.mean_slow;
+        self.mean_falling = mean < MEAN_FALL * self.mean_slow;
         let min = cfg.min_writes.max(1) as f64;
         if self.skew_active {
             if my < min || my < Self::skew_stop(cfg.skew) * mean {
@@ -1311,7 +1325,7 @@ impl ShardState {
             }
             return;
         }
-        if my >= min && my > cfg.skew * mean {
+        if !self.mean_falling && my >= min && my > cfg.skew * mean {
             self.skew_run += 1;
         } else {
             self.skew_run = 0;
@@ -1570,6 +1584,7 @@ impl ShardState {
         //    shards (D217).
         if self.skew_active
             && !dwelling
+            && !self.mean_falling
             && let Some(writes) = self.published_loads(now)
         {
             let settled: Vec<TabletEntry> = owned

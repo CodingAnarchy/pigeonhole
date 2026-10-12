@@ -2158,6 +2158,11 @@ pub(crate) struct ShardState {
     /// Whether this shard acts on write skew: from `SKEW_PERSIST` skewed passes until its
     /// load falls below the stop ratio (D214).
     skew_active: bool,
+    /// A slow moving average of the mean write load over the active shards, and whether the
+    /// mean now is falling below it: then skewed passes don't count and no skew change is
+    /// made (#582).
+    mean_slow: f64,
+    mean_falling: bool,
     /// Packing (D217): this shard's busy time and clock at its last pass, the moving average
     /// of how busy it was, how many shards stay active (`0..pack_k`; 0 before the first
     /// decision), and the consecutive passes calling for more or fewer of them.
@@ -2321,6 +2326,8 @@ impl ShardState {
             skew_pass: None,
             skew_run: 0,
             skew_active: false,
+            mean_slow: 0.0,
+            mean_falling: false,
             busy_mark: None,
             busy_ewma: 0.0,
             pack_k: 0,
