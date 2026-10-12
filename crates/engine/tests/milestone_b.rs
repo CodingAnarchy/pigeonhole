@@ -1429,9 +1429,10 @@ fn a_stall_on_a_frozen_clock_ends_when_compaction_fails_or_completes() {
         );
         tx.send(i).unwrap();
     });
-    let rows = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .expect("a stalled commit never resolved on a frozen clock (issue #70)");
+    let rows = worker_result(
+        &rx,
+        "a stalled commit never resolved on a frozen clock (issue #70)",
+    );
     assert!(rows > 600);
 }
 
@@ -1476,10 +1477,24 @@ fn a_room_wait_pinned_by_a_snapshot_is_refused_on_a_frozen_clock() {
         commit_frozen(&engine, &mut shards, &*sim, &t, refused).unwrap();
         tx.send(refused).unwrap();
     });
-    let refused = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .expect("a commit waiting for arena room never resolved on a frozen clock (issue #70)");
+    let refused = worker_result(
+        &rx,
+        "a commit waiting for arena room never resolved on a frozen clock (issue #70)",
+    );
     assert!(refused > 0);
+}
+
+/// A worker thread's result: its value, or a failure that says which way it went (#596). A
+/// worker that panicked drops its sender (`Disconnected`; its own message is printed above),
+/// which is not the same as a commit that never resolved (`Timeout`).
+fn worker_result<T>(rx: &std::sync::mpsc::Receiver<T>, never: &str) -> T {
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the worker panicked (its message is above)")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{never}"),
+    }
 }
 
 /// Options for a one-shard application-owned engine on `vfs` whose arena fills quickly.
@@ -1501,60 +1516,101 @@ fn a_reader_pin_waits_for_the_stall_timeout_on_a_moving_clock() {
     // process's snapshot pins retired memtables, which it may release at any time, so a
     // commit waiting for arena room is refused only after `write_stall_timeout_nanos`
     // (D124), never at once.
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     std::thread::spawn(move || {
-        let sim = SimVfs::new(72);
-        let vfs: VfsRef = Arc::new(FailReadsVfs::real(&sim, None));
-        let (writer, reader_process) = (
-            ProcessId {
-                pid: 1,
-                start_time: 1,
-            },
-            ProcessId {
-                pid: 2,
-                start_time: 1,
-            },
-        );
-        sim.enter_process(writer);
-        let timeout = std::time::Duration::from_millis(200);
-        let mut o = small_arena(Arc::clone(&vfs));
-        o.write_stall_timeout_nanos = timeout.as_nanos() as u64;
-        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
-        let t = engine
-            .create_table("t", &[("f".into(), FamilyOptions::default())])
-            .unwrap();
-        for i in 0..8 {
-            commit_frozen(&engine, &mut shards, &*vfs, &t, i).unwrap();
-        }
-        sim.enter_process(reader_process);
-        let reader = Engine::open_reader(Path::new(DB), small_arena(Arc::clone(&vfs))).unwrap();
-        let pin = reader.snapshot().unwrap();
-        sim.enter_process(writer);
-        let mut i = 8;
-        loop {
-            assert!(i < 2_000, "never stalled: {:?}", engine.metrics());
-            let started = std::time::Instant::now();
-            match commit_frozen(&engine, &mut shards, &*vfs, &t, i) {
-                Ok(()) => i += 1,
-                Err(Error::Busy) => {
-                    let waited = started.elapsed();
-                    assert!(
-                        waited >= timeout,
-                        "refused after {waited:?}, before the timeout"
-                    );
-                    break;
-                }
-                Err(e) => panic!("commit {i}: {e}"),
+        // The worker reports its errors on the channel (#596): a panic here would only show as
+        // the main thread's timeout, with the error lost.
+        let run = || -> Result<u32, String> {
+            let sim = SimVfs::new(72);
+            let vfs: VfsRef = Arc::new(FailReadsVfs::real(&sim, None));
+            let (writer, reader_process) = (
+                ProcessId {
+                    pid: 1,
+                    start_time: 1,
+                },
+                ProcessId {
+                    pid: 2,
+                    start_time: 1,
+                },
+            );
+            sim.enter_process(writer);
+            let timeout = std::time::Duration::from_millis(200);
+            let mut o = small_arena(Arc::clone(&vfs));
+            o.write_stall_timeout_nanos = timeout.as_nanos() as u64;
+            let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), o)
+                .map_err(|e| format!("open: {e}"))?;
+            let t = engine
+                .create_table("t", &[("f".into(), FamilyOptions::default())])
+                .map_err(|e| format!("create table: {e}"))?;
+            for i in 0..8 {
+                commit_frozen(&engine, &mut shards, &*vfs, &t, i)
+                    .map_err(|e| format!("commit {i}: {e}"))?;
             }
-        }
-        sim.enter_process(reader_process);
-        drop(pin);
-        reader.close().unwrap();
-        tx.send(i).unwrap();
+            sim.enter_process(reader_process);
+            let reader = Engine::open_reader(Path::new(DB), small_arena(Arc::clone(&vfs)))
+                .map_err(|e| format!("open the reader: {e}"))?;
+            // The writer is application-owned and driven only by this thread. A flush's root
+            // commit may have become durable after `commit_frozen` stopped driving, with its
+            // view published only on the shard's next turn: the reader's snapshot then waits
+            // (`Busy` after a second) for a writer nobody runs. A real writer keeps running, so
+            // drive it between attempts (#596: it failed only under load, which shifts when the
+            // root commit's completion lands).
+            let mut attempts = 0;
+            let pin = loop {
+                match reader.snapshot() {
+                    Ok(pin) => break pin,
+                    Err(Error::Busy) if attempts < 10 => {
+                        attempts += 1;
+                        sim.enter_process(writer);
+                        for _ in 0..1_000 {
+                            let now = vfs.monotonic_nanos();
+                            for s in shards.iter_mut() {
+                                s.run_once(now + 1_000);
+                            }
+                        }
+                        sim.enter_process(reader_process);
+                    }
+                    Err(e) => {
+                        return Err(format!("the reader's snapshot (attempt {attempts}): {e}"));
+                    }
+                }
+            };
+            sim.enter_process(writer);
+            let mut i = 8;
+            loop {
+                if i >= 2_000 {
+                    return Err(format!("never stalled: {:?}", engine.metrics()));
+                }
+                let started = std::time::Instant::now();
+                match commit_frozen(&engine, &mut shards, &*vfs, &t, i) {
+                    Ok(()) => i += 1,
+                    Err(Error::Busy) => {
+                        let waited = started.elapsed();
+                        if waited < timeout {
+                            return Err(format!("refused after {waited:?}, before the timeout"));
+                        }
+                        break;
+                    }
+                    Err(e) => return Err(format!("commit {i}: {e}")),
+                }
+            }
+            sim.enter_process(reader_process);
+            drop(pin);
+            reader
+                .close()
+                .map_err(|e| format!("close the reader: {e}"))?;
+            Ok(i)
+        };
+        let _ = tx.send(run());
     });
-    let rows = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .expect("a commit waiting for arena room never resolved");
+    let rows = match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => panic!("{e}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the worker panicked"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("a commit waiting for arena room never resolved")
+        }
+    };
     assert!(rows > 8);
 }
 
@@ -1596,9 +1652,7 @@ fn a_moving_clock_paces_a_deep_l0_with_the_token_bucket() {
         }
         tx.send(engine.metrics()).unwrap();
     });
-    let m = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .expect("the paced writer never finished");
+    let m = worker_result(&rx, "the paced writer never finished");
     assert!(m.stalls.0 > 0 && m.stalls.1 > 0, "{m:?}");
 }
 
@@ -1673,9 +1727,7 @@ fn close_returns_after_a_room_wait_a_flush_ended_on_a_frozen_clock() {
         }
         tx.send(i).unwrap();
     });
-    let rows = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .expect("close never finished after a room wait (issue #88)");
+    let rows = worker_result(&rx, "close never finished after a room wait (issue #88)");
     assert!(rows > 0);
 }
 
