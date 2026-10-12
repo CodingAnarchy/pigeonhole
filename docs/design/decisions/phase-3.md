@@ -193,6 +193,7 @@ The two write shapes pay for the index's bookkeeping:
   - the wal crash sweep with deferred I/O, crashing inside the window over recycled slots (closest stale epoch two below the held one): no acknowledged commit is lost, and no early frame replays;
   - a process-kill sweep inside the window, for Buffered;
   - a mutation check: acknowledging Buffered records under a held header loses commits.
+- **Visibility (D227):** a group with a record under a held header is also not visible until a sync resolves it (which writes the header first). Visibility no longer waits for a group's sync, so without this a process crash could remove what readers saw.
 
 <a id="d201"></a>
 ## D201 — The row cache: per-row write watermarks as epochs, latest reads of the newest version only, gets consult without filling (approved; coordinator, 2026-10-10; cache, engine, pigeonhole, #404; plan approved, measurement decides the default)
@@ -933,6 +934,34 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - The p99.9 hardly moves with the in-flight count: it comes from syncs and flush and compaction steps, not from queueing.
 
 **Work toward the judged row.** The first finding is a lost wake in `ShardDriver::wait` (#567). A commit that resolves during the driver's own `run_once` wakes the driver by setting the same flag the scheduler's `collect_woken` then clears, so the driver's next `wait` sleeps until the next I/O completion or its timeout. Its fix and the remaining attribution (the global watermark, D19; the group-sync wait, D207) are tracked separately and recorded here when they land.
+
+<a id="d227"></a>
+## D227 — A commit is visible once applied, not once durable; durable snapshots keep the old view (owner decision, 2026-10-12; engine, shm, docs, #406; amends D19)
+
+**Decided:**
+- **Visibility.** A shard publishes a group's seqnos once the group's WAL records are handed to the OS (`write()`) and the group is applied to the memtables, without waiting for the group's sync. The snapshot watermark is, per shard, the minimum of:
+  - the cross-shard seqnos it coordinates that are not yet applied everywhere (`held`, unchanged);
+  - its reserved but not yet applied seqnos;
+  - any group with a record under a held segment header (D200), until a sync resolves it.
+- **Acknowledgement is unchanged.** A commit returns only once it is durable at its level and visible (D19), so read-your-writes holds after the call returns.
+- **Cross-shard commits are unchanged.** One becomes visible only after its COMMIT meets the requested level and every participant has applied it.
+- **`Buffered` and `None`** become visible at apply, like every level (they already did).
+- **Durable snapshots** (ICR 0037, a separate change): a snapshot or read option that sees a commit only once it is durable at its level on its shard. It is backed by a second published watermark per shard, a shared-memory layout version bump. It keeps D19's strict view for readers that need it.
+- **The D226 row** (group commit p99 < 200 µs) is judged on the default, this decision.
+
+**Consequences users must know** (the durability guide's "Visibility and durability" section has the examples):
+- **Readers can see data a power loss removes,** at every level. That includes readers in other processes. A process crash alone does not remove it: the records are already in the OS.
+- **No global prefix across shards** (D84). After a power loss, a later commit on one shard can survive while an earlier one on another shard, which readers saw (and a later write may have been derived from), is lost. On each shard, what survives is still a prefix of what readers saw.
+- **Backups** copy what is visible at their snapshot, so they can hold commits the source then loses. A durable snapshot avoids it.
+- **Seqnos and default timestamps** that readers saw can be reissued after a power loss: they are assigned in memory, before the sync. For example, a change consumer that stored "up to seqno 1042" from other clients' commits skips a new commit 1042 after the restart. Seqnos and timestamps of acknowledged commits are durable and never reused.
+
+**Why.** The global watermark (D19) made every commit wait for every other shard's in-flight sync. On the reference machine at 16 shards × 16 commits in flight (D226), 56% of commits waited for it, with a p99 of about 200 µs of the bench's ~245 µs p99. RocksDB with `sync=false` and SQLite with `synchronous=NORMAL` expose unsynced commits to readers the same way. Pigeonhole keeps the stronger guarantee for the committer: a `GroupSync` commit has returned only once durable. The owner accepted the cross-shard anomaly at the default level and added the durable-snapshot opt-in for readers that need the old view. The design is `.coord/design-a1-visibility-at-apply.md`. The audit of what relied on "visible implies durable" is `.coord/audit-a1-visible-durable.md`.
+
+**What still holds it up:** the flush's sync barrier (D115). It is now what keeps a flush from persisting a record into an SST ahead of its own stream's sync. Freezing (D117), the flush and compaction guards (D191, D192), checkpoints (D24, D116, D225) and the row cache (D201) rely only on "visible means applied", which still holds.
+
+**Checked by:**
+- `model_check`'s new case `reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant`: deferred I/O, reads while commits are in flight (`Config::flight_read_ppm`), and power losses inside commits at 12%. Acknowledged commits survive at their level, and reads match the model.
+- The checker now applies acknowledged commits to its model in seqno order. A commit is acknowledged at its own durability, so a later seqno's shard may acknowledge first.
 
 <a id="d229"></a>
 ## D229 — `wal_pin_bytes` stays at twice the memtable budget (owner decision, 2026-10-12; engine, bench, #527)

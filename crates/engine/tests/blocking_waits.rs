@@ -49,6 +49,21 @@ fn put(t: &TableInfo, row: &str) -> WriteBatch {
     wb
 }
 
+/// A cross-shard batch: a row of `first` (whose shard coordinates it), then one of `second`.
+fn cross(first: &TableInfo, second: &TableInfo, row: &str) -> WriteBatch {
+    let mut wb = put(first, row);
+    wb.put(
+        second.id,
+        second.families[0].id,
+        row.as_bytes(),
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    wb
+}
+
 fn table(db: &Engine, name: &str) -> Arc<TableInfo> {
     db.create_table(name, &[("f".into(), FamilyOptions::default())])
         .unwrap()
@@ -279,9 +294,11 @@ fn tables_on_0_and_1(db: &Engine) -> (Arc<TableInfo>, Arc<TableInfo>) {
     }
 }
 
-/// A commit waiting for visibility behind shard 1's in-flight group ends with `Closed`
-/// when shard 1 dies (its `EngineShard` is dropped mid-group), instead of parking for ever,
-/// and the close then ends (unclean) instead of waiting on the dead shard.
+/// A commit waiting for visibility behind a cross-shard commit shard 1 coordinates (its
+/// seqno held until every participant applied, which waits on shard 1's held sync) ends with
+/// `Closed` when shard 1 dies (its `EngineShard` is dropped mid-commit), instead of parking
+/// for ever, and the close then ends (unclean) instead of waiting on the dead shard. A
+/// single-shard group no longer holds visibility while its sync runs (D227).
 #[test]
 fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     let (vfs, gate) = gate::vfs(1358);
@@ -302,7 +319,7 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     let (on_a, on_b) = tables.join().unwrap();
     gate.hold(&wal(1));
     drop(
-        db.submit(put(&on_b, "held"), Some(Durability::Sync))
+        db.submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
             .unwrap(),
     );
     while gate.held().is_empty() {
@@ -319,9 +336,9 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
         "visible while shard 1 held the watermark"
     );
     // Dropping the shard syncs its stream, and that sync waits for every older sync of the
-    // stream to finish (#179), the held group sync included: release it from another
-    // thread once the drop is under way, as the I/O backend would complete it. Shard 1
-    // never runs again, so its group stays unresolved and keeps the watermark down.
+    // stream to finish (#179), the held sync included: release it from another thread once
+    // the drop is under way, as the I/O backend would complete it. Shard 1 never runs
+    // again, so the cross-shard commit stays held and keeps the watermark down.
     let releaser = {
         let gate = Arc::clone(&gate);
         thread::spawn(move || {
@@ -503,10 +520,10 @@ fn a_panicked_shard_thread_does_not_hang_close() {
 }
 
 /// Shard 1 is poisoned while its `Sync` group is unresolved (the group's sync fails). A
-/// commit on shard 0 waiting for visibility behind that group does not park for ever: the
-/// failed sync resolves the group (its members get the poison error) and releases the
-/// watermark, so the waiter sees its own commit. A cross-shard commit that then reaches
-/// the poisoned participant fails without pinning the watermark either.
+/// commit on shard 0 does not wait behind that group at all: the group is applied, so it
+/// holds no visibility while its sync runs (D227). The failed sync then resolves the group
+/// (its members get the poison error). A cross-shard commit that then reaches the
+/// poisoned participant fails without pinning the watermark either.
 #[test]
 fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     let (vfs, gate) = gate::vfs(1359);
@@ -523,16 +540,13 @@ fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     thread::spawn(move || {
         let _ = tx.send(db2.commit(put(&on_a2, "waits"), Some(Durability::None)));
     });
-    assert!(
-        rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "visible while shard 1's group was unresolved"
-    );
+    // D227: shard 1's group, applied with its sync held, holds back no other shard's
+    // commits: the commit on shard 0 is visible and returns meanwhile.
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("a commit on shard 0 waited behind shard 1's unsynced group")
+        .unwrap();
     // The held sync completes with its (injected) failure: shard 1 is poisoned.
     gate.release();
-    let waited = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the visibility wait outlived the poisoned shard's group");
-    waited.unwrap();
     let doomed = gate::within(10, move || doomed.wait()).expect("the poisoned commit hung");
     assert!(matches!(doomed, Err(Error::Io(_))), "{doomed:?}");
 

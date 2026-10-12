@@ -1,0 +1,5 @@
+### Changed
+- **A commit is visible to readers once applied, not once durable (D227, amends D19).** A shard publishes a group's seqnos once its WAL records are handed to the OS and it is applied, without waiting for the group's fsync. A commit's own call still returns only once it is durable at its level and visible, and cross-shard commits are unchanged. Readers, reader processes and backups can therefore see `GroupSync` and `Sync` commits that a power loss then removes. Across shards, a later commit can survive an earlier one it was derived from. A seqno or default timestamp a reader saw can be handed out again after a power loss. The durability guide's "Visibility and durability" section has examples. A durable snapshot for readers that need the old view follows (ICR 0037).
+
+### Fixed
+- A close no longer hangs when a shard died while coordinating a cross-shard commit: a participant stops waiting for that share's decision. The close is unclean, and the next open decides the share from its COMMIT record.

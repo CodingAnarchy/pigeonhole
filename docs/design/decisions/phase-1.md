@@ -83,8 +83,10 @@ The spec makes `async` a default-on feature. In Phase 1 it gates only an empty p
 The spec allows "a ribbon (or blocked bloom) filter". Blocked bloom is simpler and fast enough for Phase 1; the filter block's kind byte leaves room for ribbon later without a format break.
 
 <a id="d19"></a>
-## D19 — read-your-writes: commits return once visible (approved; revised after review)
+## D19 — read-your-writes: commits return once visible (approved; revised after review; amended by D227)
 A shard publishes a group's seqnos only after the group's WAL write meets the strongest level any member requested, and a commit returns only once it is durable at its level **and** `visible_seqno >= seqno`, so a caller always reads its own write. Idle shards publish `pending = u64::MAX` and never hold back the watermark. Cost: a cross-shard commit becomes visible only after every participant applies, so its latency includes the slowest participant's group, and any shard's in-flight group briefly delays visibility for all. A reader can still observe a `Buffered` or `None` commit that a later power loss removes; that is inherent in those levels.
+
+*Amended by D227 (2026-10-12): a shard publishes a group's seqnos once the group is applied, not once its WAL write meets the level, so readers can see a commit before it is durable. The commit's own return (durable at its level and visible) is unchanged.*
 
 <a id="d20"></a>
 ## D20 — a changed shard count flushes recovered data before dropping streams (approved)
@@ -409,6 +411,8 @@ Single-shard commits keep D42's prefix promise within their shard's stream. A cr
 ## D85 — a failed WAL sync after a group was applied leaves its data visible (approved; engine)
 The group's members are told the commit failed and the stream is poisoned (wal contract), but entries already applied to memtables stay readable until restart, like `Durability::None` data. Documented on `Engine::commit` next to `Durability::None`.
 
+*Since D227, data is visible from apply, before its sync, so readers can see a group before its sync fails, not only after.*
+
 <a id="d86"></a>
 ## D86 — default timestamps use a per-shard floor seeded at replay (approved; engine)
 Each shard's default-timestamp floor (D11) is seeded from every replayed commit timestamp at open and persisted in `Counters`. Per-tablet floors arrive with tablet moves (#38).
@@ -640,6 +644,8 @@ fjall (2.x and 3.x) depends on `varint-rs` (0BSD) and `xxhash-rust` (BSL-1.0). B
 The spec says a flush "must not persist a share of a cross-shard commit until every PREPARE and the COMMIT are durable" but does not say how the flush learns that. Checking per commit (which shards hold shares, whether their records are past each stream's durable LSN) needs cross-shard state the flush task does not have.
 
 **Decision:** before committing its manifest edit, a flush task sends a `SyncBarrier` to its own shard always (so an earlier commit of the same stream is never lost while a later one survives in an SST) and to every shard when any flushed memtable holds a share of a cross-shard commit (`MemEntry::has_shares`). Each barrier is one `submit_sync` of that stream; the task waits for all replies. This over-syncs (every stream, not just the participants') but needs no bookkeeping; a flush is rare compared with commits. Confirmed in review; syncing only the participants' streams is a Phase 3 optimization (issue #64).
+
+*Since D227, a flush's frozen memtables can hold records whose group sync is still in flight. This barrier is what keeps a flush from persisting them into an SST ahead of their stream's sync.*
 
 <a id="d116"></a>
 ## D116 — When may a shard checkpoint a PREPARE or COMMIT record? (approved; engine Milestone B)

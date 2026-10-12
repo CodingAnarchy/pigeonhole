@@ -1128,6 +1128,11 @@ struct Group {
     /// Lowest seqno the group reserved (its watermark), if any.
     first: Option<Seqno>,
     members: Vec<Member>,
+    /// Some record of the group is past what the stream has written where a crash
+    /// recovers it ([`pigeonhole_wal::Wal::written`]): its segment's header still waits for
+    /// the previous rollover's sync (#19, D200). Such a group holds the watermark until it
+    /// resolves; any other group is visible once applied (D227).
+    unwritten: bool,
 }
 
 /// A cross-shard commit this shard coordinates.
@@ -3421,11 +3426,17 @@ impl ShardState {
 
     // ---- watermarks and timestamps ----
 
+    /// The lowest seqno this shard holds back from readers: a cross-shard commit it
+    /// coordinates that is not applied everywhere (`held`), or a group whose records are not
+    /// yet where a crash recovers them (`Group::unwritten`). A group waiting only for its
+    /// sync does not hold it: a commit is visible once written and applied, and its future
+    /// still resolves only when its durability is met (D227, amending D19).
     fn watermark(&self) -> Seqno {
         let held = self.held.first().copied().unwrap_or(u64::MAX);
         let groups = self
             .unresolved
             .iter()
+            .filter(|g| g.unwritten)
             .filter_map(|g| g.first)
             .min()
             .unwrap_or(u64::MAX);
@@ -4239,6 +4250,7 @@ impl ShardState {
             id: self.next_group,
             first,
             members: admitted,
+            unwritten: false,
         };
         self.next_group += 1;
         let mut need_group_sync = false;
@@ -4252,6 +4264,8 @@ impl ShardState {
         // The end of the last Buffered record: `write` may not cover it while a segment
         // header is held back (#19).
         let mut buffered_end: Option<Lsn> = None;
+        // The end of the group's last written record (any level but `None`), for D227.
+        let mut group_end: Option<Lsn> = None;
         for m in &mut group.members {
             if m.failed.is_some() {
                 continue;
@@ -4324,6 +4338,7 @@ impl ShardState {
                     if m.durability != Durability::None {
                         appended = true;
                         unsynced = true;
+                        group_end = Some(group_end.map_or(t.end, |e| e.max(t.end)));
                     }
                 }
                 Err(pigeonhole_wal::Error::RecordTooLarge) => {
@@ -4367,6 +4382,10 @@ impl ShardState {
                 self.fail_all(group.members, ctx);
                 return;
             }
+            // Visible once applied (D227), unless a record is not yet where a crash
+            // recovers it: then the group stays hidden until a sync resolves it, which
+            // writes the held header first (D200).
+            group.unwritten = group_end.is_some_and(|end| end > wal.written());
             // A Buffered ticket `write` did not cover: its record is in a segment whose
             // header still waits for the previous rollover's sync (#19). Resolve the group
             // through a sync then, which writes that header first.
@@ -6857,9 +6876,14 @@ impl ShardState {
                 );
             }
         }
+        // A share prepared for a coordinator that died is never decided here: the close is
+        // unclean, the PREPARE stays in the WAL, and the next open decides it by its COMMIT
+        // (D83, D116). Waiting for it would hang the close (found by D227's tests, whose
+        // visibility pin is now such a commit).
+        let died = self.shared.shard_died.load(Ordering::Acquire);
         if !self.unresolved.is_empty()
             || !self.coord.is_empty()
-            || !self.prepared.is_empty()
+            || (!self.prepared.is_empty() && !died)
             || !self.pending.is_empty()
             || self.op.is_some()
             || !self.parked.is_empty()
@@ -6900,8 +6924,9 @@ impl ShardState {
             self.flush_failed = true;
             self.shared.fail_close();
             // Give up on flushing: the WAL keeps everything, the next open replays it, and
-            // the close is reported unclean. A dead shard (issue #135) pins the global
-            // watermark, so a deferred freeze would wait for it for ever.
+            // the close is reported unclean. A dead shard (issue #135) can pin the global
+            // watermark (a cross-shard commit it holds, or a group under a held segment
+            // header, D227), so a deferred freeze could wait for it for ever.
             self.close_stage = CloseStage::Checkpointing;
             self.checkpoint_inflight = false;
         }

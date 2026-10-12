@@ -302,6 +302,11 @@ pub struct Config {
     /// Per-op probability (ppm) of requesting a random tablet split, merge or move; it runs
     /// while the workload goes on (interleaved with commits, two-phase commits and crashes).
     pub tablet_ops_ppm: u32,
+    /// Per poll (ppm) while commits are in flight: read a cell an acknowledged commit wrote
+    /// and no in-flight commit touches, and compare it with the model (D227: commits are
+    /// visible once applied, before they are durable, so reads run beside them). 0 draws
+    /// nothing, so other suites' seeds run as before.
+    pub flight_read_ppm: u32,
     /// Run the balancer every few operations with tiny thresholds, so splits, moves and
     /// merges also happen on their own.
     pub balance_fast: bool,
@@ -357,6 +362,7 @@ impl Config {
             compact_ppm: 15_000,
             tablet_changes: tablets_env.as_deref() != Some("0"),
             tablet_ops_ppm: 0,
+            flight_read_ppm: 0,
             balance_fast: tablets_env.as_deref() == Some("1"),
             tablet_every: None,
             deferred_io: std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1"),
@@ -383,6 +389,8 @@ pub struct Stats {
     pub cas_refused: usize,
     pub conflicts: usize,
     pub io_errors: usize,
+    /// Reads run while commits were in flight (`Config::flight_read_ppm`, D227).
+    pub flight_reads: usize,
     pub crashes: usize,
     pub mid_commit_crashes: usize,
     /// Armed power losses that fired on background I/O and surfaced as a later step's error.
@@ -1243,6 +1251,8 @@ struct World {
     engine_seqnos: Vec<Seqno>,
     /// Every commit since the last recovery, by engine seqno.
     history: BTreeMap<Seqno, Committed>,
+    /// Acknowledged commits not yet applied to the model (`poll_in_flight`, D227).
+    acked_pending: Vec<(Seqno, InFlight, Option<pigeonhole_engine::CommitInfo>)>,
     /// Commits that returned an error (or were in flight at a crash): maybe landed.
     unacked: Vec<Committed>,
     /// Attempts the engine refused (a false predicate, a conflict, a full arena): a
@@ -1319,6 +1329,7 @@ impl World {
             model,
             engine_seqnos: Vec::new(),
             history: BTreeMap::new(),
+            acked_pending: Vec::new(),
             unacked: Vec::new(),
             aborted: Vec::new(),
             settled_seqnos: BTreeSet::new(),
@@ -2029,6 +2040,8 @@ impl World {
         already: bool,
         rng: &mut Rng,
     ) -> Result<(), Fail> {
+        // Commits the client already saw acknowledged count, whatever is still in flight.
+        self.stash_acked();
         self.stats.crashes += 1;
         if self.trace_on() {
             eprintln!("crash {kind:?} already={already}");
@@ -3064,6 +3077,227 @@ impl World {
         }
     }
 
+    /// Applies the acknowledged commits waiting in `acked_pending` to the model, in seqno
+    /// order (see `poll_in_flight`).
+    fn apply_acked(&mut self) -> Result<(), Fail> {
+        let mut successes = std::mem::take(&mut self.acked_pending);
+        successes.sort_by_key(|(s, ..)| *s);
+        let mut logged: Option<BTreeMap<Seqno, Timestamp>> = None;
+        for (seqno, inf, info) in successes {
+            let info = info.expect("successes carry info");
+            let mut c = inf.commit;
+            if self.engine_seqnos.last().is_some_and(|l| *l >= seqno) {
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "engine seqno {seqno} is not above the previous {:?}",
+                        self.engine_seqnos.last()
+                    ),
+                );
+            }
+            if info.durability != c.durability {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("durability {:?} != {:?}", info.durability, c.durability),
+                );
+            }
+            // The commit timestamp: the clock when the commit ran alone, else the record's.
+            let ts = if c.durability == Durability::None {
+                // Never logged: it ran alone with the clock past every timestamp floor.
+                let now = c.commit_ts.expect("alone commits know their timestamp");
+                if self.cfg.tablet_changes {
+                    // A commit a moving tablet refused (`Moved`) or parked runs again later,
+                    // above every floor its participants reached meanwhile (a retry keeps
+                    // its first timestamp only when strictly above them): read it from the
+                    // entries, which must never be older than the clock it ran at. Entries a
+                    // compaction already dropped leave the clock, as without tablet changes.
+                    match self.raw_commit_ts(seqno, &c.ops).unwrap_or(0) {
+                        0 => now,
+                        ts if ts >= now => ts,
+                        ts => {
+                            return fail(
+                                FailureClass::Protocol,
+                                format!("commit {seqno} at ts {ts}, below the clock {now}"),
+                            );
+                        }
+                    }
+                } else {
+                    now
+                }
+            } else {
+                if logged.is_none() {
+                    logged = Some(self.logged_timestamps()?);
+                }
+                match logged.as_ref().and_then(|m| m.get(&seqno)) {
+                    Some(ts) => *ts,
+                    // Flushed and checkpointed before the client looked: the engine's
+                    // append record says, else the entries.
+                    None => self.checkpointed_commit_ts(seqno, &c.ops)?,
+                }
+            };
+            if let Kind::Txn { snapshot, reads } = &c.kind {
+                // Validation must have seen every commit between the snapshot and this one.
+                if let Some(bad) = self.history.values().find(|h| {
+                    h.seqno.is_some_and(|s| s > *snapshot && s < seqno)
+                        && reads.iter().any(|(t, r, f)| h.touches(t, r, f))
+                }) {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!(
+                            "transaction {seqno} committed although commit {:?} touched its reads after snapshot {snapshot}",
+                            bad.seqno
+                        ),
+                    );
+                }
+            }
+            // Compactions whose inputs ended below this commit come before it.
+            self.drain_compactions_upto(seqno - 1)?;
+            let m = match self.model.try_commit(&c.ops, ts, c.durability) {
+                Ok(m) => m,
+                Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
+            };
+            if m != self.engine_seqnos.len() as Seqno + 1 {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("model seqno {m} out of step"),
+                );
+            }
+            self.engine_seqnos.push(seqno);
+            c.seqno = Some(seqno);
+            c.commit_ts = Some(ts);
+            c.acked = true;
+            self.stats.commits += 1;
+            self.note_separations(large_puts(&c.ops));
+            if c.shards.len() > 1 {
+                self.stats.cross_shard += 1;
+            }
+            self.drain_appended();
+            self.check_fresh_seqno(seqno)?;
+            self.history.insert(seqno, c);
+        }
+        Ok(())
+    }
+
+    /// Before a crash: the acknowledged commits not yet applied to the model go into the
+    /// history as acknowledged, without reading the (crashed) engine. Recovery rebuilds the
+    /// model from the history and checks each of them survived. A logged commit's timestamp
+    /// is its record's (the append hook), a `None` commit's the clock it ran at.
+    fn stash_acked(&mut self) {
+        if self.acked_pending.is_empty() {
+            return;
+        }
+        self.drain_appended();
+        let mut pending = std::mem::take(&mut self.acked_pending);
+        pending.sort_by_key(|(s, ..)| *s);
+        // A cross-shard commit's records are no plain batch: the WAL files (still readable
+        // after a simulated crash, as recovery reads them) give its timestamp.
+        let mut logged: Option<BTreeMap<Seqno, Timestamp>> = None;
+        for (seqno, inf, _) in pending {
+            let mut c = inf.commit;
+            if c.durability != Durability::None {
+                let ts = match self.appended_ts.get(&seqno) {
+                    Some((_, ts)) => Some(*ts),
+                    None => {
+                        if logged.is_none() {
+                            logged = self.logged_timestamps().ok();
+                        }
+                        logged.as_ref().and_then(|m| m.get(&seqno).copied())
+                    }
+                };
+                if ts.is_some() {
+                    c.commit_ts = ts;
+                }
+            }
+            c.seqno = Some(seqno);
+            c.acked = true;
+            self.stats.commits += 1;
+            let at = self.engine_seqnos.partition_point(|s| *s < seqno);
+            self.engine_seqnos.insert(at, seqno);
+            self.history.insert(seqno, c);
+        }
+    }
+
+    /// A read while commits are in flight (D227): a cell an acknowledged commit put, which
+    /// no in-flight commit touches, read at a fresh snapshot. Its value is the model's at the
+    /// snapshot's acknowledged prefix, whatever in-flight commits the snapshot already
+    /// covers (they touch other cells), so the comparison is exact.
+    fn read_beside_flight(&mut self, rng: &mut Rng) -> Result<(), Fail> {
+        if self.history.is_empty() || self.store.is_none() || !self.alive() {
+            return Ok(());
+        }
+        let pick = rng.below(self.history.len() as u64) as usize;
+        let Some((table, row, family, qualifier)) = self.history.values().nth(pick).and_then(|c| {
+            c.ops.iter().find_map(|op| match op {
+                ModelOp::Put {
+                    table,
+                    row,
+                    family,
+                    qualifier,
+                    ..
+                } => Some((
+                    table.clone(),
+                    row.clone(),
+                    family.clone(),
+                    qualifier.clone(),
+                )),
+                _ => None,
+            })
+        }) else {
+            return Ok(());
+        };
+        if self
+            .in_flight
+            .iter()
+            .map(|i| &i.commit)
+            .chain(self.acked_pending.iter().map(|(_, i, _)| &i.commit))
+            .any(|c| c.touches(&table, &row, &family))
+        {
+            return Ok(());
+        }
+        let snap = match self.store().engine.snapshot() {
+            Ok(s) => s,
+            Err(_) if !self.alive() => return Ok(()),
+            Err(e) => return fail(FailureClass::Protocol, format!("snapshot: {e}")),
+        };
+        let ms = self.model_seqno(snap.seqno());
+        let now = self.now();
+        self.stats.flight_reads += 1;
+        self.trace.push(format!(
+            "flight read {}/{family}:{} @engine {} (model {ms}, {} in flight)",
+            text(&row),
+            text(&qualifier),
+            snap.seqno(),
+            self.in_flight.len()
+        ));
+        let got = self.store().get(&snap, &row, &family, &qualifier);
+        let want = self
+            .model
+            .try_get(&table, &row, &family, &qualifier, ms, now);
+        match (got, want) {
+            (Ok(g), Ok(w)) if g == w => Ok(()),
+            (Err(Error::Merge(_)), Err(pigeonhole_sim::ModelError::MergeFailed(_))) => Ok(()),
+            (Err(_), _) if !self.alive() => Ok(()),
+            (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 => {
+                self.stats.io_errors += 1;
+                self.trace.push(format!("  -> read I/O error ({e})"));
+                Ok(())
+            }
+            (g, w) => fail(
+                FailureClass::LiveReadMismatch,
+                format!(
+                    "read beside {} in-flight commits, {}/{family}:{} at engine seqno {}: \
+                     engine {:?} vs model {:?}",
+                    self.in_flight.len(),
+                    text(&row),
+                    text(&qualifier),
+                    snap.seqno(),
+                    g.map(|c| c.as_ref().map(show_cell)),
+                    w.map(|c| c.as_ref().map(show_cell))
+                ),
+            ),
+        }
+    }
+
     /// Settles every in-flight commit that resolved. Returns whether the client may go on
     /// (nothing left in flight).
     fn poll_in_flight(&mut self, rng: &mut Rng) -> Result<bool, Fail> {
@@ -3204,99 +3438,12 @@ impl World {
                 self.faults_active = true;
             }
         }
-        successes.sort_by_key(|(s, ..)| *s);
-        let mut logged: Option<BTreeMap<Seqno, Timestamp>> = None;
-        for (seqno, inf, info) in successes {
-            let info = info.expect("successes carry info");
-            let mut c = inf.commit;
-            if self.engine_seqnos.last().is_some_and(|l| *l >= seqno) {
-                return fail(
-                    FailureClass::Protocol,
-                    format!(
-                        "engine seqno {seqno} is not above the previous {:?}",
-                        self.engine_seqnos.last()
-                    ),
-                );
-            }
-            if info.durability != c.durability {
-                return fail(
-                    FailureClass::Protocol,
-                    format!("durability {:?} != {:?}", info.durability, c.durability),
-                );
-            }
-            // The commit timestamp: the clock when the commit ran alone, else the record's.
-            let ts = if c.durability == Durability::None {
-                // Never logged: it ran alone with the clock past every timestamp floor.
-                let now = c.commit_ts.expect("alone commits know their timestamp");
-                if self.cfg.tablet_changes {
-                    // A commit a moving tablet refused (`Moved`) or parked runs again later,
-                    // above every floor its participants reached meanwhile (a retry keeps
-                    // its first timestamp only when strictly above them): read it from the
-                    // entries, which must never be older than the clock it ran at. Entries a
-                    // compaction already dropped leave the clock, as without tablet changes.
-                    match self.raw_commit_ts(seqno, &c.ops).unwrap_or(0) {
-                        0 => now,
-                        ts if ts >= now => ts,
-                        ts => {
-                            return fail(
-                                FailureClass::Protocol,
-                                format!("commit {seqno} at ts {ts}, below the clock {now}"),
-                            );
-                        }
-                    }
-                } else {
-                    now
-                }
-            } else {
-                if logged.is_none() {
-                    logged = Some(self.logged_timestamps()?);
-                }
-                match logged.as_ref().and_then(|m| m.get(&seqno)) {
-                    Some(ts) => *ts,
-                    // Flushed and checkpointed before the client looked: the engine's
-                    // append record says, else the entries.
-                    None => self.checkpointed_commit_ts(seqno, &c.ops)?,
-                }
-            };
-            if let Kind::Txn { snapshot, reads } = &c.kind {
-                // Validation must have seen every commit between the snapshot and this one.
-                if let Some(bad) = self.history.values().find(|h| {
-                    h.seqno.is_some_and(|s| s > *snapshot && s < seqno)
-                        && reads.iter().any(|(t, r, f)| h.touches(t, r, f))
-                }) {
-                    return fail(
-                        FailureClass::Protocol,
-                        format!(
-                            "transaction {seqno} committed although commit {:?} touched its reads after snapshot {snapshot}",
-                            bad.seqno
-                        ),
-                    );
-                }
-            }
-            // Compactions whose inputs ended below this commit come before it.
-            self.drain_compactions_upto(seqno - 1)?;
-            let m = match self.model.try_commit(&c.ops, ts, c.durability) {
-                Ok(m) => m,
-                Err(e) => return fail(FailureClass::Protocol, format!("model: {e}")),
-            };
-            if m != self.engine_seqnos.len() as Seqno + 1 {
-                return fail(
-                    FailureClass::Protocol,
-                    format!("model seqno {m} out of step"),
-                );
-            }
-            self.engine_seqnos.push(seqno);
-            c.seqno = Some(seqno);
-            c.commit_ts = Some(ts);
-            c.acked = true;
-            self.stats.commits += 1;
-            self.note_separations(large_puts(&c.ops));
-            if c.shards.len() > 1 {
-                self.stats.cross_shard += 1;
-            }
-            self.drain_appended();
-            self.check_fresh_seqno(seqno)?;
-            self.history.insert(seqno, c);
+        // Acknowledged, in any seqno order: a commit resolves at its own durability, and a
+        // later seqno's shard may sync first (D227). The model applies them in seqno order
+        // once nothing is in flight (or before a crash), when no lower seqno can still come.
+        self.acked_pending.extend(successes);
+        if self.in_flight.is_empty() {
+            self.apply_acked()?;
         }
         let drained = self.drain_compactions();
         if self.recover_if_fired(drained, rng)? {
@@ -4231,6 +4378,9 @@ fn run_with(
                         w.stats.io_in_flight_steps += 1;
                     }
                     if !w.poll_in_flight(rng)? {
+                        if w.cfg.flight_read_ppm > 0 && rng.chance(w.cfg.flight_read_ppm) {
+                            w.read_beside_flight(rng)?;
+                        }
                         return Ok(true);
                     }
                     let Some(op) = w.next_op() else {

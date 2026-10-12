@@ -673,3 +673,23 @@ fn a_read_after_a_background_fired_crash_recovers() {
         );
     }
 }
+
+#[test]
+fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant() {
+    // D227: a commit is visible once written and applied, before its sync returns. Reads
+    // run while commits are in flight (`flight_read_ppm`), with deferred I/O keeping syncs
+    // pending across steps, and power losses land inside commits more often. Acknowledged
+    // commits must survive at their level and reads must match the model; a commit readers
+    // may have seen but nobody was told committed may be lost.
+    let mut cfg = Config::standard(250);
+    cfg.shards = 3;
+    cfg.deferred_io = true;
+    cfg.flight_read_ppm = 300_000;
+    cfg.mid_commit_crash_ppm = 120_000;
+    let mut reads = 0;
+    for seed in seeds() {
+        let s = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+        reads += s.flight_reads;
+    }
+    assert!(reads > 0, "no read ran beside an in-flight commit");
+}

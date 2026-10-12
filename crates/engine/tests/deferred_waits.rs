@@ -315,6 +315,23 @@ fn put(t: &TableInfo, row: &str) -> WriteBatch {
     wb
 }
 
+/// The visibility pin (D227): a cross-shard batch with a row of `first` (whose shard
+/// coordinates it, holding its seqno until every participant applied) and one of `second`.
+/// A single-shard group no longer holds visibility while its sync is in flight.
+fn cross(first: &TableInfo, second: &TableInfo, row: &str) -> WriteBatch {
+    let mut wb = put(first, row);
+    wb.put(
+        second.id,
+        second.families[0].id,
+        row.as_bytes(),
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    wb
+}
+
 fn has(db: &Engine, t: &TableInfo, row: &str) -> bool {
     db.get_latest(t.id, t.families[0].id, row.as_bytes(), b"q")
         .unwrap()
@@ -505,10 +522,11 @@ fn commit_waits_park_until_their_sync_completes_and_the_driver_is_refused() {
         let mut rig = Rig::open(seed, 2);
         let (on_a, on_b) = rig.tables_on_0_and_1();
 
-        // Shard 1's group sync is in flight (it holds the global watermark too).
+        // Shard 1 coordinates a cross-shard commit whose sync is in flight: it holds the
+        // global watermark (D227: a single-shard group would not).
         let held = rig
             .db
-            .submit(put(&on_b, "held"), Some(Durability::Sync))
+            .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
             .unwrap();
         rig.run();
         assert!(
@@ -973,7 +991,7 @@ fn a_visibility_wait_ends_with_closed_when_the_shard_holding_it_dies_mid_io() {
         let (on_a, on_b) = rig.tables_on_0_and_1();
         drop(
             rig.db
-                .submit(put(&on_b, "held"), Some(Durability::Sync))
+                .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
                 .unwrap(),
         );
         rig.run();
@@ -1024,7 +1042,7 @@ fn a_visibility_wait_ends_when_the_database_closes_mid_io() {
         let (on_a, on_b) = rig.tables_on_0_and_1();
         drop(
             rig.db
-                .submit(put(&on_b, "held"), Some(Durability::Sync))
+                .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
                 .unwrap(),
         );
         rig.run();
