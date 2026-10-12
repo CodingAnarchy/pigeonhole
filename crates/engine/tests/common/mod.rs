@@ -4299,16 +4299,44 @@ fn run_with(
         }
     }
     w.stats.reads_at_older_views = w.reads_at_older_views.get();
-    let result = match w.failure.take() {
+    let mut result = match w.failure.take() {
         Some(f) => Err(f),
         None => Ok(w.stats),
     };
-    // Tear down: close, then drive the shards so they finish the close.
+    // Tear down: close, then drive the shards until every one has finished the close. A
+    // passing run must close: a close that never finishes (#585, #591: logs that can never
+    // be checkpointed empty) fails it.
     w.in_flight.clear();
     if let Some(mut store) = w.store.take() {
         let _ = store.engine.close();
-        for _ in 0..4 {
+        let mut steps = 0u32;
+        while store.shards.iter().any(|s| s.closed().is_none()) {
+            if steps == 200_000 {
+                if result.is_ok() {
+                    result = Err(Failure {
+                        seed,
+                        class: FailureClass::Protocol,
+                        op_index: w.op_index,
+                        message: format!(
+                            "the final close did not finish within {steps} shard steps; shards \
+                             closed: {:?}",
+                            store
+                                .shards
+                                .iter()
+                                .map(|s| s.closed().is_some())
+                                .collect::<Vec<_>>()
+                        ),
+                        trace: std::mem::take(&mut w.trace),
+                    });
+                }
+                break;
+            }
             store.step_shards(vfs.monotonic_nanos());
+            // Timers (a flush retry's backoff, a checkpoint's) wait on the simulated clock.
+            if steps % 64 == 63 {
+                vfs.advance(1_000_000);
+            }
+            steps += 1;
         }
     }
     result
