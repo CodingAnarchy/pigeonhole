@@ -1753,6 +1753,10 @@ impl ShardState {
             .filter(|(i, l)| *i != me && open(*i) && (**l as f64) < mean)
             .map(|(i, l)| (*l, i))
             .collect();
+        if targets.is_empty() {
+            // Every shard below the mean is claimed by another skew change (D223).
+            return None;
+        }
         targets.sort_unstable();
         let parts = ((my as f64 / mean.max(1.0)).round() as usize).clamp(2, targets.len() + 1);
         let mut owners = vec![self.id];

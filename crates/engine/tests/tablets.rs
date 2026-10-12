@@ -531,6 +531,39 @@ fn skewed_shards_never_shed_into_the_same_cold_shard_at_once() {
     }
 }
 
+/// Three skewed shards with one tablet each and a single cold shard: the first splits into
+/// the cold shard and claims it, and the others, finding every shard below the mean claimed,
+/// wait for a later pass instead of splitting with nowhere to go (D223).
+#[test]
+fn skewed_shards_wait_when_every_cold_shard_is_claimed() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    let n = 4;
+    tablets_on(&mut db, n, |t| t as u16);
+    let rows = |t: usize| if t == 3 { 2 } else { 40 };
+    let mut written = 0;
+    let before = tablet_changes(&db.engine);
+    let mut passes = 0;
+    while tablet_changes(&db.engine) == before && passes < 100 {
+        write_and_balance(&mut db, n, rows, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    assert_eq!(
+        (after.0 - before.0, after.2 - before.2),
+        (1, 0),
+        "one split into the cold shard after {passes} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// A burst of skew shorter than the persistence (10 passes, D214) moves and splits nothing:
 /// before D214 one skewed pass split the hot shard's tablet over the others.
 #[test]
