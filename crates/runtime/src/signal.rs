@@ -35,6 +35,11 @@ pub(crate) enum WakeTarget {
 pub(crate) struct Signal {
     sleeping: AtomicBool,
     task_woken: AtomicBool,
+    /// An application wake ([`ShardDriver::waker`](crate::ShardDriver::waker)) not yet seen
+    /// by [`Signal::sleep_unless`]. Apart from `task_woken`, which the scheduler clears as it
+    /// collects woken tasks: a wake that arrives during a turn (a commit the driver's own
+    /// shard resolved) must still end the driver's next wait (#592).
+    app_woken: AtomicBool,
     target: Mutex<WakeTarget>,
     /// Times the consumer's engine-owned thread parked idle (ICR 0027).
     parks: AtomicU64,
@@ -58,6 +63,7 @@ impl Signal {
         Self {
             sleeping: AtomicBool::new(false),
             task_woken: AtomicBool::new(false),
+            app_woken: AtomicBool::new(false),
             target: Mutex::new(WakeTarget::None),
             parks: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
@@ -84,6 +90,13 @@ impl Signal {
         self.notify();
     }
 
+    /// Records an application wake (`ShardDriver::waker`), then notifies: the consumer's next
+    /// [`Signal::sleep_unless`] returns at once if it is not asleep already (#592).
+    pub(crate) fn notify_app(&self) {
+        self.app_woken.store(true, Ordering::Release);
+        self.notify();
+    }
+
     /// Wakes the consumer whether or not it announced sleep (shutdown).
     pub(crate) fn force_wake(&self) {
         self.sleeping.store(false, Ordering::Relaxed);
@@ -98,23 +111,30 @@ impl Signal {
     }
 
     /// Consumer side, for a thread that sleeps on its own terms (`ShardDriver::wait`,
-    /// #553): announces sleep, re-checks with `has_work` and `task_woken`, and calls `sleep`
-    /// only if neither found anything. A producer that publishes work after the announcement
-    /// sees the consumer asleep and wakes its target, which must end `sleep`. Returns
-    /// whether it slept.
+    /// #553): announces sleep, re-checks with `has_work`, `task_woken` and the application
+    /// wake (which it clears), and calls `sleep` only if none found anything. A producer that
+    /// publishes work after the announcement sees the consumer asleep and wakes its target,
+    /// which must end `sleep`. Returns whether it slept.
     pub(crate) fn sleep_unless(
         &self,
         has_work: impl FnOnce() -> bool,
         sleep: impl FnOnce(),
     ) -> bool {
         self.prepare_sleep();
-        if has_work() || self.task_woken() {
+        if has_work() || self.task_woken() || self.take_app_woken() {
             self.awake();
             return false;
         }
         sleep();
         self.awake();
+        // The wake that ended the sleep is spent: the caller looks at everything next.
+        self.take_app_woken();
         true
+    }
+
+    /// Whether an application wake arrived since the last call (clears it).
+    fn take_app_woken(&self) -> bool {
+        self.app_woken.load(Ordering::Relaxed) && self.app_woken.swap(false, Ordering::Acquire)
     }
 
     /// Consumer side: back to work (producers need not wake us).
@@ -315,28 +335,38 @@ mod loom_tests {
     #[ignore = "loom 0.7.2 lets an RMW read past a store (tokio-rs/loom#254; `notify`'s swap): \
                 passes with tokio-rs/loom#391 patched in; un-ignore with #533"]
     fn loom_an_application_wait_is_never_slept_through() {
-        // `ShardDriver::wait` (#553): the application thread announces sleep, re-checks its
-        // queue and task wakes, then parks (`sleep_unless`). A submit and a `waker()` wake
-        // from other threads race it; neither leaves it parked for good. The park is untimed
-        // here (a timeout would hide a lost wake).
+        // `ShardDriver::wait` (#553): the application thread looks at its commit, runs a
+        // turn (which collects woken background tasks, clearing their flag), then announces
+        // sleep, re-checks and parks (`sleep_unless`). A submit and a `waker()` wake for its
+        // commit, from other threads, race it; neither leaves it parked for good, including
+        // a wake that lands between its look and the turn's collection (#592: with the wake
+        // in `task_woken`, the turn cleared it and the wait slept through it). The park is
+        // untimed here (a timeout would hide a lost wake).
         model(|| {
             let (shard, parker) = Shard::new();
+            let resolved = std::sync::Arc::new(loom::sync::atomic::AtomicBool::new(false));
             let producer = {
                 let shard = std::sync::Arc::clone(&shard);
                 thread::spawn(move || shard.submit(1))
             };
             let waker = {
                 let shard = std::sync::Arc::clone(&shard);
-                thread::spawn(move || shard.signal.notify_task())
+                let resolved = std::sync::Arc::clone(&resolved);
+                thread::spawn(move || {
+                    resolved.store(true, std::sync::atomic::Ordering::Release);
+                    shard.signal.notify_app();
+                })
             };
-            let (mut handled, mut task) = (0, false);
+            let mut handled = 0;
             loop {
                 shard.signal.awake();
+                // Poll the commit, then run a turn: drain, and collect woken tasks.
+                let done = resolved.load(std::sync::atomic::Ordering::Acquire);
                 while shard.queue.lock().unwrap().pop_front().is_some() {
                     handled += 1;
                 }
-                task |= shard.signal.take_task_woken();
-                if handled == 1 && task {
+                shard.signal.take_task_woken();
+                if handled == 1 && done {
                     break;
                 }
                 shard
