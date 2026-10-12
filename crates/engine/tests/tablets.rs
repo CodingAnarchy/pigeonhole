@@ -495,8 +495,16 @@ fn a_skewed_shard_keeps_shedding_tablets_until_balanced() {
 /// One phase of a closed-loop load, as the scaling gate's driver runs it (D204): tablet `t`
 /// gets `demand[t]` new rows, each assigned at the start to the shard owning it, and every
 /// shard writes 20 of its rows per balancer pass until it is done, then idles until every
-/// shard is. Returns the passes the phase took.
-fn closed_loop_phase(db: &mut Db, demand: &[u64], written: &mut u64) -> usize {
+/// shard is. With `speedup`, a busy shard writes faster as the others finish, up to 1.6x (on
+/// a real machine a shard runs faster once the others stop competing for it). Returns the
+/// passes the phase took.
+fn closed_loop_phase(
+    db: &mut Db,
+    shards: usize,
+    demand: &[u64],
+    written: &mut u64,
+    speedup: bool,
+) -> usize {
     let ranges = db.ranges();
     let owner = |row: &[u8]| {
         ranges
@@ -507,7 +515,7 @@ fn closed_loop_phase(db: &mut Db, demand: &[u64], written: &mut u64) -> usize {
             .unwrap()
             .1
     };
-    let mut rows: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 4];
+    let mut rows: Vec<Vec<Vec<u8>>> = vec![Vec::new(); shards];
     for (t, d) in demand.iter().enumerate() {
         for _ in 0..*d {
             let row = tablet_row(t, *written);
@@ -517,8 +525,14 @@ fn closed_loop_phase(db: &mut Db, demand: &[u64], written: &mut u64) -> usize {
     }
     let mut passes = 0;
     while rows.iter().any(|r| !r.is_empty()) {
+        let busy = rows.iter().filter(|r| !r.is_empty()).count();
+        let rate = if speedup {
+            (20.0 * (shards as f64 / busy as f64).sqrt().min(1.6)) as usize
+        } else {
+            20
+        };
         for mine in &mut rows {
-            for row in mine.drain(..mine.len().min(20)) {
+            for row in mine.drain(..mine.len().min(rate)) {
                 db.put(&row, b"v");
             }
         }
@@ -550,7 +564,7 @@ fn a_closed_loop_load_settles_instead_of_churning_every_tail() {
     let mut changes = Vec::new();
     for _ in 0..12 {
         let before = tablet_changes(&db.engine);
-        closed_loop_phase(&mut db, &demand, &mut written);
+        closed_loop_phase(&mut db, shards, &demand, &mut written, false);
         let after = tablet_changes(&db.engine);
         changes.push(after.1 - before.1 + after.2 - before.2 + after.0 - before.0);
     }
@@ -582,6 +596,88 @@ fn a_closed_loop_load_settles_instead_of_churning_every_tail() {
         "rows per shard {per:?}, changes per phase {changes:?}"
     );
     assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A shard that speeds up for a while, its share of the work even, moves nothing (D228). On
+/// the reference machine a phase of the closed-loop driver ends a few shards at a time, and a
+/// shard still busy runs faster once others stop competing for the machine: its rate rose
+/// from 1.2x to 1.9x the mean over 1.6 s while the mean held, so D224's falling-mean rule did
+/// not see a tail, and the fast path shed its tablets in every phase. Here shard 0 writes
+/// 30 rows a pass against 19 for 16 passes of every 200 (1.5x the mean, the mean steady):
+/// its share over time is 1.04x, and its slow average stays under the stop ratio.
+#[test]
+fn a_shard_that_speeds_up_for_a_while_moves_nothing() {
+    let shards = 16;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    tablets_on(&mut db, shards, |t| t as u16);
+    let mut written = 0;
+    // Even writes first, so the slow averages settle.
+    for _ in 0..150 {
+        write_and_balance(&mut db, shards, |_| 20, &mut written);
+    }
+    let before = tablet_changes(&db.engine);
+    for pass in 0..1_000 {
+        let burst = pass % 200 >= 184;
+        write_and_balance(
+            &mut db,
+            shards,
+            |t| match (burst, t) {
+                (false, _) => 20,
+                (true, 0) => 30,
+                (true, _) => 19,
+            },
+            &mut written,
+        );
+    }
+    assert_eq!(tablet_changes(&db.engine), before);
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// An open-loop shift of a third more load onto one shard still moves a tablet within 4 s of
+/// balancer passes (D228): the fast path waits for the slow averages to agree, which a 1.33x
+/// shift reaches in under 3 s, against under 2 s before D228.
+#[test]
+fn an_open_loop_skew_shift_still_moves_a_tablet_within_seconds() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // Two tablets per shard, written evenly for a while (the slow averages settle).
+    let n = 8;
+    tablets_on(&mut db, n, |t| (t / 2) as u16);
+    let mut written = 0;
+    for _ in 0..150 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+    }
+    let before = tablet_changes(&db.engine);
+    // Writers move toward shard 0's range: 54 of 162 rows a pass, 1.33x the mean.
+    let mut passes = 0;
+    while tablet_changes(&db.engine) == before && passes < 100 {
+        write_and_balance(&mut db, n, |t| if t < 2 { 27 } else { 18 }, &mut written);
+        passes += 1;
+    }
+    assert_ne!(
+        tablet_changes(&db.engine),
+        before,
+        "no change after {passes} passes"
+    );
+    // 27 passes with D228 (16 without): within 4 s at the default interval.
+    assert!(
+        passes <= 40,
+        "moved after {passes} passes (4 s at the default interval)"
+    );
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
