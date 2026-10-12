@@ -48,7 +48,6 @@ mod watermark_waiters;
 mod write;
 
 pub use admission::Admit;
-pub use engine::AsyncSubmit;
 pub use engine::PendingMaintenance;
 pub use engine::{
     CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats, TableInfo,

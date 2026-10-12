@@ -61,12 +61,12 @@ use std::task::{Context, Poll};
 use pigeonhole_format::Durability;
 
 use crate::cell::RowBuf;
-use crate::write::{AsyncCommit, Submitted, SubmittedCheck, TicketState};
+use crate::write::{Submitted, SubmittedCheck, TicketState};
 use crate::{
     Cell, CommitInfo, CommitTicket, Condition, Error, Pigeonhole, Result, Row, RowMutation,
     Transaction, WriteBatch,
 };
-use pigeonhole_engine::{Admit, ScanCursor};
+use pigeonhole_engine::ScanCursor;
 
 /// An async commit, as a future: it submits when its shard has room and resolves when the
 /// commit meets its durability level and is visible (see the [module docs](self)). Dropped
@@ -80,40 +80,12 @@ pub struct CommitFuture {
 
 #[derive(Debug)]
 enum State {
-    /// Waiting for room on its shard before it submits (D210).
-    Waiting(Box<Waiting<Submitted>>),
-    /// Submitted, not resolved.
+    /// Submitted (or waiting for room, D210: the engine's pending commit submits once
+    /// admitted), not resolved.
     Pending(Submitted),
     /// Resolved without waiting (refused before submission, or a ticket already done);
     /// `None` once taken.
     Ready(Option<Result<CommitInfo>>),
-}
-
-/// A commit waiting for admission (D210): its place in its shard's queue and the
-/// submission to run once admitted.
-struct Waiting<S> {
-    admit: Admit,
-    submit: Option<Box<dyn FnOnce() -> Result<S> + Send>>,
-}
-
-impl<S> std::fmt::Debug for Waiting<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Waiting")
-            .field("admit", &self.admit)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<S> Waiting<S> {
-    /// Ready with the submission's result once admitted.
-    fn poll_submit(&mut self, cx: &mut Context<'_>) -> Poll<(Admit, Result<S>)> {
-        if self.admit.poll_admit(cx).is_pending() {
-            return Poll::Pending;
-        }
-        let submit = self.submit.take().expect("a waiting commit submits once");
-        let admit = std::mem::take(&mut self.admit);
-        Poll::Ready((admit, submit()))
-    }
 }
 
 impl CommitFuture {
@@ -125,30 +97,6 @@ impl CommitFuture {
             },
         }
     }
-
-    /// An async commit's submission as a future: submitted, or waiting for room (D210).
-    fn from_async(r: Result<AsyncCommit<Submitted>>) -> Self {
-        match r {
-            Ok(AsyncCommit::Submitted(s)) => Self::new(Ok(s)),
-            Ok(AsyncCommit::Wait(wait)) => {
-                let (admit, submit) = *wait;
-                Self {
-                    state: State::Waiting(Box::new(Waiting {
-                        admit,
-                        submit: Some(submit),
-                    })),
-                }
-            }
-            Err(e) => Self::new(Err(e)),
-        }
-    }
-
-    fn submitted(admit: Option<Admit>, submitted: Result<Submitted>) -> Self {
-        if let (Some(admit), Ok(s)) = (admit, &submitted) {
-            admit.attach(&s.pending);
-        }
-        Self::new(submitted)
-    }
 }
 
 impl Future for CommitFuture {
@@ -156,7 +104,6 @@ impl Future for CommitFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.state {
-            State::Waiting(_) => self.poll_waiting(cx),
             State::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
                 Poll::Ready(r) => {
                     let out = s.outcome(r);
@@ -172,23 +119,6 @@ impl Future for CommitFuture {
                 ))
             })),
         }
-    }
-}
-
-impl CommitFuture {
-    /// Polls a commit still waiting for room (D210): once admitted, it submits and goes on
-    /// as a submitted commit. Out of line: the uncommon state.
-    #[cold]
-    #[inline(never)]
-    fn poll_waiting(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<CommitInfo>> {
-        let State::Waiting(w) = &mut self.state else {
-            unreachable!("only called while waiting");
-        };
-        let Poll::Ready((admit, submitted)) = w.poll_submit(cx) else {
-            return Poll::Pending;
-        };
-        *self = Self::submitted(Some(admit), submitted);
-        self.poll(cx)
     }
 }
 
@@ -213,7 +143,7 @@ impl RowMutation<'_> {
     /// the commit back. **Dropped while it still waits for room, it writes nothing**, so
     /// `let _ = ...commit_async();` can lose the commit (see the [module docs](self)).
     pub fn commit_async(self) -> CommitFuture {
-        CommitFuture::from_async(self.submit_async())
+        CommitFuture::new(self.submit_async())
     }
 }
 
@@ -227,14 +157,7 @@ impl RowMutation<'_> {
     pub fn commit_if_async(self, condition: &Condition) -> CheckFuture {
         CheckFuture {
             state: match self.submit_if_async(condition) {
-                Ok(AsyncCommit::Submitted(s)) => CheckState::Pending(s),
-                Ok(AsyncCommit::Wait(wait)) => {
-                    let (admit, submit) = *wait;
-                    CheckState::Waiting(Box::new(Waiting {
-                        admit,
-                        submit: Some(submit),
-                    }))
-                }
+                Ok(s) => CheckState::Pending(s),
                 Err(e) => CheckState::Ready(Some(Err(e))),
             },
         }
@@ -258,7 +181,7 @@ impl WriteBatch {
     }
 
     fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
-        CommitFuture::from_async(self.submit_async(durability))
+        CommitFuture::new(self.submit_async(durability))
     }
 }
 
@@ -280,7 +203,7 @@ impl Transaction {
     }
 
     fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
-        CommitFuture::from_async(self.submit_async(durability))
+        CommitFuture::new(self.submit_async(durability))
     }
 }
 
@@ -295,39 +218,17 @@ pub struct CheckFuture {
 
 #[derive(Debug)]
 enum CheckState {
-    /// Waiting for room on its shard before it submits (D210).
-    Waiting(Box<Waiting<SubmittedCheck>>),
+    /// Submitted (or waiting for room, D210), not resolved.
     Pending(SubmittedCheck),
     /// Refused before submission; `None` once taken.
     Ready(Option<Result<Option<CommitInfo>>>),
-}
-
-impl CheckFuture {
-    fn submitted(admit: Option<Admit>, submitted: Result<SubmittedCheck>) -> Self {
-        if let (Some(admit), Ok(s)) = (admit, &submitted) {
-            admit.attach_check(&s.pending);
-        }
-        Self {
-            state: match submitted {
-                Ok(s) => CheckState::Pending(s),
-                Err(e) => CheckState::Ready(Some(Err(e))),
-            },
-        }
-    }
 }
 
 impl Future for CheckFuture {
     type Output = Result<Option<CommitInfo>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let CheckState::Waiting(w) = &mut self.state {
-            let Poll::Ready((admit, submitted)) = w.poll_submit(cx) else {
-                return Poll::Pending;
-            };
-            *self = Self::submitted(Some(admit), submitted);
-        }
         match &mut self.state {
-            CheckState::Waiting(_) => unreachable!("submitted above"),
             CheckState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
                 Poll::Ready(r) => {
                     let out = s.outcome(r);

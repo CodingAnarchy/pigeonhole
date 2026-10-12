@@ -346,7 +346,7 @@ impl Admit {
     /// Hands the charge to a submitted commit: returned when the shard resolves it.
     pub fn attach(mut self, pending: &PendingCommit) {
         if let Some((a, arg)) = self.take_charge() {
-            pending.waiter.on_settled(a, arg);
+            pending.sub.waiter.on_settled(a, arg);
         }
     }
 

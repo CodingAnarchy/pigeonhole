@@ -110,3 +110,53 @@ fn closing_admits_every_waiter_and_their_submissions_fail_closed() {
     drop(held);
     assert_eq!(db.admission_inflight(0), 0, "a dropped charge comes back");
 }
+
+#[test]
+fn a_waiting_async_submission_submits_itself_once_admitted() {
+    // Each async form handed back while its shard has no room is a pending commit that
+    // submits once admitted: when polled (a commit, a conditional commit, a transaction) or
+    // when waited on (a blocking wait).
+    let (db, t) = open(2203, 1_000);
+    // Larger than the bound: admitted alone, and nothing fits beside it.
+    let held = db.admit(&batch(&t, b"held", 1_000));
+    assert!(held.is_admitted());
+    let held_bytes = db.admission_inflight(0);
+    let durable = Some(Durability::Buffered);
+    let mut commit = Box::pin(db.submit_async(batch(&t, b"commit", 8), durable).unwrap());
+    let absent = pigeonhole_engine::Predicate::Absent {
+        family: t.families[0].id,
+        qualifier: b"q".to_vec(),
+    };
+    let mut check = Box::pin(
+        db.submit_check_and_mutate_async(t.id, b"check", &absent, batch(&t, b"check", 8), durable)
+            .unwrap(),
+    );
+    let mut txn = db.begin().unwrap();
+    txn.batch()
+        .put(
+            t.id,
+            t.families[0].id,
+            b"txn",
+            b"q",
+            None,
+            ValueRef::Bytes(b"v"),
+        )
+        .unwrap();
+    let mut txn = Box::pin(txn.submit_async(durable).unwrap());
+    let blocking = db.submit_async(batch(&t, b"blocking", 8), durable).unwrap();
+    // All four wait behind the held charge, and none has submitted.
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(commit.as_mut().poll(&mut cx).is_pending());
+    assert!(check.as_mut().poll(&mut cx).is_pending());
+    assert!(txn.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(db.admission_inflight(0), held_bytes, "only the held charge");
+    drop(held);
+    let committed = ready("the commit", |cx| commit.as_mut().poll(cx)).unwrap();
+    let (applied, info) = ready("the conditional commit", |cx| check.as_mut().poll(cx)).unwrap();
+    assert!(applied && info.is_some(), "the row was absent");
+    let txn_info = ready("the transaction", |cx| txn.as_mut().poll(cx)).unwrap();
+    let blocked = blocking.wait().unwrap();
+    assert!(committed.seqno > 0 && txn_info.seqno > 0 && blocked.seqno > 0);
+    assert_eq!(db.admission_inflight(0), 0, "every charge came back");
+    db.close().unwrap();
+}
