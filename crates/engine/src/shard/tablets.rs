@@ -46,6 +46,12 @@ const SKEW_PERSIST: u64 = 10;
 /// again.
 const SKEW_STOP: f64 = 0.4;
 
+/// Scratch diagnostics (#582 follow-up): `D224DBG=1` logs the balancer's state and decisions.
+fn dbg_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("D224DBG").is_some())
+}
+
 /// Weight of the newest pass in the slow moving average of the mean write load (D224).
 const MEAN_SLOW_ALPHA: f64 = 0.05;
 
@@ -1142,6 +1148,34 @@ impl ShardState {
             l.sampled = 0;
         }
         let decision_none = decision.is_none();
+        if dbg_on() {
+            let n = self.active_shards();
+            let stale = cfg.interval_nanos.saturating_mul(3).max(1);
+            let fast: Vec<u64> = self.shared.loads[..n]
+                .iter()
+                .map(|l| l.read_fresh(now, stale).unwrap_or(0))
+                .collect();
+            let slow = self.published_slow_loads(now).unwrap_or_default();
+            if self.id.0 == 0 {
+                eprintln!("LOADS t={} fast={fast:?} slow={slow:?}", now / 1_000_000);
+            }
+            eprintln!(
+                "PASS t={} s={} pass={} act={} run={} slowrun={} falling={} meanslow={:.0} tablets={} dec={}",
+                now / 1_000_000,
+                self.id.0,
+                self.balance_pass,
+                self.skew_active,
+                self.skew_run,
+                self.slow_run,
+                self.mean_falling,
+                self.mean_slow,
+                self.loads.len(),
+                match &decision {
+                    None => "-".to_string(),
+                    Some(d) => format!("{}{d:?}", if self.chose_slow.get() { "SLOW " } else { "" }),
+                }
+            );
+        }
         match decision {
             Some(kind) => {
                 trace!("shard {} balancer: {kind:?}", self.id.0);
@@ -1682,6 +1716,20 @@ impl ShardState {
                     self.published_loads(now),
                 )
             };
+            if slow && dbg_on() && self.slow_run >= SKEW_PERSIST {
+                let fast = self.shard_loads(now);
+                let n = self.active_shards();
+                let claimable: String = self.shared.loads[..n]
+                    .iter()
+                    .map(|l| if l.claimable(now) { '.' } else { 'C' })
+                    .collect();
+                eprintln!(
+                    "SLOWATT t={} s={} pass={} ready={ready} dwelling={dwelling} slow_dwelling={slow_dwelling} fast={fast:?} slow={loads:?} claimable={claimable}",
+                    now / 1_000_000,
+                    self.id.0,
+                    self.balance_pass
+                );
+            }
             let Some(writes) = loads.filter(|_| ready && !dwelling) else {
                 continue;
             };
@@ -1712,7 +1760,23 @@ impl ShardState {
             } else {
                 Self::skew_stop(cfg.skew)
             };
-            if let Some(op) = self.skew_op(&view, &settled, &writes, &tablet_writes, ratio, now)
+            let op = self.skew_op(&view, &settled, &writes, &tablet_writes, ratio, now);
+            if dbg_on() {
+                let mut tw: Vec<(u64, u64)> = tablet_writes
+                    .iter()
+                    .map(|(t, w)| (t.0 as u64, *w))
+                    .collect();
+                tw.sort_unstable();
+                eprintln!(
+                    "OP t={} s={} slow={slow} owned={} settled={} tablets={tw:?} op={op:?} splits_ok={}",
+                    now / 1_000_000,
+                    self.id.0,
+                    owned.len(),
+                    settled.len(),
+                    op.as_ref().is_some_and(&splits_ok)
+                );
+            }
+            if let Some(op) = op
                 && splits_ok(&op)
                 && self.claim_targets(&op, if slow { SLOW_DWELL } else { DWELL_PASSES }, now)
             {
