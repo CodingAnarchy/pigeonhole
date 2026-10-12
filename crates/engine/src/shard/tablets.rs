@@ -949,6 +949,23 @@ impl ShardState {
                 if self.drop_tablets(&moving).is_err() {
                     self.poisoned = true;
                 }
+                // The load that left takes its share of this shard's slow average with it
+                // (D224): otherwise the shard keeps reading the old skew for about 10 s and
+                // sheds again, while the receiver still reads cold.
+                let (tablet, away) = match &op.kind {
+                    TabletOpKind::Move { tablet, to } => {
+                        (*tablet, f64::from(u8::from(*to != self.id)))
+                    }
+                    TabletOpKind::Split { tablet, owners, .. } => (
+                        *tablet,
+                        owners.iter().filter(|o| **o != self.id).count() as f64
+                            / owners.len().max(1) as f64,
+                    ),
+                    TabletOpKind::Merge { left, .. } => (*left, 0.0),
+                };
+                if let Some(l) = self.loads.get(&tablet) {
+                    self.load_slow = (self.load_slow - away * l.slow).max(0.0);
+                }
                 for t in &moving {
                     self.loads.remove(t);
                 }
