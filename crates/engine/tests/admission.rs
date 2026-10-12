@@ -45,9 +45,9 @@ fn batch(t: &pigeonhole_engine::TableInfo, row: &[u8], len: usize) -> WriteBatch
     wb
 }
 
-/// Polls `admit` until it is admitted, with a real waker (the shards run on their own
-/// threads here).
-fn admitted(admit: &mut pigeonhole_engine::Admit) {
+/// Polls with `poll` until it is ready, with a real waker (the shards run on their own
+/// threads here), for at most about 100 s.
+fn ready<T>(what: &str, mut poll: impl FnMut(&mut Context<'_>) -> Poll<T>) -> T {
     struct Unpark(std::thread::Thread);
     impl std::task::Wake for Unpark {
         fn wake(self: std::sync::Arc<Self>) {
@@ -57,12 +57,12 @@ fn admitted(admit: &mut pigeonhole_engine::Admit) {
     let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
     let mut cx = Context::from_waker(&waker);
     for _ in 0..10_000 {
-        if admit.poll_admit(&mut cx).is_ready() {
-            return;
+        if let Poll::Ready(v) = poll(&mut cx) {
+            return v;
         }
         std::thread::park_timeout(std::time::Duration::from_millis(10));
     }
-    panic!("never admitted");
+    panic!("{what}: never ready");
 }
 
 #[test]
@@ -82,12 +82,11 @@ fn a_commit_larger_than_the_bound_goes_alone() {
     let pending = db.submit(big, Some(Durability::Buffered)).unwrap();
     admit.attach(&pending);
     let mut pending = Box::pin(pending);
-    admitted(&mut waiting);
-    // The big commit resolved (its charge came back) before the small one was admitted.
-    assert!(matches!(
-        Pin::new(&mut pending).poll(&mut cx),
-        Poll::Ready(Ok(_))
-    ));
+    ready("the small commit's admission", |cx| waiting.poll_admit(cx));
+    // The big commit's charge came back before the small one was admitted. Its future may
+    // still be pending for a moment: the shard returns the charge (`on_settled`) before it
+    // marks the commit done.
+    ready("the big commit", |cx| Pin::new(&mut pending).poll(cx)).unwrap();
     let pending = db.submit(small, Some(Durability::Buffered)).unwrap();
     waiting.attach(&pending);
     pending.wait().unwrap();
