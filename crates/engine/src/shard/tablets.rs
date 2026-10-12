@@ -1069,6 +1069,7 @@ impl ShardState {
             self.load_ewma.round() as u64,
             (self.busy_ewma * 1e6).round() as u64,
             now.max(1),
+            self.balance_pass,
         );
         self.track_pack(now);
         self.track_skew(now);
@@ -1599,6 +1600,7 @@ impl ShardState {
                 cfg.min_writes,
                 ratio,
             ) && splits_ok(&op)
+                && self.claim_targets(&op)
             {
                 return Some(op);
             }
@@ -1677,6 +1679,20 @@ impl ShardState {
         None
     }
 
+    /// Claims every shard a skew change hands load to (D223), for a dwell of their passes.
+    /// False if another change claimed one first: the change waits for a later pass.
+    fn claim_targets(&self, op: &TabletOpKind) -> bool {
+        let to: Vec<ShardId> = match op {
+            TabletOpKind::Move { to, .. } => vec![*to],
+            TabletOpKind::Split { owners, .. } => {
+                owners.iter().copied().filter(|o| *o != self.id).collect()
+            }
+            _ => Vec::new(),
+        };
+        to.iter()
+            .all(|s| self.shared.loads[usize::from(s.0)].claim(DWELL_PASSES))
+    }
+
     /// A move or split that evens out `loads` (per shard), given this shard's tablets'
     /// shares of it (`per_tablet`), when this shard is skewed past the threshold.
     fn skew_op(
@@ -1695,10 +1711,14 @@ impl ShardState {
         if my < min.max(1) || (my as f64) <= ratio * mean {
             return None;
         }
+        // A shard another skew change just handed load is not a target until its published
+        // load shows it (D223): shards balancing at once would otherwise all shed into the
+        // same cold shard.
+        let open = |i: usize| self.shared.loads[i].claimable();
         let (cold, low) = loads
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != me)
+            .filter(|(i, _)| *i != me && open(*i))
             .min_by_key(|(i, l)| (**l, *i))
             .map(|(i, l)| (i, *l))?;
         let gap = my - low;
@@ -1730,7 +1750,7 @@ impl ShardState {
         let mut targets: Vec<(u64, usize)> = loads
             .iter()
             .enumerate()
-            .filter(|(i, l)| *i != me && (**l as f64) < mean)
+            .filter(|(i, l)| *i != me && open(*i) && (**l as f64) < mean)
             .map(|(i, l)| (*l, i))
             .collect();
         targets.sort_unstable();

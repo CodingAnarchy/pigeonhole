@@ -492,6 +492,45 @@ fn a_skewed_shard_keeps_shedding_tablets_until_balanced() {
     }
 }
 
+/// Two skewed shards acting on the same pass never both shed into the same cold shard
+/// (D223): the first claims it, and the second picks the next coldest. Before, both moved a
+/// tablet to the coldest shard, which became the hottest.
+#[test]
+fn skewed_shards_never_shed_into_the_same_cold_shard_at_once() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // Shards 0 and 1 hold three written tablets each; shard 2 one barely written, shard 3 one
+    // written like the others.
+    let n = 8;
+    tablets_on(&mut db, n, |t| match t {
+        0..3 => 0,
+        3..6 => 1,
+        6 => 2,
+        _ => 3,
+    });
+    let rows = |t: usize| if t == 6 { 2 } else { 20 };
+    let mut written = 0;
+    let before = tablets_per_shard(&db, shards);
+    let mut passes = 0;
+    while tablets_per_shard(&db, shards) == before && passes < 100 {
+        write_and_balance(&mut db, n, rows, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        tablets_per_shard(&db, shards),
+        vec![2, 2, 2, 2],
+        "the first moves after {passes} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// A burst of skew shorter than the persistence (10 passes, D214) moves and splits nothing:
 /// before D214 one skewed pass split the hot shard's tablet over the others.
 #[test]
