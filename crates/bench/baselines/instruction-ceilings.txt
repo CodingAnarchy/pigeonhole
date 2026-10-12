@@ -108,20 +108,20 @@
 # commit-async (writepath, D210: an uncontended `commit_async`, awaited) added with #521 from
 # its head's counts in scratch A/B run 38115353068: 10017-10030 (main before D210: 9782-9787),
 # so 10030 times 1.003.
-as-written 2051 0.3
-flushed 1865 0.3
-compacted 1257 0.3
+as-written 2028 0.3
+flushed 1842 0.3
+compacted 1234 0.3
 get-mem 5666 0.3
 get-sst 17272 0.5
 get-miss 4165 0.3
 row 2475 1.0
-scan 1404 0.3
-scan-filtered 5846 0.3
+scan 1358 0.3
+scan-filtered 5776 0.3
 versions 5476 0.3
 counter 9388 0.5
 rows 19655 0.3
-level-scans 14439 0.6
-short-scans 13936 0.3
+level-scans 14015 0.6
+short-scans 13564 0.3
 commit-one 9763 0.3
 commit-sixteen 50577 0.3
 flush 2199 0.3
@@ -130,10 +130,10 @@ ycsb-c 43293 1.0
 ycsb-a 27326 1.0
 commit-overwrite 11840 0.5
 commit-at 10693 0.3
-scan-narrow 1435 0.3
-scan-small 1411 0.3
-scan-wide 1331 0.3
+scan-narrow 1398 0.3
+scan-small 1374 0.3
+scan-wide 1296 0.3
 commit-async 9848 0.3
-scan-narrow-q1 5297 0.3
-scan-wide-q10 1819 0.3
-scan-wide-q1 14271 0.3
+scan-narrow-q1 5251 0.3
+scan-wide-q10 1784 0.3
+scan-wide-q1 14224 0.3
