@@ -160,3 +160,11 @@ fn a_waiting_async_submission_submits_itself_once_admitted() {
     assert_eq!(db.admission_inflight(0), 0, "every charge came back");
     db.close().unwrap();
 }
+
+#[test]
+fn pending_commits_stay_send_and_sync() {
+    // Public types: a waiting state must not take an auto trait away (semver).
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<pigeonhole_engine::PendingCommit>();
+    send_sync::<pigeonhole_engine::PendingCheck>();
+}

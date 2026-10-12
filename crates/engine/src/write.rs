@@ -376,7 +376,7 @@ type CheckReply = crate::Result<(bool, Option<CommitInfo>)>;
 /// it, beside a placeholder waiter whose notifier this keeps unresolved.
 pub(crate) struct Deferred<P, R> {
     admit: crate::Admit,
-    submit: Box<dyn FnOnce() -> crate::Result<P> + Send>,
+    submit: Box<dyn FnOnce() -> crate::Result<P> + Send + Sync>,
     placeholder: Notifier<R>,
 }
 
@@ -392,7 +392,7 @@ impl<P, R: Send> Deferred<P, R> {
     /// A deferral and the placeholder waiter its pending commit holds until it submits.
     fn new(
         admit: crate::Admit,
-        submit: Box<dyn FnOnce() -> crate::Result<P> + Send>,
+        submit: Box<dyn FnOnce() -> crate::Result<P> + Send + Sync>,
     ) -> (Box<Self>, Waiter<R>) {
         let (placeholder, waiter) = completion();
         (
@@ -735,7 +735,7 @@ impl PendingCommit {
     pub(crate) fn waiting(
         shared: Arc<crate::shard::Shared>,
         admit: crate::Admit,
-        submit: Box<dyn FnOnce() -> crate::Result<PendingCommit> + Send>,
+        submit: Box<dyn FnOnce() -> crate::Result<PendingCommit> + Send + Sync>,
     ) -> Self {
         let (deferred, waiter) = Deferred::new(admit, submit);
         Self {
@@ -839,7 +839,7 @@ impl PendingCheck {
     pub(crate) fn waiting(
         shared: Arc<crate::shard::Shared>,
         admit: crate::Admit,
-        submit: Box<dyn FnOnce() -> crate::Result<PendingCheck> + Send>,
+        submit: Box<dyn FnOnce() -> crate::Result<PendingCheck> + Send + Sync>,
     ) -> Self {
         let (deferred, waiter) = Deferred::new(admit, submit);
         Self {
