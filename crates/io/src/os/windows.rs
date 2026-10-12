@@ -20,6 +20,9 @@ use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
+use windows_sys::Win32::System::SystemInformation::{
+    GetLogicalProcessorInformation, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, GetProcessAffinityMask,
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SetThreadAffinityMask,
@@ -415,6 +418,57 @@ pub(crate) fn current_start_time() -> u64 {
 
 pub(crate) fn available_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+pub(crate) fn physical_cores() -> Option<usize> {
+    let first_of_core = first_of_core()?;
+    Some(first_of_core.iter().filter(|&&first| first).count())
+}
+
+pub(crate) fn spread_cpu(i: usize) -> usize {
+    match first_of_core() {
+        Some(first_of_core) => super::spread(&first_of_core, i),
+        None => i % available_cpus().max(1),
+    }
+}
+
+/// For each CPU in the process affinity mask (in bit order), whether it is the lowest of
+/// its physical core's CPUs in the mask. `None` if Windows does not say. Covers the
+/// process's processor group, as `pin_current_thread` does.
+fn first_of_core() -> Option<Vec<bool>> {
+    let (mut process_mask, mut system_mask) = (0usize, 0usize);
+    // SAFETY: the current-process pseudo-handle and two valid out pointers.
+    if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask) }
+        == 0
+    {
+        return None;
+    }
+    let mut len = 0u32;
+    // SAFETY: a null buffer of length 0 asks for the length needed.
+    unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len) };
+    let size = std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>();
+    let mut info =
+        vec![SYSTEM_LOGICAL_PROCESSOR_INFORMATION::default(); (len as usize).div_ceil(size)];
+    // SAFETY: `info` holds at least `len` bytes, and `len` says so.
+    if unsafe { GetLogicalProcessorInformation(info.as_mut_ptr(), &mut len) } == 0 {
+        return None;
+    }
+    info.truncate(len as usize / size);
+    let cores: Vec<usize> = info
+        .iter()
+        .filter(|i| i.Relationship == RelationProcessorCore)
+        .map(|i| i.ProcessorMask & process_mask)
+        .filter(|&mask| mask != 0)
+        .collect();
+    if cores.is_empty() {
+        return None;
+    }
+    let first_of_core = (0..usize::BITS)
+        .map(|b| 1usize << b)
+        .filter(|bit| process_mask & bit != 0)
+        .map(|bit| cores.iter().any(|&mask| mask & mask.wrapping_neg() == bit))
+        .collect();
+    Some(first_of_core)
 }
 
 pub(crate) fn pin_current_thread(cpu: usize) -> Result<()> {

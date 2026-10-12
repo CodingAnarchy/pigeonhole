@@ -27,6 +27,8 @@ fjall = ["dep:fjall"]
 [dependencies]
 # Default features (async included): the instruction counts measure what users get.
 pigeonhole = { workspace = true }
+# The default shard count (D220), for the D213 and scaling runs and the report.
+pigeonhole-io = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rocksdb = { version = "0.25", default-features = false, optional = true }
@@ -40,7 +42,6 @@ workspace = true
 proptest = { workspace = true }
 # The `commitpath` example drives the engine's shards directly.
 pigeonhole-engine = { workspace = true }
-pigeonhole-io = { workspace = true }
 # The `coldscan` example counts what the scan readahead did.
 pigeonhole-sst = { workspace = true }
 

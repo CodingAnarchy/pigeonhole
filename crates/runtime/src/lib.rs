@@ -129,7 +129,7 @@ pub struct ShardId(pub u16);
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RuntimeConfig {
-    /// Number of shards (default: available CPUs).
+    /// Number of shards (default: one per physical core, D220).
     pub shards: usize,
     /// Pin shard threads to CPUs (engine-owned mode).
     pub pin_threads: bool,
@@ -152,10 +152,11 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Defaults: one shard per available CPU, pinned, no compaction threads, 500 µs slices.
+    /// Defaults: one shard per physical core (D220), pinned, no compaction threads, 500 µs
+    /// slices.
     pub fn new(vfs: VfsRef) -> Self {
         Self {
-            shards: pigeonhole_io::sys::available_cpus().max(1),
+            shards: pigeonhole_io::sys::default_shards(),
             pin_threads: true,
             compaction_threads: 0,
             time_slice: Duration::from_micros(500),
@@ -820,11 +821,11 @@ fn build<H: ShardHandler>(
     (submitters, cores)
 }
 
-/// Pins the calling thread to `cpu` (modulo the available CPUs). Platforms without affinity
-/// control (macOS) are best-effort: `Unsupported` is not an error.
+/// Pins the calling thread to the `cpu`-th CPU, spread one per physical core first (D220), so
+/// the default shards never share a core. Platforms without affinity control (macOS) are
+/// best-effort: `Unsupported` is not an error.
 fn pin(cpu: usize) -> std::io::Result<()> {
-    let cpus = pigeonhole_io::sys::available_cpus().max(1);
-    match pigeonhole_io::sys::pin_current_thread(cpu % cpus) {
+    match pigeonhole_io::sys::pin_current_thread(pigeonhole_io::sys::spread_cpu(cpu)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind == ErrorKind::Unsupported => Ok(()),
         Err(e) => Err(std::io::Error::other(e)),
@@ -870,9 +871,10 @@ impl<H: ShardHandler> fmt::Debug for Runtime<H> {
 impl<H: ShardHandler> Runtime<H> {
     /// Spawns one thread per handler (`handlers.len()` must equal `config.shards`).
     ///
-    /// Shard `i` is pinned to CPU `i` and compaction thread `j` to CPU `shards + j` (modulo
-    /// the available CPUs) when `config.pin_threads` is set; pinning is best-effort where the
-    /// OS has no affinity control (macOS).
+    /// Shard `i` is pinned to the `i`-th CPU and compaction thread `j` to the `shards + j`-th,
+    /// spread one per physical core before the SMT siblings and wrapping (D220), when
+    /// `config.pin_threads` is set; pinning is best-effort where the OS has no affinity
+    /// control (macOS).
     ///
     /// # Panics
     /// If `handlers.len() != config.shards` or the count is not in `1..=65536`.

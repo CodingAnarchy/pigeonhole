@@ -382,3 +382,36 @@ fn sys_topology() {
     let _ = pigeonhole_io::sys::numa_node_of(0);
     assert!(pigeonhole_io::sys::pin_current_thread(usize::MAX).is_err());
 }
+
+#[test]
+fn the_default_shard_count_is_one_per_physical_core() {
+    let cpus = pigeonhole_io::sys::available_cpus();
+    let cores = pigeonhole_io::sys::physical_cores();
+    // Every platform CI runs on reports its cores (D220).
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+        assert!(cores.is_some(), "no physical core count");
+    }
+    let shards = pigeonhole_io::sys::default_shards();
+    assert!(
+        (1..=cpus).contains(&shards),
+        "{shards} shards on {cpus} CPUs"
+    );
+    if let Some(cores) = cores {
+        assert_eq!(shards, cores.clamp(1, cpus));
+    }
+    // The first `shards` pinned threads get CPUs of their own, and each one pins.
+    let spread: Vec<usize> = (0..shards).map(pigeonhole_io::sys::spread_cpu).collect();
+    let mut distinct = spread.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), shards, "{spread:?}");
+    for cpu in spread {
+        match std::thread::spawn(move || pigeonhole_io::sys::pin_current_thread(cpu))
+            .join()
+            .unwrap()
+        {
+            Ok(()) => {}
+            Err(e) => assert_eq!(e.kind, ErrorKind::Unsupported, "cpu {cpu}: {e}"),
+        }
+    }
+}

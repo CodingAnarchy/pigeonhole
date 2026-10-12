@@ -101,7 +101,8 @@ impl Options {
         self
     }
 
-    /// Number of shard threads (default: CPUs available to the process). `1` is a valid
+    /// Number of shard threads (default: one per physical core the process may run on, D220;
+    /// SMT siblings count once, and a cgroup CPU quota still caps it). `1` is a valid
     /// single-threaded configuration.
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
@@ -125,9 +126,10 @@ impl Options {
     /// [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
     /// runs shards on your threads and ignores it.
     ///
-    /// Shard `i` goes to the `i`-th CPU (wrapping) of the set the opening thread may run on.
-    /// Turn it on only when this database owns those CPUs, typically one database per
-    /// process with `shards` equal to the CPUs it was given. Otherwise pinning stacks
+    /// Shard `i` goes to the first CPU of the `i`-th physical core in the set the opening
+    /// thread may run on, then to the cores' SMT siblings, wrapping (D220), so the default
+    /// shards never share a core. Turn it on only when this database owns those CPUs,
+    /// typically one database per process with the default shards. Otherwise pinning stacks
     /// threads on the same cores: two pinned databases in one process both put shard 0 on
     /// the first CPU, containers limited by a CPU quota (not a cpuset) all pin to the host's
     /// first CPUs, and an opener already pinned to one CPU puts every shard on it.
@@ -135,8 +137,8 @@ impl Options {
     /// ```
     /// use pigeonhole::Options;
     ///
-    /// // A dedicated host: one shard per CPU, each pinned.
-    /// let options = Options::default().shards(8).pin_threads(true);
+    /// // A dedicated host: one shard per physical core (the default), each pinned.
+    /// let options = Options::default().pin_threads(true);
     /// # let _ = options;
     /// ```
     pub fn pin_threads(mut self, yes: bool) -> Self {

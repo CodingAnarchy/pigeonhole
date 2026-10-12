@@ -649,7 +649,8 @@ impl Scaling {
 pub struct GroupCommit {
     /// Shards in the run.
     pub shards: usize,
-    /// Cores of the machine ([`Environment::cores`]).
+    /// Physical cores the run could use (the default shard count, D220); logical CPUs
+    /// ([`Environment::cores`]) in runs before D220.
     pub cores: usize,
     /// Cells committed per second, over every shard.
     pub cells_per_sec: f64,
