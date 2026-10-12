@@ -3657,6 +3657,14 @@ impl ShardState {
     /// per `(column, timestamp)` (decision D34). Records the slots written in
     /// `touched_slots`.
     fn apply(&mut self, bytes: &[u8], seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
+        // Nothing is applied once the close reported: no flush would persist it (a late
+        // cross-shard decision is left to the WAL, `on_decide`).
+        debug_assert_ne!(
+            self.close_stage,
+            CloseStage::Reported,
+            "shard {} applied {seqno} after its close reported",
+            self.id.0
+        );
         let batch = BatchRef::new(bytes)?;
         let dups = self.dedup.scan(batch, bytes, commit_ts);
         let threshold = self.shared.memtable_freeze_bytes as usize;
@@ -5643,6 +5651,7 @@ impl ShardState {
             "shard {} on_prepared {seqno} from {} {error:?}",
             self.id.0, from.0
         );
+        let gave_up = self.close_gave_up();
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
@@ -5666,6 +5675,12 @@ impl ShardState {
             return;
         }
         c.decided = true;
+        if gave_up && c.failed.is_none() {
+            // The close gave up (a shard died) or reported: decide abort, so a commit whose
+            // caller hears `Closed` from such a close is never committed (no COMMIT record is
+            // logged after the close stopped waiting for it).
+            c.failed = Some(Error::Closed);
+        }
         if c.failed.is_some() || c.moved {
             let shards = c.shards.clone();
             self.mark_aborted(seqno);
@@ -6913,13 +6928,18 @@ impl ShardState {
         // may never be decided or answered here: a share prepared for a dead coordinator, or
         // a commit this shard coordinates waiting on a dead participant's `Applied`. Their
         // records stay in the WAL and the next open decides them by their COMMIT (D83,
-        // D116); waiting would hang the close. A coordinated commit's caller is told `Closed`
-        // (its outcome is the WAL's), and its seqno stays held, so nothing of it becomes
-        // visible half applied. A decision arriving later is answered without applying
-        // (`on_decide`). Found by D227's tests, whose visibility pin is such a commit.
+        // D116); waiting would hang the close. A coordinated commit still undecided is
+        // decided abort now (a late `Prepared` finds it failed, `on_prepared`), and its
+        // caller is told `Closed`: such a `Closed` always means not committed. One already
+        // decided keeps its reply, which resolves as usual, or ends `Closed` when the
+        // shard reports without a participant's answer (its outcome is then the WAL's).
+        // Either way its seqno stays held, so nothing of it becomes visible half applied.
+        // A decision arriving later is answered without applying (`on_decide`). Found by
+        // D227's tests, whose visibility pin is such a commit.
         let died = self.shared.shard_died.load(Ordering::Acquire);
         if died {
-            for c in self.coord.values_mut() {
+            for c in self.coord.values_mut().filter(|c| !c.decided) {
+                c.failed.get_or_insert(Error::Closed);
                 if let Some(reply) = c.reply.take() {
                     reply.notify(Err(Error::Closed));
                 }

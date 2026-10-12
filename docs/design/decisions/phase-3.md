@@ -959,8 +959,22 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 
 **What still holds it up:** the flush's sync barrier (D115). It is now what keeps a flush from persisting a record into an SST ahead of its own stream's sync. Freezing (D117), the flush and compaction guards (D191, D192), checkpoints (D24, D116, D225) and the row cache (D201) rely only on "visible means applied", which still holds.
 
+**A close with a dead shard** (found by this decision's tests, whose visibility pin is a cross-shard commit). A shard that dies (a panic, or an application-owned shard dropped mid-close) used to leave the close waiting for ever on a cross-shard commit's other side. Now:
+- **No waiting on the dead side:** the close is unclean and stops waiting for undecided shares and for coordinated commits' answers. Their records stay in the WAL, and the next open decides each share by its COMMIT (D83, D116).
+- **Undecided commits abort:** a coordinated commit still undecided is decided abort, and a late `Prepared` finds it failed. Its caller gets `Closed`, which then always means *not committed*.
+- **Decided commits keep their reply:** one already decided resolves as usual. It ends with `Closed` only if a participant never answers, or if its coordinator itself died. Its outcome is then the WAL's (committed if its COMMIT was logged). `Error::Closed`'s docs say so.
+- **Late decisions apply nothing:** a decision reaching a participant after its close gave up is answered without applying.
+- **No half-visible commit:** the seqno stays held throughout.
+
 **Checked by:**
-- `model_check`'s new case `reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant`: deferred I/O, reads while commits are in flight (`Config::flight_read_ppm`), and power losses inside commits at 12%. Acknowledged commits survive at their level, and reads match the model.
+- `model_check`'s new case `reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant`:
+  - deferred I/O, 3 shards;
+  - reads of in-flight commits' own cells, which must show each commit whole or not at all;
+  - power losses inside commits at 12%;
+  - a process crash after some reads that saw a commit, which recovery must keep.
+  - It fails if the watermark ignores held cross-shard seqnos.
+- `held_header_visibility.rs`: a commit written under a held segment header is not visible until the header is written. It fails if such groups count as visible: a read, then a process crash, loses the commit.
+- `blocking_waits.rs`: the close with a dead coordinator, a dead participant, a late decision at a participant that reported (debug builds assert no shard applies after its close reported), and a late `Prepared` at a coordinator whose close gave up (aborted, and absent after reopen).
 - The checker now applies acknowledged commits to its model in seqno order. A commit is acknowledged at its own durability, so a later seqno's shard may acknowledge first.
 
 <a id="d229"></a>

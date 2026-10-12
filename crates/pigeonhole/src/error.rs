@@ -49,7 +49,10 @@ pub enum ErrorCode {
     InvalidArgument = 19,
     /// The feature is not available in this build.
     Unsupported = 20,
-    /// The database is closed.
+    /// The database is closed. A commit that fails with it while a close is under way
+    /// was not committed, except for a cross-shard commit when a shard died: if the shard
+    /// coordinating it died, or it was already decided and a participant never answered,
+    /// its outcome is the WAL's, and the next open settles it (decision D227).
     Closed = 21,
     /// Every reader slot in the shared-memory region is taken.
     NoReaderSlot = 22,

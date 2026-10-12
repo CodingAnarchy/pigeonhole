@@ -414,6 +414,195 @@ fn a_close_ends_when_a_participant_dies_before_it_applied() {
     assert!(matches!(waited, Err(Error::Closed)), "{waited:?}");
 }
 
+/// ctr274's late decision: a participant's close reports while a live coordinator's
+/// decision is still on its way (a third shard died, so the close stops waiting for
+/// undecided shares). The decision then arrives at a shard that reported: it must apply
+/// nothing (no memtable change and no flush after the report), answer so the coordinator's
+/// close ends, and leave the share to the next open, which decides it by its COMMIT.
+/// All three shards are driven by hand on this thread. Removing `on_decide`'s guard
+/// trips the debug assertion in the shard's apply.
+#[test]
+fn a_decision_after_a_participants_close_reported_is_not_applied() {
+    let (vfs, _gate) = gate::vfs(1360);
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let mut d = shards.pop().unwrap();
+    let mut p = shards.pop().unwrap();
+    let mut c = shards.pop().unwrap();
+    let db2 = Arc::clone(&db);
+    let tables = thread::spawn(move || {
+        let mut on = [None, None];
+        for i in 0.. {
+            let t = table(&db2, &format!("t{i}"));
+            match shard_of(&db2, &t) {
+                s @ 0..=1 if on[s as usize].is_none() => on[s as usize] = Some(t),
+                _ => {}
+            }
+            if on.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        on.map(Option::unwrap)
+    });
+    while !tables.is_finished() {
+        idle(&mut c);
+        idle(&mut p);
+        idle(&mut d);
+    }
+    let [on_c, on_p] = tables.join().unwrap();
+    // Shard 0 coordinates and sends shard 1 its share; shard 1 prepares and answers.
+    // Shard 0 does not run again until shard 1's close has reported.
+    let pending = db
+        .submit(cross(&on_c, &on_p, "late"), Some(Durability::GroupSync))
+        .unwrap();
+    idle(&mut c);
+    idle(&mut p);
+    drop(d);
+    let (tx, rx) = mpsc::channel();
+    let db2 = Arc::clone(&db);
+    thread::spawn(move || {
+        let _ = tx.send(db2.close());
+    });
+    // Shard 1's close runs to its report (a shard died, so the undecided share does not
+    // hold it).
+    for _ in 0..200 {
+        idle(&mut p);
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Now the coordinator decides (commit: shard 1 prepared before the close gave up) and
+    // shard 1 hears it after its report.
+    // Shard 1 must answer it without applying (debug builds assert that no shard applies
+    // after its close reported), or the coordinator's close never ends.
+    let started = std::time::Instant::now();
+    let closed = loop {
+        idle(&mut c);
+        idle(&mut p);
+        if let Ok(r) = rx.try_recv() {
+            break r;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the coordinator's close waited for the reported participant's answer"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(closed.is_err(), "a close with a dead shard reported Ok");
+    drop((c, p));
+    let _ = pending.wait();
+    drop(db);
+    let (db, shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let a = shards.into_iter().map(driver).collect::<Vec<_>>();
+    let (on_c, on_p) = (db.table(&on_c.name).unwrap(), db.table(&on_p.name).unwrap());
+    let snap = db.snapshot().unwrap();
+    for t in [&on_c, &on_p] {
+        assert!(
+            db.get(&snap, t.id, t.families[0].id, b"late", b"q")
+                .unwrap()
+                .is_some(),
+            "the decided commit is lost after reopen"
+        );
+    }
+    drop(snap);
+    db.close().unwrap();
+    for (_, h) in a {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// The coordinator's side: a participant's PREPARE answer reaches a coordinator whose close
+/// already gave up (a third shard died). It decides abort, so a cross-shard commit whose
+/// caller hears `Closed` from such a close is never committed, whatever the timing: no
+/// COMMIT record is logged after the close stopped waiting for it, and the next open
+/// finds neither share.
+#[test]
+fn a_prepare_answer_after_the_coordinators_close_gave_up_aborts() {
+    let (vfs, gate) = gate::vfs(1361);
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let mut d = shards.pop().unwrap();
+    let mut p = shards.pop().unwrap();
+    let mut c = shards.pop().unwrap();
+    let db2 = Arc::clone(&db);
+    let tables = thread::spawn(move || {
+        let mut on = [None, None];
+        for i in 0.. {
+            let t = table(&db2, &format!("t{i}"));
+            match shard_of(&db2, &t) {
+                s @ 0..=1 if on[s as usize].is_none() => on[s as usize] = Some(t),
+                _ => {}
+            }
+            if on.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        on.map(Option::unwrap)
+    });
+    while !tables.is_finished() {
+        idle(&mut c);
+        idle(&mut p);
+        idle(&mut d);
+    }
+    let [on_c, on_p] = tables.join().unwrap();
+    // Shard 0 coordinates and sends shard 1 its share, which shard 1 does not see yet.
+    let pending = db
+        .submit(cross(&on_c, &on_p, "late"), Some(Durability::GroupSync))
+        .unwrap();
+    idle(&mut c);
+    // Shard 2 dies and the close starts. Shard 0's close stays in its flush (the main
+    // file's syncs are held) while shard 1 prepares and answers late.
+    gate.hold(Path::new(DB));
+    drop(d);
+    let (tx, rx) = mpsc::channel();
+    let db2 = Arc::clone(&db);
+    thread::spawn(move || {
+        let _ = tx.send(db2.close());
+    });
+    for _ in 0..200 {
+        idle(&mut c);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let started = std::time::Instant::now();
+    let closed = loop {
+        idle(&mut p);
+        idle(&mut c);
+        if started.elapsed() > Duration::from_millis(300) {
+            gate.release();
+        }
+        if let Ok(r) = rx.try_recv() {
+            break r;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the close never ended"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(closed.is_err(), "a close with a dead shard reported Ok");
+    drop((c, p));
+    let waited = pending.wait();
+    assert!(matches!(waited, Err(Error::Closed)), "{waited:?}");
+    drop(db);
+    let (db, shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let a = shards.into_iter().map(driver).collect::<Vec<_>>();
+    let (on_c, on_p) = (db.table(&on_c.name).unwrap(), db.table(&on_p.name).unwrap());
+    let snap = db.snapshot().unwrap();
+    for t in [&on_c, &on_p] {
+        assert!(
+            db.get(&snap, t.id, t.families[0].id, b"late", b"q")
+                .unwrap()
+                .is_none(),
+            "a commit whose caller heard Closed was committed"
+        );
+    }
+    drop(snap);
+    db.close().unwrap();
+    for (_, h) in a {
+        h.join().unwrap().unwrap();
+    }
+}
+
 // ---- 3-4 3.1: the application-owned close ----
 
 /// The documented loop, with the close's root commits in flight across `run_once` calls:
