@@ -1711,8 +1711,16 @@ impl ShardState {
                     self.published_slow_loads(now),
                 )
             } else {
+                // Only while the slow averages agree too (D228): with many shards a phase's
+                // tail comes a few shards at a time, the mean falls too little to read as
+                // falling, and the busy shards look skewed beside the finished ones. Their slow
+                // loads follow their shares of the work, so only a real imbalance acts.
+                let slow_agrees = self.published_slow_loads(now).is_some_and(|slow| {
+                    let mean = slow.iter().sum::<u64>() as f64 / slow.len() as f64;
+                    slow[usize::from(self.id.0)] as f64 > Self::skew_stop(cfg.skew) * mean
+                });
                 (
-                    self.skew_active && !self.mean_falling,
+                    self.skew_active && !self.mean_falling && slow_agrees,
                     self.published_loads(now),
                 )
             };
