@@ -276,6 +276,7 @@ impl Runner for PigeonholeRunner {
                     splits: s.splits,
                     merges: s.merges,
                     moves: s.moves,
+                    busy_nanos: s.busy_nanos,
                 })
                 .collect()
         })

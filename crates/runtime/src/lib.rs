@@ -311,6 +311,15 @@ impl<M: Send + 'static> Submitter<M> {
         self.inbox.signal.idle_counts()
     }
 
+    /// Nanoseconds the target shard's engine-owned thread has spent in its work turns since
+    /// the runtime started (D217, ICR 0033): handling messages and running its tasks, not
+    /// spinning (D198) or parked. Its rise over an interval, divided by the interval, is how
+    /// busy the shard was. An application-owned shard's loop is the application's, so
+    /// nothing is counted. Relaxed: a reading taken during a turn lags it.
+    pub fn busy_nanos(&self) -> u64 {
+        self.inbox.signal.busy_nanos()
+    }
+
     /// Enqueues `msg`. Fails only after shutdown.
     pub fn submit(&self, msg: M) -> Result<()> {
         let inbox = &*self.inbox;
@@ -679,8 +688,12 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
             None => WakeTarget::Thread(thread::current()),
         });
     loop {
-        let deadline = core.vfs.monotonic_nanos().saturating_add(core.time_slice);
+        let start = core.vfs.monotonic_nanos();
+        let deadline = start.saturating_add(core.time_slice);
         let more = core.run_once(deadline);
+        // The turn's time, for the balancer's view of how busy this shard is (D217).
+        core.signal()
+            .add_busy(core.vfs.monotonic_nanos().saturating_sub(start));
         if core.inbox().is_closed() {
             core.finish();
             return core.handler;

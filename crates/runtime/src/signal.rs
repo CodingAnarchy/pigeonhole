@@ -40,6 +40,8 @@ pub(crate) struct Signal {
     parks: AtomicU64,
     /// Notifies that found the consumer announced asleep and woke it (ICR 0027).
     wakes: AtomicU64,
+    /// Nanoseconds the consumer's engine-owned thread spent in work turns (D217).
+    busy: AtomicU64,
 }
 
 impl fmt::Debug for Signal {
@@ -59,6 +61,7 @@ impl Signal {
             target: Mutex::new(WakeTarget::None),
             parks: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
+            busy: AtomicU64::new(0),
         }
     }
 
@@ -111,6 +114,17 @@ impl Signal {
             self.parks.load(Ordering::Relaxed),
             self.wakes.load(Ordering::Relaxed),
         )
+    }
+
+    /// Consumer side: adds a work turn's nanoseconds (engine-owned threads only; the one
+    /// writer is the shard's thread).
+    pub(crate) fn add_busy(&self, nanos: u64) {
+        self.busy.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Nanoseconds counted by [`Signal::add_busy`].
+    pub(crate) fn busy_nanos(&self) -> u64 {
+        self.busy.load(Ordering::Relaxed)
     }
 
     /// Whether some task was woken since the last call (clears the flag).
