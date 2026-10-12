@@ -826,3 +826,62 @@ fn futures_and_streams_are_send() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn the_documented_wait_loop_completes_durable_commits_without_spinning() {
+    // #553: one shard per thread, `run_once` until idle, the thread's own futures polled
+    // with `shard.waker()`, then `shard.wait`. On real files with the default backend (io_uring
+    // on Linux, D218) a durable commit leaves a sync in flight on this thread's ring: the
+    // wait must complete it without the application taking `io_fd`.
+    let dir = std::env::temp_dir().join(format!("phdb-wait-loop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (db, mut shards) = Pigeonhole::open_application_owned(
+        dir.join("w.phdb"),
+        Options::default()
+            .shards(1)
+            .memtable_budget(4 << 20)
+            .durability(Durability::GroupSync),
+    )
+    .unwrap();
+    let shard = &mut shards[0];
+    while shard.run_once(Duration::from_micros(200)) {}
+    let t = table(&db);
+    let waker = shard.waker();
+    let mut cx = Context::from_waker(&waker);
+    let started = std::time::Instant::now();
+    let (mut turns, mut done) = (0u32, 0u32);
+    for i in 0..20u32 {
+        let mut commit = t
+            .mutate(format!("r{i}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit_async();
+        loop {
+            while shard.run_once(Duration::from_micros(200)) {}
+            if let Poll::Ready(r) = Pin::new(&mut commit).poll(&mut cx) {
+                r.unwrap();
+                done += 1;
+                break;
+            }
+            turns += 1;
+            shard.wait(Duration::from_millis(100));
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the commits stalled"
+            );
+        }
+    }
+    assert_eq!(done, 20);
+    // A spinning loop takes thousands of turns per durable commit; waiting takes a few.
+    assert!(
+        turns < 20 * 50,
+        "{turns} turns for 20 commits: the loop spun"
+    );
+    assert_eq!(value(&t, b"r19").as_deref(), Some(&b"v"[..]));
+    drop(t);
+    db.close().unwrap();
+    while shard.closed().is_none() {
+        shard.run_once(Duration::from_micros(200));
+    }
+    drop(shards);
+    std::fs::remove_dir_all(&dir).ok();
+}

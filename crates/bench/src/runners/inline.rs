@@ -10,7 +10,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pigeonhole::nonblocking::CommitFuture;
@@ -35,125 +35,6 @@ const SETTLED: Duration = Duration::from_secs(2);
 
 /// How long a shard thread's turn may run before it polls its commits again.
 const TURN: Duration = Duration::from_micros(50);
-
-/// How a shard thread sleeps between turns, and how its commits' wakers and the shard's
-/// wakeup callback wake it.
-///
-/// With `IoBackend::Uring` a shard's I/O completes only when its thread runs it again, so
-/// the thread waits on the shard's completion fd ([`Shard::io_fd`], #408) and an eventfd the
-/// wakes signal, as an application's event loop would. Without the fd (taking it is the
-/// opt-in), `next_wakeup` is zero while any I/O is in flight and the thread could only spin:
-/// with commits always in flight (D213) every driver spun on its core, and the kernel's
-/// fsync workers queued behind them. Elsewhere (pread, other systems) it parks.
-struct Sleeper {
-    thread: std::thread::Thread,
-    /// Set by a wake, taken by the next [`Sleeper::idle`]: a wake that lands while the
-    /// thread runs its turn ends the next sleep at once.
-    pending: AtomicBool,
-    #[cfg(target_os = "linux")]
-    event: Option<std::os::fd::OwnedFd>,
-    /// The thread waits on `event` (its shard has a completion fd): only then do wakes write
-    /// it. Elsewhere (pread) it parks, and the write would be a wasted system call.
-    #[cfg(target_os = "linux")]
-    polls: AtomicBool,
-}
-
-impl Sleeper {
-    /// The calling thread's sleeper.
-    fn current() -> Arc<Self> {
-        Arc::new(Self {
-            thread: std::thread::current(),
-            pending: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
-            event: rustix::event::eventfd(
-                0,
-                rustix::event::EventfdFlags::NONBLOCK | rustix::event::EventfdFlags::CLOEXEC,
-            )
-            .ok(),
-            #[cfg(target_os = "linux")]
-            polls: AtomicBool::new(false),
-        })
-    }
-
-    /// Wakes the thread from another one (or marks a wake from its own turn).
-    fn wake(&self) {
-        self.pending.store(true, Ordering::SeqCst);
-        if std::thread::current().id() == self.thread.id() {
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(event) = &self.event
-            && self.polls.load(Ordering::SeqCst)
-        {
-            let _ = rustix::io::write(event, &1u64.to_ne_bytes());
-        }
-        self.thread.unpark();
-    }
-
-    /// Sleeps until a wake, the shard's I/O completion, its [`next_wakeup`](Shard::next_wakeup)
-    /// or `cap`, whichever comes first.
-    fn idle(&self, shard: &Shard, cap: Duration) {
-        // `io_fd` first: taking it is what stops `next_wakeup` reporting in-flight I/O as due
-        // now. `polls` is published before `pending` is checked (each side stores, then
-        // loads the other's flag, SeqCst), so a wake either lands before the check or sees
-        // `polls` and writes the eventfd.
-        #[cfg(target_os = "linux")]
-        let ring = self
-            .event
-            .as_ref()
-            .and_then(|event| shard.io_fd().map(|fd| (fd, event)));
-        #[cfg(target_os = "linux")]
-        if ring.is_some() && !self.polls.load(Ordering::Relaxed) {
-            self.polls.store(true, Ordering::SeqCst);
-        }
-        if self.pending.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        if let Some((fd, event)) = ring {
-            let wait = shard.next_wakeup().unwrap_or(cap).min(cap);
-            if !wait.is_zero() {
-                poll_ring(fd, event, wait);
-            }
-            return;
-        }
-        let wait = shard.next_wakeup().unwrap_or(cap).min(cap);
-        if !wait.is_zero() {
-            std::thread::park_timeout(wait);
-        }
-    }
-}
-
-/// Waits up to `wait` for the shard's completion fd `fd` or the wake eventfd `event` to turn
-/// readable, then resets `event`.
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn poll_ring(fd: i32, event: &std::os::fd::OwnedFd, wait: Duration) {
-    use rustix::event::{PollFd, PollFlags, Timespec};
-    // SAFETY: `fd` is this thread's completion fd from `Shard::io_fd`, owned by the thread's
-    // I/O ring, which lives as long as the thread; the borrow ends with this call.
-    let ring = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    let mut fds = [
-        PollFd::new(&ring, PollFlags::IN),
-        PollFd::new(event, PollFlags::IN),
-    ];
-    let timeout = Timespec {
-        tv_sec: i64::try_from(wait.as_secs()).unwrap_or(i64::MAX),
-        tv_nsec: wait.subsec_nanos().into(),
-    };
-    let _ = rustix::event::poll(&mut fds, Some(&timeout));
-    let mut count = [0u8; 8];
-    let _ = rustix::io::read(event, &mut count);
-}
-
-impl Wake for Sleeper {
-    fn wake(self: Arc<Self>) {
-        Sleeper::wake(&self);
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        Sleeper::wake(self);
-    }
-}
 
 /// One write of the stream: a row and its cells, in one family.
 struct Write {
@@ -218,10 +99,10 @@ fn pipeline(
     writes: &[&Write],
     in_flight: usize,
     shard: &mut Shard,
-    sleeper: &Arc<Sleeper>,
     mut hist: Option<&mut Histogram>,
 ) -> Result<(), String> {
-    let waker = Waker::from(Arc::clone(sleeper));
+    // A commit can resolve on another shard's thread: its wake must end this thread's wait.
+    let waker = shard.waker();
     let mut cx = Context::from_waker(&waker);
     let mut flight: VecDeque<(Instant, CommitFuture)> = VecDeque::with_capacity(in_flight);
     let mut next = writes.iter();
@@ -257,8 +138,8 @@ fn pipeline(
         }
         let more = shard.run_once(TURN);
         if !progressed && !more {
-            // Woken by a commit's completion or by the shard's wakeup callback.
-            sleeper.idle(shard, Duration::from_micros(200));
+            // Until a commit resolves, work arrives, or this thread's own I/O completes (#553).
+            shard.wait(Duration::from_micros(200));
         }
     }
 }
@@ -272,12 +153,9 @@ fn with_drivers<T>(shards: Vec<Shard>, f: impl FnOnce() -> T) -> (Vec<Shard>, T)
         .map(|mut shard| {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                let sleeper = Sleeper::current();
-                let me = Arc::clone(&sleeper);
-                shard.set_wakeup(Box::new(move || Sleeper::wake(&me)));
                 while !stop.load(Ordering::Acquire) {
                     if !shard.run_once(Duration::from_millis(1)) {
-                        sleeper.idle(&shard, Duration::from_micros(500));
+                        shard.wait(Duration::from_micros(500));
                     }
                 }
                 // Handed back to the caller's next phase: nothing of the shard's may stay on
@@ -324,24 +202,14 @@ fn phase(
                     .filter(|w| t.shard_of(&w.row).unwrap_or(0) == i)
                     .collect();
                 s.spawn(move || {
-                    let sleeper = Sleeper::current();
-                    let me = Arc::clone(&sleeper);
-                    shard.set_wakeup(Box::new(move || Sleeper::wake(&me)));
                     let mut hist = Histogram::new();
-                    let r = pipeline(
-                        t,
-                        &mine,
-                        in_flight,
-                        &mut shard,
-                        &sleeper,
-                        record.then_some(&mut hist),
-                    );
+                    let r = pipeline(t, &mine, in_flight, &mut shard, record.then_some(&mut hist));
                     done.fetch_add(1, Ordering::AcqRel);
-                    // Other threads' commits may still need this shard: serve them, parked
-                    // between turns until one arrives (the wakeup unparks this thread).
+                    // Other threads' commits may still need this shard: serve them, waiting
+                    // between turns until one arrives.
                     while done.load(Ordering::Acquire) < n {
                         if !shard.run_once(TURN) {
-                            sleeper.idle(&shard, Duration::from_micros(200));
+                            shard.wait(Duration::from_micros(200));
                         }
                     }
                     // The next phase drives it on another thread (#492).
@@ -520,72 +388,5 @@ impl PigeonholeRunner {
                 ..RunDetail::default()
             },
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pigeonhole::Options;
-
-    /// A one-shard application-owned store, driven on this thread until idle.
-    fn idle_shard(tag: &str) -> (Pigeonhole, Shard, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("phdb-bench-inline-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (db, mut shards) = Pigeonhole::open_application_owned(
-            dir.join("s.phdb"),
-            Options::default().shards(1).tablet_changes(false),
-        )
-        .unwrap();
-        let mut shard = shards.pop().unwrap();
-        while shard.run_once(TURN) {}
-        (db, shard, dir)
-    }
-
-    fn close(db: Pigeonhole, mut shard: Shard, dir: &Path) {
-        db.close().unwrap();
-        while shard.closed().is_none() {
-            shard.run_once(TURN);
-        }
-        shard.closed().unwrap().unwrap();
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn a_wake_during_the_turn_ends_the_next_sleep_at_once() {
-        let (db, shard, dir) = idle_shard("self");
-        let sleeper = Sleeper::current();
-        let started = Instant::now();
-        Sleeper::wake(&sleeper);
-        sleeper.idle(&shard, Duration::from_secs(30));
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
-        );
-        close(db, shard, &dir);
-    }
-
-    #[test]
-    fn a_wake_from_another_thread_ends_the_sleep() {
-        let (db, shard, dir) = idle_shard("other");
-        let sleeper = Sleeper::current();
-        let idle_for = shard.next_wakeup();
-        let waker = Arc::clone(&sleeper);
-        let woke = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            Sleeper::wake(&waker);
-        });
-        let started = Instant::now();
-        sleeper.idle(&shard, Duration::from_secs(30));
-        let slept = started.elapsed();
-        woke.join().unwrap();
-        // Nothing else is due for longer than the wake takes (a sleep cut short by the shard's
-        // own deadline would prove nothing).
-        if idle_for.is_none_or(|d| d >= Duration::from_secs(10)) {
-            assert!(slept < Duration::from_secs(5), "slept {slept:?}");
-        }
-        close(db, shard, &dir);
     }
 }

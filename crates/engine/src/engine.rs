@@ -3437,6 +3437,27 @@ impl EngineShard {
             .outcome(|r| r.as_ref().copied().map_err(Error::duplicate))
     }
 
+    /// Waits until this shard has work again (#553, ICR 0035): a commit or message arrives,
+    /// a [`waker`](EngineShard::waker) fires, the calling thread's own I/O completes, the
+    /// next background deadline passes, or `timeout` passes. Call it after
+    /// [`run_once`](EngineShard::run_once) returns `false`, on the thread that runs the
+    /// shard. It may return early: loop on `run_once`. It needs no completion fd: with
+    /// io_uring it waits in the thread's ring while its own I/O is in flight.
+    pub fn wait(&mut self, timeout: std::time::Duration) {
+        if let Some(d) = self.driver.as_mut() {
+            d.wait(timeout);
+        }
+    }
+
+    /// A waker that ends this shard's [`wait`](EngineShard::wait) from any thread, for
+    /// futures the driving thread polls itself (a commit's future, resolved on another
+    /// shard's thread).
+    pub fn waker(&self) -> std::task::Waker {
+        self.driver
+            .as_ref()
+            .map_or_else(|| std::task::Waker::noop().clone(), |d| d.waker())
+    }
+
     /// The earliest deadline (VFS `monotonic_nanos`) of background work sleeping on this
     /// shard (a write stall's refill, a wait for arena room's timeout, a failed compaction's
     /// backoff), or `None`. After [`run_once`](EngineShard::run_once) returns `false`, call

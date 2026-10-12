@@ -815,7 +815,6 @@ dependencies = [
  "proptest",
  "rocksdb",
  "rusqlite",
- "rustix",
  "serde",
  "serde_json",
 ]

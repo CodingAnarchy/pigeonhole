@@ -666,6 +666,38 @@ impl<H: ShardHandler> ShardCore<H> {
         false
     }
 
+    /// An application thread's wait between turns (`ShardDriver::wait`, #553): until work
+    /// arrives, a woken task, this thread's own I/O completing, the next background
+    /// deadline, or `timeout`. It waits in the thread's ring while its own I/O is in flight
+    /// (only a reap completes that), and parks otherwise.
+    fn wait(&mut self, timeout: Duration) {
+        let now = self.vfs.monotonic_nanos();
+        let wait = self.next_deadline().map_or(timeout, |d| {
+            Duration::from_nanos(d.saturating_sub(now)).min(timeout)
+        });
+        if wait.is_zero() {
+            return;
+        }
+        let ring = self.own_ring && pigeonhole_io::own_io_in_flight();
+        let signal = &self.submitters[usize::from(self.id.0)].inbox.signal;
+        let (stash, rx) = (&mut self.stash, &self.rx);
+        signal.sleep_unless(
+            || {
+                if stash.is_none() {
+                    *stash = rx.try_recv().ok();
+                }
+                stash.is_some()
+            },
+            || {
+                if ring {
+                    pigeonhole_io::reap_own_io(Some(wait));
+                } else {
+                    thread::park_timeout(wait);
+                }
+            },
+        );
+    }
+
     /// Shutdown: wait out in-flight submits, then handle everything queued.
     fn finish(&mut self) {
         self.inbox().gate.wait_drained();
@@ -914,6 +946,7 @@ impl<H: ShardHandler> Runtime<H> {
             .map(|core| ShardDriver {
                 _close: CloseOnDrop(core.submitters[usize::from(core.id.0)].clone()),
                 core,
+                wakes: Wakes::default(),
             })
             .collect())
     }
@@ -1035,6 +1068,52 @@ impl<H: ShardHandler> Drop for Runtime<H> {
 pub struct ShardDriver<H: ShardHandler> {
     core: ShardCore<H>,
     _close: CloseOnDrop<H::Msg>,
+    /// Who a wake reaches: the application's callback ([`ShardDriver::set_wakeup`]) and the
+    /// thread in [`ShardDriver::wait`].
+    wakes: Wakes,
+}
+
+/// What a wake of an application-owned shard calls, composed into one wake target.
+#[derive(Default)]
+struct Wakes {
+    callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The thread that last waited, and its ring's waker if it has a ring.
+    waiter: Option<(thread::Thread, Option<pigeonhole_io::OwnIoWaker>)>,
+}
+
+impl Wakes {
+    /// The wake target: the callback, then the waiting thread (its ring's waker and an
+    /// unpark: it waits in one or the other).
+    fn target(&self) -> WakeTarget {
+        let callback = self.callback.clone();
+        let waiter = self.waiter.clone();
+        match (callback, waiter) {
+            (None, None) => WakeTarget::None,
+            (Some(cb), None) => WakeTarget::Callback(cb),
+            (callback, Some((thread, ring))) => WakeTarget::Callback(Arc::new(move || {
+                if let Some(cb) = &callback {
+                    cb();
+                }
+                if let Some(ring) = &ring {
+                    ring.wake();
+                }
+                thread.unpark();
+            })),
+        }
+    }
+}
+
+/// Ends a [`ShardDriver::wait`] from any thread ([`ShardDriver::waker`]).
+struct WaitWaker(Arc<Signal>);
+
+impl std::task::Wake for WaitWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_task();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.notify_task();
+    }
 }
 
 /// Refuses further submits once the driver is gone (shut down or dropped).
@@ -1170,19 +1249,45 @@ impl<H: ShardHandler> ShardDriver<H> {
     /// work may have arrived before it was registered.
     pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(wake);
-        self.core
-            .signal()
-            .set_target(WakeTarget::Callback(Arc::clone(&wake)));
+        self.wakes.callback = Some(Arc::clone(&wake));
+        self.core.signal().set_target(self.wakes.target());
         // A submit that found the shard idle before the target existed woke nobody; a
         // spurious wake is harmless, a lost one is not.
         wake();
+    }
+
+    /// Waits until this shard has work again: a message arrives, a [`waker`](Self::waker)
+    /// fires, the calling thread's own I/O completes, the next background deadline
+    /// ([`next_deadline`](Self::next_deadline)) passes, or `timeout` passes (#553, ICR
+    /// 0035). Call it after [`run_once`](Self::run_once) returns `false`, on the thread
+    /// that runs the shard; a spurious return is possible, so loop on `run_once`. It needs no
+    /// completion fd: with io_uring it waits in the thread's ring while its own I/O is in
+    /// flight, and parks otherwise. It composes with [`set_wakeup`](Self::set_wakeup), whose
+    /// callback still fires. A thread that drives several shards from one loop waits in its
+    /// own event loop instead (the wakeup callbacks and the I/O completion fd).
+    pub fn wait(&mut self, timeout: Duration) {
+        let me = thread::current();
+        if self.wakes.waiter.as_ref().map(|(t, _)| t.id()) != Some(me.id()) {
+            self.wakes.waiter = Some((me, pigeonhole_io::own_io_waker()));
+            self.core.signal().set_target(self.wakes.target());
+        }
+        self.core.wait(timeout);
+    }
+
+    /// A waker that ends this shard's [`wait`](Self::wait) from any thread: for futures the
+    /// driving thread polls itself (a commit's future, resolved on another shard's
+    /// thread). Waking it when nobody waits only makes the next `wait` return at once.
+    pub fn waker(&self) -> std::task::Waker {
+        std::task::Waker::from(Arc::new(WaitWaker(Arc::clone(&self.core.inbox().signal))))
     }
 
     /// Closes the shard, waits for in-flight submits, handles every queued message (calling
     /// `end_batch` per batch) and returns the handler. Unfinished background tasks are
     /// dropped. Later submits fail with [`Error::Closed`].
     pub fn shutdown(self) -> H {
-        let ShardDriver { mut core, _close } = self;
+        let ShardDriver {
+            mut core, _close, ..
+        } = self;
         let _shard = EnterShard::new(core.id);
         core.inbox().gate.close();
         core.finish();
