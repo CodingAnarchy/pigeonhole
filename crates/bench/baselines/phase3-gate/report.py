@@ -397,7 +397,8 @@ if cs:
     print("|---|---|---|---:|")
     groups = {}
     for l in cs:
-        groups.setdefault((l["io"], l["direct"], l["readahead"]), []).append(l["mib_per_sec"])
+        # Since D222 the step runs the default only (16 blocks, unmerged), with no readahead field.
+        groups.setdefault((l["io"], l["direct"], l.get("readahead") or "16 (D222)"), []).append(l["mib_per_sec"])
     for (io, d, ra), v in sorted(groups.items()):
         print(f"| {io} | {d} | {ra} | {statistics.median(v):.0f} |")
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The cold-scan step of the Phase 3 gate-window run (#405): a full scan of a table the block
-# cache and the page cache do not hold, across the I/O backends (#402), the scan readahead
-# (#402 PR 5; depth and merging are decided from this run, #431) and direct I/O (#403).
+# cache and the page cache do not hold, across the I/O backends (#402) and direct I/O (#403),
+# at the scan readahead D222 set (16 blocks, unmerged; the first window's run decided it, #431).
 #
 #   crates/bench/baselines/phase3-io/cold-scan.sh DATA_DIR [OUT.jsonl] [MIB]
 #
@@ -65,17 +65,14 @@ fi
 
 for io in pread uring; do
     for direct in 0 1; do
-        for readahead in 0 4 16 4,merge 16,merge; do
-            for run in 1 2 3; do
-                [[ "$direct" == 1 ]] || drop_caches
-                line=$(PIGEONHOLE_IO=$io PIGEONHOLE_DIRECT=$direct PIGEONHOLE_READAHEAD=$readahead \
-                    "$bin" scan "$data")
-                echo "$line" | python3 -c '
+        for run in 1 2 3; do
+            [[ "$direct" == 1 ]] || drop_caches
+            line=$(PIGEONHOLE_IO=$io PIGEONHOLE_DIRECT=$direct "$bin" scan "$data")
+            echo "$line" | python3 -c '
 import json, sys
 d = json.loads(sys.stdin.read())
 d["run"] = int(sys.argv[1])
 print(json.dumps(d))' "$run" | tee -a "$out"
-            done
         done
     done
 done

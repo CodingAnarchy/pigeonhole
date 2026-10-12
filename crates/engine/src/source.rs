@@ -219,30 +219,18 @@ fn overlaps_range(sst: &OpenSst, start: Option<&[u8]>, end: Option<&[u8]>) -> bo
 }
 
 /// Data blocks a scan fetches ahead (`ReadOptions::readahead_blocks`), and whether adjacent
-/// ones go as one read: 4 and no, unless `PIGEONHOLE_READAHEAD=N[,merge]` (a bench and test
-/// variable, read once per process) says otherwise, until #431 decides both from the gate
-/// measurement (#405).
-fn scan_readahead() -> (u32, bool) {
-    static READAHEAD: std::sync::OnceLock<(u32, bool)> = std::sync::OnceLock::new();
-    *READAHEAD.get_or_init(|| {
-        let Ok(v) = std::env::var("PIGEONHOLE_READAHEAD") else {
-            return (4, false);
-        };
-        let mut parts = v.split(',');
-        let blocks = parts
-            .next()
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or(4);
-        (blocks, parts.any(|p| p.trim() == "merge"))
-    })
-}
+/// ones go as one read (D222, from the reference machine's cold scans): 16, unmerged. On the
+/// AX102, 16 blocks ahead scanned fastest on both buffered backends (3.2-3.6 GiB/s against
+/// 2.6 with none), and merging adjacent fetches cost buffered scans 10-26% (with direct I/O,
+/// off by default, merging gained 1-7%).
+const SCAN_READAHEAD: (u32, bool) = (16, false);
 
 /// Read options for a scan or a point read.
 fn read_options(priority: Priority, scan: bool, cache_only: bool) -> ReadOptions {
     let mut o = ReadOptions::default();
     o.priority = priority;
     if scan {
-        (o.readahead_blocks, o.readahead_merge) = scan_readahead();
+        (o.readahead_blocks, o.readahead_merge) = SCAN_READAHEAD;
     }
     o.cache_only = cache_only;
     o

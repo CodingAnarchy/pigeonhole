@@ -33,12 +33,11 @@
 #                  client threads vs RocksDB; the short 200K run and the same on
 #                  pread, reported                                                    55
 #   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
-#   group-sync-depth  group-commit at group sync depth 1, 2 and unlimited (D207)      15
 #   row-cache      ycsb-c and ycsb-a with the row cache off (D216: on by default)      30
 #   scaling        scaling gate (D204) at 1, 4, 8, 16 shards, 8 s or more each (D219)  45
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   cold-get       cold point gets, one I/O (#87; phase3-io/cold-get.sh)              45
-#   cold-scan      cold scans, readahead depth and merging (#431; cold-scan.sh)       45
+#   cold-scan      cold scans, direct vs buffered at D222's readahead (cold-scan.sh) 15
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
@@ -80,10 +79,10 @@ data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
-    group-sync-depth row-cache scaling open-latency cold-get cold-scan scan-cache report)
+    row-cache scaling open-latency cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [group-sync-depth]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [cold-get]=45
-    [cold-scan]=45 [scan-cache]=10 [report]=1)
+    [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [cold-get]=45
+    [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
 commit="$(git -C "$root" rev-parse --short=12 HEAD)"
@@ -320,19 +319,6 @@ step_ycsb-a-shards() {
     local us
     for us in 100 200 500; do
         run_one "spin$us" --engine pigeonhole --shard-spin "$us"
-    done
-}
-
-# The group sync depth (D207): durable group commits at 1, 4 and 16 clients with at most 1, 2
-# or unlimited (0) group syncs in flight per stream. The interim default is 1 on macOS and 2
-# elsewhere; this run decides it.
-step_group-sync-depth() {
-    local d
-    for d in 1 2 0; do
-        PIGEONHOLE_IO=uring PIGEONHOLE_GROUP_SYNC_DEPTH="$d" "$bench" group-commit \
-            --engine pigeonhole --scale "$scale" --dir "$data/bench" \
-            --json "$results/group-sync-depth-$d.json"
-        rm -r "$data/bench"
     done
 }
 

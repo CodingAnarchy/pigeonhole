@@ -42,12 +42,11 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
   4. `all` against RocksDB, three times: twice on io_uring (the reproducibility pair) and once on pread (the backend decision).
   5. `latency`: point gets in memory (ycsb-c with every engine's block cache at 2 GiB, holding the table, and a warmup as long as the measured phase: D216), ycsb-a and skewed-multi-shard, and durable group commit in the D213 shape (one shard per physical core: 16 on the AX102, D220; the table split over every shard, commits in flight inline) on 2M commits (D219), plus 1/4/16 client threads; then the D213 shape on the preset's 200K commits (the first window's length) and again on pread (reported, not judged: it decides the io_uring default). The setup step also times the data drive's raw fdatasync, shown beside the group commit p99.
   6. `ycsb-a-shards`: ycsb-a with one client, at the default shard count against 1 and 4 shards and longer shard spins, beside RocksDB (D198 item 2, #478).
-  7. `group-sync-depth`: durable group commits at a group sync depth of 1, 2 and unlimited (D207's default).
-  8. `row-cache`: ycsb-c and ycsb-a with the row cache off, against the latency step's default (on, D216).
-  9. `scaling`: D204, at 1, 4, 8 and 16 shards, each measured for at least 8 s (D219). The summary gives each run's stall breakdown: the share of shard time in write stalls, flushes, compactions and the longest operation.
-  10. `open-latency`, `cold-get` and `cold-scan`: the `phase3-io` steps.
-  11. `scan-cache`: the ordered scan from cache.
-  12. `report`.
+  7. `row-cache`: ycsb-c and ycsb-a with the row cache off, against the latency step's default (on, D216).
+  8. `scaling`: D204, at 1, 4, 8 and 16 shards, each measured for at least 8 s (D219). The summary gives each run's stall breakdown: the share of shard time in write stalls, flushes, compactions and the longest operation.
+  9. `open-latency`, `cold-get` and `cold-scan`: the `phase3-io` steps.
+  10. `scan-cache`: the ordered scan from cache.
+  11. `report`.
 - **Each step logs** to `RESULTS/logs/STEP.log`, and its real duration goes to `durations.tsv`.
 - **A step whose feature the built binary lacks skips itself** (not marked done), and the window goes on.
 - **A failed step stops the run.** Fix the cause and rerun the same command: finished steps (`RESULTS/STEP.done`) are skipped. A target that is missed is not a failed step; it is a verdict in the summary.

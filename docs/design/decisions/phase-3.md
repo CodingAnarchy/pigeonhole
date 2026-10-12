@@ -746,6 +746,44 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 
 **Not changed:** an explicit `shards(n)`; D213's and D204's shapes. `Environment::cores` in the bench report stays the logical CPU count: it identifies the machine when comparing runs.
 
+## D221 — The group sync depth stays 2 on Linux and 1 on macOS; `PIGEONHOLE_GROUP_SYNC_DEPTH` is removed (owner decision, 2026-10-12; engine, #476; decides D207's depth)
+
+**Decided:**
+- **D207's interim defaults become the defaults:** a shard keeps at most 2 group syncs in flight per WAL stream on Linux (and other systems), 1 on macOS. They stay an internal constant, with no option.
+- **The measurement variable `PIGEONHOLE_GROUP_SYNC_DEPTH` is removed,** and so is the gate window's `group-sync-depth` step that varied it.
+
+**Why.** The first gate run on the reference machine (AX102, 2026-10-11, io_uring, durable group commits) compared 1, 2 and unlimited:
+
+| Depth | 1 client | 4 clients | 16 clients |
+|---|---|---|---|
+| 1 | 17,206 ops/s, p99 130 µs | 51,129 ops/s, p99 132 µs | 106,501 ops/s, p99 248 µs |
+| 2 | 17,526 ops/s, p99 122 µs | 51,009 ops/s, p99 138 µs | 113,790 ops/s, p99 191 µs |
+| unlimited | 17,704 ops/s, p99 119 µs | 51,381 ops/s, p99 136 µs | 115,458 ops/s, p99 188 µs |
+
+- **Depth 2 is within about 1.5% of unlimited** at every client count.
+- **Depth 1 falls behind at 16 clients:** 6% fewer commits per second than depth 2, and a p99 of 248 µs against 191.
+- **Depth 2 also bounds the syncs** a shard can pile onto the device.
+- macOS keeps 1, for D207's reason: `F_FULLFSYNC` serializes on the device.
+
+## D222 — Scans read 16 data blocks ahead, without merging adjacent fetches; `PIGEONHOLE_READAHEAD` is removed (owner decision, 2026-10-12; engine, #431)
+
+**Decided:**
+- **A scan's readahead (`ReadOptions::readahead_blocks`) is 16 data blocks**, up from the interim 4, and **adjacent fetches are not merged** (`readahead_merge` off). Both are an internal constant.
+- **The test variable `PIGEONHOLE_READAHEAD` is removed.** The cold-scan script (`phase3-io/cold-scan.sh`) now measures backend × direct/buffered at the default only.
+
+**Why.** The first gate run on the reference machine (AX102, 2026-10-11) scanned a 16 GiB table cold. The table gives the median MiB/s over 3 runs:
+
+| io | direct | readahead 0 | 4 | 4, merged | 16 | 16, merged |
+|---|---|--:|--:|--:|--:|--:|
+| pread | no | 2,669 | 3,158 | 2,466 | **3,679** | 2,736 |
+| io_uring | no | 2,650 | 3,057 | 2,624 | **3,284** | 2,957 |
+| pread | yes | 186 | 380 | 473 | 1,028 | 1,037 |
+| io_uring | yes | 186 | 380 | 480 | 1,016 | 1,082 |
+
+- **16 blocks ahead is the fastest buffered setting on both backends:** 24–38% above no readahead, and 7–17% above 4.
+- **Merging adjacent fetches hurts buffered scans** by 10–26%: the page cache's own readahead already reads sequentially, and a merged fetch only waits longer for its first block.
+- With direct I/O (off by default, #403), merging helps by 1–7%. That doesn't outweigh the buffered loss, since buffered is the default.
+
 <a id="d223"></a>
 ## D223 — The scaling gate's placement check is a busiest share of at most 1.25/N, and the driver starts every shard together (owner decision, 2026-10-12; bench, tablets, #406; amends D204)
 

@@ -20,8 +20,8 @@
 //!
 //! `scan` measures nothing about the page cache: the caller empties it before each `scan` (on
 //! Linux, `sync; echo 3 > /proc/sys/vm/drop_caches` as root), or opens with direct I/O
-//! (`PIGEONHOLE_DIRECT=1`). The backend comes from `PIGEONHOLE_IO` (`pread`, `uring`) and the
-//! scan readahead from `PIGEONHOLE_READAHEAD` (`N[,merge]`, #431), as for the test suites;
+//! (`PIGEONHOLE_DIRECT=1`). The backend comes from `PIGEONHOLE_IO` (`pread`, `uring`), as for
+//! the test suites, and the scan reads ahead as the engine does (16 blocks, unmerged: D222);
 //! the JSON line names the environment it ran with.
 
 use std::path::Path;
@@ -97,14 +97,13 @@ fn scan(dir: &Path) {
     println!(
         "{{\"rows\":{rows},\"bytes\":{bytes},\"secs\":{secs:.4},\"mib_per_sec\":{:.1},\
          \"readahead_issued\":{},\"readahead_used\":{},\"readahead_waited\":{},\
-         \"io\":\"{}\",\"direct\":\"{}\",\"readahead\":\"{}\"}}",
+         \"io\":\"{}\",\"direct\":\"{}\"}}",
         bytes as f64 / f64::from(1 << 20) / secs,
         ahead.issued,
         ahead.used,
         ahead.waited,
         env("PIGEONHOLE_IO"),
         env("PIGEONHOLE_DIRECT"),
-        env("PIGEONHOLE_READAHEAD"),
     );
     drop(t);
     db.close().unwrap();
