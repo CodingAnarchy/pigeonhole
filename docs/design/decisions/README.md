@@ -129,7 +129,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D113](phase-1.md#d113) — Time series: TTL never expires during a run · deferred to #54 (Phase 2)
 - [D114](phase-1.md#d114) — the recovery oracle also works on record lists · sim, #59; extends D93
 - [D115](phase-1.md#d115) — Which WAL streams must a flush sync before its SSTs become visible · engine Milestone B
-- [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B
+- [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B · **amended by D225**
 - [D117](phase-1.md#d117) — Is `SetFlushed` the memtable's max seqno, or the shard's visible seqno · engine Milestone B
 - [D118](phase-1.md#d118) — How conservative is `GcPolicy` about reader-process snapshots · engine Milestone B; precise per-slot pinning is #39
 - [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161, D166**
@@ -236,6 +236,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D221](phase-3.md#d221) — The group sync depth stays 2 on Linux and 1 on macOS (on the AX102, 2 was within ~1.5% of unlimited and 1 lost 6% at 16 clients); `PIGEONHOLE_GROUP_SYNC_DEPTH` and the gate's depth step are removed · owner decision, engine, #476 · decides D207
 - [D222](phase-3.md#d222) — Scans read 16 data blocks ahead without merging adjacent fetches (fastest buffered cold scan on both backends; merging cost buffered scans 10–26%); `PIGEONHOLE_READAHEAD` is removed · owner decision, engine, #431
 - [D223](phase-3.md#d223) — The scaling gate's busiest shard may take at most 1.25/N of the commits (consistent with 0.8 efficiency; 2/N allowed 0.5), and the D204 driver picks each shard's rows on its own thread and starts every shard at a barrier; with it, D214 meets the bound at 8 and 16 shards unchanged (no margin at 16), and packing keeps its 0.75 grow threshold; churn follows in #582 · owner decision, bench, tablets, #406 · amends D204
+- [D225](phase-3.md#d225) — A participant's PREPARE may be checkpointed once its commit is settled (every share in SSTs: `CommitSettled`), not once the coordinator checkpointed the COMMIT, which let crossed cross-shard commits pin each other's checkpoints and hang the close; a coordinator counts its own share without a message to itself · coordinator decision, engine, #585 · amends D116
 
 ## Open questions
 _None._

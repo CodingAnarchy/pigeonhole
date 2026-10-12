@@ -835,3 +835,22 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
   | Moves per run | 0 | up to 4 |
 
   0.6 gained nothing anywhere, and it was the only threshold that moved tablets.
+
+<a id="d225"></a>
+## D225 — A participant's PREPARE may be checkpointed once its commit is settled, not once the coordinator checkpointed the COMMIT (coordinator decision, 2026-10-12; engine, #585; amends D116)
+
+**Decided:**
+- **"Settled"** means the coordinator has counted every participant's `ShareFlushed`, its own share included: every share of the commit is in SSTs, D24's condition for the COMMIT record. At that point it tells the other participants (`CommitSettled`, formerly `CommitCheckpointed`), and each may checkpoint past its PREPARE.
+- **Before,** D116 kept a participant's PREPARE until the coordinator's checkpoint passed the COMMIT. The checkpoint-time notice and the `passed_commits` queue are gone.
+- **A coordinator counts its own share directly,** not as a message sent to itself.
+
+**Why.**
+- **A checkpoint is a stream prefix,** so D116's rule made one stream's checkpoint wait on another's. Two cross-shard commits in flight together whose coordinators take part in each other log each other's PREPARE before their own COMMIT. For example, shard 0 logs PREPARE 715 (coordinated by 2) before COMMIT 719, and shard 2 logs PREPARE 719 (coordinated by 0) before COMMIT 715. Neither checkpoint can then pass. Close waits for empty logs and never returned, and live, the WAL stopped being trimmed past those records (#585, found by the #527 gate-step work, 0.2.1 included).
+- **The self-sent share report** re-entered the close once per share, and a close with thousands of them overflowed the shard's stack.
+
+**Why it is safe.** A replay that finds a COMMIT whose participant trimmed its PREPARE treats the commit as incomplete (D116's all-or-nothing replay) and applies none of it. Once the commit is settled, every share is already in SSTs, so nothing is lost and nothing is applied twice.
+- `model_check` has a case for it (`settled_commits_trimmed_by_participants_survive_crashes`: 16 cross-shard commits in flight, frequent flushes, crashes between and inside commits, at 2–4 shards).
+- The same case runs a second loop with tablets splitting, merging and moving (`tablet_ops_ppm` 20 000, the fast balancer), where a moved slot or a retired tablet reads as flushed through the published catalog.
+- Telling participants before the shares are settled fails that case with `LostAckedCommit`. A tablet change that commits before the moving tablet's frozen memtables are flushed (the `frozen.is_empty()` wait in `progress_op` dropped) fails its tablet loop.
+- `engine/tests/close_crossed.rs` closes after concurrent cross-shard commits on real files, under a watchdog.
+
