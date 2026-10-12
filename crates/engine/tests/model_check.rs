@@ -58,6 +58,28 @@ fn faults_and_crashes_for_every_shard_count() {
     }
 }
 
+/// D225 (#585): a participant trims a PREPARE once its commit is settled (every share in
+/// SSTs), not once the coordinator checkpointed the COMMIT. Many cross-shard commits in
+/// flight together (crossing each other's records), frequent flushes (so commits settle
+/// early and participants trim before coordinators) and crashes between and inside commits:
+/// a replay that finds a COMMIT whose participant trimmed its PREPARE must lose nothing and
+/// apply nothing twice.
+#[test]
+fn settled_commits_trimmed_by_participants_survive_crashes() {
+    for shards in 2..=4 {
+        let mut cfg = Config::standard(400);
+        cfg.shards = shards;
+        cfg.tasks = 16;
+        cfg.spec.max_batch = 8;
+        cfg.flush_ppm = 100_000;
+        cfg.crash_ppm = 20_000;
+        cfg.mid_commit_crash_ppm = 30_000;
+        for seed in seeds() {
+            check(seed, &cfg);
+        }
+    }
+}
+
 #[test]
 fn runs_with_tablet_changes_off_match_the_model() {
     // Tablet changes are on by default (D129 as amended); the off path keeps its coverage.
