@@ -42,7 +42,7 @@ use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 mod tablets;
 
 use tablets::{ActiveOp, TabletLoad};
-pub(crate) use tablets::{BalanceConfig, LoadSlot, TabletOpKind, split_by_shard};
+pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
 
 use crate::catalog::{Catalog, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
@@ -2151,6 +2151,8 @@ pub(crate) struct ShardState {
     balance_pass: u64,
     /// The pass at which each owned tablet arrived on this shard (0: held at the first pass).
     arrived: HashMap<TabletId, u64>,
+    /// The clock when each owned tablet arrived on this shard (0: held at the first pass).
+    arrived_at: HashMap<TabletId, u64>,
     /// The pass at which the balancer last started a move or a split over shards.
     skew_pass: Option<u64>,
     /// Consecutive balancer passes this shard's load was skewed (D214).
@@ -2158,6 +2160,18 @@ pub(crate) struct ShardState {
     /// Whether this shard acts on write skew: from `SKEW_PERSIST` skewed passes until its
     /// load falls below the stop ratio (D214).
     skew_active: bool,
+    /// A slow moving average of the mean write load over the active shards, and whether the
+    /// mean now is falling below it: then skewed passes don't count and no skew change is
+    /// made (D224).
+    mean_slow: f64,
+    mean_falling: bool,
+    /// The slow skew path (D224): a slow moving average of `window_writes`, the consecutive
+    /// passes it was skewed, the pass of its last change, and whether this pass's decision
+    /// came from it.
+    load_slow: f64,
+    slow_run: u64,
+    slow_pass: Option<u64>,
+    chose_slow: std::cell::Cell<bool>,
     /// Packing (D217): this shard's busy time and clock at its last pass, the moving average
     /// of how busy it was, how many shards stay active (`0..pack_k`; 0 before the first
     /// decision), and the consecutive passes calling for more or fewer of them.
@@ -2318,9 +2332,16 @@ impl ShardState {
             load_ewma: 0.0,
             balance_pass: 0,
             arrived: HashMap::new(),
+            arrived_at: HashMap::new(),
             skew_pass: None,
             skew_run: 0,
             skew_active: false,
+            mean_slow: 0.0,
+            mean_falling: false,
+            load_slow: 0.0,
+            slow_run: 0,
+            slow_pass: None,
+            chose_slow: std::cell::Cell::new(false),
             busy_mark: None,
             busy_ewma: 0.0,
             pack_k: 0,

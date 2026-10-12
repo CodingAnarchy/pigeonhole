@@ -31,6 +31,11 @@ use crate::snapshot::TabletEntry;
 /// Row samples kept per tablet and balancer interval (split points for write skew).
 const SAMPLES: usize = 64;
 
+/// Row samples a tablet pools over its recent intervals, each weighted by its interval's
+/// writes per sample: a skew split cuts on these (D224). One interval's 64 samples left a
+/// piece up to twice its share at 16 shards.
+const POOL: usize = 1024;
+
 /// Weight of the newest interval in the moving averages of write load (#103, D214): one
 /// interval's noise never decides a move on its own.
 const LOAD_ALPHA: f64 = 0.2;
@@ -45,6 +50,33 @@ const SKEW_PERSIST: u64 = 10;
 /// (1.1 at the default skew of 1.25), then needs `SKEW_PERSIST` skewed passes to start
 /// again.
 const SKEW_STOP: f64 = 0.4;
+
+/// Weight of the newest pass in the slow moving average of the mean write load (D224).
+const MEAN_SLOW_ALPHA: f64 = 0.05;
+
+/// The mean write load is falling while it is below this fraction of its slow average
+/// (D224). Skew that appears because other shards' load fell, not because this shard's rose,
+/// is the tail of a closed-loop load: the lighter shards finished their work, and the busy
+/// ones look skewed only beside them. It neither counts toward `SKEW_PERSIST` nor moves a
+/// tablet. If the others' load stays down, the slow average catches up in a few seconds and
+/// the skew counts again.
+const MEAN_FALL: f64 = 0.9;
+
+/// How long a tablet must go unwritten, and have been on its shard, before it counts as cold
+/// for merges and consolidation (D224): `COLD_PASSES` balancer passes or as many base
+/// intervals of clock (10 s at the default), whichever comes first, so an idle shard backing
+/// off its passes still merges. Longer than a closed-loop load's phases, so a tablet idle only
+/// through a phase's tail (its shard finished its work first) is not merged or moved away.
+pub(crate) const COLD_PASSES: u64 = 100;
+
+/// Weight of the newest interval in the slow moving averages of write load (D224): a time
+/// constant of about 10 s at the default interval, longer than a closed-loop load's phases, so
+/// a shard's slow load follows its share of the work rather than its rate while busy.
+const SLOW_ALPHA: f64 = 0.01;
+
+/// Balancer passes the slow skew path waits after a change before deciding again (D224):
+/// about the slow averages' time constant, so they show the change first.
+const SLOW_DWELL: u64 = 100;
 
 /// Balancer passes a shard waits after starting a move or a skew split, and a tablet stays
 /// put after it arrived on a shard, before write skew moves or splits again (#103): the
@@ -143,14 +175,43 @@ pub(crate) struct TabletLoad {
     /// allocate (#320).
     samples: Vec<Vec<u8>>,
     sampled: usize,
+    /// The samples of recent intervals with their weights (writes per sample), a ring of
+    /// up to `POOL` overwritten in place from `pool_next` (D224).
+    pool: Vec<(Vec<u8>, f64)>,
+    pool_next: usize,
     /// Moving average of `writes` over intervals (`LOAD_ALPHA`).
     ewma: f64,
+    /// Slow moving average of `writes` (`SLOW_ALPHA`, D224).
+    slow: f64,
+    /// The balancer pass and clock of the last interval with writes (D224).
+    last_write: (u64, u64),
 }
 
 impl TabletLoad {
     /// This interval's row samples.
     fn live_samples(&self) -> &[Vec<u8>] {
         &self.samples[..self.sampled]
+    }
+
+    /// The weight of each of this interval's samples: the writes it stands for.
+    fn live_weight(&self) -> f64 {
+        self.writes as f64 / self.sampled.max(1) as f64
+    }
+
+    /// Adds this interval's samples to the pool, as the interval ends.
+    fn pool_interval(&mut self) {
+        let w = self.live_weight();
+        for row in &self.samples[..self.sampled] {
+            if self.pool.len() < POOL {
+                self.pool.push((row.clone(), w));
+            } else {
+                let (r, weight) = &mut self.pool[self.pool_next];
+                r.clear();
+                r.extend_from_slice(row);
+                *weight = w;
+            }
+            self.pool_next = (self.pool_next + 1) % POOL;
+        }
     }
 }
 
@@ -165,6 +226,8 @@ pub(crate) struct BalanceConfig {
     pub split_bytes: u64,
     /// `EngineOptions::balance_pack`, engine-owned shards only (D217).
     pub pack: bool,
+    /// Unwritten passes before a tablet is cold (`EngineOptions::balance_cold_passes`, D224).
+    pub cold_passes: u64,
 }
 
 pub(crate) use crate::load_slot::LoadSlot;
@@ -1059,16 +1122,25 @@ impl ShardState {
         // each tablet's (#103). One interval's swing, or a flush, never decides a move.
         self.load_ewma =
             LOAD_ALPHA * self.window_writes as f64 + (1.0 - LOAD_ALPHA) * self.load_ewma;
+        self.load_slow =
+            SLOW_ALPHA * self.window_writes as f64 + (1.0 - SLOW_ALPHA) * self.load_slow;
+        let (pass, clock) = (self.balance_pass, now);
         for l in self.loads.values_mut() {
+            if l.writes > 0 {
+                l.last_write = (pass, clock);
+            }
             l.ewma = LOAD_ALPHA * l.writes as f64 + (1.0 - LOAD_ALPHA) * l.ewma;
+            l.slow = SLOW_ALPHA * l.writes as f64 + (1.0 - SLOW_ALPHA) * l.slow;
         }
-        self.note_arrivals();
+        self.note_arrivals(now);
         let (_, mem_per) = self.mem_bytes();
         self.measure_busy(now);
         self.shared.loads[usize::from(self.id.0)].publish(
             self.load_ewma.round() as u64,
+            self.load_slow.round() as u64,
             (self.busy_ewma * 1e6).round() as u64,
             now.max(1),
+            self.balance_pass,
         );
         self.track_pack(now);
         self.track_skew(now);
@@ -1094,6 +1166,7 @@ impl ShardState {
         };
         self.window_writes = 0;
         for l in self.loads.values_mut() {
+            l.pool_interval();
             l.prev_writes = l.writes;
             l.writes = 0;
             l.seen = 0;
@@ -1109,6 +1182,9 @@ impl ShardState {
                     if owners.iter().all(|o| *o == self.id));
                 if !size_split {
                     self.skew_pass = Some(self.balance_pass);
+                }
+                if self.chose_slow.get() {
+                    self.slow_pass = Some(self.balance_pass);
                 }
                 self.request_tablet_op(kind, reply, ctx);
             }
@@ -1150,7 +1226,7 @@ impl ShardState {
 
     /// Records the balancer pass at which each tablet this shard owns first appeared here
     /// (the tablets it held at its first pass count as settled).
-    fn note_arrivals(&mut self) {
+    fn note_arrivals(&mut self, now: u64) {
         let view = self.shared.view.load();
         let first = self.balance_pass <= 1;
         let pass = if first { 0 } else { self.balance_pass };
@@ -1161,7 +1237,11 @@ impl ShardState {
             .map(|t| t.id)
             .collect();
         self.arrived.retain(|t, _| owned.contains(t));
+        self.arrived_at.retain(|t, _| owned.contains(t));
         for t in owned {
+            self.arrived_at
+                .entry(t)
+                .or_insert(if first { 0 } else { now });
             self.arrived.entry(t).or_insert(pass);
         }
     }
@@ -1298,11 +1378,27 @@ impl ShardState {
     /// `balance_min_writes`. Counted on every pass, dwell or not.
     fn track_skew(&mut self, now: u64) {
         let cfg = self.shared.balance;
+        // The slow path (D224): skew on the slow averages, whatever the mean does.
+        self.slow_run = match self.published_slow_loads(now) {
+            Some(slow) => {
+                let my = slow[usize::from(self.id.0)] as f64;
+                let mean = slow.iter().sum::<u64>() as f64 / slow.len() as f64;
+                if my >= cfg.min_writes.max(1) as f64 && my > cfg.skew * mean {
+                    self.slow_run + 1
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
         let Some((my, mean)) = self.shard_loads(now) else {
             self.skew_run = 0;
             self.skew_active = false;
+            self.mean_falling = false;
             return;
         };
+        self.mean_slow = MEAN_SLOW_ALPHA * mean + (1.0 - MEAN_SLOW_ALPHA) * self.mean_slow;
+        self.mean_falling = mean < MEAN_FALL * self.mean_slow;
         let min = cfg.min_writes.max(1) as f64;
         if self.skew_active {
             if my < min || my < Self::skew_stop(cfg.skew) * mean {
@@ -1311,7 +1407,7 @@ impl ShardState {
             }
             return;
         }
-        if my >= min && my > cfg.skew * mean {
+        if !self.mean_falling && my >= min && my > cfg.skew * mean {
             self.skew_run += 1;
         } else {
             self.skew_run = 0;
@@ -1339,6 +1435,25 @@ impl ShardState {
             self.shared.loads[..n]
                 .iter()
                 .map(|slot| slot.read_fresh(now, stale).unwrap_or(0))
+                .collect(),
+        )
+    }
+
+    /// The published slow write loads of the active shards (D224), as
+    /// [`published_loads`](Self::published_loads). A shard backing off while idle publishes
+    /// rarely, so a slow load stays current for twice the longest backoff.
+    fn published_slow_loads(&self, now: u64) -> Option<Vec<u64>> {
+        let n = self.active_shards();
+        if n < 2 || usize::from(self.id.0) >= n {
+            return None;
+        }
+        let stale = BALANCE_IDLE_CAP_NANOS
+            .max(self.shared.balance.interval_nanos)
+            .saturating_mul(2);
+        Some(
+            self.shared.loads[..n]
+                .iter()
+                .map(|slot| slot.read_slow_fresh(now, stale).unwrap_or(0))
                 .collect(),
         )
     }
@@ -1568,10 +1683,34 @@ impl ShardState {
         //    (`track_skew`, D214), not during the shard's dwell after its last move, and only
         //    for tablets that dwelt here long enough. Under packing, only among the active
         //    shards (D217).
-        if self.skew_active
-            && !dwelling
-            && let Some(writes) = self.published_loads(now)
-        {
+        //    The slow path (D224) acts on the slow averages instead, once per `SLOW_DWELL`:
+        //    under a closed-loop load the fast averages show skew only in each phase's tail
+        //    (where it doesn't count), the slow ones the shards' shares of the work.
+        self.chose_slow.set(false);
+        let slow_dwelling = self
+            .slow_pass
+            .is_some_and(|p| p + SLOW_DWELL > self.balance_pass);
+        for slow in [false, true] {
+            let (ready, loads) = if slow {
+                // Only while the fast averages agree this shard is above the stop ratio: once
+                // the fast path balanced it, the slow averages still show the old skew for a
+                // while, and acting on them would overshoot.
+                let agrees = self
+                    .shard_loads(now)
+                    .is_some_and(|(my, mean)| my > Self::skew_stop(cfg.skew) * mean);
+                (
+                    self.slow_run >= SKEW_PERSIST && !slow_dwelling && agrees,
+                    self.published_slow_loads(now),
+                )
+            } else {
+                (
+                    self.skew_active && !self.mean_falling,
+                    self.published_loads(now),
+                )
+            };
+            let Some(writes) = loads.filter(|_| ready && !dwelling) else {
+                continue;
+            };
             let settled: Vec<TabletEntry> = owned
                 .iter()
                 .filter(|t| self.settled(t.id))
@@ -1580,7 +1719,10 @@ impl ShardState {
             let tablet_writes: HashMap<TabletId, u64> = settled
                 .iter()
                 .map(|t| {
-                    let w = self.loads.get(&t.id).map_or(0.0, |l| l.ewma);
+                    let w = self
+                        .loads
+                        .get(&t.id)
+                        .map_or(0.0, |l| if slow { l.slow } else { l.ewma });
                     (t.id, w.round() as u64)
                 })
                 .collect();
@@ -1590,7 +1732,12 @@ impl ShardState {
                 }
                 _ => true,
             };
-            let ratio = Self::skew_stop(cfg.skew);
+            // The slow path makes one change per dwell, only past the trigger itself.
+            let ratio = if slow {
+                cfg.skew
+            } else {
+                Self::skew_stop(cfg.skew)
+            };
             if let Some(op) = self.skew_op(
                 &view,
                 &settled,
@@ -1599,16 +1746,26 @@ impl ShardState {
                 cfg.min_writes,
                 ratio,
             ) && splits_ok(&op)
+                && self.claim_targets(&op, if slow { SLOW_DWELL } else { DWELL_PASSES })
             {
+                self.chose_slow.set(slow);
                 return Some(op);
             }
         }
         // 3. Merge two adjacent cold tablets of one table that are small together.
+        let cold_nanos = cfg.interval_nanos.saturating_mul(cfg.cold_passes);
+        let long_ago = |(pass, clock): (u64, u64)| {
+            pass + cfg.cold_passes <= self.balance_pass || clock.saturating_add(cold_nanos) <= now
+        };
         let cold = |id: TabletId| {
-            self.loads
-                .get(&id)
-                .is_none_or(|l| l.writes == 0 && l.prev_writes == 0)
-                && mem_per.get(&id).copied().unwrap_or(0) == 0
+            self.loads.get(&id).is_none_or(|l| {
+                l.writes == 0
+                    && l.prev_writes == 0
+                    && (l.last_write == (0, 0) || long_ago(l.last_write))
+            }) && long_ago((
+                self.arrived.get(&id).copied().unwrap_or(0),
+                self.arrived_at.get(&id).copied().unwrap_or(0),
+            )) && mem_per.get(&id).copied().unwrap_or(0) == 0
         };
         for pair in owned.windows(2) {
             let (l, r) = (&pair[0], &pair[1]);
@@ -1677,6 +1834,21 @@ impl ShardState {
         None
     }
 
+    /// Claims every shard a skew change hands load to (D224), for `dwell` of their passes (the
+    /// slow path's dwell for its changes, D224). False if another change claimed one first:
+    /// the change waits for a later pass.
+    fn claim_targets(&self, op: &TabletOpKind, dwell: u64) -> bool {
+        let to: Vec<ShardId> = match op {
+            TabletOpKind::Move { to, .. } => vec![*to],
+            TabletOpKind::Split { owners, .. } => {
+                owners.iter().copied().filter(|o| *o != self.id).collect()
+            }
+            _ => Vec::new(),
+        };
+        to.iter()
+            .all(|s| self.shared.loads[usize::from(s.0)].claim(dwell))
+    }
+
     /// A move or split that evens out `loads` (per shard), given this shard's tablets'
     /// shares of it (`per_tablet`), when this shard is skewed past the threshold.
     fn skew_op(
@@ -1695,12 +1867,20 @@ impl ShardState {
         if my < min.max(1) || (my as f64) <= ratio * mean {
             return None;
         }
+        // A shard another skew change just handed load is not a target until its published
+        // load shows it (D224): shards balancing at once would otherwise all shed into the
+        // same cold shard.
+        let open = |i: usize| self.shared.loads[i].claimable();
         let (cold, low) = loads
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != me)
+            .filter(|(i, _)| *i != me && open(*i))
             .min_by_key(|(i, l)| (**l, *i))
             .map(|(i, l)| (i, *l))?;
+        // With the claimed shards left out, the coldest one left may not be cold at all.
+        if low as f64 >= mean {
+            return None;
+        }
         let gap = my - low;
         let mut tablets: Vec<(TabletId, u64)> = owned
             .iter()
@@ -1730,9 +1910,13 @@ impl ShardState {
         let mut targets: Vec<(u64, usize)> = loads
             .iter()
             .enumerate()
-            .filter(|(i, l)| *i != me && (**l as f64) < mean)
+            .filter(|(i, l)| *i != me && open(*i) && (**l as f64) < mean)
             .map(|(i, l)| (*l, i))
             .collect();
+        if targets.is_empty() {
+            // Every shard below the mean is claimed by another skew change (D224).
+            return None;
+        }
         targets.sort_unstable();
         let parts = ((my as f64 / mean.max(1.0)).round() as usize).clamp(2, targets.len() + 1);
         let mut owners = vec![self.id];
@@ -1754,21 +1938,33 @@ impl ShardState {
         })
     }
 
-    /// Up to `parts - 1` split keys from the rows written to `t` this interval (quantiles of
-    /// the sample), strictly inside its range.
+    /// Up to `parts - 1` split keys for `t`, strictly inside its range: the cuts that leave
+    /// the heaviest piece lightest, over the rows sampled from its recent writes, each row
+    /// weighted by the writes it stands for (D224). A row sampled often (a hot row) keeps its
+    /// weight, so a cut can isolate it.
     fn skew_split_keys(&self, t: &TabletEntry, parts: usize) -> Vec<Vec<u8>> {
         let Some(load) = self.loads.get(&t.id) else {
             return Vec::new();
         };
-        let mut rows: Vec<&[u8]> = load
-            .live_samples()
+        let live = load.live_weight();
+        let in_range =
+            |r: &[u8]| r >= t.start.as_slice() && t.end.as_ref().is_none_or(|e| r < e.as_slice());
+        let mut rows: Vec<(&[u8], f64)> = load
+            .pool
             .iter()
-            .map(Vec::as_slice)
-            .filter(|r| inside(t, r))
+            .map(|(r, w)| (r.as_slice(), *w))
+            .chain(load.live_samples().iter().map(|r| (r.as_slice(), live)))
+            .filter(|(r, w)| *w > 0.0 && in_range(r))
             .collect();
-        rows.sort_unstable();
-        rows.dedup();
-        quantiles(&rows, parts)
+        rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut merged: Vec<(&[u8], f64)> = Vec::with_capacity(rows.len());
+        for (r, w) in rows {
+            match merged.last_mut() {
+                Some((last, sum)) if *last == r => *sum += w,
+                _ => merged.push((r, w)),
+            }
+        }
+        weighted_cuts(&merged, parts)
     }
 
     /// A split key near the middle of `t`'s SSTs (their boundary rows) and recent writes.
@@ -1810,6 +2006,39 @@ fn quantiles(rows: &[&[u8]], parts: usize) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// Up to `parts - 1` cut rows over `rows` (sorted, distinct, with weights) that minimise
+/// the heaviest piece's weight; each cut is the first row of a piece after the first, so it
+/// is never the first row. The bound on the heaviest piece is found by bisection.
+fn weighted_cuts(rows: &[(&[u8], f64)], parts: usize) -> Vec<Vec<u8>> {
+    let cuts = |cap: f64| {
+        let mut out: Vec<&[u8]> = Vec::new();
+        let mut acc = 0.0;
+        for (r, w) in rows {
+            if acc > 0.0 && acc + w > cap {
+                out.push(r);
+                acc = *w;
+            } else {
+                acc += w;
+            }
+        }
+        out
+    };
+    if parts < 2 || rows.len() < 2 {
+        return Vec::new();
+    }
+    let total: f64 = rows.iter().map(|(_, w)| w).sum();
+    let (mut lo, mut hi) = (rows.iter().map(|(_, w)| *w).fold(0.0, f64::max), total);
+    for _ in 0..50 {
+        let mid = (lo + hi) / 2.0;
+        if cuts(mid).len() < parts {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    cuts(hi).into_iter().map(<[u8]>::to_vec).collect()
 }
 
 /// Whether `row` lies strictly inside `t` (a split there leaves both sides non-empty).
@@ -2146,5 +2375,30 @@ fn tablet_change(
             edits.push(Edit::DropTablet { tablet: *right });
             Ok((edits, vec![(id, me)]))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::weighted_cuts;
+
+    #[test]
+    fn weighted_cuts_isolate_a_hot_row_and_keep_its_weight() {
+        // A row carrying 6 of 10 writes gets a piece of its own: the heaviest piece weighs 6,
+        // not the 6 + 1 that cutting at even sample counts would leave.
+        let rows: Vec<(&[u8], f64)> = vec![
+            (b"a", 1.0),
+            (b"b", 1.0),
+            (b"c", 6.0),
+            (b"d", 1.0),
+            (b"e", 1.0),
+        ];
+        assert_eq!(weighted_cuts(&rows, 3), vec![b"c".to_vec(), b"d".to_vec()]);
+        // Even weights split evenly; never more pieces than asked, never a cut at the first row.
+        let even: Vec<(&[u8], f64)> = vec![(b"a", 1.0), (b"b", 1.0), (b"c", 1.0), (b"d", 1.0)];
+        assert_eq!(weighted_cuts(&even, 2), vec![b"c".to_vec()]);
+        assert_eq!(weighted_cuts(&even, 8).len(), 3);
+        assert!(weighted_cuts(&even, 1).is_empty());
+        assert!(weighted_cuts(&even[..1], 4).is_empty());
     }
 }

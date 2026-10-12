@@ -790,7 +790,7 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 **Decided:**
 - **The busiest shard may take at most 1.25/N of the measured commits** (`Scaling::MAX_SHARE`), down from 2/N. Above it the run fails as skewed, whatever its efficiency. The gate summary (`report.py`) checks the same bound.
 - **The D204 driver starts every shard together.** Each shard thread picks the rows its shard owns, taking a turn of its shard every 64K writes so the shard's balancer keeps publishing its load. All threads then start at a barrier, and the phase clock starts there.
-- **The balancer (D214) is not changed for the bound.** With the driver fix, D214 already meets 1.25/N at 8 and 16 shards on the AX102 (below). The balancer work that followed didn't improve placement there, so it isn't shipped. Balancer churn under the closed-loop driver is tracked in #582.
+- **The balancer (D214) is not changed for the bound.** With the driver fix, D214 already meets 1.25/N at 8 and 16 shards on the AX102 (below). The balancer work that followed didn't improve placement there on its own, so it isn't shipped with D223. Its claims and weighted split keys ship with the churn fix in [D224](#d224) (#582).
 - **Packing (D217) keeps its grow threshold at 0.75** busy per active shard. 0.6 was measured and gained nothing.
 
 **Why the bound.** With equal per-shard rates, a phase lasts as long as its busiest shard, so efficiency is at most 1/(N × busiest share). Under 2/N, a placement that capped efficiency at 0.5 still passed, so the check didn't fit the 0.8 target. 1.25/N is the loosest bound that still allows 0.8. On the AX102, perf287 measured busiest shares of 1.2–1.5× the ideal at 8 and 16 shards.
@@ -835,3 +835,55 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
   | Moves per run | 0 | up to 4 |
 
   0.6 gained nothing anywhere, and it was the only threshold that moved tablets.
+
+<a id="d224"></a>
+## D224 — Under a closed-loop write load the balancer ignores tail skew, corrects placement on slow averages, claims its targets and splits on weighted samples, and a tablet is cold only after 100 unwritten passes (owner direction, 2026-10-12; tablets, #582; amends D214, D134, D146; follows D223)
+
+**Decided:**
+- **Skew while the mean is falling doesn't count.** Each shard keeps a slow average of the mean write load over the active shards (newest pass weighted 0.05, about 2 s). While the mean is below 0.9 times that average, a skewed pass doesn't count toward D214's persistence, and no skew change is made.
+  - A shard looks skewed beside others that just went idle. That's the tail of a closed-loop load, where the lighter shards finished their work first.
+  - A standing imbalance, emerging skew and a table's first load all leave the mean steady or rising, so they count as D214 has it.
+  - If the others' load stays down, the slow average catches up within a few seconds and the skew counts again.
+- **A slow path acts on the shards' shares of the work.**
+  - Each shard publishes a slow moving average of its writes per interval (newest weighted 0.01, about 10 s, longer than a closed-loop load's phases), and keeps one per tablet.
+  - A shard whose slow load is above `balance_skew` times the mean of the slow loads, and at least `balance_min_writes`, for 10 passes in a row may make one move or skew split chosen on the slow loads. It then waits 100 passes.
+  - It acts only while the fast averages also put the shard above D214's stop ratio. Once the fast path has balanced a shard, its slow average still shows the old skew for a while, and acting on that would overshoot.
+- **Skew changes claim their targets.**
+  - A move or skew split claims every shard it hands load to, with a compare-and-swap in the receiver's `LoadSlot`. The claim holds until the receiver has published 10 more passes (100 for a slow-path change).
+  - A claimed shard is no other skew change's target. Shards balancing at once never all shed into the same cold shard.
+  - A target must also be below the mean. If none is, nothing is decided that pass.
+- **Skew splits cut on weighted samples.**
+  - Each tablet pools its recent intervals' row samples (up to 1024, filled at balancer-pass time, so the commit path is unchanged). Each sample is weighted by its interval's writes per sample.
+  - A skew split takes the cuts that leave its heaviest piece lightest. Before, it took quantiles of one interval's 64 deduplicated samples, which dropped a hot row's weight.
+- **A tablet is cold (for merges and D146's consolidation) only after 100 unwritten passes, or 100 base intervals of clock, and as long on its shard.** Before, 2 unwritten passes were enough, so tablets idle only through a tail were merged or moved away. `EngineOptions::balance_cold_passes` (hidden) shortens it for tests.
+- **Not changed:** D214's thresholds, persistence, hysteresis and dwell; size splits; packing (D217); the options.
+
+**Why.** D223 put the scaling gate's placement within 1.25/N, but its runs never settled. The inline driver (D204) is closed-loop:
+- While all shards are busy they write at the same rate, so skew shows only in each phase's tail.
+- There, every still-busy shard read above 1.25 times the falling mean and shed tablets, every phase.
+- Merges and consolidation also picked up the tablets idle in the tail.
+- On the AX102 at 16 shards, main made 48–63 tablet changes in the measured phase, with efficiency 0.28–0.37.
+
+**Measured** (AX102, 2026-10-12; `scaling --scale full --ops 2M×N --min-secs 8`):
+
+| Run | Efficiency | Busiest share | × ideal | ≤ 1.25/N | Splits / moves while measuring |
+|---|--:|--:|--:|---|--:|
+| 8 shards, main | 0.55 | 17.8% | 1.42 | no | 4 / 12 |
+| 8 shards, falling mean only | 0.79 | 18.6% | 1.49 | no | 0 / 0 |
+| 8 shards, + slow path, claims, cold | 0.84 | 15.0% | 1.20 | yes | 1 / 0 |
+| 16 shards, main | 0.33 | 7.6% | 1.22 | yes | 13 / 50 |
+| 16 shards, falling mean only (2 runs) | 0.45, 0.42 | 11.2%, 13.5% | 1.80, 2.17 | no | 0 / 0 |
+| 16 shards, + slow path, claims, cold (2 runs) | 0.48, 0.45 | 9.0%, 8.0% | 1.45, 1.29 | no | 0 / 1, 1 / 7 |
+
+- **The falling-mean rule alone** removes the churn but freezes placement where the first split left it. Under a closed loop, real imbalance is visible only in the tails.
+- **The slow path** corrects placement without the churn. At 16 shards it was still converging when the 30 s warmup ended. The weighted split keys start it closer: simulated on the workload's key distribution, the first split's busiest piece goes from 2.16× to 1.33× ideal at 16 shards.
+
+**Tests:**
+- D214's two tests pass unchanged.
+- `a_closed_loop_load_settles_instead_of_churning_every_tail`:
+  - The setup is D204's shape. Rows are assigned to their owning shard at phase start, each shard writes at the same rate, and a shard idles once it's done.
+  - It must stop changing tablets and end with no shard over 1.25 times the mean.
+  - It fails without each of the four parts: without the falling-mean rule (4–10 changes every phase), without the slow path (no change, imbalance kept), with the 2-pass cold criterion (consolidation churn), and without claims (herd moves).
+- `a_standing_imbalance_still_moves_a_tablet`: a shard at 2.3 times the mean from the start moves within D214's persistence.
+- `skewed_shards_never_shed_into_the_same_cold_shard_at_once` and `skewed_shards_wait_when_every_cold_shard_is_claimed`.
+- Loom: two skew changes never both claim one shard.
