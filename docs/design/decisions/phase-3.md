@@ -718,3 +718,30 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 - **The scaling runs measured 1.1–1.3 s.** At 10M operations (8–10 s), efficiency at 4 shards was 0.76 rather than 1.03, because sustained writes reach the write-stall regime. Up to 3 s of stall in an 8 s run sat outside the short runs.
 
 **Not changed:** the targets, D213's shape (shards, pre-split placement, commits in flight) and D204's. The shard count is D220's.
+
+## D220 — The default shard count is one per physical core (owner decision, 2026-10-11; io, runtime, engine, pigeonhole, bench, #406)
+
+**Decided:**
+- **`Options::shards` defaults to the physical cores the process may run on**, within `available_parallelism` (so a cgroup CPU quota still caps it). SMT siblings count once. `pigeonhole_io::sys::default_shards()` resolves it, and `physical_cores()` reports the cores:
+  - **Linux:** the sysfs topology of the CPUs in the affinity mask. A core is named by the first CPU of its sibling list (`topology/core_cpus_list`, or `thread_siblings_list` before Linux 5.6). Unlike `core_id`, that name is unique across packages, dies and clusters.
+  - **macOS:** `hw.physicalcpu`.
+  - **Windows:** `GetLogicalProcessorInformation`, over the CPUs in the process affinity mask (the process's processor group, as pinning already is).
+  - **Elsewhere, or where the OS doesn't say** (no sysfs in a container, say): `available_parallelism`, as before.
+- **Pinned threads spread over cores first.** With `pin_threads`, shard `i` goes to the first CPU of the `i`-th physical core in the opener's affinity set, then to the cores' SMT siblings, wrapping (`sys::spread_cpu`). Default-count shards never share a core, whatever the CPU numbering. Before, shard `i` went to the `i`-th CPU, which on machines that number siblings next to each other (0 and 1 one core) put two shards on each core.
+- **The gate runs at physical cores:** 16 on the AX102. D213's shape and the scaling gate's N (D204) default to `default_shards()`, so the gate window needs no flag, and so does the ycsb-a-shards step's default. The report's "per core" divides by the same count.
+- No new dependency: the detection is a few sysfs reads, one `sysctlbyname`, or one Win32 call (a `windows-sys` feature) at open.
+
+**Why.** perf287's AX102 runs (2026-10-11; 16 cores, 32 SMT threads), durable group commit in D213's shape on 2M commits:
+
+| | cells/s | p99 |
+|---|---|---|
+| io_uring, 16 shards | 4.50M | 199 µs |
+| io_uring, 32 shards | 2.28M | 913 µs |
+| pread, 16 shards | 4.52M | 169 µs |
+| pread, 32 shards | 2.15M | 541 µs |
+
+- **32 shards are SMT pairs on 16 cores, so they slow each other.** Each shard's flushes and compactions run on its own thread in application-owned mode, and a stalled shard holds the visibility watermark for every other one.
+- **16 shards give twice the long-run throughput of 32,** and meet the p99 target on both backends.
+- The spec already says one shard per physical core ([Thread-per-core execution](../spec.md#thread-per-core-execution)); the code counted logical CPUs.
+
+**Not changed:** an explicit `shards(n)`; D213's and D204's shapes. `Environment::cores` in the bench report stays the logical CPU count: it identifies the machine when comparing runs.

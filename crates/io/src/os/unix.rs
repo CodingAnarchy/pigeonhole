@@ -511,6 +511,67 @@ pub(crate) fn available_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn physical_cores() -> Option<usize> {
+    let first_of_core = first_of_core()?;
+    Some(first_of_core.iter().filter(|&&first| first).count())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn physical_cores() -> Option<usize> {
+    let mut cores: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a NUL-terminated name, and `cores` is a valid buffer of `len` bytes.
+    let ok = unsafe {
+        libc::sysctlbyname(
+            c"hw.physicalcpu".as_ptr(),
+            (&raw mut cores).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    usize::try_from(cores).ok().filter(|&n| ok && n > 0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn physical_cores() -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn spread_cpu(i: usize) -> usize {
+    match first_of_core() {
+        Some(first_of_core) => super::spread(&first_of_core, i),
+        None => i % available_cpus().max(1),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn spread_cpu(i: usize) -> usize {
+    i % available_cpus().max(1)
+}
+
+/// For each CPU this thread may run on (in order), whether it is the first of its physical
+/// core among them. A core is named by the first CPU of its sysfs sibling list
+/// (`core_cpus_list`, or `thread_siblings_list` before Linux 5.6), which, unlike `core_id`,
+/// is unique across packages, dies and clusters. `None` if sysfs does not say.
+#[cfg(target_os = "linux")]
+fn first_of_core() -> Option<Vec<bool>> {
+    let cores = allowed_cpus()
+        .ok()?
+        .into_iter()
+        .map(|cpu| {
+            let topology = format!("/sys/devices/system/cpu/cpu{cpu}/topology/");
+            let list = fs::read_to_string(topology.clone() + "core_cpus_list")
+                .or_else(|_| fs::read_to_string(topology + "thread_siblings_list"))
+                .ok()?;
+            super::first_cpu_of_list(&list)
+        })
+        .collect::<Option<Vec<usize>>>()?;
+    Some(super::first_of_core(&cores))
+}
+
 /// The CPU ids this thread may run on, in order.
 #[cfg(target_os = "linux")]
 fn allowed_cpus() -> Result<Vec<usize>> {

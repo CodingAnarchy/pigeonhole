@@ -26,7 +26,7 @@ pub struct EngineOptions {
     pub vfs: VfsRef,
     /// Create the file if missing.
     pub create_if_missing: bool,
-    /// Shard count; 0 means available CPUs.
+    /// Shard count; 0 means one per physical core (D220).
     pub shards: usize,
     /// Pin each shard thread (and each compaction thread) to one CPU (default off).
     /// Engine-owned mode only; application-owned shards run on the caller's threads.

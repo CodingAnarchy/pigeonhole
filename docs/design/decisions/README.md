@@ -232,6 +232,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D217](phase-3.md#d217) — While writes are light, the balancer keeps the written tablets on `ceil(B / 0.5)` shards (`B` the summed shard busy fraction; grow after 1 s above 0.75 per active shard, shrink after 5 s), never fewer than their memtable slots need; on by default, `Options::tablet_packing(false)` keeps the placement exactly · owner decision, tablets, engine, #478 · amends D134, D214
 - [D218](phase-3.md#d218) — io_uring is the default I/O backend where the kernel offers it (`IoBackend::Auto`; `pread` elsewhere, never failing the open), so application-owned mode on Linux starts no I/O threads by default and event loops wait on `Shard::io_fd` · owner decision, pigeonhole, io, #402
 - [D219](phase-3.md#d219) — The gate judges durable group commit (D213) on at least 2M commits (`--inline-ops`) and still reports the 200K run; the scaling gate measures at least 8 s per shard count (`--min-secs`); the summary breaks out each run's stalls, flushes and compactions · owner decision, bench, #406 · amends D213, D204
+- [D220](phase-3.md#d220) — The default shard count is one per physical core the process may run on (Linux sysfs sibling lists, macOS `hw.physicalcpu`, Windows `GetLogicalProcessorInformation`; else `available_parallelism`), within the CPU quota; pinned threads spread one per core before SMT siblings; the gate runs at physical cores (16 on the AX102) · owner decision, io, runtime, engine, pigeonhole, bench, #406
 
 ## Open questions
 _None._

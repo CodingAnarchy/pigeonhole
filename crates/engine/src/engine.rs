@@ -481,7 +481,7 @@ impl Engine {
         mode: Mode,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
         let shards = if options.shards == 0 {
-            pigeonhole_io::sys::available_cpus().max(1)
+            pigeonhole_io::sys::default_shards()
         } else {
             options.shards
         };

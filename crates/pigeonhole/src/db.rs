@@ -886,9 +886,9 @@ struct ShmFootprint {
 
 impl ShmFootprint {
     fn of(o: &pigeonhole_engine::EngineOptions) -> Self {
-        // As the engine resolves it: 0 shards means one per available CPU.
+        // As the engine resolves it: 0 shards means one per physical core (D220).
         let shards = match o.shards {
-            0 => pigeonhole_io::sys::available_cpus().max(1),
+            0 => pigeonhole_io::sys::default_shards(),
             n => n,
         };
         let count = u32::try_from(shards).unwrap_or(u32::MAX);

@@ -60,7 +60,7 @@ OPTIONS:
                            measured writes until at least S seconds are measured
                            (D219) [default: 0, once]
     --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
-    --shards N             Pigeonhole shards (scaling: N, default all cores)
+    --shards N             Pigeonhole shards (scaling: N; default one per physical core)
     --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
                            shard) [default: 64 MiB]
     --cache B              every engine's read cache (SQLite: page cache gets
@@ -339,8 +339,8 @@ fn bench(a: &Args) -> Result<Suite, String> {
     let result = (|| -> Result<(), String> {
         if a.command == "scaling" {
             // The gate (D204): application-owned shards, each thread writing its share
-            // inline, at 1 shard and at N (up to the core count).
-            let n = a.shards.unwrap_or(suite.environment.cores);
+            // inline, at 1 shard and at N (default: one per physical core, D220).
+            let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
             let c = config(a, WorkloadKind::SkewedMultiShard)?;
             let single = one_inline(a, &root, &mut seq, &pigeonhole(a, Some(1)), &c)?;
             let multi = one_inline(a, &root, &mut seq, &pigeonhole(a, Some(n)), &c)?;
@@ -365,10 +365,10 @@ fn bench(a: &Args) -> Result<Suite, String> {
         for kind in kinds {
             let c = config(a, kind)?;
             if kind == WorkloadKind::GroupCommit && a.engines.iter().any(|e| e == "pigeonhole") {
-                // The target's shape (D213): one shard per core, the table split over all of
-                // them, each shard's thread keeping commits in flight inline (D204's driver).
-                // The client-thread sweep below stays as a secondary report.
-                let cores = suite.environment.cores;
+                // The target's shape (D213): one shard per core (physical, D220), the table
+                // split over all of them, each shard's thread keeping commits in flight inline
+                // (D204's driver). The client-thread sweep below stays as a secondary report.
+                let cores = pigeonhole_io::sys::default_shards();
                 let n = a.shards.unwrap_or(cores);
                 let r = pigeonhole(a, Some(n)).group_sync(true).presplit(true);
                 let inline = WorkloadConfig {

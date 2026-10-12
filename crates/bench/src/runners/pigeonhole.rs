@@ -73,7 +73,7 @@ pub(crate) fn err(e: pigeonhole::Error) -> String {
 }
 
 impl PigeonholeRunner {
-    /// Shard threads (default: the engine default, one per available CPU).
+    /// Shard threads (default: the engine default, one per physical core, D220).
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
@@ -319,12 +319,7 @@ impl Runner for PigeonholeRunner {
     fn describe(&self) -> String {
         let s = &self.settings;
         let shards = s.shards.map_or_else(
-            || {
-                format!(
-                    "default({})",
-                    std::thread::available_parallelism().map_or(1, |n| n.get())
-                )
-            },
+            || format!("default({})", pigeonhole_io::sys::default_shards()),
             |n| n.to_string(),
         );
         format!(

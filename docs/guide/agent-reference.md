@@ -93,9 +93,9 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Method | Meaning |
 |---|---|
 | `durability(Durability)` | Writer default (default `GroupSync`). |
-| `shards(usize)` | Shard threads (default CPUs available). `1` is valid. With few concurrent writing threads, set it to about that number: thinly spread writes pay a shard wakeup per commit (see [Getting started](getting-started.md)). |
+| `shards(usize)` | Shard threads (default: one per physical core the process may run on, D220; SMT siblings count once, a cgroup CPU quota still caps it). `1` is valid. With few concurrent writing threads, set it to about that number: thinly spread writes pay a shard wakeup per commit (see [Getting started](getting-started.md)). |
 | `compaction_cores(usize)` | Extra threads for flush/compaction (pinned with `pin_threads`). Engine-owned mode only (D40). |
-| `pin_threads(bool)` | Pin shard `i` (and compaction threads) to the `i`-th CPU of the opener's affinity set (default off). Engine-owned mode only. Turn on only when this database owns those CPUs: two pinned databases, quota-limited containers or a pinned opener stack shards on the same cores. |
+| `pin_threads(bool)` | Pin shard `i` (and compaction threads) to the `i`-th physical core of the opener's affinity set, then the SMT siblings (default off). Engine-owned mode only. Turn on only when this database owns those CPUs: two pinned databases, quota-limited containers or a pinned opener stack shards on the same cores. |
 | `memtable_budget(u64)` | Arena bytes per shard (default 64 MiB). The shm region is `memtable_budget × shards` (each arena rounded up to 2 MiB) plus about 10 MiB for views and reader slots, filled as memtables grow; open fails with `ShmUnavailable` if its filesystem lacks that much free space. Something else filling that tmpfs after open can still crash the process with `SIGBUS`. |
 | `commit_spin(Duration)` | How long a thread waiting for a `Buffered` or `None` commit polls before it sleeps (default 15 µs; D198). Durable commits sleep at once. `Duration::ZERO` never polls (battery-powered or CPU-constrained hosts). |
 | `shard_spin(Duration)` | How long an engine-owned shard that just handled a commit polls for the next one (default 50 µs; D198). Idle databases never poll; ignored by application-owned shards. `Duration::ZERO` never polls. |

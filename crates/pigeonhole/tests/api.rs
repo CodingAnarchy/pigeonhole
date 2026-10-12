@@ -1333,6 +1333,25 @@ fn closed_handles_fail_with_closed() {
 }
 
 #[test]
+fn the_default_shard_count_is_one_per_physical_core() {
+    let vfs = SimVfs::new(5);
+    let options = Options::default()
+        .vfs(Arc::clone(&vfs) as _)
+        .memtable_budget(4 << 20);
+    let (db, mut shards) = Pigeonhole::open_application_owned("/db/cores.phdb", options).unwrap();
+    // D220: SMT siblings count once, within the CPUs the process may use.
+    assert_eq!(shards.len(), pigeonhole_io::sys::default_shards());
+    // The close needs every shard's turn: drive them all until each has closed.
+    let closing = std::thread::spawn(move || db.close());
+    while shards.iter().any(|s| s.closed().is_none()) {
+        for shard in &mut shards {
+            shard.run_once(Duration::from_millis(1));
+        }
+    }
+    closing.join().unwrap().unwrap();
+}
+
+#[test]
 fn application_owned_mode() {
     let vfs = SimVfs::new(5);
     let err =
