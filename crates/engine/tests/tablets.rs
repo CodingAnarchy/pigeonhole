@@ -559,14 +559,28 @@ fn a_closed_loop_load_settles_instead_of_churning_every_tail() {
         changes[6..].iter().all(|c| *c == 0),
         "changes per phase {changes:?}"
     );
-    // Settled where every shard does the same work: one tablet with twice the work each.
-    let mut per = [0; 4];
-    for (_, s, start, _) in db.ranges() {
-        if start.as_slice() < b"t04".as_slice() {
-            per[usize::from(s)] += 1;
+    // Settled where the shards share the work evenly: each owns at most 1.25x the mean of the
+    // next phase's rows (the scaling gate's bound, D223).
+    let ranges = db.ranges();
+    let mut per = [0u64; 4];
+    for (t, d) in demand.iter().enumerate() {
+        for i in 0..*d {
+            let row = tablet_row(t, written + i);
+            let (_, s, ..) = ranges
+                .iter()
+                .find(|(_, _, start, end)| {
+                    row.as_slice() >= start.as_slice()
+                        && end.as_deref().is_none_or(|e| row.as_slice() < e)
+                })
+                .unwrap();
+            per[usize::from(*s)] += 1;
         }
     }
-    assert_eq!(per, [1, 1, 1, 1], "changes per phase {changes:?}");
+    let mean = per.iter().sum::<u64>() as f64 / 4.0;
+    assert!(
+        per.iter().all(|p| *p as f64 <= 1.25 * mean),
+        "rows per shard {per:?}, changes per phase {changes:?}"
+    );
     assert_eq!(db.scan_rows().len() as u64, written);
     db.engine.close().unwrap();
     for _ in 0..8 {
