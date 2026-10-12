@@ -29,12 +29,13 @@
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
 #   latency        ycsb-c (2 GiB cache, warmed: D216), ycsb-a, skewed vs RocksDB;
 #                  group-commit: the D213 shape (one shard per core, table split over
-#                  all, commits in flight inline), then 1/4/16 client threads vs
-#                  RocksDB; the same on pread, reported                               55
+#                  all, commits in flight inline) on 2M commits (D219), then 1/4/16
+#                  client threads vs RocksDB; the short 200K run and the same on
+#                  pread, reported                                                    55
 #   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
 #   group-sync-depth  group-commit at group sync depth 1, 2 and unlimited (D207)      15
 #   row-cache      ycsb-c and ycsb-a with the row cache off (D216: on by default)      30
-#   scaling        scaling gate (D204) at 1, 4, 8, 16 shards                          30
+#   scaling        scaling gate (D204) at 1, 4, 8, 16 shards, 8 s or more each (D219)  45
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   cold-get       cold point gets, one I/O (#87; phase3-io/cold-get.sh)              45
 #   cold-scan      cold scans, readahead depth and merging (#431; cold-scan.sh)       45
@@ -81,7 +82,7 @@ results="$(cd "$results" && pwd)"
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     group-sync-depth row-cache scaling open-latency cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [group-sync-depth]=15 [row-cache]=30 [scaling]=30 [open-latency]=5 [cold-get]=45
+    [all-pread]=90 [latency]=45 [ycsb-a-shards]=15 [group-sync-depth]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [cold-get]=45
     [cold-scan]=45 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
@@ -257,6 +258,18 @@ step_all-pread() { all_vs_rocksdb pread all-pread; }
 # warmup reads as many rows as the measured phase, so the gets measure cached reads.
 ycsb_c_memory=(--cache 2147483648 --warmup 1.0)
 
+# Run lengths (D219). The durable group-commit target is judged on at least 2M commits, long
+# enough for every shard's flushes and compactions to fall inside the measured phase; the
+# short run (the preset's 200K) is reported beside it. The scaling gate measures at least 8 s
+# at every shard count. The small scale (the dry run) keeps both short.
+if [[ "$scale" == full ]]; then
+    gc_inline_ops=2000000
+    scaling_min_secs=8
+else
+    gc_inline_ops=50000
+    scaling_min_secs=1
+fi
+
 step_latency() {
     local w extra
     for w in ycsb-c ycsb-a skewed-multi-shard; do
@@ -270,13 +283,19 @@ step_latency() {
     # shape (D213): one shard per core, the table split over every shard, each shard's thread
     # keeping commits in flight inline; then, reported beside it, 1, 4 and 16 client threads.
     PIGEONHOLE_IO=uring "$bench" group-commit --engine pigeonhole,rocksdb --scale "$scale" \
-        --dir "$data/bench" --json "$results/latency-group-commit.json"
+        --inline-ops "$gc_inline_ops" --dir "$data/bench" \
+        --json "$results/latency-group-commit.json"
+    rm -r "$data/bench"
+    # The short D213 run (the preset's commits, D219), reported: the first window's length.
+    PIGEONHOLE_IO=uring "$bench" group-commit --engine pigeonhole --scale "$scale" --threads 1 \
+        --dir "$data/bench" --json "$results/latency-group-commit-short.json"
     rm -r "$data/bench"
     # The same on the pread backend, reported beside the judged io_uring run (D213): on a
     # Linux runner the D213 shape reached 3x the cells/s on pread, with a p99.9 near 1 ms
     # against 0.6-0.8 s on io_uring. The comparison decides the io_uring default.
     PIGEONHOLE_IO=pread "$bench" group-commit --engine pigeonhole --scale "$scale" \
-        --dir "$data/bench" --json "$results/latency-group-commit-pread.json"
+        --inline-ops "$gc_inline_ops" --dir "$data/bench" \
+        --json "$results/latency-group-commit-pread.json"
     rm -r "$data/bench"
 }
 
@@ -338,7 +357,7 @@ step_scaling() {
     local n
     for n in 1 4 8 16; do
         PIGEONHOLE_IO=uring "$bench" scaling --shards "$n" --scale "$scale" \
-            --dir "$data/bench" --json "$results/scaling-$n.json"
+            --min-secs "$scaling_min_secs" --dir "$data/bench" --json "$results/scaling-$n.json"
         rm -r "$data/bench"
     done
 }

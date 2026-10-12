@@ -459,7 +459,19 @@ impl PigeonholeRunner {
         }
         let (before, stalls_before) = (db.shard_stats(), super::pigeonhole::stalls(&db));
         let latency_before = db.commit_latency_buckets();
-        let (shards, elapsed, hist) = phase(&t, shards, measured, INLINE_IN_FLIGHT, true)?;
+        // The measured writes, repeated until `min_measured` has been measured (D219): a
+        // fixed count measures a faster store for less time, too short for its flushes and
+        // compactions to show.
+        let (mut shards, mut elapsed, mut hist) = (shards, Duration::ZERO, Histogram::new());
+        loop {
+            let (s, e, h) = phase(&t, shards, measured, INLINE_IN_FLIGHT, true)?;
+            shards = s;
+            elapsed += e;
+            hist.merge(&h);
+            if elapsed >= options_.min_measured || measured.is_empty() {
+                break;
+            }
+        }
         let (after, stalls_after) = (db.shard_stats(), super::pigeonhole::stalls(&db));
         let engine_commit = EngineCommit::between(
             &latency_before,

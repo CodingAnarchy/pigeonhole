@@ -105,7 +105,16 @@ fn warmup_is_run_but_not_recorded() {
     let mut r = PigeonholeRunner::default()
         .shards(1)
         .memtable_budget(16 << 20);
-    let rec = run_detailed(&mut r, &config, &root, &RunOptions { warmup: 0.25 }).unwrap();
+    let rec = run_detailed(
+        &mut r,
+        &config,
+        &root,
+        &RunOptions {
+            warmup: 0.25,
+            ..RunOptions::default()
+        },
+    )
+    .unwrap();
     assert_eq!(rec.operations, config.operations);
     assert_eq!(rec.warmup_ops, config.operations / 4);
     std::fs::remove_dir_all(&root).ok();
@@ -171,8 +180,16 @@ fn larger_than_ram_preset_splits_cold_and_hot_gets() {
     };
     assert!(MemoryBudget::larger_than_ram().cache < MemoryBudget::default().cache);
     let mut r = PigeonholeRunner::default().shards(1).memory(budget);
-    let rec = run_detailed(&mut r, &config, &root, &RunOptions { warmup: 0.0 })
-        .unwrap_or_else(|e| panic!("seed {}: {e}", config.seed));
+    let rec = run_detailed(
+        &mut r,
+        &config,
+        &root,
+        &RunOptions {
+            warmup: 0.0,
+            ..RunOptions::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("seed {}: {e}", config.seed));
     let reads = rec.detail.reads.expect("a read workload reports the split");
     // Every measured op is a get: each is cold (first touch of its row) or hot.
     assert_eq!(reads.cold.count + reads.hot.count, rec.operations);
