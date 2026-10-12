@@ -136,14 +136,23 @@ With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `
 
 **The loop for one shard per thread: `run_once` until idle, poll your futures with `shard.waker()`, then `shard.wait(timeout)`** (#553):
 
-```rust,ignore
+```rust,no_run
+# use std::time::Duration;
+# use pigeonhole::{Options, Pigeonhole};
+# let dir = pigeonhole::doc_support::temp_dir();
+# let (_db, mut shards) =
+#     Pigeonhole::open_application_owned(dir.join("app.phdb"), Options::default().shards(1))?;
+# let mut shard = shards.pop().expect("one shard");
 let waker = shard.waker();
 let mut cx = std::task::Context::from_waker(&waker);
 loop {
     while shard.run_once(Duration::from_micros(200)) {}
     // poll this thread's futures (commit_async and friends) with `cx`
+    # let _ = &mut cx;
     shard.wait(Duration::from_millis(10));
 }
+# #[allow(unreachable_code)]
+# Ok::<(), pigeonhole::Error>(())
 ```
 
 - `wait` returns when work arrives for the shard, a future's wake reaches `shard.waker()`, this thread's own I/O completes, background work falls due, or the timeout passes. It may return early.

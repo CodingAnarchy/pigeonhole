@@ -94,7 +94,7 @@ A `WriteBatch` whose rows live on different shards is atomic across them (two-ph
 | is fine because you can rebuild | `None` |
 | is unacceptable and you cannot wait for a group | `Sync` (rarely right; it never shares an fsync) |
 
-Throughput note: `GroupSync` costs about one fsync per group, not per commit. Many concurrent committers, or one large `WriteBatch`, amortize it. A shard keeps only a bounded number of group syncs in flight per WAL stream; durable commits that arrive while those run batch behind them and share the next sync, so under many concurrent committers each fsync covers more commits (D207). The bound is interim (1 on macOS, 2 elsewhere) until the Phase 3 gate measurements decide it.
+Throughput note: `GroupSync` costs about one fsync per group, not per commit. Many concurrent committers, or one large `WriteBatch`, amortize it. A shard keeps only a bounded number of group syncs in flight per WAL stream; durable commits that arrive while those run batch behind them and share the next sync, so under many concurrent committers each fsync covers more commits (D207). The bound is 2 on Linux and 1 on macOS (D221): on the reference machine, 2 came within about 1.5% of no bound, while 1 lost 6% at 16 concurrent committers.
 
 Right after a clean reopen, the first `GroupSync` or `Sync` commit also waits for the new WAL files' and their directory's syncs, which the open no longer waits for itself (D203).
 
