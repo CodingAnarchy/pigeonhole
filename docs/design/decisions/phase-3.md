@@ -790,7 +790,8 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 **Decided:**
 - **The busiest shard may take at most 1.25/N of the measured commits** (`Scaling::MAX_SHARE`), down from 2/N. Above it the run fails as skewed, whatever its efficiency. The gate summary (`report.py`) checks the same bound.
 - **The D204 driver starts every shard together.** Each shard thread picks the rows its shard owns, taking a turn of its shard every 64K writes so the shard's balancer keeps publishing its load. All threads then start at a barrier, and the phase clock starts there.
-- **The balancer (D214) is tuned toward 1.25/N** under the scaling workload, keeping D214's damping. That's a separate change, recorded here when it lands.
+- **The balancer (D214) is not changed for the bound.** With the driver fix, D214 already meets 1.25/N at 8 and 16 shards on the AX102 (below). The balancer work that followed didn't improve placement there, so it isn't shipped. Balancer churn under the closed-loop driver is tracked in #582.
+- **Packing (D217) keeps its grow threshold at 0.75** busy per active shard. 0.6 was measured and gained nothing.
 
 **Why the bound.** With equal per-shard rates, a phase lasts as long as its busiest shard, so efficiency is at most 1/(N × busiest share). Under 2/N, a placement that capped efficiency at 0.5 still passed, so the check didn't fit the 0.8 target. 1.25/N is the loosest bound that still allows 0.8. On the AX102, perf287 measured busiest shares of 1.2–1.5× the ideal at 8 and 16 shards.
 
@@ -805,3 +806,32 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 | 1.25/N | 31.3% | 15.6% | 7.8% | 3.9% |
 
 The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 shards. The gate runs scaling at most at the physical core count (16 on the AX102, D220), where it can.
+
+**Measured (AX102, 2026-10-12; `scaling --scale full --ops 2M×N --min-secs 8`):**
+
+| Run | Busiest share | × ideal | ≤ 1.25/N | Efficiency | Splits / moves while measuring |
+|---|--:|--:|---|--:|--:|
+| 8 shards, main (e99ace8) | 13.8% | 1.11 | yes | 0.65 | 4 / 18 |
+| 16 shards, main, run 1 | 7.80% | 1.25 | yes (limit 7.81%) | 0.37 | 5 / 48 |
+| 16 shards, main, run 2 | 7.79% | 1.25 | yes | 0.28 | 17 / 63 |
+| 8 shards, balancer change | 15.3% | 1.22 | yes | 0.70 | 2 / 23 |
+| 16 shards, balancer change, run 1 | 8.76% | 1.40 | no | 0.35 | 8 / 48 |
+| 16 shards, balancer change, run 2 | 8.0% | 1.29 | no | 0.42 | 3 / 30 |
+
+- **The driver fix moved placement.** On the old driver, perf287 measured 1.51× ideal at 8 shards and 1.62× at 16. Efficiency rose too: from 0.49 to 0.65 at 8 shards, and from 0.21–0.25 to 0.28–0.37 at 16. Part of that is the clock no longer counting the picks.
+- **16 shards has no margin.** The busiest shard there probably holds the hottest row (6.5% of the writes) and little else.
+- **The balancer change tried** had two parts:
+  - Claims: a shard just handed load by a skew change isn't another skew change's target for 10 of its passes.
+  - Skew split keys cut over 1024 pooled samples weighted by writes. Simulated, they improve the first split's busiest piece from 2.16× to 1.33× ideal at 16 shards.
+  - It failed the bound in 2 of 3 runs, because the balancer keeps moving tablets after the first split. The branch `engine/223-balancer` is kept for reference.
+- **Churn is what's left** (#582). No run's warmup settled within its 30 s cap. The driver is closed-loop: shards write at equal rates while all are busy, so skew shows only in a phase's tail, when the lighter shards finish. Every still-busy shard then reads above 1.25 × the mean together and sheds tablets, every phase.
+- **Packing grow threshold, 0.75 vs 0.6** (16 default shards, 2 runs each):
+
+  | Workload | 0.75 | 0.6 |
+  |---|--:|--:|
+  | skewed-multi-shard (ops/s) | 453K, 446K | 369K, 439K |
+  | time-series-ttl (ops/s) | 285K, 289K | 232K, 284K |
+  | ycsb-f (ops/s) | 105K, 107K | 109K, 108K |
+  | Moves per run | 0 | up to 4 |
+
+  0.6 gained nothing anywhere, and it was the only threshold that moved tablets.
