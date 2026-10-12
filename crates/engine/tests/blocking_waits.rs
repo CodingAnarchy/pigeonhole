@@ -360,6 +360,60 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     );
 }
 
+/// The symmetric case: a *participant* of a cross-shard commit dies after its PREPARE and
+/// before the coordinator's decision reaches it. Its `Applied` never comes, so the
+/// coordinator's share of the commit never settles; the close must still end (unclean)
+/// rather than wait for that reply for ever, and the commit's waiter hears `Closed`.
+#[test]
+fn a_close_ends_when_a_participant_dies_before_it_applied() {
+    let (vfs, gate) = gate::vfs(1359);
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), options(vfs, 2)).unwrap();
+    let mut b = shards.pop().unwrap();
+    let a = driver(shards.pop().unwrap());
+    let (db2, mut b) = (Arc::clone(&db), {
+        let me = thread::current();
+        b.set_wakeup(Box::new(move || me.unpark()));
+        b
+    });
+    let tables = thread::spawn(move || tables_on_0_and_1(&db2));
+    while !tables.is_finished() {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    let (on_a, on_b) = tables.join().unwrap();
+    // Shard 0 coordinates. Its sync is held, so its decision waits while shard 1 (driven
+    // here) prepares; shard 1 then stops running and is dropped before the decision.
+    gate.hold(&wal(0));
+    let pending = db
+        .submit(cross(&on_a, &on_b, "dies"), Some(Durability::Sync))
+        .unwrap();
+    while gate.held().is_empty() {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    for _ in 0..20 {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    drop(b);
+    gate.release();
+    let (tx, rx) = mpsc::channel();
+    let db2 = Arc::clone(&db);
+    thread::spawn(move || {
+        let _ = tx.send(db2.close());
+    });
+    let closed = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the close waited for a dead participant's reply");
+    assert!(closed.is_err(), "a close with a dead shard reported Ok");
+    assert!(
+        a.1.join().unwrap().is_err(),
+        "a close with a dropped shard is unclean"
+    );
+    let waited = pending.wait();
+    assert!(matches!(waited, Err(Error::Closed)), "{waited:?}");
+}
+
 // ---- 3-4 3.1: the application-owned close ----
 
 /// The documented loop, with the close's root commits in flight across `run_once` calls:

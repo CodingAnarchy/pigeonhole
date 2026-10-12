@@ -5733,6 +5733,27 @@ impl ShardState {
         // Every decision is answered, even for a share this shard never held or already
         // dropped (a refused or failed PREPARE): the coordinator waits for every participant.
         let mut error = None;
+        if self.close_gave_up() {
+            // The close reported, or gave up flushing (a shard died): apply nothing more.
+            // The share's PREPARE stays in the WAL, and the next open decides it by its
+            // COMMIT (D83, D116).
+            if let Some(share) = self.prepared.remove(&seqno) {
+                if share.tracked {
+                    self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                }
+                self.release_room(share.reserved);
+            }
+            self.send(
+                coordinator,
+                ShardMsg::Applied {
+                    seqno,
+                    from: self.id,
+                    error: None,
+                },
+                ctx,
+            );
+            return;
+        }
         if let Some(share) = self.prepared.remove(&seqno) {
             if share.tracked {
                 self.track_share_rows(share.bytes.batch().as_bytes(), false);
@@ -5795,6 +5816,18 @@ impl ShardState {
             },
             ctx,
         );
+    }
+
+    /// Whether this shard's close has reported, or gave up flushing because a shard died: it
+    /// applies no further cross-shard decision.
+    fn close_gave_up(&self) -> bool {
+        self.close_stage == CloseStage::Reported
+            || (self.flush_failed
+                && matches!(
+                    self.close_stage,
+                    CloseStage::Flushing | CloseStage::Checkpointing
+                )
+                && self.shared.shard_died.load(Ordering::Acquire))
     }
 
     fn on_applied(
@@ -6876,13 +6909,24 @@ impl ShardState {
                 );
             }
         }
-        // A share prepared for a coordinator that died is never decided here: the close is
-        // unclean, the PREPARE stays in the WAL, and the next open decides it by its COMMIT
-        // (D83, D116). Waiting for it would hang the close (found by D227's tests, whose
-        // visibility pin is now such a commit).
+        // With a shard dead the close is unclean, and a cross-shard commit it took part in
+        // may never be decided or answered here: a share prepared for a dead coordinator, or
+        // a commit this shard coordinates waiting on a dead participant's `Applied`. Their
+        // records stay in the WAL and the next open decides them by their COMMIT (D83,
+        // D116); waiting would hang the close. A coordinated commit's caller is told `Closed`
+        // (its outcome is the WAL's), and its seqno stays held, so nothing of it becomes
+        // visible half applied. A decision arriving later is answered without applying
+        // (`on_decide`). Found by D227's tests, whose visibility pin is such a commit.
         let died = self.shared.shard_died.load(Ordering::Acquire);
+        if died {
+            for c in self.coord.values_mut() {
+                if let Some(reply) = c.reply.take() {
+                    reply.notify(Err(Error::Closed));
+                }
+            }
+        }
         if !self.unresolved.is_empty()
-            || !self.coord.is_empty()
+            || (!self.coord.is_empty() && !died)
             || (!self.prepared.is_empty() && !died)
             || !self.pending.is_empty()
             || self.op.is_some()
