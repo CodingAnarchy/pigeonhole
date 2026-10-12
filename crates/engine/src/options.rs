@@ -138,6 +138,12 @@ pub struct EngineOptions {
     /// particular arena layout, such as one a flush can starve.
     #[doc(hidden)]
     pub arena_chunk_bytes: Option<usize>,
+    /// Overrides the page file's growth ahead of need, `(block, from)` in bytes: once no
+    /// free block of `block` bytes is left and the file is at least `from` long, it grows by
+    /// such a block outside the allocator lock (64 MiB from 128 MiB by default). For tests on
+    /// the simulator, which keeps whole files in memory, so they reach it.
+    #[doc(hidden)]
+    pub grow_ahead: Option<(u64, u64)>,
     /// How long a slot whose compaction failed waits before it is retried (nanoseconds,
     /// default 1 s), doubling with each failure in a row up to 60 times this. A refused WAL
     /// checkpoint retries on the same schedule. Mostly for tests, which shorten it.
@@ -204,6 +210,7 @@ impl EngineOptions {
             compaction: PickerOptions::default(),
             write_stall_timeout_nanos: 30_000_000_000,
             arena_chunk_bytes: None,
+            grow_ahead: None,
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,

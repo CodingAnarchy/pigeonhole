@@ -62,6 +62,10 @@ pub(crate) struct Alloc {
     /// Regions held for a larger extent (`clear_for`): first unit -> class. Space freed
     /// inside one becomes a placeholder, not free, so no allocation lands there.
     held: BTreeMap<u64, u8>,
+    /// Growth ahead of need ([`Alloc::wants_ahead`]): the class of the block it keeps free,
+    /// and the file length (units) from which it does.
+    ahead_class: u8,
+    ahead_from: u64,
 }
 
 /// A region `Alloc::clear_for` could clear: occupied units, first unit, and occupants as
@@ -91,6 +95,22 @@ fn units(class: u8) -> u64 {
     1 << class
 }
 
+/// The largest class of an aligned block starting at `from` and ending by `to`.
+fn block_class(from: u64, to: u64) -> u8 {
+    let mut class = 0u8;
+    while class < Extent::MAX_CLASS
+        && from.is_multiple_of(units(class + 1))
+        && from + units(class + 1) <= to
+    {
+        class += 1;
+    }
+    class
+}
+
+/// The file length, in units, from which it grows ahead of need by default
+/// ([`Alloc::wants_ahead`]): two blocks of the largest class (128 MiB).
+pub(crate) const AHEAD_FROM_UNITS: u64 = 2 << Extent::MAX_CLASS;
+
 /// The extent's first unit, if it is a well-formed extent.
 pub(crate) fn unit_of(e: Extent) -> Option<u64> {
     if e.size_class > Extent::MAX_CLASS || !e.page.is_multiple_of(UNIT_PAGES) {
@@ -118,6 +138,8 @@ impl Alloc {
             used_units: 0,
             retired_units: 0,
             held: BTreeMap::new(),
+            ahead_class: Extent::MAX_CLASS,
+            ahead_from: AHEAD_FROM_UNITS,
         };
         a.free_range(1, a.frontier);
         a
@@ -145,6 +167,8 @@ impl Alloc {
             used_units: 0,
             retired_units: 0,
             held: BTreeMap::new(),
+            ahead_class: Extent::MAX_CLASS,
+            ahead_from: AHEAD_FROM_UNITS,
         };
         let mut next = 1;
         for (u, class) in extents {
@@ -176,13 +200,7 @@ impl Alloc {
     /// neighbors.
     fn free_range(&mut self, mut from: u64, to: u64) {
         while from < to {
-            let mut class = 0u8;
-            while class < Extent::MAX_CLASS
-                && from.is_multiple_of(units(class + 1))
-                && from + units(class + 1) <= to
-            {
-                class += 1;
-            }
+            let class = block_class(from, to);
             self.free_block(from, class);
             from += units(class);
         }
@@ -260,6 +278,73 @@ impl Alloc {
         self.frontier = end;
         self.free_range(old, unit);
         self.mark_used(unit, class)
+    }
+
+    /// Sets the growth ahead of need: the class of the block it keeps free, and the file
+    /// length (units) from which it does.
+    pub(crate) fn set_ahead(&mut self, class: u8, from: u64) {
+        (self.ahead_class, self.ahead_from) = (class.min(Extent::MAX_CLASS), from);
+    }
+
+    /// Whether the file should grow ahead of need: no free block of the ahead class (the
+    /// largest, by default) or larger is left, so the next allocation that large would grow
+    /// the file inline, and the file is long enough ([`AHEAD_FROM_UNITS`] by default: a
+    /// small database never grows ahead).
+    pub(crate) fn wants_ahead(&self) -> bool {
+        self.frontier >= self.ahead_from
+            && (self.ahead_class..=Extent::MAX_CLASS).all(|k| self.free[k as usize].is_empty())
+    }
+
+    /// Claims the tail for a growth ahead of need: `[frontier, end)`, through the next block
+    /// of the ahead class, becomes the new frontier, held as placeholders so no allocation
+    /// lands there before the file has grown. Returns `(from, end)` for
+    /// [`release_ahead`](Self::release_ahead).
+    pub(crate) fn claim_ahead(&mut self) -> (u64, u64) {
+        let (_, end) = self.grow_target(self.ahead_class);
+        let from = self.frontier;
+        self.frontier = end;
+        let mut at = from;
+        while at < end {
+            let class = block_class(at, end);
+            self.used.insert(
+                at,
+                Used {
+                    class,
+                    retired: None,
+                    published: false,
+                    placeholder: true,
+                },
+            );
+            self.used_units += units(class);
+            at += units(class);
+        }
+        (from, end)
+    }
+
+    /// Ends a growth claimed by [`claim_ahead`](Self::claim_ahead). Grown (`grown`), its
+    /// placeholders become free space. Not grown, the claim is undone if it is still the
+    /// file's tail; otherwise (an inline growth went past it meanwhile) the placeholders stay,
+    /// unused until the next open.
+    pub(crate) fn release_ahead(&mut self, from: u64, end: u64, grown: bool) {
+        if !grown && self.frontier != end {
+            return;
+        }
+        let blocks: Vec<u64> = self
+            .used
+            .range(from..end)
+            .filter(|(_, u)| u.placeholder)
+            .map(|(&u, _)| u)
+            .collect();
+        for unit in blocks {
+            let used = self.used.remove(&unit).expect("placeholder");
+            self.used_units -= units(used.class);
+            if grown {
+                self.free_block(unit, used.class);
+            }
+        }
+        if !grown {
+            self.frontier = from;
+        }
     }
 
     /// Whether `e` is exactly a pending extent: live and not known to be published.
@@ -870,5 +955,47 @@ mod tests {
         a.truncate(a.used_end());
         a.check();
         assert_eq!(a.frontier(), 5);
+    }
+
+    #[test]
+    fn a_growth_ahead_claims_the_tail_until_released() {
+        let mut a = Alloc::empty(3);
+        a.set_ahead(2, 0);
+        assert!(a.wants_ahead());
+        let (from, end) = a.claim_ahead();
+        assert_eq!((from, end, a.frontier()), (3, 8, 8));
+        a.check();
+        // Claimed space is not handed out: an allocation of the class grows past it.
+        assert!(a.alloc_free(2).is_none());
+        assert!(a.alloc_free(0).is_some());
+        a.release_ahead(from, end, true);
+        a.check();
+        assert!(!a.wants_ahead());
+        assert_eq!(a.alloc_free(2).map(|e| e.page / UNIT_PAGES), Some(4));
+        a.check();
+    }
+
+    #[test]
+    fn a_failed_growth_ahead_undoes_its_claim_only_at_the_tail() {
+        let mut a = Alloc::empty(3);
+        a.set_ahead(2, 0);
+        let (from, end) = a.claim_ahead();
+        a.release_ahead(from, end, false);
+        assert_eq!(a.frontier(), 3);
+        a.check();
+        // An inline growth went past the claim: it stays, unused, below the new tail.
+        let (from, end) = a.claim_ahead();
+        a.alloc_grown(2);
+        a.release_ahead(from, end, false);
+        assert_eq!(a.frontier(), 12);
+        a.check();
+    }
+
+    #[test]
+    fn a_small_file_does_not_grow_ahead() {
+        let a = Alloc::empty(3);
+        assert!(!a.wants_ahead());
+        // Long enough, but with a free block of the largest class: not yet.
+        assert!(!Alloc::empty(AHEAD_FROM_UNITS + 1).wants_ahead());
     }
 }
