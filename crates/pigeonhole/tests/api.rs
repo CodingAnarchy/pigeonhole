@@ -1431,6 +1431,29 @@ fn io_rings_report_the_backend() {
 }
 
 #[test]
+fn the_default_backend_is_io_uring_where_the_kernel_offers_it() {
+    // D218: `IoBackend::Auto`, io_uring where available and `pread` elsewhere.
+    assert_eq!(IoBackend::default(), IoBackend::Auto);
+    // A CI step that forces a backend through the test variable decides it there.
+    if std::env::var_os("PIGEONHOLE_IO").is_some() {
+        return;
+    }
+    let dir = TempDir::new("io-default");
+    let db = Pigeonhole::open(
+        dir.0.join("db.phdb"),
+        Options::default().shards(1).memtable_budget(4 << 20),
+    )
+    .unwrap();
+    // Linux CI runners offer io_uring; other systems open on `pread`, with no rings.
+    if cfg!(target_os = "linux") {
+        assert!(db.io_rings().is_some(), "the default did not pick io_uring");
+    } else {
+        assert_eq!(db.io_rings(), None);
+    }
+    db.close().unwrap();
+}
+
+#[test]
 fn reader_handles_see_the_writers_commits() {
     let vfs = SimVfs::new(9);
     let db = Pigeonhole::open("/db/r.phdb", sim_options(&vfs)).unwrap();
