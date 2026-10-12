@@ -31,6 +31,11 @@ use crate::snapshot::TabletEntry;
 /// Row samples kept per tablet and balancer interval (split points for write skew).
 const SAMPLES: usize = 64;
 
+/// Row samples a tablet pools over its recent intervals, each weighted by its interval's
+/// writes per sample: a skew split cuts on these (D223). One interval's 64 samples left a
+/// piece up to twice its share at 16 shards.
+const POOL: usize = 1024;
+
 /// Weight of the newest interval in the moving averages of write load (#103, D214): one
 /// interval's noise never decides a move on its own.
 const LOAD_ALPHA: f64 = 0.2;
@@ -176,6 +181,10 @@ pub(crate) struct TabletLoad {
     /// allocate (#320).
     samples: Vec<Vec<u8>>,
     sampled: usize,
+    /// The samples of recent intervals with their weights (writes per sample), a ring of
+    /// up to `POOL` overwritten in place from `pool_next` (D223).
+    pool: Vec<(Vec<u8>, f64)>,
+    pool_next: usize,
     /// Moving average of `writes` over intervals (`LOAD_ALPHA`).
     ewma: f64,
     /// Slow moving average of `writes` (`SLOW_ALPHA`, D224).
@@ -188,6 +197,27 @@ impl TabletLoad {
     /// This interval's row samples.
     fn live_samples(&self) -> &[Vec<u8>] {
         &self.samples[..self.sampled]
+    }
+
+    /// The weight of each of this interval's samples: the writes it stands for.
+    fn live_weight(&self) -> f64 {
+        self.writes as f64 / self.sampled.max(1) as f64
+    }
+
+    /// Adds this interval's samples to the pool, as the interval ends.
+    fn pool_interval(&mut self) {
+        let w = self.live_weight();
+        for row in &self.samples[..self.sampled] {
+            if self.pool.len() < POOL {
+                self.pool.push((row.clone(), w));
+            } else {
+                let (r, weight) = &mut self.pool[self.pool_next];
+                r.clear();
+                r.extend_from_slice(row);
+                *weight = w;
+            }
+            self.pool_next = (self.pool_next + 1) % POOL;
+        }
     }
 }
 
@@ -1142,6 +1172,7 @@ impl ShardState {
         };
         self.window_writes = 0;
         for l in self.loads.values_mut() {
+            l.pool_interval();
             l.prev_writes = l.writes;
             l.writes = 0;
             l.seen = 0;
@@ -1981,21 +2012,33 @@ impl ShardState {
         })
     }
 
-    /// Up to `parts - 1` split keys from the rows written to `t` this interval (quantiles of
-    /// the sample), strictly inside its range.
+    /// Up to `parts - 1` split keys for `t`, strictly inside its range: the cuts that leave
+    /// the heaviest piece lightest, over the rows sampled from its recent writes, each row
+    /// weighted by the writes it stands for (D223). A row sampled often (a hot row) keeps its
+    /// weight, so a cut can isolate it.
     fn skew_split_keys(&self, t: &TabletEntry, parts: usize) -> Vec<Vec<u8>> {
         let Some(load) = self.loads.get(&t.id) else {
             return Vec::new();
         };
-        let mut rows: Vec<&[u8]> = load
-            .live_samples()
+        let live = load.live_weight();
+        let in_range =
+            |r: &[u8]| r >= t.start.as_slice() && t.end.as_ref().is_none_or(|e| r < e.as_slice());
+        let mut rows: Vec<(&[u8], f64)> = load
+            .pool
             .iter()
-            .map(Vec::as_slice)
-            .filter(|r| inside(t, r))
+            .map(|(r, w)| (r.as_slice(), *w))
+            .chain(load.live_samples().iter().map(|r| (r.as_slice(), live)))
+            .filter(|(r, w)| *w > 0.0 && in_range(r))
             .collect();
-        rows.sort_unstable();
-        rows.dedup();
-        quantiles(&rows, parts)
+        rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut merged: Vec<(&[u8], f64)> = Vec::with_capacity(rows.len());
+        for (r, w) in rows {
+            match merged.last_mut() {
+                Some((last, sum)) if *last == r => *sum += w,
+                _ => merged.push((r, w)),
+            }
+        }
+        weighted_cuts(&merged, parts)
     }
 
     /// A split key near the middle of `t`'s SSTs (their boundary rows) and recent writes.
@@ -2037,6 +2080,39 @@ fn quantiles(rows: &[&[u8]], parts: usize) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// Up to `parts - 1` cut rows over `rows` (sorted, distinct, with weights) that minimise
+/// the heaviest piece's weight; each cut is the first row of a piece after the first, so it
+/// is never the first row. The bound on the heaviest piece is found by bisection.
+fn weighted_cuts(rows: &[(&[u8], f64)], parts: usize) -> Vec<Vec<u8>> {
+    let cuts = |cap: f64| {
+        let mut out: Vec<&[u8]> = Vec::new();
+        let mut acc = 0.0;
+        for (r, w) in rows {
+            if acc > 0.0 && acc + w > cap {
+                out.push(r);
+                acc = *w;
+            } else {
+                acc += w;
+            }
+        }
+        out
+    };
+    if parts < 2 || rows.len() < 2 {
+        return Vec::new();
+    }
+    let total: f64 = rows.iter().map(|(_, w)| w).sum();
+    let (mut lo, mut hi) = (rows.iter().map(|(_, w)| *w).fold(0.0, f64::max), total);
+    for _ in 0..50 {
+        let mid = (lo + hi) / 2.0;
+        if cuts(mid).len() < parts {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    cuts(hi).into_iter().map(<[u8]>::to_vec).collect()
 }
 
 /// Whether `row` lies strictly inside `t` (a split there leaves both sides non-empty).
@@ -2373,5 +2449,30 @@ fn tablet_change(
             edits.push(Edit::DropTablet { tablet: *right });
             Ok((edits, vec![(id, me)]))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::weighted_cuts;
+
+    #[test]
+    fn weighted_cuts_isolate_a_hot_row_and_keep_its_weight() {
+        // A row carrying 6 of 10 writes gets a piece of its own: the heaviest piece weighs 6,
+        // not the 6 + 1 that cutting at even sample counts would leave.
+        let rows: Vec<(&[u8], f64)> = vec![
+            (b"a", 1.0),
+            (b"b", 1.0),
+            (b"c", 6.0),
+            (b"d", 1.0),
+            (b"e", 1.0),
+        ];
+        assert_eq!(weighted_cuts(&rows, 3), vec![b"c".to_vec(), b"d".to_vec()]);
+        // Even weights split evenly; never more pieces than asked, never a cut at the first row.
+        let even: Vec<(&[u8], f64)> = vec![(b"a", 1.0), (b"b", 1.0), (b"c", 1.0), (b"d", 1.0)];
+        assert_eq!(weighted_cuts(&even, 2), vec![b"c".to_vec()]);
+        assert_eq!(weighted_cuts(&even, 8).len(), 3);
+        assert!(weighted_cuts(&even, 1).is_empty());
+        assert!(weighted_cuts(&even[..1], 4).is_empty());
     }
 }
