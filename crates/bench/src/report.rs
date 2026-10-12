@@ -652,9 +652,10 @@ impl Scaling {
     }
 }
 
-/// The durable group-commit target (D213): 4-cell `GroupSync` commits at N shards (one per
-/// core), the table split over every shard up front, each shard's thread keeping
-/// [`INLINE_IN_FLIGHT`](crate::INLINE_IN_FLIGHT) commits in flight (the D204 driver).
+/// The durable group-commit target (D213, D226): 4-cell `GroupSync` commits at N shards (one
+/// per core), the table split over every shard up front, each shard's thread keeping
+/// [`INLINE_IN_FLIGHT`](crate::INLINE_IN_FLIGHT) commits in flight (the D204 driver). A run
+/// at another [`in_flight`](GroupCommit::in_flight) is reported beside it, not judged.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GroupCommit {
     /// Shards in the run.
@@ -683,6 +684,14 @@ pub struct GroupCommit {
     /// See [`GroupCommit::wal_rollover_blocks`].
     #[serde(default)]
     pub wal_inline_syncs: u64,
+    /// Commits each shard's thread kept in flight ([`INLINE_IN_FLIGHT`](crate::INLINE_IN_FLIGHT)
+    /// in results written before the flag existed).
+    #[serde(default = "judged_in_flight")]
+    pub in_flight: usize,
+}
+
+fn judged_in_flight() -> usize {
+    crate::INLINE_IN_FLIGHT
 }
 
 impl GroupCommit {
@@ -691,9 +700,15 @@ impl GroupCommit {
     /// The p99 commit latency the target allows, nanoseconds.
     pub const P99_NS: u64 = 200_000;
 
-    /// Builds the result from the D213 run's record: its throughput times
-    /// [`GROUP_COMMIT_CELLS`](crate::GROUP_COMMIT_CELLS) cells per commit.
-    pub fn new(shards: usize, cores: usize, run: &RunRecord) -> Self {
+    /// Whether this run is the judged shape: [`INLINE_IN_FLIGHT`](crate::INLINE_IN_FLIGHT)
+    /// commits in flight per shard (D226; fewer are reported beside it).
+    pub fn judged(&self) -> bool {
+        self.in_flight == crate::INLINE_IN_FLIGHT
+    }
+
+    /// Builds the result from the D213 run's record (`in_flight` commits per shard): its
+    /// throughput times [`GROUP_COMMIT_CELLS`](crate::GROUP_COMMIT_CELLS) cells per commit.
+    pub fn new(shards: usize, cores: usize, in_flight: usize, run: &RunRecord) -> Self {
         let total: u64 = run.detail.shards.iter().map(|s| s.commits).sum();
         let top = run
             .detail
@@ -723,6 +738,7 @@ impl GroupCommit {
             engine: run.detail.engine_commit,
             wal_rollover_blocks: st.wal_rollover_blocks,
             wal_inline_syncs: st.wal_inline_syncs,
+            in_flight,
         }
     }
 
@@ -738,19 +754,23 @@ impl GroupCommit {
     ///     p50_ns: 80_000,
     ///     p99_ns: 150_000,
     ///     max_share: 0.13,
+    ///     in_flight: pigeonhole_bench::INLINE_IN_FLIGHT,
     ///     ..Default::default()
     /// };
     /// assert_eq!(gc.cells_per_core(), 150_000.0);
     /// assert!(gc.passes());
+    /// // At fewer commits in flight it is reported, not judged (D226).
+    /// assert!(!GroupCommit { in_flight: 8, ..gc }.passes());
     /// ```
     pub fn cells_per_core(&self) -> f64 {
         self.cells_per_sec / self.cores.max(1) as f64
     }
 
     /// Whether the target is met: more than 1M cells/s and p99 under 200 µs, measured on a
-    /// placement that did not change.
+    /// placement that did not change, at the judged commits in flight (D226).
     pub fn passes(&self) -> bool {
-        self.tablet_changes == 0
+        self.judged()
+            && self.tablet_changes == 0
             && self.cells_per_sec > Self::CELLS_PER_SEC
             && self.p99_ns < Self::P99_NS
     }
@@ -1034,7 +1054,7 @@ impl Suite {
                  rollover blocks, {} inline WAL syncs — {}.",
                 gc.shards,
                 gc.cores,
-                crate::INLINE_IN_FLIGHT,
+                gc.in_flight,
                 ops(gc.cells_per_sec),
                 ops(gc.cells_per_core()),
                 us(gc.p50_ns),
@@ -1051,6 +1071,8 @@ impl Suite {
                 gc.wal_inline_syncs,
                 if gc.tablet_changes > 0 {
                     "invalid: the placement changed while measuring"
+                } else if !gc.judged() {
+                    "reported, not judged (D226 judges 16 in flight)"
                 } else if gc.passes() {
                     "pass"
                 } else {

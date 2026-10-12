@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pigeonhole_bench::{
-    Environment, GROUP_COMMIT_THREADS, GroupCommit, MemoryBudget, PigeonholeRunner, RunOptions,
-    RunRecord, Runner, Scaling, Suite, Tolerance, WorkloadConfig, WorkloadKind, compare,
-    run_detailed,
+    Environment, GROUP_COMMIT_THREADS, GroupCommit, INLINE_IN_FLIGHT, MemoryBudget,
+    PigeonholeRunner, RunOptions, RunRecord, Runner, Scaling, Suite, Tolerance, WorkloadConfig,
+    WorkloadKind, compare, run_detailed,
 };
 
 /// Default warmup of `scaling`, as a fraction of the measured ops. The balancer needs about
@@ -60,6 +60,9 @@ OPTIONS:
                            measured writes until at least S seconds are measured
                            (D219) [default: 0, once]
     --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
+    --in-flight N          inline runs: commits each shard's thread keeps in flight
+                           [default: 16, the judged shape]; fewer trade throughput for
+                           latency (the gate reports 4 and 8 beside 16, D226)
     --shards N             Pigeonhole shards (scaling: N; default one per physical core)
     --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
                            shard) [default: 64 MiB]
@@ -95,6 +98,7 @@ struct Args {
     warmup: Option<f64>,
     min_secs: Option<f64>,
     inline_ops: Option<u64>,
+    in_flight: Option<usize>,
     shards: Option<usize>,
     write_buffer: Option<u64>,
     cache: Option<u64>,
@@ -137,6 +141,13 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--warmup" => a.warmup = Some(parse(&arg, it.next())?),
             "--min-secs" => a.min_secs = Some(parse(&arg, it.next())?),
             "--inline-ops" => a.inline_ops = Some(parse(&arg, it.next())?),
+            "--in-flight" => {
+                let n: usize = parse(&arg, it.next())?;
+                if n == 0 {
+                    return Err("--in-flight must be at least 1".to_owned());
+                }
+                a.in_flight = Some(n);
+            }
             "--write-buffer" | "--memtable-budget" => {
                 a.write_buffer = Some(parse(&arg, it.next())?)
             }
@@ -287,6 +298,7 @@ fn one_inline(
     let options = RunOptions {
         warmup: a.warmup.unwrap_or(SCALING_WARMUP),
         min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
+        in_flight: a.in_flight.unwrap_or(INLINE_IN_FLIGHT),
     };
     let result = runner
         .run_inline(config, &dir, &options)
@@ -376,7 +388,8 @@ fn bench(a: &Args) -> Result<Suite, String> {
                     ..c.clone()
                 };
                 let run = one_inline(a, &root, &mut seq, &r, &inline)?;
-                suite.group_commit = Some(GroupCommit::new(n, cores, &run));
+                let in_flight = a.in_flight.unwrap_or(INLINE_IN_FLIGHT);
+                suite.group_commit = Some(GroupCommit::new(n, cores, in_flight, &run));
                 suite.results.push(run);
             }
             let threads = match (kind, a.threads) {
@@ -641,6 +654,24 @@ mod tests {
         let suite = bench(&a).unwrap();
         let ops: Vec<u64> = suite.results.iter().map(|r| r.operations).collect();
         assert_eq!(ops, [256, 64], "the D213 run, then one client run");
+        assert!(suite.group_commit.as_ref().is_some_and(|g| g.judged()));
+        // D226: `--in-flight` sets the commits each shard keeps in flight; a run at fewer
+        // than 16 is reported, not judged.
+        let a = args(&format!(
+            "group-commit --scale smoke --ops 64 --inline-ops 256 --threads 1 --shards 2 \
+             --in-flight 4 --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        let gc = suite.group_commit.as_ref().expect("the D213 result");
+        assert_eq!(gc.in_flight, 4);
+        assert!(!gc.judged() && !gc.passes());
+        assert!(suite.results[0].store_config.ends_with("in-flight=4"));
+        assert!(
+            suite
+                .to_markdown()
+                .contains("4 commits in flight per shard")
+        );
         let a = args(&format!(
             "scaling --scale smoke --ops 64 --shards 2 --min-secs 0.2 --write-buffer 16777216 \
              --dir {}",

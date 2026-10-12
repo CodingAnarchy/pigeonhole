@@ -158,7 +158,7 @@ def run_length(name):
 if g:
     cells, per_core = g["cells_per_sec"], g["cells_per_sec"] / max(g["cores"], 1)
     fixed = g.get("tablet_changes", 1) == 0
-    rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)",
+    rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213, D226: 16 in flight)",
                  f"{cells / 1e6:.2f}M cells/s at {g['shards']} shards ({per_core / 1e3:.0f}K per core); "
                  f"p50 {us(g['p50_ns']):.0f} µs, p99 {us(g['p99_ns']):.0f} µs; busiest shard "
                  f"{100 * g['max_share']:.0f}%{run_length('latency-group-commit.json')}{stages(g)}{floor}"
@@ -167,6 +167,25 @@ if g:
 else:
     rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)", floor.lstrip("; "),
                  verdict(None), "latency-group-commit.json"))
+# The trade-off beside the judged row (D226): the same D213 run at 4 and 8 commits in flight
+# per shard instead of 16. Fewer in flight lower the p99 and give up throughput.
+def p999_of(name):
+    r = next((r for r in results(name, "pigeonhole") if "presplit" in r.get("store_config", "")), None)
+    return f", p99.9 {us(r['p999_ns']):.0f} µs" if r and "p999_ns" in r else ""
+
+
+for f in (4, 8):
+    name = f"latency-group-commit-inflight-{f}.json"
+    gf = (load(name) or {}).get("group_commit")
+    if not gf:
+        continue
+    vs = f" ({100 * gf['cells_per_sec'] / g['cells_per_sec'] - 100:+.0f}% vs 16)" if g else ""
+    e = gf.get("engine")
+    inside = f"; in the engine p99 {us(e['p99_ns']):.0f} µs" if e else ""
+    rows.append((f"Durable group commit at {f} in flight per shard (reported, not judged; D226)",
+                 f"{gf['cells_per_sec'] / 1e6:.2f}M cells/s{vs}; p50 {us(gf['p50_ns']):.0f} µs, "
+                 f"p99 {us(gf['p99_ns']):.0f} µs{p999_of(name)}{inside}",
+                 "-", name))
 gp = (load("latency-group-commit-pread.json") or {}).get("group_commit")
 if gp:
     rows.append(("Durable group commit on pread (reported, not judged; D213: decides the io_uring default)",
