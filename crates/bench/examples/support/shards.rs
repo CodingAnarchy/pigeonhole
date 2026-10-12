@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Waker;
 use std::thread;
 use std::time::Duration;
 
@@ -73,25 +74,26 @@ struct Ctl {
     /// Whether a shape is being measured: each shard is then driven, in `shape_run_shard`,
     /// by a thread spawned for the measurement.
     measuring: AtomicBool,
-    /// Shard threads running (not parked).
+    /// Shard threads running (not waiting).
     busy: AtomicUsize,
     /// The number of shards.
     shards: usize,
     /// Shards with their measured thread.
     handed: AtomicUsize,
-    /// The threads driving the shards now, to wake when `measuring` changes.
-    drivers: Mutex<Vec<thread::Thread>>,
+    /// The threads driving the shards now, with their shard's waker, to wake when
+    /// `measuring` changes.
+    drivers: Mutex<Vec<(thread::ThreadId, Waker)>>,
 }
 
 impl Ctl {
     /// Wakes every thread driving a shard.
     fn wake(&self) {
-        for t in self.drivers.lock().unwrap().iter() {
-            t.unpark();
+        for (_, waker) in self.drivers.lock().unwrap().iter() {
+            waker.wake_by_ref();
         }
     }
 
-    /// Waits until every shard thread is parked: nothing left to run.
+    /// Waits until every shard thread is waiting: nothing left to run.
     fn wait_idle(&self) {
         while self.busy.load(Ordering::Acquire) > 0 {
             thread::yield_now();
@@ -162,10 +164,8 @@ fn run(mut shard: Shard, ctl: &Ctl) {
 /// (the shard, idle, for the next thread). `busy` counts the thread while it runs (the
 /// caller counted it in).
 fn drive(mut shard: Shard, ctl: &Ctl, measured: bool) -> Option<Shard> {
-    let me = thread::current();
-    let wake = me.clone();
-    shard.set_wakeup(Box::new(move || wake.unpark()));
-    ctl.drivers.lock().unwrap().push(me.clone());
+    let me = thread::current().id();
+    ctl.drivers.lock().unwrap().push((me, shard.waker()));
     let driven = loop {
         if measured {
             shape_run_shard(&mut shard);
@@ -180,13 +180,12 @@ fn drive(mut shard: Shard, ctl: &Ctl, measured: bool) -> Option<Shard> {
             break Some(shard);
         }
         ctl.busy.fetch_sub(1, Ordering::AcqRel);
-        match shard.next_wakeup() {
-            Some(due) => thread::park_timeout(due),
-            None => thread::park(),
-        }
+        // Ends early for work, a wake or due background work; the timeout is never what
+        // ends it in a run, so no turn is counted for it.
+        shard.wait(Duration::from_secs(60));
         ctl.busy.fetch_add(1, Ordering::AcqRel);
     };
-    ctl.drivers.lock().unwrap().retain(|t| t.id() != me.id());
+    ctl.drivers.lock().unwrap().retain(|(id, _)| *id != me);
     ctl.busy.fetch_sub(1, Ordering::AcqRel);
     driven
 }
