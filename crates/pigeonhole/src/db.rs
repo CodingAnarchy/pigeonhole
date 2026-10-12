@@ -821,6 +821,51 @@ impl Shard {
         fd
     }
 
+    /// Waits until this shard has work again: a commit or message arrives for it, a
+    /// [`waker`](Shard::waker) fires, I/O this thread submitted completes, background work
+    /// falls due ([`next_wakeup`](Shard::next_wakeup)), or `timeout` passes (#553). The loop
+    /// for one shard per thread:
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::{Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let (db, mut shards) =
+    ///     Pigeonhole::open_application_owned(dir.join("w.phdb"), Options::default().shards(1))?;
+    /// let shard = &mut shards[0];
+    /// for _ in 0..3 {
+    ///     while shard.run_once(Duration::from_micros(200)) {}
+    ///     // Poll your own futures here, with `shard.waker()` as their waker.
+    ///     shard.wait(Duration::from_millis(10));
+    /// }
+    /// db.close()?;
+    /// while shard.closed().is_none() {
+    ///     shard.run_once(Duration::from_micros(200));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Call it on the thread that drives the shard, after [`run_once`](Shard::run_once)
+    /// returns `false`. It may return early, so loop on `run_once`. It needs no completion fd
+    /// and works on every backend: with io_uring it waits in the thread's ring while its own
+    /// I/O is in flight, and parks otherwise. The [`set_wakeup`](Shard::set_wakeup) callback
+    /// still fires. A thread that drives several shards, or waits on other sources too,
+    /// uses its own event loop instead: [`io_fd`](Shard::io_fd), `set_wakeup` and
+    /// `next_wakeup`.
+    pub fn wait(&mut self, timeout: std::time::Duration) {
+        self.inner.wait(timeout);
+    }
+
+    /// A waker that ends this shard's [`wait`](Shard::wait) from any thread. Give it to the
+    /// futures the driving thread polls itself (`commit_async` and the other async calls):
+    /// a commit can complete on another shard's thread, and its wake must reach this one.
+    pub fn waker(&self) -> std::task::Waker {
+        self.inner.waker()
+    }
+
     /// Registers a callback invoked (from any thread) when work arrives for this shard. It
     /// does not fire when background work falls due: see [`next_wakeup`](Shard::next_wakeup).
     pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {

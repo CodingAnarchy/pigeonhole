@@ -134,7 +134,24 @@ Making scan steps resumable, so the last case never blocks, is tracked in [#398]
 ## Application-owned mode
 With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `compact` refuse to run on a thread that drives a shard, because they could wait on that same shard (D88). The async forms are how you call them from the event loop: submit with `commit_async`, `commit_if_async`, `flush_async` or `compact_async` and await the future there.
 
-**With io_uring (the default on Linux: `IoBackend::Auto`, D218), wait on each shard's `Shard::io_fd`** in your event loop (`poll`/`epoll`, readable), as well as on the `set_wakeup` callback and `next_wakeup` (D202):
+**The loop for one shard per thread: `run_once` until idle, poll your futures with `shard.waker()`, then `shard.wait(timeout)`** (#553):
+
+```rust,ignore
+let waker = shard.waker();
+let mut cx = std::task::Context::from_waker(&waker);
+loop {
+    while shard.run_once(Duration::from_micros(200)) {}
+    // poll this thread's futures (commit_async and friends) with `cx`
+    shard.wait(Duration::from_millis(10));
+}
+```
+
+- `wait` returns when work arrives for the shard, a future's wake reaches `shard.waker()`, this thread's own I/O completes, background work falls due, or the timeout passes. It may return early.
+- It works on every backend and needs no file descriptor: with io_uring (the default on Linux) it waits in the thread's ring while the thread's own I/O is in flight, and parks otherwise.
+- Give the futures this thread polls `shard.waker()`: a commit can complete on another shard's thread, and its wake must end this thread's wait.
+- A thread that drives several shards, or waits on other sources too, uses its own event loop instead: the points below.
+
+**In your own event loop, with io_uring (the default on Linux: `IoBackend::Auto`, D218), wait on each shard's `Shard::io_fd`** (`poll`/`epoll`, readable), as well as on the `set_wakeup` callback and `next_wakeup` (D202):
 - **Why.** In application-owned mode the engine starts no threads, so nothing in the background completes I/O. A read an async call submits from a thread that drives no shard (an executor's `get_async` that misses the cache) completes when a driving thread's turn takes it, and the driving threads' `io_fd` turns readable for exactly that.
 - **If your loop doesn't wait on `io_fd`,** such an async read still completes, but only at the loop's next timed turn: up to `next_wakeup` later, which can be seconds when idle.
 - **Blocking calls are unaffected:** a thread blocked on its own read completes it itself.

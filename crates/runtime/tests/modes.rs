@@ -1022,3 +1022,84 @@ fn a_clock_that_does_not_move_runs_sleepers_early() {
     assert!(!d.run_once(u64::MAX));
     assert_eq!(runs.load(Ordering::Relaxed), 2);
 }
+
+// ---------------------------------------------------------------------------------------
+// `ShardDriver::wait` (#553, ICR 0035).
+
+/// An idle shard whose thread waits; `wake` (on another thread, after 50 ms) must end the
+/// wait long before its 30 s timeout.
+fn wait_is_ended_by(wake: impl FnOnce(&ShardDriver<Handler>) -> Box<dyn FnOnce() + Send>) {
+    let (mut drivers, _) = app_drivers(1);
+    let mut d = drivers.remove(0);
+    assert!(!d.run_once(u64::MAX));
+    let fire = wake(&d);
+    let other = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        fire();
+    });
+    let started = Instant::now();
+    d.wait(Duration::from_secs(30));
+    let waited = started.elapsed();
+    other.join().unwrap();
+    assert!(waited < Duration::from_secs(5), "the wait ran {waited:?}");
+}
+
+#[test]
+fn a_message_ends_the_wait() {
+    wait_is_ended_by(|d| {
+        let s = d.submitter(ShardId(0));
+        Box::new(move || {
+            let (n, _w) = completion();
+            s.submit(Msg::Echo(1, n)).unwrap();
+        })
+    });
+}
+
+#[test]
+fn a_waker_ends_the_wait() {
+    wait_is_ended_by(|d| {
+        let w = d.waker();
+        Box::new(move || w.wake())
+    });
+}
+
+#[test]
+fn work_queued_before_the_wait_returns_it_at_once() {
+    let (mut drivers, _) = app_drivers(1);
+    let mut d = drivers.remove(0);
+    assert!(!d.run_once(u64::MAX));
+    let (n, w) = completion();
+    // Submitted while the shard was idle with nobody to wake: only the wait's re-check
+    // finds it.
+    d.submitter(ShardId(0)).submit(Msg::Echo(4, n)).unwrap();
+    let started = Instant::now();
+    d.wait(Duration::from_secs(30));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!d.run_once(u64::MAX));
+    assert_eq!(w.wait(), Some(4));
+}
+
+#[test]
+fn the_wakeup_callback_still_fires_beside_a_wait() {
+    let (mut drivers, _) = app_drivers(1);
+    let mut d = drivers.remove(0);
+    let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let f = Arc::clone(&fired);
+    d.set_wakeup(Box::new(move || {
+        f.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert!(!d.run_once(u64::MAX));
+    let before = fired.load(Ordering::SeqCst);
+    let s = d.submitter(ShardId(0));
+    let other = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        let (n, _w) = completion();
+        s.submit(Msg::Echo(2, n)).unwrap();
+    });
+    d.wait(Duration::from_secs(30));
+    other.join().unwrap();
+    assert!(
+        fired.load(Ordering::SeqCst) > before,
+        "the callback was not called"
+    );
+}

@@ -33,10 +33,6 @@ rocksdb = { version = "0.25", default-features = false, optional = true }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 fjall = { version = "3", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# The inline driver's wait on a shard's completion fd and a wake eventfd.
-rustix = { version = "1", features = ["event"] }
-
 [lints]
 workspace = true
 
