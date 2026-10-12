@@ -1195,7 +1195,7 @@ impl Committed {
     }
 }
 
-/// The result of a blocking engine call run on a helper thread.
+/// The result of an in-flight commit, conditional commit or transaction.
 enum Outcome {
     Commit(Result<pigeonhole_engine::CommitInfo, Error>),
     Cas(Result<(bool, Option<pigeonhole_engine::CommitInfo>), Error>),
@@ -3428,7 +3428,7 @@ impl World {
         }
     }
 
-    /// Submits a `check_and_mutate` (alone) on a helper thread.
+    /// Submits a `check_and_mutate` (alone) without waiting (`submit_check_and_mutate`).
     fn submit_cas(
         &mut self,
         ops: Vec<ModelOp>,
@@ -3539,8 +3539,8 @@ impl World {
         Ok(())
     }
 
-    /// Begins a transaction, reads a few columns (checked against the model), and commits
-    /// it on a helper thread.
+    /// Begins a transaction, reads a few columns (checked against the model), and submits
+    /// its commit without waiting (`Txn::submit`).
     fn submit_txn(
         &mut self,
         ops: Vec<ModelOp>,
