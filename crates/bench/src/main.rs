@@ -68,6 +68,8 @@ OPTIONS:
     --sync                 fsync every commit on every engine [default: buffered]
     --no-tablet-changes    Pigeonhole: keep each table one tablet on one shard (tablets
                            split, merge and move between shards by default)
+    --no-packing           Pigeonhole: spread tablets over every shard even under light
+                           writes (D217's packing is on by default)
     --row-cache B          Pigeonhole: row cache bytes; 0 turns it off (D201)
                            [default: the library's, on (D216)]
     --shard-spin US        Pigeonhole: a shard's idle spin before it parks, in µs (D198)
@@ -98,6 +100,7 @@ struct Args {
     cache: Option<u64>,
     sync: bool,
     no_tablet_changes: bool,
+    no_packing: bool,
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
     dir: Option<PathBuf>,
@@ -140,6 +143,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
             "--sync" => a.sync = true,
             "--no-tablet-changes" => a.no_tablet_changes = true,
+            "--no-packing" => a.no_packing = true,
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
@@ -203,7 +207,8 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     let mut r = PigeonholeRunner::default()
         .sync(a.sync)
         .memory(memory(a))
-        .tablet_changes(!a.no_tablet_changes);
+        .tablet_changes(!a.no_tablet_changes)
+        .packing(!a.no_packing);
     if let Some(bytes) = a.row_cache {
         r = r.row_cache(bytes);
     }

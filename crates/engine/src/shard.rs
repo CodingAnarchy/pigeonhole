@@ -2155,6 +2155,14 @@ pub(crate) struct ShardState {
     /// Whether this shard acts on write skew: from `SKEW_PERSIST` skewed passes until its
     /// load falls below the stop ratio (D214).
     skew_active: bool,
+    /// Packing (D217): this shard's busy time and clock at its last pass, the moving average
+    /// of how busy it was, how many shards stay active (`0..pack_k`; 0 before the first
+    /// decision), and the consecutive passes calling for more or fewer of them.
+    busy_mark: Option<(u64, u64)>,
+    busy_ewma: f64,
+    pack_k: usize,
+    pack_up: u64,
+    pack_down: u64,
     /// Wakes the shard for its next balancer pass (#103).
     balance_timer: Option<Arc<TimerState>>,
     /// The current balancer interval: the base `balance_interval_nanos`, doubled after each
@@ -2310,6 +2318,11 @@ impl ShardState {
             skew_pass: None,
             skew_run: 0,
             skew_active: false,
+            busy_mark: None,
+            busy_ewma: 0.0,
+            pack_k: 0,
+            pack_up: 0,
+            pack_down: 0,
             balance_timer: None,
             balance_interval: 0,
             balance_epoch: 0,

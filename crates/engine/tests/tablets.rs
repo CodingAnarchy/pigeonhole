@@ -523,6 +523,185 @@ fn a_short_burst_of_skew_changes_no_tablet() {
     }
 }
 
+/// Four shards, one written tablet each, every shard measuring itself `busy` (the test hook
+/// stands in for the threads' busy time, which application-owned shards do not count).
+fn spread_and_busy(busy: f64, pack: bool) -> Db {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+        o.balance_pack = pack;
+    });
+    tablets_on(&mut db, shards, |t| t as u16);
+    for s in 0..shards {
+        db.engine.set_shard_busy(s, Some(busy));
+    }
+    db
+}
+
+/// Light writes (D217): four shards each 10% busy (B = 0.4) need one shard. After the 50-pass
+/// shrink persistence, shards 1-3 hand their written tablets to shard 0, one per dwell, and
+/// then nothing changes.
+#[test]
+fn light_writes_pack_tablets_onto_fewer_shards() {
+    let mut db = spread_and_busy(0.1, true);
+    let setup = tablet_changes(&db.engine);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    let changes = (after.0 - setup.0, after.1 - setup.1, after.2 - setup.2);
+    assert_eq!(
+        tablets_per_shard(&db, 4),
+        vec![4, 0, 0, 0],
+        "after {passes} passes, (splits, merges, moves) {changes:?}"
+    );
+    assert_eq!(changes, (0, 0, 3), "three moves, one per tablet");
+    assert!(
+        passes >= 50,
+        "packed after {passes} passes, before the persistence"
+    );
+    for _ in 0..60 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    assert_eq!(
+        tablet_changes(&db.engine),
+        after,
+        "packed: nothing more changes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Packing never strands tablets (D217): six tablets of a 20-family table need 120 memtable
+/// slots, and a shard serves 64 (three tablets). Light writes (B = 0.3, one shard's worth)
+/// pack them onto two shards, not three onto one shard and the rest left where they were.
+#[test]
+fn packing_keeps_as_many_shards_as_the_tablets_slots_need() {
+    let shards = 6;
+    let mut db = open_wide(&SimVfs::new(7), shards, 20, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    // One tablet per shard. Each split is moved off before the next (all six on one shard
+    // would not fit).
+    let id = db.table.id;
+    let owner_of = |db: &Db, t: usize| {
+        let row = tablet_row(t, 0);
+        db.ranges()
+            .into_iter()
+            .find(|(_, _, start, end)| {
+                row.as_slice() >= start.as_slice()
+                    && end.as_deref().is_none_or(|e| row.as_slice() < e)
+            })
+            .unwrap()
+            .1
+    };
+    for t in 1..shards {
+        let m = db
+            .engine
+            .split_tablet_pending(id, format!("t{t:02}").as_bytes())
+            .unwrap();
+        db.drive(m).unwrap();
+        for u in 0..=t {
+            if owner_of(&db, u) != u as u16 {
+                let m = db
+                    .engine
+                    .move_tablet_pending(id, &tablet_row(u, 0), u as u16)
+                    .unwrap();
+                db.drive(m).unwrap();
+            }
+        }
+    }
+    assert_eq!(tablets_per_shard(&db, shards), vec![1; shards]);
+    for s in 0..shards {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    let mut written = 0;
+    let mut passes = 0;
+    let packed = |db: &Db| tablets_per_shard(db, shards)[2..].iter().all(|&n| n == 0);
+    while !packed(&db) && passes < 400 {
+        write_and_balance(&mut db, shards, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        packed(&db),
+        "after {passes} passes: {:?}",
+        tablets_per_shard(&db, shards)
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Once packed, a shard that turns 90% busy (B / k = 0.9, past 0.75 for 10 passes) brings a
+/// second shard back, and write skew spreads the tablets over the two active shards only.
+#[test]
+fn packed_tablets_spread_again_when_the_shard_turns_busy() {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    db.engine.set_shard_busy(0, Some(0.9));
+    for s in 1..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    let packed = tablet_changes(&db.engine);
+    passes = 0;
+    while tablets_per_shard(&db, 4) != vec![2, 2, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    assert_eq!(
+        tablets_per_shard(&db, 4),
+        vec![2, 2, 0, 0],
+        "after {passes} passes, changes {:?}",
+        (after.0 - packed.0, after.1 - packed.1, after.2 - packed.2)
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// With packing off (`balance_pack = false`), or an idle store (writes below
+/// `balance_min_writes`), the same light load changes no tablet.
+#[test]
+fn packing_off_or_an_idle_store_keeps_the_placement() {
+    for (pack, rows) in [(false, 20), (true, 1)] {
+        let mut db = spread_and_busy(0.1, pack);
+        let before = tablet_changes(&db.engine);
+        let mut written = 0;
+        for _ in 0..120 {
+            write_and_balance(&mut db, 4, |_| rows, &mut written);
+        }
+        assert_eq!(
+            tablet_changes(&db.engine),
+            before,
+            "pack {pack}, {rows} rows per tablet"
+        );
+        assert_eq!(tablets_per_shard(&db, 4), vec![1, 1, 1, 1]);
+        db.engine.close().unwrap();
+        for _ in 0..8 {
+            db.step();
+        }
+    }
+}
+
 #[test]
 fn a_tablet_splits_at_the_size_threshold_and_merges_when_small_and_cold() {
     let mut db = open(2, |o| {

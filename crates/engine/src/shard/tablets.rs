@@ -55,6 +55,22 @@ const DWELL_PASSES: u64 = 10;
 /// writes and no tablet change since the last one, double the interval up to this (10 s).
 const BALANCE_IDLE_CAP_NANOS: u64 = 10_000_000_000;
 
+/// Packing (D217): the busy fraction each active shard aims for. With `B` the summed busy
+/// fraction of all shards, `ceil(B / PACK_TARGET)` shards stay active, so each has headroom
+/// before commits queue.
+const PACK_TARGET: f64 = 0.5;
+
+/// Packing grows the active shards once `B / k` stays above this for `PACK_GROW_PASSES`.
+const PACK_SPREAD: f64 = 0.75;
+
+/// Consecutive passes over `PACK_SPREAD` before more shards become active (1 s): a burst
+/// spreads quickly.
+const PACK_GROW_PASSES: u64 = 10;
+
+/// Consecutive passes with `B / (k - 1)` below `PACK_TARGET` before fewer shards stay active
+/// (5 s): packing is slow, so a pause between bursts does not reshuffle.
+const PACK_SHRINK_PASSES: u64 = 50;
+
 /// Slots reserved on shards receiving tablets (`LoadSlot::reserved`).
 type Reserved = Vec<(ShardId, usize)>;
 
@@ -147,6 +163,8 @@ pub(crate) struct BalanceConfig {
     pub min_writes: u64,
     pub skew: f64,
     pub split_bytes: u64,
+    /// `EngineOptions::balance_pack`, engine-owned shards only (D217).
+    pub pack: bool,
 }
 
 pub(crate) use crate::load_slot::LoadSlot;
@@ -1046,8 +1064,13 @@ impl ShardState {
         }
         self.note_arrivals();
         let (_, mem_per) = self.mem_bytes();
-        self.shared.loads[usize::from(self.id.0)]
-            .publish(self.load_ewma.round() as u64, now.max(1));
+        self.measure_busy(now);
+        self.shared.loads[usize::from(self.id.0)].publish(
+            self.load_ewma.round() as u64,
+            (self.busy_ewma * 1e6).round() as u64,
+            now.max(1),
+        );
+        self.track_pack(now);
         self.track_skew(now);
         let idle = self.op.is_none()
             && self.op_queue.is_empty()
@@ -1143,6 +1166,132 @@ impl ShardState {
         }
     }
 
+    /// Updates this shard's moving average of how busy it was since the last pass (D217):
+    /// the rise of its thread's busy time over the time that passed.
+    fn measure_busy(&mut self, now: u64) {
+        let me = usize::from(self.id.0);
+        let busy = self
+            .shared
+            .submitters
+            .get()
+            .and_then(|s| s.get(me))
+            .map_or(0, |s| s.busy_nanos());
+        let measured = match self.busy_mark {
+            Some((was, at)) if now > at => {
+                Some((busy.saturating_sub(was) as f64 / (now - at) as f64).min(1.0))
+            }
+            _ => None,
+        };
+        #[cfg(feature = "test-hooks")]
+        let measured = match self.shared.metrics[me]
+            .hooks
+            .busy_override
+            .load(Ordering::Relaxed)
+        {
+            0 => measured,
+            v => Some((v - 1) as f64 / 1e6),
+        };
+        if let Some(frac) = measured {
+            self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
+        }
+        self.busy_mark = Some((busy, now));
+    }
+
+    /// The shards that stay active under packing (D217): `0..k`. Every shard, without
+    /// packing or before it has decided.
+    pub(super) fn active_shards(&self) -> usize {
+        let n = self.shared.shards;
+        if self.shared.balance.pack && self.pack_k > 0 {
+            self.pack_k.min(n)
+        } else {
+            n
+        }
+    }
+
+    /// Updates how many shards stay active (D217): every shard computes the same `k` from the
+    /// published busy fractions, `ceil(B / PACK_TARGET)`. It grows (at least by one) after
+    /// `PACK_GROW_PASSES` passes with the active shards above `PACK_SPREAD` busy on average,
+    /// and shrinks after `PACK_SHRINK_PASSES` passes with one fewer shard enough to stay
+    /// under `PACK_TARGET`. Never fewer than the shards the tablets' memtable slots need
+    /// (`max_slots` each), and at once up to that. Only while the store writes (`balance_min_writes` over all
+    /// shards) and some shard reports busy time: an idle store, or a clock that does not
+    /// move while shards work (the simulated VFS), keeps its placement.
+    fn track_pack(&mut self, now: u64) {
+        let n = self.shared.shards;
+        if !self.shared.balance.pack || n < 2 {
+            return;
+        }
+        if self.pack_k == 0 {
+            self.pack_k = n;
+        }
+        let stale = self.shared.balance.interval_nanos.saturating_mul(3).max(1);
+        let busy: f64 = self
+            .shared
+            .loads
+            .iter()
+            .map(|l| l.read_busy_fresh(now, stale).unwrap_or(0) as f64 / 1e6)
+            .sum();
+        let writes: u64 = self
+            .shared
+            .loads
+            .iter()
+            .map(|l| l.read_fresh(now, stale).unwrap_or(0))
+            .sum();
+        if busy <= 0.0 || writes < self.shared.balance.min_writes.max(1) {
+            self.pack_up = 0;
+            self.pack_down = 0;
+            return;
+        }
+        // The active shards must hold every tablet's memtable slots: without the floor, the
+        // first full shard strands the rest of the written tablets across the inactive ones.
+        let floor = {
+            let view = self.shared.view.load();
+            let slots: usize = view
+                .tablets
+                .iter()
+                .map(|t| view.catalog.family_ids_of(t.table).len())
+                .sum();
+            slots.div_ceil(self.max_slots().max(1))
+        };
+        let k = self.pack_k;
+        let want = ((busy / PACK_TARGET).ceil() as usize)
+            .max(floor)
+            .clamp(1, n);
+        if k < floor {
+            self.pack_k = want;
+            trace!(
+                "shard {} balancer: active shards {k} -> {want} (slots need {floor})",
+                self.id.0
+            );
+            self.pack_up = 0;
+            self.pack_down = 0;
+            return;
+        }
+        if k < n && busy / k as f64 > PACK_SPREAD {
+            self.pack_up += 1;
+        } else {
+            self.pack_up = 0;
+        }
+        if k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
+            self.pack_down += 1;
+        } else {
+            self.pack_down = 0;
+        }
+        if self.pack_up >= PACK_GROW_PASSES {
+            self.pack_k = want.max(k + 1).min(n);
+        } else if self.pack_down >= PACK_SHRINK_PASSES {
+            self.pack_k = want.min(k - 1);
+        } else {
+            return;
+        }
+        trace!(
+            "shard {} balancer: active shards {k} -> {} (busy {busy:.2})",
+            self.id.0, self.pack_k
+        );
+        self.pack_up = 0;
+        self.pack_down = 0;
+    }
+
     /// Updates whether this shard acts on write skew (D214, with hysteresis): it starts after
     /// `SKEW_PERSIST` consecutive passes above `balance_skew` times the mean (and at least
     /// `balance_min_writes`), and stops once its load falls below the stop ratio or
@@ -1177,24 +1326,24 @@ impl ShardState {
         1.0 + SKEW_STOP * (skew - 1.0)
     }
 
-    /// The published write loads of every shard (stale ones count as 0), or `None` with a
-    /// single shard.
+    /// The published write loads of the active shards (every shard without packing, D217;
+    /// stale ones count as 0), or `None` with a single active shard or when this shard is not
+    /// active (it only hands its tablets to the active ones).
     fn published_loads(&self, now: u64) -> Option<Vec<u64>> {
-        let n = self.shared.shards;
-        if n < 2 {
+        let n = self.active_shards();
+        if n < 2 || usize::from(self.id.0) >= n {
             return None;
         }
         let stale = self.shared.balance.interval_nanos.saturating_mul(3).max(1);
         Some(
-            self.shared
-                .loads
+            self.shared.loads[..n]
                 .iter()
                 .map(|slot| slot.read_fresh(now, stale).unwrap_or(0))
                 .collect(),
         )
     }
 
-    /// This shard's published load and the mean over shards.
+    /// This shard's published load and the mean over the active shards.
     fn shard_loads(&self, now: u64) -> Option<(f64, f64)> {
         let loads = self.published_loads(now)?;
         let mean = loads.iter().sum::<u64>() as f64 / loads.len() as f64;
@@ -1378,13 +1527,47 @@ impl ShardState {
                 });
             }
         }
-        // 2. Skew across shards, on the moving averages of write load (#103; memtable bytes
-        //    swing with every flush and no longer count). Only once the skew persisted
-        //    (`track_skew`, D214), not during the shard's dwell after its last move, and only
-        //    for tablets that dwelt here long enough.
         let dwelling = self
             .skew_pass
             .is_some_and(|p| p + DWELL_PASSES > self.balance_pass);
+        // Packing (D217): a shard outside the active ones (`0..k`) hands its written tablets,
+        // one per dwell, to the least busy active shard with room. Cold tablets stay: they
+        // cost no wakeups.
+        let active = self.active_shards();
+        if usize::from(self.id.0) >= active && !dwelling {
+            let stale = cfg.interval_nanos.saturating_mul(3).max(1);
+            let mut targets: Vec<(u64, usize)> = self.shared.loads[..active]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (l.read_busy_fresh(now, stale).unwrap_or(0), i))
+                .collect();
+            targets.sort_unstable();
+            let written = owned
+                .iter()
+                .filter(|t| self.settled(t.id))
+                .filter(|t| self.loads.get(&t.id).is_some_and(|l| l.ewma >= 1.0))
+                .max_by(|a, b| {
+                    let w = |t: &TabletEntry| self.loads.get(&t.id).map_or(0.0, |l| l.ewma);
+                    w(a).total_cmp(&w(b)).then(b.id.cmp(&a.id))
+                });
+            if let Some(t) = written {
+                let families = view.catalog.family_ids_of(t.table).len();
+                if let Some((_, to)) = targets
+                    .iter()
+                    .find(|(_, i)| self.slots_fit(&view, ShardId(*i as u16), families))
+                {
+                    return Some(TabletOpKind::Move {
+                        tablet: t.id,
+                        to: ShardId(*to as u16),
+                    });
+                }
+            }
+        }
+        // 2. Skew across shards, on the moving averages of write load (#103; memtable bytes
+        //    swing with every flush and no longer count). Only once the skew persisted
+        //    (`track_skew`, D214), not during the shard's dwell after its last move, and only
+        //    for tablets that dwelt here long enough. Under packing, only among the active
+        //    shards (D217).
         if self.skew_active
             && !dwelling
             && let Some(writes) = self.published_loads(now)
@@ -1477,7 +1660,8 @@ impl ShardState {
             else {
                 continue;
             };
-            if left.shard == self.id {
+            // Never onto a shard packing is emptying (D217).
+            if left.shard == self.id || usize::from(left.shard.0) >= active {
                 continue;
             }
             let (lb, _) = live_bytes(&view, left, &refs);

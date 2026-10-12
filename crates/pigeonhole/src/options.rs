@@ -52,6 +52,7 @@ pub struct Options {
     vfs: Option<VfsRef>,
     wal_segment_size: Option<u64>,
     tablet_changes: bool,
+    tablet_packing: bool,
     tablet_balance: Option<(Duration, u64, u64)>,
     write_stall_timeout: Option<Duration>,
     commit_spin: Option<Duration>,
@@ -84,6 +85,7 @@ impl Default for Options {
             vfs: None,
             wal_segment_size: None,
             tablet_changes: true,
+            tablet_packing: true,
             tablet_balance: None,
             write_stall_timeout: None,
             commit_spin: None,
@@ -343,6 +345,28 @@ impl Options {
     /// ```
     pub fn tablet_changes(mut self, yes: bool) -> Self {
         self.tablet_changes = yes;
+        self
+    }
+
+    /// Pack a lightly written store's tablets onto few shards (default on; D217). While the
+    /// shards' threads are mostly idle, the balancer keeps the tablets being written on as few
+    /// shards as stay about half busy, so a commit seldom has to wake a sleeping shard
+    /// thread (a single writer over 32 shards otherwise pays a wakeup per commit). It
+    /// spreads them again within about a second once those shards pass 75% busy. Off,
+    /// tablets spread over every shard whatever the load. Only read with
+    /// [`tablet_changes`](Self::tablet_changes) on; shards the application drives
+    /// ([`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned))
+    /// are never packed.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // Spread over every shard even under light writes.
+    /// let options = Options::default().tablet_packing(false);
+    /// # let _ = options;
+    /// ```
+    pub fn tablet_packing(mut self, yes: bool) -> Self {
+        self.tablet_packing = yes;
         self
     }
 
@@ -678,6 +702,7 @@ impl Options {
             o.wal.segment_size = bytes;
         }
         o.tablet_changes = self.tablet_changes;
+        o.balance_pack = self.tablet_packing;
         if let Some(window) = self.commit_spin {
             o.commit_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         }

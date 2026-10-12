@@ -152,6 +152,9 @@ pub(crate) struct ShardCounters {
     /// Compactions whose purge a write voided before they installed
     /// (`Engine::compaction_purge_voids`, #316).
     pub purge_voids: AtomicU64,
+    /// The busy fraction the shard's balancer measures (millionths plus one; 0 measures the
+    /// thread's real busy time), `Engine::set_shard_busy` (D217's packing tests).
+    pub busy_override: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -509,6 +512,18 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Makes shard `shard`'s balancer measure itself `busy` (a fraction of the time, 0 to 1)
+    /// busy from now on, or its thread's real busy time with `None` (test hook: packing,
+    /// D217, decided on chosen loads under any clock).
+    #[doc(hidden)]
+    pub fn set_shard_busy(&self, shard: usize, busy: Option<f64>) {
+        let v = busy.map_or(0, |b| (b.clamp(0.0, 1.0) * 1e6).round() as u64 + 1);
+        self.inner.shared.metrics[shard]
+            .hooks
+            .busy_override
+            .store(v, Ordering::Relaxed);
     }
 
     /// Bytes in the block cache (test hook: `shrink`'s tests check that an abandoned copy
