@@ -11,6 +11,10 @@
 //!   that returns what was reserved before, and gives them back if that would pass the
 //!   limit ([`LoadSlot::release`]). So concurrent changes never commit a shard past
 //!   `max_slots` together. The caller reserves on every receiving shard, all or none.
+//! - **Skew claims (D223).** A shard handing another load for write skew claims it first
+//!   ([`LoadSlot::claim`], a compare-and-swap), and the claim holds until the receiver has
+//!   published a dwell's worth (10) more balancer passes. Two shards balancing at once
+//!   never both shed into the same cold shard: the second sees the claim and picks another.
 
 #[cfg(engine_loom)]
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -33,15 +37,21 @@ pub(crate) struct LoadSlot {
     reserved: AtomicUsize,
     /// When it was published (monotonic nanoseconds; 0 = never).
     at: AtomicU64,
+    /// The owning shard's balancer passes as of its last publication.
+    passes: AtomicU64,
+    /// The pass (of the owning shard, as `passes`) until which a skew change handing it load
+    /// holds it (D223): until then, no other skew change picks it.
+    claimed: AtomicU64,
 }
 
 impl LoadSlot {
     /// The owning shard publishes its write rate and busy fraction (millionths, D217) as of
     /// `now` (nonzero).
-    pub(crate) fn publish(&self, writes: u64, writes_slow: u64, busy: u64, now: u64) {
+    pub(crate) fn publish(&self, writes: u64, writes_slow: u64, busy: u64, now: u64, passes: u64) {
         self.writes.store(writes, Ordering::Relaxed);
         self.writes_slow.store(writes_slow, Ordering::Relaxed);
         self.busy.store(busy, Ordering::Relaxed);
+        self.passes.store(passes, Ordering::Relaxed);
         self.at.store(now, Ordering::Release);
     }
 
@@ -64,6 +74,23 @@ impl LoadSlot {
     pub(crate) fn read_busy_fresh(&self, now: u64, stale: u64) -> Option<u64> {
         let at = self.at.load(Ordering::Acquire);
         (at != 0 && now.saturating_sub(at) <= stale).then(|| self.busy.load(Ordering::Relaxed))
+    }
+
+    /// Whether no skew change holds this shard (D223): a balancer may pick it.
+    pub(crate) fn claimable(&self) -> bool {
+        self.passes.load(Ordering::Relaxed) >= self.claimed.load(Ordering::Acquire)
+    }
+
+    /// Claims this shard for a skew change handing it load, until it has published `dwell`
+    /// more passes. Fails while another claim holds it, or when one lands first.
+    pub(crate) fn claim(&self, dwell: u64) -> bool {
+        let passes = self.passes.load(Ordering::Relaxed);
+        let held = self.claimed.load(Ordering::Acquire);
+        passes >= held
+            && self
+                .claimed
+                .compare_exchange(held, passes + dwell, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 
     /// Slots reserved on this shard by changes in flight.
@@ -99,8 +126,8 @@ mod loom_tests {
             let owner = {
                 let slot = Arc::clone(&slot);
                 thread::spawn(move || {
-                    slot.publish(10, 0, 0, 1);
-                    slot.publish(20, 0, 0, 2);
+                    slot.publish(10, 0, 0, 1, 1);
+                    slot.publish(20, 0, 0, 2, 2);
                 })
             };
             for _ in 0..2 {
@@ -154,6 +181,29 @@ mod loom_tests {
             }
         });
     }
+
+    #[test]
+    fn loom_two_skew_changes_never_both_claim_one_shard() {
+        // Two shards balancing at once claim the same cold shard while it publishes a pass:
+        // at most one claim holds it until it has made a dwell of passes.
+        loom::model(|| {
+            let slot = Arc::new(LoadSlot::default());
+            let claimers: Vec<_> = (0..2)
+                .map(|_| {
+                    let slot = Arc::clone(&slot);
+                    thread::spawn(move || slot.claim(10))
+                })
+                .collect();
+            slot.publish(0, 0, 0, 1, 1);
+            let won = claimers
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|c| *c)
+                .count();
+            assert_eq!(won, 1, "{won} claims hold one shard");
+            assert!(!slot.claimable());
+        });
+    }
 }
 
 #[cfg(all(test, not(engine_loom)))]
@@ -164,12 +214,25 @@ mod tests {
     fn a_publication_is_read_while_fresh_and_reservations_count() {
         let slot = LoadSlot::default();
         assert_eq!(slot.read_fresh(5, 10), None, "never published");
-        slot.publish(7, 0, 0, 5);
+        slot.publish(7, 0, 0, 5, 1);
         assert_eq!(slot.read_fresh(10, 10), Some(7));
         assert_eq!(slot.read_fresh(20, 10), None, "stale");
         assert_eq!(slot.reserve(2), 0);
         assert_eq!(slot.reserve(1), 2);
         slot.release(2);
         assert_eq!(slot.reserved(), 1);
+    }
+
+    #[test]
+    fn a_claim_holds_a_shard_for_a_dwell_of_its_passes() {
+        let slot = LoadSlot::default();
+        slot.publish(7, 0, 0, 5, 3);
+        assert!(slot.claimable());
+        assert!(slot.claim(10));
+        assert!(!slot.claimable() && !slot.claim(10), "held until pass 13");
+        slot.publish(7, 0, 0, 6, 12);
+        assert!(!slot.claimable());
+        slot.publish(7, 0, 0, 7, 13);
+        assert!(slot.claimable() && slot.claim(10));
     }
 }
