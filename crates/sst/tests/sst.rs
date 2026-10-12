@@ -695,3 +695,31 @@ fn a_scan_waits_for_fetches_still_in_flight_and_seeks_drop_them() {
         pigeonhole_io::reap_own_io(Some(std::time::Duration::ZERO));
     }
 }
+
+#[test]
+fn a_blob_writer_reserves_exactly_the_extents_an_append_adds() {
+    use pigeonhole_format::BlobFileId;
+    use pigeonhole_io::{OpenOptions, Vfs};
+    use pigeonhole_sst::BlobWriter;
+    let file = pigeonhole_io::sim::SimVfs::new(499)
+        .open("/blobs".as_ref(), OpenOptions::read_write_create())
+        .unwrap();
+    let mut w = BlobWriter::new(file, BlobFileId(1), 0);
+    let mut page = 16;
+    // Values that fit what is left, end exactly at an extent's end, and span several.
+    for len in [10, 65_000, 1, 200_000, 0, 1 << 20, 3] {
+        let want = w.reserve_for(len);
+        let mut added = 0;
+        while w.needs_extent(len) {
+            w.add_extent(ExtentRef {
+                page,
+                size_class: 0,
+            })
+            .unwrap();
+            page += 16;
+            added += 1;
+        }
+        assert_eq!(added, want, "value of {len} bytes");
+        w.append(&vec![9u8; len]).unwrap();
+    }
+}

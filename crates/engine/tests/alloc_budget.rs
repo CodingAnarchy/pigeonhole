@@ -645,15 +645,18 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     ("commit, 1 cell", "commit", 3.0),
     ("commit, 16 cells", "commit", 2.0),
     ("commit, 16 cells, 8 per group", "commit", 5.0),
-    // Includes SimVfs's copy of every write, kept for crash simulation: about 38 allocations
+    // Includes SimVfs's copy of every write, kept for crash simulation: about 44 allocations
     // and 1 MB per put that a real file does not make (#499). Most of the rest is the
-    // manifest commit a separated put makes before its WAL record (D16).
-    ("commit, one 1 MiB put (separated)", "commit", 130.0),
+    // manifest commit a separated put makes before its WAL record (D16). 113 until the blob
+    // extent lists were reserved up front, the catalog's blob files shared their extents,
+    // and the manifest kept its block buffer (92 on macOS).
+    ("commit, one 1 MiB put (separated)", "commit", 100.0),
     // A flush's manifest commit and the maintenance scan after it, at two catalog sizes
     // (#499). The large catalog's budget only goes down: 3,050 until the view stopped
-    // rebuilding the slots a commit left alone (322 on Linux, 331 on macOS).
-    ("flush of one cell, small catalog", "flush", 300.0),
-    ("flush of one cell, 2,048-SST catalog", "flush", 360.0),
+    // rebuilding the slots a commit left alone (322 on Linux, 331 on macOS), then 322 on
+    // macOS once the manifest kept its block buffer (#499).
+    ("flush of one cell, small catalog", "flush", 250.0),
+    ("flush of one cell, 2,048-SST catalog", "flush", 345.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];

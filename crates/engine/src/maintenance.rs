@@ -699,7 +699,7 @@ impl Moves {
                     catalog
                         .blob_files
                         .get(&blob_file)
-                        .map(|b| b.extents.clone())
+                        .map(|b| b.extents.to_vec())
                 });
             match current {
                 Some(mut extents) if extents.get(index) == Some(&old) => {

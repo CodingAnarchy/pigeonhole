@@ -2126,7 +2126,7 @@ fn sweep_unreferenced_blobs(
         .blob_files
         .iter()
         .filter(|(id, b)| !keep.contains(id) && !unrecorded.contains(&b.family))
-        .map(|(id, b)| (*id, b.extents.clone()))
+        .map(|(id, b)| (*id, b.extents.to_vec()))
         .collect();
     if dropped.is_empty() {
         return Ok(());

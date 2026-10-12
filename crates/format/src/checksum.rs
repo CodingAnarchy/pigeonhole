@@ -61,7 +61,10 @@ pub fn xxh3_64(bytes: &[u8]) -> u64 {
 /// xxh3-64 (seed 0) of the concatenation of `parts`, without copying them together.
 pub(crate) fn xxh3_64_parts(parts: &[&[u8]]) -> u64 {
     use std::hash::Hasher;
-    let mut h = twox_hash::XxHash3_64::with_seed(0);
+    use twox_hash::xxhash3_64::{RawHasher, SecretBuffer};
+    // The default seed and secret, borrowed: `XxHash3_64::with_seed` boxes a copy of the
+    // secret per hash (#499).
+    let mut h = RawHasher::new(SecretBuffer::default());
     for p in parts {
         h.write(p);
     }
@@ -70,6 +73,22 @@ pub(crate) fn xxh3_64_parts(parts: &[&[u8]]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xxh3_of_parts_is_xxh3_of_their_concatenation() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for len in [0, 1, 16, 240, 241, 1024, 5000] {
+            let whole = super::xxh3_64(&data[..len]);
+            for split in [0, len / 3, len / 2, len] {
+                let (a, b) = data[..len].split_at(split);
+                assert_eq!(
+                    super::xxh3_64_parts(&[a, b]),
+                    whole,
+                    "len {len} split {split}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn soft_crc_matches() {
         let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + i / 3) as u8).collect();

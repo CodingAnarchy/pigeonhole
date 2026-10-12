@@ -878,7 +878,7 @@ pub(crate) fn blob_edits(catalog: &Catalog, changes: BlobChanges) -> Result<Vec<
             edits.push(Edit::PutBlobFile {
                 blob_file,
                 family: b.family,
-                extents: b.extents.clone(),
+                extents: b.extents.to_vec(),
                 total_bytes: b.total_bytes,
                 live_bytes,
             });
