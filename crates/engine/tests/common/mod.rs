@@ -40,10 +40,9 @@ use std::ops::Bound;
 use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 
 use pigeonhole_engine::{
     AppendedKind, CompactionRecord, Compression, Engine, EngineOptions, EngineShard, Error,
@@ -1196,15 +1195,20 @@ impl Committed {
     }
 }
 
-/// The result of a blocking engine call run on a helper thread.
+/// The result of an in-flight commit, conditional commit or transaction.
 enum Outcome {
     Commit(Result<pigeonhole_engine::CommitInfo, Error>),
     Cas(Result<(bool, Option<pigeonhole_engine::CommitInfo>), Error>),
 }
 
+/// An in-flight commit, polled between scheduler steps. Every kind goes through the
+/// engine's non-blocking API, so no OS thread or real-time wait takes part and a seed
+/// replays exactly (#590).
 enum Pending {
     Poll(PendingCommit),
-    Thread(mpsc::Receiver<Outcome>),
+    Check(pigeonhole_engine::PendingCheck),
+    /// Refused at submission: the outcome is known.
+    Ready(Option<Outcome>),
 }
 
 struct InFlight {
@@ -3085,7 +3089,14 @@ impl World {
                     Poll::Ready(r) => Some(Outcome::Commit(r)),
                     Poll::Pending => None,
                 },
-                Pending::Thread(rx) => recv_within(rx, Duration::from_millis(1)),
+                Pending::Check(pc) => {
+                    let mut cx = Context::from_waker(Waker::noop());
+                    match Pin::new(pc).poll(&mut cx) {
+                        Poll::Ready(r) => Some(Outcome::Cas(r)),
+                        Poll::Pending => None,
+                    }
+                }
+                Pending::Ready(o) => o.take(),
             };
             match outcome {
                 Some(o) => resolved.push((inf, o)),
@@ -3417,7 +3428,7 @@ impl World {
         }
     }
 
-    /// Submits a `check_and_mutate` (alone) on a helper thread.
+    /// Submits a `check_and_mutate` (alone) without waiting (`submit_check_and_mutate`).
     fn submit_cas(
         &mut self,
         ops: Vec<ModelOp>,
@@ -3492,14 +3503,18 @@ impl World {
             Ok(b) => b,
             Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
         };
-        let (tx, rx) = mpsc::channel();
-        let row2 = row.clone();
-        std::thread::spawn(move || {
-            let r = engine.check_and_mutate(table_id, &row2, &engine_pred, batch, Some(durability));
-            let _ = tx.send(Outcome::Cas(r));
-        });
+        let pending = match engine.submit_check_and_mutate(
+            table_id,
+            &row,
+            &engine_pred,
+            batch,
+            Some(durability),
+        ) {
+            Ok(pc) => Pending::Check(pc),
+            Err(e) => Pending::Ready(Some(Outcome::Cas(Err(e)))),
+        };
         self.in_flight.push(InFlight {
-            pending: Pending::Thread(rx),
+            pending,
             commit: Committed {
                 seqno: None,
                 ops,
@@ -3524,8 +3539,8 @@ impl World {
         Ok(())
     }
 
-    /// Begins a transaction, reads a few columns (checked against the model), and commits
-    /// it on a helper thread.
+    /// Begins a transaction, reads a few columns (checked against the model), and submits
+    /// its commit without waiting (`Txn::submit`).
     fn submit_txn(
         &mut self,
         ops: Vec<ModelOp>,
@@ -3641,10 +3656,10 @@ impl World {
             ops.iter().map(show).collect::<Vec<_>>().join("; "),
             if armed { " (crash armed)" } else { "" }
         ));
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(Outcome::Commit(txn.commit(Some(durability))));
-        });
+        let pending = match txn.submit(Some(durability)) {
+            Ok(pc) => Pending::Poll(pc),
+            Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
+        };
         // Every shard owning a read row is a participant with an empty PREPARE (D91).
         let read_shards: Vec<u16> = {
             let store = self.store();
@@ -3659,7 +3674,7 @@ impl World {
                 .collect()
         };
         self.in_flight.push(InFlight {
-            pending: Pending::Thread(rx),
+            pending,
             commit: Committed {
                 seqno: None,
                 ops,
@@ -4046,22 +4061,6 @@ impl World {
     }
 }
 
-/// The helper thread's result if it arrives within `limit` of real time. Unlike
-/// `recv_timeout`, which sleeps on the OS timer (about 15.6 ms per wait on Windows, longer
-/// than asked on macOS), it yields until `limit` passes. The harness polls this between
-/// simulation steps, so each poll costs at most `limit` on every OS (#91).
-fn recv_within<T>(rx: &mpsc::Receiver<T>, limit: Duration) -> Option<T> {
-    let end = std::time::Instant::now() + limit;
-    loop {
-        match rx.try_recv() {
-            Ok(v) => return Some(v),
-            Err(mpsc::TryRecvError::Disconnected) => return None,
-            Err(mpsc::TryRecvError::Empty) if std::time::Instant::now() >= end => return None,
-            Err(mpsc::TryRecvError::Empty) => std::thread::yield_now(),
-        }
-    }
-}
-
 /// A maximum matching of WAL seqnos to unacknowledged commits (Kuhn's augmenting paths):
 /// `fits[s]` lists, in order of preference, the commits seqno `s` may belong to. Returns
 /// each seqno's commit; no commit gets two seqnos.
@@ -4273,7 +4272,32 @@ fn run_with(
             class: FailureClass::Protocol,
             op_index: w.op_index,
             message: format!(
-                "the run did not finish within {budget} scheduler steps (a hung commit?)"
+                "the run did not finish within {budget} scheduler steps (a hung commit?); in \
+                 flight: [{}]; I/O in flight: {}",
+                w.in_flight
+                    .iter()
+                    .map(|i| {
+                        let kind = match &i.commit.kind {
+                            Kind::Plain => "commit",
+                            Kind::Cas { .. } => "cas",
+                            Kind::Txn { .. } => "txn",
+                        };
+                        let pending = match &i.pending {
+                            Pending::Poll(_) => "pending",
+                            Pending::Check(_) => "pending check",
+                            Pending::Ready(_) => "ready",
+                        };
+                        format!(
+                            "{kind} {:?} shards={:?} seqno={:?} {pending}{}",
+                            i.commit.durability,
+                            i.commit.shards,
+                            i.commit.seqno,
+                            if i.armed { " (crash armed)" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                w.vfs.io_in_flight()
             ),
             trace: std::mem::take(&mut w.trace),
         });
