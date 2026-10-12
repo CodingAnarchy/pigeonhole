@@ -4305,21 +4305,28 @@ fn run_with(
     };
     // Tear down: close, then drive the shards until every one has finished the close. A
     // passing run must close: a close that never finishes (#585, #591: logs that can never
-    // be checkpointed empty) fails it.
+    // be checkpointed empty) fails it. A close may legitimately wait for a tablet change in
+    // progress, a failing flush's backoff, or parked commits until the write-stall timeout
+    // (30 s by default): the bound is simulated time past that timeout plus a margin, with a
+    // step cap as a backstop.
     w.in_flight.clear();
     if let Some(mut store) = w.store.take() {
         let _ = store.engine.close();
+        const CLOSE_BOUND_NANOS: u64 = 90_000_000_000; // 30 s stall timeout + 60 s margin
+        const CLOSE_STEP_CAP: u32 = 2_000_000;
+        let deadline = vfs.monotonic_nanos().saturating_add(CLOSE_BOUND_NANOS);
         let mut steps = 0u32;
         while store.shards.iter().any(|s| s.closed().is_none()) {
-            if steps == 200_000 {
+            if vfs.monotonic_nanos() >= deadline || steps == CLOSE_STEP_CAP {
                 if result.is_ok() {
                     result = Err(Failure {
                         seed,
                         class: FailureClass::Protocol,
                         op_index: w.op_index,
                         message: format!(
-                            "the final close did not finish within {steps} shard steps; shards \
-                             closed: {:?}",
+                            "the final close did not finish within {} s simulated ({steps} shard \
+                             steps); shards closed: {:?}",
+                            CLOSE_BOUND_NANOS / 1_000_000_000,
                             store
                                 .shards
                                 .iter()
@@ -4332,9 +4339,9 @@ fn run_with(
                 break;
             }
             store.step_shards(vfs.monotonic_nanos());
-            // Timers (a flush retry's backoff, a checkpoint's) wait on the simulated clock.
+            // Timers (a flush retry's backoff, a stall timeout) wait on the simulated clock.
             if steps % 64 == 63 {
-                vfs.advance(1_000_000);
+                vfs.advance(10_000_000);
             }
             steps += 1;
         }
