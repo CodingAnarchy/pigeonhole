@@ -4251,7 +4251,11 @@ impl ShardState {
             if self.retire_idle_slots().is_err() {
                 self.poison(crate::health::FailureCause::Internal);
             }
-            let _ = self.freeze(true);
+            // Freezing every memtable frees room only when no flush will: while a frozen one
+            // is queued or flushing, its flush frees room and the wait looks again then.
+            // Freezing each small active memtable on every wait instead filled a backlogged
+            // L0 with SSTs a fraction of the freeze size.
+            let _ = self.freeze(self.flush_idle());
             // That freeze may have queued guarded flushes after this group's members were
             // admitted but before they are applied (below, into the fresh active memtables):
             // their deletes void those guards now. Nothing claims a fresh guard before the
