@@ -90,14 +90,12 @@ const FLUSH_BACKOFF_CAP: u64 = 100;
 const ROOM_RECHECK_CAP: u64 = 100;
 
 /// The wait before retrying after `failures` failed compactions in a row (at least one).
-/// Attempts of a cross-shard commit refused with `Moved` before it fails with `Busy`
-/// (#102): a commit that keeps meeting tablet changes gives up rather than retrying for ever.
-pub(crate) const MOVED_RETRIES: u32 = 16;
-
-/// Whether a cross-shard commit refused with `Moved` for the `attempts`-th time, `waited`
-/// nanoseconds after it was submitted, fails with `Busy` instead of retrying.
-fn moved_gives_up(attempts: u32, waited: u64, timeout: u64) -> bool {
-    attempts >= MOVED_RETRIES || waited >= timeout
+/// Whether a cross-shard commit refused with `Moved` (or a timestamp below a floor),
+/// `waited` nanoseconds after it was submitted, fails with `Busy` instead of retrying: only
+/// once the write-stall timeout has passed (D241). A commit that keeps meeting tablet
+/// changes still gives up, but never sooner, however often it was refused.
+fn moved_gives_up(waited: u64, timeout: u64) -> bool {
+    waited >= timeout
 }
 
 // ---------------------------------------------------------------------------------------
@@ -784,8 +782,8 @@ pub(crate) struct CommitReq {
     /// Version of the tablet map the commit was routed with (0: unknown): a shard that
     /// handed a tablet away checks the routing of commits routed with an older map.
     pub map_version: u64,
-    /// Times a participant refused this (cross-shard) commit with `Moved` so far: past
-    /// `MOVED_RETRIES` it fails with `Busy` (#102).
+    /// Times a participant refused this (cross-shard) commit with `Moved` so far (traced; it
+    /// fails with `Busy` only at the write-stall timeout, D241).
     pub attempts: u32,
 }
 
@@ -2122,6 +2120,9 @@ pub(crate) struct ShardState {
     fifo: CompactionPicker,
     /// The slot a compaction task is running for.
     compaction: Option<(TabletId, FamilyId)>,
+    /// The balancer chose a change that waits on the running compaction (its tablets'): it
+    /// decides again as soon as that ends, before the next compaction is picked (#102).
+    change_waits: bool,
     /// `Engine::compact` callers: `(table filter, reply)`, served in order.
     compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>)>,
     /// The running compaction was started for the `compact_all` caller at the front: its
@@ -2340,6 +2341,7 @@ impl ShardState {
             tiered,
             fifo,
             compaction: None,
+            change_waits: false,
             compact_all: VecDeque::new(),
             compaction_full: false,
             blob_gc: compact::BlobGc,
@@ -6032,7 +6034,6 @@ impl ShardState {
             // Either gives up once it was refused too often or waited too long (#102).
             let attempts = c.attempts.saturating_add(1);
             if moved_gives_up(
-                attempts,
                 ctx.now_nanos().saturating_sub(c.submitted_at),
                 self.shared.write_stall_timeout_nanos,
             ) {
@@ -7021,6 +7022,10 @@ impl ShardState {
         if !self.pending.is_empty() {
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
+        // A change waited on this compaction: it starts before the next one is picked.
+        if self.change_waits {
+            self.start_waiting_change(ctx);
+        }
         self.maintain(ctx);
         self.progress_op(ctx);
     }
@@ -7793,12 +7798,11 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_refused_with_moved_gives_up_after_the_cap_or_the_timeout() {
+    fn a_commit_refused_with_moved_gives_up_only_at_the_timeout() {
         let timeout = 30_000_000_000;
-        assert!(!moved_gives_up(1, 0, timeout));
-        assert!(!moved_gives_up(MOVED_RETRIES - 1, timeout - 1, timeout));
-        assert!(moved_gives_up(MOVED_RETRIES, 0, timeout));
-        assert!(moved_gives_up(1, timeout, timeout));
+        assert!(!moved_gives_up(0, timeout));
+        assert!(!moved_gives_up(timeout - 1, timeout));
+        assert!(moved_gives_up(timeout, timeout));
     }
 
     #[test]

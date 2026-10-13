@@ -173,9 +173,13 @@ impl From<pigeonhole_engine::Error> for Error {
             // Built from the fields: the message does not depend on the operator's `Display`.
             E::Merge(m) => format!("merge operator {:?} failed: {}", m.operator, m.message),
             // A write stall that outlasted the engine's timeout: transient.
-            E::Busy => "stalled: a flush or compaction did not free room within the write-stall \
-                        timeout (30 s); back off and retry, and drop old snapshots"
-                .to_owned(),
+            E::Busy => {
+                "stalled past the write-stall timeout (Options::write_stall_timeout, 30 s by \
+                        default): no flush or compaction freed room in time, or a tablet split \
+                        or move kept the commit waiting; back off and retry, and drop old \
+                        snapshots"
+                    .to_owned()
+            }
             E::BatchTooLarge => "the batch can never fit a shard's memtable arena (about half \
                                  of Options::memtable_budget); split it or raise the budget"
                 .to_owned(),

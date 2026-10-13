@@ -342,9 +342,13 @@ fn every_engine_error_maps_to_its_code() {
         let what = format!("{e:?}");
         let message = match &e {
             E::Merge(_) => "merge operator \"op\" failed: bad".to_owned(),
-            E::Busy => "stalled: a flush or compaction did not free room within the write-stall \
-                        timeout (30 s); back off and retry, and drop old snapshots"
-                .to_owned(),
+            E::Busy => {
+                "stalled past the write-stall timeout (Options::write_stall_timeout, 30 s by \
+                        default): no flush or compaction freed room in time, or a tablet split \
+                        or move kept the commit waiting; back off and retry, and drop old \
+                        snapshots"
+                    .to_owned()
+            }
             E::BatchTooLarge => "the batch can never fit a shard's memtable arena (about half \
                                  of Options::memtable_budget); split it or raise the budget"
                 .to_owned(),

@@ -902,6 +902,44 @@ fn packing_off_or_an_idle_store_keeps_the_placement() {
 }
 
 #[test]
+fn a_split_due_on_a_compacting_tablet_starts_when_the_compaction_ends() {
+    // The balancer leaves a compacting tablet alone (#102). Under a load whose compactions
+    // run back to back no pass lands between two, so the split it chose starts as soon as
+    // the running compaction ends, before the next one is picked and with no further
+    // balancer pass.
+    let mut db = open(1, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.tablet_split_bytes = 8 << 10;
+        o.memtable_freeze_bytes = 32 << 10;
+    });
+    db.engine.hold_compactions(true);
+    let value = vec![0x5A; 200];
+    let mut i = 0;
+    while !db.engine.compaction_held() {
+        assert!(i < 20_000, "no compaction started");
+        for _ in 0..250 {
+            db.put(&key(i), &value);
+            i += 1;
+        }
+        let m = db.engine.flush_pending().unwrap();
+        db.drive(m).unwrap();
+    }
+    // Due a split, but compacting: the pass holds the tablet.
+    let m = db.engine.balance_pending().unwrap();
+    db.drive(m).unwrap();
+    assert_eq!(db.ranges().len(), 1);
+    db.engine.hold_compactions(false);
+    db.settle();
+    let ranges = db.ranges();
+    assert_eq!(ranges.len(), 2, "{ranges:?}");
+    assert_eq!(db.scan_rows().len(), i as usize);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
 fn a_tablet_splits_at_the_size_threshold_and_merges_when_small_and_cold() {
     let mut db = open(2, |o| {
         o.balance_interval_nanos = u64::MAX;
@@ -2128,6 +2166,72 @@ fn a_prepare_routed_with_an_older_map_runs_when_none_of_its_rows_moved() {
     let r = done.expect("the commit never finished");
     assert!(r.is_ok(), "{r:?}");
     assert_eq!(db.get(&key(0)).map(|(_, v)| v), Some(b"t".to_vec()));
+    close(db);
+}
+
+#[test]
+fn a_commit_refused_many_times_before_the_timeout_still_commits() {
+    // As below, but other tablet changes complete many times while the split waits: each
+    // one retries the commit, and shard 0 refuses it again. It used to
+    // give up with `Busy` after 16 refusals, long before the write-stall timeout; it now
+    // waits for the split and commits (D241).
+    let mut db = open(2, ticking);
+    let u = two_shards_with_a_lost_tablet(&mut db);
+    let t = Arc::clone(&db.table);
+    let mut rows: Vec<Vec<u8>> = (0..20).map(key).collect();
+    rows.sort();
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    // The split waits on a compaction of t held before its first slice (catalog changes
+    // still commit meanwhile).
+    db.engine.hold_compactions(true);
+    let compact = db.engine.compact_pending(Some(t.id)).unwrap();
+    for _ in 0..1_000 {
+        if db.engine.compaction_held() {
+            break;
+        }
+        db.step();
+    }
+    assert!(db.engine.compaction_held());
+    let split = db.engine.split_tablet_pending(t.id, &rows[5]).unwrap();
+    for _ in 0..50 {
+        db.step();
+    }
+    let mut wb = WriteBatch::new();
+    wb.put(
+        u.id,
+        u.families[0].id,
+        b"x",
+        b"q",
+        None,
+        ValueRef::Bytes(b"u"),
+    )
+    .unwrap();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        &rows[1],
+        b"q",
+        None,
+        ValueRef::Bytes(b"t"),
+    )
+    .unwrap();
+    let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    // Shard 1 splits u's tablet again and again: each change retries the commit.
+    for i in 0..48 {
+        let m = db
+            .engine
+            .split_tablet_pending(u.id, format!("k{i:02}").as_bytes())
+            .unwrap();
+        db.drive(m).unwrap();
+        assert!(poll_commit(&mut pc).is_none(), "resolved after {i} changes");
+    }
+    db.engine.hold_compactions(false);
+    db.drive(compact).unwrap();
+    db.drive(split).unwrap();
+    let r = step_until(&mut db, &mut pc, 1_000);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(db.get(&rows[1]).map(|(_, v)| v), Some(b"t".to_vec()));
     close(db);
 }
 
