@@ -335,8 +335,10 @@ pub enum Predicate {
 #[derive(Debug)]
 pub(crate) struct Submission {
     pub(crate) waiter: Waiter<crate::Result<Settled>>,
-    /// The engine, for registering an async waker on the global watermark.
-    pub(crate) shared: Arc<crate::shard::Shared>,
+    /// The engine, for registering an async waker on the global watermark: reached through
+    /// the commit's shard's handle, so commits to different shards share no reference count
+    /// (D236).
+    pub(crate) shared: Arc<crate::engine::ShardRef>,
     /// Whether `wait` may poll before it parks (D198): not for a durable commit, which
     /// waits for a sync. The window is the engine's `commit_spin_nanos`.
     pub(crate) spins: bool,
@@ -507,25 +509,45 @@ impl Submission {
     /// [`PendingCommit::wait`] for a commit the engine submitted itself (a blocking
     /// commit): never waiting for room.
     pub(crate) fn wait(mut self) -> crate::Result<CommitInfo> {
-        let window = if self.spins {
-            self.shared.commit_spin_nanos
-        } else {
-            0
-        };
-        if window == 0 {
-            // No spin: exactly the parking wait.
-            let Settled { info, batch } = wait_reply(&self.shared, &mut self.waiter)?;
-            recycle(batch);
-            wait_visible(&self.shared, info.seqno)?;
-            return Ok(info);
-        }
-        let mut spin = SpinWait::new(window);
-        let Settled { info, batch } =
-            wait_reply_spinning(&self.shared, &mut self.waiter, &mut spin)?;
-        recycle(batch);
-        wait_visible_spinning(&self.shared, info.seqno, &mut spin)?;
-        Ok(info)
+        wait_body(&self.shared, &mut self.waiter, self.spins)
     }
+}
+
+/// A blocking commit's wait on the engine's own borrowed state (D236): the caller holds
+/// the engine for the whole wait, so the commit takes no reference on it. Returns the
+/// completion slot to this thread's cache, as dropping a [`Submission`] does.
+#[inline]
+pub(crate) fn wait_blocking(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<Settled>>,
+    spins: bool,
+) -> crate::Result<CommitInfo> {
+    let r = wait_body(shared, waiter, spins);
+    let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
+    r
+}
+
+/// The wait of a submitted commit: its reply, then visibility (D19), spinning first for a
+/// commit that may (D198).
+#[inline]
+fn wait_body(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<Settled>>,
+    spins: bool,
+) -> crate::Result<CommitInfo> {
+    let window = if spins { shared.commit_spin_nanos } else { 0 };
+    if window == 0 {
+        // No spin: exactly the parking wait.
+        let Settled { info, batch } = wait_reply(shared, waiter)?;
+        recycle(batch);
+        wait_visible(shared, info.seqno)?;
+        return Ok(info);
+    }
+    let mut spin = SpinWait::new(window);
+    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
+    recycle(batch);
+    wait_visible_spinning(shared, info.seqno, &mut spin)?;
+    Ok(info)
 }
 
 /// A blocking wait's poll before it parks (D198): up to its window, unless this thread's
@@ -769,7 +791,7 @@ impl PendingCommit {
     /// An async commit that waits for room on its shard (D210) and runs `submit` once
     /// admitted.
     pub(crate) fn waiting(
-        shared: Arc<crate::shard::Shared>,
+        shared: Arc<crate::engine::ShardRef>,
         admit: crate::Admit,
         submit: Box<dyn FnOnce() -> crate::Result<PendingCommit> + Send + Sync>,
     ) -> Self {
@@ -846,7 +868,7 @@ impl Future for PendingCommit {
 #[must_use = "dropping a pending check does not cancel it, but its result is lost"]
 pub struct PendingCheck {
     pub(crate) waiter: Waiter<crate::Result<(bool, Option<CommitInfo>)>>,
-    pub(crate) shared: Arc<crate::shard::Shared>,
+    pub(crate) shared: Arc<crate::engine::ShardRef>,
     /// Resolved by the shard; waiting for visibility (async polling).
     pub(crate) resolved: Option<(bool, Option<CommitInfo>)>,
     /// As [`PendingCommit`]'s: still waiting for room (D210).
@@ -873,7 +895,7 @@ impl PendingCheck {
 impl PendingCheck {
     /// [`PendingCommit::waiting`] for a conditional commit.
     pub(crate) fn waiting(
-        shared: Arc<crate::shard::Shared>,
+        shared: Arc<crate::engine::ShardRef>,
         admit: crate::Admit,
         submit: Box<dyn FnOnce() -> crate::Result<PendingCheck> + Send + Sync>,
     ) -> Self {
@@ -1025,7 +1047,9 @@ impl Txn {
     pub fn submit_async(self, durability: Option<Durability>) -> crate::Result<PendingCommit> {
         let mut charge = match self.engine.fast_admit(None, &self.batch) {
             crate::engine::FastAdmit::Wait(admit) => {
-                let shared = Arc::clone(&self.engine.shared);
+                let shared = self
+                    .engine
+                    .shard_ref(pigeonhole_runtime::ShardId(admit.shard() as u16));
                 return Ok(PendingCommit::waiting(
                     shared,
                     admit,

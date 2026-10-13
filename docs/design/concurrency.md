@@ -31,15 +31,15 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 
 ## Counts
 
-**153 primitives** (`main` after #592 split the application wake out of `Signal::task_woken` into `Signal::app_woken`; 152 before, after D221 and D222 replaced the `PIGEONHOLE_GROUP_SYNC_DEPTH` and `PIGEONHOLE_READAHEAD` statics with constants, plus the watermark registry's `listed` mask; 159 before #134 step 2):
+**157 primitives** (D236 added the async-commit admission (admission.rs), which D210 had left out of the inventory; 153 on `main` after #592 split the application wake out of `Signal::task_woken` into `Signal::app_woken`; 152 before, after D221 and D222 replaced the `PIGEONHOLE_GROUP_SYNC_DEPTH` and `PIGEONHOLE_READAHEAD` statics with constants, plus the watermark registry's `listed` mask; 159 before #134 step 2):
 
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
 | `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared`) | 66 | (mixed in, marked) | Static test hooks: `READS_STEP`, `TAIL_SKIPS` |
 | `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 27 | `Hooks` 21, `ShardCounters` 4, `ReaderHooks` 2 |
-| other `engine/src` files | 36 | | 10 of them thread-locals (per-thread scratch and caches) |
+| other `engine/src` files | 40 | | 10 of them thread-locals (per-thread scratch and caches) |
 | `runtime/src` | 17 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
-| **Total** | **153** | | |
+| **Total** | **157** | | |
 
 A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityCounts::{waits, scanned, passes, woken}` and `WatermarkWaiters::contended`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
 
@@ -388,13 +388,13 @@ Uncertainties: `Drivers`, `LiveSeqnos`, `MaintenanceGuard`, `Waiter`/`Notifier` 
 
 ## Appendix C: The other `engine/src` files (manifest, snapshot, read path, flush, compaction, wakers)
 
-Files covered: catalog.rs, compact.rs, error.rs, flush.rs, large.rs, lib.rs, maintenance.rs,
+Files covered: admission.rs, catalog.rs, compact.rs, error.rs, flush.rs, large.rs, lib.rs, maintenance.rs,
 manifest.rs, nonblocking.rs, options.rs, read.rs, row_cache.rs, snapshot.rs, source.rs,
 waker.rs, write.rs. catalog.rs, error.rs, lib.rs, options.rs, large.rs, maintenance.rs and
 nonblocking.rs declare no primitive of their own (large.rs, maintenance.rs and nonblocking.rs
 use `Shared` fields declared in shard.rs; see "Used here, declared elsewhere" below).
 
-**33 primitives** (23 struct fields / statics + 10 `thread_local!`s).
+**37 primitives** (27 struct fields / statics + 10 `thread_local!`s).
 
 ### Manifest commit path (manifest.rs)
 
@@ -426,6 +426,19 @@ use `Shared` fields declared in shard.rs; see "Used here, declared elsewhere" be
 | `RowCaches::hits` row_cache.rs:61 | `AtomicU64` | Row-cache hit counter. | `get` (`fetch_add`, Relaxed), reading threads. | `stats` (`load`, Relaxed) for `Engine::row_cache_stats` (engine.rs:1638). | Relaxed statistic. | #404, D201. |
 | `RowCaches::misses` row_cache.rs:62 | `AtomicU64` | Row-cache miss counter. | `get` (`fetch_add`, Relaxed). | `stats` (Relaxed). | Relaxed statistic. | #404, D201. |
 | `RowCaches::fills` row_cache.rs:63 | `AtomicU64` | Row-cache fill counter. | `insert` (`fetch_add`, Relaxed). | `stats` (Relaxed). | Relaxed statistic. | #404, D201. |
+
+### Async-commit admission (admission.rs, `Inner::admission`; D210, D236)
+
+One `ShardAdmission` per shard, each its own `Arc` aligned to 128 bytes, so no two shards' counters or reference counts share a cache line. A commit charges the shard it routes to (its coordinator) and returns the charge to that shard alone; nothing in the fast path is written by commits to other shards. D210's engine-wide `total`/`routed`/`queued` counts are gone (D236): at 16 shards, `perf c2c` put 70% of the cross-core HITM loads on them.
+
+The pending commit's handle on the shared state is per shard too (D236): `Inner::shard_refs` holds one `Arc<ShardRef>` per shard (each 128-byte aligned, wrapping the engine's `Arc<Shared>`), and a `Submission` or `PendingCheck` clones its target shard's. That reference count was the other engine-wide line every commit wrote (an `Arc<Shared>` clone per commit). It's not a synchronization primitive, so it isn't counted below. On the AX102, the two per-shard changes together raised 16 pinned shards from 4.20M to 4.69M commits/s.
+
+| Name | Type | Protects / means | Writers | Readers | Ordering / nesting | Why / history |
+|---|---|---|---|---|---|---|
+| `Admission::closed` admission.rs | `AtomicBool` | The engine is closing: waiters are admitted and their submissions fail `Closed`; the fast path charges nothing | `Admission::close` (`store`, Release), from the engine's close | `Admit::new` and `poll_admit` (Acquire). The fast path (`try_fast`) doesn't read it: its caller checks the engine is open first, and a commit charged as a close begins is answered `Closed` by its shard, which returns the charge | — | D210 |
+| `ShardAdmission::inflight` admission.rs | `AtomicU64` per shard | Bytes of the shard's async commits charged and not yet resolved; at most the bound unless a lone commit is larger | `try_charge` (CAS loop, AcqRel) from `try_fast` and `Admit::{new, poll_admit}` on submitting threads; `release` (`fetch_sub`, AcqRel) on the resolving thread (`Settle::settled`) or a dropped `Charge`/`Admit` | the same CAS; `Engine::admission_inflight` (tests) | AcqRel RMWs | D210; per shard only since D236 |
+| `ShardAdmission::waiting` admission.rs | `AtomicUsize` per shard | Waiters in the shard's queue: the fast path charges only when it is 0, so no commit overtakes a waiting one | `Admit::new` (`fetch_add`), `poll_admit` and `Admit::drop` (`fetch_sub`), all under `queue` | `try_fast`, `Admit::new` (before the lock), `release` (after its `fetch_sub`) | AcqRel / Acquire. A release that reads 0 races a waiter that queued just after: that waiter's first `poll_admit` retries the charge under `queue`, so the room is never missed | D210 |
+| `ShardAdmission::queue` admission.rs | `Mutex<Queue>` per shard: waiter ids in arrival order and each one's last waker | Arrival order among a shard's waiting async commits | `Admit::new`, `poll_admit`, `Admit::drop`, `Admission::close` | `release` (wakes the first waiter) | Taken alone: no other lock is held while it is held, and only `Waker::wake_by_ref` runs under it | D210 |
 
 ### Shard drivers and commit waits (waker.rs, write.rs)
 
