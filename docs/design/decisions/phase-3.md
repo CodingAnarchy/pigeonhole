@@ -951,3 +951,43 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - 2× keeps the WAL about 190 MiB smaller and the replay after a crash about 20% shorter (460 against 573 ms).
 - 4×'s gain is fewer small flushes (0 against 320; total flushes 210 against 225). That's write amplification compaction absorbs: compactions were 157–159 against 159–171.
 - The first read after reopen differed by a fraction of a millisecond either way.
+
+<a id="d230"></a>
+## D230 — The memtable lookup target (≤ 300 ns) is judged at 2^18 entries, the largest one memtable reaches under the defaults with small cells; 1M is reported (owner decision, 2026-10-12; bench, memtable, #17, #406)
+
+**Decided:**
+- **The judged row.** The memtable point lookup (≤ 300 ns, #17, the spec's "typically under 300 ns") is judged at **262,144 entries (2^18)**: criterion `seek/262k entries/hit (get)`, pinned to one core, in the gate's `memtable-lookup` step.
+- **Reported, not judged:** 1M entries (the old judged size) and 10k entries (cache-resident), in the same step.
+- **The skiplist search is unchanged.** Software prefetch of the next level's first node during the search was measured and not adopted (below).
+
+**Why 2^18: the arithmetic from the code.**
+- **When a memtable freezes.** A memtable belongs to one (tablet, family). It freezes once its arena allocation reaches `memtable_freeze_bytes`, a quarter of `memtable_budget` by default: 64 MiB → **16 MiB** (`EngineOptions`, `pigeonhole::Options`; the engine's `freeze`, which compares `allocated_bytes` with the threshold).
+  - An insert that crosses the threshold freezes the memtable at the next freeze check, so the memtable holds at most about 16 MiB of nodes.
+  - (D117 may defer a freeze until every seqno it holds is visible; D227 makes that wait short.)
+- **One entry's node:** a 12-byte header (key length, value length, height), then a tower of 4-byte links, then the internal key, then the stored value. The total is rounded up to 4 bytes (memtable `insert`).
+  - The height is geometric with ratio 1/4, so the tower averages 4/3 links: 5.33 bytes.
+  - The stored value is a 1-byte tag plus the value.
+- **The internal key:** the escaped row + 2-byte terminator + the escaped qualifier + 2-byte terminator + a 17-byte suffix (timestamp, seqno, kind; FORMAT §2).
+
+| cell | internal key | node, average | entries in 16 MiB |
+|---|--:|--:|--:|
+| YCSB shape: 24-byte row (`user` + 20 digits), 6-byte qualifier, 100-byte value | 51 B | 12 + 5.33 + 51 + 101 ≈ 169 B | ~99K |
+| the same with a 16-byte value (D205's small cell) | 51 B | 12 + 5.33 + 51 + 17 ≈ 85 B | ~197K |
+| **8-byte row, 1-byte qualifier, 16-byte value** | **30 B** | **12 + 5.33 + 30 + 17 ≈ 64 B** | **~262K = 2^18** |
+| empty row and qualifier, 1-byte value (degenerate) | 21 B | 12 + 5.33 + 21 + 2 ≈ 40 B | ~420K |
+
+2^18 covers every cell with an internal key of at least 30 bytes and a value of at least 16 bytes: both bench shapes, and small cells with short keys. Only degenerate cells (empty or near-empty keys and values) fill a memtable with more entries. A larger `memtable_budget` (or `memtable_freeze_bytes`) raises all of these in proportion; the judged size follows the defaults.
+
+**The prefetch, measured** (the AX102, 2026-10-12, criterion pinned; off → prefetch of `cur.tower[level-1]`'s node at every level ≥ 1):
+
+| | 1M hit | 10k hit | 10k miss |
+|---|--:|--:|--:|
+| CPU 10, random rows | 447 → 434 ns (−2.9%) | 121 → 126 (+3.6%) | 101 → 106 (+5.4%) |
+| CPU 10, shared-prefix rows | 446 → 430 (−3.5%) | 122 → 130 (+6.0%) | 100 → 107 (+7.2%) |
+| CPU 2 (V-cache), random | 479 → 464 (−3.2%) | 129 → 136 (+6.1%) | 106 → 116 (+9.5%) |
+| CPU 2, shared-prefix | 477 → 462 (−3.1%) | 131 → 133 (+1.7%) | 106 → 110 (+3.5%) |
+
+- About 3% at 1M, against a 2–9% loss whenever the memtable is cache-resident. An Apple M5 had shown −4 to −10% at 1M without the 10k cost; the reference machine decides.
+- blob33's prefix-beside-link layout was rejected earlier (+13–31% at 10k and with shared prefixes; #17).
+
+**Reported beside the judged row:** 1M entries, 446–479 ns on the AX102 (2026-10-12), memory-latency bound (~40 dependent node reads over ~70 MB). The judged 2^18 row is first measured in the next gate window.

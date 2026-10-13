@@ -83,8 +83,10 @@ if got:
 else:
     rows.append(("Point get in memory: p50 < 2 µs, p99 < 10 µs", "", verdict(None), "latency-ycsb-c.json"))
 
-# Memtable point lookup at 1M entries: <= 300 ns (#17; criterion `seek/`, median of the
-# estimate). Criterion prints the name, then `time: [low mid high]`, on one line or two.
+# Memtable point lookup: <= 300 ns at 2^18 (262,144) entries, the largest one memtable
+# reaches under the defaults with small cells (D230); 1M and 10k reported (#17; criterion
+# `seek/`, median of the estimate). Criterion prints the name, then `time: [low mid high]`,
+# on one line or two.
 UNITS = {"ps": 1e-3, "ns": 1.0, "us": 1e3, "µs": 1e3, "ms": 1e6, "s": 1e9}
 seek, name = {}, None
 try:
@@ -97,18 +99,19 @@ try:
                 seek[name] = float(m.group(1)) * UNITS.get(m.group(2), 1.0)
 except OSError:
     pass
-def is_1m_hit(k):
-    # `seek/1M entries/hit (get)`: the size label, then the probe.
+def is_hit(k, size):
+    # `seek/262k entries/hit (get)`: the size label, then the probe.
     parts = k.split("/")
-    return len(parts) >= 3 and parts[1].startswith("1M") and parts[2].startswith("hit")
+    return len(parts) >= 3 and parts[1].startswith(size + " ") and parts[2].startswith("hit")
 
-hit_1m = next((v for k, v in seek.items() if is_1m_hit(k)), None)
-if hit_1m is not None:
-    others = ", ".join(f"{k.split('/', 1)[1]} {v:.0f} ns" for k, v in seek.items() if not is_1m_hit(k))
-    rows.append(("Memtable point lookup at 1M entries: ≤ 300 ns (#17)", f"1M hit {hit_1m:.0f} ns ({others})",
-                 verdict(hit_1m <= 300), "memtable-lookup.txt"))
+LOOKUP_TARGET = "Memtable point lookup at 2^18 entries (D230): ≤ 300 ns (#17)"
+judged = next((v for k, v in seek.items() if is_hit(k, "262k")), None)
+if judged is not None:
+    others = ", ".join(f"{k.split('/', 1)[1]} {v:.0f} ns" for k, v in seek.items() if not is_hit(k, "262k"))
+    rows.append((LOOKUP_TARGET, f"262k hit {judged:.0f} ns ({others})",
+                 verdict(judged <= 300), "memtable-lookup.txt"))
 else:
-    rows.append(("Memtable point lookup at 1M entries: ≤ 300 ns (#17)", "", verdict(None), "memtable-lookup.txt"))
+    rows.append((LOOKUP_TARGET, "", verdict(None), "memtable-lookup.txt"))
 
 # Cold get: one I/O (direct I/O, 1 thread, present rows; median over runs).
 cg = [l for l in lines("cold-get.jsonl") if l.get("phase") == "present" and l.get("mode") == "direct" and l.get("threads") == 1]

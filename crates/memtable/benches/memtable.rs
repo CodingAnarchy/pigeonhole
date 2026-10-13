@@ -1,7 +1,8 @@
-//! Insert and lookup latency on memtables of one million and ten thousand entries. The
-//! spec's "typically under 300 ns" lookup holds while the memtable fits in cache (10k
-//! entries: ~150-190 ns); at 1M randomly inserted entries a lookup is ~40 dependent node
-//! reads over a ~70 MB working set and is memory-latency bound (~500 ns).
+//! Insert and lookup latency on memtables of 2^18 (262,144), one million and ten thousand
+//! entries. The gate judges the lookup at 2^18 entries, the largest one (tablet, family)
+//! memtable reaches under the default options with small cells (D230); 1M and 10k are
+//! reported. A lookup is about two dependent node reads per level of the skiplist, so it is
+//! memory-latency bound once the memtable outgrows the caches (1M entries: ~70 MB).
 
 use std::hint::black_box;
 
@@ -76,7 +77,11 @@ fn bench(c: &mut Criterion) {
     });
     group.finish();
 
-    for (label, n) in [("1M entries", MILLION), ("10k entries", 10_000)] {
+    for (label, n) in [
+        ("262k entries", 1 << 18),
+        ("1M entries", MILLION),
+        ("10k entries", 10_000),
+    ] {
         let (_arena, mt) = build(&keys[..n], &values[..n]);
         let reader = mt.reader();
         // Probe keys in an order unrelated to insertion order.
