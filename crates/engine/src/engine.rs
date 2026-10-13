@@ -2963,7 +2963,6 @@ impl Inner {
                         predicate: predicate.map(Box::new),
                         commit_ts: None,
                         map_version: view.tablets().version(),
-                        attempts: 0,
                     })
                 };
             }
@@ -3000,7 +2999,6 @@ impl Inner {
             map_version: view.tablets.version(),
             commit_ts: None,
             epoch: 0,
-            attempts: 0,
         }));
         let Some(charge) = admit.admit(target) else {
             return Ok(Routed::Held(Prepared {
@@ -3126,7 +3124,6 @@ impl Inner {
                 predicate: Some(Box::new((table, row.to_vec(), predicate.clone()))),
                 commit_ts: None,
                 map_version: view.tablets().version(),
-                attempts: 0,
             }))?;
         Ok(PendingCheck {
             waiter: rx,
@@ -3853,7 +3850,6 @@ impl EngineShard {
                     predicate: None,
                     commit_ts: None,
                     map_version: view.tablets().version(),
-                    attempts: 0,
                 },
                 ctx,
             )

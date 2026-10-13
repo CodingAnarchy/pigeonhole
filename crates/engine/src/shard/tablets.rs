@@ -420,7 +420,6 @@ impl ShardState {
                     map_version: view.tablets.version(),
                     commit_ts: req.commit_ts,
                     epoch: 0,
-                    attempts: req.attempts,
                 };
                 if shards[0] == self.id {
                     self.start_coordination(creq, ctx);
@@ -495,7 +494,6 @@ impl ShardState {
             predicate: None,
             commit_ts: r.commit_ts,
             map_version: r.map_version,
-            attempts: r.attempts,
         });
         if let Some(m) = self.forward(m, ctx) {
             self.pending.push(m);
@@ -2095,7 +2093,6 @@ fn member_req(m: Member) -> CommitReq {
             own: m.preset_own,
         }),
         map_version: m.map_version,
-        attempts: m.attempts,
     }
 }
 

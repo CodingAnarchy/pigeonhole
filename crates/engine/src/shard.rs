@@ -89,7 +89,19 @@ const COMPACTION_BACKOFF_CAP: u64 = 60;
 const FLUSH_BACKOFF_CAP: u64 = 100;
 const ROOM_RECHECK_CAP: u64 = 100;
 
-/// The wait before retrying after `failures` failed compactions in a row (at least one).
+/// A member's `room_since`: the shard clock in milliseconds (wrapping after 49 days, never
+/// 0) when it first waited for arena room.
+fn room_stamp(now: u64) -> u32 {
+    ((now / 1_000_000) as u32).wrapping_add(1).max(1)
+}
+
+/// When (in nanoseconds on the clock that reads `now`) the member stamped `stamp` began
+/// waiting, to the millisecond.
+fn room_since(stamp: u32, now: u64) -> u64 {
+    let waited = u64::from(room_stamp(now).wrapping_sub(stamp)) * 1_000_000;
+    now.saturating_sub(waited)
+}
+
 /// Whether a cross-shard commit refused with `Moved` (or a timestamp below a floor),
 /// `waited` nanoseconds after it was submitted, fails with `Busy` instead of retrying: only
 /// once the write-stall timeout has passed (D241). A commit that keeps meeting tablet
@@ -782,9 +794,6 @@ pub(crate) struct CommitReq {
     /// Version of the tablet map the commit was routed with (0: unknown): a shard that
     /// handed a tablet away checks the routing of commits routed with an older map.
     pub map_version: u64,
-    /// Times a participant refused this (cross-shard) commit with `Moved` so far (traced; it
-    /// fails with `Busy` only at the write-stall timeout, D241).
-    pub attempts: u32,
 }
 
 /// A refused commit's first timestamp, carried into its retry.
@@ -834,8 +843,6 @@ pub(crate) struct CoordinateReq {
     /// retried once a tablet change has finished since (it may have failed, leaving the map
     /// as it was).
     pub epoch: u64,
-    /// `CommitReq::attempts`.
-    pub attempts: u32,
 }
 
 /// A participant's share of a cross-shard commit.
@@ -1068,8 +1075,11 @@ struct Member {
     map_version: u64,
     /// A retried commit: the shards that may already hold its timestamp (`Preset::own`).
     preset_own: Vec<ShardId>,
-    /// `CommitReq::attempts`.
-    attempts: u32,
+    /// When it first waited for arena room, as a `room_stamp` (0: it has not): it is refused
+    /// with `Busy` once it has waited `write_stall_timeout_nanos` itself (D240), whatever
+    /// room the shard freed for the members ahead of it meanwhile. Four bytes, in padding
+    /// `Member` already had: every member is moved several times per group.
+    room_since: u32,
 }
 
 #[derive(Debug)]
@@ -1097,7 +1107,6 @@ impl Member {
             durability: req.durability,
             seqno: 0,
             commit_ts: req.commit_ts.as_ref().map_or(0, |p| p.ts),
-            attempts: req.attempts,
             preset_own: req.commit_ts.map(|p| p.own).unwrap_or_default(),
             bytes: Bytes::Own(req.bytes),
             reply: req.reply,
@@ -1108,6 +1117,7 @@ impl Member {
             failed: None,
             reserved: 0,
             map_version: req.map_version,
+            room_since: 0,
         }
     }
 
@@ -1180,8 +1190,6 @@ struct Coord {
     /// Shards that may hold `commit_ts` because of this commit (see `Preset::own`).
     own: Vec<ShardId>,
     epoch: u64,
-    /// `CommitReq::attempts`.
-    attempts: u32,
 }
 
 /// A share this shard prepared and holds until the decision.
@@ -1636,10 +1644,11 @@ struct ArenaNeed {
     alloc_chunks: usize,
 }
 
-/// A group waiting for a flush to free memtable arena room (a write stall, counted in the
-/// metrics), refused with `Busy` once `write_stall_timeout_nanos` have passed (D124). On a
-/// frozen clock it is also refused after `ROOM_FLUSH_ATTEMPTS` failed flushes in a row, or
-/// at once when nothing can free room (issue #70).
+/// A shard's wait for a flush to free memtable arena room (a write stall, counted in the
+/// metrics, from the first member that waits until none does). Each waiting member is
+/// refused with `Busy` once it has waited `write_stall_timeout_nanos` itself (D124, D240).
+/// On a frozen clock every waiting member is also refused after `ROOM_FLUSH_ATTEMPTS`
+/// failed flushes in a row, or at once when nothing can free room (issue #70).
 #[derive(Debug)]
 struct RoomWait {
     since: u64,
@@ -2019,8 +2028,9 @@ pub(crate) struct ShardState {
     /// Roots handed to the running flush task.
     flushing: Vec<u32>,
     flush_running: bool,
-    /// `Engine::flush` callers waiting for every frozen memtable to reach the manifest.
-    flush_waiters: Vec<Notifier<Result<()>>>,
+    /// `Engine::flush` callers waiting for every frozen memtable to reach the manifest, with
+    /// when each asked (its own write-stall deadline in a starved freeze, D240).
+    flush_waiters: Vec<(u64, Notifier<Result<()>>)>,
     /// A group is deferred until a flush frees arena room.
     wait_room: bool,
     /// The wait for arena room in progress: when it began and its timeout timer.
@@ -2123,8 +2133,8 @@ pub(crate) struct ShardState {
     /// The balancer chose a change that waits on the running compaction (its tablets'): it
     /// decides again as soon as that ends, before the next compaction is picked (#102).
     change_waits: bool,
-    /// `Engine::compact` callers: `(table filter, reply)`, served in order.
-    compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>)>,
+    /// `Engine::compact` callers: `(table filter, reply, when it asked)`, served in order.
+    compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>, u64)>,
     /// The running compaction was started for the `compact_all` caller at the front: its
     /// failure is that caller's. A background compaction's failure is nobody's: it backs
     /// off (issue #141).
@@ -2894,6 +2904,11 @@ impl ShardState {
             self.shared.metrics[usize::from(self.id.0)]
                 .stall_nanos
                 .fetch_add(now.saturating_sub(w.since), Ordering::Relaxed);
+            // A member still pending (behind a conditional one, say) starts a fresh wait if
+            // room runs out again (D240).
+            for m in &mut self.pending {
+                m.room_since = 0;
+            }
         }
     }
 
@@ -3088,16 +3103,16 @@ impl ShardState {
             // Whoever waits for a flush hears now that none will run (a `flush` or
             // `compact` that passed its open check just before the close began: its message
             // comes after the close's), rather than when the close ends.
-            for w in self.flush_waiters.drain(..) {
+            for (_, w) in self.flush_waiters.drain(..) {
                 w.notify(Err(Error::Closed));
             }
-            for (_, w) in self.compact_all.drain(..) {
+            for (_, w, _) in self.compact_all.drain(..) {
                 w.notify(Err(Error::Closed));
             }
             return;
         }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
-            for w in self.flush_waiters.drain(..) {
+            for (_, w) in self.flush_waiters.drain(..) {
                 w.notify(Err(ManifestWriter::poisoned_error()));
             }
             return;
@@ -3135,7 +3150,7 @@ impl ShardState {
             return;
         }
         if self.flush_idle() {
-            for w in self.flush_waiters.drain(..) {
+            for (_, w) in self.flush_waiters.drain(..) {
                 w.notify(Ok(()));
             }
         }
@@ -3191,13 +3206,17 @@ impl ShardState {
             // Either timer giving up on this reading means the clock stopped (#244).
             Some(w) => (w.since, w.stopped(now)),
         };
+        // Each caller waits `timeout` itself (D240): from when it asked, or from when the
+        // freeze starved if it asked before that.
+        let oldest = self.starved_oldest(since);
         if let Some(w) = &self.starve_wait
             && w.timer.finished()
             && !frozen
-            && now.saturating_sub(since) < timeout
+            && now.saturating_sub(oldest) < timeout
         {
-            // A timer that gave up on a clock that has moved since is armed again.
-            let timer = arm(since, ctx);
+            // The timer fired for an earlier caller's deadline, or gave up on a clock that
+            // has moved since: it is armed again for the oldest caller's.
+            let timer = arm(oldest, ctx);
             if let Some(w) = &mut self.starve_wait {
                 w.timer = timer;
             }
@@ -3216,26 +3235,68 @@ impl ShardState {
                 self.id,
             );
         }
-        if now.saturating_sub(since) >= timeout || idle {
+        if idle {
             trace!(
                 "shard {} starved freeze: refusing {} flush and {} compact callers \
-                 (waited {} ns, frozen clock {frozen}, idle {idle})",
+                 (frozen clock, nothing in flight)",
                 self.id.0,
                 self.flush_waiters.len(),
                 self.compact_all.len(),
-                now.saturating_sub(since)
             );
             if let Some(w) = self.starve_wait.take() {
                 w.cancel();
             }
             self.starved_all = false;
-            for w in self.flush_waiters.drain(..) {
+            for (_, w) in self.flush_waiters.drain(..) {
                 w.notify(Err(Error::Busy));
             }
-            for (_, w) in self.compact_all.drain(..) {
+            for (_, w, _) in self.compact_all.drain(..) {
                 w.notify(Err(Error::Busy));
+            }
+        } else if now.saturating_sub(oldest) >= timeout {
+            // The callers that waited the whole timeout themselves are refused; the rest
+            // keep waiting (D240).
+            let late = |at: u64| now.saturating_sub(at.max(since)) >= timeout;
+            trace!(
+                "shard {} starved freeze: refusing the callers waiting since {oldest}",
+                self.id.0
+            );
+            let (refused, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.flush_waiters)
+                .into_iter()
+                .partition(|(at, _)| late(*at));
+            self.flush_waiters = kept;
+            for (_, w) in refused {
+                w.notify(Err(Error::Busy));
+            }
+            let (refused, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.compact_all)
+                .into_iter()
+                .partition(|(_, _, at)| late(*at));
+            self.compact_all = kept;
+            for (_, w, _) in refused {
+                w.notify(Err(Error::Busy));
+            }
+            if let Some(w) = self.starve_wait.take() {
+                w.cancel();
+            }
+            if self.flush_waiters.is_empty() && self.compact_all.is_empty() {
+                self.starved_all = false;
+            } else {
+                let next = self.starved_oldest(since);
+                let timer = arm(next, ctx);
+                self.starve_wait = Some(RoomWait::new(since, timer));
             }
         }
+    }
+
+    /// When the longest-waiting `flush` or `compact` caller began waiting for a starved
+    /// freeze that began at `since`.
+    fn starved_oldest(&self, since: u64) -> u64 {
+        self.flush_waiters
+            .iter()
+            .map(|(at, _)| *at)
+            .chain(self.compact_all.iter().map(|(_, _, at)| *at))
+            .min()
+            .map_or(since, |at| at.max(since))
     }
 
     /// A flush task finished.
@@ -3354,11 +3415,11 @@ impl ShardState {
                 self.abort_op(crate::error::relay("flush", &e), ctx);
                 // Whoever asked for this flush hears about the failure now rather than
                 // waiting for a retry that may never come (a dead device).
-                for w in self.flush_waiters.drain(..) {
+                for (_, w) in self.flush_waiters.drain(..) {
                     w.notify(Err(crate::error::relay("flush", &e)));
                 }
                 // A full compaction starts with a flush: it fails with it.
-                for (_, w) in self.compact_all.drain(..) {
+                for (_, w, _) in self.compact_all.drain(..) {
                     w.notify(Err(crate::error::relay("flush", &e)));
                 }
                 if self.closing {
@@ -4006,6 +4067,185 @@ impl ShardState {
         self.publish_watermark();
     }
 
+    /// A group found no arena room for some members (now in `pending`): starts or continues
+    /// the write stall, refuses the members whose own wait reached the timeout (D124,
+    /// D240), and frees room. Out of line: only stalled groups get here, and keeping it out
+    /// of `run_group` keeps the per-member admission loop's code tight.
+    #[cold]
+    #[inline(never)]
+    fn wait_for_room(&mut self, admitted: &[Member], ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.wait_room = true;
+        let now = ctx.now_nanos();
+        let timeout = self.shared.write_stall_timeout_nanos;
+        // Each member's own wait starts the first time it waits (D240); the members cut
+        // after it wait behind it from now on too.
+        for m in &mut self.pending {
+            if m.room_since == 0 {
+                m.room_since = room_stamp(now);
+            }
+        }
+        // The oldest waiter's deadline: the pending queue keeps submission order, so the
+        // oldest waiter is also the first to be admitted once room frees.
+        let oldest = self
+            .pending
+            .iter()
+            .filter(|m| m.room_since > 0)
+            .map(|m| room_since(m.room_since, now))
+            .min()
+            .unwrap_or(now);
+        // The clock has stopped if either of the wait's timers gave up on this reading.
+        // The re-check timer counts too (#244): the timeout timer may have seen the clock
+        // move and be asleep towards a deadline the clock never reaches, and a shard
+        // kicked by each re-check never goes idle for it to be polled and notice.
+        let frozen = self.room_wait.as_ref().is_some_and(|w| w.stopped(now));
+        let mut refuse = false;
+        match &self.room_wait {
+            None => {
+                // The stall begins: count it, and arm the timeout.
+                let metrics = &self.shared.metrics[usize::from(self.id.0)];
+                metrics.stalls.fetch_add(1, Ordering::Relaxed);
+                let state = TimerState::new();
+                ctx.spawn(Box::new(ClockTimer::new(
+                    &self.shared.vfs,
+                    oldest.saturating_add(timeout),
+                    Arc::clone(&state),
+                    ctx.submitter(self.id).clone(),
+                    ShardMsg::Kick,
+                )));
+                self.room_wait = Some(RoomWait::new(now, state));
+            }
+            Some(w) if frozen && w.failed_flushes >= ROOM_FLUSH_ATTEMPTS => {
+                // On a frozen clock, which never reaches the timeout, the flushes keep
+                // failing (issue #70): every waiting member is refused.
+                refuse = true;
+            }
+            Some(w) => {
+                // The timer fired for a deadline (or gave up on a clock that has moved
+                // since): it is armed again for the oldest waiter's deadline, unless that
+                // has passed (its members are refused below).
+                if w.timer.finished() && !frozen && now.saturating_sub(oldest) < timeout {
+                    let state = TimerState::new();
+                    ctx.spawn(Box::new(ClockTimer::new(
+                        &self.shared.vfs,
+                        oldest.saturating_add(timeout),
+                        Arc::clone(&state),
+                        ctx.submitter(self.id).clone(),
+                        ShardMsg::Kick,
+                    )));
+                    if let Some(w) = &mut self.room_wait {
+                        w.timer = state;
+                    }
+                }
+            }
+        }
+        // A flush frees room (one that failed is tried again), and so do empty slots.
+        if self.retire_idle_slots().is_err() {
+            self.poison(crate::health::FailureCause::Internal);
+        }
+        // Freezing every memtable frees room only when no flush will: while a frozen one
+        // is queued or flushing, its flush frees room and the wait looks again then.
+        // Freezing each small active memtable on every wait instead filled a backlogged
+        // L0 with SSTs a fraction of the freeze size.
+        let _ = self.freeze(self.flush_idle());
+        // That freeze may have queued guarded flushes after this group's members were
+        // admitted but before they are applied (below, into the fresh active memtables):
+        // their deletes void those guards now. Nothing claims a fresh guard before the
+        // flush task runs, after this call.
+        for m in admitted {
+            if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                let admitted_again = self.admit_against_guards(m);
+                debug_assert!(admitted_again, "a fresh guard is never installing");
+            }
+        }
+        self.spawn_flush(ctx);
+        // On a frozen clock, with no flush, deferred freeze, undecided share or unsynced
+        // group in flight and no retired memtable a reader process still pins, nothing
+        // the shard will hear of can free room (in-process snapshots hold what is left)
+        // and the timeout never comes: refuse now (issue #70). A moving clock waits for
+        // the timeout (D124), since a reader may release room meanwhile.
+        let idle = frozen
+            && !self.flush_running
+            && self.flush_queue.is_empty()
+            && !self.freeze_deferred
+            && self.prepared.is_empty()
+            && self.unresolved.is_empty()
+            && self.retired.is_empty();
+        trace!(
+            "shard {} room wait: frozen={frozen} idle={idle} refuse={refuse}",
+            self.id.0
+        );
+        if !refuse && !idle && !frozen {
+            // Room freed by a snapshot dropped on another thread or a reader process's
+            // unpin is announced to nobody: look again soon (issue #141).
+            if let Some(w) = &mut self.room_wait {
+                w.arm_recheck(
+                    &self.shared.vfs,
+                    self.shared.room_recheck_nanos,
+                    ctx,
+                    self.id,
+                );
+            }
+        }
+        if refuse || idle {
+            // Refuse the waiting members; this group's admitted ones still apply.
+            self.end_room_wait(now);
+            self.wait_room = false;
+            let waiting = std::mem::take(&mut self.pending);
+            for mut m in waiting {
+                if matches!(m.kind, MemberKind::CommitRecord { .. }) {
+                    self.pending.push(m);
+                    continue;
+                }
+                m.failed = Some(Error::Busy);
+                self.settle(m, Ok(()), ctx);
+            }
+        } else if now.saturating_sub(oldest) >= timeout {
+            // The members that waited the whole timeout themselves are refused (D124,
+            // D240); the rest keep their place, and the wait goes on for them.
+            let waiting = std::mem::take(&mut self.pending);
+            for mut m in waiting {
+                if m.room_since > 0
+                    && now.saturating_sub(room_since(m.room_since, now)) >= timeout
+                    && !matches!(m.kind, MemberKind::CommitRecord { .. })
+                {
+                    m.failed = Some(Error::Busy);
+                    self.settle(m, Ok(()), ctx);
+                } else {
+                    self.pending.push(m);
+                }
+            }
+            if !self
+                .pending
+                .iter()
+                .any(|m| !matches!(m.kind, MemberKind::CommitRecord { .. }))
+            {
+                self.end_room_wait(now);
+                self.wait_room = false;
+            } else if let Some(w) = &self.room_wait {
+                // The next deadline: the timer that fired for this one is done.
+                w.timer.cancel();
+                let next = self
+                    .pending
+                    .iter()
+                    .filter(|m| m.room_since > 0)
+                    .map(|m| room_since(m.room_since, now))
+                    .min()
+                    .unwrap_or(now);
+                let state = TimerState::new();
+                ctx.spawn(Box::new(ClockTimer::new(
+                    &self.shared.vfs,
+                    next.saturating_add(timeout),
+                    Arc::clone(&state),
+                    ctx.submitter(self.id).clone(),
+                    ShardMsg::Kick,
+                )));
+                if let Some(w) = &mut self.room_wait {
+                    w.timer = state;
+                }
+            }
+        }
+    }
+
     /// Runs the group commit over everything drained since the last one.
     fn run_group(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.pending.is_empty() {
@@ -4200,117 +4440,7 @@ impl ShardState {
         }
         self.return_member_buf(members);
         if need_room {
-            self.wait_room = true;
-            let now = ctx.now_nanos();
-            let timeout = self.shared.write_stall_timeout_nanos;
-            // The clock has stopped if either of the wait's timers gave up on this reading.
-            // The re-check timer counts too (#244): the timeout timer may have seen the clock
-            // move and be asleep towards a deadline the clock never reaches, and a shard
-            // kicked by each re-check never goes idle for it to be polled and notice.
-            let frozen = self.room_wait.as_ref().is_some_and(|w| w.stopped(now));
-            let mut refuse = false;
-            match &self.room_wait {
-                None => {
-                    // The stall begins: count it, and arm the timeout.
-                    let metrics = &self.shared.metrics[usize::from(self.id.0)];
-                    metrics.stalls.fetch_add(1, Ordering::Relaxed);
-                    let state = TimerState::new();
-                    ctx.spawn(Box::new(ClockTimer::new(
-                        &self.shared.vfs,
-                        now.saturating_add(timeout),
-                        Arc::clone(&state),
-                        ctx.submitter(self.id).clone(),
-                        ShardMsg::Kick,
-                    )));
-                    self.room_wait = Some(RoomWait::new(now, state));
-                }
-                Some(w)
-                    if now.saturating_sub(w.since) >= timeout
-                        || (frozen && w.failed_flushes >= ROOM_FLUSH_ATTEMPTS) =>
-                {
-                    // Nothing freed room in time (D124), or on a frozen clock, which never
-                    // reaches the timeout, the flushes keep failing (issue #70).
-                    refuse = true;
-                }
-                Some(w) => {
-                    // A timer that gave up on a clock that has moved since is armed again.
-                    if w.timer.finished() && !frozen {
-                        let state = TimerState::new();
-                        ctx.spawn(Box::new(ClockTimer::new(
-                            &self.shared.vfs,
-                            w.since.saturating_add(timeout),
-                            Arc::clone(&state),
-                            ctx.submitter(self.id).clone(),
-                            ShardMsg::Kick,
-                        )));
-                        if let Some(w) = &mut self.room_wait {
-                            w.timer = state;
-                        }
-                    }
-                }
-            }
-            // A flush frees room (one that failed is tried again), and so do empty slots.
-            if self.retire_idle_slots().is_err() {
-                self.poison(crate::health::FailureCause::Internal);
-            }
-            // Freezing every memtable frees room only when no flush will: while a frozen one
-            // is queued or flushing, its flush frees room and the wait looks again then.
-            // Freezing each small active memtable on every wait instead filled a backlogged
-            // L0 with SSTs a fraction of the freeze size.
-            let _ = self.freeze(self.flush_idle());
-            // That freeze may have queued guarded flushes after this group's members were
-            // admitted but before they are applied (below, into the fresh active memtables):
-            // their deletes void those guards now. Nothing claims a fresh guard before the
-            // flush task runs, after this call.
-            for m in &admitted {
-                if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                    let admitted_again = self.admit_against_guards(m);
-                    debug_assert!(admitted_again, "a fresh guard is never installing");
-                }
-            }
-            self.spawn_flush(ctx);
-            // On a frozen clock, with no flush, deferred freeze, undecided share or unsynced
-            // group in flight and no retired memtable a reader process still pins, nothing
-            // the shard will hear of can free room (in-process snapshots hold what is left)
-            // and the timeout never comes: refuse now (issue #70). A moving clock waits for
-            // the timeout (D124), since a reader may release room meanwhile.
-            let idle = frozen
-                && !self.flush_running
-                && self.flush_queue.is_empty()
-                && !self.freeze_deferred
-                && self.prepared.is_empty()
-                && self.unresolved.is_empty()
-                && self.retired.is_empty();
-            trace!(
-                "shard {} room wait: frozen={frozen} idle={idle} refuse={refuse}",
-                self.id.0
-            );
-            if !refuse && !idle && !frozen {
-                // Room freed by a snapshot dropped on another thread or a reader process's
-                // unpin is announced to nobody: look again soon (issue #141).
-                if let Some(w) = &mut self.room_wait {
-                    w.arm_recheck(
-                        &self.shared.vfs,
-                        self.shared.room_recheck_nanos,
-                        ctx,
-                        self.id,
-                    );
-                }
-            }
-            if refuse || idle {
-                // Refuse the waiting members; this group's admitted ones still apply.
-                self.end_room_wait(now);
-                self.wait_room = false;
-                let waiting = std::mem::take(&mut self.pending);
-                for mut m in waiting {
-                    if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                        self.pending.push(m);
-                        continue;
-                    }
-                    m.failed = Some(Error::Busy);
-                    self.settle(m, Ok(()), ctx);
-                }
-            }
+            self.wait_for_room(&admitted, ctx);
         } else {
             if let Some(w) = &self.room_wait
                 && !self.wait_room
@@ -5641,7 +5771,6 @@ impl ShardState {
                     .is_some_and(|p| preset_fits(p.ts, &p.own, *s, own_floor, raise));
             }
         }
-        let attempts = req.attempts;
         let (commit_ts, own) = match req.commit_ts {
             Some(p) if fits => {
                 self.raise_ts_floor(p.ts);
@@ -5687,7 +5816,6 @@ impl ShardState {
                 commit_ts,
                 own,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
-                attempts,
             },
         );
         for (shard, bytes) in req.parts {
@@ -5754,7 +5882,7 @@ impl ShardState {
             reserved: 0,
             map_version: req.map_version,
             preset_own: Vec::new(),
-            attempts: 0,
+            room_since: 0,
         });
     }
 
@@ -5853,7 +5981,7 @@ impl ShardState {
             reserved: 0,
             map_version: 0,
             preset_own: Vec::new(),
-            attempts: 0,
+            room_since: 0,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
@@ -6031,16 +6159,10 @@ impl ShardState {
             // A participant was splitting, merging or moving a tablet: the commit was
             // aborted everywhere and runs again once the tablet map has changed. One that
             // refused the timestamp as below its floor runs again at once, with a fresh one.
-            // Either gives up once it was refused too often or waited too long (#102).
-            let attempts = c.attempts.saturating_add(1);
-            if moved_gives_up(
-                ctx.now_nanos().saturating_sub(c.submitted_at),
-                self.shared.write_stall_timeout_nanos,
-            ) {
-                trace!(
-                    "shard {} gives up on {seqno} after {attempts} attempts",
-                    self.id.0
-                );
+            // Either gives up once it has waited the write-stall timeout (D241).
+            let waited = ctx.now_nanos().saturating_sub(c.submitted_at);
+            if moved_gives_up(waited, self.shared.write_stall_timeout_nanos) {
+                trace!("shard {} gives up on {seqno} after {waited} ns", self.id.0);
                 reply.notify(Err(Error::Busy));
                 self.try_finish_close(ctx);
                 return;
@@ -6057,7 +6179,6 @@ impl ShardState {
                     own: std::mem::take(&mut c.own),
                 }),
                 epoch: c.epoch,
-                attempts,
             };
             if c.below_floor {
                 self.retry(req, ctx);
@@ -6511,7 +6632,7 @@ impl ShardState {
             return;
         }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
-            for (_, w) in self.compact_all.drain(..) {
+            for (_, w, _) in self.compact_all.drain(..) {
                 w.notify(Err(poisoned_error()));
             }
             return;
@@ -6529,7 +6650,7 @@ impl ShardState {
             self.arm_compaction_retry(now_nanos.saturating_add(wait), ctx);
         }
         // Full compactions first (a caller waits), one slot at a time.
-        while let Some((filter, _)) = self.compact_all.front() {
+        while let Some((filter, _, _)) = self.compact_all.front() {
             if !self.flush_idle() || self.freeze_all_pending || self.starved_all {
                 self.spawn_flush(ctx);
                 return;
@@ -6580,14 +6701,14 @@ impl ShardState {
                         return;
                     }
                     Err(e) => {
-                        let (_, reply) = self.compact_all.pop_front().expect("front");
+                        let (_, reply, _) = self.compact_all.pop_front().expect("front");
                         reply.notify(Err(e));
                     }
                 },
                 None => {
                     // Every slot is fully compacted. A background failure meanwhile is not
                     // this caller's (issue #141): its own failures were reported at once.
-                    let (_, reply) = self.compact_all.pop_front().expect("front");
+                    let (_, reply, _) = self.compact_all.pop_front().expect("front");
                     reply.notify(Ok(()));
                 }
             }
@@ -7010,7 +7131,7 @@ impl ShardState {
                 // nobody's (a later `compact` must not inherit it, issue #141): it backs off,
                 // and its slot waits out a backoff of its own so the other slots still
                 // compact.
-                if full && let Some((_, reply)) = self.compact_all.pop_front() {
+                if full && let Some((_, reply, _)) = self.compact_all.pop_front() {
                     reply.notify(Err(e));
                 }
                 if let Some(key) = key {
@@ -7400,7 +7521,7 @@ impl ShardState {
                     reply.notify(Err(e));
                     return;
                 }
-                self.flush_waiters.push(reply);
+                self.flush_waiters.push((ctx.now_nanos(), reply));
                 self.spawn_flush(ctx);
                 self.check_flush_waiters();
             }
@@ -7464,7 +7585,7 @@ impl ShardState {
                     reply.notify(Err(e));
                     return;
                 }
-                self.compact_all.push_back((table, reply));
+                self.compact_all.push_back((table, reply, ctx.now_nanos()));
                 self.spawn_flush(ctx);
                 self.maintain(ctx);
             }

@@ -1928,6 +1928,106 @@ fn flush_and_compact_are_busy_after_the_stall_timeout_when_snapshots_hold_the_ar
     starved_flush_and_compact(true);
 }
 
+/// D240: in the starved freeze of the test below, each `flush` caller waits the stall
+/// timeout itself. A second caller that asks halfway through the first one's wait is not
+/// refused at the first one's deadline, and its flush succeeds once the pin drops.
+#[test]
+fn a_later_flush_caller_is_not_refused_at_an_earlier_ones_deadline() {
+    const TIMEOUT: u64 = 1_000_000_000;
+    let sim = SimVfs::new(240);
+    let vfs: VfsRef = Arc::new(FailReadsVfs::real(&sim, None));
+    let mut o = common::options(Arc::clone(&sim), 1, 2 << 20);
+    o.vfs = Arc::clone(&vfs);
+    o.memtable_freeze_bytes = 1 << 20;
+    o.tablet_changes = false;
+    o.arena_chunk_bytes = Some(32 << 10);
+    o.write_stall_timeout_nanos = TIMEOUT;
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+    let mut run = || {
+        for _ in 0..100_000 {
+            let mut more = false;
+            for s in &mut shards {
+                more |= s.run_once(u64::MAX);
+            }
+            if !more {
+                return;
+            }
+        }
+        panic!("the shards never went idle");
+    };
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut poll =
+        |m: &mut pigeonhole_engine::PendingMaintenance| match std::pin::Pin::new(m).poll(&mut cx) {
+            Poll::Ready(r) => Some(r),
+            Poll::Pending => None,
+        };
+    let defs: Vec<(String, FamilyOptions)> = (0..8)
+        .map(|f| (format!("f{f}"), FamilyOptions::default()))
+        .collect();
+    let t = db.create_table("t", &defs).unwrap();
+    let mut snap = None;
+    for round in 0..2 {
+        for (fi, f) in t.families.iter().enumerate() {
+            let rows = match (round, fi) {
+                (0, 0..4) => 190,
+                (0, _) => 170,
+                _ => 1,
+            };
+            let mut wb = WriteBatch::new();
+            for i in 0..rows {
+                let row = format!("r{round}-{i:03}");
+                let v = ValueRef::Bytes(&[7u8; 1000]);
+                wb.put(t.id, f.id, row.as_bytes(), b"q", None, v).unwrap();
+            }
+            let mut pc = db.submit(wb, Some(Durability::Buffered)).unwrap();
+            while poll_commit(&mut pc).is_pending() {
+                run();
+            }
+        }
+        if round == 0 {
+            snap = Some(db.snapshot().unwrap());
+            let mut m = db.flush_pending().unwrap();
+            loop {
+                if let Some(r) = poll(&mut m) {
+                    r.unwrap();
+                    break;
+                }
+                run();
+            }
+        }
+    }
+    let pin_round1 = db.snapshot().unwrap();
+    let start = vfs.monotonic_nanos();
+    let mut first = db.flush_pending().unwrap();
+    while vfs.monotonic_nanos() - start < TIMEOUT / 2 {
+        run();
+        assert!(poll(&mut first).is_none(), "refused before the timeout");
+    }
+    let mut second = db.flush_pending().unwrap();
+    let refused = loop {
+        run();
+        if let Some(r) = poll(&mut first) {
+            break r;
+        }
+    };
+    assert!(matches!(refused, Err(Error::Busy)), "{refused:?}");
+    assert!(
+        poll(&mut second).is_none(),
+        "the second caller was refused at the first one's deadline"
+    );
+    drop(pin_round1);
+    let flushed = loop {
+        run();
+        if let Some(r) = poll(&mut second) {
+            break r;
+        }
+    };
+    flushed.unwrap();
+    drop(snap);
+    db.close().unwrap();
+    run();
+}
+
 /// The arena of the #111 test: after the second round, four of the eight memtables can be
 /// replaced and four cannot while a snapshot pins the first round's memtables. `flush` and
 /// `compact` used to report success with those four still unflushed. While a second

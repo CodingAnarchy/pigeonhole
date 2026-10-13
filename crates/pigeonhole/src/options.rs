@@ -173,8 +173,9 @@ impl Options {
 
     /// How long a write, `flush` or `compact` may wait out a write stall (L0 compaction
     /// falling behind, or the memtable arena full while snapshots or a slow flush hold it)
-    /// before it fails with [`ErrorCode::Busy`](crate::ErrorCode::Busy) (default 30 s).
-    /// Latency-sensitive applications can fail fast and retry later; batch loaders can wait
+    /// before it fails with [`ErrorCode::Busy`](crate::ErrorCode::Busy) (default 30 s). Each
+    /// call's wait counts from when it began waiting, however long the stall has lasted for
+    /// the calls ahead of it. Latency-sensitive applications can fail fast and retry later; batch loaders can wait
     /// longer. `Duration::ZERO` refuses as soon as a wait would begin. On a clock that does
     /// not move (a simulator's), a wait nothing can end is refused at once whatever this
     /// says.

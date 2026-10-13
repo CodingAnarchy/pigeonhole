@@ -139,7 +139,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B · **amended by D156**
 - [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
 - [D123](phase-1.md#d123) — Does the sim's recovery helper cover a coordinator that is also a participant · superseded for new code by D114; engine adoption in #48 · **amended by D125**
-- [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D126, D138, D161, D162**
+- [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D126, D138, D161, D162, D240**
 - [D125](phase-1.md#d125) — the model suites use the sim's record-level oracle on every crash · harness, #48 · amends D123
 - [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119, D124 · **amended by D138, D161, D171, D176**
 - [D127](phase-1.md#d127) — a model harness attributes an error to an armed power loss only once the crash has fired · harness, #62
@@ -255,6 +255,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D237](phase-3.md#d237) — An application-owned shard's `run_once` ends its turn after the message drain, before its background slices, when it woke a future the driving thread awaits (a commit settled), at most 8 turns in a row; group commit p99 at 16 in flight 183 → 157–167 µs on the AX102 · owner decision, runtime, engine, pigeonhole, #406
 - [D238](phase-3.md#d238) — The scaling gate judges ≥ 0.8 × N for N up to one chiplet's (CCD's) physical cores, read from the L3 topology, and reports larger N (~0.70 at 16 accepted on the AX102's two CCDs); efficiency against a fixed single-shard rate (417,922 commits/s, AX102) is reported beside it · owner decision, bench, #154, #406 · amends D204, D231
 - [D239](phase-3.md#d239) — The memtable lookup (#17) is accepted at 337 ns at 2^18 entries: the gate reports it against 300 ns with the verdict "accepted (D239)" up to 354 ns (5% above 337); #612 stays the post-1.0 lever · owner decision, bench, memtable, #17, #406 · amends D230
+- [D240](phase-3.md#d240) — The write-stall timeout is each waiting write's (and `flush` or `compact` caller's) own: refused with `Busy` once it waited that long itself, not once the shard was short of room that long · coordinator, engine, cold-get liveness (c) · amends D124
 - [D241](phase-3.md#d241) — A cross-shard commit refused with `Moved` or below a timestamp floor gives up only at the write-stall timeout, never after 16 attempts; the `Busy` message names tablet changes; making the `BelowFloor` retry win is #637 · owner decision, engine, tablets, #102 · amends D145
 
 ## Open questions
