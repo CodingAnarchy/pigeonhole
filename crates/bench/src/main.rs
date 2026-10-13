@@ -33,11 +33,13 @@ USAGE:
 
 WORKLOADS:
     ycsb-a ycsb-b ycsb-c ycsb-d ycsb-e ycsb-f sparse-wide time-series-ttl
-    adjacency skewed-multi-shard group-commit
+    adjacency skewed-multi-shard group-commit cross-shard-contention
     all       every workload above
               (group-commit: durable commits, GroupSync on Pigeonhole and fsync on
               the others whatever --sync says; without --threads it runs at 1, 4
-              and 16 client threads)
+              and 16 client threads; cross-shard-contention: 32 clients, half the
+              commits across 2-4 of 16 partitions, and on Pigeonhole the same run
+              with tablet changes off beside the default, D246)
     scaling   the scaling gate (D204, D231): skewed-multi-shard on Pigeonhole at 1 and N
               shards, application-owned with each shard thread writing inline (16 in
               flight), the table pre-split at the writes' quantiles, the balancer off;
@@ -461,6 +463,15 @@ fn bench(a: &Args) -> Result<Suite, String> {
                     };
                     let mut r = runner(a, engine, kind)?;
                     suite.results.push(one(a, &root, &mut seq, r.as_mut(), &c)?);
+                    // D246: the default (tablet changes on) is judged against the same build
+                    // with tablet changes off, its partitions one per shard.
+                    if kind == WorkloadKind::CrossShardContention
+                        && engine == "pigeonhole"
+                        && !a.no_tablet_changes
+                    {
+                        let mut off = pigeonhole(a, None).tablet_changes(false);
+                        suite.results.push(one(a, &root, &mut seq, &mut off, &c)?);
+                    }
                 }
             }
         }
@@ -603,6 +614,36 @@ mod tests {
         assert_eq!(p.shares.len(), 2);
         assert!(p.achieved_rate > 0.0);
         assert!(suite.to_markdown().contains("Balancer placement (D231)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_shard_contention_runs_tablets_off_beside_the_default() {
+        // D246: the default is judged against the same build with tablet changes off.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-xs-{}", std::process::id()));
+        let a = args(&format!(
+            "cross-shard-contention --scale smoke --shards 4 --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        let configs: Vec<&str> = suite
+            .results
+            .iter()
+            .map(|r| r.store_config.as_str())
+            .collect();
+        assert_eq!(configs.len(), 2, "{configs:?}");
+        assert!(configs[0].contains("tablets=on") && !configs[1].contains("tablets=on"));
+        assert!(suite.results.iter().all(|r| r.rounds().is_some()));
+        assert!(suite.to_markdown().contains("Per cross-shard commit"));
+        let a = args(&format!(
+            "cross-shard-contention --scale smoke --shards 4 --no-tablet-changes --dir {}",
+            dir.display()
+        ));
+        assert_eq!(
+            bench(&a).unwrap().results.len(),
+            1,
+            "no second tablets-off run"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

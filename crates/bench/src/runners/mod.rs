@@ -377,7 +377,9 @@ mod agreement {
                 read > 0
                     || matches!(
                         kind,
-                        WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit
+                        WorkloadKind::SkewedMultiShard
+                            | WorkloadKind::GroupCommit
+                            | WorkloadKind::CrossShardContention
                     ),
                 "{kind:?} reads nothing"
             );

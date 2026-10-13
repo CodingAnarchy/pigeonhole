@@ -53,6 +53,16 @@ def results(name, store=None, workload=None):
     ]
 
 
+XSHARD = "cross-shard-contention"
+
+
+def default_config(r):
+    """False for the run `all` adds beside the default for D246: Pigeonhole's cross-shard
+    contention with tablet changes off. Tables keyed by workload use the default run."""
+    return not (r["store"] == "pigeonhole" and r["workload"] == XSHARD
+                and "tablets=on" not in r.get("store_config", ""))
+
+
 def op(r, name):
     for t in r.get("detail", {}).get("by_type", []):
         if t["op"] == name:
@@ -322,7 +332,7 @@ else:
 # Within 1.5x of RocksDB on every workload: throughput and p99, both runs.
 gap_rows, gap_ok = [], None
 for run in ("all-uring-1.json", "all-uring-2.json"):
-    ph = {r["workload"]: r for r in results(run, "pigeonhole")}
+    ph = {r["workload"]: r for r in results(run, "pigeonhole") if default_config(r)}
     rk = {r["workload"]: r for r in results(run, "rocksdb")}
     for w in sorted(ph):
         if w not in rk:
@@ -348,6 +358,56 @@ if missing:
 rows.append(("Within 1.5× of RocksDB on every workload",
              "; ".join(measured) or ("all within" if gap_ok else ""),
              verdict(gap_ok), "all-uring-1.json, all-uring-2.json"))
+
+# Contended cross-shard commits (D246), on the default config in both `all` runs: 32 clients,
+# half the commits across 2-4 of 16 partitions. Judged: within 1.5x of RocksDB (throughput
+# and p99, its commits one multi-key WriteBatch); tablet changes on at least 0.8x the same
+# build with them off; at most 0.1 wasted 2PC rounds per cross-shard commit; no `Busy`. Until ICR 0043's
+# counters land, wasted rounds are inferred as perf2 did: sequence numbers used while
+# measuring minus the commits (`seqnos_used`). The cross-shard commit p99 is reported; its
+# bound is the owner's, from D245's numbers.
+XSHARD_P99_BOUND_US = None  # TODO(D246): the owner sets it from D245's numbers
+XSHARD_TARGET = ("Contended cross-shard commits (D246): within 1.5× of RocksDB; tablets on ≥ 0.8× off; "
+                 "≤ 0.1 wasted 2PC rounds per cross-shard commit; no Busy; cross-shard p99 bound TODO (D245)")
+
+
+def xshard(run):
+    """D246's figures for one `all` run, or None when the run lacks one of its three records."""
+    rs = results(run, workload=XSHARD)
+    on = next((r for r in rs if r["store"] == "pigeonhole" and "tablets=on" in r.get("store_config", "")), None)
+    off = next((r for r in rs if r["store"] == "pigeonhole" and "tablets=on" not in r.get("store_config", "")), None)
+    rk = next((r for r in rs if r["store"] == "rocksdb"), None)
+    if not (on and off and rk):
+        return None
+    cross = op(on, "cross-shard commit") or {}
+    commits = cross.get("count", 0) + (op(on, "put") or {}).get("count", 0)
+    seqnos = on.get("detail", {}).get("seqnos_used")
+    wasted = None if seqnos is None or not cross.get("count") else max(seqnos - commits, 0) / cross["count"]
+    x = {
+        "tput": rk["throughput"] / on["throughput"],
+        "p99": on["p99_ns"] / max(rk["p99_ns"], 1),
+        "on_off": on["throughput"] / max(off["throughput"], 1e-9),
+        "wasted": wasted,
+        "cross_p99_us": us(cross["p99_ns"]) if cross else None,
+        "on": on["throughput"],
+        "busy": on.get("detail", {}).get("busy_retries", 0),
+    }
+    x["ok"] = (x["tput"] <= 1.5 and x["p99"] <= 1.5 and x["on_off"] >= 0.8
+               and wasted is not None and wasted <= 0.1 and x["busy"] == 0
+               and (XSHARD_P99_BOUND_US is None or (x["cross_p99_us"] or 0) < XSHARD_P99_BOUND_US))
+    return x
+
+
+xs = [(run[:-5], xshard(run)) for run in ("all-uring-1.json", "all-uring-2.json")]
+if all(x for _, x in xs):
+    detail = "; ".join(
+        f"{name}: {x['on'] / 1e3:.0f}K ops/s, RocksDB {x['tput']:.2f}× throughput, p99 {x['p99']:.2f}×; "
+        f"tablets on/off {x['on_off']:.2f}; wasted rounds {x['wasted']:.3f} per cross-shard commit (inferred); "
+        f"Busy {x['busy']}; cross-shard p99 {x['cross_p99_us']:.0f} µs"
+        for name, x in xs)
+    rows.append((XSHARD_TARGET, detail, verdict(all(x["ok"] for _, x in xs)), "all-uring-1.json, all-uring-2.json"))
+else:
+    rows.append((XSHARD_TARGET, "", verdict(None), "all-uring-1.json, all-uring-2.json"))
 
 rep = status("all-uring-compare.status")
 # D243: runs shorter than 10 s are reported, not judged; D233: pairs whose measured phases did
@@ -489,8 +549,8 @@ if any(depth_rows.values()):
         ]
         print(f"| {label} | " + " | ".join(cells) + " |")
 # The I/O backend's default (#402 PR 6).
-pu = {r["workload"]: r for r in results("all-uring-1.json", "pigeonhole")}
-pp = {r["workload"]: r for r in results("all-pread.json", "pigeonhole")}
+pu = {r["workload"]: r for r in results("all-uring-1.json", "pigeonhole") if default_config(r)}
+pp = {r["workload"]: r for r in results("all-pread.json", "pigeonhole") if default_config(r)}
 if pu and pp:
     print("\n**I/O backend (#402):** io_uring against pread, Pigeonhole throughput and p99.\n")
     print("| Workload | uring/pread throughput | uring/pread p99 |")

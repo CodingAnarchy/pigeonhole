@@ -1368,3 +1368,22 @@ The AX102 confirms at 64 GiB.
 - the 16-client group commit measured 1.7 s.
 
 At those lengths, one flush or compaction more or less, or a placement change, moves a run by more than the tolerance. That's timing luck, not the engine. In the full-scale `all`, 18 of the 28 runs measured under 10 s, both engines included.
+
+## D246 — Contended cross-shard commits are a judged gate workload (owner decision, 2026-10-13; bench, #406; part of D247)
+
+**Decided:**
+- **The workload.** `cross-shard-contention` joins `phdb-bench`'s suite, and with it `all`. It promotes perf2's `xshard_contention` example:
+  - 32 client threads over 16 partitions, `records` rows dealt over them;
+  - half the commits write one row in one partition; the other half write one row in each of 2–4 consecutive partitions, in one commit (`BenchOp::Commit`, reported per type as `cross-shard commit`);
+  - rows are uniform within their partition.
+- **The stores.** Pigeonhole gives each partition a table of its own, created one after another, so with tablet changes off they sit one per shard and every multi-row commit is a two-phase commit; it commits with one `WriteBatch` across the tables. RocksDB commits the rows in one multi-key `WriteBatch`, SQLite in one transaction, fjall in one batch.
+- **On the default config, in both `all` runs, judged:**
+  - within 1.5× of RocksDB, throughput and p99, as every `all` workload;
+  - tablet changes on at least 0.8× the same build with them off (`all` runs Pigeonhole's tablets-off run beside the default);
+  - at most 0.1 wasted two-phase rounds per cross-shard commit, and no `Busy`;
+  - the cross-shard commit p99 under a bound the owner sets from D245's numbers (a TODO in `report.py` until then; the p99 is reported).
+- **Wasted rounds** are inferred, as perf2 did, until ICR 0043's counters (`Metrics::cross_shard`, #658) land: the sequence numbers used while measuring minus the commits measured (`RunDetail::seqnos_used`, `RunRecord::rounds`). Each commit uses one sequence number and each refused round one more. With tablet changes on, a split, merge or move while measuring may use some too; the shard table counts those beside it.
+- The reproducibility pair (D243) includes it, as part of `all`; at full scale its runs measure at least 10 s.
+- D247's `contended` step runs it again at 16 threads under the default durability.
+
+**Why:** the gate had no multi-row or cross-shard commit under contention (perf287's #406 audit, finding 1), so a 36× slowdown in the default config got through: on the AX102 (perf2, main a9ecfc77), 16 shards and 32 clients at 50% cross-shard commits ran 401K ops/s with tablet changes off and 11K with them on. Locally (M5, `--scale small`, busy laptop) the new workload shows the same: 3.0K and 5.9K ops/s with tablet changes on against 219K and 204K off and 192K for RocksDB, with about 5 wasted rounds per cross-shard commit on and none off.

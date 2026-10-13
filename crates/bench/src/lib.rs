@@ -39,8 +39,8 @@ mod workload;
 pub use histogram::Histogram;
 pub use report::{
     Comparison, Delta, EngineCommit, Environment, GroupCommit, JUDGED_MIN_COMMITS, JUDGED_MIN_SECS,
-    LatencyStats, OpTypeStats, Placement, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling,
-    Settle, ShardShare, Stalls, Suite, Tolerance, compare,
+    LatencyStats, OpTypeStats, Placement, ReadSplit, Rounds, RunDetail, RunRecord, SUITE_FORMAT,
+    Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -53,8 +53,9 @@ pub use runners::rocksdb::RocksDbRunner;
 pub use runners::sqlite::SqliteRunner;
 pub use runners::{BLOOM_BITS, MemoryBudget};
 pub use workload::{
-    EDGE_FAMILY, FAMILIES, GROUP_COMMIT_CELLS, GROUP_COMMIT_ROWS, GROUP_COMMIT_THREADS,
-    METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY,
+    CROSS_SHARD_COMMIT, EDGE_FAMILY, FAMILIES, GROUP_COMMIT_CELLS, GROUP_COMMIT_ROWS,
+    GROUP_COMMIT_THREADS, METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL, XSHARD_CLIENTS,
+    XSHARD_CROSS_FRACTION, XSHARD_PARTITIONS, YCSB_FAMILY,
 };
 
 /// The benchmark suite.
@@ -86,11 +87,18 @@ pub enum WorkloadKind {
     /// `phdb-bench` sets that durability for this workload; a library caller sets it on
     /// the runner ([`PigeonholeRunner::group_sync`]).
     GroupCommit,
+    /// Contended cross-shard commits (D246): [`XSHARD_CLIENTS`] clients over
+    /// [`XSHARD_PARTITIONS`] partitions, half the commits one row in one partition and half
+    /// one row in each of 2-4 partitions, committed together
+    /// ([`BenchOp::Commit`]). Pigeonhole gives each partition a table of its own, so with
+    /// tablet changes off they sit one per shard and a multi-row commit crosses shards;
+    /// the other stores commit the rows in one batch or transaction.
+    CrossShardContention,
 }
 
 impl WorkloadKind {
     /// Every workload, in suite order.
-    pub const ALL: [WorkloadKind; 11] = [
+    pub const ALL: [WorkloadKind; 12] = [
         WorkloadKind::YcsbA,
         WorkloadKind::YcsbB,
         WorkloadKind::YcsbC,
@@ -102,6 +110,7 @@ impl WorkloadKind {
         WorkloadKind::Adjacency,
         WorkloadKind::SkewedMultiShard,
         WorkloadKind::GroupCommit,
+        WorkloadKind::CrossShardContention,
     ];
 
     /// The CLI and report name (`ycsb-a`, `sparse-wide`, ...).
@@ -126,6 +135,7 @@ impl WorkloadKind {
             WorkloadKind::Adjacency => "adjacency",
             WorkloadKind::SkewedMultiShard => "skewed-multi-shard",
             WorkloadKind::GroupCommit => "group-commit",
+            WorkloadKind::CrossShardContention => "cross-shard-contention",
         }
     }
 }
@@ -167,7 +177,8 @@ pub struct WorkloadConfig {
 impl WorkloadConfig {
     /// A size that runs in well under a second per workload, for tests and CI smoke
     /// runs: 1,000 records, 2,000 operations, 100-byte values, one client thread (two
-    /// for [`WorkloadKind::SkewedMultiShard`]).
+    /// for [`WorkloadKind::SkewedMultiShard`], [`WorkloadKind::GroupCommit`] and
+    /// [`WorkloadKind::CrossShardContention`]).
     pub fn smoke(kind: WorkloadKind) -> Self {
         Self {
             kind,
@@ -176,7 +187,9 @@ impl WorkloadConfig {
             operations: 2_000,
             value_len: 100,
             threads: match kind {
-                WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit => 2,
+                WorkloadKind::SkewedMultiShard
+                | WorkloadKind::GroupCommit
+                | WorkloadKind::CrossShardContention => 2,
                 _ => 1,
             },
             epoch_micros: 0,
@@ -184,7 +197,8 @@ impl WorkloadConfig {
     }
 
     /// The CLI default: 50,000 records, 200,000 operations, 100-byte values, one client
-    /// thread (four for [`WorkloadKind::SkewedMultiShard`]). Small enough to finish in
+    /// thread (four for [`WorkloadKind::SkewedMultiShard`] and [`WorkloadKind::GroupCommit`],
+    /// [`XSHARD_CLIENTS`] for [`WorkloadKind::CrossShardContention`]). Small enough to finish in
     /// seconds per workload, so it is the quick check; [`WorkloadConfig::full`] is the
     /// spec's scale.
     pub fn small(kind: WorkloadKind) -> Self {
@@ -204,6 +218,7 @@ impl WorkloadConfig {
             value_len: 100,
             threads: match kind {
                 WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit => 4,
+                WorkloadKind::CrossShardContention => XSHARD_CLIENTS,
                 _ => 1,
             },
             epoch_micros: 0,
@@ -319,6 +334,27 @@ pub enum BenchOp {
         /// Qualifier.
         qualifier: Vec<u8>,
     },
+    /// Write cells of one or more rows in one commit, each row in a partition
+    /// ([`WorkloadKind::CrossShardContention`], D246). Pigeonhole puts each partition in a
+    /// table of its own; the other stores keep every partition's rows in one key space (the
+    /// row keys name the partition) and commit the rows in one batch or transaction.
+    Commit {
+        /// Family.
+        family: &'static str,
+        /// The rows, each in a different partition.
+        rows: Vec<PartitionRow>,
+    },
+}
+
+/// One row of a [`BenchOp::Commit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionRow {
+    /// Partition, below [`XSHARD_PARTITIONS`].
+    pub partition: usize,
+    /// Row (unique across partitions).
+    pub row: Vec<u8>,
+    /// Qualifier/value pairs.
+    pub cells: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl BenchOp {
@@ -330,8 +366,13 @@ impl BenchOp {
     /// let op = BenchOp::Scan { start: b"r".to_vec(), len: 10 };
     /// assert_eq!(op.type_name(), "scan");
     /// ```
+    ///
+    /// A [`BenchOp::Commit`] of one row is a `put`; of several, a
+    /// [`CROSS_SHARD_COMMIT`].
     pub fn type_name(&self) -> &'static str {
         match self {
+            Self::Commit { rows, .. } if rows.len() > 1 => CROSS_SHARD_COMMIT,
+            Self::Commit { .. } => "put",
             Self::Get { .. } => "get",
             Self::GetRow { .. } => "row read",
             Self::Put { .. } => "put",
@@ -450,6 +491,14 @@ pub trait Runner {
     /// The store's background work so far, for the settle step after the load (D233) and
     /// the measured phase's report; `None` (the default) for stores without background work.
     fn background(&self) -> Option<Background> {
+        None
+    }
+
+    /// The store's last sequence number, for stores that number their commits; `None` (the
+    /// default) elsewhere. [`run_detailed`] reads it around the measured phase: the
+    /// sequence numbers used beyond one per commit are commit rounds that did not commit
+    /// (D246).
+    fn seqno(&self) -> Option<u64> {
         None
     }
 }
@@ -676,7 +725,8 @@ pub fn run_detailed(
     let busy_retries = runner.busy_retries();
     let closed = runner.close();
     let (load, elapsed, threads, hist, split, detail) = result?;
-    let (shards, stalls, settle, background_work, (warmup_secs, warmup_settled)) = detail;
+    let (shards, stalls, settle, background_work, (warmup_secs, warmup_settled), seqnos_used) =
+        detail;
     closed?;
     let ops = hist.count();
     let (reads, by_type) = split.into_split();
@@ -710,6 +760,7 @@ pub fn run_detailed(
             background_work,
             warmup_secs: Some(warmup_secs),
             warmup_settled: Some(warmup_settled),
+            seqnos_used,
         },
     })
 }
@@ -824,6 +875,7 @@ type Measured = (
         Settle,
         Option<u64>,
         (f64, bool),
+        Option<u64>,
     ),
 );
 
@@ -885,7 +937,12 @@ fn measure(
     // The measured operations: the configured count, then, while less than `min_measured`
     // has been measured, the stream's next operations, about enough for the rest at the rate
     // so far (D243). Each pass's operations are generated before its clock starts.
-    let before = (runner.shard_shares(), runner.stalls(), runner.background());
+    let before = (
+        runner.shard_shares(),
+        runner.stalls(),
+        runner.background(),
+        runner.seqno(),
+    );
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
     loop {
@@ -912,6 +969,10 @@ fn measure(
         settled,
         work_between(before.2, runner.background()),
         warmed,
+        before
+            .3
+            .zip(runner.seqno())
+            .map(|(b, a)| a.saturating_sub(b)),
     );
     Ok((load, elapsed, lanes, hist, split, shards))
 }

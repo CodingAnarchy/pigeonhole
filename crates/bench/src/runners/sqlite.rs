@@ -163,13 +163,25 @@ impl Conn {
         ts: u64,
         cells: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), String> {
+        self.put_rows(family, ts, std::iter::once((row, cells)))
+    }
+
+    /// One transaction of cells of any rows, all stamped `ts` (D246's cross-shard commit).
+    fn put_rows<'a>(
+        &mut self,
+        family: &str,
+        ts: u64,
+        rows: impl Iterator<Item = (&'a [u8], &'a [(Vec<u8>, Vec<u8>)])>,
+    ) -> Result<(), String> {
         let e = |e: rusqlite::Error| e.to_string();
         let ts = i64::try_from(ts).unwrap_or(i64::MAX);
         let tx = self.0.transaction().map_err(e)?;
         {
             let mut stmt = tx.prepare_cached(PUT).map_err(e)?;
-            for (q, v) in cells {
-                stmt.execute(params![row, family, q, ts, v]).map_err(e)?;
+            for (row, cells) in rows {
+                for (q, v) in cells {
+                    stmt.execute(params![row, family, q, ts, v]).map_err(e)?;
+                }
             }
         }
         tx.commit().map_err(e)
@@ -220,6 +232,11 @@ impl Conn {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Commit { family, rows } => self.put_rows(
+                family,
+                now_micros(),
+                rows.iter().map(|r| (r.row.as_slice(), r.cells.as_slice())),
+            )?,
             BenchOp::Scan { start, len } => {
                 let mut stmt = self.0.prepare_cached(SCAN).map_err(e)?;
                 let live = oldest_live(METRIC_FAMILY, now_micros());

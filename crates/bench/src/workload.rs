@@ -9,11 +9,12 @@
 //! | time-series | `ts:<entity>:<reversed time>` (newest first), event-time timestamps | `metric` (TTL) | `v` |
 //! | adjacency | `v:<vertex>` | `edge` | `edge:<dst>`, power-law degree |
 //! | skewed multi-shard | `sk:<fnv(i)>` | `ycsb` | `field0` |
+//! | cross-shard contention | `xs:<partition>:<fnv(i)>`, in partitions | `ycsb` | `field0` |
 
 use std::collections::BTreeSet;
 
 use crate::rng::{Rng, Zipf, fnv64};
-use crate::{BenchOp, WorkloadConfig, WorkloadKind};
+use crate::{BenchOp, PartitionRow, WorkloadConfig, WorkloadKind};
 
 /// Family of the YCSB and skewed workloads.
 pub const YCSB_FAMILY: &str = "ycsb";
@@ -47,6 +48,19 @@ pub const GROUP_COMMIT_CELLS: u64 = 4;
 pub const GROUP_COMMIT_ROWS: u64 = 1_000;
 /// Client threads `phdb-bench group-commit` sweeps when `--threads` is not given.
 pub const GROUP_COMMIT_THREADS: [usize; 3] = [1, 4, 16];
+/// Partitions of [`WorkloadKind::CrossShardContention`](crate::WorkloadKind::CrossShardContention)
+/// (D246): one table each on Pigeonhole, so with tablet changes off they sit one per shard
+/// on the gate's 16-shard machine.
+pub const XSHARD_PARTITIONS: usize = 16;
+/// Client threads of [`WorkloadKind::CrossShardContention`](crate::WorkloadKind::CrossShardContention)
+/// at the small and full presets (D246): two per shard on the gate's machine.
+pub const XSHARD_CLIENTS: usize = 32;
+/// The share of [`WorkloadKind::CrossShardContention`](crate::WorkloadKind::CrossShardContention)'s
+/// commits that write one row in each of 2-4 partitions; the rest write one row (D246).
+pub const XSHARD_CROSS_FRACTION: f64 = 0.5;
+/// The operation type ([`BenchOp::type_name`]) of a [`BenchOp::Commit`] of more than one row:
+/// the commit D246 judges.
+pub const CROSS_SHARD_COMMIT: &str = "cross-shard commit";
 /// YCSB E: scan lengths are uniform in `1..=YCSB_MAX_SCAN`.
 const YCSB_MAX_SCAN: u64 = 100;
 /// Sparse-wide qualifier vocabulary.
@@ -183,6 +197,21 @@ impl Gen {
     fn value(&self, rng: &mut Rng) -> Vec<u8> {
         rng.bytes(self.config.value_len)
     }
+
+    /// Rows per partition of the cross-shard contention workload: the loaded rows, dealt
+    /// round-robin over the partitions.
+    fn rows_per_partition(&self) -> u64 {
+        (self.n_items / XSHARD_PARTITIONS as u64).max(1)
+    }
+
+    /// One row of a cross-shard contention commit: row `i` of `partition`, one cell.
+    fn partition_row(&self, partition: usize, i: u64, rng: &mut Rng) -> PartitionRow {
+        PartitionRow {
+            partition,
+            row: partition_key(partition, i),
+            cells: vec![(field(0), self.value(rng))],
+        }
+    }
 }
 
 pub(crate) fn ycsb_key(i: u64) -> Vec<u8> {
@@ -195,6 +224,10 @@ fn field(i: u64) -> Vec<u8> {
 
 fn skewed_key(i: u64) -> Vec<u8> {
     format!("sk:{:020}", fnv64(i)).into_bytes()
+}
+
+fn partition_key(partition: usize, i: u64) -> Vec<u8> {
+    format!("xs:{partition:02}:{:020}", fnv64(i)).into_bytes()
 }
 
 fn sparse_key(i: u64) -> Vec<u8> {
@@ -259,6 +292,13 @@ impl Iterator for LoadIter<'_> {
                     cells: vec![(field(0), g.value(rng))],
                 },
                 WorkloadKind::GroupCommit => g.commit(ycsb_key(i), rng),
+                WorkloadKind::CrossShardContention => {
+                    let p = XSHARD_PARTITIONS as u64;
+                    BenchOp::Commit {
+                        family: YCSB_FAMILY,
+                        rows: vec![g.partition_row((i % p) as usize, i / p, rng)],
+                    }
+                }
                 WorkloadKind::SparseWide => {
                     let n = rng.range(0, 2 * SPARSE_MEAN_CELLS);
                     if n == 0 {
@@ -466,6 +506,29 @@ impl Iterator for RunIter<'_> {
                 let row = ycsb_key(self.rng.below(g.n_items));
                 g.commit(row, &mut self.rng)
             }
+            // D246: a row in one partition, or one row in each of 2-4 consecutive partitions
+            // (distinct, so on different shards when the partitions sit one per shard), the
+            // rows uniform within their partitions.
+            WorkloadKind::CrossShardContention => {
+                let n = XSHARD_PARTITIONS as u64;
+                let parts = if p < XSHARD_CROSS_FRACTION {
+                    2 + self.rng.below(3)
+                } else {
+                    1
+                };
+                let first = self.rng.below(n);
+                let per = g.rows_per_partition();
+                let rows = (0..parts)
+                    .map(|k| {
+                        let i = self.rng.below(per);
+                        g.partition_row(((first + k) % n) as usize, i, &mut self.rng)
+                    })
+                    .collect();
+                BenchOp::Commit {
+                    family: YCSB_FAMILY,
+                    rows,
+                }
+            }
         };
         Some(op)
     }
@@ -576,6 +639,47 @@ mod tests {
         }
         // Uniform: 2,000 commits over 1,000 rows touch most of them.
         assert!(touched.len() > 800, "seed 7: {} rows", touched.len());
+    }
+
+    #[test]
+    fn half_the_contention_commits_cross_two_to_four_partitions() {
+        let seed = 9;
+        let mut config = WorkloadConfig::smoke(WorkloadKind::CrossShardContention);
+        config.seed = seed;
+        config.operations = 20_000;
+        let mut w = Workload::new(config.clone());
+        let loaded: BTreeSet<Vec<u8>> = w
+            .load_ops()
+            .flat_map(|op| match op {
+                BenchOp::Commit { rows, .. } if rows.len() == 1 => rows.into_iter().map(|r| r.row),
+                other => panic!("the load commits one row each, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(loaded.len() as u64, config.records, "seed {seed}");
+        let mut cross = 0;
+        for op in w.run_ops() {
+            let BenchOp::Commit { rows, .. } = &op else {
+                panic!("cross-shard-contention runs commits, got {op:?}")
+            };
+            assert!((1..=4).contains(&rows.len()), "seed {seed}: {op:?}");
+            let parts: BTreeSet<usize> = rows.iter().map(|r| r.partition).collect();
+            assert_eq!(parts.len(), rows.len(), "seed {seed}: distinct partitions");
+            for r in rows {
+                assert!(r.partition < XSHARD_PARTITIONS);
+                assert!(loaded.contains(&r.row), "seed {seed}: rows are loaded rows");
+            }
+            if rows.len() > 1 {
+                cross += 1;
+                assert_eq!(op.type_name(), CROSS_SHARD_COMMIT);
+            } else {
+                assert_eq!(op.type_name(), "put");
+            }
+        }
+        let share = f64::from(cross) / config.operations as f64;
+        assert!(
+            (share - XSHARD_CROSS_FRACTION).abs() < 0.02,
+            "seed {seed}: {share}"
+        );
     }
 
     #[test]
