@@ -4,6 +4,8 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 
 **Reading them:** don't read every file. Read this index, then open the decisions that touch your crate or topic, for example `grep -n -A30 '^## D83 ' docs/design/decisions/*.md`. An amended decision's text states what is in force now and ends with a one-line history; the amending decisions ("amended by" below) stay unchanged as the record of why, so read them only for the reasoning.
 
+**Not adopted:** a numbered proposal the owner declined keeps its number and a short entry marked *considered, not adopted*, with the reason, so the number is never reused and the idea isn't proposed again without new evidence.
+
 **Adding them:** agents never write here. Record open questions and interim behavior in `docs/design/questions/<crate>.md` (see [questions/README.md](../questions/README.md)); the coordinator folds them into the current phase's file with the next free number and adds a line to this index. Deferred work is a GitHub issue ([status](../../status.md#tracked-follow-ups)).
 
 | Phase | File | Range |
@@ -43,7 +45,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D27](phase-1.md#d27) — a shared-memory directory plus generation-named regions
 - [D28](phase-1.md#d28) — an oversized view is refused, never truncated
 - [D29](phase-1.md#d29) — small memtable values are copied; one-shot gets avoid view refcounts · **amended by D180**
-- [D30](phase-1.md#d30) — no fsync on a shard's foreground loop
+- [D30](phase-1.md#d30) — no fsync on a shard's foreground loop · **amended by D200**
 - [D31](phase-1.md#d31) — merge operators are associative folds
 - [D32](phase-1.md#d32) — cursors own what they read
 - [D33](phase-1.md#d33) — configuration structs are non-exhaustive
@@ -51,7 +53,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D35](phase-1.md#d35) — WAL spare segments are zero-filled off the shard thread · **amended by D157**
 - [D36](phase-1.md#d36) — reader processes open the database file read-write · owner decision U1
 - [D37](phase-1.md#d37) — Windows lock upgrades are not atomic; the writer opens shared memory before taking `Presence` · audit C1, K10
-- [D38](phase-1.md#d38) — a cell delete is timestamp-only · owner decision U2; purge behavior in D74
+- [D38](phase-1.md#d38) — a cell delete is timestamp-only · owner decision U2; purge behavior in D74 · **amended by D74**
 - [D39](phase-1.md#d39) — a row read returns families in creation order, or in the caller's order · owner decision U3
 - [D40](phase-1.md#d40) — `compaction_cores(k)` is refused in application-owned mode · owner decision U4
 - [D41](phase-1.md#d41) — merge folding across timestamps; a non-`i64` base fails · audit K14, K15, C2 · **amended by D96**
@@ -137,7 +139,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B · **amended by D156**
 - [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
 - [D123](phase-1.md#d123) — Does the sim's recovery helper cover a coordinator that is also a participant · superseded for new code by D114; engine adoption in #48 · **amended by D125**
-- [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D138, D161, D162**
+- [D124](phase-1.md#d124) — How does a group waiting for arena room learn that a flush freed some · engine Milestone B; flush/compact under arena pressure in the decision folded from #116 · **amended by D126, D138, D161, D162**
 - [D125](phase-1.md#d125) — the model suites use the sim's record-level oracle on every crash · harness, #48 · amends D123
 - [D126](phase-1.md#d126) — write stalls and failed background work on a frozen or moving clock · engine, #70 #79 #88; flush/compact under arena pressure in the decision folded from #116 · amends D119, D124 · **amended by D138, D161, D171, D176**
 - [D127](phase-1.md#d127) — a model harness attributes an error to an armed power loss only once the crash has fired · harness, #62
@@ -168,7 +170,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D152](phase-1.md#d152) — A panicked engine-owned shard thread fails the close instead of hanging · engine, #135
 - [D153](phase-1.md#d153) — Tablet changes are on by default · engine, #38, #168 · amends D129
 - [D154](phase-1.md#d154) — An idle shard's balancer backs off to 10 s · engine, #168 · amends D146
-- [D155](phase-1.md#d155) — A stream's checkpoint may lag its end by at most `wal_pin_bytes` · engine, #137, #171
+- [D155](phase-1.md#d155) — A stream's checkpoint may lag its end by at most `wal_pin_bytes` · engine, #137, #171 · **amended by D206**
 - [D156](phase-1.md#d156) — Replay spills recovered memtables to L0 when an arena runs short · engine, #143, #172 · extends D121
 - [D157](phase-1.md#d157) — An open writes one frame per stream; spares wait for use · wal, #143, #172 · amends D35
 - [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core · **amended by D235**
@@ -222,6 +224,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D206](phase-3.md#d206) — WAL pin passes run in bounded slices from a lazily built log index; the WAL bound may be exceeded by what is logged while a pass runs · coordinator decision, engine, #474, #175 · amends D155
 - [D207](phase-3.md#d207) — A shard keeps a bounded number of group syncs in flight per WAL stream (interim: 1 on macOS, 2 elsewhere); groups that need one meanwhile batch behind them and share the next. 16 clients: Linux 29.5K → 31.5K ops/s, p99 1,458 → ~1,000 µs; macOS 578 → 2.2K ops/s, p99 33 → 11.6 ms · coordinator decision, #412 · default decided on #405 · **decided by D221**
 - [D208](phase-3.md#d208) — The Phase 2 gate's baseline moves to the reference machine: the AX102's first two official gate runs replace the Mac runs 5–6 once committed; #387's ratio to SQLite EAV is judged on them · owner decision, bench, #387, #405 · amends D193
+- [D209](phase-3.md#d209) — A reopened WAL stream's first segment takes max seen + 3, never the epoch of a successor whose header never reached the disk (at most two headers are non-durable at once) · coordinator decision, wal, #508 · amends FORMAT §10.1 rule 2 · shipped in 0.2.1
 - [D210](phase-3.md#d210) — Async commits wait for room before they submit: half `memtable_budget` per shard of async commits in flight, waiters in arrival order; a commit future dropped before it submitted writes nothing · owner decision, engine, pigeonhole, runtime, #149 · amends D196
 - [D211](phase-3.md#d211) — No manifest checkpoint may name a WAL stream whose file creation is not durable: a shard holds its checkpoint back until the new stream's file and directory syncs finish (`Wal::created_durable`, ICR 0031) · coordinator decision, engine, wal, #520 · amends D203
 - [D212](phase-3.md#d212) — The manifest keeps today's exclusion protocol (loom-modelled, #536); no single writer task, which would refuse blocking catalog changes on the writer shard's driver (changing D150 (a)) and need async catalog APIs; revisit at the public API / C ABI review or on a new bug in these paths · owner decision, engine, #134
@@ -240,9 +243,11 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D225](phase-3.md#d225) — A participant's PREPARE may be checkpointed once its commit is settled (every share in SSTs: `CommitSettled`), not once the coordinator checkpointed the COMMIT, which let crossed cross-shard commits pin each other's checkpoints and hang the close; a coordinator counts its own share without a message to itself · coordinator decision, engine, #585 · amends D116
 - [D226](phase-3.md#d226) — The durable group-commit p99 (< 200 µs) is judged on the bench side under full load: 16 shards, 16 commits in flight, the D223 driver, which measured about 320 µs against the old driver's 210 (engine side 131 µs both); 4 and 8 in flight are reported beside it (`--in-flight`), at 8 p99 about 165 µs for 30% less throughput · owner decision, bench, engine, #406 · amends D213
 - [D227](phase-3.md#d227) — A commit is visible once applied (its WAL record written to the OS), not once durable; its own return still waits for its level, cross-shard commits are unchanged, and a group under a held segment header stays hidden; readers, backups and other processes can see data a power loss removes, across shards a later write can outlive an earlier one it came from, and seqnos or timestamps readers saw can be reissued; durable snapshots (ICR 0037) keep the old view; a commit whose outcome is the WAL's fails with `OutcomeUnknown` (ICR 0038), so `Closed` means not committed · owner decision, engine, shm, docs, #406 · amends D19
+- [D228](phase-3.md#d228) — The balancer's fast skew path acts only while slow loads agree · blob33, #582 follow-up · **considered, not adopted** (D231 judges placement open-loop; nothing needed it)
 - [D229](phase-3.md#d229) — `wal_pin_bytes` stays at 2× the memtable budget (the default, 0); 4× is not adopted: on the AX102 gate window 2× held throughput, kept the WAL ~190 MiB smaller and replayed ~20% faster, at the cost of 320 small flushes per 4M commits · owner decision, engine, bench, #527
 - [D230](phase-3.md#d230) — The memtable lookup target (≤ 300 ns) is judged at 2^18 entries, the largest one (tablet, family) memtable reaches under the default options with small cells (16 MiB freeze ÷ ~64-byte nodes; the arithmetic is in the entry); 1M and 10k are reported; software prefetch in the search was measured (−3% at 1M, +2–9% at 10k on the AX102) and not adopted · owner decision, bench, memtable, #17, #406
 - [D231](phase-3.md#d231) — The scaling gate is split: engine scaling (≥ 0.8 × N) on a table pre-split at the writes' quantiles with the balancer off, and balancer placement judged by an open-loop check (busiest ≤ 1.25/N once settled within 60 s, no tablet change while measuring, the offered rate sustained) · owner decision, bench, #406 · amends D204, D223
+- [D232](phase-3.md#d232) — An async-admission fast path per shard with no engine-wide counter · perf2, #615 · **considered, not adopted** (no measured gain on the AX102; D236 takes the commit-path part further)
 - [D233](phase-3.md#d233) — The bench settles every engine after the load (a flush, then a bounded wait until its background work is quiet) before the warmup; records carry the settle and the measured phase's background work, and `compare` notes pairs whose background work differs · owner decision, bench, #406 · the public idle API is deferred to Phase 4
 - [D234](phase-3.md#d234) — The L0 write stall starts at twice `l0_trigger` (8 files at the defaults): at the trigger a single shard spent 26% of its time stalled while L0 never passed 4 files; at 8, none, +6% writes, no read cost measured · owner decision, compaction, engine, #406 · amends D119, D166
 - [D235](phase-3.md#d235) — Engine-owned shard threads are pinned by default inside the opener's affinity set, unpinned (never a failed open) where the platform, a CPU quota or too few free CPUs make it unsafe, and several databases in one process never share a pinned CPU; the gate's inline drivers pin, with unpinned reported · owner decision, io, runtime, engine, pigeonhole, bench, #406 · amends D158
