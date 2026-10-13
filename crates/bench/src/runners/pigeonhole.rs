@@ -328,6 +328,25 @@ impl Runner for PigeonholeRunner {
         Some(stalls(&self.open.as_ref()?.db))
     }
 
+    fn flush(&mut self) -> Result<(), String> {
+        match &self.open {
+            Some(o) => o.db.flush().map_err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn background(&self) -> Option<crate::Background> {
+        let db = &self.open.as_ref()?.db;
+        let m = db.engine_metrics();
+        let work = m.flushes + m.compactions;
+        Some(crate::Background {
+            work: Some(work),
+            marker: work,
+            running: None,
+            busy_nanos: Some(db.shard_stats().iter().map(|s| s.busy_nanos).sum()),
+        })
+    }
+
     fn client(&self) -> Option<Box<dyn Client>> {
         let open = self.open.as_ref()?;
         Some(Box::new(PigeonholeClient {

@@ -1072,3 +1072,19 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - **The fix:** an engine-scaling result should not depend on that, and the balancer's placement is better judged under a load where a shard's rate is its share.
 
 **Not changed:** the 0.8 efficiency target, the single-shard p99 half (`phdb-bench compare`), D204's driver otherwise, D213's group-commit shape, and the 1.25/N bound (now on the placement check).
+
+<a id="d233"></a>
+## D233 — The bench settles every engine after the load before it warms up and measures (owner decision, 2026-10-13; bench, #406 reproducibility)
+
+**Decided:** between the load and the warmup, `run_detailed` (every workload except the inline drivers) runs a settle step for every engine alike:
+- The engine flushes its write buffer: Pigeonhole `flush()`, RocksDB `flush` of both column families, fjall `rotate_memtable_and_wait`, SQLite `wal_checkpoint(TRUNCATE)`.
+- Then the bench polls the engine's background work every 20 ms until it has been quiet for 1 s, at most 60 s. Past the bound it warns, and the record says `settled: false`.
+  - Quiet for Pigeonhole: flushes plus compactions unchanged, and the shard threads' work time rising by under 5 ms per poll.
+  - Quiet for RocksDB: no flush or compaction running or pending, and the SST bytes unchanged.
+  - Quiet for fjall: no outstanding flush and the table count unchanged.
+- It's a bench-side poll of metrics the engines already expose (option (a)). A public "wait until background work is idle" API is #616 (Phase 4).
+
+Each record carries `detail.settle` (milliseconds, settled, the work done while settling) and, for Pigeonhole, `detail.background_work`: the flushes plus compactions completed in the measured phase. `compare` notes every matched pair whose measured phases did different background work (one some and the other none, or more than twice as much). The note is reported, not judged.
+
+**Why:** on the 2026-10-12 gate, ycsb-b on Pigeonhole measured 224.5K and 280.6K ops/s in two identical runs (+25%, beyond the ±20% tolerance). p50 and p99 were the same (1.06/1.05 µs, 13.9/13.4 µs), but the slower run's measured phase held 7 flushes, 7 compactions, 365 write stalls (128 ms) and a 182 ms operation, and the faster one none. The load (1M rows, ~15 s) went straight into a 0.2 s warmup and a 3.5 s measured phase, so how much of its background tail landed in the window was timing luck. Four repeats on the AX102 (2026-10-13) measured 270K–292K: the two slower ones each had a flush and a compaction in the measured phase, the faster two none.
+

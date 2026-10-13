@@ -39,8 +39,8 @@ mod workload;
 pub use histogram::Histogram;
 pub use report::{
     Comparison, Delta, EngineCommit, Environment, GroupCommit, LatencyStats, OpTypeStats,
-    Placement, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling, ShardShare, Stalls, Suite,
-    Tolerance, compare,
+    Placement, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls,
+    Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -440,6 +440,101 @@ pub trait Runner {
     fn stalls(&self) -> Option<Stalls> {
         None
     }
+
+    /// Writes out the store's write buffer: the first part of the settle step after the
+    /// load (D233). The default does nothing.
+    fn flush(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The store's background work so far, for the settle step after the load (D233) and
+    /// the measured phase's report; `None` (the default) for stores without background work.
+    fn background(&self) -> Option<Background> {
+        None
+    }
+}
+
+/// A store's background work so far ([`Runner::background`]), sampled while settling after
+/// the load and around the measured phase (D233).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Background {
+    /// Flushes and compactions completed since open, for stores that count them.
+    pub work: Option<u64>,
+    /// Anything that changes while background work runs (the work count, a file count): the
+    /// store has settled once it stays the same.
+    pub marker: u64,
+    /// Whether the store reports work running or queued now, for stores that tell.
+    pub running: Option<bool>,
+    /// Nanoseconds the store's own threads spent working since open, for stores that count
+    /// it: a rise while no operation runs is background work.
+    pub busy_nanos: Option<u64>,
+}
+
+/// How long a store's background work must stay quiet before the settle step ends (D233).
+pub const SETTLE_QUIET: Duration = Duration::from_secs(1);
+/// The longest the settle step waits (D233): past it the run goes on with a warning, and
+/// the record says it did not settle.
+pub const SETTLE_BOUND: Duration = Duration::from_secs(60);
+/// How often the settle step samples the store's background work.
+const SETTLE_POLL: Duration = Duration::from_millis(20);
+
+/// The settle step between the load and the warmup (D233): flushes the store's write buffer,
+/// then waits until its background work stays quiet for [`SETTLE_QUIET`]: no work running,
+/// the marker unchanged, and its threads' work time rising by less than a quarter of the
+/// poll interval per poll. Gives up after [`SETTLE_BOUND`] with a warning. Every store
+/// takes the same step; a store without background work settles at once after its flush.
+pub fn settle(runner: &mut dyn Runner) -> Result<Settle, String> {
+    settle_within(runner, SETTLE_QUIET, SETTLE_BOUND)
+}
+
+/// [`settle`] with its quiet time and bound given.
+fn settle_within(
+    runner: &mut dyn Runner,
+    quiet: Duration,
+    bound: Duration,
+) -> Result<Settle, String> {
+    let start = Instant::now();
+    let first = runner.background();
+    runner.flush().map_err(|e| format!("settle: {e}"))?;
+    let Some(mut last) = runner.background() else {
+        return Ok(Settle {
+            millis: start.elapsed().as_millis() as u64,
+            settled: true,
+            work: None,
+        });
+    };
+    let mut quiet_since = Instant::now();
+    let settled = loop {
+        if quiet_since.elapsed() >= quiet {
+            break true;
+        }
+        if start.elapsed() >= bound {
+            eprintln!(
+                "warning: {} still had background work {bound:?} after the load; the \
+                 measured phase may include it",
+                runner.name()
+            );
+            break false;
+        }
+        std::thread::sleep(SETTLE_POLL);
+        let now = runner.background().unwrap_or_default();
+        let worked = match (now.busy_nanos, last.busy_nanos) {
+            (Some(n), Some(l)) => n.saturating_sub(l) > SETTLE_POLL.as_nanos() as u64 / 4,
+            _ => false,
+        };
+        if now.running == Some(true) || now.marker != last.marker || worked {
+            quiet_since = Instant::now();
+        }
+        last = now;
+    };
+    Ok(Settle {
+        millis: start.elapsed().as_millis() as u64,
+        settled,
+        work: first
+            .and_then(|f| f.work)
+            .zip(last.work)
+            .map(|(f, l)| l.saturating_sub(f)),
+    })
 }
 
 /// Runs Pigeonhole through its public API.
@@ -566,7 +661,7 @@ pub fn run_detailed(
         .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
     let closed = runner.close();
-    let (load, elapsed, threads, hist, split, (shards, stalls)) = result?;
+    let (load, elapsed, threads, hist, split, (shards, stalls, settle, background_work)) = result?;
     closed?;
     let ops = hist.count();
     let (reads, by_type) = split.into_split();
@@ -596,6 +691,8 @@ pub fn run_detailed(
             shards,
             stalls,
             engine_commit: None,
+            settle: Some(settle),
+            background_work,
         },
     })
 }
@@ -704,8 +801,13 @@ type Measured = (
     usize,
     Histogram,
     Split,
-    (Vec<ShardShare>, Option<Stalls>),
+    (Vec<ShardShare>, Option<Stalls>, Settle, Option<u64>),
 );
+
+/// Background work completed between two [`Runner::background`] readings (D233).
+fn work_between(before: Option<Background>, after: Option<Background>) -> Option<u64> {
+    Some(after?.work?.saturating_sub(before?.work?))
+}
 
 /// What the measured phase stalled on, between two [`Runner::stalls`] readings.
 fn stalls_between(before: Option<Stalls>, after: Option<Stalls>) -> Option<Stalls> {
@@ -732,6 +834,7 @@ fn measure(
         runner.execute(&op).map_err(|e| format!("load: {e}"))?;
     }
     let load = load_start.elapsed();
+    let settled = settle(runner)?;
 
     let mut ops = workload.run_ops();
     let mut seen = std::collections::HashSet::new();
@@ -752,7 +855,7 @@ fn measure(
     if clients.len() < 2 {
         let mut hist = Histogram::new();
         let mut split = Split::default();
-        let before = (runner.shard_shares(), runner.stalls());
+        let before = (runner.shard_shares(), runner.stalls(), runner.background());
         let start = Instant::now();
         for (op, class) in ops.iter().zip(&classes) {
             let t = Instant::now();
@@ -765,6 +868,8 @@ fn measure(
         let shards = (
             shares_between(&before.0, &runner.shard_shares()),
             stalls_between(before.1, runner.stalls()),
+            settled,
+            work_between(before.2, runner.background()),
         );
         return Ok((load, elapsed, 1, hist, split, shards));
     }
@@ -799,7 +904,7 @@ fn measure(
                 })
             })
             .collect();
-        let before = (runner.shard_shares(), runner.stalls());
+        let before = (runner.shard_shares(), runner.stalls(), runner.background());
         barrier.wait();
         let start = Instant::now();
         let mut hist = Histogram::new();
@@ -823,10 +928,86 @@ fn measure(
         let shards = (
             shares_between(&before.0, &runner.shard_shares()),
             stalls_between(before.1, runner.stalls()),
+            settled,
+            work_between(before.2, runner.background()),
         );
         match first_err {
             Some(e) => Err(e),
             None => Ok((load, elapsed, n, hist, split, shards)),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store whose background work runs for its first `busy_polls` samples after the
+    /// flush (forever with `u32::MAX`).
+    struct Fake {
+        flushed: bool,
+        polls: std::cell::Cell<u32>,
+        busy_polls: u32,
+    }
+
+    impl Runner for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn open(&mut self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn execute(&mut self, _: &BenchOp) -> Result<(), String> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), String> {
+            self.flushed = true;
+            Ok(())
+        }
+        fn background(&self) -> Option<Background> {
+            let n = self.polls.get();
+            self.polls.set(n.saturating_add(1));
+            let work = u64::from(n.min(self.busy_polls));
+            Some(Background {
+                work: Some(work),
+                marker: work,
+                running: Some(n < self.busy_polls),
+                busy_nanos: None,
+            })
+        }
+    }
+
+    fn fake(busy_polls: u32) -> Fake {
+        Fake {
+            flushed: false,
+            polls: std::cell::Cell::new(0),
+            busy_polls,
+        }
+    }
+
+    #[test]
+    fn settling_flushes_then_waits_for_the_background_work_to_stop() {
+        let mut r = fake(5);
+        let s = settle_within(&mut r, Duration::from_millis(100), Duration::from_secs(10)).unwrap();
+        assert!(r.flushed);
+        assert!(s.settled);
+        assert_eq!(s.work, Some(5), "the work done while settling");
+        assert!(s.millis >= 100, "quiet for the whole quiet time: {s:?}");
+    }
+
+    #[test]
+    fn settling_gives_up_at_its_bound() {
+        let mut r = fake(u32::MAX);
+        let s = settle_within(
+            &mut r,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(!s.settled);
+        assert!(s.millis >= 300);
+    }
 }

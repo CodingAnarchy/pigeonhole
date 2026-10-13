@@ -130,6 +130,30 @@ impl Runner for RocksDbRunner {
         Ok(())
     }
 
+    fn flush(&mut self) -> Result<(), String> {
+        let Some(db) = &self.db else { return Ok(()) };
+        db.flush().map_err(|e| e.to_string())?;
+        if let Some(cf) = db.cf_handle(METRIC_CF) {
+            db.flush_cf(cf).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn background(&self) -> Option<crate::Background> {
+        let db = self.db.as_ref()?;
+        let prop = |name: &str| db.property_int_value(name).ok().flatten().unwrap_or(0);
+        let running = prop("rocksdb.num-running-compactions")
+            + prop("rocksdb.num-running-flushes")
+            + prop("rocksdb.compaction-pending")
+            + prop("rocksdb.mem-table-flush-pending");
+        Some(crate::Background {
+            work: None,
+            marker: prop("rocksdb.total-sst-files-size"),
+            running: Some(running > 0),
+            busy_nanos: None,
+        })
+    }
+
     fn client(&self) -> Option<Box<dyn Client>> {
         Some(Box::new(handle(
             self.db.as_ref()?,

@@ -243,6 +243,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D229](phase-3.md#d229) — `wal_pin_bytes` stays at 2× the memtable budget (the default, 0); 4× is not adopted: on the AX102 gate window 2× held throughput, kept the WAL ~190 MiB smaller and replayed ~20% faster, at the cost of 320 small flushes per 4M commits · owner decision, engine, bench, #527
 - [D230](phase-3.md#d230) — The memtable lookup target (≤ 300 ns) is judged at 2^18 entries, the largest one (tablet, family) memtable reaches under the default options with small cells (16 MiB freeze ÷ ~64-byte nodes; the arithmetic is in the entry); 1M and 10k are reported; software prefetch in the search was measured (−3% at 1M, +2–9% at 10k on the AX102) and not adopted · owner decision, bench, memtable, #17, #406
 - [D231](phase-3.md#d231) — The scaling gate is split: engine scaling (≥ 0.8 × N) on a table pre-split at the writes' quantiles with the balancer off, and balancer placement judged by an open-loop check (busiest ≤ 1.25/N once settled within 60 s, no tablet change while measuring, the offered rate sustained) · owner decision, bench, #406 · amends D204, D223
+- [D233](phase-3.md#d233) — The bench settles every engine after the load (a flush, then a bounded wait until its background work is quiet) before the warmup; records carry the settle and the measured phase's background work, and `compare` notes pairs whose background work differs · owner decision, bench, #406 · the public idle API is deferred to Phase 4
 
 ## Open questions
 _None._
