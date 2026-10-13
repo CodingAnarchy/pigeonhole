@@ -12,7 +12,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 fn smoke_all(tag: &str, mut make: impl FnMut() -> Box<dyn Runner>) {
     let root = temp_dir(tag);
-    for kind in WorkloadKind::ALL {
+    for kind in WorkloadKind::EVERY {
         let config = WorkloadConfig::smoke(kind);
         let dir = root.join(kind.name());
         std::fs::create_dir_all(&dir).unwrap();

@@ -53,9 +53,9 @@ pub use runners::rocksdb::RocksDbRunner;
 pub use runners::sqlite::SqliteRunner;
 pub use runners::{BLOOM_BITS, MemoryBudget};
 pub use workload::{
-    CROSS_SHARD_COMMIT, EDGE_FAMILY, FAMILIES, GROUP_COMMIT_CELLS, GROUP_COMMIT_ROWS,
-    GROUP_COMMIT_THREADS, METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL, XSHARD_CLIENTS,
-    XSHARD_CROSS_FRACTION, XSHARD_PARTITIONS, YCSB_FAMILY,
+    COUNTER_THREADS, CROSS_SHARD_COMMIT, EDGE_FAMILY, FAMILIES, GROUP_COMMIT_CELLS,
+    GROUP_COMMIT_ROWS, GROUP_COMMIT_THREADS, METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL,
+    XSHARD_CLIENTS, XSHARD_CROSS_FRACTION, XSHARD_PARTITIONS, YCSB_FAMILY,
 };
 
 /// The benchmark suite.
@@ -94,10 +94,16 @@ pub enum WorkloadKind {
     /// tablet changes off they sit one per shard and a multi-row commit crosses shards;
     /// the other stores commit the rows in one batch or transaction.
     CrossShardContention,
+    /// Counters (D247): from [`COUNTER_THREADS`] clients, 90% increments of a Zipfian row's
+    /// counter ([`BenchOp::Incr`]) and 10% reads of one ([`BenchOp::ReadCounter`]). Pigeonhole
+    /// increments a counter family without reading it; RocksDB uses a merge operator (an
+    /// `i64` add), SQLite an upsert, fjall a locked read-modify-write. Not in `all`: the gate's
+    /// `contended` step runs it.
+    Counters,
 }
 
 impl WorkloadKind {
-    /// Every workload, in suite order.
+    /// The `all` suite, in order.
     pub const ALL: [WorkloadKind; 12] = [
         WorkloadKind::YcsbA,
         WorkloadKind::YcsbB,
@@ -113,14 +119,33 @@ impl WorkloadKind {
         WorkloadKind::CrossShardContention,
     ];
 
+    /// Every workload: [`ALL`](Self::ALL) and the ones only named runs take
+    /// ([`WorkloadKind::Counters`]).
+    pub const EVERY: [WorkloadKind; 13] = [
+        WorkloadKind::YcsbA,
+        WorkloadKind::YcsbB,
+        WorkloadKind::YcsbC,
+        WorkloadKind::YcsbD,
+        WorkloadKind::YcsbE,
+        WorkloadKind::YcsbF,
+        WorkloadKind::SparseWide,
+        WorkloadKind::TimeSeriesTtl,
+        WorkloadKind::Adjacency,
+        WorkloadKind::SkewedMultiShard,
+        WorkloadKind::GroupCommit,
+        WorkloadKind::CrossShardContention,
+        WorkloadKind::Counters,
+    ];
+
     /// The CLI and report name (`ycsb-a`, `sparse-wide`, ...).
     ///
     /// ```
     /// use pigeonhole_bench::WorkloadKind;
     ///
-    /// for kind in WorkloadKind::ALL {
+    /// for kind in WorkloadKind::EVERY {
     ///     assert_eq!(kind.name().parse::<WorkloadKind>(), Ok(kind));
     /// }
+    /// assert!(WorkloadKind::ALL.iter().all(|k| WorkloadKind::EVERY.contains(k)));
     /// ```
     pub fn name(self) -> &'static str {
         match self {
@@ -136,6 +161,7 @@ impl WorkloadKind {
             WorkloadKind::SkewedMultiShard => "skewed-multi-shard",
             WorkloadKind::GroupCommit => "group-commit",
             WorkloadKind::CrossShardContention => "cross-shard-contention",
+            WorkloadKind::Counters => "counters",
         }
     }
 }
@@ -144,7 +170,7 @@ impl FromStr for WorkloadKind {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, String> {
-        WorkloadKind::ALL
+        WorkloadKind::EVERY
             .into_iter()
             .find(|k| k.name() == s)
             .ok_or_else(|| format!("unknown workload {s:?}"))
@@ -189,7 +215,8 @@ impl WorkloadConfig {
             threads: match kind {
                 WorkloadKind::SkewedMultiShard
                 | WorkloadKind::GroupCommit
-                | WorkloadKind::CrossShardContention => 2,
+                | WorkloadKind::CrossShardContention
+                | WorkloadKind::Counters => 2,
                 _ => 1,
             },
             epoch_micros: 0,
@@ -219,6 +246,7 @@ impl WorkloadConfig {
             threads: match kind {
                 WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit => 4,
                 WorkloadKind::CrossShardContention => XSHARD_CLIENTS,
+                WorkloadKind::Counters => COUNTER_THREADS,
                 _ => 1,
             },
             epoch_micros: 0,
@@ -344,6 +372,19 @@ pub enum BenchOp {
         /// The rows, each in a different partition.
         rows: Vec<PartitionRow>,
     },
+    /// Add `delta` to a row's counter ([`WorkloadKind::Counters`], D247): a counter family's
+    /// increment on Pigeonhole, a merge on RocksDB, an upsert on SQLite.
+    Incr {
+        /// Row.
+        row: Vec<u8>,
+        /// The amount added.
+        delta: i64,
+    },
+    /// Read a row's counter ([`WorkloadKind::Counters`]).
+    ReadCounter {
+        /// Row.
+        row: Vec<u8>,
+    },
 }
 
 /// One row of a [`BenchOp::Commit`].
@@ -373,6 +414,8 @@ impl BenchOp {
         match self {
             Self::Commit { rows, .. } if rows.len() > 1 => CROSS_SHARD_COMMIT,
             Self::Commit { .. } => "put",
+            Self::Incr { .. } => "incr",
+            Self::ReadCounter { .. } => "counter read",
             Self::Get { .. } => "get",
             Self::GetRow { .. } => "row read",
             Self::Put { .. } => "put",

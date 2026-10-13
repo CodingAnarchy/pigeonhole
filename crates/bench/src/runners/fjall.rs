@@ -75,6 +75,9 @@ struct Handle {
     db: Database,
     cells: Keyspace,
     mode: PersistMode,
+    /// The counters workload's keyspace (D247): one `i64` (little-endian) per row,
+    /// incremented by a read-modify-write under the row's lock.
+    counters: Keyspace,
     /// Row locks for an atomic read-modify-write across clients.
     locks: std::sync::Arc<RowLocks>,
 }
@@ -96,9 +99,13 @@ impl Runner for FjallRunner {
                 KeyspaceCreateOptions::default().max_memtable_size(m.write_buffer)
             })
             .map_err(e)?;
+        let counters = db
+            .keyspace("counters", KeyspaceCreateOptions::default)
+            .map_err(e)?;
         self.open = Some(Handle {
             db,
             cells,
+            counters,
             mode: self.mode(self.sync && !self.load_buffered),
             locks: std::sync::Arc::default(),
         });
@@ -238,6 +245,27 @@ impl Handle {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Incr { row, delta } => {
+                let _held = self.locks.lock(row);
+                let n = self
+                    .counters
+                    .get(row)
+                    .map_err(e)?
+                    .and_then(|v| v.as_ref().try_into().ok().map(i64::from_le_bytes))
+                    .unwrap_or(0);
+                let mut batch = self.db.batch().durability(Some(self.mode));
+                batch.insert(
+                    &self.counters,
+                    row.as_slice(),
+                    n.wrapping_add(*delta).to_le_bytes(),
+                );
+                batch.commit().map_err(e)?;
+            }
+            BenchOp::ReadCounter { row } => {
+                if let Some(v) = self.counters.get(row).map_err(e)? {
+                    t.cell(&v);
+                }
+            }
             BenchOp::Commit { family, rows } => self.put_rows(
                 family,
                 now_micros(),
