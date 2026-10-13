@@ -84,10 +84,8 @@ pub enum Error {
     InvalidArgument(String),
     /// The feature is not available in this build or phase.
     Unsupported(&'static str),
-    /// The database is closed. A commit that fails with it while a close is under way
-    /// was not committed, except for a cross-shard commit when a shard died: if the shard
-    /// coordinating it died, or it was already decided and a participant never answered,
-    /// its outcome is the WAL's, and the next open settles it (decision D227).
+    /// The database is closed. A commit that fails with it was not committed: when its
+    /// outcome is not known, the commit fails with [`Error::OutcomeUnknown`] instead.
     Closed,
     /// Every reader slot in the shared-memory region is taken.
     NoReaderSlot,
@@ -106,6 +104,15 @@ pub enum Error {
     /// (application-owned mode), where blocking could deadlock. The commit was submitted
     /// and will apply; await its future from the event loop instead (D88).
     WouldDeadlock,
+    /// A commit's outcome is not known in this process: a shard died (a panic, or an
+    /// application-owned shard dropped) or the database closed after the commit's records
+    /// may have reached the WAL, and before every shard applied it. The next open decides
+    /// it from the WAL: reopen and read to see whether it landed. Cases: a cross-shard
+    /// commit whose coordinator died, or one decided to commit that a participant did not
+    /// apply or never answered; a commit in a group whose sync had not resolved when its
+    /// shard died; a commit acknowledged by its shard whose wait for visibility ended
+    /// (decision D227, ICR 0038).
+    OutcomeUnknown,
 }
 
 impl fmt::Display for Error {
@@ -140,6 +147,9 @@ impl fmt::Display for Error {
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::Closed => f.write_str("the database is closed"),
+            Error::OutcomeUnknown => f.write_str(
+                "the commit's outcome is not known: a shard died or the database closed while                  it was in flight; the next open decides it from the WAL (reopen and read)",
+            ),
             Error::NoReaderSlot => f.write_str("every reader slot is taken"),
             Error::RecordTooLarge => {
                 f.write_str("the commit's WAL record is larger than a segment can hold")
@@ -202,6 +212,7 @@ impl Error {
             Error::InvalidArgument(s) => Error::InvalidArgument(s.clone()),
             Error::Unsupported(s) => Error::Unsupported(s),
             Error::Closed => Error::Closed,
+            Error::OutcomeUnknown => Error::OutcomeUnknown,
             Error::NoReaderSlot => Error::NoReaderSlot,
             Error::RecordTooLarge => Error::RecordTooLarge,
             Error::Busy => Error::Busy,

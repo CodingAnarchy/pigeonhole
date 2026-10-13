@@ -297,8 +297,8 @@ fn tables_on_0_and_1(db: &Engine) -> (Arc<TableInfo>, Arc<TableInfo>) {
 
 /// A commit waiting for visibility behind a cross-shard commit shard 1 coordinates (its
 /// seqno held until every participant applied, which waits on shard 1's held sync) ends with
-/// `Closed` when shard 1 dies (its `EngineShard` is dropped mid-commit), instead of parking
-/// for ever, and the close then ends (unclean) instead of waiting on the dead shard. A
+/// `OutcomeUnknown` when shard 1 dies (its `EngineShard` is dropped mid-commit), instead of
+/// parking for ever, and the close then ends (unclean) instead of waiting on the dead shard. A
 /// single-shard group no longer holds visibility while its sync runs (D227).
 #[test]
 fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
@@ -352,7 +352,8 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     let ended = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the visibility wait outlived the shard holding it");
-    assert!(matches!(ended, Err(Error::Closed)), "{ended:?}");
+    // Acknowledged by its shard but never visible here: the next open decides (ICR 0038).
+    assert!(matches!(ended, Err(Error::OutcomeUnknown)), "{ended:?}");
     // The close ends (it no longer waits on the dead shard) and is unclean.
     assert!(db.close().is_err(), "a close with a dead shard reported Ok");
     assert!(
@@ -364,7 +365,8 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
 /// The symmetric case: a *participant* of a cross-shard commit dies after its PREPARE and
 /// before the coordinator's decision reaches it. Its `Applied` never comes, so the
 /// coordinator's share of the commit never settles; the close must still end (unclean)
-/// rather than wait for that reply for ever, and the commit's waiter hears `Closed`.
+/// rather than wait for that reply for ever, and the commit's waiter hears `OutcomeUnknown`
+/// (decided to commit, so its COMMIT may be in the WAL).
 #[test]
 fn a_close_ends_when_a_participant_dies_before_it_applied() {
     let (vfs, gate) = gate::vfs(1359);
@@ -411,8 +413,10 @@ fn a_close_ends_when_a_participant_dies_before_it_applied() {
         a.1.join().unwrap().is_err(),
         "a close with a dropped shard is unclean"
     );
+    // Decided to commit (shard 1 prepared before it died), but shard 1 never applied it:
+    // the COMMIT may be in the WAL, so the outcome is the next open's (ICR 0038).
     let waited = pending.wait();
-    assert!(matches!(waited, Err(Error::Closed)), "{waited:?}");
+    assert!(matches!(waited, Err(Error::OutcomeUnknown)), "{waited:?}");
 }
 
 /// ctr274's late decision: a participant's close reports while a live coordinator's
@@ -424,7 +428,7 @@ fn a_close_ends_when_a_participant_dies_before_it_applied() {
 /// trips the debug assertion in the shard's apply.
 #[test]
 fn a_decision_after_a_participants_close_reported_is_not_applied() {
-    let (vfs, _gate) = gate::vfs(1360);
+    let (vfs, gate) = gate::vfs(1360);
     let (db, mut shards) =
         Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
     let mut d = shards.pop().unwrap();
@@ -471,9 +475,28 @@ fn a_decision_after_a_participants_close_reported_is_not_applied() {
         thread::sleep(Duration::from_millis(1));
     }
     // Now the coordinator decides (commit: shard 1 prepared before the close gave up) and
-    // shard 1 hears it after its report.
-    // Shard 1 must answer it without applying (debug builds assert that no shard applies
-    // after its close reported), or the coordinator's close never ends.
+    // shard 1 hears it after its report. Shard 1 must answer without applying (debug builds
+    // assert that no shard applies after its close reported), and the coordinator, kept in
+    // its close's flush by the held main-file syncs, must then keep the seqno held: a read
+    // never sees shard 0's share without shard 1's.
+    gate.hold(Path::new(DB));
+    for _ in 0..3 {
+        idle(&mut c);
+        idle(&mut p);
+    }
+    let snap = db.snapshot().unwrap();
+    let seen = [&on_c, &on_p].map(|t| {
+        db.get(&snap, t.id, t.families[0].id, b"late", b"q")
+            .unwrap()
+            .is_some()
+    });
+    assert!(
+        seen[0] == seen[1],
+        "half a cross-shard commit is visible (shard 0, shard 1): {seen:?}"
+    );
+    drop(snap);
+    gate.release();
+    // Either way the coordinator's close then ends.
     let started = std::time::Instant::now();
     let closed = loop {
         idle(&mut c);
@@ -489,7 +512,9 @@ fn a_decision_after_a_participants_close_reported_is_not_applied() {
     };
     assert!(closed.is_err(), "a close with a dead shard reported Ok");
     drop((c, p));
-    let _ = pending.wait();
+    // Committed in the WAL, never visible here: the next open decides (ICR 0038).
+    let waited = pending.wait();
+    assert!(matches!(waited, Err(Error::OutcomeUnknown)), "{waited:?}");
     drop(db);
     let (db, shards) =
         Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();

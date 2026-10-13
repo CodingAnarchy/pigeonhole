@@ -1146,6 +1146,12 @@ struct Coord {
     applied: usize,
     failed: Option<Error>,
     decided: bool,
+    /// Decided to commit: its COMMIT record is pending or logged.
+    committing: bool,
+    /// A participant answered a commit decision without applying its share (its close
+    /// gave up, or its apply failed): the seqno stays held, so the commit is never
+    /// visible half applied, and the caller gets `OutcomeUnknown` (D227, ICR 0038).
+    not_applied: bool,
     shards: Vec<ShardId>,
     /// The request, kept for a retry when a participant refused with `Moved`.
     parts: Vec<(ShardId, Arc<BatchBuilder>)>,
@@ -5454,8 +5460,11 @@ impl ShardState {
                     (Err(_), true) => false,
                     (Err(_), false) => true,
                 };
-                if let (Err(e), Some(c)) = (result, self.coord.get_mut(&m.seqno)) {
-                    c.failed = Some(e);
+                if let Some(c) = self.coord.get_mut(&m.seqno) {
+                    c.committing = commit;
+                    if let Err(e) = result {
+                        c.failed = Some(e);
+                    }
                 }
                 if !commit {
                     self.mark_aborted(m.seqno);
@@ -5551,6 +5560,8 @@ impl ShardState {
                 applied: 0,
                 failed: None,
                 decided: false,
+                committing: false,
+                not_applied: false,
                 shards: shards.clone(),
                 // Kept for a retry only when a participant may refuse with `Moved`.
                 parts: if self.tablets_on() {
@@ -5697,11 +5708,13 @@ impl ShardState {
             }
             return;
         }
+        c.committing = true;
         let streams: Vec<StreamId> = c.shards.iter().map(|s| StreamId(u32::from(s.0))).collect();
         let (durability, shards) = (c.durability, c.shards.clone());
         let mut encoded = Vec::new();
         if let Err(e) = StreamList::encode(&streams, &mut encoded) {
             c.failed = Some(e.into());
+            c.committing = false;
             self.mark_aborted(seqno);
             for p in shards {
                 self.send(
@@ -5758,12 +5771,14 @@ impl ShardState {
                 }
                 self.release_room(share.reserved);
             }
+            // Answered as not applied: a commit decision then keeps its seqno held at the
+            // coordinator (`on_applied`), never visible with only the other shares.
             self.send(
                 coordinator,
                 ShardMsg::Applied {
                     seqno,
                     from: self.id,
-                    error: None,
+                    error: Some(PrepareError::Closed),
                 },
                 ctx,
             );
@@ -5855,6 +5870,9 @@ impl ShardState {
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
+        if error.is_some() && c.committing {
+            c.not_applied = true;
+        }
         if let Some(e) = error
             && c.failed.is_none()
         {
@@ -5869,6 +5887,16 @@ impl ShardState {
             return;
         }
         let mut c = self.coord.remove(&seqno).expect("present");
+        if c.not_applied {
+            // Decided to commit, but a share was not applied here (its shard's close gave up,
+            // or its apply failed): the seqno stays held, so no reader sees the commit half
+            // applied in this process, and the next open decides it from the WAL.
+            if let Some(reply) = c.reply.take() {
+                reply.notify(Err(Error::OutcomeUnknown));
+            }
+            self.try_finish_close(ctx);
+            return;
+        }
         self.held.remove(&seqno);
         self.publish_watermark();
         if c.moved
@@ -7037,6 +7065,7 @@ impl ShardState {
             self.final_sync();
             // The stream is checkpointed to its end: the last process removes the files.
             self.wal = None;
+            self.answer_unsettled();
             self.shared.report_closed();
         }
     }
@@ -7093,6 +7122,7 @@ impl ShardState {
         self.closing = true;
         self.close_stage = CloseStage::Reported;
         self.final_sync();
+        self.answer_unsettled();
         shared.shard_died();
         shared.report_closed();
     }
@@ -7106,8 +7136,33 @@ impl ShardState {
         }
         self.closing = true;
         self.close_stage = CloseStage::Reported;
+        self.answer_unsettled();
         self.shared.shard_died();
         self.shared.report_closed();
+    }
+
+    /// The shard stops (its close reported, or it died) with commits still unsettled:
+    /// answers each now rather than leaving its dropped reply to read as `Closed`, which
+    /// means not committed (D227, ICR 0038). A group whose records were written but whose
+    /// sync never resolved here, and a cross-shard commit decided to commit but not
+    /// answered by every participant, may be in the WAL: `OutcomeUnknown`. A coordinated
+    /// commit not decided to commit was not: `Closed`. Members not yet written are dropped
+    /// (their replies read as `Closed`, rightly).
+    fn answer_unsettled(&mut self) {
+        for group in &mut self.unresolved {
+            for m in &mut group.members {
+                std::mem::replace(&mut m.reply, Reply::None).resolve(Err(Error::OutcomeUnknown));
+            }
+        }
+        for c in self.coord.values_mut() {
+            if let Some(reply) = c.reply.take() {
+                reply.notify(Err(if c.committing {
+                    Error::OutcomeUnknown
+                } else {
+                    Error::Closed
+                }));
+            }
+        }
     }
 
     /// Commits inline on the shard's own thread (application-owned mode): the member joins

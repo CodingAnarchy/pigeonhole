@@ -962,9 +962,15 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 **A close with a dead shard** (found by this decision's tests, whose visibility pin is a cross-shard commit). A shard that dies (a panic, or an application-owned shard dropped mid-close) used to leave the close waiting for ever on a cross-shard commit's other side. Now:
 - **No waiting on the dead side:** the close is unclean and stops waiting for undecided shares and for coordinated commits' answers. Their records stay in the WAL, and the next open decides each share by its COMMIT (D83, D116).
 - **Undecided commits abort:** a coordinated commit still undecided is decided abort, and a late `Prepared` finds it failed. Its caller gets `Closed`, which then always means *not committed*.
-- **Decided commits keep their reply:** one already decided resolves as usual. It ends with `Closed` only if a participant never answers, or if its coordinator itself died. Its outcome is then the WAL's (committed if its COMMIT was logged). `Error::Closed`'s docs say so.
-- **Late decisions apply nothing:** a decision reaching a participant after its close gave up is answered without applying.
-- **No half-visible commit:** the seqno stays held throughout.
+- **Decided commits keep their reply.** One already decided resolves as usual when every participant applied it.
+- **Late decisions apply nothing.** A decision reaching a participant after its close gave up is answered as *not applied*. The same holds for a participant whose apply failed.
+- **No half-visible commit.** A commit decision with any share not applied keeps its seqno held at the coordinator, never published. No reader in this process sees one share without the others.
+- **Outcome unknown (ICR 0038, owner decision 2026-10-12).** `Closed` always means *not committed*. Where the outcome is the WAL's, decided at the next open, a commit fails with the new `Error::OutcomeUnknown` (`ErrorCode::OutcomeUnknown` = 28):
+  - a cross-shard commit whose coordinator died, or one decided to commit that a participant did not apply or never answered;
+  - a commit in a group whose sync had not resolved when its shard stopped;
+  - a commit acknowledged by its shard whose wait for visibility ended because the close finished or a shard died.
+  - A shard that stops answers each such commit before it reports (`answer_unsettled`). A commit dropped before it was written still reads as `Closed`.
+  - Both error enums are `#[non_exhaustive]`, so the new variant is a minor (semver-compatible) change.
 
 **Checked by:**
 - `model_check`'s new case `reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant`:
@@ -974,7 +980,11 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
   - a process crash after some reads that saw a commit, which recovery must keep.
   - It fails if the watermark ignores held cross-shard seqnos.
 - `held_header_visibility.rs`: a commit written under a held segment header is not visible until the header is written. It fails if such groups count as visible: a read, then a process crash, loses the commit.
-- `blocking_waits.rs`: the close with a dead coordinator, a dead participant, a late decision at a participant that reported (debug builds assert no shard applies after its close reported), and a late `Prepared` at a coordinator whose close gave up (aborted, and absent after reopen).
+- `blocking_waits.rs`, closes with a dead shard:
+  - **Dead coordinator:** the visibility wait ends `OutcomeUnknown`.
+  - **Dead participant:** the decided commit ends `OutcomeUnknown`.
+  - **Late decision at a participant that reported:** never applied (a debug assertion), never half visible to a read, `OutcomeUnknown`, present after reopen.
+  - **Late `Prepared` at a coordinator whose close gave up:** aborted, `Closed`, absent after reopen.
 - The checker now applies acknowledged commits to its model in seqno order. A commit is acknowledged at its own durability, so a later seqno's shard may acknowledge first.
 
 <a id="d229"></a>

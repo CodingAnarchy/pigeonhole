@@ -284,6 +284,7 @@ fn error_codes_are_stable_numbers() {
         (ErrorCode::SnapshotExpired, 25),
         (ErrorCode::WouldDeadlock, 26),
         (ErrorCode::BatchTooLarge, 27),
+        (ErrorCode::OutcomeUnknown, 28),
     ];
     for (code, n) in codes {
         assert_eq!(code as u32, n, "{code:?}");
@@ -335,6 +336,7 @@ fn every_engine_error_maps_to_its_code() {
         (E::BatchTooLarge, ErrorCode::BatchTooLarge),
         (E::SnapshotExpired, ErrorCode::SnapshotExpired),
         (E::WouldDeadlock, ErrorCode::WouldDeadlock),
+        (E::OutcomeUnknown, ErrorCode::OutcomeUnknown),
     ];
     for (e, code) in cases {
         let what = format!("{e:?}");

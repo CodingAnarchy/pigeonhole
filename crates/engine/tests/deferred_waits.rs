@@ -984,9 +984,10 @@ fn dropping_a_shard_on_its_driver_reaps_the_wal_sync_in_flight() {
 /// Shard 1 coordinates a cross-shard commit whose sync is in flight (its seqno holds the
 /// global watermark) when another thread's
 /// commit on shard 0 waits for visibility. Shard 1 is dropped (its group never resolves):
-/// the wait ends with `Closed` instead of parking for ever, and the close is unclean.
+/// the wait ends with `OutcomeUnknown` (the commit was acknowledged by its shard but never
+/// became visible here, ICR 0038) instead of parking for ever, and the close is unclean.
 #[test]
-fn a_visibility_wait_ends_with_closed_when_the_shard_holding_it_dies_mid_io() {
+fn a_visibility_wait_ends_with_outcome_unknown_when_the_shard_holding_it_dies_mid_io() {
     each_seed(|seed| {
         let mut rig = Rig::open(seed, 2);
         let (on_a, on_b) = rig.tables_on_0_and_1();
@@ -1020,7 +1021,7 @@ fn a_visibility_wait_ends_with_closed_when_the_shard_holding_it_dies_mid_io() {
         dropper.join().unwrap();
         let ended = waiter.join().unwrap();
         assert!(
-            matches!(ended, Err(Error::Closed)),
+            matches!(ended, Err(Error::OutcomeUnknown)),
             "seed {seed}: {ended:?}"
         );
         // This thread still drives shard 0: `close` cannot wait here.

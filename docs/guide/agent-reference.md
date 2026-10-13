@@ -169,7 +169,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `delete_family(family)` | Delete all columns of a family in this row. |
 | `delete_row()` | Delete whole row. |
 | `durability(Durability)` | Override for this commit. |
-| `commit(self) -> Result<CommitInfo>` | Commit. |
+| `commit(self) -> Result<CommitInfo>` | Commit. Returns once durable at its level and visible. `Closed`: not committed. `OutcomeUnknown` (a shard failed or the database closed mid-commit): reopen and read to see whether it landed. |
 | `commit_if(self, &Condition) -> Result<Option<CommitInfo>>` | Compare-and-set on this row (BigTable `check_and_mutate`); `None` if the condition failed and nothing was written. |
 
 `Condition` variants: `Exists { family: String, qualifier: Vec<u8> }`, `Absent { .. }`, `Value { family, qualifier, filter: ValueFilter }`.
@@ -227,7 +227,7 @@ Pushdown (D22): qualifier and time filters in the block decoder; versions, colum
 Cells within a row: ordered by family (creation order, or the order the read listed families; D39), then qualifier, then newest version first.
 
 ## Error codes (`ErrorCode`, `#[non_exhaustive]`, `repr(u32)`)
-`Io`=1 `Corruption`=2 `WriterLocked`=3 `ShmVersionMismatch`=4 `ShmUnavailable`=5 `UnsupportedFormat`=6 `NetworkFilesystem`=7 `TableNotFound`=8 `TableExists`=9 `FamilyNotFound`=10 `FamilyExists`=11 `UnknownMergeOperator`=12 `MergeFailed`=13 `Conflict`=14 `ReadOnly`=15 `KeyTooLarge`=16 `ValueTooLarge`=17 `NoSpace`=18 `InvalidArgument`=19 `Unsupported`=20 `Closed`=21 `NoReaderSlot`=22 `RecordTooLarge`=23 `Busy`=24 `SnapshotExpired`=25 `WouldDeadlock`=26 `BatchTooLarge`=27. Causes and fixes: [`errors.md`](errors.md). `Error::code()`, `Error::message()`.
+`Io`=1 `Corruption`=2 `WriterLocked`=3 `ShmVersionMismatch`=4 `ShmUnavailable`=5 `UnsupportedFormat`=6 `NetworkFilesystem`=7 `TableNotFound`=8 `TableExists`=9 `FamilyNotFound`=10 `FamilyExists`=11 `UnknownMergeOperator`=12 `MergeFailed`=13 `Conflict`=14 `ReadOnly`=15 `KeyTooLarge`=16 `ValueTooLarge`=17 `NoSpace`=18 `InvalidArgument`=19 `Unsupported`=20 `Closed`=21 `NoReaderSlot`=22 `RecordTooLarge`=23 `Busy`=24 `SnapshotExpired`=25 `WouldDeadlock`=26 `BatchTooLarge`=27 `OutcomeUnknown`=28 (a commit's outcome is not known: reopen and read; `Closed` means not committed). Causes and fixes: [`errors.md`](errors.md). `Error::code()`, `Error::message()`.
 
 ## Async (feature `async`, default on; module `nonblocking`)
 Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [`async.md`](async.md).
