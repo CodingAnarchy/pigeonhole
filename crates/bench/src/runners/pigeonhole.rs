@@ -609,11 +609,11 @@ impl Runner for PigeonholeRunner {
         })
     }
 
-    fn measured_durability(&mut self) -> Result<(), String> {
-        if let Some(o) = self.open.as_mut() {
-            o.target.load_buffered = false;
-        }
-        Ok(())
+    fn measured_durability(&mut self) -> Result<bool, String> {
+        Ok(self
+            .open
+            .as_mut()
+            .is_some_and(|o| std::mem::take(&mut o.target.load_buffered)))
     }
 
     fn start_riders(&mut self) -> Result<(), String> {
@@ -1175,7 +1175,10 @@ mod tests {
             put(&mut r, i);
         }
         let loaded = levels(&r);
-        r.measured_durability().unwrap();
+        assert!(
+            r.measured_durability().unwrap(),
+            "the load was buffered, the run is not"
+        );
         for i in 10..20 {
             put(&mut r, i);
         }

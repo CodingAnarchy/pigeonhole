@@ -1,6 +1,6 @@
 # Phase 3 gate window (#405, #406)
 
-The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 11.8 hours at full scale by the step estimates. The 2026-10-13b window's steps took 109 minutes; with `contended` (about 105) and D246's runs in `all`, expect about 3.6 hours. It is resumable, and it leaves one tarball to copy back.
+The Phase 3 gate is measured on the reference machine (D5): a Hetzner dedicated AX102 (Ryzen 9 7950X3D, 16 cores, 128 GB ECC, 2× 1.92 TB Datacenter Edition NVMe). It is rented for the measurement window only. `run-window.sh` runs every measurement the gate needs, unattended, in about 12.1 hours at full scale by the step estimates. The 2026-10-13b window's steps took 109 minutes; with `contended` (about 125) and D246's runs in `all`, expect about 3.9 hours. It is resumable, and it leaves one tarball to copy back.
 
 ## Before renting
 

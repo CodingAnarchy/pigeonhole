@@ -559,9 +559,11 @@ pub trait Runner {
     }
 
     /// Called after the load and the settle step, before the warmup: a runner set to load at
-    /// buffered durability commits at its own from here on (D247). The default does nothing.
-    fn measured_durability(&mut self) -> Result<(), String> {
-        Ok(())
+    /// buffered durability commits at its own from here on (D247). Returns whether the
+    /// durability changed, so the warmup waits for the placement to react to it (D242); the
+    /// default does nothing and returns `false`.
+    fn measured_durability(&mut self) -> Result<bool, String> {
+        Ok(false)
     }
 
     /// Starts background work riding on the measured phase, for runners asked to (D247's
@@ -1008,7 +1010,7 @@ fn measure(
     }
     let load = load_start.elapsed();
     let settled = settle(runner)?;
-    runner.measured_durability()?;
+    let switched = runner.measured_durability()?;
 
     let threads = config.threads.max(1);
     let mut clients: Vec<Box<dyn Client>> = if threads > 1 {
@@ -1030,7 +1032,14 @@ fn measure(
         }
     }
     let warm = deal(warm.into_iter().map(|op| (op, Class::Other)), lanes);
-    let warmed = warm_up(runner, &mut clients, &warm, WARMUP_SETTLED, WARMUP_CAP)?;
+    // D242, D247: after a durability switch packing re-places the tablets over 30-40 s, one
+    // move per dwell with gaps longer than the usual quiet window, so the warmup waits longer.
+    let (quiet, cap) = if switched {
+        (WARMUP_SETTLED_AFTER_SWITCH, WARMUP_CAP_AFTER_SWITCH)
+    } else {
+        (WARMUP_SETTLED, WARMUP_CAP)
+    };
+    let warmed = warm_up(runner, &mut clients, &warm, quiet, cap)?;
 
     // The measured operations: the configured count, then, while less than `min_measured`
     // has been measured, the stream's next operations, about enough for the rest at the rate
@@ -1090,6 +1099,17 @@ const MIN_EXTRA_OPS: u64 = 1_000;
 /// stretch means the balancer settled, not that it is waiting out a dwell.
 pub const WARMUP_SETTLED: Duration = Duration::from_secs(2);
 
+/// The warmup's quiet window after the run's durability switched from the load's (D242,
+/// D247): longer than packing's move cadence while it re-places the tablets for the new
+/// level. On the AX102 (ctr274's D248 A/B, ycsb-a at 16 threads, default durability) that
+/// re-placement took 30-40 s, one move per dwell with gaps longer than [`WARMUP_SETTLED`], so a
+/// 2 s window, or a 5 s minimum before it, passed mid-spread.
+pub const WARMUP_SETTLED_AFTER_SWITCH: Duration = Duration::from_secs(5);
+
+/// The longest the warmup waits after a durability switch (D242, D247): room for the
+/// 30-40 s re-placement and a quiet window after it.
+pub const WARMUP_CAP_AFTER_SWITCH: Duration = Duration::from_secs(60);
+
 /// The longest the warmup waits for the tablet placement to settle (D242): past it the run
 /// measures anyway, with a warning, and the record says it did not settle.
 pub const WARMUP_CAP: Duration = Duration::from_secs(30);
@@ -1097,9 +1117,10 @@ pub const WARMUP_CAP: Duration = Duration::from_secs(30);
 /// The warmup (D242): the warmup operations, repeated on the measured phase's own client
 /// threads until the store's tablet placement has gone [`WARMUP_SETTLED`] without a split,
 /// merge or move, at most [`WARMUP_CAP`]. Every store takes the same step; a store without
-/// shards never changes placement, so it warms for [`WARMUP_SETTLED`]. Returns the warmup's
-/// seconds and whether the placement settled; no warmup operations, no warmup. `quiet` and
-/// `cap` are [`WARMUP_SETTLED`] and [`WARMUP_CAP`] outside tests.
+/// shards never changes placement, so it warms for [`WARMUP_SETTLED`]. After a durability
+/// switch `quiet` and `cap` are [`WARMUP_SETTLED_AFTER_SWITCH`] and
+/// [`WARMUP_CAP_AFTER_SWITCH`]. Returns the warmup's seconds and whether the placement
+/// settled; no warmup operations, no warmup. Tests pass shorter windows.
 fn warm_up(
     runner: &mut dyn Runner,
     clients: &mut [Box<dyn Client>],
@@ -1241,6 +1262,8 @@ mod tests {
         /// Tablet moves the store reports: one more per reading until `moving` readings.
         readings: std::cell::Cell<u64>,
         moving: u64,
+        /// A timed spread: from the instant, one more move every interval, this many in all.
+        spread: Option<(Instant, Duration, u64)>,
         /// Operations executed, and how long each takes.
         executed: u64,
         op_time: Duration,
@@ -1266,6 +1289,13 @@ mod tests {
             Ok(())
         }
         fn shard_shares(&self) -> Vec<ShardShare> {
+            if let Some((from, every, moves)) = self.spread {
+                let n = (from.elapsed().as_nanos() / every.as_nanos()) as u64;
+                return vec![ShardShare {
+                    moves: n.min(moves),
+                    ..ShardShare::default()
+                }];
+            }
             let n = self.readings.get();
             self.readings.set(n + 1);
             vec![ShardShare {
@@ -1293,6 +1323,7 @@ mod tests {
             busy_polls,
             readings: std::cell::Cell::new(0),
             moving: 0,
+            spread: None,
             executed: 0,
             op_time: Duration::ZERO,
         }
@@ -1334,6 +1365,51 @@ mod tests {
         // No warmup operations, no warmup.
         let (secs, settled) = warm_up(&mut r, &mut [], &warm_ops(0), quiet, cap).unwrap();
         assert_eq!((secs, settled), (0.0, true));
+    }
+
+    #[test]
+    fn a_quiet_window_longer_than_the_move_cadence_outlasts_a_slow_spread() {
+        // D242/D247: a store whose placement moves once every 300 ms for 1.5 s, as packing
+        // re-places tablets one per dwell after a durability switch. A 200 ms window ends
+        // between two moves; a 500 ms one outlasts the spread.
+        let spreading = || {
+            let mut r = fake(0);
+            r.op_time = Duration::from_millis(5);
+            r.spread = Some((Instant::now(), Duration::from_millis(300), 5));
+            r
+        };
+        let warm = warm_ops(4);
+        let cap = Duration::from_secs(10);
+        let (early, settled) = warm_up(
+            &mut spreading(),
+            &mut [],
+            &warm,
+            Duration::from_millis(200),
+            cap,
+        )
+        .unwrap();
+        assert!(settled && early < 1.0, "ended mid-spread: {early}");
+        let (secs, settled) = warm_up(
+            &mut spreading(),
+            &mut [],
+            &warm,
+            Duration::from_millis(500),
+            cap,
+        )
+        .unwrap();
+        assert!(settled && secs >= 1.5 + 0.5, "outlasted the spread: {secs}");
+        // A spread longer than the cap ends at the cap, not settled.
+        let mut r = spreading();
+        r.spread = Some((Instant::now(), Duration::from_millis(100), u64::MAX));
+        let (_, settled) = warm_up(
+            &mut r,
+            &mut [],
+            &warm,
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!settled);
     }
 
     #[test]

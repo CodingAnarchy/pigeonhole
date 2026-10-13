@@ -112,12 +112,12 @@ impl Runner for FjallRunner {
         Ok(())
     }
 
-    fn measured_durability(&mut self) -> Result<(), String> {
+    fn measured_durability(&mut self) -> Result<bool, String> {
         let mode = self.mode(self.sync);
         if let Some(h) = self.open.as_mut() {
             h.mode = mode;
         }
-        Ok(())
+        Ok(self.load_buffered && self.sync)
     }
 
     fn flush(&mut self) -> Result<(), String> {
