@@ -18,19 +18,28 @@ It ran `run-window.sh` at full scale on 8654ad69: D236, D237, D238 and D239 merg
     - open to first read (median 2.6–3.0 ms);
     - thread-per-core scaling within one CCD (N = 1: 0.90, N = 4: 1.10, N = 8: 0.99);
     - balancer placement at 4, 8 and 16;
-    - within 1.5× of RocksDB on every workload;
+    - within 1.5× of RocksDB on every workload, in the first pair only (see below);
     - the Phase 2 floors;
     - #387's ratios to SQLite EAV (row read 1.32× and 1.47×, scan 1.17× and 1.25×).
   - **Accepted (D239):** memtable lookup at 2^18 entries, 339 ns.
   - **Reported (D238):**
     - scaling at N = 16: 0.70 (pinned) and 0.59 (unpinned);
     - against the fixed 417,922 commits/s single shard: 0.90 / 1.10 / 1.00 / 0.69.
-  - **Fail: run-to-run reproducibility** (`all-uring-compare.txt`), on one row only. That's `group-commit` with 16 synchronous client threads (not the judged D213 shape): p99 175 µs → 247 µs, +40.9% against a ±40% tolerance.
+  - **Fail: run-to-run reproducibility, in both pairs, on different rows.** The `all` pair was run twice (see "Two reproducibility pairs" below).
   - **Not run: cold get.** The first attempt's 64 GiB load stopped on `Busy` (a 30 s write stall). The diagnosis found the stall predates this window's changes:
     - the whole load stays on one shard and one tablet, never split;
     - compaction falls behind, with L0 past 1,000 SSTs.
 
     The investigation is ctr274's (splitting and the stall timeout) and perf2's (compaction under a deep L0). `cold-get` runs last, once that's understood, and its results are added to this directory.
+- **Two reproducibility pairs.** The first pair is `all-uring-{1,2}-run1.*`, `all-uring-compare-run1.txt` and `summary-run1.md`. The second, run on request after the first failed on one row, is `all-uring-{1,2}.*`, `all-uring-compare.txt` and `summary.md`. Both are at 8654ad69 on the same box and data directory.
+  - **First pair:** one row out of tolerance. `group-commit` with 16 synchronous clients: p99 175 → 247 µs (+40.9%, ±40%).
+  - **Second pair:** that row is within tolerance (p99 296 → 234 µs). Three others are out:
+    - `ycsb-a` with one client, throughput 174K → 226K (+29.7%, ±20%). The measured phases did different background work, 2 and 0;
+    - the D213 shape inside `all`, run at the preset's 200K commits (0.16–0.26 s): throughput 782K → 1.20M (+53%) and p50 260 → 155 µs (−41%).
+  - **Second pair, against RocksDB:** `skewed-multi-shard` is outside 1.5× in both runs: throughput 1.93× and 1.66×, p99 2.96× and 1.92×. The first pair had 1.43× and 1.49×.
+    - Pigeonhole moved, and RocksDB held (518K–550K ops/s in all four runs). Pigeonhole ran 362K and 368K ops/s in the first pair and 285K and 325K in the second.
+    - Its p99 went from 15–16 µs to 22–35 µs, and its measured phase did about twice the background work (flushes plus compactions: 120 and 104, then 251 and 211).
+  - **The 16-sync-client p99 over the four runs:** 175, 246, 296 and 234 µs.
 - **Worth knowing:** scaling's N = 1 efficiency is 0.90, which means two single-shard runs in the same step measured 417K and 375K commits/s. The single-shard rate varies about that much between runs.
 - **Not committed:** the raw step logs, criterion's HTML reports, the step markers (`*.done`, `*.status`) and the failed load's `cold-get.jsonl` (its machine line only).
 - **Expected warning:** the PM9A3 reports a volatile write cache (`vwc 0x6`) although it has power-loss protection. The measured fdatasync (p50 25 µs, p99 77 µs) agrees.

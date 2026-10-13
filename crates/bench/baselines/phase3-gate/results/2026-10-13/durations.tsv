@@ -16,3 +16,6 @@ wal-pin	0	full	8654ad6924a9
 cold-scan	2	full	8654ad6924a9
 scan-cache	0	full	8654ad6924a9
 report	0	full	8654ad6924a9
+all-uring-1	12	full	8654ad6924a9
+all-uring-2	12	full	8654ad6924a9
+report	0	full	8654ad6924a9

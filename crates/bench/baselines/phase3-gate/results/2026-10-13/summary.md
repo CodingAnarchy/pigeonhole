@@ -30,7 +30,7 @@ vwc       : 0x6): check it has power-loss protection
 | Thread-per-core scaling against a fixed single-shard rate, 417,922 commits/s (reported, not judged; D238) | N=1: 0.90; N=4: 1.10; N=8: 1.00; N=16: 0.69 | - | `scaling-N.json` |
 | Thread-per-core scaling, shard threads unpinned (reported, not judged; D235) | N=4: 1.03; N=8: 0.90; N=16: 0.59 | - | `scaling-N.json` |
 | Balancer placement: busiest ≤ 1.25/N once settled (D231) | N=4: busiest 28.0% (max 31.2%), settled 21 s, 0 changes, 120K of 120K writes/s; N=8: busiest 14.3% (max 15.6%), settled 16 s, 0 changes, 240K of 240K writes/s; N=16: busiest 7.7% (max 7.8%), settled 26 s, 0 changes, 480K of 480K writes/s | **pass** | `placement-N.json` |
-| Within 1.5× of RocksDB on every workload | all within | **pass** | `all-uring-1.json, all-uring-2.json` |
+| Within 1.5× of RocksDB on every workload | outside: skewed-multi-shard (all-uring-1), skewed-multi-shard (all-uring-2) | **FAIL** | `all-uring-1.json, all-uring-2.json` |
 | Reproducibility: run 1 and run 2 within tolerance |  | **FAIL** | `all-uring-compare.txt` |
 | Phase 2 floors hold (D193 sparse-wide gate, both runs) |  | **pass** | `phase2-gate.json, phase2-gate-2.json, logs/phase2-gate*.log` |
 | #387: row-read and scan p99 within 1.5× of SQLite EAV | run 1: row read 1.32×, scan 1.17×; run 2: row read 1.47×, scan 1.25× | **pass** | `phase2-gate.json, phase2-gate-2.json` |
@@ -40,28 +40,28 @@ vwc       : 0x6): check it has power-loss protection
 
 | Run | Workload | RocksDB/Pigeonhole throughput | Pigeonhole/RocksDB p99 | Within 1.5× |
 |---|---|---:|---:|---|
-| all-uring-1 | adjacency | 0.62 | 0.56 | yes |
-| all-uring-1 | group-commit | 0.79 | 0.75 | yes |
-| all-uring-1 | skewed-multi-shard | 1.43 | 1.38 | yes |
-| all-uring-1 | sparse-wide | 0.71 | 0.48 | yes |
-| all-uring-1 | time-series-ttl | 1.20 | 1.22 | yes |
-| all-uring-1 | ycsb-a | 0.58 | 0.50 | yes |
-| all-uring-1 | ycsb-b | 0.32 | 0.58 | yes |
-| all-uring-1 | ycsb-c | 0.42 | 1.06 | yes |
-| all-uring-1 | ycsb-d | 0.41 | 0.91 | yes |
-| all-uring-1 | ycsb-e | 0.87 | 0.99 | yes |
-| all-uring-1 | ycsb-f | 0.76 | 0.68 | yes |
-| all-uring-2 | adjacency | 0.60 | 0.54 | yes |
-| all-uring-2 | group-commit | 0.80 | 1.04 | yes |
-| all-uring-2 | skewed-multi-shard | 1.49 | 1.33 | yes |
-| all-uring-2 | sparse-wide | 0.66 | 0.46 | yes |
-| all-uring-2 | time-series-ttl | 1.14 | 1.10 | yes |
-| all-uring-2 | ycsb-a | 0.58 | 0.50 | yes |
-| all-uring-2 | ycsb-b | 0.32 | 0.56 | yes |
-| all-uring-2 | ycsb-c | 0.42 | 1.04 | yes |
-| all-uring-2 | ycsb-d | 0.45 | 0.98 | yes |
-| all-uring-2 | ycsb-e | 0.84 | 0.96 | yes |
-| all-uring-2 | ycsb-f | 0.71 | 0.66 | yes |
+| all-uring-1 | adjacency | 0.60 | 0.53 | yes |
+| all-uring-1 | group-commit | 0.83 | 1.23 | yes |
+| all-uring-1 | skewed-multi-shard | 1.93 | 2.96 | **no** |
+| all-uring-1 | sparse-wide | 0.68 | 0.46 | yes |
+| all-uring-1 | time-series-ttl | 1.17 | 1.14 | yes |
+| all-uring-1 | ycsb-a | 0.58 | 0.44 | yes |
+| all-uring-1 | ycsb-b | 0.30 | 0.48 | yes |
+| all-uring-1 | ycsb-c | 0.43 | 1.09 | yes |
+| all-uring-1 | ycsb-d | 0.45 | 0.97 | yes |
+| all-uring-1 | ycsb-e | 0.88 | 0.97 | yes |
+| all-uring-1 | ycsb-f | 0.69 | 0.58 | yes |
+| all-uring-2 | adjacency | 0.62 | 0.56 | yes |
+| all-uring-2 | group-commit | 0.83 | 0.99 | yes |
+| all-uring-2 | skewed-multi-shard | 1.66 | 1.92 | **no** |
+| all-uring-2 | sparse-wide | 0.69 | 0.47 | yes |
+| all-uring-2 | time-series-ttl | 1.17 | 1.14 | yes |
+| all-uring-2 | ycsb-a | 0.48 | 0.49 | yes |
+| all-uring-2 | ycsb-b | 0.33 | 0.59 | yes |
+| all-uring-2 | ycsb-c | 0.44 | 1.10 | yes |
+| all-uring-2 | ycsb-d | 0.46 | 0.97 | yes |
+| all-uring-2 | ycsb-e | 0.80 | 0.83 | yes |
+| all-uring-2 | ycsb-f | 0.72 | 0.66 | yes |
 
 ## Decisions this window settles
 
@@ -89,16 +89,16 @@ vwc       : 0x6): check it has power-loss protection
 | Workload | uring/pread throughput | uring/pread p99 |
 |---|---:|---:|
 | adjacency | 1.03 | 0.96 |
-| group-commit | 1.04 | 0.73 |
-| skewed-multi-shard | 0.88 | 1.20 |
-| sparse-wide | 1.00 | 0.97 |
-| time-series-ttl | 1.03 | 1.01 |
-| ycsb-a | 0.98 | 1.00 |
-| ycsb-b | 1.02 | 0.96 |
-| ycsb-c | 1.00 | 1.00 |
-| ycsb-d | 1.09 | 0.94 |
-| ycsb-e | 1.00 | 0.94 |
-| ycsb-f | 0.89 | 1.13 |
+| group-commit | 0.98 | 1.24 |
+| skewed-multi-shard | 0.69 | 2.60 |
+| sparse-wide | 1.02 | 0.96 |
+| time-series-ttl | 1.02 | 0.96 |
+| ycsb-a | 0.92 | 1.02 |
+| ycsb-b | 1.01 | 0.96 |
+| ycsb-c | 0.96 | 1.04 |
+| ycsb-d | 0.99 | 1.01 |
+| ycsb-e | 1.00 | 0.92 |
+| ycsb-f | 0.93 | 1.09 |
 
 **Scan readahead (#431):** cold full scan, median MiB/s over runs.
 
@@ -139,4 +139,7 @@ The WAL files' size counts whole preallocated segments (the disk the WAL holds),
 | wal-pin | 0 | 8654ad6924a9 |
 | cold-scan | 2 | 8654ad6924a9 |
 | scan-cache | 0 | 8654ad6924a9 |
-| **total** | **62** | |
+| report | 0 | 8654ad6924a9 |
+| all-uring-1 | 12 | 8654ad6924a9 |
+| all-uring-2 | 12 | 8654ad6924a9 |
+| **total** | **86** | |
