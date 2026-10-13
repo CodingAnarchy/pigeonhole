@@ -253,34 +253,36 @@ pub struct RunRecord {
 
 impl RunRecord {
     /// The measured phase's commit rounds (D246), for a run with cross-shard commits on a
-    /// store that numbers its commits; `None` otherwise.
+    /// store that counts them; `None` otherwise.
     ///
-    /// Until the engine counts refused two-phase-commit rounds itself (ICR 0043), they are
-    /// inferred as perf2 did: the sequence numbers used beyond one per commit. Each commit
-    /// uses one when it commits and each refused round one more. With tablet changes on, a
-    /// split, merge or move while measuring may use some as well; the record's shard table
-    /// counts those beside it.
+    /// The wasted rounds are the engine's refused two-phase rounds (ICR 0043,
+    /// `Metrics::cross_shard`, in the stall counters). The sequence numbers used beyond one
+    /// per commit (perf2's inference, which D246 used before the counters existed) are kept
+    /// as a cross-check: each commit uses one sequence number and each refused round one more;
+    /// with tablet changes on, a split, merge or move may use some as well.
     ///
     /// ```
-    /// use pigeonhole_bench::{OpTypeStats, RunRecord, LatencyStats, CROSS_SHARD_COMMIT};
+    /// use pigeonhole_bench::{OpTypeStats, RunRecord, LatencyStats, Stalls, CROSS_SHARD_COMMIT};
     ///
     /// let mut r: RunRecord = serde_json::from_str(r#"{"store":"pigeonhole","store_config":"",
     ///     "workload":"cross-shard-contention","seed":1,"records":1,"operations":300,
     ///     "value_len":100,"threads":32,"load_secs":0,"run_secs":10,"throughput":30,
     ///     "p50_ns":0,"p99_ns":0,"p999_ns":0,"mean_ns":0,"max_ns":0}"#).unwrap();
-    /// assert!(r.rounds().is_none(), "no cross-shard commits, no seqnos");
+    /// assert!(r.rounds().is_none(), "no cross-shard commits, no counters");
     /// let stats = |count| LatencyStats { count, ..LatencyStats::default() };
     /// r.detail.by_type = vec![
     ///     OpTypeStats { op: CROSS_SHARD_COMMIT.into(), stats: stats(100), mean_ns: 0 },
     ///     OpTypeStats { op: "put".into(), stats: stats(200), mean_ns: 0 },
     /// ];
-    /// r.detail.seqnos_used = Some(310);
+    /// r.detail.seqnos_used = Some(311);
     /// let x = r.rounds().unwrap();
-    /// assert_eq!((x.commits, x.cross, x.wasted()), (300, 100, 10));
-    /// assert_eq!(x.per_cross(), 0.1);
+    /// assert_eq!((x.commits, x.cross, x.refused, x.inferred()), (300, 100, None, Some(11)));
+    /// assert_eq!(x.wasted(), 11, "inferred without the engine's counters");
+    /// r.detail.stalls = Some(Stalls { xshard_rounds: 110, xshard_refused_rounds: 10, ..Default::default() });
+    /// let x = r.rounds().unwrap();
+    /// assert_eq!((x.wasted(), x.per_cross()), (10, 0.1));
     /// ```
     pub fn rounds(&self) -> Option<Rounds> {
-        let seqnos = self.detail.seqnos_used?;
         let count = |name: &str| {
             self.detail
                 .by_type
@@ -289,30 +291,41 @@ impl RunRecord {
                 .map_or(0, |t| t.stats.count)
         };
         let cross = count(crate::CROSS_SHARD_COMMIT);
-        (cross > 0).then(|| Rounds {
+        let refused = self.detail.stalls.as_ref().map(|s| s.xshard_refused_rounds);
+        let seqnos = self.detail.seqnos_used;
+        (cross > 0 && (refused.is_some() || seqnos.is_some())).then(|| Rounds {
             commits: cross + count("put"),
             cross,
+            refused,
             seqnos,
         })
     }
 }
 
-/// A measured phase's commits and the sequence numbers they used ([`RunRecord::rounds`],
-/// D246).
+/// A measured phase's commits and their two-phase rounds ([`RunRecord::rounds`], D246).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rounds {
     /// Commits measured, single-row and cross-shard.
     pub commits: u64,
     /// Cross-shard commits measured.
     pub cross: u64,
-    /// Sequence numbers used while measuring.
-    pub seqnos: u64,
+    /// Two-phase rounds a participant refused (ICR 0043), for stores that count them.
+    pub refused: Option<u64>,
+    /// Sequence numbers used while measuring, for stores that number their commits.
+    pub seqnos: Option<u64>,
 }
 
 impl Rounds {
-    /// Rounds that did not commit: the sequence numbers used beyond one per commit.
+    /// Rounds that did not commit: the engine's refused rounds, else the inference from
+    /// sequence numbers.
     pub fn wasted(&self) -> u64 {
-        self.seqnos.saturating_sub(self.commits)
+        self.refused.or_else(|| self.inferred()).unwrap_or(0)
+    }
+
+    /// The sequence numbers used beyond one per commit: perf2's inference of the wasted
+    /// rounds, a cross-check on [`refused`](Self::refused).
+    pub fn inferred(&self) -> Option<u64> {
+        Some(self.seqnos?.saturating_sub(self.commits))
     }
 
     /// [`wasted`](Self::wasted) per cross-shard commit; D246 judges it at most 0.1.
@@ -587,6 +600,28 @@ pub struct Stalls {
     /// See [`Stalls::row_cache_hits`].
     #[serde(default)]
     pub row_cache_fills: u64,
+    /// Cross-shard two-phase rounds decided, and the rounds a participant refused (ICR 0043,
+    /// `Metrics::cross_shard`): the refused rounds over the cross-shard commits are D246's
+    /// wasted rounds per commit.
+    #[serde(default)]
+    pub xshard_rounds: u64,
+    /// See [`Stalls::xshard_rounds`].
+    #[serde(default)]
+    pub xshard_refused_rounds: u64,
+    /// Refused PREPAREs by reason: below a timestamp the participant assigned (D11), below a
+    /// tablet move's raised floor, a tablet being changed or moved (D145), no arena room
+    /// (ICR 0042). One refused round can hold several.
+    #[serde(default)]
+    pub xshard_refused_below_floor: u64,
+    /// See [`Stalls::xshard_refused_below_floor`].
+    #[serde(default)]
+    pub xshard_refused_move_raise: u64,
+    /// See [`Stalls::xshard_refused_below_floor`].
+    #[serde(default)]
+    pub xshard_refused_moved: u64,
+    /// See [`Stalls::xshard_refused_below_floor`].
+    #[serde(default)]
+    pub xshard_refused_room: u64,
 }
 
 impl Stalls {
@@ -617,6 +652,18 @@ impl Stalls {
             row_cache_hits: d(before.row_cache_hits, after.row_cache_hits),
             row_cache_misses: d(before.row_cache_misses, after.row_cache_misses),
             row_cache_fills: d(before.row_cache_fills, after.row_cache_fills),
+            xshard_rounds: d(before.xshard_rounds, after.xshard_rounds),
+            xshard_refused_rounds: d(before.xshard_refused_rounds, after.xshard_refused_rounds),
+            xshard_refused_below_floor: d(
+                before.xshard_refused_below_floor,
+                after.xshard_refused_below_floor,
+            ),
+            xshard_refused_move_raise: d(
+                before.xshard_refused_move_raise,
+                after.xshard_refused_move_raise,
+            ),
+            xshard_refused_moved: d(before.xshard_refused_moved, after.xshard_refused_moved),
+            xshard_refused_room: d(before.xshard_refused_room, after.xshard_refused_room),
         }
     }
 }
@@ -1138,20 +1185,35 @@ impl Suite {
             .filter_map(|r| r.rounds().map(|x| (r, x)))
             .collect();
         if !rounds.is_empty() {
-            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Seqnos used | Wasted rounds | Per cross-shard commit |\n");
-            s.push_str("|---|---|---|--:|--:|--:|--:|--:|\n");
+            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: below floor, move raise, moved, room | Seqnos used | Inferred wasted rounds |\n");
+            s.push_str("|---|---|---|--:|--:|--:|--:|---|--:|--:|\n");
+            let opt = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
             for (r, x) in rounds {
+                let reasons = r.detail.stalls.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    |st| {
+                        format!(
+                            "{}, {}, {}, {}",
+                            st.xshard_refused_below_floor,
+                            st.xshard_refused_move_raise,
+                            st.xshard_refused_moved,
+                            st.xshard_refused_room
+                        )
+                    },
+                );
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {} | {} | {} | {} | {:.3} |",
+                    "| {} | {} | {} | {} | {} | {} | {:.3} | {} | {} | {} |",
                     r.workload,
                     r.store,
                     r.store_config,
                     x.commits,
                     x.cross,
-                    x.seqnos,
-                    x.wasted(),
+                    opt(x.refused),
                     x.per_cross(),
+                    reasons,
+                    opt(x.seqnos),
+                    opt(x.inferred()),
                 );
             }
         }

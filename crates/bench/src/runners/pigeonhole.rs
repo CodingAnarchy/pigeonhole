@@ -695,6 +695,12 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         row_cache_hits: rc.hits,
         row_cache_misses: rc.misses,
         row_cache_fills: rc.fills,
+        xshard_rounds: m.cross_shard.rounds,
+        xshard_refused_rounds: m.cross_shard.refused_rounds,
+        xshard_refused_below_floor: m.cross_shard.refused_below_floor,
+        xshard_refused_move_raise: m.cross_shard.refused_move_raise,
+        xshard_refused_moved: m.cross_shard.refused_moved,
+        xshard_refused_room: m.cross_shard.refused_room,
     }
 }
 
@@ -811,6 +817,12 @@ mod tests {
         assert_eq!(cross + count("put"), config.operations);
         // Every commit uses a sequence number; refused rounds use more.
         assert!(rec.detail.seqnos_used.unwrap() >= config.operations);
+        // The engine counts the refused rounds itself (ICR 0043); every one of them used a
+        // sequence number too.
+        let rounds = rec.rounds().unwrap();
+        let refused = rounds.refused.expect("Metrics::cross_shard");
+        assert!(refused <= rounds.inferred().unwrap(), "{rounds:?}");
+        assert!(rec.detail.stalls.unwrap().xshard_rounds >= cross);
         std::fs::remove_dir_all(dir).ok();
     }
 

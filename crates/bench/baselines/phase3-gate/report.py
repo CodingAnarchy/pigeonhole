@@ -386,13 +386,27 @@ def xshard(run):
         return None
     cross = op(on, "cross-shard commit") or {}
     commits = cross.get("count", 0) + (op(on, "put") or {}).get("count", 0)
+    # Wasted rounds: the engine's refused two-phase rounds (ICR 0043, Metrics::cross_shard,
+    # in the stall counters); the seqnos used beyond one per commit (perf2's inference) are
+    # kept beside them as a cross-check, and stand in for runs from before the counters.
+    st = on.get("detail", {}).get("stalls") or {}
     seqnos = on.get("detail", {}).get("seqnos_used")
-    wasted = None if seqnos is None or not cross.get("count") else max(seqnos - commits, 0) / cross["count"]
+    n = cross.get("count") or 0
+    inferred = None if seqnos is None or not n else max(seqnos - commits, 0) / n
+    counted = st["xshard_refused_rounds"] / n if n and "xshard_refused_rounds" in st else None
+    wasted = counted if counted is not None else inferred
+    reasons = (f"below floor {st.get('xshard_refused_below_floor', 0)}, move raise {st.get('xshard_refused_move_raise', 0)}, "
+               f"moved {st.get('xshard_refused_moved', 0)}, room {st.get('xshard_refused_room', 0)}"
+               if counted is not None else "")
+    check = f"{inferred:.3f}" if inferred is not None else "-"
+    how = (f"refused rounds, ICR 0043; refusals: {reasons}; seqno inference {check}"
+           if counted is not None else "inferred from seqnos")
     x = {
         "tput": rk["throughput"] / on["throughput"],
         "p99": on["p99_ns"] / max(rk["p99_ns"], 1),
         "on_off": on["throughput"] / max(off["throughput"], 1e-9),
         "wasted": wasted,
+        "how": how,
         "cross_p99_us": us(cross["p99_ns"]) if cross else None,
         "on": on["throughput"],
         "busy": on.get("detail", {}).get("busy_retries", 0),
@@ -407,7 +421,7 @@ xs = [(run[:-5], xshard(run)) for run in ("all-uring-1.json", "all-uring-2.json"
 if all(x for _, x in xs):
     detail = "; ".join(
         f"{name}: {rate(x['on'])} ops/s, RocksDB {x['tput']:.2f}× throughput, p99 {x['p99']:.2f}×; "
-        f"tablets on/off {x['on_off']:.2f}; wasted rounds {x['wasted']:.3f} per cross-shard commit (inferred); "
+        f"tablets on/off {x['on_off']:.2f}; wasted rounds {x['wasted']:.3f} per cross-shard commit ({x['how']}); "
         f"Busy {x['busy']}; cross-shard p99 {x['cross_p99_us']:.0f} µs"
         for name, x in xs)
     rows.append((XSHARD_TARGET, detail, verdict(all(x["ok"] for _, x in xs)), "all-uring-1.json, all-uring-2.json"))
@@ -470,7 +484,7 @@ for level, label in CONTENDED_LEVELS:
         rows.append((xt,
                      f"{rate(xc['on'])} ops/s, RocksDB {xc['tput']:.2f}× throughput, p99 {xc['p99']:.2f}×; "
                      f"tablets on/off {xc['on_off']:.2f}; wasted rounds {xc['wasted']:.3f} per cross-shard commit "
-                     f"(inferred); Busy {xc['busy']}; cross-shard p99 {xc['cross_p99_us']:.0f} µs",
+                     f"({xc['how']}); Busy {xc['busy']}; cross-shard p99 {xc['cross_p99_us']:.0f} µs",
                      verdict(xc["ok"]), f"contended-{level}-{XSHARD}.json"))
     else:
         rows.append((xt, "", verdict(None), f"contended-{level}-{XSHARD}.json"))
