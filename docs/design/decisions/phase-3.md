@@ -1280,9 +1280,9 @@ Throughput is unchanged (8.8–9.6M cells/s at 16 in flight).
 **Why.** The lookup is bound by memory latency. Each probe follows dependent node reads through the skiplist. D230 measured software prefetch in the search and didn't adopt it (−3% at 1M, +2–9% when cache-resident). Closing the last 37 ns needs a different structure for frozen memtables (#612), and that isn't Phase 3 work. The gate previously measured 481 ns at 1M; D230's 2^18 entries give 337 ns.
 
 <a id="d241"></a>
-## D241 — A cross-shard commit refused with `Moved` or below a timestamp floor gives up only at the write-stall timeout, never after a number of attempts (proposed, pending the owner; engine, tablets, #102; amends D145)
+## D241 — A cross-shard commit refused with `Moved` or below a timestamp floor gives up only at the write-stall timeout, never after a number of attempts (owner decision, 2026-10-13; engine, tablets, #102; amends D145)
 
-**Decided (pending the owner):**
+**Decided:**
 - **No attempt cap.** A cross-shard commit that a participant refuses because a tablet is being changed (`Moved`) or because its timestamp is below the participant's floor (`BelowFloor`, D11) is retried until it commits, or until `write_stall_timeout_nanos` has passed since it was submitted. Then it fails with `Busy`. D145's cap of 16 refusals (`MOVED_RETRIES`) is gone.
 - **What `Busy` means is unchanged:** stalled past the write-stall timeout (D124, D240). The attempt count is still carried, for tracing.
 - **The `Busy` message** no longer blames only flushes and compaction. It names a tablet change too, and the configurable timeout (`Options::write_stall_timeout`, 30 s by default).
@@ -1291,7 +1291,7 @@ Throughput is unchanged (8.8–9.6M cells/s at 16 in flight).
 - A busy participant keeps giving its own commits wall-clock default timestamps while a PREPARE waits in its queue. So the coordinator's timestamp, chosen above every published floor, is below the floor again when the PREPARE arrives. The retry runs at once and loses the same race.
 - Locally (4 GiB, 8 loaders) a commit gave up after 16 refusals within about 10 s, and 17–446 commits per run got `Busy`. With the timeout as the only bound, none did.
 - The cost is aborted two-phase rounds (about 1,000–3,000 per 4 GiB load): each a seqno, a PREPARE and an abort. That is bounded by the timeout.
-- Making the `BelowFloor` retry win sooner is a separate design question about D11's timestamps, not taken here.
+- Making the `BelowFloor` retry win sooner is a separate design question about D11's timestamps, tracked in #637.
 
 **Measured** (macOS, 4 GiB, 8 loaders, with the balancer's re-decision after a compaction):
 - the table spread over 7–10 shards instead of 1;

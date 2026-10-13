@@ -255,7 +255,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D237](phase-3.md#d237) — An application-owned shard's `run_once` ends its turn after the message drain, before its background slices, when it woke a future the driving thread awaits (a commit settled), at most 8 turns in a row; group commit p99 at 16 in flight 183 → 157–167 µs on the AX102 · owner decision, runtime, engine, pigeonhole, #406
 - [D238](phase-3.md#d238) — The scaling gate judges ≥ 0.8 × N for N up to one chiplet's (CCD's) physical cores, read from the L3 topology, and reports larger N (~0.70 at 16 accepted on the AX102's two CCDs); efficiency against a fixed single-shard rate (417,922 commits/s, AX102) is reported beside it · owner decision, bench, #154, #406 · amends D204, D231
 - [D239](phase-3.md#d239) — The memtable lookup (#17) is accepted at 337 ns at 2^18 entries: the gate reports it against 300 ns with the verdict "accepted (D239)" up to 354 ns (5% above 337); #612 stays the post-1.0 lever · owner decision, bench, memtable, #17, #406 · amends D230
-- [D241](phase-3.md#d241) — A cross-shard commit refused with `Moved` or below a timestamp floor gives up only at the write-stall timeout, never after 16 attempts; the `Busy` message names tablet changes · pending the owner, engine, tablets, #102 · amends D145
+- [D241](phase-3.md#d241) — A cross-shard commit refused with `Moved` or below a timestamp floor gives up only at the write-stall timeout, never after 16 attempts; the `Busy` message names tablet changes; making the `BelowFloor` retry win is #637 · owner decision, engine, tablets, #102 · amends D145
 
 ## Open questions
 _None._
