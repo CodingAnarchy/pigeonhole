@@ -639,7 +639,11 @@ mod tests {
             "cross-shard-contention --scale smoke --shards 4 --no-tablet-changes --dir {}",
             dir.display()
         ));
-        assert_eq!(bench(&a).unwrap().results.len(), 1, "no second tablets-off run");
+        assert_eq!(
+            bench(&a).unwrap().results.len(),
+            1,
+            "no second tablets-off run"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
