@@ -200,3 +200,33 @@ fn frame_tail_too_short_for_a_header_is_skipped() {
     // A frame of the wrong size is an error, not a panic.
     assert!(FrameDecoder::new(1, start).decode(&[0; 10]).is_err());
 }
+
+proptest! {
+    #![proptest_config(config(300))]
+
+    /// A record framed from parts (`encode_parts`, #320) is byte for byte the record framed
+    /// whole, wherever the parts split it (empty parts included) and wherever in a frame it
+    /// starts: the same fragments, headers and checksums.
+    #[test]
+    fn framing_from_parts_matches_framing_whole(
+        r in record(),
+        cuts in vec(any::<prop::sample::Index>(), 0..4),
+        start in FRAME_SIZE as u64..(3 * FRAME_SIZE) as u64,
+    ) {
+        let mut at: Vec<usize> = cuts.iter().map(|c| c.index(r.len() + 1)).collect();
+        at.sort_unstable();
+        let mut parts = Vec::new();
+        let mut from = 0;
+        for &to in &at {
+            parts.push(&r[from..to]);
+            from = to;
+        }
+        parts.push(&r[from..]);
+        let mut whole = Vec::new();
+        let whole_end = FrameEncoder::new(9, start).encode(&r, &mut whole);
+        let mut framed = vec![7u8];
+        let parts_end = FrameEncoder::new(9, start).encode_parts(&parts, &mut framed);
+        prop_assert_eq!(parts_end, whole_end);
+        prop_assert_eq!(&framed[1..], &whole[..]);
+    }
+}

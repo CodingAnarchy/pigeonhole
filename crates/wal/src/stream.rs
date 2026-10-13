@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use pigeonhole_format::wal::{
-    FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameEncoder, SegmentHeader, WalRecord,
+    FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameEncoder, RECORD_HEAD_MAX, SegmentHeader, WalRecord,
 };
 use pigeonhole_format::{Durability, FormatVersion, Lsn, StreamId};
 use pigeonhole_io::{Completion, FileRef, IoBuf, OpenOptions, VfsRef};
@@ -1043,8 +1043,6 @@ pub struct WalStream {
     written_off: u64,
     /// Appended, not yet written bytes of the current segment.
     buf: Vec<u8>,
-    /// Record encoding scratch, reused across appends.
-    scratch: Vec<u8>,
     /// The current segment's header while it waits for the previous segment's submitted
     /// sync (FORMAT §10.1 rule 1).
     held: Option<HeldHeader>,
@@ -1263,7 +1261,6 @@ impl WalStream {
             enc: FrameEncoder::new(0, FRAME),
             written_off: 0,
             buf: Vec::new(),
-            scratch: Vec::new(),
             held: None,
             stale: None,
             shared: Arc::new(Shared {
@@ -1636,13 +1633,14 @@ impl WalStream {
         Ok(())
     }
 
-    /// Frames `scratch` into the buffer, rolling over first if it does not fit.
-    fn append_scratch(&mut self) -> Result<Lsn> {
-        let need = self.enc.encoded_len(self.scratch.len()) as u64;
+    /// Frames a record of `len` bytes, given as `parts`, into the buffer, rolling over first
+    /// if it does not fit.
+    fn append_parts(&mut self, parts: &[&[u8]], len: usize) -> Result<Lsn> {
+        let need = self.enc.encoded_len(len) as u64;
         if self.append_pos() + need > self.segment_size {
             self.rollover()?;
         }
-        let end = self.enc.encode(&self.scratch, &mut self.buf);
+        let end = self.enc.encode_parts(parts, &mut self.buf);
         Ok(Lsn::new(self.epoch, end as u32))
     }
 }
@@ -1655,12 +1653,14 @@ impl Wal for WalStream {
     fn append(&mut self, record: &WalRecord<'_>, durability: Durability) -> Result<CommitTicket> {
         let _fg = crate::foreground::Foreground::enter();
         self.check_poisoned()?;
-        self.scratch.clear();
-        record.encode(&mut self.scratch);
-        if self.scratch.len() > self.max_payload {
+        // Framed straight from the batch: no copy of the record into a buffer first (#320).
+        let mut head = [0u8; RECORD_HEAD_MAX];
+        let (head, body) = record.split(&mut head);
+        let len = head.len() + body.len();
+        if len > self.max_payload {
             return Err(Error::RecordTooLarge);
         }
-        let end = self.append_scratch();
+        let end = self.append_parts(&[head, body], len);
         let end = self.poison_on_err(end)?;
         Ok(CommitTicket {
             stream: self.stream,
