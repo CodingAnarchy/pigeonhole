@@ -3,7 +3,7 @@
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use pigeonhole::{
@@ -340,6 +340,19 @@ impl Runner for PigeonholeRunner {
     fn open(&mut self, dir: &Path) -> Result<(), String> {
         let db = Pigeonhole::open(dir.join("bench.phdb"), options(&self.settings)).map_err(err)?;
         let table = create_table(&db)?;
+        // SCRATCH (perf287, GroupSync placement A/B; never commit): SCRATCH_PRESPLIT splits
+        // the YCSB key space evenly over every shard before the load; SCRATCH_TIMELINE prints
+        // per-second placement and busy fractions to stderr.
+        if std::env::var_os("SCRATCH_PRESPLIT").is_some() {
+            let n = db.shard_stats().len().max(1) as u64;
+            let keys: Vec<Vec<u8>> = (1..n)
+                .map(|i| format!("user{:020}", (u64::MAX / n) * i).into_bytes())
+                .collect();
+            table.split_over_shards(keys).map_err(err)?;
+        }
+        if std::env::var_os("SCRATCH_TIMELINE").is_some() {
+            scratch_timeline(db.clone());
+        }
         self.open = Some(Open {
             target: Target {
                 db,
@@ -357,6 +370,7 @@ impl Runner for PigeonholeRunner {
     }
 
     fn close(&mut self) -> Result<(), String> {
+        scratch_timeline_stop();
         match self.open.take() {
             Some(Open {
                 target: Target {
@@ -887,5 +901,53 @@ mod tests {
         assert_eq!(r.execute_counted(&read).unwrap().cells, 10);
         r.close().unwrap();
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+// SCRATCH (perf287; never commit): the per-second placement timeline.
+static SCRATCH_STOP: AtomicBool = AtomicBool::new(false);
+static SCRATCH_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+fn scratch_timeline(db: Pigeonhole) {
+    SCRATCH_STOP.store(false, Ordering::SeqCst);
+    let h = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let mut last = db.shard_stats();
+        let mut at = std::time::Instant::now();
+        while !SCRATCH_STOP.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(1));
+            let now = db.shard_stats();
+            let dt = at.elapsed().as_nanos().max(1) as f64;
+            at = std::time::Instant::now();
+            let (mut sp, mut me, mut mv) = (0, 0, 0);
+            let mut tabs = Vec::new();
+            let mut busy = Vec::new();
+            let mut commits = Vec::new();
+            for (n, l) in now.iter().zip(&last) {
+                sp += n.splits;
+                me += n.merges;
+                mv += n.moves;
+                tabs.push(n.tablets.to_string());
+                busy.push(format!("{:.2}", n.busy_nanos.saturating_sub(l.busy_nanos) as f64 / dt));
+                commits.push((n.commits.saturating_sub(l.commits)).to_string());
+            }
+            eprintln!(
+                "TL t={} splits={sp} merges={me} moves={mv} tablets=[{}] busy=[{}] commits/s=[{}]",
+                start.elapsed().as_secs(),
+                tabs.join(","),
+                busy.join(","),
+                commits.join(",")
+            );
+            last = now;
+        }
+    });
+    *SCRATCH_THREAD.lock().unwrap() = Some(h);
+}
+
+fn scratch_timeline_stop() {
+    SCRATCH_STOP.store(true, Ordering::SeqCst);
+    if let Some(h) = SCRATCH_THREAD.lock().unwrap().take() {
+        let _ = h.join();
     }
 }
