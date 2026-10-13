@@ -2490,6 +2490,19 @@ impl Inner {
         MaintenanceGuard::enter(&self.shared, || self.check_open())
     }
 
+    /// `check_open` for a new commit: also refused once a shard died (a panic, a dropped
+    /// application-owned shard, a failed WAL sync or a failed cross-shard apply). Its writes
+    /// could never become durable or visible here (the durable watermark is stuck, or the
+    /// dead shard's watermark is), so it fails fast with `Closed`: nothing was written, so
+    /// not committed (D227, ICR 0038).
+    fn check_writable(&self) -> Result<()> {
+        self.check_open()?;
+        if self.shared.shard_died.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
     fn check_open(&self) -> Result<()> {
         if self.closing.load(Ordering::Acquire) || self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
@@ -2755,7 +2768,7 @@ impl Inner {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
-        self.check_open()?;
+        self.check_writable()?;
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
         // One tablet map for the whole routing: its version goes with a cross-shard commit,
         // which a participant moving a tablet refuses and the coordinator retries.
@@ -2834,7 +2847,7 @@ impl Inner {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
-        self.check_open()?;
+        self.check_writable()?;
         for rd in &batch.row_deletes {
             if rd.table != table || rd.row != row {
                 return Err(Error::InvalidArgument(
@@ -3568,7 +3581,7 @@ impl EngineShard {
         durability: Option<Durability>,
     ) -> Result<PendingCommit> {
         let engine = Arc::clone(&self.engine);
-        engine.check_open()?;
+        engine.check_writable()?;
         let durability = durability.unwrap_or_else(|| engine.shared.default_durability());
         let view = engine.shared.view.load();
         let (builder, shards) = engine.route(batch, &view)?;

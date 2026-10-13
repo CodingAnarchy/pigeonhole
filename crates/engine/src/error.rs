@@ -84,8 +84,10 @@ pub enum Error {
     InvalidArgument(String),
     /// The feature is not available in this build or phase.
     Unsupported(&'static str),
-    /// The database is closed. A commit that fails with it was not committed: when its
-    /// outcome is not known, the commit fails with [`Error::OutcomeUnknown`] instead.
+    /// The database is closed, or a shard died (a panic, a dropped application-owned shard,
+    /// a failed WAL sync or a failed apply), after which every new commit is refused. A
+    /// commit that fails with it was not committed: when its outcome is not known, the
+    /// commit fails with [`Error::OutcomeUnknown`] instead.
     Closed,
     /// Every reader slot in the shared-memory region is taken.
     NoReaderSlot,

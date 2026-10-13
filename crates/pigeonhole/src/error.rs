@@ -49,8 +49,9 @@ pub enum ErrorCode {
     InvalidArgument = 19,
     /// The feature is not available in this build.
     Unsupported = 20,
-    /// The database is closed. A commit that fails with it was not committed (one whose
-    /// outcome is not known fails with [`ErrorCode::OutcomeUnknown`]).
+    /// The database is closed, or a shard failed and the database now refuses every new
+    /// commit (reads still work; reopen it). A commit that fails with it was not committed
+    /// (one whose outcome is not known fails with [`ErrorCode::OutcomeUnknown`]).
     Closed = 21,
     /// Every reader slot in the shared-memory region is taken.
     NoReaderSlot = 22,
