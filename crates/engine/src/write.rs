@@ -678,21 +678,24 @@ fn park_for_reply<T: Send>(
 /// `OutcomeUnknown`, which the next open settles (ICR 0038, ICR 0040). Any recorded failure
 /// counts, even another shard's: then a commit dropped unwritten also reads `OutcomeUnknown`,
 /// which is safe (reading it back finds it missing). A panicking shard records its failure as
-/// its thread unwinds, after it dropped the replies in flight, so this waits briefly for that
-/// record, sleeping between looks (blocking waits only; never on the commit path).
+/// its thread unwinds, after the frames holding replies in flight dropped them, so this waits
+/// up to 100 ms for that record: the record wakes it, as does the close finishing (#646;
+/// blocking waits only, never on the commit path).
 #[cold]
 fn dropped_reply(shared: &crate::shard::Shared) -> Error {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
-    loop {
-        if shared.failure.get().is_some() {
-            return Error::OutcomeUnknown;
-        }
-        if shared.closed.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
-            return Error::Closed;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    let deadline = std::time::Instant::now() + DROPPED_REPLY_WAIT;
+    if shared
+        .failure
+        .wait(deadline, || shared.closed.load(Ordering::Acquire))
+    {
+        Error::OutcomeUnknown
+    } else {
+        Error::Closed
     }
 }
+
+/// How long [`dropped_reply`] waits for a dropping shard's failure to be recorded.
+const DROPPED_REPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// As [`dropped_reply`] without waiting (a poll, or a thread that drives a shard): a failure
 /// already recorded makes it `OutcomeUnknown`.
