@@ -333,11 +333,13 @@ impl std::ops::Deref for ShardRef {
 
 /// What [`Inner::route_and_send`] did with a commit's request.
 pub(crate) enum Routed {
-    /// Sent to `target`; the commit's waiter and whether a wait may spin.
+    /// Sent to `target`; the commit's waiter, whether a wait may spin, and the admission
+    /// charge it took (an async commit's).
     Sent {
         target: ShardId,
         waiter: Waiter<Result<crate::write::Settled>>,
         spins: bool,
+        charge: Option<crate::admission::Charge>,
     },
     /// Built and held back, to send once admitted.
     Held(Prepared),
@@ -1424,12 +1426,7 @@ impl Engine {
         // D236: routed once; the charge goes to the shard the request is sent to (a
         // cross-shard commit's coordinator), on that shard's own count.
         let bytes = crate::admission::batch_bytes(&batch);
-        let mut charge = None;
-        let routed = inner.route_and_send(batch, durability, None, None, |target| {
-            charge = a.try_fast(usize::from(target.0), bytes);
-            charge.is_some()
-        })?;
-        match routed {
+        match inner.route_and_send(batch, durability, None, None, Some((a, bytes)))? {
             Routed::Held(prepared) => {
                 let shard = usize::from(prepared.target.0);
                 let admit = crate::Admit::new(Some(a), shard, bytes);
@@ -1449,9 +1446,17 @@ impl Engine {
                     }),
                 ))
             }
-            sent => {
-                // A failed send dropped the charge, which returned it.
-                let pending = PendingCommit::from(inner.submission(sent)?);
+            Routed::Sent {
+                target,
+                waiter,
+                spins,
+                charge,
+            } => {
+                let pending = PendingCommit::from(Submission {
+                    waiter,
+                    shared: inner.shard_ref(target),
+                    spins,
+                });
                 if let Some(mut charge) = charge {
                     charge.attach(&pending.sub.waiter);
                 }
@@ -2868,14 +2873,14 @@ impl Inner {
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
-        let routed = self.route_and_send(batch, durability, validate, predicate, |_| true)?;
+        let routed = self.route_and_send(batch, durability, validate, predicate, None)?;
         self.submission(routed)
     }
 
     /// Routes `batch` and sends its request to its shard (a cross-shard commit's
-    /// coordinator) if `admit(target)` says so, else builds it and hands it back to send
-    /// later ([`send`](Self::send)). An async commit charges its admission in `admit`
-    /// (D236), so it is routed once. A request sent later than it was routed is still
+    /// coordinator). With `admit` (an async commit's admission and bytes), it first charges
+    /// that shard (D236), so the commit is routed once; without room it builds the request
+    /// and hands it back to send later ([`send`](Self::send)). A request sent later than it was routed is still
     /// correct: a shard that handed a tablet away re-routes commits routed with an older
     /// tablet map. The request is built inside the `submit` call that sends it, never moved
     /// through a struct or a closure on the way: that cost the commit shapes 60–90
@@ -2887,7 +2892,7 @@ impl Inner {
         durability: Option<Durability>,
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
-        admit: impl FnOnce(ShardId) -> bool,
+        admit: Option<(&crate::admission::Admission, u64)>,
     ) -> Result<Routed> {
         if self.read_only {
             return Err(Error::ReadOnly);
@@ -2934,20 +2939,28 @@ impl Inner {
                     })
                 };
             }
-            if admit(target) {
-                self.shared.submitter(target).submit(request!())?;
-                return Ok(Routed::Sent {
-                    target,
-                    waiter,
-                    spins,
-                });
-            }
-            return Ok(Routed::Held(Prepared {
+            let charge = match admit {
+                None => None,
+                Some((a, bytes)) => match a.try_fast(usize::from(target.0), bytes) {
+                    Some(c) => Some(c),
+                    None => {
+                        return Ok(Routed::Held(Prepared {
+                            target,
+                            msg: request!(),
+                            waiter,
+                            spins,
+                        }));
+                    }
+                },
+            };
+            // A failed submit drops the charge, which returns it.
+            self.shared.submitter(target).submit(request!())?;
+            return Ok(Routed::Sent {
                 target,
-                msg: request!(),
                 waiter,
                 spins,
-            }));
+                charge,
+            });
         }
         if predicate.is_some() {
             return Err(Error::InvalidArgument(
@@ -2967,20 +2980,28 @@ impl Inner {
             epoch: 0,
             attempts: 0,
         }));
-        if admit(target) {
-            self.shared.submitter(target).submit(msg)?;
-            return Ok(Routed::Sent {
-                target,
-                waiter,
-                spins,
-            });
-        }
-        Ok(Routed::Held(Prepared {
+        let charge = match admit {
+            None => None,
+            Some((a, bytes)) => match a.try_fast(usize::from(target.0), bytes) {
+                Some(c) => Some(c),
+                None => {
+                    return Ok(Routed::Held(Prepared {
+                        target,
+                        msg,
+                        waiter,
+                        spins,
+                    }));
+                }
+            },
+        };
+        // A failed submit drops the charge, which returns it.
+        self.shared.submitter(target).submit(msg)?;
+        Ok(Routed::Sent {
             target,
-            msg,
             waiter,
             spins,
-        }))
+            charge,
+        })
     }
 
     /// Submits and waits on the engine's borrowed state (D236): a blocking commit takes no
@@ -2990,7 +3011,7 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
-        match self.route_and_send(batch, durability, None, None, |_| true)? {
+        match self.route_and_send(batch, durability, None, None, None)? {
             Routed::Sent {
                 mut waiter, spins, ..
             } => crate::write::wait_blocking(&self.shared, &mut waiter, spins),
@@ -3006,6 +3027,7 @@ impl Inner {
                 target,
                 waiter,
                 spins,
+                ..
             } => Ok(Submission {
                 waiter,
                 shared: self.shard_ref(target),
