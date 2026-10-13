@@ -3981,11 +3981,23 @@ impl ShardState {
 
     // ---- the group commit ----
 
-    /// Fails every member of a group that could not be logged.
-    fn fail_all(&mut self, members: Vec<Member>, ctx: &mut ShardContext<'_, ShardMsg>) {
+    /// Fails every member of a group that could not be logged. `written`: the failure came
+    /// at or after the group's `write()`, which may have put some or all of its records in
+    /// the file, so the next open may replay them: `OutcomeUnknown` (ICR 0038, ICR 0040).
+    /// Otherwise nothing reached the file: the poison error, not committed.
+    fn fail_all(
+        &mut self,
+        members: Vec<Member>,
+        written: bool,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
         for mut m in members {
             if m.failed.is_none() {
-                m.failed = Some(poisoned_error());
+                m.failed = Some(if written {
+                    Error::OutcomeUnknown
+                } else {
+                    poisoned_error()
+                });
             }
             self.settle(m, Ok(()), ctx);
         }
@@ -4440,7 +4452,8 @@ impl ShardState {
                 Err(e) => {
                     trace!("shard {} append failed: {e}", self.id.0);
                     self.poison(crate::health::FailureCause::Io);
-                    self.fail_all(group.members, ctx);
+                    // Nothing of the group was written: the stream is poisoned before it.
+                    self.fail_all(group.members, false, ctx);
                     return;
                 }
             }
@@ -4454,7 +4467,8 @@ impl ShardState {
                         }
                         Err(_) => {
                             self.poison(crate::health::FailureCause::Io);
-                            self.fail_all(group.members, ctx);
+                            // Submitting the sync writes what is buffered first.
+                            self.fail_all(group.members, true, ctx);
                             return;
                         }
                     }
@@ -4467,7 +4481,8 @@ impl ShardState {
             let wal = self.wal.as_mut().expect("appended through it");
             if wal.write().is_err() {
                 self.poison(crate::health::FailureCause::Io);
-                self.fail_all(group.members, ctx);
+                // A partial write may leave whole records in the file.
+                self.fail_all(group.members, true, ctx);
                 return;
             }
             // Visible once applied (D227), unless a record is not yet where a crash
@@ -4501,7 +4516,8 @@ impl ShardState {
                         }
                         Err(_) => {
                             self.poison(crate::health::FailureCause::Io);
-                            self.fail_all(group.members, ctx);
+                            // Submitting the sync writes what is buffered first.
+                            self.fail_all(group.members, true, ctx);
                             return;
                         }
                     }
@@ -5315,11 +5331,10 @@ impl ShardState {
                 self.sync_failed_floor = self.sync_failed_floor.min(first);
             }
             self.publish_watermark();
+            // The group's records were written (and applied, D227): a reopen without a power
+            // loss replays them, so the outcome is the WAL's (ICR 0038, ICR 0040).
             let outcome = if failed {
-                Err(Error::Io(pigeonhole_io::Error::new(
-                    ErrorKind::Other,
-                    "WAL sync failed; the commit may not be durable",
-                )))
+                Err(Error::OutcomeUnknown)
             } else {
                 Ok(())
             };
@@ -5347,10 +5362,7 @@ impl ShardState {
         let mut members = group.members;
         for m in members.drain(..) {
             let outcome = if failed {
-                Err(Error::Io(pigeonhole_io::Error::new(
-                    ErrorKind::Other,
-                    "WAL sync failed; the commit may not be durable",
-                )))
+                Err(Error::OutcomeUnknown)
             } else {
                 Ok(())
             };

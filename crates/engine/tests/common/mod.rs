@@ -4931,8 +4931,12 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
                 };
                 match poll_commit(pc) {
                     Poll::Pending => i += 1,
-                    Poll::Ready(Err(Error::Io(e))) => {
-                        w.trace.push(format!("  -> I/O error ({e})"));
+                    // The injected write error fails the group after its write: the outcome
+                    // is the WAL's (`OutcomeUnknown`, ICR 0040), or an I/O error for a group
+                    // refused before writing. Either may have landed or not.
+                    Poll::Ready(Err(e @ (Error::Io(_) | Error::OutcomeUnknown))) => {
+                        w.trace
+                            .push(format!("  -> I/O error or outcome unknown ({e})"));
                         w.stats.io_errors += 1;
                         let c = w.in_flight.remove(i).commit;
                         w.unacked.push(c);

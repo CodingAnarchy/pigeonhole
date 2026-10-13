@@ -37,10 +37,14 @@ impl Engine /* and pigeonhole::Pigeonhole */ {
   - The WAL keeps the record, and the next open replays it.
 - **`OutcomeUnknown` for commits that may have been written** (following ICR 0038, which already decided that `Closed` means not committed):
   - a single-shard commit whose apply failed after its WAL append (was the apply's own error, e.g. `Busy`): its record replays at the next open;
+  - a commit whose group's WAL sync failed (was `Io("WAL sync failed; …")`): its records were written, and applied (D227), so a reopen without a power loss replays them;
+  - a commit whose group's `write()`, or the sync submission that writes first, failed (was the poison `Io`): a partial write can leave whole records in the file. A failure while *appending*, before any write, keeps the poison `Io`: nothing of the group reached the file. So `Io` for a commit means "refused before anything was written", as the recovery guide says;
   - a commit whose reply the shard dropped unanswered because the instance failed (was `Closed`).
     - A panicking shard drops the members in flight while unwinding, possibly after writing them.
     - It records its failure only at the end of the unwind, so a blocking wait allows up to 100 ms (yielding) for the record before it decides. That's off the commit path: only when a reply is dropped.
     - A poll checks once.
+    - Any recorded failure counts, even another shard's or the main file's. After an unrelated failure, a commit dropped unwritten also reads `OutcomeUnknown` where `Closed` would have been exact. That's safe: reading it back finds it missing.
+    - The wait sleeps 1 ms between looks rather than spinning.
 
 ## Why
 

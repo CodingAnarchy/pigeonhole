@@ -32,7 +32,7 @@ Open the same path with the same options. The open replays the log: every commit
 |---|---|---|
 | `OutcomeUnknown` | maybe committed: its records may be in the log | Read it back after the reopen. If it's missing, write it again. Idempotent writes (a `put` of a full value, not an `incr`) make "write it again" always safe. |
 | `Closed` | not committed | Retry it on the reopened instance. |
-| `Io` | not committed (the shard refused it) | Retry it on the reopened instance. If the disk keeps failing, the reopen or the retry fails too: fix the disk first. |
+| `Io` | not committed: the shard refused it before writing anything (a commit whose own log write or sync failed gets `OutcomeUnknown` instead) | Retry it on the reopened instance. If the disk keeps failing, the reopen or the retry fails too: fix the disk first. |
 | success | committed, durable at its level | Nothing. |
 
 Non-idempotent writes (`incr`, a `commit_if` whose condition depends on the outcome) need care with `OutcomeUnknown`. Read the current value after the reopen and decide from it, or record an operation id in the same commit and check for it before writing again.

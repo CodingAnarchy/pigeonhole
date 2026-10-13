@@ -653,9 +653,11 @@ fn park_for_reply<T: Send>(
 /// The error for a commit whose shard dropped its reply unanswered: it stopped first. A
 /// shard the close stopped drops only commits it never wrote: `Closed`. A failed shard (a
 /// panic, a dropped driver) may have written the commit's record before it stopped:
-/// `OutcomeUnknown`, which the next open settles (ICR 0038, ICR 0040). A panicking shard
-/// records its failure as its thread unwinds, after it dropped the replies in flight, so this
-/// waits briefly for that record (blocking waits only; never on the commit path).
+/// `OutcomeUnknown`, which the next open settles (ICR 0038, ICR 0040). Any recorded failure
+/// counts, even another shard's: then a commit dropped unwritten also reads `OutcomeUnknown`,
+/// which is safe (reading it back finds it missing). A panicking shard records its failure as
+/// its thread unwinds, after it dropped the replies in flight, so this waits briefly for that
+/// record, sleeping between looks (blocking waits only; never on the commit path).
 #[cold]
 fn dropped_reply(shared: &crate::shard::Shared) -> Error {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -666,7 +668,7 @@ fn dropped_reply(shared: &crate::shard::Shared) -> Error {
         if shared.closed.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
             return Error::Closed;
         }
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 

@@ -873,10 +873,11 @@ fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     rx.recv_timeout(Duration::from_secs(10))
         .expect("a commit on shard 0 waited behind shard 1's unsynced group")
         .unwrap();
-    // The held sync completes with its (injected) failure: shard 1 is poisoned.
+    // The held sync completes with its (injected) failure: shard 1 is poisoned. The group was
+    // written, so its outcome is the WAL's (ICR 0040).
     gate.release();
     let doomed = gate::within(10, move || doomed.wait()).expect("the poisoned commit hung");
-    assert!(matches!(doomed, Err(Error::Io(_))), "{doomed:?}");
+    assert!(matches!(doomed, Err(Error::OutcomeUnknown)), "{doomed:?}");
 
     // A cross-shard commit with the poisoned participant fails, and leaves nothing held.
     let mut both = put(&on_a, "both");
