@@ -244,6 +244,8 @@ struct Attachment {
 /// Everything behind an [`Engine`] (and the handle a [`Txn`] keeps).
 pub(crate) struct Inner {
     pub(crate) shared: Arc<Shared>,
+    /// One handle on `shared` per shard, for pending commits (D236).
+    shard_refs: Box<[Arc<ShardRef>]>,
     role: Role,
     /// Refuses writes and catalog changes with `ReadOnly`: a reader process, or a writer
     /// opened with `allow_unregistered_merge` over a family whose operator is unknown.
@@ -315,6 +317,29 @@ pub struct Engine {
 
 /// [`Inner::fast_admit`]'s outcome: a charge (none when unbounded) to submit with, or the
 /// admission to wait on.
+/// The engine's shared state as one shard's commits reach it (D236): one handle per shard,
+/// each in its own cache lines, so the reference count a pending commit takes is its shard's
+/// alone rather than one every committing thread writes.
+#[derive(Debug)]
+#[repr(align(128))]
+pub(crate) struct ShardRef(Arc<Shared>);
+
+impl std::ops::Deref for ShardRef {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.0
+    }
+}
+
+/// A routed commit request not yet sent ([`Inner::prepare`]).
+pub(crate) struct Prepared {
+    /// The shard it goes to: its only shard, or a cross-shard commit's coordinator.
+    pub(crate) target: ShardId,
+    msg: ShardMsg,
+    waiter: Waiter<Result<crate::write::Settled>>,
+    spins: bool,
+}
+
 pub(crate) enum FastAdmit {
     Charged(crate::admission::Charge),
     Wait(crate::Admit),
@@ -1022,6 +1047,9 @@ impl Engine {
         let admission = Some(Arc::new(crate::admission::Admission::new(shards, bound)));
         let inner = Arc::new(Inner {
             shared: Arc::clone(&shared),
+            shard_refs: (0..shards.max(1))
+                .map(|_| Arc::new(ShardRef(Arc::clone(&shared))))
+                .collect(),
             role: Role::Writer,
             read_only,
             options,
@@ -1197,6 +1225,8 @@ impl Engine {
             hooks: Default::default(),
         };
         let inner = Arc::new(Inner {
+            // A reader commits nothing; one handle keeps `shard_ref` total.
+            shard_refs: Box::new([Arc::new(ShardRef(Arc::clone(&shared)))]),
             shared,
             role: Role::Reader,
             read_only: true,
@@ -1373,25 +1403,41 @@ impl Engine {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<PendingCommit> {
-        match self.inner.fast_admit(None, &batch) {
-            FastAdmit::Wait(admit) => {
-                let inner = Arc::clone(&self.inner);
-                Ok(PendingCommit::waiting(
-                    Arc::clone(&self.inner.shared),
-                    admit,
-                    Box::new(move || {
-                        inner
-                            .submit(batch, durability, None, None)
-                            .map(PendingCommit::from)
-                    }),
-                ))
-            }
-            FastAdmit::Charged(mut charge) => {
-                // A failed submission drops the charge, which returns it.
-                let pending =
-                    PendingCommit::from(self.inner.submit(batch, durability, None, None)?);
+        let inner = &self.inner;
+        let Some(a) = &inner.admission else {
+            return inner
+                .submit(batch, durability, None, None)
+                .map(PendingCommit::from);
+        };
+        // D236: routed once; the charge goes to the shard the request is sent to (a
+        // cross-shard commit's coordinator), on that shard's own count.
+        let bytes = crate::admission::batch_bytes(&batch);
+        let prepared = inner.prepare(batch, durability, None, None)?;
+        let shard = usize::from(prepared.target.0);
+        match a.try_fast(shard, bytes) {
+            Some(mut charge) => {
+                // A failed send drops the charge, which returns it.
+                let pending = PendingCommit::from(inner.send(prepared)?);
                 charge.attach(&pending.sub.waiter);
                 Ok(pending)
+            }
+            None => {
+                let admit = crate::Admit::new(Some(a), shard, bytes);
+                let engine = Arc::clone(inner);
+                // The request is sent once admitted; `Mutex` only makes the closure `Sync`.
+                let prepared = Mutex::new(Some(prepared));
+                Ok(PendingCommit::waiting(
+                    inner.shard_ref(ShardId(shard as u16)),
+                    admit,
+                    Box::new(move || {
+                        let prepared = prepared
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                            .ok_or(Error::Closed)?;
+                        engine.send(prepared).map(PendingCommit::from)
+                    }),
+                ))
             }
         }
     }
@@ -1411,7 +1457,7 @@ impl Engine {
                 let inner = Arc::clone(&self.inner);
                 let (row, predicate) = (row.to_vec(), predicate.clone());
                 return Ok(PendingCheck::waiting(
-                    Arc::clone(&self.inner.shared),
+                    self.inner.shard_ref(ShardId(admit.shard() as u16)),
                     admit,
                     Box::new(move || {
                         inner.submit_check_and_mutate(table, &row, &predicate, batch, durability)
@@ -2454,8 +2500,8 @@ impl Inner {
         self.admit_routed(None, batch)
     }
 
-    /// The async fast path (D210): a charge on the engine-wide count when it fits and no
-    /// one waits, else the routed admission to wait on.
+    /// The async fast path (D210, D236): a charge on its shard's count when it fits and no
+    /// one waits there, else the admission to wait on.
     #[inline]
     pub(crate) fn fast_admit(
         &self,
@@ -2465,9 +2511,11 @@ impl Inner {
         let Some(a) = &self.admission else {
             return FastAdmit::Charged(crate::admission::Charge::none());
         };
-        match a.try_fast(crate::admission::batch_bytes(batch)) {
-            Some(arg) => FastAdmit::Charged(crate::admission::Charge::new(a, arg)),
-            None => FastAdmit::Wait(self.admit_routed(row, batch)),
+        let shard = self.admission_shard(a, row, batch);
+        let bytes = crate::admission::batch_bytes(batch);
+        match a.try_fast(shard, bytes) {
+            Some(charge) => FastAdmit::Charged(charge),
+            None => FastAdmit::Wait(crate::Admit::new(Some(a), shard, bytes)),
         }
     }
 
@@ -2477,29 +2525,48 @@ impl Inner {
         row: Option<(TableId, &[u8])>,
         batch: &WriteBatch,
     ) -> crate::Admit {
-        let shard = match &self.admission {
-            Some(a) if a.sharded() => {
-                let view = self.shared.view.load();
-                let route = |t: TableId, r: &[u8]| view.tablets().route(t, r);
-                let routed = match row {
-                    Some((t, r)) => route(t, r),
-                    None => match batch.builder.batch().iter().next().and_then(|m| m.ok()) {
-                        Some(m) => route(m.table, m.row),
-                        None => batch
-                            .row_deletes
-                            .first()
-                            .and_then(|d| route(d.table, &d.row)),
-                    },
-                };
-                routed.map_or(0, |(_, s)| usize::from(s.0))
-            }
-            _ => 0,
-        };
+        let shard = self
+            .admission
+            .as_ref()
+            .map_or(0, |a| self.admission_shard(a, row, batch));
         crate::Admit::new(
             self.admission.as_ref(),
             shard,
             crate::admission::batch_bytes(batch),
         )
+    }
+
+    /// The shard an async commit of `batch` is charged to: that of `row` when given, else
+    /// of the batch's first row (a cross-shard batch's coordinator). With one shard, no
+    /// routing.
+    /// The handle on the shared state for commits to `shard` (D236).
+    pub(crate) fn shard_ref(&self, shard: ShardId) -> Arc<ShardRef> {
+        let i = usize::from(shard.0).min(self.shard_refs.len() - 1);
+        Arc::clone(&self.shard_refs[i])
+    }
+
+    fn admission_shard(
+        &self,
+        a: &crate::admission::Admission,
+        row: Option<(TableId, &[u8])>,
+        batch: &WriteBatch,
+    ) -> usize {
+        if !a.sharded() {
+            return 0;
+        }
+        let view = self.shared.view.load();
+        let route = |t: TableId, r: &[u8]| view.tablets().route(t, r);
+        let routed = match row {
+            Some((t, r)) => route(t, r),
+            None => match batch.builder.batch().iter().next().and_then(|m| m.ok()) {
+                Some(m) => route(m.table, m.row),
+                None => batch
+                    .row_deletes
+                    .first()
+                    .and_then(|d| route(d.table, &d.row)),
+            },
+        };
+        routed.map_or(0, |(_, s)| usize::from(s.0))
     }
 
     /// Enters application-thread maintenance: refused once the engine is closing, and the
@@ -2783,6 +2850,21 @@ impl Inner {
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
+        let prepared = self.prepare(batch, durability, validate, predicate)?;
+        self.send(prepared)
+    }
+
+    /// Routes `batch` and builds its request, without sending it: [`send`](Self::send)
+    /// does. An async commit charges its admission between the two (D236), so it is routed
+    /// once. A request sent later than it was routed is still correct: a shard that handed a
+    /// tablet away re-routes commits routed with an older tablet map.
+    pub(crate) fn prepare(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        validate: Option<(Seqno, Vec<ReadKey>)>,
+        predicate: Option<(TableId, Vec<u8>, Predicate)>,
+    ) -> Result<Prepared> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -2809,11 +2891,11 @@ impl Inner {
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::commit_succeeded);
         }
-        if shards.len() <= 1 {
+        let (target, msg) = if shards.len() <= 1 {
             let shard = shards.first().copied().unwrap_or(ShardId(0));
-            self.shared
-                .submitter(shard)
-                .submit(ShardMsg::Commit(CommitReq {
+            (
+                shard,
+                ShardMsg::Commit(CommitReq {
                     bytes: builder,
                     durability,
                     reply: Reply::Commit(tx),
@@ -2823,7 +2905,8 @@ impl Inner {
                     commit_ts: None,
                     map_version: view.tablets().version(),
                     attempts: 0,
-                }))?;
+                }),
+            )
         } else {
             if predicate.is_some() {
                 return Err(Error::InvalidArgument(
@@ -2832,9 +2915,9 @@ impl Inner {
             }
             let parts = split_by_shard(&view, &builder, &shards)?;
             let coordinator = shards[0];
-            self.shared
-                .submitter(coordinator)
-                .submit(ShardMsg::Coordinate(Box::new(CoordinateReq {
+            (
+                coordinator,
+                ShardMsg::Coordinate(Box::new(CoordinateReq {
                     parts,
                     durability,
                     reply: tx,
@@ -2844,13 +2927,32 @@ impl Inner {
                     commit_ts: None,
                     epoch: 0,
                     attempts: 0,
-                })))?;
-        }
-        Ok(Submission {
+                })),
+            )
+        };
+        Ok(Prepared {
+            target,
+            msg,
             waiter,
-            shared: Arc::clone(&self.shared),
             // A durable commit waits for a sync: polling for it would only burn the CPU.
             spins: matches!(durability, Durability::None | Durability::Buffered),
+        })
+    }
+
+    /// Sends a [`prepare`](Self::prepare)d request to its shard (the coordinator of a
+    /// cross-shard one).
+    pub(crate) fn send(&self, prepared: Prepared) -> Result<Submission> {
+        let Prepared {
+            target,
+            msg,
+            waiter,
+            spins,
+        } = prepared;
+        self.shared.submitter(target).submit(msg)?;
+        Ok(Submission {
+            waiter,
+            shared: self.shard_ref(target),
+            spins,
         })
     }
 
@@ -2914,7 +3016,7 @@ impl Inner {
             }))?;
         Ok(PendingCheck {
             waiter: rx,
-            shared: Arc::clone(&self.shared),
+            shared: self.shard_ref(shard),
             resolved: None,
             deferred: None,
         })
@@ -3639,7 +3741,7 @@ impl EngineShard {
         });
         Ok(PendingCommit::from(Submission {
             waiter,
-            shared: Arc::clone(&engine.shared),
+            shared: engine.shard_ref(me),
             spins: false,
         }))
     }

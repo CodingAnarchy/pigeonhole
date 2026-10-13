@@ -436,7 +436,7 @@ The full record is in `docs/design/questions/wal.md`.
 **Now:**
 - **The bound.** Each shard holds at most half `memtable_budget` (2 MiB per 4 MiB arena; 32 MiB at the defaults) of async commits submitted and not yet resolved. Bytes are the encoded batch. A cross-shard batch is charged to its coordinator, the shard of its first row. The bound follows `memtable_budget`; there is no separate option (an `EngineOptions` override exists for tests).
 - **Over the bound, an async commit waits before it submits.** `commit_async`, `commit_with_async`, `commit_if_async` and `Transaction::commit_async`/`commit_with_async` submit at the call when their shard has room and no earlier async commit waits. Otherwise the future waits in its shard's queue, in arrival order, and submits when it's first and fits. A commit larger than the bound goes alone once the shard holds nothing. A later commit never overtakes an earlier waiting one, even if it would fit.
-- **The fast path.** While the async bytes in flight on all shards *together* fit the bound and no commit waits, a commit is charged to that engine-wide count with one compare-and-add, without routing, and submitted at once; every shard is then within the bound. Past that, a commit is routed to its shard and charged there (counting the unrouted bytes as possibly that shard's), or queued.
+- **The fast path.** While the async bytes in flight on all shards *together* fit the bound and no commit waits, a commit is charged to that engine-wide count with one compare-and-add, without routing, and submitted at once; every shard is then within the bound. Past that, a commit is routed to its shard and charged there (counting the unrouted bytes as possibly that shard's), or queued. *(Replaced by D236: the fast path charges the commit's own shard, once it is routed.)*
 - **The charge is returned when the commit resolves,** on the resolving thread, whether or not anyone polls the future. It's a field on the completion, set from the waiting side (`Waiter::on_settled(Arc<dyn Settle>, u64)` in `pigeonhole-runtime`): no allocation.
 - **A future dropped before it submitted writes nothing** (amends D196, which said dropping a commit future never rolls it back). Once submitted, dropping still does not roll the commit back. So "fire and forget" (`let _ = t.mutate(..).commit_async();`) is safe only while the shard is under its bound. When it's over, the dropped commit is lost. Keep the future and await it, or use a blocking `commit` or `commit_with_ticket`.
 - **Blocking commits and `commit_with_ticket` are not charged and never wait for admission.** Their threads bound them, and their path is unchanged.
@@ -1182,4 +1182,31 @@ A thread-per-core application pins its shard threads, so the gate measures that,
 **Proposed:** async admission charged on a per-shard counter on its own cache line, with no engine-wide total and no per-commit `Arc` clone. D210's semantics would be unchanged.
 
 **Not adopted:** #615 measured no gain on the AX102 and was closed. D236 (#626) takes the commit-path part of the idea further: a per-shard submission handle, and admission charged on the target shard once the commit is routed.
+
+<a id="d236"></a>
+## D236 — A commit writes no engine-wide memory on its way: the async fast path charges the shard the commit is routed to, and a pending commit holds its shard's handle on the shared state (coordinator, 2026-10-13; engine, #406 scaling; amends D210)
+
+**Decided:**
+- **Admission (amends D210's fast path).**
+  - `submit_async` routes the batch once (`Inner::prepare`), then charges the shard the request goes to (its only shard, or a cross-shard commit's coordinator) with one compare-and-add on that shard's own count, and sends it.
+  - Without room, the prepared request waits in that shard's queue and is sent once admitted. A request sent later than it was routed is still correct: a shard that handed a tablet away re-routes commits routed with an older map.
+  - D210's engine-wide count is gone. Each shard's count, waiter count and queue sit in their own 128-byte-aligned allocation, and a charge returns to its shard alone.
+  - The bound, arrival order, blocking commits and the drop semantics are unchanged.
+- **The pending commit's handle.** `Submission` and `PendingCheck` hold an `Arc<ShardRef>` for their target shard (one per shard, made at open, wrapping the engine's `Arc<Shared>`), not an `Arc<Shared>` clone each. Commits to different shards no longer share a reference count.
+
+**Why:** both were cache lines every commit on every shard wrote: a CAS and a `fetch_sub` on the admission count, and an increment and decrement of `Shared`'s reference count. Across the AX102's two CCDs those lines bounce.
+- A removal A/B on scratch builds, 8 shards pinned, isolated them (two rounds):
+  - main: one CCD 3.23–3.24M commits/s, split 4+4 2.70–2.73M (−16%);
+  - without the refcount: split 2.80–2.83M;
+  - without both: split 2.95–2.99M (−9%).
+- An earlier attempt at the admission part alone (#615) routed every commit twice. It measured −3.4% at 8 shards and was closed; this design routes once.
+
+**Measured** (AX102, 2026-10-13, scaling pre-split, `--scale full --min-secs 8`, two rounds alternated):
+
+| | main | D236 |
+|---|--:|--:|
+| 8 shards, one CCD, pinned | 3.31M, 3.24M | 3.34M, 3.24M |
+| 8 shards, split 4+4, pinned | 2.71M, 2.74M | **2.92M, 2.92M (+7%)** |
+| 16 shards, pinned | 4.20M, 4.20M | **4.69M, 4.68M (+11.6%)** |
+| 16 shards, unpinned | 4.15M, 4.03M | 4.37M, 4.43M (+7%) |
 
