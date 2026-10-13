@@ -51,20 +51,54 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | 21 | `Closed` | The database is closed. | A table or snapshot handle used after `close()`; a commit still in flight when the database closed; or any new commit after a shard failed (a panic, a dropped application-owned shard, a failed log fsync or a failed apply): the database refuses writes from then on, though reads still work. | Reopen the database. A commit that got `Closed` was **not committed**; one whose outcome is not known gets `OutcomeUnknown` instead. |
 | 22 | `NoReaderSlot` | Every reader slot in the shared-memory region is taken. | Too many concurrent reader processes. | Close idle readers, then retry. |
 | 23 | `RecordTooLarge` | A commit is too large for one WAL record. | A very large `WriteBatch`. | Split it into smaller batches (each atomic on its own). |
-| 24 | `Busy` | A write, a `flush` or a `compact` waited out a write stall for the whole write-stall timeout (`Options::write_stall_timeout`, 30 s by default), counted from when that call began waiting. In a reader process, `snapshot()` also returns it when the writer has committed a manifest change but has not published it for about a second (a writer that died or stalled mid-publish). | A write found the arena full and waited for a flush, or a flush had no room for the fresh memtables it needs, and nothing freed room in time (a slow or full disk, ingest faster than flush and compaction can keep up, or snapshots pinning memtables). Or a commit waited on a tablet split, merge or move for the whole timeout. | **Transient: back off and retry**, and drop old snapshots. To fail faster (latency-sensitive callers) or wait longer (bulk loads), set `Options::write_stall_timeout`. A batch that can never fit gets `BatchTooLarge` instead, never `Busy`. Known limit: a value close to the `ValueTooLarge` limit can find no long enough free run in a fragmented arena even after a flush, and then ends with `Busy` at the timeout rather than being admitted; raise `Options::memtable_budget`. |
+| 24 | `Busy` | A write, a `flush` or a `compact` waited past the write-stall timeout (`Options::write_stall_timeout`, 30 s by default). The timeout is each call's own: a wait for memtable room counts from when that call began waiting, however long the shard has been short of room for the calls ahead of it (D240), and a wait on a tablet change counts from when the commit was submitted (D241). In a reader process, `snapshot()` also returns it when the writer has committed a manifest change but has not published it for about a second (a writer that died or stalled mid-publish). | Waiting for memtable room: a commit found the arena full and waited for a flush, or a flush had no room for the fresh memtables it needs, and nothing freed room in time (a slow or full disk, ingest faster than flush and compaction can keep up, or snapshots pinning memtables). Waiting on a tablet change: the commit's rows were being split, merged or moved between shards for the whole timeout, or a cross-shard commit kept being refused by its participants for that reason (it is retried as often as needed until the timeout, never given up after a number of tries). An L0 write stall (compaction falling behind) slows commits down but never returns `Busy`. | **Transient: back off and retry.** A commit that got `Busy` was **not committed**, so retrying it is safe, conditional and non-idempotent ones included. Back off with a growing, jittered delay: retrying at once adds to the load that caused the stall. A `flush` or `compact` that got `Busy` did not finish; nothing already committed is lost. Drop old snapshots, which pin memtables. To fail faster (latency-sensitive callers) or wait longer (bulk loads), set `Options::write_stall_timeout`. A batch that can never fit gets `BatchTooLarge` instead, never `Busy`. Known limit: a value close to the `ValueTooLarge` limit can find no long enough free run in a fragmented arena even after a flush, and then ends with `Busy` at the timeout rather than being admitted; raise `Options::memtable_budget`. |
 | 25 | `SnapshotExpired` | A reader process's snapshot was taken before a writer restart. | The writer process closed or crashed and a new writer opened. The new writer may reuse the space the old snapshot reads, so every read through that snapshot (`get`, `row`, `scan` and each scan step) fails instead of returning wrong data. Snapshots in the writer process never expire. | Drop the snapshot, take a new one and redo the read. |
 | 26 | `WouldDeadlock` | A submitted commit's outcome was awaited on a thread that drives a shard (application-owned mode). | `PendingCommit::wait()` called on the thread that runs a `Shard`, where blocking could deadlock (the commit may need that shard, or any shard it drives, to run). | The commit was submitted and **will apply**: do not resubmit it. Poll its future from the event loop, or wait on another thread. Blocking calls that would submit and wait there (`commit()`, `check_and_mutate`, `flush`, `compact`) fail with `InvalidArgument` instead, before submitting anything. |
 | 27 | `BatchTooLarge` | A batch can never fit a shard's memtable arena, even an empty one. | One batch whose cells (keys and values, plus per-entry overhead) need more than about half of `Options::memtable_budget` on one shard. A single value within the `ValueTooLarge` limit always fits on its own. | **Not transient: retrying never succeeds.** Split the batch into smaller ones (each atomic on its own), or raise `Options::memtable_budget`. |
-| 28 | `OutcomeUnknown` | A commit's outcome is not known in this process. | A shard failed (a panic, or an application-owned shard dropped) or the database closed while the commit was in flight, after its records may have reached the log. Cases: a multi-shard commit whose coordinating shard failed, or one decided to commit that another shard did not apply; a commit whose log sync had not finished when its shard failed; a commit that was durable but whose wait to become visible ended. Never returned for a commit that was not written. In the last case a `GroupSync` or `Sync` commit is in fact durable (its shard acknowledged it only after its sync), so a reopen shows it; a `Buffered` one survives unless a power loss followed. | Reopen the database and read: the reopen decides the commit from the log, all of it or none of it. If the write is idempotent, writing it again is safe. |
+| 28 | `OutcomeUnknown` | A commit's outcome is not known in this process. | A shard failed (a panic, an application-owned shard dropped, or a log write or sync that failed) or the database closed while the commit was in flight, after its records may have reached the log. Cases: a commit whose own log write or sync failed, or whose apply failed after it was logged; a multi-shard commit whose coordinating shard failed, or one decided to commit that another shard did not apply; a commit whose log sync had not finished when its shard failed; a commit that was durable but whose wait to become visible ended. Never returned for a commit that was not written. In the last case a `GroupSync` or `Sync` commit is in fact durable (its shard acknowledged it only after its sync), so a reopen shows it; a `Buffered` one survives unless a power loss followed. | Reopen the database and read: the reopen decides the commit from the log, all of it or none of it. If the write is idempotent, writing it again is safe. [Recovering from a failed shard](recovery.md) has the steps and an example. |
 
 ## Handling guide
 | Situation | Action |
 |---|---|
-| Retryable | `Busy` from a write stall (back off); `Conflict` (retry the whole transaction); `WriterLocked` (after the other writer exits); `NoSpace` and `Io` once the cause is fixed; `NoReaderSlot` (after a reader process closes); `SnapshotExpired` (take a new snapshot, then redo the read). |
+| Retryable | `Busy` (not committed; back off, then retry); `Conflict` (retry the whole transaction); `WriterLocked` (after the other writer exits); `NoSpace` and `Io` once the cause is fixed; `NoReaderSlot` (after a reader process closes); `SnapshotExpired` (take a new snapshot, then redo the read). |
 | Programmer error | `FamilyNotFound`, `TableNotFound`, `TableExists`, `FamilyExists`, `KeyTooLarge`, `ValueTooLarge`, `RecordTooLarge` (split the batch), `MergeFailed` (bad operand, or mixed data in a 0.1.0 counter column), `InvalidArgument`, `Unsupported`, `Closed`, `ReadOnly`, `WouldDeadlock` (await from the event loop; the commit still applies). Fix the code or the data model. |
 | Configuration | `BatchTooLarge` (split the batch or raise `Options::memtable_budget`), `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
 | Outcome unknown | `OutcomeUnknown`: reopen and read to see whether the commit landed (whole or not at all), then write it again if it did not. |
 | Failed instance | `Pigeonhole::is_failed()` is true (a shard panicked, lost its driver, or stopped after an I/O or internal error; `failure()` says which and why). Close, reopen, then settle the commits in flight: see [Recovering from a failed shard](recovery.md). |
 | Data integrity | `Corruption`. Do not retry; restore from backup. |
+
+
+## Retrying `Busy`
+`Busy` means the call waited the whole write-stall timeout and gave up; a commit that got it was not committed. Retry after a growing delay, and give up (or shed load) after a few tries. The example below retries a commit three times. It runs here on a database with room, so its first try commits.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let pages = pigeonhole::doc_support::table(&db, "pages", &["meta"])?;
+use std::time::Duration;
+use pigeonhole::ErrorCode;
+
+let mut delay = Duration::from_millis(50);
+let mut tries = 0;
+let info = loop {
+    match pages.mutate(b"k").put("meta", b"q", b"v").commit() {
+        // Not committed: nothing to undo. Wait, then try again (add jitter when many
+        // writers retry at once).
+        Err(e) if e.code() == ErrorCode::Busy && tries < 3 => {
+            tries += 1;
+            std::thread::sleep(delay);
+            delay *= 4;
+        }
+        other => break other?,
+    }
+};
+assert!(info.seqno > 0);
+# Ok::<(), pigeonhole::Error>(())
+```
+
+- **What it waited for.** Usually memtable room, because flushes couldn't keep up: a slow or full disk, writes faster than flush and compaction, or old snapshots pinning memtables. `engine_metrics().stalls` counts the stalls and their total time. Less often, a tablet split, merge or move kept the commit waiting.
+- **The timeout.** It is each call's own (D240, D241): a call that began waiting later is not refused at an earlier call's deadline. A shorter `Options::write_stall_timeout` fails faster; a bulk load can set a longer one instead of retrying.
+- **In async code,** `commit_async` fails with the same code. Sleep with your runtime's timer, not `std::thread::sleep`.
 
 If this table disagrees with `crates/pigeonhole/src/error.rs`, the source wins; please report it.

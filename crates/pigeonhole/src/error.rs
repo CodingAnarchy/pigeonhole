@@ -57,10 +57,14 @@ pub enum ErrorCode {
     NoReaderSlot = 22,
     /// A commit is too large for one WAL record.
     RecordTooLarge = 23,
-    /// Writes are stalled. A write that finds the memtable arena full waits while a flush
-    /// frees room; this code means the wait outlasted the engine's stall timeout (30 s), a
-    /// transient condition: back off and retry. A batch that can never fit gets
-    /// [`ErrorCode::BatchTooLarge`] instead.
+    /// A write, `flush` or `compact` waited past
+    /// [`Options::write_stall_timeout`](crate::Options::write_stall_timeout) (30 s by
+    /// default): for memtable room, counted from when that call began waiting, or for a
+    /// tablet split, merge or move, counted from when the commit was submitted. A commit
+    /// that fails with it was not committed. Transient: back off and retry. A batch that can
+    /// never fit gets [`ErrorCode::BatchTooLarge`] instead. A reader process's `snapshot()`
+    /// also returns it when the writer has not published a manifest change for about a
+    /// second.
     Busy = 24,
     /// A reader process's snapshot was taken before a writer restart, which may have reused
     /// the space it reads. Take a new snapshot and redo the read.

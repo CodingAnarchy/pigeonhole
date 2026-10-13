@@ -171,14 +171,24 @@ impl Options {
         self
     }
 
-    /// How long a write, `flush` or `compact` may wait out a write stall (L0 compaction
-    /// falling behind, or the memtable arena full while snapshots or a slow flush hold it)
-    /// before it fails with [`ErrorCode::Busy`](crate::ErrorCode::Busy) (default 30 s). Each
-    /// call's wait counts from when it began waiting, however long the stall has lasted for
-    /// the calls ahead of it. Latency-sensitive applications can fail fast and retry later; batch loaders can wait
-    /// longer. `Duration::ZERO` refuses as soon as a wait would begin. On a clock that does
-    /// not move (a simulator's), a wait nothing can end is refused at once whatever this
-    /// says.
+    /// How long a write, `flush` or `compact` may wait before it fails with
+    /// [`ErrorCode::Busy`](crate::ErrorCode::Busy) (default 30 s). Two waits count:
+    /// - **Memtable room.** A commit that finds its shard's arena full, or a `flush` or
+    ///   `compact` with no room for fresh memtables, waits while flushes free room
+    ///   (snapshots or a slow disk can hold it). Each call's wait counts from when it began
+    ///   waiting, however long the shard has been short of room for the calls ahead of it
+    ///   (D240).
+    /// - **A tablet change.** A commit whose rows are being split, merged or moved between
+    ///   shards waits for the change, and a cross-shard commit that a participant refuses
+    ///   because of one is retried, as often as needed (D241). Both count from when the
+    ///   commit was submitted.
+    ///
+    /// An L0 write stall (compaction falling behind) slows commits down but never fails
+    /// them. A commit that fails with `Busy` was not committed: back off and retry it.
+    /// Latency-sensitive applications can set a shorter timeout and retry later; bulk loaders
+    /// can wait longer. `Duration::ZERO` refuses as soon as a wait would begin. On a clock
+    /// that does not move (a simulator's), a wait nothing can end is refused at once whatever
+    /// this says.
     ///
     /// ```
     /// use std::time::Duration;

@@ -93,8 +93,9 @@ pub enum Error {
     NoReaderSlot,
     /// A commit's WAL record is larger than a WAL segment can hold.
     RecordTooLarge,
-    /// Writes are stalled (L0 too deep, the memtable arena full, or a tablet change the
-    /// commit waits on) and stayed stalled past the write-stall timeout. Transient: retry
+    /// The call waited past the write-stall timeout: for memtable arena room (counted from
+    /// when it began waiting, D240), or for a tablet change (counted from the commit's
+    /// submission, D241). A commit refused with it was not committed. Transient: retry
     /// later.
     Busy,
     /// A batch can never fit a shard's memtable arena, even an empty one (about half of
