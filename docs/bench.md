@@ -85,7 +85,7 @@ Tablets do not split yet (#38), so one table's writes use one shard whatever `--
 
 ## Workloads
 
-Every workload is deterministic for a seed (default `0x5EED`, recorded in every result). After the load, a warmup of 5% of `--ops` runs unrecorded on one thread: these are the first operations of the same seeded stream, and the measured operations follow them. All measured operations are generated before the clock starts, so generation cost is never measured.
+Every workload is deterministic for a seed (default `0x5EED`, recorded in every result). After the load, every engine **settles** (D233): it flushes its write buffer (Pigeonhole and RocksDB flush, fjall rotates its memtable, SQLite checkpoints its WAL), then the run waits until its background work has been quiet for 1 s (no flush or compaction running or completed, and for Pigeonhole no work time on the shard threads), at most 60 s, with a warning and `detail.settle.settled: false` past that. Then a warmup of 5% of `--ops` runs unrecorded on one thread: these are the first operations of the same seeded stream, and the measured operations follow them. All measured operations are generated before the clock starts, so generation cost is never measured.
 
 | Workload | Data | Operation mix |
 |---|---|---|
@@ -133,6 +133,7 @@ Latency is the wall time of one `execute` call, recorded in an HDR-style log-lin
 - **Timer overhead.** Each operation is bracketed by two `Instant::now()` calls, roughly 20–40 ns on current hardware, and that time is included in its latency. It matters only for sub-microsecond operations (point gets on hot data).
 - **Sample counts.** At 200,000 measured operations, p99 rests on 2,000 samples and p99.9 on 200, of which the slowest 200 decide the value. With one thread per workload, a handful of OS scheduling events moves p99.9 a lot; see the calibration below. Raise `--ops` before reading anything into p99.9.
 - **Warmup.** 5% of `--ops` run unrecorded first (`--warmup`). Warmup does not remove effects that grow with time, such as memtable size growing during the run.
+- **Settling after the load (D233).** Before the warmup every engine flushes and waits for its background work to stop (see above), so the measured phase starts from the same state each time. Without it, how much of the load's flushes and compactions fell into the measured phase was timing luck: on the 2026-10-12 gate, ycsb-b's two identical runs measured 224.5K and 280.6K ops/s, the slower with 7 flushes and 7 compactions in its measured phase and the faster with none. The JSON records the step (`detail.settle`: milliseconds, settled, work done) and the measured phase's own background work (`detail.background_work`, flushes plus compactions, Pigeonhole only). `compare` notes every pair whose measured phases did different background work (one some and the other none, or more than twice as much): reported, not judged. The inline drivers (`scaling`, the D213 group commit) have their own warmup and don't settle.
 
 ## Reading results
 

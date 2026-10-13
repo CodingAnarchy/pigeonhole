@@ -108,6 +108,16 @@ impl Runner for SqliteRunner {
         self.execute_counted(op).map(drop)
     }
 
+    fn flush(&mut self) -> Result<(), String> {
+        // Checkpoint the WAL into the database file: SQLite's write buffer (D233).
+        match &self.conn {
+            Some(Conn(c)) => c
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
     fn close(&mut self) -> Result<(), String> {
         if let Some(Conn(c)) = self.conn.take() {
             c.close().map_err(|(_, e)| e.to_string())?;

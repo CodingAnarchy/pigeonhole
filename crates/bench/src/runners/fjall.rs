@@ -89,6 +89,26 @@ impl Runner for FjallRunner {
         Ok(())
     }
 
+    fn flush(&mut self) -> Result<(), String> {
+        match &self.open {
+            Some(h) => h
+                .cells
+                .rotate_memtable_and_wait()
+                .map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    fn background(&self) -> Option<crate::Background> {
+        let h = self.open.as_ref()?;
+        Some(crate::Background {
+            work: None,
+            marker: h.cells.table_count() as u64,
+            running: Some(h.db.outstanding_flushes() > 0),
+            busy_nanos: None,
+        })
+    }
+
     fn execute(&mut self, op: &BenchOp) -> Result<(), String> {
         self.execute_counted(op).map(drop)
     }

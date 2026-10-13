@@ -325,6 +325,28 @@ pub struct RunDetail {
     /// D213); `None` elsewhere and in results written before it existed.
     #[serde(default)]
     pub engine_commit: Option<EngineCommit>,
+    /// The settle step between the load and the warmup (D233); `None` in results written
+    /// before it and for runs without it (the inline drivers).
+    #[serde(default)]
+    pub settle: Option<Settle>,
+    /// Background work (flushes and compactions) completed during the measured phase, for
+    /// stores that count it (Pigeonhole); `None` elsewhere and in results written before it.
+    #[serde(default)]
+    pub background_work: Option<u64>,
+}
+
+/// The settle step after the load (D233): the store flushed its write buffer, then the run
+/// waited until its background work stopped, so the measured phase starts from a settled
+/// store instead of a timing-dependent share of the load's flushes and compactions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settle {
+    /// Milliseconds from the flush to settled (or to the bound).
+    pub millis: u64,
+    /// False when the bound ran out first: the measured phase may include the load's tail.
+    pub settled: bool,
+    /// Background work (flushes and compactions) completed while settling, for stores that
+    /// count it.
+    pub work: Option<u64>,
 }
 
 /// A measured phase's commit latency inside the engine, from its own histograms (D213):
@@ -1240,6 +1262,10 @@ pub struct Comparison {
     /// Set when the suites ran on different machines or build profiles, or on a busy
     /// machine.
     pub environment_warning: Option<String>,
+    /// Matched records whose measured phases did different background work (D233): one ran
+    /// flushes or compactions and the other none, or one did more than twice the other's.
+    /// A throughput gap there may be that work, not the store. Reported, not judged.
+    pub background_notes: Vec<String>,
 }
 
 impl Comparison {
@@ -1281,6 +1307,9 @@ impl Comparison {
         for u in &self.unmatched {
             let _ = writeln!(s, "\nOnly in one run: {u}");
         }
+        for n in &self.background_notes {
+            let _ = writeln!(s, "\n**Background work differs:** {n}");
+        }
         let _ = writeln!(
             s,
             "\n**{}**",
@@ -1319,11 +1348,21 @@ impl Comparison {
 pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Comparison {
     let mut deltas = Vec::new();
     let mut unmatched = Vec::new();
+    let mut background_notes = Vec::new();
     for b in &baseline.results {
         let Some(c) = candidate.results.iter().find(|c| c.key() == b.key()) else {
             unmatched.push(b.key());
             continue;
         };
+        if let (Some(bw), Some(cw)) = (b.detail.background_work, c.detail.background_work)
+            && background_differs(bw, cw)
+        {
+            background_notes.push(format!(
+                "{}: {bw} flushes and compactions in the baseline's measured phase, {cw} in \
+                 the candidate's",
+                b.key()
+            ));
+        }
         let metrics: [(&'static str, f64, f64, Option<f64>); 4] = [
             (
                 "throughput",
@@ -1374,7 +1413,15 @@ pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Com
         deltas,
         unmatched,
         environment_warning,
+        background_notes,
     }
+}
+
+/// Whether two measured phases' background work counts differ enough to note (D233): one
+/// did some and the other none, or one more than twice the other.
+fn background_differs(a: u64, b: u64) -> bool {
+    let (lo, hi) = (a.min(b), a.max(b));
+    (lo == 0 && hi > 0) || hi > 2 * lo
 }
 
 #[cfg(test)]
@@ -1408,6 +1455,36 @@ mod tests {
         let mut s = Suite::new(Environment::detect(Path::new(".")));
         s.results = records;
         s
+    }
+
+    #[test]
+    fn compare_notes_pairs_whose_background_work_differs() {
+        // D233: the 2026-10-12 gate's ycsb-b differed by 25% between runs; one measured
+        // phase ran 7 flushes and 7 compactions, the other none.
+        let with = |work: Option<u64>| {
+            let mut r = rec("ycsb-b", 1e5, 1000, 5000);
+            r.detail.background_work = work;
+            r
+        };
+        let cmp = |a, b| {
+            compare(
+                &suite(vec![with(a)]),
+                &suite(vec![with(b)]),
+                Tolerance::default(),
+            )
+        };
+        let c = cmp(Some(14), Some(0));
+        assert_eq!(c.background_notes.len(), 1);
+        assert!(c.background_notes[0].contains("14 flushes and compactions"));
+        assert!(c.to_markdown().contains("Background work differs"));
+        assert!(c.passes(), "noted, not judged");
+        assert!(cmp(Some(3), Some(7)).background_notes.len() == 1);
+        assert!(cmp(Some(4), Some(7)).background_notes.is_empty());
+        assert!(cmp(Some(0), Some(0)).background_notes.is_empty());
+        assert!(
+            cmp(None, Some(5)).background_notes.is_empty(),
+            "uncounted stores"
+        );
     }
 
     #[test]

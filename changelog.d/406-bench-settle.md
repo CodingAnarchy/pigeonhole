@@ -1,0 +1,2 @@
+### Changed
+- `phdb-bench`: every engine settles after the load (a flush, then a bounded wait until its background work is quiet) before the warmup, so a measured phase no longer includes a timing-dependent share of the load's flushes and compactions (D233). Records carry `detail.settle` and, for Pigeonhole, `detail.background_work`; `compare` notes pairs whose measured phases did different background work.
