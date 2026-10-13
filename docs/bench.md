@@ -158,7 +158,7 @@ Each result row gives the workload, store, store settings, size, client threads,
 - No client thread competes with the shards for cores, so the gate runs at N up to the core count.
 - The load goes through the blocking API first. Then the warm-up (as long as the measured part, unrecorded) and the measured writes run inline.
 - A commit's latency is from submission to resolution, so it includes the time it waited behind the other commits in flight.
-- **The table is pre-split, with the balancer off** (D231, as D213 does for group commit). Before loading, the table is split at the quantiles of the measured writes, each row counted once per write, so every shard takes about the same share of them. A row hotter than a share (the skewed workload's hottest takes 6.5%) gets a piece to itself. No balancer pass falls due, so the placement holds, and the run fails if the split did not leave one tablet per shard.
+- **The table is pre-split, with the balancer off** (D231, as D213 does for group commit). Before loading, the table is cut into one piece per shard by the measured writes, each row weighing its writes, so the heaviest piece is as light as it can be. A row hotter than a share (the skewed workload's hottest takes 6.5%) sits alone, cut just before and just after it. No balancer pass falls due, so the placement holds, and the run fails if the split did not leave one tablet per shard.
 - The verdict is efficiency alone. The busiest shard's share is printed with it, and each shard's share in every result.
 
 **Reported beside it, not gating:** the engine-owned shape, with synchronous client threads (four per shard) at half the gate's shards, so the clients have cores of their own. `scaling` prints both, and the JSON carries the second as `scaling_sync`.

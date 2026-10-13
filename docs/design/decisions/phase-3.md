@@ -997,7 +997,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 
 **Decided:**
 - **Engine scaling (≥ 0.8 × N)** is judged on a table split up front with the balancer off, as D213 does for group commit, so it measures per-shard throughput only.
-  - `phdb-bench scaling` splits at the quantiles of the measured writes, each row counted once per write, so every shard takes about the same share of them. Where a row covers a cut (the skewed workload's hottest takes 6.5%), the next cut moves past it, so it keeps a piece of its own.
+  - `phdb-bench scaling` cuts the measured writes, each row weighing its writes, into one contiguous piece per shard with the heaviest piece as light as possible. A row heavier than a fair share (the skewed workload's hottest takes 6.5%) sits alone, cut just before and just after it, and the other cuts go by write weight over the rest. Cutting at the plain write quantiles gave the hot row's piece a normal slice too: 10.3% of the writes at 16 shards, which capped efficiency at about 0.61 (perf2's box run).
   - The run fails if the split did not leave one tablet per shard.
   - The verdict is efficiency alone. The busiest share is reported.
 - **Balancer placement** is judged by `phdb-bench placement`:

@@ -73,25 +73,85 @@ fn split_keys(load: &[Write], pieces: usize) -> Vec<Vec<u8>> {
     keys
 }
 
-/// Keys that cut the measured writes into `pieces` runs of about equal size (D231): each row
-/// counts once per write, so the cuts follow the writes, not the rows. Where a hot row covers
-/// a cut, the next key is the next row past it, so it keeps a piece of its own.
+/// Keys that cut the measured writes into `pieces` contiguous runs whose heaviest is as light
+/// as it can be (D231): each row weighs its writes. A row heavier than a fair share (the
+/// skewed workload's hottest takes 6.5%) gets a piece of its own, cut just before it and just
+/// after it, and the other cuts go by write weight over the rest. Exactly `pieces - 1` keys
+/// when there are enough distinct rows, so every shard gets one piece.
 fn split_keys_by_writes(writes: &[Write], pieces: usize) -> Vec<Vec<u8>> {
-    let mut rows: Vec<&[u8]> = writes.iter().map(|w| w.row.as_slice()).collect();
-    rows.sort_unstable();
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    for i in 1..pieces {
-        let mut at = i * rows.len() / pieces;
-        // Strictly increasing: past the previous key (a hot row spanning several cuts).
-        while at < rows.len() && keys.last().is_some_and(|k| rows[at] <= k.as_slice()) {
-            at += 1;
+    let mut sorted: Vec<&[u8]> = writes.iter().map(|w| w.row.as_slice()).collect();
+    sorted.sort_unstable();
+    let mut rows: Vec<(&[u8], u64)> = Vec::new();
+    for r in sorted {
+        match rows.last_mut() {
+            Some((last, n)) if *last == r => *n += 1,
+            _ => rows.push((r, 1)),
         }
-        if at >= rows.len() || rows[at].is_empty() {
-            break;
-        }
-        keys.push(rows[at].to_vec());
     }
-    keys
+    weighted_cuts(&rows, pieces)
+}
+
+/// Piece boundaries (the index of each piece's first row, after the first piece) over `rows`
+/// (sorted, distinct, weighted) for the smallest cap on a piece's weight that a greedy pass
+/// fits in `pieces`; then the heaviest pieces of two rows or more split at their weighted
+/// middle until there are `pieces` (or no piece can split). Returns the cut rows.
+fn weighted_cuts(rows: &[(&[u8], u64)], pieces: usize) -> Vec<Vec<u8>> {
+    if pieces < 2 || rows.len() < 2 {
+        return Vec::new();
+    }
+    let starts = |cap: u64| {
+        let mut out: Vec<usize> = Vec::new();
+        let mut acc = 0;
+        for (i, (_, w)) in rows.iter().enumerate() {
+            if acc > 0 && acc + w > cap {
+                out.push(i);
+                acc = *w;
+            } else {
+                acc += w;
+            }
+        }
+        out
+    };
+    let (mut lo, mut hi) = (
+        rows.iter().map(|(_, w)| *w).max().unwrap_or(0),
+        rows.iter().map(|(_, w)| *w).sum::<u64>(),
+    );
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if starts(mid).len() < pieces {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let mut cuts = starts(lo);
+    // One piece per shard: split the heaviest piece that has two rows or more.
+    while cuts.len() + 1 < pieces {
+        let bounds: Vec<(usize, usize)> = std::iter::once(0)
+            .chain(cuts.iter().copied())
+            .zip(cuts.iter().copied().chain(std::iter::once(rows.len())))
+            .collect();
+        let Some(&(a, b)) = bounds
+            .iter()
+            .filter(|(a, b)| b - a >= 2)
+            .max_by_key(|(a, b)| rows[*a..*b].iter().map(|(_, w)| w).sum::<u64>())
+        else {
+            break;
+        };
+        let half = rows[a..b].iter().map(|(_, w)| w).sum::<u64>() / 2;
+        let (mut acc, mut at) = (0, a + 1);
+        for (i, (_, w)) in rows.iter().enumerate().take(b - 1).skip(a) {
+            acc += w;
+            at = i + 1;
+            if acc >= half {
+                break;
+            }
+        }
+        cuts.push(at.clamp(a + 1, b - 1));
+        cuts.sort_unstable();
+        cuts.dedup();
+    }
+    cuts.into_iter().map(|i| rows[i].0.to_vec()).collect()
 }
 
 /// Fails unless every shard owns exactly one tablet (D213: the pre-split's placement, which
@@ -544,7 +604,62 @@ impl PigeonholeRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::{ANOTHER_FAILED, run_crew};
+    use super::{ANOTHER_FAILED, Write, run_crew, split_keys_by_writes};
+
+    fn writes_of(rows: &[(String, u64)]) -> Vec<Write> {
+        rows.iter()
+            .flat_map(|(r, n)| {
+                (0..*n).map(move |_| Write {
+                    row: r.clone().into_bytes(),
+                    family: "f",
+                    cells: Vec::new(),
+                })
+            })
+            .collect()
+    }
+
+    /// The pieces' write counts for `keys` over `rows` (sorted), and which piece holds `row`.
+    fn pieces(rows: &[(String, u64)], keys: &[Vec<u8>], row: &str) -> (Vec<u64>, usize) {
+        let mut out = vec![0u64; keys.len() + 1];
+        let mut at = 0;
+        for (r, n) in rows {
+            let p = keys.iter().filter(|k| k.as_slice() <= r.as_bytes()).count();
+            out[p] += n;
+            if r == row {
+                at = p;
+            }
+        }
+        (out, at)
+    }
+
+    #[test]
+    fn the_write_split_gives_a_hot_row_a_piece_of_its_own() {
+        // D231 (perf2's 16-shard finding): 1,000 rows of 10 writes and one with 700, 6.5% of
+        // the writes, about a fair share. Cutting at the writes' quantiles gave its piece the
+        // hot row plus a normal slice (10.3% at 16 shards).
+        let mut rows: Vec<(String, u64)> = (0..1_000).map(|i| (format!("r{i:04}"), 10)).collect();
+        rows[300].1 = 700;
+        let keys = split_keys_by_writes(&writes_of(&rows), 16);
+        assert_eq!(keys.len(), 15, "one piece per shard");
+        let (weights, hot) = pieces(&rows, &keys, "r0300");
+        assert_eq!(weights[hot], 700, "the hot row sits alone: {weights:?}");
+        let total: u64 = weights.iter().sum();
+        let bound = (700f64).max(1.2 * total as f64 / 16.0);
+        assert!(
+            weights.iter().all(|w| *w as f64 <= bound),
+            "a piece over {bound}: {weights:?}"
+        );
+        // Without a hot row the pieces come out even.
+        rows[300].1 = 10;
+        let keys = split_keys_by_writes(&writes_of(&rows), 16);
+        let (weights, _) = pieces(&rows, &keys, "r0000");
+        assert_eq!(keys.len(), 15);
+        // A fair share is 625 writes; rows of 10 make the heaviest piece 630.
+        assert!(weights.iter().all(|w| *w <= 630), "{weights:?}");
+        // As many pieces as distinct rows allow.
+        let few: Vec<(String, u64)> = vec![("a".into(), 5), ("b".into(), 90), ("c".into(), 5)];
+        assert_eq!(split_keys_by_writes(&writes_of(&few), 3).len(), 2);
+    }
     use std::sync::mpsc;
     use std::time::Duration;
 

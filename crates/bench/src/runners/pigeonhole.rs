@@ -203,10 +203,10 @@ impl PigeonholeRunner {
         self
     }
 
-    /// `true`: as [`presplit`](Self::presplit), cutting at the quantiles of the measured
-    /// writes (each row counted once per write), so every piece takes about the same share of
-    /// them (D231: engine scaling, judged on per-shard throughput with the placement fixed).
-    /// A row hotter than a piece's share gets a piece to itself.
+    /// `true`: as [`presplit`](Self::presplit), cutting by the measured writes (each row
+    /// weighing its writes) so the heaviest piece is as light as it can be (D231: engine
+    /// scaling, judged on per-shard throughput with the placement fixed). A row hotter than a
+    /// piece's share sits alone.
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
