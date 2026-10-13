@@ -82,7 +82,12 @@ OPTIONS:
                            shard) [default: 64 MiB]
     --cache B              every engine's read cache (SQLite: page cache gets
                            write buffer + cache) [default: 256 MiB]
-    --sync                 fsync every commit on every engine [default: buffered]
+    --sync                 fsync every commit on every engine [default: buffered];
+                           the same as --durability sync
+    --durability MODE      buffered, sync, group-sync or default [default: buffered].
+                           group-sync: Pigeonhole commits GroupSync, the others fsync
+                           every write; default: Pigeonhole keeps Options::default()'s
+                           durability (GroupSync), the others fsync every write (D247)
     --no-tablet-changes    Pigeonhole: keep each table one tablet on one shard (tablets
                            split, merge and move between shards by default)
     --no-packing           Pigeonhole: spread tablets over every shard even under light
@@ -97,6 +102,15 @@ OPTIONS:
     --tolerance T          compare: relative tolerance for throughput and p50; p99
                            gets 2T [default: 0.20]
 ";
+
+/// A `--durability` beyond buffered and sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    /// Pigeonhole commits `GroupSync`.
+    GroupSync,
+    /// Pigeonhole keeps `Options::default()`'s durability (D247).
+    Default,
+}
 
 #[derive(Debug, Default, Clone)]
 struct Args {
@@ -118,6 +132,8 @@ struct Args {
     write_buffer: Option<u64>,
     cache: Option<u64>,
     sync: bool,
+    /// `--durability`: `None` is buffered (or `--sync`).
+    durability: Option<Durability>,
     no_tablet_changes: bool,
     no_packing: bool,
     row_cache: Option<u64>,
@@ -169,6 +185,17 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
             "--sync" => a.sync = true,
+            "--durability" => match it.next().as_deref() {
+                Some("buffered") => a.durability = None,
+                Some("sync") => a.sync = true,
+                Some("group-sync") => a.durability = Some(Durability::GroupSync),
+                Some("default") => a.durability = Some(Durability::Default),
+                other => {
+                    return Err(format!(
+                        "--durability takes buffered, sync, group-sync or default, not {other:?}"
+                    ));
+                }
+            },
             "--no-tablet-changes" => a.no_tablet_changes = true,
             "--no-packing" => a.no_packing = true,
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
@@ -233,6 +260,8 @@ fn memory(a: &Args) -> MemoryBudget {
 fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     let mut r = PigeonholeRunner::default()
         .sync(a.sync)
+        .group_sync(a.durability == Some(Durability::GroupSync))
+        .default_durability(a.durability == Some(Durability::Default))
         .memory(memory(a))
         .tablet_changes(!a.no_tablet_changes)
         .packing(!a.no_packing);
@@ -260,12 +289,17 @@ fn missing(feature: &str) -> Result<Box<dyn Runner>, String> {
 /// write group, its group commit).
 fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>, String> {
     let group = kind == WorkloadKind::GroupCommit;
+    // A durable Pigeonhole commit (group sync, or the default's) is matched by an fsync per
+    // write on the other stores.
     let a = &Args {
-        sync: a.sync || group,
+        sync: a.sync || group || a.durability.is_some(),
         ..a.clone()
     };
     match engine {
-        "pigeonhole" => Ok(Box::new(pigeonhole(a, None).group_sync(group))),
+        "pigeonhole" => {
+            let r = pigeonhole(a, None);
+            Ok(Box::new(if group { r.group_sync(true) } else { r }))
+        }
         #[cfg(feature = "rocksdb")]
         "rocksdb" => Ok(Box::new(
             pigeonhole_bench::RocksDbRunner::default()
@@ -571,6 +605,27 @@ mod tests {
         assert!(!a.no_tablet_changes);
         assert!(!args("scaling --tablet-changes").no_tablet_changes);
         assert!(args("scaling --no-tablet-changes").no_tablet_changes);
+        assert_eq!(args("all").durability, None);
+        assert!(args("all --durability sync").sync);
+        assert_eq!(
+            args("all --durability default").durability,
+            Some(Durability::Default)
+        );
+        assert_eq!(
+            args("all --durability group-sync").durability,
+            Some(Durability::GroupSync)
+        );
+        assert!(parse_args(["all".into(), "--durability".into(), "fast".into()]).is_err());
+        let describe = |cmd: &str, kind| runner(&args(cmd), "pigeonhole", kind).unwrap().describe();
+        assert!(describe("ycsb-a", WorkloadKind::YcsbA).contains(" buffered"));
+        assert!(
+            describe("ycsb-a --durability default", WorkloadKind::YcsbA)
+                .contains(" group-sync(default)")
+        );
+        assert!(
+            describe("ycsb-a --durability group-sync", WorkloadKind::YcsbA).contains(" group-sync")
+        );
+        assert!(describe("ycsb-a --durability sync", WorkloadKind::YcsbA).contains(" sync"));
         assert_eq!(args("all --engine all").engines.len(), 4);
         assert_eq!(args("").command, "help");
         let rc = args("ycsb-c --row-cache 1048576");
