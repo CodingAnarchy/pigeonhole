@@ -2097,6 +2097,9 @@ pub(crate) struct ShardState {
     /// Slots flushed because their records pinned the checkpoint, whatever their size,
     /// until their active memtable freezes.
     unpin: BTreeSet<(TabletId, FamilyId)>,
+    /// Slots a wait for arena room picked to freeze, whatever their size, until their active
+    /// memtable freezes: the largest ones, holding about half the arena (D124).
+    room_freezes: BTreeSet<(TabletId, FamilyId)>,
     /// The last unpin pass forced every record below this position, at `log_bytes` equal
     /// to `unpin_at`.
     unpin_upto: u64,
@@ -2337,6 +2340,7 @@ impl ShardState {
             cross_log: BTreeSet::new(),
             cross_seqnos: BTreeSet::new(),
             unpin: BTreeSet::new(),
+            room_freezes: BTreeSet::new(),
             unpin_upto: 0,
             unpin_at: 0,
             asked: HashMap::new(),
@@ -2920,12 +2924,53 @@ impl ShardState {
         self.reserved = self.reserved.saturating_sub(bytes);
     }
 
+    /// Picks the slots a wait for arena room freezes when no flush is in flight (D124): the
+    /// open memtables, largest first, until those picked hold half the arena (all of them if
+    /// they hold less). At least one is picked while any holds data.
+    #[cold]
+    #[inline(never)]
+    fn pick_room_freezes(&mut self) {
+        let mut open: Vec<(usize, (TabletId, FamilyId))> = self
+            .memtables
+            .iter()
+            .filter(|(_, s)| s.seal == Seal::Open && !s.active.table.is_empty())
+            .map(|(k, s)| (s.active.table.allocated_bytes(), *k))
+            .collect();
+        open.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let half = self.arena.region().len() / 2;
+        let mut picked = 0;
+        for (bytes, key) in open {
+            if picked >= half {
+                break;
+            }
+            picked += bytes;
+            self.room_freezes.insert(key);
+        }
+    }
+
     /// Freezes the active memtables that crossed the threshold during `apply` (or every
     /// non-empty one when `all`), and queues them for flushing. A memtable freezes only
     /// once every seqno it holds is durable (D227), so also visible: then its largest seqno is exact as the slot's
     /// flushed-through seqno (no lower seqno can land in a newer memtable), so replay skips
     /// exactly what the SST holds.
     fn freeze(&mut self, all: bool) -> Result<()> {
+        // The commit path calls this after every group: slots a wait for room picked (D124)
+        // take a cold copy, so the usual one checks nothing more.
+        if !self.room_freezes.is_empty() {
+            return self.freeze_for_room(all);
+        }
+        self.freeze_with::<false>(all)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn freeze_for_room(&mut self, all: bool) -> Result<()> {
+        self.freeze_with::<true>(all)
+    }
+
+    /// [`Self::freeze`], with the slots in `room_freezes` forced when `ROOM`.
+    #[inline(always)]
+    fn freeze_with<const ROOM: bool>(&mut self, all: bool) -> Result<()> {
         let all = all || self.freeze_all_pending;
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let keys: Vec<(TabletId, FamilyId)> = if all {
@@ -2934,9 +2979,12 @@ impl ShardState {
         } else {
             let mut keys = std::mem::take(&mut self.to_freeze);
             // A tablet being split, merged or moved freezes whatever it holds, and so does a
-            // slot pinning the WAL checkpoint (#137).
+            // slot pinning the WAL checkpoint (#137) or picked by a wait for room (D124).
             for key in self.memtables.keys() {
-                if (self.moving.contains(&key.0) || self.unpin.contains(key)) && !keys.contains(key)
+                if (self.moving.contains(&key.0)
+                    || self.unpin.contains(key)
+                    || (ROOM && self.room_freezes.contains(key)))
+                    && !keys.contains(key)
                 {
                     keys.push(*key);
                 }
@@ -2962,7 +3010,9 @@ impl ShardState {
                 continue;
             }
             let big = slot.active.table.allocated_bytes() >= threshold;
-            let forced = self.moving.contains(&key.0) || self.unpin.contains(&key);
+            let forced = self.moving.contains(&key.0)
+                || self.unpin.contains(&key)
+                || (ROOM && self.room_freezes.contains(&key));
             if slot.active.table.is_empty() || !(all || big || forced) {
                 continue;
             }
@@ -3062,6 +3112,13 @@ impl ShardState {
                 .get(k)
                 .is_some_and(|s| s.seal == Seal::Open && !s.active.table.is_empty())
         });
+        if ROOM {
+            self.room_freezes.retain(|k| {
+                memtables
+                    .get(k)
+                    .is_some_and(|s| s.seal == Seal::Open && !s.active.table.is_empty())
+            });
+        }
         self.freeze_all_pending = all && deferred;
         if all {
             self.starved_all = starved;
@@ -4146,11 +4203,14 @@ impl ShardState {
         if self.retire_idle_slots().is_err() {
             self.poison(crate::health::FailureCause::Internal);
         }
-        // Freezing every memtable frees room only when no flush will: while a frozen one
-        // is queued or flushing, its flush frees room and the wait looks again then.
-        // Freezing each small active memtable on every wait instead filled a backlogged
-        // L0 with SSTs a fraction of the freeze size.
-        let _ = self.freeze(self.flush_idle());
+        // A freeze frees room only when no flush will: while a frozen memtable is queued or
+        // flushing, its flush frees room and the wait looks again then. With none, the
+        // largest memtables freeze, about half the arena, not every one: on a shard with many
+        // slots, each wait froze them all (many small flushes and L0 SSTs, D124).
+        if self.flush_idle() {
+            self.pick_room_freezes();
+        }
+        let _ = self.freeze(false);
         // That freeze may have queued guarded flushes after this group's members were
         // admitted but before they are applied (below, into the fresh active memtables):
         // their deletes void those guards now. Nothing claims a fresh guard before the
