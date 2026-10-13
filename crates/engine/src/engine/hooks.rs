@@ -235,6 +235,14 @@ pub struct ManifestInfo {
 }
 
 impl Engine {
+    /// The seqnos of this process's live snapshots, the ones compaction's GC keeps
+    /// (`gc_snapshots`): a transaction's commit holds its snapshot here until it resolves
+    /// (#672).
+    #[doc(hidden)]
+    pub fn live_snapshot_seqnos(&self) -> Vec<Seqno> {
+        self.inner.shared.live_seqnos.list()
+    }
+
     /// `flush` as a future (test harnesses that drive the shards themselves).
     #[doc(hidden)]
     pub fn flush_pending(&self) -> Result<PendingMaintenance> {

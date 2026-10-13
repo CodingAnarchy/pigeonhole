@@ -974,6 +974,34 @@ pub(crate) struct ReadKey {
     pub family: FamilyId,
 }
 
+/// A transaction's validation data, carried by its commit: the snapshot's seqno and the
+/// recorded reads, plus the snapshot's seqno pin. The pin keeps the seqno in `LiveSeqnos`,
+/// so compaction's GC (`gc_snapshots`) cannot purge a write above it (a delete and the value
+/// it hides) before validation looks for it (#672). The commit owns it until the commit
+/// resolves, fails or is dropped, retries included. Only the seqno pin: the snapshot's view
+/// would also hold every shard's memtables and extents, and an async commit waiting for
+/// arena room could then wait on room its own pin holds. Boxed: commits without one move a
+/// pointer-sized `None`.
+#[derive(Debug, Clone)]
+pub(crate) struct Validate {
+    pub seqno: pigeonhole_format::Seqno,
+    pub reads: Vec<ReadKey>,
+    /// Never read: held so the seqno stays in `LiveSeqnos`. `None` only for a snapshot that
+    /// pins no seqno (a reader process's, which has no transactions).
+    pub _pin: Option<Arc<crate::snapshot::SeqnoPin>>,
+}
+
+impl Validate {
+    /// Takes the snapshot's seqno pin and drops the rest of it (its view).
+    pub(crate) fn boxed(snapshot: Snapshot, reads: Vec<ReadKey>) -> Box<Self> {
+        Box::new(Self {
+            seqno: snapshot.seqno,
+            reads,
+            _pin: snapshot._pin.clone(),
+        })
+    }
+}
+
 /// An optimistic multi-row transaction (Phase 4). Reads record the `(row, family)` ranges
 /// they touch; at commit, each participant shard checks its tablets for conflicting commits
 /// since the snapshot during PREPARE, and any conflict aborts with `Error::Conflict`.
@@ -1053,10 +1081,23 @@ impl Txn {
                 let shared = self
                     .engine
                     .shard_ref(pigeonhole_runtime::ShardId(admit.shard() as u16));
+                // Wait with the seqno pin only (#672): the snapshot's view would hold every
+                // shard's memtables, the room this commit waits for among them.
+                let Txn {
+                    engine,
+                    snapshot,
+                    reads,
+                    batch,
+                } = self;
+                let validate = Validate::boxed(snapshot, reads);
                 return Ok(PendingCommit::waiting(
                     shared,
                     admit,
-                    Box::new(move || self.submit(durability)),
+                    Box::new(move || {
+                        engine
+                            .submit(batch, durability, Some(validate), None)
+                            .map(PendingCommit::from)
+                    }),
                 ));
             }
             crate::engine::FastAdmit::Charged(charge) => charge,
@@ -1081,7 +1122,12 @@ impl Txn {
             reads,
             batch,
         } = self;
-        engine.submit(batch, durability, Some((snapshot.seqno, reads)), None)
+        engine.submit(
+            batch,
+            durability,
+            Some(Validate::boxed(snapshot, reads)),
+            None,
+        )
     }
 
     /// Validates and commits.
@@ -1094,7 +1140,12 @@ impl Txn {
         } = self;
         engine.shared.refuse_blocking_on_driver("Txn::commit")?;
         engine
-            .submit(batch, durability, Some((snapshot.seqno, reads)), None)?
+            .submit(
+                batch,
+                durability,
+                Some(Validate::boxed(snapshot, reads)),
+                None,
+            )?
             .wait()
     }
 }

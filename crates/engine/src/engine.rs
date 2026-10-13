@@ -41,7 +41,7 @@ use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
     TabletMap, View, ViewPin,
 };
-use crate::write::{COUNTER_TS, ReadKey, Submission};
+use crate::write::{COUNTER_TS, Submission, Validate};
 
 /// The shards a commit writes to: inline for up to four (no allocation per commit, #320).
 pub(crate) type Shards = smallvec::SmallVec<[ShardId; 4]>;
@@ -2946,7 +2946,7 @@ impl Inner {
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
-        validate: Option<(Seqno, Vec<ReadKey>)>,
+        validate: Option<Box<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
         let routed = self.route_and_send(batch, durability, validate, predicate, NoAdmission)?;
@@ -2966,7 +2966,7 @@ impl Inner {
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
-        validate: Option<(Seqno, Vec<ReadKey>)>,
+        validate: Option<Box<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
@@ -2982,7 +2982,7 @@ impl Inner {
         let (builder, large) = self.separate_large(builder)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
-        if let Some((_, reads)) = &validate {
+        if let Some(reads) = validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 if let Some((_, shard)) = view.tablets().route(r.table, &r.row)
                     && !shards.contains(&shard)
