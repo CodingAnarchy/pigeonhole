@@ -306,7 +306,7 @@ The internal interface change is ICR 0019.
 <a id="d204"></a>
 ## D204 — The scaling gate measures application-owned shards writing inline; engine-owned synchronous clients are reported (owner decision, 2026-10-10; bench, #154; amends the spec's Goals scaling definition and the #406 checklist)
 **Decision.**
-- **The thread-per-core scaling target is measured with Pigeonhole application-owned, at N shards up to the core count.** Each shard thread drives its own shard and commits the `skewed-multi-shard` writes to rows its shard owns (`Table::shard_of`, ICR 0022; owner routing approved by the coordinator) inline, with 16 commits in flight (`commit_async`). The target is unchanged: N-shard write throughput ≥ 0.8 × N × single-shard, with no single-shard p99 regression. `phdb-bench scaling` runs it, and `docs/bench.md` defines it.
+- **The thread-per-core scaling target is measured with Pigeonhole application-owned, at N shards up to the core count.** Each shard thread drives its own shard and commits the `skewed-multi-shard` writes to rows its shard owns (`Table::shard_of`, ICR 0022; owner routing approved by the coordinator) inline, with 16 commits in flight (`commit_async`). The target is unchanged: N-shard write throughput ≥ 0.8 × N × single-shard, with no single-shard p99 regression. `phdb-bench scaling` runs it, and `docs/bench.md` defines it. [D238](#d238) judges N only up to one chiplet's physical cores and reports larger N.
 - **The engine-owned shape is reported, not gated:** synchronous client threads, at least four per shard, at N ≤ cores/2.
 
 **Why.** The old gate ran N synchronous clients against N engine-owned shards: 2N busy threads.
@@ -1051,6 +1051,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - **The judged row.** The memtable point lookup (≤ 300 ns, #17, the spec's "typically under 300 ns") is judged at **262,144 entries (2^18)**: criterion `seek/262k entries/hit (get)`, pinned to one core, in the gate's `memtable-lookup` step.
 - **Reported, not judged:** 1M entries (the old judged size) and 10k entries (cache-resident), in the same step.
 - **The skiplist search is unchanged.** Software prefetch of the next level's first node during the search was measured and not adopted (below).
+- [D239](#d239) accepts 337 ns at 2^18 entries: the gate's verdict there is "accepted (D239)", not FAIL.
 
 **Why 2^18: the arithmetic from the code.**
 - **When a memtable freezes.** A memtable belongs to one (tablet, family). It freezes once its arena allocation reaches `memtable_freeze_bytes`, a quarter of `memtable_budget` by default: 64 MiB → **16 MiB** (`EngineOptions`, `pigeonhole::Options`; the engine's `freeze`, which compares `allocated_bytes` with the threshold).
@@ -1092,6 +1093,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
   - `phdb-bench scaling` cuts the measured writes, each row weighing its writes, into one contiguous piece per shard with the heaviest piece as light as possible. A row heavier than a fair share (the skewed workload's hottest takes 6.5%) sits alone, cut just before and just after it, and the other cuts go by write weight over the rest. Cutting at the plain write quantiles gave the hot row's piece a normal slice too: 10.3% of the writes at 16 shards, which capped efficiency at about 0.61 (perf2's box run).
   - The run fails if the split did not leave one tablet per shard.
   - The verdict is efficiency alone. The busiest share is reported.
+  - [D238](#d238) judges it for N up to one chiplet's physical cores and reports larger N.
 - **Balancer placement** is judged by `phdb-bench placement`:
   - Engine-owned shards, tablet changes on, packing off. Packing keeps a light load on few shards on purpose, and is not what this judges.
   - The skewed-multi-shard writes are offered **open-loop** at a fixed rate (default 30,000 writes/s per shard, above the balancer's per-pass minimum for an average shard). Clients behind their schedule catch up instead of slowing the offer.
@@ -1210,3 +1212,44 @@ A thread-per-core application pins its shard threads, so the gate measures that,
 | 16 shards, pinned | 4.20M, 4.20M | **4.69M, 4.68M (+11.6%)** |
 | 16 shards, unpinned | 4.15M, 4.03M | 4.37M, 4.43M (+7%) |
 
+
+<a id="d238"></a>
+## D238 — The scaling gate judges ≥ 0.8 × N up to one chiplet's physical cores and reports larger N; efficiency against a fixed single-shard rate is reported beside it (owner decision, 2026-10-13; bench, #154, #406; amends D204, D231)
+
+**Decided:**
+- **Engine scaling (≥ 0.8 × N) is judged per chiplet.** It's judged for every N up to the physical cores of one chiplet (CCD), meaning the cores that share one L3 cache. Larger N are reported, not judged.
+  - **On the AX102** (Ryzen 9 7950X3D, 2 CCDs × 8 cores), N = 1, 4 and 8 are judged and N = 16 is reported. About 0.70 at 16 is recorded as accepted for two-chiplet parts.
+  - A CPU with a single L3 over all its cores is judged up to its core count, as D204 had it.
+- **The CCD size comes from the L3 topology.** The setup step (`machine.py`) reads `/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`, counts each L3's physical cores (SMT siblings once), and records them in `machine.json` (`l3_cores`, and `ccd_cores`, the smallest).
+  - `report.py` prints the CCD size and splits the scaling target into a judged row and a reported row.
+  - Without a recorded size (a `machine.json` from before D238, or no L3 in sysfs) every N is judged.
+- **Efficiency against a fixed single-shard rate** is reported beside the judged column, not judged (owner Q4).
+  - The judged efficiency divides by the same build's single shard, so a single-shard speed-up (D234's, about 5.5%) lowers it. The fixed column shows engine progress that the ratio hides.
+  - The rate is pinned in `report.py`: 417,922 commits/s, `scaling-1.json`'s single-shard rate (pinned, pre-split, inline, 16 in flight). It was recorded on the AX102 on main 9ff02d00 in the pre-gate check of 2026-10-13.
+
+**Why.** Thread-per-core scaling within a chiplet is the design's claim. The cost of crossing chiplets comes from the hardware.
+- **The pre-gate check** (AX102, 2026-10-13, main 9ff02d00, pinned) measured 1.08 at N = 4, 0.98 at 8 and 0.63 at 16. At 16 the busiest shard took 7% of the commits and no shard time was stalled, so the loss isn't placement or stalls.
+- **D236** (+11.6% at 16 pinned) brought 16 to about 0.70. perf2's per-thread measurement on top of it found the gap per commit at 16 spread over the whole path, with no single hot spot:
+  - about 300 ns more waiting for the global visibility watermark (D19);
+  - about 320 ns more in the shard's own turn;
+  - about 160 ns more submitting and polling.
+- **IPC** drops from 1.88 to 1.39 at the same clock: that's coherence and memory latency across the two CCDs.
+- **The same shards on one CCD and split over two:** 8 shards pinned on one CCD ran 3.24M commits/s, and split 4 + 4 they ran 2.92M even after D236 (D235, D236).
+- **Tried and dropped:** a cached visible seqno, per-shard waiter sections (about 1–2%, within noise), and a memory-copy hot spot that was a sampling artifact.
+- **Possible later:** a commit that resolves once its own shard's data is visible, without waiting on every shard's watermark. That changes D19 / D227's semantics, needs its own design, and would also help latency.
+
+**Not changed:** the 0.8 target, the single-shard p99 half (`phdb-bench compare`), the pre-split table and pinned drivers (D231, D235), balancer placement at 4, 8 and 16 (D231's 1.25/N bound, judged at every N), and D213's group-commit shape.
+
+<a id="d239"></a>
+## D239 — The memtable lookup is accepted at 337 ns at 2^18 entries; the gate reports it against 300 ns with the verdict "accepted (D239)" (owner decision, 2026-10-13; bench, memtable, #17, #406; amends D230)
+
+**Decided:**
+- **#17 is accepted at 337 ns** at 262,144 entries (2^18, D230's judged size). That's criterion `seek/262k entries/hit (get)`, pinned, as measured on the AX102 in the pre-gate check of 2026-10-13 on main 9ff02d00.
+- **The verdict.** The gate summary still reports the row against the 300 ns target.
+  - At or under 300 ns it passes.
+  - Up to 5% above 337 ns (354 ns) it reads **accepted (D239)**, not FAIL.
+  - Slower than that is a FAIL: a regression past the accepted value. The criterion estimate on that box varies by well under 1%.
+- **#612** (a read-only lookup index built when a memtable freezes) stays the lever, after 1.0.
+- **Reported as before:** 1M entries (484 ns) and 10k entries (128 ns).
+
+**Why.** The lookup is bound by memory latency. Each probe follows dependent node reads through the skiplist. D230 measured software prefetch in the search and didn't adopt it (−3% at 1M, +2–9% when cache-resident). Closing the last 37 ns needs a different structure for frozen memtables (#612), and that isn't Phase 3 work. The gate previously measured 481 ns at 1M; D230's 2^18 entries give 337 ns.
