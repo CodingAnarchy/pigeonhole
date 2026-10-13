@@ -19,8 +19,8 @@ use rocksdb::{
 };
 
 use super::{
-    BLOOM_BITS, Counted, MemoryBudget, Touched, durability, encode_value, family_id, keys,
-    live_value, modified, now_micros, read_family, scan_rows,
+    BLOOM_BITS, Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id,
+    keys, live_value, modified, now_micros, read_family, scan_rows,
 };
 use crate::workload::{METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
 
@@ -46,6 +46,8 @@ pub struct RocksDbRunner {
     db: Option<Arc<DB>>,
     /// Whether a `metric` cell was written: scans then merge both column families.
     metric_written: Arc<AtomicBool>,
+    /// Row locks for an atomic read-modify-write across clients.
+    locks: Arc<RowLocks>,
 }
 
 impl std::fmt::Debug for RocksDbRunner {
@@ -84,15 +86,19 @@ struct Handle {
     db: Arc<DB>,
     write: WriteOptions,
     metric_written: Arc<AtomicBool>,
+    locks: Arc<RowLocks>,
 }
 
-fn handle(db: &Arc<DB>, sync: bool, metric_written: &Arc<AtomicBool>) -> Handle {
-    let mut write = WriteOptions::default();
-    write.set_sync(sync);
-    Handle {
-        db: Arc::clone(db),
-        write,
-        metric_written: Arc::clone(metric_written),
+impl RocksDbRunner {
+    fn handle(&self, db: &Arc<DB>, sync: bool) -> Handle {
+        let mut write = WriteOptions::default();
+        write.set_sync(sync);
+        Handle {
+            db: Arc::clone(db),
+            write,
+            metric_written: Arc::clone(&self.metric_written),
+            locks: Arc::clone(&self.locks),
+        }
     }
 }
 
@@ -172,11 +178,7 @@ impl Runner for RocksDbRunner {
     }
 
     fn client(&self) -> Option<Box<dyn Client>> {
-        Some(Box::new(handle(
-            self.db.as_ref()?,
-            self.sync,
-            &self.metric_written,
-        )))
+        Some(Box::new(self.handle(self.db.as_ref()?, self.sync)))
     }
 
     fn describe(&self) -> String {
@@ -196,7 +198,7 @@ impl Runner for RocksDbRunner {
 impl Counted for RocksDbRunner {
     fn execute_counted(&mut self, op: &BenchOp) -> Result<Touched, String> {
         let db = self.db.as_ref().ok_or("rocksdb runner is not open")?;
-        handle(db, self.sync && !self.loading, &self.metric_written).execute(op)
+        self.handle(db, self.sync && !self.loading).execute(op)
     }
 }
 
@@ -317,6 +319,8 @@ impl Handle {
             BenchOp::ReadModifyWrite { row, qualifier } => {
                 let key = keys::cell(row, family_id(YCSB_FAMILY)?, qualifier);
                 let f = family_id(YCSB_FAMILY)?;
+                // Atomic across clients: the read and the write under the row's lock.
+                let _held = self.locks.lock(&key);
                 let stored = self.db.get_pinned(&key).map_err(e)?;
                 let old = match &stored {
                     Some(v) => live_value(f, v, now_micros())?,

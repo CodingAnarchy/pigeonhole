@@ -113,6 +113,34 @@ pub(crate) trait Counted {
     fn execute_counted(&mut self, op: &BenchOp) -> Result<Touched, String>;
 }
 
+#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+/// Striped locks that make a key-value store's read-modify-write atomic across client
+/// threads (D247: ycsb-f runs at 16 threads; Pigeonhole uses `commit_if`, SQLite an
+/// immediate transaction). One lock per key hash stripe, held from the read to the write.
+#[derive(Debug)]
+pub(crate) struct RowLocks(Box<[std::sync::Mutex<()>]>);
+
+#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+impl Default for RowLocks {
+    fn default() -> Self {
+        Self((0..1024).map(|_| std::sync::Mutex::new(())).collect())
+    }
+}
+
+#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+impl RowLocks {
+    /// Holds the stripe of `key` until the guard drops.
+    pub(crate) fn lock(&self, key: &[u8]) -> std::sync::MutexGuard<'_, ()> {
+        let h = key.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
+        });
+        let i = (h % self.0.len() as u64) as usize;
+        self.0[i]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Microseconds since the Unix epoch: the clock every store's TTL runs on, and the commit
 /// timestamp of a [`BenchOp::Put`] in the runners that stamp cells themselves.
 pub(crate) fn now_micros() -> u64 {
@@ -311,6 +339,75 @@ mod tests {
                 prop_assert!(row_prefix(&a) <= kb);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod concurrent_rmw {
+    use crate::{BenchOp, PigeonholeRunner, Runner, YCSB_FAMILY};
+
+    const CLIENTS: usize = 8;
+    const EACH: usize = 100;
+
+    /// Every client read-modify-writes the same cell; none fails (SQLite's immediate
+    /// transactions wait instead of failing an upgrade) and none races (D247).
+    fn hammer<R: Runner>(mut r: R, tag: &str) -> (R, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-rmw-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        r.open(&dir).unwrap();
+        r.execute(&BenchOp::Put {
+            row: b"hot".to_vec(),
+            family: YCSB_FAMILY,
+            cells: vec![(b"field0".to_vec(), vec![0; 8])],
+        })
+        .unwrap();
+        let clients: Vec<_> = (0..CLIENTS).map(|_| r.client().unwrap()).collect();
+        std::thread::scope(|s| {
+            for mut c in clients {
+                s.spawn(move || {
+                    let op = BenchOp::ReadModifyWrite {
+                        row: b"hot".to_vec(),
+                        qualifier: b"field0".to_vec(),
+                    };
+                    for _ in 0..EACH {
+                        c.execute(&op).unwrap();
+                    }
+                });
+            }
+        });
+        (r, dir)
+    }
+
+    fn done<R: Runner>((mut r, dir): (R, std::path::PathBuf)) {
+        r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pigeonhole_loses_no_update() {
+        let run = hammer(PigeonholeRunner::default().shards(2), "ph");
+        // Each read-modify-write adds one to the first byte.
+        let first = run.0.first_byte(b"hot", b"field0");
+        assert_eq!(first, Some(((CLIENTS * EACH) % 256) as u8));
+        done(run);
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_runs_concurrent_rmw() {
+        done(hammer(crate::RocksDbRunner::default(), "rocksdb"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_runs_concurrent_rmw() {
+        done(hammer(crate::SqliteRunner::default(), "sqlite"));
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_runs_concurrent_rmw() {
+        done(hammer(crate::FjallRunner::default(), "fjall"));
     }
 }
 

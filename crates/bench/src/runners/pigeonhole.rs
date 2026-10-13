@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pigeonhole::{
-    Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, RowMutation, Table,
+    Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, RowMutation, Table,
+    ValueFilter,
 };
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
@@ -487,6 +488,16 @@ impl Runner for PigeonholeRunner {
     }
 }
 
+#[cfg(test)]
+impl PigeonholeRunner {
+    /// The first byte of a bench-table cell's value, for tests.
+    pub(crate) fn first_byte(&self, row: &[u8], qualifier: &[u8]) -> Option<u8> {
+        let table = &self.open.as_ref()?.target.table;
+        let cell = table.get(row, YCSB_FAMILY, qualifier).ok()??;
+        cell.value().first().copied()
+    }
+}
+
 impl Counted for PigeonholeRunner {
     fn execute_counted(&mut self, op: &BenchOp) -> Result<Touched, String> {
         let o = self.open.as_mut().ok_or("pigeonhole runner is not open")?;
@@ -584,17 +595,36 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             }
         }
         BenchOp::ReadModifyWrite { row, qualifier } => {
-            let old = table.get(row, YCSB_FAMILY, qualifier).map_err(err)?;
-            let new = modified(old.as_ref().map(|c| c.value()));
-            if let Some(cell) = &old {
-                t.cell(cell.value());
+            // Atomic across clients (D247): the write commits only if the cell still holds
+            // what was read, else the read and the write go again.
+            loop {
+                let old = table.get(row, YCSB_FAMILY, qualifier).map_err(err)?;
+                let new = modified(old.as_ref().map(|c| c.value()));
+                let condition = match &old {
+                    Some(cell) => Condition::Value {
+                        family: YCSB_FAMILY.to_owned(),
+                        qualifier: qualifier.clone(),
+                        filter: ValueFilter::Equals(cell.value().to_vec()),
+                    },
+                    None => Condition::Absent {
+                        family: YCSB_FAMILY.to_owned(),
+                        qualifier: qualifier.clone(),
+                    },
+                };
+                t = Touched::default();
+                if let Some(cell) = &old {
+                    t.cell(cell.value());
+                }
+                drop(old);
+                let applied = retry_busy(busy, || {
+                    level(buffered, table.mutate(row))
+                        .put(YCSB_FAMILY, qualifier, &new)
+                        .commit_if(&condition)
+                })?;
+                if applied.is_some() {
+                    break;
+                }
             }
-            drop(old);
-            retry_busy(busy, || {
-                level(buffered, table.mutate(row))
-                    .put(YCSB_FAMILY, qualifier, &new)
-                    .commit()
-            })?;
         }
         BenchOp::Commit { family, rows } => {
             let part = |p: usize| {

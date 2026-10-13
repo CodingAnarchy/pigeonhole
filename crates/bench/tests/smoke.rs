@@ -121,15 +121,16 @@ fn warmup_is_run_but_not_recorded() {
 }
 
 #[test]
-fn ycsb_f_refuses_concurrent_clients() {
+fn ycsb_f_runs_on_concurrent_clients() {
+    // D247: read-modify-write is atomic in every runner, so ycsb-f takes any thread count.
     let root = temp_dir("ycsb-f-threads");
     let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbF);
-    config.threads = 2;
+    config.threads = 4;
     let mut r = PigeonholeRunner::default()
-        .shards(1)
+        .shards(2)
         .memtable_budget(16 << 20);
-    let err = run(&mut r, &config, &root).unwrap_err();
-    assert!(err.contains("one thread"), "{err}");
+    let report = run(&mut r, &config, &root).unwrap();
+    assert!(report.throughput > 0.0);
     std::fs::remove_dir_all(&root).ok();
 }
 

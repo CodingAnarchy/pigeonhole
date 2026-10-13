@@ -697,22 +697,14 @@ pub fn run(runner: &mut dyn Runner, config: &WorkloadConfig, dir: &Path) -> Resu
 /// [`run`] with explicit [`RunOptions`], returning the full record written to JSON
 /// reports.
 ///
-/// Fails up front for [`WorkloadKind::YcsbF`] with more than one thread: its
-/// read-modify-write is a get and then a put, not atomic, so concurrent clients would
-/// lose each other's updates and the stores would no longer do the same work.
+/// [`WorkloadKind::YcsbF`] runs on any number of threads: every runner's read-modify-write
+/// is atomic across clients (Pigeonhole's `commit_if`, retried on a lost race; D247).
 pub fn run_detailed(
     runner: &mut dyn Runner,
     config: &WorkloadConfig,
     dir: &Path,
     options: &RunOptions,
 ) -> Result<RunRecord, String> {
-    if config.threads > 1 && config.kind == WorkloadKind::YcsbF {
-        return Err(
-            "ycsb-f runs on one thread: read-modify-write is not atomic in the runners, \
-             so concurrent clients would race"
-                .to_owned(),
-        );
-    }
     let warmup = options.warmup_ops(config);
     // A run lengthened to `min_measured` (D243) takes operations past the configured count
     // from the same stream.

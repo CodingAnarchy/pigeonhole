@@ -45,9 +45,9 @@
 #                  against RocksDB and SQLite at two durabilities: D108 parity
 #                  (Pigeonhole Buffered, RocksDB unsynced WAL, SQLite NORMAL) and the
 #                  default (Pigeonhole GroupSync, the others fsync every write;
-#                  every store loads buffered): ycsb-a/b/c/e, sparse-wide,
+#                  every store loads buffered): ycsb-a/b/c/e/f, sparse-wide,
 #                  time-series-ttl, cross-shard-contention (D246, also with tablet
-#                  changes off)                                                       70
+#                  changes off)                                                       75
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   wal-pin        wal_pin_bytes 2x vs 4x the budget: write path, open after a crash
 #                  (#527; phase3-io/wal-pin.sh)                                        10
@@ -97,7 +97,7 @@ results="$(cd "$results" && pwd)"
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     row-cache scaling placement contended open-latency wal-pin cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [contended]=70 [open-latency]=5 [wal-pin]=10 [cold-get]=45
+    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [contended]=75 [open-latency]=5 [wal-pin]=10 [cold-get]=45
     [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
@@ -406,7 +406,7 @@ step_placement() {
 # loads buffered and switches after the settle step). Judged within
 # 1.5x at each; cross-shard-contention also runs with tablet changes off (D246).
 contended_levels=(buffered default)
-contended_workloads=(ycsb-a ycsb-b ycsb-c ycsb-e sparse-wide time-series-ttl cross-shard-contention)
+contended_workloads=(ycsb-a ycsb-b ycsb-c ycsb-e ycsb-f sparse-wide time-series-ttl cross-shard-contention)
 step_contended() {
     local level w
     for level in "${contended_levels[@]}"; do
