@@ -12,6 +12,7 @@
 //! | cross-shard contention | `xs:<partition>:<fnv(i)>`, in partitions | `ycsb` | `field0` |
 //! | counters | `ctr:<fnv(i)>` | each store's counter (below) | one counter per row |
 //! | transfer | `acct:<fnv(i)>` | `ycsb` | `bal`, an `i64` balance |
+//! | sparse-wide deletes | as sparse-wide | `attr` | as sparse-wide |
 
 use std::collections::BTreeSet;
 
@@ -107,7 +108,9 @@ impl Gen {
             _ => config.records.max(1),
         };
         let aux = match config.kind {
-            WorkloadKind::SparseWide => Zipf::new(SPARSE_VOCABULARY),
+            WorkloadKind::SparseWide | WorkloadKind::SparseWideDeletes => {
+                Zipf::new(SPARSE_VOCABULARY)
+            }
             WorkloadKind::Adjacency => Zipf::new(ADJ_MAX_DEGREE),
             _ => Zipf::new(1),
         };
@@ -328,7 +331,7 @@ impl Iterator for LoadIter<'_> {
                     row: counter_key(i),
                     delta: 1,
                 },
-                WorkloadKind::SparseWide => {
+                WorkloadKind::SparseWide | WorkloadKind::SparseWideDeletes => {
                     let n = rng.range(0, 2 * SPARSE_MEAN_CELLS);
                     if n == 0 {
                         continue; // a row with no cells does not exist
@@ -417,6 +420,39 @@ impl RunIter<'_> {
                 .collect(),
         }
     }
+
+    /// A [`WorkloadKind::SparseWide`] operation for the draw `p` in `[0, 1)`.
+    fn sparse_op(&mut self, p: f64) -> BenchOp {
+        match () {
+            _ if p < 0.4 => BenchOp::Get {
+                row: sparse_key(self.g.items.sample_scrambled(&mut self.rng)),
+                family: SPARSE_FAMILY,
+                qualifier: sparse_qualifier(self.g.aux.sample(&mut self.rng)),
+            },
+            _ if p < 0.6 => BenchOp::GetRow {
+                row: sparse_key(self.g.items.sample_scrambled(&mut self.rng)),
+                family: SPARSE_FAMILY,
+            },
+            _ if p < 0.8 => {
+                let row = sparse_key(self.g.items.sample_scrambled(&mut self.rng));
+                let n = self.rng.range(1, 4);
+                let quals: BTreeSet<u64> =
+                    (0..n).map(|_| self.g.aux.sample(&mut self.rng)).collect();
+                BenchOp::Put {
+                    row,
+                    family: SPARSE_FAMILY,
+                    cells: quals
+                        .into_iter()
+                        .map(|q| (sparse_qualifier(q), self.g.value(&mut self.rng)))
+                        .collect(),
+                }
+            }
+            _ => BenchOp::Scan {
+                start: sparse_key(self.g.items.sample_scrambled(&mut self.rng)),
+                len: 10,
+            },
+        }
+    }
 }
 
 impl Iterator for RunIter<'_> {
@@ -455,32 +491,19 @@ impl Iterator for RunIter<'_> {
                 row: ycsb_key(g.items.sample_scrambled(&mut self.rng)),
                 qualifier: field(self.rng.below(YCSB_FIELDS)),
             },
-            WorkloadKind::SparseWide if p < 0.4 => BenchOp::Get {
-                row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
-                family: SPARSE_FAMILY,
-                qualifier: sparse_qualifier(g.aux.sample(&mut self.rng)),
-            },
-            WorkloadKind::SparseWide if p < 0.6 => BenchOp::GetRow {
-                row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
-                family: SPARSE_FAMILY,
-            },
-            WorkloadKind::SparseWide if p < 0.8 => {
-                let row = sparse_key(g.items.sample_scrambled(&mut self.rng));
-                let n = self.rng.range(1, 4);
-                let quals: BTreeSet<u64> = (0..n).map(|_| g.aux.sample(&mut self.rng)).collect();
-                BenchOp::Put {
-                    row,
+            // D247: sparse-wide's mix with 5% deletes taken from its puts (20% -> 15%), half a
+            // column and half a whole row.
+            WorkloadKind::SparseWideDeletes if (0.75..0.775).contains(&p) => {
+                BenchOp::DeleteColumn {
+                    row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
                     family: SPARSE_FAMILY,
-                    cells: quals
-                        .into_iter()
-                        .map(|q| (sparse_qualifier(q), g.value(&mut self.rng)))
-                        .collect(),
+                    qualifier: sparse_qualifier(g.aux.sample(&mut self.rng)),
                 }
             }
-            WorkloadKind::SparseWide => BenchOp::Scan {
-                start: sparse_key(g.items.sample_scrambled(&mut self.rng)),
-                len: 10,
+            WorkloadKind::SparseWideDeletes if (0.775..0.8).contains(&p) => BenchOp::DeleteRow {
+                row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
             },
+            WorkloadKind::SparseWide | WorkloadKind::SparseWideDeletes => self.sparse_op(p),
             WorkloadKind::TimeSeriesTtl => {
                 let e = g.items.sample_scrambled(&mut self.rng);
                 let clock = &mut self.clocks[e as usize];
@@ -772,6 +795,37 @@ mod tests {
             assert!(accounts.contains(from) && accounts.contains(to), "seed 17");
             assert_eq!(*amount, 1);
         }
+    }
+
+    #[test]
+    fn sparse_wide_deletes_delete_five_in_a_hundred_and_keep_sparse_wides_stream_otherwise() {
+        let seed = 19;
+        let mut config = WorkloadConfig::smoke(WorkloadKind::SparseWideDeletes);
+        config.seed = seed;
+        config.operations = 40_000;
+        let ops: Vec<BenchOp> = Workload::new(config.clone()).run_ops().collect();
+        let share = |f: fn(&BenchOp) -> bool| {
+            ops.iter().filter(|op| f(op)).count() as f64 / config.operations as f64
+        };
+        let columns = share(|op| matches!(op, BenchOp::DeleteColumn { .. }));
+        let rows = share(|op| matches!(op, BenchOp::DeleteRow { .. }));
+        let puts = share(|op| matches!(op, BenchOp::Put { .. }));
+        assert!((columns - 0.025).abs() < 0.005, "seed {seed}: {columns}");
+        assert!((rows - 0.025).abs() < 0.005, "seed {seed}: {rows}");
+        assert!((puts - 0.15).abs() < 0.01, "seed {seed}: {puts}");
+        // The load is sparse-wide's.
+        let load = |kind| {
+            Workload::new(WorkloadConfig {
+                kind,
+                ..config.clone()
+            })
+            .load_ops()
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            load(WorkloadKind::SparseWideDeletes),
+            load(WorkloadKind::SparseWide)
+        );
     }
 
     #[test]

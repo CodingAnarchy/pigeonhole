@@ -27,6 +27,9 @@ const COUNTERS: &str = "CREATE TABLE IF NOT EXISTS counters (row BLOB PRIMARY KE
 const INCR: &str = "INSERT INTO counters (row, n) VALUES (?1, ?2) ON CONFLICT (row) DO UPDATE SET n = n + excluded.n";
 const READ_COUNTER: &str = "SELECT n FROM counters WHERE row = ?1";
 
+const DELETE_COLUMN: &str = "DELETE FROM cells WHERE row = ?1 AND family = ?2 AND qualifier = ?3";
+const DELETE_ROW: &str = "DELETE FROM cells WHERE row = ?1";
+
 const GET: &str =
     "SELECT value FROM cells WHERE row = ?1 AND family = ?2 AND qualifier = ?3 AND ts > ?4";
 const GET_ROW: &str =
@@ -269,6 +272,24 @@ impl Conn {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::DeleteColumn {
+                row,
+                family,
+                qualifier,
+            } => {
+                self.0
+                    .prepare_cached(DELETE_COLUMN)
+                    .map_err(e)?
+                    .execute(params![row, family, qualifier])
+                    .map_err(e)?;
+            }
+            BenchOp::DeleteRow { row } => {
+                self.0
+                    .prepare_cached(DELETE_ROW)
+                    .map_err(e)?
+                    .execute(params![row])
+                    .map_err(e)?;
+            }
             BenchOp::Transfer { from, to, amount } => {
                 // Immediate: the write lock from the reads on (D247).
                 let tx = self

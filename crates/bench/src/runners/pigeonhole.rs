@@ -860,6 +860,22 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 }
             }
         }
+        BenchOp::DeleteColumn {
+            row,
+            family,
+            qualifier,
+        } => {
+            retry_busy(busy, || {
+                level(buffered, table.mutate(row))
+                    .delete_column(family, qualifier)
+                    .commit()
+            })?;
+        }
+        BenchOp::DeleteRow { row } => {
+            retry_busy(busy, || {
+                level(buffered, table.mutate(row)).delete_row().commit()
+            })?;
+        }
         BenchOp::Transfer { from, to, amount } => {
             // An optimistic transaction reading both balances, retried on a conflict
             // (counted) and on `Busy` (as `retry_busy` counts it).

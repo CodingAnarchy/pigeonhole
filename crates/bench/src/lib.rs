@@ -106,6 +106,10 @@ pub enum WorkloadKind {
     /// conflict (counted, [`RunDetail::txn_conflicts`]); RocksDB and fjall lock both rows,
     /// SQLite uses an immediate transaction. Not in `all`.
     Transfer,
+    /// Sparse-wide with deletes (D247, reported): [`WorkloadKind::SparseWide`]'s mix with 5% of
+    /// the operations deleting, half a column ([`BenchOp::DeleteColumn`]) and half a whole row
+    /// ([`BenchOp::DeleteRow`]), taken from its puts. Not in `all`.
+    SparseWideDeletes,
 }
 
 impl WorkloadKind {
@@ -126,8 +130,9 @@ impl WorkloadKind {
     ];
 
     /// Every workload: [`ALL`](Self::ALL) and the ones only named runs take
-    /// ([`WorkloadKind::Counters`], [`WorkloadKind::Transfer`]).
-    pub const EVERY: [WorkloadKind; 14] = [
+    /// ([`WorkloadKind::Counters`], [`WorkloadKind::Transfer`],
+    /// [`WorkloadKind::SparseWideDeletes`]).
+    pub const EVERY: [WorkloadKind; 15] = [
         WorkloadKind::YcsbA,
         WorkloadKind::YcsbB,
         WorkloadKind::YcsbC,
@@ -142,6 +147,7 @@ impl WorkloadKind {
         WorkloadKind::CrossShardContention,
         WorkloadKind::Counters,
         WorkloadKind::Transfer,
+        WorkloadKind::SparseWideDeletes,
     ];
 
     /// The CLI and report name (`ycsb-a`, `sparse-wide`, ...).
@@ -170,6 +176,7 @@ impl WorkloadKind {
             WorkloadKind::CrossShardContention => "cross-shard-contention",
             WorkloadKind::Counters => "counters",
             WorkloadKind::Transfer => "transfer",
+            WorkloadKind::SparseWideDeletes => "sparse-wide-deletes",
         }
     }
 }
@@ -405,6 +412,20 @@ pub enum BenchOp {
         /// The amount moved.
         amount: i64,
     },
+    /// Delete one column of a row ([`WorkloadKind::SparseWideDeletes`]).
+    DeleteColumn {
+        /// Row.
+        row: Vec<u8>,
+        /// Family.
+        family: &'static str,
+        /// Qualifier.
+        qualifier: Vec<u8>,
+    },
+    /// Delete a whole row, every family ([`WorkloadKind::SparseWideDeletes`]).
+    DeleteRow {
+        /// Row.
+        row: Vec<u8>,
+    },
 }
 
 /// One row of a [`BenchOp::Commit`].
@@ -437,6 +458,8 @@ impl BenchOp {
             Self::Incr { .. } => "incr",
             Self::ReadCounter { .. } => "counter read",
             Self::Transfer { .. } => "transfer",
+            Self::DeleteColumn { .. } => "column delete",
+            Self::DeleteRow { .. } => "row delete",
             Self::Get { .. } => "get",
             Self::GetRow { .. } => "row read",
             Self::Put { .. } => "put",
