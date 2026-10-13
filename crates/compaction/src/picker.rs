@@ -6,6 +6,13 @@ use pigeonhole_format::key::row_prefix_len;
 use pigeonhole_format::manifest::{CompactionStyle, SstMeta};
 use pigeonhole_format::{BlobFileId, FamilyId, SstId, TabletId, Timestamp};
 
+/// The L0 depth at which writers start to be paced, as a multiple of `l0_trigger` (D234):
+/// 8 files at the default trigger of 4. Starting at the trigger itself (D119) paced writers
+/// whenever a compaction was merely running: on the AX102 a single shard spent 26% of its
+/// time stalled while L0 never passed 4 files; starting at 2× it spent none, wrote 6% more,
+/// and L0 still stayed at 4 or fewer.
+const STALL_START: f64 = 2.0;
+
 /// The SSTs of one `(tablet, family)` by level. Level 0 is ordered newest first and may
 /// overlap; deeper levels are sorted by key and disjoint.
 #[derive(Debug, Clone, Default)]
@@ -271,17 +278,19 @@ impl CompactionPicker {
         }
     }
 
-    /// The L0 write stall's score (D119): L0 depth over `l0_trigger`, so writers are paced
-    /// only while flushes outrun compaction (never for a deeper level, tiered space
-    /// amplification or FIFO expiry, which only drive picking). FIFO keeps its files in L0,
-    /// so its depth is the longest window of small L0 files a merge would relieve.
+    /// The L0 write stall's score (D119, D234): L0 depth over [`STALL_START`] times
+    /// `l0_trigger`, so writers are paced only once flushes outrun compaction by a full
+    /// trigger's worth of files (never for a deeper level, tiered space amplification or
+    /// FIFO expiry, which only drive picking). FIFO keeps its files in L0, so its depth is
+    /// the longest window of small L0 files a merge would relieve.
     pub fn stall_score(&self, levels: &Levels) -> f64 {
-        match self.style {
+        let depth = match self.style {
             CompactionStyle::Leveled | CompactionStyle::Tiered => self.level_score(levels, 0),
             CompactionStyle::FifoByTime => {
                 self.fifo_window(levels, &[]).1 as f64 / self.fifo_trigger() as f64
             }
-        }
+        };
+        depth / STALL_START
     }
 
     /// Tiered: how far the runs above the oldest one exceed the space-amplification cap

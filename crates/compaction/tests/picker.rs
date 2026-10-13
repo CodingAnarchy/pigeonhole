@@ -467,7 +467,8 @@ fn tiered_merges_l0_with_runs_of_similar_size() {
         levels: vec![(0..3).map(|i| sst(&mut id, i, i + 5, 100)).collect()],
     };
     assert!(p.score(&three) >= 1.0);
-    assert!((p.stall_score(&three) - 0.75).abs() < 1e-9);
+    // D234: the stall starts at twice the trigger.
+    assert!((p.stall_score(&three) - 0.75 / 2.0).abs() < 1e-9);
     // A lone L0 file over an empty tree moves down whole.
     let mut options = PickerOptions::default();
     options.l0_trigger = 1;
@@ -675,7 +676,7 @@ fn fifo_merges_the_longest_window_of_small_l0_files() {
     let levels = Levels { levels: vec![l0] };
     assert!((picker.score(&levels) - 1.5).abs() < 1e-9);
     // The stall follows that window, not the five L0 files FIFO keeps by design.
-    assert!((picker.stall_score(&levels) - 1.5).abs() < 1e-9);
+    assert!((picker.stall_score(&levels) - 1.5 / 2.0).abs() < 1e-9);
     let big = Levels {
         levels: vec![(0..5).map(|i| timed(&mut id, 0, (i, i), 900)).collect()],
     };

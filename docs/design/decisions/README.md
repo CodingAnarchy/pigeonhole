@@ -132,7 +132,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D116](phase-1.md#d116) — When may a shard checkpoint a PREPARE or COMMIT record · engine Milestone B · **amended by D225**
 - [D117](phase-1.md#d117) — Is `SetFlushed` the memtable's max seqno, or the shard's visible seqno · engine Milestone B
 - [D118](phase-1.md#d118) — How conservative is `GcPolicy` about reader-process snapshots · engine Milestone B; precise per-slot pinning is #39
-- [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161, D166**
+- [D119](phase-1.md#d119) — How should the L0 write stall behave with a frozen or coarse clock · engine Milestone B · **amended by D126, D161, D166, D234**
 - [D120](phase-1.md#d120) — What does `backup` write for an engine with memtables and many levels · engine Milestone B; blob extents are #58 · **amended by D182**
 - [D121](phase-1.md#d121) — What happens at open when the discovered streams do not match `0..shards` · engine Milestone B · **amended by D156**
 - [D122](phase-1.md#d122) — Should SST readers open lazily or at manifest apply · engine Milestone B
@@ -179,7 +179,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D163](phase-2.md#d163) — Fairness rules for the Phase 2 benchmark against SQLite EAV and hand-keyed stores · bench, #54, #220 · **amended by D178**
 - [D164](phase-2.md#d164) — The engine\'s test hooks live in one module, and a public seam beats a hook · engine, #184 · touches D90, D134 · **amended by D174**
 - [D165](phase-2.md#d165) — The tiered picker's runs, triggers and output levels; the engine picks per family · compaction, #31, #227 · **amended by D169**
-- [D166](phase-2.md#d166) — The write stall follows L0 depth only · compaction, engine, #227 · amends D119
+- [D166](phase-2.md#d166) — The write stall follows L0 depth only · compaction, engine, #227 · amends D119 · **amended by D234**
 - [D167](phase-2.md#d167) — The FIFO-by-time picker: expiry drops, the size cap and intra-L0 merges · compaction, #32, #229 · **amended by D170**
 - [D168](phase-2.md#d168) — Tiered and FifoByTime families are accepted by the public API · pigeonhole, #44, #241 · amends D95 · **amended by D175**
 - [D169](phase-2.md#d169) — The tiered picker needs no extra write-amplification bound; the proptest guards it · compaction, #228, #245 · supersedes D165's write-amp follow-up
@@ -244,6 +244,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D230](phase-3.md#d230) — The memtable lookup target (≤ 300 ns) is judged at 2^18 entries, the largest one (tablet, family) memtable reaches under the default options with small cells (16 MiB freeze ÷ ~64-byte nodes; the arithmetic is in the entry); 1M and 10k are reported; software prefetch in the search was measured (−3% at 1M, +2–9% at 10k on the AX102) and not adopted · owner decision, bench, memtable, #17, #406
 - [D231](phase-3.md#d231) — The scaling gate is split: engine scaling (≥ 0.8 × N) on a table pre-split at the writes' quantiles with the balancer off, and balancer placement judged by an open-loop check (busiest ≤ 1.25/N once settled within 60 s, no tablet change while measuring, the offered rate sustained) · owner decision, bench, #406 · amends D204, D223
 - [D233](phase-3.md#d233) — The bench settles every engine after the load (a flush, then a bounded wait until its background work is quiet) before the warmup; records carry the settle and the measured phase's background work, and `compare` notes pairs whose background work differs · owner decision, bench, #406 · the public idle API is deferred to Phase 4
+- [D234](phase-3.md#d234) — The L0 write stall starts at twice `l0_trigger` (8 files at the defaults): at the trigger a single shard spent 26% of its time stalled while L0 never passed 4 files; at 8, none, +6% writes, no read cost measured · owner decision, compaction, engine, #406 · amends D119, D166
 
 ## Open questions
 _None._

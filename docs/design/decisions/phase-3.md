@@ -1088,3 +1088,22 @@ Each record carries `detail.settle` (milliseconds, settled, the work done while 
 
 **Why:** on the 2026-10-12 gate, ycsb-b on Pigeonhole measured 224.5K and 280.6K ops/s in two identical runs (+25%, beyond the ±20% tolerance). p50 and p99 were the same (1.06/1.05 µs, 13.9/13.4 µs), but the slower run's measured phase held 7 flushes, 7 compactions, 365 write stalls (128 ms) and a 182 ms operation, and the faster one none. The load (1M rows, ~15 s) went straight into a 0.2 s warmup and a 3.5 s measured phase, so how much of its background tail landed in the window was timing luck. Four repeats on the AX102 (2026-10-13) measured 270K–292K: the two slower ones each had a flush and a compaction in the measured phase, the faster two none.
 
+<a id="d234"></a>
+## D234 — The L0 write stall starts at twice `l0_trigger` (8 L0 files at the defaults), not at the trigger itself (owner decision, 2026-10-13; compaction, engine, #406; amends D119, D166)
+
+**Decided:** `CompactionPicker::stall_score` is L0 depth over 2 × `l0_trigger`, for every compaction style (FIFO's window too). The token bucket (D119) is unchanged: it engages at a score of 1, now 8 L0 files at the default trigger of 4, and its rate still falls as the score rises (4,000 groups/s ÷ score). There is still no hard stop (spec: "a token bucket rather than hard stops"). The factor is relative, so a family with its own `l0_trigger` keeps the same relation between when compaction starts and when writers slow down.
+
+**Why:** at the trigger, writers were paced whenever a compaction was merely running.
+- On the AX102 (2026-10-13, scratch build with the start as a knob), a single shard spent 26% of its thread stalled on the bucket. L0 never went past 4 files: the compaction already running at 4 cleared it.
+- With the start at 8 or 12 it spent none, and L0 still stayed at 4 files or fewer: 54% of the time at 4, 0% deeper. So reads saw no deeper L0.
+
+| Stall starts at | 1-shard inline writes | 4-shard inline writes | 1 shard: stalled / compaction share of its thread | sparse-wide ops/s, p99 | ycsb-a ops/s, p99 | ycsb-b ops/s, p99 | L0 SSTs probed per read (sparse-wide / ycsb-a / ycsb-b) |
+|---|--:|--:|---|---|---|---|---|
+| 4 (D119) | 407K, 407K | 1.69M, 1.67M | 26% / 35% | 28K, 416–422 µs | 159–196K, 14.2–15.6 µs | 263–275K, 14.0–14.1 µs | 0.05–0.08 / 0.14–0.29 / 0.14–0.18 |
+| **8 (adopted)** | **433K, 432K** | 1.69M, 1.71M | **0%** / 37% | 28K, 422–440 µs | 166–185K, 14.7–16.1 µs | 266–276K, 13.9–14.1 µs | 0.07–0.15 / 0.28–0.35 / 0.13–0.15 |
+| 12 | 430K, 430K | 1.71M, 1.69M | 0% / 37% | 28–29K, 416–426 µs | 177–193K, 14.6–15.2 µs | 262–284K, 13.6–14.3 µs | 0.03–0.07 / 0.23–0.25 / 0.16–0.18 |
+
+- **Runs:** two per arm, order rotated. Pigeonhole only, `--scale full`, uring. The read workloads ran before D233's settle step, so ycsb-a's run-to-run spread is wide. Read p99 and L0 probes per read stay within that spread at every start.
+- **Why 8 over 12:** 12 bought nothing over 8 here, and 8 still paces writers well before a backlog can build.
+- **What it costs:** the single-shard baseline rises ~6%, which lowers the scaling gate's efficiency at a given N by about as much where per-shard rates are unchanged.
+
