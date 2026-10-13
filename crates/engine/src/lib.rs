@@ -29,6 +29,7 @@ mod engine;
 mod error;
 mod flush;
 mod flushed_roots;
+mod health;
 mod large;
 mod large_settle;
 mod load_slot;
@@ -53,6 +54,7 @@ pub use engine::{
     CommitInfo, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats, TableInfo,
 };
 pub use error::{Error, Result};
+pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, RowFuture};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};

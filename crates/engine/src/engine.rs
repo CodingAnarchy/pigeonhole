@@ -642,6 +642,7 @@ impl Engine {
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             pager_poisoned: AtomicBool::new(false),
+            failure: Default::default(),
             close: CloseState::new(shards),
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             ts_floors: (0..shards)
@@ -1155,6 +1156,7 @@ impl Engine {
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             pager_poisoned: AtomicBool::new(false),
+            failure: Default::default(),
             close: CloseState::new(0),
             metrics: Vec::new(),
             ts_floors: Vec::new(),
@@ -1915,6 +1917,22 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// Whether this instance has failed (ICR 0040): a shard died (its thread panicked, or
+    /// its application-owned driver was dropped before the close finished) or poisoned
+    /// itself (a WAL write or sync failed, or its state could not be updated), or a manifest
+    /// commit to the main file failed. A failed instance refuses some or all commits until
+    /// it is closed and reopened; [`Engine::failure`] says which shard and why. Cheap: one
+    /// atomic load.
+    pub fn is_failed(&self) -> bool {
+        self.inner.shared.failure.get().is_some()
+    }
+
+    /// The instance's first failure, if any (see [`Engine::is_failed`]). Later failures do
+    /// not replace it.
+    pub fn failure(&self) -> Option<crate::Failure> {
+        self.inner.shared.failure.get()
     }
 
     /// Current metrics.

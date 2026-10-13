@@ -28,7 +28,7 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 ## Code table
 | # | Code | Meaning | Typical cause | What to do |
 |---|---|---|---|---|
-| 1 | `Io` | An I/O failure. | Disk or filesystem error, failed `write` or fsync, permissions. | Check `message()`. Treat an in-flight commit as **not durable**. Retry only if the cause is transient. |
+| 1 | `Io` | An I/O failure. | Disk or filesystem error, failed `write` or fsync, permissions. For a commit: refused before anything of it was written (its shard had already stopped after an I/O error). A commit whose own log write or sync failed gets `OutcomeUnknown` instead, since its record may be in the file. | Check `message()`. A commit that got `Io` was **not committed**: retry it once the cause is fixed (after a reopen if the instance failed). |
 | 2 | `Corruption` | Stored data failed validation (checksum, structure). | Disk fault, truncated or modified file, bug. Also a crash during the very first `open` that created the file: the message then says it looks like an interrupted create. | Stop writing to this file. Restore from a backup (`Pigeonhole::backup`) and report it. For an interrupted create, nothing was ever committed: delete the file and open again (Pigeonhole never deletes it for you). |
 | 3 | `WriterLocked` | Another process holds the writer lock. | A second `open` or `open_application_owned` on the same file. | Use `open_reader` for the second process, or wait and retry after the writer closes. |
 | 4 | `ShmVersionMismatch` | A live shared-memory region has a different layout version. | A newer or older Pigeonhole build is attached to the same database. | Run one build version against a database at a time; close all handles and reopen. |
@@ -64,6 +64,7 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | Programmer error | `FamilyNotFound`, `TableNotFound`, `TableExists`, `FamilyExists`, `KeyTooLarge`, `ValueTooLarge`, `RecordTooLarge` (split the batch), `MergeFailed` (bad operand, or mixed data in a 0.1.0 counter column), `InvalidArgument`, `Unsupported`, `Closed`, `ReadOnly`, `WouldDeadlock` (await from the event loop; the commit still applies). Fix the code or the data model. |
 | Configuration | `BatchTooLarge` (split the batch or raise `Options::memtable_budget`), `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
 | Outcome unknown | `OutcomeUnknown`: reopen and read to see whether the commit landed (whole or not at all), then write it again if it did not. |
+| Failed instance | `Pigeonhole::is_failed()` is true (a shard panicked, lost its driver, or stopped after an I/O or internal error; `failure()` says which and why). Close, reopen, then settle the commits in flight: see [Recovering from a failed shard](recovery.md). |
 | Data integrity | `Corruption`. Do not retry; restore from backup. |
 
 If this table disagrees with `crates/pigeonhole/src/error.rs`, the source wins; please report it.

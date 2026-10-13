@@ -873,6 +873,10 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             drop(writer);
             if poisoned {
                 shared.pager_poisoned.store(true, Ordering::Release);
+                shared.failure.record(
+                    crate::health::Failure::MAIN_FILE,
+                    crate::health::FailureCause::Io,
+                );
             } else {
                 // Nothing was written (a snapshot rewrite found no space): refuse the batch
                 // as a whole and free what its requests wrote, as for a refused request.
@@ -923,6 +927,10 @@ pub(crate) fn end(
         Ok(v) => v,
         Err(e) => {
             shared.pager_poisoned.store(true, Ordering::Release);
+            shared.failure.record(
+                crate::health::Failure::MAIN_FILE,
+                crate::health::FailureCause::Io,
+            );
             let msg = e.to_string();
             for (req, r) in reqs {
                 (req.reply)(
@@ -995,6 +1003,10 @@ pub(crate) fn end(
         // commit would retire what this one already retired: no further commits (the
         // pager is poisoned until reopen), and the requesters must not touch their extents.
         shared.pager_poisoned.store(true, Ordering::Release);
+        shared.failure.record(
+            crate::health::Failure::MAIN_FILE,
+            crate::health::FailureCause::Io,
+        );
         let msg = e.to_string();
         for (req, r) in reqs {
             (req.reply)(r.and_then(|()| Err(Error::Corruption(msg.clone()))));

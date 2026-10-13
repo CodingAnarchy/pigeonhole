@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use pigeonhole_engine::{Engine, EngineShard};
+use pigeonhole_engine::{Engine, EngineShard, Failure};
 use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
 
@@ -277,6 +277,24 @@ impl Pigeonhole {
             Arc::clone(&self.db),
             self.db.engine.begin()?,
         ))
+    }
+
+    /// Whether this instance has failed (ICR 0040): a shard's thread panicked, an
+    /// application-owned shard's driver was dropped before the close finished, a shard
+    /// stopped after a WAL write or sync failed (or its in-memory state could not be
+    /// updated), or a manifest commit to the main file failed. A failed instance refuses
+    /// some or all commits until it is closed and reopened: see the user guide's
+    /// "Recovering from a failed shard". [`failure`](Self::failure) says which shard and
+    /// why. Cheap (one atomic load), so it can back a health endpoint.
+    pub fn is_failed(&self) -> bool {
+        self.db.engine.is_failed()
+    }
+
+    /// The instance's first failure, if any (see [`is_failed`](Self::is_failed)): the shard
+    /// ([`Failure::MAIN_FILE`] for the main file) and the
+    /// [`FailureCause`](crate::FailureCause). Later failures do not replace it.
+    pub fn failure(&self) -> Option<Failure> {
+        self.db.engine.failure()
     }
 
     /// A consistent snapshot of everything committed so far. It sees a commit once the commit

@@ -14,7 +14,8 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 5. [Scans and filters](scans-and-filters.md): row, prefix and range scans, projection, versions, time ranges, snapshots, pushdown semantics.
 6. [Data modeling](data-modeling.md): row-key design, family split, time series with TTL, adjacency lists, counters, versions, anti-patterns.
 7. [Errors](errors.md): every `ErrorCode` with cause and remedy.
-8. [Agent reference](agent-reference.md): every public type and method, limits, error codes and copy-paste recipes on one page.
+8. [Recovering from a failed shard](recovery.md): detect a failed instance (`is_failed`), close, reopen, settle the commits in flight.
+9. [Agent reference](agent-reference.md): every public type and method, limits, error codes and copy-paste recipes on one page.
 
 Multi-process readers (P4) will get their own page when they are hardened; for now see [Concepts](concepts.md#multi-process-readers-phase-4-available-now) (including why readers need write permission on the file) and the API in the agent reference.
 

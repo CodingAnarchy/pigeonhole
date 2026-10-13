@@ -112,8 +112,8 @@ pub(crate) struct Hooks {
     /// Commits no `SstBlobRefs` edit and keeps no blob references, as a build from before
     /// tag 13 (#240) wrote (`Engine::omit_blob_refs`).
     pub omit_blob_refs: AtomicBool,
-    /// Fails the next single-shard batch's apply with `Busy` after its WAL append, without
-    /// applying it, as an arena miscount would (`Engine::fail_next_apply`).
+    /// Fails the next apply after its WAL append, without applying it, as an arena miscount
+    /// would (`Engine::fail_next_apply`).
     pub fail_next_apply: AtomicBool,
     /// A deliberate fault in the flush GC (`Engine::mutate_flush_gc`, #287): 1 treats the
     /// guard as always holding, 2 drops the snapshot floor (no live read point is kept), 3
@@ -905,8 +905,9 @@ impl Engine {
 
     /// Fails the next apply after its WAL append, of a single-shard batch or of a
     /// cross-shard share: it is not applied, and the shard poisons itself, as an arena
-    /// miscount would (#230). A single-shard commit returns `Busy`; a cross-shard commit
-    /// decided to commit returns `OutcomeUnknown` (D227). Test hook.
+    /// miscount would (#230). The commit returns `OutcomeUnknown` either way: a single-shard
+    /// one's record replays at the next open, and a cross-shard one decided to commit is
+    /// settled there too (D227, ICR 0038, ICR 0040). Test hook.
     #[doc(hidden)]
     pub fn fail_next_apply(&self) {
         self.inner
