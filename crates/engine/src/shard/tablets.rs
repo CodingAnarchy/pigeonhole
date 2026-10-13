@@ -1125,7 +1125,12 @@ impl ShardState {
             now.max(1),
             self.balance_pass,
         );
-        self.track_pack(now);
+        let store_writes = self.track_pack(now);
+        #[cfg(feature = "test-hooks")]
+        self.shared.metrics[usize::from(self.id.0)]
+            .hooks
+            .pack_k
+            .store(self.active_shards() as u64 + 1, Ordering::Relaxed);
         self.track_skew(now);
         let idle = self.may_change();
         // A change waits for a running compaction on its tablets (#102: a running change
@@ -1168,8 +1173,11 @@ impl ShardState {
         // Idle backoff: a pass that found nothing to do, after no writes and no tablet change,
         // doubles the interval (up to `BALANCE_IDLE_CAP_NANOS`, never below the base), so an
         // idle shard wakes rarely; anything else returns to the base interval.
+        // Shard 0 decides the active shard count for every shard: it keeps the base interval
+        // while the store writes, even when it writes nothing itself (D217).
         let quiet = idle
             && !wrote
+            && !store_writes
             && decision_none
             && cleanups.is_empty()
             && epoch == self.balance_epoch
@@ -1299,25 +1307,39 @@ impl ShardState {
     /// packing or before it has decided.
     pub(super) fn active_shards(&self) -> usize {
         let n = self.shared.shards;
-        if self.shared.balance.pack && self.pack_k > 0 {
-            self.pack_k.min(n)
+        let k = self.shared.pack_k.load(Ordering::Acquire);
+        if self.shared.balance.pack && k > 0 {
+            k.min(n)
         } else {
             n
         }
     }
 
-    /// Updates how many shards stay active (D217): every shard computes the same `k` from the
-    /// published busy fractions, `ceil(B / PACK_TARGET)`. It grows (at least by one) after
+    /// Shard 0 decides how many shards stay active and publishes it; the others read it
+    /// (`active_shards`), so every shard uses the same `k` (D217). Each shard keeping its own
+    /// hysteresis over loads read at different passes disagreed for good. Returns whether the
+    /// store writes enough for packing to act (shard 0 then keeps its base interval).
+    fn track_pack(&mut self, now: u64) -> bool {
+        if self.id.0 != 0 {
+            return false;
+        }
+        let writing = self.decide_pack(now);
+        self.shared.pack_k.store(self.pack_k, Ordering::Release);
+        writing
+    }
+
+    /// Updates how many shards stay active (D217): shard 0 decides `k` for every shard and
+    /// publishes it (`Shared::pack_k`), from the published busy fractions, `ceil(B / PACK_TARGET)`. It grows (at least by one) after
     /// `PACK_GROW_PASSES` passes with the active shards above `PACK_SPREAD` busy on average,
     /// and shrinks after `PACK_SHRINK_PASSES` passes with one fewer shard enough to stay
     /// under `PACK_TARGET`. Never fewer than the shards the tablets' memtable slots need
     /// (`max_slots` each), and at once up to that. Only while the store writes (`balance_min_writes` over all
     /// shards) and some shard reports busy time: an idle store, or a clock that does not
     /// move while shards work (the simulated VFS), keeps its placement.
-    fn track_pack(&mut self, now: u64) {
+    fn decide_pack(&mut self, now: u64) -> bool {
         let n = self.shared.shards;
         if !self.shared.balance.pack || n < 2 {
-            return;
+            return false;
         }
         if self.pack_k == 0 {
             self.pack_k = n;
@@ -1338,7 +1360,7 @@ impl ShardState {
         if busy <= 0.0 || writes < self.shared.balance.min_writes.max(1) {
             self.pack_up = 0;
             self.pack_down = 0;
-            return;
+            return false;
         }
         // The active shards must hold every tablet's memtable slots: without the floor, the
         // first full shard strands the rest of the written tablets across the inactive ones.
@@ -1363,7 +1385,7 @@ impl ShardState {
             );
             self.pack_up = 0;
             self.pack_down = 0;
-            return;
+            return true;
         }
         if k < n && busy / k as f64 > PACK_SPREAD {
             self.pack_up += 1;
@@ -1380,7 +1402,7 @@ impl ShardState {
         } else if self.pack_down >= PACK_SHRINK_PASSES {
             self.pack_k = want.min(k - 1);
         } else {
-            return;
+            return true;
         }
         trace!(
             "shard {} balancer: active shards {k} -> {} (busy {busy:.2})",
@@ -1388,6 +1410,7 @@ impl ShardState {
         );
         self.pack_up = 0;
         self.pack_down = 0;
+        true
     }
 
     /// Updates whether this shard acts on write skew (D214, with hysteresis): it starts after

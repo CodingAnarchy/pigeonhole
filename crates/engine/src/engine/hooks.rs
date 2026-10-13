@@ -158,6 +158,9 @@ pub(crate) struct ShardCounters {
     /// The busy fraction the shard's balancer measures (millionths plus one; 0 measures the
     /// thread's real busy time), `Engine::set_shard_busy` (D217's packing tests).
     pub busy_override: AtomicU64,
+    /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
+    /// one (0 before its first pass), `Engine::pack_ks`.
+    pub pack_k: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -527,6 +530,21 @@ impl Engine {
             .hooks
             .busy_override
             .store(v, Ordering::Relaxed);
+    }
+
+    /// The active shard count (`k`, D217's packing) each shard's balancer used at its last
+    /// pass, by shard (`None` before its first pass). Test hook: every shard must use the same.
+    #[doc(hidden)]
+    pub fn pack_ks(&self) -> Vec<Option<usize>> {
+        self.inner
+            .shared
+            .metrics
+            .iter()
+            .map(|m| match m.hooks.pack_k.load(Ordering::Relaxed) {
+                0 => None,
+                v => Some(v as usize - 1),
+            })
+            .collect()
     }
 
     /// Bytes in the block cache (test hook: `shrink`'s tests check that an abandoned copy

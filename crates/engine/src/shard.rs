@@ -350,6 +350,9 @@ pub(crate) struct Shared {
     /// Full compactions (`Engine::compact`) in progress: the balancer starts no change
     /// meanwhile, so a tablet does not move past the shards' rounds (issue #94).
     pub full_compactions: AtomicUsize,
+    /// How many shards stay active under packing (`0..pack_k`, D217; 0 before shard 0's
+    /// first decision): shard 0's balancer decides it for every shard.
+    pub pack_k: AtomicUsize,
     /// Async commits and deferred freezes waiting for the watermark.
     pub waiters: WatermarkWaiters,
     /// Shards whose deferred freeze waits for the durable seqno (D227, ICR 0037): a frozen
@@ -2218,8 +2221,9 @@ pub(crate) struct ShardState {
     slow_pass: Option<u64>,
     chose_slow: std::cell::Cell<bool>,
     /// Packing (D217): this shard's busy time and clock at its last pass, the moving average
-    /// of how busy it was, how many shards stay active (`0..pack_k`; 0 before the first
-    /// decision), and the consecutive passes calling for more or fewer of them.
+    /// of how busy it was, and, on shard 0 only (which decides for every shard and publishes
+    /// it as `Shared::pack_k`), how many shards stay active (`0..pack_k`; 0 before the first
+    /// decision) and the consecutive passes calling for more or fewer of them.
     busy_mark: Option<(u64, u64)>,
     busy_ewma: f64,
     pack_k: usize,
