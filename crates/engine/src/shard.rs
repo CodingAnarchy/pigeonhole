@@ -2924,14 +2924,11 @@ impl ShardState {
         self.reserved = self.reserved.saturating_sub(bytes);
     }
 
-    /// Freezes the active memtables that crossed the threshold during `apply` (or every
-    /// non-empty one when `all`), and queues them for flushing. A memtable freezes only
-    /// once every seqno it holds is durable (D227), so also visible: then its largest seqno is exact as the slot's
-    /// flushed-through seqno (no lower seqno can land in a newer memtable), so replay skips
-    /// exactly what the SST holds.
     /// Picks the slots a wait for arena room freezes when no flush is in flight (D124): the
     /// open memtables, largest first, until those picked hold half the arena (all of them if
     /// they hold less). At least one is picked while any holds data.
+    #[cold]
+    #[inline(never)]
     fn pick_room_freezes(&mut self) {
         let mut open: Vec<(usize, (TabletId, FamilyId))> = self
             .memtables
@@ -2951,7 +2948,29 @@ impl ShardState {
         }
     }
 
+    /// Freezes the active memtables that crossed the threshold during `apply` (or every
+    /// non-empty one when `all`), and queues them for flushing. A memtable freezes only
+    /// once every seqno it holds is durable (D227), so also visible: then its largest seqno is exact as the slot's
+    /// flushed-through seqno (no lower seqno can land in a newer memtable), so replay skips
+    /// exactly what the SST holds.
     fn freeze(&mut self, all: bool) -> Result<()> {
+        // The commit path calls this after every group: slots a wait for room picked (D124)
+        // take a cold copy, so the usual one checks nothing more.
+        if !self.room_freezes.is_empty() {
+            return self.freeze_for_room(all);
+        }
+        self.freeze_with::<false>(all)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn freeze_for_room(&mut self, all: bool) -> Result<()> {
+        self.freeze_with::<true>(all)
+    }
+
+    /// [`Self::freeze`], with the slots in `room_freezes` forced when `ROOM`.
+    #[inline(always)]
+    fn freeze_with<const ROOM: bool>(&mut self, all: bool) -> Result<()> {
         let all = all || self.freeze_all_pending;
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let keys: Vec<(TabletId, FamilyId)> = if all {
@@ -2964,7 +2983,7 @@ impl ShardState {
             for key in self.memtables.keys() {
                 if (self.moving.contains(&key.0)
                     || self.unpin.contains(key)
-                    || self.room_freezes.contains(key))
+                    || (ROOM && self.room_freezes.contains(key)))
                     && !keys.contains(key)
                 {
                     keys.push(*key);
@@ -2993,7 +3012,7 @@ impl ShardState {
             let big = slot.active.table.allocated_bytes() >= threshold;
             let forced = self.moving.contains(&key.0)
                 || self.unpin.contains(&key)
-                || self.room_freezes.contains(&key);
+                || (ROOM && self.room_freezes.contains(&key));
             if slot.active.table.is_empty() || !(all || big || forced) {
                 continue;
             }
@@ -3093,11 +3112,13 @@ impl ShardState {
                 .get(k)
                 .is_some_and(|s| s.seal == Seal::Open && !s.active.table.is_empty())
         });
-        self.room_freezes.retain(|k| {
-            memtables
-                .get(k)
-                .is_some_and(|s| s.seal == Seal::Open && !s.active.table.is_empty())
-        });
+        if ROOM {
+            self.room_freezes.retain(|k| {
+                memtables
+                    .get(k)
+                    .is_some_and(|s| s.seal == Seal::Open && !s.active.table.is_empty())
+            });
+        }
         self.freeze_all_pending = all && deferred;
         if all {
             self.starved_all = starved;
