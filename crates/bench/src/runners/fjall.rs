@@ -9,7 +9,7 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use super::{
     Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id, keys,
-    live_value, modified, now_micros, read_family, scan_rows,
+    live_value, modified, now_micros, read_family, scan_rows, transfer_balances,
 };
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
@@ -245,6 +245,33 @@ impl Handle {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Transfer { from, to, amount } => {
+                // Both rows locked from the reads to the batch (D247).
+                let f = family_id(YCSB_FAMILY)?;
+                let (ka, kb) = (keys::cell(from, f, b"bal"), keys::cell(to, f, b"bal"));
+                let _held = self.locks.lock_two(&ka, &kb);
+                let now = now_micros();
+                let a = self.cells.get(&ka).map_err(e)?;
+                let b = self.cells.get(&kb).map_err(e)?;
+                let va = a
+                    .as_deref()
+                    .map(|v| live_value(f, v, now))
+                    .transpose()?
+                    .flatten();
+                let vb = b
+                    .as_deref()
+                    .map(|v| live_value(f, v, now))
+                    .transpose()?
+                    .flatten();
+                for v in [va, vb].into_iter().flatten() {
+                    t.cell(v);
+                }
+                let (na, nb) = transfer_balances(va, vb, *amount);
+                let mut batch = self.db.batch().durability(Some(self.mode));
+                batch.insert(&self.cells, ka, encode_value(now, &na.to_le_bytes()));
+                batch.insert(&self.cells, kb, encode_value(now, &nb.to_le_bytes()));
+                batch.commit().map_err(e)?;
+            }
             BenchOp::Incr { row, delta } => {
                 let _held = self.locks.lock(row);
                 let n = self

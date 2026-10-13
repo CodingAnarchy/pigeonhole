@@ -100,6 +100,12 @@ pub enum WorkloadKind {
     /// `i64` add), SQLite an upsert, fjall a locked read-modify-write. Not in `all`: the gate's
     /// `contended` step runs it.
     Counters,
+    /// Transfers (D247, reported): from [`COUNTER_THREADS`] clients, each operation moves one
+    /// unit between two Zipfian accounts in one transaction that reads both
+    /// ([`BenchOp::Transfer`]). Pigeonhole runs an optimistic `Transaction`, retried on a
+    /// conflict (counted, [`RunDetail::txn_conflicts`]); RocksDB and fjall lock both rows,
+    /// SQLite uses an immediate transaction. Not in `all`.
+    Transfer,
 }
 
 impl WorkloadKind {
@@ -120,8 +126,8 @@ impl WorkloadKind {
     ];
 
     /// Every workload: [`ALL`](Self::ALL) and the ones only named runs take
-    /// ([`WorkloadKind::Counters`]).
-    pub const EVERY: [WorkloadKind; 13] = [
+    /// ([`WorkloadKind::Counters`], [`WorkloadKind::Transfer`]).
+    pub const EVERY: [WorkloadKind; 14] = [
         WorkloadKind::YcsbA,
         WorkloadKind::YcsbB,
         WorkloadKind::YcsbC,
@@ -135,6 +141,7 @@ impl WorkloadKind {
         WorkloadKind::GroupCommit,
         WorkloadKind::CrossShardContention,
         WorkloadKind::Counters,
+        WorkloadKind::Transfer,
     ];
 
     /// The CLI and report name (`ycsb-a`, `sparse-wide`, ...).
@@ -162,6 +169,7 @@ impl WorkloadKind {
             WorkloadKind::GroupCommit => "group-commit",
             WorkloadKind::CrossShardContention => "cross-shard-contention",
             WorkloadKind::Counters => "counters",
+            WorkloadKind::Transfer => "transfer",
         }
     }
 }
@@ -216,7 +224,8 @@ impl WorkloadConfig {
                 WorkloadKind::SkewedMultiShard
                 | WorkloadKind::GroupCommit
                 | WorkloadKind::CrossShardContention
-                | WorkloadKind::Counters => 2,
+                | WorkloadKind::Counters
+                | WorkloadKind::Transfer => 2,
                 _ => 1,
             },
             epoch_micros: 0,
@@ -246,7 +255,7 @@ impl WorkloadConfig {
             threads: match kind {
                 WorkloadKind::SkewedMultiShard | WorkloadKind::GroupCommit => 4,
                 WorkloadKind::CrossShardContention => XSHARD_CLIENTS,
-                WorkloadKind::Counters => COUNTER_THREADS,
+                WorkloadKind::Counters | WorkloadKind::Transfer => COUNTER_THREADS,
                 _ => 1,
             },
             epoch_micros: 0,
@@ -385,6 +394,17 @@ pub enum BenchOp {
         /// Row.
         row: Vec<u8>,
     },
+    /// Move `amount` from one account to another in one transaction that reads both
+    /// balances ([`WorkloadKind::Transfer`]): `i64` little-endian, in [`YCSB_FAMILY`]'s
+    /// `bal` column.
+    Transfer {
+        /// The account debited.
+        from: Vec<u8>,
+        /// The account credited (never `from`).
+        to: Vec<u8>,
+        /// The amount moved.
+        amount: i64,
+    },
 }
 
 /// One row of a [`BenchOp::Commit`].
@@ -416,6 +436,7 @@ impl BenchOp {
             Self::Commit { .. } => "put",
             Self::Incr { .. } => "incr",
             Self::ReadCounter { .. } => "counter read",
+            Self::Transfer { .. } => "transfer",
             Self::Get { .. } => "get",
             Self::GetRow { .. } => "row read",
             Self::Put { .. } => "put",
@@ -541,6 +562,13 @@ pub trait Runner {
     /// buffered durability commits at its own from here on (D247). The default does nothing.
     fn measured_durability(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Transactions retried after a conflict since open, for stores whose transactions can
+    /// conflict; `None` (the default) elsewhere. [`run_detailed`] reads it around the measured
+    /// phase.
+    fn txn_conflicts(&self) -> Option<u64> {
+        None
     }
 
     /// The store's last sequence number, for stores that number their commits; `None` (the
@@ -766,8 +794,15 @@ pub fn run_detailed(
     let busy_retries = runner.busy_retries();
     let closed = runner.close();
     let (load, elapsed, threads, hist, split, detail) = result?;
-    let (shards, stalls, settle, background_work, (warmup_secs, warmup_settled), seqnos_used) =
-        detail;
+    let (
+        shards,
+        stalls,
+        settle,
+        background_work,
+        (warmup_secs, warmup_settled),
+        seqnos_used,
+        txn_conflicts,
+    ) = detail;
     closed?;
     let ops = hist.count();
     let (reads, by_type) = split.into_split();
@@ -802,6 +837,7 @@ pub fn run_detailed(
             warmup_secs: Some(warmup_secs),
             warmup_settled: Some(warmup_settled),
             seqnos_used,
+            txn_conflicts,
         },
     })
 }
@@ -917,6 +953,7 @@ type Measured = (
         Option<u64>,
         (f64, bool),
         Option<u64>,
+        Option<u64>,
     ),
 );
 
@@ -984,6 +1021,7 @@ fn measure(
         runner.stalls(),
         runner.background(),
         runner.seqno(),
+        runner.txn_conflicts(),
     );
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
@@ -1014,6 +1052,10 @@ fn measure(
         before
             .3
             .zip(runner.seqno())
+            .map(|(b, a)| a.saturating_sub(b)),
+        before
+            .4
+            .zip(runner.txn_conflicts())
             .map(|(b, a)| a.saturating_sub(b)),
     );
     Ok((load, elapsed, lanes, hist, split, shards))
