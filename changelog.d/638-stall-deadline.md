@@ -1,0 +1,2 @@
+### Fixed
+- The write-stall timeout (`Options::write_stall_timeout`) now applies to each waiting write, `flush` or `compact` on its own, counted from when that call began waiting. Before, a shard short of memtable room for the whole timeout refused every waiting write with `Busy` at once, including writes that had only just arrived, even when flushes kept freeing room. A bulk load with many writers on one shard could fail this way (D240, #638).

@@ -1279,12 +1279,45 @@ Throughput is unchanged (8.8–9.6M cells/s at 16 in flight).
 
 **Why.** The lookup is bound by memory latency. Each probe follows dependent node reads through the skiplist. D230 measured software prefetch in the search and didn't adopt it (−3% at 1M, +2–9% when cache-resident). Closing the last 37 ns needs a different structure for frozen memtables (#612), and that isn't Phase 3 work. The gate previously measured 481 ns at 1M; D230's 2^18 entries give 337 ns.
 
+<a id="d240"></a>
+## D240 — The write-stall timeout is each waiting write's own: a commit, `flush` or `compact` is refused with `Busy` once it has waited that long itself (coordinator, 2026-10-13; engine, cold-get liveness (c); amends D124)
+
+**Decided:**
+- **Per waiter.** A commit waiting for arena room is refused with `Busy` once it has itself waited `write_stall_timeout_nanos`, counted from when it first waited.
+  - Room freed for the commits ahead of it, and how long the shard has been short of room, don't count against it.
+  - The waiting queue keeps submission order, so the oldest waiter is admitted first, and the timeout timer is armed for its deadline.
+- **`flush` and `compact` callers** in a starved freeze (D138) wait the same way: from when they asked, or from when the freeze starved if later.
+- **Unchanged:**
+  - On a frozen clock, every waiter is still refused after `ROOM_FLUSH_ATTEMPTS` failed flushes, or at once when nothing can free room (D126).
+  - The stall metrics (count and nanoseconds) still cover the shard's wait, from its first waiter to its last.
+  - `Duration::ZERO` still refuses as soon as a wait would begin.
+- **A member's clock restarts** when the shard's wait ends (a group needs no room) and it later waits again, behind a conditional commit for example.
+- **The stamp** is a `u32` of milliseconds on the shard clock (it wraps after 49 days, far past any timeout).
+  - It sits where `Member::attempts` was: D241 left that counter trace-only, so it's gone from every commit request.
+  - So a member stays the size it was. A first build with a `u64` stamp grew `Member` from 248 to 256 bytes and put `commit-sixteen` 46 instructions over its callgrind ceiling. Members are moved several times per group.
+
+**Why.** The code read the timeout as "the shard was never fully caught up for 30 s":
+- one clock per shard, started by the first waiter, ending only when a group needed no room or no one waited;
+- at that deadline every waiter got `Busy`, including one that arrived a moment earlier.
+
+Under a bulk load with many loaders on one shard, each flush frees room for some waiters but never all of them. So after 30 s of continuous pressure, commits were refused although room had been freed many times: the gate's cold-get load failed this way on 2026-10-13. The documented contract already said otherwise:
+- D124: "passed without room";
+- errors.md: "nothing freed room in time";
+- the option: "how long a write … may wait".
+
+So this is a bug fix in the code, not a contract change. The coordinator approved it, and the owner was told as an FYI.
+
+**Tests:**
+- A commit that starts waiting 0.6 × the timeout after another isn't refused at the other's deadline, and commits once room frees. It fails on the old reading.
+- Two commits that both wait the whole timeout are both refused.
+- The same for a later `flush` caller in a starved freeze. It fails on the old reading.
+
 <a id="d241"></a>
 ## D241 — A cross-shard commit refused with `Moved` or below a timestamp floor gives up only at the write-stall timeout, never after a number of attempts (owner decision, 2026-10-13; engine, tablets, #102; amends D145)
 
 **Decided:**
 - **No attempt cap.** A cross-shard commit that a participant refuses because a tablet is being changed (`Moved`) or because its timestamp is below the participant's floor (`BelowFloor`, D11) is retried until it commits, or until `write_stall_timeout_nanos` has passed since it was submitted. Then it fails with `Busy`. D145's cap of 16 refusals (`MOVED_RETRIES`) is gone.
-- **What `Busy` means is unchanged:** stalled past the write-stall timeout (D124, D240). The attempt count is still carried, for tracing.
+- **What `Busy` means is unchanged:** stalled past the write-stall timeout (D124, D240). No attempt count is kept: D240 removed the trace-only counter, so that `Member` stays the same size.
 - **The `Busy` message** no longer blames only flushes and compaction. It names a tablet change too, and the configurable timeout (`Options::write_stall_timeout`, 30 s by default).
 
 **Why.** The 64 GiB cold-get load of the 2026-10-13 gate stayed on one tablet. Once the balancer could split it (the #102 note in D145), the loaders' in-flight batches spanned the new tablets' shards.
