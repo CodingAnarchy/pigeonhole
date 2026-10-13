@@ -406,6 +406,28 @@ What a pass forces is otherwise unchanged; the mixed-temperature harness gives m
 
 *Checked by:* the first gate window's report (`report.py`), whose Phase 2 rows read both runs.
 
+<a id="d209"></a>
+## D209 — A reopened WAL stream's first segment takes max seen + 3, so it never takes the epoch of a successor whose header never reached the disk (coordinator decision, 2026-10-11; wal, #508; amends FORMAT §10.1 rule 2; shipped in 0.2.1)
+
+**Decided:** recovery starts the reopened segment at max seen + 3 (`REOPEN_EPOCH_GAP`), where max seen covers every segment header and the replayed end. It was max seen + 1.
+
+**Why:**
+- **The problem.** A successor segment whose header never reaches the disk leaves its frames in the slot under the epoch the header would have had. That happens two ways:
+  - a crash while a rollover sync is in flight after the successor's records were written (D200);
+  - a power loss that keeps a header-and-records write's record sectors but not its header (0.2.0 too).
+- **What went wrong.** Recovery ends at the full segment and reopened at + 1, usually in the same recycled slot. Once the new header was written, the stale frames replayed as the new segment's records, and their seqnos were reused by new commits.
+- **Why + 3.** At most two headers are ever not durable at once, since a header is written only after its predecessor is durable: the full segment's own header, and the held successor's. So surviving frames carry at most the largest durable header's epoch + 2. The reopened segment's header is synced before anything is appended, so skipped epochs are never reached again.
+- **Rejected:** zero-filling a recycled slot at open (up to 64 MiB of writes per stream per reopen), and holding a successor's records until its predecessor's header is durable (gives up #19's overlap).
+- **Compatibility:** files written before D209 read unchanged, since chaining follows `prev_epoch`. The 0.2.1 backport uses the same constant, so FORMAT has one rule (FORMAT §10.1).
+
+**Checked by** `crates/wal/tests/crash.rs`:
+- the held-header and lost-header cases;
+- the double window (fails at + 2);
+- a reordering power-loss sweep over Buffered rollovers;
+- a 0.2.0 stream fixture.
+
+The full record is in `docs/design/questions/wal.md`.
+
 <a id="d210"></a>
 ## D210 — Async commits wait for room before they submit: a per-shard bound on async commits in flight; a future dropped before it submitted writes nothing (owner decision, 2026-10-10; engine, pigeonhole, runtime, #149; amends D196)
 
@@ -1146,4 +1168,18 @@ Each record carries `detail.settle` (milliseconds, settled, the work done while 
 - 16 shards: pinned 4.16M, unpinned 4.06M.
 
 A thread-per-core application pins its shard threads, so the gate measures that, and the engine's own threads do it by default.
+
+<a id="d228"></a>
+## D228 — The balancer's fast skew path acts only while slow loads agree (considered, not adopted; blob33, #582 follow-up; would have amended D224)
+
+**Proposed:** D224's fast skew path would act only while the slow (~10 s) loads agree, and the bench's settle would follow the slowest dwell (`SPREAD_CAP` 60 s).
+
+**Not adopted:** D231 split the scaling gate. Balancer placement is judged by an open-loop check, which already passes, and closed-loop tails are no longer judged. Nothing measured needed the change.
+
+<a id="d232"></a>
+## D232 — An async-admission fast path per shard, with no engine-wide counter (considered, not adopted; perf2, #615; would have amended D210's wording)
+
+**Proposed:** async admission charged on a per-shard counter on its own cache line, with no engine-wide total and no per-commit `Arc` clone. D210's semantics would be unchanged.
+
+**Not adopted:** #615 measured no gain on the AX102 and was closed. D236 (#626) takes the commit-path part of the idea further: a per-shard submission handle, and admission charged on the target shard once the commit is routed.
 
