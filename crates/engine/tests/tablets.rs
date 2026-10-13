@@ -1296,12 +1296,20 @@ fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
     }
     assert!(db.get(b"a").is_none());
     db.engine.publish_stale_ts_floor(high, 0);
+    let before = db.engine.metrics().cross_shard;
     let mut wb = WriteBatch::new();
     wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"low"))
         .unwrap();
     wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"both"))
         .unwrap();
     db.commit(wb);
+    // Counted by reason (ICR 0043): one refused round below the floor, then the commit.
+    let after = db.engine.metrics().cross_shard;
+    assert_eq!(after.refused_below_floor - before.refused_below_floor, 1);
+    assert_eq!(after.refused_rounds - before.refused_rounds, 1);
+    assert_eq!(after.rounds - before.rounds, 2);
+    assert_eq!(after.refused_moved, before.refused_moved);
+    assert_eq!(after.refused_move_raise, before.refused_move_raise);
     let (ts, v) = db.get(b"z").unwrap();
     assert_eq!(v, b"both");
     assert!(
@@ -1309,6 +1317,55 @@ fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
         "{ts} <= {last}: the commit went below the participant's floor"
     );
     assert_eq!(db.get(b"a").unwrap().0, ts);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_cross_shard_commit_no_participant_refuses_counts_one_round() {
+    // ICR 0043: `Metrics::cross_shard` counts the coordinator's decided rounds, and only
+    // refused ones as refused.
+    let mut db = open(2, |_| {});
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    let before = db.engine.metrics().cross_shard;
+    db.put(b"a", b"single");
+    assert_eq!(
+        db.engine.metrics().cross_shard,
+        before,
+        "a one-shard commit"
+    );
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    db.commit(wb);
+    let after = db.engine.metrics().cross_shard;
+    assert_eq!(after.rounds - before.rounds, 1);
+    assert_eq!(after.refused_rounds, before.refused_rounds);
+    assert_eq!(
+        (
+            after.refused_below_floor,
+            after.refused_moved,
+            after.refused_room
+        ),
+        (
+            before.refused_below_floor,
+            before.refused_moved,
+            before.refused_room
+        )
+    );
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
@@ -2264,6 +2321,7 @@ fn a_commit_refused_many_times_before_the_timeout_still_commits() {
         ValueRef::Bytes(b"t"),
     )
     .unwrap();
+    let before = db.engine.metrics().cross_shard;
     let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
     // Shard 1 splits u's tablet again and again: each change retries the commit.
     for i in 0..48 {
@@ -2280,6 +2338,19 @@ fn a_commit_refused_many_times_before_the_timeout_still_commits() {
     let r = step_until(&mut db, &mut pc, 1_000);
     assert!(r.is_ok(), "{r:?}");
     assert_eq!(db.get(&rows[1]).map(|(_, v)| v), Some(b"t".to_vec()));
+    // Every refused round holds one `Moved` refusal per participant changing a tablet
+    // (shard 0, and shard 1 while its split of u runs), and the last round commits
+    // (ICR 0043).
+    let after = db.engine.metrics().cross_shard;
+    let refused = after.refused_rounds - before.refused_rounds;
+    assert!(refused >= 20, "{refused} refused rounds");
+    let moved = after.refused_moved - before.refused_moved;
+    assert!(
+        (refused..=2 * refused).contains(&moved),
+        "{moved} refusals in {refused} rounds"
+    );
+    assert_eq!(after.rounds - before.rounds, refused + 1);
+    assert_eq!(after.refused_below_floor, before.refused_below_floor);
     close(db);
 }
 

@@ -228,6 +228,12 @@ impl ShardState {
         if self.below_floor(&m) {
             // The coordinator's retry reads this shard's floor again.
             let floor = self.ts_floor();
+            // Below the shard's own floor, or only below a moved tablet's raise (ICR 0043).
+            self.shared.metrics[usize::from(self.id.0)].count_refusal(if m.commit_ts < floor {
+                CrossRefusal::BelowFloor
+            } else {
+                CrossRefusal::MoveRaise
+            });
             self.shared.ts_floors[usize::from(self.id.0)]
                 .0
                 .fetch_max(floor, Ordering::AcqRel);
@@ -261,6 +267,7 @@ impl ShardState {
             }
             (Routing::Elsewhere, true) => self.forward(m, ctx),
             (_, false) => {
+                self.shared.metrics[usize::from(self.id.0)].count_refusal(CrossRefusal::Moved);
                 self.refuse_prepare(m, PrepareError::Moved, ctx);
                 None
             }

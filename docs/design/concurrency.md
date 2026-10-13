@@ -31,15 +31,15 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 
 ## Counts
 
-**133 production primitives and 36 test hooks** (169 in all), counted distinct: a primitive with handles in several structs counts once. Before #134 step 2 (#518, at #306's head) the count was 131 production (75 + 8 + 34 + 16, less the two test statics then among the 75) and 26 test hooks, 159 rows, counted with some handles twice (purge guards, the live-snapshot count). Step 2 removed 8 coordinating primitives (the close gate replaced 6; the watermark registry merged 2 lists). Later features added 15, each justified where it is listed: the registry's `listed` mask (#564), `Signal::app_woken` (#592) and `Signal::turn_woken` (D237), async admission's 4 (D210, D236; previously uninventoried), `LoadSlot::{busy (D217), writes_slow, passes, claimed (D224)}`, `Shared::pack_k` (#641), `Shared::failure` (ICR 0040) and its wake's `Mutex` and `Condvar` (#646, which replaced a poll). D221 and D222 removed two statics (`PIGEONHOLE_GROUP_SYNC_DEPTH`, `PIGEONHOLE_READAHEAD`). The table below is a recount of the appendix rows and is the authority.
+**136 production primitives and 36 test hooks** (172 in all), counted distinct: a primitive with handles in several structs counts once. Before #134 step 2 (#518, at #306's head) the count was 131 production (75 + 8 + 34 + 16, less the two test statics then among the 75) and 26 test hooks, 159 rows, counted with some handles twice (purge guards, the live-snapshot count). Step 2 removed 8 coordinating primitives (the close gate replaced 6; the watermark registry merged 2 lists). Later features added 18, each justified where it is listed: the registry's `listed` mask (#564), `Signal::app_woken` (#592) and `Signal::turn_woken` (D237), async admission's 4 (D210, D236; previously uninventoried), `LoadSlot::{busy (D217), writes_slow, passes, claimed (D224)}`, `Shared::pack_k` (#641), `Shared::failure` (ICR 0040) and its wake's `Mutex` and `Condvar` (#646, which replaced a poll), the three `CrossShardCounters` fields (ICR 0043). D221 and D222 removed two statics (`PIGEONHOLE_GROUP_SYNC_DEPTH`, `PIGEONHOLE_READAHEAD`). The table below is a recount of the appendix rows and is the authority.
 
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
-| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared` and the helper files appendix A covers) | 75 | 3 | Static test hooks: `READS_STEP`, `TAIL_SKIPS`, `SST_SKIPS` |
+| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared` and the helper files appendix A covers) | 78 | 3 | Static test hooks: `READS_STEP`, `TAIL_SKIPS`, `SST_SKIPS` |
 | `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 30 | `Hooks` 22, `ShardCounters` 6, `ReaderHooks` 2 |
 | other `engine/src` files | 31 | 3 | Distinct: 37 rows minus 3 test-only rows minus 3 handles counted elsewhere (`LiveSnapshot::count`, `FlushItem::guard`, `CompactionWork::guard`). 10 thread-locals (one test-only) |
 | `runtime/src` | 19 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
-| **Total** | **133** | **36** | |
+| **Total** | **136** | **36** | |
 
 A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityCounts::{waits, scanned, passes, woken}` and `WatermarkWaiters::contended`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
 
@@ -142,6 +142,9 @@ Every counter in this struct has one writer, its own shard thread, and the reade
 | `ShardMetrics::refused_slots` shard.rs:128 | `AtomicU64` | Tablet changes refused for lack of memtable slots | shard thread: tablets.rs `reserve_slots` (715), `choose` (1275) | `Engine::metrics` (engine.rs:1668) | Relaxed | D28; #122, 0b46ae1 (#259) |
 | `ShardMetrics::refused_view` shard.rs:129 | `AtomicU64` | Splits refused because the shm view would outgrow its buffer | shard thread: tablets.rs `validate_op` (631) | engine.rs:1669 | Relaxed | D28; #122, 0b46ae1 (#259) |
 | `ShardMetrics::wal` shard.rs:131 | `OnceLock<Arc<WalCounters>>` | The shard's WAL stream stall counters, set once the stream is open | open thread: `open_writer` (engine.rs:847, 843, 875; `set`, a later set is ignored) | `Engine::metrics` (engine.rs:1734–1735, `get`) | OnceLock (set happens-before a successful get) | ICR 0015, #64; 0f0c7cf (#414) |
+| `ShardMetrics::cross.rounds` shard.rs:187 | `AtomicU64` in `CrossShardCounters` (`#[repr(align(128))]`, so no other shard's counters share its lines) | Two-phase rounds this shard coordinated and decided | shard thread (the coordinator): `on_prepared` once the round is decided (shard.rs:6030) | `Engine::metrics` (engine.rs:2123) | Relaxed | ICR 0043 |
+| `ShardMetrics::cross.refused_rounds` shard.rs:189 | `AtomicU64`, as above | Of those, rounds a participant refused | as `rounds` | `Engine::metrics` | Relaxed | ICR 0043 |
+| `ShardMetrics::cross.refused` shard.rs:191 | `[AtomicU64; 4]`, as above | PREPAREs this shard refused, by `CrossRefusal` (BelowFloor, MoveRaise, Moved, Room) | shard thread (the participant): `count_refusal` (shard.rs:215) from tablets.rs `route_member` (232, 270) | `Engine::metrics` | Relaxed | ICR 0043. Room has no writer until ICR 0042 (D245) |
 
 ### `CloseState` (shard.rs:199), `Shared::close`
 
