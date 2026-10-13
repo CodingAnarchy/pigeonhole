@@ -180,6 +180,22 @@ fn load(slot: &mut Option<BlockIter<BlockHandle>>, block: BlockHandle) -> Result
     Ok(())
 }
 
+/// Whether `sep` is a row-end separator: an escaped row followed by `00 02`, the bound past
+/// every key of that row (ICR 0039). An escaped row holds `00` only as `00 FF`.
+#[inline]
+fn row_end(sep: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(p) = sep[i..].iter().position(|&b| b == 0) {
+        let at = i + p;
+        match sep.get(at + 1) {
+            Some(0xFF) => i = at + 2,
+            Some(0x02) => return at + 2 == sep.len(),
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn valid(slot: &Option<BlockIter<BlockHandle>>) -> bool {
     slot.as_ref().is_some_and(|it| it.valid())
 }
@@ -488,13 +504,27 @@ impl SstIter {
         }
         if !data.valid() {
             // A separator may sort above the block's last key; the answer starts the next.
-            self.advance_block()?;
+            self.advance_block(false)?;
         }
         Ok(())
     }
 
-    /// Moves to the first entry of the next data block.
-    fn advance_block(&mut self) -> Result<()> {
+    /// Moves to the first entry of the next data block. With `may_end` (the cursor has
+    /// reached its read's row: every key it passed sorts at or after that row's start) and a
+    /// one-row read ([`ReadOptions::one_row`]), it ends instead when the block it leaves has
+    /// a row-end separator: every key of a later block sorts after the separator, so past
+    /// the row of that block's last key, and so past the read's row (ICR 0039).
+    fn advance_block(&mut self, may_end: bool) -> Result<()> {
+        if may_end
+            && self.options.one_row
+            && self
+                .index
+                .as_ref()
+                .is_some_and(|i| i.valid() && row_end(i.key()))
+        {
+            self.data = None;
+            return Ok(());
+        }
         loop {
             loaded(&mut self.index)?.next()?;
             while !valid(&self.index) {
@@ -521,7 +551,7 @@ impl SstIter {
         };
         data.next()?;
         if !data.valid() {
-            self.advance_block()?;
+            self.advance_block(true)?;
         }
         Ok(())
     }
@@ -556,7 +586,7 @@ impl SstIter {
         data.seek(target)?;
         if !data.valid() {
             // A separator may sort above the block's last key; the answer starts the next.
-            self.advance_block()?;
+            self.advance_block(true)?;
         }
         Ok(())
     }
@@ -652,7 +682,7 @@ impl Cursor for SstIter {
                 if valid(&it.data) {
                     Ok(())
                 } else {
-                    it.advance_block()
+                    it.advance_block(true)
                 }
             }),
             Err(e) => {
@@ -664,7 +694,9 @@ impl Cursor for SstIter {
 
     /// Passes the column's later entries in the current block from their headers
     /// ([`BlockIter`]'s `skip_column`, ICR 0041); at the block's end it moves to the next
-    /// block, as `next` does, where the column may continue.
+    /// block, as `next` does, where the column may continue. Like `next`, a one-row read
+    /// ends there instead when the block's separator ends its row: the cursor is on the
+    /// read's row, so every key it passes sorts at or after it (ICR 0039).
     #[inline]
     fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
         let Some(data) = self.data.as_mut().filter(|d| d.valid()) else {
@@ -677,7 +709,7 @@ impl Cursor for SstIter {
                     if valid(&it.data) {
                         Ok(())
                     } else {
-                        it.advance_block()
+                        it.advance_block(true)
                     }
                 })
                 .map(|()| true),

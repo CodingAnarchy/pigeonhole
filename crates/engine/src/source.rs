@@ -239,6 +239,10 @@ fn read_options(priority: Priority, scan: bool, cache_only: bool) -> ReadOptions
     o.priority = priority;
     if scan {
         (o.readahead_blocks, o.readahead_merge) = SCAN_READAHEAD;
+    } else {
+        // A point get or a single-row read stops at its row's end: an SST cursor need not
+        // read the block after a row-end separator (ICR 0039).
+        o.one_row = true;
     }
     o.cache_only = cache_only;
     o
