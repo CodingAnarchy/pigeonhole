@@ -2,6 +2,8 @@
 
 **Status:** Approved (coordinator, 2026-10-09), for the D194 prototype (#387). Everything is additive and off by default.
 
+*Amended by ICR 0041: `BlockIter`, `SstIter` and the engine's SST sources implement `skip_column` too, and the engine sets `skip_columns` whenever a read has an SST source.*
+
 *Amended by D199: `memtable_tail_index` is on by default, the switch is per engine (no longer process-wide), and `PIGEONHOLE_TAIL_INDEX=0` turns the default off for A/B runs.*
 
 ## Change

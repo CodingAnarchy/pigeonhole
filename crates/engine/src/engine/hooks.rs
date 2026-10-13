@@ -714,6 +714,12 @@ impl Engine {
         crate::shard::TAIL_SKIPS.load(Ordering::Relaxed)
     }
 
+    /// SST column skips reads have taken in this process (ICR 0041). Test hook.
+    #[doc(hidden)]
+    pub fn sst_skips() -> u64 {
+        crate::shard::SST_SKIPS.load(Ordering::Relaxed)
+    }
+
     /// Breaks the flush GC on purpose (#287), so a test can check the oracle catches it;
     /// [`FlushGcMutation::None`] restores it.
     #[doc(hidden)]

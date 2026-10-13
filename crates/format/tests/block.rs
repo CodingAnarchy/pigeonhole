@@ -138,6 +138,54 @@ proptest! {
         }
     }
 
+    /// `skip_column` from any entry lands on the first entry outside its column (or runs
+    /// out at the block's end) with the key and value a step lands on, over columns with
+    /// many versions, qualifiers that extend each other, and every restart interval
+    /// (ICR 0041).
+    #[test]
+    fn skip_column_lands_where_stepping_does(
+        cols in vec((0u8..3, 0usize..4, 1usize..30), 1..sized(12, 4)),
+        interval in 1usize..20,
+        start in any::<prop::sample::Index>(),
+    ) {
+        let quals: [&[u8]; 4] = [b"a", b"ab", b"a\x00", b"b"];
+        let mut model = BTreeMap::new();
+        for (row, q, versions) in cols {
+            for v in 0..versions as u64 {
+                let mut k = Vec::new();
+                pigeonhole_format::key::encode_key(&mut k, &[b'r', row], quals[q], 100 + v * 7 % 13, v + 1, pigeonhole_format::key::Kind::Put).unwrap();
+                model.insert(k, vec![row, q as u8, v as u8]);
+            }
+        }
+        let bytes = build_data(&model, interval);
+        let keys: Vec<&Vec<u8>> = model.keys().collect();
+        let first = keys[start.index(keys.len())].clone();
+        let column = first[..first.len() - pigeonhole_format::key::SUFFIX_LEN].to_vec();
+        let in_col = |k: &[u8]| k.len() == first.len() && k.starts_with(&column);
+        let mut it = Block::new(bytes.as_slice()).unwrap().into_cursor();
+        it.seek(&first).unwrap();
+        prop_assert!(it.skip_column(&column).unwrap());
+        let mut step = Block::new(bytes.as_slice()).unwrap().into_cursor();
+        step.seek(&first).unwrap();
+        // The skip may stop on an entry of the column (a restart it could not pass); every
+        // entry it passed is in the column, and it never passes one outside.
+        step.next().unwrap();
+        while step.valid() && in_col(step.key()) && (!it.valid() || step.key() < it.key()) {
+            step.next().unwrap();
+        }
+        prop_assert_eq!(it.valid(), step.valid());
+        if it.valid() {
+            // A restart entry of the column is passed too: the skip stops only outside it.
+            prop_assert!(!in_col(it.key()), "stopped inside the column");
+            prop_assert_eq!(it.key(), step.key());
+            prop_assert_eq!(it.value(), step.value());
+            // Stepping on from both stays in step.
+            it.next().unwrap();
+            step.next().unwrap();
+            prop_assert_eq!(it.valid().then(|| it.key().to_vec()), step.valid().then(|| step.key().to_vec()));
+        }
+    }
+
     #[test]
     fn index_block_matches_model(model in btree_map(vec(any::<u8>(), 0..12), vec(any::<u8>(), 0..10), 0..sized(60, 10)), targets in vec(vec(any::<u8>(), 0..12), 0..sized(10, 3))) {
         let mut b = BlockBuilder::index();
