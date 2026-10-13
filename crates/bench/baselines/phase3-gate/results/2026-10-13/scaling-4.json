@@ -1,0 +1,550 @@
+{
+  "format": 1,
+  "environment": {
+    "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor",
+    "cores": 32,
+    "memory_bytes": 134514339840,
+    "os": "linux 6.8.0-139-generic",
+    "arch": "x86_64",
+    "filesystem": "xfs",
+    "reference": false,
+    "label": "non-reference (D5)",
+    "profile": "release",
+    "git_rev": "8654ad6924a9",
+    "started_unix": 1791894836,
+    "load_average": 1.83
+  },
+  "results": [
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=1 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on presplit=writes inline in-flight=16 pinned",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 4000000,
+      "value_len": 100,
+      "threads": 1,
+      "load_secs": 5.619278546,
+      "run_secs": 9.552853241,
+      "throughput": 418723.06619684625,
+      "p50_ns": 15935,
+      "p99_ns": 24831,
+      "p999_ns": 32767,
+      "mean_ns": 16670,
+      "max_ns": 6686437,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 0,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [],
+        "shards": [
+          {
+            "commits": 4000000,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 0,
+          "write_stall_nanos": 0,
+          "flushes": 41,
+          "compactions": 10,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "file_growths_ahead": 1,
+          "shard_parks": 0,
+          "shard_wakes": 181340,
+          "commit_parks": 0,
+          "visibility_waits": 0,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 0,
+          "visibility_woken": 0,
+          "visibility_contended": 0,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0,
+          "row_cache_hits": 0,
+          "row_cache_misses": 0,
+          "row_cache_fills": 0
+        },
+        "engine_commit": {
+          "durability": 1,
+          "commits": 4000000,
+          "p50_ns": 12288,
+          "p99_ns": 16384,
+          "p999_ns": 24576
+        },
+        "settle": null,
+        "background_work": null
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=4 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on presplit=writes inline in-flight=16 pinned",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 16000000,
+      "value_len": 100,
+      "threads": 4,
+      "load_secs": 8.119838626,
+      "run_secs": 8.708768204,
+      "throughput": 1837228.827912894,
+      "p50_ns": 18047,
+      "p99_ns": 30591,
+      "p999_ns": 88063,
+      "mean_ns": 19362,
+      "max_ns": 22507886,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 0,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [],
+        "shards": [
+          {
+            "commits": 4066712,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          },
+          {
+            "commits": 4058328,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          },
+          {
+            "commits": 4051056,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          },
+          {
+            "commits": 3823904,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 0,
+          "write_stall_nanos": 0,
+          "flushes": 163,
+          "compactions": 42,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "file_growths_ahead": 7,
+          "shard_parks": 0,
+          "shard_wakes": 981789,
+          "commit_parks": 0,
+          "visibility_waits": 607089,
+          "visibility_scanned": 1770432,
+          "visibility_wake_passes": 59940,
+          "visibility_woken": 477948,
+          "visibility_contended": 6442,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0,
+          "row_cache_hits": 0,
+          "row_cache_misses": 0,
+          "row_cache_fills": 0
+        },
+        "engine_commit": {
+          "durability": 1,
+          "commits": 16000000,
+          "p50_ns": 12288,
+          "p99_ns": 24576,
+          "p999_ns": 32768
+        },
+        "settle": null,
+        "background_work": null
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=1 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on presplit=writes inline in-flight=16 unpinned",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 4000000,
+      "value_len": 100,
+      "threads": 1,
+      "load_secs": 5.938069775,
+      "run_secs": 8.996201769,
+      "throughput": 444632.0905989008,
+      "p50_ns": 15807,
+      "p99_ns": 25471,
+      "p999_ns": 31359,
+      "mean_ns": 16550,
+      "max_ns": 6651541,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 0,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [],
+        "shards": [
+          {
+            "commits": 4000000,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 0,
+          "write_stall_nanos": 0,
+          "flushes": 41,
+          "compactions": 10,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "file_growths_ahead": 1,
+          "shard_parks": 0,
+          "shard_wakes": 186780,
+          "commit_parks": 0,
+          "visibility_waits": 0,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 0,
+          "visibility_woken": 0,
+          "visibility_contended": 0,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0,
+          "row_cache_hits": 0,
+          "row_cache_misses": 0,
+          "row_cache_fills": 0
+        },
+        "engine_commit": {
+          "durability": 1,
+          "commits": 4000000,
+          "p50_ns": 12288,
+          "p99_ns": 16384,
+          "p999_ns": 24576
+        },
+        "settle": null,
+        "background_work": null
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=4 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on presplit=writes inline in-flight=16 unpinned",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 16000000,
+      "value_len": 100,
+      "threads": 4,
+      "load_secs": 8.168127986,
+      "run_secs": 8.737194736,
+      "throughput": 1831251.3894276558,
+      "p50_ns": 18815,
+      "p99_ns": 33023,
+      "p999_ns": 99327,
+      "mean_ns": 20297,
+      "max_ns": 25601339,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 0,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [],
+        "shards": [
+          {
+            "commits": 4066712,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          },
+          {
+            "commits": 4058328,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          },
+          {
+            "commits": 4051056,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          },
+          {
+            "commits": 3823904,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 0
+          }
+        ],
+        "stalls": {
+          "write_stalls": 0,
+          "write_stall_nanos": 0,
+          "flushes": 163,
+          "compactions": 43,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "file_growths_ahead": 6,
+          "shard_parks": 0,
+          "shard_wakes": 1002978,
+          "commit_parks": 0,
+          "visibility_waits": 1252634,
+          "visibility_scanned": 3182006,
+          "visibility_wake_passes": 103175,
+          "visibility_woken": 984855,
+          "visibility_contended": 12961,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0,
+          "row_cache_hits": 0,
+          "row_cache_misses": 0,
+          "row_cache_fills": 0
+        },
+        "engine_commit": {
+          "durability": 1,
+          "commits": 16000000,
+          "p50_ns": 16384,
+          "p99_ns": 24576,
+          "p999_ns": 32768
+        },
+        "settle": null,
+        "background_work": null
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=1 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 2000000,
+      "value_len": 100,
+      "threads": 8,
+      "load_secs": 5.144803089,
+      "run_secs": 5.918796355,
+      "throughput": 337906.54045910324,
+      "p50_ns": 9983,
+      "p99_ns": 518143,
+      "p999_ns": 557055,
+      "mean_ns": 20657,
+      "max_ns": 222088854,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 536870912,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [
+          {
+            "op": "put",
+            "stats": {
+              "count": 2000000,
+              "p50_ns": 9983,
+              "p99_ns": 518143,
+              "p999_ns": 557055
+            },
+            "mean_ns": 20657
+          }
+        ],
+        "shards": [
+          {
+            "commits": 2000000,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 5729581482
+          }
+        ],
+        "stalls": {
+          "write_stalls": 0,
+          "write_stall_nanos": 0,
+          "flushes": 21,
+          "compactions": 6,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "file_growths_ahead": 0,
+          "shard_parks": 4,
+          "shard_wakes": 92072,
+          "commit_parks": 143592,
+          "visibility_waits": 0,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 0,
+          "visibility_woken": 0,
+          "visibility_contended": 0,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0,
+          "row_cache_hits": 0,
+          "row_cache_misses": 0,
+          "row_cache_fills": 0
+        },
+        "engine_commit": null,
+        "settle": {
+          "millis": 1027,
+          "settled": true,
+          "work": 1
+        },
+        "background_work": 27
+      }
+    },
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=2 memtable=64MiB cache=256MiB bloom=10 buffered tablets=on",
+      "workload": "skewed-multi-shard",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 2000000,
+      "value_len": 100,
+      "threads": 8,
+      "load_secs": 4.821412856,
+      "run_secs": 3.66022303,
+      "throughput": 546414.790467017,
+      "p50_ns": 8575,
+      "p99_ns": 25343,
+      "p999_ns": 536575,
+      "mean_ns": 13243,
+      "max_ns": 17208967,
+      "warmup_ops": 2000000,
+      "detail": {
+        "store_bytes": 536870912,
+        "busy_retries": 0,
+        "reads": null,
+        "by_type": [
+          {
+            "op": "put",
+            "stats": {
+              "count": 2000000,
+              "p50_ns": 8575,
+              "p99_ns": 25343,
+              "p999_ns": 536575
+            },
+            "mean_ns": 13243
+          }
+        ],
+        "shards": [
+          {
+            "commits": 791592,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 2498311478
+          },
+          {
+            "commits": 1208408,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 2807399407
+          }
+        ],
+        "stalls": {
+          "write_stalls": 0,
+          "write_stall_nanos": 0,
+          "flushes": 20,
+          "compactions": 5,
+          "unpin_passes": 0,
+          "unpin_flushes": 0,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "file_growths_ahead": 0,
+          "shard_parks": 3842,
+          "shard_wakes": 90427,
+          "commit_parks": 58738,
+          "visibility_waits": 203,
+          "visibility_scanned": 56,
+          "visibility_wake_passes": 108,
+          "visibility_woken": 203,
+          "visibility_contended": 1,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0,
+          "row_cache_hits": 0,
+          "row_cache_misses": 0,
+          "row_cache_fills": 0
+        },
+        "engine_commit": null,
+        "settle": {
+          "millis": 1062,
+          "settled": true,
+          "work": 2
+        },
+        "background_work": 25
+      }
+    }
+  ],
+  "scaling": {
+    "shards": 4,
+    "single_shard_throughput": 418723.06619684625,
+    "multi_shard_throughput": 1837228.827912894,
+    "efficiency": 1.096923585199145,
+    "single_shard_p99_ns": 24831,
+    "max_share": 0.2541695,
+    "visibility_waits_per_op": 0.0379430625
+  },
+  "scaling_sync": {
+    "shards": 2,
+    "single_shard_throughput": 337906.54045910324,
+    "multi_shard_throughput": 546414.790467017,
+    "efficiency": 0.8085294675335671,
+    "single_shard_p99_ns": 518143,
+    "max_share": 0.604204,
+    "visibility_waits_per_op": 0.0001015
+  },
+  "group_commit": null,
+  "scaling_unpinned": {
+    "shards": 4,
+    "single_shard_throughput": 444632.0905989008,
+    "multi_shard_throughput": 1831251.3894276558,
+    "efficiency": 1.0296441868157993,
+    "single_shard_p99_ns": 25471,
+    "max_share": 0.2541695,
+    "visibility_waits_per_op": 0.078289625
+  },
+  "group_commit_unpinned": null,
+  "placement": null
+}
