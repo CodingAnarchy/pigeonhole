@@ -47,12 +47,14 @@ fn read(db: &Pigeonhole) {
 #[test]
 fn a_cold_read_misses_and_the_same_read_then_hits() {
     let db = reopened(1 << 20);
-    let (_, m0) = db.engine_metrics().block_cache;
+    let m0 = db.engine_metrics().block_cache_misses;
     read(&db);
-    let (h1, m1) = db.engine_metrics().block_cache;
+    let m = db.engine_metrics();
+    let (h1, m1) = (m.block_cache_hits, m.block_cache_misses);
     assert!(m1 > m0, "the first read of a reopened store misses");
     read(&db);
-    let (h2, m2) = db.engine_metrics().block_cache;
+    let m = db.engine_metrics();
+    let (h2, m2) = (m.block_cache_hits, m.block_cache_misses);
     assert_eq!(m2, m1, "the same read again misses nothing");
     assert!(h2 > h1, "and hits");
 }
@@ -63,7 +65,7 @@ fn a_disabled_block_cache_counts_nothing() {
     read(&db);
     read(&db);
     let m = db.engine_metrics();
-    assert_eq!(m.block_cache, (0, 0));
+    assert_eq!((m.block_cache_hits, m.block_cache_misses), (0, 0));
     assert_eq!(
         m.block_cache_pinned_warnings, 0,
         "no capacity to warn about"
@@ -72,9 +74,9 @@ fn a_disabled_block_cache_counts_nothing() {
 
 /// The bytes the open SST readers pin (top index, filters): none before any read opens one.
 fn pinned_after_a_read(db: &Pigeonhole) -> u64 {
-    assert_eq!(db.engine_metrics().block_cache_pinned, 0);
+    assert_eq!(db.engine_metrics().block_cache_pinned_bytes, 0);
     read(db);
-    db.engine_metrics().block_cache_pinned
+    db.engine_metrics().block_cache_pinned_bytes
 }
 
 #[test]
@@ -83,7 +85,7 @@ fn open_ssts_count_their_pinned_metadata() {
     let pinned = pinned_after_a_read(&db);
     let m = db.engine_metrics();
     assert!(pinned > 0, "the read opened an SST reader");
-    assert_eq!(m.block_cache_capacity, 1 << 20);
+    assert_eq!(m.block_cache_capacity_bytes, 1 << 20);
     assert_eq!(m.block_cache_pinned_warnings, 0, "far below half the cache");
 }
 

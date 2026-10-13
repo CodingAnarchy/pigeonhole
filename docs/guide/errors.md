@@ -97,7 +97,7 @@ assert!(info.seqno > 0);
 # Ok::<(), pigeonhole::Error>(())
 ```
 
-- **What it waited for.** Usually memtable room, because flushes couldn't keep up: a slow or full disk, writes faster than flush and compaction, or old snapshots pinning memtables. `engine_metrics().stalls` counts the stalls and their total time. Less often, a tablet split, merge or move kept the commit waiting.
+- **What it waited for.** Usually memtable room, because flushes couldn't keep up: a slow or full disk, writes faster than flush and compaction, or old snapshots pinning memtables. `engine_metrics()` counts the stalls (`write_stalls`) and their total time (`write_stall_nanos`). Less often, a tablet split, merge or move kept the commit waiting.
 - **The timeout.** It is each call's own (D240, D241): a call that began waiting later is not refused at an earlier call's deadline. A shorter `Options::write_stall_timeout` fails faster; a bulk load can set a longer one instead of retrying.
 - **In async code,** `commit_async` fails with the same code. Sleep with your runtime's timer, not `std::thread::sleep`.
 

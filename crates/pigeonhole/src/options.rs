@@ -134,7 +134,8 @@ impl Options {
     ///   CPU quota (a cgroup `cpu.max`, not a cpuset) is narrower than the affinity set,
     ///   there are fewer free CPUs in the set than threads (never two pinned threads on one
     ///   CPU), or the OS refuses a pin. [`Pigeonhole::engine_metrics`](crate::Pigeonhole::engine_metrics)
-    ///   reports `pinned_threads` and why not (`unpinned`).
+    ///   reports how many threads are pinned (`threads_started`, `threads_pinned`) and why
+    ///   not (`unpinned_reason`).
     /// - **Several databases in one process** share the set: each pins to CPUs the others
     ///   don't hold, and one that finds too few free runs unpinned.
     /// - **Several processes on one host** don't see each other's pins and would pin onto
