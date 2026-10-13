@@ -74,6 +74,11 @@ def us(ns):
     return ns / 1000
 
 
+def rate(x):
+    """Operations per second, in K from 10K up."""
+    return f"{x / 1e3:.0f}K" if x >= 1e4 else f"{x:.0f}"
+
+
 def verdict(ok):
     return "not run" if ok is None else ("**pass**" if ok else "**FAIL**")
 
@@ -401,13 +406,72 @@ def xshard(run):
 xs = [(run[:-5], xshard(run)) for run in ("all-uring-1.json", "all-uring-2.json")]
 if all(x for _, x in xs):
     detail = "; ".join(
-        f"{name}: {x['on'] / 1e3:.0f}K ops/s, RocksDB {x['tput']:.2f}× throughput, p99 {x['p99']:.2f}×; "
+        f"{name}: {rate(x['on'])} ops/s, RocksDB {x['tput']:.2f}× throughput, p99 {x['p99']:.2f}×; "
         f"tablets on/off {x['on_off']:.2f}; wasted rounds {x['wasted']:.3f} per cross-shard commit (inferred); "
         f"Busy {x['busy']}; cross-shard p99 {x['cross_p99_us']:.0f} µs"
         for name, x in xs)
     rows.append((XSHARD_TARGET, detail, verdict(all(x["ok"] for _, x in xs)), "all-uring-1.json, all-uring-2.json"))
 else:
     rows.append((XSHARD_TARGET, "", verdict(None), "all-uring-1.json, all-uring-2.json"))
+
+# The contended step (D247, perf287's #406 audit): 16 client threads, the default options
+# (the default I/O backend), runs of 60 s or more, against RocksDB and SQLite at two
+# durabilities (owner decision): `buffered`, D108's parity (Pigeonhole Buffered, RocksDB's
+# WAL unsynced, SQLite NORMAL), and `default` (Pigeonhole's GroupSync, the others fsyncing
+# every write). Every workload below is judged within 1.5x of each store, throughput and
+# p99, at both levels; cross-shard-contention is judged as D246 judges it in `all`, at both.
+CONTENDED_LEVELS = [("buffered", "D108 parity, buffered"), ("default", "default durability, GroupSync")]
+CONTENDED_JUDGED = ["ycsb-a", "ycsb-b", "ycsb-c", "ycsb-e", "sparse-wide", "time-series-ttl", XSHARD]
+CONTENDED_AGAINST = ["rocksdb", "sqlite-eav"]
+
+
+def contended(level, w):
+    """{store: (other/Pigeonhole throughput, Pigeonhole/other p99)} and Pigeonhole's run for
+    one workload at one level, or None when Pigeonhole's run is missing."""
+    name = f"contended-{level}-{w}.json"
+    ph = next((r for r in results(name, "pigeonhole", w) if default_config(r)), None)
+    if not ph:
+        return None
+    vs = {}
+    for store in CONTENDED_AGAINST:
+        o = next(iter(results(name, store, w)), None)
+        if o:
+            vs[store] = (o["throughput"] / ph["throughput"], ph["p99_ns"] / max(o["p99_ns"], 1))
+    return ph, vs
+
+
+cont = {}  # (level, workload) -> (pigeonhole run, {store: (tput, p99)}, ok)
+for level, _ in CONTENDED_LEVELS:
+    for w in CONTENDED_JUDGED:
+        c = contended(level, w)
+        if c:
+            ph, vs = c
+            ok = len(vs) == len(CONTENDED_AGAINST) and all(t <= 1.5 and l <= 1.5 for t, l in vs.values())
+            cont[(level, w)] = (ph, vs, ok)
+for level, label in CONTENDED_LEVELS:
+    target = f"Contended, 16 threads on the default options, {label} (D247): within 1.5× of RocksDB and SQLite"
+    got = [(w, cont[(level, w)]) for w in CONTENDED_JUDGED if (level, w) in cont]
+    if not got:
+        rows.append((target, "", verdict(None), f"contended-{level}-*.json"))
+        continue
+    missing = [w for w in CONTENDED_JUDGED if (level, w) not in cont]
+    out = [f"{w} (" + ", ".join(f"{s.split('-')[0]} {t:.2f}×/p99 {l:.2f}×" for s, (t, l) in vs.items()
+                                if t > 1.5 or l > 1.5) + ")"
+           for w, (ph, vs, ok) in got if not ok]
+    detail = ("outside: " + "; ".join(out)) if out else "all within"
+    if missing:
+        detail += f"; missing: {', '.join(missing)}"
+    rows.append((target, detail, verdict(not out and not missing), f"contended-{level}-*.json"))
+    xc = xshard(f"contended-{level}-{XSHARD}.json")
+    xt = XSHARD_TARGET.replace("(D246)", f"at 16 threads, {label} (D246, D247)")
+    if xc:
+        rows.append((xt,
+                     f"{rate(xc['on'])} ops/s, RocksDB {xc['tput']:.2f}× throughput, p99 {xc['p99']:.2f}×; "
+                     f"tablets on/off {xc['on_off']:.2f}; wasted rounds {xc['wasted']:.3f} per cross-shard commit "
+                     f"(inferred); Busy {xc['busy']}; cross-shard p99 {xc['cross_p99_us']:.0f} µs",
+                     verdict(xc["ok"]), f"contended-{level}-{XSHARD}.json"))
+    else:
+        rows.append((xt, "", verdict(None), f"contended-{level}-{XSHARD}.json"))
 
 rep = status("all-uring-compare.status")
 # D243: runs shorter than 10 s are reported, not judged; D233: pairs whose measured phases did
@@ -496,6 +560,26 @@ if gap_rows:
     print("|---|---|---:|---:|---|")
     for run, w, t, l, ok in gap_rows:
         print(f"| {run[:-5]} | {w} | {t:.2f} | {l:.2f} | {'yes' if ok else '**no**'} |")
+
+if cont:
+    # The two levels side by side (owner decision): per store, its throughput over
+    # Pigeonhole's and Pigeonhole's p99 over its (> 1: the other store ahead).
+    print("\n## Contended, 16 threads on the default options (D247; ratio > 1: the other store ahead)\n")
+    print("| Workload | " + " | ".join(f"{lvl}: Pigeonhole ops/s | {lvl}: vs RocksDB (tput, p99) | "
+                                     f"{lvl}: vs SQLite (tput, p99) | {lvl}: within 1.5×"
+                                     for lvl, _ in CONTENDED_LEVELS) + " |")
+    print("|---|" + "--:|---|---|---|" * len(CONTENDED_LEVELS))
+    for w in CONTENDED_JUDGED:
+        cells = []
+        for level, _ in CONTENDED_LEVELS:
+            c = cont.get((level, w))
+            if not c:
+                cells += ["-"] * 4
+                continue
+            ph, vs, ok = c
+            pair = lambda s: f"{vs[s][0]:.2f}, {vs[s][1]:.2f}" if s in vs else "-"
+            cells += [f"{ph['throughput']:.0f}", pair("rocksdb"), pair("sqlite-eav"), "yes" if ok else "**no**"]
+        print(f"| {w} | " + " | ".join(cells) + " |")
 
 print("\n## Decisions this window settles\n")
 # The row cache (D216: on by default, amending D201): off (row-cache step) against the

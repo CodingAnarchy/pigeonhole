@@ -41,6 +41,13 @@
 #                  shards, 8 s or more each (D219)                                    45
 #   placement      balancer placement (D231): open-loop writes at 4, 8, 16 shards;
 #                  settle time, busiest share once settled, churn while measuring     8
+#   contended      D247: 16 client threads, default options, 60 s or more per run,
+#                  against RocksDB and SQLite at two durabilities: D108 parity
+#                  (Pigeonhole Buffered, RocksDB unsynced WAL, SQLite NORMAL) and the
+#                  default (Pigeonhole GroupSync, the others fsync every write;
+#                  every store loads buffered): ycsb-a/b/c/e, sparse-wide,
+#                  time-series-ttl, cross-shard-contention (D246, also with tablet
+#                  changes off)                                                       70
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   wal-pin        wal_pin_bytes 2x vs 4x the budget: write path, open after a crash
 #                  (#527; phase3-io/wal-pin.sh)                                        10
@@ -49,7 +56,8 @@
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 10.5 hours unattended at full scale (the sum of the estimates above).
+# Total: about 11.3 hours unattended at full scale (the sum of the estimates above; the
+# 2026-10-13b window's steps took 109 minutes before `contended` was added).
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
 # it back with the `scp` line the last step prints, and commit it from there.
@@ -87,9 +95,9 @@ data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
-    row-cache scaling placement open-latency wal-pin cold-get cold-scan scan-cache report)
+    row-cache scaling placement contended open-latency wal-pin cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [open-latency]=5 [wal-pin]=10 [cold-get]=45
+    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [contended]=70 [open-latency]=5 [wal-pin]=10 [cold-get]=45
     [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
@@ -273,16 +281,20 @@ ycsb_c_memory=(--cache 2147483648 --warmup 1.0)
 # enough for every shard's flushes and compactions to fall inside the measured phase; the
 # short run (the preset's 200K) is reported beside it. The scaling gate measures at least 8 s
 # at every shard count. The small scale (the dry run) keeps both short.
+# The contended step (D247) measures each run for at least 60 s from a count that any store
+# finishes sooner, so the time, not the count, sets its length.
 if [[ "$scale" == full ]]; then
     gc_inline_ops=2000000
     scaling_min_secs=8
     placement_window=10
     repro_min_secs=10
+    contended_secs=60 contended_ops=100000
 else
     gc_inline_ops=50000
     scaling_min_secs=1
     placement_window=3
     repro_min_secs=1
+    contended_secs=2 contended_ops=5000
 fi
 
 step_latency() {
@@ -383,6 +395,28 @@ step_placement() {
         PIGEONHOLE_IO=uring "$bench" placement --shards "$n" --scale "$scale" \
             --min-secs "$placement_window" --dir "$data/bench" --json "$results/placement-$n.json"
         rm -r "$data/bench"
+    done
+}
+
+# D247 (perf287's #406 audit): every public operation under contention on the defaults. 16
+# client threads and the default options (the default I/O backend: no PIGEONHOLE_IO), against
+# RocksDB and SQLite, at both durabilities (owner decision): `buffered`, D108's parity
+# (Pigeonhole Buffered, RocksDB's WAL unsynced, SQLite NORMAL), and `default`
+# (`Options::default()`'s GroupSync against the others fsyncing every write; every store
+# loads buffered and switches after the settle step). Judged within
+# 1.5x at each; cross-shard-contention also runs with tablet changes off (D246).
+contended_levels=(buffered default)
+contended_workloads=(ycsb-a ycsb-b ycsb-c ycsb-e sparse-wide time-series-ttl cross-shard-contention)
+step_contended() {
+    local level w
+    for level in "${contended_levels[@]}"; do
+        for w in "${contended_workloads[@]}"; do
+            "$bench" "$w" --engine pigeonhole,rocksdb,sqlite --scale "$scale" --threads 16 \
+                --durability "$level" --ops "$contended_ops" --min-secs "$contended_secs" \
+                --dir "$data/bench" --json "$results/contended-$level-$w.json" \
+                --markdown "$results/contended-$level-$w.md"
+            rm -r "$data/bench"
+        done
     done
 }
 
