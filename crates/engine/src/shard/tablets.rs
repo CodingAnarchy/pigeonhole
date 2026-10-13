@@ -238,6 +238,9 @@ impl ShardState {
     #[inline(never)]
     fn route_prepare(&mut self, m: Member, ctx: &mut ShardContext<'_, ShardMsg>) -> Option<Member> {
         if self.below_floor(&m) {
+            // Below the shard's own floor or out of order with what it stamped, or only below
+            // a moved tablet's raise (ICR 0043); decided before the floor is raised below.
+            let by_move = m.commit_ts >= self.ts_floor() && !self.stamped_below(&m);
             // The coordinator's retry reads this shard's floor again, raised to the refused
             // timestamp, or to an earlier-seqno PREPARE's above it that refused it (D244):
             // this shard's later singles stamp above both, so the retry's fresh timestamp
@@ -251,11 +254,10 @@ impl ShardState {
                 .unwrap_or(0);
             self.raise_ts_floor(m.commit_ts.max(conflict));
             let floor = self.ts_floor();
-            // Below the shard's own floor, or only below a moved tablet's raise (ICR 0043).
-            self.shared.metrics[usize::from(self.id.0)].count_refusal(if m.commit_ts < floor {
-                CrossRefusal::BelowFloor
-            } else {
+            self.shared.metrics[usize::from(self.id.0)].count_refusal(if by_move {
                 CrossRefusal::MoveRaise
+            } else {
+                CrossRefusal::BelowFloor
             });
             self.shared.ts_floors[usize::from(self.id.0)]
                 .0
