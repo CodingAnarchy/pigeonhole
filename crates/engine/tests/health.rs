@@ -162,3 +162,18 @@ fn a_failed_manifest_commit_is_reported_against_the_main_file() {
     assert_eq!(db.failure(), failed(Failure::MAIN_FILE, FailureCause::Io));
     let _ = gate::within(10, move || db.close()).expect("close hung");
 }
+
+#[test]
+fn a_failed_tablet_change_is_reported_as_internal() {
+    let (vfs, _gate) = gate::vfs(1507);
+    let db = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
+    let t = table(&db, "t");
+    let s = shard_of(&db, &t);
+    db.commit(put(&t, "a"), Some(Durability::Buffered)).unwrap();
+    db.fail_next_tablet_freeze();
+    let split = db.split_table(t.id, vec![b"m".to_vec()], &[s as u16, s as u16]);
+    assert!(split.is_err(), "{split:?}");
+    assert!(db.is_failed());
+    assert_eq!(db.failure(), failed(s, FailureCause::Internal));
+    let _ = gate::within(10, move || db.close()).expect("close hung");
+}
