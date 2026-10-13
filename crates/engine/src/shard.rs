@@ -690,6 +690,8 @@ impl Shared {
             .finish(result.as_ref().copied().map_err(Error::duplicate));
         manifest::release(self);
         self.closed.store(true, Ordering::Release);
+        // A blocking waiter whose reply the close dropped answers `Closed` now (#646).
+        self.failure.notify();
         if let Some(n) = waiter {
             n.notify(result);
         }
