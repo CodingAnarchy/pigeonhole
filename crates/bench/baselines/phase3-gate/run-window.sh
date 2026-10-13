@@ -20,7 +20,7 @@
 # ones in RESULTS_DIR/durations.tsv):
 #   setup          machine, kernel, drive and file-system checks; machine.json        1
 #   build          phdb-bench (rocksdb, sqlite) and the examples                      10
-#   memtable-lookup  memtable 1M/10k point lookup (#17; criterion)                    5
+#   memtable-lookup  memtable 262k (judged, D230)/1M/10k point lookup (#17; criterion) 5
 #   phase2-gate    D193 sparse-wide gate against SQLite and RocksDB (run-gate.sh)     40
 #   phase2-gate-2  the same again: #387's row-read p99 sits near 1.5x SQLite's, and one
 #                  run varies by about 5%                                             40
