@@ -932,9 +932,14 @@ fn scratch_timeline(db: Pigeonhole) {
                 busy.push(format!("{:.2}", n.busy_nanos.saturating_sub(l.busy_nanos) as f64 / dt));
                 commits.push((n.commits.saturating_sub(l.commits)).to_string());
             }
+            let sy: Vec<String> = pigeonhole::SCRATCH_SYNCS
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed).to_string())
+                .collect();
             eprintln!(
-                "TL t={} splits={sp} merges={me} moves={mv} tablets=[{}] busy=[{}] commits/s=[{}]",
+                "TL t={} syncs[all,prep,commit,batched,batchsync]=[{}] splits={sp} merges={me} moves={mv} tablets=[{}] busy=[{}] commits/s=[{}]",
                 start.elapsed().as_secs(),
+                sy.join(","),
                 tabs.join(","),
                 busy.join(","),
                 commits.join(",")

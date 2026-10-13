@@ -80,3 +80,10 @@ pub use pigeonhole_format::manifest::{CachePriority, CompactionStyle, FamilyKind
 pub use pigeonhole_format::scan::QualifierFilter;
 pub use pigeonhole_format::value::ValueRef;
 pub use pigeonhole_format::{Durability, FamilyId, Seqno, TableId, Timestamp};
+
+/// SCRATCH (perf287; never commit): group syncs submitted [0], of which covering a PREPARE
+/// [1] or a COMMIT record [2]; groups batched behind in-flight syncs (D207) [3]. The syncs a
+/// batched group later shares are submitted from `sync_wanted` and counted in [4].
+pub static SCRATCH_SYNCS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+

@@ -4710,11 +4710,13 @@ impl ShardState {
                     // batch: that sync covers only the records before it.
                     batched = true;
                     self.sync_wanted = true;
+                    crate::SCRATCH_SYNCS[3].fetch_add(1, Ordering::Relaxed);
                 } else {
                     match wal.submit_sync() {
                         Ok(c) => {
                             last_sync = Some(c);
                             group_sync = true;
+                            scratch_count_sync(&group.members);
                         }
                         Err(_) => {
                             self.poison(crate::health::FailureCause::Io);
@@ -5499,6 +5501,8 @@ impl ShardState {
         };
         match wal.submit_sync() {
             Ok(c) => {
+                crate::SCRATCH_SYNCS[0].fetch_add(1, Ordering::Relaxed);
+                crate::SCRATCH_SYNCS[4].fetch_add(1, Ordering::Relaxed);
                 self.group_syncs_in_flight += 1;
                 self.on_sync_done(c, through, true, ctx);
             }
@@ -8024,5 +8028,17 @@ mod message_size {
             "ShardMsg grew to {} bytes",
             std::mem::size_of::<super::ShardMsg>()
         );
+    }
+}
+
+/// SCRATCH (perf287; never commit): counts a submitted group sync by what it covers.
+fn scratch_count_sync(members: &[Member]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::SCRATCH_SYNCS[0].fetch_add(1, Relaxed);
+    if members.iter().any(|m| matches!(m.kind, MemberKind::Prepare { .. })) {
+        crate::SCRATCH_SYNCS[1].fetch_add(1, Relaxed);
+    }
+    if members.iter().any(|m| matches!(m.kind, MemberKind::CommitRecord { .. })) {
+        crate::SCRATCH_SYNCS[2].fetch_add(1, Relaxed);
     }
 }

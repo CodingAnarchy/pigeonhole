@@ -142,3 +142,7 @@ pub use pigeonhole_engine::ShardStats;
 pub use pigeonhole_engine::{Failure, FailureCause};
 pub use pigeonhole_engine::{MergeError, MergeOperator};
 pub use pigeonhole_format::Durability;
+
+/// SCRATCH (perf287; never commit).
+#[doc(hidden)]
+pub use pigeonhole_engine::SCRATCH_SYNCS;
