@@ -966,6 +966,15 @@ where
                         break;
                     };
                     if t != ts {
+                        // The group ended on an older version of the column, so its outcome
+                        // is known: a version that finishes the column (#387) passes the
+                        // rest now, without returning here through `advance` first.
+                        if self.finishes_column(ts, hidden, base, fold_ready) {
+                            self.col_skipped += 1;
+                            if !self.cursor.skip_column(&self.col)? {
+                                self.col_noskip = true;
+                            }
+                        }
                         break;
                     }
                     (seqno, kind)
@@ -1086,6 +1095,23 @@ where
                 Ok(None)
             }
         }
+    }
+
+    /// Whether a group at `ts`, read to its end with `hidden` and a `base`, returns its version
+    /// from the buffers and finishes the column (`count_version` sets `col_skip`, or the
+    /// predicate fails and does), so the column's remaining entries can be skipped before it
+    /// is returned; `run` is `self.run` when the group began. Only where
+    /// [`ResolveOptions::skip_columns`] is set and the cursor has not refused a skip.
+    fn finishes_column(&self, ts: Timestamp, hidden: bool, base: Base, run: bool) -> bool {
+        self.opts.skip_columns
+            && !self.col_noskip
+            && !self.opts.counter
+            && !run
+            && !hidden
+            && base == Base::Copied
+            && self.opts.versions != 0
+            && self.col_versions + 1 >= self.opts.versions
+            && self.opts.in_time_range(ts)
     }
 
     /// Emits the pending run with no base below it.
