@@ -229,14 +229,19 @@ pub(crate) struct VisibilityCounts {
 }
 
 /// Engine-wide state every shard and every caller shares.
-/// Test hook: reads step over superseded memtable versions even where a memtable's
-/// stale-tail index could skip them (D194), so a test reads the same data both ways.
+/// Test hook: reads step over a finished column's entries even where a memtable's
+/// stale-tail index (D194) or an SST's block headers (ICR 0041) could skip them, so a test
+/// reads the same data both ways.
 #[cfg(feature = "test-hooks")]
 pub(crate) static READS_STEP: AtomicBool = AtomicBool::new(false);
 
 /// Memtable jumps taken by reads (test hook).
 #[cfg(feature = "test-hooks")]
 pub(crate) static TAIL_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// SST column skips taken by reads (ICR 0041; test hook).
+#[cfg(feature = "test-hooks")]
+pub(crate) static SST_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A slot's new active memtable, with a stale-tail index if `tail_index` (D194, D199).
 fn new_memtable(

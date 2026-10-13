@@ -256,6 +256,7 @@ fn jumping_reads_return_what_stepping_reads_return() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
     let before = Engine::tail_skips();
+    let sst_before = Engine::sst_skips();
     for seed in 1..=seeds {
         history(seed);
     }
@@ -264,4 +265,6 @@ fn jumping_reads_return_what_stepping_reads_return() {
         jumps > 1_000,
         "only {jumps} memtable jumps: the index is not used"
     );
+    let sst = Engine::sst_skips() - sst_before;
+    assert!(sst > 1_000, "only {sst} SST column skips (ICR 0041)");
 }

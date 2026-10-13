@@ -736,6 +736,13 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
                 return Err(err);
             }
         };
+        self.apply(offset, e)
+    }
+
+    /// Positions on the entry at `offset`, whose header `e` is already decoded, taking its
+    /// shared prefix from the current key.
+    #[inline]
+    fn apply(&mut self, offset: usize, e: Entry) -> crate::Result<()> {
         let bytes: &[u8] = &self.block.bytes;
         if e.shared == 0 {
             self.key = KeySrc::Block(e.unshared.clone());
@@ -919,6 +926,48 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
             self.next()?;
         }
         Ok(())
+    }
+
+    /// Passes the column's later entries in this block from their headers alone (ICR 0041):
+    /// an entry sharing at least `column`'s length with the key before it, at a column key's
+    /// length, is in the column, and a restart entry is checked against `column` directly.
+    /// Only the entry it stops on is decoded: it shares at most `column`'s length with the
+    /// last one passed, which the current key holds. Becomes invalid at the block's end.
+    fn skip_column(&mut self, column: &[u8]) -> crate::Result<bool> {
+        if !self.valid() {
+            return Ok(false);
+        }
+        let key_len = column.len() + crate::key::SUFFIX_LEN;
+        let mut at = self.next;
+        let stop = loop {
+            if at >= self.block.data_end {
+                self.invalidate();
+                return Ok(true);
+            }
+            let e = self.block.entry(at);
+            let e = self.or_invalidate(e)?;
+            let unshared = e.unshared.len();
+            let in_column = if e.shared == 0 {
+                unshared == key_len && self.block.bytes[e.unshared.clone()].starts_with(column)
+            } else {
+                e.shared >= column.len() && e.shared + unshared == key_len
+            };
+            if !in_column {
+                break e;
+            }
+            at = e.value.end;
+        };
+        if stop.shared > column.len() && at != self.next {
+            // Malformed (a key outside the column sharing more than the column with one in
+            // it): rebuild the passed entries' keys by stepping.
+            while self.valid() && self.next != at {
+                self.load(self.next)?;
+            }
+        }
+        // The header is decoded already: the stop shares at most the column with the last
+        // entry passed, and the current key starts with the column.
+        self.apply(at, stop)?;
+        Ok(true)
     }
 
     /// Uses the row-start table: one binary search, no cell decoding. Becomes invalid if no

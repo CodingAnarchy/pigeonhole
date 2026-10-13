@@ -1723,17 +1723,20 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
     }
 }
 
-/// Whether a read over `sources` should pass finished columns with `skip_column` (D194):
-/// only when the index is on and a memtable source can jump, so a read of SSTs alone never
-/// pays for a try that cannot succeed.
+/// Whether a read over `sources` should pass finished columns with `skip_column`: when an
+/// SST source can (ICR 0041), or a memtable source with the stale-tail index (D194), so a
+/// read of index-less memtables alone never pays for a try that cannot succeed.
 fn skips_columns(sources: &[Source]) -> bool {
     #[cfg(feature = "test-hooks")]
     if crate::shard::READS_STEP.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
-    sources
-        .iter()
-        .any(|s| matches!(s, Source::Mem(m) if m.inner().skips_columns()))
+    sources.iter().any(|s| match s {
+        Source::Mem(m) => m.inner().skips_columns(),
+        Source::Sst(_) => true,
+        #[cfg(test)]
+        Source::Vec(_) => false,
+    })
 }
 
 /// A point get's resolver options: as `ReadSpec { versions: 1, .. }.resolve_opts`, built

@@ -662,6 +662,32 @@ impl Cursor for SstIter {
         }
     }
 
+    /// Passes the column's later entries in the current block from their headers
+    /// ([`BlockIter`]'s `skip_column`, ICR 0041); at the block's end it moves to the next
+    /// block, as `next` does, where the column may continue.
+    #[inline]
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
+        let Some(data) = self.data.as_mut().filter(|d| d.valid()) else {
+            return Ok(false);
+        };
+        match data.skip_column(column) {
+            Ok(_) if data.valid() && self.filter_all => Ok(true),
+            Ok(_) => self
+                .run(|it| {
+                    if valid(&it.data) {
+                        Ok(())
+                    } else {
+                        it.advance_block()
+                    }
+                })
+                .map(|()| true),
+            Err(e) => {
+                self.data = None;
+                Err(e.into())
+            }
+        }
+    }
+
     /// Uses the block's row-start table; crosses into the next block only if the row
     /// continues there.
     fn skip_row(&mut self) -> Result<()> {

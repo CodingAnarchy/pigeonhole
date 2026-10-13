@@ -118,7 +118,8 @@ impl Cursor for Source {
         }
     }
 
-    /// A memtable with a stale-tail index jumps (D194); an SST steps as before.
+    /// A memtable with a stale-tail index jumps (D194); an SST passes the column's entries
+    /// from its block headers (ICR 0041).
     #[inline]
     fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
         match self {
@@ -130,7 +131,14 @@ impl Cursor for Source {
                 }
                 Ok(skipped)
             }
-            Source::Sst(_) => Ok(false),
+            Source::Sst(it) => {
+                let skipped = it.skip_column(column)?;
+                #[cfg(feature = "test-hooks")]
+                if skipped {
+                    crate::shard::SST_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(skipped)
+            }
             #[cfg(test)]
             Source::Vec(it) => Ok(it.skip_column(column)?),
         }
@@ -551,6 +559,19 @@ impl SstSource {
             self.next_file()?;
         }
         Ok(())
+    }
+
+    /// The open SST passes the column's entries from its block headers (ICR 0041); past its
+    /// end the level moves on as `next` does.
+    #[inline]
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
+        if !self.iter.skip_column(column)? {
+            return Ok(false);
+        }
+        if self.level.is_some() && !self.iter.valid() {
+            self.next_file()?;
+        }
+        Ok(true)
     }
 
     fn skip_row(&mut self) -> Result<()> {
