@@ -1316,6 +1316,93 @@ fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
 }
 
 #[test]
+fn a_participant_never_stamps_a_later_seqno_below_a_prepared_commit_timestamp() {
+    // D142's order, the other way round from the test above. `high` coordinates a
+    // cross-shard commit B: it reserves B's seqno, then picks B's timestamp above every
+    // floor, its own here, which ran ahead of `low`'s on the frozen clock. A single A,
+    // queued on the participant `low` ahead of B's PREPARE, is admitted in the same group,
+    // so it gets a later seqno; it must not get a lower default timestamp than B's (D11: a
+    // tablet's default timestamps never go backwards in seqno order).
+    let mut db = open(2, |_| {});
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    // The frozen clock: each default timestamp is the shard's floor plus one, so `high`'s
+    // floor climbs ten above `low`'s.
+    for i in 0..10u8 {
+        db.put(b"z", &[i]);
+    }
+    // A, a single on `low`, then B, coordinated by `high` (its first row is there); neither
+    // has run yet.
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"a", b"s", None, ValueRef::Bytes(b"single"))
+        .unwrap();
+    let mut a = db
+        .engine
+        .submit(wb, Some(Durability::Buffered))
+        .expect("submit");
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"both"))
+        .unwrap();
+    wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"both"))
+        .unwrap();
+    let mut b = db
+        .engine
+        .submit(wb, Some(Durability::Buffered))
+        .expect("submit");
+    // `high` reserves B's seqno, picks its timestamp and sends `low` the PREPARE, which
+    // queues behind A; then `low` admits both in one group.
+    let now = db.clock.monotonic_nanos();
+    db.shards[usize::from(high)].run_once(now + 1_000);
+    db.shards[usize::from(low)].run_once(now + 1_000);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut seqno = |pc: &mut pigeonhole_engine::PendingCommit, db: &mut Db| {
+        for _ in 0..100_000 {
+            if let Poll::Ready(r) = Pin::new(&mut *pc).poll(&mut cx) {
+                return r.expect("commit").seqno;
+            }
+            db.step();
+        }
+        panic!("a commit never resolved");
+    };
+    let seqno_a = seqno(&mut a, &mut db);
+    let seqno_b = seqno(&mut b, &mut db);
+    let ts_a = db
+        .engine
+        .get_latest(id, f, b"a", b"s")
+        .unwrap()
+        .expect("A")
+        .timestamp();
+    let (ts_b, _) = db.get(b"z").unwrap();
+    assert_eq!(db.get(b"a").unwrap().0, ts_b);
+    eprintln!("A: seqno {seqno_a} ts {ts_a}; B: seqno {seqno_b} ts {ts_b}");
+    let (first, second) = if seqno_a < seqno_b {
+        ((seqno_a, ts_a), (seqno_b, ts_b))
+    } else {
+        ((seqno_b, ts_b), (seqno_a, ts_a))
+    };
+    assert!(
+        second.1 >= first.1,
+        "seqno {} has timestamp {} below seqno {}'s {} on one tablet (D11, D142)",
+        second.0,
+        second.1,
+        first.0,
+        first.1
+    );
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
 fn invalid_tablet_changes_are_refused() {
     let mut db = open(2, |_| {});
     for i in 0..10 {
