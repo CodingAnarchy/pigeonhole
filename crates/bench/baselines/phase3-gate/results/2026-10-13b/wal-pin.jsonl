@@ -1,0 +1,9 @@
+{"machine": true, "kernel": "6.8.0-139-generic", "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor\nAMD Ryzen 9 7950X3D 16-Core Processor           Unknown CPU @ 4.2GHz", "cpus": 32, "mount": "xfs    rw,noatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota", "load": "3.27 3.56 3.12 1/720 925609"}
+{"mode":"write","mult":2,"budget":67108864,"shards":4,"commits":4000000,"secs":10.130,"commits_per_sec":394853,"unpin_passes":184,"small_flushes":391,"flushes":224,"compactions":129,"max_wal_bytes":1275068416,"wal_bytes_at_crash":1275068416}
+{"mode":"reopen","mult":2,"wal_bytes":1275068416,"open_ms":521.9,"first_read_us":1987}
+{"mode":"write","mult":4,"budget":67108864,"shards":4,"commits":4000000,"secs":10.439,"commits_per_sec":383169,"unpin_passes":102,"small_flushes":131,"flushes":215,"compactions":89,"max_wal_bytes":1543503872,"wal_bytes_at_crash":1543503872}
+{"mode":"reopen","mult":4,"wal_bytes":1543503872,"open_ms":716.5,"first_read_us":4026}
+{"mode":"write","mult":2,"budget":67108864,"shards":4,"commits":4000000,"secs":10.060,"commits_per_sec":397610,"unpin_passes":190,"small_flushes":393,"flushes":220,"compactions":130,"max_wal_bytes":1275068416,"wal_bytes_at_crash":1275068416}
+{"mode":"reopen","mult":2,"wal_bytes":1275068416,"open_ms":533.9,"first_read_us":4143}
+{"mode":"write","mult":4,"budget":67108864,"shards":4,"commits":4000000,"secs":10.750,"commits_per_sec":372096,"unpin_passes":119,"small_flushes":147,"flushes":223,"compactions":94,"max_wal_bytes":1543503872,"wal_bytes_at_crash":1543503872}
+{"mode":"reopen","mult":4,"wal_bytes":1543503872,"open_ms":526.6,"first_read_us":193}
