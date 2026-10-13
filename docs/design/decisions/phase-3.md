@@ -1382,7 +1382,7 @@ At those lengths, one flush or compaction more or less, or a placement change, m
   - tablet changes on at least 0.8× the same build with them off (`all` runs Pigeonhole's tablets-off run beside the default);
   - at most 0.1 wasted two-phase rounds per cross-shard commit, and no `Busy`;
   - the cross-shard commit p99 under a bound the owner sets from D245's numbers (a TODO in `report.py` until then; the p99 is reported).
-- **Wasted rounds** are inferred, as perf2 did, until ICR 0043's counters (`Metrics::cross_shard`, #658) land: the sequence numbers used while measuring minus the commits measured (`RunDetail::seqnos_used`, `RunRecord::rounds`). Each commit uses one sequence number and each refused round one more. With tablet changes on, a split, merge or move while measuring may use some too; the shard table counts those beside it.
+- **Wasted rounds** are the engine's refused two-phase rounds over the measured phase's cross-shard commits (ICR 0043, `Metrics::cross_shard.refused_rounds`, in the run's stall counters, with the refusals by reason beside them). perf2's inference, the sequence numbers used while measuring minus the commits measured (`RunDetail::seqnos_used`), stays in the report as a cross-check: each commit uses one sequence number and each refused round one more, and with tablet changes on a split, merge or move may use some too.
 - The reproducibility pair (D243) includes it, as part of `all`; at full scale its runs measure at least 10 s.
 - D247's `contended` step runs it again at 16 threads under the default durability.
 
