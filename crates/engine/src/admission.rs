@@ -89,7 +89,7 @@ impl Admission {
     /// The fast path: charges `bytes` to `shard` if no one waits there and it has room.
     #[inline]
     pub(crate) fn try_fast(&self, shard: usize, bytes: u64) -> Option<Charge> {
-        let s = &self.shards[shard.min(self.shards.len() - 1)];
+        let s = &self.shards[shard];
         if s.waiting.load(Ordering::Acquire) != 0 || self.closed.load(Ordering::Relaxed) {
             return None;
         }

@@ -1357,7 +1357,7 @@ impl Engine {
     /// loop.
     pub fn commit(&self, batch: WriteBatch, durability: Option<Durability>) -> Result<CommitInfo> {
         self.inner.shared.refuse_blocking_on_driver("commit")?;
-        self.inner.submit(batch, durability, None, None)?.wait()
+        self.inner.commit_blocking(batch, durability)
     }
 
     /// Applies `batch` (which must touch only `row`) if `predicate` holds, atomically on the
@@ -1418,21 +1418,22 @@ impl Engine {
             None,
             None,
             |target, msg, waiter, spins| {
-                let prepared = Prepared {
-                    target,
-                    msg,
-                    waiter,
-                    spins,
-                };
                 let shard = usize::from(target.0);
                 match a.try_fast(shard, bytes) {
                     Some(mut charge) => {
                         // A failed send drops the charge, which returns it.
-                        let pending = PendingCommit::from(inner.send(prepared)?);
+                        let pending =
+                            PendingCommit::from(inner.send_parts(target, msg, waiter, spins)?);
                         charge.attach(&pending.sub.waiter);
                         Ok(pending)
                     }
                     None => {
+                        let prepared = Prepared {
+                            target,
+                            msg,
+                            waiter,
+                            spins,
+                        };
                         let admit = crate::Admit::new(Some(a), shard, bytes);
                         let engine = Arc::clone(inner);
                         // Sent once admitted; the `Mutex` only makes the closure `Sync`.
@@ -2554,8 +2555,8 @@ impl Inner {
     /// routing.
     /// The handle on the shared state for commits to `shard` (D236).
     pub(crate) fn shard_ref(&self, shard: ShardId) -> Arc<ShardRef> {
-        let i = usize::from(shard.0).min(self.shard_refs.len() - 1);
-        Arc::clone(&self.shard_refs[i])
+        // Routing only names shards that exist; a reader commits nothing.
+        Arc::clone(&self.shard_refs[usize::from(shard.0)])
     }
 
     fn admission_shard(
@@ -2958,6 +2959,25 @@ impl Inner {
         Ok(then(target, msg, waiter, spins))
     }
 
+    /// Submits and waits on the engine's borrowed state (D236): a blocking commit takes no
+    /// reference on the engine and moves no request through a struct.
+    fn commit_blocking(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<CommitInfo> {
+        self.prepare_then(
+            batch,
+            durability,
+            None,
+            None,
+            |target, msg, waiter, spins| {
+                self.shared.submitter(target).submit(msg)?;
+                crate::write::wait_blocking(&self.shared, waiter, spins)
+            },
+        )?
+    }
+
     /// Sends a prepared request ([`prepare_then`](Self::prepare_then)) to its shard (the
     /// coordinator of a cross-shard one).
     #[inline(always)]
@@ -2974,7 +2994,7 @@ impl Inner {
     /// [`send`](Self::send) taking the request's parts, so the blocking path never moves
     /// them through a struct.
     #[inline(always)]
-    fn send_parts(
+    pub(crate) fn send_parts(
         &self,
         target: ShardId,
         msg: ShardMsg,

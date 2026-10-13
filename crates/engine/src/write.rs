@@ -509,25 +509,45 @@ impl Submission {
     /// [`PendingCommit::wait`] for a commit the engine submitted itself (a blocking
     /// commit): never waiting for room.
     pub(crate) fn wait(mut self) -> crate::Result<CommitInfo> {
-        let window = if self.spins {
-            self.shared.commit_spin_nanos
-        } else {
-            0
-        };
-        if window == 0 {
-            // No spin: exactly the parking wait.
-            let Settled { info, batch } = wait_reply(&self.shared, &mut self.waiter)?;
-            recycle(batch);
-            wait_visible(&self.shared, info.seqno)?;
-            return Ok(info);
-        }
-        let mut spin = SpinWait::new(window);
-        let Settled { info, batch } =
-            wait_reply_spinning(&self.shared, &mut self.waiter, &mut spin)?;
-        recycle(batch);
-        wait_visible_spinning(&self.shared, info.seqno, &mut spin)?;
-        Ok(info)
+        wait_body(&self.shared, &mut self.waiter, self.spins)
     }
+}
+
+/// A blocking commit's wait on the engine's own borrowed state (D236): the caller holds
+/// the engine for the whole wait, so the commit takes no reference on it. Returns the
+/// completion slot to this thread's cache, as dropping a [`Submission`] does.
+#[inline]
+pub(crate) fn wait_blocking(
+    shared: &crate::shard::Shared,
+    mut waiter: Waiter<crate::Result<Settled>>,
+    spins: bool,
+) -> crate::Result<CommitInfo> {
+    let r = wait_body(shared, &mut waiter, spins);
+    let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
+    r
+}
+
+/// The wait of a submitted commit: its reply, then visibility (D19), spinning first for a
+/// commit that may (D198).
+#[inline]
+fn wait_body(
+    shared: &crate::shard::Shared,
+    waiter: &mut Waiter<crate::Result<Settled>>,
+    spins: bool,
+) -> crate::Result<CommitInfo> {
+    let window = if spins { shared.commit_spin_nanos } else { 0 };
+    if window == 0 {
+        // No spin: exactly the parking wait.
+        let Settled { info, batch } = wait_reply(shared, waiter)?;
+        recycle(batch);
+        wait_visible(shared, info.seqno)?;
+        return Ok(info);
+    }
+    let mut spin = SpinWait::new(window);
+    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
+    recycle(batch);
+    wait_visible_spinning(shared, info.seqno, &mut spin)?;
+    Ok(info)
 }
 
 /// A blocking wait's poll before it parks (D198): up to its window, unless this thread's
