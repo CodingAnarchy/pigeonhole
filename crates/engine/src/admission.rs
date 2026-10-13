@@ -87,10 +87,13 @@ impl Admission {
     }
 
     /// The fast path: charges `bytes` to `shard` if no one waits there and it has room.
+    /// It doesn't look at `closed`: its caller checked the engine is open just before, and
+    /// a commit charged as a close begins is answered `Closed` by its shard, which returns
+    /// the charge like any other resolution.
     #[inline]
     pub(crate) fn try_fast(&self, shard: usize, bytes: u64) -> Option<Charge> {
         let s = &self.shards[shard];
-        if s.waiting.load(Ordering::Acquire) != 0 || self.closed.load(Ordering::Relaxed) {
+        if s.waiting.load(Ordering::Acquire) != 0 {
             return None;
         }
         s.try_charge(bytes)
