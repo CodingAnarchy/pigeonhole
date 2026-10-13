@@ -151,7 +151,8 @@ impl fmt::Display for Error {
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::Closed => f.write_str("the database is closed"),
             Error::OutcomeUnknown => f.write_str(
-                "the commit's outcome is not known: a shard died or the database closed while                  it was in flight; the next open decides it from the WAL (reopen and read)",
+                "the commit's outcome is not known: a shard died or the database closed while it was \
+                 in flight; the next open decides it from the WAL (reopen and read)",
             ),
             Error::NoReaderSlot => f.write_str("every reader slot is taken"),
             Error::RecordTooLarge => {
