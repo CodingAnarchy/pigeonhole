@@ -627,31 +627,37 @@ impl<H: ShardHandler> ShardCore<H> {
             self.spawner.local.wake_sleepers();
         }
         self.spawner.local.wake_due(start);
-        // D237: the drain woke a future the driving thread awaits (a commit it submitted
-        // settled): hand the thread back before the background slices, so it sees that now
-        // rather than at the deadline. The slices run next turn, and after
-        // `MAX_TURN_YIELDS` such turns in a row one runs them anyway. Only a
-        // `ShardDriver::waker` wakes this, so engine-owned threads never skip.
-        if self.signal().take_turn_woken()
-            && self.yields < MAX_TURN_YIELDS
-            && self.spawner.local.has_runnable()
-        {
-            self.yields += 1;
-            return true;
-        }
-        self.yields = 0;
-        while self.spawner.local.has_runnable() {
-            let now = self.vfs.monotonic_nanos();
-            if now >= deadline {
-                break;
+        if self.spawner.local.has_runnable() {
+            // D237: the drain woke a future the driving thread awaits (a commit it submitted
+            // settled): hand the thread back before the background slices, so it sees that
+            // now rather than at the deadline. The slices run next turn, and after
+            // `MAX_TURN_YIELDS` such turns in a row one runs them anyway. Only a
+            // `ShardDriver::waker` wakes this, so engine-owned threads never skip. Checked
+            // only when there are slices to skip: a turn without background work pays
+            // nothing (the D193 commit ceilings), and a wake left for a later turn costs
+            // that turn's slices at most.
+            if self.signal().take_turn_woken() && self.yields < MAX_TURN_YIELDS {
+                self.yields += 1;
+                return true;
             }
-            self.spawner
-                .local
-                .run_one(now.saturating_add(self.time_slice).min(deadline));
-            // Foreground first: whatever queued during the slice runs before the next one.
-            self.drain();
-            self.spawner.local.collect_woken();
-            self.spawner.local.wake_due(self.vfs.monotonic_nanos());
+            self.yields = 0;
+            loop {
+                let now = self.vfs.monotonic_nanos();
+                if now >= deadline {
+                    break;
+                }
+                self.spawner
+                    .local
+                    .run_one(now.saturating_add(self.time_slice).min(deadline));
+                // Foreground first: whatever queued during the slice runs before the next
+                // one.
+                self.drain();
+                self.spawner.local.collect_woken();
+                self.spawner.local.wake_due(self.vfs.monotonic_nanos());
+                if !self.spawner.local.has_runnable() {
+                    break;
+                }
+            }
         }
         if self.spawner.local.has_runnable() {
             return true;
