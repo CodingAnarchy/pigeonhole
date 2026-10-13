@@ -509,6 +509,29 @@ for level, label in CONTENDED_LEVELS:
             if mine > 3 * theirs:
                 flag = f"**> 3× worse than {near} against RocksDB ({mine:.2f}× vs {theirs:.2f}×): file an issue**"
         reported.append((label, w, ph, vs, flag))
+# ycsb-a's riders (D247, reported): readers under snapshots, a durable backup and a compaction
+# beside the measured phase; the foreground's p99 is held against the judged ycsb-a run's.
+for level, label in CONTENDED_LEVELS:
+    rr = next(iter(results(f"contended-{level}-ycsb-a-riders.json", "pigeonhole", "ycsb-a")), None)
+    rd = (rr or {}).get("detail", {}).get("riders")
+    if not rd:
+        continue
+    judged = cont.get((level, "ycsb-a"))
+    fg = ""
+    flag = ""
+    if judged:
+        ratio = rr["p99_ns"] / max(judged[0]["p99_ns"], 1)
+        fg = f"; foreground p99 {us(rr['p99_ns']):.0f} µs, {ratio:.2f}× the judged ycsb-a's"
+        if ratio > 3:
+            flag = "; **> 3× the judged ycsb-a's p99: file an issue**"
+    ms = lambda v: f"{v:.0f} ms" if v is not None else "not reached"
+    close = (rr.get("detail", {}).get("close_ms"))
+    rows.append((f"Contended ycsb-a with riders, {label} (reported, not judged; D247)",
+                 f"snapshot scans p99 {us(rd['snapshot_scans']['p99_ns']):.0f} µs ({rd['snapshots']} snapshots), "
+                 f"durable-snapshot scans p99 {us(rd['durable_snapshot_scans']['p99_ns']):.0f} µs "
+                 f"({rd['durable_snapshots']}); durable backup {ms(rd.get('backup_ms'))}, compaction "
+                 f"{ms(rd.get('compact_ms'))}; close {ms(close)}{fg}{flag}",
+                 "-", f"contended-{level}-ycsb-a-riders.json"))
 for label, w, ph, vs, flag in reported:
     d = ph.get("detail", {})
     conflicts = d.get("txn_conflicts")

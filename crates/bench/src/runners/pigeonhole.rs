@@ -43,6 +43,9 @@ pub(crate) struct Settings {
     pub(crate) shard_spin_micros: Option<u64>,
     /// The inline driver splits the table over every shard before loading it (D213).
     pub(crate) presplit: bool,
+    /// Riders on the measured phase (D247): snapshot and durable-snapshot readers, then a
+    /// durable backup and a compaction.
+    pub(crate) riders: bool,
     /// The pre-split cuts at the measured writes' quantiles rather than the loaded rows', so
     /// each piece takes about the same share of the writes (D231's engine scaling).
     pub(crate) presplit_writes: bool,
@@ -53,6 +56,10 @@ pub(crate) struct Open {
     target: Target,
     /// Writes retried after `Busy`, shared with every client.
     busy: Arc<AtomicU64>,
+    /// The store's directory (the riders' backup goes under it).
+    dir: std::path::PathBuf,
+    /// The riders' threads while the measured phase runs.
+    riders: Option<riders::Running>,
 }
 
 /// How many times a write refused with `Busy` is retried (each after the engine's own
@@ -161,6 +168,21 @@ impl PigeonholeRunner {
         self
     }
 
+    /// `true`: background work rides on the measured phase (D247, reported): one thread scans
+    /// 10 rows at a time under a snapshot re-taken every 100 ms, another the same under a
+    /// durable snapshot, and a third takes a durable backup 2 s in, then a full compaction.
+    /// The record's [`Riders`](crate::Riders) has their latencies and durations.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(PigeonholeRunner::default().riders(true).describe().contains(" riders"));
+    /// ```
+    pub fn riders(mut self, yes: bool) -> Self {
+        self.settings.riders = yes;
+        self
+    }
+
     /// `true` (the library default): tablets split, merge and move between shards, so the
     /// bench table's writes spread over every shard ([`Options::tablet_changes`]); `false`:
     /// the table is one tablet on one shard.
@@ -262,6 +284,148 @@ impl PigeonholeRunner {
 /// (`Options::default()`; a test checks a default commit's level).
 fn default_durability() -> &'static str {
     "group-sync(default)"
+}
+
+/// D247's riders: background readers, a backup and a compaction beside a measured phase.
+mod riders {
+    use std::ops::Bound;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use pigeonhole::{Pigeonhole, Snapshot, Table};
+
+    use super::err;
+    use crate::{Histogram, LatencyStats, Riders};
+
+    /// How often a reader takes a new snapshot.
+    const RESNAPSHOT: Duration = Duration::from_millis(100);
+    /// How far into the measured phase the backup starts.
+    const BACKUP_AFTER: Duration = Duration::from_secs(2);
+
+    type Reader = JoinHandle<Result<(Histogram, u64), String>>;
+    /// The backup and compaction thread: their milliseconds, each `None` if not reached.
+    type Work = JoinHandle<Result<(Option<f64>, Option<f64>), String>>;
+
+    pub(super) struct Running {
+        stop: Arc<AtomicBool>,
+        plain: Reader,
+        durable: Reader,
+        work: Work,
+        backup: std::path::PathBuf,
+    }
+
+    impl std::fmt::Debug for Running {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Running").finish_non_exhaustive()
+        }
+    }
+
+    pub(super) fn start(db: &Pigeonhole, table: &Table, backup: std::path::PathBuf) -> Running {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = |durable: bool| {
+            let (db, table, stop) = (db.clone(), table.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || read(&db, &table, &stop, durable))
+        };
+        let (plain, durable) = (reader(false), reader(true));
+        let work = {
+            let (db, stop, path) = (db.clone(), Arc::clone(&stop), backup.clone());
+            std::thread::spawn(move || {
+                let begun = Instant::now();
+                while begun.elapsed() < BACKUP_AFTER {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok((None, None));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let t = Instant::now();
+                db.backup_durable(&path).map_err(err)?;
+                let backup_ms = t.elapsed().as_secs_f64() * 1e3;
+                if stop.load(Ordering::Relaxed) {
+                    return Ok((Some(backup_ms), None));
+                }
+                let t = Instant::now();
+                db.compact().map_err(err)?;
+                Ok((Some(backup_ms), Some(t.elapsed().as_secs_f64() * 1e3)))
+            })
+        };
+        Running {
+            stop,
+            plain,
+            durable,
+            work,
+            backup,
+        }
+    }
+
+    /// Scans 10 rows from a random start under a snapshot taken anew every
+    /// [`RESNAPSHOT`], until stopped.
+    fn read(
+        db: &Pigeonhole,
+        table: &Table,
+        stop: &AtomicBool,
+        durable: bool,
+    ) -> Result<(Histogram, u64), String> {
+        let take = || -> Result<Snapshot, String> {
+            if durable {
+                db.durable_snapshot()
+            } else {
+                db.snapshot()
+            }
+            .map_err(err)
+        };
+        let (mut hist, mut taken) = (Histogram::new(), 1u64);
+        let mut snap = take()?;
+        let mut since = Instant::now();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(durable);
+        while !stop.load(Ordering::Relaxed) {
+            if since.elapsed() >= RESNAPSHOT {
+                snap = take()?;
+                taken += 1;
+                since = Instant::now();
+            }
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            // YCSB rows are `user` and 20 digits; a random 20-digit start lands among them.
+            let start = format!("user{:020}", x % 10u64.pow(19));
+            let t = Instant::now();
+            let mut it = table
+                .scan_bounds(Bound::Included(start.as_bytes()), Bound::Unbounded)
+                .snapshot(&snap)
+                .limit(10)
+                .iter()
+                .map_err(err)?;
+            while it.next_ref().map_err(err)?.is_some() {}
+            hist.record(t.elapsed());
+        }
+        Ok((hist, taken))
+    }
+
+    impl Running {
+        pub(super) fn stop(self) -> Result<Riders, String> {
+            self.stop.store(true, Ordering::Relaxed);
+            let join = |h: Reader| h.join().map_err(|_| "a rider panicked".to_owned())?;
+            let (plain, snapshots) = join(self.plain)?;
+            let (durable, durable_snapshots) = join(self.durable)?;
+            let (backup_ms, compact_ms) = self
+                .work
+                .join()
+                .map_err(|_| "the backup rider panicked".to_owned())??;
+            // Not counted in the store's size.
+            let _ = std::fs::remove_dir_all(&self.backup);
+            let _ = std::fs::remove_file(&self.backup);
+            Ok(Riders {
+                snapshot_scans: LatencyStats::of(&plain),
+                durable_snapshot_scans: LatencyStats::of(&durable),
+                snapshots,
+                durable_snapshots,
+                backup_ms,
+                compact_ms,
+            })
+        }
+    }
 }
 
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
@@ -367,6 +531,8 @@ impl Runner for PigeonholeRunner {
                 load_buffered: self.settings.load_buffered,
             },
             busy: Arc::default(),
+            dir: dir.to_path_buf(),
+            riders: None,
         });
         Ok(())
     }
@@ -450,6 +616,26 @@ impl Runner for PigeonholeRunner {
         Ok(())
     }
 
+    fn start_riders(&mut self) -> Result<(), String> {
+        if !self.settings.riders {
+            return Ok(());
+        }
+        let o = self.open.as_mut().ok_or("pigeonhole runner is not open")?;
+        o.riders = Some(riders::start(
+            &o.target.db,
+            &o.target.table,
+            o.dir.join("rider-backup"),
+        ));
+        Ok(())
+    }
+
+    fn stop_riders(&mut self) -> Result<Option<crate::Riders>, String> {
+        match self.open.as_mut().and_then(|o| o.riders.take()) {
+            Some(r) => r.stop().map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn txn_conflicts(&self) -> Option<u64> {
         Some(self.open.as_ref()?.target.conflicts.load(Ordering::Relaxed))
     }
@@ -479,7 +665,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -510,7 +696,8 @@ impl Runner for PigeonholeRunner {
                 (_, true) => " presplit=writes",
                 (true, false) => " presplit",
                 _ => "",
-            }
+            },
+            if s.riders { " riders" } else { "" }
         )
     }
 }
@@ -1015,6 +1202,37 @@ mod tests {
         drop(c);
         assert_eq!(grew(&before, &levels(&r)), run_level);
         r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn riders_read_under_snapshots_then_back_up_and_compact() {
+        // D247: the riders run beside a 3 s measured phase and report.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-riders-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default()
+            .shards(2)
+            .memtable_budget(16 << 20)
+            .riders(true);
+        let config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+        let options = crate::RunOptions {
+            warmup: 0.0,
+            min_measured: Duration::from_secs(3),
+            ..crate::RunOptions::default()
+        };
+        let rec = crate::run_detailed(&mut r, &config, &dir, &options).unwrap();
+        let riders = rec.detail.riders.expect("riders");
+        assert!(riders.snapshot_scans.count > 0 && riders.durable_snapshot_scans.count > 0);
+        assert!(
+            riders.snapshots >= 10 && riders.durable_snapshots >= 10,
+            "{riders:?}"
+        );
+        assert!(
+            riders.backup_ms.is_some() && riders.compact_ms.is_some(),
+            "{riders:?}"
+        );
+        assert!(rec.detail.close_ms.is_some());
+        assert!(!dir.join("rider-backup").exists(), "the backup is removed");
         std::fs::remove_dir_all(dir).ok();
     }
 

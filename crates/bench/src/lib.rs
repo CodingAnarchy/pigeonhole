@@ -39,8 +39,8 @@ mod workload;
 pub use histogram::Histogram;
 pub use report::{
     Comparison, Delta, EngineCommit, Environment, GroupCommit, JUDGED_MIN_COMMITS, JUDGED_MIN_SECS,
-    LatencyStats, OpTypeStats, Placement, ReadSplit, Rounds, RunDetail, RunRecord, SUITE_FORMAT,
-    Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
+    LatencyStats, OpTypeStats, Placement, ReadSplit, Riders, Rounds, RunDetail, RunRecord,
+    SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -564,6 +564,19 @@ pub trait Runner {
         Ok(())
     }
 
+    /// Starts background work riding on the measured phase, for runners asked to (D247's
+    /// riders); the default does nothing. [`run_detailed`] calls it as the measured phase
+    /// starts and [`stop_riders`](Self::stop_riders) as it ends.
+    fn start_riders(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Stops the riders [`start_riders`](Self::start_riders) started and reports them; `None`
+    /// (the default) when there were none.
+    fn stop_riders(&mut self) -> Result<Option<Riders>, String> {
+        Ok(None)
+    }
+
     /// Transactions retried after a conflict since open, for stores whose transactions can
     /// conflict; `None` (the default) elsewhere. [`run_detailed`] reads it around the measured
     /// phase.
@@ -792,7 +805,9 @@ pub fn run_detailed(
     let result = measure(runner, config, &mut workload, warmup, options.min_measured)
         .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
+    let closing = Instant::now();
     let closed = runner.close();
+    let close_ms = closing.elapsed().as_secs_f64() * 1e3;
     let (load, elapsed, threads, hist, split, detail) = result?;
     let (
         shards,
@@ -802,6 +817,7 @@ pub fn run_detailed(
         (warmup_secs, warmup_settled),
         seqnos_used,
         txn_conflicts,
+        riders,
     ) = detail;
     closed?;
     let ops = hist.count();
@@ -838,6 +854,8 @@ pub fn run_detailed(
             warmup_settled: Some(warmup_settled),
             seqnos_used,
             txn_conflicts,
+            riders,
+            close_ms: Some(close_ms),
         },
     })
 }
@@ -954,6 +972,7 @@ type Measured = (
         (f64, bool),
         Option<u64>,
         Option<u64>,
+        Option<Riders>,
     ),
 );
 
@@ -1023,6 +1042,7 @@ fn measure(
         runner.seqno(),
         runner.txn_conflicts(),
     );
+    runner.start_riders()?;
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
     loop {
@@ -1057,6 +1077,7 @@ fn measure(
             .4
             .zip(runner.txn_conflicts())
             .map(|(b, a)| a.saturating_sub(b)),
+        runner.stop_riders()?,
     );
     Ok((load, elapsed, lanes, hist, split, shards))
 }

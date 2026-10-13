@@ -426,6 +426,15 @@ pub struct RunDetail {
     /// when the warmup ran out first, so the measured phase may include tablet changes.
     #[serde(default)]
     pub warmup_settled: Option<bool>,
+    /// Background work riding on the measured phase (D247: snapshot and durable-snapshot
+    /// readers, a durable backup and a compaction), for runs that asked for it
+    /// (`--riders`, Pigeonhole); `None` elsewhere.
+    #[serde(default)]
+    pub riders: Option<Riders>,
+    /// Milliseconds the store took to close after the measured phase (D247: the flush and
+    /// drain of a store that was just under load); `None` in results written before it.
+    #[serde(default)]
+    pub close_ms: Option<f64>,
     /// Transactions retried after a conflict during the measured phase, for stores whose
     /// transactions can conflict ([`Runner::txn_conflicts`](crate::Runner::txn_conflicts):
     /// Pigeonhole's optimistic ones); `None` elsewhere. Reported per transfer (D247).
@@ -437,6 +446,25 @@ pub struct RunDetail {
     /// is commit rounds that did not commit: D246 judges it per cross-shard commit.
     #[serde(default)]
     pub seqnos_used: Option<u64>,
+}
+
+/// Background work that ran beside a measured phase (D247's riders, reported).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Riders {
+    /// Scans of 10 rows under a snapshot re-taken every 100 ms, from a thread of their own.
+    pub snapshot_scans: LatencyStats,
+    /// The same under a durable snapshot.
+    pub durable_snapshot_scans: LatencyStats,
+    /// Snapshots and durable snapshots taken.
+    pub snapshots: u64,
+    /// See [`Riders::snapshots`].
+    pub durable_snapshots: u64,
+    /// Milliseconds a durable backup took, started 2 s into the measured phase; `None` if the
+    /// phase ended first.
+    pub backup_ms: Option<f64>,
+    /// Milliseconds a full compaction took, started after the backup; `None` if the phase
+    /// ended first.
+    pub compact_ms: Option<f64>,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run
