@@ -181,8 +181,9 @@ impl Options {
     ///   (D240).
     /// - **A tablet change.** A commit whose rows are being split, merged or moved between
     ///   shards waits for the change, and a cross-shard commit that a participant refuses
-    ///   because of one is retried, as often as needed (D241). Both count from when the
-    ///   commit was submitted.
+    ///   because of one is retried, as often as needed (D241). So is a cross-shard commit a
+    ///   participant refuses as below writes it already made, with tablet changes on or off
+    ///   (D244). These count from when the commit was submitted.
     ///
     /// An L0 write stall (compaction falling behind) slows commits down but never fails
     /// them. A commit that fails with `Busy` was not committed: back off and retry it.

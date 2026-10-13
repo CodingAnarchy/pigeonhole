@@ -69,6 +69,9 @@ pub(crate) struct Hooks {
     pub compactions: Mutex<Vec<CompactionRecord>>,
     /// Every WAL record appended, in append order (`Engine::take_appended`).
     pub appended: Mutex<Vec<AppendedRecord>>,
+    /// The seqnos of cross-shard attempts a participant refused (`Moved` or `BelowFloor`),
+    /// whose commit was retried under a new seqno or gave up (`Engine::take_refused_attempts`).
+    pub refused: Mutex<Vec<Seqno>>,
     /// Arms the manifest queue's release window (`manifest::race_window`,
     /// `Engine::probe_manifest_release_window`), and the waiter of the request it pushed.
     pub manifest_race: AtomicBool,
@@ -858,6 +861,23 @@ impl Engine {
                 .shared
                 .hooks
                 .appended
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// The seqnos of cross-shard attempts refused by a participant (`Moved` or
+    /// `BelowFloor`, D244) since the last call, when recording is on
+    /// ([`record_history`](Self::record_history)): their PREPAREs never get a COMMIT, and the
+    /// commit runs again under a new seqno or gives up with `Busy`.
+    #[doc(hidden)]
+    pub fn take_refused_attempts(&self) -> Vec<Seqno> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .shared
+                .hooks
+                .refused
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )

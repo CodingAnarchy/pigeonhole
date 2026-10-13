@@ -685,7 +685,7 @@ D191 already guards a flush's purge with a void/wait handshake (`IN_FLIGHT` / `V
   - A write above every input is a newer version, a delete that hides no input, or a delete that hides all of them. Each reads the same with or without the purge.
 - **Writes without a timestamp:** a default timestamp counts at its lower bound.
   - For a single commit, that is `floor + 1`, or its preset when the preset still fits the floor.
-  - For a share, it is the share's commit timestamp. With tablet changes off, that can be below the participant's floor, because D11's `BelowFloor` refusal covers only tablet changes on.
+  - For a share, it is the share's commit timestamp. With tablet changes off, that could be below the participant's floor, because D11's `BelowFloor` refusal covered only tablet changes on. *(Amended by D244: the refusal now applies with tablet changes off too, so a share is never below its participant's floor.)*
 - **Admission:**
   - While the guard is in flight, a touching member voids it.
   - While its commit installs, the member waits, and a PREPARE waits too, as in D191.
