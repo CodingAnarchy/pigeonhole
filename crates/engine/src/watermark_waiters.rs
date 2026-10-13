@@ -206,15 +206,17 @@ impl<W> WatermarkWaiters<W> {
     /// After a watermark publish: hands `wake` every entry whose seqno is at or below what
     /// `visible` reads, forgotten, and runs it outside the locks. Returns whether the pass
     /// took a lock. With nobody registered it is one fence and one load of `listed` (plus
-    /// one per further 64 parts), and it visits only the parts that list someone.
+    /// one per further 64 parts), and it visits only the parts that list someone. The engine
+    /// fences once for both registries and calls `wake_ready_fenced`; this stays for tests.
+    #[cfg(test)]
     pub(crate) fn wake_ready(&self, visible: impl Fn() -> Seqno, wake: impl FnMut(W)) -> bool {
         // Pairs with the fence in `register`.
         fence(Ordering::SeqCst);
         self.wake_ready_fenced(visible, wake)
     }
 
-    /// [`WatermarkWaiters::wake_ready`] for a caller that has already issued the SeqCst
-    /// fence after its watermark publish: one fence then serves every registry it wakes.
+    /// `wake_ready` for a caller that has already issued the SeqCst fence after its
+    /// watermark publish: one fence then serves every registry it wakes.
     #[inline]
     pub(crate) fn wake_ready_fenced(
         &self,
