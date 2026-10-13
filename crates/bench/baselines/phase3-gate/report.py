@@ -86,7 +86,8 @@ else:
 # Memtable point lookup: <= 300 ns at 2^18 (262,144) entries, the largest one memtable
 # reaches under the defaults with small cells (D230); 1M and 10k reported (#17; criterion
 # `seek/`, median of the estimate). Criterion prints the name, then `time: [low mid high]`,
-# on one line or two.
+# on one line or two. D239 accepts 337 ns, measured on the AX102 (2026-10-13 pre-gate check,
+# main 9ff02d00): up to 354 ns (5% above it) the verdict is "accepted (D239)"; slower is a FAIL.
 UNITS = {"ps": 1e-3, "ns": 1.0, "us": 1e3, "µs": 1e3, "ms": 1e6, "s": 1e9}
 seek, name = {}, None
 try:
@@ -104,12 +105,15 @@ def is_hit(k, size):
     parts = k.split("/")
     return len(parts) >= 3 and parts[1].startswith(size + " ") and parts[2].startswith("hit")
 
-LOOKUP_TARGET = "Memtable point lookup at 2^18 entries (D230): ≤ 300 ns (#17)"
+LOOKUP_TARGET = "Memtable point lookup at 2^18 entries (D230): ≤ 300 ns (#17); 337 ns accepted (D239)"
+LOOKUP_ACCEPTED_MAX_NS = 354
 judged = next((v for k, v in seek.items() if is_hit(k, "262k")), None)
 if judged is not None:
     others = ", ".join(f"{k.split('/', 1)[1]} {v:.0f} ns" for k, v in seek.items() if not is_hit(k, "262k"))
     rows.append((LOOKUP_TARGET, f"262k hit {judged:.0f} ns ({others})",
-                 verdict(judged <= 300), "memtable-lookup.txt"))
+                 verdict(True) if judged <= 300
+                 else "accepted (D239)" if judged <= LOOKUP_ACCEPTED_MAX_NS
+                 else verdict(False), "memtable-lookup.txt"))
 else:
     rows.append((LOOKUP_TARGET, "", verdict(None), "memtable-lookup.txt"))
 
@@ -235,10 +239,21 @@ if ol:
 else:
     rows.append(("Open to first read: < 5 ms", "", verdict(None), "open-latency.jsonl"))
 
-# Engine scaling (D204, D231): efficiency >= 0.8 at every N > 1, the table pre-split at the
-# writes' quantiles with the balancer off (its busiest share is reported, not judged).
+# Engine scaling (D204, D231, D238): efficiency >= 0.8 for every N up to one chiplet's (CCD's)
+# physical cores, the table pre-split at the writes' quantiles with the balancer off (its
+# busiest share is reported, not judged). Above one CCD, N is reported: on the AX102 (2 CCDs
+# x 8 cores) N = 16 crosses the chiplets, and ~0.70 there is accepted for two-chiplet parts.
+# machine.json's ccd_cores comes from the L3 topology; without it (a machine.json from
+# before D238, or no L3 in sysfs) every N is judged.
+machine = load("machine.json") or {}
+ccd = machine.get("ccd_cores")
+# D238 (Q4): efficiency against a fixed single-shard rate as well as each run's own, reported
+# only. 417,922 commits/s: scaling-1.json's single-shard rate (pinned, pre-split, inline, 16
+# in flight) on the AX102, main 9ff02d00, the pre-gate check of 2026-10-13
+# (.coord results-precheck-20261013).
+SINGLE_SHARD_REF = 417_922
 scal = []
-for n in (4, 8, 16):
+for n in (1, 4, 8, 16):
     d = load(f"scaling-{n}.json")
     if d and d.get("scaling"):
         s = d["scaling"]
@@ -247,19 +262,33 @@ for n in (4, 8, 16):
         multi = next((r for r in d.get("results", []) if "inline" in r.get("store_config", "")
                       and r.get("threads") == n), None)
         brk = ""
-        if multi:
+        if multi and n > 1:
             st = multi.get("detail", {}).get("stalls") or {}
             stalled = st.get("write_stall_nanos", 0) / max(multi["run_secs"] * n * 1e9, 1)
             brk = (f"; {multi['run_secs']:.1f} s, stalled {stalled:.0%} of shard time, "
                    f"{st.get('flushes', 0)} flushes, {st.get('compactions', 0)} compactions, "
                    f"max {multi['max_ns'] / 1e6:.1f} ms")
-        scal.append((n, s["efficiency"], s["max_share"], brk,
-                     s["efficiency"] >= 0.8))
-if scal:
-    detail = "; ".join(f"N={n}: {e:.2f} (busiest {m:.0%}{b})" for n, e, m, b, _ in scal)
-    rows.append(("Thread-per-core scaling: ≥ 0.8 × N", detail, verdict(all(ok for *_, ok in scal)), "scaling-N.json"))
+        fixed = s["multi_shard_throughput"] / (n * SINGLE_SHARD_REF)
+        scal.append((n, s["efficiency"], s["max_share"], brk, fixed, ccd is None or n <= ccd))
+scal_judged = [x for x in scal if x[5]]
+over = [x for x in scal if not x[5]]
+where = (f"one CCD is {ccd} physical cores, from the L3 topology" if ccd is not None
+         else "the CCD size is unknown, so every N is judged")
+SCALING_TARGET = f"Thread-per-core scaling: ≥ 0.8 × N for N up to one CCD (D238; {where})"
+if scal_judged:
+    detail = "; ".join(f"N={n}: {e:.2f}" + (f" (busiest {m:.0%}{b})" if n > 1 else "")
+                       for n, e, m, b, _, _ in scal_judged)
+    rows.append((SCALING_TARGET, detail, verdict(all(e >= 0.8 for _, e, *_ in scal_judged)), "scaling-N.json"))
 else:
-    rows.append(("Thread-per-core scaling: ≥ 0.8 × N", "", verdict(None), "scaling-N.json"))
+    rows.append((SCALING_TARGET, "", verdict(None), "scaling-N.json"))
+if over:
+    rows.append(("Thread-per-core scaling above one CCD (reported, not judged; D238: ~0.70 accepted on two-chiplet parts)",
+                 "; ".join(f"N={n}: {e:.2f} (busiest {m:.0%}{b})" for n, e, m, b, _, _ in over),
+                 "-", "scaling-N.json"))
+if scal:
+    rows.append((f"Thread-per-core scaling against a fixed single-shard rate, {SINGLE_SHARD_REF:,} commits/s "
+                 "(reported, not judged; D238)",
+                 "; ".join(f"N={n}: {f:.2f}" for n, _, _, _, f, _ in scal), "-", "scaling-N.json"))
 # D235: the judged scaling runs pin each shard's thread; the same runs unpinned are reported.
 unp = [(n, (load(f"scaling-{n}.json") or {}).get("scaling_unpinned")) for n in (4, 8, 16)]
 unp = [(n, s) for n, s in unp if s]
@@ -361,7 +390,6 @@ else:
                  "phase2-gate.json, phase2-gate-2.json"))
 rows.append(("D193 instruction ceilings", "measured by CI's instructions job, not here", "see CI", "-"))
 
-machine = load("machine.json") or {}
 try:
     with open(path("timedout.txt")) as f:
         timedout = [l.strip() for l in f if l.strip()]
@@ -371,6 +399,9 @@ print("# Phase 3 gate window: summary\n")
 print(f"- **Machine:** {machine.get('cpu', '?')}, {machine.get('cpus', '?')} CPUs, {machine.get('memory', '?')}")
 print(f"- **Kernel:** {machine.get('kernel', '?')}; **drive:** {machine.get('drive', '?')}; **mount:** {machine.get('mount', '?')}")
 print(f"- **Commit:** {machine.get('commit', '?')}; **scale:** {machine.get('scale', '?')}")
+l3 = machine.get("l3_cores")
+print(f"- **CCD (D238):** " + (f"{ccd} physical cores per L3 (L3s: {', '.join(map(str, l3))})" if ccd is not None
+                               else "not recorded (machine.json from before D238, or no L3 in sysfs)"))
 for w in machine.get("warnings", []):
     print(f"- **Warning:** {w}")
 for t in timedout:

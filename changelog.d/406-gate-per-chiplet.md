@@ -1,0 +1,2 @@
+### Changed
+- Phase 3 gate window: the setup step records the CPU's chiplet (CCD) size from the L3 topology, and the summary judges engine scaling (≥ 0.8 × N) for N up to one chiplet's physical cores and reports larger N (D238). It also reports efficiency against a fixed AX102 single-shard rate. The memtable lookup at 2^18 entries reads "accepted (D239)" up to 354 ns (5% above 337) instead of FAIL.

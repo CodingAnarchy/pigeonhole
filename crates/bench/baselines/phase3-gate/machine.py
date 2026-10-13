@@ -13,7 +13,11 @@ volatile (no power-loss protection); transparent hugepages `always`.
 
 It also times the data drive's raw fdatasync (4 KiB writes, then fdatasync, 2,000 times, in
 DATA_DIR): the floor under any durable commit, which report.py shows beside the group
-commit p99 target (D213)."""
+commit p99 target (D213).
+
+It records the CPU's chiplet (CCD) size, the physical cores that share one L3 cache, from
+/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list: the scaling gate judges N up to
+it and reports the rest (D238)."""
 import json, os, platform, shutil, subprocess, sys, time
 
 data, out, scale = sys.argv[1:4]
@@ -37,6 +41,33 @@ def read(path):
             return f.read().strip()
     except OSError:
         return None
+
+
+def cpu_list(text):
+    """The CPUs in a sysfs list such as `0-7,16-23`."""
+    cpus = set()
+    for part in (text or "").split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            cpus.update(range(int(lo), int(hi) + 1))
+        elif part.strip():
+            cpus.add(int(part))
+    return cpus
+
+
+def l3_groups(root="/sys/devices/system/cpu"):
+    """Each L3 cache's physical cores (SMT siblings counted once), smallest first; empty
+    where sysfs has no L3 (macOS, some VMs)."""
+    groups = set()
+    for cpu in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        if cpu.startswith("cpu") and cpu[3:].isdigit():
+            shared = read(f"{root}/{cpu}/cache/index3/shared_cpu_list")
+            if shared:
+                groups.add(frozenset(cpu_list(shared)))
+    def cores(group):
+        return len({(read(f"{root}/cpu{c}/topology/physical_package_id"),
+                     read(f"{root}/cpu{c}/topology/core_id") or c) for c in group})
+    return sorted(cores(g) for g in groups)
 
 
 failures, warnings = [], []
@@ -107,6 +138,10 @@ machine = {
     "cpu": sh("lscpu | grep -m1 'Model name' | sed 's/.*: *//'"),
     "cpus": os.cpu_count(),
     "smt": read("/sys/devices/system/cpu/smt/control"),
+    # D238: physical cores per L3 (one CCD on Ryzen), each L3 listed; the smallest is the
+    # largest N the scaling gate judges.
+    "l3_cores": l3_groups(),
+    "ccd_cores": min(l3_groups(), default=None),
     "governors": sorted(governors),
     "memory": sh("grep MemTotal /proc/meminfo"),
     "thp": thp,

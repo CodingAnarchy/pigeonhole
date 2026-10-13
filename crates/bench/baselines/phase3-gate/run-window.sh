@@ -355,6 +355,8 @@ step_row-cache() {
     done
 }
 
+# D204, D231: engine scaling on a pre-split table. report.py judges N up to one CCD's physical
+# cores (machine.json's ccd_cores, from the setup step) and reports the larger N (D238).
 step_scaling() {
     local n
     for n in 1 4 8 16; do
