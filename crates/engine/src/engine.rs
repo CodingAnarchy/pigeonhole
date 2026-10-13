@@ -2387,8 +2387,8 @@ impl Inner {
         self.admit_routed(None, batch)
     }
 
-    /// The async fast path (D210): a charge on the engine-wide count when it fits and no
-    /// one waits, else the routed admission to wait on.
+    /// The async fast path (D210, D232): a charge on its shard's count when it fits and no
+    /// one waits there, else the admission to wait on.
     #[inline]
     pub(crate) fn fast_admit(
         &self,
@@ -2398,9 +2398,11 @@ impl Inner {
         let Some(a) = &self.admission else {
             return FastAdmit::Charged(crate::admission::Charge::none());
         };
-        match a.try_fast(crate::admission::batch_bytes(batch)) {
-            Some(arg) => FastAdmit::Charged(crate::admission::Charge::new(a, arg)),
-            None => FastAdmit::Wait(self.admit_routed(row, batch)),
+        let shard = self.admission_shard(a, row, batch);
+        let bytes = crate::admission::batch_bytes(batch);
+        match a.try_fast(shard, bytes) {
+            Some(charge) => FastAdmit::Charged(charge),
+            None => FastAdmit::Wait(crate::Admit::new(Some(a), shard, bytes)),
         }
     }
 
@@ -2410,29 +2412,42 @@ impl Inner {
         row: Option<(TableId, &[u8])>,
         batch: &WriteBatch,
     ) -> crate::Admit {
-        let shard = match &self.admission {
-            Some(a) if a.sharded() => {
-                let view = self.shared.view.load();
-                let route = |t: TableId, r: &[u8]| view.tablets().route(t, r);
-                let routed = match row {
-                    Some((t, r)) => route(t, r),
-                    None => match batch.builder.batch().iter().next().and_then(|m| m.ok()) {
-                        Some(m) => route(m.table, m.row),
-                        None => batch
-                            .row_deletes
-                            .first()
-                            .and_then(|d| route(d.table, &d.row)),
-                    },
-                };
-                routed.map_or(0, |(_, s)| usize::from(s.0))
-            }
-            _ => 0,
-        };
+        let shard = self
+            .admission
+            .as_ref()
+            .map_or(0, |a| self.admission_shard(a, row, batch));
         crate::Admit::new(
             self.admission.as_ref(),
             shard,
             crate::admission::batch_bytes(batch),
         )
+    }
+
+    /// The shard an async commit of `batch` is charged to: that of `row` when given, else
+    /// of the batch's first row (a cross-shard batch's coordinator). With one shard, no
+    /// routing.
+    fn admission_shard(
+        &self,
+        a: &crate::admission::Admission,
+        row: Option<(TableId, &[u8])>,
+        batch: &WriteBatch,
+    ) -> usize {
+        if !a.sharded() {
+            return 0;
+        }
+        let view = self.shared.view.load();
+        let route = |t: TableId, r: &[u8]| view.tablets().route(t, r);
+        let routed = match row {
+            Some((t, r)) => route(t, r),
+            None => match batch.builder.batch().iter().next().and_then(|m| m.ok()) {
+                Some(m) => route(m.table, m.row),
+                None => batch
+                    .row_deletes
+                    .first()
+                    .and_then(|d| route(d.table, &d.row)),
+            },
+        };
+        routed.map_or(0, |(_, s)| usize::from(s.0))
     }
 
     /// Enters application-thread maintenance: refused once the engine is closing, and the
