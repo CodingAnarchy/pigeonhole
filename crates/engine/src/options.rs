@@ -17,7 +17,7 @@ use pigeonhole_wal::WalOptions;
 /// options.create_if_missing = true;
 /// assert_eq!(options.memtable_budget, 64 << 20);
 /// assert_eq!(options.memtable_freeze_bytes, 16 << 20);
-/// assert!(!options.pin_threads);
+/// assert!(options.pin_threads);
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -28,13 +28,17 @@ pub struct EngineOptions {
     pub create_if_missing: bool,
     /// Shard count; 0 means one per physical core (D220).
     pub shards: usize,
-    /// Pin each shard thread (and each compaction thread) to one CPU (default off).
-    /// Engine-owned mode only; application-owned shards run on the caller's threads.
+    /// Pin each shard thread (and each compaction thread) to a CPU of its own (default on,
+    /// D235). Engine-owned mode only; application-owned shards run on the caller's threads.
     ///
-    /// Shard `i` is pinned to the `i`-th CPU (wrapping) of the set the opening thread may
-    /// run on, so turn it on only when this database owns those CPUs: two pinned databases
-    /// in one process, several containers sharing a host's CPUs, or an opener already pinned
-    /// to a few CPUs would stack every shard on the same cores.
+    /// The CPUs come from the opening thread's affinity set, one per physical core first and
+    /// then their SMT siblings (D220), skipping CPUs another pinned engine in this process
+    /// holds. Threads stay unpinned, and the open still succeeds, where the platform has no
+    /// hard affinity (macOS), a CPU quota is narrower than the affinity set, there are fewer
+    /// free CPUs than threads, or the OS refuses a pin; `Engine::metrics` reports it
+    /// (`pinned_threads`, `unpinned`). Engines in *other processes* on the host don't know
+    /// about each other and would pin to the same CPUs: give each process its own CPUs (an
+    /// affinity mask, a cpuset) or turn this off.
     pub pin_threads: bool,
     /// Extra threads dedicated to flush and compaction; 0 runs them on the shards.
     /// Engine-owned mode only: [`Engine::open_application_owned`](crate::Engine::open_application_owned)
@@ -193,7 +197,7 @@ impl EngineOptions {
             vfs,
             create_if_missing: false,
             shards: 0,
-            pin_threads: false,
+            pin_threads: true,
             compaction_threads: 0,
             durability: Durability::GroupSync,
             memtable_budget,

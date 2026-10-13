@@ -69,7 +69,7 @@ impl Default for Options {
             durability: Durability::GroupSync,
             shards: 0,
             compaction_cores: 0,
-            pin_threads: false,
+            pin_threads: true,
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,
@@ -122,23 +122,31 @@ impl Options {
     }
 
     /// Pin each shard thread, and each [`compaction_cores`](Options::compaction_cores)
-    /// thread, to its own CPU (default off). Engine-owned mode only:
+    /// thread, to a CPU of its own (default on, D235). Engine-owned mode only:
     /// [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
-    /// runs shards on your threads and ignores it.
+    /// runs shards on your threads, which you place yourself.
     ///
-    /// Shard `i` goes to the first CPU of the `i`-th physical core in the set the opening
-    /// thread may run on, then to the cores' SMT siblings, wrapping (D220), so the default
-    /// shards never share a core. Turn it on only when this database owns those CPUs,
-    /// typically one database per process with the default shards. Otherwise pinning stacks
-    /// threads on the same cores: two pinned databases in one process both put shard 0 on
-    /// the first CPU, containers limited by a CPU quota (not a cpuset) all pin to the host's
-    /// first CPUs, and an opener already pinned to one CPU puts every shard on it.
+    /// - **Where:** the CPUs come from the set the opening thread may run on (its affinity
+    ///   mask: `taskset`, a cpuset, a container's CPUs), one per physical core first, then
+    ///   the cores' SMT siblings (D220). Threads are never pinned outside that set.
+    /// - **When it doesn't pin:** threads run unpinned, and the open still succeeds, where
+    ///   the platform has no hard thread affinity (macOS: affinity tags are only hints), a
+    ///   CPU quota (a cgroup `cpu.max`, not a cpuset) is narrower than the affinity set,
+    ///   there are fewer free CPUs in the set than threads (never two pinned threads on one
+    ///   CPU), or the OS refuses a pin. [`Pigeonhole::engine_metrics`](crate::Pigeonhole::engine_metrics)
+    ///   reports `pinned_threads` and why not (`unpinned`).
+    /// - **Several databases in one process** share the set: each pins to CPUs the others
+    ///   don't hold, and one that finds too few free runs unpinned.
+    /// - **Several processes on one host** don't see each other's pins and would pin onto
+    ///   the same CPUs. Give each process its own CPUs (start it under an affinity mask or
+    ///   in its own cpuset), or turn this off with `pin_threads(false)`. There is no option
+    ///   to name cores: the affinity mask chooses them.
     ///
     /// ```
     /// use pigeonhole::Options;
     ///
-    /// // A dedicated host: one shard per physical core (the default), each pinned.
-    /// let options = Options::default().pin_threads(true);
+    /// // Several processes sharing one host's CPUs: leave placement to the OS.
+    /// let options = Options::default().pin_threads(false);
     /// # let _ = options;
     /// ```
     pub fn pin_threads(mut self, yes: bool) -> Self {

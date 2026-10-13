@@ -168,6 +168,16 @@ pub struct Metrics {
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
+    /// Threads an engine-owned open started (shards and compaction threads), and how many
+    /// of them are pinned to a CPU of their own (D235). Both 0 for an application-owned or
+    /// closed engine.
+    pub pinned_threads: (u64, u64),
+    /// Why no thread is pinned although `pin_threads` asked for it: the platform has no hard
+    /// thread affinity (macOS), a CPU quota is narrower than the affinity set, too few free
+    /// CPUs in the affinity set (other pinned databases in this process hold the rest), or
+    /// the OS refused (some threads unpinned). `None` when every thread is pinned or
+    /// pinning is off (D235).
+    pub unpinned: Option<&'static str>,
     /// Async commit polls that found their seqno not yet visible and registered as waiters
     /// on the global watermark (D19, ICR 0023), and the waiters already listed in the
     /// registry part each registration joined (a queue depth: registration no longer scans
@@ -1889,6 +1899,21 @@ impl Engine {
     pub fn metrics(&self) -> Metrics {
         let shared = &self.inner.shared;
         let mut m = Metrics::default();
+        if let Some(rt) = self
+            .inner
+            .runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            let p = rt.pinning();
+            m.pinned_threads = (p.pinned as u64, p.threads as u64);
+            m.unpinned = match (p.unpinned, p.failed) {
+                (Some(why), _) => Some(why.as_str()),
+                (None, 0) => None,
+                (None, _) => Some("the OS refused some pins"),
+            };
+        }
         for d in 0..4 {
             let mut hist = [0u64; 64];
             for s in &shared.metrics {

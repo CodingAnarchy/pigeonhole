@@ -490,6 +490,38 @@ pub(crate) fn pin_current_thread(cpu: usize) -> Result<()> {
     Ok(())
 }
 
+/// The CPU numbers (bits of the process affinity mask, within the process's processor
+/// group) in pinning order: one per physical core first, then their SMT siblings (D220).
+pub(crate) fn pin_order() -> Option<Vec<usize>> {
+    let (mut process_mask, mut system_mask) = (0usize, 0usize);
+    // SAFETY: the current-process pseudo-handle and two valid out pointers.
+    if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask) }
+        == 0
+    {
+        return None;
+    }
+    let ids: Vec<usize> = (0..usize::BITS as usize)
+        .filter(|b| process_mask & (1 << b) != 0)
+        .collect();
+    let order = match first_of_core() {
+        Some(first) => (0..ids.len()).map(|i| super::spread(&first, i)).collect(),
+        None => (0..ids.len()).collect::<Vec<_>>(),
+    };
+    Some(order.into_iter().map(|k| ids[k]).collect())
+}
+
+/// Pins the calling thread to CPU `id` (one of [`pin_order`]'s).
+pub(crate) fn pin_current_thread_to(id: usize) -> Result<()> {
+    if id >= usize::BITS as usize {
+        return Err(Error::new(ErrorKind::Other, "cpu id out of range"));
+    }
+    // SAFETY: the current-thread pseudo-handle and a one-bit mask within the process mask.
+    if unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << id) } == 0 {
+        return Err(last_error("SetThreadAffinityMask"));
+    }
+    Ok(())
+}
+
 pub(crate) fn numa_node_of(_cpu: usize) -> Option<u32> {
     None
 }

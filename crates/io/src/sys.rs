@@ -51,3 +51,153 @@ pub fn spread_cpu(i: usize) -> usize {
 pub fn numa_node_of(cpu: usize) -> Option<u32> {
     crate::os::numa_node_of(cpu)
 }
+
+/// Why a [`pin_plan`] leaves threads unpinned (D235).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unpinned {
+    /// The platform has no hard thread affinity. macOS only offers affinity tags, which are
+    /// hints the scheduler may ignore, so Pigeonhole does not set them.
+    Unsupported,
+    /// A CPU quota (a cgroup's `cpu.max`, not a cpuset) caps the process below the CPUs in
+    /// its affinity set: pinning there would put every such process on the host's first CPUs.
+    CpuQuota,
+    /// Fewer CPUs in the process's affinity set than threads, counting those pinned threads
+    /// of other plans in this process still hold (another database, say).
+    TooFewCpus,
+}
+
+impl Unpinned {
+    /// A short description, for metrics and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "the platform has no hard thread affinity",
+            Self::CpuQuota => "a CPU quota is narrower than the affinity set",
+            Self::TooFewCpus => "too few free CPUs in the affinity set",
+        }
+    }
+}
+
+/// CPUs held by the live [`PinPlan`]s of this process.
+static CLAIMED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// A CPU of its own for each of a set of threads, claimed for this process until the plan is
+/// dropped (D235). Made by [`pin_plan`]; each thread pins itself with [`PinPlan::cpu`] and
+/// [`pin_current_thread_to`].
+#[derive(Debug)]
+pub struct PinPlan {
+    cpus: Vec<usize>,
+}
+
+impl PinPlan {
+    /// The CPU id for thread `i`, if the plan covers it.
+    pub fn cpu(&self, i: usize) -> Option<usize> {
+        self.cpus.get(i).copied()
+    }
+
+    /// Threads the plan covers.
+    pub fn len(&self) -> usize {
+        self.cpus.len()
+    }
+
+    /// Whether the plan covers no thread.
+    pub fn is_empty(&self) -> bool {
+        self.cpus.is_empty()
+    }
+}
+
+impl Drop for PinPlan {
+    fn drop(&mut self) {
+        let mut claimed = CLAIMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claimed.retain(|c| !self.cpus.contains(c));
+    }
+}
+
+/// Plans pinning for `threads` threads (D235): a distinct CPU each from the calling thread's
+/// affinity set, one per physical core first and then their SMT siblings (D220), skipping
+/// CPUs other live plans in this process hold. Threads are only ever pinned inside the
+/// affinity set (taskset, cpusets, containers). It refuses, so the threads run unpinned,
+/// where pinning would hurt more than it helps: no hard affinity on this platform, a CPU
+/// quota narrower than the affinity set, or fewer free CPUs than threads (never two pinned
+/// threads on one CPU).
+///
+/// ```
+/// use pigeonhole_io::sys::{Unpinned, pin_plan};
+///
+/// match pin_plan(2) {
+///     Ok(plan) => assert_eq!(plan.len(), 2),
+///     Err(why) => assert!(!why.as_str().is_empty()),
+/// }
+/// ```
+pub fn pin_plan(threads: usize) -> std::result::Result<PinPlan, Unpinned> {
+    let order = crate::os::pin_order().ok_or(Unpinned::Unsupported)?;
+    plan_from(&order, available_cpus(), threads)
+}
+
+/// [`pin_plan`] over `order` (the affinity set in pinning order) with `quota` CPUs available.
+fn plan_from(
+    order: &[usize],
+    quota: usize,
+    threads: usize,
+) -> std::result::Result<PinPlan, Unpinned> {
+    if threads == 0 {
+        return Ok(PinPlan { cpus: Vec::new() });
+    }
+    if quota < order.len() {
+        return Err(Unpinned::CpuQuota);
+    }
+    let mut claimed = CLAIMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cpus: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|c| !claimed.contains(c))
+        .take(threads)
+        .collect();
+    if cpus.len() < threads {
+        return Err(Unpinned::TooFewCpus);
+    }
+    claimed.extend_from_slice(&cpus);
+    Ok(PinPlan { cpus })
+}
+
+/// Pins the calling thread to CPU id `cpu` (from [`PinPlan::cpu`]). `Unsupported` on
+/// platforms without hard affinity.
+pub fn pin_current_thread_to(cpu: usize) -> Result<()> {
+    crate::os::pin_current_thread_to(cpu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Unpinned, plan_from};
+
+    #[test]
+    fn plans_take_distinct_free_cpus_and_release_them() {
+        // CPU ids far above any test machine's, so other tests' plans never overlap.
+        let order = [9000, 9002, 9001, 9003];
+        let a = plan_from(&order, 4, 2).unwrap();
+        assert_eq!(
+            (a.cpu(0), a.cpu(1), a.cpu(2)),
+            (Some(9000), Some(9002), None)
+        );
+        // A second plan in the process takes what is left, in order.
+        let b = plan_from(&order, 4, 2).unwrap();
+        assert_eq!((b.cpu(0), b.cpu(1)), (Some(9001), Some(9003)));
+        // Nothing left: unpinned rather than stacked.
+        assert_eq!(plan_from(&order, 4, 1).unwrap_err(), Unpinned::TooFewCpus);
+        drop(a);
+        let c = plan_from(&order, 4, 2).unwrap();
+        assert_eq!((c.cpu(0), c.cpu(1)), (Some(9000), Some(9002)));
+    }
+
+    #[test]
+    fn more_threads_than_cpus_or_a_quota_stay_unpinned() {
+        let order = [9100, 9101];
+        assert_eq!(plan_from(&order, 2, 3).unwrap_err(), Unpinned::TooFewCpus);
+        assert_eq!(plan_from(&order, 1, 1).unwrap_err(), Unpinned::CpuQuota);
+        assert!(plan_from(&order, 2, 0).unwrap().is_empty());
+    }
+}

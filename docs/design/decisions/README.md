@@ -171,7 +171,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D155](phase-1.md#d155) — A stream's checkpoint may lag its end by at most `wal_pin_bytes` · engine, #137, #171
 - [D156](phase-1.md#d156) — Replay spills recovered memtables to L0 when an arena runs short · engine, #143, #172 · extends D121
 - [D157](phase-1.md#d157) — An open writes one frame per stream; spares wait for use · wal, #143, #172 · amends D35
-- [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core
+- [D158](phase-1.md#d158) — Shard and compaction threads are not pinned unless asked · engine, #142 · amends spec §Thread-per-core · **amended by D235**
 - [D159](phase-1.md#d159) — A new shared-memory region checks free space at open and stays sparse · io, #142 · owner decision
 - [D160](phase-1.md#d160) — What `shrink` reports and what it commits · engine, #138, #200 · amends D60 · **amended by D183, D185, D190**
 - [D161](phase-1.md#d161) — Stalls, retries and backoffs on a moving clock · engine, #141, #186 · amends D124, D126 · **amended by D171, D176**
@@ -245,6 +245,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D231](phase-3.md#d231) — The scaling gate is split: engine scaling (≥ 0.8 × N) on a table pre-split at the writes' quantiles with the balancer off, and balancer placement judged by an open-loop check (busiest ≤ 1.25/N once settled within 60 s, no tablet change while measuring, the offered rate sustained) · owner decision, bench, #406 · amends D204, D223
 - [D233](phase-3.md#d233) — The bench settles every engine after the load (a flush, then a bounded wait until its background work is quiet) before the warmup; records carry the settle and the measured phase's background work, and `compare` notes pairs whose background work differs · owner decision, bench, #406 · the public idle API is deferred to Phase 4
 - [D234](phase-3.md#d234) — The L0 write stall starts at twice `l0_trigger` (8 files at the defaults): at the trigger a single shard spent 26% of its time stalled while L0 never passed 4 files; at 8, none, +6% writes, no read cost measured · owner decision, compaction, engine, #406 · amends D119, D166
+- [D235](phase-3.md#d235) — Engine-owned shard threads are pinned by default inside the opener's affinity set, unpinned (never a failed open) where the platform, a CPU quota or too few free CPUs make it unsafe, and several databases in one process never share a pinned CPU; the gate's inline drivers pin, with unpinned reported · owner decision, io, runtime, engine, pigeonhole, bench, #406 · amends D158
 
 ## Open questions
 _None._
