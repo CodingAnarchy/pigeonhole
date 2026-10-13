@@ -1369,6 +1369,7 @@ The AX102 confirms at 64 GiB.
 
 At those lengths, one flush or compaction more or less, or a placement change, moves a run by more than the tolerance. That's timing luck, not the engine. In the full-scale `all`, 18 of the 28 runs measured under 10 s, both engines included.
 
+<a id="d246"></a>
 ## D246 — Contended cross-shard commits are a judged gate workload (owner decision, 2026-10-13; bench, #406; part of D247)
 
 **Decided:**
@@ -1388,6 +1389,7 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 
 **Why:** the gate had no multi-row or cross-shard commit under contention (perf287's #406 audit, finding 1), so a 36× slowdown in the default config got through: on the AX102 (perf2, main a9ecfc77), 16 shards and 32 clients at 50% cross-shard commits ran 401K ops/s with tablet changes off and 11K with them on. Locally (M5, `--scale small`, busy laptop) the new workload shows the same: 3.0K and 5.9K ops/s with tablet changes on against 219K and 204K off and 192K for RocksDB, with about 5 wasted rounds per cross-shard commit on and none off.
 
+<a id="d247"></a>
 ## D247 — The gate's `contended` step measures every public operation under contention on the default options, judged at two durabilities (owner decision, 2026-10-13; bench, #406)
 
 **Decided:**
