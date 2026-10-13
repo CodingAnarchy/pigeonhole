@@ -1172,22 +1172,22 @@ mod tests {
 
     #[test]
     fn a_short_run_goes_on_until_its_minimum_is_measured() {
-        // D243: 20 operations of 2 ms measure about 40 ms; a 150 ms minimum takes more of
-        // the stream.
+        // D243: 2 operations of 1 ms measure about 2 ms (tens on a loaded CI runner); a
+        // 300 ms minimum takes more of the stream.
         let mut r = fake(0);
-        r.op_time = Duration::from_millis(2);
+        r.op_time = Duration::from_millis(1);
         let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
-        config.operations = 20;
+        config.operations = 2;
         let options = RunOptions {
             warmup: 0.0,
-            min_measured: Duration::from_millis(150),
+            min_measured: Duration::from_millis(300),
             ..RunOptions::default()
         };
         let dir = std::env::temp_dir().join(format!("phdb-bench-min-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let rec = run_detailed(&mut r, &config, &dir, &options).unwrap();
-        assert!(rec.run_secs >= 0.15, "{}", rec.run_secs);
-        assert!(rec.operations > 20, "{}", rec.operations);
+        assert!(rec.run_secs >= 0.3, "{}", rec.run_secs);
+        assert!(rec.operations > 2, "{}", rec.operations);
         assert_eq!(rec.detail.warmup_secs, Some(0.0));
         let once = RunOptions {
             warmup: 0.0,
@@ -1195,7 +1195,7 @@ mod tests {
         };
         let rec = run_detailed(&mut fake(0), &config, &dir, &once).unwrap();
         assert_eq!(
-            rec.operations, 20,
+            rec.operations, 2,
             "no minimum: the configured operations once"
         );
         std::fs::remove_dir(&dir).unwrap();
