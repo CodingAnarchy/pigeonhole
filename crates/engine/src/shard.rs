@@ -3076,6 +3076,13 @@ impl ShardState {
         if self.flush_running || self.flush_queue.is_empty() {
             return;
         }
+        // The close gave up flushing after a failure (the WAL keeps the data; the close is
+        // unclean). A failure while closing sets no backoff, so without this a deferred
+        // freeze's kick restarted the flush before the close could give up, rewriting the
+        // same SST for ever (a poisoned stream fails every flush at its WAL barrier).
+        if self.closing && self.flush_failed {
+            return;
+        }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
             for w in self.flush_waiters.drain(..) {
                 w.notify(Err(ManifestWriter::poisoned_error()));
