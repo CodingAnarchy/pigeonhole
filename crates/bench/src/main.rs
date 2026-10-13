@@ -785,7 +785,11 @@ mod tests {
             .iter()
             .filter(|r| r.store_config.contains("inline"))
             .collect();
-        assert_eq!(inline.len(), 4, "one shard, then two; pinned, then unpinned (D235)");
+        assert_eq!(
+            inline.len(),
+            4,
+            "one shard, then two; pinned, then unpinned (D235)"
+        );
         for r in inline {
             assert!(r.run_secs >= 0.2, "{} s measured", r.run_secs);
             assert!(
