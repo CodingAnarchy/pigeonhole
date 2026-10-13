@@ -331,6 +331,58 @@ pub(crate) fn scan_rows<K: AsRef<[u8]>, V: AsRef<[u8]>, E: std::fmt::Display>(
     Ok(t)
 }
 
+/// [`scan_rows`] for [`BenchOp::ScanFiltered`]: only the cells of family `family` whose
+/// qualifier starts with `prefix` and whose timestamp is in `range`; a row with none of them
+/// is not counted (D247).
+#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+pub(crate) fn scan_rows_filtered<K: AsRef<[u8]>, V: AsRef<[u8]>, E: std::fmt::Display>(
+    iter: impl Iterator<Item = Result<(K, V), E>>,
+    len: u32,
+    now: u64,
+    family: u8,
+    prefix: Option<&[u8]>,
+    range: Option<(u64, u64)>,
+) -> Result<Touched, String> {
+    let mut t = Touched::default();
+    let mut rows = 0u32;
+    let mut current: Option<Vec<u8>> = None;
+    let mut counted = false;
+    for item in iter {
+        let (k, v) = item.map_err(|e| e.to_string())?;
+        let k = k.as_ref();
+        let p = keys::row_prefix_len(k).ok_or("malformed key")?;
+        if current.as_deref() != Some(&k[..p]) {
+            current = Some(k[..p].to_vec());
+            counted = false;
+        }
+        if *k.get(p).ok_or("malformed key")? != family
+            || prefix.is_some_and(|q| !k[p + 1..].starts_with(q))
+        {
+            continue;
+        }
+        let v = v.as_ref();
+        let ts = u64::from_be_bytes(
+            *v.first_chunk::<8>()
+                .ok_or("stored value shorter than its timestamp")?,
+        );
+        if range.is_some_and(|(a, b)| ts < a || ts >= b) {
+            continue;
+        }
+        let Some(value) = live_value(family, v, now)? else {
+            continue;
+        };
+        if !counted {
+            if rows == len {
+                break;
+            }
+            rows += 1;
+            counted = true;
+        }
+        t.cell(value);
+    }
+    Ok(t)
+}
+
 /// Walks sorted `(key, value)` pairs from a seek to `prefix` (a row prefix plus a family
 /// id), counting the live cells until the keys leave the prefix: one family of one row.
 #[cfg(any(feature = "rocksdb", feature = "fjall"))]

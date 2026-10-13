@@ -13,6 +13,7 @@
 //! | counters | `ctr:<fnv(i)>` | each store's counter (below) | one counter per row |
 //! | transfer | `acct:<fnv(i)>` | `ycsb` | `bal`, an `i64` balance |
 //! | sparse-wide deletes | as sparse-wide | `attr` | as sparse-wide |
+//! | adjacency prefix, time-series range | as adjacency, as time series | as theirs | as theirs |
 
 use std::collections::BTreeSet;
 
@@ -76,6 +77,13 @@ const YCSB_MAX_SCAN: u64 = 100;
 pub(crate) const SPARSE_VOCABULARY: u64 = 10_000;
 /// Sparse-wide: cells per row are uniform in `0..=2 * SPARSE_MEAN_CELLS`.
 const SPARSE_MEAN_CELLS: u64 = 20;
+/// [`WorkloadKind::TimeSeriesRange`](crate::WorkloadKind::TimeSeriesRange)'s scans read the
+/// points from 12 to 6 hours before the epoch: older than the newest ten (about 14 minutes
+/// apart), so the scan skips the newer points to reach them.
+const TIME_RANGE: (std::time::Duration, std::time::Duration) = (
+    std::time::Duration::from_secs(12 * 3600),
+    std::time::Duration::from_secs(6 * 3600),
+);
 /// Time series: points loaded per entity.
 const POINTS_PER_ENTITY: u64 = 100;
 /// Adjacency: out-degree is `1 + Zipf(ADJ_MAX_DEGREE)`; mean about 40.
@@ -103,19 +111,25 @@ pub(crate) struct Gen {
 impl Gen {
     pub(crate) fn new(config: WorkloadConfig) -> Self {
         let n_items = match config.kind {
-            WorkloadKind::TimeSeriesTtl => (config.records / POINTS_PER_ENTITY).max(1),
-            WorkloadKind::Adjacency => (config.records / ADJ_MEAN_DEGREE).max(1),
+            WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange => {
+                (config.records / POINTS_PER_ENTITY).max(1)
+            }
+            WorkloadKind::Adjacency | WorkloadKind::AdjacencyPrefix => {
+                (config.records / ADJ_MEAN_DEGREE).max(1)
+            }
             _ => config.records.max(1),
         };
         let aux = match config.kind {
             WorkloadKind::SparseWide | WorkloadKind::SparseWideDeletes => {
                 Zipf::new(SPARSE_VOCABULARY)
             }
-            WorkloadKind::Adjacency => Zipf::new(ADJ_MAX_DEGREE),
+            WorkloadKind::Adjacency | WorkloadKind::AdjacencyPrefix => Zipf::new(ADJ_MAX_DEGREE),
             _ => Zipf::new(1),
         };
         let n_load = match config.kind {
-            WorkloadKind::TimeSeriesTtl => n_items * POINTS_PER_ENTITY,
+            WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange => {
+                n_items * POINTS_PER_ENTITY
+            }
             _ => n_items,
         };
         let epoch = match config.epoch_micros {
@@ -159,7 +173,11 @@ impl Gen {
     /// results no longer compare. Other workloads have no TTL to drift against.
     pub(crate) fn check_epoch_age(&self) -> Result<(), String> {
         let age = crate::runners::now_micros().saturating_sub(self.epoch);
-        if self.config.kind == WorkloadKind::TimeSeriesTtl && age > LIVE_MARGIN.as_micros() as u64 {
+        let ts = matches!(
+            self.config.kind,
+            WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange
+        );
+        if ts && age > LIVE_MARGIN.as_micros() as u64 {
             return Err(format!(
                 "time-series-ttl ran {}s past its epoch, longer than the {}s its live points \
                  have before they expire; engines may disagree on which cells are live. \
@@ -180,7 +198,10 @@ impl Gen {
     }
 
     pub(crate) fn run(&self) -> RunIter<'_> {
-        let clocks = if self.config.kind == WorkloadKind::TimeSeriesTtl {
+        let clocks = if matches!(
+            self.config.kind,
+            WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange
+        ) {
             vec![POINTS_PER_ENTITY; self.n_items as usize]
         } else {
             Vec::new()
@@ -346,7 +367,7 @@ impl Iterator for LoadIter<'_> {
                             .collect(),
                     }
                 }
-                WorkloadKind::TimeSeriesTtl => {
+                WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange => {
                     // Interleave entities in time order, as live ingestion would.
                     let (t, e) = (i / g.n_items, i % g.n_items);
                     BenchOp::PutAt {
@@ -356,7 +377,7 @@ impl Iterator for LoadIter<'_> {
                         cells: vec![(b"v".to_vec(), g.value(rng))],
                     }
                 }
-                WorkloadKind::Adjacency => {
+                WorkloadKind::Adjacency | WorkloadKind::AdjacencyPrefix => {
                     let degree = 1 + g.aux.sample(rng);
                     let dsts: BTreeSet<u64> =
                         (0..degree).map(|_| g.items.sample_scrambled(rng)).collect();
@@ -504,7 +525,7 @@ impl Iterator for RunIter<'_> {
                 row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
             },
             WorkloadKind::SparseWide | WorkloadKind::SparseWideDeletes => self.sparse_op(p),
-            WorkloadKind::TimeSeriesTtl => {
+            WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange => {
                 let e = g.items.sample_scrambled(&mut self.rng);
                 let clock = &mut self.clocks[e as usize];
                 if p < 0.4 {
@@ -515,6 +536,18 @@ impl Iterator for RunIter<'_> {
                         family: METRIC_FAMILY,
                         ts: g.point_ts(t),
                         cells: vec![(b"v".to_vec(), g.value(&mut self.rng))],
+                    }
+                } else if p < 0.8 && g.config.kind == WorkloadKind::TimeSeriesRange {
+                    // D247: up to ten points of one entity from 12 to 6 hours ago.
+                    BenchOp::ScanFiltered {
+                        start: entity_prefix(e).into_bytes(),
+                        len: 10,
+                        family: METRIC_FAMILY,
+                        qualifier_prefix: None,
+                        time_range: Some((
+                            g.epoch - TIME_RANGE.0.as_micros() as u64,
+                            g.epoch - TIME_RANGE.1.as_micros() as u64,
+                        )),
                     }
                 } else if p < 0.8 {
                     // The newest ten points of one entity.
@@ -531,16 +564,33 @@ impl Iterator for RunIter<'_> {
                     }
                 }
             }
+            // D247: one vertex's out-edges to about a tenth of the vertices: a qualifier prefix
+            // fixing every digit but the lowest `k` of the destination, 10^k about n/10.
+            WorkloadKind::AdjacencyPrefix if p < 0.8 => {
+                let start = vertex_key(g.items.sample_scrambled(&mut self.rng));
+                let k = ((g.n_items as f64 / 10.0).max(1.0).log10().floor() as u32).min(9);
+                let buckets = g.n_items.div_ceil(10u64.pow(k)).max(1);
+                let bucket = self.rng.below(buckets);
+                BenchOp::ScanFiltered {
+                    start,
+                    len: 1,
+                    family: EDGE_FAMILY,
+                    qualifier_prefix: Some(
+                        format!("edge:{bucket:0w$}", w = (10 - k) as usize).into_bytes(),
+                    ),
+                    time_range: None,
+                }
+            }
             WorkloadKind::Adjacency if p < 0.8 => BenchOp::Scan {
                 // Out-edges of one vertex.
                 start: vertex_key(g.items.sample_scrambled(&mut self.rng)),
                 len: 1,
             },
-            WorkloadKind::Adjacency if p < 0.9 => BenchOp::Scan {
+            WorkloadKind::Adjacency | WorkloadKind::AdjacencyPrefix if p < 0.9 => BenchOp::Scan {
                 start: vertex_key(g.items.sample_scrambled(&mut self.rng)),
                 len: 10,
             },
-            WorkloadKind::Adjacency => BenchOp::Put {
+            WorkloadKind::Adjacency | WorkloadKind::AdjacencyPrefix => BenchOp::Put {
                 row: vertex_key(g.items.sample_scrambled(&mut self.rng)),
                 family: EDGE_FAMILY,
                 cells: vec![(

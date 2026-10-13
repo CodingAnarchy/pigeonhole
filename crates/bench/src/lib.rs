@@ -110,6 +110,14 @@ pub enum WorkloadKind {
     /// the operations deleting, half a column ([`BenchOp::DeleteColumn`]) and half a whole row
     /// ([`BenchOp::DeleteRow`]), taken from its puts. Not in `all`.
     SparseWideDeletes,
+    /// Adjacency with filtered scans (D247, reported): [`WorkloadKind::Adjacency`]'s mix with
+    /// its one-vertex scans reading only the edges whose qualifier starts with a prefix that
+    /// selects about a tenth of the vertices ([`BenchOp::ScanFiltered`]). Not in `all`.
+    AdjacencyPrefix,
+    /// Time series with time-range scans (D247, reported): [`WorkloadKind::TimeSeriesTtl`]'s mix
+    /// with its newest-ten scans reading only the points from 12 to 6 hours old
+    /// ([`BenchOp::ScanFiltered`]). Not in `all`.
+    TimeSeriesRange,
 }
 
 impl WorkloadKind {
@@ -131,8 +139,9 @@ impl WorkloadKind {
 
     /// Every workload: [`ALL`](Self::ALL) and the ones only named runs take
     /// ([`WorkloadKind::Counters`], [`WorkloadKind::Transfer`],
-    /// [`WorkloadKind::SparseWideDeletes`]).
-    pub const EVERY: [WorkloadKind; 15] = [
+    /// [`WorkloadKind::SparseWideDeletes`], [`WorkloadKind::AdjacencyPrefix`],
+    /// [`WorkloadKind::TimeSeriesRange`]).
+    pub const EVERY: [WorkloadKind; 17] = [
         WorkloadKind::YcsbA,
         WorkloadKind::YcsbB,
         WorkloadKind::YcsbC,
@@ -148,6 +157,8 @@ impl WorkloadKind {
         WorkloadKind::Counters,
         WorkloadKind::Transfer,
         WorkloadKind::SparseWideDeletes,
+        WorkloadKind::AdjacencyPrefix,
+        WorkloadKind::TimeSeriesRange,
     ];
 
     /// The CLI and report name (`ycsb-a`, `sparse-wide`, ...).
@@ -177,6 +188,8 @@ impl WorkloadKind {
             WorkloadKind::Counters => "counters",
             WorkloadKind::Transfer => "transfer",
             WorkloadKind::SparseWideDeletes => "sparse-wide-deletes",
+            WorkloadKind::AdjacencyPrefix => "adjacency-prefix",
+            WorkloadKind::TimeSeriesRange => "time-series-range",
         }
     }
 }
@@ -426,6 +439,20 @@ pub enum BenchOp {
         /// Row.
         row: Vec<u8>,
     },
+    /// Scan `len` rows from `start` in one family, reading only the cells that pass the
+    /// filters; a row with none of them is not a row (D247's filtered scans).
+    ScanFiltered {
+        /// Start row.
+        start: Vec<u8>,
+        /// Rows to read.
+        len: u32,
+        /// Family.
+        family: &'static str,
+        /// Only qualifiers starting with this.
+        qualifier_prefix: Option<Vec<u8>>,
+        /// Only cells with a timestamp in `start..end` (µs).
+        time_range: Option<(u64, u64)>,
+    },
 }
 
 /// One row of a [`BenchOp::Commit`].
@@ -460,6 +487,7 @@ impl BenchOp {
             Self::Transfer { .. } => "transfer",
             Self::DeleteColumn { .. } => "column delete",
             Self::DeleteRow { .. } => "row delete",
+            Self::ScanFiltered { .. } => "filtered scan",
             Self::Get { .. } => "get",
             Self::GetRow { .. } => "row read",
             Self::Put { .. } => "put",

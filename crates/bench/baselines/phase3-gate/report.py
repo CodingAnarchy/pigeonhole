@@ -495,7 +495,8 @@ for level, label in CONTENDED_LEVELS:
 # nearest judged row gets an issue. "Worse" compares the stores' ratio: the reported row's
 # RocksDB/Pigeonhole throughput against its judged neighbour's at the same level.
 # (reported workload, nearest judged workload)
-CONTENDED_REPORTED = [("transfer", XSHARD), ("sparse-wide-deletes", "sparse-wide")]
+CONTENDED_REPORTED = [("transfer", XSHARD), ("sparse-wide-deletes", "sparse-wide"),
+                      ("adjacency-prefix", "ycsb-e"), ("time-series-range", "time-series-ttl")]
 reported = []  # (level label, workload, pigeonhole run, {store: (tput, p99)}, flag)
 for level, label in CONTENDED_LEVELS:
     for w, near in CONTENDED_REPORTED:

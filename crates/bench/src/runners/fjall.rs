@@ -9,7 +9,8 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use super::{
     Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id, keys,
-    live_value, modified, now_micros, read_family, scan_rows, transfer_balances,
+    live_value, modified, now_micros, read_family, scan_rows, scan_rows_filtered,
+    transfer_balances,
 };
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
@@ -322,6 +323,24 @@ impl Handle {
                 let from = keys::row_prefix(start);
                 let iter = self.cells.range(from..).map(|g| g.into_inner());
                 t = scan_rows(iter, *len, now_micros())?;
+            }
+            BenchOp::ScanFiltered {
+                start,
+                len,
+                family,
+                qualifier_prefix,
+                time_range,
+            } => {
+                let from = keys::row_prefix(start);
+                let iter = self.cells.range(from..).map(|g| g.into_inner());
+                t = scan_rows_filtered(
+                    iter,
+                    *len,
+                    now_micros(),
+                    family_id(family)?,
+                    qualifier_prefix.as_deref(),
+                    *time_range,
+                )?;
             }
             BenchOp::ReadModifyWrite { row, qualifier } => {
                 let key = keys::cell(row, family_id(YCSB_FAMILY)?, qualifier);

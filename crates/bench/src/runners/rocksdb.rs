@@ -20,7 +20,8 @@ use rocksdb::{
 
 use super::{
     BLOOM_BITS, Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id,
-    keys, live_value, modified, now_micros, read_family, scan_rows, transfer_balances,
+    keys, live_value, modified, now_micros, read_family, scan_rows, scan_rows_filtered,
+    transfer_balances,
 };
 use crate::workload::{METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
 
@@ -406,6 +407,36 @@ impl Handle {
                     scan_rows(Merged::new(main, metric), *len, now_micros())?
                 } else {
                     scan_rows(main, *len, now_micros())?
+                };
+            }
+            BenchOp::ScanFiltered {
+                start,
+                len,
+                family,
+                qualifier_prefix,
+                time_range,
+            } => {
+                let from = keys::row_prefix(start);
+                let mode = IteratorMode::From(&from, Direction::Forward);
+                let f = family_id(family)?;
+                let q = qualifier_prefix.as_deref();
+                t = match self.cf(family)? {
+                    Some(cf) => scan_rows_filtered(
+                        self.db.iterator_cf(cf, mode),
+                        *len,
+                        now_micros(),
+                        f,
+                        q,
+                        *time_range,
+                    )?,
+                    None => scan_rows_filtered(
+                        self.db.iterator(mode),
+                        *len,
+                        now_micros(),
+                        f,
+                        q,
+                        *time_range,
+                    )?,
                 };
             }
             BenchOp::ReadModifyWrite { row, qualifier } => {
