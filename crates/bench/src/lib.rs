@@ -38,9 +38,9 @@ mod workload;
 
 pub use histogram::Histogram;
 pub use report::{
-    Comparison, Delta, EngineCommit, Environment, GroupCommit, LatencyStats, OpTypeStats,
-    Placement, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls,
-    Suite, Tolerance, compare,
+    Comparison, Delta, EngineCommit, Environment, GroupCommit, JUDGED_MIN_COMMITS, JUDGED_MIN_SECS,
+    LatencyStats, OpTypeStats, Placement, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling,
+    Settle, ShardShare, Stalls, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
@@ -580,12 +580,14 @@ pub struct Report {
 pub struct RunOptions {
     /// Unrecorded warmup operations before the measured ones, as a fraction of
     /// [`WorkloadConfig::operations`] (default 0.05). They are the first operations of
-    /// the same seeded stream, executed on one thread, so caches, allocators and lazily
-    /// built structures are warm when the clock starts.
+    /// the same seeded stream, executed on the measured phase's client threads and repeated
+    /// until the tablet placement settles (D242), so caches, allocators, lazily built
+    /// structures and the balancer are warm when the clock starts.
     pub warmup: f64,
-    /// The shortest measured phase of an inline run (the scaling gate and D213's group
-    /// commit, [`PigeonholeRunner::run_inline`]): its writes repeat until this much time
-    /// has been measured (D219). Zero (the default) measures them once.
+    /// The shortest measured phase. An inline run (the scaling gate and D213's group
+    /// commit, [`PigeonholeRunner::run_inline`]) repeats its writes until this much time has
+    /// been measured (D219); a client run ([`run_detailed`]) goes on with the stream's next
+    /// operations (D243). Zero (the default) measures the configured operations once.
     pub min_measured: std::time::Duration,
     /// Commits each shard's thread keeps in flight in an inline run (at least 1; default
     /// [`INLINE_IN_FLIGHT`], the shape D213 and D226 judge). Fewer trade throughput for
@@ -657,16 +659,24 @@ pub fn run_detailed(
         );
     }
     let warmup = options.warmup_ops(config);
+    // A run lengthened to `min_measured` (D243) takes operations past the configured count
+    // from the same stream.
+    let operations = if options.min_measured.is_zero() {
+        config.operations + warmup
+    } else {
+        u64::MAX
+    };
     let mut workload = Workload::new(WorkloadConfig {
-        operations: config.operations + warmup,
+        operations,
         ..config.clone()
     });
     runner.open(dir)?;
-    let result = measure(runner, config, &mut workload, warmup)
+    let result = measure(runner, config, &mut workload, warmup, options.min_measured)
         .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
     let closed = runner.close();
-    let (load, elapsed, threads, hist, split, (shards, stalls, settle, background_work)) = result?;
+    let (load, elapsed, threads, hist, split, detail) = result?;
+    let (shards, stalls, settle, background_work, (warmup_secs, warmup_settled)) = detail;
     closed?;
     let ops = hist.count();
     let (reads, by_type) = split.into_split();
@@ -698,6 +708,8 @@ pub fn run_detailed(
             engine_commit: None,
             settle: Some(settle),
             background_work,
+            warmup_secs: Some(warmup_secs),
+            warmup_settled: Some(warmup_settled),
         },
     })
 }
@@ -806,7 +818,13 @@ type Measured = (
     usize,
     Histogram,
     Split,
-    (Vec<ShardShare>, Option<Stalls>, Settle, Option<u64>),
+    (
+        Vec<ShardShare>,
+        Option<Stalls>,
+        Settle,
+        Option<u64>,
+        (f64, bool),
+    ),
 );
 
 /// Background work completed between two [`Runner::background`] readings (D233).
@@ -833,6 +851,7 @@ fn measure(
     config: &WorkloadConfig,
     workload: &mut Workload,
     warmup: u64,
+    min_measured: Duration,
 ) -> Result<Measured, String> {
     let load_start = Instant::now();
     for op in workload.load_ops() {
@@ -841,75 +860,181 @@ fn measure(
     let load = load_start.elapsed();
     let settled = settle(runner)?;
 
-    let mut ops = workload.run_ops();
-    let mut seen = std::collections::HashSet::new();
-    for op in ops.by_ref().take(warmup as usize) {
-        if let BenchOp::Get { row, .. } | BenchOp::GetRow { row, .. } = &op {
-            seen.insert(row_hash(row));
-        }
-        runner.execute(&op).map_err(|e| format!("warmup: {e}"))?;
-    }
-    let ops: Vec<BenchOp> = ops.collect();
-    let classes = classify(&ops, &mut seen);
     let threads = config.threads.max(1);
-    let clients: Vec<Box<dyn Client>> = if threads > 1 {
+    let mut clients: Vec<Box<dyn Client>> = if threads > 1 {
         (0..threads).map_while(|_| runner.client()).collect()
     } else {
         Vec::new()
     };
     if clients.len() < 2 {
+        clients.clear();
+    }
+    let lanes = clients.len().max(1);
+
+    let mut ops = workload.run_ops();
+    let mut seen = std::collections::HashSet::new();
+    let warm: Vec<BenchOp> = ops.by_ref().take(warmup as usize).collect();
+    for op in &warm {
+        if let BenchOp::Get { row, .. } | BenchOp::GetRow { row, .. } = op {
+            seen.insert(row_hash(row));
+        }
+    }
+    let warm = deal(warm.into_iter().map(|op| (op, Class::Other)), lanes);
+    let warmed = warm_up(runner, &mut clients, &warm, WARMUP_SETTLED, WARMUP_CAP)?;
+
+    // The measured operations: the configured count, then, while less than `min_measured`
+    // has been measured, the stream's next operations, about enough for the rest at the rate
+    // so far (D243). Each pass's operations are generated before its clock starts.
+    let before = (runner.shard_shares(), runner.stalls(), runner.background());
+    let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
+    let mut next = config.operations;
+    loop {
+        let chunk: Vec<BenchOp> = ops.by_ref().take(next as usize).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let classes = classify(&chunk, &mut seen);
+        let share = deal(chunk.into_iter().zip(classes), lanes);
+        let (e, h, s) = pass(runner, &mut clients, &share, true)?;
+        elapsed += e;
+        hist.merge(&h);
+        split.merge(&s);
+        if elapsed >= min_measured {
+            break;
+        }
+        let rate = hist.count() as f64 / elapsed.as_secs_f64().max(1e-9);
+        let rest = (min_measured - elapsed).as_secs_f64() * rate * 1.1;
+        next = (rest.ceil() as u64).max(MIN_EXTRA_OPS);
+    }
+    let shards = (
+        shares_between(&before.0, &runner.shard_shares()),
+        stalls_between(before.1, runner.stalls()),
+        settled,
+        work_between(before.2, runner.background()),
+        warmed,
+    );
+    Ok((load, elapsed, lanes, hist, split, shards))
+}
+
+/// The fewest operations a pass that lengthens the measured phase runs (D243).
+const MIN_EXTRA_OPS: u64 = 1_000;
+
+/// How long the tablet placement must go without a split, merge or move before the warmup
+/// ends (D242): longer than the balancer's dwell (10 passes of 100 ms, D146), so a quiet
+/// stretch means the balancer settled, not that it is waiting out a dwell.
+pub const WARMUP_SETTLED: Duration = Duration::from_secs(2);
+
+/// The longest the warmup waits for the tablet placement to settle (D242): past it the run
+/// measures anyway, with a warning, and the record says it did not settle.
+pub const WARMUP_CAP: Duration = Duration::from_secs(30);
+
+/// The warmup (D242): the warmup operations, repeated on the measured phase's own client
+/// threads until the store's tablet placement has gone [`WARMUP_SETTLED`] without a split,
+/// merge or move, at most [`WARMUP_CAP`]. Every store takes the same step; a store without
+/// shards never changes placement, so it warms for [`WARMUP_SETTLED`]. Returns the warmup's
+/// seconds and whether the placement settled; no warmup operations, no warmup. `quiet` and
+/// `cap` are [`WARMUP_SETTLED`] and [`WARMUP_CAP`] outside tests.
+fn warm_up(
+    runner: &mut dyn Runner,
+    clients: &mut [Box<dyn Client>],
+    warm: &[Vec<(BenchOp, Class)>],
+    quiet: Duration,
+    cap: Duration,
+) -> Result<(f64, bool), String> {
+    if warm.iter().all(Vec::is_empty) {
+        return Ok((0.0, true));
+    }
+    let started = Instant::now();
+    let mut last_change = started;
+    let settled = loop {
+        let before = runner.shard_shares();
+        pass(runner, clients, warm, false).map_err(|e| format!("warmup: {e}"))?;
+        if placement_changed(&before, &runner.shard_shares()) {
+            last_change = Instant::now();
+        }
+        if last_change.elapsed() >= quiet {
+            break true;
+        }
+        if started.elapsed() >= cap {
+            eprintln!(
+                "warning: {}'s tablet placement still changed {cap:?} into the warmup; the \
+                 measured phase may include tablet changes",
+                runner.name()
+            );
+            break false;
+        }
+    };
+    Ok((started.elapsed().as_secs_f64(), settled))
+}
+
+/// Whether any shard split, merged or moved a tablet between two [`Runner::shard_shares`]
+/// readings.
+fn placement_changed(before: &[ShardShare], after: &[ShardShare]) -> bool {
+    before.len() != after.len()
+        || before
+            .iter()
+            .zip(after)
+            .any(|(b, a)| (a.splits, a.merges, a.moves) != (b.splits, b.merges, b.moves))
+}
+
+/// Deals operations round-robin into `lanes` shares, so each client thread sees the
+/// workload's mix in order.
+fn deal(
+    ops: impl ExactSizeIterator<Item = (BenchOp, Class)>,
+    lanes: usize,
+) -> Vec<Vec<(BenchOp, Class)>> {
+    let mut shares: Vec<Vec<_>> = (0..lanes)
+        .map(|_| Vec::with_capacity(ops.len() / lanes + 1))
+        .collect();
+    for (i, op) in ops.enumerate() {
+        shares[i % lanes].push(op);
+    }
+    shares
+}
+
+/// Runs one share per client thread (on the runner itself when there are no clients), from
+/// a common start, and returns the wall time and, when `record` is set, each operation's
+/// latency.
+fn pass(
+    runner: &mut dyn Runner,
+    clients: &mut [Box<dyn Client>],
+    shares: &[Vec<(BenchOp, Class)>],
+    record: bool,
+) -> Result<(Duration, Histogram, Split), String> {
+    let run = |exec: &mut dyn FnMut(&BenchOp) -> Result<(), String>,
+               share: &[(BenchOp, Class)]|
+     -> Result<(Histogram, Split), String> {
         let mut hist = Histogram::new();
         let mut split = Split::default();
-        let before = (runner.shard_shares(), runner.stalls(), runner.background());
-        let start = Instant::now();
-        for (op, class) in ops.iter().zip(&classes) {
+        for (op, class) in share {
             let t = Instant::now();
-            runner.execute(op)?;
-            let latency = t.elapsed();
-            hist.record(latency);
-            split.record(op, *class, latency);
+            exec(op)?;
+            if record {
+                let latency = t.elapsed();
+                hist.record(latency);
+                split.record(op, *class, latency);
+            }
         }
-        let elapsed = start.elapsed();
-        let shards = (
-            shares_between(&before.0, &runner.shard_shares()),
-            stalls_between(before.1, runner.stalls()),
-            settled,
-            work_between(before.2, runner.background()),
-        );
-        return Ok((load, elapsed, 1, hist, split, shards));
+        Ok((hist, split))
+    };
+    if clients.is_empty() {
+        let start = Instant::now();
+        let (hist, split) = run(&mut |op| runner.execute(op), &shares[0])?;
+        return Ok((start.elapsed(), hist, split));
     }
-
-    // Deal operations round-robin so each thread sees the workload's mix in order.
-    let n = clients.len();
-    let mut shares: Vec<Vec<(BenchOp, Class)>> = (0..n)
-        .map(|_| Vec::with_capacity(ops.len() / n + 1))
-        .collect();
-    for (i, (op, class)) in ops.into_iter().zip(classes).enumerate() {
-        shares[i % n].push((op, class));
-    }
-    let barrier = Arc::new(Barrier::new(n + 1));
+    let barrier = Arc::new(Barrier::new(clients.len() + 1));
     std::thread::scope(|scope| {
         let handles: Vec<_> = clients
-            .into_iter()
+            .iter_mut()
             .zip(shares)
-            .map(|(mut client, share)| {
+            .map(|(client, share)| {
                 let barrier = Arc::clone(&barrier);
-                scope.spawn(move || -> Result<(Histogram, Split), String> {
-                    let mut hist = Histogram::new();
-                    let mut split = Split::default();
+                scope.spawn(move || {
                     barrier.wait();
-                    for (op, class) in &share {
-                        let t = Instant::now();
-                        client.execute(op)?;
-                        let latency = t.elapsed();
-                        hist.record(latency);
-                        split.record(op, *class, latency);
-                    }
-                    Ok((hist, split))
+                    run(&mut |op| client.execute(op), share)
                 })
             })
             .collect();
-        let before = (runner.shard_shares(), runner.stalls(), runner.background());
         barrier.wait();
         let start = Instant::now();
         let mut hist = Histogram::new();
@@ -930,15 +1055,9 @@ fn measure(
             }
         }
         let elapsed = start.elapsed();
-        let shards = (
-            shares_between(&before.0, &runner.shard_shares()),
-            stalls_between(before.1, runner.stalls()),
-            settled,
-            work_between(before.2, runner.background()),
-        );
         match first_err {
             Some(e) => Err(e),
-            None => Ok((load, elapsed, n, hist, split, shards)),
+            None => Ok((elapsed, hist, split)),
         }
     })
 }
@@ -953,6 +1072,12 @@ mod tests {
         flushed: bool,
         polls: std::cell::Cell<u32>,
         busy_polls: u32,
+        /// Tablet moves the store reports: one more per reading until `moving` readings.
+        readings: std::cell::Cell<u64>,
+        moving: u64,
+        /// Operations executed, and how long each takes.
+        executed: u64,
+        op_time: Duration,
     }
 
     impl Runner for Fake {
@@ -963,6 +1088,8 @@ mod tests {
             Ok(())
         }
         fn execute(&mut self, _: &BenchOp) -> Result<(), String> {
+            self.executed += 1;
+            std::thread::sleep(self.op_time);
             Ok(())
         }
         fn close(&mut self) -> Result<(), String> {
@@ -971,6 +1098,14 @@ mod tests {
         fn flush(&mut self) -> Result<(), String> {
             self.flushed = true;
             Ok(())
+        }
+        fn shard_shares(&self) -> Vec<ShardShare> {
+            let n = self.readings.get();
+            self.readings.set(n + 1);
+            vec![ShardShare {
+                moves: n.min(self.moving),
+                ..ShardShare::default()
+            }]
         }
         fn background(&self) -> Option<Background> {
             let n = self.polls.get();
@@ -990,7 +1125,80 @@ mod tests {
             flushed: false,
             polls: std::cell::Cell::new(0),
             busy_polls,
+            readings: std::cell::Cell::new(0),
+            moving: 0,
+            executed: 0,
+            op_time: Duration::ZERO,
         }
+    }
+
+    fn warm_ops(n: usize) -> Vec<Vec<(BenchOp, Class)>> {
+        let ops = Workload::new(WorkloadConfig::smoke(WorkloadKind::YcsbA))
+            .run_ops()
+            .take(n)
+            .map(|op| (op, Class::Other))
+            .collect::<Vec<_>>();
+        deal(ops.into_iter(), 1)
+    }
+
+    #[test]
+    fn the_warmup_repeats_until_the_placement_stops_changing() {
+        // D242: a store whose tablets move for its first 6 readings (3 warmup passes).
+        let mut r = fake(0);
+        r.moving = 6;
+        r.op_time = Duration::from_millis(5);
+        let warm = warm_ops(4);
+        let quiet = Duration::from_millis(100);
+        let (secs, settled) =
+            warm_up(&mut r, &mut [], &warm, quiet, Duration::from_secs(10)).unwrap();
+        assert!(settled);
+        assert!(
+            r.executed >= 4 * 4,
+            "the passes that moved, then quiet: {}",
+            r.executed
+        );
+        assert!(secs >= quiet.as_secs_f64());
+        // A placement that never settles ends at the cap.
+        let mut r = fake(0);
+        r.moving = u64::MAX;
+        let cap = Duration::from_millis(200);
+        let (secs, settled) = warm_up(&mut r, &mut [], &warm, quiet, cap).unwrap();
+        assert!(!settled);
+        assert!(secs >= cap.as_secs_f64());
+        // No warmup operations, no warmup.
+        let (secs, settled) = warm_up(&mut r, &mut [], &warm_ops(0), quiet, cap).unwrap();
+        assert_eq!((secs, settled), (0.0, true));
+    }
+
+    #[test]
+    fn a_short_run_goes_on_until_its_minimum_is_measured() {
+        // D243: 2 operations of 1 ms measure about 2 ms (tens on a loaded CI runner); a
+        // 300 ms minimum takes more of the stream.
+        let mut r = fake(0);
+        r.op_time = Duration::from_millis(1);
+        let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+        config.operations = 2;
+        let options = RunOptions {
+            warmup: 0.0,
+            min_measured: Duration::from_millis(300),
+            ..RunOptions::default()
+        };
+        let dir = std::env::temp_dir().join(format!("phdb-bench-min-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = run_detailed(&mut r, &config, &dir, &options).unwrap();
+        assert!(rec.run_secs >= 0.3, "{}", rec.run_secs);
+        assert!(rec.operations > 2, "{}", rec.operations);
+        assert_eq!(rec.detail.warmup_secs, Some(0.0));
+        let once = RunOptions {
+            warmup: 0.0,
+            ..RunOptions::default()
+        };
+        let rec = run_detailed(&mut fake(0), &config, &dir, &once).unwrap();
+        assert_eq!(
+            rec.operations, 2,
+            "no minimum: the configured operations once"
+        );
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

@@ -302,7 +302,7 @@ pub struct OpTypeStats {
 }
 
 /// Extra facts about a run.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunDetail {
     /// Bytes of the store directory when the run ended (0 when not measured).
     pub store_bytes: u64,
@@ -333,6 +333,16 @@ pub struct RunDetail {
     /// stores that count it (Pigeonhole); `None` elsewhere and in results written before it.
     #[serde(default)]
     pub background_work: Option<u64>,
+    /// Seconds of warmup between the settle step and the measured phase (D242): the warmup
+    /// writes repeated on the measured phase's own client threads until the tablet placement
+    /// went [`WARMUP_SETTLED`](crate::WARMUP_SETTLED) without a change; `None` in results
+    /// written before it.
+    #[serde(default)]
+    pub warmup_secs: Option<f64>,
+    /// Whether the placement settled within [`WARMUP_CAP`](crate::WARMUP_CAP) (D242); false
+    /// when the warmup ran out first, so the measured phase may include tablet changes.
+    #[serde(default)]
+    pub warmup_settled: Option<bool>,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run
@@ -1297,6 +1307,25 @@ pub struct Comparison {
     /// flushes or compactions and the other none, or one did more than twice the other's.
     /// A throughput gap there may be that work, not the store. Reported, not judged.
     pub background_notes: Vec<String>,
+    /// Matched records too short to judge (D243): a measured phase under
+    /// [`JUDGED_MIN_SECS`] in either run, unless it is a group-commit run of at least
+    /// [`JUDGED_MIN_COMMITS`]. Their metrics are reported with no tolerance.
+    pub short: Vec<String>,
+}
+
+/// The shortest measured phase the reproducibility check judges (D243): a shorter one
+/// holds too few flushes and compactions for two runs to agree on more than timing luck.
+pub const JUDGED_MIN_SECS: f64 = 10.0;
+
+/// A group-commit run of at least this many commits is judged however long it ran (D243,
+/// as D219 judges the durable group-commit target).
+pub const JUDGED_MIN_COMMITS: u64 = 2_000_000;
+
+/// Whether the reproducibility check judges `r` (D243).
+fn judged(r: &RunRecord) -> bool {
+    r.run_secs >= JUDGED_MIN_SECS
+        || (r.workload == crate::WorkloadKind::GroupCommit.name()
+            && r.operations >= JUDGED_MIN_COMMITS)
 }
 
 impl Comparison {
@@ -1341,6 +1370,12 @@ impl Comparison {
         for n in &self.background_notes {
             let _ = writeln!(s, "\n**Background work differs:** {n}");
         }
+        for n in &self.short {
+            let _ = writeln!(
+                s,
+                "\n**Not judged (D243, shorter than {JUDGED_MIN_SECS:.0} s):** {n}"
+            );
+        }
         let _ = writeln!(
             s,
             "\n**{}**",
@@ -1364,7 +1399,7 @@ impl Comparison {
 /// let rec = |tput: f64| RunRecord {
 ///     store: "pigeonhole".into(), store_config: String::new(), workload: "ycsb-c".into(),
 ///     seed: 1, records: 10, operations: 10, value_len: 8, threads: 1, load_secs: 0.0,
-///     run_secs: 1.0, throughput: tput, p50_ns: 1000, p99_ns: 2000, p999_ns: 3000,
+///     run_secs: 10.0, throughput: tput, p50_ns: 1000, p99_ns: 2000, p999_ns: 3000,
 ///     mean_ns: 1100, max_ns: 5000, warmup_ops: 0, detail: Default::default(),
 /// };
 /// let env = Environment::detect(&std::env::temp_dir());
@@ -1380,6 +1415,7 @@ pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Com
     let mut deltas = Vec::new();
     let mut unmatched = Vec::new();
     let mut background_notes = Vec::new();
+    let mut short = Vec::new();
     for b in &baseline.results {
         let Some(c) = candidate.results.iter().find(|c| c.key() == b.key()) else {
             unmatched.push(b.key());
@@ -1394,15 +1430,35 @@ pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Com
                 b.key()
             ));
         }
+        let judge = judged(b) && judged(c);
+        if !judge {
+            short.push(format!(
+                "{}: measured {:.2} s and {:.2} s",
+                b.key(),
+                b.run_secs,
+                c.run_secs
+            ));
+        }
+        let allow = |t: f64| judge.then_some(t);
         let metrics: [(&'static str, f64, f64, Option<f64>); 4] = [
             (
                 "throughput",
                 b.throughput,
                 c.throughput,
-                Some(tolerance.throughput),
+                allow(tolerance.throughput),
             ),
-            ("p50", b.p50_ns as f64, c.p50_ns as f64, Some(tolerance.p50)),
-            ("p99", b.p99_ns as f64, c.p99_ns as f64, Some(tolerance.p99)),
+            (
+                "p50",
+                b.p50_ns as f64,
+                c.p50_ns as f64,
+                allow(tolerance.p50),
+            ),
+            (
+                "p99",
+                b.p99_ns as f64,
+                c.p99_ns as f64,
+                allow(tolerance.p99),
+            ),
             ("p99.9", b.p999_ns as f64, c.p999_ns as f64, None),
         ];
         for (metric, bv, cv, allowed) in metrics {
@@ -1445,6 +1501,7 @@ pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Com
         unmatched,
         environment_warning,
         background_notes,
+        short,
     }
 }
 
@@ -1470,7 +1527,7 @@ mod tests {
             value_len: 100,
             threads: 1,
             load_secs: 0.1,
-            run_secs: 0.1,
+            run_secs: 10.0,
             throughput: tput,
             p50_ns: p50,
             p99_ns: p99,
@@ -1515,6 +1572,48 @@ mod tests {
         assert!(
             cmp(None, Some(5)).background_notes.is_empty(),
             "uncounted stores"
+        );
+    }
+
+    #[test]
+    fn compare_reports_short_runs_without_judging_them() {
+        // D243: the 2026-10-13 pair-2 run's 0.16 s D213 shape differed by +53% throughput.
+        let a = rec("ycsb-a", 1e5, 1000, 5000);
+        let mut short = rec("ycsb-a", 2e5, 500, 5000);
+        short.run_secs = 0.16;
+        let c = compare(
+            &suite(vec![a.clone()]),
+            &suite(vec![short]),
+            Tolerance::default(),
+        );
+        assert!(c.passes(), "reported, not judged");
+        assert_eq!(c.short.len(), 1);
+        assert!(c.short[0].contains("10.00 s and 0.16 s"));
+        assert!(c.deltas.iter().all(|d| d.allowed.is_none()));
+        assert!(c.to_markdown().contains("Not judged (D243"));
+        // A group-commit run of 2M commits is judged however short (D219).
+        let gc = |tput: f64| {
+            let mut r = rec("group-commit", tput, 1000, 5000);
+            r.run_secs = 0.8;
+            r.operations = JUDGED_MIN_COMMITS;
+            r
+        };
+        let c = compare(
+            &suite(vec![gc(1e6)]),
+            &suite(vec![gc(2e6)]),
+            Tolerance::default(),
+        );
+        assert!(c.short.is_empty());
+        assert!(!c.passes());
+        let mut few = gc(2e6);
+        few.operations = JUDGED_MIN_COMMITS - 1;
+        assert!(
+            compare(
+                &suite(vec![gc(1e6)]),
+                &suite(vec![few]),
+                Tolerance::default()
+            )
+            .passes()
         );
     }
 

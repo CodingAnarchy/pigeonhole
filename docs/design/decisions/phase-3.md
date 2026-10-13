@@ -1334,3 +1334,37 @@ So this is a bug fix in the code, not a contract change. The coordinator approve
 - no `Busy`.
 
 The AX102 confirms at 64 GiB.
+
+<a id="d242"></a>
+## D242 — Every engine warms up on the measured phase's own client threads until the tablet placement settles, and records how long (owner decision, 2026-10-13; bench, #406 reproducibility; amends D233)
+
+**Decided:**
+- **The warmup.** After the settle step (D233), `run_detailed` (every workload but the inline drivers) runs the warmup operations on the measured phase's own client threads (four for skewed-multi-shard, sixteen for the 16-client group commit), dealt the same way as the measured ones.
+- **Until placement settles.** It repeats those operations until the store's tablet placement has gone 2 s without a split, merge or move (`WARMUP_SETTLED`), at most 30 s (`WARMUP_CAP`, the inline drivers' former `SPREAD_CAP`). Past the cap the run measures anyway, with a warning.
+- **Every engine alike.** A store without shards never changes placement, so it warms for 2 s. The warmup's operations are the same for every engine.
+- **The record** carries `detail.warmup_secs` and `detail.warmup_settled`. The inline drivers record theirs too: they already warmed until the table spread and stayed unchanged for 2 s, and now share the constants.
+- **Unchanged:** the warmup's size (5% of `--ops` per pass by default; `--warmup`), the settle step, and which operations are measured. Repeated passes reuse the same warmup operations, so the measured stream stays the same.
+
+**Why:** ctr274's F3 read (2026-10-13) of skewed-multi-shard on Pigeonhole.
+- The load runs on one client thread, which keeps every shard lightly busy, so D217 packs the table: in one pass, 13 shards each handed their tablet to shard 0.
+- The 4-thread measured phase then started with shard 0 holding 13 tablets. Unpacking sheds one tablet per dwell, about one per second, so a measured phase of about 5 s spent most of its time packed.
+- So the phase measured placement converging after the switch from 1 client to 4, not the steady state. On the 2026-10-13 gate, Pigeonhole's skewed-multi-shard fell from 362K/368K to 285K/325K ops/s between the two pairs, with its background work doubled.
+- This is a bench change, not an engine one: users' placement is unchanged. Faster unpacking (E-F3b) and making the shards agree on `k` (E-F3c) are separate engine questions.
+
+<a id="d243"></a>
+## D243 — The reproducibility check judges only runs of about 10 s or more; the short runs are lengthened, not dropped (owner decision, 2026-10-13; bench, #406 reproducibility)
+
+**Decided:**
+- **What is judged.** `phdb-bench compare` judges a matched pair only when both measured phases ran at least 10 s (`JUDGED_MIN_SECS`), or, for group commit, at least 2M commits (`JUDGED_MIN_COMMITS`, as D219 judges the durable group-commit target).
+  - A shorter pair's metrics are still listed, with no tolerance, and the report names it under "Not judged (D243)" with both lengths.
+  - D233's background-work note still applies to every pair, judged or not.
+- **The short runs are lengthened.** `--min-secs S` now applies to client runs as well as inline ones. A client run whose configured operations measure under S seconds continues with the workload stream's next operations, in passes sized from the rate so far, until S seconds are measured. Each pass's operations are generated before its clock starts.
+- **In the gate.** `run-window.sh` runs every `all` (both io_uring runs and pread) with `--min-secs 10`, and the D213 group-commit run inside it with the judged run's 2M commits (`--inline-ops`). The dry run (`--scale small`) uses 1 s.
+- The tolerance itself (±20% throughput and p50, ±40% p99) is unchanged.
+
+**Why:** the 2026-10-13 gate's second pair failed only on short runs:
+- the D213 shape inside `all` measured 0.16 s (+53% throughput, −41% p50);
+- ycsb-a with one client measured 5.3 s (+29.7%, with 2 flushes and compactions in one measured phase and none in the other);
+- the 16-client group commit measured 1.7 s.
+
+At those lengths, one flush or compaction more or less, or a placement change, moves a run by more than the tolerance. That's timing luck, not the engine. In the full-scale `all`, 18 of the 28 runs measured under 10 s, both engines included.

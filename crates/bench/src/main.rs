@@ -60,14 +60,17 @@ OPTIONS:
     --value-len N          bytes per value
     --threads N            client threads
     --seed N               RNG seed
-    --warmup F             unrecorded warmup, as a fraction of --ops [default: 0.05;
-                           scaling: 1.0, so the balancer spreads the table first]
-    --min-secs S           inline runs (scaling, group-commit's D213 run): repeat the
-                           measured writes until at least S seconds are measured;
-                           placement: the measured window [default: 10]
+    --warmup F             unrecorded warmup, as a fraction of --ops, on the measured
+                           client threads and repeated until the tablet placement has
+                           not changed for 2 s, at most 30 s (D242) [default: 0.05;
+                           scaling: 1.0]
+    --min-secs S           measure at least S seconds: inline runs (scaling,
+                           group-commit's D213 run) repeat the measured writes (D219),
+                           client runs go on with the workload's next operations (D243)
+                           [default: 0, the configured operations once]; placement: the
+                           measured window [default: 10]
     --offered-rate R       placement: writes per second offered over every client
                            [default: 30,000 per shard]
-                           (D219) [default: 0, once]
     --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
     --in-flight N          inline runs: commits each shard's thread keeps in flight
                            [default: 16, the judged shape]; fewer trade throughput for
@@ -342,6 +345,7 @@ fn one(
         } else {
             RunOptions::default().warmup
         }),
+        min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
         ..RunOptions::default()
     };
     let result = run_detailed(runner, config, &dir, &options)

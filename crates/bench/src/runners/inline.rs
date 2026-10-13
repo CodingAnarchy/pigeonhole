@@ -20,19 +20,11 @@ use pigeonhole_io::sys::PinPlan;
 use super::pigeonhole::{create_table, err, options};
 use crate::{
     BenchOp, EngineCommit, Histogram, PigeonholeRunner, RunDetail, RunOptions, RunRecord, Runner,
-    ShardShare, Stalls, Workload, WorkloadConfig,
+    ShardShare, Stalls, WARMUP_CAP, WARMUP_SETTLED, Workload, WorkloadConfig,
 };
 
 /// Commits each shard thread keeps in flight (D204).
 pub const INLINE_IN_FLIGHT: usize = 16;
-
-/// Longest the warmup runs while waiting for the balancer to spread the table (D204).
-const SPREAD_CAP: Duration = Duration::from_secs(30);
-
-/// How long the table must go without a split, merge or move before the warmup ends: longer
-/// than the balancer's dwell (10 passes of 100 ms, D146), so a quiet stretch means the
-/// balancer settled, not that it is waiting out a dwell.
-const SETTLED: Duration = Duration::from_secs(2);
 
 /// How long a shard thread's turn may run before it polls its commits again.
 const TURN: Duration = Duration::from_micros(50);
@@ -523,12 +515,13 @@ impl PigeonholeRunner {
         let load = load_start.elapsed();
         let (warm, measured) = run.split_at((warmup as usize).min(run.len()));
         // Warm up until the balancer has spread the table and settled: every shard owns a
-        // tablet and nothing split, merged or moved for `SETTLED` (a fixed warmup can end
+        // tablet and nothing split, merged or moved for `WARMUP_SETTLED` (a fixed warmup can end
         // before the first split, and the measured phase would then be one tablet on one
         // shard). Passes repeat the warmup writes; the cap bounds a table that never settles,
         // reported as a warning.
         let started = Instant::now();
         let mut last_change = started;
+        let mut warmup_settled = true;
         let mut shards = shards;
         loop {
             let before = db.shard_stats();
@@ -543,17 +536,19 @@ impl PigeonholeRunner {
             }
             let spread = after.iter().all(|s| s.tablets > 0);
             // Pre-split, the balancer never runs (D213): one warmup pass is enough.
-            if presplit || (spread && last_change.elapsed() >= SETTLED) || warm.is_empty() {
+            if presplit || (spread && last_change.elapsed() >= WARMUP_SETTLED) || warm.is_empty() {
                 break;
             }
-            if started.elapsed() > SPREAD_CAP {
+            if started.elapsed() > WARMUP_CAP {
                 eprintln!(
-                    "warning: the table did not spread over {n} shards within {SPREAD_CAP:?}; \
+                    "warning: the table did not spread over {n} shards within {WARMUP_CAP:?}; \
                      the measured phase may use fewer"
                 );
+                warmup_settled = false;
                 break;
             }
         }
+        let warmup_secs = started.elapsed().as_secs_f64();
         if presplit && n > 1 {
             one_tablet_each(&db, "before the measured phase")?;
         }
@@ -620,6 +615,8 @@ impl PigeonholeRunner {
                 shards: detail_shards,
                 stalls: Some(Stalls::between(&stalls_before, &stalls_after)),
                 engine_commit,
+                warmup_secs: Some(warmup_secs),
+                warmup_settled: Some(warmup_settled),
                 ..RunDetail::default()
             },
         })

@@ -24,8 +24,10 @@
 #   phase2-gate    D193 sparse-wide gate against SQLite and RocksDB (run-gate.sh)     40
 #   phase2-gate-2  the same again: #387's row-read p99 sits near 1.5x SQLite's, and one
 #                  run varies by about 5%                                             40
-#   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring               90
-#   all-uring-2    the same again (the reproducibility gate: compare 1 and 2)         90
+#   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring, every run
+#                  10 s or more (D243)                                                90
+#   all-uring-2    the same again (the reproducibility gate: compare 1 and 2, judging
+#                  runs of 10 s or more, D243)                                        90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
 #   latency        ycsb-c (2 GiB cache, warmed: D216), ycsb-a, skewed vs RocksDB;
 #                  group-commit: the D213 shape (one shard per core, table split over
@@ -238,9 +240,12 @@ phase2_gate() {
 step_phase2-gate() { phase2_gate phase2-gate; }
 step_phase2-gate-2() { phase2_gate phase2-gate-2; }
 
-# `phdb-bench all` against RocksDB, stores under DATA_DIR, on backend $1, into $2.json.
+# `phdb-bench all` against RocksDB, stores under DATA_DIR, on backend $1, into $2.json. Every
+# run measures at least $repro_min_secs (D243: the reproducibility check judges only runs of
+# about 10 s or more), and the D213 run inside it takes the judged run's commits (D219).
 all_vs_rocksdb() {
     PIGEONHOLE_IO="$1" "$bench" all --engine pigeonhole,rocksdb --scale "$scale" \
+        --min-secs "$repro_min_secs" --inline-ops "$gc_inline_ops" \
         --dir "$data/bench" --json "$results/$2.json" --markdown "$results/$2.md"
     rm -r "$data/bench"
 }
@@ -248,8 +253,9 @@ all_vs_rocksdb() {
 step_all-uring-1() { all_vs_rocksdb uring all-uring-1; }
 step_all-uring-2() {
     all_vs_rocksdb uring all-uring-2
-    # The reproducibility gate: every result within tolerance across the two runs. A result
-    # out of tolerance is a verdict for the report, not a reason to stop.
+    # The reproducibility gate: every result within tolerance across the two runs (judged at
+    # 10 s or more, D243). A result out of tolerance is a verdict for the report, not a reason
+    # to stop.
     local status=0
     "$bench" compare "$results/all-uring-1.json" "$results/all-uring-2.json" \
         > "$results/all-uring-compare.txt" || status=$?
@@ -270,10 +276,12 @@ if [[ "$scale" == full ]]; then
     gc_inline_ops=2000000
     scaling_min_secs=8
     placement_window=10
+    repro_min_secs=10
 else
     gc_inline_ops=50000
     scaling_min_secs=1
     placement_window=3
+    repro_min_secs=1
 fi
 
 step_latency() {

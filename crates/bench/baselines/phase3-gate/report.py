@@ -350,7 +350,25 @@ rows.append(("Within 1.5× of RocksDB on every workload",
              verdict(gap_ok), "all-uring-1.json, all-uring-2.json"))
 
 rep = status("all-uring-compare.status")
-rows.append(("Reproducibility: run 1 and run 2 within tolerance", "", verdict(None if rep is None else rep == 0),
+# D243: runs shorter than 10 s are reported, not judged; D233: pairs whose measured phases did
+# different background work are noted.
+rep_detail = []
+try:
+    with open(path("all-uring-compare.txt")) as f:
+        text = f.read()
+    rep_fails = text.count("**FAIL**")
+    short = text.count("**Not judged (D243")
+    bg = text.count("**Background work differs:**")
+    if rep_fails:
+        rep_detail.append(f"{rep_fails} metrics outside tolerance")
+    if short:
+        rep_detail.append(f"{short} runs shorter than 10 s, not judged (D243)")
+    if bg:
+        rep_detail.append(f"{bg} with different background work (D233)")
+except OSError:
+    pass
+rows.append(("Reproducibility: run 1 and run 2 within tolerance (runs of 10 s or more, D243)",
+             "; ".join(rep_detail), verdict(None if rep is None else rep == 0),
              "all-uring-compare.txt"))
 p2 = [status(f"{n}.status") for n in ("phase2-gate", "phase2-gate-2")]
 rows.append(("Phase 2 floors hold (D193 sparse-wide gate, both runs)", "",
