@@ -317,6 +317,19 @@ pub(crate) fn create_table(db: &Pigeonhole) -> Result<Table, String> {
     builder.create_if_missing().map_err(err)
 }
 
+/// The counters workload's table (D247): `ctr`, one counter family.
+fn create_counters(db: &Pigeonhole) -> Result<Table, String> {
+    db.table("ctr")
+        .map_err(err)?
+        .family(COUNTER_FAMILY, Family::counter().bloom_bits(BLOOM_BITS))
+        .create_if_missing()
+        .map_err(err)
+}
+
+/// The family and qualifier of the counters workload's counter.
+const COUNTER_FAMILY: &str = "n";
+const COUNTER: &[u8] = b"n";
+
 /// The cross-shard contention workload's partition tables (D246), `xs00` to `xs15`, created
 /// one after another as perf2's measurement did, so with tablet changes off the engine
 /// places them one per shard.
@@ -346,6 +359,7 @@ impl Runner for PigeonholeRunner {
                 db,
                 table,
                 parts: Arc::default(),
+                counters: None,
                 load_buffered: self.settings.load_buffered,
             },
             busy: Arc::default(),
@@ -360,12 +374,17 @@ impl Runner for PigeonholeRunner {
     fn close(&mut self) -> Result<(), String> {
         match self.open.take() {
             Some(Open {
-                target: Target {
-                    db, table, parts, ..
-                },
+                target:
+                    Target {
+                        db,
+                        table,
+                        parts,
+                        counters,
+                        ..
+                    },
                 ..
             }) => {
-                drop((table, parts));
+                drop((table, parts, counters));
                 db.close().map_err(err)
             }
             None => Ok(()),
@@ -496,6 +515,12 @@ impl PigeonholeRunner {
         let cell = table.get(row, YCSB_FAMILY, qualifier).ok()??;
         cell.value().first().copied()
     }
+
+    /// A counter of the counters workload, for tests.
+    pub(crate) fn counter(&self, row: &[u8]) -> Option<i64> {
+        let table = self.open.as_ref()?.target.counters.as_ref()?;
+        table.get(row, COUNTER_FAMILY, COUNTER).ok()??.as_i64()
+    }
 }
 
 impl Counted for PigeonholeRunner {
@@ -503,6 +528,9 @@ impl Counted for PigeonholeRunner {
         let o = self.open.as_mut().ok_or("pigeonhole runner is not open")?;
         if matches!(op, BenchOp::Commit { .. }) && o.target.parts.is_empty() {
             o.target.parts = Arc::new(create_partitions(&o.target.db)?);
+        }
+        if matches!(op, BenchOp::Incr { .. }) && o.target.counters.is_none() {
+            o.target.counters = Some(create_counters(&o.target.db)?);
         }
         execute(&o.target, &o.busy, op)
     }
@@ -515,6 +543,8 @@ pub(crate) struct Target {
     db: Pigeonhole,
     table: Table,
     parts: Arc<Vec<Table>>,
+    /// The counters workload's table (D247), created by its load's first increment.
+    counters: Option<Table>,
     /// Commits are `Buffered` (the load of a run set to [`PigeonholeRunner::load_buffered`]).
     load_buffered: bool,
 }
@@ -624,6 +654,27 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 if applied.is_some() {
                     break;
                 }
+            }
+        }
+        BenchOp::Incr { row, delta } => {
+            let table = target
+                .counters
+                .as_ref()
+                .ok_or("no counters table: the load creates it")?;
+            retry_busy(busy, || {
+                level(buffered, table.mutate(row))
+                    .incr(COUNTER_FAMILY, COUNTER, *delta)
+                    .commit()
+            })?;
+        }
+        BenchOp::ReadCounter { row } => {
+            let table = target
+                .counters
+                .as_ref()
+                .ok_or("no counters table: the load creates it")?;
+            if let Some(cell) = table.get(row, COUNTER_FAMILY, COUNTER).map_err(err)? {
+                let n = cell.as_i64().ok_or("a counter that is not an i64")?;
+                t.cell(&n.to_le_bytes());
             }
         }
         BenchOp::Commit { family, rows } => {

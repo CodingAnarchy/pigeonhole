@@ -26,6 +26,22 @@ use crate::workload::{METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
 
 /// The column family of [`METRIC_FAMILY`].
 const METRIC_CF: &str = "metric";
+/// The counters workload's column family (D247): one `i64` (little-endian) per row,
+/// incremented with an associative add merge operator.
+const COUNTER_CF: &str = "counter";
+
+/// The counter column family's merge: the stored value plus every operand, wrapping.
+fn add_i64(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &rocksdb::MergeOperands,
+) -> Option<Vec<u8>> {
+    let read = |v: &[u8]| v.try_into().map_or(0, i64::from_le_bytes);
+    let sum = operands
+        .iter()
+        .fold(existing.map_or(0, read), |n, op| n.wrapping_add(read(op)));
+    Some(sum.to_le_bytes().to_vec())
+}
 use crate::{BenchOp, Client, Runner};
 
 /// Runs RocksDB (feature `rocksdb`).
@@ -126,10 +142,15 @@ impl Runner for RocksDbRunner {
         fifo.set_max_table_files_size(u64::MAX);
         metric.set_fifo_compaction_options(&fifo);
         metric.set_ttl(TIME_SERIES_TTL.as_secs());
+        let mut counter = opts.clone();
+        counter.set_merge_operator_associative("i64_add", add_i64);
         let db = DB::open_cf_descriptors(
             &opts,
             dir.join("rocksdb"),
-            [ColumnFamilyDescriptor::new(METRIC_CF, metric)],
+            [
+                ColumnFamilyDescriptor::new(METRIC_CF, metric),
+                ColumnFamilyDescriptor::new(COUNTER_CF, counter),
+            ],
         )
         .map_err(|e| e.to_string())?;
         self.db = Some(Arc::new(db));
@@ -220,6 +241,12 @@ impl Handle {
             .ok_or_else(|| "no metric column family".to_owned())
     }
 
+    fn counter_cf(&self) -> Result<&rocksdb::ColumnFamily, String> {
+        self.db
+            .cf_handle(COUNTER_CF)
+            .ok_or_else(|| "no counter column family".to_owned())
+    }
+
     /// One atomic batch of cells of one row, all stamped `ts`.
     fn put(
         &self,
@@ -299,6 +326,17 @@ impl Handle {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Incr { row, delta } => {
+                let cf = self.counter_cf()?;
+                self.db
+                    .merge_cf_opt(cf, row, delta.to_le_bytes(), &self.write)
+                    .map_err(e)?;
+            }
+            BenchOp::ReadCounter { row } => {
+                if let Some(v) = self.db.get_pinned_cf(self.counter_cf()?, row).map_err(e)? {
+                    t.cell(&v);
+                }
+            }
             BenchOp::Commit { family, rows } => self.put_rows(
                 family,
                 now_micros(),

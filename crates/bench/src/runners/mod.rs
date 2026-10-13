@@ -384,6 +384,33 @@ mod concurrent_rmw {
     }
 
     #[test]
+    fn pigeonhole_counts_every_increment() {
+        // D247: concurrent increments of one counter, none lost.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-incr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default().shards(2);
+        r.open(&dir).unwrap();
+        let incr = BenchOp::Incr {
+            row: b"c".to_vec(),
+            delta: 1,
+        };
+        r.execute(&incr).unwrap();
+        let clients: Vec<_> = (0..CLIENTS).map(|_| r.client().unwrap()).collect();
+        std::thread::scope(|s| {
+            for mut c in clients {
+                let incr = incr.clone();
+                s.spawn(move || {
+                    for _ in 0..EACH {
+                        c.execute(&incr).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(r.counter(b"c"), Some(1 + (CLIENTS * EACH) as i64));
+        done((r, dir));
+    }
+
+    #[test]
     fn pigeonhole_loses_no_update() {
         let run = hammer(PigeonholeRunner::default().shards(2), "ph");
         // Each read-modify-write adds one to the first byte.
@@ -455,7 +482,7 @@ mod agreement {
     fn agree<R: Runner + Counted>(make: impl Fn() -> R, tag: &str) {
         // One "now" for both stores, so they place the same event times.
         let epoch = super::now_micros();
-        for kind in WorkloadKind::ALL {
+        for kind in WorkloadKind::EVERY {
             let (want, want_misses) = trace(
                 PigeonholeRunner::default()
                     .shards(1)

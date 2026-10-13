@@ -10,6 +10,7 @@
 //! | adjacency | `v:<vertex>` | `edge` | `edge:<dst>`, power-law degree |
 //! | skewed multi-shard | `sk:<fnv(i)>` | `ycsb` | `field0` |
 //! | cross-shard contention | `xs:<partition>:<fnv(i)>`, in partitions | `ycsb` | `field0` |
+//! | counters | `ctr:<fnv(i)>` | each store's counter (below) | one counter per row |
 
 use std::collections::BTreeSet;
 
@@ -58,6 +59,12 @@ pub const XSHARD_CLIENTS: usize = 32;
 /// The share of [`WorkloadKind::CrossShardContention`](crate::WorkloadKind::CrossShardContention)'s
 /// commits that write one row in each of 2-4 partitions; the rest write one row (D246).
 pub const XSHARD_CROSS_FRACTION: f64 = 0.5;
+/// Client threads of [`WorkloadKind::Counters`](crate::WorkloadKind::Counters) at the small
+/// and full presets (D247).
+pub const COUNTER_THREADS: usize = 16;
+/// [`WorkloadKind::Counters`](crate::WorkloadKind::Counters): the share of increments; the
+/// rest read a counter.
+const COUNTER_INCR_FRACTION: f64 = 0.9;
 /// The operation type ([`BenchOp::type_name`]) of a [`BenchOp::Commit`] of more than one row:
 /// the commit D246 judges.
 pub const CROSS_SHARD_COMMIT: &str = "cross-shard commit";
@@ -230,6 +237,10 @@ fn partition_key(partition: usize, i: u64) -> Vec<u8> {
     format!("xs:{partition:02}:{:020}", fnv64(i)).into_bytes()
 }
 
+fn counter_key(i: u64) -> Vec<u8> {
+    format!("ctr:{:020}", fnv64(i)).into_bytes()
+}
+
 fn sparse_key(i: u64) -> Vec<u8> {
     format!("sw:{i:010}").into_bytes()
 }
@@ -299,6 +310,11 @@ impl Iterator for LoadIter<'_> {
                         rows: vec![g.partition_row((i % p) as usize, i / p, rng)],
                     }
                 }
+                // Every counter starts at 1.
+                WorkloadKind::Counters => BenchOp::Incr {
+                    row: counter_key(i),
+                    delta: 1,
+                },
                 WorkloadKind::SparseWide => {
                     let n = rng.range(0, 2 * SPARSE_MEAN_CELLS);
                     if n == 0 {
@@ -506,6 +522,14 @@ impl Iterator for RunIter<'_> {
                 let row = ycsb_key(self.rng.below(g.n_items));
                 g.commit(row, &mut self.rng)
             }
+            // D247: Zipfian rows, so hot counters take many increments.
+            WorkloadKind::Counters if p < COUNTER_INCR_FRACTION => BenchOp::Incr {
+                row: counter_key(g.items.sample_scrambled(&mut self.rng)),
+                delta: 1,
+            },
+            WorkloadKind::Counters => BenchOp::ReadCounter {
+                row: counter_key(g.items.sample_scrambled(&mut self.rng)),
+            },
             // D246: a row in one partition, or one row in each of 2-4 consecutive partitions
             // (distinct, so on different shards when the partitions sit one per shard), the
             // rows uniform within their partitions.
@@ -552,7 +576,7 @@ mod tests {
 
     #[test]
     fn deterministic_per_seed() {
-        for kind in WorkloadKind::ALL {
+        for kind in WorkloadKind::EVERY {
             let seed = 11;
             assert_eq!(ops(kind, seed), ops(kind, seed), "{kind:?} seed {seed}");
             assert_ne!(
@@ -679,6 +703,28 @@ mod tests {
         assert!(
             (share - XSHARD_CROSS_FRACTION).abs() < 0.02,
             "seed {seed}: {share}"
+        );
+    }
+
+    #[test]
+    fn counters_increment_nine_in_ten_and_read_the_rest() {
+        let seed = 13;
+        let mut config = WorkloadConfig::smoke(WorkloadKind::Counters);
+        config.seed = seed;
+        config.operations = 20_000;
+        let mut w = Workload::new(config.clone());
+        assert!(
+            w.load_ops()
+                .all(|op| matches!(op, BenchOp::Incr { delta: 1, .. }))
+        );
+        let incrs = w
+            .run_ops()
+            .filter(|op| matches!(op, BenchOp::Incr { .. }))
+            .count() as f64
+            / config.operations as f64;
+        assert!(
+            (incrs - COUNTER_INCR_FRACTION).abs() < 0.02,
+            "seed {seed}: {incrs}"
         );
     }
 

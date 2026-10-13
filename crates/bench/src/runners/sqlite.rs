@@ -20,6 +20,11 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS cells (
 ) WITHOUT ROWID";
 
 // `?4` is the oldest live timestamp of the cell's family: `ts > ?4` is the TTL filter.
+/// The counters workload's table (D247): one integer per row.
+const COUNTERS: &str = "CREATE TABLE IF NOT EXISTS counters (row BLOB PRIMARY KEY NOT NULL, n INTEGER NOT NULL) WITHOUT ROWID";
+const INCR: &str = "INSERT INTO counters (row, n) VALUES (?1, ?2) ON CONFLICT (row) DO UPDATE SET n = n + excluded.n";
+const READ_COUNTER: &str = "SELECT n FROM counters WHERE row = ?1";
+
 const GET: &str =
     "SELECT value FROM cells WHERE row = ?1 AND family = ?2 AND qualifier = ?3 AND ts > ?4";
 const GET_ROW: &str =
@@ -98,6 +103,7 @@ fn connect(path: &Path, sync: bool, page_cache: u64) -> Result<Conn, String> {
     let kib = i64::try_from(page_cache / 1024).unwrap_or(i64::MAX);
     c.pragma_update(None, "cache_size", -kib).map_err(e)?;
     c.execute(SCHEMA, []).map_err(e)?;
+    c.execute(COUNTERS, []).map_err(e)?;
     Ok(Conn(c))
 }
 
@@ -260,6 +266,25 @@ impl Conn {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Incr { row, delta } => {
+                self.0
+                    .prepare_cached(INCR)
+                    .map_err(e)?
+                    .execute(params![row, delta])
+                    .map_err(e)?;
+            }
+            BenchOp::ReadCounter { row } => {
+                let n: Option<i64> = self
+                    .0
+                    .prepare_cached(READ_COUNTER)
+                    .map_err(e)?
+                    .query_row(params![row], |r| r.get(0))
+                    .optional()
+                    .map_err(e)?;
+                if let Some(n) = n {
+                    t.cell(&n.to_le_bytes());
+                }
+            }
             BenchOp::Commit { family, rows } => self.put_rows(
                 family,
                 now_micros(),

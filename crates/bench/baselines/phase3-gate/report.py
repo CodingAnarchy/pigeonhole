@@ -437,7 +437,9 @@ else:
 CONTENDED_LEVELS = [("buffered", "D108 parity, buffered"), ("default", "default durability, GroupSync")]
 # ycsb-f's read-modify-write is atomic in every runner (Pigeonhole: commit_if, retried on a
 # lost race; RocksDB and fjall: a row lock; SQLite: an immediate transaction).
-CONTENDED_JUDGED = ["ycsb-a", "ycsb-b", "ycsb-c", "ycsb-e", "ycsb-f", "sparse-wide", "time-series-ttl", XSHARD]
+# counters: Pigeonhole's counter family against RocksDB's merge operator and SQLite's upsert.
+CONTENDED_JUDGED = ["ycsb-a", "ycsb-b", "ycsb-c", "ycsb-e", "ycsb-f", "sparse-wide", "time-series-ttl", XSHARD,
+                    "counters"]
 CONTENDED_AGAINST = ["rocksdb", "sqlite-eav"]
 
 
