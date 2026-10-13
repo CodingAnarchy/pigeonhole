@@ -342,14 +342,13 @@ impl Pigeonhole {
         self.db.engine.row_cache_stats()
     }
 
-    /// The engine's counters since open: commits, flushes, compactions, write stalls, WAL
-    /// unpin passes, inline WAL syncs, file growths, block-cache hits and misses, and
-    /// cross-shard commits' two-phase rounds and refusals
-    /// ([`CrossShardMetrics`](crate::CrossShardMetrics), ICR 0043). A bench hook (ICR 0015)
-    /// that shows what stalled during a run; take two readings and subtract for a phase.
-    #[doc(hidden)]
+    /// The writer's counters since this instance opened: commits and their latency,
+    /// flushes, compactions, write stalls, the block cache, the WAL, file growth, the shard
+    /// threads, and cross-shard commits' rounds and refusals (ICR 0044). Most are cumulative
+    /// from 0 at open, so take two readings and subtract for an interval; see
+    /// [`EngineMetrics`](crate::EngineMetrics) for each field. Cheap and non-blocking.
     pub fn engine_metrics(&self) -> crate::EngineMetrics {
-        self.db.engine.metrics()
+        self.db.engine.metrics().into()
     }
 
     /// Commit latency histograms per durability level since open, summed over shards: a

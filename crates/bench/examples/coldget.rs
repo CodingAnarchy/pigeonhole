@@ -232,12 +232,12 @@ fn get(dir: &Path) {
         ("present", key as fn(u64) -> Vec<u8>, 2),
         ("absent", absent, 3),
     ] {
-        let (_, misses_before) = db.engine_metrics().block_cache;
+        let misses_before = db.engine_metrics().block_cache_misses;
         let device_before = device_reads(dev.as_deref());
         let start = Instant::now();
         let (hist, found) = run(&t, threads, gets, rows, seed, row);
         let secs = start.elapsed().as_secs_f64();
-        let (_, misses_after) = db.engine_metrics().block_cache;
+        let misses_after = db.engine_metrics().block_cache_misses;
         let n = hist.count() as f64;
         let device = match (device_before, device_reads(dev.as_deref())) {
             (Some(b), Some(a)) => format!("{:.3}", (a - b) as f64 / n),

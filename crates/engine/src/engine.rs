@@ -168,9 +168,9 @@ pub struct Metrics {
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
-    /// Threads an engine-owned open started (shards and compaction threads), and how many
-    /// of them are pinned to a CPU of their own (D235). Both 0 for an application-owned or
-    /// closed engine.
+    /// How many of the threads an engine-owned open started are pinned to a CPU of their
+    /// own (D235), and how many it started (shards and compaction threads): `(pinned,
+    /// started)`. Both 0 for an application-owned or closed engine.
     pub pinned_threads: (u64, u64),
     /// Why no thread is pinned although `pin_threads` asked for it: the platform has no hard
     /// thread affinity (macOS), a CPU quota is narrower than the affinity set, too few free

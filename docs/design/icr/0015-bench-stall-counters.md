@@ -2,6 +2,8 @@
 
 **Status:** Approved (coordinator, 2026-10-09). Additive. (0014 is blob33's async read tier.)
 
+**Superseded in part by [ICR 0044](0044-public-engine-metrics.md):** `Pigeonhole::engine_metrics` is no longer a hidden bench hook. It returns `pigeonhole::EngineMetrics`, a documented, semver-covered struct of the public crate with named fields.
+
 ## Change
 
 1. **`pigeonhole-wal`:** `WalCounters` (`inline_grows`, `inline_rollover_syncs`; atomics) and `WalStream::counters() -> Arc<WalCounters>`. A metrics reader keeps the handle and reads it from any thread while the stream runs on its shard. `WalStream::inline_grows` and `inline_rollover_syncs` read the same counters, no longer the pool lock.

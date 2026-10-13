@@ -86,6 +86,7 @@
 mod cell;
 mod db;
 mod error;
+mod metrics;
 mod options;
 mod read;
 mod table;
@@ -128,17 +129,12 @@ pub mod nonblocking;
 pub use cell::{Cell, CellEntry, CellRef, Row, RowRef, Value};
 pub use db::{Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
+pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
 pub use options::{Compaction, Family, IoBackend, IoRings, Options, Priority, ReaderOptions, days};
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
 
-/// Cross-shard commit rounds and refusals, in [`EngineMetrics`] (ICR 0043).
-#[doc(hidden)]
-pub use pigeonhole_engine::CrossShardMetrics;
-/// The engine's counters, for [`Pigeonhole::engine_metrics`] (a bench hook, ICR 0015).
-#[doc(hidden)]
-pub use pigeonhole_engine::Metrics as EngineMetrics;
 pub use pigeonhole_engine::RowCacheStats;
 #[doc(hidden)]
 pub use pigeonhole_engine::ShardStats;

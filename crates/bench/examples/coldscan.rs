@@ -118,11 +118,13 @@ fn warm(dir: &Path) {
     let db = open(dir, cache);
     let t = db.table("t").unwrap().open().unwrap();
     pass(&t);
-    let (hits_before, misses_before) = db.engine_metrics().block_cache;
+    let m = db.engine_metrics();
+    let (hits_before, misses_before) = (m.block_cache_hits, m.block_cache_misses);
     let start = Instant::now();
     let (rows, bytes) = pass(&t);
     let secs = start.elapsed().as_secs_f64();
-    let (hits_after, misses_after) = db.engine_metrics().block_cache;
+    let m = db.engine_metrics();
+    let (hits_after, misses_after) = (m.block_cache_hits, m.block_cache_misses);
     println!(
         "{{\"mode\":\"warm\",\"rows\":{rows},\"bytes\":{bytes},\"secs\":{secs:.4},\
          \"mib_per_sec\":{:.1},\"gb_per_sec\":{:.3},\"cache_mib\":{},\"cache_hits\":{},\"cache_misses\":{},\
