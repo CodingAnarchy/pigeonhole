@@ -779,6 +779,11 @@ impl Shard {
     /// a failed compaction's retry, the tablet balancer's next pass) is not work that remains: with only that left it returns
     /// `false`, and [`next_wakeup`](Shard::next_wakeup) says when to call it again. The
     /// callback registered with [`set_wakeup`](Shard::set_wakeup) does not fire for it.
+    ///
+    /// A call that completed a future woken through [`waker`](Shard::waker) (a commit this
+    /// thread awaits) returns `true` before its background work, so the loop can poll that
+    /// future sooner; the background work runs on the next call, and at the latest every
+    /// ninth (D237).
     pub fn run_once(&mut self, budget: std::time::Duration) -> bool {
         let budget = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
         let deadline = self.vfs.monotonic_nanos().saturating_add(budget);

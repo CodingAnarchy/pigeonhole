@@ -3740,6 +3740,11 @@ impl EngineShard {
     /// Returns whether work remains. Work blocked on I/O in flight does not count: the
     /// wakeup fires when it completes.
     ///
+    /// A turn that resolved a commit (or another future) the application polls with this
+    /// shard's [`waker`](Self::waker) returns once its queued work is done, before the
+    /// background work, so the caller sees the result sooner; the background work runs on the
+    /// next call, and at the latest every ninth (D237).
+    ///
     /// The calling thread counts as this shard's driver from now on (until another thread
     /// runs it or it is dropped), so its blocking calls fail rather than deadlock (see
     /// [`Engine::open_application_owned`]). Until a thread first runs the shard, nobody

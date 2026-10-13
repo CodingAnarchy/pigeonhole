@@ -40,6 +40,12 @@ pub(crate) struct Signal {
     /// collects woken tasks: a wake that arrives during a turn (a commit the driver's own
     /// shard resolved) must still end the driver's next wait (#592).
     app_woken: AtomicBool,
+    /// An application wake not yet seen by a turn (D237): a future the driving thread awaits
+    /// was woken, so the turn skips its background slices and hands the thread back. Apart
+    /// from `app_woken`, which only `sleep_unless` clears: a turn that takes this one leaves
+    /// the next `wait`'s answer unchanged (#592). A hint: a missed or stale one costs at most
+    /// one turn's slices.
+    turn_woken: AtomicBool,
     target: Mutex<WakeTarget>,
     /// Times the consumer's engine-owned thread parked idle (ICR 0027).
     parks: AtomicU64,
@@ -64,6 +70,7 @@ impl Signal {
             sleeping: AtomicBool::new(false),
             task_woken: AtomicBool::new(false),
             app_woken: AtomicBool::new(false),
+            turn_woken: AtomicBool::new(false),
             target: Mutex::new(WakeTarget::None),
             parks: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
@@ -93,6 +100,7 @@ impl Signal {
     /// Records an application wake (`ShardDriver::waker`), then notifies: the consumer's next
     /// [`Signal::sleep_unless`] returns at once if it is not asleep already (#592).
     pub(crate) fn notify_app(&self) {
+        self.turn_woken.store(true, Ordering::Relaxed);
         self.app_woken.store(true, Ordering::Release);
         self.notify();
     }
@@ -130,6 +138,11 @@ impl Signal {
         // The wake that ended the sleep is spent: the caller looks at everything next.
         self.take_app_woken();
         true
+    }
+
+    /// Whether an application wake arrived since a turn last asked (clears it; D237).
+    pub(crate) fn take_turn_woken(&self) -> bool {
+        self.turn_woken.load(Ordering::Relaxed) && self.turn_woken.swap(false, Ordering::Relaxed)
     }
 
     /// Whether an application wake arrived since the last call (clears it).

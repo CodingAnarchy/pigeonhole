@@ -77,6 +77,11 @@ use signal::{Signal, WakeTarget};
 /// Most messages handled before `end_batch` runs, so a flooded queue still commits groups.
 const MAX_BATCH: usize = 1024;
 
+/// The most turns in a row that skip their background slices because a future of the
+/// driving thread was woken (D237): the next turn runs them, so flush and compaction keep
+/// at least one turn in `MAX_TURN_YIELDS + 1`.
+const MAX_TURN_YIELDS: u32 = 8;
+
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -403,6 +408,10 @@ struct ShardCore<H: ShardHandler> {
     released: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
+    /// Turns in a row that ended before their background slices because a future of the
+    /// driving thread was woken (D237; application-owned mode only, at most
+    /// [`MAX_TURN_YIELDS`]).
+    yields: u32,
 }
 
 /// An engine-owned shard's poll of its queue before it parks (D198).
@@ -618,18 +627,37 @@ impl<H: ShardHandler> ShardCore<H> {
             self.spawner.local.wake_sleepers();
         }
         self.spawner.local.wake_due(start);
-        while self.spawner.local.has_runnable() {
-            let now = self.vfs.monotonic_nanos();
-            if now >= deadline {
-                break;
+        if self.spawner.local.has_runnable() {
+            // D237: the drain woke a future the driving thread awaits (a commit it submitted
+            // settled): hand the thread back before the background slices, so it sees that
+            // now rather than at the deadline. The slices run next turn, and after
+            // `MAX_TURN_YIELDS` such turns in a row one runs them anyway. Only a
+            // `ShardDriver::waker` wakes this, so engine-owned threads never skip. Checked
+            // only when there are slices to skip: a turn without background work pays
+            // nothing (the D193 commit ceilings), and a wake left for a later turn costs
+            // that turn's slices at most.
+            if self.signal().take_turn_woken() && self.yields < MAX_TURN_YIELDS {
+                self.yields += 1;
+                return true;
             }
-            self.spawner
-                .local
-                .run_one(now.saturating_add(self.time_slice).min(deadline));
-            // Foreground first: whatever queued during the slice runs before the next one.
-            self.drain();
-            self.spawner.local.collect_woken();
-            self.spawner.local.wake_due(self.vfs.monotonic_nanos());
+            self.yields = 0;
+            loop {
+                let now = self.vfs.monotonic_nanos();
+                if now >= deadline {
+                    break;
+                }
+                self.spawner
+                    .local
+                    .run_one(now.saturating_add(self.time_slice).min(deadline));
+                // Foreground first: whatever queued during the slice runs before the next
+                // one.
+                self.drain();
+                self.spawner.local.collect_woken();
+                self.spawner.local.wake_due(self.vfs.monotonic_nanos());
+                if !self.spawner.local.has_runnable() {
+                    break;
+                }
+            }
         }
         if self.spawner.local.has_runnable() {
             return true;
@@ -809,6 +837,7 @@ fn build<H: ShardHandler>(
             vfs: Arc::clone(&config.vfs),
             time_slice: config.slice_nanos(),
             idle_at: None,
+            yields: 0,
             attached: 0,
             #[cfg(debug_assertions)]
             left_io: false,
@@ -1193,6 +1222,13 @@ impl<H: ShardHandler> ShardDriver<H> {
     ///
     /// Between task slices (each at most `time_slice` long) it drains the queue again, so
     /// foreground messages never wait behind more than one slice.
+    ///
+    /// When a [`waker`](Self::waker) wake arrived since the last turn (typically a message
+    /// this turn handled settled a future the calling thread awaits), it returns `true` right
+    /// after the drain, before the background tasks, so the caller can poll that future now
+    /// rather than at the deadline (D237). The tasks run on the next call; after eight such
+    /// turns in a row, a turn runs them anyway. The wake still ends the next
+    /// [`wait`](Self::wait) at once.
     ///
     /// Tasks sleeping until a deadline ([`TaskPoll::SleepUntil`]) are not work that remains:
     /// with only those left it returns `false`, and the application should call it again
