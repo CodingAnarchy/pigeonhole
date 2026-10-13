@@ -889,9 +889,10 @@ impl Engine {
             .store(omit, Ordering::Release);
     }
 
-    /// Fails the next single-shard batch after its WAL append: it is not applied, the shard
-    /// poisons itself and the commit returns `Busy`, as an arena miscount would (#230).
-    /// Test hook.
+    /// Fails the next apply after its WAL append, of a single-shard batch or of a
+    /// cross-shard share: it is not applied, and the shard poisons itself, as an arena
+    /// miscount would (#230). A single-shard commit returns `Busy`; a cross-shard commit
+    /// decided to commit returns `OutcomeUnknown` (D227). Test hook.
     #[doc(hidden)]
     pub fn fail_next_apply(&self) {
         self.inner

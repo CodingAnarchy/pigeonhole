@@ -965,6 +965,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - **Decided commits keep their reply.** One already decided resolves as usual when every participant applied it.
 - **Late decisions apply nothing.** A decision reaching a participant after its close gave up is answered as *not applied*. The same holds for a participant whose apply failed.
 - **No half-visible commit.** A commit decision with any share not applied keeps its seqno held at the coordinator, never published. No reader in this process sees one share without the others.
+- **A failed share apply counts as a shard's death.** Outside a close, a held-for-good seqno would stall every later commit's visibility wait and the close's deferred freezes. So the coordinator calls `shard_died()`: waiters get `OutcomeUnknown`, the close gives up flushing and is unclean, and the next open decides the commit. A poisoned shard already means the database needs reopening.
 - **Outcome unknown (ICR 0038, owner decision 2026-10-12).** `Closed` always means *not committed*. Where the outcome is the WAL's, decided at the next open, a commit fails with the new `Error::OutcomeUnknown` (`ErrorCode::OutcomeUnknown` = 28):
   - a cross-shard commit whose coordinator died, or one decided to commit that a participant did not apply or never answered;
   - a commit in a group whose sync had not resolved when its shard stopped;
@@ -985,6 +986,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
   - **Dead participant:** the decided commit ends `OutcomeUnknown`.
   - **Late decision at a participant that reported:** never applied (a debug assertion), never half visible to a read, `OutcomeUnknown`, present after reopen.
   - **Late `Prepared` at a coordinator whose close gave up:** aborted, `Closed`, absent after reopen.
+  - **A failed share apply:** `OutcomeUnknown` for the commit and for a later commit on a healthy shard (a watchdog catches the stall), nothing visible, and an unclean close.
 - The checker now applies acknowledged commits to its model in seqno order. A commit is acknowledged at its own durability, so a later seqno's shard may acknowledge first.
 
 <a id="d229"></a>

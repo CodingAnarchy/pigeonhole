@@ -629,6 +629,61 @@ fn a_prepare_answer_after_the_coordinators_close_gave_up_aborts() {
     }
 }
 
+/// A participant's apply of a cross-shard share fails (its shard poisons itself, as an arena
+/// miscount would). The commit was decided to commit, so its seqno stays held: nothing of
+/// it is ever visible half applied, and its caller gets `OutcomeUnknown`. Held for good it
+/// would stall every later commit's visibility wait, so visibility ends as on a shard's
+/// death: a later commit on a healthy shard returns (`OutcomeUnknown`) instead of hanging,
+/// and the close is unclean (the next open decides the commit from the WAL).
+#[test]
+fn a_failed_share_apply_ends_visibility_instead_of_stalling_it() {
+    let (vfs, _gate) = gate::vfs(1362);
+    let (db, shards) = Engine::open_application_owned(Path::new(DB), options(vfs, 2)).unwrap();
+    let drivers: Vec<_> = shards.into_iter().map(driver).collect();
+    let (on_a, on_b) = tables_on_0_and_1(&db);
+    db.fail_next_apply();
+    let (db2, a2, b2) = (Arc::clone(&db), Arc::clone(&on_a), Arc::clone(&on_b));
+    let crossed = gate::within(10, move || {
+        db2.commit(cross(&b2, &a2, "fails"), Some(Durability::Sync))
+    })
+    .expect("the cross-shard commit hung");
+    assert!(matches!(crossed, Err(Error::OutcomeUnknown)), "{crossed:?}");
+    // Later commits end at once on both shards: the healthy one's with `OutcomeUnknown`
+    // (acknowledged, never visible here), the poisoned one's with its failure.
+    let mut unknown = 0;
+    for t in [&on_a, &on_b] {
+        let (db2, t2) = (Arc::clone(&db), Arc::clone(t));
+        let later = gate::within(10, move || {
+            db2.commit(put(&t2, "later"), Some(Durability::Sync))
+        })
+        .expect("a later commit hung behind the held seqno");
+        assert!(later.is_err(), "{later:?}");
+        unknown += usize::from(matches!(later, Err(Error::OutcomeUnknown)));
+    }
+    assert_eq!(
+        unknown, 1,
+        "the healthy shard's commit is acknowledged, never visible"
+    );
+    // Nothing of the cross-shard commit is visible.
+    for t in [&on_a, &on_b] {
+        assert!(
+            db.get_latest(t.id, t.families[0].id, b"fails", b"q")
+                .unwrap()
+                .is_none(),
+            "part of the cross-shard commit is visible"
+        );
+    }
+    let closed = gate::within(10, {
+        let db = Arc::clone(&db);
+        move || db.close()
+    })
+    .expect("the close hung on the held seqno");
+    assert!(closed.is_err(), "the close after a failed apply is unclean");
+    for (_, h) in drivers {
+        let _ = h.join().unwrap();
+    }
+}
+
 // ---- 3-4 3.1: the application-owned close ----
 
 /// The documented loop, with the close's root commits in flight across `run_once` calls:

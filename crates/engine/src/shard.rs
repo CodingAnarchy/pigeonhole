@@ -5791,7 +5791,20 @@ impl ShardState {
             self.release_room(share.reserved);
             if commit {
                 self.refresh_tablets();
-                match self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts) {
+                #[cfg(feature = "test-hooks")]
+                let applied = if self
+                    .shared
+                    .hooks
+                    .fail_next_apply
+                    .swap(false, Ordering::AcqRel)
+                {
+                    Err(Error::Busy)
+                } else {
+                    self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts)
+                };
+                #[cfg(not(feature = "test-hooks"))]
+                let applied = self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts);
+                match applied {
                     Ok(()) => {
                         let slots = self.touched_slots.clone();
                         for key in &slots {
@@ -5888,12 +5901,17 @@ impl ShardState {
         }
         let mut c = self.coord.remove(&seqno).expect("present");
         if c.not_applied {
-            // Decided to commit, but a share was not applied here (its shard's close gave up,
-            // or its apply failed): the seqno stays held, so no reader sees the commit half
-            // applied in this process, and the next open decides it from the WAL.
+            // Decided to commit, but a share was not applied (its shard's close gave up, or
+            // its apply failed): the seqno stays held, so no reader sees the commit half
+            // applied in this process, and the next open decides it from the WAL. Held for
+            // good, it would stall every later commit's visibility wait and the close's
+            // deferred freezes: treat it as a shard's death (visibility ends, waiters get
+            // `OutcomeUnknown`, the close gives up flushing and is unclean). A poisoned shard
+            // already means the database needs reopening.
             if let Some(reply) = c.reply.take() {
                 reply.notify(Err(Error::OutcomeUnknown));
             }
+            self.shared.shard_died();
             self.try_finish_close(ctx);
             return;
         }
@@ -7147,7 +7165,9 @@ impl ShardState {
     /// sync never resolved here, and a cross-shard commit decided to commit but not
     /// answered by every participant, may be in the WAL: `OutcomeUnknown`. A coordinated
     /// commit not decided to commit was not: `Closed`. Members not yet written are dropped
-    /// (their replies read as `Closed`, rightly).
+    /// (their replies read as `Closed`, rightly). Runs in `report_panicked` while the thread
+    /// unwinds, so it only notifies (a slot store and a wake), which must stay panic-free: a
+    /// panic here would abort the process.
     fn answer_unsettled(&mut self) {
         for group in &mut self.unresolved {
             for m in &mut group.members {

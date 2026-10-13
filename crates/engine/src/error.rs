@@ -110,8 +110,9 @@ pub enum Error {
     /// it from the WAL: reopen and read to see whether it landed. Cases: a cross-shard
     /// commit whose coordinator died, or one decided to commit that a participant did not
     /// apply or never answered; a commit in a group whose sync had not resolved when its
-    /// shard died; a commit acknowledged by its shard whose wait for visibility ended
-    /// (decision D227, ICR 0038).
+    /// shard died; a commit acknowledged by its shard whose wait for visibility ended (a
+    /// `GroupSync` or `Sync` one is then durable: a reopen shows it) (decision D227,
+    /// ICR 0038).
     OutcomeUnknown,
 }
 
