@@ -116,6 +116,9 @@
 # shape decodes more of them per seek (scratch A/B 38334877222: block decoding only). The
 # trade: a point or row read whose row ends a block no longer reads the next one (coldget
 # 1.059 -> 0.992 reads per present get). No other shape rose.
+# #626 (D236): a blocking commit waits on the engine's borrowed state and its request is
+# built in the submit that sends it, so commit-one, commit-overwrite and commit-at lowered
+# (callgrind 9600 -> 9556, 11647 -> 11601, 10596 -> 10558); commit-async is +2 (9689).
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -130,14 +133,14 @@ counter 9388 0.5
 rows 19655 0.3
 level-scans 14015 0.6
 short-scans 13564 0.3
-commit-one 9610 0.3
+commit-one 9585 0.3
 commit-sixteen 50044 0.3
 flush 2199 0.3
 compact 2692 0.5
 ycsb-c 43293 1.0
 ycsb-a 27239 1.0
-commit-overwrite 11686 0.5
-commit-at 10616 0.3
+commit-overwrite 11660 0.5
+commit-at 10590 0.3
 scan-narrow 1398 0.3
 scan-small 1374 0.3
 scan-wide 1296 0.3
