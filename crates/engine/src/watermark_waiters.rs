@@ -207,9 +207,20 @@ impl<W> WatermarkWaiters<W> {
     /// `visible` reads, forgotten, and runs it outside the locks. Returns whether the pass
     /// took a lock. With nobody registered it is one fence and one load of `listed` (plus
     /// one per further 64 parts), and it visits only the parts that list someone.
-    pub(crate) fn wake_ready(&self, visible: impl Fn() -> Seqno, mut wake: impl FnMut(W)) -> bool {
+    pub(crate) fn wake_ready(&self, visible: impl Fn() -> Seqno, wake: impl FnMut(W)) -> bool {
         // Pairs with the fence in `register`.
         fence(Ordering::SeqCst);
+        self.wake_ready_fenced(visible, wake)
+    }
+
+    /// [`WatermarkWaiters::wake_ready`] for a caller that has already issued the SeqCst
+    /// fence after its watermark publish: one fence then serves every registry it wakes.
+    #[inline]
+    pub(crate) fn wake_ready_fenced(
+        &self,
+        visible: impl Fn() -> Seqno,
+        mut wake: impl FnMut(W),
+    ) -> bool {
         let first = self.listed.0.load(Ordering::SeqCst);
         if first == 0 && self.more.is_empty() {
             return false;

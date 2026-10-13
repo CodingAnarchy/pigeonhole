@@ -467,7 +467,9 @@ impl Shared {
     /// Wakes, outside the lock, every watermark waiter whose seqno is visible now. Called by
     /// shards after a watermark publish (one fence and one load when nobody waits).
     pub(crate) fn wake_visible(&self) {
-        let passed = self.waiters.wake_ready(
+        // One fence for both registries: it pairs with the fence in each one's `register`.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let passed = self.waiters.wake_ready_fenced(
             || self.shm.visible_seqno(),
             |w| {
                 if matches!(w, Wake::Task(_)) {
@@ -481,7 +483,7 @@ impl Shared {
         }
         // Deferred freezes wait for the durable seqno (D227).
         self.durable_waiters
-            .wake_ready(|| self.shm.durable_seqno(), |w| self.wake(w));
+            .wake_ready_fenced(|| self.shm.durable_seqno(), |w| self.wake(w));
     }
 
     /// Publishes a new view built by `f` from the current one, in shared memory too. The
