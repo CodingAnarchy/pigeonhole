@@ -1387,3 +1387,20 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 - D247's `contended` step runs it again at 16 threads under the default durability.
 
 **Why:** the gate had no multi-row or cross-shard commit under contention (perf287's #406 audit, finding 1), so a 36× slowdown in the default config got through: on the AX102 (perf2, main a9ecfc77), 16 shards and 32 clients at 50% cross-shard commits ran 401K ops/s with tablet changes off and 11K with them on. Locally (M5, `--scale small`, busy laptop) the new workload shows the same: 3.0K and 5.9K ops/s with tablet changes on against 219K and 204K off and 192K for RocksDB, with about 5 wasted rounds per cross-shard commit on and none off.
+
+## D247 — The gate's `contended` step measures every public operation under contention on the default options, judged at two durabilities (owner decision, 2026-10-13; bench, #406)
+
+**Decided:**
+- **The rule (owner):** every public API operation is measured under contention (at least 4 concurrent clients on a multi-shard engine) with default settings at least once. perf287's #406 audit maps each operation to its gate coverage.
+- **The step.** `contended` runs at 16 client threads, the default options (one shard per physical core, tablet changes and packing on, pinned threads, the row cache, the default I/O backend), each run measuring at least 60 s from a count every store finishes sooner (`--ops 100000 --min-secs 60`), against RocksDB and SQLite.
+- **Two durabilities, both judged, shown side by side (owner):**
+  - D108 parity, `--durability buffered`: Pigeonhole `Buffered`, RocksDB's WAL unsynced, SQLite `synchronous=NORMAL`;
+  - the default, `--durability default`: Pigeonhole at `Options::default()`'s `GroupSync`, RocksDB and SQLite fsyncing every write.
+  - At the default level every store loads at buffered durability (D108's level), the settle step flushes, and only the warmup and the measured phase run at the judged durability (owner, option (a)): a single-client durable load of 1M rows would otherwise be most of each run and about 15 minutes of the window.
+- **Judged within 1.5× of RocksDB and of SQLite**, throughput and p99, at both levels: ycsb-a, ycsb-b, ycsb-c, ycsb-e, sparse-wide, time-series-ttl, and cross-shard-contention (D246). D246's own checks also apply at both levels: tablets on ≥ 0.8× off, ≤ 0.1 wasted two-phase rounds per cross-shard commit, no `Busy`.
+  - Still to join the judged set: commit_if (ycsb-f's read-modify-write as `commit_if`) and counters (RocksDB's merge operator).
+- **Reported, not judged:** transactions (transfer), async commits and reads, filtered scans, large values, deletes, snapshot and durable-snapshot readers and reader processes riding on ycsb-a, application-owned mode on the defaults, and close, backup and compact under load. A reported row more than 3× worse than its nearest judged row gets an issue.
+- The step lands in parts: the judged rows first (this entry's PRs), then commit_if, counters and the reported rows.
+- **The window.** The step is about 70 minutes on the AX102 (44 runs: 3 stores × 7 workloads × 2 levels, plus the tablets-off cross-shard run at each level, each about 90 s with its load, settle and warmup). With D246's runs in `all`, the whole window is about 3 hours (the 2026-10-13b window's steps took 109 minutes).
+
+**Why:** the gate measured almost nothing contended, nothing at the shipped durability, and no cross-shard commit (perf287's audit, findings 1–3), which let #637's 36× slowdown through. Judging both levels keeps the long-standing like-for-like comparison (D108) and adds the one users get by default.
