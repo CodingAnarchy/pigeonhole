@@ -586,8 +586,8 @@ pub struct Scaling {
     /// checked by [`compare`] against a baseline).
     pub single_shard_p99_ns: u64,
     /// The largest share of the N-shard run's commits on one shard (0 when the run did not
-    /// report shares). Above [`Scaling::max_share_allowed`] the table was not spread and
-    /// the run fails as skewed whatever its efficiency (D204, D223).
+    /// report shares). Reported only: the gate's run is pre-split at the writes' quantiles,
+    /// and placement is judged on its own by [`Placement`] (D231).
     #[serde(default)]
     pub max_share: f64,
     /// The N-shard run's async commits that waited on the global visibility watermark, per
@@ -600,11 +600,6 @@ pub struct Scaling {
 impl Scaling {
     /// Minimum efficiency for the scaling gate (spec, Goals).
     pub const GATE: f64 = 0.8;
-
-    /// The busiest shard's share may be at most this times an even share (D223). At equal
-    /// per-shard rates, efficiency is at most `1 / (shards * max_share)`, so 1.25 is the
-    /// loosest bound that still lets the run reach [`GATE`](Self::GATE).
-    pub const MAX_SHARE: f64 = 1.25;
 
     /// Builds the gate result from a one-shard and an N-shard record.
     pub fn new(shards: usize, single: &RunRecord, multi: &RunRecord) -> Self {
@@ -634,21 +629,79 @@ impl Scaling {
         }
     }
 
-    /// The largest share of commits one shard may take for the run to count:
-    /// [`MAX_SHARE`](Self::MAX_SHARE) times an even share, or everything with one shard (D223).
+    /// Whether the scaling target is met: efficiency at the gate (D231: the placement is
+    /// fixed by the pre-split, so efficiency alone is judged).
+    pub fn passes(&self) -> bool {
+        self.efficiency >= Self::GATE
+    }
+}
+
+/// The balancer placement check (D231): an open-loop write load at a fixed offered rate over
+/// N engine-owned shards, its table spread by the balancer. Once settled, the busiest shard
+/// may take at most 1.25/N of the writes, it must settle within a bound, and nothing may
+/// split, merge or move while measuring.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Placement {
+    /// Shards.
+    pub shards: usize,
+    /// Writes offered per second (the drivers' schedule, kept whatever the store does).
+    pub offered_rate: f64,
+    /// Writes completed per second over the measured window.
+    pub achieved_rate: f64,
+    /// Seconds from the first write until the table had spread and nothing had split,
+    /// merged or moved for [`Placement::QUIET_SECS`]; `None` when that never happened
+    /// within [`settle_bound_secs`](Self::settle_bound_secs).
+    pub settle_secs: Option<f64>,
+    /// The settle-time bound, in seconds.
+    pub settle_bound_secs: f64,
+    /// Seconds measured after settling (or after the bound).
+    pub window_secs: f64,
+    /// Splits, merges and moves while measuring.
+    pub changes_measured: u64,
+    /// The largest share of the window's writes on one shard.
+    pub max_share: f64,
+    /// Every shard's share of the window's writes.
+    #[serde(default)]
+    pub shares: Vec<f64>,
+}
+
+impl Placement {
+    /// The busiest shard's share may be at most this times an even share (D223, D231). At
+    /// equal per-shard rates, scaling efficiency is at most `1 / (shards * max_share)`, so
+    /// 1.25 is the loosest bound that still allows 0.8.
+    pub const MAX_SHARE: f64 = 1.25;
+
+    /// Seconds without a split, merge or move that count as settled: longer than the
+    /// balancer's longest dwell (the slow skew path's 10 s, D224).
+    pub const QUIET_SECS: f64 = 12.0;
+
+    /// The window must complete at least this fraction of the offered rate, or the store
+    /// could not keep up and the load was not open-loop.
+    pub const SUSTAINED: f64 = 0.95;
+
+    /// The largest share one shard may take: [`MAX_SHARE`](Self::MAX_SHARE) times an even
+    /// share, or everything with one shard.
+    ///
+    /// ```
+    /// let p = pigeonhole_bench::Placement { shards: 8, ..Default::default() };
+    /// assert!((p.max_share_allowed() - 0.15625).abs() < 1e-12);
+    /// ```
     pub fn max_share_allowed(&self) -> f64 {
         (Self::MAX_SHARE / self.shards.max(1) as f64).min(1.0)
     }
 
-    /// Whether the N-shard run's commits were spread (no shard over
-    /// [`max_share_allowed`](Self::max_share_allowed)).
-    pub fn spread(&self) -> bool {
-        self.max_share <= self.max_share_allowed()
+    /// Whether the store kept up with the offered rate over the window.
+    pub fn sustained(&self) -> bool {
+        self.achieved_rate >= Self::SUSTAINED * self.offered_rate
     }
 
-    /// Whether the scaling target is met: efficiency at the gate, on a spread table.
+    /// Whether the check passes: settled within the bound, no tablet change while measuring,
+    /// the busiest share within bound, and the offered rate sustained.
     pub fn passes(&self) -> bool {
-        self.efficiency >= Self::GATE && self.spread()
+        self.settle_secs.is_some()
+            && self.changes_measured == 0
+            && self.max_share <= self.max_share_allowed()
+            && self.sustained()
     }
 }
 
@@ -803,6 +856,9 @@ pub struct Suite {
     /// The durable group-commit target (D213), when `group-commit` ran on Pigeonhole.
     #[serde(default)]
     pub group_commit: Option<GroupCommit>,
+    /// The balancer placement check (D231), when `placement` ran.
+    #[serde(default)]
+    pub placement: Option<Placement>,
 }
 
 fn us(ns: u64) -> String {
@@ -840,6 +896,7 @@ impl Suite {
             scaling: None,
             scaling_sync: None,
             group_commit: None,
+            placement: None,
         }
     }
 
@@ -1025,20 +1082,42 @@ impl Suite {
             let _ = writeln!(
                 s,
                 "\n**Scaling gate:** {} shards reach {} ops/s against {} ops/s on one shard: \
-                 efficiency {:.2} (gate ≥ {:.1}); the busiest shard took {:.0}% of the commits \
-                 (at most {:.0}%); {:.3} visibility waits per operation — {}.",
+                 efficiency {:.2} (gate ≥ {:.1}); the table pre-split at the writes' quantiles, the \
+                 busiest shard took {:.0}% of the commits; {:.3} visibility waits per operation — {}.",
                 sc.shards,
                 ops(sc.multi_shard_throughput),
                 ops(sc.single_shard_throughput),
                 sc.efficiency,
                 Scaling::GATE,
                 100.0 * sc.max_share,
-                100.0 * sc.max_share_allowed(),
                 sc.visibility_waits_per_op,
-                if !sc.spread() {
-                    "fail: skewed, the table was not spread"
-                } else if sc.passes() {
+                if sc.passes() { "pass" } else { "fail" }
+            );
+        }
+        if let Some(p) = &self.placement {
+            let _ = writeln!(
+                s,
+                "\n**Balancer placement (D231):** {} shards, open-loop at {} writes/s offered ({} \
+                 completed); {}; the busiest shard took {:.1}% of {:.0} s of writes (at most \
+                 {:.1}%); {} tablet changes while measuring — {}.",
+                p.shards,
+                ops(p.offered_rate),
+                ops(p.achieved_rate),
+                match p.settle_secs {
+                    Some(t) => format!(
+                        "settled after {t:.0} s (bound {:.0} s)",
+                        p.settle_bound_secs
+                    ),
+                    None => format!("did not settle within {:.0} s", p.settle_bound_secs),
+                },
+                100.0 * p.max_share,
+                p.window_secs,
+                100.0 * p.max_share_allowed(),
+                p.changes_measured,
+                if p.passes() {
                     "pass"
+                } else if !p.sustained() {
+                    "fail: the store did not keep up with the offered rate"
                 } else {
                     "fail"
                 }
@@ -1409,23 +1488,50 @@ mod tests {
     }
 
     #[test]
-    fn scaling_is_spread_only_within_a_quarter_over_an_even_share() {
-        // D223: at 8 shards an even share is 12.5%, so the busiest shard may take 15.6%.
+    fn scaling_is_judged_on_efficiency_and_placement_on_its_own() {
+        // D231: engine scaling passes on efficiency alone (its busiest share is reported).
         let mut a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
         let mut sc = Scaling::new(
             8,
             &rec("skewed-multi-shard", 1e5, 1000, 5000),
             &rec("skewed-multi-shard", 7e5, 1000, 5000),
         );
-        assert!((sc.max_share_allowed() - 0.15625).abs() < 1e-12);
-        sc.max_share = 0.15;
-        assert!(sc.passes());
-        // 18.9% (perf287's 8-shard run) passed the old 2/N bound but caps efficiency at 0.66.
         sc.max_share = 0.189;
-        assert!(!sc.spread() && !sc.passes());
+        assert!(sc.passes(), "efficiency {}", sc.efficiency);
         a.scaling = Some(sc);
-        assert!(a.to_markdown().contains("(at most 16%)"));
-        assert!(a.to_markdown().contains("fail: skewed"));
+        // The placement check: at 8 shards the busiest may take 15.6%, after settling, with
+        // no change while measuring, at the offered rate.
+        let mut p = Placement {
+            shards: 8,
+            offered_rate: 400_000.0,
+            achieved_rate: 399_000.0,
+            settle_secs: Some(20.0),
+            settle_bound_secs: 60.0,
+            window_secs: 10.0,
+            changes_measured: 0,
+            max_share: 0.15,
+            shares: Vec::new(),
+        };
+        assert!(p.passes());
+        a.placement = Some(p.clone());
+        assert!(a.to_markdown().contains("(at most 15.6%)"));
+        assert!(a.to_markdown().contains("— pass."));
+        // 18.9% (perf287's 8-shard run) passed the old 2/N bound but caps efficiency at 0.66.
+        p.max_share = 0.189;
+        assert!(!p.passes());
+        p.max_share = 0.15;
+        p.changes_measured = 1;
+        assert!(!p.passes(), "a change while measuring fails it");
+        p.changes_measured = 0;
+        p.settle_secs = None;
+        assert!(!p.passes(), "never settling fails it");
+        p.settle_secs = Some(20.0);
+        p.achieved_rate = 300_000.0;
+        assert!(!p.sustained() && !p.passes());
+        a.placement = Some(p);
+        assert!(a.to_markdown().contains("did not keep up"));
+        let back = Suite::from_json(&a.to_json()).unwrap();
+        assert_eq!(back, a);
     }
 
     #[test]

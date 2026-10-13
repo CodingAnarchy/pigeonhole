@@ -228,7 +228,8 @@ if ol:
 else:
     rows.append(("Open to first read: < 5 ms", "", verdict(None), "open-latency.jsonl"))
 
-# Scaling (D204): efficiency >= 0.8, busiest shard <= 1.25/N (D223), at every N > 1.
+# Engine scaling (D204, D231): efficiency >= 0.8 at every N > 1, the table pre-split at the
+# writes' quantiles with the balancer off (its busiest share is reported, not judged).
 scal = []
 for n in (4, 8, 16):
     d = load(f"scaling-{n}.json")
@@ -246,12 +247,35 @@ for n in (4, 8, 16):
                    f"{st.get('flushes', 0)} flushes, {st.get('compactions', 0)} compactions, "
                    f"max {multi['max_ns'] / 1e6:.1f} ms")
         scal.append((n, s["efficiency"], s["max_share"], brk,
-                     s["efficiency"] >= 0.8 and s["max_share"] <= 1.25 / n))
+                     s["efficiency"] >= 0.8))
 if scal:
     detail = "; ".join(f"N={n}: {e:.2f} (busiest {m:.0%}{b})" for n, e, m, b, _ in scal)
     rows.append(("Thread-per-core scaling: ≥ 0.8 × N", detail, verdict(all(ok for *_, ok in scal)), "scaling-N.json"))
 else:
     rows.append(("Thread-per-core scaling: ≥ 0.8 × N", "", verdict(None), "scaling-N.json"))
+
+# Balancer placement (D231): open-loop writes at a fixed rate; settled within the bound, the
+# busiest shard <= 1.25/N once settled, no tablet change while measuring, the rate sustained.
+plc = []
+for n in (4, 8, 16):
+    d = load(f"placement-{n}.json")
+    if d and d.get("placement"):
+        p = d["placement"]
+        settled = p.get("settle_secs")
+        ok = (settled is not None and p["changes_measured"] == 0
+              and p["max_share"] <= 1.25 / n and p["achieved_rate"] >= 0.95 * p["offered_rate"])
+        plc.append((n, p, ok))
+if plc:
+    detail = "; ".join(
+        f"N={n}: busiest {p['max_share']:.1%} (max {1.25 / n:.1%}), "
+        + (f"settled {p['settle_secs']:.0f} s" if p.get("settle_secs") is not None
+           else f"not settled in {p['settle_bound_secs']:.0f} s")
+        + f", {p['changes_measured']} changes, {p['achieved_rate'] / 1e3:.0f}K of {p['offered_rate'] / 1e3:.0f}K writes/s"
+        for n, p, _ in plc)
+    rows.append(("Balancer placement: busiest ≤ 1.25/N once settled (D231)", detail,
+                 verdict(all(ok for *_, ok in plc)), "placement-N.json"))
+else:
+    rows.append(("Balancer placement: busiest ≤ 1.25/N once settled (D231)", "", verdict(None), "placement-N.json"))
 
 # Within 1.5x of RocksDB on every workload: throughput and p99, both runs.
 gap_rows, gap_ok = [], None

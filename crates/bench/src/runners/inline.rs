@@ -73,6 +73,27 @@ fn split_keys(load: &[Write], pieces: usize) -> Vec<Vec<u8>> {
     keys
 }
 
+/// Keys that cut the measured writes into `pieces` runs of about equal size (D231): each row
+/// counts once per write, so the cuts follow the writes, not the rows. Where a hot row covers
+/// a cut, the next key is the next row past it, so it keeps a piece of its own.
+fn split_keys_by_writes(writes: &[Write], pieces: usize) -> Vec<Vec<u8>> {
+    let mut rows: Vec<&[u8]> = writes.iter().map(|w| w.row.as_slice()).collect();
+    rows.sort_unstable();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for i in 1..pieces {
+        let mut at = i * rows.len() / pieces;
+        // Strictly increasing: past the previous key (a hot row spanning several cuts).
+        while at < rows.len() && keys.last().is_some_and(|k| rows[at] <= k.as_slice()) {
+            at += 1;
+        }
+        if at >= rows.len() || rows[at].is_empty() {
+            break;
+        }
+        keys.push(rows[at].to_vec());
+    }
+    keys
+}
+
 /// Fails unless every shard owns exactly one tablet (D213: the pre-split's placement, which
 /// the measured phase must run on unchanged).
 fn one_tablet_each(db: &Pigeonhole, when: &str) -> Result<(), String> {
@@ -380,11 +401,17 @@ impl PigeonholeRunner {
                 .map_err(err)?;
         let n = shards.len();
         let load_ops = writes(workload.load_ops())?;
+        // The measured writes are the same sequence whenever they are generated, so the
+        // pre-split can cut at their quantiles before the load (D231).
+        let run = writes(workload.run_ops())?;
         let load_start = Instant::now();
         let presplit = self.settings.presplit;
+        let by_writes = self.settings.presplit_writes;
         let (shards, setup) = with_drivers(shards, || -> Result<Table, String> {
             let t = create_table(&db)?;
-            let keys = if presplit && n > 1 {
+            let keys = if presplit && n > 1 && by_writes {
+                split_keys_by_writes(&run, n)
+            } else if presplit && n > 1 {
                 split_keys(&load_ops, n)
             } else {
                 Vec::new()
@@ -413,7 +440,6 @@ impl PigeonholeRunner {
         });
         let t = setup?;
         let load = load_start.elapsed();
-        let run = writes(workload.run_ops())?;
         let (warm, measured) = run.split_at((warmup as usize).min(run.len()));
         // Warm up until the balancer has spread the table and settled: every shard owns a
         // tablet and nothing split, merged or moved for `SETTLED` (a fixed warmup can end

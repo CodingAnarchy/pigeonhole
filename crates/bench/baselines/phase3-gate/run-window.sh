@@ -34,7 +34,10 @@
 #                  pread, and 4 and 8 commits in flight (D226), reported              57
 #   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
 #   row-cache      ycsb-c and ycsb-a with the row cache off (D216: on by default)      30
-#   scaling        scaling gate (D204) at 1, 4, 8, 16 shards, 8 s or more each (D219)  45
+#   scaling        engine scaling (D204, D231: pre-split, balancer off) at 1, 4, 8, 16
+#                  shards, 8 s or more each (D219)                                    45
+#   placement      balancer placement (D231): open-loop writes at 4, 8, 16 shards;
+#                  settle time, busiest share once settled, churn while measuring     8
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   wal-pin        wal_pin_bytes 2x vs 4x the budget: write path, open after a crash
 #                  (#527; phase3-io/wal-pin.sh)                                        10
@@ -81,9 +84,9 @@ data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
 
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
-    row-cache scaling open-latency wal-pin cold-get cold-scan scan-cache report)
+    row-cache scaling placement open-latency wal-pin cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [open-latency]=5 [wal-pin]=10 [cold-get]=45
+    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [open-latency]=5 [wal-pin]=10 [cold-get]=45
     [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
@@ -266,9 +269,11 @@ ycsb_c_memory=(--cache 2147483648 --warmup 1.0)
 if [[ "$scale" == full ]]; then
     gc_inline_ops=2000000
     scaling_min_secs=8
+    placement_window=10
 else
     gc_inline_ops=50000
     scaling_min_secs=1
+    placement_window=3
 fi
 
 step_latency() {
@@ -355,6 +360,17 @@ step_scaling() {
     for n in 1 4 8 16; do
         PIGEONHOLE_IO=uring "$bench" scaling --shards "$n" --scale "$scale" \
             --min-secs "$scaling_min_secs" --dir "$data/bench" --json "$results/scaling-$n.json"
+        rm -r "$data/bench"
+    done
+}
+
+# D231: the balancer's placement, judged on its own under an open-loop load (the scaling
+# step's table is pre-split and its balancer off).
+step_placement() {
+    local n
+    for n in 4 8 16; do
+        PIGEONHOLE_IO=uring "$bench" placement --shards "$n" --scale "$scale" \
+            --min-secs "$placement_window" --dir "$data/bench" --json "$results/placement-$n.json"
         rm -r "$data/bench"
     done
 }

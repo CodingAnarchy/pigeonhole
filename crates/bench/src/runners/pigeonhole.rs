@@ -35,6 +35,9 @@ pub(crate) struct Settings {
     pub(crate) shard_spin_micros: Option<u64>,
     /// The inline driver splits the table over every shard before loading it (D213).
     pub(crate) presplit: bool,
+    /// The pre-split cuts at the measured writes' quantiles rather than the loaded rows', so
+    /// each piece takes about the same share of the writes (D231's engine scaling).
+    pub(crate) presplit_writes: bool,
 }
 
 #[derive(Debug)]
@@ -199,6 +202,23 @@ impl PigeonholeRunner {
         self.settings.presplit = yes;
         self
     }
+
+    /// `true`: as [`presplit`](Self::presplit), cutting at the quantiles of the measured
+    /// writes (each row counted once per write), so every piece takes about the same share of
+    /// them (D231: engine scaling, judged on per-shard throughput with the placement fixed).
+    /// A row hotter than a piece's share gets a piece to itself.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().presplit_writes(true);
+    /// assert!(r.describe().contains(" presplit=writes"));
+    /// ```
+    pub fn presplit_writes(mut self, yes: bool) -> Self {
+        self.settings.presplit = yes;
+        self.settings.presplit_writes = yes;
+        self
+    }
 }
 
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
@@ -343,7 +363,11 @@ impl Runner for PigeonholeRunner {
             },
             s.shard_spin_micros
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
-            if s.presplit { " presplit" } else { "" }
+            match (s.presplit, s.presplit_writes) {
+                (_, true) => " presplit=writes",
+                (true, false) => " presplit",
+                _ => "",
+            }
         )
     }
 }

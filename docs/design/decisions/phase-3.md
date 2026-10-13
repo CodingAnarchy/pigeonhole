@@ -788,7 +788,7 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 ## D223 — The scaling gate's placement check is a busiest share of at most 1.25/N, and the driver starts every shard together (owner decision, 2026-10-12; bench, tablets, #406; amends D204)
 
 **Decided:**
-- **The busiest shard may take at most 1.25/N of the measured commits** (`Scaling::MAX_SHARE`), down from 2/N. Above it the run fails as skewed, whatever its efficiency. The gate summary (`report.py`) checks the same bound.
+- **The busiest shard may take at most 1.25/N of the measured commits** (`Scaling::MAX_SHARE`), down from 2/N. Above it the run fails as skewed, whatever its efficiency. The gate summary (`report.py`) checks the same bound. [D231](#d231) moves the bound to a separate open-loop placement check (`Placement::MAX_SHARE`); the scaling run is pre-split with the balancer off.
 - **The D204 driver starts every shard together.** Each shard thread picks the rows its shard owns, taking a turn of its shard every 64K writes so the shard's balancer keeps publishing its load. All threads then start at a barrier, and the phase clock starts there.
 - **The balancer (D214) is not changed for the bound.** With the driver fix, D214 already meets 1.25/N at 8 and 16 shards on the AX102 (below). The balancer work that followed didn't improve placement there on its own, so it isn't shipped with D223. Its claims ship with the churn fix in [D224](#d224) (#582).
 - **Packing (D217) keeps its grow threshold at 0.75** busy per active shard. 0.6 was measured and gained nothing.
@@ -991,3 +991,29 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - blob33's prefix-beside-link layout was rejected earlier (+13–31% at 10k and with shared prefixes; #17).
 
 **Reported beside the judged row:** 1M entries, 446–479 ns on the AX102 (2026-10-12), memory-latency bound (~40 dependent node reads over ~70 MB). The judged 2^18 row is first measured in the next gate window.
+
+<a id="d231"></a>
+## D231 — The scaling gate is split: engine scaling on a pre-split table with the balancer off, and balancer placement judged by its own open-loop check (owner decision, 2026-10-13; bench, #406; amends D204, D223)
+
+**Decided:**
+- **Engine scaling (≥ 0.8 × N)** is judged on a table split up front with the balancer off, as D213 does for group commit, so it measures per-shard throughput only.
+  - `phdb-bench scaling` splits at the quantiles of the measured writes, each row counted once per write, so every shard takes about the same share of them. Where a row covers a cut (the skewed workload's hottest takes 6.5%), the next cut moves past it, so it keeps a piece of its own.
+  - The run fails if the split did not leave one tablet per shard.
+  - The verdict is efficiency alone. The busiest share is reported.
+- **Balancer placement** is judged by `phdb-bench placement`:
+  - Engine-owned shards, tablet changes on, packing off. Packing keeps a light load on few shards on purpose, and is not what this judges.
+  - The skewed-multi-shard writes are offered **open-loop** at a fixed rate (default 30,000 writes/s per shard, above the balancer's per-pass minimum for an average shard). Clients behind their schedule catch up instead of slowing the offer.
+  - The table starts as one tablet. Once every shard owns a tablet and nothing has split, merged or moved for 12 s (longer than the slow skew path's dwell, D224), a 10 s window is measured.
+  - **It passes when:**
+    - the table settled within 60 s;
+    - nothing split, merged or moved in the window;
+    - the busiest shard took at most 1.25/N of the window's writes (D223's bound);
+    - the store completed at least 95% of the offered rate.
+- **The gate window** runs `placement` at 4, 8 and 16 shards after `scaling`, and `report.py` reports the two as separate rows.
+
+**Why.** D223 put a placement bound on the scaling gate, and D224 then made the balancer settle under its driver. But the driver is closed-loop: each shard thread commits only the rows it owns, with commits in flight.
+- **What the balancer sees there:** while every shard is busy, their write rates are equal whatever their share of the work. Skew shows only in each phase's tail, and there a still-busy shard runs faster once others stop competing (on the AX102 its rate rose to 1.9× the mean while the mean held).
+- **The result:** placement under that driver varied between runs about as much as any balancer change moved it. At 16 shards main measured 1.22× and 1.34×, and two D228 variants 1.25–1.44×. The gate re-run on main measured 1.28×/1.36×/1.28× at 4/8/16.
+- **The fix:** an engine-scaling result should not depend on that, and the balancer's placement is better judged under a load where a shard's rate is its share.
+
+**Not changed:** the 0.8 efficiency target, the single-shard p99 half (`phdb-bench compare`), D204's driver otherwise, D213's group-commit shape, and the 1.25/N bound (now on the placement check).

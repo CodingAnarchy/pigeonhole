@@ -3,6 +3,7 @@
 
 pub(crate) mod inline;
 pub(crate) mod pigeonhole;
+pub(crate) mod placement;
 
 #[cfg(feature = "fjall")]
 pub(crate) mod fjall;
