@@ -1279,8 +1279,13 @@ impl ShardState {
         }
     }
 
-    /// Updates this shard's moving average of how busy it was since the last pass (D217):
-    /// the rise of its thread's busy time over the time that passed.
+    /// Updates this shard's moving average of how busy it was since the last pass (D217,
+    /// D248): the larger of its thread's busy time and its group syncs' utilization, each
+    /// over the time that passed. Utilization is the syncs' in-flight time over
+    /// `group_sync_depth` times that time, so a shard whose durable commits keep its syncs in
+    /// flight reads busy although its thread mostly waits. `max`, since a turn often runs
+    /// while a sync is in flight. Syncs count only while the runtime counts turn time
+    /// (engine-owned shards): an application-owned store stays unpacked, as before.
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
         let busy = self
@@ -1289,25 +1294,38 @@ impl ShardState {
             .get()
             .and_then(|s| s.get(me))
             .map_or(0, |s| s.busy_nanos());
-        let measured = match self.busy_mark {
-            Some((was, at)) if now > at => {
-                Some((busy.saturating_sub(was) as f64 / (now - at) as f64).min(1.0))
-            }
+        let sync = self.sync_busy_nanos(now);
+        let elapsed = match self.busy_mark {
+            Some((_, _, at)) if now > at => Some((now - at) as f64),
             _ => None,
         };
+        // The thread's busy time (none counted for an application-owned shard).
+        let turns = match (self.busy_mark, elapsed) {
+            (Some((was, _, _)), Some(e)) => Some(busy.saturating_sub(was) as f64 / e),
+            _ => None,
+        };
+        let counted = busy > 0;
+        // A chosen turn busy, as an engine-owned shard measures it.
         #[cfg(feature = "test-hooks")]
-        let measured = match self.shared.metrics[me]
+        let (turns, counted) = match self.shared.metrics[me]
             .hooks
             .busy_override
             .load(Ordering::Relaxed)
         {
-            0 => measured,
-            v => Some((v - 1) as f64 / 1e6),
+            0 => (turns, counted),
+            v => (Some((v - 1) as f64 / 1e6), true),
         };
+        let syncs = match (self.busy_mark, elapsed) {
+            (Some((_, sync_was, _)), Some(e)) if counted => {
+                sync.saturating_sub(sync_was) as f64 / (f64::from(self.group_sync_depth.max(1)) * e)
+            }
+            _ => 0.0,
+        };
+        let measured = turns.map(|t| t.max(syncs).min(1.0));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
         }
-        self.busy_mark = Some((busy, now));
+        self.busy_mark = Some((busy, sync, now));
     }
 
     /// The shards that stay active under packing (D217): `0..k`. Every shard, without

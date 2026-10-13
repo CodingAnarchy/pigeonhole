@@ -242,6 +242,11 @@ pub struct ShardStats {
     /// parked (D217, ICR 0033); zero for an application-owned shard. Its rise over a phase,
     /// divided by the phase's length, is the fraction of the time the shard was busy.
     pub busy_nanos: u64,
+    /// Nanoseconds of group-sync in-flight time: the integral over time of the shard's group
+    /// syncs in flight (D248), as of the last sync submitted or completed. Divided by the
+    /// group-sync depth (2, or 1 on macOS) and by an interval, its rise is how much of the
+    /// shard's sync capacity durable commits used. Zero for `Buffered` and `None` commits.
+    pub sync_busy_nanos: u64,
 }
 
 /// The lock-page byte range of the superblock-less file check (decision D59).
@@ -2035,6 +2040,7 @@ impl Engine {
                 merges: m.merges.load(Ordering::Relaxed),
                 moves: m.moves.load(Ordering::Relaxed),
                 busy_nanos: 0,
+                sync_busy_nanos: m.sync_busy_nanos.load(Ordering::Relaxed),
             })
             .collect();
         if let Some(subs) = shared.submitters.get() {

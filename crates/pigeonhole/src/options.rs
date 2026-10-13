@@ -374,7 +374,9 @@ impl Options {
     /// shards' threads are mostly idle, the balancer keeps the tablets being written on as few
     /// shards as stay about half busy, so a commit seldom has to wake a sleeping shard
     /// thread (a single writer over 32 shards otherwise pays a wakeup per commit). It
-    /// spreads them again within about a second once those shards pass 75% busy. Off,
+    /// spreads them again within about a second once those shards pass 75% busy. A shard is
+    /// busy while its thread works or while its group fsyncs are in flight (D248), so
+    /// durable commits waiting on the disk keep enough shards active. Off,
     /// tablets spread over every shard whatever the load. Only read with
     /// [`tablet_changes`](Self::tablet_changes) on; shards the application drives
     /// ([`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned))

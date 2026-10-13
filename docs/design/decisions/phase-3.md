@@ -702,6 +702,8 @@ With the slot floor (931c578, the same setup, two runs each, ranges):
 - **time-series-ttl now packs fully** onto the shards its slots need (34 tablets, 2–3 shards) and gains 22%, against 3.5% without the floor.
 - **skewed-multi-shard settled on 2 shards** in both runs, against 3 in the first. `B / k` of 0.62–0.64 sits inside the hysteresis band (grow above 0.75, shrink below 0.5), so `k` stays where the load phase left it. With 3 active shards, the first run reached 464K.
 
+*Amended by [D248](#d248): the busy fraction is the larger of the thread's busy time and its group syncs' utilization, so a load bound by its fsyncs is not packed below the shards it needs.*
+
 *History: shard 0's balancer decides `k` and publishes it, and every shard uses that value. Each shard used to run its own hysteresis over loads it read at different passes, so the shards disagreed: in one run, one kept 16 while others used 1 to 3. This is an implementation fix to match the rule above ("every shard computes the same `k`"), from the skewed-multi-shard placement analysis (F3).*
 
 ## D218 — io_uring is the default I/O backend where the kernel offers it: `IoBackend::Auto` (owner decision, 2026-10-12; pigeonhole, io, #402)
@@ -1405,3 +1407,31 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 - **The window.** The step is about 100 minutes on the AX102 (64 runs: 3 stores × 10 workloads × 2 levels, the riders' ycsb-a at each level, plus the tablets-off cross-shard run at each level, each about 90 s with its load, settle and warmup). With D246's runs in `all`, the whole window is about 3.5 hours (the 2026-10-13b window's steps took 109 minutes).
 
 **Why:** the gate measured almost nothing contended, nothing at the shipped durability, and no cross-shard commit (perf287's audit, findings 1–3), which let #637's 36× slowdown through. Judging both levels keeps the long-standing like-for-like comparison (D108) and adds the one users get by default.
+
+<a id="d248"></a>
+## D248 — Packing's busy fraction counts group-sync utilization: a shard's busy is the larger of its thread's busy time and its group syncs' in-flight time over the sync depth (owner decision, 2026-10-13; engine, tablets, #406; amends D217)
+
+- **The busy fraction (D217's measure)** is, per engine-owned shard and balancer pass, `max(turn busy, sync utilization)`:
+  - `turn busy`: the rise of the thread's busy time over the time since the last pass (as before);
+  - `sync utilization`: the group syncs' in-flight time in that interval over `group_sync_depth` (D207, D221: 2, or 1 on macOS) times the interval. That is the integral of the group syncs in flight (from `submit_sync` to the shard handling the completion) over the slots D207 allows.
+- **`max`, not a sum:** a turn often runs while a sync is in flight, so a sum would count that time twice. A shard bound by its syncs reads about 1, and a CPU-bound one reads as before.
+- **Utilization, not waiting commits.** Utilization is linear in the offered load and adds up across shards: without batching, `B` is about the group rate times the sync latency over the depth, whatever `k` is. So `k = ceil(B / 0.5)` keeps its meaning, and packing settles as it does for CPU load. A queue length (waiting commits, batched groups) grows faster than linearly near saturation and falls to 0 once spread, so packing on it overshoots, shrinks back, and oscillates.
+- **Engine-owned shards only.** Syncs count only while the runtime counts the thread's busy time. An application-owned store keeps D217's behaviour: no packing.
+- **Only group syncs:** a group's own and a batched one. Not spare-segment preparation, rollovers or manifest syncs. `Buffered` and `None` stores have no group syncs, so their packing is unchanged.
+- **Exposed:** `ShardStats::sync_busy_nanos`, the integral of the shard's group syncs in flight, beside `busy_nanos`.
+- **Cost:** a clock read and a few adds when a group sync is submitted and when it completes, on the shard thread. Nothing on the `Buffered` commit path the callgrind ceilings measure.
+
+**Why.** perf287 on the AX102 (2026-10-13), ycsb-a, 16 threads, at the default durability (GroupSync):
+- Packing pulled the table onto 2 shards, each about 0.5 busy by turn time. B was about 1.0, `k = 2`, and `B / k` stayed under 0.75, so `k` never grew.
+- Against packing off (16 shards, 0.14–0.23 busy each), that cost 36% of throughput (265K against 415K ops/s), +74% put p50 (92 against 53 µs) and about 5× put p99 (~600 against 121 µs).
+- `busy_nanos` counts only the thread's turns, so the time commits wait on in-flight group fsyncs was invisible. On macOS (F_FULLFSYNC), a durable table packed onto one shard.
+
+**Tests** (simulated, deterministic: deferred I/O, the clock moved while syncs are in flight):
+- Four shards 5% busy whose group syncs stay in flight through each pass keep `k` = 4 and stay spread. This fails without the sync term.
+- The same load at `Buffered`, and a durable trickle (syncs in flight 5% of the time), pack onto one shard as before.
+- Application-owned shards: a durable load that would pack if counted is not packed. This fails without the engine-owned gate.
+
+**Acceptance (AX102 A/B, perf287's shape):**
+- ycsb-a, 16 threads, `--durability default`, defaults against `--no-packing`: at least 95% of packing-off throughput, and put p99 within 1.3×.
+- ycsb-a `--durability buffered`, main against D248: unchanged within noise, and packing still packs.
+- `k` settles with no oscillation over the 60 s.

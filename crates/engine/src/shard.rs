@@ -140,6 +140,9 @@ pub(crate) struct ShardMetrics {
     /// splits refused because the tablet map would outgrow the shared-memory view (D28).
     pub refused_slots: AtomicU64,
     pub refused_view: AtomicU64,
+    /// Group syncs' in-flight time (D248): the integral of the group syncs in flight over
+    /// time, in nanoseconds, as of the last change in their number.
+    pub sync_busy_nanos: AtomicU64,
     /// The shard's WAL stream stall counters (ICR 0015), once the stream is open.
     pub wal: std::sync::OnceLock<Arc<pigeonhole_wal::WalCounters>>,
     /// Cross-shard two-phase commit counters (ICR 0043).
@@ -169,6 +172,7 @@ impl Default for ShardMetrics {
             unpin_flushes: AtomicU64::new(0),
             refused_slots: AtomicU64::new(0),
             refused_view: AtomicU64::new(0),
+            sync_busy_nanos: AtomicU64::new(0),
             wal: std::sync::OnceLock::new(),
             cross: CrossShardCounters::default(),
             #[cfg(feature = "test-hooks")]
@@ -2013,6 +2017,10 @@ pub(crate) struct ShardState {
     group_sync_depth: u32,
     /// Groups batched behind the in-flight group sync wait in `unresolved` for the next.
     sync_wanted: bool,
+    /// Group syncs' in-flight time (D248): the integral of `group_syncs_in_flight` over the
+    /// shard's clock up to `sync_since`, when their number last changed.
+    sync_nanos: u64,
+    sync_since: u64,
     next_group: u64,
     /// Cross-shard seqnos this shard coordinates, not yet applied everywhere.
     held: BTreeSet<Seqno>,
@@ -2270,7 +2278,7 @@ pub(crate) struct ShardState {
     /// of how busy it was, and, on shard 0 only (which decides for every shard and publishes
     /// it as `Shared::pack_k`), how many shards stay active (`0..pack_k`; 0 before the first
     /// decision) and the consecutive passes calling for more or fewer of them.
-    busy_mark: Option<(u64, u64)>,
+    busy_mark: Option<(u64, u64, u64)>,
     busy_ewma: f64,
     pack_k: usize,
     pack_up: u64,
@@ -2329,6 +2337,8 @@ impl ShardState {
             group_syncs_in_flight: 0,
             group_sync_depth: group_sync_depth(),
             sync_wanted: false,
+            sync_nanos: 0,
+            sync_since: 0,
             next_group: 1,
             held: BTreeSet::new(),
             sync_failed_floor: u64::MAX,
@@ -4868,6 +4878,7 @@ impl ShardState {
                 self.unresolved.push_back(group);
                 self.publish_watermark();
                 if group_sync {
+                    self.syncs_in_flight_change(ctx.now_nanos());
                     self.group_syncs_in_flight += 1;
                 }
                 self.on_sync_done(completion, id, group_sync, ctx);
@@ -5527,6 +5538,23 @@ impl ShardState {
         }));
     }
 
+    /// Group syncs' in-flight time up to `now` (D248): the integral of the syncs in flight.
+    pub(crate) fn sync_busy_nanos(&self, now: u64) -> u64 {
+        self.sync_nanos
+            + u64::from(self.group_syncs_in_flight) * now.saturating_sub(self.sync_since)
+    }
+
+    /// Before `group_syncs_in_flight` changes: closes the integral at `now` and publishes it
+    /// (`ShardStats::sync_busy_nanos`). Only durable groups get here, never a `Buffered` or
+    /// `None` commit.
+    fn syncs_in_flight_change(&mut self, now: u64) {
+        self.sync_nanos = self.sync_busy_nanos(now);
+        self.sync_since = now;
+        self.shared.metrics[usize::from(self.id.0)]
+            .sync_busy_nanos
+            .store(self.sync_nanos, Ordering::Relaxed);
+    }
+
     /// The group sync for the groups batched behind the one that just finished (D207): one
     /// sync covering every unresolved group, whose records are all written.
     fn submit_batched_sync(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
@@ -5540,6 +5568,7 @@ impl ShardState {
         };
         match wal.submit_sync() {
             Ok(c) => {
+                self.syncs_in_flight_change(ctx.now_nanos());
                 self.group_syncs_in_flight += 1;
                 self.on_sync_done(c, through, true, ctx);
             }
@@ -7621,6 +7650,7 @@ impl ShardState {
                 group_sync,
             } => {
                 if group_sync {
+                    self.syncs_in_flight_change(ctx.now_nanos());
                     self.group_syncs_in_flight = self.group_syncs_in_flight.saturating_sub(1);
                 }
                 self.resolve_through(group, result, ctx);
