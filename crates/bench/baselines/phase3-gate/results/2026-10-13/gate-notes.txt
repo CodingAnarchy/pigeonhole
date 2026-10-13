@@ -4,3 +4,4 @@ rerun start: 13:22Z load 0.17 0.63 0.94 1/434 838718
 rerun exit 0; load at end: 2.09 1.86 1.40 1/429 839510
 rerun2 (reproducibility) start: 13:30Z load 0.02 0.74 1.03 1/422 840099
 rerun2 exit 0; load at end: 2.52 1.76 1.43 2/471 850499
+cold-get rerun on 93052c78 (D240/D241, #636+#638); first attempt on 8654ad69 failed at the 64 GiB load: cold-get-failed-load-8654ad69.jsonl, logs/cold-get-failed-load-8654ad69.log

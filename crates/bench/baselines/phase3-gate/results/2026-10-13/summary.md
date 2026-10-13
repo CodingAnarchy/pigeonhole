@@ -15,7 +15,7 @@ vwc       : 0x6): check it has power-loss protection
 |---|---|---|---|
 | Point get in memory: p50 < 2 µs, p99 < 10 µs | p50 0.80 µs, p99 5.63 µs | **pass** | `latency-ycsb-c.json` |
 | Memtable point lookup at 2^18 entries (D230): ≤ 300 ns (#17); 337 ns accepted (D239) | 262k hit 339 ns (262k entries/miss (lower bound) 265 ns, 1M entries/hit (get) 482 ns, 1M entries/miss (lower bound) 401 ns, 10k entries/hit (get) 128 ns, 10k entries/miss (lower bound) 106 ns) | accepted (D239) | `memtable-lookup.txt` |
-| Point get on cold data: one I/O |  | not run | `cold-get.jsonl` |
+| Point get on cold data: one I/O | 1.028 device reads, 1.025 cache misses per get; p50 87 µs, p99 181 µs; block cache 1024 MiB | **pass** | `cold-get.jsonl` |
 | Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213, D226: 16 in flight) | 9.75M cells/s at 16 shards (609K per core); p50 84 µs, p99 138 µs; busiest shard 6%; 2.0M commits in 0.8 s, 80 flushes, 16 compactions; in the engine p50 66 µs, p99 131 µs, p99.9 524 µs; WAL rollover blocks 0, inline syncs 0; tablet changes while measuring 0; disk fdatasync p50 25 µs, p99 77 µs | **pass** | `latency-group-commit.json` |
 | Durable group commit, shard threads unpinned (reported, not judged; D235) | 9.22M cells/s (-5% vs pinned); p50 79 µs, p99 162 µs | - | `latency-group-commit.json` |
 | Durable group commit at 4 in flight per shard (reported, not judged; D226) | 4.84M cells/s (-50% vs 16); p50 46 µs, p99 78 µs, p99.9 113 µs; in the engine p99 66 µs | - | `latency-group-commit-inflight-4.json` |
@@ -118,6 +118,8 @@ vwc       : 0x6): check it has power-loss protection
 
 The WAL files' size counts whole preallocated segments (the disk the WAL holds), not live records; the reopen replays what the crash left past each stream's checkpoint.
 
+**Mixed commits:** the steps ran at 8654ad6924a9, 93052c78c110 (a resumed window); see the table below.
+
 ## Step durations
 
 | Step | Minutes | Commit |
@@ -142,4 +144,7 @@ The WAL files' size counts whole preallocated segments (the disk the WAL holds),
 | report | 0 | 8654ad6924a9 |
 | all-uring-1 | 12 | 8654ad6924a9 |
 | all-uring-2 | 12 | 8654ad6924a9 |
-| **total** | **86** | |
+| report | 0 | 8654ad6924a9 |
+| build | 2 | 93052c78c110 |
+| cold-get | 40 | 93052c78c110 |
+| **total** | **128** | |

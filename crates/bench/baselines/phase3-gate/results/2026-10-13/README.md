@@ -2,7 +2,7 @@
 
 The third Phase 3 gate run on the reference machine (#405), on the same hardware as [2026-10-12](../2026-10-12/README.md): a Hetzner AX102 (Ryzen 9 7950X3D, 2 CCDs × 8 cores, 32 threads, 128 GB ECC), Ubuntu 24.04, kernel 6.8, `/data` XFS on a Samsung PM9A3 (PLP).
 
-It ran `run-window.sh` at full scale on 8654ad69: D236, D237, D238 and D239 merged, shard threads pinned (D235). Every step except `cold-get` ran, 62 minutes of steps in all. The box was quiet at the start (load 0.00), and `gate-notes.txt` records the load at each start and end.
+It ran `run-window.sh` at full scale on 8654ad69: D236, D237, D238 and D239 merged, shard threads pinned (D235). Every step except `cold-get` ran there, 62 minutes of steps in all. `cold-get` ran last, resumed in the same results directory on 93052c78 (D240, D241: #636 and #638) after its first attempt failed; `summary.md`'s step table lists each step's commit. The box was quiet at the start (load 0.00), and `gate-notes.txt` records the load at each start and end.
 
 - **Start here:** `summary.md` has every #406 target with its value and verdict, and the decision tables.
 - **New since 2026-10-12:**
@@ -26,11 +26,17 @@ It ran `run-window.sh` at full scale on 8654ad69: D236, D237, D238 and D239 merg
     - scaling at N = 16: 0.70 (pinned) and 0.59 (unpinned);
     - against the fixed 417,922 commits/s single shard: 0.90 / 1.10 / 1.00 / 0.69.
   - **Fail: run-to-run reproducibility, in both pairs, on different rows.** The `all` pair was run twice (see "Two reproducibility pairs" below).
-  - **Not run: cold get.** The first attempt's 64 GiB load stopped on `Busy` (a 30 s write stall). The diagnosis found the stall predates this window's changes:
-    - the whole load stays on one shard and one tablet, never split;
-    - compaction falls behind, with L0 past 1,000 SSTs.
+  - **Cold get (on 93052c78): pass.** 1.028 device reads and 1.025 block-cache misses per get on a 64 GiB table (67.1M rows) with a 1 GiB block cache, direct I/O, one thread: p50 87 µs, p99 181 µs, about 10.8K gets/s. The same on io_uring.
+    - **16 threads, direct:** 139K gets/s, p50 103 µs, p99 250 µs.
+    - **Buffered under an 8 GiB memory cap:** 0.97 device reads per get, p50 91 µs, p99 241 µs (one thread).
+    - **Absent rows:** 0.019 device reads per get, p50 0.7 µs.
+    - Three runs per shape agree within 1%.
+    - **The load** took 984 s (16,037 compactions).
+  - **Cold get's first attempt (on 8654ad69) failed:** the 64 GiB load stopped on `Busy` (a 30 s write stall). The diagnosis found the stall predated this window's changes:
+    - the whole load stayed on one shard and one tablet, never split;
+    - compaction fell behind, with L0 past 1,000 SSTs.
 
-    The investigation is ctr274's (splitting and the stall timeout) and perf2's (compaction under a deep L0). `cold-get` runs last, once that's understood, and its results are added to this directory.
+    ctr274 fixed the splitting and the stall timeout (#636, #638: D240, D241). perf2 is investigating compaction under a deep L0.
 - **Two reproducibility pairs.** The first pair is `all-uring-{1,2}-run1.*`, `all-uring-compare-run1.txt` and `summary-run1.md`. The second, run on request after the first failed on one row, is `all-uring-{1,2}.*`, `all-uring-compare.txt` and `summary.md`. Both are at 8654ad69 on the same box and data directory.
   - **First pair:** one row out of tolerance. `group-commit` with 16 synchronous clients: p99 175 → 247 µs (+40.9%, ±40%).
   - **Second pair:** that row is within tolerance (p99 296 → 234 µs). Three others are out:
