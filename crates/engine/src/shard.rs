@@ -142,6 +142,8 @@ pub(crate) struct ShardMetrics {
     pub refused_view: AtomicU64,
     /// The shard's WAL stream stall counters (ICR 0015), once the stream is open.
     pub wal: std::sync::OnceLock<Arc<pigeonhole_wal::WalCounters>>,
+    /// Cross-shard two-phase commit counters (ICR 0043).
+    pub cross: CrossShardCounters,
     /// Test-hook counters (`engine::hooks::ShardCounters`).
     #[cfg(feature = "test-hooks")]
     pub hooks: crate::engine::hooks::ShardCounters,
@@ -168,13 +170,52 @@ impl Default for ShardMetrics {
             refused_slots: AtomicU64::new(0),
             refused_view: AtomicU64::new(0),
             wal: std::sync::OnceLock::new(),
+            cross: CrossShardCounters::default(),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
         }
     }
 }
 
+/// One shard's cross-shard two-phase commit counters (ICR 0043), on cache lines of their
+/// own: only this shard's thread writes them (`Relaxed`, off the single-shard commit path),
+/// and `Engine::metrics` sums them.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+pub(crate) struct CrossShardCounters {
+    /// Two-phase rounds this shard coordinated and decided.
+    pub rounds: AtomicU64,
+    /// Of those, rounds a participant refused (so the commit was retried or gave up).
+    pub refused_rounds: AtomicU64,
+    /// PREPAREs this shard refused, by reason (see `CrossRefusal`).
+    pub refused: [AtomicU64; CrossRefusal::COUNT],
+}
+
+/// Why a participant refused a PREPARE (ICR 0043).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrossRefusal {
+    /// The commit timestamp is below a default timestamp this shard already assigned (D11).
+    BelowFloor = 0,
+    /// The commit timestamp is below the floor a shard that handed this one a tablet raised
+    /// it to (`ts_raises`, D11), and not below its own.
+    MoveRaise = 1,
+    /// A row's tablet is being split, merged or moved, or now lives elsewhere (`Moved`).
+    Moved = 2,
+    /// The share had to wait for arena room (ICR 0042).
+    Room = 3,
+}
+
+impl CrossRefusal {
+    const COUNT: usize = 4;
+}
+
 impl ShardMetrics {
+    /// Counts a PREPARE this shard refused.
+    #[cold]
+    pub(crate) fn count_refusal(&self, why: CrossRefusal) {
+        self.cross.refused[why as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record(&self, durability: Durability, nanos: u64) {
         let d = durability as usize;
         self.commits[d].fetch_add(1, Ordering::Relaxed);
@@ -5987,6 +6028,11 @@ impl ShardState {
             return;
         }
         c.decided = true;
+        let cross = &self.shared.metrics[usize::from(self.id.0)].cross;
+        cross.rounds.fetch_add(1, Ordering::Relaxed);
+        if c.moved {
+            cross.refused_rounds.fetch_add(1, Ordering::Relaxed);
+        }
         if gave_up && c.failed.is_none() {
             // The close gave up (a shard died) or reported: decide abort, so a commit whose
             // caller hears `Closed` from such a close is never committed (no COMMIT record is

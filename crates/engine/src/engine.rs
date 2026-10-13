@@ -33,9 +33,9 @@ use crate::flush::{SstSink, write_memtable};
 use crate::manifest::{self, ManifestWriter, ReqKind};
 use crate::read::{self, get_in};
 use crate::shard::{
-    BalanceConfig, COLD_PASSES, CloseState, CommitReq, CoordinateReq, LoadSlot, Locks,
-    MaintenanceGuard, Padded, ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState, Shared,
-    VisibilityCounts, WatermarkWaiters, bucket_floor, split_by_shard,
+    BalanceConfig, COLD_PASSES, CloseState, CommitReq, CoordinateReq, CrossRefusal, LoadSlot,
+    Locks, MaintenanceGuard, Padded, ReplayedKind, Reply, ShardMetrics, ShardMsg, ShardState,
+    Shared, VisibilityCounts, WatermarkWaiters, bucket_floor, split_by_shard,
 };
 use crate::snapshot::{
     LiveSeqnos, LiveSnapshot, LiveViews, MemSet, SeqnoPin, ShardMems, SstSet, TabletEntry,
@@ -189,6 +189,38 @@ pub struct Metrics {
     pub visibility_wakes: (u64, u64),
     /// Registrations and wake passes that found the list's lock held by another thread.
     pub visibility_contended: u64,
+    /// Cross-shard commits' two-phase rounds and the PREPAREs participants refused, by
+    /// reason (ICR 0043).
+    pub cross_shard: CrossShardMetrics,
+}
+
+/// Cross-shard commits' two-phase rounds and refusals since open, summed over shards
+/// (ICR 0043; [`Metrics::cross_shard`]).
+///
+/// A participant that refuses a PREPARE makes the round abort everywhere, and the commit
+/// runs again in a new round (or fails with [`Error::Busy`] at the write-stall timeout,
+/// D241). `refused_rounds` over the cross-shard commits in an interval is the wasted rounds
+/// per commit; `rounds - refused_rounds` counts the rounds that committed or failed for
+/// another reason (a conflict, an I/O error). One refused round can hold several refusals,
+/// one per refusing participant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CrossShardMetrics {
+    /// Two-phase rounds decided, by every coordinator.
+    pub rounds: u64,
+    /// Rounds that a participant refused.
+    pub refused_rounds: u64,
+    /// PREPAREs refused because the commit timestamp was below a timestamp the participant
+    /// had already assigned (D11). Only with `tablet_changes` on.
+    pub refused_below_floor: u64,
+    /// PREPAREs refused because the commit timestamp was below the floor a tablet move
+    /// raised the participant to (D11), though not below the participant's own.
+    pub refused_move_raise: u64,
+    /// PREPAREs refused because a row's tablet was being split, merged or moved, or had
+    /// moved to another shard (D145).
+    pub refused_moved: u64,
+    /// PREPAREs refused because the participant had no arena room for the share (ICR 0042).
+    pub refused_room: u64,
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -2087,6 +2119,14 @@ impl Engine {
             m.unpin.1 += s.unpin_flushes.load(Ordering::Relaxed);
             m.wal_inline_syncs += s.wal.get().map_or(0, |c| c.inline_rollover_syncs());
             m.wal_rollover_blocks += s.wal.get().map_or(0, |c| c.rollover_blocks());
+            let x = &mut m.cross_shard;
+            x.rounds += s.cross.rounds.load(Ordering::Relaxed);
+            x.refused_rounds += s.cross.refused_rounds.load(Ordering::Relaxed);
+            let refused = |r: CrossRefusal| s.cross.refused[r as usize].load(Ordering::Relaxed);
+            x.refused_below_floor += refused(CrossRefusal::BelowFloor);
+            x.refused_move_raise += refused(CrossRefusal::MoveRaise);
+            x.refused_moved += refused(CrossRefusal::Moved);
+            x.refused_room += refused(CrossRefusal::Room);
         }
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);
