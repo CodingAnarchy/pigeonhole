@@ -9,9 +9,16 @@
 //! shards share no written memory. (D210's engine-wide count was written by every async
 //! commit on every shard; at 16 shards it was most of the cross-core traffic.)
 
+#[cfg(engine_loom)]
+use loom::sync::Mutex;
+#[cfg(engine_loom)]
+use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::collections::VecDeque;
+#[cfg(not(engine_loom))]
+use std::sync::Mutex;
+#[cfg(not(engine_loom))]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use crate::write::{PendingCheck, PendingCommit, WriteBatch};
@@ -135,7 +142,12 @@ impl ShardAdmission {
     /// Returns a charge of `bytes` and, if anyone waits, wakes the first waiter.
     fn release(&self, bytes: u64) {
         self.inflight.fetch_sub(bytes, Ordering::AcqRel);
-        if self.waiting.load(Ordering::Acquire) != 0 {
+        // A read-modify-write, not a load: it reads the latest `waiting`, so either it sees
+        // a waiter that queued meanwhile (and wakes it), or that waiter's `fetch_add` reads
+        // from it and so sees the charge returned above when it next tries to charge. A
+        // plain load could miss the waiter while the waiter misses the room (store
+        // buffering, loom-modelled below), leaving it queued with nothing to wake it.
+        if self.waiting.fetch_add(0, Ordering::AcqRel) != 0 {
             let q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some((_, Some(w))) = q.waiters.front() {
                 w.wake_by_ref();
@@ -343,4 +355,50 @@ impl Drop for Admit {
 pub(crate) fn batch_bytes(batch: &WriteBatch) -> u64 {
     let rows: usize = batch.row_deletes.iter().map(|d| d.row.len() + 16).sum();
     (batch.builder.batch().as_bytes().len() + rows) as u64
+}
+
+#[cfg(all(test, engine_loom))]
+mod loom_tests {
+    use super::{Admission, Admit};
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::thread;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Flag(AtomicBool);
+
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn loom_a_queued_commit_is_admitted_or_woken_when_a_charge_returns() {
+        // One shard, bound 10, a charge of 10 held. A commit of 5 queues behind it while the
+        // charge returns: its poll either finds the room, or the return wakes it to poll
+        // again. Both missing each other leaves it queued with nothing to wake it.
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = Some(3);
+        b.check(|| {
+            let a = Arc::new(Admission::new(1, 10));
+            let mut held = Admit::new(Some(&a), 0, 10);
+            assert!(held.is_admitted());
+            let (s, bytes) = held.take_charge().expect("charged");
+            let returner = thread::spawn(move || s.release(bytes));
+            let flag = Arc::new(Flag(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&flag));
+            let mut queued = Admit::new(Some(&a), 0, 5);
+            let admitted = queued.is_admitted()
+                || matches!(
+                    queued.poll_admit(&mut Context::from_waker(&waker)),
+                    Poll::Ready(())
+                );
+            returner.join().unwrap();
+            assert!(
+                admitted || flag.0.load(Ordering::SeqCst),
+                "the queued commit was neither admitted nor woken"
+            );
+        });
+    }
 }
