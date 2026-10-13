@@ -87,7 +87,9 @@ OPTIONS:
     --durability MODE      buffered, sync, group-sync or default [default: buffered].
                            group-sync: Pigeonhole commits GroupSync, the others fsync
                            every write; default: Pigeonhole keeps Options::default()'s
-                           durability (GroupSync), the others fsync every write (D247)
+                           durability (GroupSync), the others fsync every write. With
+                           either, every engine loads buffered and switches after the
+                           settle step (D247)
     --no-tablet-changes    Pigeonhole: keep each table one tablet on one shard (tablets
                            split, merge and move between shards by default)
     --no-packing           Pigeonhole: spread tablets over every shard even under light
@@ -262,6 +264,7 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
         .sync(a.sync)
         .group_sync(a.durability == Some(Durability::GroupSync))
         .default_durability(a.durability == Some(Durability::Default))
+        .load_buffered(a.durability.is_some())
         .memory(memory(a))
         .tablet_changes(!a.no_tablet_changes)
         .packing(!a.no_packing);
@@ -304,6 +307,7 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
         "rocksdb" => Ok(Box::new(
             pigeonhole_bench::RocksDbRunner::default()
                 .sync(a.sync)
+                .load_buffered(a.durability.is_some())
                 .memory(memory(a)),
         )),
         #[cfg(not(feature = "rocksdb"))]
@@ -312,6 +316,7 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
         "sqlite" | "sqlite-eav" => Ok(Box::new(
             pigeonhole_bench::SqliteRunner::default()
                 .sync(a.sync)
+                .load_buffered(a.durability.is_some())
                 .memory(memory(a)),
         )),
         #[cfg(not(feature = "sqlite"))]
@@ -320,6 +325,7 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
         "fjall" => Ok(Box::new(
             pigeonhole_bench::FjallRunner::default()
                 .sync(a.sync)
+                .load_buffered(a.durability.is_some())
                 .memory(memory(a)),
         )),
         #[cfg(not(feature = "fjall"))]
@@ -620,7 +626,7 @@ mod tests {
         assert!(describe("ycsb-a", WorkloadKind::YcsbA).contains(" buffered"));
         assert!(
             describe("ycsb-a --durability default", WorkloadKind::YcsbA)
-                .contains(" group-sync(default)")
+                .contains(" group-sync(default) load=buffered")
         );
         assert!(
             describe("ycsb-a --durability group-sync", WorkloadKind::YcsbA).contains(" group-sync")

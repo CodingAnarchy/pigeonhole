@@ -24,6 +24,8 @@ use crate::{BenchOp, Client, Runner};
 #[derive(Default)]
 pub struct FjallRunner {
     sync: bool,
+    /// The load persists to the OS buffer, the measured phase at `sync` (D247).
+    load_buffered: bool,
     memory: MemoryBudget,
     open: Option<Handle>,
 }
@@ -50,6 +52,21 @@ impl FjallRunner {
     pub fn memory(mut self, memory: MemoryBudget) -> Self {
         self.memory = memory;
         self
+    }
+
+    /// `true`: the load persists to the OS buffer, and the warmup and the measured phase as
+    /// [`sync`](Self::sync) says (D247).
+    pub fn load_buffered(mut self, yes: bool) -> Self {
+        self.load_buffered = yes;
+        self
+    }
+
+    fn mode(&self, sync: bool) -> PersistMode {
+        if sync {
+            PersistMode::SyncAll
+        } else {
+            PersistMode::Buffer
+        }
     }
 }
 
@@ -80,12 +97,16 @@ impl Runner for FjallRunner {
         self.open = Some(Handle {
             db,
             cells,
-            mode: if self.sync {
-                PersistMode::SyncAll
-            } else {
-                PersistMode::Buffer
-            },
+            mode: self.mode(self.sync && !self.load_buffered),
         });
+        Ok(())
+    }
+
+    fn measured_durability(&mut self) -> Result<(), String> {
+        let mode = self.mode(self.sync);
+        if let Some(h) = self.open.as_mut() {
+            h.mode = mode;
+        }
         Ok(())
     }
 
@@ -125,7 +146,16 @@ impl Runner for FjallRunner {
     }
 
     fn describe(&self) -> String {
-        format!("{} bloom=default {}", self.memory, durability(self.sync))
+        format!(
+            "{} bloom=default {}{}",
+            self.memory,
+            durability(self.sync),
+            if self.load_buffered {
+                " load=buffered"
+            } else {
+                ""
+            }
+        )
     }
 }
 
