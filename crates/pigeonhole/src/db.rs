@@ -775,10 +775,16 @@ impl Shard {
     /// Runs queued writes, group commit and background work for up to `budget`. Returns
     /// whether work remains.
     ///
+    /// A call first handles the queued messages (up to 1,024) and commits them as one group,
+    /// whatever `budget` says. Then it runs background work (flush, compaction, the tablet
+    /// balancer) in slices of at most 500 µs until `budget` is spent, handling newly queued
+    /// messages between slices.
+    ///
     /// Background work waiting for a time (a write stall's pacing, a wait for memtable room,
-    /// a failed compaction's retry, the tablet balancer's next pass) is not work that remains: with only that left it returns
-    /// `false`, and [`next_wakeup`](Shard::next_wakeup) says when to call it again. The
-    /// callback registered with [`set_wakeup`](Shard::set_wakeup) does not fire for it.
+    /// a failed compaction's retry, the tablet balancer's next pass) is not work that
+    /// remains: with only that left it returns `false`, and
+    /// [`next_wakeup`](Shard::next_wakeup) says when to call it again. The callback
+    /// registered with [`set_wakeup`](Shard::set_wakeup) does not fire for it.
     ///
     /// A call that completed a future woken through [`waker`](Shard::waker) (a commit this
     /// thread awaits) returns `true` before its background work, so the loop can poll that

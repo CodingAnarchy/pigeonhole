@@ -10,7 +10,12 @@ A Pigeonhole instance runs one thread per shard. A shard can fail on its own:
 
 The whole instance can also fail when a manifest commit to the main file fails.
 
-A failed shard refuses its commits, and a failed instance refuses all of them. Nothing already durable is lost: the log and the main file hold it, and the next open replays what the log holds. Recovery is therefore: notice, close, reopen, and settle the commits that were in flight. Pigeonhole doesn't recover in place yet. Automatic recovery is a planned option ([#620](https://github.com/CodingAnarchy/pigeonhole/issues/620)).
+What a failure refuses depends on what failed:
+- **A shard that died** (a panic, a dropped driver, a failed log sync, or a cross-shard commit a shard could not apply): every shard refuses new commits with `Closed`.
+- **A shard that stopped for another reason** (a failed log write, an internal error) refuses its own commits.
+- **After a failed manifest commit,** flushes stop, so commits fail once they need memtable room.
+
+Reads keep working in every case. Nothing already durable is lost: the log and the main file hold it, and the next open replays what the log holds. Recovery is therefore: notice, close, reopen, and settle the commits that were in flight. Pigeonhole doesn't recover in place yet. Automatic recovery is a planned option ([#620](https://github.com/CodingAnarchy/pigeonhole/issues/620)).
 
 ## 1. Detect
 Either way works; use both in a long-running service.
@@ -18,6 +23,7 @@ Either way works; use both in a long-running service.
 - **The health check.** `Pigeonhole::is_failed()` is one atomic load, cheap enough for a health endpoint or a loop. `Pigeonhole::failure()` names the first failure:
   - the shard, or `Failure::MAIN_FILE`;
   - the `FailureCause`: `Panic`, `DriverDropped`, `Io` or `Internal`. Log it: `Panic` and `Internal` are bugs worth reporting.
+- **Not failures.** `Busy` (a write stall or tablet change outlasted the write-stall timeout), `Conflict` and the other codes in [Errors](errors.md) leave `is_failed()` false: handle them where they occur, without reopening.
 
 ## 2. Close the instance
 - Call `close()`. On a failed instance it returns an error (the close is unclean): that's expected. The log keeps everything the close could not checkpoint.

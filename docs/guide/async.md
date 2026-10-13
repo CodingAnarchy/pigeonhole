@@ -160,7 +160,14 @@ loop {
 - `wait` returns when work arrives for the shard, a future's wake reaches `shard.waker()`, this thread's own I/O completes, background work falls due, or the timeout passes. It may return early.
 - It works on every backend and needs no file descriptor: with io_uring (the default on Linux) it waits in the thread's ring while the thread's own I/O is in flight, and parks otherwise.
 - Give the futures this thread polls `shard.waker()`: a commit can complete on another shard's thread, and its wake must end this thread's wait.
-- When a `run_once` call completes a future woken through `shard.waker()`, it returns `true` early, before the shard's background work, so the loop gets to poll it sooner (D237). Background work runs on the next call, and at the latest on every ninth. A loop that polls its futures only after `run_once` returns `false` gives up that gain, so poll them after every call, as above.
+- **What one `run_once(budget)` call does,** in order:
+  1. With io_uring, it completes the I/O this thread submitted that has finished.
+  2. It handles the shard's queued messages (commits, flush and compact requests, cross-shard rounds), up to 1,024 of them, and then commits them as one group. This part isn't bounded by `budget`.
+  3. **The early end (D237).** If that completed a future woken through `shard.waker()` (typically a commit this thread submitted), the call returns `true` now, before the background work, so the loop can poll the future sooner. The background work runs on the next call. After 8 early ends in a row, a call runs it anyway, so flush and compaction get at least one call in nine.
+  4. Otherwise, it runs the shard's background work (flush, compaction, the tablet balancer) in slices of at most 500 µs until `budget` is spent or no background work is runnable. Between slices, it handles newly queued messages first, so a commit never waits behind more than one slice.
+  5. It returns whether runnable work remains. Background work waiting for a time doesn't count: `next_wakeup` says when that is due.
+
+  A loop that polls its futures only after `run_once` returns `false` gives up the early end's gain, so poll them after every call, as above. A smaller `budget` hands the thread back sooner; it doesn't shorten step 2.
 - A thread that drives several shards, or waits on other sources too, uses its own event loop instead: the points below.
 
 **In your own event loop, with io_uring (the default on Linux: `IoBackend::Auto`, D218), wait on each shard's `Shard::io_fd`** (`poll`/`epoll`, readable), as well as on the `set_wakeup` callback and `next_wakeup` (D202):
