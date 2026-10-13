@@ -332,17 +332,46 @@ impl std::ops::Deref for ShardRef {
 }
 
 /// What [`Inner::route_and_send`] did with a commit's request.
-pub(crate) enum Routed {
+pub(crate) enum Routed<C> {
     /// Sent to `target`; the commit's waiter, whether a wait may spin, and the admission
-    /// charge it took (an async commit's).
+    /// charge it took (`()` for a commit that takes none).
     Sent {
         target: ShardId,
         waiter: Waiter<Result<crate::write::Settled>>,
         spins: bool,
-        charge: Option<crate::admission::Charge>,
+        charge: C,
     },
     /// Built and held back, to send once admitted.
     Held(Prepared),
+}
+
+/// How [`Inner::route_and_send`] admits a request once it knows its shard (D236): a
+/// blocking commit takes no admission ([`NoAdmission`]); an async one charges its shard's
+/// count (`(&Admission, bytes)`). Generic, so the blocking path compiles to no admission
+/// code at all.
+pub(crate) trait Admitter {
+    type Charge;
+    /// The charge on `target`, or `None` to hold the request back.
+    fn admit(self, target: ShardId) -> Option<Self::Charge>;
+}
+
+/// No admission: every request is sent.
+pub(crate) struct NoAdmission;
+
+impl Admitter for NoAdmission {
+    type Charge = ();
+    #[inline(always)]
+    fn admit(self, _: ShardId) -> Option<()> {
+        Some(())
+    }
+}
+
+impl Admitter for (&crate::admission::Admission, u64) {
+    type Charge = crate::admission::Charge;
+    #[inline(always)]
+    fn admit(self, target: ShardId) -> Option<crate::admission::Charge> {
+        self.0.try_fast(usize::from(target.0), self.1)
+    }
 }
 
 /// A routed commit request not yet sent ([`Inner::route_and_send`]).
@@ -1426,7 +1455,7 @@ impl Engine {
         // D236: routed once; the charge goes to the shard the request is sent to (a
         // cross-shard commit's coordinator), on that shard's own count.
         let bytes = crate::admission::batch_bytes(&batch);
-        match inner.route_and_send(batch, durability, None, None, Some((a, bytes)))? {
+        match inner.route_and_send(batch, durability, None, None, (&**a, bytes))? {
             Routed::Held(prepared) => {
                 let shard = usize::from(prepared.target.0);
                 let admit = crate::Admit::new(Some(a), shard, bytes);
@@ -1457,9 +1486,8 @@ impl Engine {
                     shared: inner.shard_ref(target),
                     spins,
                 });
-                if let Some(mut charge) = charge {
-                    charge.attach(&pending.sub.waiter);
-                }
+                let mut charge = charge;
+                charge.attach(&pending.sub.waiter);
                 Ok(pending)
             }
         }
@@ -2873,7 +2901,7 @@ impl Inner {
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
-        let routed = self.route_and_send(batch, durability, validate, predicate, None)?;
+        let routed = self.route_and_send(batch, durability, validate, predicate, NoAdmission)?;
         self.submission(routed)
     }
 
@@ -2886,14 +2914,14 @@ impl Inner {
     /// through a struct or a closure on the way: that cost the commit shapes 60–90
     /// instructions each.
     #[inline(always)]
-    pub(crate) fn route_and_send(
+    pub(crate) fn route_and_send<A: Admitter>(
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
-        admit: Option<(&crate::admission::Admission, u64)>,
-    ) -> Result<Routed> {
+        admit: A,
+    ) -> Result<Routed<A::Charge>> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -2939,19 +2967,13 @@ impl Inner {
                     })
                 };
             }
-            let charge = match admit {
-                None => None,
-                Some((a, bytes)) => match a.try_fast(usize::from(target.0), bytes) {
-                    Some(c) => Some(c),
-                    None => {
-                        return Ok(Routed::Held(Prepared {
-                            target,
-                            msg: request!(),
-                            waiter,
-                            spins,
-                        }));
-                    }
-                },
+            let Some(charge) = admit.admit(target) else {
+                return Ok(Routed::Held(Prepared {
+                    target,
+                    msg: request!(),
+                    waiter,
+                    spins,
+                }));
             };
             // A failed submit drops the charge, which returns it.
             self.shared.submitter(target).submit(request!())?;
@@ -2980,19 +3002,13 @@ impl Inner {
             epoch: 0,
             attempts: 0,
         }));
-        let charge = match admit {
-            None => None,
-            Some((a, bytes)) => match a.try_fast(usize::from(target.0), bytes) {
-                Some(c) => Some(c),
-                None => {
-                    return Ok(Routed::Held(Prepared {
-                        target,
-                        msg,
-                        waiter,
-                        spins,
-                    }));
-                }
-            },
+        let Some(charge) = admit.admit(target) else {
+            return Ok(Routed::Held(Prepared {
+                target,
+                msg,
+                waiter,
+                spins,
+            }));
         };
         // A failed submit drops the charge, which returns it.
         self.shared.submitter(target).submit(msg)?;
@@ -3011,7 +3027,7 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
-        match self.route_and_send(batch, durability, None, None, None)? {
+        match self.route_and_send(batch, durability, None, None, NoAdmission)? {
             Routed::Sent {
                 mut waiter, spins, ..
             } => crate::write::wait_blocking(&self.shared, &mut waiter, spins),
@@ -3021,7 +3037,7 @@ impl Inner {
 
     /// The pending commit for a request [`route_and_send`](Self::route_and_send) sent.
     #[inline(always)]
-    pub(crate) fn submission(&self, routed: Routed) -> Result<Submission> {
+    pub(crate) fn submission(&self, routed: Routed<()>) -> Result<Submission> {
         match routed {
             Routed::Sent {
                 target,
