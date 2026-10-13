@@ -23,6 +23,9 @@ pub(crate) struct Settings {
     pub(crate) sync: bool,
     /// Commits are `GroupSync` (overrides `sync`).
     pub(crate) group_sync: bool,
+    /// Commits keep the library's default durability, `Options::default()`'s (overrides
+    /// `sync` and `group_sync`; D247).
+    pub(crate) default_durability: bool,
     /// `None`: the library default (on).
     pub(crate) tablet_changes: Option<bool>,
     /// Packing (`Options::tablet_packing`, D217); on, the library default.
@@ -123,6 +126,21 @@ impl PigeonholeRunner {
         self
     }
 
+    /// `true`: commits keep the library's default durability (`Options::default()`, which is
+    /// `Durability::GroupSync`), whatever [`sync`](Self::sync) and
+    /// [`group_sync`](Self::group_sync) say: the durability D247's `contended` step measures.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().default_durability(true);
+    /// assert!(r.describe().contains(" group-sync(default)"));
+    /// ```
+    pub fn default_durability(mut self, yes: bool) -> Self {
+        self.settings.default_durability = yes;
+        self
+    }
+
     /// `true` (the library default): tablets split, merge and move between shards, so the
     /// bench table's writes spread over every shard ([`Options::tablet_changes`]); `false`:
     /// the table is one tablet on one shard.
@@ -220,16 +238,25 @@ impl PigeonholeRunner {
     }
 }
 
+/// How [`describe`](Runner::describe) names the library's default durability, `GroupSync`
+/// (`Options::default()`; a test checks a default commit's level).
+fn default_durability() -> &'static str {
+    "group-sync(default)"
+}
+
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
 pub(crate) fn options(s: &Settings) -> Options {
-    let mut options = Options::default()
-        .durability(if s.group_sync {
+    let mut options = Options::default();
+    if !s.default_durability {
+        options = options.durability(if s.group_sync {
             Durability::GroupSync
         } else if s.sync {
             Durability::Sync
         } else {
             Durability::Buffered
-        })
+        });
+    }
+    let mut options = options
         .memtable_budget(s.memory.write_buffer)
         .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
     if let Some(yes) = s.tablet_changes {
@@ -398,7 +425,9 @@ impl Runner for PigeonholeRunner {
             "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
-            if s.group_sync {
+            if s.default_durability {
+                default_durability()
+            } else if s.group_sync {
                 "group-sync"
             } else {
                 durability(s.sync)
@@ -701,6 +730,31 @@ mod tests {
         assert_eq!(cross + count("put"), config.operations);
         // Every commit uses a sequence number; refused rounds use more.
         assert!(rec.detail.seqnos_used.unwrap() >= config.operations);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_default_durability_is_group_sync() {
+        // D247: `default_durability` keeps `Options::default()`'s level, which `describe`
+        // names group-sync.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-dur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default()
+            .shards(1)
+            .sync(true)
+            .default_durability(true);
+        r.open(&dir).unwrap();
+        let info = r
+            .open
+            .as_ref()
+            .unwrap()
+            .target
+            .table
+            .mutate(b"r")
+            .put(YCSB_FAMILY, b"q", b"v");
+        assert_eq!(info.commit().unwrap().durability, Durability::GroupSync);
+        assert!(r.describe().contains(default_durability()));
+        r.close().unwrap();
         std::fs::remove_dir_all(dir).ok();
     }
 
