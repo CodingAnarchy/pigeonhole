@@ -519,10 +519,10 @@ impl Submission {
 #[inline]
 pub(crate) fn wait_blocking(
     shared: &crate::shard::Shared,
-    mut waiter: Waiter<crate::Result<Settled>>,
+    waiter: &mut Waiter<crate::Result<Settled>>,
     spins: bool,
 ) -> crate::Result<CommitInfo> {
-    let r = wait_body(shared, &mut waiter, spins);
+    let r = wait_body(shared, waiter, spins);
     let _ = COMMIT_SLOTS.try_with(|c| waiter.recycle_into(c));
     r
 }

@@ -331,7 +331,19 @@ impl std::ops::Deref for ShardRef {
     }
 }
 
-/// A routed commit request not yet sent ([`Inner::prepare`]).
+/// What [`Inner::route_and_send`] did with a commit's request.
+pub(crate) enum Routed {
+    /// Sent to `target`; the commit's waiter and whether a wait may spin.
+    Sent {
+        target: ShardId,
+        waiter: Waiter<Result<crate::write::Settled>>,
+        spins: bool,
+    },
+    /// Built and held back, to send once admitted.
+    Held(Prepared),
+}
+
+/// A routed commit request not yet sent ([`Inner::route_and_send`]).
 pub(crate) struct Prepared {
     /// The shard it goes to: its only shard, or a cross-shard commit's coordinator.
     pub(crate) target: ShardId,
@@ -1412,48 +1424,40 @@ impl Engine {
         // D236: routed once; the charge goes to the shard the request is sent to (a
         // cross-shard commit's coordinator), on that shard's own count.
         let bytes = crate::admission::batch_bytes(&batch);
-        inner.prepare_then(
-            batch,
-            durability,
-            None,
-            None,
-            |target, msg, waiter, spins| {
-                let shard = usize::from(target.0);
-                match a.try_fast(shard, bytes) {
-                    Some(mut charge) => {
-                        // A failed send drops the charge, which returns it.
-                        let pending =
-                            PendingCommit::from(inner.send_parts(target, msg, waiter, spins)?);
-                        charge.attach(&pending.sub.waiter);
-                        Ok(pending)
-                    }
-                    None => {
-                        let prepared = Prepared {
-                            target,
-                            msg,
-                            waiter,
-                            spins,
-                        };
-                        let admit = crate::Admit::new(Some(a), shard, bytes);
-                        let engine = Arc::clone(inner);
-                        // Sent once admitted; the `Mutex` only makes the closure `Sync`.
-                        let prepared = Mutex::new(Some(prepared));
-                        Ok(PendingCommit::waiting(
-                            inner.shard_ref(target),
-                            admit,
-                            Box::new(move || {
-                                let prepared = prepared
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .take()
-                                    .ok_or(Error::Closed)?;
-                                engine.send(prepared).map(PendingCommit::from)
-                            }),
-                        ))
-                    }
+        let mut charge = None;
+        let routed = inner.route_and_send(batch, durability, None, None, |target| {
+            charge = a.try_fast(usize::from(target.0), bytes);
+            charge.is_some()
+        })?;
+        match routed {
+            Routed::Held(prepared) => {
+                let shard = usize::from(prepared.target.0);
+                let admit = crate::Admit::new(Some(a), shard, bytes);
+                let engine = Arc::clone(inner);
+                // Sent once admitted; the `Mutex` only makes the closure `Sync`.
+                let prepared = Mutex::new(Some(prepared));
+                Ok(PendingCommit::waiting(
+                    inner.shard_ref(ShardId(shard as u16)),
+                    admit,
+                    Box::new(move || {
+                        let prepared = prepared
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take()
+                            .ok_or(Error::Closed)?;
+                        engine.send(prepared).map(PendingCommit::from)
+                    }),
+                ))
+            }
+            sent => {
+                // A failed send dropped the charge, which returned it.
+                let pending = PendingCommit::from(inner.submission(sent)?);
+                if let Some(mut charge) = charge {
+                    charge.attach(&pending.sub.waiter);
                 }
-            },
-        )?
+                Ok(pending)
+            }
+        }
     }
 
     /// [`submit_check_and_mutate`](Self::submit_check_and_mutate) for an async commit, as
@@ -2864,31 +2868,27 @@ impl Inner {
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
-        self.prepare_then(
-            batch,
-            durability,
-            validate,
-            predicate,
-            |target, msg, waiter, spins| self.send_parts(target, msg, waiter, spins),
-        )?
+        let routed = self.route_and_send(batch, durability, validate, predicate, |_| true)?;
+        self.submission(routed)
     }
 
-    /// Routes `batch`, builds its request and hands it to `then` (its target shard, the
-    /// request, the commit's waiter, whether a wait may spin), which sends it or keeps it to
-    /// send later ([`send`](Self::send)). An async commit charges its admission in `then`
+    /// Routes `batch` and sends its request to its shard (a cross-shard commit's
+    /// coordinator) if `admit(target)` says so, else builds it and hands it back to send
+    /// later ([`send`](Self::send)). An async commit charges its admission in `admit`
     /// (D236), so it is routed once. A request sent later than it was routed is still
     /// correct: a shard that handed a tablet away re-routes commits routed with an older
-    /// tablet map. Inlined, with `then`, so the request is built where it is used: moved
-    /// through a struct, it cost the commit shapes about 120 instructions each.
+    /// tablet map. The request is built inside the `submit` call that sends it, never moved
+    /// through a struct or a closure on the way: that cost the commit shapes 60–90
+    /// instructions each.
     #[inline(always)]
-    pub(crate) fn prepare_then<R>(
+    pub(crate) fn route_and_send(
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
         validate: Option<(Seqno, Vec<ReadKey>)>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
-        then: impl FnOnce(ShardId, ShardMsg, Waiter<Result<crate::write::Settled>>, bool) -> R,
-    ) -> Result<R> {
+        admit: impl FnOnce(ShardId) -> bool,
+    ) -> Result<Routed> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -2915,76 +2915,108 @@ impl Inner {
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::commit_succeeded);
         }
-        let (target, msg) = if shards.len() <= 1 {
-            let shard = shards.first().copied().unwrap_or(ShardId(0));
-            (
-                shard,
-                ShardMsg::Commit(CommitReq {
-                    bytes: builder,
-                    durability,
-                    reply: Reply::Commit(tx),
-                    submitted_at,
-                    validate,
-                    predicate: predicate.map(Box::new),
-                    commit_ts: None,
-                    map_version: view.tablets().version(),
-                    attempts: 0,
-                }),
-            )
-        } else {
-            if predicate.is_some() {
-                return Err(Error::InvalidArgument(
-                    "check_and_mutate touches one row".to_owned(),
-                ));
-            }
-            let parts = split_by_shard(&view, &builder, &shards)?;
-            let coordinator = shards[0];
-            (
-                coordinator,
-                ShardMsg::Coordinate(Box::new(CoordinateReq {
-                    parts,
-                    durability,
-                    reply: tx,
-                    submitted_at,
-                    validate,
-                    map_version: view.tablets.version(),
-                    commit_ts: None,
-                    epoch: 0,
-                    attempts: 0,
-                })),
-            )
-        };
         // A durable commit waits for a sync: polling for it would only burn the CPU.
         let spins = matches!(durability, Durability::None | Durability::Buffered);
-        // Released before `then`, which may wait for the commit (a blocking one): a view held
-        // across that wait would keep its memtables, and their arena room, from being
-        // reclaimed.
-        drop(view);
-        Ok(then(target, msg, waiter, spins))
+        if shards.len() <= 1 {
+            let target = shards.first().copied().unwrap_or(ShardId(0));
+            macro_rules! request {
+                () => {
+                    ShardMsg::Commit(CommitReq {
+                        bytes: builder,
+                        durability,
+                        reply: Reply::Commit(tx),
+                        submitted_at,
+                        validate,
+                        predicate: predicate.map(Box::new),
+                        commit_ts: None,
+                        map_version: view.tablets().version(),
+                        attempts: 0,
+                    })
+                };
+            }
+            if admit(target) {
+                self.shared.submitter(target).submit(request!())?;
+                return Ok(Routed::Sent {
+                    target,
+                    waiter,
+                    spins,
+                });
+            }
+            return Ok(Routed::Held(Prepared {
+                target,
+                msg: request!(),
+                waiter,
+                spins,
+            }));
+        }
+        if predicate.is_some() {
+            return Err(Error::InvalidArgument(
+                "check_and_mutate touches one row".to_owned(),
+            ));
+        }
+        let parts = split_by_shard(&view, &builder, &shards)?;
+        let target = shards[0];
+        let msg = ShardMsg::Coordinate(Box::new(CoordinateReq {
+            parts,
+            durability,
+            reply: tx,
+            submitted_at,
+            validate,
+            map_version: view.tablets.version(),
+            commit_ts: None,
+            epoch: 0,
+            attempts: 0,
+        }));
+        if admit(target) {
+            self.shared.submitter(target).submit(msg)?;
+            return Ok(Routed::Sent {
+                target,
+                waiter,
+                spins,
+            });
+        }
+        Ok(Routed::Held(Prepared {
+            target,
+            msg,
+            waiter,
+            spins,
+        }))
     }
 
     /// Submits and waits on the engine's borrowed state (D236): a blocking commit takes no
-    /// reference on the engine and moves no request through a struct.
+    /// reference on the engine.
     fn commit_blocking(
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
-        self.prepare_then(
-            batch,
-            durability,
-            None,
-            None,
-            |target, msg, waiter, spins| {
-                self.shared.submitter(target).submit(msg)?;
-                crate::write::wait_blocking(&self.shared, waiter, spins)
-            },
-        )?
+        match self.route_and_send(batch, durability, None, None, |_| true)? {
+            Routed::Sent {
+                mut waiter, spins, ..
+            } => crate::write::wait_blocking(&self.shared, &mut waiter, spins),
+            Routed::Held(p) => self.send(p)?.wait(),
+        }
     }
 
-    /// Sends a prepared request ([`prepare_then`](Self::prepare_then)) to its shard (the
-    /// coordinator of a cross-shard one).
+    /// The pending commit for a request [`route_and_send`](Self::route_and_send) sent.
     #[inline(always)]
+    pub(crate) fn submission(&self, routed: Routed) -> Result<Submission> {
+        match routed {
+            Routed::Sent {
+                target,
+                waiter,
+                spins,
+            } => Ok(Submission {
+                waiter,
+                shared: self.shard_ref(target),
+                spins,
+            }),
+            Routed::Held(p) => self.send(p),
+        }
+    }
+
+    /// Sends a request [`route_and_send`](Self::route_and_send) held back (an async commit
+    /// that waited for room).
     pub(crate) fn send(&self, prepared: Prepared) -> Result<Submission> {
         let Prepared {
             target,
@@ -2992,19 +3024,6 @@ impl Inner {
             waiter,
             spins,
         } = prepared;
-        self.send_parts(target, msg, waiter, spins)
-    }
-
-    /// [`send`](Self::send) taking the request's parts, so the blocking path never moves
-    /// them through a struct.
-    #[inline(always)]
-    pub(crate) fn send_parts(
-        &self,
-        target: ShardId,
-        msg: ShardMsg,
-        waiter: Waiter<Result<crate::write::Settled>>,
-        spins: bool,
-    ) -> Result<Submission> {
         self.shared.submitter(target).submit(msg)?;
         Ok(Submission {
             waiter,
