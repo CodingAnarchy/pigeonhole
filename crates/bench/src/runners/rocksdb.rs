@@ -38,6 +38,10 @@ use crate::{BenchOp, Client, Runner};
 #[derive(Default)]
 pub struct RocksDbRunner {
     sync: bool,
+    /// The load writes unsynced, the measured phase at `sync` (D247).
+    load_buffered: bool,
+    /// The load is running (unsynced when `load_buffered`).
+    loading: bool,
     memory: MemoryBudget,
     db: Option<Arc<DB>>,
     /// Whether a `metric` cell was written: scans then merge both column families.
@@ -65,6 +69,13 @@ impl RocksDbRunner {
     /// Write buffer size and block cache (default [`MemoryBudget::default`]).
     pub fn memory(mut self, memory: MemoryBudget) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// `true`: the load writes the WAL unsynced, and the warmup and the measured phase as
+    /// [`sync`](Self::sync) says (D247).
+    pub fn load_buffered(mut self, yes: bool) -> Self {
+        self.load_buffered = yes;
         self
     }
 }
@@ -116,6 +127,12 @@ impl Runner for RocksDbRunner {
         )
         .map_err(|e| e.to_string())?;
         self.db = Some(Arc::new(db));
+        self.loading = self.load_buffered;
+        Ok(())
+    }
+
+    fn measured_durability(&mut self) -> Result<(), String> {
+        self.loading = false;
         Ok(())
     }
 
@@ -164,9 +181,14 @@ impl Runner for RocksDbRunner {
 
     fn describe(&self) -> String {
         format!(
-            "{} bloom={BLOOM_BITS} {}",
+            "{} bloom={BLOOM_BITS} {}{}",
             self.memory,
-            durability(self.sync)
+            durability(self.sync),
+            if self.load_buffered {
+                " load=buffered"
+            } else {
+                ""
+            }
         )
     }
 }
@@ -174,7 +196,7 @@ impl Runner for RocksDbRunner {
 impl Counted for RocksDbRunner {
     fn execute_counted(&mut self, op: &BenchOp) -> Result<Touched, String> {
         let db = self.db.as_ref().ok_or("rocksdb runner is not open")?;
-        handle(db, self.sync, &self.metric_written).execute(op)
+        handle(db, self.sync && !self.loading, &self.metric_written).execute(op)
     }
 }
 

@@ -494,6 +494,12 @@ pub trait Runner {
         None
     }
 
+    /// Called after the load and the settle step, before the warmup: a runner set to load at
+    /// buffered durability commits at its own from here on (D247). The default does nothing.
+    fn measured_durability(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// The store's last sequence number, for stores that number their commits; `None` (the
     /// default) elsewhere. [`run_detailed`] reads it around the measured phase: the
     /// sequence numbers used beyond one per commit are commit rounds that did not commit
@@ -911,6 +917,7 @@ fn measure(
     }
     let load = load_start.elapsed();
     let settled = settle(runner)?;
+    runner.measured_durability()?;
 
     let threads = config.threads.max(1);
     let mut clients: Vec<Box<dyn Client>> = if threads > 1 {

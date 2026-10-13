@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pigeonhole::{Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, Table};
+use pigeonhole::{
+    Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, RowMutation, Table,
+};
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, XSHARD_PARTITIONS, YCSB_FAMILY};
@@ -26,6 +28,8 @@ pub(crate) struct Settings {
     /// Commits keep the library's default durability, `Options::default()`'s (overrides
     /// `sync` and `group_sync`; D247).
     pub(crate) default_durability: bool,
+    /// The load commits `Buffered`, the measured phase at the run's durability (D247).
+    pub(crate) load_buffered: bool,
     /// `None`: the library default (on).
     pub(crate) tablet_changes: Option<bool>,
     /// Packing (`Options::tablet_packing`, D217); on, the library default.
@@ -138,6 +142,21 @@ impl PigeonholeRunner {
     /// ```
     pub fn default_durability(mut self, yes: bool) -> Self {
         self.settings.default_durability = yes;
+        self
+    }
+
+    /// `true`: the load commits `Buffered` (D108's parity level), and the warmup and the
+    /// measured phase at the run's durability, so a durable level's run is not mostly its
+    /// load (D247). The settle step flushes the load either way.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().default_durability(true).load_buffered(true);
+    /// assert!(r.describe().contains(" group-sync(default) load=buffered"));
+    /// ```
+    pub fn load_buffered(mut self, yes: bool) -> Self {
+        self.settings.load_buffered = yes;
         self
     }
 
@@ -326,6 +345,7 @@ impl Runner for PigeonholeRunner {
                 db,
                 table,
                 parts: Arc::default(),
+                load_buffered: self.settings.load_buffered,
             },
             busy: Arc::default(),
         });
@@ -339,7 +359,9 @@ impl Runner for PigeonholeRunner {
     fn close(&mut self) -> Result<(), String> {
         match self.open.take() {
             Some(Open {
-                target: Target { db, table, parts },
+                target: Target {
+                    db, table, parts, ..
+                },
                 ..
             }) => {
                 drop((table, parts));
@@ -397,6 +419,13 @@ impl Runner for PigeonholeRunner {
         })
     }
 
+    fn measured_durability(&mut self) -> Result<(), String> {
+        if let Some(o) = self.open.as_mut() {
+            o.target.load_buffered = false;
+        }
+        Ok(())
+    }
+
     fn seqno(&self) -> Option<u64> {
         self.open
             .as_ref()?
@@ -422,7 +451,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -431,6 +460,11 @@ impl Runner for PigeonholeRunner {
                 "group-sync"
             } else {
                 durability(s.sync)
+            },
+            if s.load_buffered {
+                " load=buffered"
+            } else {
+                ""
             },
             match (s.tablet_changes == Some(false), s.no_packing) {
                 (true, _) => "",
@@ -470,6 +504,8 @@ pub(crate) struct Target {
     db: Pigeonhole,
     table: Table,
     parts: Arc<Vec<Table>>,
+    /// Commits are `Buffered` (the load of a run set to [`PigeonholeRunner::load_buffered`]).
+    load_buffered: bool,
 }
 
 struct PigeonholeClient {
@@ -485,6 +521,15 @@ impl Client for PigeonholeClient {
 
 fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, String> {
     let table = &target.table;
+    // A load at buffered durability (D247).
+    let buffered = target.load_buffered;
+    fn level(buffered: bool, m: RowMutation<'_>) -> RowMutation<'_> {
+        if buffered {
+            m.durability(Durability::Buffered)
+        } else {
+            m
+        }
+    }
     let mut t = Touched::default();
     match op {
         BenchOp::Get {
@@ -505,7 +550,7 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
         }
         BenchOp::Put { row, family, cells } => {
             retry_busy(busy, || {
-                let mut m = table.mutate(row);
+                let mut m = level(buffered, table.mutate(row));
                 for (q, v) in cells {
                     m = m.put(family, q, v);
                 }
@@ -519,7 +564,7 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             cells,
         } => {
             retry_busy(busy, || {
-                let mut m = table.mutate(row);
+                let mut m = level(buffered, table.mutate(row));
                 for (q, v) in cells {
                     m = m.put_at(family, q, *ts, v);
                 }
@@ -546,7 +591,9 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             }
             drop(old);
             retry_busy(busy, || {
-                table.mutate(row).put(YCSB_FAMILY, qualifier, &new).commit()
+                level(buffered, table.mutate(row))
+                    .put(YCSB_FAMILY, qualifier, &new)
+                    .commit()
             })?;
         }
         BenchOp::Commit { family, rows } => {
@@ -559,7 +606,7 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             if let [r] = rows.as_slice() {
                 let table = part(r.partition)?;
                 retry_busy(busy, || {
-                    let mut m = table.mutate(&r.row);
+                    let mut m = level(buffered, table.mutate(&r.row));
                     for (q, v) in &r.cells {
                         m = m.put(family, q, v);
                     }
@@ -577,7 +624,11 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                             wb.put(table, &r.row, family, q, v);
                         }
                     }
-                    wb.commit()
+                    if target.load_buffered {
+                        wb.commit_with(Durability::Buffered)
+                    } else {
+                        wb.commit()
+                    }
                 })?;
             }
         }
@@ -754,6 +805,66 @@ mod tests {
             .put(YCSB_FAMILY, b"q", b"v");
         assert_eq!(info.commit().unwrap().durability, Durability::GroupSync);
         assert!(r.describe().contains(default_durability()));
+        r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_buffered_load_switches_to_the_runs_durability_after_the_settle() {
+        // D247: the load commits Buffered; from `measured_durability` on, the default level.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-lb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default()
+            .shards(1)
+            .default_durability(true)
+            .load_buffered(true);
+        r.open(&dir).unwrap();
+        let levels = |r: &PigeonholeRunner| -> Vec<u64> {
+            let db = &r.open.as_ref().unwrap().target.db;
+            db.commit_latency_buckets()
+                .iter()
+                .map(|b| b.iter().sum())
+                .collect()
+        };
+        let put = |r: &mut PigeonholeRunner, i: u32| {
+            r.execute(&BenchOp::Put {
+                row: format!("r{i}").into_bytes(),
+                family: YCSB_FAMILY,
+                cells: vec![(b"q".to_vec(), b"v".to_vec())],
+            })
+            .unwrap();
+        };
+        let start = levels(&r);
+        for i in 0..10 {
+            put(&mut r, i);
+        }
+        let loaded = levels(&r);
+        r.measured_durability().unwrap();
+        for i in 10..20 {
+            put(&mut r, i);
+        }
+        let measured = levels(&r);
+        let grew = |a: &[u64], b: &[u64]| -> Vec<usize> {
+            (0..a.len()).filter(|&l| b[l] > a[l]).collect()
+        };
+        let (load_level, run_level) = (grew(&start, &loaded), grew(&loaded, &measured));
+        assert_eq!(load_level.len(), 1, "{start:?} -> {loaded:?}");
+        assert_eq!(run_level.len(), 1, "{loaded:?} -> {measured:?}");
+        assert_ne!(
+            load_level, run_level,
+            "the load and the run commit at different levels"
+        );
+        // The client a run creates after the switch commits at the run's level too.
+        let mut c = r.client().unwrap();
+        let before = levels(&r);
+        c.execute(&BenchOp::Put {
+            row: b"c".to_vec(),
+            family: YCSB_FAMILY,
+            cells: vec![(b"q".to_vec(), b"v".to_vec())],
+        })
+        .unwrap();
+        drop(c);
+        assert_eq!(grew(&before, &levels(&r)), run_level);
         r.close().unwrap();
         std::fs::remove_dir_all(dir).ok();
     }
