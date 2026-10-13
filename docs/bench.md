@@ -165,6 +165,8 @@ Each result row gives the workload, store, store settings, size, client threads,
 
 Before D204 the gate ran N synchronous clients on N engine-owned shards. That's 2N busy threads, which can't reach 0.8 × N at N = cores (#154). A `scaling.json` from before D204 is not a baseline for the p99 half: the first run after it starts a new one.
 
+**Since D231, `phdb-bench scaling` means something else, run by hand too.** It always pre-splits the table at the writes' quantiles and runs with the balancer off, so it measures the engine's per-shard throughput, not the balancer's placement. Its efficiency is not comparable with a `scaling` result from before D231, where the balancer spread the table during the warm-up and the placement it left capped the result; its busiest share no longer judges placement either. To see how the balancer places a table, run `phdb-bench placement`.
+
 **The scaling gate has two halves, checked differently.** Each `scaling` run evaluates only the efficiency half and prints pass or fail. The other half, "no regression in single-shard p99", needs a baseline: compare this run's `scaling.json` against a stored one with `phdb-bench compare old/scaling.json new/scaling.json`, which checks the single-shard p99 within the p99 tolerance. The weekly `bench.yml` uploads `scaling.json` with every run, so each run leaves the baseline for the next.
 
 **Scaling needs tablet changes** (on by default) for its pre-split. With `--no-tablet-changes` a table stays one tablet on one shard, so the writes all land on one shard whatever N is, and `scaling` fails by construction. `scaling` warms up as long as it measures (`--warmup 1.0`) unless `--warmup` says otherwise, so flushes and compactions reach their steady state first.
