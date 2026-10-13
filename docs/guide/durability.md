@@ -86,7 +86,29 @@ What that means in practice:
 - **Across shards, a later write can survive while an earlier one it depended on is lost.** Each shard recovers a prefix of its own log, so on one shard what survives is always a prefix of what readers saw. Shards are logged independently, though. Example: client P writes `order:7 = "placed"` (shard 1). Client Q reads it and writes `invoice:7 = "for order 7"` (shard 2), and Q's commit returns. Power fails before shard 1's fsync. After recovery `invoice:7` exists and `order:7` doesn't. A transaction that read `order:7` doesn't prevent this either: it validates against what was visible. If a write must never outlive what it was derived from, read through a durable snapshot (see below), or put both rows in one shard's batch.
 - **A backup can include commits the database later loses.** `backup` copies exactly what is visible at its snapshot. That can include commits whose fsync hasn't returned yet. If the power then fails, the backup holds commits the database itself doesn't. To back up only durable data, take the backup from a durable snapshot (see below).
 - **A sequence number or timestamp a reader saw can be handed out again after a power loss.** Seqnos and default timestamps are assigned in memory, ahead of the fsync. If a reader saw commit seqno 1042 and that commit is then lost to a power loss, the restarted database can give 1042, and the same default timestamp, to a different commit. This matters if you use seqnos or timestamps as cursors or versions. Example: a change consumer records "processed up to seqno 1042" after reading other clients' commits. After a power loss, it skips the new commit 1042, which it has never seen. Seqnos and timestamps of commits whose own `commit()` returned are durable and never reused. A cursor taken from a durable snapshot is safe too.
-- **Durable snapshots.** A reader that needs every value it sees to be durable will be able to ask for a durable snapshot: one that sees a commit only once its level is met on its shard. This is how reads behaved before D227. *(Coming next: ICR 0037.)*
+- **Durable snapshots (opt-in, ICR 0037).** A reader that needs every value it sees to be durable takes a durable snapshot instead: `db.durable_snapshot()` (also on a reader process's handle). It sees a commit only once its level is met on its shard, which is how every snapshot behaved before D227. Durable means durable at the commit's own level: `GroupSync` and `Sync` commits survive a power loss, `Buffered` ones a process crash, `None` ones nothing. To read only data that survives a power loss, write it with `GroupSync` or `Sync`. A failed fsync never counts as durable. It lags `snapshot()` by the fsyncs in flight, typically well under a millisecond. Use it when what you read must never be undone:
+  - before writing something derived from it, on another shard;
+  - for a cursor or version you persist;
+  - for a backup that must hold only durable data: `db.backup_durable(path)`.
+
+  ```rust
+  # use pigeonhole::{Family, Options, Pigeonhole};
+  # fn main() -> pigeonhole::Result<()> {
+  # let dir = pigeonhole::doc_support::temp_dir();
+  # let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+  # let orders = db.table("orders")?.family("f", Family::default()).create_if_missing()?;
+  # orders.mutate(b"order:7").put("f", b"state", b"placed").commit()?;
+  let durable = db.durable_snapshot()?;
+  if let Some(state) = orders.get_at(&durable, b"order:7", "f", b"state")? {
+      // `state` survives a power loss: safe to act on, or to derive another write from.
+      # let _ = state;
+  }
+  # drop(durable);
+  # drop(orders);
+  # db.close()?;
+  # Ok(())
+  # }
+  ```
 
 Unchanged:
 - **Acknowledged commits** are never lost at their level.

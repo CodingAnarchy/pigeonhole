@@ -411,7 +411,7 @@ Single-shard commits keep D42's prefix promise within their shard's stream. A cr
 ## D85 — a failed WAL sync after a group was applied leaves its data visible (approved; engine)
 The group's members are told the commit failed and the stream is poisoned (wal contract), but entries already applied to memtables stay readable until restart, like `Durability::None` data. Documented on `Engine::commit` next to `Durability::None`.
 
-*Since D227, data is visible from apply, before its sync, so readers can see a group before its sync fails, not only after.*
+*Since D227, data is visible from apply, before its sync, so readers can see a group before its sync fails, not only after. Since D227 part 2 (ICR 0037), a failed sync also counts as the shard's death. The failed group never becomes durable: the durable watermark stays below it, so durable snapshots and `backup_durable` never include it. The close is unclean: it gives up flushing instead of waiting on freezes that the stuck durable watermark holds back. From then on every new commit is refused with `Closed`, healthy shards included (nothing is written, so not committed). Without that, healthy shards would keep committing until their arenas filled behind freezes the stuck durable watermark holds back, then fail with `Busy` after the write-stall timeout. Reads keep working. A poisoned stream already means the database needs reopening.*
 
 <a id="d86"></a>
 ## D86 — default timestamps use a per-shard floor seeded at replay (approved; engine)
@@ -658,6 +658,8 @@ D24 says a checkpoint never strands a prepared commit, and D83 that a cross-shar
 The manifest brief says `SetFlushed { tablet, family, seqno }` and replay skips mutations at or below it, but a memtable frozen while a group is mid-apply could hold a seqno above the visible watermark while a lower one is still being applied to the active memtable.
 
 **Decision:** a shard freezes only when `active.max_seqno <= visible_seqno`, so every entry up to the memtable's max seqno is in it and `SetFlushed` is exactly that max. The freeze is deferred (`freeze_deferred`) until the condition holds, never skipped.
+
+*Since D227, the condition is the durable seqno, not the visible one: a frozen memtable holds only durable entries, so a flush never collapses a version a durable snapshot reads.*
 
 <a id="d118"></a>
 ## D118 — How conservative is `GcPolicy` about reader-process snapshots? (approved; engine Milestone B; precise per-slot pinning is #39)

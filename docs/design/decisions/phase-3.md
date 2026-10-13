@@ -946,7 +946,22 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - **Acknowledgement is unchanged.** A commit returns only once it is durable at its level and visible (D19), so read-your-writes holds after the call returns.
 - **Cross-shard commits are unchanged.** One becomes visible only after its COMMIT meets the requested level and every participant has applied it.
 - **`Buffered` and `None`** become visible at apply, like every level (they already did).
-- **Durable snapshots** (ICR 0037, a separate change): a snapshot or read option that sees a commit only once it is durable at its level on its shard. It is backed by a second published watermark per shard, a shared-memory layout version bump. It keeps D19's strict view for readers that need it.
+- **Durable snapshots** (ICR 0037): `durable_snapshot()` (engine, `Pigeonhole` and reader handles) sees a commit only once it is durable at its level on its shard; `backup_durable` backs up from one.
+  - Backed by a second published watermark per shard: `durable` at offset 8 of each shard's watermark line, shared-memory layout version 2 (FORMAT §11.2–11.3).
+  - It keeps D19's strict view for readers that need it.
+- **A memtable freezes only once everything in it is durable** (D117's rule, at the durable seqno instead of the visible one). A deferred freeze waits in a registry of its own, `Shared::durable_waiters`, woken against the durable seqno.
+  - Why: GC at flush keeps the newest version at each read point (live snapshots and "latest"). A memtable frozen at the visible seqno could hold versions above the durable seqno, and its flush would collapse one that a later durable snapshot reads (found by the new `durable_freeze` test's mutation check: the durable read came back empty).
+  - Frozen at the durable seqno, every entry a flush writes is at or below a durable seqno at or below any later durable snapshot. Compaction inputs inherit that bound.
+  - Cost: a freeze waits for the syncs in flight, D19's timing for freezes.
+- **A reader process's durable snapshot** pins its slot with a durable seqno, or lowers an existing pin to it while keeping the pinned view.
+- **Durable means durable at the commit's own level.** Of what a durable snapshot reads, `GroupSync` and `Sync` commits survive a power loss, `Buffered` ones a process crash, `None` ones nothing.
+- **A failed fsync is never durable.** The shard keeps the failed group's lowest seqno as a floor under its durable watermark for good. Every shard's freezes would then stall behind it, so the failure also counts as the shard's death (`shard_died`): the close gives up flushing and is unclean, and the next open replays only what reached the disk (D85's note).
+- **Replay after a process crash:** recovered records may sit in the page cache only. Open syncs each recovered stream (the new segment's `sync_all`, `Recovery::into_stream`) before any watermark is published, so they're durable before a durable snapshot can read them. `durable_snapshot.rs` checks this with a power loss after the reopen.
+- **After a shard's death, new commits are refused** (owner decision on ctr274's point 5, option (b)). This covers a panic, a dropped application-owned shard, a failed fsync and a failed cross-shard apply. `Inner::submit`, `check_and_mutate` and `commit_local` check `shard_died` and return `Closed`: nothing is written, so not committed. Reads keep working.
+  - Why: fail fast beats a 30 s `Busy` stall once memtables can no longer freeze behind a stuck durable watermark, and a commit that could never become visible here.
+  - Checked by `blocking_waits`: a dead coordinator, a poisoned shard's failed sync, and a failed share apply each refuse later commits on every shard. Without the check, all three tests fail.
+- **Upgrades:** layout 2 refuses mixed versions, so stop reader processes before upgrading the writer.
+- **Cost:** the shard computes both watermarks in one pass and skips the durable store when its value is unchanged.
 - **The D226 row** (group commit p99 < 200 µs) is judged on the default, this decision.
 
 **Consequences users must know** (the durability guide's "Visibility and durability" section has the examples):

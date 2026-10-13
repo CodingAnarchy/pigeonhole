@@ -340,6 +340,11 @@ pub(crate) struct Shared {
     pub full_compactions: AtomicUsize,
     /// Async commits and deferred freezes waiting for the watermark.
     pub waiters: WatermarkWaiters,
+    /// Shards whose deferred freeze waits for the durable seqno (D227, ICR 0037): a frozen
+    /// memtable holds only durable entries, so flush and compaction GC never collapse a
+    /// version a durable snapshot may still read. Woken from `publish_watermark` beside
+    /// `waiters`, against `ShmRegion::durable_seqno`.
+    pub durable_waiters: WatermarkWaiters,
     pub visibility: VisibilityCounts,
     /// A shard died (`Shared::shard_died`).
     pub shard_died: AtomicBool,
@@ -412,7 +417,7 @@ impl Shared {
 
     /// Whether visibility can no longer advance: the close finished, or a shard died (its
     /// thread panicked, or its `EngineShard` was dropped, which also fails the close). A
-    /// visibility wait then ends with `Closed`.
+    /// visibility wait then ends with `OutcomeUnknown`.
     pub(crate) fn visibility_ended(&self) -> bool {
         self.closed.load(Ordering::SeqCst) || self.close.failed()
     }
@@ -421,6 +426,7 @@ impl Shared {
     /// true: each re-checks and ends.
     pub(crate) fn wake_all_visible(&self) {
         self.waiters.wake_all(|w| self.wake(w));
+        self.durable_waiters.wake_all(|w| self.wake(w));
     }
 
     /// Runs a watermark waiter's wake.
@@ -461,7 +467,9 @@ impl Shared {
     /// Wakes, outside the lock, every watermark waiter whose seqno is visible now. Called by
     /// shards after a watermark publish (one fence and one load when nobody waits).
     pub(crate) fn wake_visible(&self) {
-        let passed = self.waiters.wake_ready(
+        // One fence for both registries: it pairs with the fence in each one's `register`.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let passed = self.waiters.wake_ready_fenced(
             || self.shm.visible_seqno(),
             |w| {
                 if matches!(w, Wake::Task(_)) {
@@ -473,6 +481,9 @@ impl Shared {
         if passed {
             self.visibility.passes.fetch_add(1, Ordering::Relaxed);
         }
+        // Deferred freezes wait for the durable seqno (D227).
+        self.durable_waiters
+            .wake_ready_fenced(|| self.shm.durable_seqno(), |w| self.wake(w));
     }
 
     /// Publishes a new view built by `f` from the current one, in shared memory too. The
@@ -1950,6 +1961,12 @@ pub(crate) struct ShardState {
     next_group: u64,
     /// Cross-shard seqnos this shard coordinates, not yet applied everywhere.
     held: BTreeSet<Seqno>,
+    /// The lowest seqno of a group whose WAL sync failed (D85): never durable, so the
+    /// durable watermark stays below it for good (D227, ICR 0037).
+    sync_failed_floor: Seqno,
+    /// The durable watermark this shard last published: a publish that would store the
+    /// same value skips the store (the commit path publishes after every group).
+    published_durable: std::cell::Cell<Seqno>,
     coord: HashMap<Seqno, Coord>,
     prepared: HashMap<Seqno, PreparedShare>,
     /// Queued or running flushes that may purge versions under the guard (#287), as
@@ -2251,6 +2268,8 @@ impl ShardState {
             sync_wanted: false,
             next_group: 1,
             held: BTreeSet::new(),
+            sync_failed_floor: u64::MAX,
+            published_durable: std::cell::Cell::new(u64::MAX),
             coord: HashMap::new(),
             prepared: HashMap::new(),
             guarded: Vec::new(),
@@ -2880,7 +2899,7 @@ impl ShardState {
 
     /// Freezes the active memtables that crossed the threshold during `apply` (or every
     /// non-empty one when `all`), and queues them for flushing. A memtable freezes only
-    /// once every seqno it holds is visible: then its largest seqno is exact as the slot's
+    /// once every seqno it holds is durable (D227), so also visible: then its largest seqno is exact as the slot's
     /// flushed-through seqno (no lower seqno can land in a newer memtable), so replay skips
     /// exactly what the SST holds.
     fn freeze(&mut self, all: bool) -> Result<()> {
@@ -2902,11 +2921,15 @@ impl ShardState {
             keys
         };
         let tablets_on = self.tablets_on();
-        let visible = self.shared.shm.visible_seqno();
+        // A memtable freezes once everything in it is durable, not only visible (D227):
+        // flush GC then never collapses versions a durable snapshot may still read, and
+        // compaction's inputs inherit the bound (ICR 0037). Read once, and only when a
+        // memtable is due: the commit path calls this after every group, usually with none.
+        let mut durable: Option<Seqno> = None;
         let view = self.shared.view.load();
         let mut deferred = false;
         let mut starved = false;
-        // The seqno that must be visible before every deferred memtable can freeze.
+        // The seqno that must be durable before every deferred memtable can freeze.
         let mut needed: Seqno = 0;
         for key in keys {
             let Some(slot) = self.memtables.get_mut(&key) else {
@@ -2916,18 +2939,18 @@ impl ShardState {
                 continue;
             }
             let big = slot.active.table.allocated_bytes() >= threshold;
-            trace!(
-                "shard {} freeze {:?}: all={all} big={big} empty={} max_seqno={} visible={visible}",
-                self.id.0,
-                key,
-                slot.active.table.is_empty(),
-                slot.active.max_seqno()
-            );
             let forced = self.moving.contains(&key.0) || self.unpin.contains(&key);
             if slot.active.table.is_empty() || !(all || big || forced) {
                 continue;
             }
-            if slot.active.max_seqno() > visible {
+            let durable = *durable.get_or_insert_with(|| self.shared.shm.durable_seqno());
+            trace!(
+                "shard {} freeze {:?}: all={all} big={big} forced={forced} max_seqno={} durable={durable}",
+                self.id.0,
+                key,
+                slot.active.max_seqno()
+            );
+            if slot.active.max_seqno() > durable {
                 deferred = true;
                 needed = needed.max(slot.active.max_seqno());
                 if !self.to_freeze.contains(&key) {
@@ -3025,16 +3048,16 @@ impl ShardState {
             // waits for: a publish wakes this shard only once that seqno is visible (main's
             // flag-guarded registration was lost after the first wake, and a tablet change
             // waits on the freeze with every write to its tablet parked, so nothing else
-            // would wake it). A watermark published since `visible` was read may have missed
+            // would wake it). A watermark published since the durable seqno was read may have missed
             // the registration: look again.
             self.freeze_deferred = true;
             let id = self.id.0;
-            self.shared.waiters.register(
+            self.shared.durable_waiters.register(
                 crate::watermark_waiters::shard_key(id),
                 needed,
                 Wake::Shard(id),
             );
-            if self.shared.shm.visible_seqno() >= needed
+            if self.shared.shm.durable_seqno() >= needed
                 && let Some(subs) = self.shared.submitters.get()
             {
                 let _ = subs[usize::from(self.id.0)].submit(ShardMsg::Kick);
@@ -3051,6 +3074,13 @@ impl ShardState {
     /// Starts a flush task over everything queued, if none is running.
     fn spawn_flush(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.flush_running || self.flush_queue.is_empty() {
+            return;
+        }
+        // The close gave up flushing after a failure (the WAL keeps the data; the close is
+        // unclean). A failure while closing sets no backoff, so without this a deferred
+        // freeze's kick restarted the flush before the close could give up, rewriting the
+        // same SST for ever (a poisoned stream fails every flush at its WAL barrier).
+        if self.closing && self.flush_failed {
             return;
         }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
@@ -3454,10 +3484,38 @@ impl ShardState {
         held.min(groups)
     }
 
+    /// `watermark()`, and the durable watermark, in one pass over `held` and `unresolved`.
+    /// The durable one is the lowest seqno this shard holds that is not yet durable at its
+    /// level: `held`, every unresolved group (its sync has not returned: D19's rule, which
+    /// durable snapshots keep; D227, ICR 0037), and a group whose sync failed
+    /// (`sync_failed_floor`).
+    #[inline]
+    fn watermarks(&self) -> (Seqno, Seqno) {
+        let held = self.held.first().copied().unwrap_or(u64::MAX);
+        let (mut pending, mut durable) = (held, held.min(self.sync_failed_floor));
+        for g in &self.unresolved {
+            if let Some(first) = g.first {
+                durable = durable.min(first);
+                if g.unwritten {
+                    pending = pending.min(first);
+                }
+            }
+        }
+        (pending, durable)
+    }
+
     fn publish_watermark(&self) {
-        self.shared
-            .shm
-            .publish_pending(u32::from(self.id.0), self.watermark());
+        let shard = u32::from(self.id.0);
+        let (pending, durable) = self.watermarks();
+        debug_assert_eq!(pending, self.watermark());
+        // Durable first: a reader that sees the raised pending watermark (Acquire) then sees
+        // the durable one covering what is applied but not yet synced. An unchanged value is
+        // already published.
+        if durable != self.published_durable.get() {
+            self.shared.shm.publish_durable(shard, durable);
+            self.published_durable.set(durable);
+        }
+        self.shared.shm.publish_pending(shard, pending);
         self.shared.wake_visible();
     }
 
@@ -5238,6 +5296,9 @@ impl ShardState {
         }
         while self.unresolved.front().is_some_and(|g| g.id <= through) {
             let group = self.unresolved.pop_front().expect("checked");
+            if failed && let Some(first) = group.first {
+                self.sync_failed_floor = self.sync_failed_floor.min(first);
+            }
             self.publish_watermark();
             let outcome = if failed {
                 Err(Error::Io(pigeonhole_io::Error::new(
@@ -5248,6 +5309,14 @@ impl ShardState {
                 Ok(())
             };
             self.resolve_group(group, outcome, ctx);
+        }
+        if failed {
+            // The durable watermark stays below the failed group for good, so every shard's
+            // freezes (which wait for the durable seqno) would stall behind it: treat the
+            // failure as a shard's death. Visibility ends (waiters get `OutcomeUnknown`), the
+            // close is unclean, and the next open replays only what reached the disk. A
+            // poisoned stream already means the database needs reopening.
+            self.shared.shard_died();
         }
         self.try_finish_close(ctx);
     }

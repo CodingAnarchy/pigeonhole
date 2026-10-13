@@ -48,8 +48,9 @@ impl FormatVersion {
 pub struct ShmLayoutVersion(pub u32);
 
 impl ShmLayoutVersion {
-    /// The layout this build creates and attaches to (exact match required).
-    pub const CURRENT: Self = Self(1);
+    /// The layout this build creates and attaches to (exact match required). Version 2 adds
+    /// each shard's durable watermark (D227).
+    pub const CURRENT: Self = Self(2);
 }
 
 /// Magic at offset 0 of each superblock (pages 0 and 1).

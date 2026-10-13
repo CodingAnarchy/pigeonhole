@@ -354,6 +354,13 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
         .expect("the visibility wait outlived the shard holding it");
     // Acknowledged by its shard but never visible here: the next open decides (ICR 0038).
     assert!(matches!(ended, Err(Error::OutcomeUnknown)), "{ended:?}");
+    // A new commit, even on the live shard, is refused before anything is written.
+    let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
+    let refused = gate::within(10, move || {
+        db2.commit(put(&on_a2, "after"), Some(Durability::None))
+    })
+    .expect("a commit after a shard's death hung");
+    assert!(matches!(refused, Err(Error::Closed)), "{refused:?}");
     // The close ends (it no longer waits on the dead shard) and is unclean.
     assert!(db.close().is_err(), "a close with a dead shard reported Ok");
     assert!(
@@ -632,9 +639,9 @@ fn a_prepare_answer_after_the_coordinators_close_gave_up_aborts() {
 /// A participant's apply of a cross-shard share fails (its shard poisons itself, as an arena
 /// miscount would). The commit was decided to commit, so its seqno stays held: nothing of
 /// it is ever visible half applied, and its caller gets `OutcomeUnknown`. Held for good it
-/// would stall every later commit's visibility wait, so visibility ends as on a shard's
-/// death: a later commit on a healthy shard returns (`OutcomeUnknown`) instead of hanging,
-/// and the close is unclean (the next open decides the commit from the WAL).
+/// would stall every later commit's visibility wait, so it counts as a shard's death: a
+/// later commit on any shard is refused with `Closed` instead of hanging, and the close is
+/// unclean (the next open decides the commit from the WAL).
 #[test]
 fn a_failed_share_apply_ends_visibility_instead_of_stalling_it() {
     let (vfs, _gate) = gate::vfs(1362);
@@ -648,22 +655,16 @@ fn a_failed_share_apply_ends_visibility_instead_of_stalling_it() {
     })
     .expect("the cross-shard commit hung");
     assert!(matches!(crossed, Err(Error::OutcomeUnknown)), "{crossed:?}");
-    // Later commits end at once on both shards: the healthy one's with `OutcomeUnknown`
-    // (acknowledged, never visible here), the poisoned one's with its failure.
-    let mut unknown = 0;
+    // Later commits are refused at once on both shards, before anything is written: `Closed`
+    // (not committed), never a hang behind the held seqno.
     for t in [&on_a, &on_b] {
         let (db2, t2) = (Arc::clone(&db), Arc::clone(t));
         let later = gate::within(10, move || {
             db2.commit(put(&t2, "later"), Some(Durability::Sync))
         })
         .expect("a later commit hung behind the held seqno");
-        assert!(later.is_err(), "{later:?}");
-        unknown += usize::from(matches!(later, Err(Error::OutcomeUnknown)));
+        assert!(matches!(later, Err(Error::Closed)), "{later:?}");
     }
-    assert_eq!(
-        unknown, 1,
-        "the healthy shard's commit is acknowledged, never visible"
-    );
     // Nothing of the cross-shard commit is visible.
     for t in [&on_a, &on_b] {
         assert!(
@@ -846,8 +847,11 @@ fn a_panicked_shard_thread_does_not_hang_close() {
 /// Shard 1 is poisoned while its `Sync` group is unresolved (the group's sync fails). A
 /// commit on shard 0 does not wait behind that group at all: the group is applied, so it
 /// holds no visibility while its sync runs (D227). The failed sync then resolves the group
-/// (its members get the poison error). A cross-shard commit that then reaches the
-/// poisoned participant fails without pinning the watermark either.
+/// (its members get the poison error) and counts as shard 1's death (D85 since D227 part
+/// 2): the group never becomes durable, so the durable watermark stays below it for good
+/// and a durable snapshot never reads it. Later commits are refused at once with `Closed`
+/// (nothing written), on the healthy shard too, instead of stalling once memtables can no
+/// longer freeze.
 #[test]
 fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     let (vfs, gate) = gate::vfs(1359);
@@ -893,17 +897,21 @@ fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
         "a commit through a poisoned shard succeeded"
     );
     let db2 = Arc::clone(&db);
-    let (on_a2, on_a3) = (Arc::clone(&on_a), Arc::clone(&on_a));
+    let on_a2 = Arc::clone(&on_a);
     let after = gate::within(10, move || {
         db2.commit(put(&on_a2, "after"), Some(Durability::None))
     })
     .expect("a later commit's visibility wait hung behind the poisoned shard");
-    after.unwrap();
+    assert!(matches!(after, Err(Error::Closed)), "{after:?}");
+    // The failed group is visible (applied, D85) but never durable.
+    let snap = db.durable_snapshot().unwrap();
     assert!(
-        db.get_latest(on_a3.id, on_a3.families[0].id, b"after", b"q")
+        db.get(&snap, on_b.id, on_b.families[0].id, b"doomed", b"q")
             .unwrap()
-            .is_some()
+            .is_none(),
+        "a durable snapshot reads a group whose sync failed"
     );
+    drop(snap);
     let db2 = Arc::clone(&db);
     let closed = gate::within(10, move || db2.close()).expect("close hung");
     assert!(closed.is_err(), "a close with a poisoned shard reported Ok");

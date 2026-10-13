@@ -895,6 +895,14 @@ impl Engine {
             .store(omit, Ordering::Release);
     }
 
+    /// Whether a shard died (a panic, a dropped application-owned shard, a failed WAL sync or
+    /// a failed cross-shard apply): new commits are then refused with `Closed` (D227). Lets
+    /// the model checker tell that refusal from a wrong one. Test hook.
+    #[doc(hidden)]
+    pub fn shard_died(&self) -> bool {
+        self.inner.shared.shard_died.load(Ordering::Acquire)
+    }
+
     /// Fails the next apply after its WAL append, of a single-shard batch or of a
     /// cross-shard share: it is not applied, and the shard poisons itself, as an arena
     /// miscount would (#230). A single-shard commit returns `Busy`; a cross-shard commit
