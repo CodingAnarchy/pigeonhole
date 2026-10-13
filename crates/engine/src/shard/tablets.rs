@@ -1281,9 +1281,11 @@ impl ShardState {
 
     /// Updates this shard's moving average of how busy it was since the last pass (D217,
     /// D248): the larger of its thread's busy time and its group syncs' utilization, each
-    /// over the time that passed. Utilization is the syncs' in-flight time over
-    /// `group_sync_depth` times that time, so a shard whose durable commits keep its syncs in
-    /// flight reads busy although its thread mostly waits. `max`, since a turn often runs
+    /// over the time that passed. Utilization is the syncs' in-flight time (summed over the
+    /// syncs in flight) over that time, capped at 1, so a shard whose durable commits keep a
+    /// sync in flight reads busy although its thread mostly waits. Not divided by
+    /// `group_sync_depth`: a shard's concurrent syncs fold into one journal commit (D221), so
+    /// they are one server, not two (D248's A/B). `max`, since a turn often runs
     /// while a sync is in flight. Syncs count only while the runtime counts turn time
     /// (engine-owned shards): an application-owned store stays unpacked, as before.
     fn measure_busy(&mut self, now: u64) {
@@ -1317,7 +1319,7 @@ impl ShardState {
         };
         let syncs = match (self.busy_mark, elapsed) {
             (Some((_, sync_was, _)), Some(e)) if counted => {
-                sync.saturating_sub(sync_was) as f64 / (f64::from(self.group_sync_depth.max(1)) * e)
+                sync.saturating_sub(sync_was) as f64 / e
             }
             _ => 0.0,
         };

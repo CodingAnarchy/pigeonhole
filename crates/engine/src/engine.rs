@@ -243,9 +243,9 @@ pub struct ShardStats {
     /// divided by the phase's length, is the fraction of the time the shard was busy.
     pub busy_nanos: u64,
     /// Nanoseconds of group-sync in-flight time: the integral over time of the shard's group
-    /// syncs in flight (D248), as of the last sync submitted or completed. Divided by the
-    /// group-sync depth (2, or 1 on macOS) and by an interval, its rise is how much of the
-    /// shard's sync capacity durable commits used. Zero for `Buffered` and `None` commits.
+    /// syncs in flight (D248), as of the last sync submitted or completed. Its rise over an
+    /// interval, divided by the interval (capped at 1), is the sync utilization packing
+    /// counts as busy. Zero for `Buffered` and `None` commits.
     pub sync_busy_nanos: u64,
 }
 

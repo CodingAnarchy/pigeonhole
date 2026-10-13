@@ -888,7 +888,7 @@ fn sync_pass(
 
 /// D248: packing counts group-sync utilization. Four shards whose threads are only 5% busy
 /// (B = 0.2, one shard's worth) but whose durable commits keep a group sync in flight
-/// through the whole pass read about `1 / group_sync_depth` busy each, so `k` stays 4 and
+/// through the whole pass read about 1 busy each, so `k` stays 4 and
 /// the table stays spread. Counting only the threads' busy time, they packed onto one shard
 /// (perf287, AX102: 36% of ycsb-a's throughput at GroupSync).
 #[test]

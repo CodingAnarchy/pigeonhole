@@ -1409,13 +1409,14 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 **Why:** the gate measured almost nothing contended, nothing at the shipped durability, and no cross-shard commit (perf287's audit, findings 1–3), which let #637's 36× slowdown through. Judging both levels keeps the long-standing like-for-like comparison (D108) and adds the one users get by default.
 
 <a id="d248"></a>
-## D248 — Packing's busy fraction counts group-sync utilization: a shard's busy is the larger of its thread's busy time and its group syncs' in-flight time over the sync depth (owner decision, 2026-10-13; engine, tablets, #406; amends D217)
+## D248 — Packing's busy fraction counts group-sync utilization: a shard's busy is the larger of its thread's busy time and the time its group syncs are in flight (owner decision, 2026-10-13; engine, tablets, #406; amends D217)
 
 - **The busy fraction (D217's measure)** is, per engine-owned shard and balancer pass, `max(turn busy, sync utilization)`:
   - `turn busy`: the rise of the thread's busy time over the time since the last pass (as before);
-  - `sync utilization`: the group syncs' in-flight time in that interval over `group_sync_depth` (D207, D221: 2, or 1 on macOS) times the interval. That is the integral of the group syncs in flight (from `submit_sync` to the shard handling the completion) over the slots D207 allows.
+  - `sync utilization`: the group syncs' in-flight time in that interval over the interval, capped at 1. That is the integral of the group syncs in flight (from `submit_sync` to the shard handling the completion).
+- **Not divided by `group_sync_depth`** (coordinator, 2026-10-13, after the A/B below). Dividing by the depth (2 on Linux) was the first design. Measured, it stopped packing at 4 shards with each at about 0.6, inside D217's band (grow only above 0.75), while the shards already queued hard. A shard's concurrent `fdatasync`s fold into one journal commit (D221's note), so they behave as one server, not two. On macOS the depth is 1 anyway.
 - **`max`, not a sum:** a turn often runs while a sync is in flight, so a sum would count that time twice. A shard bound by its syncs reads about 1, and a CPU-bound one reads as before.
-- **Utilization, not waiting commits.** Utilization is linear in the offered load and adds up across shards: without batching, `B` is about the group rate times the sync latency over the depth, whatever `k` is. So `k = ceil(B / 0.5)` keeps its meaning, and packing settles as it does for CPU load. A queue length (waiting commits, batched groups) grows faster than linearly near saturation and falls to 0 once spread, so packing on it overshoots, shrinks back, and oscillates.
+- **Utilization, not waiting commits.** Utilization is linear in the offered load and adds up across shards: without batching, `B` is about the group rate times the sync latency, whatever `k` is. So `k = ceil(B / 0.5)` keeps its meaning, and packing settles as it does for CPU load. A queue length (waiting commits, batched groups) grows faster than linearly near saturation and falls to 0 once spread, so packing on it overshoots, shrinks back, and oscillates.
 - **Engine-owned shards only.** Syncs count only while the runtime counts the thread's busy time. An application-owned store keeps D217's behaviour: no packing.
 - **Only group syncs:** a group's own and a batched one. Not spare-segment preparation, rollovers or manifest syncs. `Buffered` and `None` stores have no group syncs, so their packing is unchanged.
 - **Exposed:** `ShardStats::sync_busy_nanos`, the integral of the shard's group syncs in flight, beside `busy_nanos`.
@@ -1430,6 +1431,18 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 - Four shards 5% busy whose group syncs stay in flight through each pass keep `k` = 4 and stay spread. This fails without the sync term.
 - The same load at `Buffered`, and a durable trickle (syncs in flight 5% of the time), pack onto one shard as before.
 - Application-owned shards: a durable load that would pack if counted is not packed. This fails without the engine-owned gate.
+
+**Measured** (ctr274, AX102, 2026-10-13; ycsb-a full, 16 threads, ≥60 s, uring; #662's bench and perf287's timeline; two runs each):
+
+| GroupSync | ops/s | put p50 | put p99 | active shards |
+|---|--:|--:|--:|--:|
+| main (perf287) | 263–268K | 92 µs | 569–745 µs | 2 |
+| sync time ÷ depth (first design) | 309–318K | 73–76 µs | 545 µs | 4 |
+| sync time ÷ 1 (adopted) | 363–383K | 57–61 µs | 166–180 µs | 12–13 |
+| packing off | 409–418K | 53 µs | 123–137 µs | 16 |
+
+- ÷1's averages include the 30–40 s in which `k` grows inside the measured phase: the bench loads at `Buffered` and switches after the settle. After that, commit rates match packing off. The bench now warms up again after the switch until the placement settles (D242's rule).
+- `Buffered`: main 807–815K, D248 815–820K, unchanged, still packed on 4 shards.
 
 **Acceptance (AX102 A/B, perf287's shape):**
 - ycsb-a, 16 threads, `--durability default`, defaults against `--no-packing`: at least 95% of packing-off throughput, and put p99 within 1.3×.
