@@ -421,7 +421,9 @@ else:
 # every write). Every workload below is judged within 1.5x of each store, throughput and
 # p99, at both levels; cross-shard-contention is judged as D246 judges it in `all`, at both.
 CONTENDED_LEVELS = [("buffered", "D108 parity, buffered"), ("default", "default durability, GroupSync")]
-CONTENDED_JUDGED = ["ycsb-a", "ycsb-b", "ycsb-c", "ycsb-e", "sparse-wide", "time-series-ttl", XSHARD]
+# ycsb-f's read-modify-write is atomic in every runner (Pigeonhole: commit_if, retried on a
+# lost race; RocksDB and fjall: a row lock; SQLite: an immediate transaction).
+CONTENDED_JUDGED = ["ycsb-a", "ycsb-b", "ycsb-c", "ycsb-e", "ycsb-f", "sparse-wide", "time-series-ttl", XSHARD]
 CONTENDED_AGAINST = ["rocksdb", "sqlite-eav"]
 
 

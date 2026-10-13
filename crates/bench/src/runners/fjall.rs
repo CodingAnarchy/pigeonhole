@@ -8,8 +8,8 @@ use std::path::Path;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use super::{
-    Counted, MemoryBudget, Touched, durability, encode_value, family_id, keys, live_value,
-    modified, now_micros, read_family, scan_rows,
+    Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id, keys,
+    live_value, modified, now_micros, read_family, scan_rows,
 };
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
@@ -75,6 +75,8 @@ struct Handle {
     db: Database,
     cells: Keyspace,
     mode: PersistMode,
+    /// Row locks for an atomic read-modify-write across clients.
+    locks: std::sync::Arc<RowLocks>,
 }
 
 impl Runner for FjallRunner {
@@ -98,6 +100,7 @@ impl Runner for FjallRunner {
             db,
             cells,
             mode: self.mode(self.sync && !self.load_buffered),
+            locks: std::sync::Arc::default(),
         });
         Ok(())
     }
@@ -248,6 +251,8 @@ impl Handle {
             BenchOp::ReadModifyWrite { row, qualifier } => {
                 let key = keys::cell(row, family_id(YCSB_FAMILY)?, qualifier);
                 let f = family_id(YCSB_FAMILY)?;
+                // Atomic across clients: the read and the write under the row's lock.
+                let _held = self.locks.lock(&key);
                 let stored = self.cells.get(&key).map_err(e)?;
                 let old = match &stored {
                     Some(v) => live_value(f, v, now_micros())?,

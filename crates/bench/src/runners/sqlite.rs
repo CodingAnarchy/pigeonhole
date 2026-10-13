@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{Counted, MemoryBudget, Touched, durability, modified, now_micros, ttl_micros};
 use crate::workload::{METRIC_FAMILY, YCSB_FAMILY};
@@ -293,7 +293,12 @@ impl Conn {
                 }
             }
             BenchOp::ReadModifyWrite { row, qualifier } => {
-                let tx = self.0.transaction().map_err(e)?;
+                // Immediate: the write lock from the read on, so concurrent clients never
+                // lose an update or deadlock upgrading a read lock.
+                let tx = self
+                    .0
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(e)?;
                 let old: Option<Vec<u8>> = tx
                     .prepare_cached(GET)
                     .map_err(e)?

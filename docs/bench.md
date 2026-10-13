@@ -95,7 +95,7 @@ Every workload is deterministic for a seed (default `0x5EED`, recorded in every 
 | `ycsb-c` | same | 100% read |
 | `ycsb-d` | same | 95% read-latest, 5% insert |
 | `ycsb-e` | same | 95% scan of 1–100 rows (uniform), 5% insert |
-| `ycsb-f` | same | 50% read, 50% read-modify-write |
+| `ycsb-f` | same | 50% read, 50% read-modify-write, atomic across clients in every store (Pigeonhole: `commit_if` on the value read, retried on a lost race; RocksDB, fjall: a striped row lock; SQLite: an immediate transaction), so it runs at any thread count (D247) |
 | `sparse-wide` | `records` rows, 0–40 cells each (mean 20), qualifiers from a 10K vocabulary with Zipfian popularity | 40% point get (many miss, as in a sparse store), 20% read of a whole row's family, 20% put of 1–4 cells, 20% scan of 10 rows |
 | `time-series-ttl` | `records / 100` entities × 100 points; row `ts:<entity>:<reversed time>`, so a scan from the entity prefix returns the newest point first; family with a 1-day TTL; points carry event timestamps, and a quarter of the loaded ones are already older than the TTL | 40% timestamped append, 40% scan of the newest 10 points, 20% get of a recent point (a miss when expired) |
 | `adjacency` | about `records / 40` vertices; row `v:<id>`, qualifiers `edge:<dst>`, out-degree `1 + Zipf(256)` (mean ≈ 40), Zipfian destinations | 80% scan of one vertex's edges, 10% scan of 10 vertices, 10% add an edge |
