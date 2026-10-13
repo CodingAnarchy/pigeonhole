@@ -720,7 +720,7 @@ Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledg
 - `flush` and `compact` wait for arena room as a stalled write does, ending with `Busy` on the same terms (each caller's wait counted from when it asked, or from when the freeze starved if later), and never report success while a memtable they were asked to flush is still unflushed (D138).
 - See D126 for the frozen clock and for rules that hold on both clocks: `reserve_room` reclaims retired memtables whose readers left before it reports no room; refusing the waiting members does not drop the members the same group admitted before the cut; a wait ends (and its timeout timer is cancelled) when a flush completes with no group left waiting, and at close.
 
-*History: Amended by D126 (#70, #79, #88), D138 (#116), D161 and D162 (#141, #186); the freeze-only-when-no-flush-is-in-flight rule (#635) and the largest-half rule (#NNN); D240 (each waiter's own deadline).*
+*History: Amended by D126 (#70, #79, #88), D138 (#116), D161 and D162 (#141, #186); the freeze-only-when-no-flush-is-in-flight rule (#635) and the largest-half rule (#642); D240 (each waiter's own deadline).*
 
 <a id="d125"></a>
 ## D125 — the model suites use the sim's record-level oracle on every crash (approved; harness, #48; amends D123)

@@ -64,5 +64,5 @@ The instruction ceilings (D193) are not measured here: CI's instructions job on 
 - RocksDB's write buffer holds one memtable (per column family).
 - Pigeonhole's is each shard's memtable arena, shared by one memtable per tablet slot the shard holds.
 - So a Pigeonhole shard holding many tablets has a fraction of that buffer per memtable. skewed-multi-shard starts with all 16 tablets on one shard, so 16 memtables share 64 MiB there, while RocksDB's one memtable gets all of it.
-- The arena fills long before any memtable reaches the freeze size, so flushes come from waits for room. Since #635 and #NNN those freeze the largest memtables (D124), but the per-memtable share is still smaller.
+- The arena fills long before any memtable reaches the freeze size, so flushes come from waits for room. Since #635 and #642 those freeze the largest memtables (D124), but the per-memtable share is still smaller.
 - Read a skewed-multi-shard gap with that in mind: a run whose hot shard holds most tablets does more background work than one whose tablets are already spread. The `stalls` row and each shard's `tablets_start` in the JSON show which case a run was.
