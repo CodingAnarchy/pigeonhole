@@ -712,13 +712,14 @@ Issue #48 asks the engine suite to adopt `recovered_commits` / `check_acknowledg
 `ShardArena` reports free bytes only through `reserve`; nothing signals the shard when `reclaim` returns memory.
 
 **Decision:** a group that finds no room waits (a write stall, counted in `Metrics::stalls` with its duration): the shard freezes and flushes, and a flush completion (`Flushed`), every `Maintain` message and the stall's timeout timer re-run `reserve_room` for the waiting group (`refresh_free`).
+- The wait freezes every active memtable only when no flush is in flight (no frozen memtable queued or flushing). Otherwise it freezes only those due anyway (at the freeze size, or forced), and the flush in flight frees room. Freezing each small active memtable on every wait filled a backlogged single-shard load's L0 with SSTs a fraction of the freeze size: 603 of 641 freezes, and 60-75% of L0 files under a quarter of it (the Phase 3 gate's cold-get bulk load, 2026-10-13).
 - On a moving clock, a wait for room also arms a re-check timer that kicks the shard after 1 ms, doubling up to 100 ms (`room_recheck_nanos`), so room freed by a snapshot dropped on another thread, or by a reader process's unpin, is seen within about 100 ms (D161); the same timer covers the starved-freeze wait of `flush` and `compact` (D138).
 - A flush that fails backs off: no flush starts until a timer fires (`RetryFlush`), 10 ms doubling up to 1 s (`flush_backoff_nanos`), reset by a flush that succeeds; a close flushes at once (D161). On a frozen clock the timer gives up and the next trigger retries, and `ROOM_FLUSH_ATTEMPTS` still ends a room wait there (D126).
 - The wait ends with `Busy` after `EngineOptions::write_stall_timeout_nanos` (30 s; there is no public knob) passed without room, or with the poison error when the pager is poisoned. A batch that can never fit an empty arena fails at once with the non-retryable `BatchTooLarge` instead, not `Busy` (D162); `Busy` means only "stalled past the write-stall timeout; retry".
 - `flush` and `compact` wait for arena room as a stalled write does, ending with `Busy` on the same terms, and never report success while a memtable they were asked to flush is still unflushed (D138).
 - See D126 for the frozen clock and for rules that hold on both clocks: `reserve_room` reclaims retired memtables whose readers left before it reports no room; refusing the waiting members does not drop the members the same group admitted before the cut; a wait ends (and its timeout timer is cancelled) when a flush completes with no group left waiting, and at close.
 
-*History: Amended by D126 (#70, #79, #88), D138 (#116), D161 and D162 (#141, #186).*
+*History: Amended by D126 (#70, #79, #88), D138 (#116), D161 and D162 (#141, #186); the freeze-only-when-no-flush-is-in-flight rule (#635).*
 
 <a id="d125"></a>
 ## D125 — the model suites use the sim's record-level oracle on every crash (approved; harness, #48; amends D123)
