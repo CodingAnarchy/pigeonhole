@@ -13,13 +13,15 @@ use std::process::ExitCode;
 
 use pigeonhole_bench::{
     Environment, GROUP_COMMIT_THREADS, GroupCommit, INLINE_IN_FLIGHT, MemoryBudget,
-    PigeonholeRunner, RunOptions, RunRecord, Runner, Scaling, Suite, Tolerance, WorkloadConfig,
-    WorkloadKind, compare, run_detailed,
+    PLACEMENT_RATE_PER_SHARD, PLACEMENT_SETTLE_BOUND, PigeonholeRunner, PlacementOptions,
+    RunOptions, RunRecord, Runner, Scaling, Suite, Tolerance, WorkloadConfig, WorkloadKind,
+    compare, run_detailed,
 };
 
-/// Default warmup of `scaling`, as a fraction of the measured ops. The balancer needs about
-/// a second of writes to split the table over the shards (issue #51); the 5% default
-/// (10,000 ops at `small`) ends before the first split, so the run would measure one tablet.
+/// Default warmup of `scaling`, as a fraction of the measured ops: as long as the measured
+/// writes, so flushes and compactions reach their steady state before measuring (the table
+/// is pre-split, D231; before that the balancer also needed about a second of writes to
+/// spread it, issue #51).
 const SCALING_WARMUP: f64 = 1.0;
 
 const HELP: &str = "\
@@ -36,9 +38,13 @@ WORKLOADS:
               (group-commit: durable commits, GroupSync on Pigeonhole and fsync on
               the others whatever --sync says; without --threads it runs at 1, 4
               and 16 client threads)
-    scaling   the scaling gate (D204): skewed-multi-shard on Pigeonhole at 1 and N shards,
-              application-owned with each shard thread writing inline (16 in flight);
+    scaling   the scaling gate (D204, D231): skewed-multi-shard on Pigeonhole at 1 and N
+              shards, application-owned with each shard thread writing inline (16 in
+              flight), the table pre-split at the writes' quantiles, the balancer off;
               then, reported only, synchronous clients (4 per shard) at N/2 shards
+    placement the balancer placement check (D231): skewed-multi-shard writes offered
+              open-loop at a fixed rate over N engine-owned shards; the balancer spreads
+              the table, and once settled the busiest shard's share is judged
 
 OPTIONS:
     --engine LIST          pigeonhole,rocksdb,sqlite,fjall or all [default: pigeonhole]
@@ -57,7 +63,10 @@ OPTIONS:
     --warmup F             unrecorded warmup, as a fraction of --ops [default: 0.05;
                            scaling: 1.0, so the balancer spreads the table first]
     --min-secs S           inline runs (scaling, group-commit's D213 run): repeat the
-                           measured writes until at least S seconds are measured
+                           measured writes until at least S seconds are measured;
+                           placement: the measured window [default: 10]
+    --offered-rate R       placement: writes per second offered over every client
+                           [default: 30,000 per shard]
                            (D219) [default: 0, once]
     --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
     --in-flight N          inline runs: commits each shard's thread keeps in flight
@@ -99,6 +108,7 @@ struct Args {
     min_secs: Option<f64>,
     inline_ops: Option<u64>,
     in_flight: Option<usize>,
+    offered_rate: Option<f64>,
     shards: Option<usize>,
     write_buffer: Option<u64>,
     cache: Option<u64>,
@@ -148,6 +158,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 }
                 a.in_flight = Some(n);
             }
+            "--offered-rate" => a.offered_rate = Some(parse(&arg, it.next())?),
             "--write-buffer" | "--memtable-budget" => {
                 a.write_buffer = Some(parse(&arg, it.next())?)
             }
@@ -349,13 +360,42 @@ fn bench(a: &Args) -> Result<Suite, String> {
     }
     let mut seq = 0;
     let result = (|| -> Result<(), String> {
-        if a.command == "scaling" {
-            // The gate (D204): application-owned shards, each thread writing its share
-            // inline, at 1 shard and at N (default: one per physical core, D220).
+        if a.command == "placement" {
             let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
             let c = config(a, WorkloadKind::SkewedMultiShard)?;
-            let single = one_inline(a, &root, &mut seq, &pigeonhole(a, Some(1)), &c)?;
-            let multi = one_inline(a, &root, &mut seq, &pigeonhole(a, Some(n)), &c)?;
+            let runner = pigeonhole(a, Some(n));
+            seq += 1;
+            let dir = root.join(format!("placement-{seq}"));
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            let opts = PlacementOptions {
+                offered_rate: a
+                    .offered_rate
+                    .unwrap_or(PLACEMENT_RATE_PER_SHARD * n as f64),
+                clients: a.threads.unwrap_or(n.max(2)),
+                settle_bound: PLACEMENT_SETTLE_BOUND,
+                window: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(10.0).max(1.0)),
+            };
+            eprintln!(
+                "running the placement check on pigeonhole ({}), {:.0} writes/s offered ...",
+                runner.describe(),
+                opts.offered_rate
+            );
+            let p = runner.run_placement(&c, &dir, &opts);
+            let _ = std::fs::remove_dir_all(&dir);
+            suite.placement = Some(p?);
+            return Ok(());
+        }
+        if a.command == "scaling" {
+            // The gate (D204): application-owned shards, each thread writing its share
+            // inline, at 1 shard and at N (default: one per physical core, D220). D231: the
+            // table is split at the measured writes' quantiles up front and the balancer stays
+            // off, so the run measures per-shard throughput; placement is judged on its own
+            // (`placement`).
+            let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
+            let c = config(a, WorkloadKind::SkewedMultiShard)?;
+            let gate = |shards| pigeonhole(a, Some(shards)).presplit_writes(true);
+            let single = one_inline(a, &root, &mut seq, &gate(1), &c)?;
+            let multi = one_inline(a, &root, &mut seq, &gate(n), &c)?;
             suite.scaling = Some(Scaling::new(n, &single, &multi));
             suite.results.extend([single, multi]);
             // Reported beside it, not gating (D204): engine-owned with synchronous clients,
@@ -530,6 +570,23 @@ mod tests {
         assert_eq!(memory(&a).cache, 1 << 20);
         assert_eq!(memory(&a).write_buffer, 8 << 20);
         assert_eq!(memory(&args("ycsb-c")), MemoryBudget::default());
+    }
+
+    #[test]
+    fn placement_smoke_reports_the_check() {
+        // D231: the open-loop placement check runs end to end and reports its record.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-placement-{}", std::process::id()));
+        let a = args(&format!(
+            "placement --scale smoke --shards 2 --offered-rate 40000 --min-secs 1 --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        let p = suite.placement.clone().expect("a placement record");
+        assert_eq!(p.shards, 2);
+        assert_eq!(p.shares.len(), 2);
+        assert!(p.achieved_rate > 0.0);
+        assert!(suite.to_markdown().contains("Balancer placement (D231)"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

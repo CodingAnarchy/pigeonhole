@@ -39,13 +39,14 @@ mod workload;
 pub use histogram::Histogram;
 pub use report::{
     Comparison, Delta, EngineCommit, Environment, GroupCommit, LatencyStats, OpTypeStats,
-    ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling, ShardShare, Stalls, Suite, Tolerance,
-    compare,
+    Placement, ReadSplit, RunDetail, RunRecord, SUITE_FORMAT, Scaling, ShardShare, Stalls, Suite,
+    Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
 pub use runners::inline::INLINE_IN_FLIGHT;
 pub use runners::pigeonhole::DEFAULT_MEMTABLE_BUDGET;
+pub use runners::placement::{PLACEMENT_RATE_PER_SHARD, PLACEMENT_SETTLE_BOUND, PlacementOptions};
 #[cfg(feature = "rocksdb")]
 pub use runners::rocksdb::RocksDbRunner;
 #[cfg(feature = "sqlite")]
