@@ -2956,6 +2956,10 @@ impl Inner {
         };
         // A durable commit waits for a sync: polling for it would only burn the CPU.
         let spins = matches!(durability, Durability::None | Durability::Buffered);
+        // Released before `then`, which may wait for the commit (a blocking one): a view held
+        // across that wait would keep its memtables, and their arena room, from being
+        // reclaimed.
+        drop(view);
         Ok(then(target, msg, waiter, spins))
     }
 
