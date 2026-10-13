@@ -3596,6 +3596,27 @@ impl World {
                     self.unacked.push(c);
                     self.need_reopen = true;
                 }
+                Outcome::Commit(Err(Error::OutcomeUnknown))
+                | Outcome::Cas(Err(Error::OutcomeUnknown)) => {
+                    // A shard died meanwhile (a failed sync, D227): the commit may have
+                    // landed, and the next open decides it from the WAL. As a failed sync.
+                    self.stats.io_errors += 1;
+                    self.trace
+                        .push("  -> outcome unknown; reopen pending".into());
+                    let mut c = inf.commit;
+                    c.acked = false;
+                    self.unacked.push(c);
+                    self.need_reopen = true;
+                }
+                Outcome::Commit(Err(Error::Closed)) | Outcome::Cas(Err(Error::Closed))
+                    if self.store().engine.shard_died() =>
+                {
+                    // Refused after a shard's death (D227): nothing was written.
+                    self.trace
+                        .push("  -> refused after a shard's death; reopen pending".into());
+                    self.aborted.push(inf.commit);
+                    self.need_reopen = true;
+                }
                 Outcome::Commit(Err(e)) | Outcome::Cas(Err(e)) => {
                     return fail(
                         FailureClass::Protocol,
@@ -3734,6 +3755,13 @@ impl World {
                 c.acked = false;
                 self.unacked.push(c);
                 self.crash_and_recover(CrashKind::Power, true, rng)?;
+                Ok(false)
+            }
+            Err(Error::Closed) if self.store().engine.shard_died() => {
+                // Refused after a shard's death (D227): nothing was logged.
+                self.trace
+                    .push("  -> refused after a shard's death; reopen pending".into());
+                self.need_reopen = true;
                 Ok(false)
             }
             Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
@@ -4045,6 +4073,13 @@ impl World {
             Err(e) if is_crashed(&e) || !self.alive() => {
                 self.unacked.push(unacked);
                 self.crash_and_recover(CrashKind::Power, true, rng)?;
+                return Ok(false);
+            }
+            Err(Error::Closed) if self.store().engine.shard_died() => {
+                // Refused after a shard's death (D227): nothing was logged.
+                self.trace
+                    .push("  -> refused after a shard's death; reopen pending".into());
+                self.need_reopen = true;
                 return Ok(false);
             }
             Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
