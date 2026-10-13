@@ -591,6 +591,10 @@ pub struct RunOptions {
     /// [`INLINE_IN_FLIGHT`], the shape D213 and D226 judge). Fewer trade throughput for
     /// latency: the gate reports 4 and 8 beside the judged 16 (D226).
     pub in_flight: usize,
+    /// Inline runs: pin each shard's thread to a CPU of its own, one per physical core first
+    /// (D220, D235; [`pigeonhole_io::sys::pin_plan`]). The gate judges pinned runs and
+    /// reports unpinned ones beside them. Default off.
+    pub pin: bool,
 }
 
 impl Default for RunOptions {
@@ -599,6 +603,7 @@ impl Default for RunOptions {
             warmup: 0.05,
             min_measured: std::time::Duration::ZERO,
             in_flight: INLINE_IN_FLIGHT,
+            pin: false,
         }
     }
 }

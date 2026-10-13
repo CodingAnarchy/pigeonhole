@@ -878,6 +878,14 @@ pub struct Suite {
     /// The durable group-commit target (D213), when `group-commit` ran on Pigeonhole.
     #[serde(default)]
     pub group_commit: Option<GroupCommit>,
+    /// The scaling gate's runs with the shard threads unpinned, reported beside the pinned,
+    /// judged ones (D235).
+    #[serde(default)]
+    pub scaling_unpinned: Option<Scaling>,
+    /// D213's group-commit run with the shard threads unpinned, reported beside the pinned,
+    /// judged one (D235).
+    #[serde(default)]
+    pub group_commit_unpinned: Option<GroupCommit>,
     /// The balancer placement check (D231), when `placement` ran.
     #[serde(default)]
     pub placement: Option<Placement>,
@@ -918,6 +926,8 @@ impl Suite {
             scaling: None,
             scaling_sync: None,
             group_commit: None,
+            scaling_unpinned: None,
+            group_commit_unpinned: None,
             placement: None,
         }
     }
@@ -1179,6 +1189,27 @@ impl Suite {
                 } else {
                     "fail"
                 }
+            );
+        }
+        if let Some(sc) = &self.scaling_unpinned {
+            let _ = writeln!(
+                s,
+                "\n**Scaling with the shard threads unpinned (reported, not judged; D235):** \
+                 {} shards reach {} ops/s against {} ops/s on one shard: efficiency {:.2}.",
+                sc.shards,
+                ops(sc.multi_shard_throughput),
+                ops(sc.single_shard_throughput),
+                sc.efficiency,
+            );
+        }
+        if let Some(gc) = &self.group_commit_unpinned {
+            let _ = writeln!(
+                s,
+                "\n**Durable group commit with the shard threads unpinned (reported, not \
+                 judged; D235):** {} cells/s, commit p50 {} µs, p99 {} µs.",
+                ops(gc.cells_per_sec),
+                us(gc.p50_ns),
+                us(gc.p99_ns),
             );
         }
         if let Some(sc) = &self.scaling_sync {

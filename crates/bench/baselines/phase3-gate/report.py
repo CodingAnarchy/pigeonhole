@@ -170,6 +170,13 @@ if g:
 else:
     rows.append(("Durable group commit: > 1M cells/s across cores; p99 < 200 µs (D213)", floor.lstrip("; "),
                  verdict(None), "latency-group-commit.json"))
+# D235: the judged run pins the shard threads; the same run unpinned is reported beside it.
+gu = gcd.get("group_commit_unpinned")
+if gu:
+    vs = f" ({100 * gu['cells_per_sec'] / g['cells_per_sec'] - 100:+.0f}% vs pinned)" if g else ""
+    rows.append(("Durable group commit, shard threads unpinned (reported, not judged; D235)",
+                 f"{gu['cells_per_sec'] / 1e6:.2f}M cells/s{vs}; p50 {us(gu['p50_ns']):.0f} µs, "
+                 f"p99 {us(gu['p99_ns']):.0f} µs", "-", "latency-group-commit.json"))
 # The trade-off beside the judged row (D226): the same D213 run at 4 and 8 commits in flight
 # per shard instead of 16. Fewer in flight lower the p99 and give up throughput.
 def p999_of(name):
@@ -253,6 +260,12 @@ if scal:
     rows.append(("Thread-per-core scaling: ≥ 0.8 × N", detail, verdict(all(ok for *_, ok in scal)), "scaling-N.json"))
 else:
     rows.append(("Thread-per-core scaling: ≥ 0.8 × N", "", verdict(None), "scaling-N.json"))
+# D235: the judged scaling runs pin each shard's thread; the same runs unpinned are reported.
+unp = [(n, (load(f"scaling-{n}.json") or {}).get("scaling_unpinned")) for n in (4, 8, 16)]
+unp = [(n, s) for n, s in unp if s]
+if unp:
+    rows.append(("Thread-per-core scaling, shard threads unpinned (reported, not judged; D235)",
+                 "; ".join(f"N={n}: {s['efficiency']:.2f}" for n, s in unp), "-", "scaling-N.json"))
 
 # Balancer placement (D231): open-loop writes at a fixed rate; settled within the bound, the
 # busiest shard <= 1.25/N once settled, no tablet change while measuring, the rate sustained.
