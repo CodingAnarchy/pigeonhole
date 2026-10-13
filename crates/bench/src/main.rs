@@ -297,6 +297,7 @@ fn one_inline(
     seq: &mut u32,
     runner: &PigeonholeRunner,
     config: &WorkloadConfig,
+    pin: bool,
 ) -> Result<RunRecord, String> {
     *seq += 1;
     let dir = root.join(format!("{}-inline-{}", config.kind.name(), *seq));
@@ -310,6 +311,7 @@ fn one_inline(
         warmup: a.warmup.unwrap_or(SCALING_WARMUP),
         min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
         in_flight: a.in_flight.unwrap_or(INLINE_IN_FLIGHT),
+        pin,
     };
     let result = runner
         .run_inline(config, &dir, &options)
@@ -394,9 +396,16 @@ fn bench(a: &Args) -> Result<Suite, String> {
             let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
             let c = config(a, WorkloadKind::SkewedMultiShard)?;
             let gate = |shards| pigeonhole(a, Some(shards)).presplit_writes(true);
-            let single = one_inline(a, &root, &mut seq, &gate(1), &c)?;
-            let multi = one_inline(a, &root, &mut seq, &gate(n), &c)?;
+            // D235: judged with each shard's thread pinned to a CPU of its own (D220's
+            // order), as a thread-per-core application runs; the same runs unpinned are
+            // reported beside it.
+            let single = one_inline(a, &root, &mut seq, &gate(1), &c, true)?;
+            let multi = one_inline(a, &root, &mut seq, &gate(n), &c, true)?;
             suite.scaling = Some(Scaling::new(n, &single, &multi));
+            suite.results.extend([single, multi]);
+            let single = one_inline(a, &root, &mut seq, &gate(1), &c, false)?;
+            let multi = one_inline(a, &root, &mut seq, &gate(n), &c, false)?;
+            suite.scaling_unpinned = Some(Scaling::new(n, &single, &multi));
             suite.results.extend([single, multi]);
             // Reported beside it, not gating (D204): engine-owned with synchronous clients,
             // four per shard, at half the shards, so the clients have cores of their own.
@@ -427,9 +436,13 @@ fn bench(a: &Args) -> Result<Suite, String> {
                     operations: a.inline_ops.unwrap_or(c.operations),
                     ..c.clone()
                 };
-                let run = one_inline(a, &root, &mut seq, &r, &inline)?;
+                // D235: judged pinned, reported unpinned.
+                let run = one_inline(a, &root, &mut seq, &r, &inline, true)?;
                 let in_flight = a.in_flight.unwrap_or(INLINE_IN_FLIGHT);
                 suite.group_commit = Some(GroupCommit::new(n, cores, in_flight, &run));
+                suite.results.push(run);
+                let run = one_inline(a, &root, &mut seq, &r, &inline, false)?;
+                suite.group_commit_unpinned = Some(GroupCommit::new(n, cores, in_flight, &run));
                 suite.results.push(run);
             }
             let threads = match (kind, a.threads) {
@@ -607,15 +620,34 @@ mod tests {
             dir.display()
         ));
         let suite = bench(&a).unwrap();
-        // The gate's inline runs at 1 and 2 shards (D204), then the engine-owned synchronous
-        // runs it reports at 1 and 2 / 2 = 1 shards.
-        assert_eq!(suite.results.len(), 4);
+        // The gate's inline runs at 1 and 2 shards (D204), pinned and judged, then unpinned
+        // and reported (D235), then the engine-owned synchronous runs it reports at 1 and
+        // 2 / 2 = 1 shards.
+        assert_eq!(suite.results.len(), 6);
         assert!(suite.scaling.is_some());
+        assert!(suite.scaling_unpinned.is_some());
         assert!(suite.scaling_sync.is_some());
+        assert!(
+            suite.results[..4]
+                .iter()
+                .all(|r| r.store_config.contains("inline"))
+        );
+        // Pinned where the platform can (unpinned with the reason elsewhere), then unpinned.
         assert!(
             suite.results[..2]
                 .iter()
-                .all(|r| r.store_config.contains("inline"))
+                .all(|r| r.store_config.contains(" pinned")
+                    || r.store_config.contains(" unpinned ("))
+        );
+        assert!(
+            suite.results[2..4]
+                .iter()
+                .all(|r| r.store_config.ends_with(" unpinned"))
+        );
+        assert!(
+            suite
+                .to_markdown()
+                .contains("shard threads unpinned (reported, not judged")
         );
         assert!(suite.to_markdown().contains("reported, not gating"));
         assert!(suite.to_markdown().contains("the busiest shard took"));
@@ -626,7 +658,7 @@ mod tests {
                 .all(|r| r.store_config.contains("tablets=on"))
         );
         // Every measured put is one commit on one shard; the report shows where they went.
-        for (r, shards) in suite.results.iter().zip([1, 2, 1, 1]) {
+        for (r, shards) in suite.results.iter().zip([1, 2, 1, 2, 1, 1]) {
             assert_eq!(
                 r.warmup_ops, r.operations,
                 "scaling warms up as long as it measures"
@@ -656,8 +688,16 @@ mod tests {
             dir.display()
         ));
         let suite = bench(&a).unwrap();
-        // First the D213 shape: the table split over both shards, commits in flight inline.
-        let (gate, clients) = suite.results.split_first().unwrap();
+        // First the D213 shape: the table split over both shards, commits in flight inline,
+        // pinned (judged), then the same unpinned (reported, D235).
+        let (gate, rest) = suite.results.split_first().unwrap();
+        let (unpinned, clients) = rest.split_first().unwrap();
+        assert!(
+            unpinned
+                .store_config
+                .ends_with(" inline in-flight=16 unpinned")
+        );
+        assert!(suite.group_commit_unpinned.is_some());
         assert!(
             gate.store_config.contains(" presplit inline"),
             "{}",
@@ -693,7 +733,8 @@ mod tests {
             "group-commit --scale smoke --ops 64 --threads 2 --shards 2 --write-buffer 16777216 --dir {}",
             dir.display()
         ));
-        assert_eq!(bench(&a).unwrap().results.len(), 2);
+        // The D213 run pinned and unpinned (D235), then the one client run.
+        assert_eq!(bench(&a).unwrap().results.len(), 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -710,7 +751,11 @@ mod tests {
         assert_eq!((a.inline_ops, a.min_secs), (Some(256), None));
         let suite = bench(&a).unwrap();
         let ops: Vec<u64> = suite.results.iter().map(|r| r.operations).collect();
-        assert_eq!(ops, [256, 64], "the D213 run, then one client run");
+        assert_eq!(
+            ops,
+            [256, 256, 64],
+            "the D213 run pinned and unpinned, then one client run"
+        );
         assert!(suite.group_commit.as_ref().is_some_and(|g| g.judged()));
         // D226: `--in-flight` sets the commits each shard keeps in flight; a run at fewer
         // than 16 is reported, not judged.
@@ -723,7 +768,7 @@ mod tests {
         let gc = suite.group_commit.as_ref().expect("the D213 result");
         assert_eq!(gc.in_flight, 4);
         assert!(!gc.judged() && !gc.passes());
-        assert!(suite.results[0].store_config.ends_with("in-flight=4"));
+        assert!(suite.results[0].store_config.contains("in-flight=4 "));
         assert!(
             suite
                 .to_markdown()
@@ -740,7 +785,7 @@ mod tests {
             .iter()
             .filter(|r| r.store_config.contains("inline"))
             .collect();
-        assert_eq!(inline.len(), 2, "one shard, then two");
+        assert_eq!(inline.len(), 4, "one shard, then two; pinned, then unpinned (D235)");
         for r in inline {
             assert!(r.run_secs >= 0.2, "{} s measured", r.run_secs);
             assert!(

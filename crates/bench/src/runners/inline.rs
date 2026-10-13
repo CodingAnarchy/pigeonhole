@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use pigeonhole::nonblocking::CommitFuture;
 use pigeonhole::{Pigeonhole, Shard, Table};
+use pigeonhole_io::sys::PinPlan;
 
 use super::pigeonhole::{create_table, err, options};
 use crate::{
@@ -381,8 +382,14 @@ fn phase(
     writes: &[Write],
     in_flight: usize,
     record: bool,
+    pins: Option<&PinPlan>,
 ) -> Result<(Vec<Shard>, Duration, Histogram), String> {
     let (results, start) = run_crew(shards, |mut shard, crew| {
+        // D235: each shard's thread on a CPU of its own, the same one every phase. A pin the
+        // OS refuses leaves the thread unpinned (the plan was checked when it was made).
+        if let Some(cpu) = pins.and_then(|p| p.cpu(shard.index())) {
+            let _ = pigeonhole_io::sys::pin_current_thread_to(cpu);
+        }
         // The rows this thread's shard owns as the phase starts (D204): its writes then
         // commit on its own shard. A row the balancer moves during the phase is still
         // committed correctly, routed to its new owner. Every thread picks its rows, then
@@ -460,6 +467,20 @@ impl PigeonholeRunner {
             Pigeonhole::open_application_owned(dir.join("bench.phdb"), options(&self.settings))
                 .map_err(err)?;
         let n = shards.len();
+        // D235: the judged runs pin each shard's thread to a CPU of its own, one per physical
+        // core first (D220); the plan holds those CPUs for the run. Where pinning is refused
+        // the run goes on unpinned, and its settings say so.
+        let (pins, placement) = if options_.pin {
+            match pigeonhole_io::sys::pin_plan(n) {
+                Ok(plan) => (Some(plan), "pinned".to_owned()),
+                Err(why) => {
+                    eprintln!("warning: running unpinned: {}", why.as_str());
+                    (None, format!("unpinned ({})", why.as_str()))
+                }
+            }
+        } else {
+            (None, "unpinned".to_owned())
+        };
         let load_ops = writes(workload.load_ops())?;
         // The measured writes are the same sequence whenever they are generated, so the
         // pre-split can cut at their quantiles before the load (D231).
@@ -511,7 +532,7 @@ impl PigeonholeRunner {
         let mut shards = shards;
         loop {
             let before = db.shard_stats();
-            shards = phase(&t, shards, warm, in_flight, false)?.0;
+            shards = phase(&t, shards, warm, in_flight, false, pins.as_ref())?.0;
             let after = db.shard_stats();
             let changed = before
                 .iter()
@@ -543,7 +564,7 @@ impl PigeonholeRunner {
         // compactions to show.
         let (mut shards, mut elapsed, mut hist) = (shards, Duration::ZERO, Histogram::new());
         loop {
-            let (s, e, h) = phase(&t, shards, measured, in_flight, true)?;
+            let (s, e, h) = phase(&t, shards, measured, in_flight, true, pins.as_ref())?;
             shards = s;
             elapsed += e;
             hist.merge(&h);
@@ -576,7 +597,10 @@ impl PigeonholeRunner {
         let ops = hist.count();
         Ok(RunRecord {
             store: self.name().to_owned(),
-            store_config: format!("{} inline in-flight={in_flight}", self.describe()),
+            store_config: format!(
+                "{} inline in-flight={in_flight} {placement}",
+                self.describe()
+            ),
             workload: config.kind.name().to_owned(),
             seed: config.seed,
             records: config.records,
