@@ -1129,21 +1129,20 @@ impl ShardState {
         );
         self.track_pack(now);
         self.track_skew(now);
-        let idle = self.op.is_none()
-            && self.op_queue.is_empty()
-            && !self.closing
-            && !self.replaying
-            && !self.poisoned
-            && !self.shared.closing.load(Ordering::Acquire)
-            && !self.shared.pager_poisoned.load(Ordering::Acquire)
-            && self.shared.full_compactions.load(Ordering::Acquire) == 0;
-        // A change waits for a running compaction on its tablets: the balancer leaves a
-        // compacting tablet alone and decides again next interval (#102).
+        let idle = self.may_change();
+        // A change waits for a running compaction on its tablets (#102: a running change
+        // parks their writes, and a compaction can run for minutes). It is decided again as
+        // soon as this one ends, before the next one is picked, so back-to-back compactions
+        // never starve it.
+        self.change_waits = false;
         let (decision, cleanups) = if idle {
             let (kind, cleanups) = self.decide(now, &mem_per);
-            let kind = kind.filter(|kind| {
-                self.compaction
-                    .is_none_or(|(t, _)| !kind.tablets().contains(&t))
+            let kind = kind.filter(|kind| match self.compaction {
+                Some((t, _)) if kind.tablets().contains(&t) => {
+                    self.change_waits = true;
+                    false
+                }
+                _ => true,
             });
             (kind, cleanups)
         } else {
@@ -1160,17 +1159,7 @@ impl ShardState {
         match decision {
             Some(kind) => {
                 trace!("shard {} balancer: {kind:?}", self.id.0);
-                // Anything but a size split (a move, or a split over shards) starts the
-                // shard's dwell: the loads settle before write skew acts again.
-                let size_split = matches!(&kind, TabletOpKind::Split { owners, .. }
-                    if owners.iter().all(|o| *o == self.id));
-                if !size_split {
-                    self.skew_pass = Some(self.balance_pass);
-                }
-                if self.chose_slow.get() {
-                    self.slow_pass = Some(self.balance_pass);
-                }
-                self.request_tablet_op(kind, reply, ctx);
+                self.start_change(kind, reply, ctx);
             }
             None => {
                 if let Some(r) = reply {
@@ -1206,6 +1195,53 @@ impl ShardState {
             self.maintain(ctx);
         }
         self.arm_balance_timer(ctx);
+    }
+
+    /// Whether the balancer may start a tablet change now.
+    fn may_change(&self) -> bool {
+        self.op.is_none()
+            && self.op_queue.is_empty()
+            && !self.closing
+            && !self.replaying
+            && !self.poisoned
+            && !self.shared.closing.load(Ordering::Acquire)
+            && !self.shared.pager_poisoned.load(Ordering::Acquire)
+            && self.shared.full_compactions.load(Ordering::Acquire) == 0
+    }
+
+    /// The compaction a change waited on ended: decides again (on this interval's loads)
+    /// and starts the change, before the next compaction is picked.
+    pub(super) fn start_waiting_change(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.change_waits = false;
+        if !self.may_change() {
+            return;
+        }
+        let (_, mem_per) = self.mem_bytes();
+        let (kind, _) = self.decide(ctx.now_nanos(), &mem_per);
+        if let Some(kind) = kind {
+            trace!("shard {} balancer, after a compaction: {kind:?}", self.id.0);
+            self.start_change(kind, None, ctx);
+        }
+    }
+
+    /// Starts a change the balancer chose.
+    fn start_change(
+        &mut self,
+        kind: TabletOpKind,
+        reply: Option<Notifier<Result<()>>>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        // Anything but a size split (a move, or a split over shards) starts the shard's
+        // dwell: the loads settle before write skew acts again.
+        let size_split = matches!(&kind, TabletOpKind::Split { owners, .. }
+            if owners.iter().all(|o| *o == self.id));
+        if !size_split {
+            self.skew_pass = Some(self.balance_pass);
+        }
+        if self.chose_slow.get() {
+            self.slow_pass = Some(self.balance_pass);
+        }
+        self.request_tablet_op(kind, reply, ctx);
     }
 
     /// Records the balancer pass at which each tablet this shard owns first appeared here
