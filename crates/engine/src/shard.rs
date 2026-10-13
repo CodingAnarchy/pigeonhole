@@ -3081,6 +3081,15 @@ impl ShardState {
         // freeze's kick restarted the flush before the close could give up, rewriting the
         // same SST for ever (a poisoned stream fails every flush at its WAL barrier).
         if self.closing && self.flush_failed {
+            // Whoever waits for a flush hears now that none will run (a `flush` or
+            // `compact` that passed its open check just before the close began: its message
+            // comes after the close's), rather than when the close ends.
+            for w in self.flush_waiters.drain(..) {
+                w.notify(Err(Error::Closed));
+            }
+            for (_, w) in self.compact_all.drain(..) {
+                w.notify(Err(Error::Closed));
+            }
             return;
         }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
