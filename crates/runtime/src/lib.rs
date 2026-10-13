@@ -66,7 +66,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pigeonhole_io::{ErrorKind, Vfs, VfsRef};
+use pigeonhole_io::{Vfs, VfsRef};
 
 pub use completion::{Notifier, Settle, SlotCache, Waiter, completion, completion_from};
 pub use sched::{Task, TaskPoll, TaskWaker};
@@ -821,28 +821,33 @@ fn build<H: ShardHandler>(
     (submitters, cores)
 }
 
-/// Pins the calling thread to the `cpu`-th CPU, spread one per physical core first (D220), so
-/// the default shards never share a core. Platforms without affinity control (macOS) are
-/// best-effort: `Unsupported` is not an error.
-fn pin(cpu: usize) -> std::io::Result<()> {
-    match pigeonhole_io::sys::pin_current_thread(pigeonhole_io::sys::spread_cpu(cpu)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind == ErrorKind::Unsupported => Ok(()),
-        Err(e) => Err(std::io::Error::other(e)),
-    }
+/// How a runtime's threads were pinned (D235): see [`Runtime::pinning`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Pinning {
+    /// Threads the runtime started: shards and compaction threads.
+    pub threads: usize,
+    /// Threads pinned to a CPU of their own.
+    pub pinned: usize,
+    /// Why the runtime pinned no thread, when pinning was asked for but planned none.
+    pub unpinned: Option<pigeonhole_io::sys::Unpinned>,
+    /// Threads the OS refused to pin; they run unpinned.
+    pub failed: usize,
 }
 
-/// Spawns a named thread that optionally pins itself, reports the pin result, then runs `f`.
+/// Spawns a named thread that pins itself to CPU id `cpu` if given, reports whether it is
+/// pinned (a refused pin leaves it unpinned, never stops it), then runs `f`.
 fn spawn_pinned<T: Send + 'static>(
     name: String,
     cpu: Option<usize>,
     f: impl FnOnce() -> T + Send + 'static,
-) -> Result<(JoinHandle<T>, Receiver<std::io::Result<()>>)> {
+) -> Result<(JoinHandle<T>, Receiver<bool>)> {
     let (ack_tx, ack_rx) = mpsc::channel();
     let handle = thread::Builder::new()
         .name(name)
         .spawn(move || {
-            let _ = ack_tx.send(cpu.map_or(Ok(()), pin));
+            let pinned = cpu.is_some_and(|c| pigeonhole_io::sys::pin_current_thread_to(c).is_ok());
+            let _ = ack_tx.send(pinned);
             f()
         })
         .map_err(Error::Spawn)?;
@@ -857,6 +862,9 @@ pub struct Runtime<H: ShardHandler> {
     submitters: Arc<[Submitter<H::Msg>]>,
     shards: Vec<JoinHandle<H>>,
     pool: Vec<(Arc<PoolShared>, JoinHandle<()>)>,
+    /// The CPUs this runtime's threads hold, released once they are joined (D235).
+    plan: Option<pigeonhole_io::sys::PinPlan>,
+    pinning: Pinning,
 }
 
 impl<H: ShardHandler> fmt::Debug for Runtime<H> {
@@ -871,10 +879,13 @@ impl<H: ShardHandler> fmt::Debug for Runtime<H> {
 impl<H: ShardHandler> Runtime<H> {
     /// Spawns one thread per handler (`handlers.len()` must equal `config.shards`).
     ///
-    /// Shard `i` is pinned to the `i`-th CPU and compaction thread `j` to the `shards + j`-th,
-    /// spread one per physical core before the SMT siblings and wrapping (D220), when
-    /// `config.pin_threads` is set; pinning is best-effort where the OS has no affinity
-    /// control (macOS).
+    /// With `config.pin_threads`, each shard and compaction thread gets a CPU of its own from
+    /// the opening thread's affinity set, one per physical core first and then their SMT
+    /// siblings (D220, D235), skipping CPUs other runtimes in this process hold
+    /// ([`pigeonhole_io::sys::pin_plan`]). Where that plan refuses (no hard affinity on the
+    /// platform, a CPU quota narrower than the affinity set, too few free CPUs) or the OS
+    /// refuses a pin, threads run unpinned: pinning never fails the start.
+    /// [`pinning`](Runtime::pinning) says what happened.
     ///
     /// # Panics
     /// If `handlers.len() != config.shards` or the count is not in `1..=65536`.
@@ -891,37 +902,55 @@ impl<H: ShardHandler> Runtime<H> {
         }
         let pool: Arc<[Arc<PoolShared>]> = pool.into();
         let (submitters, cores) = build(&config, handlers, Arc::clone(&pool));
+        let threads = config.shards + config.compaction_threads;
+        let (plan, unpinned) = if config.pin_threads {
+            match pigeonhole_io::sys::pin_plan(threads) {
+                Ok(plan) => (Some(plan), None),
+                Err(why) => (None, Some(why)),
+            }
+        } else {
+            (None, None)
+        };
+        let cpu = |k: usize| plan.as_ref().and_then(|p| p.cpu(k));
         let mut rt = Runtime {
             submitters,
             shards: Vec::with_capacity(cores.len()),
             pool: Vec::new(),
+            plan: None,
+            pinning: Pinning {
+                threads,
+                unpinned,
+                ..Pinning::default()
+            },
         };
         for (j, rx) in pool_rxs.into_iter().enumerate() {
             let shared = Arc::clone(&pool[j]);
             let vfs = Arc::clone(&config.vfs);
-            let cpu = config.pin_threads.then_some(config.shards + j);
-            let (handle, ack) = spawn_pinned(format!("pigeonhole-compaction-{j}"), cpu, {
-                let shared = Arc::clone(&shared);
-                move || sched::pool_main(shared, rx, vfs, slice)
-            })?;
+            let (handle, ack) = spawn_pinned(
+                format!("pigeonhole-compaction-{j}"),
+                cpu(config.shards + j),
+                {
+                    let shared = Arc::clone(&shared);
+                    move || sched::pool_main(shared, rx, vfs, slice)
+                },
+            )?;
             pool_threads.push((shared, handle));
             acks.push(ack);
         }
         rt.pool = pool_threads;
         for (i, core) in cores.into_iter().enumerate() {
-            let cpu = config.pin_threads.then_some(i);
-            let (handle, ack) = spawn_pinned(format!("pigeonhole-shard-{i}"), cpu, move || {
+            let (handle, ack) = spawn_pinned(format!("pigeonhole-shard-{i}"), cpu(i), move || {
                 shard_main(core)
             })?;
             rt.shards.push(handle);
             acks.push(ack);
         }
-        for ack in acks {
-            // A thread that died before reporting will surface its panic at shutdown.
-            if let Ok(Err(e)) = ack.recv() {
-                return Err(Error::Spawn(e));
-            }
-        }
+        let planned = plan.as_ref().map_or(0, pigeonhole_io::sys::PinPlan::len);
+        // A thread that died before reporting surfaces its panic at shutdown.
+        let pinned = acks.into_iter().filter(|a| a.recv() == Ok(true)).count();
+        rt.pinning.pinned = pinned;
+        rt.pinning.failed = planned.saturating_sub(pinned);
+        rt.plan = plan;
         Ok(rt)
     }
 
@@ -983,6 +1012,12 @@ impl<H: ShardHandler> Runtime<H> {
         self.stop()
     }
 
+    /// How this runtime's threads were pinned (D235): how many it started, how many got a
+    /// CPU of their own, and why none did when pinning was asked for and refused.
+    pub fn pinning(&self) -> Pinning {
+        self.pinning
+    }
+
     fn stop(&mut self) -> Result<Vec<H>> {
         for s in self.submitters.iter() {
             s.inbox.close();
@@ -1004,6 +1039,8 @@ impl<H: ShardHandler> Runtime<H> {
                 panic = panic.or(Some(p));
             }
         }
+        // Every thread is gone: its CPU is free for another runtime in this process.
+        self.plan = None;
         if let Some(p) = panic {
             std::panic::resume_unwind(p);
         }

@@ -1107,3 +1107,28 @@ Each record carries `detail.settle` (milliseconds, settled, the work done while 
 - **Why 8 over 12:** 12 bought nothing over 8 here, and 8 still paces writers well before a backlog can build.
 - **What it costs:** the single-shard baseline rises ~6%, which lowers the scaling gate's efficiency at a given N by about as much where per-shard rates are unchanged.
 
+<a id="d235"></a>
+## D235 — Engine-owned shard threads are pinned by default, safely; the gate's inline drivers pin theirs, with unpinned reported beside them (owner decision, 2026-10-13; io, runtime, engine, pigeonhole, bench, #406; amends D158)
+
+**Decided:**
+1. **The gate pins.** The scaling and group-commit inline drivers pin their shard threads in D220's order (one per physical core first), and that run is judged. The same runs unpinned are reported beside them, not judged.
+2. **The engine pins by default.** `pin_threads` defaults to true in `EngineOptions` and `pigeonhole::Options` (engine-owned mode; application-owned shards run on the application's threads, which it places).
+
+**How pinning stays safe** (D158's three failure cases, and the rest):
+- **Only inside the affinity set.** At open, `pigeonhole_io::sys::pin_plan` takes the opening thread's affinity set (taskset, cpusets, containers) in D220 order and gives each shard and compaction thread a distinct CPU from it. Threads are never pinned outside it, and never two on one CPU.
+- **It runs unpinned instead when:**
+  - the platform has no hard affinity: macOS's affinity tags are hints, so they aren't set;
+  - a CPU quota (a cgroup `cpu.max`, seen by `available_parallelism`) is narrower than the affinity set: D158's quota-limited containers, which would all pin to the host's first CPUs;
+  - fewer free CPUs than threads: D158's opener pinned to a few CPUs.
+- **Several databases in one process:** a process-wide registry of claimed CPUs makes each plan skip CPUs another live runtime holds, so the second database pins elsewhere or runs unpinned (D158's first case). Claims are released when the runtime's threads are joined.
+- **Never fails an open.** A pin the OS refuses leaves that thread unpinned. `Runtime::start` returned `Spawn` on a pin error before.
+  - `Runtime::pinning` and `Metrics::{pinned_threads, unpinned}` report threads, pinned, and why not.
+- **Several processes on one host** can't see each other's pins and would pin onto the same CPUs. That's documented on `pin_threads`, in the guide and the agent reference: give each process its own CPUs (an affinity mask or cpuset) or `pin_threads(false)`. No option names cores; the affinity mask chooses them.
+- **Windows** pins within the process affinity mask (one processor group) with `SetThreadAffinityMask`, as before.
+
+**Why:** on the AX102 (perf2, 2026-10-13), the shard threads' placement moved throughput more than most engine changes:
+- 8 shards pinned on one CCD: 3.24M commits/s. Unpinned under `taskset` on two CCDs: 2.36–2.42M; pinned there: 2.63–2.67M.
+- 16 shards: pinned 4.16M, unpinned 4.06M.
+
+A thread-per-core application pins its shard threads, so the gate measures that, and the engine's own threads do it by default.
+
