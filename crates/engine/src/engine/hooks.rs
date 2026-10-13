@@ -115,6 +115,9 @@ pub(crate) struct Hooks {
     /// Fails the next apply after its WAL append, without applying it, as an arena miscount
     /// would (`Engine::fail_next_apply`).
     pub fail_next_apply: AtomicBool,
+    /// Fails the next freeze a tablet change makes, as an arena miscount would
+    /// (`Engine::fail_next_tablet_freeze`).
+    pub fail_next_tablet_freeze: AtomicBool,
     /// A deliberate fault in the flush GC (`Engine::mutate_flush_gc`, #287): 1 treats the
     /// guard as always holding, 2 drops the snapshot floor (no live read point is kept), 3
     /// lets writes pass guarded flushes and compactions without voiding them.
@@ -914,6 +917,18 @@ impl Engine {
             .shared
             .hooks
             .fail_next_apply
+            .store(true, Ordering::Release);
+    }
+
+    /// Fails the next freeze a tablet change (a split, merge or move) makes of its tablets'
+    /// memtables: the shard poisons itself, as an arena miscount would, and the instance
+    /// reports the failure (ICR 0040). Test hook.
+    #[doc(hidden)]
+    pub fn fail_next_tablet_freeze(&self) {
+        self.inner
+            .shared
+            .hooks
+            .fail_next_tablet_freeze
             .store(true, Ordering::Release);
     }
 

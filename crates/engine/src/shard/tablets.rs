@@ -627,8 +627,8 @@ impl ShardState {
                         committing: false,
                         reserved,
                     });
-                    if self.freeze(false).is_err() {
-                        self.poisoned = true;
+                    if self.freeze_moving().is_err() {
+                        self.poison(crate::health::FailureCause::Internal);
                     }
                     self.spawn_flush(ctx);
                     self.progress_op(ctx);
@@ -829,8 +829,8 @@ impl ShardState {
             self.id.0, self.freeze_deferred, self.flush_running
         );
         if refreeze {
-            if self.freeze(false).is_err() {
-                self.poisoned = true;
+            if self.freeze_moving().is_err() {
+                self.poison(crate::health::FailureCause::Internal);
             }
             self.spawn_flush(ctx);
         }
@@ -838,6 +838,21 @@ impl ShardState {
             return;
         }
         self.commit_op(ctx);
+    }
+
+    /// Freezes the memtables of the tablets being changed (`freeze` freezes them whatever
+    /// they hold).
+    fn freeze_moving(&mut self) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if self
+            .shared
+            .hooks
+            .fail_next_tablet_freeze
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(Error::Busy);
+        }
+        self.freeze(false)
     }
 
     /// Whether a prepared, undecided share writes or reads a tablet being changed.
@@ -917,7 +932,7 @@ impl ShardState {
                 trace!("shard {} tablet change {:?} done", self.id.0, op.kind);
                 self.refresh_tablets();
                 if self.drop_tablets(&moving).is_err() {
-                    self.poisoned = true;
+                    self.poison(crate::health::FailureCause::Internal);
                 }
                 for t in &moving {
                     self.loads.remove(t);
