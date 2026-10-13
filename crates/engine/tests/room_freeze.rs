@@ -161,3 +161,110 @@ fn a_backlogged_load_leaves_few_small_l0_ssts() {
     engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A wait for room with no flush in flight, on a shard holding many slots, freezes the
+/// largest memtables until they hold about half the arena, not every one (D124): three
+/// large tablets beside thirteen small ones flush three SSTs, not sixteen.
+#[test]
+fn a_room_wait_on_a_crowded_shard_freezes_the_largest_memtables() {
+    let vfs = SimVfs::new(618);
+    let mut o = EngineOptions::new(vfs.clone());
+    o.create_if_missing = true;
+    o.shards = 1;
+    o.pin_threads = false;
+    o.reader_slots = 4;
+    o.tablet_changes = true;
+    o.balance_interval_nanos = 0;
+    o.memtable_budget = 8 << 20;
+    // No memtable is due by size: only the wait for room freezes.
+    o.memtable_freeze_bytes = 8 << 20;
+    o.compaction.l0_trigger = 1 << 20;
+    let (engine, mut shards) =
+        Engine::open_application_owned(Path::new("/db/data.phdb"), o).expect("open");
+    let mut shard: EngineShard = shards.remove(0);
+    let mut settle = |shard: &mut EngineShard| {
+        for _ in 0..100_000 {
+            let now = pigeonhole_io::Vfs::monotonic_nanos(&*vfs);
+            if !shard.run_once(now + 1_000_000) {
+                return;
+            }
+        }
+        panic!("the shard did not settle");
+    };
+    let t = engine
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .expect("table");
+    let f = t.families[0].id;
+    let drive = |shard: &mut EngineShard, settle: &mut dyn FnMut(&mut EngineShard), mut m| {
+        for _ in 0..1000 {
+            if let Some(r) = ready(&mut m) {
+                return r;
+            }
+            settle(shard);
+        }
+        panic!("did not finish")
+    };
+    for n in 1..16 {
+        let m = engine
+            .split_tablet_pending(t.id, format!("t{n:02}").as_bytes())
+            .unwrap();
+        drive(&mut shard, &mut settle, m).unwrap();
+    }
+    let tablets = engine
+        .snapshot()
+        .unwrap()
+        .view()
+        .tablets()
+        .ranges(t.id)
+        .len();
+    assert_eq!(tablets, 16);
+    let l0 = || engine.sst_levels().iter().filter(|s| s.1 == 0).count();
+    let before = l0();
+    // Tablets 0-2 hold 1.5 MiB each (4.5 MiB together, past half the 8 MiB arena; two hold
+    // less than half), the other thirteen 32 KiB each.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut value = vec![0u8; 1024];
+    for n in 0..16u32 {
+        let rows = if n < 3 { 1536 } else { 32 };
+        for chunk in 0..rows / 32 {
+            let mut b = WriteBatch::new();
+            for i in 0..32 {
+                for v in value.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *v = x as u8;
+                }
+                let row = format!("t{n:02}-{:05}", chunk * 32 + i);
+                b.put(t.id, f, row.as_bytes(), b"q", None, ValueRef::Bytes(&value))
+                    .unwrap();
+            }
+            let mut pc = engine.submit(b, Some(Durability::Buffered)).unwrap();
+            settle(&mut shard);
+            assert!(ready(&mut pc).expect("committed").is_ok());
+        }
+    }
+    assert_eq!(l0(), before, "nothing froze by size");
+    // A group whose second member waits for room, with no flush in flight.
+    engine.force_room_wait_once();
+    let pcs: Vec<PendingCommit> = [&b"t05-x"[..], b"t06-x"]
+        .iter()
+        .map(|row| {
+            let mut b = WriteBatch::new();
+            b.put(t.id, f, row, b"q", None, ValueRef::Bytes(b"v"))
+                .unwrap();
+            engine.submit(b, Some(Durability::Buffered)).unwrap()
+        })
+        .collect();
+    settle(&mut shard);
+    for mut pc in pcs {
+        assert!(ready(&mut pc).expect("committed").is_ok());
+    }
+    assert_eq!(
+        l0() - before,
+        3,
+        "the three largest memtables froze and flushed, the small ones stayed open"
+    );
+    engine.close().unwrap();
+    settle(&mut shard);
+}

@@ -59,3 +59,10 @@ crates/bench/baselines/phase3-gate/run-window.sh /data/gate /root/results-$(date
 The last step writes `RESULTS/summary.md`. For every #406 target it gives the measured value, a verdict and the file that shows it. It also gives the data for the decisions the window settles: the row cache's effect (on by default since D216), the I/O backend's default (#402), the scan readahead (#431), and the WAL pin bound (#527). Then it packs `RESULTS.tar.gz` and prints the `scp` line to copy it back. There are no GitHub credentials on the rented machine (owner decision, 2026-10-10): the results are committed from a development machine. Then cancel the server.
 
 The instruction ceilings (D193) are not measured here: CI's instructions job on the same commit is their record.
+
+**Reading the RocksDB comparison:** `--write-buffer` (64 MiB by default) is the same number for every engine, but it doesn't buy the same thing.
+- RocksDB's write buffer holds one memtable (per column family).
+- Pigeonhole's is each shard's memtable arena, shared by one memtable per tablet slot the shard holds.
+- So a Pigeonhole shard holding many tablets has a fraction of that buffer per memtable. skewed-multi-shard starts with all 16 tablets on one shard, so 16 memtables share 64 MiB there, while RocksDB's one memtable gets all of it.
+- The arena fills long before any memtable reaches the freeze size, so flushes come from waits for room. Since #635 and #NNN those freeze the largest memtables (D124), but the per-memtable share is still smaller.
+- Read a skewed-multi-shard gap with that in mind: a run whose hot shard holds most tablets does more background work than one whose tablets are already spread. The `stalls` row and each shard's `tablets_start` in the JSON show which case a run was.
