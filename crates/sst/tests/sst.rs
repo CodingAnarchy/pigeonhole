@@ -723,3 +723,72 @@ fn a_blob_writer_reserves_exactly_the_extents_an_append_adds() {
         w.append(&vec![9u8; len]).unwrap();
     }
 }
+
+// ---- one-row reads stop at a row-end separator (ICR 0039) ----
+
+#[test]
+fn a_one_row_read_never_reads_the_block_after_its_row() {
+    // Neighbouring rows `row00041` and `row00042` differ by one in their last byte. With
+    // row-end separators, a one-row cursor whose row ends a block knows from the index that
+    // the next block starts a later row: it makes no read past its seek, and returns the same
+    // entries. Otherwise (as before) it reads the next block to find the row's end.
+    let (_vfs, r, want) = many_blocks(24);
+    let mut o = ReadOptions::default();
+    o.fill_cache = false;
+    let mut stepped_over = 0;
+    for i in 0..800u32 {
+        let mut prefix = Vec::new();
+        pigeonhole_format::key::encode_row_prefix(&mut prefix, format!("row{i:05}").as_bytes())
+            .unwrap();
+        let mut past = prefix.clone();
+        *past.last_mut().unwrap() += 1;
+        let row_entries: Vec<(Vec<u8>, Vec<u8>)> = want
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        // Steps with `next`, or (`skip`) passes each finished column with `skip_column`, as
+        // the resolver does (ICR 0041): both leave a block the same way.
+        let read = |one_row: bool, skip: bool| {
+            let mut o = o;
+            o.one_row = one_row;
+            pigeonhole_sst::counting_file_reads(|| {
+                let mut it = r.iter(ScanFilter::all(), o);
+                it.seek(&prefix).unwrap();
+                let mut got = Vec::new();
+                while it.valid() && it.key() < past.as_slice() {
+                    got.push((it.key().to_vec(), it.value().to_vec()));
+                    let column = it.key()[..it.key().len() - SUFFIX_LEN].to_vec();
+                    if !(skip && it.skip_column(&column).unwrap()) {
+                        it.next().unwrap();
+                    }
+                }
+                got
+            })
+        };
+        let ((), seek_reads) = pigeonhole_sst::counting_file_reads(|| {
+            r.iter(ScanFilter::all(), o).seek(&prefix).unwrap();
+        });
+        let (one, one_reads) = read(true, false);
+        let (skipped, skipped_reads) = read(true, true);
+        let (plain, plain_reads) = read(false, false);
+        assert_eq!(one, row_entries, "row {i}");
+        assert_eq!(skipped, row_entries, "row {i}");
+        assert_eq!(plain, row_entries, "row {i}");
+        assert_eq!(
+            one_reads, seek_reads,
+            "row {i}: a one-row read went past its row"
+        );
+        assert_eq!(
+            skipped_reads, seek_reads,
+            "row {i}: a one-row read skipping columns went past its row"
+        );
+        if plain_reads > seek_reads {
+            stepped_over += 1;
+        }
+    }
+    assert!(
+        stepped_over > 0,
+        "no row ended a block, so the test checks nothing"
+    );
+}

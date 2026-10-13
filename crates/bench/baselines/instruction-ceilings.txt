@@ -108,6 +108,14 @@
 # commit-async (writepath, D210: an uncontended `commit_async`, awaited) added with #521 from
 # its head's counts in scratch A/B run 38115353068: 10017-10030 (main before D210: 9782-9787),
 # so 10030 times 1.003.
+#
+# Raised by owner decision (2026-10-12, #611, ICR 0039): scan-wide-q1 14224 -> 14282 (its
+# head count 14239 in run 38333652981, times 1.003). The SST writer now ends a row with a
+# row-end index separator (escaped row ++ 00 02) where it used to fall back to the block's
+# whole last key, so index partitions hold more, shorter entries, and this seek-per-row
+# shape decodes more of them per seek (scratch A/B 38334877222: block decoding only). The
+# trade: a point or row read whose row ends a block no longer reads the next one (coldget
+# 1.059 -> 0.992 reads per present get). No other shape rose.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -136,4 +144,4 @@ scan-wide 1296 0.3
 commit-async 9695 0.3
 scan-narrow-q1 5251 0.3
 scan-wide-q10 1784 0.3
-scan-wide-q1 14224 0.3
+scan-wide-q1 14282 0.3

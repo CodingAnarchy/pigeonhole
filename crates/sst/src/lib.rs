@@ -521,6 +521,11 @@ pub struct ReadOptions {
     /// Read only what is cached: a block that is not fails the read with
     /// [`Error::WouldBlock`] instead of being read from the file (async reads, ICR 0014).
     pub cache_only: bool,
+    /// The read stays within one row: its caller stops at the first key past the row of the
+    /// keys it reads (a point get or a single-row read). Leaving a data block whose index
+    /// separator marks the end of a row (the writer's row-end separators, ICR 0039), the
+    /// cursor ends instead of reading the next block, which holds only later rows.
+    pub one_row: bool,
 }
 
 impl Default for ReadOptions {
@@ -531,6 +536,7 @@ impl Default for ReadOptions {
             readahead_blocks: 0,
             readahead_merge: false,
             cache_only: false,
+            one_row: false,
         }
     }
 }

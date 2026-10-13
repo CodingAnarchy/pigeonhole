@@ -5,7 +5,9 @@ use pigeonhole_format::block::{BlockAddr, BlockBuilder, BlockKind, TRAILER_LEN, 
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::compress::Compressor;
 use pigeonhole_format::filter::{FilterBuilder, column_hash, row_hash};
-use pigeonhole_format::key::{SUFFIX_LEN, common_prefix_len, decode_key, decode_key_in_row};
+use pigeonhole_format::key::{
+    SUFFIX_LEN, common_prefix_len, decode_key, decode_key_in_row, row_prefix_len,
+};
 use pigeonhole_format::manifest::SstMeta;
 use pigeonhole_format::sst::{FOOTER_LEN, Footer, Properties};
 use pigeonhole_format::superblock::ExtentRef;
@@ -461,18 +463,52 @@ impl Writer {
 }
 
 /// Writes a short separator `s` with `last <= s < next` into `out`: the common prefix plus
-/// one incremented byte when that stays below `next`, else `last` itself.
+/// one incremented byte when that stays below `next`, else `last` itself. When `last` and
+/// `next` are internal keys of different rows, `s` is at least the bound past `last`'s row
+/// (its prefix with the terminator's last byte bumped), so a read bounded at the end of that
+/// row knows from the index that the next block holds none of it (ICR 0039): neighbouring
+/// rows such as `…1234` and `…1235` would otherwise get `last` itself, and a row read whose
+/// row ends a block would read the next block only to find it starts another row.
 fn separator(last: &[u8], next: Option<&[u8]>, out: &mut Vec<u8>) {
     out.clear();
-    if let Some(next) = next {
-        let p = last.iter().zip(next).take_while(|(a, b)| a == b).count();
-        if p < last.len() && p < next.len() && last[p] < 0xFF && last[p] + 1 < next[p] {
-            out.extend_from_slice(&last[..p]);
-            out.push(last[p] + 1);
-            return;
+    let Some(next) = next else {
+        out.extend_from_slice(last);
+        return;
+    };
+    let p = last.iter().zip(next).take_while(|(a, b)| a == b).count();
+    if p < last.len() && p < next.len() && last[p] < 0xFF && last[p] + 1 < next[p] {
+        out.extend_from_slice(&last[..p]);
+        out.push(last[p] + 1);
+    } else {
+        out.extend_from_slice(last);
+    }
+    // The row prefix ends in the terminator `00 01`, so bumping its last byte gives a key
+    // above every key of the row and, when `next`'s row differs, still below `next`: a longer
+    // row continues with a nonzero byte or an escaped `00 FF`.
+    if let (Ok(lr), Ok(nr)) = (row_prefix_len(last), row_prefix_len(next))
+        && last[..lr] != next[..nr]
+        && !past_row_end(out, &last[..lr])
+    {
+        out.clear();
+        out.extend_from_slice(&last[..lr]);
+        if let Some(b) = out.last_mut() {
+            *b += 1;
         }
     }
-    out.extend_from_slice(last);
+}
+
+/// Whether `s` sorts at or past the end bound of the row whose prefix is `row` (`row` with
+/// its last byte bumped).
+fn past_row_end(s: &[u8], row: &[u8]) -> bool {
+    let Some((&end, head)) = row.split_last() else {
+        return true;
+    };
+    let n = head.len().min(s.len());
+    match s[..n].cmp(&head[..n]) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => s.get(head.len()).is_some_and(|&b| b > end),
+    }
 }
 
 #[cfg(test)]
@@ -498,5 +534,53 @@ mod tests {
         }
         separator(b"q", None, &mut s);
         assert_eq!(s, b"q");
+    }
+
+    /// Internal keys of rows drawn from a few bytes (`00`, `01`, `FF` and letters, so rows
+    /// share prefixes, contain escapes and differ by one in their last byte).
+    fn internal_key() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        let byte = prop_oneof![Just(0u8), Just(1u8), Just(0xFFu8), Just(b'a'), Just(b'b')];
+        (
+            proptest::collection::vec(byte.clone(), 0..6),
+            proptest::collection::vec(byte, 0..3),
+            any::<u64>(),
+        )
+            .prop_map(|(row, q, ts)| {
+                let mut k = Vec::new();
+                pigeonhole_format::key::encode_key(
+                    &mut k,
+                    &row,
+                    &q,
+                    ts,
+                    1,
+                    pigeonhole_format::Kind::Put,
+                )
+                .unwrap();
+                k
+            })
+    }
+
+    proptest::proptest! {
+        /// ICR 0039: between internal keys of different rows the separator also reaches the
+        /// end of the first key's row, and still lies in `[last, next)`.
+        #[test]
+        fn separators_between_rows_reach_past_the_first_row(
+            a in internal_key(),
+            b in internal_key(),
+        ) {
+            let (last, next) = if a < b { (a, b) } else { (b, a) };
+            proptest::prop_assume!(last != next);
+            let mut s = Vec::new();
+            separator(&last, Some(&next), &mut s);
+            proptest::prop_assert!(last.as_slice() <= s.as_slice() && s.as_slice() < next.as_slice());
+            let lr = super::row_prefix_len(&last).unwrap();
+            let nr = super::row_prefix_len(&next).unwrap();
+            if last[..lr] != next[..nr] {
+                let mut past = last[..lr].to_vec();
+                *past.last_mut().unwrap() += 1;
+                proptest::prop_assert!(s.as_slice() >= past.as_slice(), "{last:?} {s:?} {next:?}");
+            }
+        }
     }
 }
