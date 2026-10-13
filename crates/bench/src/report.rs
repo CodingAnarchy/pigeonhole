@@ -251,6 +251,76 @@ pub struct RunRecord {
     pub detail: RunDetail,
 }
 
+impl RunRecord {
+    /// The measured phase's commit rounds (D246), for a run with cross-shard commits on a
+    /// store that numbers its commits; `None` otherwise.
+    ///
+    /// Until the engine counts refused two-phase-commit rounds itself (ICR 0043), they are
+    /// inferred as perf2 did: the sequence numbers used beyond one per commit. Each commit
+    /// uses one when it commits and each refused round one more. With tablet changes on, a
+    /// split, merge or move while measuring may use some as well; the record's shard table
+    /// counts those beside it.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{OpTypeStats, RunRecord, LatencyStats, CROSS_SHARD_COMMIT};
+    ///
+    /// let mut r: RunRecord = serde_json::from_str(r#"{"store":"pigeonhole","store_config":"",
+    ///     "workload":"cross-shard-contention","seed":1,"records":1,"operations":300,
+    ///     "value_len":100,"threads":32,"load_secs":0,"run_secs":10,"throughput":30,
+    ///     "p50_ns":0,"p99_ns":0,"p999_ns":0,"mean_ns":0,"max_ns":0}"#).unwrap();
+    /// assert!(r.rounds().is_none(), "no cross-shard commits, no seqnos");
+    /// let stats = |count| LatencyStats { count, ..LatencyStats::default() };
+    /// r.detail.by_type = vec![
+    ///     OpTypeStats { op: CROSS_SHARD_COMMIT.into(), stats: stats(100), mean_ns: 0 },
+    ///     OpTypeStats { op: "put".into(), stats: stats(200), mean_ns: 0 },
+    /// ];
+    /// r.detail.seqnos_used = Some(310);
+    /// let x = r.rounds().unwrap();
+    /// assert_eq!((x.commits, x.cross, x.wasted()), (300, 100, 10));
+    /// assert_eq!(x.per_cross(), 0.1);
+    /// ```
+    pub fn rounds(&self) -> Option<Rounds> {
+        let seqnos = self.detail.seqnos_used?;
+        let count = |name: &str| {
+            self.detail
+                .by_type
+                .iter()
+                .find(|t| t.op == name)
+                .map_or(0, |t| t.stats.count)
+        };
+        let cross = count(crate::CROSS_SHARD_COMMIT);
+        (cross > 0).then(|| Rounds {
+            commits: cross + count("put"),
+            cross,
+            seqnos,
+        })
+    }
+}
+
+/// A measured phase's commits and the sequence numbers they used ([`RunRecord::rounds`],
+/// D246).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rounds {
+    /// Commits measured, single-row and cross-shard.
+    pub commits: u64,
+    /// Cross-shard commits measured.
+    pub cross: u64,
+    /// Sequence numbers used while measuring.
+    pub seqnos: u64,
+}
+
+impl Rounds {
+    /// Rounds that did not commit: the sequence numbers used beyond one per commit.
+    pub fn wasted(&self) -> u64 {
+        self.seqnos.saturating_sub(self.commits)
+    }
+
+    /// [`wasted`](Self::wasted) per cross-shard commit; D246 judges it at most 0.1.
+    pub fn per_cross(&self) -> f64 {
+        self.wasted() as f64 / self.cross.max(1) as f64
+    }
+}
+
 /// Percentiles of one class of operations, in nanoseconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencyStats {
@@ -343,6 +413,12 @@ pub struct RunDetail {
     /// when the warmup ran out first, so the measured phase may include tablet changes.
     #[serde(default)]
     pub warmup_settled: Option<bool>,
+    /// Sequence numbers the store used during the measured phase, for stores that number
+    /// their commits ([`Runner::seqno`](crate::Runner::seqno)); `None` elsewhere and in
+    /// results written before it. With one per commit, the excess over the measured commits
+    /// is commit rounds that did not commit: D246 judges it per cross-shard commit.
+    #[serde(default)]
+    pub seqnos_used: Option<u64>,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run
@@ -1054,6 +1130,29 @@ impl Suite {
                         us(t.stats.p999_ns),
                     );
                 }
+            }
+        }
+        let rounds: Vec<(&RunRecord, Rounds)> = self
+            .results
+            .iter()
+            .filter_map(|r| r.rounds().map(|x| (r, x)))
+            .collect();
+        if !rounds.is_empty() {
+            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Seqnos used | Wasted rounds | Per cross-shard commit |\n");
+            s.push_str("|---|---|---|--:|--:|--:|--:|--:|\n");
+            for (r, x) in rounds {
+                let _ = writeln!(
+                    s,
+                    "| {} | {} | {} | {} | {} | {} | {} | {:.3} |",
+                    r.workload,
+                    r.store,
+                    r.store_config,
+                    x.commits,
+                    x.cross,
+                    x.seqnos,
+                    x.wasted(),
+                    x.per_cross(),
+                );
             }
         }
         let spread: Vec<&RunRecord> = self

@@ -259,6 +259,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D241](phase-3.md#d241) — A cross-shard commit refused with `Moved` or below a timestamp floor gives up only at the write-stall timeout, never after 16 attempts; the `Busy` message names tablet changes; making the `BelowFloor` retry win is #637 · owner decision, engine, tablets, #102 · amends D145
 - [D242](phase-3.md#d242) — Every engine warms up on the measured phase's own client threads, repeating the warmup until the tablet placement goes 2 s without a change (at most 30 s), and records `warmup_secs`; skewed-multi-shard's 1-thread load had left D217's packing to unwind inside the measured phase · owner decision, bench, #406 · amends D233
 - [D243](phase-3.md#d243) — The reproducibility check judges only pairs that ran ≥ 10 s (or ≥ 2M group commits); shorter pairs are reported, and the gate lengthens its `all` runs with `--min-secs 10` (client runs continue the workload stream) · owner decision, bench, #406
+- [D246](phase-3.md#d246) — Contended cross-shard commits are a judged gate workload (`cross-shard-contention`: 32 clients, 16 partitions, half the commits across 2–4): within 1.5× of RocksDB (one multi-key `WriteBatch`), tablet changes on ≥ 0.8× off, ≤ 0.1 wasted 2PC rounds per cross-shard commit (inferred from sequence numbers until ICR 0043), no `Busy`, and a p99 bound the owner sets from D245 · owner decision, bench, #406 · part of D247
 
 ## Open questions
 _None._

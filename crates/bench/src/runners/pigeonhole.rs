@@ -9,7 +9,7 @@ use std::time::Duration;
 use pigeonhole::{Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, Table};
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
-use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
+use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, XSHARD_PARTITIONS, YCSB_FAMILY};
 use crate::{BenchOp, Client, PigeonholeRunner, Runner, ShardShare};
 
 /// Default per-shard memtable budget of the runner ([`MemoryBudget`]'s write buffer): the
@@ -42,8 +42,7 @@ pub(crate) struct Settings {
 
 #[derive(Debug)]
 pub(crate) struct Open {
-    db: Pigeonhole,
-    table: Table,
+    target: Target,
     /// Writes retried after `Busy`, shared with every client.
     busy: Arc<AtomicU64>,
 }
@@ -271,6 +270,22 @@ pub(crate) fn create_table(db: &Pigeonhole) -> Result<Table, String> {
     builder.create_if_missing().map_err(err)
 }
 
+/// The cross-shard contention workload's partition tables (D246), `xs00` to `xs15`, created
+/// one after another as perf2's measurement did, so with tablet changes off the engine
+/// places them one per shard.
+fn create_partitions(db: &Pigeonhole) -> Result<Vec<Table>, String> {
+    (0..XSHARD_PARTITIONS)
+        .map(|p| {
+            let f = Family::default().max_versions(1).bloom_bits(BLOOM_BITS);
+            db.table(&format!("xs{p:02}"))
+                .map_err(err)?
+                .family(YCSB_FAMILY, f)
+                .create_if_missing()
+                .map_err(err)
+        })
+        .collect()
+}
+
 impl Runner for PigeonholeRunner {
     fn name(&self) -> &'static str {
         "pigeonhole"
@@ -280,8 +295,11 @@ impl Runner for PigeonholeRunner {
         let db = Pigeonhole::open(dir.join("bench.phdb"), options(&self.settings)).map_err(err)?;
         let table = create_table(&db)?;
         self.open = Some(Open {
-            db,
-            table,
+            target: Target {
+                db,
+                table,
+                parts: Arc::default(),
+            },
             busy: Arc::default(),
         });
         Ok(())
@@ -293,8 +311,11 @@ impl Runner for PigeonholeRunner {
 
     fn close(&mut self) -> Result<(), String> {
         match self.open.take() {
-            Some(Open { db, table, .. }) => {
-                drop(table);
+            Some(Open {
+                target: Target { db, table, parts },
+                ..
+            }) => {
+                drop((table, parts));
                 db.close().map_err(err)
             }
             None => Ok(()),
@@ -309,7 +330,9 @@ impl Runner for PigeonholeRunner {
 
     fn shard_shares(&self) -> Vec<ShardShare> {
         self.open.as_ref().map_or_else(Vec::new, |o| {
-            o.db.shard_stats()
+            o.target
+                .db
+                .shard_stats()
                 .into_iter()
                 .map(|s| ShardShare {
                     commits: s.commits,
@@ -325,18 +348,18 @@ impl Runner for PigeonholeRunner {
     }
 
     fn stalls(&self) -> Option<crate::Stalls> {
-        Some(stalls(&self.open.as_ref()?.db))
+        Some(stalls(&self.open.as_ref()?.target.db))
     }
 
     fn flush(&mut self) -> Result<(), String> {
         match &self.open {
-            Some(o) => o.db.flush().map_err(err),
+            Some(o) => o.target.db.flush().map_err(err),
             None => Ok(()),
         }
     }
 
     fn background(&self) -> Option<crate::Background> {
-        let db = &self.open.as_ref()?.db;
+        let db = &self.open.as_ref()?.target.db;
         let m = db.engine_metrics();
         let work = m.flushes + m.compactions;
         Some(crate::Background {
@@ -347,10 +370,20 @@ impl Runner for PigeonholeRunner {
         })
     }
 
+    fn seqno(&self) -> Option<u64> {
+        self.open
+            .as_ref()?
+            .target
+            .db
+            .snapshot()
+            .ok()
+            .map(|s| s.seqno())
+    }
+
     fn client(&self) -> Option<Box<dyn Client>> {
         let open = self.open.as_ref()?;
         Some(Box::new(PigeonholeClient {
-            table: open.table.clone(),
+            target: open.target.clone(),
             busy: Arc::clone(&open.busy),
         }))
     }
@@ -393,23 +426,36 @@ impl Runner for PigeonholeRunner {
 
 impl Counted for PigeonholeRunner {
     fn execute_counted(&mut self, op: &BenchOp) -> Result<Touched, String> {
-        let o = self.open.as_ref().ok_or("pigeonhole runner is not open")?;
-        execute(&o.table, &o.busy, op)
+        let o = self.open.as_mut().ok_or("pigeonhole runner is not open")?;
+        if matches!(op, BenchOp::Commit { .. }) && o.target.parts.is_empty() {
+            o.target.parts = Arc::new(create_partitions(&o.target.db)?);
+        }
+        execute(&o.target, &o.busy, op)
     }
 }
 
-struct PigeonholeClient {
+/// What an operation runs against: the bench table, and the partition tables with the
+/// database for multi-table commits.
+#[derive(Debug, Clone)]
+pub(crate) struct Target {
+    db: Pigeonhole,
     table: Table,
+    parts: Arc<Vec<Table>>,
+}
+
+struct PigeonholeClient {
+    target: Target,
     busy: Arc<AtomicU64>,
 }
 
 impl Client for PigeonholeClient {
     fn execute(&mut self, op: &BenchOp) -> Result<(), String> {
-        execute(&self.table, &self.busy, op).map(drop)
+        execute(&self.target, &self.busy, op).map(drop)
     }
 }
 
-fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, String> {
+fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, String> {
+    let table = &target.table;
     let mut t = Touched::default();
     match op {
         BenchOp::Get {
@@ -473,6 +519,38 @@ fn execute(table: &Table, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, Str
             retry_busy(busy, || {
                 table.mutate(row).put(YCSB_FAMILY, qualifier, &new).commit()
             })?;
+        }
+        BenchOp::Commit { family, rows } => {
+            let part = |p: usize| {
+                target
+                    .parts
+                    .get(p)
+                    .ok_or_else(|| format!("no partition table {p}: the load creates them"))
+            };
+            if let [r] = rows.as_slice() {
+                let table = part(r.partition)?;
+                retry_busy(busy, || {
+                    let mut m = table.mutate(&r.row);
+                    for (q, v) in &r.cells {
+                        m = m.put(family, q, v);
+                    }
+                    m.commit()
+                })?;
+            } else {
+                let tables = rows
+                    .iter()
+                    .map(|r| part(r.partition))
+                    .collect::<Result<Vec<_>, _>>()?;
+                retry_busy(busy, || {
+                    let mut wb = target.db.write_batch();
+                    for (r, table) in rows.iter().zip(&tables) {
+                        for (q, v) in &r.cells {
+                            wb.put(table, &r.row, family, q, v);
+                        }
+                    }
+                    wb.commit()
+                })?;
+            }
         }
     }
     Ok(t)
@@ -555,6 +633,74 @@ mod tests {
         }
         assert_eq!(dead * 3, live, "a quarter of the points are expired");
         r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_cross_shard_commit_writes_each_row_in_its_partition_table() {
+        // D246: tablet changes off, so the partition tables sit one per shard.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-xs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default()
+            .shards(4)
+            .tablet_changes(false)
+            .memtable_budget(16 << 20);
+        r.open(&dir).unwrap();
+        let mut w = Workload::new(WorkloadConfig::smoke(WorkloadKind::CrossShardContention));
+        for op in w.load_ops() {
+            r.execute(&op).unwrap();
+        }
+        let op = w
+            .run_ops()
+            .find(|op| op.type_name() == crate::CROSS_SHARD_COMMIT)
+            .expect("the run has cross-shard commits");
+        let before = r.seqno().unwrap();
+        r.execute(&op).unwrap();
+        assert!(r.seqno().unwrap() > before);
+        let BenchOp::Commit { family, rows } = &op else {
+            unreachable!()
+        };
+        let parts = &r.open.as_ref().unwrap().target.parts;
+        for row in rows {
+            let (q, v) = &row.cells[0];
+            let got = parts[row.partition].get(&row.row, family, q).unwrap();
+            assert_eq!(got.as_ref().map(|c| c.value()), Some(v.as_slice()));
+            // Not in any other partition.
+            for (p, t) in parts.iter().enumerate() {
+                if p != row.partition {
+                    assert!(t.get(&row.row, family, q).unwrap().is_none());
+                }
+            }
+        }
+        r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_contention_run_counts_its_cross_shard_commits_and_seqnos() {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-xsr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default()
+            .shards(4)
+            .memtable_budget(16 << 20);
+        let config = WorkloadConfig::smoke(WorkloadKind::CrossShardContention);
+        let options = crate::RunOptions {
+            warmup: 0.0,
+            ..crate::RunOptions::default()
+        };
+        let rec = crate::run_detailed(&mut r, &config, &dir, &options).unwrap();
+        let count = |name: &str| {
+            rec.detail
+                .by_type
+                .iter()
+                .find(|t| t.op == name)
+                .map_or(0, |t| t.stats.count)
+        };
+        let cross = count(crate::CROSS_SHARD_COMMIT);
+        assert!(cross > 0);
+        assert_eq!(cross + count("put"), config.operations);
+        // Every commit uses a sequence number; refused rounds use more.
+        assert!(rec.detail.seqnos_used.unwrap() >= config.operations);
         std::fs::remove_dir_all(dir).ok();
     }
 

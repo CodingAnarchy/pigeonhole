@@ -153,10 +153,22 @@ impl Handle {
         ts: u64,
         cells: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), String> {
+        self.put_rows(family, ts, std::iter::once((row, cells)))
+    }
+
+    /// One atomic batch of cells of any rows, all stamped `ts` (D246's cross-shard commit).
+    fn put_rows<'a>(
+        &self,
+        family: &str,
+        ts: u64,
+        rows: impl Iterator<Item = (&'a [u8], &'a [(Vec<u8>, Vec<u8>)])>,
+    ) -> Result<(), String> {
         let f = family_id(family)?;
         let mut batch = self.db.batch().durability(Some(self.mode));
-        for (q, v) in cells {
-            batch.insert(&self.cells, keys::cell(row, f, q), encode_value(ts, v));
+        for (row, cells) in rows {
+            for (q, v) in cells {
+                batch.insert(&self.cells, keys::cell(row, f, q), encode_value(ts, v));
+            }
         }
         batch.commit().map_err(|e| e.to_string())
     }
@@ -193,6 +205,11 @@ impl Handle {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Commit { family, rows } => self.put_rows(
+                family,
+                now_micros(),
+                rows.iter().map(|r| (r.row.as_slice(), r.cells.as_slice())),
+            )?,
             BenchOp::Scan { start, len } => {
                 let from = keys::row_prefix(start);
                 let iter = self.cells.range(from..).map(|g| g.into_inner());

@@ -204,14 +204,27 @@ impl Handle {
         ts: u64,
         cells: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), String> {
+        self.put_rows(family, ts, std::iter::once((row, cells)))
+    }
+
+    /// One atomic batch of cells of any rows, all stamped `ts`: a cross-shard commit's
+    /// counterpart is one multi-key `WriteBatch` (D246).
+    fn put_rows<'a>(
+        &self,
+        family: &str,
+        ts: u64,
+        rows: impl Iterator<Item = (&'a [u8], &'a [(Vec<u8>, Vec<u8>)])>,
+    ) -> Result<(), String> {
         let f = family_id(family)?;
         let cf = self.cf(family)?;
         let mut batch = WriteBatch::default();
-        for (q, v) in cells {
-            let (key, value) = (keys::cell(row, f, q), encode_value(ts, v));
-            match cf {
-                Some(cf) => batch.put_cf(cf, key, value),
-                None => batch.put(key, value),
+        for (row, cells) in rows {
+            for (q, v) in cells {
+                let (key, value) = (keys::cell(row, f, q), encode_value(ts, v));
+                match cf {
+                    Some(cf) => batch.put_cf(cf, key, value),
+                    None => batch.put(key, value),
+                }
             }
         }
         if cf.is_some() {
@@ -262,6 +275,11 @@ impl Handle {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Commit { family, rows } => self.put_rows(
+                family,
+                now_micros(),
+                rows.iter().map(|r| (r.row.as_slice(), r.cells.as_slice())),
+            )?,
             BenchOp::Scan { start, len } => {
                 let from = keys::row_prefix(start);
                 let mode = IteratorMode::From(&from, Direction::Forward);

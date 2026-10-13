@@ -25,7 +25,8 @@
 #   phase2-gate-2  the same again: #387's row-read p99 sits near 1.5x SQLite's, and one
 #                  run varies by about 5%                                             40
 #   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring, every run
-#                  10 s or more (D243)                                                90
+#                  10 s or more (D243); cross-shard-contention also with tablet
+#                  changes off (D246)                                                 90
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2, judging
 #                  runs of 10 s or more, D243)                                        90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
