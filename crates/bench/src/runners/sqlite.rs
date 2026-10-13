@@ -49,6 +49,8 @@ fn oldest_live(family: &str, now: u64) -> i64 {
 #[derive(Debug, Default)]
 pub struct SqliteRunner {
     sync: bool,
+    /// The load commits at `synchronous=NORMAL`, the measured phase at `sync` (D247).
+    load_buffered: bool,
     memory: MemoryBudget,
     path: Option<PathBuf>,
     conn: Option<Conn>,
@@ -66,6 +68,13 @@ impl SqliteRunner {
     /// Page cache of `write_buffer + cache` bytes (default [`MemoryBudget::default`]).
     pub fn memory(mut self, memory: MemoryBudget) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// `true`: the load commits at `synchronous=NORMAL`, and the warmup and the measured
+    /// phase as [`sync`](Self::sync) says (D247).
+    pub fn load_buffered(mut self, yes: bool) -> Self {
+        self.load_buffered = yes;
         self
     }
 
@@ -99,7 +108,8 @@ impl Runner for SqliteRunner {
 
     fn open(&mut self, dir: &Path) -> Result<(), String> {
         let path = dir.join("bench.sqlite");
-        self.conn = Some(connect(&path, self.sync, self.page_cache())?);
+        let sync = self.sync && !self.load_buffered;
+        self.conn = Some(connect(&path, sync, self.page_cache())?);
         self.path = Some(path);
         Ok(())
     }
@@ -118,6 +128,19 @@ impl Runner for SqliteRunner {
         }
     }
 
+    fn measured_durability(&mut self) -> Result<(), String> {
+        match &self.conn {
+            Some(Conn(c)) if self.load_buffered => c
+                .pragma_update(
+                    None,
+                    "synchronous",
+                    if self.sync { "FULL" } else { "NORMAL" },
+                )
+                .map_err(|e| e.to_string()),
+            _ => Ok(()),
+        }
+    }
+
     fn close(&mut self) -> Result<(), String> {
         if let Some(Conn(c)) = self.conn.take() {
             c.close().map_err(|(_, e)| e.to_string())?;
@@ -132,9 +155,14 @@ impl Runner for SqliteRunner {
 
     fn describe(&self) -> String {
         format!(
-            "page_cache={}MiB {}",
+            "page_cache={}MiB {}{}",
             self.page_cache() >> 20,
-            durability(self.sync)
+            durability(self.sync),
+            if self.load_buffered {
+                " load=buffered"
+            } else {
+                ""
+            }
         )
     }
 }
