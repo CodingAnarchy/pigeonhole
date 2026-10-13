@@ -35,7 +35,9 @@ WORKLOADS:
     ycsb-a ycsb-b ycsb-c ycsb-d ycsb-e ycsb-f sparse-wide time-series-ttl
     adjacency skewed-multi-shard group-commit cross-shard-contention
     counters  (not in all: 16 clients incrementing Zipfian counters, D247)
-    all       every workload above but counters
+    transfer  (not in all: 16 clients moving units between Zipfian accounts in
+              transactions, D247)
+    all       every workload above but counters and transfer
               (group-commit: durable commits, GroupSync on Pigeonhole and fsync on
               the others whatever --sync says; without --threads it runs at 1, 4
               and 16 client threads; cross-shard-contention: 32 clients, half the

@@ -131,14 +131,50 @@ impl Default for RowLocks {
 impl RowLocks {
     /// Holds the stripe of `key` until the guard drops.
     pub(crate) fn lock(&self, key: &[u8]) -> std::sync::MutexGuard<'_, ()> {
+        self.hold(self.stripe(key))
+    }
+
+    /// Holds the stripes of two keys (one lock when they share a stripe), taken in stripe
+    /// order so two clients locking the same pair never deadlock.
+    pub(crate) fn lock_two(
+        &self,
+        a: &[u8],
+        b: &[u8],
+    ) -> (
+        std::sync::MutexGuard<'_, ()>,
+        Option<std::sync::MutexGuard<'_, ()>>,
+    ) {
+        let (i, j) = (self.stripe(a), self.stripe(b));
+        let (lo, hi) = (i.min(j), i.max(j));
+        let first = self.hold(lo);
+        (first, (hi != lo).then(|| self.hold(hi)))
+    }
+
+    fn stripe(&self, key: &[u8]) -> usize {
         let h = key.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
             (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
         });
-        let i = (h % self.0.len() as u64) as usize;
+        (h % self.0.len() as u64) as usize
+    }
+
+    fn hold(&self, i: usize) -> std::sync::MutexGuard<'_, ()> {
         self.0[i]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// A transfer's new balances: `from` less `amount`, `to` plus it; a missing account reads
+/// as 0, and a stored value that is not 8 bytes as well.
+pub(crate) fn transfer_balances(from: Option<&[u8]>, to: Option<&[u8]>, amount: i64) -> (i64, i64) {
+    let read = |v: Option<&[u8]>| {
+        v.and_then(|v| v.try_into().ok())
+            .map_or(0, i64::from_le_bytes)
+    };
+    (
+        read(from).wrapping_sub(amount),
+        read(to).wrapping_add(amount),
+    )
 }
 
 /// Microseconds since the Unix epoch: the clock every store's TTL runs on, and the commit
@@ -407,6 +443,46 @@ mod concurrent_rmw {
             }
         });
         assert_eq!(r.counter(b"c"), Some(1 + (CLIENTS * EACH) as i64));
+        done((r, dir));
+    }
+
+    #[test]
+    fn pigeonhole_transfers_keep_the_total_and_count_conflicts() {
+        // D247: optimistic transfers among 4 accounts from 8 clients conflict often; every
+        // conflict retries, so no unit is lost or made.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-xfer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default().shards(2);
+        r.open(&dir).unwrap();
+        let account = |i: usize| format!("acct:{i}").into_bytes();
+        for i in 0..4 {
+            r.execute(&BenchOp::Put {
+                row: account(i),
+                family: YCSB_FAMILY,
+                cells: vec![(b"bal".to_vec(), 100i64.to_le_bytes().to_vec())],
+            })
+            .unwrap();
+        }
+        let clients: Vec<_> = (0..CLIENTS).map(|_| r.client().unwrap()).collect();
+        std::thread::scope(|s| {
+            for (c, mut client) in clients.into_iter().enumerate() {
+                s.spawn(move || {
+                    for k in 0..EACH {
+                        let from = (c + k) % 4;
+                        client
+                            .execute(&BenchOp::Transfer {
+                                from: account(from),
+                                to: account((from + 1 + k % 3) % 4),
+                                amount: 1,
+                            })
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let total: i64 = (0..4).map(|i| r.balance(&account(i)).unwrap()).sum();
+        assert_eq!(total, 400);
+        assert!(r.txn_conflicts().unwrap() > 0, "4 hot accounts, 8 clients");
         done((r, dir));
     }
 

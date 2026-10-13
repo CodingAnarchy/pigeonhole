@@ -11,7 +11,7 @@ use pigeonhole::{
     ValueFilter,
 };
 
-use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified};
+use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified, transfer_balances};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, XSHARD_PARTITIONS, YCSB_FAMILY};
 use crate::{BenchOp, Client, PigeonholeRunner, Runner, ShardShare};
 
@@ -326,6 +326,9 @@ fn create_counters(db: &Pigeonhole) -> Result<Table, String> {
         .map_err(err)
 }
 
+/// The transfer workload's balance column, in [`YCSB_FAMILY`].
+const BALANCE: &[u8] = b"bal";
+
 /// The family and qualifier of the counters workload's counter.
 const COUNTER_FAMILY: &str = "n";
 const COUNTER: &[u8] = b"n";
@@ -360,6 +363,7 @@ impl Runner for PigeonholeRunner {
                 table,
                 parts: Arc::default(),
                 counters: None,
+                conflicts: Arc::default(),
                 load_buffered: self.settings.load_buffered,
             },
             busy: Arc::default(),
@@ -446,6 +450,10 @@ impl Runner for PigeonholeRunner {
         Ok(())
     }
 
+    fn txn_conflicts(&self) -> Option<u64> {
+        Some(self.open.as_ref()?.target.conflicts.load(Ordering::Relaxed))
+    }
+
     fn seqno(&self) -> Option<u64> {
         self.open
             .as_ref()?
@@ -516,6 +524,13 @@ impl PigeonholeRunner {
         cell.value().first().copied()
     }
 
+    /// A transfer workload balance, for tests.
+    pub(crate) fn balance(&self, row: &[u8]) -> Option<i64> {
+        let table = &self.open.as_ref()?.target.table;
+        let cell = table.get(row, YCSB_FAMILY, BALANCE).ok()??;
+        Some(i64::from_le_bytes(cell.value().try_into().ok()?))
+    }
+
     /// A counter of the counters workload, for tests.
     pub(crate) fn counter(&self, row: &[u8]) -> Option<i64> {
         let table = self.open.as_ref()?.target.counters.as_ref()?;
@@ -545,6 +560,8 @@ pub(crate) struct Target {
     parts: Arc<Vec<Table>>,
     /// The counters workload's table (D247), created by its load's first increment.
     counters: Option<Table>,
+    /// Transactions retried after a conflict, shared with every client (D247).
+    conflicts: Arc<AtomicU64>,
     /// Commits are `Buffered` (the load of a run set to [`PigeonholeRunner::load_buffered`]).
     load_buffered: bool,
 }
@@ -653,6 +670,45 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 })?;
                 if applied.is_some() {
                     break;
+                }
+            }
+        }
+        BenchOp::Transfer { from, to, amount } => {
+            // An optimistic transaction reading both balances, retried on a conflict
+            // (counted) and on `Busy` (as `retry_busy` counts it).
+            let mut busy_tries = 0;
+            loop {
+                let mut txn = target.db.transaction().map_err(err)?;
+                let mut read = |row: &[u8]| -> Result<Option<Vec<u8>>, String> {
+                    Ok(txn
+                        .get(table, row, YCSB_FAMILY, BALANCE)
+                        .map_err(err)?
+                        .map(|c| c.value().to_vec()))
+                };
+                let (a, b) = (read(from)?, read(to)?);
+                t = Touched::default();
+                for v in [&a, &b].into_iter().flatten() {
+                    t.cell(v);
+                }
+                let (na, nb) = transfer_balances(a.as_deref(), b.as_deref(), *amount);
+                txn.put(table, from, YCSB_FAMILY, BALANCE, &na.to_le_bytes());
+                txn.put(table, to, YCSB_FAMILY, BALANCE, &nb.to_le_bytes());
+                let committed = if buffered {
+                    txn.commit_with(Durability::Buffered)
+                } else {
+                    txn.commit()
+                };
+                match committed {
+                    Ok(_) => break,
+                    Err(e) if e.code() == ErrorCode::Conflict => {
+                        target.conflicts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) if e.code() == ErrorCode::Busy && busy_tries < BUSY_RETRIES => {
+                        busy_tries += 1;
+                        busy.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(err(e)),
                 }
             }
         }

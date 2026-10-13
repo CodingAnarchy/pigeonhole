@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::{Counted, MemoryBudget, Touched, durability, modified, now_micros, ttl_micros};
+use super::{
+    Counted, MemoryBudget, Touched, durability, modified, now_micros, transfer_balances, ttl_micros,
+};
 use crate::workload::{METRIC_FAMILY, YCSB_FAMILY};
 use crate::{BenchOp, Client, Runner};
 
@@ -266,6 +268,48 @@ impl Conn {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::Transfer { from, to, amount } => {
+                // Immediate: the write lock from the reads on (D247).
+                let tx = self
+                    .0
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(e)?;
+                let read = |row: &[u8]| -> Result<Option<Vec<u8>>, String> {
+                    tx.prepare_cached(GET)
+                        .map_err(e)?
+                        .query_row(params![row, YCSB_FAMILY, b"bal".as_slice(), -1], |r| {
+                            r.get(0)
+                        })
+                        .optional()
+                        .map_err(e)
+                };
+                let (a, b) = (read(from)?, read(to)?);
+                for v in [&a, &b].into_iter().flatten() {
+                    t.cell(v);
+                }
+                let (na, nb) = transfer_balances(a.as_deref(), b.as_deref(), *amount);
+                let ts = i64::try_from(now_micros()).unwrap_or(i64::MAX);
+                {
+                    let mut put = tx.prepare_cached(PUT).map_err(e)?;
+                    put.execute(params![
+                        from,
+                        YCSB_FAMILY,
+                        b"bal".as_slice(),
+                        ts,
+                        na.to_le_bytes().as_slice()
+                    ])
+                    .map_err(e)?;
+                    put.execute(params![
+                        to,
+                        YCSB_FAMILY,
+                        b"bal".as_slice(),
+                        ts,
+                        nb.to_le_bytes().as_slice()
+                    ])
+                    .map_err(e)?;
+                }
+                tx.commit().map_err(e)?;
+            }
             BenchOp::Incr { row, delta } => {
                 self.0
                     .prepare_cached(INCR)

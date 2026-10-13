@@ -11,6 +11,7 @@
 //! | skewed multi-shard | `sk:<fnv(i)>` | `ycsb` | `field0` |
 //! | cross-shard contention | `xs:<partition>:<fnv(i)>`, in partitions | `ycsb` | `field0` |
 //! | counters | `ctr:<fnv(i)>` | each store's counter (below) | one counter per row |
+//! | transfer | `acct:<fnv(i)>` | `ycsb` | `bal`, an `i64` balance |
 
 use std::collections::BTreeSet;
 
@@ -237,6 +238,13 @@ fn partition_key(partition: usize, i: u64) -> Vec<u8> {
     format!("xs:{partition:02}:{:020}", fnv64(i)).into_bytes()
 }
 
+fn account_key(i: u64) -> Vec<u8> {
+    format!("acct:{:020}", fnv64(i)).into_bytes()
+}
+
+/// Every account's balance after the transfer workload's load.
+pub(crate) const OPENING_BALANCE: i64 = 1_000_000;
+
 fn counter_key(i: u64) -> Vec<u8> {
     format!("ctr:{:020}", fnv64(i)).into_bytes()
 }
@@ -310,6 +318,11 @@ impl Iterator for LoadIter<'_> {
                         rows: vec![g.partition_row((i % p) as usize, i / p, rng)],
                     }
                 }
+                WorkloadKind::Transfer => BenchOp::Put {
+                    row: account_key(i),
+                    family: YCSB_FAMILY,
+                    cells: vec![(b"bal".to_vec(), OPENING_BALANCE.to_le_bytes().to_vec())],
+                },
                 // Every counter starts at 1.
                 WorkloadKind::Counters => BenchOp::Incr {
                     row: counter_key(i),
@@ -522,6 +535,19 @@ impl Iterator for RunIter<'_> {
                 let row = ycsb_key(self.rng.below(g.n_items));
                 g.commit(row, &mut self.rng)
             }
+            // D247: two distinct Zipfian accounts, so hot ones conflict.
+            WorkloadKind::Transfer => {
+                let from = g.items.sample_scrambled(&mut self.rng);
+                let mut to = g.items.sample_scrambled(&mut self.rng);
+                if to == from {
+                    to = (from + 1) % g.n_items.max(2);
+                }
+                BenchOp::Transfer {
+                    from: account_key(from),
+                    to: account_key(to),
+                    amount: 1,
+                }
+            }
             // D247: Zipfian rows, so hot counters take many increments.
             WorkloadKind::Counters if p < COUNTER_INCR_FRACTION => BenchOp::Incr {
                 row: counter_key(g.items.sample_scrambled(&mut self.rng)),
@@ -726,6 +752,26 @@ mod tests {
             (incrs - COUNTER_INCR_FRACTION).abs() < 0.02,
             "seed {seed}: {incrs}"
         );
+    }
+
+    #[test]
+    fn transfers_move_one_unit_between_two_loaded_accounts() {
+        let (load, run) = ops(WorkloadKind::Transfer, 17);
+        let accounts: BTreeSet<Vec<u8>> = load
+            .iter()
+            .map(|op| match op {
+                BenchOp::Put { row, .. } => row.clone(),
+                other => panic!("the load opens accounts, got {other:?}"),
+            })
+            .collect();
+        for op in &run {
+            let BenchOp::Transfer { from, to, amount } = op else {
+                panic!("transfer runs transfers, got {op:?}")
+            };
+            assert_ne!(from, to, "seed 17");
+            assert!(accounts.contains(from) && accounts.contains(to), "seed 17");
+            assert_eq!(*amount, 1);
+        }
     }
 
     #[test]

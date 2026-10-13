@@ -426,6 +426,11 @@ pub struct RunDetail {
     /// when the warmup ran out first, so the measured phase may include tablet changes.
     #[serde(default)]
     pub warmup_settled: Option<bool>,
+    /// Transactions retried after a conflict during the measured phase, for stores whose
+    /// transactions can conflict ([`Runner::txn_conflicts`](crate::Runner::txn_conflicts):
+    /// Pigeonhole's optimistic ones); `None` elsewhere. Reported per transfer (D247).
+    #[serde(default)]
+    pub txn_conflicts: Option<u64>,
     /// Sequence numbers the store used during the measured phase, for stores that number
     /// their commits ([`Runner::seqno`](crate::Runner::seqno)); `None` elsewhere and in
     /// results written before it. With one per commit, the excess over the measured commits
