@@ -6,25 +6,158 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
-### Added
-- Stall counters (ICR 0015, #64):
-  - `pigeonhole-engine`: `Metrics::wal_inline_syncs` and `Metrics::file_growths`;
-  - `pigeonhole-pager`: `PagerStats::growths` and `growth_nanos`;
-  - `pigeonhole-wal`: `WalCounters` from `WalStream::counters`.
+## [0.3.0] - 2026-10-13
+The **Phase 3 latency engine**: io_uring and direct I/O, an async form of every data operation, commits visible once applied with group syncs shared between them, one-I/O cold gets, thread-per-core shards that are pinned and packed by load, and the work that met the Phase 3 gate on the reference machine (<GATE:date and commit>; see [Performance](#performance)). Several defaults and error semantics change; read [Upgrading from 0.2.x](#upgrading-from-02x) first. The file format is unchanged, and files written by 0.2.x open as before; the shared-memory layout moves to version 2, so stop reader processes before upgrading the writer. Includes the fixes released in 0.2.1 and 0.2.2. Every published crate moves to 0.3.0 together.
 
-  `phdb-bench` reports what each Pigeonhole run's measured phase stalled on: write stalls, flushes, compactions, WAL unpin passes, inline WAL syncs and file growths. JSON has it in `detail.stalls`, and the markdown summary prints a table.
+### Latency engine: commits
+- **Commits are visible once applied, not once durable** (D227 part 1, amends D19). A shard publishes a group's seqnos once its WAL records are handed to the OS and the group is applied, without waiting for its fsync. A commit's own call still returns only once it is durable at its level and visible, and cross-shard commits are unchanged. Readers, reader processes and backups can therefore see `GroupSync` and `Sync` commits that a power loss then removes; across shards, a later commit can survive an earlier one it was derived from, and a seqno or default timestamp a reader saw can be handed out again after a power loss. The durability guide's "Visibility and durability" section has examples.
+- **Durable snapshots** (D227 part 2, ICR 0037): `durable_snapshot()` on the writer and on reader-process handles sees a commit only once it is durable at its level (the view every snapshot had before), and `backup_durable` takes a backup from one. A memtable freezes only once everything in it is durable, so a flush never collapses a version a durable snapshot reads; a freeze may wait for the fsyncs in flight.
+- **Durable group commits share their syncs** (D207, #412). A shard keeps a bounded number of group syncs in flight per WAL stream (2 on Linux, 1 on macOS; D221), and commits that need one meanwhile batch behind them and share the next. At 16 clients: Linux 29.5K → about 31.5K ops/s with p99 1.46 → about 1.0 ms; macOS 578 → 2.2K ops/s with p99 33 → 11.6 ms.
+- **A commit writes no engine-wide memory on its way** (D236, amends D210): an async commit is charged on the admission count of the shard it is routed to, and a pending commit holds its shard's handle instead of a reference on the engine's shared state. 16 pinned shards commit 11.6% faster on the reference machine.
+- **In application-owned mode, `Shard::run_once` returns early when it completed a future woken through `Shard::waker()`** (D237). It returns `true` right after the shard's queued work, before its background work (flush, compaction), so the loop polls the commit sooner; background work runs on the next call, and at the latest on every ninth. On the reference machine's 16-shard durable group commit this lowers the p99 by about 20 µs at 16 commits in flight and about 30 µs at 8. See [Upgrading](#upgrading-from-02x) for the loop change it needs.
+- **Async commits wait for room before they submit** (D210, #149). Each shard holds at most half `memtable_budget` of async commits submitted and not yet resolved (32 MiB at the defaults); over that, async commits wait in arrival order. A commit future dropped while it still waits writes nothing; blocking commits and `commit_with_ticket` are neither counted nor held. An async commit that waits for room is one state of the engine's pending commit, about 43 instructions less per uncontended `commit_async` (ICR 0036).
+- **Nothing slow on the commit path:**
+  - A WAL segment rollover no longer waits on the shard thread for the full segment's sync: only the successor's header waits, and its records are written meanwhile (D200, #19; FORMAT §10.1 rule 1). A rollover with no spare slot ready holds the group back instead of growing the stream file inline. `WalCounters::rollover_blocks`/`rollover_waits` and `Metrics::wal_rollover_blocks` count it.
+  - WAL spare slots are prepared in short submitted steps (D35), not a ~30 ms zero-fill and sync on the shard thread.
+  - The page file grows ahead of need, off the allocator lock (D58, #182), and a submitted root commit no longer waits on the I/O backend for a growth's or truncation's sync. `PagerStats::growths_ahead`/`ahead_nanos` and `Metrics::file_growths_ahead` count it.
+  - WAL pin passes (D155) run from an index of the log in slices averaging under 50 µs, instead of scanning the shard's whole log for 6–11 ms (D206, #474).
+- **Opening after a clean close waits for no flush** (D203, #158): open to first read on macOS goes from about 17 ms to about 1 ms. A `GroupSync` or `Sync` commit right after the open waits for the new WAL files' syncs instead.
+- **Fewer allocations and copies per commit** (#320):
+  - the batch buffer is handed back and reused, and completion slots are recycled per thread: allocations per one-cell commit go from 5.25 to 2.25 (#458, #498);
+  - the WAL frames records straight from the batch, so a value committed on one shard is copied three times instead of four (#608);
+  - a separated large put and a view publish after a manifest commit reuse what didn't change: 92 allocations per 1 MiB put instead of 113, and 80% fewer on a one-cell flush against 2,048 SSTs (#499).
+- **Cheaper visibility waits:** waiters register in one part per shard, keyed by waiter (#154); a publish visits only the shards that list a waiter, one load when nobody waits (#580); a publish below every waiter's seqno skips the list without its lock (#134); a commit wakes a thread waiting in `Shard::wait` directly (#577).
+- Writes escape their row keys with a word-at-a-time search for zero bytes (#406).
+- New counters: `Metrics::visibility_waits`, `visibility_wakes` and `visibility_contended` (ICR 0023), `Metrics::shard_idle` and `commit_parks` (ICR 0027).
 
-- **Async commits** (Phase 3, #42; behind the `async` feature, which stays off by default until the async front door is complete): `RowMutation::commit_async`, `WriteBatch::commit_async` and `commit_with_async`, and `Transaction::commit_async` and `commit_with_async` return a `nonblocking::CommitFuture`. It submits at the call and resolves when the commit is durable at its level and visible, as the sync `commit` returns. Dropping it does not roll the commit back. It runs on any executor (no runtime dependency, no `spawn_blocking`) and on an application-owned shard's own event loop.
-- `WriteBatch::commit_with_ticket` returns a `CommitTicket` (D196): `wait`, a non-blocking `try_result`, `seqno` once resolved, and `.await` with the `async` feature. It is available without the feature.
-- `pigeonhole-engine`: `Txn::submit`, the non-blocking half of `Txn::commit`.
-- `Options::io_backend` and `ReaderOptions::io_backend` choose the I/O backend (#402): `IoBackend::Pread` (the default, as before), `IoBackend::Uring` (Linux: submitted I/O goes through io_uring, and opening fails with `Unsupported` where it is unavailable), or `IoBackend::Auto` (io_uring where available). `pigeonhole-io` adds the backend as `uring::UringVfs`.
-- With `IoBackend::Uring`, each shard thread gets an io_uring ring of its own and completes its I/O itself, in its turns and its waits (#402). In application-owned mode, `Shard::next_wakeup` is `Some(Duration::ZERO)` while the driving thread has I/O in flight on its ring (a completion fd is #408). `pigeonhole-io` adds `Vfs::attach_thread`, `own_io_waker` and `OwnIoWaker`.
-- `pigeonhole-io`: `OpenOptions::direct` is honored (#403): `O_DIRECT` on Linux, `F_NOCACHE` on macOS, `FILE_FLAG_NO_BUFFERING` on Windows, and `SimVfs` enforces the alignment. `File::direct_align` gives the alignment a direct handle's reads and writes must keep, a misaligned one fails with the new `ErrorKind::Misaligned` on every backend, and a file system that refuses direct I/O fails the open with `Unsupported`. Nothing in the engine opens direct handles yet.
-- **Async gets and row reads** (#42, D196; behind `async`): `Table::get_async` and `get_at_async` (and the same on `ReadTable`) resolve to an owned `Cell`, and `RowRead::read_async` to an owned `Row`. Memtable and cache hits resolve on the first poll. A block the cache does not hold is read through the VFS's asynchronous reads and the read runs again, so no executor thread blocks on it. `Pigeonhole::async_sync_reads` counts the reads that still go to the file synchronously: separated values too large to cache, and blocks a cache of size 0 cannot keep.
-- `pigeonhole-sst`: `ReadOptions::cache_only`, `Error::WouldBlock(Fetch)`, `Fetch`, `SstReader::open_cache_only`, `BlobReader::cached` and `BlobReader::read_cache_only` (ICR 0014). `pigeonhole-engine`: `Engine::get_latest_async`, `get_async`, `read_row_latest_async` and `read_row_async` (`GetFuture`, `RowFuture`), and `Metrics::async_sync_reads`.
+### Async front door (#42)
+- **The `async` feature is on by default** (D17). Every data operation has an async form: `get_async`, `get_at_async`, `RowRead::read_async`, `Scan::stream`, `commit_async`, `commit_with_async`, `commit_if_async`, `Transaction::get_async`, `commit_async` and `commit_with_async`, and `Pigeonhole::flush_async` and `compact_async` (D196, ICR 0018). They run on any executor (no runtime dependency, no `spawn_blocking`) and on an application-owned shard's own event loop. `backup`, `shrink`, open, close and the schema calls stay blocking. Build with `default-features = false` to drop them and their `futures-core` dependency; the blocking API is unchanged.
+- **Async reads** resolve to owned values. Memtable and cache hits resolve on the first poll; a block the cache lacks is read through the VFS's asynchronous reads. `Scan::stream` fetches each step's blocks one block ahead, as it is polled. `Pigeonhole::async_sync_reads` counts the reads that still go to the file synchronously.
+- **Commit futures** submit at the call and resolve when the commit is durable at its level and visible. Dropping one after it submitted does not roll the commit back. `WriteBatch::commit_with_ticket` returns a `CommitTicket` (D196): `wait`, a non-blocking `try_result`, `seqno` once resolved, and `.await` with the feature.
+- A user-guide page on the async front door (`docs/guide/async.md`): the call table, executors, cancellation, the counted synchronous fallbacks and the sync-only calls.
 
-### Changed (breaking)
-- `pigeonhole-sst`: `ReadOptions` gains the public field `cache_only`, so building it with a struct literal no longer compiles; start from `ReadOptions::default()` and set fields.
+### I/O backends and application-owned mode
+- **io_uring** (#402): `Options::io_backend` and `ReaderOptions::io_backend` choose `IoBackend::Pread`, `IoBackend::Uring` (Linux; the open fails with `Unsupported` where it is unavailable) or `IoBackend::Auto`, the new default (see [Defaults](#defaults)). Each shard thread gets a ring of its own and completes its I/O in its turns and waits. Rings register a pool of buffer slots with the kernel, up to half `RLIMIT_MEMLOCK` (`Pigeonhole::io_rings` reports how many got one). A quiet turn makes no system call, and a wake writes the ring's eventfd only while its thread waits in the ring; those cost write-heavy workloads 15–20% against pread before.
+- **Direct I/O** (#403): `Options::direct_io` and `ReaderOptions::direct_io` (default off) read and write SST and blob extents through a second handle opened for direct I/O, so the block cache is their only cache. Superblocks, the manifest and the WAL stay buffered, and a file system that refuses direct I/O keeps buffered I/O. Size `block_cache` for the working set with it on.
+- **Application-owned mode starts no engine threads with io_uring** (D202, #408): the threads that drive shards reap the shared ring. `Shard::io_fd` turns readable when the driving thread's I/O has finished, for an application's own `poll`/`epoll`.
+- **`Shard::wait(timeout)` and `Shard::waker()`** (ICR 0035): `wait` blocks the driving thread until the shard has work again (a commit or message, a `waker()` wake, the thread's own I/O, due background work, or the timeout), on every backend with no file descriptor. Give the futures the driving thread polls `shard.waker()`.
+- **`Shard::release()`** (ICR 0029): call it before handing an application-owned shard to another thread. With io_uring only the submitting thread can complete its I/O, so `release()` drains it first; debug builds panic on a move that skipped it.
+- `Table::shard_of(row)` (ICR 0022): the shard that owns a row now, a routing hint so an application-owned shard thread can commit the rows it owns with no handoff. Commits stay correct whatever it says.
+- Fixed: a thread blocked on the WAL or on the manifest writer behind I/O on a ring no thread reaps now reaps it (ICR 0028, #306, #473); a shard moved to another thread gets a ring on that thread; `Shard::wait` no longer sleeps through a `waker()` wake that arrived during `run_once` (#592).
+
+### Reads
+- **A cold point get is one I/O** (#406): the gate measured 1.106 device reads per get before.
+  - A point get or single-row read whose row ends a data block no longer reads the next block to learn that the row ended (ICR 0039, #611). SSTs mark where a row ends in their index when neighbouring rows differ by one byte; existing SSTs read as before and gain once compacted.
+  - `engine_metrics()` reports the SST top indexes and filters pinned in the block cache: `block_cache_pinned`, `block_cache_capacity` and `block_cache_pinned_warnings` (D215, ICR 0032). Past half the cache, index partitions no longer stay cached and a cold get costs two reads: size `block_cache` to at least twice `block_cache_pinned`.
+- **Reads skip superseded versions** (#387). A process-local stale-tail index beside each memtable lets row reads and scans pass a column's older memtable versions in one jump (D194, D199, ICR 0013; ycsb-c −43% instructions on Linux callgrind; an overwrite costs about 200 more to record), and SST sources pass a finished column's entries reading only their block headers (ICR 0041; scans 1.7–2.4% fewer instructions). Results are identical.
+- **The row cache works** (D201, ICR 0019): `Options::row_cache(bytes)` used to do nothing. It serves latest row reads of the newest version and point gets from cached family rows; a write or a TTL expiry makes the cached copy miss at once. `Options::row_cache_max_row` (default 4 KiB), `Options::row_cache_family` and `Pigeonhole::row_cache_stats`. It is on by default now (see [Defaults](#defaults)); snapshot reads, multi-version and time-range reads, scans and reader processes don't use it.
+- **Point reads** find a row's SSTs by a binary search over each level below 0 (ycsb-c −8.5% instructions; no slowdown as SST counts grow), and skip a skiplist search in memtables that hold no delete markers (ICR 0020; get-mem −16%).
+- **Scans:**
+  - readahead submits fetches for the next 16 blocks the cache lacks, unmerged (D222, #402): 3.2–3.6 GiB/s on cold tables on the reference machine, against 2.6 GiB/s with none;
+  - filtered scans compile their filter once (ICR 0030), seek forward within a block, and walk the index forward to the target block (#29);
+  - a scan sets up nothing for families with no data in a tablet's range, and stops at its row limit without reading the next row (a 10-row scan with 3 of 4 families empty: 9%, then another 10%, fewer instructions);
+  - each cell is read once to append it to its row (#607), and row keys are unescaped in one copy (−13% on a time-series newest-ten scan);
+  - compaction and uncached scans reuse decompression buffers per SST (#372).
+- **Block-cache hits scale across threads** (#18): 10 threads hitting the cache, 371 → 106 ns per hit; ycsb-c with 8 client threads on one shard, 863K → 1.67M ops/s.
+- Fixed: `engine_metrics().block_cache` reported `(0, 0)`; hits and misses are now counted (#57).
+
+### Tablets and balancer
+- **Tablet packing** (D217, ICR 0034): the balancer packs a lightly loaded store's written tablets onto as few shards as their summed busy time needs at half load each, and spreads them again as load grows. `Options::tablet_packing(false)` keeps the 0.2 placement exactly. `shard_stats()` reports each shard's `busy_nanos` and `engine_metrics()` their sum (ICR 0033).
+- Fixed: under packing, every shard uses the same count of active shards, decided by shard 0. Before, shards could disagree for good and place tablets on fewer or more shards than the load called for (#641).
+- **Damped, closed-loop placement** (D214, D224): the balancer moves or splits for write skew only after it has lasted 10 passes (1 s), then sheds load until the shard is within 1.1× the mean, with as many pieces as the skew needs. Skew that appears only because other shards went idle no longer moves tablets; placement is corrected on loads averaged over about 10 s, one change per 10 s; shards balancing at once never shed into the same shard; a tablet must go unwritten for 100 passes (10 s) before it is merged or consolidated. Reacting to a real, sustained skew takes about 1–3 s longer.
+- **Fixed: a table loaded faster than it compacts now splits and spreads over shards** (D241, #636). The balancer skipped the split whenever the tablet was compacting, which under a bulk load was always, so the whole load stayed on one shard. A split due on a compacting tablet now starts when the compaction ends.
+- Placement is judged on its own (D231): `phdb-bench placement` offers skewed writes open-loop and passes when the table settles within 60 s, nothing changes while measuring, and the busiest shard takes at most 1.25/N of the writes (D223). The scaling gate pre-splits with the balancer off and judges efficiency alone.
+
+### Stalls and errors
+- **The L0 write stall starts at twice the compaction trigger** (8 L0 files at the defaults) instead of the trigger itself (D234): writers are no longer paced while a compaction is merely running. A single shard wrote ~6% more on the reference machine.
+- **The write-stall timeout is each waiting write's own** (D240, #638): `Options::write_stall_timeout` counts from when that write, `flush` or `compact` began waiting. Before, a shard short of room for the whole timeout refused every waiting write with `Busy` at once, including ones that had just arrived.
+- **Cross-shard commits that keep meeting tablet changes or a participant's timestamp floor fail with `Busy` only after the write-stall timeout** (D241, #636), not after 16 refusals within seconds. The `Busy` message names tablet changes as a cause and refers to `Options::write_stall_timeout`.
+- **A write waiting for room with no flush in flight freezes the largest memtables, about half the arena,** instead of every open one (D124, #642). A shard holding many tablets flushes fewer, larger SSTs and stalls less: locally, a 16-tablet hot shard went from 109–245 background jobs and 1.2–2.9 s of stalls to 31–44 jobs and about 0.1 s.
+- A write stall admits commits at its designed rate where the timer is coarse (#149): a single committer on Windows was throttled about 5× harder than designed.
+- **`ErrorCode::OutcomeUnknown` (28) and `Error::OutcomeUnknown`** (ICR 0038, ICR 0040): a commit whose outcome is not known in this process, because a shard failed or the database closed after its records may have reached the log. Reopen and read: the next open decides it, all of it or none of it. **`Closed` now always means the commit was not committed.** A visibility wait that ends because the database closed or a shard died, a commit whose apply or WAL sync failed after its write, and one in flight when a shard panicked now return `OutcomeUnknown` (they returned `Closed`, `Busy` or `Io`). `Io` for a commit means it was refused before anything was written.
+- **A health check** (ICR 0040): `Pigeonhole::is_failed()` (one atomic load) and `failure()`: which shard failed (`Failure::MAIN_FILE` for a failed manifest commit) and why (`FailureCause::{Panic, DriverDropped, Io, Internal}`). The user guide's new "Recovering from a failed shard" page says what to do next. A shard poisoned during a tablet change now records its failure (#634).
+- **A shard's death stops every commit** (D85 since D227): after a panic, a dropped application-owned shard, a failed WAL fsync or a failed cross-shard apply, every new commit fails at once with `Closed`, on healthy shards too. Reads keep working; the close is unclean, and the database needs reopening. A failed fsync's commits never become durable, so durable snapshots and `backup_durable` never include them.
+- **Close hangs fixed:**
+  - a shard dying in the middle of a cross-shard commit: the commit is aborted (`Closed`) if undecided, fails with `OutcomeUnknown` if decided, and is never partly visible;
+  - a shard stopped after a failed apply: the close gives up flushing it, reports unclean, and the next open replays its log;
+  - a flush failed after a WAL write error: the close no longer restarts it indefinitely, rewriting the same SST and growing the file; a `flush` or `compact` racing such a close gets `Closed` at once.
+- Fixed: after a power loss shortly after a database was created, or after its shard count was raised, a later crash could lose acknowledged commits (D211, #520). A WAL checkpoint now waits until its stream's creation is durable. Released versions (0.2.0 to 0.2.2) are not affected.
+- Fixed: an async commit waiting for admission could miss its wake when a charge returned at the same moment it queued (#645). Found by a loom model; not observed on hardware.
+- Stall counters (ICR 0015, #64): `Metrics::wal_inline_syncs` and `file_growths`, `PagerStats::growths` and `growth_nanos`, and `WalCounters`.
+
+### Defaults
+Each of these changes behaviour on upgrade; [Upgrading from 0.2.x](#upgrading-from-02x) says what to set to keep the old one.
+- **Engine-owned shard and compaction threads are pinned to CPUs of their own** (`Options::pin_threads`, D235): inside the opening thread's affinity set, one per physical core first. Opens never fail because of pinning: threads run unpinned on macOS, under a CPU quota narrower than the affinity set, or when too few CPUs are free, and several databases in one process pin to different CPUs. `EngineMetrics::{pinned_threads, unpinned}` report it.
+- **One shard per physical core** the process may run on, not one per logical CPU (D220): SMT siblings count once, and a cgroup quota still caps it. On the reference machine (16 cores, 32 threads), 16 shards gave twice the durable group-commit throughput of 32. With pinning, shard `i` goes to the `i`-th physical core's first CPU.
+- **The I/O backend is `IoBackend::Auto`** (D218): io_uring where the kernel offers it, the `pread` thread pool elsewhere; the open never fails over it.
+- **The row cache is on, at 64 MiB** (D216, amending D201). A writer's caches default to 256 MiB of block cache plus 64 MiB of row cache, and about 6 MiB of per-row write watermarks zeroed at open; each write pays one atomic per row it touches. Reader processes are unchanged.
+- **The group sync depth is 2 on Linux and 1 on macOS** (D221), and scans read 16 blocks ahead (D222). The measurement variables `PIGEONHOLE_GROUP_SYNC_DEPTH` and `PIGEONHOLE_READAHEAD` are gone.
+- **Buffered commits spin briefly before parking** (D198): 15 µs on the client (`Options::commit_spin`) and 50 µs on engine-owned shards (`Options::shard_spin`). On a Linux CI runner a buffered commit's median fell from 32.9 µs to 4.1 µs. Durable commits, idle databases and application-owned shards do not spin.
+- **The `async` feature is on** (D17; see [Async front door](#async-front-door-42)).
+
+### Bench and gate
+- **The Phase 3 gate-window runbook** (#405): `crates/bench/baselines/phase3-gate/run-window.sh` runs every measurement the gate needs on the reference machine, resumable, with a `summary.md` of every #406 target; `gate-dry-run.yml` runs it small on a Linux runner. Steps include scaling, cold get (block cache at 1/64 of the table, D215), scan rate (`examples/scanrate.rs`), the row cache (`--row-cache`), `wal_pin_bytes` (#527) and the durable group commit at 4, 8 and 16 in flight (D226).
+- **Gate judgments:**
+  - engine scaling (≥ 0.8 × N) is judged up to one chiplet's physical cores, read from the L3 topology, and larger N is reported (D238);
+  - the memtable lookup at 2^18 entries is accepted up to 354 ns, 5% above 337 (D239);
+  - durable group commit is judged on 2M commits, and the scaling gate on at least 8 s per shard count (D219).
+- **Reproducible runs:**
+  - every engine settles after the load (a flush, then a bounded wait for quiet background work) before the warmup (D233), and `compare` notes pairs whose measured phases did different background work;
+  - the warmup runs on the measured phase's own client threads until the tablet placement has gone 2 s without a change (D242);
+  - `compare` judges only results of 10 s or more (or 2M group commits), and the gate runs `all` with `--min-secs 10` (D243).
+- **The D213 group-commit and scaling runs:** application-owned shards committing inline with 16 in flight (D204, D213), a fixed pre-split placement, threads pinned and reported unpinned beside them (D235), a run failed as skewed when one shard took more than 1.25/N of the commits (D223), waits on each shard's completion fd instead of spinning (p99 at 32 io_uring shards 1.3–3.5 → 0.29–0.36 ms), and a clean exit when a shard thread panics.
+- New options: `--min-secs`, `--inline-ops`, `--in-flight`, `--row-cache`, `--offered-rate`, `--shard-spin`. Records carry each run's stalls, flushes, compactions, visibility waits, park and wake counts, per-shard busy time and row-cache counts. Results from before the settle, warmup and inline-wait changes aren't comparable.
+
+### Lower-level crates
+Additions in the crates below `pigeonhole`, for those who build on them directly:
+- `pigeonhole-engine`: `Txn::submit`, `Engine::{get_latest_async, get_async, read_row_latest_async, read_row_async, scan_async, submit_check_and_mutate, submit_flush, submit_compact, admit, shard_of, durable_snapshot, backup_durable, is_failed, failure, row_cache_stats}`, `Txn::{admit, get_async}`, `EngineShard::release`, `ScanCursor::{poll_next_row, counted, push_next_cell}`, `PendingCheck`, `PendingMaintenance`, `Admit`, `RowCacheStats`, `Failure`, `FailureCause`, `RowSink::{cell_count, cell}`, `Error::OutcomeUnknown`, and `EngineOptions::{async_commit_bound, row_cache_max_row, row_cache_families, memtable_tail_index, direct_io, commit_spin_nanos, shard_spin_nanos}`.
+- `pigeonhole-io`: `uring::UringVfs` (with `new_application_owned`), `Vfs::{attach_thread, submit_sync_dir, ring_stats}`, `own_io_waker`, `OwnIoWaker`, `own_io_fd`, `reap_orphan_io`, `Completion::fan_out`, `BufPool`, `File::{direct_align, read_buf}`, `IoBuf::{detached, keep}`, `ErrorKind::Misaligned`; `OpenOptions::direct` is honored on every platform; `SimVfs::hold_dir_syncs`.
+- `pigeonhole-sst`: `ReadOptions::{cache_only, one_row}`, `Error::WouldBlock(Fetch)`, `SstReader::{open_cache_only, first_fetch}`, `SstIter::{set_cache_only, upcoming, at_last_block}`, `BlobReader::{cached, read_cache_only}`, `BlobWriter::reserve_for`, `counting_file_reads`, `counting_readahead`; SSTs and blob files are written through direct-I/O handles when given one.
+- `pigeonhole-wal`: `StrictForeground`, `SpareSegments::start` (`SparePrep`), `Wal::{blocked, notify_unblocked, created_durable, notify_created}`, `WalCounters`.
+- `pigeonhole-runtime`: `Waiter::{on_settled, recycle_into}`, `SlotCache`, `completion_from`, `Submitter::{busy_nanos, idle_counts}`, `RuntimeConfig::idle_spin`.
+- `pigeonhole-cache`: `BlockCache::{hits_and_misses, add_pinned, sub_pinned, pinned, pinned_warnings}`, `BlockHandle::charge`, `RowEpochs`.
+- `pigeonhole-format`: `ScanFilter::compile` (`CompiledFilter`), `Cursor::skip_column`, `WalRecord::split`, `RECORD_HEAD_MAX`, `FrameEncoder::encode_parts`, `watermark::DURABLE`.
+- `pigeonhole-memtable`: `Memtable::{with_tail_index, note_marker}`, `MemIter::skips_columns`, `MemtableReader::may_have_markers`. `pigeonhole-compaction`: `ResolveOptions::skip_columns`, `CellResolver::seek_column_encoded_unmarked`. `pigeonhole-pager`: `Pager::{data_file, set_data_file}`, `PagerStats::{growths, growth_nanos, growths_ahead, ahead_nanos}`. `pigeonhole-shm`: `ShmRegion::{publish_durable, durable_seqno}`, `ReaderSlot::{pin_durable, lower_pin}`.
+- The simulator's deferred I/O runs the simulated device when the thread that turned deferral on blocks without owner reaping (ICR 0028).
+
+### Performance
+The Phase 3 gate ([D197](docs/design/decisions/phase-3.md#d197), [#406](https://github.com/CodingAnarchy/pigeonhole/issues/406)) is met on the reference machine, a Hetzner AX102 (16 cores, 32 threads), in the <GATE:window date> window at <GATE:commit> ([results](crates/bench/baselines/phase3-gate/results/<GATE:dir>/summary.md)).
+
+| Target | Goal | Measured |
+|---|---|--:|
+| Point get in memory | p50 < 2 µs, p99 < 10 µs | <GATE:point-get p50 / p99> |
+| Memtable lookup at 2^18 entries (D230, D239) | ≤ 300 ns (accepted to 354) | <GATE:memtable ns> |
+| Point get on cold data | one I/O | <GATE:reads per get> |
+| Durable group commit (D213, D226) | > 1M cells/s, p99 < 200 µs | <GATE:cells/s, p99> |
+| Ordered scan from cache | > 1 GB/s per core | <GATE:GB/s> |
+| Open to first read | < 5 ms | <GATE:open ms> |
+| Thread-per-core scaling (D231, D238) | ≥ 0.8 × N | <GATE:efficiency at N> |
+| Balancer placement (D223, D231) | busiest ≤ 1.25/N | <GATE:placement> |
+| Every workload against RocksDB | within 1.5× | <GATE:rocksdb> |
+| Phase 2 floors (D193); #387 | no regression | <GATE:floors, #387 ratios> |
+| Run-to-run reproducibility (D243) | ±40% | <GATE:repro> |
+
+### Upgrading from 0.2.x
+- **Files.** The file format is unchanged (version 2): files written by 0.2.x open and read as before. Keep a backup from before the upgrade if you may need to go back.
+- **Reader processes.** The shared-memory layout is version 2 (FORMAT §11.2). Writer and reader processes must run builds with the same layout: **stop reader processes before upgrading the writer.** A new writer fails to open with `ShmVersionMismatch` while readers of an older build are still attached, and an old reader can't attach to a new writer.
+- **Visibility.** Readers now see a commit once it is applied, before its fsync (D227). If a reader must not act on a commit a power loss could remove (deriving a write on another shard from what it read, persisting a cursor, taking a backup), read from `durable_snapshot()` and back up with `backup_durable`. A commit's own call returns when it did before.
+- **Errors.**
+  - Handle `ErrorCode::OutcomeUnknown` (28) on commits: the commit may or may not have happened; reopen and read it back, or write it again if it is idempotent. `ErrorCode` and `Error` are `#[non_exhaustive]`, so existing matches compile, but a catch-all arm that treated every failure as "not written" is now wrong for this code.
+  - `Closed` now always means not committed. After any shard's death, every new commit fails with `Closed` (healthy shards included) until you close and reopen; poll `Pigeonhole::is_failed()` from a health endpoint or supervisor to learn of it without a commit.
+  - **`Busy`:** the write-stall timeout is per waiting write (D240), cross-shard commits retry tablet changes until that timeout (D241), and the L0 stall starts at 8 files, not 4 (D234). A bulk load that used to fail with `Busy` should now finish; a write that does get `Busy` really waited `write_stall_timeout`. Code that matched the old message text needs the new one.
+- **Threads and placement.**
+  - Threads are pinned by default (D235). Several processes with Pigeonhole on one host should each get their own CPUs (an affinity mask or a cpuset) or open with `Options::pin_threads(false)`.
+  - The default shard count is the physical cores, so an SMT machine gets half the shards it did. `Options::shards(n)` sets it.
+  - Tablet packing (D217) gathers a lightly loaded store onto fewer shards; `Options::tablet_packing(false)` keeps 0.2's placement. Balancer moves are slower to start (D214, D224).
+- **Memory and CPU.** A writer uses about 70 MiB more by default (the 64 MiB row cache and its per-row watermarks; `Options::row_cache(0)` turns it off), and io_uring rings register up to 1 MiB each of locked memory within `RLIMIT_MEMLOCK`. Buffered commits spin up to 15 µs on the client and 50 µs on engine-owned shards before parking; on battery-powered or CPU-constrained hosts set `Options::commit_spin(Duration::ZERO)` and `shard_spin(Duration::ZERO)`.
+- **I/O backend.** Linux uses io_uring where the kernel offers it (D218). `Options::io_backend(IoBackend::Pread)` keeps 0.2's behaviour.
+- **Application-owned mode** (`Shard::run_once`):
+  - **Poll your futures after every `run_once` call,** not only once it returns `false` (D237). A call that settles a commit the loop awaits returns `true` early, with background work still to run; a loop that polls only when idle still works but loses the latency gain. Wait with `Shard::wait(timeout)` when `run_once` returns `false`, and give the futures the loop polls `shard.waker()`; the [async guide](docs/guide/async.md) has the loop.
+  - With io_uring the engine starts no I/O threads: use `Shard::wait`, or wait on `Shard::io_fd` in your own event loop (D202). A loop that takes neither keeps polling while I/O is in flight.
+  - Call `Shard::release()` before handing a shard to another thread.
+- **Async.** The `async` feature is on by default and adds the `futures-core` dependency; `default-features = false` drops both. An async commit future dropped while it waits for room (D210) writes nothing: await it, or use `WriteBatch::commit_with_ticket`, which always submits.
+- **Measurement variables.** `PIGEONHOLE_GROUP_SYNC_DEPTH` and `PIGEONHOLE_READAHEAD` are gone; the settled values are built in (D221, D222).
+- **API.** No breaking API change: `cargo semver-checks` against 0.2.2 passes for every published crate. The changes are additions, and the behaviour changes above.
 
 ## [0.2.2] - 2026-10-12
 Fixes to closing a database after cross-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 and 0.2.1 open as before. Every published crate moves to 0.2.2 together.
@@ -127,7 +260,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.1.0...v0.2.0

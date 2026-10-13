@@ -1,2 +1,0 @@
-### Changed
-- A point get or single-row read whose row ends a data block no longer reads the next block to learn that the row ended (ICR 0039). SSTs now mark where a row ends in their index when neighbouring rows differ by one byte (sequential ids, timestamps), and point and row reads stop there. The gate's cold-get workload measured about 6% fewer reads per get. Existing SSTs read as before and gain once compacted. `pigeonhole-sst` adds `ReadOptions::one_row`.

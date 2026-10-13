@@ -328,6 +328,7 @@ Counters for the visibility and queue waits come first, so each change shows on 
 
 The #406 checklist's scaling item reads: "Thread-per-core scaling (D204: application-owned inline, N up to cores): efficiency ≥ 0.8, single-shard p99 not regressed; the engine-owned synchronous shape reported."
 
+<a id="d205"></a>
 ## D205 — The scan target counts decoded bytes on the bench's default shape (owner decision, 2026-10-10; bench, #29; amends the spec's Goals scan line and the #406 checklist)
 **Decision.**
 - **"> 1 GB/s decoded per core from cache" counts decoded bytes:** the row key, qualifier and value of every cell an ordered single-family scan returns, on one thread.
@@ -342,6 +343,7 @@ The #406 checklist's scaling item reads: "Thread-per-core scaling (D204: applica
 
 The #406 checklist's scan item reads: "Ordered row scan, single family: > 1 GB/s decoded per core from cache — #29 — measured as decoded bytes on the default 100 B / 8-cell shape; small and wide shapes reported (owner decision, D205)."
 
+<a id="d206"></a>
 ## D206 — WAL pin passes run in bounded slices; the WAL bound may be exceeded by what is logged while a pass runs (coordinator decision, 2026-10-10; engine, #474, #175; amends D155)
 **Decision.**
 - **A pass runs in slices.** A pass (a shard's own past `wal_pin_bytes`, or one served for another shard's `Unpin`) does at most `PIN_SLICE` units of work per shard turn (1,024: a record indexed, a slot examined, a cross-shard record examined or an ask pair processed, one unit each; an internal constant). So no pass blocks the shard thread for more than a slice.
@@ -714,6 +716,7 @@ With the slot floor (931c578, the same setup, two runs each, ranges):
 
 *History: shard 0's balancer decides `k` and publishes it, and every shard uses that value. Each shard used to run its own hysteresis over loads it read at different passes, so the shards disagreed: in one run, one kept 16 while others used 1 to 3. This is an implementation fix to match the rule above ("every shard computes the same `k`"), from the skewed-multi-shard placement analysis (F3).*
 
+<a id="d218"></a>
 ## D218 — io_uring is the default I/O backend where the kernel offers it: `IoBackend::Auto` (owner decision, 2026-10-12; pigeonhole, io, #402)
 
 **Decided:**
@@ -754,6 +757,7 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 
 **Not changed:** the targets, D213's shape (shards, pre-split placement, commits in flight) and D204's. The shard count is D220's.
 
+<a id="d220"></a>
 ## D220 — The default shard count is one per physical core (owner decision, 2026-10-11; io, runtime, engine, pigeonhole, bench, #406)
 
 **Decided:**
@@ -781,6 +785,7 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 
 **Not changed:** an explicit `shards(n)`; D213's and D204's shapes. `Environment::cores` in the bench report stays the logical CPU count: it identifies the machine when comparing runs.
 
+<a id="d221"></a>
 ## D221 — The group sync depth stays 2 on Linux and 1 on macOS; `PIGEONHOLE_GROUP_SYNC_DEPTH` is removed (owner decision, 2026-10-12; engine, #476; decides D207's depth)
 
 **Decided:**
@@ -800,6 +805,7 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 - **Depth 2 also bounds the syncs** a shard can pile onto the device.
 - macOS keeps 1, for D207's reason: `F_FULLFSYNC` serializes on the device.
 
+<a id="d222"></a>
 ## D222 — Scans read 16 data blocks ahead, without merging adjacent fetches; `PIGEONHOLE_READAHEAD` is removed (owner decision, 2026-10-12; engine, #431)
 
 **Decided:**

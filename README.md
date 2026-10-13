@@ -7,9 +7,9 @@
 [![docs.rs](https://img.shields.io/docsrs/pigeonhole)](https://docs.rs/pigeonhole)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, and the wide-column model (Phase 2: counter families, blob separation, compaction styles, zstd) is complete in 0.2.0: its performance gate is met as amended by [D193](docs/design/decisions/phase-2.md#d193), with one documented gap, the read tail of wide, heavily overwritten rows ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The on-disk format and the API may change before 1.0 ([`FORMAT.md`](FORMAT.md)). The latency work (Phase 3) is in progress on `main`: io_uring, direct I/O, the async API, and commit-path and read-path work (see the roadmap). Pigeonhole is **not recommended for production use yet**. See [`docs/status.md`](docs/status.md) for the roadmap.
+> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, and the wide-column model (Phase 2: counter families, blob separation, compaction styles, zstd) is complete in 0.2.0: its performance gate is met as amended by [D193](docs/design/decisions/phase-2.md#d193), with one documented gap, the read tail of wide, heavily overwritten rows ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The latency engine (Phase 3: io_uring, direct I/O, the async API, apply-time visibility, group syncs, pinned thread-per-core shards) is complete in 0.3.0: its gate is met on the reference machine ([status](docs/status.md#phase-3-gate-results)). The on-disk format and the API may change before 1.0 ([`FORMAT.md`](FORMAT.md)). Pigeonhole is **not recommended for production use yet**. See [`docs/status.md`](docs/status.md) for the roadmap.
 
-> **Status: usable and disk-backed.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. The current release is 0.2.2, with a blocking API (see the [changelog](CHANGELOG.md)); on `main` every data operation also has an async form, on by default ([async guide](docs/guide/async.md)).
+> **Status: usable and disk-backed.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. The current release is 0.3.0 (see the [changelog](CHANGELOG.md)): every data operation has a blocking form and an async form, on by default ([async guide](docs/guide/async.md)).
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
 
@@ -17,7 +17,7 @@ SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missin
 ```sh
 cargo add pigeonhole
 ```
-or `pigeonhole = "0.2"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on [docs.rs](https://docs.rs/pigeonhole); what changed is in the [changelog](CHANGELOG.md) and the [0.2.2 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.2).
+or `pigeonhole = "0.3"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on [docs.rs](https://docs.rs/pigeonhole); what changed is in the [changelog](CHANGELOG.md) and the [0.3.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.0).
 
 ```rust
 use pigeonhole::{Pigeonhole, Options, Family};

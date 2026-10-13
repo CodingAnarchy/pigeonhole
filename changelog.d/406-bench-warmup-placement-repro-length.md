@@ -1,3 +1,0 @@
-### Changed
-- The bench warms every engine up on the measured phase's own client threads, repeating the warmup until the tablet placement has gone 2 s without a split, merge or move (at most 30 s), and records `detail.warmup_secs` and `detail.warmup_settled` (D242). Results from before this aren't comparable for multi-client workloads such as skewed-multi-shard.
-- `phdb-bench --min-secs` lengthens client runs too: a run continues with the workload stream's next operations until that long is measured. `phdb-bench compare` judges only results of 10 s or more (or 2M group commits) and lists shorter ones as not judged; the gate window runs `all` with `--min-secs 10` (D243).

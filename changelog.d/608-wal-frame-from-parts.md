@@ -1,2 +1,0 @@
-### Changed
-- A commit copies its batch once less: the WAL frames each record straight from its batch instead of first copying it into a staging buffer, so a value committed on one shard is copied three times in memory (into the batch, the WAL buffer and the memtable) instead of four (#320). The bytes written are unchanged. `pigeonhole-format` adds `WalRecord::split`, `RECORD_HEAD_MAX` and `FrameEncoder::encode_parts`.
