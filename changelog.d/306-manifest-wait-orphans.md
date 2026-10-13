@@ -1,2 +1,0 @@
-### Fixed
-- In application-owned io_uring mode with no reaper thread, a thread blocked on the manifest writer behind a shard's in-flight manifest commit now reaps the rings no thread reaps, as the WAL's blocking waits already do (ICR 0028, #306). Before, it parked and relied on another thread to complete that I/O. The blocked call could be a table creation or drop, `shrink`, or a commit whose value is separated into a blob file.
