@@ -75,13 +75,24 @@ pub struct CommitInfo {
 
 Log or assert on `info.durability` if your correctness depends on it.
 
-## Read-your-writes (D19)
+## Visibility and durability (D227)
 A commit returns only once it is durable at its level **and** visible to readers, so a thread always reads its own write immediately after `commit()` returns.
 
-Costs and caveats:
-- A **cross-shard** commit (a batch whose rows live on different shards) is two-phase. It becomes visible only after every participating shard has applied it, so its latency includes the slowest participant's group.
-- Any shard's in-flight group can briefly delay visibility of newer commits on other shards.
-- A reader can observe a `Buffered` or `None` commit that a later power loss then removes. That is inherent in those levels: visible does not mean durable.
+**Other readers can see a commit sooner than that.** A shard makes a commit visible once its WAL record is handed to the operating system and the commit is applied in memory. It doesn't wait for the fsync (D227, which amends D19). That keeps one shard's sync from delaying every other shard's commits. The cost is that **visible no longer means durable**, at any level, for anyone but the committing thread after its call returns.
+
+What that means in practice:
+
+- **A reader can see data that a power loss then removes.** Thread A commits `user:42 → "paid"` with `GroupSync`. Before the fsync finishes, thread B (or a reader process) reads `"paid"`. The power fails before the fsync completes. After the restart, `user:42` has its old value. A was never told the commit succeeded, but B acted on it. A process crash alone doesn't do this: the write has already reached the operating system. It takes an OS crash or a power loss.
+- **Across shards, a later write can survive while an earlier one it depended on is lost.** Each shard recovers a prefix of its own log, so on one shard what survives is always a prefix of what readers saw. Shards are logged independently, though. Example: client P writes `order:7 = "placed"` (shard 1). Client Q reads it and writes `invoice:7 = "for order 7"` (shard 2), and Q's commit returns. Power fails before shard 1's fsync. After recovery `invoice:7` exists and `order:7` doesn't. A transaction that read `order:7` doesn't prevent this either: it validates against what was visible. If a write must never outlive what it was derived from, read through a durable snapshot (see below), or put both rows in one shard's batch.
+- **A backup can include commits the database later loses.** `backup` copies exactly what is visible at its snapshot. That can include commits whose fsync hasn't returned yet. If the power then fails, the backup holds commits the database itself doesn't. To back up only durable data, take the backup from a durable snapshot (see below).
+- **A sequence number or timestamp a reader saw can be handed out again after a power loss.** Seqnos and default timestamps are assigned in memory, ahead of the fsync. If a reader saw commit seqno 1042 and that commit is then lost to a power loss, the restarted database can give 1042, and the same default timestamp, to a different commit. This matters if you use seqnos or timestamps as cursors or versions. Example: a change consumer records "processed up to seqno 1042" after reading other clients' commits. After a power loss, it skips the new commit 1042, which it has never seen. Seqnos and timestamps of commits whose own `commit()` returned are durable and never reused. A cursor taken from a durable snapshot is safe too.
+- **Durable snapshots.** A reader that needs every value it sees to be durable will be able to ask for a durable snapshot: one that sees a commit only once its level is met on its shard. This is how reads behaved before D227. *(Coming next: ICR 0037.)*
+
+Unchanged:
+- **Acknowledged commits** are never lost at their level.
+- **Read-your-writes** holds after `commit()` returns.
+- **Each shard** recovers a prefix of its log.
+- **A cross-shard commit** is still all or nothing, and becomes visible only after its decision record meets the requested level and every participant has applied it. So its latency includes the slowest participant's group.
 
 ## Cross-shard batches
 A `WriteBatch` whose rows live on different shards is atomic across them (two-phase commit over the shards' WAL streams). It returns only when every participant's record, and the coordinator's decision record, meet the requested level. After a crash, the batch is applied in full or not at all.

@@ -221,7 +221,7 @@ fn read_error_txn_config() -> Config {
     cfg.faults.io_error_ppm = 20_000;
     cfg.txn_ppm = 600_000;
     cfg.crash_ppm = 0;
-    cfg.mid_commit_crash_ppm = 0;
+    cfg.mid_commit_crash_ppm = 120_000;
     cfg
 }
 
@@ -672,4 +672,34 @@ fn a_read_after_a_background_fired_crash_recovers() {
             "seed {seed}: no read step met the background-fired crash"
         );
     }
+}
+
+#[test]
+fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant() {
+    // D227: a commit is visible once written and applied, before its sync returns. Reads
+    // run while commits are in flight (`flight_read_ppm`), with deferred I/O keeping syncs
+    // pending across steps, and power losses land inside commits more often. Acknowledged
+    // commits must survive at their level and reads must match the model; a commit readers
+    // may have seen but nobody was told committed may be lost to a power loss, never to a
+    // process crash.
+    let mut cfg = Config::standard(250);
+    cfg.shards = 3;
+    cfg.deferred_io = true;
+    cfg.flight_read_ppm = 300_000;
+    cfg.mid_commit_crash_ppm = 120_000;
+    // Reads of in-flight commits' own cells (visible whole or not at all), and a process
+    // crash after some of them: recovery must keep what a read saw. (Crashes this frequent
+    // leave no segment time to fill, so the D200 held-header window is covered by
+    // `held_header_visibility.rs` instead.)
+    cfg.observed_crash_ppm = 200_000;
+    let (mut reads, mut observed, mut crashes) = (0, 0, 0);
+    for seed in seeds() {
+        let s = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+        reads += s.flight_reads;
+        observed += s.observed_in_flight;
+        crashes += s.observed_crashes;
+    }
+    assert!(reads > 0, "no read ran beside an in-flight commit");
+    assert!(observed > 0, "no read saw an in-flight commit whole");
+    eprintln!("{reads} reads beside commits, {observed} saw one whole, {crashes} crashes after");
 }

@@ -1128,6 +1128,11 @@ struct Group {
     /// Lowest seqno the group reserved (its watermark), if any.
     first: Option<Seqno>,
     members: Vec<Member>,
+    /// Some record of the group is past what the stream has written where a crash
+    /// recovers it ([`pigeonhole_wal::Wal::written`]): its segment's header still waits for
+    /// the previous rollover's sync (#19, D200). Such a group holds the watermark until it
+    /// resolves; any other group is visible once applied (D227).
+    unwritten: bool,
 }
 
 /// A cross-shard commit this shard coordinates.
@@ -1141,6 +1146,12 @@ struct Coord {
     applied: usize,
     failed: Option<Error>,
     decided: bool,
+    /// Decided to commit: its COMMIT record is pending or logged.
+    committing: bool,
+    /// A participant answered a commit decision without applying its share (its close
+    /// gave up, or its apply failed): the seqno stays held, so the commit is never
+    /// visible half applied, and the caller gets `OutcomeUnknown` (D227, ICR 0038).
+    not_applied: bool,
     shards: Vec<ShardId>,
     /// The request, kept for a retry when a participant refused with `Moved`.
     parts: Vec<(ShardId, Arc<BatchBuilder>)>,
@@ -3421,11 +3432,17 @@ impl ShardState {
 
     // ---- watermarks and timestamps ----
 
+    /// The lowest seqno this shard holds back from readers: a cross-shard commit it
+    /// coordinates that is not applied everywhere (`held`), or a group whose records are not
+    /// yet where a crash recovers them (`Group::unwritten`). A group waiting only for its
+    /// sync does not hold it: a commit is visible once written and applied, and its future
+    /// still resolves only when its durability is met (D227, amending D19).
     fn watermark(&self) -> Seqno {
         let held = self.held.first().copied().unwrap_or(u64::MAX);
         let groups = self
             .unresolved
             .iter()
+            .filter(|g| g.unwritten)
             .filter_map(|g| g.first)
             .min()
             .unwrap_or(u64::MAX);
@@ -3646,6 +3663,14 @@ impl ShardState {
     /// per `(column, timestamp)` (decision D34). Records the slots written in
     /// `touched_slots`.
     fn apply(&mut self, bytes: &[u8], seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
+        // Nothing is applied once the close reported: no flush would persist it (a late
+        // cross-shard decision is left to the WAL, `on_decide`).
+        debug_assert_ne!(
+            self.close_stage,
+            CloseStage::Reported,
+            "shard {} applied {seqno} after its close reported",
+            self.id.0
+        );
         let batch = BatchRef::new(bytes)?;
         let dups = self.dedup.scan(batch, bytes, commit_ts);
         let threshold = self.shared.memtable_freeze_bytes as usize;
@@ -4239,6 +4264,7 @@ impl ShardState {
             id: self.next_group,
             first,
             members: admitted,
+            unwritten: false,
         };
         self.next_group += 1;
         let mut need_group_sync = false;
@@ -4252,6 +4278,8 @@ impl ShardState {
         // The end of the last Buffered record: `write` may not cover it while a segment
         // header is held back (#19).
         let mut buffered_end: Option<Lsn> = None;
+        // The end of the group's last written record (any level but `None`), for D227.
+        let mut group_end: Option<Lsn> = None;
         for m in &mut group.members {
             if m.failed.is_some() {
                 continue;
@@ -4324,6 +4352,7 @@ impl ShardState {
                     if m.durability != Durability::None {
                         appended = true;
                         unsynced = true;
+                        group_end = Some(group_end.map_or(t.end, |e| e.max(t.end)));
                     }
                 }
                 Err(pigeonhole_wal::Error::RecordTooLarge) => {
@@ -4367,6 +4396,10 @@ impl ShardState {
                 self.fail_all(group.members, ctx);
                 return;
             }
+            // Visible once applied (D227), unless a record is not yet where a crash
+            // recovers it: then the group stays hidden until a sync resolves it, which
+            // writes the held header first (D200).
+            group.unwritten = group_end.is_some_and(|end| end > wal.written());
             // A Buffered ticket `write` did not cover: its record is in a segment whose
             // header still waits for the previous rollover's sync (#19). Resolve the group
             // through a sync then, which writes that header first.
@@ -5427,8 +5460,11 @@ impl ShardState {
                     (Err(_), true) => false,
                     (Err(_), false) => true,
                 };
-                if let (Err(e), Some(c)) = (result, self.coord.get_mut(&m.seqno)) {
-                    c.failed = Some(e);
+                if let Some(c) = self.coord.get_mut(&m.seqno) {
+                    c.committing = commit;
+                    if let Err(e) = result {
+                        c.failed = Some(e);
+                    }
                 }
                 if !commit {
                     self.mark_aborted(m.seqno);
@@ -5524,6 +5560,8 @@ impl ShardState {
                 applied: 0,
                 failed: None,
                 decided: false,
+                committing: false,
+                not_applied: false,
                 shards: shards.clone(),
                 // Kept for a retry only when a participant may refuse with `Moved`.
                 parts: if self.tablets_on() {
@@ -5624,6 +5662,7 @@ impl ShardState {
             "shard {} on_prepared {seqno} from {} {error:?}",
             self.id.0, from.0
         );
+        let gave_up = self.close_gave_up();
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
@@ -5647,6 +5686,12 @@ impl ShardState {
             return;
         }
         c.decided = true;
+        if gave_up && c.failed.is_none() {
+            // The close gave up (a shard died) or reported: decide abort, so a commit whose
+            // caller hears `Closed` from such a close is never committed (no COMMIT record is
+            // logged after the close stopped waiting for it).
+            c.failed = Some(Error::Closed);
+        }
         if c.failed.is_some() || c.moved {
             let shards = c.shards.clone();
             self.mark_aborted(seqno);
@@ -5663,11 +5708,13 @@ impl ShardState {
             }
             return;
         }
+        c.committing = true;
         let streams: Vec<StreamId> = c.shards.iter().map(|s| StreamId(u32::from(s.0))).collect();
         let (durability, shards) = (c.durability, c.shards.clone());
         let mut encoded = Vec::new();
         if let Err(e) = StreamList::encode(&streams, &mut encoded) {
             c.failed = Some(e.into());
+            c.committing = false;
             self.mark_aborted(seqno);
             for p in shards {
                 self.send(
@@ -5714,6 +5761,29 @@ impl ShardState {
         // Every decision is answered, even for a share this shard never held or already
         // dropped (a refused or failed PREPARE): the coordinator waits for every participant.
         let mut error = None;
+        if self.close_gave_up() {
+            // The close reported, or gave up flushing (a shard died): apply nothing more.
+            // The share's PREPARE stays in the WAL, and the next open decides it by its
+            // COMMIT (D83, D116).
+            if let Some(share) = self.prepared.remove(&seqno) {
+                if share.tracked {
+                    self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                }
+                self.release_room(share.reserved);
+            }
+            // Answered as not applied: a commit decision then keeps its seqno held at the
+            // coordinator (`on_applied`), never visible with only the other shares.
+            self.send(
+                coordinator,
+                ShardMsg::Applied {
+                    seqno,
+                    from: self.id,
+                    error: Some(PrepareError::Closed),
+                },
+                ctx,
+            );
+            return;
+        }
         if let Some(share) = self.prepared.remove(&seqno) {
             if share.tracked {
                 self.track_share_rows(share.bytes.batch().as_bytes(), false);
@@ -5721,7 +5791,20 @@ impl ShardState {
             self.release_room(share.reserved);
             if commit {
                 self.refresh_tablets();
-                match self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts) {
+                #[cfg(feature = "test-hooks")]
+                let applied = if self
+                    .shared
+                    .hooks
+                    .fail_next_apply
+                    .swap(false, Ordering::AcqRel)
+                {
+                    Err(Error::Busy)
+                } else {
+                    self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts)
+                };
+                #[cfg(not(feature = "test-hooks"))]
+                let applied = self.apply(share.bytes.batch().as_bytes(), seqno, share.commit_ts);
+                match applied {
                     Ok(()) => {
                         let slots = self.touched_slots.clone();
                         for key in &slots {
@@ -5778,6 +5861,18 @@ impl ShardState {
         );
     }
 
+    /// Whether this shard's close has reported, or gave up flushing because a shard died: it
+    /// applies no further cross-shard decision.
+    fn close_gave_up(&self) -> bool {
+        self.close_stage == CloseStage::Reported
+            || (self.flush_failed
+                && matches!(
+                    self.close_stage,
+                    CloseStage::Flushing | CloseStage::Checkpointing
+                )
+                && self.shared.shard_died.load(Ordering::Acquire))
+    }
+
     fn on_applied(
         &mut self,
         seqno: Seqno,
@@ -5788,6 +5883,9 @@ impl ShardState {
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
+        if error.is_some() && c.committing {
+            c.not_applied = true;
+        }
         if let Some(e) = error
             && c.failed.is_none()
         {
@@ -5802,6 +5900,21 @@ impl ShardState {
             return;
         }
         let mut c = self.coord.remove(&seqno).expect("present");
+        if c.not_applied {
+            // Decided to commit, but a share was not applied (its shard's close gave up, or
+            // its apply failed): the seqno stays held, so no reader sees the commit half
+            // applied in this process, and the next open decides it from the WAL. Held for
+            // good, it would stall every later commit's visibility wait and the close's
+            // deferred freezes: treat it as a shard's death (visibility ends, waiters get
+            // `OutcomeUnknown`, the close gives up flushing and is unclean). A poisoned shard
+            // already means the database needs reopening.
+            if let Some(reply) = c.reply.take() {
+                reply.notify(Err(Error::OutcomeUnknown));
+            }
+            self.shared.shard_died();
+            self.try_finish_close(ctx);
+            return;
+        }
         self.held.remove(&seqno);
         self.publish_watermark();
         if c.moved
@@ -6857,9 +6970,30 @@ impl ShardState {
                 );
             }
         }
+        // With a shard dead the close is unclean, and a cross-shard commit it took part in
+        // may never be decided or answered here: a share prepared for a dead coordinator, or
+        // a commit this shard coordinates waiting on a dead participant's `Applied`. Their
+        // records stay in the WAL and the next open decides them by their COMMIT (D83,
+        // D116); waiting would hang the close. A coordinated commit still undecided is
+        // decided abort now (a late `Prepared` finds it failed, `on_prepared`), and its
+        // caller is told `Closed`: such a `Closed` always means not committed. One already
+        // decided keeps its reply, which resolves as usual, or ends `Closed` when the
+        // shard reports without a participant's answer (its outcome is then the WAL's).
+        // Either way its seqno stays held, so nothing of it becomes visible half applied.
+        // A decision arriving later is answered without applying (`on_decide`). Found by
+        // D227's tests, whose visibility pin is such a commit.
+        let died = self.shared.shard_died.load(Ordering::Acquire);
+        if died {
+            for c in self.coord.values_mut().filter(|c| !c.decided) {
+                c.failed.get_or_insert(Error::Closed);
+                if let Some(reply) = c.reply.take() {
+                    reply.notify(Err(Error::Closed));
+                }
+            }
+        }
         if !self.unresolved.is_empty()
-            || !self.coord.is_empty()
-            || !self.prepared.is_empty()
+            || (!self.coord.is_empty() && !died)
+            || (!self.prepared.is_empty() && !died)
             || !self.pending.is_empty()
             || self.op.is_some()
             || !self.parked.is_empty()
@@ -6900,8 +7034,9 @@ impl ShardState {
             self.flush_failed = true;
             self.shared.fail_close();
             // Give up on flushing: the WAL keeps everything, the next open replays it, and
-            // the close is reported unclean. A dead shard (issue #135) pins the global
-            // watermark, so a deferred freeze would wait for it for ever.
+            // the close is reported unclean. A dead shard (issue #135) can pin the global
+            // watermark (a cross-shard commit it holds, or a group under a held segment
+            // header, D227), so a deferred freeze could wait for it for ever.
             self.close_stage = CloseStage::Checkpointing;
             self.checkpoint_inflight = false;
         }
@@ -6948,6 +7083,7 @@ impl ShardState {
             self.final_sync();
             // The stream is checkpointed to its end: the last process removes the files.
             self.wal = None;
+            self.answer_unsettled();
             self.shared.report_closed();
         }
     }
@@ -7004,6 +7140,7 @@ impl ShardState {
         self.closing = true;
         self.close_stage = CloseStage::Reported;
         self.final_sync();
+        self.answer_unsettled();
         shared.shard_died();
         shared.report_closed();
     }
@@ -7017,8 +7154,35 @@ impl ShardState {
         }
         self.closing = true;
         self.close_stage = CloseStage::Reported;
+        self.answer_unsettled();
         self.shared.shard_died();
         self.shared.report_closed();
+    }
+
+    /// The shard stops (its close reported, or it died) with commits still unsettled:
+    /// answers each now rather than leaving its dropped reply to read as `Closed`, which
+    /// means not committed (D227, ICR 0038). A group whose records were written but whose
+    /// sync never resolved here, and a cross-shard commit decided to commit but not
+    /// answered by every participant, may be in the WAL: `OutcomeUnknown`. A coordinated
+    /// commit not decided to commit was not: `Closed`. Members not yet written are dropped
+    /// (their replies read as `Closed`, rightly). Runs in `report_panicked` while the thread
+    /// unwinds, so it only notifies (a slot store and a wake), which must stay panic-free: a
+    /// panic here would abort the process.
+    fn answer_unsettled(&mut self) {
+        for group in &mut self.unresolved {
+            for m in &mut group.members {
+                std::mem::replace(&mut m.reply, Reply::None).resolve(Err(Error::OutcomeUnknown));
+            }
+        }
+        for c in self.coord.values_mut() {
+            if let Some(reply) = c.reply.take() {
+                reply.notify(Err(if c.committing {
+                    Error::OutcomeUnknown
+                } else {
+                    Error::Closed
+                }));
+            }
+        }
     }
 
     /// Commits inline on the shard's own thread (application-owned mode): the member joins

@@ -49,7 +49,8 @@ pub enum ErrorCode {
     InvalidArgument = 19,
     /// The feature is not available in this build.
     Unsupported = 20,
-    /// The database is closed.
+    /// The database is closed. A commit that fails with it was not committed (one whose
+    /// outcome is not known fails with [`ErrorCode::OutcomeUnknown`]).
     Closed = 21,
     /// Every reader slot in the shared-memory region is taken.
     NoReaderSlot = 22,
@@ -71,6 +72,11 @@ pub enum ErrorCode {
     /// more than about half of `Options::memtable_budget`. Retrying never succeeds: split
     /// the batch, or raise the budget.
     BatchTooLarge = 27,
+    /// A commit's outcome is not known in this process: a shard failed or the database
+    /// closed while the commit was in flight, after its records may have reached the log.
+    /// The next open decides it: reopen and read to see whether it landed. `Closed`, by
+    /// contrast, means not committed.
+    OutcomeUnknown = 28,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
@@ -156,6 +162,7 @@ impl From<pigeonhole_engine::Error> for Error {
             E::BatchTooLarge => ErrorCode::BatchTooLarge,
             E::SnapshotExpired => ErrorCode::SnapshotExpired,
             E::WouldDeadlock => ErrorCode::WouldDeadlock,
+            E::OutcomeUnknown => ErrorCode::OutcomeUnknown,
             // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
             // here surfaces as `Io` (the message names it) until it gets its own code; the
             // mapping test lists every current variant.

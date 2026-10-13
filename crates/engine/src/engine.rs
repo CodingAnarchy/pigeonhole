@@ -1739,7 +1739,9 @@ impl Engine {
     }
 
     /// Writes a consistent single-file copy to `dest` while writers run: everything visible
-    /// at a snapshot taken now, as a clean database that opens without WAL replay.
+    /// at a snapshot taken now, as a clean database that opens without WAL replay. Visible is
+    /// not durable (D227): the copy can hold commits whose sync had not finished, which a
+    /// power loss then removes from this database.
     pub fn backup(&self, dest: &Path) -> Result<()> {
         let inner = &self.inner;
         if inner.role != Role::Writer {

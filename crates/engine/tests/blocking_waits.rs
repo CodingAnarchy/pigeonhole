@@ -49,6 +49,21 @@ fn put(t: &TableInfo, row: &str) -> WriteBatch {
     wb
 }
 
+/// A cross-shard batch: a row of `first` (whose shard coordinates it), then one of `second`.
+fn cross(first: &TableInfo, second: &TableInfo, row: &str) -> WriteBatch {
+    let mut wb = put(first, row);
+    wb.put(
+        second.id,
+        second.families[0].id,
+        row.as_bytes(),
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    wb
+}
+
 fn table(db: &Engine, name: &str) -> Arc<TableInfo> {
     db.create_table(name, &[("f".into(), FamilyOptions::default())])
         .unwrap()
@@ -184,8 +199,9 @@ fn a_catalog_change_finishes_a_pump_commit_whose_shard_is_not_run() {
 
 // ---- 1-2 F1 / 3-4 3.3: a blocking wait on a thread that drives a shard ----
 
-/// Thread X drives shard B, which has a `Sync` group in flight (holding the global
-/// watermark). X commits to a table on shard A (driven by thread Y) and waits: only X can
+/// Thread X drives shard B, which coordinates a cross-shard `Sync` commit whose sync is in
+/// flight (its seqno holds the global watermark; a single-shard group no longer does,
+/// D227). X commits to a table on shard A (driven by thread Y) and waits: only X can
 /// let B publish, so the wait used to spin for ever. Now (amended D88) calls that would
 /// submit and block are refused before submitting anything (`InvalidArgument`), and
 /// waiting on an already-submitted commit fails with `WouldDeadlock` while the commit
@@ -199,7 +215,7 @@ fn a_blocking_wait_on_a_thread_driving_another_shard_fails_instead_of_deadlockin
     let x = &drivers[1];
     gate.hold(&wal(1));
     let pending = db
-        .submit(put(&on_b, "held"), Some(Durability::Sync))
+        .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
         .unwrap();
     gate.wait_held(&wal(1));
 
@@ -279,9 +295,11 @@ fn tables_on_0_and_1(db: &Engine) -> (Arc<TableInfo>, Arc<TableInfo>) {
     }
 }
 
-/// A commit waiting for visibility behind shard 1's in-flight group ends with `Closed`
-/// when shard 1 dies (its `EngineShard` is dropped mid-group), instead of parking for ever,
-/// and the close then ends (unclean) instead of waiting on the dead shard.
+/// A commit waiting for visibility behind a cross-shard commit shard 1 coordinates (its
+/// seqno held until every participant applied, which waits on shard 1's held sync) ends with
+/// `OutcomeUnknown` when shard 1 dies (its `EngineShard` is dropped mid-commit), instead of
+/// parking for ever, and the close then ends (unclean) instead of waiting on the dead shard. A
+/// single-shard group no longer holds visibility while its sync runs (D227).
 #[test]
 fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     let (vfs, gate) = gate::vfs(1358);
@@ -302,7 +320,7 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     let (on_a, on_b) = tables.join().unwrap();
     gate.hold(&wal(1));
     drop(
-        db.submit(put(&on_b, "held"), Some(Durability::Sync))
+        db.submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
             .unwrap(),
     );
     while gate.held().is_empty() {
@@ -319,9 +337,9 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
         "visible while shard 1 held the watermark"
     );
     // Dropping the shard syncs its stream, and that sync waits for every older sync of the
-    // stream to finish (#179), the held group sync included: release it from another
-    // thread once the drop is under way, as the I/O backend would complete it. Shard 1
-    // never runs again, so its group stays unresolved and keeps the watermark down.
+    // stream to finish (#179), the held sync included: release it from another thread once
+    // the drop is under way, as the I/O backend would complete it. Shard 1 never runs
+    // again, so the cross-shard commit stays held and keeps the watermark down.
     let releaser = {
         let gate = Arc::clone(&gate);
         thread::spawn(move || {
@@ -334,13 +352,336 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     let ended = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("the visibility wait outlived the shard holding it");
-    assert!(matches!(ended, Err(Error::Closed)), "{ended:?}");
+    // Acknowledged by its shard but never visible here: the next open decides (ICR 0038).
+    assert!(matches!(ended, Err(Error::OutcomeUnknown)), "{ended:?}");
     // The close ends (it no longer waits on the dead shard) and is unclean.
     assert!(db.close().is_err(), "a close with a dead shard reported Ok");
     assert!(
         a.1.join().unwrap().is_err(),
         "a close with a dropped shard is unclean"
     );
+}
+
+/// The symmetric case: a *participant* of a cross-shard commit dies after its PREPARE and
+/// before the coordinator's decision reaches it. Its `Applied` never comes, so the
+/// coordinator's share of the commit never settles; the close must still end (unclean)
+/// rather than wait for that reply for ever, and the commit's waiter hears `OutcomeUnknown`
+/// (decided to commit, so its COMMIT may be in the WAL).
+#[test]
+fn a_close_ends_when_a_participant_dies_before_it_applied() {
+    let (vfs, gate) = gate::vfs(1359);
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), options(vfs, 2)).unwrap();
+    let mut b = shards.pop().unwrap();
+    let a = driver(shards.pop().unwrap());
+    let (db2, mut b) = (Arc::clone(&db), {
+        let me = thread::current();
+        b.set_wakeup(Box::new(move || me.unpark()));
+        b
+    });
+    let tables = thread::spawn(move || tables_on_0_and_1(&db2));
+    while !tables.is_finished() {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    let (on_a, on_b) = tables.join().unwrap();
+    // Shard 0 coordinates. Its sync is held, so its decision waits while shard 1 (driven
+    // here) prepares; shard 1 then stops running and is dropped before the decision.
+    gate.hold(&wal(0));
+    let pending = db
+        .submit(cross(&on_a, &on_b, "dies"), Some(Durability::Sync))
+        .unwrap();
+    while gate.held().is_empty() {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    for _ in 0..20 {
+        idle(&mut b);
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    drop(b);
+    gate.release();
+    let (tx, rx) = mpsc::channel();
+    let db2 = Arc::clone(&db);
+    thread::spawn(move || {
+        let _ = tx.send(db2.close());
+    });
+    let closed = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the close waited for a dead participant's reply");
+    assert!(closed.is_err(), "a close with a dead shard reported Ok");
+    assert!(
+        a.1.join().unwrap().is_err(),
+        "a close with a dropped shard is unclean"
+    );
+    // Decided to commit (shard 1 prepared before it died), but shard 1 never applied it:
+    // the COMMIT may be in the WAL, so the outcome is the next open's (ICR 0038).
+    let waited = pending.wait();
+    assert!(matches!(waited, Err(Error::OutcomeUnknown)), "{waited:?}");
+}
+
+/// ctr274's late decision: a participant's close reports while a live coordinator's
+/// decision is still on its way (a third shard died, so the close stops waiting for
+/// undecided shares). The decision then arrives at a shard that reported: it must apply
+/// nothing (no memtable change and no flush after the report), answer so the coordinator's
+/// close ends, and leave the share to the next open, which decides it by its COMMIT.
+/// All three shards are driven by hand on this thread. Removing `on_decide`'s guard
+/// trips the debug assertion in the shard's apply.
+#[test]
+fn a_decision_after_a_participants_close_reported_is_not_applied() {
+    let (vfs, gate) = gate::vfs(1360);
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let mut d = shards.pop().unwrap();
+    let mut p = shards.pop().unwrap();
+    let mut c = shards.pop().unwrap();
+    let db2 = Arc::clone(&db);
+    let tables = thread::spawn(move || {
+        let mut on = [None, None];
+        for i in 0.. {
+            let t = table(&db2, &format!("t{i}"));
+            match shard_of(&db2, &t) {
+                s @ 0..=1 if on[s as usize].is_none() => on[s as usize] = Some(t),
+                _ => {}
+            }
+            if on.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        on.map(Option::unwrap)
+    });
+    while !tables.is_finished() {
+        idle(&mut c);
+        idle(&mut p);
+        idle(&mut d);
+    }
+    let [on_c, on_p] = tables.join().unwrap();
+    // Shard 0 coordinates and sends shard 1 its share; shard 1 prepares and answers.
+    // Shard 0 does not run again until shard 1's close has reported.
+    let pending = db
+        .submit(cross(&on_c, &on_p, "late"), Some(Durability::GroupSync))
+        .unwrap();
+    idle(&mut c);
+    idle(&mut p);
+    drop(d);
+    let (tx, rx) = mpsc::channel();
+    let db2 = Arc::clone(&db);
+    thread::spawn(move || {
+        let _ = tx.send(db2.close());
+    });
+    // Shard 1's close runs to its report (a shard died, so the undecided share does not
+    // hold it).
+    for _ in 0..200 {
+        idle(&mut p);
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Now the coordinator decides (commit: shard 1 prepared before the close gave up) and
+    // shard 1 hears it after its report. Shard 1 must answer without applying (debug builds
+    // assert that no shard applies after its close reported), and the coordinator, kept in
+    // its close's flush by the held main-file syncs, must then keep the seqno held: a read
+    // never sees shard 0's share without shard 1's.
+    gate.hold(Path::new(DB));
+    for _ in 0..3 {
+        idle(&mut c);
+        idle(&mut p);
+    }
+    let snap = db.snapshot().unwrap();
+    let seen = [&on_c, &on_p].map(|t| {
+        db.get(&snap, t.id, t.families[0].id, b"late", b"q")
+            .unwrap()
+            .is_some()
+    });
+    assert!(
+        seen[0] == seen[1],
+        "half a cross-shard commit is visible (shard 0, shard 1): {seen:?}"
+    );
+    drop(snap);
+    gate.release();
+    // Either way the coordinator's close then ends.
+    let started = std::time::Instant::now();
+    let closed = loop {
+        idle(&mut c);
+        idle(&mut p);
+        if let Ok(r) = rx.try_recv() {
+            break r;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the coordinator's close waited for the reported participant's answer"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(closed.is_err(), "a close with a dead shard reported Ok");
+    drop((c, p));
+    // Committed in the WAL, never visible here: the next open decides (ICR 0038).
+    let waited = pending.wait();
+    assert!(matches!(waited, Err(Error::OutcomeUnknown)), "{waited:?}");
+    drop(db);
+    let (db, shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let a = shards.into_iter().map(driver).collect::<Vec<_>>();
+    let (on_c, on_p) = (db.table(&on_c.name).unwrap(), db.table(&on_p.name).unwrap());
+    let snap = db.snapshot().unwrap();
+    for t in [&on_c, &on_p] {
+        assert!(
+            db.get(&snap, t.id, t.families[0].id, b"late", b"q")
+                .unwrap()
+                .is_some(),
+            "the decided commit is lost after reopen"
+        );
+    }
+    drop(snap);
+    db.close().unwrap();
+    for (_, h) in a {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// The coordinator's side: a participant's PREPARE answer reaches a coordinator whose close
+/// already gave up (a third shard died). It decides abort, so a cross-shard commit whose
+/// caller hears `Closed` from such a close is never committed, whatever the timing: no
+/// COMMIT record is logged after the close stopped waiting for it, and the next open
+/// finds neither share.
+#[test]
+fn a_prepare_answer_after_the_coordinators_close_gave_up_aborts() {
+    let (vfs, gate) = gate::vfs(1361);
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let mut d = shards.pop().unwrap();
+    let mut p = shards.pop().unwrap();
+    let mut c = shards.pop().unwrap();
+    let db2 = Arc::clone(&db);
+    let tables = thread::spawn(move || {
+        let mut on = [None, None];
+        for i in 0.. {
+            let t = table(&db2, &format!("t{i}"));
+            match shard_of(&db2, &t) {
+                s @ 0..=1 if on[s as usize].is_none() => on[s as usize] = Some(t),
+                _ => {}
+            }
+            if on.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        on.map(Option::unwrap)
+    });
+    while !tables.is_finished() {
+        idle(&mut c);
+        idle(&mut p);
+        idle(&mut d);
+    }
+    let [on_c, on_p] = tables.join().unwrap();
+    // Shard 0 coordinates and sends shard 1 its share, which shard 1 does not see yet.
+    let pending = db
+        .submit(cross(&on_c, &on_p, "late"), Some(Durability::GroupSync))
+        .unwrap();
+    idle(&mut c);
+    // Shard 2 dies and the close starts. Shard 0's close stays in its flush (the main
+    // file's syncs are held) while shard 1 prepares and answers late.
+    gate.hold(Path::new(DB));
+    drop(d);
+    let (tx, rx) = mpsc::channel();
+    let db2 = Arc::clone(&db);
+    thread::spawn(move || {
+        let _ = tx.send(db2.close());
+    });
+    for _ in 0..200 {
+        idle(&mut c);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let started = std::time::Instant::now();
+    let closed = loop {
+        idle(&mut p);
+        idle(&mut c);
+        if started.elapsed() > Duration::from_millis(300) {
+            gate.release();
+        }
+        if let Ok(r) = rx.try_recv() {
+            break r;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the close never ended"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(closed.is_err(), "a close with a dead shard reported Ok");
+    drop((c, p));
+    let waited = pending.wait();
+    assert!(matches!(waited, Err(Error::Closed)), "{waited:?}");
+    drop(db);
+    let (db, shards) =
+        Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 3)).unwrap();
+    let a = shards.into_iter().map(driver).collect::<Vec<_>>();
+    let (on_c, on_p) = (db.table(&on_c.name).unwrap(), db.table(&on_p.name).unwrap());
+    let snap = db.snapshot().unwrap();
+    for t in [&on_c, &on_p] {
+        assert!(
+            db.get(&snap, t.id, t.families[0].id, b"late", b"q")
+                .unwrap()
+                .is_none(),
+            "a commit whose caller heard Closed was committed"
+        );
+    }
+    drop(snap);
+    db.close().unwrap();
+    for (_, h) in a {
+        h.join().unwrap().unwrap();
+    }
+}
+
+/// A participant's apply of a cross-shard share fails (its shard poisons itself, as an arena
+/// miscount would). The commit was decided to commit, so its seqno stays held: nothing of
+/// it is ever visible half applied, and its caller gets `OutcomeUnknown`. Held for good it
+/// would stall every later commit's visibility wait, so visibility ends as on a shard's
+/// death: a later commit on a healthy shard returns (`OutcomeUnknown`) instead of hanging,
+/// and the close is unclean (the next open decides the commit from the WAL).
+#[test]
+fn a_failed_share_apply_ends_visibility_instead_of_stalling_it() {
+    let (vfs, _gate) = gate::vfs(1362);
+    let (db, shards) = Engine::open_application_owned(Path::new(DB), options(vfs, 2)).unwrap();
+    let drivers: Vec<_> = shards.into_iter().map(driver).collect();
+    let (on_a, on_b) = tables_on_0_and_1(&db);
+    db.fail_next_apply();
+    let (db2, a2, b2) = (Arc::clone(&db), Arc::clone(&on_a), Arc::clone(&on_b));
+    let crossed = gate::within(10, move || {
+        db2.commit(cross(&b2, &a2, "fails"), Some(Durability::Sync))
+    })
+    .expect("the cross-shard commit hung");
+    assert!(matches!(crossed, Err(Error::OutcomeUnknown)), "{crossed:?}");
+    // Later commits end at once on both shards: the healthy one's with `OutcomeUnknown`
+    // (acknowledged, never visible here), the poisoned one's with its failure.
+    let mut unknown = 0;
+    for t in [&on_a, &on_b] {
+        let (db2, t2) = (Arc::clone(&db), Arc::clone(t));
+        let later = gate::within(10, move || {
+            db2.commit(put(&t2, "later"), Some(Durability::Sync))
+        })
+        .expect("a later commit hung behind the held seqno");
+        assert!(later.is_err(), "{later:?}");
+        unknown += usize::from(matches!(later, Err(Error::OutcomeUnknown)));
+    }
+    assert_eq!(
+        unknown, 1,
+        "the healthy shard's commit is acknowledged, never visible"
+    );
+    // Nothing of the cross-shard commit is visible.
+    for t in [&on_a, &on_b] {
+        assert!(
+            db.get_latest(t.id, t.families[0].id, b"fails", b"q")
+                .unwrap()
+                .is_none(),
+            "part of the cross-shard commit is visible"
+        );
+    }
+    let closed = gate::within(10, {
+        let db = Arc::clone(&db);
+        move || db.close()
+    })
+    .expect("the close hung on the held seqno");
+    assert!(closed.is_err(), "the close after a failed apply is unclean");
+    for (_, h) in drivers {
+        let _ = h.join().unwrap();
+    }
 }
 
 // ---- 3-4 3.1: the application-owned close ----
@@ -503,10 +844,10 @@ fn a_panicked_shard_thread_does_not_hang_close() {
 }
 
 /// Shard 1 is poisoned while its `Sync` group is unresolved (the group's sync fails). A
-/// commit on shard 0 waiting for visibility behind that group does not park for ever: the
-/// failed sync resolves the group (its members get the poison error) and releases the
-/// watermark, so the waiter sees its own commit. A cross-shard commit that then reaches
-/// the poisoned participant fails without pinning the watermark either.
+/// commit on shard 0 does not wait behind that group at all: the group is applied, so it
+/// holds no visibility while its sync runs (D227). The failed sync then resolves the group
+/// (its members get the poison error). A cross-shard commit that then reaches the
+/// poisoned participant fails without pinning the watermark either.
 #[test]
 fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     let (vfs, gate) = gate::vfs(1359);
@@ -523,16 +864,13 @@ fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     thread::spawn(move || {
         let _ = tx.send(db2.commit(put(&on_a2, "waits"), Some(Durability::None)));
     });
-    assert!(
-        rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "visible while shard 1's group was unresolved"
-    );
+    // D227: shard 1's group, applied with its sync held, holds back no other shard's
+    // commits: the commit on shard 0 is visible and returns meanwhile.
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("a commit on shard 0 waited behind shard 1's unsynced group")
+        .unwrap();
     // The held sync completes with its (injected) failure: shard 1 is poisoned.
     gate.release();
-    let waited = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the visibility wait outlived the poisoned shard's group");
-    waited.unwrap();
     let doomed = gate::within(10, move || doomed.wait()).expect("the poisoned commit hung");
     assert!(matches!(doomed, Err(Error::Io(_))), "{doomed:?}");
 

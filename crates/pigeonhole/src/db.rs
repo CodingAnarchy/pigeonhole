@@ -429,7 +429,9 @@ impl Pigeonhole {
 
     /// Writes a consistent single-file copy to `dest`, which must not exist, while writes
     /// continue. The copy holds exactly the commits visible when this is called and opens
-    /// on its own, without WAL replay or sidecar files. Separated values (above a family's
+    /// on its own, without WAL replay or sidecar files. Visible is not durable: the copy can
+    /// hold commits whose fsync had not finished, which a power loss then removes from this
+    /// database (see the durability guide). Separated values (above a family's
     /// `blob_threshold`) are copied into the copy's own blob files, which hold only the
     /// values the copy references.
     ///

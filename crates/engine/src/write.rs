@@ -473,8 +473,10 @@ impl Drop for Submission {
 
 impl PendingCommit {
     /// Blocks until the commit meets its durability level and is visible. The thread parks
-    /// while it waits. Fails with [`Error::Closed`] if the database closes, or a shard dies
-    /// (its thread panicked, or its `EngineShard` was dropped), before the commit is visible.
+    /// while it waits. Fails with [`Error::Closed`] if the database closed before the commit
+    /// was written, and with [`Error::OutcomeUnknown`] if it closed, or a shard died (its
+    /// thread panicked, or its `EngineShard` was dropped), after the commit may have reached
+    /// the WAL but before it was visible: the next open decides it (D227, ICR 0038).
     ///
     /// In application-owned mode a thread that drives a shard must not block: the commit
     /// may need that shard to run (its own group, or any group holding the global
@@ -683,7 +685,8 @@ fn wait_reply_spinning<T: Send>(
 
 /// Blocks until `seqno` is visible (D19), parked on the shards' watermark publishes. Fails
 /// instead on a thread that drives a shard, which may be the one holding the watermark, and
-/// with `Closed` once visibility can no longer advance (the close finished, or a shard died).
+/// with `OutcomeUnknown` once visibility can no longer advance (the close finished, or a
+/// shard died): the commit was acknowledged by its shard, but never became visible here.
 pub(crate) fn wait_visible(
     shared: &crate::shard::Shared,
     seqno: pigeonhole_format::Seqno,
@@ -697,7 +700,7 @@ pub(crate) fn wait_visible(
     let waker = crate::waker::thread_waker();
     while !shared.wait_visible(seqno, &waker) {
         if shared.visibility_ended() {
-            return Err(Error::Closed);
+            return Err(Error::OutcomeUnknown);
         }
         std::thread::park();
     }
@@ -722,7 +725,7 @@ fn wait_visible_spinning(
     let waker = crate::waker::thread_waker();
     while !shared.wait_visible(seqno, &waker) {
         if shared.visibility_ended() {
-            return Err(Error::Closed);
+            return Err(Error::OutcomeUnknown);
         }
         std::thread::park();
     }
@@ -795,7 +798,7 @@ impl Future for PendingCommit {
         if this.sub.shared.wait_visible(info.seqno, cx.waker()) {
             Poll::Ready(Ok(info))
         } else if this.sub.shared.visibility_ended() {
-            Poll::Ready(Err(Error::Closed))
+            Poll::Ready(Err(Error::OutcomeUnknown))
         } else {
             Poll::Pending
         }
@@ -898,7 +901,7 @@ impl Future for PendingCheck {
         if this.shared.wait_visible(info.seqno, cx.waker()) {
             Poll::Ready(Ok(outcome))
         } else if this.shared.visibility_ended() {
-            Poll::Ready(Err(Error::Closed))
+            Poll::Ready(Err(Error::OutcomeUnknown))
         } else {
             Poll::Pending
         }

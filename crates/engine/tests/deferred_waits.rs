@@ -315,6 +315,23 @@ fn put(t: &TableInfo, row: &str) -> WriteBatch {
     wb
 }
 
+/// The visibility pin (D227): a cross-shard batch with a row of `first` (whose shard
+/// coordinates it, holding its seqno until every participant applied) and one of `second`.
+/// A single-shard group no longer holds visibility while its sync is in flight.
+fn cross(first: &TableInfo, second: &TableInfo, row: &str) -> WriteBatch {
+    let mut wb = put(first, row);
+    wb.put(
+        second.id,
+        second.families[0].id,
+        row.as_bytes(),
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    wb
+}
+
 fn has(db: &Engine, t: &TableInfo, row: &str) -> bool {
     db.get_latest(t.id, t.families[0].id, row.as_bytes(), b"q")
         .unwrap()
@@ -505,10 +522,11 @@ fn commit_waits_park_until_their_sync_completes_and_the_driver_is_refused() {
         let mut rig = Rig::open(seed, 2);
         let (on_a, on_b) = rig.tables_on_0_and_1();
 
-        // Shard 1's group sync is in flight (it holds the global watermark too).
+        // Shard 1 coordinates a cross-shard commit whose sync is in flight: it holds the
+        // global watermark (D227: a single-shard group would not).
         let held = rig
             .db
-            .submit(put(&on_b, "held"), Some(Durability::Sync))
+            .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
             .unwrap();
         rig.run();
         assert!(
@@ -963,17 +981,19 @@ fn dropping_a_shard_on_its_driver_reaps_the_wal_sync_in_flight() {
 
 // ---- D150: a visibility wait ends when the shard holding it dies or closes ----
 
-/// Shard 1's group sync is in flight (holding the global watermark) when another thread's
+/// Shard 1 coordinates a cross-shard commit whose sync is in flight (its seqno holds the
+/// global watermark) when another thread's
 /// commit on shard 0 waits for visibility. Shard 1 is dropped (its group never resolves):
-/// the wait ends with `Closed` instead of parking for ever, and the close is unclean.
+/// the wait ends with `OutcomeUnknown` (the commit was acknowledged by its shard but never
+/// became visible here, ICR 0038) instead of parking for ever, and the close is unclean.
 #[test]
-fn a_visibility_wait_ends_with_closed_when_the_shard_holding_it_dies_mid_io() {
+fn a_visibility_wait_ends_with_outcome_unknown_when_the_shard_holding_it_dies_mid_io() {
     each_seed(|seed| {
         let mut rig = Rig::open(seed, 2);
         let (on_a, on_b) = rig.tables_on_0_and_1();
         drop(
             rig.db
-                .submit(put(&on_b, "held"), Some(Durability::Sync))
+                .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
                 .unwrap(),
         );
         rig.run();
@@ -1001,7 +1021,7 @@ fn a_visibility_wait_ends_with_closed_when_the_shard_holding_it_dies_mid_io() {
         dropper.join().unwrap();
         let ended = waiter.join().unwrap();
         assert!(
-            matches!(ended, Err(Error::Closed)),
+            matches!(ended, Err(Error::OutcomeUnknown)),
             "seed {seed}: {ended:?}"
         );
         // This thread still drives shard 0: `close` cannot wait here.
@@ -1024,7 +1044,7 @@ fn a_visibility_wait_ends_when_the_database_closes_mid_io() {
         let (on_a, on_b) = rig.tables_on_0_and_1();
         drop(
             rig.db
-                .submit(put(&on_b, "held"), Some(Durability::Sync))
+                .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
                 .unwrap(),
         );
         rig.run();

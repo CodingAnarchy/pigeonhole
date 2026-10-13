@@ -87,9 +87,21 @@ fn a_commit_wait_held_by_another_shards_group_parks() {
     }
     let [(a, sa), (b, sb)] = <[_; 2]>::try_from(tables).unwrap();
     assert_ne!(sa, sb, "one table per shard");
-    // Shard B's `Sync` group stays in flight: the global watermark stays below it.
+    // A cross-shard commit shard B coordinates stays in flight: its seqno is held until
+    // every participant applied, so the global watermark stays below it (D227: a
+    // single-shard group no longer holds visibility while its sync runs).
     gate.hold(&wal(sb));
-    let held = db.submit(put(&b, "held"), Some(Durability::Sync)).unwrap();
+    let mut both = put(&b, "held");
+    both.put(
+        a.id,
+        a.families[0].id,
+        b"held",
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    let held = db.submit(both, Some(Durability::Sync)).unwrap();
     gate.wait_held(&wal(sb));
     // A `None` commit on shard A resolves at once, then waits for visibility.
     let (db2, a2) = (Arc::clone(&db), Arc::clone(&a));
