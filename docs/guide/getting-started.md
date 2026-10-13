@@ -291,6 +291,8 @@ db.close()?;
 ```
 If this is the last handle open anywhere, `close` checkpoints the WAL and removes the sidecar and shared-memory files, leaving one file. A crash instead leaves the sidecars, and the next open replays them. Dropping the last clone does the same but ignores errors, so call `close()` when you want to know about failures.
 
+If a shard fails (a panic, or an I/O error on its log), `db.is_failed()` turns true and some commits fail. Close the database and open it again: [Recovering from a failed shard](recovery.md) walks through it, including what to do with the commits that were in flight.
+
 ## Maintenance
 The database lives on disk: memtables are flushed into the file as they fill, and the size of your data is limited by the disk, not by memory. `Options::memtable_budget` (per shard, default 64 MiB) only sizes the in-memory write buffer. You rarely need to call anything below; background flushes and compactions run on their own.
 

@@ -64,6 +64,7 @@ match pages.mutate(b"k").put("nope", b"q", b"v").commit() {
 | Programmer error | `FamilyNotFound`, `TableNotFound`, `TableExists`, `FamilyExists`, `KeyTooLarge`, `ValueTooLarge`, `RecordTooLarge` (split the batch), `MergeFailed` (bad operand, or mixed data in a 0.1.0 counter column), `InvalidArgument`, `Unsupported`, `Closed`, `ReadOnly`, `WouldDeadlock` (await from the event loop; the commit still applies). Fix the code or the data model. |
 | Configuration | `BatchTooLarge` (split the batch or raise `Options::memtable_budget`), `ShmUnavailable`, `ShmVersionMismatch`, `NetworkFilesystem`, `UnknownMergeOperator`, `UnsupportedFormat`. |
 | Outcome unknown | `OutcomeUnknown`: reopen and read to see whether the commit landed (whole or not at all), then write it again if it did not. |
+| Failed instance | `Pigeonhole::is_failed()` is true (a shard panicked, lost its driver, or stopped after an I/O or internal error; `failure()` says which and why). Close, reopen, then settle the commits in flight: see [Recovering from a failed shard](recovery.md). |
 | Data integrity | `Corruption`. Do not retry; restore from backup. |
 
 If this table disagrees with `crates/pigeonhole/src/error.rs`, the source wins; please report it.

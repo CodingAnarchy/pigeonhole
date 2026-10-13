@@ -619,7 +619,7 @@ pub(crate) fn wait_reply<T: Send>(
         let mut cx = Context::from_waker(std::task::Waker::noop());
         return match Pin::new(waiter).poll(&mut cx) {
             Poll::Ready(Some(r)) => r,
-            Poll::Ready(None) => Err(Error::Closed),
+            Poll::Ready(None) => Err(dropped_reply_now(shared)),
             Poll::Pending => Err(Error::WouldDeadlock),
         };
     }
@@ -638,7 +638,7 @@ fn park_for_reply<T: Send>(
     loop {
         match Pin::new(&mut *waiter).poll(&mut cx) {
             Poll::Ready(Some(r)) => return r,
-            Poll::Ready(None) => return Err(Error::Closed),
+            Poll::Ready(None) => return Err(dropped_reply(shared)),
             Poll::Pending => {
                 if !parked {
                     parked = true;
@@ -647,6 +647,37 @@ fn park_for_reply<T: Send>(
                 std::thread::park();
             }
         }
+    }
+}
+
+/// The error for a commit whose shard dropped its reply unanswered: it stopped first. A
+/// shard the close stopped drops only commits it never wrote: `Closed`. A failed shard (a
+/// panic, a dropped driver) may have written the commit's record before it stopped:
+/// `OutcomeUnknown`, which the next open settles (ICR 0038, ICR 0040). A panicking shard
+/// records its failure as its thread unwinds, after it dropped the replies in flight, so this
+/// waits briefly for that record (blocking waits only; never on the commit path).
+#[cold]
+fn dropped_reply(shared: &crate::shard::Shared) -> Error {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    loop {
+        if shared.failure.get().is_some() {
+            return Error::OutcomeUnknown;
+        }
+        if shared.closed.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            return Error::Closed;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// As [`dropped_reply`] without waiting (a poll, or a thread that drives a shard): a failure
+/// already recorded makes it `OutcomeUnknown`.
+#[cold]
+fn dropped_reply_now(shared: &crate::shard::Shared) -> Error {
+    if shared.failure.get().is_some() {
+        Error::OutcomeUnknown
+    } else {
+        Error::Closed
     }
 }
 
@@ -660,7 +691,7 @@ fn wait_reply_spinning<T: Send>(
         let mut cx = Context::from_waker(std::task::Waker::noop());
         return match Pin::new(waiter).poll(&mut cx) {
             Poll::Ready(Some(r)) => r,
-            Poll::Ready(None) => Err(Error::Closed),
+            Poll::Ready(None) => Err(dropped_reply_now(shared)),
             Poll::Pending => Err(Error::WouldDeadlock),
         };
     }
@@ -677,7 +708,7 @@ fn wait_reply_spinning<T: Send>(
     });
     match polled {
         Some(Poll::Ready(Some(r))) => return r,
-        Some(Poll::Ready(None)) => return Err(Error::Closed),
+        Some(Poll::Ready(None)) => return Err(dropped_reply(shared)),
         _ => {}
     }
     park_for_reply(shared, waiter)
@@ -783,7 +814,7 @@ impl Future for PendingCommit {
             Some(info) => info,
             None => match Pin::new(&mut this.sub.waiter).poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(Err(Error::Closed)),
+                Poll::Ready(None) => return Poll::Ready(Err(dropped_reply_now(&this.sub.shared))),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
                 Poll::Ready(Some(Ok(Settled { info, batch }))) => {
                     recycle(batch);
@@ -886,7 +917,7 @@ impl Future for PendingCheck {
             Some(outcome) => outcome,
             None => match Pin::new(&mut this.waiter).poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(Err(Error::Closed)),
+                Poll::Ready(None) => return Poll::Ready(Err(dropped_reply_now(&this.shared))),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
                 Poll::Ready(Some(Ok(outcome))) => {
                     this.resolved = Some(outcome);

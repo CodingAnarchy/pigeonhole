@@ -107,6 +107,8 @@ mod guide {
     struct DataModeling;
     #[doc = include_str!("../../../docs/guide/errors.md")]
     struct Errors;
+    #[doc = include_str!("../../../docs/guide/recovery.md")]
+    struct Recovery;
     #[doc = include_str!("../../../docs/guide/agent-reference.md")]
     struct AgentReference;
     #[doc = include_str!("../../../docs/guide/concepts.md")]
@@ -137,5 +139,6 @@ pub use pigeonhole_engine::Metrics as EngineMetrics;
 pub use pigeonhole_engine::RowCacheStats;
 #[doc(hidden)]
 pub use pigeonhole_engine::ShardStats;
+pub use pigeonhole_engine::{Failure, FailureCause};
 pub use pigeonhole_engine::{MergeError, MergeOperator};
 pub use pigeonhole_format::Durability;

@@ -239,9 +239,9 @@ fn a_merge_operand_above_the_limit_is_refused() {
 
 #[test]
 fn a_commit_that_fails_after_its_wal_append_keeps_its_blob_files() {
-    // The batch is logged, then its apply fails with `Busy` (as an arena miscount would):
-    // the error is one a refused commit also returns, but the record is in the WAL, so the
-    // value's file must stay for the replay to find.
+    // The batch is logged, then its apply fails (as an arena miscount would): the commit
+    // returns `OutcomeUnknown`, since the record is in the WAL and the value's file must stay
+    // for the replay to find.
     let vfs = SimVfs::new(234);
     let db = open(&vfs);
     let t = db
@@ -254,7 +254,7 @@ fn a_commit_that_fails_after_its_wal_append_keeps_its_blob_files() {
         .unwrap();
     assert!(matches!(
         db.commit(wb, Some(Durability::Sync)),
-        Err(Error::Busy)
+        Err(Error::OutcomeUnknown)
     ));
     assert_eq!(db.blob_files().len(), 1, "the logged commit's file stays");
     // A power loss: the synced record is replayed (a close of the poisoned shard could

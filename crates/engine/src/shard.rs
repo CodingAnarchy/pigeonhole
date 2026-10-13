@@ -317,6 +317,8 @@ pub(crate) struct Shared {
     /// A manifest (root) commit failed: the pager is poisoned (decision D58) and every later
     /// write fails until the database is reopened.
     pub pager_poisoned: AtomicBool,
+    /// The instance's first failure: a shard's death or poisoning, or the pager's (ICR 0040).
+    pub failure: crate::health::FailureRecord,
     pub close: CloseState,
     pub metrics: Vec<ShardMetrics>,
     /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits
@@ -4235,7 +4237,7 @@ impl ShardState {
             }
             // A flush frees room (one that failed is tried again), and so do empty slots.
             if self.retire_idle_slots().is_err() {
-                self.poisoned = true;
+                self.poison(crate::health::FailureCause::Internal);
             }
             let _ = self.freeze(true);
             // That freeze may have queued guarded flushes after this group's members were
@@ -4437,7 +4439,7 @@ impl ShardState {
                 }
                 Err(e) => {
                     trace!("shard {} append failed: {e}", self.id.0);
-                    self.poisoned = true;
+                    self.poison(crate::health::FailureCause::Io);
                     self.fail_all(group.members, ctx);
                     return;
                 }
@@ -4451,7 +4453,7 @@ impl ShardState {
                             unsynced = false;
                         }
                         Err(_) => {
-                            self.poisoned = true;
+                            self.poison(crate::health::FailureCause::Io);
                             self.fail_all(group.members, ctx);
                             return;
                         }
@@ -4464,7 +4466,7 @@ impl ShardState {
         if appended {
             let wal = self.wal.as_mut().expect("appended through it");
             if wal.write().is_err() {
-                self.poisoned = true;
+                self.poison(crate::health::FailureCause::Io);
                 self.fail_all(group.members, ctx);
                 return;
             }
@@ -4498,7 +4500,7 @@ impl ShardState {
                             group_sync = true;
                         }
                         Err(_) => {
-                            self.poisoned = true;
+                            self.poison(crate::health::FailureCause::Io);
                             self.fail_all(group.members, ctx);
                             return;
                         }
@@ -4530,8 +4532,12 @@ impl ShardState {
                     let applied = self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts);
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
-                        self.poisoned = true;
-                        m.failed = Some(e);
+                        self.poison(crate::health::FailureCause::Internal);
+                        // The record is in the log: the next open replays it, so the commit
+                        // may land after all. `OutcomeUnknown`, not the apply's own error,
+                        // which reads as "not committed" (ICR 0038, ICR 0040).
+                        let _ = e;
+                        m.failed = Some(Error::OutcomeUnknown);
                     }
                     self.release_room(m.reserved);
                     m.reserved = 0;
@@ -4574,7 +4580,7 @@ impl ShardState {
         if self.view_dirty
             && let Err(e) = self.publish_memtables()
         {
-            self.poisoned = true;
+            self.poison(crate::health::FailureCause::Internal);
             for m in &mut group.members {
                 if m.failed.is_none() {
                     m.failed = Some(Error::Corruption(format!("view publish failed: {e}")));
@@ -4584,7 +4590,7 @@ impl ShardState {
         self.limit_wal_pin(ctx);
         self.maybe_index(ctx);
         if self.freeze(false).is_err() {
-            self.poisoned = true;
+            self.poison(crate::health::FailureCause::Internal);
         }
         self.spawn_flush(ctx);
 
@@ -4764,7 +4770,7 @@ impl ShardState {
         let done = self.advance_pin_pass(&mut pass, catalog, PIN_SLICE);
         if self.unpin.len() != forced_before {
             if self.freeze(false).is_err() {
-                self.poisoned = true;
+                self.poison(crate::health::FailureCause::Internal);
             }
             self.spawn_flush(ctx);
         }
@@ -5208,7 +5214,7 @@ impl ShardState {
             .collect();
         self.unpin.extend(shares);
         if self.freeze(false).is_err() {
-            self.poisoned = true;
+            self.poison(crate::health::FailureCause::Internal);
         }
         self.spawn_flush(ctx);
     }
@@ -5280,7 +5286,7 @@ impl ShardState {
             }
             Err(e) => {
                 trace!("shard {} batched sync failed: {e}", self.id.0);
-                self.poisoned = true;
+                self.poison(crate::health::FailureCause::Io);
                 self.resolve_through(
                     through,
                     Err(pigeonhole_io::Error::new(
@@ -5301,7 +5307,7 @@ impl ShardState {
     ) {
         let failed = result.is_err();
         if failed {
-            self.poisoned = true;
+            self.poison(crate::health::FailureCause::Io);
         }
         while self.unresolved.front().is_some_and(|g| g.id <= through) {
             let group = self.unresolved.pop_front().expect("checked");
@@ -5908,16 +5914,16 @@ impl ShardState {
                     }
                     Err(e) => {
                         // Possibly half applied: this shard extends nothing further.
-                        self.poisoned = true;
+                        self.poison(crate::health::FailureCause::Internal);
                         error = Some(prepare_error_of(&e));
                     }
                 }
                 if self.view_dirty && self.publish_memtables().is_err() {
-                    self.poisoned = true;
+                    self.poison(crate::health::FailureCause::Internal);
                     error = error.or(Some(PrepareError::Io));
                 }
                 if self.freeze(false).is_err() {
-                    self.poisoned = true;
+                    self.poison(crate::health::FailureCause::Internal);
                 }
                 self.spawn_flush(ctx);
             } else {
@@ -6315,7 +6321,7 @@ impl ShardState {
                     && !self.poisoned
                     && wal.checkpoint(lsn).is_err()
                 {
-                    self.poisoned = true;
+                    self.poison(crate::health::FailureCause::Io);
                 }
             }
             Err(e) => {
@@ -7005,6 +7011,13 @@ impl ShardState {
 
     // ---- close ----
 
+    /// Poisons the shard: it commits nothing more, and the instance records its first
+    /// failure (ICR 0040).
+    fn poison(&mut self, cause: crate::health::FailureCause) {
+        self.poisoned = true;
+        self.shared.failure.record(u32::from(self.id.0), cause);
+    }
+
     fn try_finish_close(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if !self.closing || self.close_stage == CloseStage::Reported {
             return;
@@ -7111,6 +7124,7 @@ impl ShardState {
         if self.close_stage == CloseStage::Flushing
             && !self.flush_running
             && (self.flush_failed
+                || self.poisoned
                 || self.shared.pager_poisoned.load(Ordering::Acquire)
                 || self.shared.shard_died.load(Ordering::Acquire))
         {
@@ -7119,7 +7133,9 @@ impl ShardState {
             // Give up on flushing: the WAL keeps everything, the next open replays it, and
             // the close is reported unclean. A dead shard (issue #135) can pin the global
             // watermark (a cross-shard commit it holds, or a group under a held segment
-            // header, D227), so a deferred freeze could wait for it for ever.
+            // header, D227), so a deferred freeze could wait for it for ever. A poisoned
+            // shard may hold a logged record it never applied (a failed apply), which no
+            // flush can pass: its checkpoint would wait for it for ever (ICR 0040).
             self.close_stage = CloseStage::Checkpointing;
             self.checkpoint_inflight = false;
         }
@@ -7141,7 +7157,7 @@ impl ShardState {
                 && !self.poisoned
                 && wal.write().is_err()
             {
-                self.poisoned = true;
+                self.poison(crate::health::FailureCause::Io);
             }
             self.report_shares_flushed(ctx);
             self.advance_checkpoint(ctx);
@@ -7220,6 +7236,10 @@ impl ShardState {
         if self.close_stage == CloseStage::Reported {
             return;
         }
+        shared.failure.record(
+            u32::from(self.id.0),
+            crate::health::FailureCause::DriverDropped,
+        );
         self.closing = true;
         self.close_stage = CloseStage::Reported;
         self.final_sync();
@@ -7235,6 +7255,9 @@ impl ShardState {
         if self.close_stage == CloseStage::Reported {
             return;
         }
+        self.shared
+            .failure
+            .record(u32::from(self.id.0), crate::health::FailureCause::Panic);
         self.closing = true;
         self.close_stage = CloseStage::Reported;
         self.answer_unsettled();
@@ -7307,7 +7330,7 @@ impl ShardState {
                     }));
                 }
                 Err(e) => {
-                    self.poisoned = true;
+                    self.poison(crate::health::FailureCause::Io);
                     reply.notify(Err(e.into()));
                 }
             },
@@ -7429,7 +7452,7 @@ impl ShardState {
             }
             ShardMsg::DropTablets { tablets } => {
                 if self.drop_tablets(&tablets).is_err() {
-                    self.poisoned = true;
+                    self.poison(crate::health::FailureCause::Internal);
                 }
             }
             ShardMsg::Start => {
