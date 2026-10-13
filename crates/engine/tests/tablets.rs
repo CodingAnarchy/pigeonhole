@@ -778,6 +778,54 @@ fn light_writes_pack_tablets_onto_fewer_shards() {
     }
 }
 
+/// Every shard uses the same active shard count `k` (D217), at every balancer pass, across
+/// a switch from light to heavy writes: packed onto shard 0, which then saturates, `k` grows
+/// and shard 0 sheds tablets. Each shard used to keep its own `k` (its own hysteresis
+/// counters over loads published at different passes), so shards disagreed while it changed
+/// and, on the AX102 and locally, for good (one kept 16, others 1 to 3).
+#[test]
+fn every_shard_uses_the_same_active_shard_count_from_light_to_heavy_writes() {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    let agree = |db: &Db, when: &str| {
+        let ks = db.engine.pack_ks();
+        assert!(
+            ks.windows(2).all(|w| w[0] == w[1]),
+            "{when}: the shards use different k: {ks:?}"
+        );
+        ks[0].expect("a balancer pass ran")
+    };
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        agree(&db, &format!("light, pass {passes}"));
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    assert_eq!(agree(&db, "packed"), 1);
+    // Shard 0 now does all the work and saturates; the others idle.
+    db.engine.set_shard_busy(0, Some(0.95));
+    for s in 1..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    let mut grew = None;
+    for pass in 0..120 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = agree(&db, &format!("heavy, pass {pass}"));
+        if k > 1 && grew.is_none() {
+            grew = Some(pass);
+        }
+    }
+    assert!(grew.is_some(), "k never grew from 1");
+    let tablets = tablets_per_shard(&db, 4);
+    assert!(tablets[0] < 4, "shard 0 shed no tablet: {tablets:?}");
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// Packing never strands tablets (D217): six tablets of a 20-family table need 120 memtable
 /// slots, and a shard serves 64 (three tablets). Light writes (B = 0.3, one shard's worth)
 /// pack them onto two shards, not three onto one shard and the rest left where they were.
