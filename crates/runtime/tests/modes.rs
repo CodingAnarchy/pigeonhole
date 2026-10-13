@@ -1111,6 +1111,81 @@ fn a_waker_wake_during_a_turn_ends_the_next_wait() {
     );
 }
 
+/// Background work that is always runnable: each slice counts itself and moves the simulated
+/// clock to the slice's deadline.
+struct AlwaysRunnable {
+    sim: Arc<SimVfs>,
+    slices: Arc<AtomicU32>,
+}
+
+impl Task for AlwaysRunnable {
+    fn run(&mut self, deadline: u64, _waker: &TaskWaker) -> TaskPoll {
+        self.slices.fetch_add(1, Ordering::Relaxed);
+        let now = self.sim.monotonic_nanos();
+        self.sim.advance(deadline.saturating_sub(now).max(1));
+        TaskPoll::Pending
+    }
+
+    fn name(&self) -> &'static str {
+        "count-slices"
+    }
+}
+
+#[test]
+fn a_turn_that_settles_a_driver_future_skips_its_slices_at_most_eight_in_a_row() {
+    // D237: a message that wakes a future the driving thread awaits (a commit it submitted
+    // settling) ends the turn before its background slices, but never more than eight turns
+    // in a row: under a steady stream of settles, background work still runs every ninth.
+    let (mut drivers, sim) = app_drivers(1);
+    let mut d = drivers.remove(0);
+    let slices = Arc::new(AtomicU32::new(0));
+    d.with_handler(|_, ctx| {
+        ctx.spawn(Box::new(AlwaysRunnable {
+            sim: sim.clone(),
+            slices: Arc::clone(&slices),
+        }));
+    });
+    let waker = d.waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut turn = |d: &mut ShardDriver<Handler>, settle: bool| -> u32 {
+        let before = slices.load(Ordering::Relaxed);
+        let mut pending = None;
+        if settle {
+            let (n, w) = completion();
+            let mut w = Box::pin(w);
+            assert!(w.as_mut().poll(&mut cx).is_pending());
+            d.submitter(ShardId(0)).submit(Msg::Echo(7, n)).unwrap();
+            pending = Some(w);
+        }
+        assert!(
+            d.run_once(sim.monotonic_nanos() + 1_000_000),
+            "always runnable"
+        );
+        if let Some(mut w) = pending {
+            assert_eq!(w.as_mut().poll(&mut cx), Poll::Ready(Some(7)));
+        }
+        slices.load(Ordering::Relaxed) - before
+    };
+    for round in 0..5 {
+        for i in 0..8 {
+            assert_eq!(turn(&mut d, true), 0, "round {round}, turn {i}: skipped");
+        }
+        assert!(
+            turn(&mut d, true) > 0,
+            "round {round}, ninth turn: slices ran"
+        );
+    }
+    // A turn that settles nothing runs its slices, even right after one that skipped them.
+    assert_eq!(turn(&mut d, true), 0);
+    assert!(turn(&mut d, false) > 0);
+    // A skipped turn leaves the application wake for the next wait (#592): it returns at once.
+    assert_eq!(turn(&mut d, true), 0);
+    let started = Instant::now();
+    d.wait(Duration::from_secs(30));
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_secs(5), "the wait ran {waited:?}");
+}
+
 #[test]
 fn work_queued_before_the_wait_returns_it_at_once() {
     let (mut drivers, _) = app_drivers(1);

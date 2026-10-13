@@ -134,7 +134,7 @@ Making scan steps resumable, so the last case never blocks, is tracked in [#398]
 ## Application-owned mode
 With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `compact` refuse to run on a thread that drives a shard, because they could wait on that same shard (D88). The async forms are how you call them from the event loop: submit with `commit_async`, `commit_if_async`, `flush_async` or `compact_async` and await the future there.
 
-**The loop for one shard per thread: `run_once` until idle, poll your futures with `shard.waker()`, then `shard.wait(timeout)`** (#553):
+**The loop for one shard per thread: `run_once`, poll your futures with `shard.waker()`, and `shard.wait(timeout)` once `run_once` returns `false`** (#553):
 
 ```rust,no_run
 # use std::time::Duration;
@@ -146,10 +146,12 @@ With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `
 let waker = shard.waker();
 let mut cx = std::task::Context::from_waker(&waker);
 loop {
-    while shard.run_once(Duration::from_micros(200)) {}
+    let more = shard.run_once(Duration::from_micros(200));
     // poll this thread's futures (commit_async and friends) with `cx`
     # let _ = &mut cx;
-    shard.wait(Duration::from_millis(10));
+    if !more {
+        shard.wait(Duration::from_millis(10));
+    }
 }
 # #[allow(unreachable_code)]
 # Ok::<(), pigeonhole::Error>(())
@@ -158,6 +160,7 @@ loop {
 - `wait` returns when work arrives for the shard, a future's wake reaches `shard.waker()`, this thread's own I/O completes, background work falls due, or the timeout passes. It may return early.
 - It works on every backend and needs no file descriptor: with io_uring (the default on Linux) it waits in the thread's ring while the thread's own I/O is in flight, and parks otherwise.
 - Give the futures this thread polls `shard.waker()`: a commit can complete on another shard's thread, and its wake must end this thread's wait.
+- When a `run_once` call completes a future woken through `shard.waker()`, it returns `true` early, before the shard's background work, so the loop gets to poll it sooner (D237). Background work runs on the next call, and at the latest on every ninth. A loop that polls its futures only after `run_once` returns `false` gives up that gain, so poll them after every call, as above.
 - A thread that drives several shards, or waits on other sources too, uses its own event loop instead: the points below.
 
 **In your own event loop, with io_uring (the default on Linux: `IoBackend::Auto`, D218), wait on each shard's `Shard::io_fd`** (`poll`/`epoll`, readable), as well as on the `set_wakeup` callback and `next_wakeup` (D202):

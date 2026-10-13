@@ -1212,6 +1212,31 @@ A thread-per-core application pins its shard threads, so the gate measures that,
 | 16 shards, pinned | 4.20M, 4.20M | **4.69M, 4.68M (+11.6%)** |
 | 16 shards, unpinned | 4.15M, 4.03M | 4.37M, 4.43M (+7%) |
 
+<a id="d237"></a>
+## D237 — An application-owned shard's turn ends early when it woke a future the driving thread awaits, before its background slices, at most 8 turns in a row (owner decision, 2026-10-13; runtime, #406 group commit)
+
+**Decided:**
+- **The early end.** `ShardDriver::run_once` (`EngineShard::run_once`, `Shard::run_once`) checks once per turn, after the whole message drain and `end_batch`, whether a `ShardDriver::waker()` wake arrived since the last turn. Typically this is a commit the thread submitted that this drain settled. If one did and background tasks are runnable, the turn returns `true` without running its background slices: the caller polls the woken future now instead of at the turn's deadline.
+- **The guard.** After 8 such turns in a row (`MAX_TURN_YIELDS`), a turn runs its slices whatever wakes arrived, so flush and compaction get at least one turn in nine.
+- **Scope.** Application-owned mode only: only a `waker()` wake sets the flag (`Signal::turn_woken`, separate from the `app_woken` that ends `wait`, so the next `wait` still returns at once, #592). Engine-owned threads never skip. The check is not repeated inside the drain or between slices.
+- **Not adopted:** stopping the drain at the first such wake. On the AX102 it split the message batch into smaller groups and cost throughput and the tail (8.35–8.58M vs 9.20–9.50M cells/s at 16 in flight, p99.9 481–602 vs 340–385 µs) without improving settle→seen.
+- Shortening the bench driver's 50 µs turn instead was not chosen either: it would change the judged shape.
+
+**Why:** after D227, the judged group-commit row (16 shards × 16 in flight) had a bench p99 of 183–187 µs, under the 200 µs target with little margin. A per-stage profile on the AX102 put about 70 µs of the p99 between a commit settling and its driver seeing it, and about 47 µs between submit and its group starting. Both are the shard's turn, not I/O: a commit settled early in a turn waited behind the turn's background slices until the deadline.
+
+**Measured** (scratch prototype, AX102, 2026-10-13, bench p99, two runs each; 0 write stalls and the same flush and compaction counts in every run):
+
+| group commit, 16 shards | off | early end, at most 8 in a row |
+|---|--:|--:|
+| 16 in flight | 182–184 µs | 157–167 µs |
+| 8 in flight | 137–139 µs | 102–111 µs |
+
+Throughput is unchanged (8.8–9.6M cells/s at 16 in flight).
+
+**Measured on the merged code** (#632 vs main 000d5e5, AX102, 2026-10-13, alternated ×2):
+- **16 in flight:** bench p99 151–177 → 132–133 µs. Throughput is unchanged (9.87–10.12 vs 9.90–10.55M cells/s).
+- **8 in flight:** bench p99 118 → 91–92 µs.
+- **Background work:** 0 write stalls and 80 flushes / 16 compactions in every run of both builds.
 
 <a id="d238"></a>
 ## D238 — The scaling gate judges ≥ 0.8 × N up to one chiplet's physical cores and reports larger N; efficiency against a fixed single-shard rate is reported beside it (owner decision, 2026-10-13; bench, #154, #406; amends D204, D231)

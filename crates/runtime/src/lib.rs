@@ -77,6 +77,11 @@ use signal::{Signal, WakeTarget};
 /// Most messages handled before `end_batch` runs, so a flooded queue still commits groups.
 const MAX_BATCH: usize = 1024;
 
+/// The most turns in a row that skip their background slices because a future of the
+/// driving thread was woken (D237): the next turn runs them, so flush and compaction keep
+/// at least one turn in `MAX_TURN_YIELDS + 1`.
+const MAX_TURN_YIELDS: u32 = 8;
+
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -403,6 +408,10 @@ struct ShardCore<H: ShardHandler> {
     released: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
+    /// Turns in a row that ended before their background slices because a future of the
+    /// driving thread was woken (D237; application-owned mode only, at most
+    /// [`MAX_TURN_YIELDS`]).
+    yields: u32,
 }
 
 /// An engine-owned shard's poll of its queue before it parks (D198).
@@ -618,6 +627,19 @@ impl<H: ShardHandler> ShardCore<H> {
             self.spawner.local.wake_sleepers();
         }
         self.spawner.local.wake_due(start);
+        // D237: the drain woke a future the driving thread awaits (a commit it submitted
+        // settled): hand the thread back before the background slices, so it sees that now
+        // rather than at the deadline. The slices run next turn, and after
+        // `MAX_TURN_YIELDS` such turns in a row one runs them anyway. Only a
+        // `ShardDriver::waker` wakes this, so engine-owned threads never skip.
+        if self.signal().take_turn_woken()
+            && self.yields < MAX_TURN_YIELDS
+            && self.spawner.local.has_runnable()
+        {
+            self.yields += 1;
+            return true;
+        }
+        self.yields = 0;
         while self.spawner.local.has_runnable() {
             let now = self.vfs.monotonic_nanos();
             if now >= deadline {
@@ -809,6 +831,7 @@ fn build<H: ShardHandler>(
             vfs: Arc::clone(&config.vfs),
             time_slice: config.slice_nanos(),
             idle_at: None,
+            yields: 0,
             attached: 0,
             #[cfg(debug_assertions)]
             left_io: false,
@@ -1193,6 +1216,13 @@ impl<H: ShardHandler> ShardDriver<H> {
     ///
     /// Between task slices (each at most `time_slice` long) it drains the queue again, so
     /// foreground messages never wait behind more than one slice.
+    ///
+    /// When a [`waker`](Self::waker) wake arrived since the last turn (typically a message
+    /// this turn handled settled a future the calling thread awaits), it returns `true` right
+    /// after the drain, before the background tasks, so the caller can poll that future now
+    /// rather than at the deadline (D237). The tasks run on the next call; after eight such
+    /// turns in a row, a turn runs them anyway. The wake still ends the next
+    /// [`wait`](Self::wait) at once.
     ///
     /// Tasks sleeping until a deadline ([`TaskPoll::SleepUntil`]) are not work that remains:
     /// with only those left it returns `false`, and the application should call it again
