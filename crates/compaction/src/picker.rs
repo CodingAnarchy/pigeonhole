@@ -278,7 +278,7 @@ impl CompactionPicker {
         }
     }
 
-    /// The L0 write stall's score (D119, D234): L0 depth over [`STALL_START`] times
+    /// The L0 write stall's score (D119, D234): L0 depth over twice
     /// `l0_trigger`, so writers are paced only once flushes outrun compaction by a full
     /// trigger's worth of files (never for a deeper level, tiered space amplification or
     /// FIFO expiry, which only drive picking). FIFO keeps its files in L0, so its depth is
