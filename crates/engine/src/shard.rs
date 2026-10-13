@@ -2899,7 +2899,7 @@ impl ShardState {
 
     /// Freezes the active memtables that crossed the threshold during `apply` (or every
     /// non-empty one when `all`), and queues them for flushing. A memtable freezes only
-    /// once every seqno it holds is visible: then its largest seqno is exact as the slot's
+    /// once every seqno it holds is durable (D227), so also visible: then its largest seqno is exact as the slot's
     /// flushed-through seqno (no lower seqno can land in a newer memtable), so replay skips
     /// exactly what the SST holds.
     fn freeze(&mut self, all: bool) -> Result<()> {
@@ -2923,8 +2923,9 @@ impl ShardState {
         let tablets_on = self.tablets_on();
         // A memtable freezes once everything in it is durable, not only visible (D227):
         // flush GC then never collapses versions a durable snapshot may still read, and
-        // compaction's inputs inherit the bound (ICR 0037).
-        let visible = self.shared.shm.durable_seqno();
+        // compaction's inputs inherit the bound (ICR 0037). Read once, and only when a
+        // memtable is due: the commit path calls this after every group, usually with none.
+        let mut durable: Option<Seqno> = None;
         let view = self.shared.view.load();
         let mut deferred = false;
         let mut starved = false;
@@ -2938,18 +2939,18 @@ impl ShardState {
                 continue;
             }
             let big = slot.active.table.allocated_bytes() >= threshold;
-            trace!(
-                "shard {} freeze {:?}: all={all} big={big} empty={} max_seqno={} visible={visible}",
-                self.id.0,
-                key,
-                slot.active.table.is_empty(),
-                slot.active.max_seqno()
-            );
             let forced = self.moving.contains(&key.0) || self.unpin.contains(&key);
             if slot.active.table.is_empty() || !(all || big || forced) {
                 continue;
             }
-            if slot.active.max_seqno() > visible {
+            let durable = *durable.get_or_insert_with(|| self.shared.shm.durable_seqno());
+            trace!(
+                "shard {} freeze {:?}: all={all} big={big} forced={forced} max_seqno={} durable={durable}",
+                self.id.0,
+                key,
+                slot.active.max_seqno()
+            );
+            if slot.active.max_seqno() > durable {
                 deferred = true;
                 needed = needed.max(slot.active.max_seqno());
                 if !self.to_freeze.contains(&key) {
@@ -3047,7 +3048,7 @@ impl ShardState {
             // waits for: a publish wakes this shard only once that seqno is visible (main's
             // flag-guarded registration was lost after the first wake, and a tablet change
             // waits on the freeze with every write to its tablet parked, so nothing else
-            // would wake it). A watermark published since `visible` was read may have missed
+            // would wake it). A watermark published since the durable seqno was read may have missed
             // the registration: look again.
             self.freeze_deferred = true;
             let id = self.id.0;
