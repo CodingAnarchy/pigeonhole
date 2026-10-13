@@ -65,6 +65,8 @@ These rules hold only until compaction purges the markers (HBase semantics, deci
 ## Multi-process readers (Phase 4; available now)
 One writer process and any number of reader processes on the same host can open the same `.phdb` file; readers see each commit as soon as the writer publishes it. A reader's handle (`Pigeonhole::open_reader`) has no write methods, but the reader process still opens the file **read-write** and writes nothing to it: the processes coordinate with byte-range locks on the file, and some of those locks are exclusive, which POSIX grants only on a writable file descriptor. This is the same requirement SQLite has in WAL mode. So every reader process needs write permission on the database file, and a database on read-only media cannot be opened by readers.
 
+**Upgrades:** the writer and every reader process must run builds with the same shared-memory layout. **Stop reader processes before upgrading the writer.** A writer of a newer layout (D227's version 2 adds a durable watermark) fails to open with `ShmVersionMismatch` while readers of an older build are still attached, and an older reader can't attach to a newer writer.
+
 A reader's snapshot survives the writer closing. Once a new writer opens, though, reads through snapshots taken before the restart fail with `SnapshotExpired`, because the new writer may reuse the space those snapshots read. Take a new snapshot and redo the read. Snapshots taken after the restart read normally.
 
 ## Platform and process notes

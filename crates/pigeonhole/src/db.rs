@@ -285,8 +285,9 @@ impl Pigeonhole {
         self.db.snapshot()
     }
 
-    /// A consistent snapshot that sees a commit only once it is durable at its level (D227,
-    /// ICR 0037): every value it reads survives a power loss. It may lag
+    /// A consistent snapshot that sees a commit only once it is durable at its commit's level
+    /// (D227, ICR 0037): of what it reads, `GroupSync` and `Sync` commits survive a power
+    /// loss, `Buffered` ones a process crash, and `None` ones nothing. It may lag
     /// [`snapshot`](Self::snapshot) by the fsyncs in flight (typically well under a
     /// millisecond). Use it when what you read must never be undone: deriving a write on
     /// another shard from it, or a cursor you persist.
@@ -497,8 +498,8 @@ impl Pigeonhole {
     }
 
     /// As [`backup`](Self::backup), at a durable snapshot (D227, ICR 0037): the copy holds
-    /// only commits that are durable here, never one a power loss then removes from this
-    /// database.
+    /// only commits durable here at their level. A `GroupSync` or `Sync` commit it holds
+    /// survives a power loss here; a `Buffered` or `None` one may not.
     pub fn backup_durable(&self, dest: impl AsRef<Path>) -> Result<()> {
         Ok(self.db.engine.backup_durable(dest.as_ref())?)
     }

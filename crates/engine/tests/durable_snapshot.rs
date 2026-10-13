@@ -15,7 +15,7 @@ use pigeonhole_engine::{
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::ProcessId;
-use pigeonhole_io::sim::SimVfs;
+use pigeonhole_io::sim::{CrashKind, SimVfs};
 
 const DB: &str = "/db/data.phdb";
 
@@ -176,4 +176,54 @@ fn a_memtable_freezes_only_once_everything_in_it_is_durable() {
     assert!(db.metrics().flushes > before);
     let durable = db.durable_snapshot().unwrap();
     assert_eq!(read(&db, &durable, &a, b"k").as_deref(), Some(&b"3"[..]));
+}
+
+/// Records recovered after a process crash may be in the page cache only: written, never
+/// synced (a `Buffered` commit). Open syncs each recovered stream before any watermark is
+/// published (`Recovery::into_stream`: the new segment's header sync, and the slot syncs
+/// before it, cover the file), so a durable snapshot taken after the reopen, even before any
+/// shard turn, reads only what survives a power loss that follows. Without the reopen the
+/// same power loss removes the commit.
+#[test]
+fn a_durable_snapshot_after_a_process_crash_reads_only_what_a_power_loss_keeps() {
+    let (vfs, db, mut shards, [_, b]) = rig(229);
+    // Written to the OS and never synced (Buffered) when the process dies.
+    let committed = db
+        .submit(put(&b, b"x", b"1"), Some(Durability::Buffered))
+        .unwrap();
+    idle(&mut shards);
+    drop(committed);
+    vfs.crash(CrashKind::Process);
+    drop(shards);
+    drop(db);
+    // The dead process's sync never runs: the record is in the page cache only.
+    vfs.set_deferred_io(false);
+
+    let reopen = |vfs: &Arc<SimVfs>| {
+        let mut o = common::options(Arc::clone(vfs), 2, 4 << 20);
+        o.tablet_changes = false;
+        Engine::open_application_owned(Path::new(DB), o).unwrap()
+    };
+    // Before any shard turn: no later sync of the stream (a spare slot's) has run yet.
+    let (db, shards) = reopen(&vfs);
+    let snap = db.durable_snapshot().unwrap();
+    let seen = read(&db, &snap, &b, b"x");
+    assert_eq!(
+        seen.as_deref(),
+        Some(&b"1"[..]),
+        "the recovered commit is replayed"
+    );
+    drop(snap);
+    // A power loss now keeps whatever that durable snapshot read.
+    vfs.crash(CrashKind::Power);
+    drop(shards);
+    drop(db);
+    let (db, mut shards) = reopen(&vfs);
+    idle(&mut shards);
+    let snap = db.snapshot().unwrap();
+    assert_eq!(
+        read(&db, &snap, &b, b"x").as_deref(),
+        Some(&b"1"[..]),
+        "a durable snapshot read a recovered record a power loss then removed"
+    );
 }

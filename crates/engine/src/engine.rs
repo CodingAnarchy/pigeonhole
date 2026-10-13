@@ -1451,7 +1451,8 @@ impl Engine {
 
     /// A snapshot that sees a commit only once it is durable at its level on its shard (D227,
     /// ICR 0037): what [`Engine::snapshot`] saw before D227. Every commit it reads is durable
-    /// at its level and survives a power loss; it may lag the visible state by the syncs in
+    /// at its level: `GroupSync` and `Sync` commits survive a power loss, `Buffered` ones a
+    /// process crash, `None` ones nothing. It may lag the visible state by the syncs in
     /// flight. In a reader process it may do I/O, as `snapshot` does.
     pub fn durable_snapshot(&self) -> Result<Snapshot> {
         self.inner.snapshot_of(true)
@@ -1767,7 +1768,8 @@ impl Engine {
     }
 
     /// As [`Engine::backup`], at a durable snapshot ([`Engine::durable_snapshot`], D227, ICR
-    /// 0037): the copy holds only commits durable here, none a power loss can remove.
+    /// 0037): the copy holds only commits durable here at their level (a `GroupSync` or
+    /// `Sync` one survives a power loss here; a `Buffered` or `None` one may not).
     pub fn backup_durable(&self, dest: &Path) -> Result<()> {
         self.backup_of(dest, true)
     }

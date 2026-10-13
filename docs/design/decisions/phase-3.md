@@ -954,6 +954,11 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
   - Frozen at the durable seqno, every entry a flush writes is at or below a durable seqno at or below any later durable snapshot. Compaction inputs inherit that bound.
   - Cost: a freeze waits for the syncs in flight, D19's timing for freezes.
 - **A reader process's durable snapshot** pins its slot with a durable seqno, or lowers an existing pin to it while keeping the pinned view.
+- **Durable means durable at the commit's own level.** Of what a durable snapshot reads, `GroupSync` and `Sync` commits survive a power loss, `Buffered` ones a process crash, `None` ones nothing.
+- **A failed fsync is never durable.** The shard keeps the failed group's lowest seqno as a floor under its durable watermark for good. Every shard's freezes would then stall behind it, so the failure also counts as the shard's death (`shard_died`): the close gives up flushing and is unclean, and the next open replays only what reached the disk (D85's note).
+- **Replay after a process crash:** recovered records may sit in the page cache only. Open syncs each recovered stream (the new segment's `sync_all`, `Recovery::into_stream`) before any watermark is published, so they're durable before a durable snapshot can read them. `durable_snapshot.rs` checks this with a power loss after the reopen.
+- **Upgrades:** layout 2 refuses mixed versions, so stop reader processes before upgrading the writer.
+- **Cost:** the shard computes both watermarks in one pass and skips the durable store when its value is unchanged.
 - **The D226 row** (group commit p99 < 200 µs) is judged on the default, this decision.
 
 **Consequences users must know** (the durability guide's "Visibility and durability" section has the examples):

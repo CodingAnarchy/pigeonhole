@@ -49,7 +49,7 @@ A shard publishes `durable` before `pending`. Readers load `pending` before `dur
 
 ## Why
 
-The owner's answer to D227 Q2: A1 makes visibility apply-time by default. A reader that must never see data a power loss removes needs D19's old view:
+The owner's answer to D227 Q2: A1 makes visibility apply-time by default. A reader that must never see a commit before it is durable at its level needs D19's old view. Of what such a reader sees, `GroupSync` and `Sync` commits survive a power loss, `Buffered` ones a process crash, `None` ones nothing. It needs that view for:
 - deriving a write on another shard from what it read;
 - persisting a cursor;
 - taking a backup that never holds a commit the source then loses.
@@ -61,7 +61,7 @@ A second published watermark keeps that view in every process, readers included,
 - `pigeonhole` `db.rs`: `Pigeonhole::durable_snapshot`, `backup_durable`, `PigeonholeReader::durable_snapshot` (doc examples).
 - `pigeonhole-engine`:
   - `engine.rs`: `snapshot_of`, `reader_snapshot`, `durable_snapshot`, `backup_durable`, `backup_of`;
-  - `shard.rs`: `durable_watermark`, `publish_watermark`, `durable_waiters`, `wake_visible`, the freeze rule.
+  - `shard.rs`: `watermarks` (both watermarks in one pass; the durable one also stays below a group whose sync failed, which counts as a shard's death), `publish_watermark` (skips an unchanged durable store), `durable_waiters`, `wake_visible`, the freeze rule.
 - `pigeonhole-shm` `region.rs`: the new methods and the `DURABLE` initialization.
 - `pigeonhole-format`: `watermark::DURABLE`, `ShmLayoutVersion::CURRENT = 2`; the golden header and the version tests.
 - Tests: `durable_snapshot.rs` (writer and reader process), `durable_freeze.rs` (the freeze rule; fails if memtables freeze at the visible seqno).

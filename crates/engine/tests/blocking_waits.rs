@@ -846,8 +846,11 @@ fn a_panicked_shard_thread_does_not_hang_close() {
 /// Shard 1 is poisoned while its `Sync` group is unresolved (the group's sync fails). A
 /// commit on shard 0 does not wait behind that group at all: the group is applied, so it
 /// holds no visibility while its sync runs (D227). The failed sync then resolves the group
-/// (its members get the poison error). A cross-shard commit that then reaches the
-/// poisoned participant fails without pinning the watermark either.
+/// (its members get the poison error) and counts as shard 1's death (D85 since D227 part
+/// 2): the group never becomes durable, so the durable watermark stays below it for good
+/// and a durable snapshot never reads it. Later commits end at once instead of hanging: a
+/// cross-shard one through the poisoned shard fails, and one on the healthy shard is
+/// visible and returns.
 #[test]
 fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     let (vfs, gate) = gate::vfs(1359);
@@ -893,17 +896,21 @@ fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
         "a commit through a poisoned shard succeeded"
     );
     let db2 = Arc::clone(&db);
-    let (on_a2, on_a3) = (Arc::clone(&on_a), Arc::clone(&on_a));
+    let on_a2 = Arc::clone(&on_a);
     let after = gate::within(10, move || {
         db2.commit(put(&on_a2, "after"), Some(Durability::None))
     })
     .expect("a later commit's visibility wait hung behind the poisoned shard");
     after.unwrap();
+    // The failed group is visible (applied, D85) but never durable.
+    let snap = db.durable_snapshot().unwrap();
     assert!(
-        db.get_latest(on_a3.id, on_a3.families[0].id, b"after", b"q")
+        db.get(&snap, on_b.id, on_b.families[0].id, b"doomed", b"q")
             .unwrap()
-            .is_some()
+            .is_none(),
+        "a durable snapshot reads a group whose sync failed"
     );
+    drop(snap);
     let db2 = Arc::clone(&db);
     let closed = gate::within(10, move || db2.close()).expect("close hung");
     assert!(closed.is_err(), "a close with a poisoned shard reported Ok");

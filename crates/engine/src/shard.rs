@@ -417,7 +417,7 @@ impl Shared {
 
     /// Whether visibility can no longer advance: the close finished, or a shard died (its
     /// thread panicked, or its `EngineShard` was dropped, which also fails the close). A
-    /// visibility wait then ends with `Closed`.
+    /// visibility wait then ends with `OutcomeUnknown`.
     pub(crate) fn visibility_ended(&self) -> bool {
         self.closed.load(Ordering::SeqCst) || self.close.failed()
     }
@@ -1959,6 +1959,12 @@ pub(crate) struct ShardState {
     next_group: u64,
     /// Cross-shard seqnos this shard coordinates, not yet applied everywhere.
     held: BTreeSet<Seqno>,
+    /// The lowest seqno of a group whose WAL sync failed (D85): never durable, so the
+    /// durable watermark stays below it for good (D227, ICR 0037).
+    sync_failed_floor: Seqno,
+    /// The durable watermark this shard last published: a publish that would store the
+    /// same value skips the store (the commit path publishes after every group).
+    published_durable: std::cell::Cell<Seqno>,
     coord: HashMap<Seqno, Coord>,
     prepared: HashMap<Seqno, PreparedShare>,
     /// Queued or running flushes that may purge versions under the guard (#287), as
@@ -2260,6 +2266,8 @@ impl ShardState {
             sync_wanted: false,
             next_group: 1,
             held: BTreeSet::new(),
+            sync_failed_floor: u64::MAX,
+            published_durable: std::cell::Cell::new(u64::MAX),
             coord: HashMap::new(),
             prepared: HashMap::new(),
             guarded: Vec::new(),
@@ -3466,28 +3474,38 @@ impl ShardState {
         held.min(groups)
     }
 
-    /// The lowest seqno this shard holds that is not yet durable at its level: `held` and
-    /// every unresolved group, whose sync has not returned (D19's rule, which durable
-    /// snapshots keep; D227, ICR 0037).
-    fn durable_watermark(&self) -> Seqno {
+    /// `watermark()`, and the durable watermark, in one pass over `held` and `unresolved`.
+    /// The durable one is the lowest seqno this shard holds that is not yet durable at its
+    /// level: `held`, every unresolved group (its sync has not returned: D19's rule, which
+    /// durable snapshots keep; D227, ICR 0037), and a group whose sync failed
+    /// (`sync_failed_floor`).
+    #[inline]
+    fn watermarks(&self) -> (Seqno, Seqno) {
         let held = self.held.first().copied().unwrap_or(u64::MAX);
-        let groups = self
-            .unresolved
-            .iter()
-            .filter_map(|g| g.first)
-            .min()
-            .unwrap_or(u64::MAX);
-        held.min(groups)
+        let (mut pending, mut durable) = (held, held.min(self.sync_failed_floor));
+        for g in &self.unresolved {
+            if let Some(first) = g.first {
+                durable = durable.min(first);
+                if g.unwritten {
+                    pending = pending.min(first);
+                }
+            }
+        }
+        (pending, durable)
     }
 
     fn publish_watermark(&self) {
         let shard = u32::from(self.id.0);
+        let (pending, durable) = self.watermarks();
+        debug_assert_eq!(pending, self.watermark());
         // Durable first: a reader that sees the raised pending watermark (Acquire) then sees
-        // the durable one covering what is applied but not yet synced.
-        self.shared
-            .shm
-            .publish_durable(shard, self.durable_watermark());
-        self.shared.shm.publish_pending(shard, self.watermark());
+        // the durable one covering what is applied but not yet synced. An unchanged value is
+        // already published.
+        if durable != self.published_durable.get() {
+            self.shared.shm.publish_durable(shard, durable);
+            self.published_durable.set(durable);
+        }
+        self.shared.shm.publish_pending(shard, pending);
         self.shared.wake_visible();
     }
 
@@ -5268,6 +5286,9 @@ impl ShardState {
         }
         while self.unresolved.front().is_some_and(|g| g.id <= through) {
             let group = self.unresolved.pop_front().expect("checked");
+            if failed && let Some(first) = group.first {
+                self.sync_failed_floor = self.sync_failed_floor.min(first);
+            }
             self.publish_watermark();
             let outcome = if failed {
                 Err(Error::Io(pigeonhole_io::Error::new(
@@ -5278,6 +5299,14 @@ impl ShardState {
                 Ok(())
             };
             self.resolve_group(group, outcome, ctx);
+        }
+        if failed {
+            // The durable watermark stays below the failed group for good, so every shard's
+            // freezes (which wait for the durable seqno) would stall behind it: treat the
+            // failure as a shard's death. Visibility ends (waiters get `OutcomeUnknown`), the
+            // close is unclean, and the next open replays only what reached the disk. A
+            // poisoned stream already means the database needs reopening.
+            self.shared.shard_died();
         }
         self.try_finish_close(ctx);
     }
