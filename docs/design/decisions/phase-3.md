@@ -1751,6 +1751,7 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 - **`CommitsSettled { seqnos }` replaces `CommitSettled { seqno }`.** A coordinator collects the commits it finds settled per participant and sends each one message (`send_settled`). That happens once per handler that can settle: the report pass, the `SharesFlushed` handler, and `run_group`'s logging of COMMIT records.
 - **Each handler advances the checkpoint and checks the close once per message**, not once per seqno.
 - **The semantics are unchanged.** The reports are commutative: a count per seqno on the coordinator and a set insert on the participant. So batching them changes no decision, only how many messages carry them, and when a handler's batch is sent within its turn. A commit is still settled exactly when its COMMIT is logged and every share has been reported (D24, D225), and a PREPARE or COMMIT is checkpointed under the same rules as before (`needed`).
+- **A backstop (perf287's review).** `end_batch` debug-asserts that no settled commit is left unsent, and sends any that are. A loop that settled without `send_settled` would otherwise hold its participants' PREPAREs, and so their WAL, until some later settle.
 - **Deterministic order.** The per-peer buffers are ordered maps, so the sends keep a seed replay's message order.
 - **An empty share** (validation only) still reports at once, as a one-seqno message.
 
@@ -1760,8 +1761,11 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 - With compaction off the shard threads (D252), these turns and the install were the remaining long-turn sources.
 
 **Tests:**
-- `share_reports.rs`: 600 cross-shard commits from two coordinators to one participant. One flush reports in at most 6 messages carrying exactly 1,200 seqnos; one message per share or commit was 1,200 messages, and the test fails against that. After a power loss every write survives.
+- `share_reports.rs`: 600 cross-shard commits from two coordinators to one participant.
+  - One flush reports in at most 6 messages carrying exactly 1,200 seqnos. With one message per share or commit it was 1,200 messages, and the test fails against that.
+  - Every checkpoint then passes all its records, including the participant's 600 PREPAREs. The test fails if `CommitsSettled` is not sent, and the backstop's assertion fails if one settling loop skips `send_settled`.
+  - After a power loss every write survives.
 - The crash and model sweeps (`model_check` with and without deferred I/O, `model`, `tablets`) check the checkpoints and replay.
-- New test hooks: `ShardCounters::{report_msgs, report_seqnos}` (`Engine::share_reports`).
+- New test hooks: `ShardCounters::{report_msgs, report_seqnos}` (`Engine::share_reports`) and `ShardCounters::logged` (`Engine::logged_records`).
 
-**Acceptance (AX102):** `on_flushed` time and the count of long turns on the cross-shard shape, against main.
+**Acceptance (AX102):** on the cross-shard shape, against main: `on_flushed` time, the count of long turns, and the coordinators' longest turn, since one `SharesFlushed` can now carry about 100K seqnos (perf287's review).
