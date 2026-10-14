@@ -995,6 +995,7 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         xshard_refused_move_raise: m.cross_shard.refused_move_raise,
         xshard_refused_moved: m.cross_shard.refused_moved,
         xshard_refused_room: m.cross_shard.refused_room,
+        xshard_refused_pending_overlap: m.cross_shard.refused_pending_overlap,
     }
 }
 

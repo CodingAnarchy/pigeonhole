@@ -655,6 +655,9 @@ pub struct Stalls {
     /// See [`Stalls::xshard_refused_below_floor`].
     #[serde(default)]
     pub xshard_refused_room: u64,
+    /// SCRATCH (perf287 D249 A/B; never merge): `CrossShardMetrics::refused_pending_overlap`.
+    #[serde(default)]
+    pub xshard_refused_pending_overlap: u64,
 }
 
 impl Stalls {
@@ -697,6 +700,10 @@ impl Stalls {
             ),
             xshard_refused_moved: d(before.xshard_refused_moved, after.xshard_refused_moved),
             xshard_refused_room: d(before.xshard_refused_room, after.xshard_refused_room),
+            xshard_refused_pending_overlap: d(
+                before.xshard_refused_pending_overlap,
+                after.xshard_refused_pending_overlap,
+            ),
         }
     }
 }
