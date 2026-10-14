@@ -1426,6 +1426,51 @@ At those lengths, one flush or compaction more or less, or a placement change, m
   - the shard-count comparison no longer compares seqnos, since a retry's seqno depends on the shard count.
 - **`purge_race`'s lagging-share case** (D192's note) can no longer arise: the share is refused below its participant's floor. The test now checks that the retry leaves the purge alone.
 
+<a id="d245"></a>
+## D245 — A cross-shard commit's timestamp is checked exactly by seqno; its coordinator raises the participants' floors before it reserves; a PREPARE short of room is refused, not held (owner decision, 2026-10-13; engine, tablets, #637, #655, ICR 0042; amends D142, D244)
+
+**Decided** (tablet changes on or off, as D244):
+- **The coordinator raises, then reserves.** `start_coordination` picks `T` above each participant's published floor, move raise and coordinator raise. It `fetch_max`es `T` into every participant's new `Shared::ts_coord_raises` (Release), and only then reserves the commit's seqno `S`.
+  - A participant's later reservation is a read-modify-write on `NEXT_SEQNO` after the coordinator's, and the group loads `ts_coord_raises` (Acquire) once after reserving, before it stamps. So a single at a seqno above `S` always stamps above `T`. That was #653's case, and #637's false refusals: a single stamped at the wall clock while the PREPARE waited in the queue.
+  - `ts_coord_raises` is separate from `ts_raises` (a moved tablet's floor), which D142 compares to a PREPARE with no regard to seqno. Coordinator raises for later seqnos there would refuse earlier ones again.
+- **The participant's check is exact by seqno.** A PREPARE `(S, T)` is refused (`BelowFloor`, retried as D241) only if one of these holds:
+  - a write at a seqno below `S` has a timestamp above `T` (`floor_below`);
+  - a write at a seqno above `S` has a timestamp below `T`.
+  - The shard's assignment-order floor no longer refuses anything.
+  - The history is D244's `stamps` (each group's first single, each routed PREPARE), plus each group's last single (`stamps_last`), plus `pruned_max`: the largest timestamp pruned or stamped before the history (the floor at open, raised by replay).
+  - The move-raise check (`T` below `ts_raises`) stays as D142 had it, counted apart.
+  - What can still refuse: a straddle (a reservation before `S` stamped after the coordinator's read), or two coordinators' crossing pick→reserve windows. Each refusal raises the participant's floor past what refused it.
+- **A retry keeps its first timestamp when it still fits,** as before: at or above every participant's coordinator raise (a tie never reorders), and within `preset_fits`. A participant that stamped since raised its floor past it, so the retry takes a fresh one. A stamp not yet published is caught by the participant's check.
+- **A PREPARE that would wait for arena room is refused** (`PrepareError::Room`, ICR 0042) instead of waiting. Its held seqno capped the durable watermark below the memtables a freeze needs durable (D227), and no room ever freed (#655).
+  - The refusal starts the room wait's freeze and flush (D124), even with no single waiting.
+  - The coordinator parks the retry until the participant reports room freed (`RoomFreed`) in a later room generation than the refusal's.
+  - The participant reports when its room wait ends, or when no single waits, no flush is in flight, and more room is free than at the refusal (after reclaiming memtables readers left). Nothing freed, no report: never a loop.
+  - A parked retry ends with `Busy` at D241's timeout, with `Closed` at close, and with `Closed` once a shard has died (D227).
+- **Issue #70's frozen-clock refusal of a room wait** now waits until the group's admitted members have applied. Their reservations starve the freeze until then. A PREPARE waiting in `prepared` used to mask this.
+- **D244's parts:** (i) stays (the admitted PREPARE's raise, now in admission). (ii)'s later-seqno side is subsumed for singles, and stays for PREPAREs.
+
+**Why:** #637.
+- On the AX102 (16 shards, 32 clients, xshard_contention), main's default configuration refused each cross-shard commit about 3 times (ctr274: almost all `BelowFloor`) and ran at 11K ops/s, against 401K with tablet changes off.
+- D244 brought that cost to tablet changes off too (42K).
+- The refusals came from D142's assignment-order check racing the participant's wall-clock stamps, not from real seqno inversions.
+
+**Convergence:**
+- **Room refusals** end when a flush frees room; only singles can keep winning it, and D241 bounds that.
+- **Ordering refusals** need a straddle or a crossing inside the retry's own pick→reserve window. Each is another commit progressing, so the protocol is lock-free, and D241 bounds a single commit's starvation.
+- **On the sim's single-threaded steps** neither can happen, so no ordering refusal ever does. The tests use that as an oracle.
+
+**Tests** (`crates/engine/tests/tablets.rs`, `src/ts_order_loom.rs`):
+- the D142 sweeps on and off, with 0 ordering refusals;
+- `cross_shard_commits_converge_on_a_frozen_clock`: no `Busy`, nothing stuck, with the default timeout;
+- the cross-group tests, which no longer refuse: attempts = 1 + room refusals;
+- `a_prepare_short_of_arena_room_is_refused_and_commits_once_room_frees` (#655);
+- `a_lone_prepare_against_a_full_arena_commits_on_a_frozen_clock`;
+- `a_retry_waiting_for_room_fails_busy_at_the_write_stall_timeout` and `…_ends_closed_at_close`;
+- `a_moved_retry_keeping_its_timestamp_still_raises_its_new_participant_first`;
+- loom models of raise→reserve against reserve→stamp, the straddle and crossing coordinators.
+
+Each part disabled fails its test.
+
 <a id="d246"></a>
 ## D246 — Contended cross-shard commits are a judged gate workload (owner decision, 2026-10-13; bench, #406; part of D247)
 

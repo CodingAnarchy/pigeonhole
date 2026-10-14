@@ -210,8 +210,9 @@ pub struct CrossShardMetrics {
     pub rounds: u64,
     /// Rounds that a participant refused.
     pub refused_rounds: u64,
-    /// PREPAREs refused because the commit timestamp was below a timestamp the participant
-    /// had already assigned (D11). Only with `tablet_changes` on.
+    /// PREPAREs refused because the commit timestamp was out of seqno order with a write
+    /// the participant had already made: above one at a later seqno, or below one at an
+    /// earlier seqno (D11, D244, D245). With tablet changes on or off.
     pub refused_below_floor: u64,
     /// PREPAREs refused because the commit timestamp was below the floor a tablet move
     /// raised the participant to (D11), though not below the participant's own.
@@ -755,6 +756,7 @@ impl Engine {
                 .collect(),
             ts_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             ts_raisers: (0..shards).map(|_| Mutex::new((0, 0))).collect(),
+            ts_coord_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
             balance: BalanceConfig {
                 enabled: options.tablet_changes,
@@ -1271,6 +1273,7 @@ impl Engine {
             ts_floors: Vec::new(),
             ts_raises: Vec::new(),
             ts_raisers: Vec::new(),
+            ts_coord_raises: Vec::new(),
             loads: Vec::new(),
             balance: BalanceConfig::default(),
             view_capacity: shm_config.view_buffer_bytes as usize,
@@ -3047,6 +3050,7 @@ impl Inner {
             map_version: view.tablets.version(),
             commit_ts: None,
             epoch: 0,
+            room_wait: None,
         }));
         let Some(charge) = admit.admit(target) else {
             return Ok(Routed::Held(Prepared {

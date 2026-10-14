@@ -72,6 +72,9 @@ pub(crate) struct Hooks {
     /// The seqnos of cross-shard attempts a participant refused (`Moved` or `BelowFloor`),
     /// whose commit was retried under a new seqno or gave up (`Engine::take_refused_attempts`).
     pub refused: Mutex<Vec<Seqno>>,
+    /// PREPAREs refused by reason (D245): a move's raise, a lower seqno's timestamp above,
+    /// a higher seqno's below, and arena room (`Engine::refusal_counts`).
+    pub refusals: [AtomicU64; 4],
     /// Arms the manifest queue's release window (`manifest::race_window`,
     /// `Engine::probe_manifest_release_window`), and the waiter of the request it pushed.
     pub manifest_race: AtomicBool,
@@ -864,6 +867,15 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// PREPAREs refused since open, by reason (D245): `[move raise, below (a lower seqno's
+    /// timestamp above), above (a higher seqno's below), arena room]`. Counted only in
+    /// builds with this feature (test hook).
+    #[doc(hidden)]
+    pub fn refusal_counts(&self) -> [u64; 4] {
+        let r = &self.inner.shared.hooks.refusals;
+        [0, 1, 2, 3].map(|i| r[i].load(Ordering::Relaxed))
     }
 
     /// The seqnos of cross-shard attempts refused by a participant (`Moved` or

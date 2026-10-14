@@ -166,8 +166,9 @@ pub struct CrossShardMetrics {
     /// Of those, rounds a participant refused. `rounds - refused_rounds` counts the rounds
     /// that committed, or failed for another reason (a conflict, an I/O error).
     pub refused_rounds: u64,
-    /// PREPAREs refused because the commit timestamp was below a timestamp the participant
-    /// had already assigned.
+    /// PREPAREs refused because the commit timestamp was out of order with a write the
+    /// participant had already made (a later write at a lower timestamp, or an earlier one at
+    /// a higher timestamp). The commit is retried with a fresh timestamp.
     pub refused_below_floor: u64,
     /// PREPAREs refused because the commit timestamp was below the floor a tablet move
     /// raised the participant to.
