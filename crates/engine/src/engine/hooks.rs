@@ -69,6 +69,12 @@ pub(crate) struct Hooks {
     pub compactions: Mutex<Vec<CompactionRecord>>,
     /// Every WAL record appended, in append order (`Engine::take_appended`).
     pub appended: Mutex<Vec<AppendedRecord>>,
+    /// The seqnos of cross-shard attempts a participant refused (`Moved` or `BelowFloor`),
+    /// whose commit was retried under a new seqno or gave up (`Engine::take_refused_attempts`).
+    pub refused: Mutex<Vec<Seqno>>,
+    /// PREPAREs refused by reason (D245): a move's raise, a lower seqno's timestamp above,
+    /// and a higher seqno's below (`Engine::refusal_counts`).
+    pub refusals: [AtomicU64; 3],
     /// Arms the manifest queue's release window (`manifest::race_window`,
     /// `Engine::probe_manifest_release_window`), and the waiter of the request it pushed.
     pub manifest_race: AtomicBool,
@@ -886,6 +892,32 @@ impl Engine {
                 .shared
                 .hooks
                 .appended
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// PREPAREs refused since open, by reason (D245): `[move raise, below (a lower seqno's
+    /// timestamp above), above (a higher seqno's below)]`. Counted only in builds with this
+    /// feature (test hook).
+    #[doc(hidden)]
+    pub fn refusal_counts(&self) -> [u64; 3] {
+        let r = &self.inner.shared.hooks.refusals;
+        [0, 1, 2].map(|i| r[i].load(Ordering::Relaxed))
+    }
+
+    /// The seqnos of cross-shard attempts refused by a participant (`Moved` or
+    /// `BelowFloor`, D244) since the last call, when recording is on
+    /// ([`record_history`](Self::record_history)): their PREPAREs never get a COMMIT, and the
+    /// commit runs again under a new seqno or gives up with `Busy`.
+    #[doc(hidden)]
+    pub fn take_refused_attempts(&self) -> Vec<Seqno> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .shared
+                .hooks
+                .refused
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )

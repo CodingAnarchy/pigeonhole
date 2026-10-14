@@ -31,6 +31,19 @@ use crate::snapshot::TabletEntry;
 /// Row samples kept per tablet and balancer interval (split points for write skew).
 const SAMPLES: usize = 64;
 
+/// Why a PREPARE is refused (D245), and the index of its test-hook count
+/// (`Engine::refusal_counts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloorRefusal {
+    MoveRaise = 0,
+    Below = 1,
+    Above = 2,
+}
+
+/// `ShardState::stamps` drops the entries at or below the visible watermark once it holds
+/// this many (D244).
+const STAMPS_PRUNE_AT: usize = 32;
+
 /// Weight of the newest interval in the moving averages of write load (#103): one interval's
 /// noise never decides a move on its own.
 const LOAD_ALPHA: f64 = 0.5;
@@ -162,11 +175,29 @@ impl ShardState {
         m: Member,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) -> Option<Member> {
-        if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-            return Some(m);
+        match m.kind {
+            MemberKind::CommitRecord { .. } => Some(m),
+            MemberKind::Prepare { .. } => self.route_prepare(m, ctx),
+            MemberKind::Single => self.route_by_map(m, ctx),
         }
-        if self.below_floor(&m) {
-            // The coordinator's retry reads this shard's floor again.
+    }
+
+    /// A PREPARE's admission routing: refused out of seqno order with what this shard
+    /// stamped (D142, D244, D245), else routed as any member and, when it runs here, kept
+    /// for later PREPAREs' checks.
+    #[inline(never)]
+    fn route_prepare(&mut self, m: Member, ctx: &mut ShardContext<'_, ShardMsg>) -> Option<Member> {
+        if let Some(why) = self.floor_refusal(&m) {
+            // The coordinator's retry reads this shard's floor again, raised to the refused
+            // timestamp, or past the earlier-seqno timestamp above it that refused it
+            // (D244, D245): the retry's fresh timestamp clears what refused this one.
+            #[cfg(feature = "test-hooks")]
+            self.shared.hooks.refusals[why as usize].fetch_add(1, Ordering::Relaxed);
+            let conflict = match why {
+                FloorRefusal::Below => self.floor_below(m.seqno),
+                FloorRefusal::MoveRaise | FloorRefusal::Above => 0,
+            };
+            self.raise_ts_floor(m.commit_ts.max(conflict));
             let floor = self.ts_floor();
             self.shared.ts_floors[usize::from(self.id.0)]
                 .0
@@ -174,6 +205,16 @@ impl ShardState {
             self.refuse_prepare(m, PrepareError::BelowFloor, ctx);
             return None;
         }
+        let m = self.route_by_map(m, ctx)?;
+        self.note_prepare(&m);
+        Some(m)
+    }
+
+    /// Routing through the tablet map for a single or a PREPARE: returns it if this shard
+    /// should run it now; parks, forwards or refuses it otherwise. Inlined into both callers:
+    /// a single's commit path pays no call for it.
+    #[inline(always)]
+    fn route_by_map(&mut self, m: Member, ctx: &mut ShardContext<'_, ShardMsg>) -> Option<Member> {
         let single = matches!(m.kind, MemberKind::Single);
         if self.moving.is_empty() && m.map_version >= self.lost_version {
             return Some(m);
@@ -249,21 +290,132 @@ impl ShardState {
         out
     }
 
-    /// Whether `m` is a PREPARE writing rows at a commit timestamp below a default timestamp
-    /// this shard already assigned. The coordinator picked it above the floor it read, but
-    /// this shard may have assigned more since (to any of its tablets, a received one
-    /// included): applying it would put a write at a lower timestamp after a write at a
-    /// higher one, so a tablet's default timestamps would go backwards (D11, issue #105).
-    /// Ties are allowed: they never reorder.
-    fn below_floor(&self, m: &Member) -> bool {
-        if !self.tablets_on() || !matches!(m.kind, MemberKind::Prepare { .. }) {
-            return false;
+    /// Why `m`, a PREPARE writing rows at `(S, T)`, would put this shard's timestamps out of
+    /// seqno order (D11, D142, D245), if it would; ties are allowed:
+    /// - `MoveRaise`: `T` is below the floor a shard handing this one a tablet raised it to
+    ///   (`ts_raises`), seqno-blind, as D142 had it: moves are rare.
+    /// - `Below`: this shard gave a seqno below `S` a timestamp above `T` (`floor_below`).
+    ///   The coordinator raised this shard's floor before reserving `S` (D245), so only a
+    ///   write reserved before `S` and stamped after the coordinator read the floors can.
+    /// - `Above`: it gave a seqno above `S` a timestamp below `T`: only a PREPARE whose
+    ///   coordinator read the floors before this one's raised them, and reserved after.
+    fn floor_refusal(&self, m: &Member) -> Option<FloorRefusal> {
+        if !matches!(m.kind, MemberKind::Prepare { .. })
+            || !BatchRef::new(m.bytes.as_slice()).is_ok_and(|b| b.iter().next().is_some())
+        {
+            return None;
         }
         let raised = self.shared.ts_raises[usize::from(self.id.0)]
             .0
             .load(Ordering::Acquire);
-        m.commit_ts < self.ts_floor().max(raised)
+        if m.commit_ts < raised {
+            Some(FloorRefusal::MoveRaise)
+        } else if self.floor_below(m.seqno) > m.commit_ts {
+            Some(FloorRefusal::Below)
+        } else if self
+            .stamps
+            .iter()
+            .any(|&(seqno, ts)| seqno > m.seqno && ts < m.commit_ts)
+        {
+            Some(FloorRefusal::Above)
+        } else {
+            None
+        }
+    }
+
+    /// The largest timestamp this shard gave a seqno below `seqno` (D245): everything pruned
+    /// or stamped before the history, each recent group's first and last single, and each
+    /// routed PREPARE. A group's seqnos are contiguous (one reservation), so a group is
+    /// wholly below or above `seqno`.
+    pub(super) fn floor_below(&self, seqno: Seqno) -> Timestamp {
+        self.stamps
+            .iter()
+            .chain(self.stamps_last.iter())
+            .filter(|&&(s, _)| s < seqno)
+            .map(|&(_, ts)| ts)
+            .fold(self.pruned_max, Timestamp::max)
+    }
+
+    /// Folds the coordinators' raises into the floor (D245): once per group, after its
+    /// reservation, so the load follows the reservation's read-modify-write on `NEXT_SEQNO`.
+    #[inline(never)]
+    pub(super) fn fold_coord_raise(&mut self) {
+        let raised = self.shared.ts_coord_raises[usize::from(self.id.0)]
+            .0
+            .load(Ordering::Acquire);
+        if raised > self.ts_floor {
+            self.ts_floor = raised;
+            self.floor_by_coord = true;
+        }
+    }
+
+    /// A PREPARE routed to this shard (D244): kept, so a PREPARE at another seqno, in this
+    /// group or a later one, is checked against it (`floor_refusal`).
+    #[inline(never)]
+    fn note_prepare(&mut self, m: &Member) {
+        if matches!(m.kind, MemberKind::Prepare { .. })
             && BatchRef::new(m.bytes.as_slice()).is_ok_and(|b| b.iter().next().is_some())
+        {
+            self.note_stamp(m.seqno, m.commit_ts);
+        }
+    }
+
+    /// An admitted PREPARE (D244): its timestamp raises the floor before the group's
+    /// singles are stamped, so none of those, all at later seqnos, lands below it. A PREPARE
+    /// that waits for room raises nothing yet; the singles stamped meanwhile fold in its
+    /// coordinator's raise (D245), so they land above it anyway.
+    #[inline(never)]
+    pub(super) fn raise_for_prepare(&mut self, m: &Member) {
+        if BatchRef::new(m.bytes.as_slice()).is_ok_and(|b| b.iter().next().is_some()) {
+            self.raise_ts_floor(m.commit_ts);
+        }
+    }
+
+    /// Drops a refused or aborted PREPARE's entry (D244): it never lands, and it would keep
+    /// refusing PREPAREs out of order with it until the watermark passes it.
+    pub(super) fn drop_stamp(&mut self, seqno: Seqno) {
+        if !self.stamps.is_empty() {
+            self.stamps.retain(|&(s, _)| s != seqno);
+        }
+    }
+
+    /// Keeps a group's first and last singles (D244, D245): a group's seqnos are
+    /// contiguous, and its timestamps rise with them.
+    #[inline(never)]
+    pub(super) fn note_group_stamps(&mut self, admitted: &[Member]) {
+        if let Some(m) = admitted
+            .iter()
+            .find(|m| matches!(m.kind, MemberKind::Single))
+        {
+            self.note_stamp(m.seqno, m.commit_ts);
+        }
+        if let Some(m) = admitted
+            .iter()
+            .rev()
+            .find(|m| matches!(m.kind, MemberKind::Single))
+        {
+            self.stamps_last.push((m.seqno, m.commit_ts));
+        }
+    }
+
+    /// Keeps `(seqno, ts)` for `floor_refusal`: a PREPARE that seqno could meet has a lower
+    /// seqno still held by its coordinator, so above the visible watermark; entries at or
+    /// below it are dropped, their timestamps kept in `pruned_max`.
+    pub(super) fn note_stamp(&mut self, seqno: Seqno, ts: Timestamp) {
+        if self.stamps.len() >= STAMPS_PRUNE_AT || self.stamps_last.len() >= STAMPS_PRUNE_AT {
+            let visible = self.shared.shm.visible_seqno();
+            let mut pruned = self.pruned_max;
+            for v in [&mut self.stamps, &mut self.stamps_last] {
+                v.retain(|&(s, t)| {
+                    s > visible || {
+                        pruned = pruned.max(t);
+                        false
+                    }
+                });
+            }
+            self.pruned_max = pruned;
+        }
+        self.stamps.push((seqno, ts));
     }
 
     /// A PREPARE refused without a record: for rows this shard is moving or no longer owns
@@ -278,6 +430,7 @@ impl ShardState {
         let MemberKind::Prepare { coordinator } = m.kind else {
             return;
         };
+        self.drop_stamp(m.seqno);
         if let Some(share) = self.prepared.remove(&m.seqno) {
             if share.tracked {
                 self.track_share_rows(share.bytes.batch().as_bytes(), false);

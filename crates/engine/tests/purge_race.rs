@@ -59,22 +59,26 @@ fn a_put_below_min_ts_above_during_a_bottommost_compaction_keeps_reads() {
 }
 
 #[test]
-fn a_share_at_a_lagging_default_timestamp_voids_the_purge() {
-    // With tablet changes off a share keeps its coordinator's commit timestamp even below
-    // the participant's floor (D11 refuses that only with tablet changes on). Here the other
-    // shard's clock-based timestamp is the first default one, below the inputs: a column
-    // delete at the second over a put at the first. The share's put lands at the first
-    // timestamp, hidden by the delete until it is purged. It counts at its commit
-    // timestamp, not the participant's floor (raised above every input by a write to
-    // another table on the shard).
-    check(&Case {
+fn a_share_never_lands_below_its_participants_floor_so_it_leaves_the_purge_alone() {
+    // With tablet changes off, a share used to keep its coordinator's commit timestamp even
+    // below the participant's floor (D192's note): here the other shard's first default
+    // timestamp, below the inputs, so it had to void the purge. D244 orders shares with
+    // tablet changes off too: the participant, whose floor a write to another table raised
+    // above every input, refuses it below its floor, and the retry lands above the inputs.
+    // It leaves the compaction alone and reads as the newest version.
+    let case = Case {
         seed: 321,
         first: |wb, t, f| wb.put(t, f, b"r", b"q", None, ValueRef::Bytes(b"old")),
         second: |wb, t, f| wb.delete_column(t, f, b"r", b"q", None),
         raise_floor: true,
         during: |wb, t, f| wb.put(t, f, b"r", b"q", None, ValueRef::Bytes(b"late")),
         cross: Cross::There,
-    });
+    };
+    for at in [Stage::Plan, Stage::Install] {
+        let r = race(&case, at, FlushGcMutation::None);
+        assert_untouched(&r, at, Cross::There);
+        assert_eq!(r.after.map(|(_, v)| v), Some(b"late".to_vec()), "{at:?}");
+    }
 }
 
 #[test]

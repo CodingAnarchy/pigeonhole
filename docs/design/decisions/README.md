@@ -210,6 +210,8 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D194](phase-3.md#d194) — Reads skip superseded memtable versions through a writer-only, process-local stale-tail index; off until measured · owner decision, #387 · in-node alternative deferred as #397
 - [D195](phase-3.md#d195) — Three instruction ceilings are raised to main's counts (#384 raced the ceilings; get-sst placement drift); ceiling changes are measured on the current main · owner decision, bench, CI · amends D193
 - [D225](phase-3.md#d225) — A participant's PREPARE may be checkpointed once its commit is settled (every share in SSTs: `CommitSettled`), not once the coordinator checkpointed the COMMIT, which let crossed cross-shard commits pin each other's checkpoints and hang the close; a coordinator counts its own share without a message to itself · coordinator decision, engine, #585 · amends D116
+- [D244](phase-3.md#d244) — A participant keeps a cross-shard commit's timestamp in seqno order with what it already stamped, with tablet changes on or off: admitted PREPAREs raise the floor before a group's singles are stamped, and a PREPARE out of order with a stamp is refused (#653; backported to 0.2.3) · owner decision, engine, tablets · amends D142, D192's note
+- [D245](phase-3.md#d245) — A cross-shard commit's timestamp is checked exactly by seqno; the coordinator raises participants' floors (`ts_coord_raises`) before it reserves (#637; backported to 0.2.3 without the arena-room refusal) · owner decision, engine, tablets · amends D142, D244
 
 ## Open questions
 _None._

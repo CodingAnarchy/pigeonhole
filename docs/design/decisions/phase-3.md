@@ -63,3 +63,29 @@ In the common overwrite pattern (each new version has a newer timestamp, so it i
 - The same case runs a second loop with tablets splitting, merging and moving (`tablet_ops_ppm` 20 000, the fast balancer), where a moved slot or a retired tablet reads as flushed through the published catalog.
 - Telling participants before the shares are settled fails that case with `LostAckedCommit`. A tablet change that commits before the moving tablet's frozen memtables are flushed (the `frozen.is_empty()` wait in `progress_op` dropped) fails its tablet loop.
 - `engine/tests/close_crossed.rs` closes after concurrent cross-shard commits on real files, under a watchdog.
+
+<a id="d244"></a>
+## D244 — A participant keeps a cross-shard commit's timestamp in seqno order with what it already stamped, with tablet changes on or off (owner decision, 2026-10-13; engine, tablets, #653; amends D142, D192's note; backported to 0.2.3)
+**Problem (#653).** A coordinator reserved a cross-shard commit's seqno, then picked its timestamp from the participants' floors. A participant could stamp singles at later seqnos below that timestamp: those queued ahead of the PREPARE in the same group (stamped before the PREPARE's timestamp raised its floor), or stamped in an earlier group from a floor that ran behind. A later seqno at a lower timestamp on one tablet reorders D11's default timestamps: a later write can be hidden behind an earlier one, a lost update. With tablet changes off, D142's check did not run at all.
+
+**Decided:**
+- An admitted PREPARE raises the participant's floor at admission, before the group's singles are stamped.
+- A participant keeps each recent group's first single and each routed PREPARE, by seqno (`stamps`), and refuses (`BelowFloor`) a PREPARE out of seqno order with one of them. The coordinator retries with a fresh timestamp. An aborted or refused PREPARE's entry is dropped.
+- All of this runs with tablet changes on or off, whenever there is more than one shard. The coordinator keeps a commit's parts for the retry either way.
+
+**On 0.2.x:** a refused commit is retried as a `Moved` one is, and gives up with `Busy` after 16 tries or the write-stall timeout (#102); main's D241 retries until the timeout only. D245 makes ordering refusals rare.
+
+<a id="d245"></a>
+## D245 — A cross-shard commit's timestamp is checked exactly by seqno; its coordinator raises the participants' floors before it reserves (owner decision, 2026-10-13; engine, tablets, #637; amends D142, D244; backported to 0.2.3 without the arena-room refusal)
+**Decided** (tablet changes on or off, as D244):
+- **The coordinator raises, then reserves.** `start_coordination` picks `T` above each participant's published floor, move raise and coordinator raise. It `fetch_max`es `T` into every participant's `Shared::ts_coord_raises` (Release), and only then reserves the commit's seqno `S`. A participant's later reservation follows on `NEXT_SEQNO`, and its group loads `ts_coord_raises` (Acquire) once after reserving, before it stamps: a single at a seqno above `S` always stamps above `T`.
+- **The participant's check is exact by seqno.** A PREPARE `(S, T)` is refused only if a write at a seqno below `S` has a timestamp above `T` (`floor_below`: `stamps`, each group's last single in `stamps_last`, and `pruned_max`), or a write at a seqno above `S` has a timestamp below `T`. The move-raise check stays as D142 had it. What can still refuse is a straddle (a reservation before `S` stamped after the coordinator's read) or two coordinators' crossing pick-to-reserve windows.
+- **A retry keeps its first timestamp** only while it is at or above every participant's coordinator raise and fits `preset_fits`.
+- **On 0.2.x, a participant's floor that only a coordinator's raise set** (`floor_by_coord`) holds no write, so a retried commit's preset may tie it. Without this, a commit whose first attempt raised a shard and was refused `Moved`, then retried there alone, took the raise plus one instead of its first timestamp (the public model suite's `quiet_runs_match_the_model` caught it). Any write at or above the floor clears it.
+
+**Why:** with D244 alone, D142's assignment-order check raced the participants' wall-clock stamps. On main's AX102 run it refused each cross-shard commit about 3 times and cost 9x the throughput under contention.
+
+**Not backported to 0.2.x:** the arena-room refusal (`PrepareError::Room`, `RoomFreed`, ICR 0042, #655). On 0.2.x a PREPARE short of room waits as before. Its held seqno keeps the visible watermark below the memtables a freeze waits for, so on a frozen clock that wait never ends, and on a real one it ends at the write-stall timeout. That is unchanged from 0.2.2: no new waits come from this backport.
+
+**Tests on 0.2.x** (`crates/engine/tests/tablets.rs`): `a_participant_never_stamps_a_later_seqno_below_a_prepared_commit_timestamp` (#653: fails on 0.2.2), the earlier-group tests, `a_moved_retry_keeping_its_timestamp_still_raises_its_new_participant_first`, `an_aborted_prepare_does_not_keep_refusing_later_commits`, and the D142 sweeps on and off with zero ordering refusals. The earlier-group and moved-retry tests use a 1 GiB arena, which keeps them clear of the room wait above. Main's loom models (`ts_order_loom.rs`) model the protocol alone and are not ported: 0.2.x has no engine loom setup.
+
