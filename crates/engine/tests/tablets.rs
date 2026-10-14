@@ -2925,3 +2925,233 @@ fn limited_scans_over_levels_of_several_ssts_match_across_a_split() {
         }
     }
 }
+
+/// An async transaction's snapshot must stay pinned until its validation runs. Here a
+/// single-shard transaction reads row `a`, a delete of `a` commits after its snapshot, and
+/// the transaction then waits behind an undecided cross-shard share on `a` while a full
+/// compaction runs on its shard. Unpinned, the compaction purges the delete with the value
+/// it hides (no live snapshot needs them), and validation no longer sees a write above the
+/// snapshot: the transaction commits a lost update instead of failing with `Conflict`.
+fn async_txn_after_a_purged_delete(
+    pin: bool,
+    compact: bool,
+) -> pigeonhole_engine::Result<pigeonhole_engine::CommitInfo> {
+    let mut db = open(2, |_| {});
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    let (low, high) = (usize::from(low), usize::from(high));
+    db.put(b"a", b"v0");
+    db.put(b"z", b"z0");
+    let fl = db.engine.submit_flush().unwrap();
+    db.drive(fl).unwrap();
+
+    // T reads `a` at its snapshot and writes it.
+    let mut t = db.engine.begin().unwrap();
+    assert!(t.get(id, f, b"a", b"q").unwrap().is_some());
+    t.batch()
+        .put(id, f, b"a", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let held = pin.then(|| t.snapshot().clone());
+
+    // A delete of `a` commits after T's snapshot, and reaches an SST.
+    let mut wb = WriteBatch::new();
+    wb.delete_family(id, f, b"a", None).unwrap();
+    db.commit(wb);
+    let fl = db.engine.submit_flush().unwrap();
+    db.drive(fl).unwrap();
+
+    // X: cross-shard (z first, so `high` coordinates), writing `a`, and doomed: its read of
+    // `z` is overwritten after its snapshot, so `high` refuses its own share. `low` prepares
+    // X's share on `a`, which stays undecided while `high` does not run.
+    let mut x = db.engine.begin().unwrap();
+    x.get(id, f, b"z", b"q").unwrap();
+    x.batch()
+        .put(id, f, b"z", b"q", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    x.batch()
+        .put(id, f, b"a", b"q", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    db.put(b"z", b"z1");
+    let mut px = x.submit(Some(Durability::Buffered)).unwrap();
+    let now = db.clock.monotonic_nanos();
+    db.shards[high].run_once(now + 1_000);
+    db.shards[low].run_once(now + 1_000);
+
+    // T is submitted (its snapshot handle goes with `t` unless `held` keeps it) and waits on
+    // X's share in `low`'s pending queue.
+    let t_seqno = t.snapshot().seqno();
+    let mut pt = t.submit(Some(Durability::Buffered)).unwrap();
+    // The waiting commit holds T's snapshot (#672).
+    assert!(db.engine.live_snapshot_seqnos().contains(&t_seqno));
+    // A full compaction runs on `low` alone, while X stays undecided.
+    let _compact = compact.then(|| db.engine.submit_compact(Some(id)).unwrap());
+    for _ in 0..10_000 {
+        let now = db.clock.monotonic_nanos();
+        if !db.shards[low].run_once(now + 1_000) {
+            break;
+        }
+    }
+    // Now everything runs: X aborts, T is admitted and validated.
+    let mut cx = Context::from_waker(Waker::noop());
+    let r = loop {
+        if let Poll::Ready(r) = Pin::new(&mut pt).poll(&mut cx) {
+            break r;
+        }
+        db.step();
+    };
+    while Pin::new(&mut px).poll(&mut cx).is_pending() {
+        db.step();
+    }
+    drop(held);
+    r
+}
+
+#[test]
+fn an_async_transaction_conflicts_with_a_delete_purged_before_its_validation() {
+    // The control: with the snapshot held, the delete survives the compaction.
+    assert!(
+        matches!(
+            async_txn_after_a_purged_delete(true, true),
+            Err(pigeonhole_engine::Error::Conflict)
+        ),
+        "control: a pinned snapshot must see the delete as a conflict"
+    );
+    // The second control: unpinned but with no compaction, the delete is still there.
+    assert!(
+        matches!(
+            async_txn_after_a_purged_delete(false, false),
+            Err(pigeonhole_engine::Error::Conflict)
+        ),
+        "control: without the compaction the delete must still conflict"
+    );
+    let r = async_txn_after_a_purged_delete(false, true);
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "an unpinned async transaction committed past a delete above its snapshot: {r:?}"
+    );
+}
+
+/// Polls `pc` to its outcome, driving every shard.
+fn resolve(
+    db: &mut Db,
+    pc: &mut pigeonhole_engine::PendingCommit,
+) -> pigeonhole_engine::Result<pigeonhole_engine::CommitInfo> {
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(r) = Pin::new(&mut *pc).poll(&mut cx) {
+            return r;
+        }
+        db.step();
+    }
+}
+
+/// A two-shard store with rows below `m` on one shard and rows from `m` on the other.
+fn split_db() -> Db {
+    let mut db = open(2, |_| {});
+    let id = db.table.id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    db
+}
+
+#[test]
+fn a_transactions_commit_releases_its_snapshot_on_every_outcome() {
+    // #672: the commit owns the transaction's snapshot until it resolves, whatever the
+    // outcome, and whether or not anyone still polls it.
+    let mut db = split_db();
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    db.put(b"a", b"v0");
+    db.put(b"z", b"z0");
+    assert!(db.engine.live_snapshot_seqnos().is_empty());
+    let put = |t: &mut pigeonhole_engine::Txn, row: &[u8]| {
+        t.batch()
+            .put(id, f, row, b"q", None, ValueRef::Bytes(b"t"))
+            .unwrap();
+    };
+
+    // Committed, single-shard.
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, b"a", b"q").unwrap();
+    put(&mut t, b"a");
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    assert!(resolve(&mut db, &mut pc).is_ok());
+    db.settle();
+    assert_eq!(db.engine.live_snapshot_seqnos(), vec![], "committed");
+
+    // Committed, cross-shard (the coordinator keeps a copy for retries).
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, b"a", b"q").unwrap();
+    t.get(id, f, b"z", b"q").unwrap();
+    put(&mut t, b"z");
+    put(&mut t, b"a");
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    assert!(resolve(&mut db, &mut pc).is_ok());
+    db.settle();
+    assert_eq!(
+        db.engine.live_snapshot_seqnos(),
+        vec![],
+        "cross-shard committed"
+    );
+
+    // A real conflict, cross-shard.
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, b"z", b"q").unwrap();
+    put(&mut t, b"z");
+    put(&mut t, b"a");
+    db.put(b"z", b"z1");
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    assert!(matches!(
+        resolve(&mut db, &mut pc),
+        Err(pigeonhole_engine::Error::Conflict)
+    ));
+    db.settle();
+    assert_eq!(db.engine.live_snapshot_seqnos(), vec![], "conflict");
+
+    // The future dropped right after submitting: the commit still holds the snapshot until
+    // it is validated, then lets it go.
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, b"a", b"q").unwrap();
+    put(&mut t, b"a");
+    let seqno = t.snapshot().seqno();
+    let pc = t.submit(Some(Durability::Buffered)).unwrap();
+    assert_eq!(
+        db.engine.live_snapshot_seqnos(),
+        vec![seqno],
+        "held while submitted"
+    );
+    drop(pc);
+    assert_eq!(
+        db.engine.live_snapshot_seqnos(),
+        vec![seqno],
+        "held after the drop"
+    );
+    db.settle();
+    assert_eq!(db.engine.live_snapshot_seqnos(), vec![], "dropped future");
+
+    // The async path, dropped before it was ever polled.
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, b"a", b"q").unwrap();
+    put(&mut t, b"a");
+    drop(t.submit_async(Some(Durability::Buffered)).unwrap());
+    db.settle();
+    assert_eq!(
+        db.engine.live_snapshot_seqnos(),
+        vec![],
+        "dropped async future"
+    );
+}

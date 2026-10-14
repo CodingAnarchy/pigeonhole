@@ -53,7 +53,7 @@ use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View}
 use crate::source::{ColumnKey, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::timer_state::TimerState;
 use crate::waker::StdWaker;
-use crate::write::{ReadKey, Settled};
+use crate::write::{ReadKey, Settled, Validate};
 use crate::{CommitInfo, Error, Predicate, Result};
 
 /// Worst-case memtable overhead per entry: node header and a full tower, plus alignment.
@@ -835,7 +835,7 @@ pub(crate) struct CommitReq {
     pub reply: Reply,
     pub submitted_at: u64,
     /// Optimistic validation: the snapshot seqno and the reads to check.
-    pub validate: Option<(Seqno, Vec<ReadKey>)>,
+    pub validate: Option<Box<Validate>>,
     /// `check_and_mutate`: the row and predicate to test first. Boxed: rare, and the
     /// largest part of the request, which every queued message is sized for.
     pub predicate: Option<RowPredicate>,
@@ -882,7 +882,7 @@ pub(crate) struct CoordinateReq {
     pub durability: Durability,
     pub reply: Notifier<Result<Settled>>,
     pub submitted_at: u64,
-    pub validate: Option<(Seqno, Vec<ReadKey>)>,
+    pub validate: Option<Box<Validate>>,
     /// Version of the tablet map the parts were routed with: a commit a participant refused
     /// because it is moving a tablet is retried once the map is newer.
     pub map_version: u64,
@@ -905,7 +905,7 @@ pub(crate) struct PrepareReq {
     pub coordinator: ShardId,
     pub bytes: Arc<BatchBuilder>,
     pub durability: Durability,
-    pub validate: Option<(Seqno, Vec<ReadKey>)>,
+    pub validate: Option<Box<Validate>>,
     /// Every shard the commit was routed to: a share routed with an older tablet map runs
     /// again only when one of its rows now lives outside them (#102).
     pub participants: Vec<ShardId>,
@@ -1114,7 +1114,7 @@ struct Member {
     bytes: Bytes,
     reply: Reply,
     submitted_at: u64,
-    validate: Option<(Seqno, Vec<ReadKey>)>,
+    validate: Option<Box<Validate>>,
     predicate: Option<RowPredicate>,
     ticket: Option<CommitTicket>,
     /// Failed before being logged (not applied, resolved with this error).
@@ -1231,7 +1231,7 @@ struct Coord {
     shards: Vec<ShardId>,
     /// The request, kept for a retry when a participant refused with `Moved`.
     parts: Vec<(ShardId, Arc<BatchBuilder>)>,
-    validate: Option<(Seqno, Vec<ReadKey>)>,
+    validate: Option<Box<Validate>>,
     map_version: u64,
     moved: bool,
     /// A participant refused `commit_ts` as below its floor: the retry takes a fresh one.
@@ -4463,7 +4463,7 @@ impl ShardState {
                     }
                 }
             }
-            if let Some((snapshot, reads)) = &m.validate {
+            if let Some((snapshot, reads)) = m.validate.as_ref().map(|v| (&v.seqno, &v.reads)) {
                 let mut conflict = false;
                 for r in reads {
                     match self.conflicts(*snapshot, r) {
@@ -5671,7 +5671,7 @@ impl ShardState {
                 check(hash_row(mu.table, mu.row));
             }
         }
-        if let Some((_, reads)) = &m.validate {
+        if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 check(hash_row(r.table, &r.row));
             }

@@ -305,7 +305,7 @@ impl ShardState {
             }
         }
         // A PREPARE carries the whole commit's reads; each participant validates its own.
-        if let Some((_, reads)) = &m.validate {
+        if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 look(r.table, &r.row, prepare);
             }
@@ -375,7 +375,7 @@ impl ShardState {
         let shards = commit_shards(
             &view,
             m.bytes.as_slice(),
-            m.validate.as_ref().map(|(_, r)| r.as_slice()),
+            m.validate.as_ref().map(|v| v.reads.as_slice()),
             m.predicate.as_deref().map(|(t, r, _)| (*t, r.as_slice())),
         );
         let shards = match shards {
@@ -2113,7 +2113,7 @@ fn member_rows(m: &Member) -> Vec<u64> {
             out.push(hash_row(mu.table, mu.row));
         }
     }
-    if let Some((_, reads)) = &m.validate {
+    if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
         for r in reads {
             out.push(hash_row(r.table, &r.row));
         }
