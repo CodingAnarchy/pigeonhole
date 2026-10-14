@@ -6,11 +6,17 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-14
+A fix for a lost write under concurrent cross-shard and single-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 to 0.2.2 open as before. Every published crate moves to 0.2.3 together.
+
+**Known issue (#655, also in 0.2.2):** a cross-shard commit that finds a participant's memtable arena full waits for room while holding its sequence number, and that participant's flush waits for the same sequence number to become visible. With a real clock the wait ends at the write-stall timeout (`Options::write_stall_timeout`, 30 s by default): the commit, and writes queued behind it on that shard, get `Busy` and can be retried. It needs a full arena, so a larger `Options::memtable_budget` makes it rarer. 0.3.0 refuses such a commit and retries it once room frees, instead of letting it wait (D245).
+
 ### Fixed
 - **A write could be lost behind an earlier cross-shard commit to the same row** (#653, D244, D245).
   - **When:** a commit wrote rows on more than one shard, and another thread wrote the same rows on one of those shards, without explicit timestamps, just after it. More likely with many threads and busy shards. Tablet changes on or off.
   - **What happened:** the shard could give the later single-shard write a default timestamp below the cross-shard commit's. Reads then returned the cross-shard commit's older value, and the later write was lost.
   - **The fix:** the coordinating shard raises every participant's timestamp floor before it takes the commit's sequence number, so later writes there stamp above the commit (D245). A participant also refuses a commit whose timestamp would land out of order with writes it has already made, and the commit is retried with a fresh timestamp (D244).
+  - **Side effect:** a cross-shard commit refused this way is retried internally. Like one refused for a tablet change, it gets `Busy` after 16 refusals or the write-stall timeout. That is rare, since the floor raise above prevents almost every refusal.
 
 ## [0.2.2] - 2026-10-12
 Fixes to closing a database after cross-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 and 0.2.1 open as before. Every published crate moves to 0.2.2 together.
@@ -113,7 +119,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.1.0...v0.2.0
