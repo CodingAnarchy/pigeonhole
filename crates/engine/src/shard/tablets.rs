@@ -343,7 +343,10 @@ impl ShardState {
         let raised = self.shared.ts_coord_raises[usize::from(self.id.0)]
             .0
             .load(Ordering::Acquire);
-        self.ts_floor = self.ts_floor.max(raised);
+        if raised > self.ts_floor {
+            self.ts_floor = raised;
+            self.floor_by_coord = true;
+        }
     }
 
     /// A PREPARE routed to this shard (D244): kept, so a PREPARE at another seqno, in this

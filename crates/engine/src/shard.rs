@@ -2012,6 +2012,10 @@ pub(crate) struct ShardState {
     /// More than one shard: cross-shard commits can run, and their timestamps are kept in
     /// seqno order with each participant's writes (D244).
     cross: bool,
+    /// `ts_floor` was last set by a coordinator's raise (`fold_coord_raise`, D245), not by a
+    /// write: this shard holds nothing at that timestamp, so a retried commit's preset may
+    /// tie it (`default_ts_or`), as a preset may tie a coordinator raise at its coordinator.
+    floor_by_coord: bool,
     /// The last unpin pass forced every record below this position, at `log_bytes` equal
     /// to `unpin_at`.
     unpin_upto: u64,
@@ -2203,6 +2207,7 @@ impl ShardState {
             stamps: Vec::new(),
             stamps_last: Vec::new(),
             pruned_max: ts_floor,
+            floor_by_coord: false,
             unpin_upto: 0,
             unpin_at: 0,
             asked: HashMap::new(),
@@ -2304,6 +2309,10 @@ impl ShardState {
 
     pub(crate) fn raise_ts_floor(&mut self, ts: Timestamp) {
         trace!("shard {} raise floor {} -> {ts}", self.id.0, self.ts_floor);
+        if ts >= self.ts_floor {
+            // A write at the floor or above it: a tie with it is no longer free.
+            self.floor_by_coord = false;
+        }
         if ts > self.ts_floor {
             self.ts_floor = ts;
             // Coordinators read it to keep a moved tablet's timestamps above its old floor,
@@ -3357,7 +3366,15 @@ impl ShardState {
         let raise = *self.shared.ts_raisers[usize::from(self.id.0)]
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if preset_fits(preset, own, self.id, self.ts_floor, raise) {
+        // A floor only a coordinator's raise set holds no write at it: a tie is free (D245).
+        // Without this, a commit whose attempt raised this shard and was refused `Moved`,
+        // then retried here alone, would lose its first timestamp to its own raise.
+        let floor = if self.floor_by_coord && preset == self.ts_floor {
+            preset - 1
+        } else {
+            self.ts_floor
+        };
+        if preset_fits(preset, own, self.id, floor, raise) {
             self.raise_ts_floor(preset);
             return preset;
         }
@@ -3373,6 +3390,7 @@ impl ShardState {
             .load(Ordering::Acquire);
         self.ts_floor = self.ts_floor.max(raised);
         let ts = now.max(self.ts_floor + 1);
+        self.floor_by_coord = false;
         trace!(
             "shard {} default_ts now={now} floor={} -> {ts}",
             self.id.0, self.ts_floor
