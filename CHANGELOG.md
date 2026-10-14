@@ -6,6 +6,12 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+- **A write could be lost behind an earlier cross-shard commit to the same row** (#653, D244, D245).
+  - **When:** a commit wrote rows on more than one shard, and another thread wrote the same rows on one of those shards, without explicit timestamps, just after it. More likely with many threads and busy shards. Tablet changes on or off.
+  - **What happened:** the shard could give the later single-shard write a default timestamp below the cross-shard commit's. Reads then returned the cross-shard commit's older value, and the later write was lost.
+  - **The fix:** the coordinating shard raises every participant's timestamp floor before it takes the commit's sequence number, so later writes there stamp above the commit (D245). A participant also refuses a commit whose timestamp would land out of order with writes it has already made, and the commit is retried with a fresh timestamp (D244).
+
 ## [0.2.2] - 2026-10-12
 Fixes to closing a database after cross-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 and 0.2.1 open as before. Every published crate moves to 0.2.2 together.
 

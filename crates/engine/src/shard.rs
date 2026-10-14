@@ -357,6 +357,11 @@ pub(crate) struct Shared {
     /// Per shard, the shards whose floor set its current raise (a bit per shard below 64),
     /// with that raise: a retried commit may tie a raise only its own shards made.
     pub ts_raisers: Vec<Mutex<(Timestamp, u64)>>,
+    /// Per shard, the largest timestamp a coordinator of a cross-shard commit it takes part
+    /// in picked, raised (`fetch_max`, Release) before that coordinator reserved the
+    /// commit's seqno (D245). The shard's stamping folds it in (Acquire), so its singles at
+    /// later seqnos land above the commit; coordinators read it too.
+    pub ts_coord_raises: Vec<Padded>,
     /// Per-shard load as of its last balancer interval.
     pub loads: Vec<LoadSlot>,
     pub balance: BalanceConfig,
@@ -1994,6 +1999,19 @@ pub(crate) struct ShardState {
     /// Slots flushed because their records pinned the checkpoint, whatever their size,
     /// until their active memtable freezes.
     unpin: BTreeSet<(TabletId, FamilyId)>,
+    /// With more than one shard, the first default timestamp of each recent group of singles
+    /// and each routed PREPARE's, by seqno, above the visible watermark (D244): a PREPARE out
+    /// of seqno order with one of them is refused.
+    stamps: Vec<(Seqno, Timestamp)>,
+    /// Each recent group's last single `(seqno, ts)` (D245), beside `stamps`.
+    stamps_last: Vec<(Seqno, Timestamp)>,
+    /// The largest timestamp of the entries pruned from `stamps` and `stamps_last`, and of
+    /// everything stamped before them (the floor at open, raised by replay; D245): every
+    /// such seqno is below any PREPARE still to be checked.
+    pruned_max: Timestamp,
+    /// More than one shard: cross-shard commits can run, and their timestamps are kept in
+    /// seqno order with each participant's writes (D244).
+    cross: bool,
     /// The last unpin pass forced every record below this position, at `log_bytes` equal
     /// to `unpin_at`.
     unpin_upto: u64,
@@ -2123,7 +2141,9 @@ impl ShardState {
         let leveled = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
         let tiered = CompactionPicker::new(CompactionStyle::Tiered, shared.picker.clone());
         let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
+        let cross = shared.ts_floors.len() > 1;
         let shard = Self {
+            cross,
             id,
             shared,
             wal: None,
@@ -2180,6 +2200,9 @@ impl ShardState {
             log: VecDeque::new(),
             log_bytes: 0,
             unpin: BTreeSet::new(),
+            stamps: Vec::new(),
+            stamps_last: Vec::new(),
+            pruned_max: ts_floor,
             unpin_upto: 0,
             unpin_at: 0,
             asked: HashMap::new(),
@@ -2283,8 +2306,9 @@ impl ShardState {
         trace!("shard {} raise floor {} -> {ts}", self.id.0, self.ts_floor);
         if ts > self.ts_floor {
             self.ts_floor = ts;
-            // Coordinators read it to keep a moved tablet's timestamps above its old floor.
-            if self.tablets_on()
+            // Coordinators read it to keep a moved tablet's timestamps above its old floor,
+            // and a share's above its participant's (D244).
+            if (self.cross || self.tablets_on())
                 && let Some(f) = self.shared.ts_floors.get(usize::from(self.id.0))
             {
                 f.0.store(ts, Ordering::Release);
@@ -2318,6 +2342,8 @@ impl ShardState {
         commit_ts: Timestamp,
     ) -> Result<Vec<(TabletId, FamilyId)>> {
         self.raise_ts_floor(commit_ts);
+        // Below every seqno a later PREPARE can carry (D245).
+        self.pruned_max = self.pruned_max.max(commit_ts);
         self.apply(bytes, seqno, commit_ts)?;
         Ok(self.touched_slots.clone())
     }
@@ -3340,7 +3366,8 @@ impl ShardState {
 
     fn default_ts(&mut self) -> Timestamp {
         let now = self.shared.vfs.now_micros();
-        // A shard that handed us a tablet raised our floor to its own (D11).
+        // A shard that handed us a tablet raised our floor to its own (D11). Coordinators'
+        // raises (D245) are folded in once per group, after its reservation (`run_group`).
         let raised = self.shared.ts_raises[usize::from(self.id.0)]
             .0
             .load(Ordering::Acquire);
@@ -3926,13 +3953,17 @@ impl ShardState {
                 }
             }
             self.touch_rows(&m);
-            if let MemberKind::Prepare { .. } = m.kind
-                && let Some(share) = self.prepared.get_mut(&m.seqno)
-                && !share.tracked
-            {
-                share.tracked = true;
-                let bytes = Arc::clone(&share.bytes);
-                self.track_share_rows(bytes.batch().as_bytes(), true);
+            if let MemberKind::Prepare { .. } = m.kind {
+                // Admitted: its timestamp raises the floor before this group's singles are
+                // stamped, below (D244).
+                self.raise_for_prepare(&m);
+                if let Some(share) = self.prepared.get_mut(&m.seqno)
+                    && !share.tracked
+                {
+                    share.tracked = true;
+                    let bytes = Arc::clone(&share.bytes);
+                    self.track_share_rows(bytes.batch().as_bytes(), true);
+                }
             }
             admitted.push(m);
         }
@@ -4071,6 +4102,14 @@ impl ShardState {
             .filter(|m| matches!(m.kind, MemberKind::Single))
             .count() as u64;
         let first = (singles > 0).then(|| self.reserve(singles));
+        // One shard has no cross-shard commits: one test of a field on its commit path. With
+        // more, the coordinators' raises are folded in after this group's reservation, so
+        // every single it stamps, presets included, lands above any cross-shard commit
+        // reserved before it (D245).
+        let cross = self.cross && first.is_some();
+        if cross {
+            self.fold_coord_raise();
+        }
         let mut next = first.unwrap_or(0);
         for m in &mut admitted {
             match m.kind {
@@ -4083,6 +4122,9 @@ impl ShardState {
                     self.raise_ts_floor(m.commit_ts);
                 }
             }
+        }
+        if cross {
+            self.note_group_stamps(&admitted);
         }
 
         // The log: append every record, one write, one submitted sync.
@@ -4770,35 +4812,32 @@ impl ShardState {
             }));
             return;
         }
-        let seqno = self.reserve(1);
-        self.held.insert(seqno);
-        self.publish_watermark();
         let shards: Vec<ShardId> = req.parts.iter().map(|(s, _)| *s).collect();
-        trace!(
-            "shard {} coordinates {seqno} over {shards:?} routed with map v{}",
-            self.id.0, req.map_version
-        );
-        // Above every participant's floor too, including the floor a shard handing it a
-        // tablet raised it to (`ts_raises`): a tablet's default timestamps never go
-        // backwards whichever shard coordinates a commit touching it (D11). A retry keeps its
-        // first timestamp only when it is above every participant's floor, or equal to the
-        // floor of a shard that reached it through this very commit (`Preset::own`): any
-        // other tie would be a write that participant already made at that timestamp.
+        // The timestamp is picked above every participant's floor (D11): its own, the floor a
+        // shard handing it a tablet raised it to (`ts_raises`), and other coordinators' raises
+        // (`ts_coord_raises`). Then every participant's coordinator raise goes to it, and
+        // only then is the seqno reserved (D245): a participant's later seqnos come from
+        // `NEXT_SEQNO` read-modify-writes after this one, so its stamping of them sees the
+        // raise and lands above the timestamp. With tablet changes on or off (D244).
+        // A retry keeps its first timestamp only when it is still at or above every
+        // participant's coordinator raise (a tie never reorders) and fits its floor and move
+        // raise (`preset_fits`). A participant that stamped anything since the first attempt
+        // raised its floor past it, so the retry takes a fresh one; a stamp not yet published
+        // is caught by the participant's own check (D245).
         let mut floor = 0;
         let mut fits = req.commit_ts.is_some();
-        if self.tablets_on() {
-            for s in &shards {
-                let i = usize::from(s.0);
-                let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
-                let raise = *self.shared.ts_raisers[i]
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                floor = floor.max(own_floor).max(raise.0);
-                fits &= req
-                    .commit_ts
-                    .as_ref()
-                    .is_some_and(|p| preset_fits(p.ts, &p.own, *s, own_floor, raise));
-            }
+        for s in &shards {
+            let i = usize::from(s.0);
+            let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
+            let coord = self.shared.ts_coord_raises[i].0.load(Ordering::Acquire);
+            let raise = *self.shared.ts_raisers[i]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            floor = floor.max(own_floor).max(coord).max(raise.0);
+            fits &= req
+                .commit_ts
+                .as_ref()
+                .is_some_and(|p| p.ts >= coord && preset_fits(p.ts, &p.own, *s, own_floor, raise));
         }
         let attempts = req.attempts;
         let (commit_ts, own) = match req.commit_ts {
@@ -4815,6 +4854,20 @@ impl ShardState {
                 (self.default_ts(), vec![self.id])
             }
         };
+        for s in &shards {
+            if *s != self.id {
+                self.shared.ts_coord_raises[usize::from(s.0)]
+                    .0
+                    .fetch_max(commit_ts, Ordering::Release);
+            }
+        }
+        let seqno = self.reserve(1);
+        self.held.insert(seqno);
+        self.publish_watermark();
+        trace!(
+            "shard {} coordinates {seqno} at {commit_ts} over {shards:?} routed with map v{}",
+            self.id.0, req.map_version
+        );
         self.coord.insert(
             seqno,
             Coord {
@@ -4827,17 +4880,10 @@ impl ShardState {
                 failed: None,
                 decided: false,
                 shards: shards.clone(),
-                // Kept for a retry only when a participant may refuse with `Moved`.
-                parts: if self.tablets_on() {
-                    req.parts.clone()
-                } else {
-                    Vec::new()
-                },
-                validate: if self.tablets_on() {
-                    req.validate.clone()
-                } else {
-                    None
-                },
+                // Kept for a retry: a participant may refuse with `Moved` (tablet changes
+                // on) or `BelowFloor` (either way, D244).
+                parts: req.parts.clone(),
+                validate: req.validate.clone(),
                 map_version: req.map_version,
                 moved: false,
                 below_floor: false,
@@ -5016,6 +5062,10 @@ impl ShardState {
         // Every decision is answered, even for a share this shard never held or already
         // dropped (a refused or failed PREPARE): the coordinator waits for every participant.
         let mut error = None;
+        if !commit {
+            // An aborted share never lands: its timestamp orders nothing (D244).
+            self.drop_stamp(seqno);
+        }
         if let Some(share) = self.prepared.remove(&seqno) {
             if share.tracked {
                 self.track_share_rows(share.bytes.batch().as_bytes(), false);
@@ -5114,6 +5164,15 @@ impl ShardState {
             // aborted everywhere and runs again once the tablet map has changed. One that
             // refused the timestamp as below its floor runs again at once, with a fresh one.
             // Either gives up once it was refused too often or waited too long (#102).
+            #[cfg(feature = "test-hooks")]
+            if self.recording() {
+                self.shared
+                    .hooks
+                    .refused
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(seqno);
+            }
             let attempts = c.attempts.saturating_add(1);
             if moved_gives_up(
                 attempts,
