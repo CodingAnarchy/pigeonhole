@@ -1551,3 +1551,48 @@ Each part disabled fails its test.
 - ycsb-a, 16 threads, `--durability default`, defaults against `--no-packing`: at least 95% of packing-off throughput, and put p99 within 1.3×.
 - ycsb-a `--durability buffered`, main against D248: unchanged within noise, and packing still packs.
 - `k` settles with no oscillation over the 60 s.
+
+<a id="d249"></a>
+## D249 — A cross-shard PREPARE that overlaps only an undecided share is refused and retried, not a `Conflict`; crossing pairs resolve older-first (owner decision, 2026-10-13; engine, #406, ICR 0045; amends D145's refusals, builds on D241 and D245)
+
+**Decided:**
+- **The participant (admission of a conditional PREPARE: a transaction or `commit_if`):**
+  - Overlapping a row touched by an earlier member of its own group: it waits for the next group, as conditional singles do. That is this shard's own write, which waits on no other coordinator.
+  - Overlapping another commit's **undecided** share (`pending_rows`): refused with `PendingOverlap`. Nothing waits, so the wait-for graph keeps only today's edges, and there is no deadlock.
+  - `Conflict` reaches the application only from validation (a commit to a read key above the snapshot) or a failed predicate.
+- **The coordinator:** the round is aborted and the commit retried with a fresh seqno, the **same snapshot and read set**, and its timestamp kept where `preset_fits` allows (D245). It gives up with `Busy` at D241's timeout.
+  - Revalidating the same reads against the snapshot at a later seqno is the same OCC check, so a retry can only reach `Conflict` through a real write.
+- **When the retry runs:** on an overlap `Wake` from the refusing participant (D245's wake, generalised: `Wake { from, reason: Room | Overlap }`), never on a timer alone, so it also progresses on a frozen clock.
+  - The participant sends it once no undecided share there overlaps the refused commit's rows.
+  - A wake that comes before the refused round is decided is kept for the retry.
+- **Crossing pairs, older-first:**
+  - **Priority** = `(submitted_at, the seqno of the commit's first attempt)`, the same across retries (carried in a boxed `Retried`).
+  - A commit refused over an **older** commit's share waits at that participant until one of:
+    1. the older commit's next attempt there is decided (a later seqno);
+    2. a `Decide` with `last` (the older commit committed, failed, or gave up; the coordinator decides whether it retries when it sends the abort, and keeps to that);
+    3. a `Released` (the older commit's retry was routed without that participant).
+
+    Each of these comes, so no deferral outlives the older commit's own progress.
+
+**Why:** blob33's measurement (ICR 0045). Cross-shard transactions conflicted 5–16× more often than same-shard ones, and under `GroupSync` 85 times per transfer. Most were not conflicts: a PREPARE that met another commit's share during its 2PC window failed at once, and the application retried in a tight loop.
+
+**Convergence:**
+- Every refusal names an undecided share, and every share is decided in bounded time: its coordinator waits only on replies, which never wait.
+- After the decision, the refused commit either proceeds or validates against a real write.
+- Older-first orders crossing pairs. The oldest of a set of mutually overlapping commits is never deferred, so by induction every commit in a finite set finishes.
+- An endless stream of *new, younger* commits can still beat an old one. D241's timeout bounds that with `Busy`; "intents" are the follow-up if the gate shows it matters.
+
+**Tests** (`crates/engine/tests/tablets.rs`, frozen clock):
+- an overlap with an undecided share that then aborts: the transaction commits, with no `Conflict`;
+- the same with the share committing a write after the snapshot: `Conflict`;
+- two crossing PREPAREs on two shards: both resolve, at least one commits, any `Conflict` is real;
+- on three shards, both refused: the older commits first, then the younger. The trace shows the younger deferred behind the older, then released by the older's next attempt.
+- **The guards (each fails with older-first disabled, `behind` forced to `None`):**
+  - `crossing_prepares_driven_to_recross_every_retry_still_resolve_older_first`: the same pair, with every retry driven in the crossing turn order `[2, 1, 1, 0, 0]`. With the rule, 2 refusals, then A commits and then B. Without it, the pair re-crosses on every retry: 2,002 refusals in 2,000 rounds, and neither resolves on the frozen clock.
+  - `a_younger_commit_refused_behind_an_older_one_waits_for_the_older_ones_next_attempt` (ctr274): with A's coordinator stopped after A's first round aborts, B must not go ahead. Without the rule, A commits at seqno 9 and B at 8.
+  - **Livelock on the simulator:** ctr274's search of 442 two-shard schedules (42 regular, 400 seeded) found none with the rule off. Serialized shard turns break the symmetry within a round. The three-shard driver above does reproduce one, so the rule is guarded by a test, not only argued. Truly concurrent engine-owned shard threads make it likelier.
+- The model checks, the D142 sweeps and D245's frozen convergence sweep (zero non-room ordering refusals) pass unchanged.
+
+**Cost of a dropped future:** a commit whose future is dropped keeps running (as before), and its retries carry the transaction's seqno pin (#672) in `validate`, moved into each retry and never re-created. So under overlap starvation, a dropped commit can hold its seqno pin, and with it compaction's GC of what that snapshot sees, for up to `write_stall_timeout` before it ends with `Busy`. It is accepted: the pin is released on every outcome, and the same bound applies to any waiting commit (D241).
+
+**Shape on the commit path:** `CommitReq`'s inline `Option<Preset>` (32 bytes) becomes `Option<Box<Retried>>` (8), so every queued commit message is smaller. The new check runs only on the existing conditional-PREPARE branch.

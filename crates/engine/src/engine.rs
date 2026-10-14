@@ -222,6 +222,9 @@ pub struct CrossShardMetrics {
     pub refused_moved: u64,
     /// PREPAREs refused because the participant had no arena room for the share (ICR 0042).
     pub refused_room: u64,
+    /// PREPAREs refused because they overlapped a row of an undecided share another commit
+    /// prepared there (D249, ICR 0045). Retried once it is decided; not a conflict.
+    pub refused_pending_overlap: u64,
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -2136,6 +2139,7 @@ impl Engine {
             x.refused_move_raise += refused(CrossRefusal::MoveRaise);
             x.refused_moved += refused(CrossRefusal::Moved);
             x.refused_room += refused(CrossRefusal::Room);
+            x.refused_pending_overlap += refused(CrossRefusal::PendingOverlap);
         }
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);
@@ -3012,7 +3016,7 @@ impl Inner {
                         submitted_at,
                         validate,
                         predicate: predicate.map(Box::new),
-                        commit_ts: None,
+                        retry: None,
                         map_version: view.tablets().version(),
                     })
                 };
@@ -3051,6 +3055,9 @@ impl Inner {
             commit_ts: None,
             epoch: 0,
             room_wait: None,
+            first_seqno: 0,
+            prev_shards: Vec::new(),
+            overlap_wait: None,
         }));
         let Some(charge) = admit.admit(target) else {
             return Ok(Routed::Held(Prepared {
@@ -3174,7 +3181,7 @@ impl Inner {
                 submitted_at,
                 validate: None,
                 predicate: Some(Box::new((table, row.to_vec(), predicate.clone()))),
-                commit_ts: None,
+                retry: None,
                 map_version: view.tablets().version(),
             }))?;
         Ok(PendingCheck {
@@ -3900,7 +3907,7 @@ impl EngineShard {
                     submitted_at,
                     validate: None,
                     predicate: None,
-                    commit_ts: None,
+                    retry: None,
                     map_version: view.tablets().version(),
                 },
                 ctx,

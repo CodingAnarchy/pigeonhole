@@ -3988,3 +3988,340 @@ fn a_transactions_commit_releases_its_snapshot_on_every_outcome() {
         "dropped async future"
     );
 }
+
+/// D249: a two-shard store with rows below `m` on one shard and rows from `m` on the other,
+/// and the two shard indexes `(low, high)`.
+fn overlap_db() -> (Db, usize, usize) {
+    let mut db = open(2, |_| {});
+    let id = db.table.id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    db.put(b"a", b"a0");
+    db.put(b"y", b"y0");
+    db.put(b"z", b"z0");
+    (db, usize::from(low), usize::from(high))
+}
+
+/// A cross-shard transaction reading `reads` and writing `writes` (in that order, so the
+/// first written row's shard coordinates).
+fn overlap_txn(db: &Db, reads: &[&[u8]], writes: &[&[u8]]) -> pigeonhole_engine::Txn {
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    for r in reads {
+        t.get(id, f, r, b"q").unwrap();
+    }
+    for w in writes {
+        t.batch()
+            .put(id, f, w, b"q", None, ValueRef::Bytes(b"t"))
+            .unwrap();
+    }
+    t
+}
+
+/// Runs one turn of shard `i` alone.
+fn turn(db: &mut Db, i: usize) {
+    let now = db.clock.monotonic_nanos();
+    db.shards[i].run_once(now + 1_000);
+}
+
+#[test]
+fn a_cross_shard_transaction_overlapping_an_undecided_share_retries_instead_of_conflicting() {
+    // D249: B's PREPARE meets A's undecided share on `a`. It used to fail at once with
+    // `Conflict` although nothing was written after B's snapshot; now it is refused, waits
+    // for A's decision there, and commits. A aborts on its own real conflict.
+    let (mut db, low, high) = overlap_db();
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    // A: coordinated by `high` (`y` first), writes `a` on `low`; doomed, since its read of
+    // `y` is overwritten after its snapshot.
+    let a = overlap_txn(&db, &[b"y"], &[b"y", b"a"]);
+    db.put(b"y", b"y1");
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    // B: also coordinated by `high`, reads and writes `a`.
+    let b = overlap_txn(&db, &[b"a"], &[b"z", b"a"]);
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    // `low` gets A's PREPARE, then B's: one group, so B is cut to the next and refused there
+    // while A is undecided.
+    turn(&mut db, low);
+    turn(&mut db, low);
+    let rb = poll_until(&mut db, &mut pb, 100_000).expect("B resolved");
+    let ra = poll_until(&mut db, &mut pa, 100_000).expect("A resolved");
+    assert!(
+        matches!(ra, Err(pigeonhole_engine::Error::Conflict)),
+        "A: {ra:?}"
+    );
+    rb.expect("B commits: it only met an undecided share");
+    assert!(
+        db.engine.metrics().cross_shard.refused_pending_overlap > before,
+        "B was never refused over the overlap"
+    );
+    assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"t".to_vec()));
+}
+
+#[test]
+fn a_cross_shard_transaction_still_conflicts_with_a_write_after_its_snapshot() {
+    // D249: the same overlap, but A commits a write to `a` after B's snapshot. B's retry
+    // validates against it: a real conflict, `Conflict`.
+    let (mut db, low, high) = overlap_db();
+    let b = overlap_txn(&db, &[b"a"], &[b"z", b"a"]);
+    let a = overlap_txn(&db, &[], &[b"y", b"a"]);
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    turn(&mut db, low);
+    turn(&mut db, low);
+    let ra = poll_until(&mut db, &mut pa, 100_000).expect("A resolved");
+    ra.expect("A commits");
+    let rb = poll_until(&mut db, &mut pb, 100_000).expect("B resolved");
+    assert!(
+        matches!(rb, Err(pigeonhole_engine::Error::Conflict)),
+        "B: {rb:?}"
+    );
+}
+
+/// Polls both commits, stepping every shard, until both resolve.
+fn resolve_both(
+    db: &mut Db,
+    pa: &mut pigeonhole_engine::PendingCommit,
+    pb: &mut pigeonhole_engine::PendingCommit,
+) -> (
+    pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>,
+    pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>,
+) {
+    let mut ra = None;
+    let mut rb = None;
+    for _ in 0..200_000 {
+        if ra.is_none() {
+            ra = poll_commit(pa);
+        }
+        if rb.is_none() {
+            rb = poll_commit(pb);
+        }
+        if ra.is_some() && rb.is_some() {
+            break;
+        }
+        db.step();
+    }
+    (
+        ra.expect("A never resolved (deadlock or livelock)"),
+        rb.expect("B never resolved (deadlock or livelock)"),
+    )
+}
+
+#[test]
+fn two_crossing_cross_shard_prepares_neither_deadlock_nor_livelock() {
+    // D249: A (coordinated by `low`) and B (by `high`) both read and write `a` and `z`; each
+    // prepares its own share and meets the other's undecided one. No PREPARE waits, so no
+    // deadlock; on a frozen clock (no timer breaks a tie) both still resolve: at least one
+    // commits, and the other commits or gets a real `Conflict` (the first one wrote a row it
+    // read after its snapshot).
+    let (mut db, low, high) = overlap_db();
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    let a = overlap_txn(&db, &[b"a"], &[b"a", b"z"]);
+    let b = overlap_txn(&db, &[b"z"], &[b"z", b"a"]);
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, low);
+    turn(&mut db, high);
+    let (ra, rb) = resolve_both(&mut db, &mut pa, &mut pb);
+    let ok = |r: &pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>| r.is_ok();
+    assert!(ok(&ra) || ok(&rb), "neither committed: {ra:?} {rb:?}");
+    for r in [&ra, &rb] {
+        assert!(
+            matches!(r, Ok(_) | Err(pigeonhole_engine::Error::Conflict)),
+            "{r:?}"
+        );
+    }
+    assert!(
+        db.engine.metrics().cross_shard.refused_pending_overlap > before,
+        "no overlap refusal: the crossing never happened"
+    );
+}
+
+/// D249: three shards (`a` on 0, `k` on 1, `z` on 2). A (older, coordinated by shard 2)
+/// writes `z`, `a`, `k`; B (younger, coordinated by shard 1) writes `k`, `a`. Driven in
+/// `CROSSING` order, each shard admits one's PREPARE and refuses the other's: shard 1 has
+/// B's own share first, shard 0 A's PREPARE first. Returns them submitted and crossed once.
+fn crossed_pair() -> (
+    Db,
+    pigeonhole_engine::PendingCommit,
+    pigeonhole_engine::PendingCommit,
+    u64,
+) {
+    let mut db = open(3, |_| {});
+    let id = db.table.id;
+    for key in [b"h".as_slice(), b"p".as_slice()] {
+        let m = db.engine.split_tablet_pending(id, key).unwrap();
+        db.drive(m).unwrap();
+    }
+    for (row, shard) in [
+        (b"a".as_slice(), 0u16),
+        (b"k".as_slice(), 1),
+        (b"z".as_slice(), 2),
+    ] {
+        let owner = db
+            .ranges()
+            .into_iter()
+            .find(|r| r.2.as_slice() <= row && r.3.as_deref().is_none_or(|e| row < e))
+            .map(|r| r.1)
+            .unwrap();
+        if owner != shard {
+            let m = db.engine.move_tablet_pending(id, row, shard).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    for row in [b"a".as_slice(), b"k", b"q", b"x", b"z"] {
+        db.put(row, b"0");
+    }
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    // A: coordinated by shard 2 (`z` first), writes `a` (shard 0) and `k` (shard 1).
+    let a = overlap_txn(&db, &[b"x"], &[b"z", b"a", b"k"]);
+    // B: coordinated by shard 1 (`k` first), writes `a` too; its read (`q`) A never writes.
+    let b = overlap_txn(&db, &[b"q"], &[b"k", b"a"]);
+    let pa = a.submit(Some(Durability::Buffered)).unwrap();
+    let pb = b.submit(Some(Durability::Buffered)).unwrap();
+    // A's PREPAREs go out first; shard 1 then coordinates B (its share on `k`) ahead of A's
+    // PREPARE there, and shard 0 gets A's PREPARE ahead of B's: each shard admits its first
+    // one and refuses the other (cut, then refused while the first is undecided).
+    turn(&mut db, 2);
+    turn(&mut db, 1);
+    turn(&mut db, 1);
+    turn(&mut db, 0);
+    turn(&mut db, 0);
+    assert!(
+        db.engine.metrics().cross_shard.refused_pending_overlap >= before + 2,
+        "both were not refused: {}",
+        db.engine.metrics().cross_shard.refused_pending_overlap - before
+    );
+    (db, pa, pb, before)
+}
+
+/// The turn order that crosses A and B: A's coordinator, then B's (its own share first, then
+/// A's PREPARE cut and refused), then shard 0 (A's PREPARE first, B's cut and refused).
+const CROSSING: [usize; 5] = [2, 1, 1, 0, 0];
+
+#[test]
+fn crossing_prepares_both_refused_resolve_older_first_on_a_frozen_clock() {
+    // D249's older-first rule: A (older) and B (younger) are each refused at the other's
+    // shard over the other's undecided share. B waits at A's shard until A's next attempt
+    // there is decided, so A commits first, then B.
+    let (mut db, mut pa, mut pb, _) = crossed_pair();
+    let (ra, rb) = resolve_both(&mut db, &mut pa, &mut pb);
+    let (a_info, b_info) = (ra.expect("A commits"), rb.expect("B commits"));
+    assert!(
+        a_info.seqno < b_info.seqno,
+        "the older committed first: A {} B {}",
+        a_info.seqno,
+        b_info.seqno
+    );
+}
+
+#[test]
+fn crossing_prepares_driven_to_recross_every_retry_still_resolve_older_first() {
+    // D249: the same pair, but every retry is driven in `CROSSING` order too, so whenever
+    // both retry together they cross again. With older-first, B does not retry until A's
+    // next attempt at shard 0 is decided, so they cross at most once more and both resolve.
+    // Without it, both are woken together each time and cross on every retry: on a frozen
+    // clock no timeout ends it, and neither ever resolves.
+    let (mut db, mut pa, mut pb, before) = crossed_pair();
+    let mut ra = None;
+    let mut rb = None;
+    for _ in 0..2_000 {
+        for &i in &CROSSING {
+            turn(&mut db, i);
+        }
+        if ra.is_none() {
+            ra = poll_commit(&mut pa);
+        }
+        if rb.is_none() {
+            rb = poll_commit(&mut pb);
+        }
+        if ra.is_some() && rb.is_some() {
+            break;
+        }
+    }
+    let refused = db.engine.metrics().cross_shard.refused_pending_overlap - before;
+    let a_info = ra.expect("A never resolved: the pair re-crossed on every retry");
+    let b_info = rb.expect("B never resolved: the pair re-crossed on every retry");
+    let (a_info, b_info) = (a_info.expect("A commits"), b_info.expect("B commits"));
+    assert!(a_info.seqno < b_info.seqno, "the older committed first");
+    assert!(
+        refused <= 4,
+        "{refused} overlap refusals: they kept crossing"
+    );
+}
+
+// D249's older-first guard, as ctr274 wrote it in their review of #681.
+#[test]
+fn a_younger_commit_refused_behind_an_older_one_waits_for_the_older_ones_next_attempt() {
+    // D249's older-first rule, isolated: B (younger) is refused at shard 0 over A's (older)
+    // undecided share. A's first round aborts; while A's coordinator (shard 2) is not run, A
+    // cannot run its next attempt, so B must not retry, even though A's share at shard 0 is
+    // decided and the overlap there is gone. Without the rule B is woken by that decision,
+    // prepares and is decided first, so its seqno precedes A's (it cannot become visible
+    // while shard 2 publishes no watermark, so the order of the commits is the check).
+    let mut db = open(3, |_| {});
+    let id = db.table.id;
+    for key in [b"h".as_slice(), b"p".as_slice()] {
+        let m = db.engine.split_tablet_pending(id, key).unwrap();
+        db.drive(m).unwrap();
+    }
+    for (row, shard) in [
+        (b"a".as_slice(), 0u16),
+        (b"k".as_slice(), 1),
+        (b"z".as_slice(), 2),
+    ] {
+        let owner = db
+            .ranges()
+            .into_iter()
+            .find(|r| r.2.as_slice() <= row && r.3.as_deref().is_none_or(|e| row < e))
+            .map(|r| r.1)
+            .unwrap();
+        if owner != shard {
+            let m = db.engine.move_tablet_pending(id, row, shard).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    for row in [b"a".as_slice(), b"j", b"k", b"x", b"z"] {
+        db.put(row, b"0");
+    }
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    // A: coordinated by shard 2 (`z` first), writes `a` (shard 0) and `k` (shard 1).
+    let a = overlap_txn(&db, &[b"x"], &[b"z", b"a", b"k"]);
+    // B: coordinated by shard 1 (`k` first), writes `a`; it reads only on shard 1 (`j`), so
+    // its rounds never need shard 2.
+    let b = overlap_txn(&db, &[b"j"], &[b"k", b"a"]);
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, 2);
+    turn(&mut db, 1);
+    turn(&mut db, 1);
+    turn(&mut db, 0);
+    turn(&mut db, 0);
+    assert!(
+        db.engine.metrics().cross_shard.refused_pending_overlap >= before + 2,
+        "both were not refused"
+    );
+    // Shard 2 decides A's first round (abort) and sends its decisions; then it stops.
+    turn(&mut db, 2);
+    for _ in 0..500 {
+        turn(&mut db, 0);
+        turn(&mut db, 1);
+    }
+    let (ra, rb) = resolve_both(&mut db, &mut pa, &mut pb);
+    let (a_info, b_info) = (ra.expect("A commits"), rb.expect("B commits"));
+    assert!(
+        a_info.seqno < b_info.seqno,
+        "B went ahead of the older A: A {} B {}",
+        a_info.seqno,
+        b_info.seqno
+    );
+}
