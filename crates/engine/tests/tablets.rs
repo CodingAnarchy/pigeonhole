@@ -826,6 +826,168 @@ fn every_shard_uses_the_same_active_shard_count_from_light_to_heavy_writes() {
     }
 }
 
+/// One balancer pass of a durable load for D248 (deferred I/O on): every tablet commits 20
+/// rows at `durability`, then the clock moves `in_flight` nanoseconds while the group syncs
+/// are in flight and `idle` more once they are done, and the balancer runs.
+fn sync_pass(
+    db: &mut Db,
+    n: usize,
+    durability: Durability,
+    in_flight: u64,
+    idle: u64,
+    written: &mut u64,
+) {
+    let f = db.table.families[0].id;
+    let mut pending: Vec<_> = (0..n)
+        .map(|t| {
+            let mut wb = WriteBatch::new();
+            for _ in 0..20 {
+                wb.put(
+                    db.table.id,
+                    f,
+                    &tablet_row(t, *written),
+                    b"q",
+                    None,
+                    ValueRef::Bytes(b"v"),
+                )
+                .unwrap();
+                *written += 1;
+            }
+            db.engine.submit(wb, Some(durability)).expect("submit")
+        })
+        .collect();
+    db.step();
+    db.vfs.advance(in_flight);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..10_000 {
+        db.vfs.complete_all_io();
+        db.step();
+        pending.retain_mut(|pc| match Pin::new(pc).poll(&mut cx) {
+            Poll::Ready(r) => {
+                r.expect("commit");
+                false
+            }
+            Poll::Pending => true,
+        });
+        if pending.is_empty() {
+            break;
+        }
+    }
+    assert!(pending.is_empty(), "commits did not finish");
+    db.vfs.advance(idle);
+    let mut m = db.engine.balance_pending().unwrap();
+    for _ in 0..100_000 {
+        if let Poll::Ready(r) = Pin::new(&mut m).poll(&mut cx) {
+            return r.unwrap();
+        }
+        db.vfs.complete_all_io();
+        db.step();
+    }
+    panic!("balancer pass did not finish");
+}
+
+/// D248: packing counts group-sync utilization. Four shards whose threads are only 5% busy
+/// (B = 0.2, one shard's worth) but whose durable commits keep a group sync in flight
+/// through the whole pass read about 1 busy each, so `k` stays 4 and
+/// the table stays spread. Counting only the threads' busy time, they packed onto one shard
+/// (perf287, AX102: 36% of ycsb-a's throughput at GroupSync).
+#[test]
+fn a_sync_bound_load_keeps_its_shards_active() {
+    let mut db = spread_and_busy(0.05, true);
+    db.vfs.set_deferred_io(true);
+    let mut written = 0;
+    for _ in 0..120 {
+        sync_pass(
+            &mut db,
+            4,
+            Durability::GroupSync,
+            1_000_000,
+            0,
+            &mut written,
+        );
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![1, 1, 1, 1]);
+    assert_eq!(db.engine.pack_ks(), vec![Some(4); 4]);
+    let synced: Vec<u64> = db
+        .engine
+        .shard_stats()
+        .iter()
+        .map(|s| s.sync_busy_nanos)
+        .collect();
+    assert!(
+        synced.iter().all(|&n| n >= 100 * 1_000_000),
+        "every shard's syncs were in flight about 120 ms: {synced:?}"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.vfs.set_deferred_io(false);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// D248's other side: the same load packs as before (D217) when its syncs are not what the
+/// shards spend their time on. At `Buffered` (no group syncs), and as a durable trickle
+/// (syncs in flight 5% of the time), four shards 5% busy pack onto one.
+#[test]
+fn buffered_and_trickling_durable_loads_still_pack() {
+    for (durability, idle) in [
+        (Durability::Buffered, 0),
+        (Durability::GroupSync, 19_000_000),
+    ] {
+        let mut db = spread_and_busy(0.05, true);
+        db.vfs.set_deferred_io(true);
+        let mut written = 0;
+        let mut passes = 0;
+        while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+            sync_pass(&mut db, 4, durability, 1_000_000, idle, &mut written);
+            passes += 1;
+        }
+        assert_eq!(
+            tablets_per_shard(&db, 4),
+            vec![4, 0, 0, 0],
+            "{durability:?} did not pack"
+        );
+        assert_eq!(db.scan_rows().len() as u64, written);
+        db.vfs.set_deferred_io(false);
+        db.engine.close().unwrap();
+        for _ in 0..8 {
+            db.step();
+        }
+    }
+}
+
+/// D248 changes nothing for application-owned shards: their threads' busy time is not
+/// counted, so packing does not act, and their group syncs do not start it. (A durable load
+/// with syncs in flight a fifth of the time: counted, it would pack.)
+#[test]
+fn an_application_owned_durable_load_is_not_packed() {
+    let mut db = spread_and_busy(0.05, true);
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, None);
+    }
+    db.vfs.set_deferred_io(true);
+    let setup = tablet_changes(&db.engine);
+    let mut written = 0;
+    for _ in 0..150 {
+        sync_pass(
+            &mut db,
+            4,
+            Durability::GroupSync,
+            1_000_000,
+            4_000_000,
+            &mut written,
+        );
+    }
+    assert_eq!(tablet_changes(&db.engine), setup);
+    assert_eq!(tablets_per_shard(&db, 4), vec![1, 1, 1, 1]);
+    db.vfs.set_deferred_io(false);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// Packing never strands tablets (D217): six tablets of a 20-family table need 120 memtable
 /// slots, and a shard serves 64 (three tablets). Light writes (B = 0.3, one shard's worth)
 /// pack them onto two shards, not three onto one shard and the rest left where they were.
