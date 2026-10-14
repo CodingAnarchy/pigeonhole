@@ -1768,4 +1768,17 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 - The crash and model sweeps (`model_check` with and without deferred I/O, `model`, `tablets`) check the checkpoints and replay.
 - New test hooks: `ShardCounters::{report_msgs, report_seqnos}` (`Engine::share_reports`) and `ShardCounters::logged` (`Engine::logged_records`).
 
-**Acceptance (AX102):** on the cross-shard shape, against main: `on_flushed` time, the count of long turns, and the coordinators' longest turn, since one `SharesFlushed` can now carry about 100K seqnos (perf287's review).
+**Acceptance (AX102, 2026-10-14):** perf2's timer build of `scratch_xs` (16 shards, 32 clients, 50% cross-shard, 20 s), on main c2d29b3d (A) and on this change (B). The runs alternated A/B, 2 each at `compaction_threads` 0 and 4. Data: `.coord/ctr274-d254-ab/`.
+
+| | ct0 A | ct0 B | ct4 A | ct4 B |
+|---|---|---|---|---|
+| ops/s | 375K, 365K | 380K, 381K | 457K, 457K | 471K, 467K |
+| shard turns ≥ 400 µs | 18,341, 18,143 | 16,115, 16,568 | 11,504, 12,652 | **1,051, 1,179** |
+| `on_flushed` p50 / max | 21.0 / 34–42 ms | 14.7 / 21 ms | 25.2 / 42–67 ms | 21.0 / 29 ms |
+| report messages handled | 15.5M | 1,679–1,695 | 18.9M | 1,837–1,877 |
+| their turn p50 / p99 / max | 0.1 µs / 1.5 µs / 29 ms | 0.5 ms / 25–29 ms / 34 ms | 0.2 µs / 2–2.6 µs / 42 ms | 0.66 ms / 42 ms / 50 ms |
+| long turns (≥ 400 µs) they dominate | 2,187–2,431, avg 1.6–1.8 ms | 686–688, avg 6.5 ms | 7,876–8,060, avg 1.0 ms | 530–622, avg 11–13 ms |
+
+- **Long turns:** about 10× fewer at ct4 (the D252 default), and about 11% fewer at ct0. Throughput is up 2–4%.
+- **The install:** `on_flushed` is down about 30% at ct0 and 17% at ct4. The rest of it is `report_shares_flushed`'s per-share scan (each share's slots checked against the catalog), not the messages.
+- **The coordinators' longest turn (perf287's review) did not improve.** One `SharesFlushed` carries a flush's ~100K seqnos, and its handler counts each one and then advances the checkpoint past the records they free. That is the same work as before (about 7 s of long turns at ct4, against about 8 s), in fewer, longer turns: 25–42 ms p99, up to 50 ms, against a 29–42 ms max on main. Bounding it is a follow-up: handle a message in slices across turns, and make the report and its receipt cheaper per share.
