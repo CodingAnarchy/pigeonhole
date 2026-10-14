@@ -655,6 +655,10 @@ pub struct Stalls {
     /// See [`Stalls::xshard_refused_below_floor`].
     #[serde(default)]
     pub xshard_refused_room: u64,
+    /// PREPAREs refused because they overlapped another commit's undecided share and retried
+    /// inside the engine, not returned as a `Conflict` (D249, ICR 0045).
+    #[serde(default)]
+    pub xshard_refused_pending_overlap: u64,
 }
 
 impl Stalls {
@@ -697,6 +701,10 @@ impl Stalls {
             ),
             xshard_refused_moved: d(before.xshard_refused_moved, after.xshard_refused_moved),
             xshard_refused_room: d(before.xshard_refused_room, after.xshard_refused_room),
+            xshard_refused_pending_overlap: d(
+                before.xshard_refused_pending_overlap,
+                after.xshard_refused_pending_overlap,
+            ),
         }
     }
 }
@@ -1218,7 +1226,7 @@ impl Suite {
             .filter_map(|r| r.rounds().map(|x| (r, x)))
             .collect();
         if !rounds.is_empty() {
-            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: below floor, move raise, moved, room | Seqnos used | Inferred wasted rounds |\n");
+            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: below floor, move raise, moved, room, pending overlap | Seqnos used | Inferred wasted rounds |\n");
             s.push_str("|---|---|---|--:|--:|--:|--:|---|--:|--:|\n");
             let opt = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
             for (r, x) in rounds {
@@ -1226,11 +1234,12 @@ impl Suite {
                     || "-".to_owned(),
                     |st| {
                         format!(
-                            "{}, {}, {}, {}",
+                            "{}, {}, {}, {}, {}",
                             st.xshard_refused_below_floor,
                             st.xshard_refused_move_raise,
                             st.xshard_refused_moved,
-                            st.xshard_refused_room
+                            st.xshard_refused_room,
+                            st.xshard_refused_pending_overlap
                         )
                     },
                 );
