@@ -50,6 +50,10 @@ WORKLOADS:
               shards, application-owned with each shard thread writing inline (16 in
               flight), the table pre-split at the writes' quantiles, the balancer off;
               then, reported only, synchronous clients (4 per shard) at N/2 shards
+    app-owned application-owned mode on the default options (D247, reported):
+              skewed-multi-shard writes inline from each shard's own thread, 16 in
+              flight, no pre-split (the balancer and packing on), about 20% of the
+              commits batches across shards
     placement the balancer placement check (D231): skewed-multi-shard writes offered
               open-loop at a fixed rate over N engine-owned shards; the balancer spreads
               the table, and once settled the busiest shard's share is judged
@@ -451,6 +455,17 @@ fn bench(a: &Args) -> Result<Suite, String> {
             suite.placement = Some(p?);
             return Ok(());
         }
+        if a.command == "app-owned" {
+            // D247 (perf287's L): the application-owned API on the defaults, which the judged
+            // inline runs (pre-split, balancer off) do not measure. Pinned, as engine-owned
+            // shards are by default (D235).
+            let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
+            let c = config(a, WorkloadKind::SkewedMultiShard)?;
+            let r = pigeonhole(a, Some(n)).cross_batches(true);
+            let run = one_inline(a, &root, &mut seq, &r, &c, true)?;
+            suite.results.push(run);
+            return Ok(());
+        }
         if a.command == "scaling" {
             // The gate (D204): application-owned shards, each thread writing its share
             // inline, at 1 shard and at N (default: one per physical core, D220). D231: the
@@ -730,6 +745,34 @@ mod tests {
             1,
             "no second tablets-off run"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_owned_runs_inline_on_the_defaults_with_cross_shard_batches() {
+        // D247: application-owned shards, no pre-split, about a fifth of the commits batches.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-appowned-{}", std::process::id()));
+        let a = args(&format!(
+            "app-owned --scale smoke --ops 400 --shards 2 --min-secs 0.2 --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        assert_eq!(suite.results.len(), 1);
+        let r = &suite.results[0];
+        assert!(
+            r.store_config.contains(" inline in-flight=16"),
+            "{}",
+            r.store_config
+        );
+        assert!(
+            r.store_config.contains(" cross-batches=20%"),
+            "{}",
+            r.store_config
+        );
+        assert!(!r.store_config.contains("presplit"), "{}", r.store_config);
+        assert!(r.operations >= 400 && r.throughput > 0.0);
+        // The batches cross shards: two-phase rounds ran while measuring.
+        assert!(r.detail.stalls.as_ref().unwrap().xshard_rounds > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

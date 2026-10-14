@@ -556,6 +556,32 @@ for level, label in CONTENDED_LEVELS:
                      "(reported, not judged; D247)",
                      f"{rate(ar['throughput'])} ops/s, p50 {us(ar['p50_ns']):.0f} µs, p99 {us(ar['p99_ns']):.0f} µs"
                      f"{vs}{flag}", "-", name))
+# Application-owned mode on the defaults (D247, reported; perf287's L): skewed writes inline
+# from each shard's own thread, no pre-split (balancer and packing on), about 20% cross-shard
+# batches. The closest judged row is the scaling gate's N = 16 (pre-split, balancer off,
+# Buffered): flagged at Buffered when it runs under a third of that.
+scal16 = ((load("scaling-16.json") or {}).get("scaling") or {}).get("multi_shard_throughput")
+for level, label in CONTENDED_LEVELS:
+    name = f"contended-{level}-app-owned.json"
+    ar = next(iter(results(name, "pigeonhole")), None)
+    if not ar:
+        continue
+    d = ar.get("detail", {})
+    st = d.get("stalls") or {}
+    spread = sum(1 for sh in d.get("shards", []) if sh.get("tablets_end", 0) > 0)
+    vs = flag = ""
+    if scal16 and level == "buffered":
+        t = ar["throughput"] / scal16
+        vs = f"; {t:.2f}× the scaling gate's N = 16 (pre-split, balancer off)"
+        if t < 1 / 3:
+            flag = "; **under a third of the scaling gate's N = 16: file an issue**"
+    rounds = (f"; {st.get('xshard_rounds', 0)} two-phase rounds, {st.get('xshard_refused_rounds', 0)} refused"
+              if "xshard_rounds" in st else "")
+    settled = "" if d.get("warmup_settled", True) else ", not settled"
+    rows.append((f"Application-owned mode on the defaults, {label} (reported, not judged; D247)",
+                 f"{rate(ar['throughput'])} commits/s, p50 {us(ar['p50_ns']):.0f} µs, p99 {us(ar['p99_ns']):.0f} µs; "
+                 f"tablets on {spread} of {len(d.get('shards', []))} shards after a {d.get('warmup_secs', 0):.0f} s "
+                 f"warmup{settled}{rounds}{vs}{flag}", "-", name))
 
 # ycsb-a's riders (D247, reported): readers under snapshots, a durable backup and a compaction
 # beside the measured phase; the foreground's p99 is held against the judged ycsb-a run's.
