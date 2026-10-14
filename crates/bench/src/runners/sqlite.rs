@@ -27,6 +27,14 @@ const COUNTERS: &str = "CREATE TABLE IF NOT EXISTS counters (row BLOB PRIMARY KE
 const INCR: &str = "INSERT INTO counters (row, n) VALUES (?1, ?2) ON CONFLICT (row) DO UPDATE SET n = n + excluded.n";
 const READ_COUNTER: &str = "SELECT n FROM counters WHERE row = ?1";
 
+/// D247's filtered scans: one family's cells from a row on, live and in a time range; the
+/// qualifier prefix is checked in Rust.
+const SCAN_FILTERED: &str = "SELECT row, qualifier, value FROM cells WHERE row >= ?1 AND family = ?2 \
+    AND ts > ?3 AND ts >= ?4 AND ts < ?5 ORDER BY row, qualifier";
+
+const DELETE_COLUMN: &str = "DELETE FROM cells WHERE row = ?1 AND family = ?2 AND qualifier = ?3";
+const DELETE_ROW: &str = "DELETE FROM cells WHERE row = ?1";
+
 const GET: &str =
     "SELECT value FROM cells WHERE row = ?1 AND family = ?2 AND qualifier = ?3 AND ts > ?4";
 const GET_ROW: &str =
@@ -136,7 +144,7 @@ impl Runner for SqliteRunner {
         }
     }
 
-    fn measured_durability(&mut self) -> Result<(), String> {
+    fn measured_durability(&mut self) -> Result<bool, String> {
         match &self.conn {
             Some(Conn(c)) if self.load_buffered => c
                 .pragma_update(
@@ -144,8 +152,9 @@ impl Runner for SqliteRunner {
                     "synchronous",
                     if self.sync { "FULL" } else { "NORMAL" },
                 )
+                .map(|()| self.sync)
                 .map_err(|e| e.to_string()),
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 
@@ -268,6 +277,24 @@ impl Conn {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::DeleteColumn {
+                row,
+                family,
+                qualifier,
+            } => {
+                self.0
+                    .prepare_cached(DELETE_COLUMN)
+                    .map_err(e)?
+                    .execute(params![row, family, qualifier])
+                    .map_err(e)?;
+            }
+            BenchOp::DeleteRow { row } => {
+                self.0
+                    .prepare_cached(DELETE_ROW)
+                    .map_err(e)?
+                    .execute(params![row])
+                    .map_err(e)?;
+            }
             BenchOp::Transfer { from, to, amount } => {
                 // Immediate: the write lock from the reads on (D247).
                 let tx = self
@@ -359,6 +386,45 @@ impl Conn {
                             .as_blob()
                             .map_err(|e| e.to_string())?,
                     );
+                }
+            }
+            BenchOp::ScanFiltered {
+                start,
+                len,
+                family,
+                qualifier_prefix,
+                time_range,
+            } => {
+                let (a, b) = time_range.unwrap_or((0, u64::MAX));
+                let ts = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                let mut stmt = self.0.prepare_cached(SCAN_FILTERED).map_err(e)?;
+                let live = oldest_live(family, now_micros());
+                let mut rows = stmt
+                    .query(params![start, family, live, ts(a), ts(b)])
+                    .map_err(e)?;
+                let (mut seen, mut current): (u32, Option<Vec<u8>>) = (0, None);
+                while let Some(r) = rows.next().map_err(e)? {
+                    let blob = |i: usize| -> Result<&[u8], String> {
+                        r.get_ref(i)
+                            .map_err(e)?
+                            .as_blob()
+                            .map_err(|e| e.to_string())
+                    };
+                    if qualifier_prefix
+                        .as_deref()
+                        .is_some_and(|q| !blob(1).is_ok_and(|v| v.starts_with(q)))
+                    {
+                        continue;
+                    }
+                    let key = blob(0)?;
+                    if current.as_deref() != Some(key) {
+                        if seen == *len {
+                            break;
+                        }
+                        seen += 1;
+                        current = Some(key.to_vec());
+                    }
+                    t.cell(blob(2)?);
                 }
             }
             BenchOp::ReadModifyWrite { row, qualifier } => {

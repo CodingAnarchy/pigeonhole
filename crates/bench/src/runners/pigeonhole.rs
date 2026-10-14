@@ -609,11 +609,11 @@ impl Runner for PigeonholeRunner {
         })
     }
 
-    fn measured_durability(&mut self) -> Result<(), String> {
-        if let Some(o) = self.open.as_mut() {
-            o.target.load_buffered = false;
-        }
-        Ok(())
+    fn measured_durability(&mut self) -> Result<bool, String> {
+        Ok(self
+            .open
+            .as_mut()
+            .is_some_and(|o| std::mem::take(&mut o.target.load_buffered)))
     }
 
     fn start_riders(&mut self) -> Result<(), String> {
@@ -828,6 +828,30 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 }
             }
         }
+        BenchOp::ScanFiltered {
+            start,
+            len,
+            family,
+            qualifier_prefix,
+            time_range,
+        } => {
+            let mut scan = table
+                .scan_bounds(Bound::Included(start.as_slice()), Bound::Unbounded)
+                .family(family)
+                .limit(u64::from(*len));
+            if let Some(q) = qualifier_prefix {
+                scan = scan.qualifier_prefix(q);
+            }
+            if let Some((a, b)) = time_range {
+                scan = scan.time_range(*a..*b);
+            }
+            let mut it = scan.iter().map_err(err)?;
+            while let Some(row) = it.next_ref().map_err(err)? {
+                for entry in row.iter() {
+                    t.cell(entry.cell.value());
+                }
+            }
+        }
         BenchOp::ReadModifyWrite { row, qualifier } => {
             // Atomic across clients (D247): the write commits only if the cell still holds
             // what was read, else the read and the write go again.
@@ -859,6 +883,22 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                     break;
                 }
             }
+        }
+        BenchOp::DeleteColumn {
+            row,
+            family,
+            qualifier,
+        } => {
+            retry_busy(busy, || {
+                level(buffered, table.mutate(row))
+                    .delete_column(family, qualifier)
+                    .commit()
+            })?;
+        }
+        BenchOp::DeleteRow { row } => {
+            retry_busy(busy, || {
+                level(buffered, table.mutate(row)).delete_row().commit()
+            })?;
         }
         BenchOp::Transfer { from, to, amount } => {
             // An optimistic transaction reading both balances, retried on a conflict
@@ -1175,7 +1215,10 @@ mod tests {
             put(&mut r, i);
         }
         let loaded = levels(&r);
-        r.measured_durability().unwrap();
+        assert!(
+            r.measured_durability().unwrap(),
+            "the load was buffered, the run is not"
+        );
         for i in 10..20 {
             put(&mut r, i);
         }
@@ -1233,6 +1276,70 @@ mod tests {
         );
         assert!(rec.detail.close_ms.is_some());
         assert!(!dir.join("rider-backup").exists(), "the backup is removed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn filtered_scans_select() {
+        // D247: the edge prefix reads some of a vertex's edges, not all of them.
+        let kind = WorkloadKind::AdjacencyPrefix;
+        let (mut r, dir) = opened(kind.name());
+        let mut w = Workload::new(WorkloadConfig::smoke(kind));
+        for op in w.load_ops() {
+            r.execute(&op).unwrap();
+        }
+        let (mut filtered, mut plain) = (0, 0);
+        for op in w.run_ops() {
+            let BenchOp::ScanFiltered { start, len, .. } = &op else {
+                continue;
+            };
+            filtered += r.execute_counted(&op).unwrap().cells;
+            let all = BenchOp::Scan {
+                start: start.clone(),
+                len: *len,
+            };
+            plain += r.execute_counted(&all).unwrap().cells;
+        }
+        assert!(0 < filtered && filtered < plain, "{filtered} of {plain}");
+        r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        // The time window reads points from 12 to 6 hours old, not the newest ones.
+        let kind = WorkloadKind::TimeSeriesRange;
+        let (mut r, dir) = opened(kind.name());
+        let mut w = Workload::new(WorkloadConfig::smoke(kind));
+        for op in w.load_ops() {
+            r.execute(&op).unwrap();
+        }
+        let op = w
+            .run_ops()
+            .find(|op| matches!(op, BenchOp::ScanFiltered { .. }))
+            .unwrap();
+        let BenchOp::ScanFiltered {
+            start,
+            len,
+            family,
+            time_range: Some((a, b)),
+            ..
+        } = &op
+        else {
+            unreachable!()
+        };
+        assert_eq!(r.execute_counted(&op).unwrap().cells, u64::from(*len));
+        let table = &r.open.as_ref().unwrap().target.table;
+        let mut it = table
+            .scan_bounds(Bound::Included(start.as_slice()), Bound::Unbounded)
+            .family(family)
+            .time_range(*a..*b)
+            .limit(u64::from(*len))
+            .iter()
+            .unwrap();
+        while let Some(row) = it.next_ref().unwrap() {
+            for e in row.iter() {
+                assert!((*a..*b).contains(&e.cell.timestamp()));
+            }
+        }
+        drop(it);
+        r.close().unwrap();
         std::fs::remove_dir_all(dir).ok();
     }
 

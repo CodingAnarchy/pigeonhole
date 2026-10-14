@@ -494,7 +494,9 @@ for level, label in CONTENDED_LEVELS:
 # The contended step's reported rows (D247): not judged, but a row more than 3x worse than its
 # nearest judged row gets an issue. "Worse" compares the stores' ratio: the reported row's
 # RocksDB/Pigeonhole throughput against its judged neighbour's at the same level.
-CONTENDED_REPORTED = [("transfer", XSHARD)]  # (reported workload, nearest judged workload)
+# (reported workload, nearest judged workload)
+CONTENDED_REPORTED = [("transfer", XSHARD), ("sparse-wide-deletes", "sparse-wide"),
+                      ("adjacency-prefix", "ycsb-e"), ("time-series-range", "time-series-ttl")]
 reported = []  # (level label, workload, pigeonhole run, {store: (tput, p99)}, flag)
 for level, label in CONTENDED_LEVELS:
     for w, near in CONTENDED_REPORTED:
@@ -557,7 +559,8 @@ for level, label in CONTENDED_LEVELS:
 for label, w, ph, vs, flag in reported:
     d = ph.get("detail", {})
     conflicts = d.get("txn_conflicts")
-    per = f"; {conflicts / max(ph['operations'], 1):.3f} conflicts per {w}" if conflicts is not None else ""
+    per = (f"; {conflicts / max(ph['operations'], 1):.3f} conflicts per {w}"
+           if conflicts is not None and w == "transfer" else "")
     ratios = ", ".join(f"{s.split('-')[0]} {t:.2f}× throughput, p99 {l:.2f}×" for s, (t, l) in vs.items())
     rows.append((f"Contended {w}, 16 threads on the default options, {label} (reported, not judged; D247)",
                  f"{rate(ph['throughput'])} ops/s, p99 {us(ph['p99_ns']):.0f} µs{per}; {ratios}"

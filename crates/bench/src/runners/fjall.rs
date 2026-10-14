@@ -9,7 +9,8 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use super::{
     Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id, keys,
-    live_value, modified, now_micros, read_family, scan_rows, transfer_balances,
+    live_value, modified, now_micros, read_family, scan_rows, scan_rows_filtered,
+    transfer_balances,
 };
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
@@ -112,12 +113,12 @@ impl Runner for FjallRunner {
         Ok(())
     }
 
-    fn measured_durability(&mut self) -> Result<(), String> {
+    fn measured_durability(&mut self) -> Result<bool, String> {
         let mode = self.mode(self.sync);
         if let Some(h) = self.open.as_mut() {
             h.mode = mode;
         }
-        Ok(())
+        Ok(self.load_buffered && self.sync)
     }
 
     fn flush(&mut self) -> Result<(), String> {
@@ -245,6 +246,26 @@ impl Handle {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::DeleteColumn {
+                row,
+                family,
+                qualifier,
+            } => {
+                let mut batch = self.db.batch().durability(Some(self.mode));
+                batch.remove(&self.cells, keys::cell(row, family_id(family)?, qualifier));
+                batch.commit().map_err(e)?;
+            }
+            BenchOp::DeleteRow { row } => {
+                // No range delete: remove each of the row's keys in one batch, under its lock.
+                let prefix = keys::row_prefix(row);
+                let _held = self.locks.lock(&prefix);
+                let mut batch = self.db.batch().durability(Some(self.mode));
+                for kv in self.cells.prefix(&prefix) {
+                    let key = kv.key().map_err(e)?;
+                    batch.remove(&self.cells, key);
+                }
+                batch.commit().map_err(e)?;
+            }
             BenchOp::Transfer { from, to, amount } => {
                 // Both rows locked from the reads to the batch (D247).
                 let f = family_id(YCSB_FAMILY)?;
@@ -302,6 +323,24 @@ impl Handle {
                 let from = keys::row_prefix(start);
                 let iter = self.cells.range(from..).map(|g| g.into_inner());
                 t = scan_rows(iter, *len, now_micros())?;
+            }
+            BenchOp::ScanFiltered {
+                start,
+                len,
+                family,
+                qualifier_prefix,
+                time_range,
+            } => {
+                let from = keys::row_prefix(start);
+                let iter = self.cells.range(from..).map(|g| g.into_inner());
+                t = scan_rows_filtered(
+                    iter,
+                    *len,
+                    now_micros(),
+                    family_id(family)?,
+                    qualifier_prefix.as_deref(),
+                    *time_range,
+                )?;
             }
             BenchOp::ReadModifyWrite { row, qualifier } => {
                 let key = keys::cell(row, family_id(YCSB_FAMILY)?, qualifier);
