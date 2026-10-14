@@ -1596,3 +1596,25 @@ Each part disabled fails its test.
 **Cost of a dropped future:** a commit whose future is dropped keeps running (as before), and its retries carry the transaction's seqno pin (#672) in `validate`, moved into each retry and never re-created. So under overlap starvation, a dropped commit can hold its seqno pin, and with it compaction's GC of what that snapshot sees, for up to `write_stall_timeout` before it ends with `Busy`. It is accepted: the pin is released on every outcome, and the same bound applies to any waiting commit (D241).
 
 **Shape on the commit path:** `CommitReq`'s inline `Option<Preset>` (32 bytes) becomes `Option<Box<Retried>>` (8), so every queued commit message is smaller. The new check runs only on the existing conditional-PREPARE branch.
+
+<a id="d250"></a>
+## D250 — Language bindings go native-to-Rust where the language allows; the C ABI is for C and FFI-only languages (owner decision, 2026-10-13; bindings, #690, #696–#699; amends the spec's Language scope)
+**Decision:** each per-language library binds the Rust crate directly through that language's native-extension or direct-to-Rust layer where one exists:
+- PyO3 for Python (#696);
+- `magnus`/`rb-sys` for Ruby (#697);
+- UniFFI for Swift and Kotlin (#699);
+- comparable layers, such as napi-rs for JavaScript, for languages added later.
+
+The stable C ABI (`pigeonhole.h`, `pigeonhole-capi`, #690) serves C itself and languages that can only reach native code through a C FFI, such as Go through cgo (#698).
+
+**Why:**
+- These layers give each language idiomatic types, async integration and error mapping without a C round trip.
+- They avoid hand-written marshalling, and they are the common practice for Rust libraries.
+- The C ABI stays useful where nothing better exists.
+
+Every binding is still a thin wrapper over the Rust crate, never a reimplementation of the engine.
+
+**Consequences:**
+- The Rust crate's public API is the contract every binding follows.
+- The C ABI no longer has to precede the Python, Ruby or mobile libraries; only the Go and C users need it.
+- AGENTS.md's rule to keep Rust-only types out of what becomes the C ABI boundary still applies to `pigeonhole-capi`.
