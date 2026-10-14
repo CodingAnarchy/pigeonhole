@@ -892,6 +892,8 @@ D133 has the coordinator pick a commit timestamp above every participant's publi
 
 *Amended by D244 (#653): the participant also keeps the PREPARE in seqno order with what it stamped since the coordinator reserved its seqno.*
 
+*Amended by D245 (#637): the check is exact by seqno (the floor in assignment order no longer refuses), and the coordinator raises the participants' floors before it reserves.*
+
 <a id="d143"></a>
 ## D143 — Should commits pipelined on one row keep their order during a move (approved; engine)
 D132 parks a commit on a tablet's old owner during a move and forwards it once the move commits, but a later commit from the same thread can reach the new owner first.

@@ -1573,30 +1573,342 @@ fn a_participant_never_stamps_a_later_seqno_below_a_prepared_commit_timestamp() 
 }
 
 #[test]
-fn a_participant_refuses_a_prepare_above_a_later_seqno_it_stamped_in_an_earlier_group() {
-    // D244 (ii), issue #653: as above, but A is stamped in an earlier group than the one
-    // that admits B's PREPARE, which is refused; its retries commit.
-    // Further refusals are D142's own check while `low`'s queued singles drain (#637).
-    let attempts = refused_in_an_earlier_group(false);
-    assert!(attempts <= 3, "B committed at attempt {attempts}");
+fn singles_stamped_ahead_of_a_prepare_in_an_earlier_group_land_above_it() {
+    // #653 across groups: A is stamped in an earlier group than the one that admits B's
+    // PREPARE, at a later seqno. B's coordinator raised `low`'s floor to B's timestamp
+    // before reserving B's seqno (D245), so A lands above it and nothing is refused for
+    // order; B is refused only for arena room, and commits once room frees.
+    let (attempts, refusals) = stamped_in_an_earlier_group(false, 64 << 20);
+    assert_eq!(refusals[..3], [0, 0, 0], "{refusals:?}");
+    assert_eq!(attempts as u64, 1 + refusals[3], "{refusals:?}");
 }
 
 #[test]
-fn a_cross_shard_commit_refused_below_a_later_stamp_commits_on_retry_with_a_moving_clock() {
-    // D244 on a clock that moves (each read a nanosecond): the refusal is retried and the
-    // retry commits, with no `Busy`.
-    let attempts = refused_in_an_earlier_group(true);
-    assert!(attempts <= 4, "B committed at attempt {attempts}");
+fn singles_stamped_ahead_of_a_prepare_land_above_it_with_a_moving_clock() {
+    // The same on a clock that moves (each read a nanosecond).
+    let (attempts, refusals) = stamped_in_an_earlier_group(true, 64 << 20);
+    assert_eq!(refusals[..3], [0, 0, 0], "{refusals:?}");
+    assert_eq!(attempts as u64, 1 + refusals[3], "{refusals:?}");
+}
+
+#[test]
+fn a_prepare_short_of_arena_room_is_refused_and_commits_once_room_frees() {
+    // #655: with a 4 MiB arena, B's PREPARE finds no room behind the queued singles. Waiting
+    // would hold B's seqno, and with it the durable watermark below the memtables the
+    // freeze needs durable (D227): no room ever frees, on a frozen clock for good. It is
+    // refused instead (D245, ICR 0042), and B commits once `low` reports room freed.
+    let (attempts, refusals) = stamped_in_an_earlier_group(false, 4 << 20);
+    assert!(refusals[3] > 0, "no room refusal: {refusals:?}");
+    assert_eq!(refusals[..3], [0, 0, 0], "{refusals:?}");
+    assert_eq!(attempts as u64, 1 + refusals[3], "{refusals:?}");
+}
+
+#[test]
+fn a_lone_prepare_against_a_full_arena_commits_on_a_frozen_clock() {
+    // D245 (perf287's check 2): no single waits, so only the PREPARE's own refusal for room
+    // can start the freeze and flush that frees it (D124's room wait); `RoomFreed` follows
+    // that flush, and the retry commits. On the frozen clock no timeout would end a loop.
+    let (mut db, mut pc, before) = prepare_against_a_full_arena(false, false);
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    r.expect("commit");
+    let after = db.engine.refusal_counts();
+    assert!(after[3] > before[3], "never refused for room: {after:?}");
+    assert_eq!(after[..3], before[..3], "{after:?}");
+    assert_eq!(db.get(b"b").map(|(_, v)| v.len()), Some(1 << 20));
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_retry_waiting_for_room_fails_busy_at_the_write_stall_timeout() {
+    // D245 (perf287's check 3): a snapshot pins the arena, so no flush frees room for the
+    // refused share. Its retry waits on the participant's room generation, and like a
+    // commit parked behind a tablet change (D241) it fails `Busy` at the timeout.
+    let (mut db, mut pc, before) = prepare_against_a_full_arena(true, true);
+    let r = poll_until(&mut db, &mut pc, 1_000_000).expect("resolved");
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Busy)), "{r:?}");
+    assert!(
+        db.engine.refusal_counts()[3] > before[3],
+        "never refused for room"
+    );
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_retry_waiting_for_room_ends_closed_at_close() {
+    // The same retry on the frozen clock, which never reaches a timeout: the close ends it
+    // with `Closed` (not committed).
+    let (mut db, mut pc, before) = prepare_against_a_full_arena(false, true);
+    for _ in 0..1_000 {
+        db.step();
+    }
+    assert!(poll_commit(&mut pc).is_none(), "resolved before the close");
+    assert!(
+        db.engine.refusal_counts()[3] > before[3],
+        "never refused for room"
+    );
+    db.engine.close().unwrap();
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Closed)), "{r:?}");
+}
+
+#[test]
+fn a_moved_retry_keeping_its_timestamp_still_raises_its_new_participant_first() {
+    // D245 (perf287's check 1): a cross-shard commit refused `Moved` while its tablet moves
+    // to a shard with a lower floor is retried with its first timestamp (it still fits).
+    // The retry must raise the new owner before it reserves its seqno, like a fresh pick:
+    // 1,024 singles queued there ahead of the retry's PREPARE are stamped in an earlier
+    // turn than the one that reads the PREPARE, at later seqnos, and must land above it.
+    let mut db = open(3, |o| o.memtable_budget = 64 << 20);
+    let (t, f) = (db.table.id, db.table.families[0].id);
+    let m = db.engine.split_tablet_pending(t, b"m").unwrap();
+    db.drive(m).unwrap();
+    // `t`: "a".. on shard 0, "m".. on shard 2; `u` alone on shard 1.
+    for (row, to) in [(&b"a"[..], 0u16), (b"m", 2)] {
+        let owner = db
+            .ranges()
+            .iter()
+            .rfind(|r| r.2.as_slice() <= row)
+            .map(|r| r.1)
+            .unwrap();
+        if owner != to {
+            let m = db.engine.move_tablet_pending(t, row, to).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    let u = db
+        .engine
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let uf = u.families[0].id;
+    let u_owner = db.engine.snapshot().unwrap().view().tablets().ranges(u.id)[0].1;
+    if u_owner != 1 {
+        let m = db.engine.move_tablet_pending(u.id, b"", 1).unwrap();
+        db.drive(m).unwrap();
+    }
+    // Shard 0's floor runs 3,000 ahead of shard 2's.
+    for i in 0..3_000u32 {
+        db.put(b"a", &i.to_le_bytes());
+    }
+    // `u`'s compaction holds at its manifest commit, so the move of `u` to shard 2 waits in
+    // its drain (D241); the commit over "a" (0) and `u` (1) meets it, is refused `Moved` and
+    // waits for the map to change.
+    for round in 0..2u8 {
+        for i in 0..20u8 {
+            let mut wb = WriteBatch::new();
+            wb.put(u.id, uf, &[b'r', i], b"q", None, ValueRef::Bytes(&[round]))
+                .unwrap();
+            db.commit(wb);
+        }
+        let m = db.engine.flush_pending().unwrap();
+        db.drive(m).unwrap();
+    }
+    db.engine.take_appended();
+    db.engine.park_manifest_commits(true);
+    let _compact = db.engine.compact_pending(Some(u.id)).unwrap();
+    for _ in 0..1_000 {
+        if db.engine.manifest_commit_parked() {
+            break;
+        }
+        db.step();
+    }
+    assert!(db.engine.manifest_commit_parked(), "no compaction held");
+    let mut mv = db.engine.move_tablet_pending(u.id, b"", 2).unwrap();
+    for _ in 0..20 {
+        db.step();
+    }
+    let mut wb = WriteBatch::new();
+    wb.put(t, f, b"a", b"q", None, ValueRef::Bytes(b"c"))
+        .unwrap();
+    wb.put(u.id, uf, b"r0", b"c", None, ValueRef::Bytes(b"c"))
+        .unwrap();
+    let mut c = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    for _ in 0..50 {
+        db.step();
+    }
+    assert!(poll_commit(&mut c).is_none(), "committed during the move");
+    // The compaction and the move finish on shards 1 and 2 only, so the retry waits on 0.
+    db.engine.park_manifest_commits(false);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut moved = false;
+    for _ in 0..10_000 {
+        let now = db.clock.monotonic_nanos();
+        db.shards[1].run_once(now + 1_000);
+        db.shards[2].run_once(now + 1_000);
+        if Pin::new(&mut mv).poll(&mut cx).is_ready() {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "the move never finished");
+    // 1,024 singles queued on 2; then 0 retries (raise, reserve, PREPARE behind them), and
+    // 2's next turn stamps only the singles.
+    let mut singles: Vec<_> = (0..1_024u32)
+        .map(|i| {
+            let mut wb = WriteBatch::new();
+            wb.put(
+                t,
+                f,
+                format!("p{i:04}").as_bytes(),
+                b"s",
+                None,
+                ValueRef::Bytes(b"s"),
+            )
+            .unwrap();
+            db.engine.submit(wb, Some(Durability::Buffered)).unwrap()
+        })
+        .collect();
+    let now = db.clock.monotonic_nanos();
+    db.shards[0].run_once(now + 1_000);
+    db.shards[2].run_once(now + 1_000);
+    step_until_done(&mut db, &mut c);
+    for s in &mut singles {
+        step_until_done(&mut db, s);
+    }
+    let records = db.engine.take_appended();
+    let prepares: Vec<_> = records
+        .iter()
+        .filter(|r| r.stream == 0 && r.kind == pigeonhole_engine::AppendedKind::Prepare)
+        .collect();
+    let (ts_c, _) = db.get(b"a").unwrap();
+    assert!(
+        prepares.len() >= 2,
+        "the commit was never refused: {prepares:?}"
+    );
+    // The `Moved` retry kept its first timestamp.
+    let (first, retry) = (prepares[0], prepares[1]);
+    assert_eq!(retry.commit_ts, first.commit_ts, "{prepares:?}");
+    let refusals = db.engine.refusal_counts();
+    assert_eq!(refusals[..3], [0, 0, 0], "{refusals:?}");
+    // Every single on 2 reserved after the retry's seqno was stamped above its kept
+    // timestamp: the retry raised 2 before reserving. (A later attempt refused for room
+    // behind them takes a fresh timestamp, since 2 stamped since.)
+    let singles_on_2: Vec<_> = records
+        .iter()
+        .filter(|r| r.stream == 2 && r.kind == pigeonhole_engine::AppendedKind::Batch)
+        .collect();
+    let after: Vec<_> = singles_on_2
+        .iter()
+        .filter(|r| r.seqno > retry.seqno)
+        .collect();
+    assert!(
+        !after.is_empty(),
+        "no single reserved after the retry's seqno"
+    );
+    for r in &after {
+        assert!(
+            r.commit_ts > retry.commit_ts,
+            "single ({}, {}) below the retry ({}, {})",
+            r.seqno,
+            r.commit_ts,
+            retry.seqno,
+            retry.commit_ts
+        );
+    }
+    // And D11's order with the share that landed.
+    let seqno_c = prepares.last().unwrap().seqno;
+    for r in &singles_on_2 {
+        assert!(
+            (r.seqno < seqno_c) == (r.commit_ts <= ts_c),
+            "single ({}, {}) against commit ({seqno_c}, {ts_c})",
+            r.seqno,
+            r.commit_ts
+        );
+    }
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Two shards: `low`'s arena (4 MiB, nothing frozen by size) filled with committed singles
+/// until less than four 64 KiB values are free, then a cross-shard commit whose 1 MiB share
+/// on `low` can't fit, submitted (not yet run). With `pin`, a snapshot taken first holds
+/// every memtable, so no flush frees room. Returns the store, the commit and the refusal
+/// counts before it.
+fn prepare_against_a_full_arena(
+    moving_clock: bool,
+    pin: bool,
+) -> (Db, pigeonhole_engine::PendingCommit, [u64; 4]) {
+    let mut db = open(2, |o| {
+        o.memtable_budget = 4 << 20;
+        // No memtable freezes by size: only a wait for room frees the arena.
+        o.memtable_freeze_bytes = 64 << 20;
+        if moving_clock {
+            o.write_stall_timeout_nanos = 200_000;
+            ticking(o);
+        }
+    });
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    let value = vec![7u8; 64 << 10];
+    for i in 0..1_000u32 {
+        let (free, largest, _) = db.engine.arena_free(usize::from(low));
+        if free < 4 * value.len() as u64 || largest < 4 * value.len() as u64 {
+            break;
+        }
+        let mut wb = WriteBatch::new();
+        wb.put(
+            id,
+            f,
+            format!("a{i:04}").as_bytes(),
+            b"q",
+            None,
+            ValueRef::Bytes(&value),
+        )
+        .unwrap();
+        db.commit(wb);
+    }
+    if pin {
+        std::mem::forget(db.engine.snapshot().unwrap());
+    }
+    let before = db.engine.refusal_counts();
+    let big = vec![9u8; 1 << 20];
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"z"))
+        .unwrap();
+    wb.put(id, f, b"b", b"q", None, ValueRef::Bytes(&big))
+        .unwrap();
+    let pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    (db, pc, before)
+}
+
+/// Steps `db` until `pc` resolves, at most `steps` times.
+fn poll_until(
+    db: &mut Db,
+    pc: &mut pigeonhole_engine::PendingCommit,
+    steps: usize,
+) -> Option<pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>> {
+    for _ in 0..steps {
+        if let Some(r) = poll_commit(pc) {
+            return Some(r);
+        }
+        db.step();
+    }
+    None
 }
 
 /// `low`'s queue holds A and 1,023 more singles ahead of cross-shard commit B's PREPARE, so
-/// its first turn (up to 1,024 messages) stamps them, at later seqnos than B's and below B's
-/// timestamp, before the PREPARE is read. Its floor is still below B's timestamp then, so
-/// only the later-seqno check (D244 (ii)) can refuse it. Returns the coordination attempts B
-/// took (its coordinator logs a PREPARE of its own for each).
-fn refused_in_an_earlier_group(moving_clock: bool) -> usize {
+/// its first turn (up to 1,024 messages) stamps them, at later seqnos than B's, before the
+/// PREPARE is read; `high`'s floor, which B's timestamp comes from, runs 3,000 ahead of
+/// `low`'s. Checks D11's order between A and B, and returns the coordination attempts B took
+/// (its coordinator logs a PREPARE of its own for each) and the refusals by reason.
+fn stamped_in_an_earlier_group(moving_clock: bool, budget: u64) -> (usize, [u64; 4]) {
     let mut db = open(2, |o| {
-        o.memtable_budget = 64 << 20;
+        o.memtable_budget = budget;
         if moving_clock {
             o.write_stall_timeout_nanos = 50_000_000;
             ticking(o);
@@ -1673,18 +1985,19 @@ fn refused_in_an_earlier_group(moving_clock: bool) -> usize {
         "A (seqno {seqno_a}, ts {ts_a}) and B (seqno {seqno_b}, ts {ts_b}) are in opposite \
          orders on one tablet (D11, D142)"
     );
-    assert!(seqno_b > seqno_a, "B was never refused");
     let attempts = db
         .engine
         .take_appended()
         .iter()
         .filter(|r| r.stream == high && r.kind == pigeonhole_engine::AppendedKind::Prepare)
         .count();
+    let refusals = db.engine.refusal_counts();
+    eprintln!("attempts {attempts}, refusals {refusals:?}");
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
     }
-    attempts
+    (attempts, refusals)
 }
 
 #[test]
@@ -1783,7 +2096,19 @@ fn an_aborted_prepare_does_not_keep_refusing_later_commits() {
 #[test]
 fn default_timestamps_keep_seqno_order_on_every_shard_under_cross_shard_commits() {
     for seed in seeds() {
-        d142_sweep(seed, true);
+        d142_sweep(seed, true, true);
+    }
+}
+
+/// D245's retry convergence on the sim's frozen clock, with the default write-stall
+/// timeout: every commit commits (no `Busy`, no hang), and no PREPARE is refused for order.
+/// Each shard step is atomic here, so no write can straddle a coordinator's floor read and
+/// its reservation; the move-raise check is counted apart, being seqno-blind (D142).
+#[test]
+fn cross_shard_commits_converge_on_a_frozen_clock() {
+    for seed in seeds() {
+        d142_sweep(seed, true, false);
+        d142_sweep(seed, false, false);
     }
 }
 
@@ -1792,11 +2117,11 @@ fn default_timestamps_keep_seqno_order_on_every_shard_under_cross_shard_commits(
 #[test]
 fn default_timestamps_keep_seqno_order_with_tablet_changes_off() {
     for seed in seeds() {
-        d142_sweep(seed, false);
+        d142_sweep(seed, false, true);
     }
 }
 
-fn d142_sweep(seed: u64, tablet_changes: bool) {
+fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut rng = move |n: u64| {
         x ^= x << 13;
@@ -1804,13 +2129,15 @@ fn d142_sweep(seed: u64, tablet_changes: bool) {
         x ^= x << 17;
         x % n
     };
-    // A clock that moves (each read is a nanosecond) and a short write-stall timeout: on a
-    // frozen one, two shards both retrying `BelowFloor` commits can refuse each other for
-    // ever (#637); here they give up with `Busy` as D241 has it, and what landed is checked.
+    // With `moving_clock`, a clock that moves (each read is a nanosecond) and a short
+    // write-stall timeout, so `Busy` is possible; without, the sim's frozen clock and the
+    // default timeout, so every commit must commit.
     let mut db = open(3, |o| {
         o.memtable_budget = 64 << 20;
-        o.write_stall_timeout_nanos = 200_000;
-        ticking(o);
+        if moving_clock {
+            o.write_stall_timeout_nanos = 200_000;
+            ticking(o);
+        }
         o.tablet_changes = tablet_changes;
     });
     let starts = *b"acegik";
@@ -1971,8 +2298,18 @@ fn d142_sweep(seed: u64, tablet_changes: bool) {
         }
     }
     assert!(shares > 0, "seed {seed}: no cross-shard commit");
+    // No PREPARE refused for order (D245); with tablet changes off not even by a move's
+    // raise, which never happens then.
+    let refusals = db.engine.refusal_counts();
+    assert_eq!(refusals[1..3], [0, 0], "seed {seed}: refusals {refusals:?}");
+    if !tablet_changes {
+        assert_eq!(refusals[0], 0, "seed {seed}: refusals {refusals:?}");
+    }
+    if !moving_clock {
+        assert_eq!(busy, 0, "seed {seed}: {busy} commits gave up");
+    }
     eprintln!(
-        "seed {seed}: {} records, {shares} shares, {busy} busy",
+        "seed {seed}: {} records, {shares} shares, {busy} busy, refusals {refusals:?}",
         records.len()
     );
     db.engine.close().unwrap();

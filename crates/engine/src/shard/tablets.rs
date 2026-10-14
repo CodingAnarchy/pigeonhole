@@ -31,6 +31,18 @@ use crate::snapshot::TabletEntry;
 /// Row samples kept per tablet and balancer interval (split points for write skew).
 const SAMPLES: usize = 64;
 
+/// Why a PREPARE is refused (D245), and the index of its test-hook count
+/// (`Engine::refusal_counts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloorRefusal {
+    MoveRaise = 0,
+    Below = 1,
+    Above = 2,
+    /// Counted by `refuse_for_room` in test-hook builds only.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    Room = 3,
+}
+
 /// `ShardState::stamps` drops the entries at or below the visible watermark once it holds
 /// this many (D244).
 const STAMPS_PRUNE_AT: usize = 32;
@@ -233,31 +245,28 @@ impl ShardState {
         }
     }
 
-    /// A PREPARE's admission routing: refused below a floor (D142, D244), else routed as any
-    /// member and, when it runs here, kept for later PREPAREs' checks (D244).
+    /// A PREPARE's admission routing: refused out of seqno order with what this shard
+    /// stamped (D142, D244, D245), else routed as any member and, when it runs here, kept
+    /// for later PREPAREs' checks.
     #[inline(never)]
     fn route_prepare(&mut self, m: Member, ctx: &mut ShardContext<'_, ShardMsg>) -> Option<Member> {
-        if self.below_floor(&m) {
-            // Below the shard's own floor or out of order with what it stamped, or only below
-            // a moved tablet's raise (ICR 0043); decided before the floor is raised below.
-            let by_move = m.commit_ts >= self.ts_floor() && !self.stamped_below(&m);
+        if let Some(why) = self.floor_refusal(&m) {
             // The coordinator's retry reads this shard's floor again, raised to the refused
-            // timestamp, or to an earlier-seqno PREPARE's above it that refused it (D244):
-            // this shard's later singles stamp above both, so the retry's fresh timestamp
-            // clears what refused this one.
-            let conflict = self
-                .stamps
-                .iter()
-                .filter(|&&(seqno, ts)| seqno < m.seqno && ts > m.commit_ts)
-                .map(|&(_, ts)| ts)
-                .max()
-                .unwrap_or(0);
+            // timestamp, or past the earlier-seqno timestamp above it that refused it
+            // (D244, D245): the retry's fresh timestamp clears what refused this one.
+            #[cfg(feature = "test-hooks")]
+            self.shared.hooks.refusals[why as usize].fetch_add(1, Ordering::Relaxed);
+            let conflict = match why {
+                FloorRefusal::Below => self.floor_below(m.seqno),
+                FloorRefusal::MoveRaise | FloorRefusal::Above | FloorRefusal::Room => 0,
+            };
             self.raise_ts_floor(m.commit_ts.max(conflict));
             let floor = self.ts_floor();
-            self.shared.metrics[usize::from(self.id.0)].count_refusal(if by_move {
-                CrossRefusal::MoveRaise
-            } else {
-                CrossRefusal::BelowFloor
+            self.shared.metrics[usize::from(self.id.0)].count_refusal(match why {
+                FloorRefusal::MoveRaise => CrossRefusal::MoveRaise,
+                FloorRefusal::Below | FloorRefusal::Above | FloorRefusal::Room => {
+                    CrossRefusal::BelowFloor
+                }
             });
             self.shared.ts_floors[usize::from(self.id.0)]
                 .0
@@ -351,38 +360,154 @@ impl ShardState {
         out
     }
 
-    /// Whether `m` is a PREPARE writing rows at a commit timestamp below a default timestamp
-    /// this shard already assigned. The coordinator picked it above the floor it read, but
-    /// this shard may have assigned more since (to any of its tablets, a received one
-    /// included): applying it would put a write at a lower timestamp after a write at a
-    /// higher one, so a tablet's default timestamps would go backwards (D11, issue #105).
-    /// Or above one it gave a later seqno (`stamped_below`, D244). Ties are allowed: they
-    /// never reorder.
-    fn below_floor(&self, m: &Member) -> bool {
-        if !matches!(m.kind, MemberKind::Prepare { .. }) {
-            return false;
+    /// Why `m`, a PREPARE writing rows at `(S, T)`, would put this shard's timestamps out of
+    /// seqno order (D11, D142, D245), if it would; ties are allowed:
+    /// - `MoveRaise`: `T` is below the floor a shard handing this one a tablet raised it to
+    ///   (`ts_raises`), seqno-blind, as D142 had it: moves are rare.
+    /// - `Below`: this shard gave a seqno below `S` a timestamp above `T` (`floor_below`).
+    ///   The coordinator raised this shard's floor before reserving `S` (D245), so only a
+    ///   write reserved before `S` and stamped after the coordinator read the floors can.
+    /// - `Above`: it gave a seqno above `S` a timestamp below `T`: only a PREPARE whose
+    ///   coordinator read the floors before this one's raised them, and reserved after.
+    fn floor_refusal(&self, m: &Member) -> Option<FloorRefusal> {
+        if !matches!(m.kind, MemberKind::Prepare { .. })
+            || !BatchRef::new(m.bytes.as_slice()).is_ok_and(|b| b.iter().next().is_some())
+        {
+            return None;
         }
         let raised = self.shared.ts_raises[usize::from(self.id.0)]
             .0
             .load(Ordering::Acquire);
-        (m.commit_ts < self.ts_floor().max(raised) || self.stamped_below(m))
-            && BatchRef::new(m.bytes.as_slice()).is_ok_and(|b| b.iter().next().is_some())
+        if m.commit_ts < raised {
+            Some(FloorRefusal::MoveRaise)
+        } else if self.floor_below(m.seqno) > m.commit_ts {
+            Some(FloorRefusal::Below)
+        } else if self
+            .stamps
+            .iter()
+            .any(|&(seqno, ts)| seqno > m.seqno && ts < m.commit_ts)
+        {
+            Some(FloorRefusal::Above)
+        } else {
+            None
+        }
     }
 
-    /// Whether `m` is a PREPARE whose commit timestamp is out of seqno order with one this
-    /// shard already gave (D244, issue #653): above a later seqno's (the coordinator reserved
-    /// the PREPARE's seqno before reading the floors, and this shard stamped later seqnos
-    /// below the timestamp it picked before the PREPARE arrived), or below an earlier
-    /// PREPARE's routed in the same group, before the floor rises. Applying it would put a
-    /// later seqno at a lower timestamp than an earlier one (D11, D142). Ties are allowed.
-    fn stamped_below(&self, m: &Member) -> bool {
-        self.stamps.iter().any(|&(seqno, ts)| {
-            (seqno > m.seqno && ts < m.commit_ts) || (seqno < m.seqno && ts > m.commit_ts)
-        })
+    /// The largest timestamp this shard gave a seqno below `seqno` (D245): everything pruned
+    /// or stamped before the history, each recent group's first and last single, and each
+    /// routed PREPARE. A group's seqnos are contiguous (one reservation), so a group is
+    /// wholly below or above `seqno`.
+    pub(super) fn floor_below(&self, seqno: Seqno) -> Timestamp {
+        self.stamps
+            .iter()
+            .chain(self.stamps_last.iter())
+            .filter(|&&(s, _)| s < seqno)
+            .map(|&(_, ts)| ts)
+            .fold(self.pruned_max, Timestamp::max)
+    }
+
+    /// Folds the coordinators' raises into the floor (D245): once per group, after its
+    /// reservation, so the load follows the reservation's read-modify-write on `NEXT_SEQNO`.
+    #[inline(never)]
+    pub(super) fn fold_coord_raise(&mut self) {
+        let raised = self.shared.ts_coord_raises[usize::from(self.id.0)]
+            .0
+            .load(Ordering::Acquire);
+        self.ts_floor = self.ts_floor.max(raised);
+    }
+
+    /// A PREPARE that would wait for arena room, refused instead (D245, ICR 0042); its
+    /// coordinator hears `RoomFreed` once this shard's room wait ends.
+    #[inline(never)]
+    pub(super) fn refuse_for_room(
+        &mut self,
+        m: Member,
+        coordinator: ShardId,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        #[cfg(feature = "test-hooks")]
+        self.shared.hooks.refusals[FloorRefusal::Room as usize].fetch_add(1, Ordering::Relaxed);
+        self.shared.metrics[usize::from(self.id.0)].count_refusal(CrossRefusal::Room);
+        if !self.room_refused.contains(&coordinator) {
+            self.room_refused.push(coordinator);
+        }
+        self.room_refused_free = self.arena.free_bytes().saturating_sub(self.reserved);
+        self.refuse_prepare(m, PrepareError::Room(self.room_generation), ctx);
+    }
+
+    /// Whether room may fit a share this shard refused for room (D245): its room wait ended,
+    /// or nothing waits or flushes and more is free than at the latest refusal (after
+    /// reclaiming the memtables readers left).
+    #[inline(never)]
+    pub(super) fn room_freed_since_refusal(&mut self) -> bool {
+        if self.room_wait.is_none() {
+            return true;
+        }
+        if !self.pending.is_empty() || self.flush_running || !self.flush_queue.is_empty() {
+            return false;
+        }
+        self.reclaim_retired();
+        self.refresh_free();
+        self.arena.free_bytes().saturating_sub(self.reserved) > self.room_refused_free
+    }
+
+    /// Tells the coordinators this shard refused for room that it has room again (D245).
+    #[inline(never)]
+    pub(super) fn notify_room_freed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.room_generation += 1;
+        let generation = self.room_generation;
+        for c in std::mem::take(&mut self.room_refused) {
+            trace!(
+                "shard {} room freed ({generation}): tells {}",
+                self.id.0, c.0
+            );
+            self.send(
+                c,
+                ShardMsg::RoomFreed {
+                    from: self.id,
+                    generation,
+                },
+                ctx,
+            );
+        }
+    }
+
+    /// Runs the retries that waited for `from`'s room before `generation` (D245).
+    pub(super) fn on_room_freed(
+        &mut self,
+        from: ShardId,
+        generation: u64,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let seen = &mut self.room_freed[usize::from(from.0)];
+        *seen = (*seen).max(generation);
+        let (ready, wait): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
+            std::mem::take(&mut self.retries)
+                .into_iter()
+                .partition(|r| {
+                    r.room_wait
+                        .is_some_and(|(p, g)| p == from && g < generation)
+                });
+        self.retries = wait;
+        trace!(
+            "shard {} room freed on {} ({generation}): {} retries ready",
+            self.id.0,
+            from.0,
+            ready.len()
+        );
+        for mut r in ready {
+            r.room_wait = None;
+            if self.closing {
+                r.reply.notify(Err(Error::Closed));
+            } else {
+                self.retry(r, ctx);
+            }
+        }
+        self.arm_tablet_timer(ctx);
     }
 
     /// A PREPARE routed to this shard (D244): kept, so a PREPARE at another seqno, in this
-    /// group or a later one, is checked against it (`stamped_below`).
+    /// group or a later one, is checked against it (`floor_refusal`).
     #[inline(never)]
     fn note_prepare(&mut self, m: &Member) {
         if matches!(m.kind, MemberKind::Prepare { .. })
@@ -394,8 +519,7 @@ impl ShardState {
 
     /// An admitted PREPARE (D244): its timestamp raises the floor before the group's
     /// singles are stamped, so none of those, all at later seqnos, lands below it. A PREPARE
-    /// that waits for room instead raises nothing yet: singles stamped meanwhile below it
-    /// refuse it when it is routed again (`stamped_below`).
+    /// that waits for room is refused instead (D245).
     #[inline(never)]
     pub(super) fn raise_for_prepare(&mut self, m: &Member) {
         if BatchRef::new(m.bytes.as_slice()).is_ok_and(|b| b.iter().next().is_some()) {
@@ -421,15 +545,31 @@ impl ShardState {
         {
             self.note_stamp(m.seqno, m.commit_ts);
         }
+        if let Some(m) = admitted
+            .iter()
+            .rev()
+            .find(|m| matches!(m.kind, MemberKind::Single))
+        {
+            self.stamps_last.push((m.seqno, m.commit_ts));
+        }
     }
 
-    /// Keeps `(seqno, ts)` for `stamped_below`: a PREPARE that seqno could meet has a lower
+    /// Keeps `(seqno, ts)` for `floor_refusal`: a PREPARE that seqno could meet has a lower
     /// seqno still held by its coordinator, so above the visible watermark; entries at or
     /// below it are dropped.
     pub(super) fn note_stamp(&mut self, seqno: Seqno, ts: Timestamp) {
-        if self.stamps.len() >= STAMPS_PRUNE_AT {
+        if self.stamps.len() >= STAMPS_PRUNE_AT || self.stamps_last.len() >= STAMPS_PRUNE_AT {
             let visible = self.shared.shm.visible_seqno();
-            self.stamps.retain(|&(s, _)| s > visible);
+            let mut pruned = self.pruned_max;
+            for v in [&mut self.stamps, &mut self.stamps_last] {
+                v.retain(|&(s, t)| {
+                    s > visible || {
+                        pruned = pruned.max(t);
+                        false
+                    }
+                });
+            }
+            self.pruned_max = pruned;
         }
         self.stamps.push((seqno, ts));
     }
@@ -529,6 +669,7 @@ impl ShardState {
                     map_version: view.tablets.version(),
                     commit_ts: req.commit_ts,
                     epoch: 0,
+                    room_wait: None,
                 };
                 if shards[0] == self.id {
                     self.start_coordination(creq, ctx);
@@ -554,13 +695,39 @@ impl ShardState {
             }
             return;
         }
+        // After a shard's death no commit is accepted (D227): one waiting for a participant's
+        // room may wait on the dead one, so it ends now rather than at the timeout (D245).
+        if self.shared.shard_died.load(Ordering::Acquire)
+            && self.retries.iter().any(|r| r.room_wait.is_some())
+        {
+            let (dead, keep): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
+                std::mem::take(&mut self.retries)
+                    .into_iter()
+                    .partition(|r| r.room_wait.is_some());
+            self.retries = keep;
+            for r in dead {
+                r.reply.notify(Err(Error::Closed));
+            }
+        }
         let version = self.shared.view.load().tablets.version();
         let epoch = self.shared.tablet_epoch.load(Ordering::Acquire);
         let (ready, wait): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
             std::mem::take(&mut self.retries)
                 .into_iter()
-                .partition(|r| r.map_version < version || r.epoch < epoch);
+                .partition(|r| {
+                    r.room_wait.is_none() && (r.map_version < version || r.epoch < epoch)
+                });
         self.retries = wait;
+        if !self.retries.is_empty() {
+            trace!(
+                "shard {} retries waiting: {:?} (map v{version}, epoch {epoch})",
+                self.id.0,
+                self.retries
+                    .iter()
+                    .map(|r| (r.room_wait.map(|(s, g)| (s.0, g)), r.map_version, r.epoch))
+                    .collect::<Vec<_>>()
+            );
+        }
         for r in ready {
             self.retry(r, ctx);
         }
