@@ -401,12 +401,14 @@ What a pass forces is otherwise unchanged; the mixed-temperature harness gives m
 **Why.** D193 made the Mac's official runs 5–6 the baseline that every later official gate run is compared with. But the Phase 3 gate and every release are judged on the reference machine (D5, #405), and run-to-run limits don't transfer across machines. A Linux runner's gate run "fails" `check.py` against the Mac baseline (#387, run 38098364056) on code that passes it on the Mac.
 
 **Now:**
-- **The reference baseline:** the two official `phase2-gate` runs of the first AX102 gate window (`run-window.sh` steps `phase2-gate` and `phase2-gate-2`, #509), committed beside the Mac runs in `crates/bench/baselines/phase2-gate/`. From then on, `run-gate.sh` compares and `check.py` checks against them.
+- **The reference baseline:** two official `phase2-gate` runs on the AX102 (amended: on main f8afbb2d, see History), committed beside the Mac runs in `crates/bench/baselines/phase2-gate/`. From then on, `run-gate.sh` compares and `check.py` checks against them.
 - **Until they're committed,** the Mac runs 5–6 stay the baseline. They remain in the repository as the Phase 2 record.
 - **D193's other rules are unchanged:** the same gated measures and noise allowances (re-derived from the AX102's pair if its spread differs, with the owner's agreement, as D193 requires for any widening), and the same "fixed or accepted by the owner" rule.
 - **#387's ratio to SQLite EAV** (row-read and scan p99, the documented gap) is judged on the same two runs. On the Mac at main 2d6b6ed it was 1.58× and 1.27× (D193: about 2.0× and 1.6×).
 
 *Checked by:* the first gate window's report (`report.py`), whose Phase 2 rows read both runs.
+
+*History: Amended by the owner, 2026-10-14. The baseline is two official `run-gate.sh` runs on main f8afbb2d (D252–D254), not the first gate window's: sparse-wide's tail had crept past the Mac limits on 175c0ffc (#705), a bisect over every engine commit since 8654ad69 found no single cause (the ~2% creep goes to #724), and the owner chose to install the baseline from current main. The files are the 2 of 8 official runs on f8afbb2d nearest the median; main failed the Mac limits in 4 of the 8. check.py's allowances are unchanged; re-deriving them from the AX102's spread is a separate owner decision.*
 
 <a id="d209"></a>
 ## D209 — A reopened WAL stream's first segment takes max seen + 3, so it never takes the epoch of a successor whose header never reached the disk (coordinator decision, 2026-10-11; wal, #508; amends FORMAT §10.1 rule 2; shipped in 0.2.1)

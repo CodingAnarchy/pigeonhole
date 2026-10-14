@@ -47,7 +47,7 @@ It ran every step of `run-window.sh` at full scale on 175c0ffc, the head of `mai
   - The step's verdict is `check.py`'s, which compares Pigeonhole's own sparse-wide measures against the Phase 2 baseline measured on the M5 (`gate2-run5.json`, `gate2-run6.json`).
   - Pigeonhole is over two limits in both runs: overall p99 444 and 447 µs (limit 443) and scan p99 586 and 561 µs (limit 555). Every other measure is within.
   - The SQLite and RocksDB differences in the log come from `phdb-bench compare`, whose exit code the step ignores.
-  - On the AX102 the same check passed on 8654ad69 (2026-10-13: p99 401 µs, scan 512 µs) and a9ecfc77 (2026-10-13b: 427 µs, 534 µs), so sparse-wide's tail crept up across those commits. The owner asked for a bisect (each engine commit since 8654ad69); the AX102 reference baselines (D208) are installed from the fixed commit afterwards.
+  - On the AX102 the same check passed on 8654ad69 (2026-10-13: p99 401 µs, scan 512 µs) and a9ecfc77 (2026-10-13b: 427 µs, 534 µs), so sparse-wide's tail crept up across those commits. The owner asked for a bisect (each engine commit since 8654ad69). It found no single cause: about 2% of creep, spread over many commits, which goes to #724. So the AX102 reference baselines (D208) are installed from main f8afbb2d ([phase2-gate](../../../phase2-gate/README.md)).
 - **Reported rows past the 3× rule (each "file an issue"):**
   - transfer at both levels (RocksDB 38× and 7.3× ahead; 1.22 and 1.97 conflicts per transfer, with 0.49 and 0.95 pending-share overlaps the engine now retries, D249);
   - ycsb-a through the async API at 16 in flight at buffered (0.13× the synchronous run, p99 17 ms);
