@@ -557,6 +557,13 @@ fn bench(a: &Args) -> Result<Suite, String> {
                     {
                         let mut off = pigeonhole(a, None).tablet_changes(false);
                         suite.results.push(one(a, &root, &mut seq, &mut off, &c)?);
+                        // D246 (owner, 2026-10-14): tablets on against off is judged with
+                        // packing off, since packing's half-load target caps how many shards
+                        // the load spreads over; the default run stays RocksDB's comparison.
+                        let mut unpacked = pigeonhole(a, None).packing(false);
+                        suite
+                            .results
+                            .push(one(a, &root, &mut seq, &mut unpacked, &c)?);
                     }
                 }
             }
@@ -733,7 +740,8 @@ mod tests {
 
     #[test]
     fn cross_shard_contention_runs_tablets_off_beside_the_default() {
-        // D246: the default is judged against the same build with tablet changes off.
+        // D246: the default, then tablet changes off, then tablet changes on with packing off
+        // (the ratio the owner judges).
         let dir = std::env::temp_dir().join(format!("phdb-bench-xs-{}", std::process::id()));
         let a = args(&format!(
             "cross-shard-contention --scale smoke --shards 4 --write-buffer 16777216 --dir {}",
@@ -745,8 +753,10 @@ mod tests {
             .iter()
             .map(|r| r.store_config.as_str())
             .collect();
-        assert_eq!(configs.len(), 2, "{configs:?}");
-        assert!(configs[0].contains("tablets=on") && !configs[1].contains("tablets=on"));
+        assert_eq!(configs.len(), 3, "{configs:?}");
+        assert!(configs[0].contains("tablets=on") && !configs[0].contains("packing=off"));
+        assert!(!configs[1].contains("tablets=on"));
+        assert!(configs[2].contains("tablets=on packing=off"), "{configs:?}");
         assert!(suite.results.iter().all(|r| r.rounds().is_some()));
         assert!(suite.to_markdown().contains("Per cross-shard commit"));
         let a = args(&format!(
@@ -756,7 +766,7 @@ mod tests {
         assert_eq!(
             bench(&a).unwrap().results.len(),
             1,
-            "no second tablets-off run"
+            "no tablets-off or packing-off run beside it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

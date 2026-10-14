@@ -43,11 +43,11 @@ It ran every step of `run-window.sh` at full scale on 175c0ffc, the head of `mai
     - ycsb-f p99 (2.2× SQLite's);
     - cross-shard p99 (2.7× SQLite's);
     - counters p99 (5.7× RocksDB's, 43× SQLite's).
-- **Phase 2 floors (D193): FAIL, but not on Pigeonhole.**
-  - The step compares against the Phase 2 baselines measured on the M5 (`gate2-run5.json`, `gate2-run6.json`).
-  - The failing measures are SQLite EAV's and RocksDB's sparse-wide p50 (and SQLite's p99 in run 2) on the AX102 against those M5 numbers.
-  - Pigeonhole's rows aren't compared at all: the settings key differs (10 shards on the M5, 16 here).
-  - D208 meant the first window's runs to become the AX102 reference baseline. That needs the owner's call and isn't changed here.
+- **Phase 2 floors (D193): FAIL, on Pigeonhole.** *Corrected after the run: this entry first said the failure wasn't Pigeonhole's, which was wrong.*
+  - The step's verdict is `check.py`'s, which compares Pigeonhole's own sparse-wide measures against the Phase 2 baseline measured on the M5 (`gate2-run5.json`, `gate2-run6.json`).
+  - Pigeonhole is over two limits in both runs: overall p99 444 and 447 µs (limit 443) and scan p99 586 and 561 µs (limit 555). Every other measure is within.
+  - The SQLite and RocksDB differences in the log come from `phdb-bench compare`, whose exit code the step ignores.
+  - On the AX102 the same check passed on 8654ad69 (2026-10-13: p99 401 µs, scan 512 µs) and a9ecfc77 (2026-10-13b: 427 µs, 534 µs), so sparse-wide's tail crept up across those commits. The owner asked for a bisect (each engine commit since 8654ad69); the AX102 reference baselines (D208) are installed from the fixed commit afterwards.
 - **Reported rows past the 3× rule (each "file an issue"):**
   - transfer at both levels (RocksDB 38× and 7.3× ahead; 1.22 and 1.97 conflicts per transfer, with 0.49 and 0.95 pending-share overlaps the engine now retries, D249);
   - ycsb-a through the async API at 16 in flight at buffered (0.13× the synchronous run, p99 17 ms);

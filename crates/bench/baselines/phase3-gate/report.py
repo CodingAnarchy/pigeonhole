@@ -57,10 +57,12 @@ XSHARD = "cross-shard-contention"
 
 
 def default_config(r):
-    """False for the run `all` adds beside the default for D246: Pigeonhole's cross-shard
-    contention with tablet changes off. Tables keyed by workload use the default run."""
+    """False for the runs `all` adds beside the default for D246: Pigeonhole's cross-shard
+    contention with tablet changes off, and with packing off. Tables keyed by workload use
+    the default run."""
+    cfg = r.get("store_config", "")
     return not (r["store"] == "pigeonhole" and r["workload"] == XSHARD
-                and "tablets=on" not in r.get("store_config", ""))
+                and ("tablets=on" not in cfg or "packing=off" in cfg))
 
 
 def op(r, name):
@@ -371,22 +373,26 @@ rows.append(("Within 1.5× of RocksDB on every workload",
 # counters land, wasted rounds are inferred as perf2 did: sequence numbers used while
 # measuring minus the commits (`seqnos_used`). The cross-shard commit p99 is reported; its
 # bound is the owner's, from D245's numbers.
-# The cross-shard commit p99 (owner, from D245's 1.02-1.03 ms at Buffered): within 1.5x of
-# RocksDB's multi-key batch p99 at each durability, and under 2 ms at Buffered. The GroupSync
-# cap is set from the pre-release gate run: reported, not judged, until then.
+# The cross-shard commit p99 (owner, from D245's 1.02-1.03 ms at Buffered and the pre-release
+# run's 303 us at GroupSync): within 1.5x of RocksDB's multi-key batch p99 at each durability,
+# and at most 2 ms at Buffered and 1 ms at GroupSync.
 XSHARD_P99_VS_ROCKSDB = 1.5
-XSHARD_P99_CAP_US = {"buffered": 2000, "default": None}
-XSHARD_TARGET = ("Contended cross-shard commits (D246): within 1.5× of RocksDB; tablets on ≥ 0.8× off; "
+XSHARD_P99_CAP_US = {"buffered": 2000, "default": 1000}
+XSHARD_TARGET = ("Contended cross-shard commits (D246): within 1.5× of RocksDB; tablets on ≥ 0.8× off (packing off); "
                  "≤ 0.1 wasted 2PC rounds per cross-shard commit; no Busy; cross-shard p99 ≤ 1.5× RocksDB's "
-                 "batch p99, and ≤ 2 ms at Buffered (GroupSync cap TBD)")
+                 "batch p99, ≤ 2 ms at Buffered and ≤ 1 ms at GroupSync")
 
 
 def xshard(run, level="buffered"):
     """D246's figures for one run file at one durability level (`all` runs are Buffered), or
     None when the run lacks one of its three records."""
     rs = results(run, workload=XSHARD)
-    on = next((r for r in rs if r["store"] == "pigeonhole" and "tablets=on" in r.get("store_config", "")), None)
-    off = next((r for r in rs if r["store"] == "pigeonhole" and "tablets=on" not in r.get("store_config", "")), None)
+    ph = [r for r in rs if r["store"] == "pigeonhole"]
+    on = next((r for r in ph if default_config(r)), None)
+    off = next((r for r in ph if "tablets=on" not in r.get("store_config", "")), None)
+    # D246 (owner, 2026-10-14): tablets on against off is judged with packing off; runs from
+    # before that have no such run and fall back to the default one.
+    unpacked = next((r for r in ph if "packing=off" in r.get("store_config", "")), None)
     rk = next((r for r in rs if r["store"] == "rocksdb"), None)
     if not (on and off and rk):
         return None
@@ -412,7 +418,8 @@ def xshard(run, level="buffered"):
     x = {
         "tput": rk["throughput"] / on["throughput"],
         "p99": on["p99_ns"] / max(rk["p99_ns"], 1),
-        "on_off": on["throughput"] / max(off["throughput"], 1e-9),
+        "on_off": (unpacked or on)["throughput"] / max(off["throughput"], 1e-9),
+        "on_off_how": "packing off" if unpacked else "packing on (no packing-off run)",
         "wasted": wasted,
         "how": how,
         "cross_p99_us": us(cross["p99_ns"]) if cross else None,
@@ -436,7 +443,7 @@ xs = [(run[:-5], xshard(run)) for run in ("all-uring-1.json", "all-uring-2.json"
 if all(x for _, x in xs):
     detail = "; ".join(
         f"{name}: {rate(x['on'])} ops/s, RocksDB {x['tput']:.2f}× throughput, p99 {x['p99']:.2f}×; "
-        f"tablets on/off {x['on_off']:.2f}; wasted rounds {x['wasted']:.3f} per cross-shard commit ({x['how']}); "
+        f"tablets on/off {x['on_off']:.2f} ({x['on_off_how']}); wasted rounds {x['wasted']:.3f} per cross-shard commit ({x['how']}); "
         f"Busy {x['busy']}; {x['p99_text']}"
         for name, x in xs)
     rows.append((XSHARD_TARGET, detail, verdict(all(x["ok"] for _, x in xs)), "all-uring-1.json, all-uring-2.json"))
@@ -500,7 +507,7 @@ for level, label in CONTENDED_LEVELS:
     if xc:
         rows.append((xt,
                      f"{rate(xc['on'])} ops/s, RocksDB {xc['tput']:.2f}× throughput, p99 {xc['p99']:.2f}×; "
-                     f"tablets on/off {xc['on_off']:.2f}; wasted rounds {xc['wasted']:.3f} per cross-shard commit "
+                     f"tablets on/off {xc['on_off']:.2f} ({xc['on_off_how']}); wasted rounds {xc['wasted']:.3f} per cross-shard commit "
                      f"({xc['how']}); Busy {xc['busy']}; {xc['p99_text']}",
                      verdict(xc["ok"]), f"contended-{level}-{XSHARD}.json"))
     else:
