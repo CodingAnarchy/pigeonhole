@@ -459,11 +459,11 @@ pub struct Riders {
     pub snapshots: u64,
     /// See [`Riders::snapshots`].
     pub durable_snapshots: u64,
-    /// Milliseconds a durable backup took, started 2 s into the measured phase; `None` if the
-    /// phase ended first.
+    /// Milliseconds a durable backup took, started 2 s into the measured phase and run to the
+    /// end; `None` if the phase ended before it started.
     pub backup_ms: Option<f64>,
-    /// Milliseconds a full compaction took, started after the backup; `None` if the phase
-    /// ended first.
+    /// Milliseconds a full compaction took, started right after the backup and run to the end
+    /// (the riders wait for it); `None` when the backup never started.
     pub compact_ms: Option<f64>,
 }
 

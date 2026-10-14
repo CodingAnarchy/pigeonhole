@@ -509,6 +509,28 @@ for level, label in CONTENDED_LEVELS:
             if mine > 3 * theirs:
                 flag = f"**> 3× worse than {near} against RocksDB ({mine:.2f}× vs {theirs:.2f}×): file an issue**"
         reported.append((label, w, ph, vs, flag))
+# Large values (D247, reported; perf287's H): ycsb-a with 16 KiB values against RocksDB and
+# SQLite, beside the judged 100-byte ycsb-a; flagged when its RocksDB ratio is past 3x that one's.
+for level, label in CONTENDED_LEVELS:
+    name = f"contended-{level}-ycsb-a-16k.json"
+    ph = next(iter(results(name, "pigeonhole", "ycsb-a")), None)
+    if not ph:
+        continue
+    vs = {}
+    for store in CONTENDED_AGAINST:
+        o = next(iter(results(name, store, "ycsb-a")), None)
+        if o:
+            vs[store] = (o["throughput"] / ph["throughput"], ph["p99_ns"] / max(o["p99_ns"], 1))
+    flag = ""
+    judged = cont.get((level, "ycsb-a"))
+    if judged and "rocksdb" in vs and "rocksdb" in judged[1]:
+        mine, theirs = vs["rocksdb"][0], judged[1]["rocksdb"][0]
+        if mine > 3 * theirs:
+            flag = f"; **> 3× worse than ycsb-a against RocksDB ({mine:.2f}× vs {theirs:.2f}×): file an issue**"
+    ratios = ", ".join(f"{s.split('-')[0]} {t:.2f}× throughput, p99 {l:.2f}×" for s, (t, l) in vs.items())
+    rows.append((f"Contended ycsb-a, 16 KiB values, {label} (reported, not judged; D247)",
+                 f"{rate(ph['throughput'])} ops/s, p99 {us(ph['p99_ns']):.0f} µs; {ratios}{flag}", "-", name))
+
 # ycsb-a's riders (D247, reported): readers under snapshots, a durable backup and a compaction
 # beside the measured phase; the foreground's p99 is held against the judged ycsb-a run's.
 for level, label in CONTENDED_LEVELS:

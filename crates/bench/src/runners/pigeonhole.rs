@@ -342,9 +342,9 @@ mod riders {
                 let t = Instant::now();
                 db.backup_durable(&path).map_err(err)?;
                 let backup_ms = t.elapsed().as_secs_f64() * 1e3;
-                if stop.load(Ordering::Relaxed) {
-                    return Ok((Some(backup_ms), None));
-                }
+                // Once started, the backup and the compaction both run to the end, whenever
+                // the measured phase ends: `stop` joins this thread, so the report always has
+                // both durations, not a race between the compaction and the phase's end.
                 let t = Instant::now();
                 db.compact().map_err(err)?;
                 Ok((Some(backup_ms), Some(t.elapsed().as_secs_f64() * 1e3)))
