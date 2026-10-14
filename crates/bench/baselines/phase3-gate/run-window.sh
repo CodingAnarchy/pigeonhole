@@ -26,7 +26,7 @@
 #                  run varies by about 5%                                             40
 #   all-uring-1    phdb-bench all vs RocksDB, full, PIGEONHOLE_IO=uring, every run
 #                  10 s or more (D243); cross-shard-contention also with tablet
-#                  changes off (D246)                                                 90
+#                  changes off and with packing off (D246)                            90
 #   all-uring-2    the same again (the reproducibility gate: compare 1 and 2, judging
 #                  runs of 10 s or more, D243)                                        90
 #   all-pread      the same on pread (#402 PR 6: is io_uring the right default?)     90
@@ -50,7 +50,8 @@
 #                  time-series-ttl, cross-shard-contention (D246, also with tablet
 #                  changes off), counters; transfer, sparse-wide with deletes,
 #                  filtered scans, the async API, app-owned mode on the defaults,
-#                  ycsb-a's riders and 16 KiB values reported                        161
+#                  ycsb-a's riders and 16 KiB values reported; cross-shard-contention
+#                  also with packing off (D246)                                      200
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   wal-pin        wal_pin_bytes 2x vs 4x the budget: write path, open after a crash
 #                  (#527; phase3-io/wal-pin.sh)                                        10
@@ -59,7 +60,7 @@
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 12.8 hours unattended at full scale (the sum of the estimates above; the
+# Total: about 13.5 hours unattended at full scale (the sum of the estimates above; the
 # 2026-10-13b window's steps took 109 minutes before `contended` was added).
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
@@ -100,7 +101,7 @@ results="$(cd "$results" && pwd)"
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     row-cache scaling placement contended open-latency wal-pin cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [contended]=161 [open-latency]=5 [wal-pin]=10 [cold-get]=45
+    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [contended]=200 [open-latency]=5 [wal-pin]=10 [cold-get]=45
     [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
