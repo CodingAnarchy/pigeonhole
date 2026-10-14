@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The kinds a turn's time is split into (the engine tags its own; the runtime tags the rest).
-pub const NAMES: [&str; 35] = [
+pub const NAMES: [&str; 46] = [
     "msg Commit",
     "msg Coordinate",
     "msg Prepare",
@@ -43,6 +43,17 @@ pub const NAMES: [&str; 35] = [
     "task untagged",
     "turn reap io",
     "turn unattributed",
+    "fl (info) up to Ok",
+    "fl (info) retire roots + memtables",
+    "fl (info) reclaim_retired",
+    "fl (info) prune_flushed_slots",
+    "fl (info) report_shares_flushed",
+    "fl (info) advance_checkpoint",
+    "fl (info) to tail",
+    "fl (info) check_flush_waiters",
+    "fl (info) spawn_flush",
+    "fl (info) maintain",
+    "fl (info) progress_op + close",
 ];
 /// A task slice whose task named no kind.
 pub const TASK_UNTAGGED: usize = 32;

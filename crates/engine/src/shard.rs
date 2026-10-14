@@ -3591,6 +3591,7 @@ impl ShardState {
         nanos: u64,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        scratch_fl(None);
         self.flush_running = false;
         self.flushing.clear();
         // The guarded flushes this one carried are settled either way (#287). One a delete
@@ -3622,6 +3623,7 @@ impl ShardState {
         };
         match result {
             Ok(_) => {
+                scratch_fl(Some(35));
                 self.flush_failures = 0;
                 for item in &items {
                     self.voided_roots.remove(&item.root);
@@ -3660,10 +3662,15 @@ impl ShardState {
                 // Idle slots keep their memtables here: retiring them after every flush
                 // would churn a fresh chunk per slot each cycle, and a reader process's pin
                 // keeps every retired chunk (#104). They retire under arena pressure only.
+                scratch_fl(Some(36));
                 self.reclaim_retired();
+                scratch_fl(Some(37));
                 self.prune_flushed_slots(&landed);
+                scratch_fl(Some(38));
                 self.report_shares_flushed(ctx);
+                scratch_fl(Some(39));
                 self.advance_checkpoint(ctx);
+                scratch_fl(Some(40));
             }
             Err(e) => {
                 // The frozen memtables stay (the WAL keeps their data) and are queued again;
@@ -3733,11 +3740,16 @@ impl ShardState {
             self.end_room_wait(ctx.now_nanos());
         }
         self.end_backoff_on_event(ctx.now_nanos());
+        scratch_fl(Some(41));
         self.check_flush_waiters();
+        scratch_fl(Some(42));
         self.spawn_flush(ctx);
+        scratch_fl(Some(43));
         self.maintain(ctx);
+        scratch_fl(Some(44));
         self.progress_op(ctx);
         self.try_finish_close(ctx);
+        scratch_fl(Some(45));
     }
 
     /// Queues every frozen memtable that is not in the manifest (after a failed flush).
@@ -8296,6 +8308,18 @@ thread_local! {
     static SCRATCH_GROUP_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static SCRATCH_LAPS_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static SCRATCH_LAP: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    static SCRATCH_FL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// SCRATCH: `on_flushed`'s laps, recorded as information only (the turn counts the message).
+fn scratch_fl(kind: Option<usize>) {
+    let now = std::time::Instant::now();
+    if let (Some(t), Some(k)) = (SCRATCH_FL.with(|c| c.replace(Some(now))), kind) {
+        pigeonhole_runtime::scratch_iter::add_info(k, (now - t).as_nanos() as u64);
+    }
 }
 
 /// SCRATCH: starts `run_group`'s lap timer.
