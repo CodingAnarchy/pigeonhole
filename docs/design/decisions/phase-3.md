@@ -940,6 +940,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - Telling participants before the shares are settled fails that case with `LostAckedCommit`. A tablet change that commits before the moving tablet's frozen memtables are flushed (the `frozen.is_empty()` wait in `progress_op` dropped) fails its tablet loop.
 - `engine/tests/close_crossed.rs` closes after concurrent cross-shard commits on real files, under a watchdog.
 
+*Amended by [D254](#d254): the reports and settlements go as `SharesFlushed { seqnos }` and `CommitsSettled { seqnos }`, one message per peer per pass, with the same rules.*
 
 <a id="d226"></a>
 ## D226 — The durable group-commit p99 is judged under full load: 16 shards, 16 commits in flight, the D223 driver; 4 and 8 in flight are reported beside it (owner decision, 2026-10-12; bench, engine, #406; amends D213)
@@ -1741,3 +1742,26 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 **Consequences:**
 - A thread waiting for a `Buffered` or `None` commit may poll for up to 50 µs before it sleeps. Durable commits still park at once.
 - The bench's measured instruction-count shapes set `commit_spin(ZERO)` (ICR 0016), so their counts don't change.
+
+<a id="d254"></a>
+## D254 — Share reports and settlements go one message per peer per pass, not one per share (owner decision, 2026-10-14; engine, #716; amends D225's messages)
+
+**Decided:**
+- **`SharesFlushed { seqnos }` replaces `ShareFlushed { seqno }`.** A participant's report pass (`report_shares_flushed`: the flush install, `Maintain` with tablet changes on, `Start`, the close) gathers the seqnos of every share it finds in SSTs by coordinator and sends each coordinator one message. A coordinator's own shares are still counted without a message (D225).
+- **`CommitsSettled { seqnos }` replaces `CommitSettled { seqno }`.** A coordinator collects the commits it finds settled per participant and sends each one message (`send_settled`). That happens once per handler that can settle: the report pass, the `SharesFlushed` handler, and `run_group`'s logging of COMMIT records.
+- **Each handler advances the checkpoint and checks the close once per message**, not once per seqno.
+- **The semantics are unchanged.** The reports are commutative: a count per seqno on the coordinator and a set insert on the participant. So batching them changes no decision, only how many messages carry them, and when a handler's batch is sent within its turn. A commit is still settled exactly when its COMMIT is logged and every share has been reported (D24, D225), and a PREPARE or COMMIT is checkpointed under the same rules as before (`needed`).
+- **Deterministic order.** The per-peer buffers are ordered maps, so the sends keep a seed replay's message order.
+- **An empty share** (validation only) still reports at once, as a one-seqno message.
+
+**Why** (perf2's shard-turn timer on the AX102, scratch_xs 16 shards, 32 clients, 50% cross-shard, Buffered; `.coord/perf2-xshard-p99-20261014/ct-ab/`):
+- Installing a flush (`on_flushed`) took 21 ms at p50 and up to 59 ms on the shard thread, and `report_shares_flushed` was nearly all of it. It sent one message per share, about 100K per flush and 15.5–18.9M in 20 s.
+- The coordinators then ran about 1 ms turns of 1024 `ShareFlushed`/`CommitSettled` messages, each advancing the checkpoint: 2,921 turns of 400 µs or more with `compaction_threads` = 0, and 7,798 with 4.
+- With compaction off the shard threads (D252), these turns and the install were the remaining long-turn sources.
+
+**Tests:**
+- `share_reports.rs`: 600 cross-shard commits from two coordinators to one participant. One flush reports in at most 6 messages carrying exactly 1,200 seqnos; one message per share or commit was 1,200 messages, and the test fails against that. After a power loss every write survives.
+- The crash and model sweeps (`model_check` with and without deferred I/O, `model`, `tablets`) check the checkpoints and replay.
+- New test hooks: `ShardCounters::{report_msgs, report_seqnos}` (`Engine::share_reports`).
+
+**Acceptance (AX102):** `on_flushed` time and the count of long turns on the cross-shard shape, against main.
