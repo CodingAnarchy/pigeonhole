@@ -205,9 +205,9 @@ impl Options {
     }
 
     /// How long a thread waiting for its buffered (or non-durable) commit polls for the
-    /// result before it sleeps (default 15 µs). A shard usually answers within a few
+    /// result before it sleeps (default 50 µs). A shard usually answers within a few
     /// microseconds, and putting the thread to sleep and waking it costs that again or more
-    /// (D198). A durable commit waits for a disk sync and sleeps at once. A wait that keeps
+    /// (D198). A cross-shard commit takes two rounds, so the default covers those too (D253). A durable commit waits for a disk sync and sleeps at once. A wait that keeps
     /// finding nothing polls less often. `Duration::ZERO` always sleeps at once: for
     /// battery-powered or CPU-constrained hosts.
     ///

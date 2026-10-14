@@ -8,7 +8,7 @@
 //!
 //! | Mode | The shard runs on | The client waits by |
 //! |---|---|---|
-//! | `threads` | the engine's own shard thread (`Engine::open`, as `phdb-bench` runs), with D198's spin before parking (50 µs) | `Engine::commit`: D198's spin (15 µs), then parking |
+//! | `threads` | the engine's own shard thread (`Engine::open`, as `phdb-bench` runs), with D198's spin before parking (50 µs) | `Engine::commit`: D198's spin (50 µs, D253), then parking |
 //! | `threads-nospin` | as `threads`, with both spin windows 0 (the engine before D198) | parking |
 //! | `park` | an application thread that parks between groups, woken by the engine | parking |
 //! | `spin` | an application thread that never parks | spinning on the commit's future |
@@ -39,11 +39,11 @@ const ROWS: u64 = 50_000;
 const VALUE: [u8; 100] = [7; 100];
 
 /// The engine's defaults, except one shard, a memtable no run fills, and the spin windows:
-/// D198's (15 µs on the client, 50 µs on the shard) with `spins`, else none. The modes
+/// D198's (50 µs on the client since D253, 50 µs on the shard) with `spins`, else none. The modes
 /// that spin by hand turn the engine's own spinning off.
 fn options(spins: bool) -> EngineOptions {
     let mut o = EngineOptions::new(pigeonhole_io::pread::PreadVfs::new(0));
-    (o.commit_spin_nanos, o.shard_spin_nanos) = if spins { (15_000, 50_000) } else { (0, 0) };
+    (o.commit_spin_nanos, o.shard_spin_nanos) = if spins { (50_000, 50_000) } else { (0, 0) };
     o.create_if_missing = true;
     o.shards = 1;
     o.tablet_changes = false;
