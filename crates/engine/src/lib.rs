@@ -44,6 +44,8 @@ mod shard;
 mod snapshot;
 mod source;
 mod timer_state;
+#[cfg(all(test, engine_loom))]
+mod ts_order_loom;
 mod waker;
 mod watermark_waiters;
 mod write;
