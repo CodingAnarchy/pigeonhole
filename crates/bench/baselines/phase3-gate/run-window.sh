@@ -293,6 +293,9 @@ if [[ "$scale" == full ]]; then
     placement_window=10
     repro_min_secs=10
     contended_secs=60 contended_ops=100000 contended_report_secs=45
+    # Every contended run is time-bounded too (D247): a slow row reports, capped, instead of
+    # stretching the window; 3x each run's minimum.
+    contended_max_secs=180 contended_report_max_secs=135
     # 16 KiB values (above the default 4 KiB blob threshold): 50K records of 10 fields is 8 GB,
     # far past every cache.
     contended_large_records=50000
@@ -302,6 +305,7 @@ else
     placement_window=3
     repro_min_secs=1
     contended_secs=2 contended_ops=5000 contended_report_secs=2
+    contended_max_secs=6 contended_report_max_secs=6
     contended_large_records=2000
 fi
 
@@ -424,6 +428,7 @@ step_contended() {
         for w in "${contended_workloads[@]}"; do
             "$bench" "$w" --engine pigeonhole,rocksdb,sqlite --scale "$scale" --threads 16 \
                 --durability "$level" --ops "$contended_ops" --min-secs "$contended_secs" \
+                --max-secs "$contended_max_secs" \
                 --dir "$data/bench" --json "$results/contended-$level-$w.json" \
                 --markdown "$results/contended-$level-$w.md"
             rm -r "$data/bench"
@@ -431,6 +436,7 @@ step_contended() {
         for w in "${contended_reported[@]}"; do
             "$bench" "$w" --engine pigeonhole,rocksdb,sqlite --scale "$scale" --threads 16 \
                 --durability "$level" --ops "$contended_ops" --min-secs "$contended_report_secs" \
+                --max-secs "$contended_report_max_secs" \
                 --dir "$data/bench" --json "$results/contended-$level-$w.json" \
                 --markdown "$results/contended-$level-$w.md"
             rm -r "$data/bench"
@@ -439,6 +445,7 @@ step_contended() {
         "$bench" ycsb-a --engine pigeonhole,rocksdb,sqlite --scale "$scale" --threads 16 \
             --value-len 16384 --records "$contended_large_records" \
             --durability "$level" --ops "$contended_ops" --min-secs "$contended_report_secs" \
+            --max-secs "$contended_report_max_secs" \
             --dir "$data/bench" --json "$results/contended-$level-ycsb-a-16k.json" \
             --markdown "$results/contended-$level-ycsb-a-16k.md"
         rm -r "$data/bench"
@@ -450,6 +457,7 @@ step_contended() {
             for k in 4 16; do
                 "$bench" "$w" --engine pigeonhole --scale "$scale" --threads 16 --async "$k" \
                     --durability "$level" --ops "$contended_ops" --min-secs "$contended_report_secs" \
+                    --max-secs "$contended_report_max_secs" \
                     --dir "$data/bench" --json "$results/contended-$level-$w-async$k.json" \
                     --markdown "$results/contended-$level-$w-async$k.md"
                 rm -r "$data/bench"
@@ -458,7 +466,8 @@ step_contended() {
         # Reported: application-owned mode on the defaults (perf287's L), skewed writes inline
         # from each shard's thread, 16 in flight, no pre-split, about 20% cross-shard batches.
         "$bench" app-owned --scale "$scale" --durability "$level" \
-            --min-secs "$contended_report_secs" --dir "$data/bench" \
+            --min-secs "$contended_report_secs" --max-secs "$contended_report_max_secs" \
+            --dir "$data/bench" \
             --json "$results/contended-$level-app-owned.json" \
             --markdown "$results/contended-$level-app-owned.md"
         rm -r "$data/bench"
@@ -466,6 +475,7 @@ step_contended() {
         # a durable backup and a compaction beside the measured phase.
         "$bench" ycsb-a --engine pigeonhole --scale "$scale" --threads 16 --riders \
             --durability "$level" --ops "$contended_ops" --min-secs "$contended_report_secs" \
+            --max-secs "$contended_report_max_secs" \
             --dir "$data/bench" --json "$results/contended-$level-ycsb-a-riders.json" \
             --markdown "$results/contended-$level-ycsb-a-riders.md"
         rm -r "$data/bench"

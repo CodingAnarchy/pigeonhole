@@ -4,7 +4,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pigeonhole::{
     Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, RowMutation, Table,
@@ -800,8 +800,12 @@ impl Client for PigeonholeClient {
         execute(&self.target, &self.busy, op).map(drop)
     }
 
-    fn pipelined(&mut self, ops: &[&BenchOp]) -> Option<Result<Vec<Duration>, String>> {
-        (self.in_flight > 0).then(|| pipeline::run(self, ops))
+    fn pipelined(
+        &mut self,
+        ops: &[&BenchOp],
+        deadline: Option<Instant>,
+    ) -> Option<Result<Vec<Option<Duration>>, String>> {
+        (self.in_flight > 0).then(|| pipeline::run(self, ops, deadline))
     }
 }
 
@@ -860,20 +864,29 @@ mod pipeline {
         })
     }
 
-    pub(super) fn run(c: &mut PigeonholeClient, ops: &[&BenchOp]) -> Result<Vec<Duration>, String> {
+    pub(super) fn run(
+        c: &mut PigeonholeClient,
+        ops: &[&BenchOp],
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Option<Duration>>, String> {
         let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
         let mut cx = Context::from_waker(&waker);
-        let mut latencies = vec![Duration::ZERO; ops.len()];
+        let mut latencies = vec![None; ops.len()];
         let mut flight: VecDeque<(usize, Instant, Pending)> = VecDeque::with_capacity(c.in_flight);
         let mut next = 0;
-        while next < ops.len() || !flight.is_empty() {
-            while flight.len() < c.in_flight && next < ops.len() {
+        // Past the deadline no operation starts; those in flight finish.
+        let mut ends = ops.len();
+        while next < ends || !flight.is_empty() {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                ends = next;
+            }
+            while flight.len() < c.in_flight && next < ends {
                 let t = Instant::now();
                 match submit(c, ops[next]) {
                     Some(f) => flight.push_back((next, t, f)),
                     None => {
                         execute(&c.target, &c.busy, ops[next])?;
-                        latencies[next] = t.elapsed();
+                        latencies[next] = Some(t.elapsed());
                     }
                 }
                 next += 1;
@@ -884,7 +897,7 @@ mod pipeline {
                 if let Poll::Ready(r) = flight[i].2.as_mut().poll(&mut cx) {
                     let (n, t, _) = flight.remove(i).expect("in range");
                     r?;
-                    latencies[n] = t.elapsed();
+                    latencies[n] = Some(t.elapsed());
                 } else {
                     i += 1;
                 }

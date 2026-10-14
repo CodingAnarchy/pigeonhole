@@ -552,10 +552,15 @@ pub trait Client: Send {
     fn execute(&mut self, op: &BenchOp) -> Result<(), String>;
 
     /// Executes `ops` with several in flight at once (D247's async rows), returning each
-    /// operation's latency from submission to resolution, in `ops`' order; `None` (the
-    /// default) when the client runs one operation at a time.
-    fn pipelined(&mut self, ops: &[&BenchOp]) -> Option<Result<Vec<Duration>, String>> {
-        let _ = ops;
+    /// operation's latency from submission to resolution, in `ops`' order (`None` for one not
+    /// started before `deadline`); `None` (the default) when the client runs one operation at
+    /// a time.
+    fn pipelined(
+        &mut self,
+        ops: &[&BenchOp],
+        deadline: Option<Instant>,
+    ) -> Option<Result<Vec<Option<Duration>>, String>> {
+        let _ = (ops, deadline);
         None
     }
 }
@@ -797,6 +802,11 @@ pub struct RunOptions {
     /// (D220, D235; [`pigeonhole_io::sys::pin_plan`]). The gate judges pinned runs and
     /// reports unpinned ones beside them. Default off.
     pub pin: bool,
+    /// The longest measured phase (D247): past it no client starts another operation, the
+    /// run reports what it measured and the record says it was capped
+    /// ([`RunDetail::capped`]). The warmup is bounded by its own cap. `None` (the default):
+    /// unbounded, the configured operations (and `min_measured`) decide.
+    pub max_measured: Option<std::time::Duration>,
 }
 
 impl Default for RunOptions {
@@ -806,6 +816,7 @@ impl Default for RunOptions {
             min_measured: std::time::Duration::ZERO,
             in_flight: INLINE_IN_FLIGHT,
             pin: false,
+            max_measured: None,
         }
     }
 }
@@ -863,8 +874,15 @@ pub fn run_detailed(
         ..config.clone()
     });
     runner.open(dir)?;
-    let result = measure(runner, config, &mut workload, warmup, options.min_measured)
-        .and_then(|measured| workload.check_epoch_age().map(|()| measured));
+    let result = measure(
+        runner,
+        config,
+        &mut workload,
+        warmup,
+        options.min_measured,
+        options.max_measured,
+    )
+    .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
     let closing = Instant::now();
     let closed = runner.close();
@@ -879,6 +897,7 @@ pub fn run_detailed(
         seqnos_used,
         txn_conflicts,
         riders,
+        capped,
     ) = detail;
     closed?;
     let ops = hist.count();
@@ -917,6 +936,7 @@ pub fn run_detailed(
             txn_conflicts,
             riders,
             close_ms: Some(close_ms),
+            capped: options.max_measured.map(|_| capped),
         },
     })
 }
@@ -1034,6 +1054,7 @@ type Measured = (
         Option<u64>,
         Option<u64>,
         Option<Riders>,
+        bool,
     ),
 );
 
@@ -1062,6 +1083,7 @@ fn measure(
     workload: &mut Workload,
     warmup: u64,
     min_measured: Duration,
+    max_measured: Option<Duration>,
 ) -> Result<Measured, String> {
     let load_start = Instant::now();
     for op in workload.load_ops() {
@@ -1113,6 +1135,9 @@ fn measure(
     runner.start_riders()?;
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
+    // D247: past `max_measured` no client starts another operation.
+    let deadline = max_measured.map(|m| Instant::now() + m);
+    let mut capped = false;
     loop {
         let chunk: Vec<BenchOp> = ops.by_ref().take(next as usize).collect();
         if chunk.is_empty() {
@@ -1120,10 +1145,14 @@ fn measure(
         }
         let classes = classify(&chunk, &mut seen);
         let share = deal(chunk.into_iter().zip(classes), lanes);
-        let (e, h, s) = pass(runner, &mut clients, &share, true)?;
+        let (e, h, s) = pass(runner, &mut clients, &share, true, deadline)?;
         elapsed += e;
         hist.merge(&h);
         split.merge(&s);
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            capped = true;
+            break;
+        }
         if elapsed >= min_measured {
             break;
         }
@@ -1146,6 +1175,7 @@ fn measure(
             .zip(runner.txn_conflicts())
             .map(|(b, a)| a.saturating_sub(b)),
         runner.stop_riders()?,
+        capped,
     );
     Ok((load, elapsed, lanes, hist, split, shards))
 }
@@ -1194,7 +1224,8 @@ fn warm_up(
     let mut last_change = started;
     let settled = loop {
         let before = runner.shard_shares();
-        pass(runner, clients, warm, false).map_err(|e| format!("warmup: {e}"))?;
+        pass(runner, clients, warm, false, Some(started + cap))
+            .map_err(|e| format!("warmup: {e}"))?;
         if placement_changed(&before, &runner.shard_shares()) {
             last_change = Instant::now();
         }
@@ -1246,6 +1277,7 @@ fn pass(
     clients: &mut [Box<dyn Client>],
     shares: &[Vec<(BenchOp, Class)>],
     record: bool,
+    deadline: Option<Instant>,
 ) -> Result<(Duration, Histogram, Split), String> {
     let run = |exec: &mut dyn FnMut(&BenchOp) -> Result<(), String>,
                share: &[(BenchOp, Class)]|
@@ -1254,6 +1286,9 @@ fn pass(
         let mut split = Split::default();
         for (op, class) in share {
             let t = Instant::now();
+            if deadline.is_some_and(|d| t >= d) {
+                break;
+            }
             exec(op)?;
             if record {
                 let latency = t.elapsed();
@@ -1278,12 +1313,13 @@ fn pass(
                 scope.spawn(move || {
                     barrier.wait();
                     let ops: Vec<&BenchOp> = share.iter().map(|(op, _)| op).collect();
-                    match client.pipelined(&ops) {
+                    match client.pipelined(&ops, deadline) {
                         Some(latencies) => {
                             let latencies = latencies?;
                             let (mut hist, mut split) = (Histogram::new(), Split::default());
                             if record {
                                 for ((op, class), latency) in share.iter().zip(latencies) {
+                                    let Some(latency) = latency else { continue };
                                     hist.record(latency);
                                     split.record(op, *class, latency);
                                 }
@@ -1483,6 +1519,39 @@ mod tests {
         )
         .unwrap();
         assert!(!settled);
+    }
+
+    #[test]
+    fn a_slow_run_stops_at_its_bound_and_says_it_was_capped() {
+        // D247: 1,000 operations of 10 ms would measure 10 s; a 300 ms bound stops it.
+        let mut r = fake(0);
+        r.op_time = Duration::from_millis(10);
+        let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+        config.records = 10;
+        config.operations = 1_000;
+        let options = RunOptions {
+            warmup: 0.0,
+            max_measured: Some(Duration::from_millis(300)),
+            ..RunOptions::default()
+        };
+        let dir = std::env::temp_dir().join(format!("phdb-bench-max-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = run_detailed(&mut r, &config, &dir, &options).unwrap();
+        assert_eq!(rec.detail.capped, Some(true));
+        assert!(
+            rec.operations < 1_000 && rec.operations > 0,
+            "{}",
+            rec.operations
+        );
+        assert!(rec.run_secs < 1.0, "{}", rec.run_secs);
+        // A bound the run never reaches: not capped.
+        config.operations = 5;
+        let rec = run_detailed(&mut fake(0), &config, &dir, &options).unwrap();
+        assert_eq!((rec.detail.capped, rec.operations), (Some(false), 5));
+        // No bound, no flag.
+        let rec = run_detailed(&mut fake(0), &config, &dir, &RunOptions::default()).unwrap();
+        assert_eq!(rec.detail.capped, None);
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]

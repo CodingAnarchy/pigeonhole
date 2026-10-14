@@ -1496,7 +1496,7 @@ Each part disabled fails its test.
 
 **Decided:**
 - **The rule (owner):** every public API operation is measured under contention (at least 4 concurrent clients on a multi-shard engine) with default settings at least once. perf287's #406 audit maps each operation to its gate coverage.
-- **The step.** `contended` runs at 16 client threads, the default options (one shard per physical core, tablet changes and packing on, pinned threads, the row cache, the default I/O backend), each judged run measuring at least 60 s from a count every store finishes sooner (`--ops 100000 --min-secs 60`) and each reported run 45 s (owner), against RocksDB and SQLite.
+- **The step.** `contended` runs at 16 client threads, the default options (one shard per physical core, tablet changes and packing on, pinned threads, the row cache, the default I/O backend), each judged run measuring at least 60 s from a count every store finishes sooner (`--ops 100000 --min-secs 60`) and each reported run 45 s (owner), against RocksDB and SQLite. Every run is also time-bounded at 3× its minimum (`--max-secs 180`, 135 for reported runs; coordinator): past it no client starts another operation, the record says `capped`, and the summary lists the capped runs. A slow row then reports instead of stretching the window (perf287's D249 A/B found transfer still running after 44 minutes at full scale, the operation count being the target and `--min-secs` only a floor).
 - **Two durabilities, both judged, shown side by side (owner):**
   - D108 parity, `--durability buffered`: Pigeonhole `Buffered`, RocksDB's WAL unsynced, SQLite `synchronous=NORMAL`;
   - the default, `--durability default`: Pigeonhole at `Options::default()`'s `GroupSync`, RocksDB and SQLite fsyncing every write.

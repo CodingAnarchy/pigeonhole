@@ -81,6 +81,9 @@ OPTIONS:
                            client runs go on with the workload's next operations (D243)
                            [default: 0, the configured operations once]; placement: the
                            measured window [default: 10]
+    --max-secs S           the longest measured phase: past it no client starts another
+                           operation, and the record says it was capped (D247)
+                           [default: none]
     --offered-rate R       placement: writes per second offered over every client
                            [default: 30,000 per shard]
     --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
@@ -143,6 +146,7 @@ struct Args {
     seed: Option<u64>,
     warmup: Option<f64>,
     min_secs: Option<f64>,
+    max_secs: Option<f64>,
     inline_ops: Option<u64>,
     in_flight: Option<usize>,
     offered_rate: Option<f64>,
@@ -191,6 +195,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--shards" => a.shards = Some(parse(&arg, it.next())?),
             "--warmup" => a.warmup = Some(parse(&arg, it.next())?),
             "--min-secs" => a.min_secs = Some(parse(&arg, it.next())?),
+            "--max-secs" => a.max_secs = Some(parse(&arg, it.next())?),
             "--inline-ops" => a.inline_ops = Some(parse(&arg, it.next())?),
             "--in-flight" => {
                 let n: usize = parse(&arg, it.next())?;
@@ -265,6 +270,12 @@ fn config(a: &Args, kind: WorkloadKind) -> Result<WorkloadConfig, String> {
     c.threads = a.threads.unwrap_or(c.threads);
     c.seed = a.seed.unwrap_or(c.seed);
     Ok(c)
+}
+
+/// `--max-secs`, the longest measured phase (D247).
+fn max_measured(a: &Args) -> Option<std::time::Duration> {
+    a.max_secs
+        .map(|s| std::time::Duration::from_secs_f64(s.max(0.0)))
 }
 
 fn memory(a: &Args) -> MemoryBudget {
@@ -379,6 +390,7 @@ fn one_inline(
         min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
         in_flight: a.in_flight.unwrap_or(INLINE_IN_FLIGHT),
         pin,
+        max_measured: max_measured(a),
     };
     let result = runner
         .run_inline(config, &dir, &options)
@@ -410,6 +422,7 @@ fn one(
             RunOptions::default().warmup
         }),
         min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
+        max_measured: max_measured(a),
         ..RunOptions::default()
     };
     let result = run_detailed(runner, config, &dir, &options)
@@ -773,6 +786,28 @@ mod tests {
         assert!(r.operations >= 400 && r.throughput > 0.0);
         // Whether the batches crossed shards depends on the placement the balancer reached;
         // the batch composition has its own test (inline.rs).
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_runs_stop_at_their_time_bound() {
+        // D247: a 5 s minimum bounded at 0.3 s stops at the bound, and the records say so.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-maxinline-{}", std::process::id()));
+        let a = args(&format!(
+            "scaling --scale smoke --ops 64 --shards 2 --min-secs 5 --max-secs 0.3 --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        let inline: Vec<_> = suite
+            .results
+            .iter()
+            .filter(|r| r.store_config.contains(" inline"))
+            .collect();
+        assert!(!inline.is_empty());
+        for r in inline {
+            assert_eq!(r.detail.capped, Some(true), "{}", r.store_config);
+            assert!(r.run_secs < 2.0, "{}", r.run_secs);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
