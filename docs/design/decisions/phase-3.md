@@ -1495,6 +1495,8 @@ Each part disabled fails its test.
 
 **Why:** the gate had no multi-row or cross-shard commit under contention (perf287's #406 audit, finding 1), so a 36× slowdown in the default config got through: on the AX102 (perf2, main a9ecfc77), 16 shards and 32 clients at 50% cross-shard commits ran 401K ops/s with tablet changes off and 11K with them on. Locally (M5, `--scale small`, busy laptop) the new workload shows the same: 3.0K and 5.9K ops/s with tablet changes on against 219K and 204K off and 192K for RocksDB, with about 5 wasted rounds per cross-shard commit on and none off.
 
+*Amended by [D251](#d251): the tablets on ≥ 0.8× off check is judged with packing off (`Options::tablet_packing(false)`, tablet changes on); the default config's on/off ratio, packing's gap, is reported beside it (#707).*
+
 <a id="d247"></a>
 ## D247 — The gate's `contended` step measures every public operation under contention on the default options, judged at two durabilities (owner decision, 2026-10-13; bench, #406)
 
@@ -1624,13 +1626,14 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
 - AGENTS.md's rule to keep Rust-only types out of what becomes the C ABI boundary still applies to `pigeonhole-capi`.
 
 <a id="d251"></a>
-## D251 — Packing grows the active shards when one of them is saturated, and write skew moves small tablets when none dominates (owner decision, 2026-10-14; engine, tablets, #406; amends D214 and D217)
+## D251 — Packing grows the active shards when one of them is saturated, and write skew moves small tablets when none dominates (owner decision, 2026-10-14; engine, tablets, #406; amends D214, D217 and D246)
 
 **Decided:**
 1. **Hot-shard growth (amends D217).** An active shard whose **turn busy** (its thread's work time, without D248's sync term) is above `PACK_HOT` = 0.9 grows `k`, with D217's persistence (`PACK_GROW_PASSES`, 1 s), whatever `B / k` says. While any active shard is that hot, `k` never shrinks.
    - **Turn busy, not D248's combined busy.** A shard whose group syncs run back to back may not cool however many shards share the load, so its sync term neither grows `k` nor blocks a shrink here; D248's average rule still applies to it. Each shard now also publishes its turn busy (`LoadSlot::turn_busy`).
    - **Once per hot spot.** A hot-triggered growth repeats only after the hot shard's turn busy has fallen by at least 0.02 since the last one (what it shed helped), or when another shard is the hot one. A hot spot that more shards can't cool (one unsplittable tablet) grows `k` once.
 2. **Small tablets move (amends D214).** When no tablet carries the eighth of the gap a move needs, and none dominates (the hottest is below the gap), the largest tablet that fits the coldest shard moves. The dominant-tablet case keeps D214's split.
+3. **D246's tablets check is judged with packing off (amends D246; owner, 2026-10-14).** `cross-shard-contention`'s tablets on ≥ 0.8× off compares tablet changes on with `tablet_packing(false)` against them off. The default config's ratio (packing on) is reported beside it as packing's gap. Packing targets about 0.5 busy per active shard, which caps a closed-loop, mostly cross-shard load at about half of spreading over every shard (0.48–0.63× in the 2026-10-14 A/B on the AX102, #707). Packing less when commits are mostly cross-shard is a Phase 4 design (#707).
 
 **Why** (the pre-release gate, 175c0ffc, AX102, 2026-10-14): `cross-shard-contention` with tablet changes on ran at 184K ops/s, against 384K off.
 - The load had packed the table onto `k` = 2 (the slot floor: 22 tablets × 4 families). In the measured phase, shard 0 held 16 tablets at 0.98 busy and shard 1 held 6 at 0.31.
@@ -1648,5 +1651,5 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
 - One unsplittable hot tablet grows `k` at most once (fails without the once-per-hot-spot rule).
 - A single sync-saturated durable writer (D248 term about 0.95, turn busy 0.05) settles at `k` ≤ 2 (fails if the hot test counts the sync term).
 
-**Acceptance (AX102, after the gate):** cross-shard-contention tablets on ≥ 0.8× off (D246), no stuck placement; a buffered packing check (ycsb-a, time-series-ttl, ycsb-f) unchanged against main.
+**Acceptance (AX102, after the gate):** no stuck placement, and a buffered packing check (ycsb-a, time-series-ttl, ycsb-f) unchanged against main. Both held in the 2026-10-14 A/B: a 90 s run settled at `k` = 4 with every shard at 0.80–0.89 busy, with no flapping, and the packing check was within run-to-run noise. Cross-shard-contention with tablet changes on reached 0.48–0.52× off (201K against 384–400K), short of D246's 0.8×; hence item 3.
 
