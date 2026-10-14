@@ -371,13 +371,19 @@ rows.append(("Within 1.5× of RocksDB on every workload",
 # counters land, wasted rounds are inferred as perf2 did: sequence numbers used while
 # measuring minus the commits (`seqnos_used`). The cross-shard commit p99 is reported; its
 # bound is the owner's, from D245's numbers.
-XSHARD_P99_BOUND_US = None  # TODO(D246): the owner sets it from D245's numbers
+# The cross-shard commit p99 (owner, from D245's 1.02-1.03 ms at Buffered): within 1.5x of
+# RocksDB's multi-key batch p99 at each durability, and under 2 ms at Buffered. The GroupSync
+# cap is set from the pre-release gate run: reported, not judged, until then.
+XSHARD_P99_VS_ROCKSDB = 1.5
+XSHARD_P99_CAP_US = {"buffered": 2000, "default": None}
 XSHARD_TARGET = ("Contended cross-shard commits (D246): within 1.5× of RocksDB; tablets on ≥ 0.8× off; "
-                 "≤ 0.1 wasted 2PC rounds per cross-shard commit; no Busy; cross-shard p99 bound TODO (D245)")
+                 "≤ 0.1 wasted 2PC rounds per cross-shard commit; no Busy; cross-shard p99 ≤ 1.5× RocksDB's "
+                 "batch p99, and ≤ 2 ms at Buffered (GroupSync cap TBD)")
 
 
-def xshard(run):
-    """D246's figures for one `all` run, or None when the run lacks one of its three records."""
+def xshard(run, level="buffered"):
+    """D246's figures for one run file at one durability level (`all` runs are Buffered), or
+    None when the run lacks one of its three records."""
     rs = results(run, workload=XSHARD)
     on = next((r for r in rs if r["store"] == "pigeonhole" and "tablets=on" in r.get("store_config", "")), None)
     off = next((r for r in rs if r["store"] == "pigeonhole" and "tablets=on" not in r.get("store_config", "")), None)
@@ -385,6 +391,7 @@ def xshard(run):
     if not (on and off and rk):
         return None
     cross = op(on, "cross-shard commit") or {}
+    rk_cross = op(rk, "cross-shard commit")
     commits = cross.get("count", 0) + (op(on, "put") or {}).get("count", 0)
     # Wasted rounds: the engine's refused two-phase rounds (ICR 0043, Metrics::cross_shard,
     # in the stall counters); the seqnos used beyond one per commit (perf2's inference) are
@@ -408,12 +415,19 @@ def xshard(run):
         "wasted": wasted,
         "how": how,
         "cross_p99_us": us(cross["p99_ns"]) if cross else None,
+        "cross_vs_rk": (cross["p99_ns"] / max(rk_cross["p99_ns"], 1)) if cross and rk_cross else None,
+        "cap_us": XSHARD_P99_CAP_US.get(level),
         "on": on["throughput"],
         "busy": on.get("detail", {}).get("busy_retries", 0),
     }
     x["ok"] = (x["tput"] <= 1.5 and x["p99"] <= 1.5 and x["on_off"] >= 0.8
                and wasted is not None and wasted <= 0.1 and x["busy"] == 0
-               and (XSHARD_P99_BOUND_US is None or (x["cross_p99_us"] or 0) < XSHARD_P99_BOUND_US))
+               and x["cross_vs_rk"] is not None and x["cross_vs_rk"] <= XSHARD_P99_VS_ROCKSDB
+               and (x["cap_us"] is None or (x["cross_p99_us"] or 0) <= x["cap_us"]))
+    cap = f"≤ {x['cap_us'] / 1000:.0f} ms" if x["cap_us"] else "cap TBD"
+    x["p99_text"] = (f"cross-shard p99 {x['cross_p99_us']:.0f} µs ({cap}), "
+                     + (f"{x['cross_vs_rk']:.2f}× RocksDB's batch p99" if x["cross_vs_rk"] is not None
+                        else "RocksDB batch p99 missing"))
     return x
 
 
@@ -422,7 +436,7 @@ if all(x for _, x in xs):
     detail = "; ".join(
         f"{name}: {rate(x['on'])} ops/s, RocksDB {x['tput']:.2f}× throughput, p99 {x['p99']:.2f}×; "
         f"tablets on/off {x['on_off']:.2f}; wasted rounds {x['wasted']:.3f} per cross-shard commit ({x['how']}); "
-        f"Busy {x['busy']}; cross-shard p99 {x['cross_p99_us']:.0f} µs"
+        f"Busy {x['busy']}; {x['p99_text']}"
         for name, x in xs)
     rows.append((XSHARD_TARGET, detail, verdict(all(x["ok"] for _, x in xs)), "all-uring-1.json, all-uring-2.json"))
 else:
@@ -480,13 +494,13 @@ for level, label in CONTENDED_LEVELS:
     if missing:
         detail += f"; missing: {', '.join(missing)}"
     rows.append((target, detail, verdict(not out and not missing), f"contended-{level}-*.json"))
-    xc = xshard(f"contended-{level}-{XSHARD}.json")
+    xc = xshard(f"contended-{level}-{XSHARD}.json", level)
     xt = XSHARD_TARGET.replace("(D246)", f"at 16 threads, {label} (D246, D247)")
     if xc:
         rows.append((xt,
                      f"{rate(xc['on'])} ops/s, RocksDB {xc['tput']:.2f}× throughput, p99 {xc['p99']:.2f}×; "
                      f"tablets on/off {xc['on_off']:.2f}; wasted rounds {xc['wasted']:.3f} per cross-shard commit "
-                     f"({xc['how']}); Busy {xc['busy']}; cross-shard p99 {xc['cross_p99_us']:.0f} µs",
+                     f"({xc['how']}); Busy {xc['busy']}; {xc['p99_text']}",
                      verdict(xc["ok"]), f"contended-{level}-{XSHARD}.json"))
     else:
         rows.append((xt, "", verdict(None), f"contended-{level}-{XSHARD}.json"))

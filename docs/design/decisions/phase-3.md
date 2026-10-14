@@ -1484,7 +1484,7 @@ Each part disabled fails its test.
   - within 1.5× of RocksDB, throughput and p99, as every `all` workload;
   - tablet changes on at least 0.8× the same build with them off (`all` runs Pigeonhole's tablets-off run beside the default);
   - at most 0.1 wasted two-phase rounds per cross-shard commit, and no `Busy`;
-  - the cross-shard commit p99 under a bound the owner sets from D245's numbers (a TODO in `report.py` until then; the p99 is reported).
+  - the cross-shard commit p99 (owner, from D245's 1.02–1.03 ms at Buffered): within 1.5× of RocksDB's multi-key batch p99 at each durability, and under 2 ms at Buffered. The GroupSync cap is set from the pre-release gate run; until then that level's p99 is reported against RocksDB's and judged on the ratio only.
 - **Wasted rounds** are the engine's refused two-phase rounds over the measured phase's cross-shard commits (ICR 0043, `Metrics::cross_shard.refused_rounds`, in the run's stall counters, with the refusals by reason beside them). perf2's inference, the sequence numbers used while measuring minus the commits measured (`RunDetail::seqnos_used`), stays in the report as a cross-check: each commit uses one sequence number and each refused round one more, and with tablet changes on a split, merge or move may use some too.
 - The reproducibility pair (D243) includes it, as part of `all`; at full scale its runs measure at least 10 s.
 - D247's `contended` step runs it again at 16 threads under the default durability.
