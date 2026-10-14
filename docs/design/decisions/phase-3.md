@@ -1750,6 +1750,10 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 - **`SharesFlushed { seqnos }` replaces `ShareFlushed { seqno }`.** A participant's report pass (`report_shares_flushed`: the flush install, `Maintain` with tablet changes on, `Start`, the close) gathers the seqnos of every share it finds in SSTs by coordinator and sends each coordinator one message. A coordinator's own shares are still counted without a message (D225).
 - **`CommitsSettled { seqnos }` replaces `CommitSettled { seqno }`.** A coordinator collects the commits it finds settled per participant and sends each one message (`send_settled`). That happens once per handler that can settle: the report pass, the `SharesFlushed` handler, and `run_group`'s logging of COMMIT records.
 - **Each handler advances the checkpoint and checks the close once per message**, not once per seqno.
+- **A bounded receive (amended 2026-10-14, coordinator; the follow-up PR).** One `SharesFlushed` can carry a flush's ~100K seqnos, and counting them in one turn, with the checkpoint advance they allow, took up to 50 ms (the acceptance below).
+  - The handler only queues the seqnos (`reports_queued`).
+  - `end_batch` counts at most `REPORT_SLICE` = 4096 of them per batch (`count_report_slice`), settles what they complete, and advances the checkpoint once per slice. While seqnos remain, it sends the shard a `ReportSlice`, which lands in the next batch, so the group commit and whatever else queued runs between slices.
+  - The queue lives in memory only. A crash loses it as it loses messages in flight: replay re-reports the flushed shares at `Start`. A close keeps counting it, since the checkpoint can't pass the COMMITs it waits for until it has.
 - **The semantics are unchanged.** The reports are commutative: a count per seqno on the coordinator and a set insert on the participant. So batching them changes no decision, only how many messages carry them, and when a handler's batch is sent within its turn. A commit is still settled exactly when its COMMIT is logged and every share has been reported (D24, D225), and a PREPARE or COMMIT is checkpointed under the same rules as before (`needed`).
 - **A backstop (perf287's review).** `end_batch` debug-asserts that no settled commit is left unsent, and sends any that are. A loop that settled without `send_settled` would otherwise hold its participants' PREPAREs, and so their WAL, until some later settle.
 - **Deterministic order.** The per-peer buffers are ordered maps, so the sends keep a seed replay's message order.
@@ -1766,7 +1770,12 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
   - Every checkpoint then passes all its records, including the participant's 600 PREPAREs. The test fails if `CommitsSettled` is not sent, and the backstop's assertion fails if one settling loop skips `send_settled`.
   - After a power loss every write survives.
 - The crash and model sweeps (`model_check` with and without deferred I/O, `model`, `tablets`) check the checkpoints and replay.
-- New test hooks: `ShardCounters::{report_msgs, report_seqnos}` (`Engine::share_reports`) and `ShardCounters::logged` (`Engine::logged_records`).
+- The bounded receive's tests in `share_reports.rs`:
+  - One flush's 100K-seqno report is counted 4096 per turn and settles everything. Without the bound, one turn counted 100,000.
+  - A close with a partly counted queue (8 slices, after the first) counts the rest and is clean, with every checkpoint passing every record.
+  - A power loss with a partly counted queue replays every commit, and the next open closes cleanly.
+  - Both of these fail without the bound. Without the `ReportSlice` kick the queue stalls: the 100K and close tests fail, and the crash test never finishes.
+- New test hooks: `ShardCounters::{report_msgs, report_seqnos, report_slice_max}` (`Engine::share_reports`, `Engine::report_slice_max`) and `ShardCounters::logged` (`Engine::logged_records`).
 
 **Acceptance (AX102, 2026-10-14):** perf2's timer build of `scratch_xs` (16 shards, 32 clients, 50% cross-shard, 20 s), on main c2d29b3d (A) and on this change (B). The runs alternated A/B, 2 each at `compaction_threads` 0 and 4. Data: `.coord/ctr274-d254-ab/`.
 
@@ -1781,4 +1790,4 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 
 - **Long turns:** about 10× fewer at ct4 (the D252 default), and about 11% fewer at ct0. Throughput is up 2–4%.
 - **The install:** `on_flushed` is down about 30% at ct0 and 17% at ct4. The rest of it is `report_shares_flushed`'s per-share scan (each share's slots checked against the catalog), not the messages.
-- **The coordinators' longest turn (perf287's review) did not improve.** One `SharesFlushed` carries a flush's ~100K seqnos, and its handler counts each one and then advances the checkpoint past the records they free. That is the same work as before (about 7 s of long turns at ct4, against about 8 s), in fewer, longer turns: 25–42 ms p99, up to 50 ms, against a 29–42 ms max on main. Bounding it is a follow-up: handle a message in slices across turns, and make the report and its receipt cheaper per share.
+- **The coordinators' longest turn (perf287's review) did not improve.** One `SharesFlushed` carries a flush's ~100K seqnos, and its handler counts each one and then advances the checkpoint past the records they free. That is the same work as before (about 7 s of long turns at ct4, against about 8 s), in fewer, longer turns: 25–42 ms p99, up to 50 ms, against a 29–42 ms max on main. The bounded receive above answers this. The sender's per-share scan is Phase 4 (#716).
