@@ -175,6 +175,9 @@ pub(crate) struct ShardCounters {
     pub report_msgs: AtomicU64,
     /// The seqnos those messages carried (`Engine::share_reports`, D254).
     pub report_seqnos: AtomicU64,
+    /// Records in the shard's log (those its checkpoint has not passed) after its last
+    /// batch (`Engine::logged_records`, D254).
+    pub logged: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -872,6 +875,16 @@ impl Engine {
             h.report_msgs.load(Ordering::Relaxed),
             h.report_seqnos.load(Ordering::Relaxed),
         )
+    }
+
+    /// The records shard `shard`'s checkpoint has not passed yet, as of its last batch: a
+    /// test checks a participant's PREPAREs go once their commits settle (D254).
+    #[doc(hidden)]
+    pub fn logged_records(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .logged
+            .load(Ordering::Relaxed)
     }
 
     /// Shard `shard`'s arena after its last batch: free bytes, the usable bytes of its

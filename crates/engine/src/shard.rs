@@ -6790,7 +6790,7 @@ impl ShardState {
 
     /// Coordinator: sends each participant the commits `settle_if_done` found settled, as
     /// one `CommitsSettled` (D254). Every caller of `settle_if_done` calls this once its loop
-    /// is done.
+    /// is done; `end_batch` checks that (debug) and sends anything left.
     fn send_settled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.settle_out.is_empty() {
             return;
@@ -8299,6 +8299,15 @@ impl ShardHandler for ShardState {
         self.run_retries(ctx);
         self.expire_tablet_waits(ctx);
         self.maybe_balance(false, None, ctx);
+        // Every loop that settles commits sends them before its handler returns
+        // (`send_settled`). One that forgot would hold the participants' PREPAREs, and so
+        // their WAL, until some later settle: caught in tests, and sent here regardless.
+        debug_assert!(
+            self.settle_out.is_empty(),
+            "settled commits left unsent to {} participants",
+            self.settle_out.len()
+        );
+        self.send_settled(ctx);
         if (self.freeze_all_pending
             || (!self.to_freeze.is_empty() && self.freeze_deferred)
             || self.wait_room)
@@ -8314,6 +8323,7 @@ impl ShardHandler for ShardState {
             let m = &self.shared.metrics[usize::from(self.id.0)].hooks;
             m.aborted
                 .store(self.aborted.len() as u64, Ordering::Relaxed);
+            m.logged.store(self.log.len() as u64, Ordering::Relaxed);
         }
         self.publish_arena();
     }

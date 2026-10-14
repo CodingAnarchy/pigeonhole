@@ -93,6 +93,10 @@ fn a_flush_reports_its_shares_in_one_message_per_coordinator() {
         "a share reported before anything flushed"
     );
 
+    // Shard 2 logged a PREPARE per commit, which its checkpoint can pass only once the
+    // commit's coordinator reports it settled.
+    assert_eq!(db.logged_records(2), u64::from(COMMITS));
+
     let flush = db.submit_flush().unwrap();
     drive(&mut shards, flush).unwrap();
     settle(&mut shards);
@@ -116,6 +120,15 @@ fn a_flush_reports_its_shares_in_one_message_per_coordinator() {
     assert!(
         msgs <= 6,
         "{msgs} report messages for {seqnos} reports, per shard (messages, seqnos): {after:?}"
+    );
+
+    // Every commit settled: the participant's checkpoint passed its PREPAREs, and each
+    // coordinator's passed its PREPAREs and COMMITs.
+    let logged: Vec<_> = (0..3).map(|s| db.logged_records(s)).collect();
+    assert_eq!(
+        logged,
+        vec![0; 3],
+        "records the checkpoints have not passed"
     );
 
     // The settled commits survive a power loss whole.
