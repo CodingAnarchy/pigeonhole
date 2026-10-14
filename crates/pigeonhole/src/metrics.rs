@@ -177,6 +177,10 @@ pub struct CrossShardMetrics {
     pub refused_moved: u64,
     /// PREPAREs refused because the participant had no memtable room for its share.
     pub refused_room: u64,
+    /// PREPAREs refused because they overlapped rows another cross-shard commit had
+    /// prepared there and not yet decided. Such a commit is retried, not failed: only a real
+    /// conflict with a write after its snapshot fails it with `Conflict`.
+    pub refused_pending_overlap: u64,
 }
 
 impl From<pigeonhole_engine::Metrics> for EngineMetrics {
@@ -229,6 +233,7 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
                 refused_move_raise: x.refused_move_raise,
                 refused_moved: x.refused_moved,
                 refused_room: x.refused_room,
+                refused_pending_overlap: x.refused_pending_overlap,
             },
         }
     }
@@ -254,6 +259,7 @@ mod tests {
         m.visibility_wakes = (20, 21);
         m.cross_shard.rounds = 22;
         m.cross_shard.refused_room = 23;
+        m.cross_shard.refused_pending_overlap = 24;
         let e = EngineMetrics::from(m);
         assert_eq!(e.commits(Durability::None).count, 1);
         assert_eq!(e.commits(Durability::GroupSync).count, 3);
@@ -272,5 +278,6 @@ mod tests {
         assert_eq!((e.visibility_waits, e.visibility_waiters_ahead), (18, 19));
         assert_eq!((e.visibility_wake_passes, e.visibility_woken), (20, 21));
         assert_eq!((e.cross_shard.rounds, e.cross_shard.refused_room), (22, 23));
+        assert_eq!(e.cross_shard.refused_pending_overlap, 24);
     }
 }

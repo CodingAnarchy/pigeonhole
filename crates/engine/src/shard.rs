@@ -207,10 +207,12 @@ pub(crate) enum CrossRefusal {
     Moved = 2,
     /// The share had to wait for arena room (ICR 0042).
     Room = 3,
+    /// The share overlapped an undecided share or an earlier member's rows (D249, ICR 0045).
+    PendingOverlap = 4,
 }
 
 impl CrossRefusal {
-    const COUNT: usize = 4;
+    const COUNT: usize = 5;
 }
 
 impl ShardMetrics {
@@ -844,11 +846,30 @@ pub(crate) struct CommitReq {
     /// `check_and_mutate`: the row and predicate to test first. Boxed: rare, and the
     /// largest part of the request, which every queued message is sized for.
     pub predicate: Option<RowPredicate>,
-    /// A retried cross-shard commit's first timestamp, kept when still above the floor.
-    pub commit_ts: Option<Preset>,
+    /// What a retried cross-shard commit carries into its next attempt (its first timestamp
+    /// when kept, its priority, its last participants). Boxed: only retries carry one, and
+    /// this request is the largest message every queued commit is sized for.
+    pub retry: Option<Box<Retried>>,
     /// Version of the tablet map the commit was routed with (0: unknown): a shard that
     /// handed a tablet away checks the routing of commits routed with an older map.
     pub map_version: u64,
+}
+
+/// A cross-shard commit's priority (D249): when it was submitted, then the seqno its first
+/// attempt reserved, unique per commit. The same across its retries; the smaller is older.
+pub(crate) type CommitPriority = (u64, Seqno);
+
+/// What a retried cross-shard commit carries into its next attempt.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Retried {
+    /// Its first timestamp, when the retry keeps it.
+    pub preset: Option<Preset>,
+    /// The seqno its first attempt reserved: with `submitted_at`, its `CommitPriority`
+    /// (D249).
+    pub first_seqno: Seqno,
+    /// The participants of the attempt it retries: those the next route leaves out hear
+    /// `ShardMsg::Released`, so a commit waiting behind it there stops waiting (D249).
+    pub prev_shards: Vec<ShardId>,
 }
 
 /// A refused commit's first timestamp, carried into its retry.
@@ -899,8 +920,16 @@ pub(crate) struct CoordinateReq {
     /// as it was).
     pub epoch: u64,
     /// A participant that refused the last attempt for arena room, and its room generation
-    /// then (D245, ICR 0042): the retry waits for a `RoomFreed` of a later generation.
+    /// then (D245, ICR 0042): the retry waits for a room `Wake` of a later generation.
     pub room_wait: Option<(ShardId, u64)>,
+    /// The seqno this commit's first attempt reserved (0: this is the first attempt), for
+    /// its `CommitPriority` (D249).
+    pub first_seqno: Seqno,
+    /// The participants of the attempt this one retries (D249, `Retried::prev_shards`).
+    pub prev_shards: Vec<ShardId>,
+    /// A participant that refused the last attempt because it overlaps an undecided share
+    /// there (D249): the retry waits for that participant's overlap `Wake`.
+    pub overlap_wait: Option<ShardId>,
 }
 
 /// A participant's share of a cross-shard commit.
@@ -917,6 +946,8 @@ pub(crate) struct PrepareReq {
     /// Every shard the commit was routed to: a share routed with an older tablet map runs
     /// again only when one of its rows now lives outside them (#102).
     pub participants: Vec<ShardId>,
+    /// The commit's priority (D249).
+    pub priority: CommitPriority,
 }
 
 /// Why a participant could not prepare.
@@ -934,6 +965,10 @@ pub(crate) enum PrepareError {
     /// coordinator retries once the participant reports room freed in a later generation
     /// than this one.
     Room(u64),
+    /// The share overlaps a row of an undecided share another commit prepared here, or the
+    /// commit's own earlier member (D249, ICR 0045): refused instead of waiting, which could
+    /// deadlock two coordinators, and retried once this participant reports the overlap gone.
+    PendingOverlap,
     Busy,
     Closed,
     TooLarge,
@@ -949,6 +984,7 @@ impl From<PrepareError> for Error {
             PrepareError::Moved
             | PrepareError::BelowFloor
             | PrepareError::Room(_)
+            | PrepareError::PendingOverlap
             | PrepareError::Busy => Error::Busy,
             PrepareError::Closed => Error::Closed,
             PrepareError::TooLarge => Error::RecordTooLarge,
@@ -976,6 +1012,16 @@ fn prepare_error_of(e: &Error) -> PrepareError {
     }
 }
 
+/// Why a participant wakes a coordinator whose PREPARE it refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeReason {
+    /// It has room again, in room generation `generation` (D245).
+    Room { generation: u64 },
+    /// The undecided shares the commit of `priority` overlapped are decided, or the older
+    /// commit it waited behind has run its next attempt here (D249).
+    Overlap { priority: CommitPriority },
+}
+
 /// Messages a shard handles. An engine enum, so the queue hot path has no boxing.
 #[derive(Debug)]
 pub(crate) enum ShardMsg {
@@ -988,16 +1034,26 @@ pub(crate) enum ShardMsg {
         from: ShardId,
         error: Option<PrepareError>,
     },
-    /// A participant that refused PREPAREs for arena room has room again, in room
-    /// generation `generation` (D245).
-    RoomFreed {
+    /// A participant that refused a coordinator's PREPAREs tells it the refusal's cause is
+    /// gone (D245, D249).
+    Wake {
         from: ShardId,
-        generation: u64,
+        reason: WakeReason,
+    },
+    /// The commit of `priority` retries without this shard among its participants (D249):
+    /// commits waiting here behind it stop waiting.
+    Released {
+        priority: CommitPriority,
     },
     Decide {
         seqno: Seqno,
         commit: bool,
         coordinator: ShardId,
+        /// The commit's priority (D249).
+        priority: CommitPriority,
+        /// The commit runs no further attempt (committed, failed, or given up): commits
+        /// waiting behind it stop waiting (D249).
+        last: bool,
     },
     Applied {
         seqno: Seqno,
@@ -1145,8 +1201,9 @@ struct Member {
     reserved: usize,
     /// A PREPARE: the tablet map version its share was routed with (0 otherwise).
     map_version: u64,
-    /// A retried commit: the shards that may already hold its timestamp (`Preset::own`).
-    preset_own: Vec<ShardId>,
+    /// A retried cross-shard commit's carried-over state (`Retried`), back to its
+    /// coordinator through routing.
+    retry: Option<Box<Retried>>,
     /// When it first waited for arena room, as a `room_stamp` (0: it has not): it is refused
     /// with `Busy` once it has waited `write_stall_timeout_nanos` itself (D240), whatever
     /// room the shard freed for the members ahead of it meanwhile. Four bytes, in padding
@@ -1178,8 +1235,12 @@ impl Member {
             kind: MemberKind::Single,
             durability: req.durability,
             seqno: 0,
-            commit_ts: req.commit_ts.as_ref().map_or(0, |p| p.ts),
-            preset_own: req.commit_ts.map(|p| p.own).unwrap_or_default(),
+            commit_ts: req
+                .retry
+                .as_ref()
+                .and_then(|r| r.preset.as_ref())
+                .map_or(0, |p| p.ts),
+            retry: req.retry,
             bytes: Bytes::Own(req.bytes),
             reply: req.reply,
             submitted_at: req.submitted_at,
@@ -1265,6 +1326,30 @@ struct Coord {
     /// Shards that may hold `commit_ts` because of this commit (see `Preset::own`).
     own: Vec<ShardId>,
     epoch: u64,
+    /// The commit's priority, the same across its retries (D249).
+    priority: CommitPriority,
+    /// A participant refused the PREPARE because it overlaps an undecided share there (D249,
+    /// ICR 0045): the retry waits for that participant's overlap `Wake`.
+    overlap: Option<ShardId>,
+    /// Decided with the abort (D249): the commit gives up rather than retry (D241's
+    /// timeout passed), so the `Decide` says it is the last attempt and the retry agrees.
+    gives_up: bool,
+}
+
+/// A PREPARE this shard refused because it overlapped an undecided share (D249).
+#[derive(Debug)]
+pub(crate) struct OverlapRefusal {
+    /// Its coordinator, woken when the overlap clears.
+    pub coordinator: ShardId,
+    /// The refused commit's priority, which the wake names.
+    pub priority: CommitPriority,
+    /// The rows it reads and writes (`hash_row`): it may retry once no undecided share here
+    /// holds any of them.
+    pub rows: Vec<u64>,
+    /// An older commit one of whose shares it overlapped, and that share's seqno: it waits
+    /// for that commit's next attempt here to be decided, or its last, or for it to retry
+    /// elsewhere (`Released`), so the older one goes first (older-first, D249).
+    pub behind: Option<(CommitPriority, Seqno)>,
 }
 
 /// A share this shard prepared and holds until the decision.
@@ -1278,6 +1363,8 @@ struct PreparedShare {
     tracked: bool,
     /// `PrepareReq::participants`.
     participants: Vec<ShardId>,
+    /// `PrepareReq::priority` (D249).
+    priority: CommitPriority,
 }
 
 /// A memtable with what flush and compaction need to know about it: the smallest user
@@ -2197,6 +2284,12 @@ pub(crate) struct ShardState {
     /// Per shard, the latest room generation its `RoomFreed` reported: a room retry waits
     /// for a later one than its refusal's.
     room_freed: Vec<u64>,
+    /// Coordinators whose PREPAREs this shard refused because they overlapped an undecided
+    /// share (D249), told when the overlap clears.
+    overlap_refused: Vec<OverlapRefusal>,
+    /// Overlap wakes this coordinator heard before the refused round was decided (D249):
+    /// `(participant, priority)`, consumed when its retry is queued.
+    overlap_released: Vec<(ShardId, CommitPriority)>,
     /// Slots a wait for arena room picked to freeze, whatever their size, until their active
     /// memtable freezes: the largest ones, holding about half the arena (D124).
     room_freezes: BTreeSet<(TabletId, FamilyId)>,
@@ -2453,6 +2546,8 @@ impl ShardState {
             room_refused_free: 0,
             room_generation: 0,
             room_freed: vec![0; shards],
+            overlap_refused: Vec::new(),
+            overlap_released: Vec::new(),
             unpin_upto: 0,
             unpin_at: 0,
             asked: HashMap::new(),
@@ -4501,20 +4596,20 @@ impl ShardState {
             // commit's decision could deadlock two coordinators).
             if m.conditional() {
                 let (same_group, pending_share) = self.conflicts_with_group(&m);
+                // Overlapping an earlier member of this group, any conditional member waits
+                // for the next group: that is this shard's own write, waiting on no other
+                // coordinator (D249). A single also waits for an undecided share's decision.
                 if same_group || (pending_share && matches!(m.kind, MemberKind::Single)) {
-                    if matches!(m.kind, MemberKind::Single) {
-                        cut = true;
-                        self.pending.push(m);
-                    } else {
-                        // A PREPARE that must wait aborts instead (deadlock avoidance).
-                        m.failed = Some(Error::Conflict);
-                        self.settle(m, Ok(()), ctx);
-                    }
+                    cut = true;
+                    self.pending.push(m);
                     continue;
                 }
                 if pending_share {
-                    m.failed = Some(Error::Conflict);
-                    self.settle(m, Ok(()), ctx);
+                    // A PREPARE does not wait on another commit's decision, which could
+                    // deadlock two coordinators: it is refused, not failed, and retried
+                    // once the overlap clears (D249, ICR 0045). `Conflict` comes only from
+                    // validation, below.
+                    self.refuse_for_overlap(m, ctx);
                     continue;
                 }
             }
@@ -4680,7 +4775,12 @@ impl ShardState {
                 MemberKind::Single => {
                     m.seqno = next;
                     next += 1;
-                    m.commit_ts = self.default_ts_or(m.commit_ts, &m.preset_own);
+                    let own = m
+                        .retry
+                        .as_ref()
+                        .and_then(|r| r.preset.as_ref())
+                        .map_or(&[][..], |p| p.own.as_slice());
+                    m.commit_ts = self.default_ts_or(m.commit_ts, own);
                 }
                 MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
                     self.raise_ts_floor(m.commit_ts);
@@ -5935,6 +6035,7 @@ impl ShardState {
                 if !commit {
                     self.mark_aborted(m.seqno);
                 }
+                let priority = self.coord.get(&m.seqno).map_or((0, 0), |c| c.priority);
                 for p in participants {
                     self.send(
                         p,
@@ -5942,6 +6043,8 @@ impl ShardState {
                             seqno: m.seqno,
                             commit,
                             coordinator: self.id,
+                            priority,
+                            last: true,
                         },
                         ctx,
                     );
@@ -6021,6 +6124,14 @@ impl ShardState {
         let seqno = self.reserve(1);
         self.held.insert(seqno);
         self.publish_watermark();
+        let priority = (
+            req.submitted_at,
+            if req.first_seqno == 0 {
+                seqno
+            } else {
+                req.first_seqno
+            },
+        );
         trace!(
             "shard {} coordinates {seqno} at {commit_ts} over {shards:?} routed with map v{}",
             self.id.0, req.map_version
@@ -6050,8 +6161,18 @@ impl ShardState {
                 commit_ts,
                 own,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
+                priority,
+                overlap: None,
+                gives_up: false,
             },
         );
+        // A retry that left a shard of its last attempt behind tells it, so commits waiting
+        // there behind this one stop waiting (D249).
+        for p in &req.prev_shards {
+            if !shards.contains(p) {
+                self.send(*p, ShardMsg::Released { priority }, ctx);
+            }
+        }
         for (shard, bytes) in req.parts {
             let msg = ShardMsg::Prepare(PrepareReq {
                 map_version: req.map_version,
@@ -6062,6 +6183,7 @@ impl ShardState {
                 durability: req.durability,
                 validate: req.validate.clone(),
                 participants: shards.clone(),
+                priority,
             });
             if shard == self.id {
                 self.handle_msg(msg, ctx);
@@ -6097,6 +6219,7 @@ impl ShardState {
                 reserved: 0,
                 tracked: false,
                 participants: req.participants,
+                priority: req.priority,
             },
         );
         self.pending.push(Member {
@@ -6115,7 +6238,7 @@ impl ShardState {
             failed: None,
             reserved: 0,
             map_version: req.map_version,
-            preset_own: Vec::new(),
+            retry: None,
             room_since: 0,
         });
     }
@@ -6148,6 +6271,13 @@ impl ShardState {
                 c.moved = true;
                 c.room.get_or_insert((from, generation));
             }
+            Some(PrepareError::PendingOverlap) => {
+                // Not a conflict (D249): the retry waits for the overlap to clear there, and
+                // keeps its timestamp. Only the first such participant is waited on: another
+                // that still overlaps refuses the retry again.
+                c.moved = true;
+                c.overlap.get_or_insert(from);
+            }
             Some(e) if c.failed.is_none() => c.failed = Some(e.into()),
             Some(_) => {}
             // It raised its floor to the commit timestamp.
@@ -6174,6 +6304,14 @@ impl ShardState {
             c.failed = Some(Error::Closed);
         }
         if c.failed.is_some() || c.moved {
+            // Whether it retries is decided now, with the abort (D249): the `Decide` tells
+            // the participants whether this was its last attempt, and the retry (once every
+            // participant has answered, `on_applied`) follows the same decision.
+            let waited = ctx.now_nanos().saturating_sub(c.submitted_at);
+            c.gives_up =
+                c.failed.is_none() && moved_gives_up(waited, self.shared.write_stall_timeout_nanos);
+            let last = c.failed.is_some() || c.gives_up;
+            let priority = c.priority;
             let shards = c.shards.clone();
             self.mark_aborted(seqno);
             for p in shards {
@@ -6183,6 +6321,8 @@ impl ShardState {
                         seqno,
                         commit: false,
                         coordinator: self.id,
+                        priority,
+                        last,
                     },
                     ctx,
                 );
@@ -6196,6 +6336,7 @@ impl ShardState {
         if let Err(e) = StreamList::encode(&streams, &mut encoded) {
             c.failed = Some(e.into());
             c.committing = false;
+            let priority = c.priority;
             self.mark_aborted(seqno);
             for p in shards {
                 self.send(
@@ -6204,6 +6345,8 @@ impl ShardState {
                         seqno,
                         commit: false,
                         coordinator: self.id,
+                        priority,
+                        last: true,
                     },
                     ctx,
                 );
@@ -6226,13 +6369,29 @@ impl ShardState {
             failed: None,
             reserved: 0,
             map_version: 0,
-            preset_own: Vec::new(),
+            retry: None,
             room_since: 0,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
 
     fn on_decide(
+        &mut self,
+        seqno: Seqno,
+        commit: bool,
+        coordinator: ShardId,
+        priority: CommitPriority,
+        last: bool,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        self.decide_share(seqno, commit, coordinator, ctx);
+        // Commits refused here over an overlap may retry now (D249).
+        if !self.overlap_refused.is_empty() {
+            self.release_overlaps(seqno, priority, last, ctx);
+        }
+    }
+
+    fn decide_share(
         &mut self,
         seqno: Seqno,
         commit: bool,
@@ -6385,6 +6544,10 @@ impl ShardState {
             return;
         }
         let mut c = self.coord.remove(&seqno).expect("present");
+        if !self.overlap_released.is_empty() && !(c.moved && c.failed.is_none() && !c.gives_up) {
+            // It runs no further attempt: an early overlap wake for it is stale (D249).
+            self.overlap_released.retain(|(_, p)| *p != c.priority);
+        }
         if c.not_applied {
             // Decided to commit, but a share was not applied (its shard's close gave up, or
             // its apply failed): the seqno stays held, so no reader sees the commit half
@@ -6420,7 +6583,8 @@ impl ShardState {
                     .push(seqno);
             }
             let waited = ctx.now_nanos().saturating_sub(c.submitted_at);
-            if moved_gives_up(waited, self.shared.write_stall_timeout_nanos) {
+            // Decided with the abort, so the participants heard the same (D249).
+            if c.gives_up {
                 trace!("shard {} gives up on {seqno} after {waited} ns", self.id.0);
                 reply.notify(Err(Error::Busy));
                 self.try_finish_close(ctx);
@@ -6439,8 +6603,24 @@ impl ShardState {
                 }),
                 epoch: c.epoch,
                 room_wait: c.room,
+                first_seqno: c.priority.1,
+                prev_shards: c.shards.clone(),
+                overlap_wait: c.overlap,
             };
-            if let Some((p, generation)) = req.room_wait {
+            if let Some(p) = req.overlap_wait {
+                // Waits for the overlap to clear at `p` (D249). A wake that came first (during
+                // the abort round) counts.
+                let key = (p, c.priority);
+                if let Some(i) = self.overlap_released.iter().position(|k| *k == key) {
+                    self.overlap_released.swap_remove(i);
+                    let mut req = req;
+                    req.overlap_wait = None;
+                    self.retry(req, ctx);
+                } else {
+                    self.retries.push(req);
+                    self.arm_tablet_timer(ctx);
+                }
+            } else if let Some((p, generation)) = req.room_wait {
                 // Not in a loop while a flush frees room: each attempt logs a PREPARE. A
                 // later `RoomFreed` that came first (during the abort round) counts.
                 if self.room_freed[usize::from(p.0)] > generation {
@@ -7768,12 +7948,18 @@ impl ShardState {
             ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),
             ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
             ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
-            ShardMsg::RoomFreed { from, generation } => self.on_room_freed(from, generation, ctx),
+            ShardMsg::Wake { from, reason } => match reason {
+                WakeReason::Room { generation } => self.on_room_freed(from, generation, ctx),
+                WakeReason::Overlap { priority } => self.on_overlap_cleared(from, priority, ctx),
+            },
+            ShardMsg::Released { priority } => self.release_overlaps_behind(priority, ctx),
             ShardMsg::Decide {
                 seqno,
                 commit,
                 coordinator,
-            } => self.on_decide(seqno, commit, coordinator, ctx),
+                priority,
+                last,
+            } => self.on_decide(seqno, commit, coordinator, priority, last, ctx),
             ShardMsg::Applied { seqno, from, error } => self.on_applied(seqno, from, error, ctx),
             ShardMsg::SyncDone {
                 group,
