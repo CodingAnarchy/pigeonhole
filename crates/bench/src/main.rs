@@ -38,7 +38,9 @@ WORKLOADS:
     transfer  (not in all: 16 clients moving units between Zipfian accounts in
               transactions, D247)
     sparse-wide-deletes  (not in all: sparse-wide with 5% column and row deletes, D247)
-    all       every workload above but counters, transfer and sparse-wide-deletes
+    adjacency-prefix  (not in all: adjacency's vertex scans filtered by an edge prefix)
+    time-series-range  (not in all: time-series scans of points 12-6 h old)
+    all       every workload above but the not-in-all ones
               (group-commit: durable commits, GroupSync on Pigeonhole and fsync on
               the others whatever --sync says; without --threads it runs at 1, 4
               and 16 client threads; cross-shard-contention: 32 clients, half the
