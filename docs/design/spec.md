@@ -56,7 +56,7 @@ Non-goals for v1:
 
 Rust is the principal language and the entire initial scope: the engine, public API, CLI, benchmarks and test suite are all Rust, and the Rust crate is the product.
 
-Other languages are a later, optional layer. The future state mirrors SQLite, whose single C library underlies bindings in Python, Ruby, JavaScript, Go and many others. Pigeonhole will expose a stable C ABI (`pigeonhole``.h`), and per-language libraries will be thin wrappers over it, never reimplementations of the engine.
+Other languages are a later, optional layer, and every per-language library is a thin wrapper over the Rust crate, never a reimplementation of the engine. Where a language has a native-extension or direct-to-Rust binding layer, the library uses it: PyO3 for Python, `magnus`/`rb-sys` for Ruby, UniFFI for Swift and Kotlin (and similar layers such as napi-rs where they exist). Pigeonhole also exposes a stable C ABI (`pigeonhole``.h`) for C itself and for languages that need a C FFI interface, such as Go through cgo ([D250](decisions/phase-3.md#d250)).
 
 To keep that door open without building it now:
 - Keep Rust-only types (borrowed lifetimes, generics, closures, trait objects) out of anything that will become the ABI boundary.
@@ -128,7 +128,7 @@ wb.commit_with(Durability::GroupSync)?;   // D12: commit() uses the writer defau
 - **Filters** (qualifier range, prefix, value predicate, version count, time range, column limit per row) run inside the block decoder, not after materialization.
 - **Merge operators** are registered per family in Rust and identified by name in the file so a different binary can't silently misinterpret them. Opening a database that references an unregistered operator fails with a typed error by default; an explicit read-only option opens it anyway, compaction stays off, and reads of affected cells return that error instead of unresolved operands.
 - **Durability** defaults to GroupSync and can be changed per writer or per call (see Durability below): `None` (memtable only), `Buffered` (WAL write, no fsync), `GroupSync` (fsync shared across concurrent committers), `Sync`.
-- **Bindings:** a C ABI (`pigeonhole``.h`) and bindings for Python, Ruby, JavaScript, Go and others are future scope (see Language scope); v1 ships the Rust crate only. A CLI (`phdb`` shell`, `phdb`` dump`, `phdb`` compact`) mirrors `sqlite3`/`duckdb`.
+- **Bindings:** bindings for Python, Ruby, JavaScript, Go, Swift, Kotlin and others are future scope, through native-extension or direct-to-Rust layers where they exist and a C ABI (`pigeonhole``.h`) for C and FFI-only languages (see Language scope, D250); v1 ships the Rust crate only. A CLI (`phdb`` shell`, `phdb`` dump`, `phdb`` compact`) mirrors `sqlite3`/`duckdb`.
 
 ### Durability
 
