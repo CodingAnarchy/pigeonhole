@@ -172,11 +172,12 @@ pub struct Metrics {
     /// own (D235), and how many it started (shards and compaction threads): `(pinned,
     /// started)`. Both 0 for an application-owned or closed engine.
     pub pinned_threads: (u64, u64),
-    /// Why no thread is pinned although `pin_threads` asked for it: the platform has no hard
-    /// thread affinity (macOS), a CPU quota is narrower than the affinity set, too few free
-    /// CPUs in the affinity set (other pinned databases in this process hold the rest), or
-    /// the OS refused (some threads unpinned). `None` when every thread is pinned or
-    /// pinning is off (D235).
+    /// Why threads are unpinned although `pin_threads` asked for them: the platform has no
+    /// hard thread affinity (macOS), a CPU quota is narrower than the affinity set, too few
+    /// free CPUs in the affinity set (other pinned databases in this process hold the rest;
+    /// with room for the shards but not the compaction threads, only the compaction threads
+    /// are unpinned, D252), or the OS refused (some threads unpinned). `None` when every
+    /// thread is pinned or pinning is off (D235).
     pub unpinned: Option<&'static str>,
     /// Async commit polls that found their seqno not yet visible and registered as waiters
     /// on the global watermark (D19, ICR 0023), and the waiters already listed in the

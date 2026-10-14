@@ -35,7 +35,7 @@ pub fn days(n: u64) -> Duration {
 pub struct Options {
     durability: Durability,
     shards: usize,
-    compaction_cores: usize,
+    compaction_cores: Option<usize>,
     pin_threads: bool,
     memtable_budget: u64,
     block_cache: Option<usize>,
@@ -59,6 +59,12 @@ pub struct Options {
     shard_spin: Option<Duration>,
 }
 
+/// Engine-owned mode's flush and compaction threads for `shards` shards (D252): one per
+/// four shards, at least one and at most four.
+fn default_compaction_cores(shards: usize) -> usize {
+    (shards / 4).clamp(1, 4)
+}
+
 /// The row cache's default capacity (D216): a quarter of the default block cache. On ycsb-c
 /// it answers about three gets in four from the cache; more memory buys few more hits.
 const DEFAULT_ROW_CACHE: usize = 64 << 20;
@@ -68,7 +74,7 @@ impl Default for Options {
         Self {
             durability: Durability::GroupSync,
             shards: 0,
-            compaction_cores: 0,
+            compaction_cores: None,
             pin_threads: true,
             memtable_budget: 64 << 20,
             block_cache: None,
@@ -109,15 +115,23 @@ impl Options {
         self
     }
 
-    /// Dedicate `k` extra threads to flush and compaction (pinned when
-    /// [`pin_threads`](Options::pin_threads) is on).
+    /// Dedicate `k` threads to flush and compaction (pinned when
+    /// [`pin_threads`](Options::pin_threads) is on); `0` runs them on the shard threads, in
+    /// time slices between commits.
     ///
-    /// Engine-owned mode only. [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
-    /// starts no shard or compaction threads, so it fails with
-    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when `k > 0`
-    /// (decision D40); flush and compaction then run on the shards you drive.
+    /// - **Default (D252):** engine-owned mode starts one per four shards, at least one and
+    ///   at most four (16 shards: 4; 8: 2; up to 7: 1). On a shard thread a flush or
+    ///   compaction slice holds up every commit queued behind it for up to half a
+    ///   millisecond, which is most of the write tail on contended workloads.
+    /// - **Pinning:** they take the CPUs after the shards' (the shards' SMT siblings first).
+    ///   Where there are too few free CPUs for both, the shards are pinned and these run
+    ///   unpinned.
+    /// - **Application-owned mode** starts no threads, so its default is `0`, and
+    ///   [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
+    ///   fails with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when
+    ///   `k > 0` (decision D40); flush and compaction then run on the shards you drive.
     pub fn compaction_cores(mut self, k: usize) -> Self {
-        self.compaction_cores = k;
+        self.compaction_cores = Some(k);
         self
     }
 
@@ -133,7 +147,8 @@ impl Options {
     ///   the platform has no hard thread affinity (macOS: affinity tags are only hints), a
     ///   CPU quota (a cgroup `cpu.max`, not a cpuset) is narrower than the affinity set,
     ///   there are fewer free CPUs in the set than threads (never two pinned threads on one
-    ///   CPU), or the OS refuses a pin. [`Pigeonhole::engine_metrics`](crate::Pigeonhole::engine_metrics)
+    ///   CPU; with room for the shards only, just the compaction threads run unpinned), or
+    ///   the OS refuses a pin. [`Pigeonhole::engine_metrics`](crate::Pigeonhole::engine_metrics)
     ///   reports how many threads are pinned (`threads_started`, `threads_pinned`) and why
     ///   not (`unpinned_reason`).
     /// - **Several databases in one process** share the set: each pins to CPUs the others
@@ -707,7 +722,15 @@ impl Options {
         o.direct_io = direct_io;
         o.create_if_missing = self.create_if_missing;
         o.shards = self.shards;
-        o.compaction_threads = self.compaction_cores;
+        o.compaction_threads = match self.compaction_cores {
+            Some(k) => k,
+            None if application_owned => 0,
+            None => default_compaction_cores(if self.shards == 0 {
+                pigeonhole_io::sys::default_shards()
+            } else {
+                self.shards
+            }),
+        };
         o.pin_threads = self.pin_threads;
         o.durability = self.durability;
         o.memtable_budget = self.memtable_budget;

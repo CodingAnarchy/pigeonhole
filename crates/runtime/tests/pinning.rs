@@ -1,6 +1,7 @@
 //! D235: engine-owned threads pin to CPUs of their own inside the process's affinity set;
 //! a runtime that finds none free runs unpinned instead of stacking or failing; claims are
-//! released at shutdown. Its own test binary, so no other runtime in the process holds CPUs.
+//! released at shutdown; compaction threads that don't fit leave the shards pinned (D252).
+//! Its own test binary, so no other runtime in the process holds CPUs.
 
 use pigeonhole_io::pread::PreadVfs;
 use pigeonhole_io::sys::Unpinned;
@@ -15,8 +16,13 @@ impl ShardHandler for Idle {
 }
 
 fn start(shards: usize) -> Runtime<Idle> {
+    start_with(shards, 0)
+}
+
+fn start_with(shards: usize, compaction_threads: usize) -> Runtime<Idle> {
     let mut c = RuntimeConfig::new(PreadVfs::new(1));
     c.shards = shards;
+    c.compaction_threads = compaction_threads;
     c.pin_threads = true;
     Runtime::start(c, (0..shards).map(|_| Idle).collect()).expect("pinning never fails a start")
 }
@@ -50,4 +56,13 @@ fn runtimes_pin_to_distinct_cpus_and_one_without_free_cpus_runs_unpinned() {
     let again = start(1);
     assert_eq!(again.pinning().unpinned, None);
     assert_eq!(again.pinning().pinned + again.pinning().failed, 1);
+    again.shutdown().unwrap();
+    // Shards on every CPU and two compaction threads: the shards are pinned, and only the
+    // compaction threads run unpinned (D252).
+    let over = start_with(cpus, 2);
+    let p = over.pinning();
+    assert_eq!(p.threads, cpus + 2);
+    assert_eq!(p.unpinned, Some(Unpinned::TooFewCpus));
+    assert_eq!(p.pinned + p.failed, cpus, "{p:?}");
+    over.shutdown().unwrap();
 }
