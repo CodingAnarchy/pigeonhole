@@ -46,6 +46,9 @@ pub(crate) struct Settings {
     /// Riders on the measured phase (D247): snapshot and durable-snapshot readers, then a
     /// durable backup and a compaction.
     pub(crate) riders: bool,
+    /// Client threads keep this many operations in flight through the async API (D247's
+    /// async rows); 0 runs one at a time.
+    pub(crate) async_in_flight: usize,
     /// The pre-split cuts at the measured writes' quantiles rather than the loaded rows', so
     /// each piece takes about the same share of the writes (D231's engine scaling).
     pub(crate) presplit_writes: bool,
@@ -180,6 +183,21 @@ impl PigeonholeRunner {
     /// ```
     pub fn riders(mut self, yes: bool) -> Self {
         self.settings.riders = yes;
+        self
+    }
+
+    /// Each client thread keeps `n` operations in flight through the async API (D247, perf287's
+    /// E/E′): puts as `commit_async`, row reads as `read_async`, gets as `get_async`, polled by
+    /// the thread itself; any other operation runs on its own in between. 0 (the default) runs
+    /// one operation at a time. Latency is each operation's submission to resolution.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(PigeonholeRunner::default().async_in_flight(16).describe().contains(" async=16"));
+    /// ```
+    pub fn async_in_flight(mut self, n: usize) -> Self {
+        self.settings.async_in_flight = n;
         self
     }
 
@@ -655,6 +673,7 @@ impl Runner for PigeonholeRunner {
         Some(Box::new(PigeonholeClient {
             target: open.target.clone(),
             busy: Arc::clone(&open.busy),
+            in_flight: self.settings.async_in_flight,
         }))
     }
 
@@ -665,7 +684,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -697,7 +716,12 @@ impl Runner for PigeonholeRunner {
                 (true, false) => " presplit",
                 _ => "",
             },
-            if s.riders { " riders" } else { "" }
+            if s.riders { " riders" } else { "" },
+            if s.async_in_flight > 0 {
+                format!(" async={}", s.async_in_flight)
+            } else {
+                String::new()
+            }
         )
     }
 }
@@ -756,11 +780,109 @@ pub(crate) struct Target {
 struct PigeonholeClient {
     target: Target,
     busy: Arc<AtomicU64>,
+    /// Operations kept in flight through the async API; 0 runs one at a time.
+    in_flight: usize,
 }
 
 impl Client for PigeonholeClient {
     fn execute(&mut self, op: &BenchOp) -> Result<(), String> {
         execute(&self.target, &self.busy, op).map(drop)
+    }
+
+    fn pipelined(&mut self, ops: &[&BenchOp]) -> Option<Result<Vec<Duration>, String>> {
+        (self.in_flight > 0).then(|| pipeline::run(self, ops))
+    }
+}
+
+/// D247's async rows: a client thread keeping operations in flight through the async API,
+/// polled by the thread itself, woken by the futures' wakers (no executor).
+mod pipeline {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::{Duration, Instant};
+
+    use super::{PigeonholeClient, err, execute};
+    use crate::BenchOp;
+
+    /// Unparks the client thread.
+    struct Unpark(std::thread::Thread);
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    type Pending = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+    /// The operation as a future, or `None` for one the async API does not cover.
+    fn submit(c: &PigeonholeClient, op: &BenchOp) -> Option<Pending> {
+        let table = &c.target.table;
+        Some(match op {
+            BenchOp::Put { row, family, cells } => {
+                let mut m = table.mutate(row);
+                for (q, v) in cells {
+                    m = m.put(family, q, v);
+                }
+                let f = m.commit_async();
+                Box::pin(async move { f.await.map(drop).map_err(err) })
+            }
+            BenchOp::Get {
+                row,
+                family,
+                qualifier,
+            } => {
+                let f = table.get_async(row, family, qualifier);
+                Box::pin(async move { f.await.map(drop).map_err(err) })
+            }
+            BenchOp::GetRow { row, family } => {
+                let f = table.row(row).family(family).read_async();
+                Box::pin(async move { f.await.map(drop).map_err(err) })
+            }
+            _ => return None,
+        })
+    }
+
+    pub(super) fn run(c: &mut PigeonholeClient, ops: &[&BenchOp]) -> Result<Vec<Duration>, String> {
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut latencies = vec![Duration::ZERO; ops.len()];
+        let mut flight: VecDeque<(usize, Instant, Pending)> = VecDeque::with_capacity(c.in_flight);
+        let mut next = 0;
+        while next < ops.len() || !flight.is_empty() {
+            while flight.len() < c.in_flight && next < ops.len() {
+                let t = Instant::now();
+                match submit(c, ops[next]) {
+                    Some(f) => flight.push_back((next, t, f)),
+                    None => {
+                        execute(&c.target, &c.busy, ops[next])?;
+                        latencies[next] = t.elapsed();
+                    }
+                }
+                next += 1;
+            }
+            let before = flight.len();
+            let mut i = 0;
+            while i < flight.len() {
+                if let Poll::Ready(r) = flight[i].2.as_mut().poll(&mut cx) {
+                    let (n, t, _) = flight.remove(i).expect("in range");
+                    r?;
+                    latencies[n] = t.elapsed();
+                } else {
+                    i += 1;
+                }
+            }
+            if flight.len() == before && !flight.is_empty() {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+        Ok(latencies)
     }
 }
 
@@ -1340,6 +1462,37 @@ mod tests {
         }
         drop(it);
         r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn async_clients_keep_operations_in_flight_and_measure_each() {
+        // D247: ycsb-a through the async API, 8 in flight per client thread.
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-async-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = PigeonholeRunner::default()
+            .shards(2)
+            .memtable_budget(16 << 20)
+            .async_in_flight(8);
+        let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+        config.threads = 2;
+        let options = crate::RunOptions {
+            warmup: 0.0,
+            ..crate::RunOptions::default()
+        };
+        let rec = crate::run_detailed(&mut r, &config, &dir, &options).unwrap();
+        assert_eq!(rec.operations, config.operations);
+        assert_eq!(rec.threads, 2);
+        let count = |name: &str| {
+            rec.detail
+                .by_type
+                .iter()
+                .find(|t| t.op == name)
+                .map_or(0, |t| t.stats.count)
+        };
+        assert_eq!(count("put") + count("row read"), config.operations);
+        assert!(rec.p50_ns > 0);
+        assert!(rec.store_config.contains(" async=8"));
         std::fs::remove_dir_all(dir).ok();
     }
 

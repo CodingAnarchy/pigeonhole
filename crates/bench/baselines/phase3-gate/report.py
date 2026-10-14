@@ -533,6 +533,30 @@ for level, label in CONTENDED_LEVELS:
     rows.append((f"Contended ycsb-a, 16 KiB values, {label} (reported, not judged; D247)",
                  f"{rate(ph['throughput'])} ops/s, p99 {us(ph['p99_ns']):.0f} µs; {ratios}{flag}", "-", name))
 
+# The async API (D247, reported; perf287's E/E′): Pigeonhole's ycsb-a and ycsb-c with 4 and
+# 16 operations in flight per client thread, against the judged run of the same workload
+# (synchronous clients). Flagged past 3x lower throughput; the p99 is shown but not held to
+# the synchronous one, since 16 in flight per client queue by design (Little's law: latency is
+# in-flight operations over throughput).
+for level, label in CONTENDED_LEVELS:
+    for w, k in (("ycsb-a", 4), ("ycsb-a", 16), ("ycsb-c", 4), ("ycsb-c", 16)):
+        name = f"contended-{level}-{w}-async{k}.json"
+        ar = next(iter(results(name, "pigeonhole", w)), None)
+        if not ar:
+            continue
+        judged = cont.get((level, w))
+        vs, flag = "", ""
+        if judged:
+            sync = judged[0]
+            t, l = ar["throughput"] / max(sync["throughput"], 1e-9), ar["p99_ns"] / max(sync["p99_ns"], 1)
+            vs = f"; {t:.2f}× the synchronous run's throughput (p99 {l:.2f}×, queued by design)"
+            if t < 1 / 3:
+                flag = "; **under a third of the synchronous run's throughput: file an issue**"
+        rows.append((f"Contended {w} through the async API, {k} in flight per client, {label} "
+                     "(reported, not judged; D247)",
+                     f"{rate(ar['throughput'])} ops/s, p50 {us(ar['p50_ns']):.0f} µs, p99 {us(ar['p99_ns']):.0f} µs"
+                     f"{vs}{flag}", "-", name))
+
 # ycsb-a's riders (D247, reported): readers under snapshots, a durable backup and a compaction
 # beside the measured phase; the foreground's p99 is held against the judged ycsb-a run's.
 for level, label in CONTENDED_LEVELS:
