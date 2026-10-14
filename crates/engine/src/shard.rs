@@ -2229,6 +2229,11 @@ pub(crate) struct ShardState {
     // ---- checkpoints ----
     /// Records the checkpoint cannot pass, in log order.
     log: VecDeque<Logged>,
+    /// The cross-shard records (PREPAREs and COMMITs) in `log`, by seqno, with how many
+    /// there are (a coordinator logs both for its own share): `mark_aborted` asks it instead
+    /// of scanning `log`, which holds every single-shard record too: a storm of refused
+    /// rounds scanned it whole once per abort.
+    log_cross: FastMap<Seqno, u8>,
     /// Bytes logged since open (record payloads plus a fixed overhead each): positions for
     /// the WAL pin limit (#137).
     log_bytes: u64,
@@ -2526,6 +2531,7 @@ impl ShardState {
             flush_retry: None,
             dropped: HashSet::new(),
             log: VecDeque::new(),
+            log_cross: FastMap::default(),
             log_bytes: 0,
             log_base: 0,
             slot_log: FastMap::default(),
@@ -2783,6 +2789,7 @@ impl ShardState {
                     seqno,
                     kind: LoggedKind::Prepare { slots, coordinator },
                 });
+                self.log_cross_record(seqno);
             }
             ReplayedKind::Commit {
                 participants,
@@ -2810,6 +2817,7 @@ impl ShardState {
                     seqno,
                     kind: LoggedKind::Commit { participants },
                 });
+                self.log_cross_record(seqno);
             }
         }
     }
@@ -2841,6 +2849,7 @@ impl ShardState {
         self.pin_queued_own = None;
         self.pin_queued_through = None;
         self.log.clear();
+        self.log_cross.clear();
         self.slot_log.clear();
         self.cross_log.clear();
         self.cross_seqnos.clear();
@@ -5023,6 +5032,7 @@ impl ShardState {
                             coordinator: *coordinator,
                         };
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
+                        self.log_cross_record(m.seqno);
                     }
                 }
                 MemberKind::CommitRecord { participants } => {
@@ -5033,6 +5043,7 @@ impl ShardState {
                             participants: participants.clone(),
                         };
                         self.log_record(t.end, m.seqno, 0, kind);
+                        self.log_cross_record(m.seqno);
                         // Every share may have reported before the record was logged.
                         self.settle_if_done(m.seqno, ctx);
                     }
@@ -6808,6 +6819,7 @@ impl ShardState {
             self.asked.remove(&l.seqno);
             match l.kind {
                 LoggedKind::Commit { .. } => {
+                    self.unlog_cross(l.seqno);
                     self.aborted.remove(&l.seqno);
                     self.share_reports.remove(&l.seqno);
                     self.settle_to.remove(&l.seqno);
@@ -6817,6 +6829,7 @@ impl ShardState {
                     // seqno: while that COMMIT is still in the log (`share_reports` has it),
                     // an aborted commit stays aborted, or its COMMIT would read as undecided
                     // and be needed for ever (#591).
+                    self.unlog_cross(l.seqno);
                     if !self.share_reports.contains_key(&l.seqno) {
                         self.aborted.remove(&l.seqno);
                     }
@@ -7809,9 +7822,33 @@ impl ShardState {
     /// replies `Prepared`, and a decision follows every reply, so the record is there by
     /// the time a decision names it.
     fn mark_aborted(&mut self, seqno: Seqno) {
-        // Newest first: a decision usually follows its own record closely.
-        if self.log.iter().rev().any(|l| l.seqno == seqno) {
+        // A lookup, not a scan of `log`: under a storm of refused rounds the scan ran once
+        // per abort over every record since the checkpoint, single-shard ones included, and
+        // saturated the shard (application-owned cross-shard batches, 2026-10-13).
+        let logged = self.log_cross.contains_key(&seqno);
+        // Checked against the scan it replaces while the log is small (every model test), so
+        // a debug build's long logs keep the lookup's cost.
+        debug_assert!(
+            self.log.len() > 4096 || logged == self.log.iter().any(|l| l.seqno == seqno),
+            "log_cross disagrees with log for {seqno}"
+        );
+        if logged {
             self.aborted.insert(seqno);
+        }
+    }
+
+    /// A cross-shard record (PREPARE or COMMIT) of `seqno` joined `log` (`log_cross`).
+    fn log_cross_record(&mut self, seqno: Seqno) {
+        *self.log_cross.entry(seqno).or_insert(0) += 1;
+    }
+
+    /// A cross-shard record of `seqno` left `log` (`log_cross`).
+    fn unlog_cross(&mut self, seqno: Seqno) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.log_cross.entry(seqno) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
         }
     }
 

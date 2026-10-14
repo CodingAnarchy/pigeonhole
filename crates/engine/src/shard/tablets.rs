@@ -250,6 +250,18 @@ impl ShardState {
     /// for later PREPAREs' checks.
     #[inline(never)]
     fn route_prepare(&mut self, m: Member, ctx: &mut ShardContext<'_, ShardMsg>) -> Option<Member> {
+        #[cfg(feature = "test-hooks")]
+        {
+            let forced = &self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .refuse_prepares;
+            if forced.load(Ordering::Acquire) > 0 {
+                forced.fetch_sub(1, Ordering::AcqRel);
+                self.shared.metrics[usize::from(self.id.0)].count_refusal(CrossRefusal::BelowFloor);
+                self.refuse_prepare(m, PrepareError::BelowFloor, ctx);
+                return None;
+            }
+        }
         if let Some(why) = self.floor_refusal(&m) {
             // The coordinator's retry reads this shard's floor again, raised to the refused
             // timestamp, or past the earlier-seqno timestamp above it that refused it
