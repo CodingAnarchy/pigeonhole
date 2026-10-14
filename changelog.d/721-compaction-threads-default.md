@@ -1,3 +1,0 @@
-### Changed
-- Engine-owned databases now run flush and compaction on threads of their own by default: one per four shards, at least one and at most four (D252). On a shard thread, each 500 µs flush or compaction slice held up the commits queued behind it. On the AX102 the change cut contended buffered ycsb-a's p99 from ~370 µs to ~45 µs and cross-shard commits' from ~550–890 µs to ~95–125 µs, with more throughput. `Options::compaction_cores(0)` restores the old behaviour. Application-owned mode still starts no threads, and its default is 0.
-- When the CPU set has room for the shard threads but not the compaction threads, the shards are now pinned and only the compaction threads run unpinned. Previously no thread was pinned (D235).
