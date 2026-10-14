@@ -820,23 +820,39 @@ fn deep_l0_stalls_writes_without_refusing_them() {
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
-    // Writes outrun compaction (2 KiB cells against 8 KiB memtables and 64 KiB SSTs):
-    // once the tree is a few levels deep, a compaction takes longer than the token bucket
-    // lets commits through, and the writer is held, never refused.
-    let mut written = 0u32;
-    while written < 20_000 && db.metrics().stalls.0 == 0 {
-        for _ in 0..50 {
-            let mut wb = WriteBatch::new();
-            put(
-                &mut wb,
-                &t,
-                format!("row{written:05}").as_bytes(),
-                b"q",
-                &vec![1u8; 2048],
-            );
-            db.commit(wb, Some(Durability::None)).unwrap();
-            written += 1;
-        }
+    // Compactions are held, so L0 deepens with every flush (2 KiB cells against 8 KiB
+    // memtables) past the stall's start (D234: twice `l0_trigger`). A writer is then held,
+    // never refused. Racing real compaction threads instead (#703) left the stall to the
+    // runner's speed: a fast one kept up and never stalled. A helper lets compaction run once
+    // the stall began; on the simulator's frozen clock, compaction progress paces the stall.
+    db.hold_compactions(true);
+    let release = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while db.metrics().stalls.0 == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            db.hold_compactions(false);
+        })
+    };
+    let written = 2_000u32;
+    for i in 0..written {
+        let mut wb = WriteBatch::new();
+        put(
+            &mut wb,
+            &t,
+            format!("row{i:05}").as_bytes(),
+            b"q",
+            &vec![1u8; 2048],
+        );
+        db.commit(wb, Some(Durability::None)).unwrap();
+    }
+    release.join().unwrap();
+    // The held compactions run once released.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while db.metrics().compactions == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     let m = db.metrics();
     assert!(m.flushes >= 4 && m.compactions >= 1, "{m:?}");
