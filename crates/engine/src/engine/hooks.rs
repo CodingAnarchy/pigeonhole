@@ -173,8 +173,12 @@ pub(crate) struct ShardCounters {
     /// `SharesFlushed` and `CommitsSettled` messages the shard handled
     /// (`Engine::share_reports`, D254).
     pub report_msgs: AtomicU64,
-    /// The seqnos those messages carried (`Engine::share_reports`, D254).
+    /// The seqnos counted from them: a `CommitsSettled`'s at once, a `SharesFlushed`'s as
+    /// its slices run (`Engine::share_reports`, D254).
     pub report_seqnos: AtomicU64,
+    /// The most share reports the shard counted in one turn (`Engine::report_slice_max`,
+    /// D254).
+    pub report_slice_max: AtomicU64,
     /// Records in the shard's log (those its checkpoint has not passed) after its last
     /// batch (`Engine::logged_records`, D254).
     pub logged: AtomicU64,
@@ -866,8 +870,9 @@ impl Engine {
     }
 
     /// Shard `shard`'s handled `SharesFlushed` and `CommitsSettled` messages, and the
-    /// seqnos they carried: one message carries every report a shard has for that peer at
-    /// once, not one per commit (D254).
+    /// seqnos counted from them so far: one message carries every report a shard has for
+    /// that peer at once, not one per commit, and a large one is counted a slice per turn
+    /// (D254).
     #[doc(hidden)]
     pub fn share_reports(&self, shard: usize) -> (u64, u64) {
         let h = &self.inner.shared.metrics[shard].hooks;
@@ -875,6 +880,16 @@ impl Engine {
             h.report_msgs.load(Ordering::Relaxed),
             h.report_seqnos.load(Ordering::Relaxed),
         )
+    }
+
+    /// The most share reports shard `shard` counted in one turn: a large `SharesFlushed`
+    /// is counted `REPORT_SLICE` at a time (D254).
+    #[doc(hidden)]
+    pub fn report_slice_max(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .report_slice_max
+            .load(Ordering::Relaxed)
     }
 
     /// The records shard `shard`'s checkpoint has not passed yet, as of its last batch: a

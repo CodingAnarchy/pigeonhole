@@ -1134,6 +1134,8 @@ pub(crate) enum ShardMsg {
     /// Run the next slice of WAL pin work: the pass in progress, or background indexing
     /// (D206, #474).
     PinSlice,
+    /// Count the next slice of queued share reports (`reports_queued`, D254).
+    ReportSlice,
     /// A failed background compaction's backoff passed (on a moving clock): retry.
     RetryCompaction,
     /// A refused checkpoint's backoff passed (on a moving clock): retry.
@@ -1929,6 +1931,11 @@ struct SlotLog {
 /// 40-60 µs on an Apple M5; a count rather than a clock, so runs stay deterministic.
 const PIN_SLICE: usize = 1024;
 
+/// The most share reports a coordinator counts in one turn (D254): a flush's `SharesFlushed`
+/// can carry ~100K seqnos, and counting them with the checkpoint advance they allow took up
+/// to 50 ms in one turn. The rest wait in `reports_queued` for the next `ReportSlice`.
+pub(crate) const REPORT_SLICE: usize = 4096;
+
 /// A WAL pin pass in progress (D206): it selects the needed records logged before it
 /// started (`end`) that `which` takes, and works through them a slice per shard turn.
 #[derive(Debug)]
@@ -2329,6 +2336,10 @@ pub(crate) struct ShardState {
     /// Coordinator: settled commits not yet sent to each participant, sent together as one
     /// `CommitsSettled` by `send_settled` (D254), in shard order.
     settle_out: BTreeMap<ShardId, Vec<Seqno>>,
+    /// Coordinator: reported shares not yet counted, at most `REPORT_SLICE` a turn (D254).
+    reports_queued: VecDeque<Seqno>,
+    /// A `ReportSlice` is in the inbox.
+    report_slice_queued: bool,
     /// Participant: applied shares whose flush has not been reported to the coordinator.
     unreported: Vec<UnreportedShare>,
 
@@ -2580,6 +2591,8 @@ impl ShardState {
             share_reports: HashMap::new(),
             settle_to: HashMap::new(),
             settle_out: BTreeMap::new(),
+            reports_queued: VecDeque::new(),
+            report_slice_queued: false,
             unreported: Vec::new(),
             leveled,
             tiered,
@@ -2871,6 +2884,7 @@ impl ShardState {
         self.asked.clear();
         self.unreported.clear();
         self.share_reports.clear();
+        self.reports_queued.clear();
         self.aborted.clear();
         out
     }
@@ -6780,12 +6794,45 @@ impl ShardState {
         }
     }
 
-    /// Counts a handled `SharesFlushed` or `CommitsSettled` and its seqnos (test hook).
+    /// Counts handled `SharesFlushed` or `CommitsSettled` messages, and the seqnos counted
+    /// (a `CommitsSettled`'s at once, a `SharesFlushed`'s as its slices run) (test hook).
     #[cfg(feature = "test-hooks")]
-    fn count_reports(&self, seqnos: usize) {
+    fn count_reports(&self, msgs: u64, seqnos: usize) {
         let h = &self.shared.metrics[usize::from(self.id.0)].hooks;
-        h.report_msgs.fetch_add(1, Ordering::Relaxed);
+        h.report_msgs.fetch_add(msgs, Ordering::Relaxed);
         h.report_seqnos.fetch_add(seqnos as u64, Ordering::Relaxed);
+    }
+
+    /// Coordinator, once per batch (`end_batch`): counts up to `REPORT_SLICE` queued share
+    /// reports, settles the commits they complete and advances the checkpoint once, then
+    /// queues a `ReportSlice` for the rest (D254). The kick lands in the next batch, so the
+    /// group commit and whatever else queued run between slices. The COMMIT record may not
+    /// be logged yet (a participant flushed before the coordinator's group ran): the count
+    /// waits for it.
+    fn count_report_slice(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.reports_queued.is_empty() {
+            return;
+        }
+        let n = self.reports_queued.len().min(REPORT_SLICE);
+        #[cfg(feature = "test-hooks")]
+        {
+            self.count_reports(0, n);
+            self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .report_slice_max
+                .fetch_max(n as u64, Ordering::Relaxed);
+        }
+        for _ in 0..n {
+            let seqno = self.reports_queued.pop_front().expect("counted");
+            self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
+            self.settle_if_done(seqno);
+        }
+        self.send_settled(ctx);
+        self.advance_checkpoint(ctx);
+        if !self.reports_queued.is_empty() && !self.report_slice_queued {
+            self.report_slice_queued = true;
+            let _ = ctx.submitter(self.id).submit(ShardMsg::ReportSlice);
+        }
     }
 
     /// Coordinator: sends each participant the commits `settle_if_done` found settled, as
@@ -8076,17 +8123,11 @@ impl ShardState {
             ShardMsg::SyncBarrier { reply } => self.on_sync_barrier(reply, ctx),
             ShardMsg::SharesFlushed { seqnos } => {
                 #[cfg(feature = "test-hooks")]
-                self.count_reports(seqnos.len());
-                // The COMMIT record may not be logged yet (a participant flushed before the
-                // coordinator's group ran): the count waits for it.
-                for seqno in seqnos {
-                    self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
-                    self.settle_if_done(seqno);
-                }
-                self.send_settled(ctx);
-                self.advance_checkpoint(ctx);
-                self.try_finish_close(ctx);
+                self.count_reports(1, 0);
+                // Counted in `end_batch`, a slice per batch.
+                self.reports_queued.extend(seqnos);
             }
+            ShardMsg::ReportSlice => self.report_slice_queued = false,
             ShardMsg::Created => {
                 self.creation_wake = false;
                 self.advance_checkpoint(ctx);
@@ -8094,7 +8135,7 @@ impl ShardState {
             }
             ShardMsg::CommitsSettled { seqnos } => {
                 #[cfg(feature = "test-hooks")]
-                self.count_reports(seqnos.len());
+                self.count_reports(1, seqnos.len());
                 self.commit_ckpt.extend(seqnos);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
@@ -8287,6 +8328,7 @@ impl ShardHandler for ShardState {
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
         self.run_group(ctx);
+        self.count_report_slice(ctx);
         // Coordinators refused for room hear once the room wait has ended, or once no single
         // waits, no flush is in flight and more room is free than at the refusal: their
         // retry may fit then. Never while nothing has freed room, so never a loop (D245).

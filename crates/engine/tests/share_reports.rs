@@ -14,7 +14,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use pigeonhole_engine::{Engine, EngineOptions, EngineShard, FamilyOptions, ValueRef, WriteBatch};
+use pigeonhole_engine::{
+    Engine, EngineOptions, EngineShard, FamilyOptions, TableInfo, ValueRef, WriteBatch,
+};
 use pigeonhole_format::{Durability, FamilyId};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 
@@ -148,4 +150,186 @@ fn a_flush_reports_its_shares_in_one_message_per_coordinator() {
         assert_eq!(get(&p, &row).as_deref(), Some(&row[..]), "commit {i}");
     }
     db.close().unwrap();
+}
+
+/// The engine's `REPORT_SLICE`: the most share reports a coordinator counts in one turn.
+const SLICE: u64 = 4096;
+
+/// Two shards: `n` cross-shard commits that shard 0 coordinates, each with a share on shard
+/// 1. Returns the tables (coordinator's, participant's).
+fn two_shard_commits(
+    vfs: &Arc<SimVfs>,
+    n: u32,
+) -> (
+    Arc<Engine>,
+    Vec<EngineShard>,
+    Arc<TableInfo>,
+    Arc<TableInfo>,
+) {
+    let o = || common::options(Arc::clone(vfs), 2, BUDGET);
+    let db = Engine::open(Path::new(DB), o()).unwrap();
+    let family = || vec![("f".into(), FamilyOptions::default())];
+    // Tablet n is on shard n % 2: p on shard 1, c on shard 0.
+    let p = db.create_table("p", &family()).unwrap();
+    let c = db.create_table("c", &family()).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o()).unwrap();
+    for i in 0..n {
+        let row = i.to_be_bytes();
+        let mut wb = WriteBatch::new();
+        for t in [&c, &p] {
+            wb.put(
+                t.id,
+                t.families[0].id,
+                &row,
+                b"q",
+                None,
+                ValueRef::Bytes(&row),
+            )
+            .unwrap();
+        }
+        drive(
+            &mut shards,
+            db.submit(wb, Some(Durability::Buffered)).unwrap(),
+        )
+        .unwrap();
+    }
+    (db, shards, c, p)
+}
+
+/// Every row of both tables reads back after a reopen.
+fn check_rows(
+    vfs: &Arc<SimVfs>,
+    n: u32,
+    c: &pigeonhole_engine::TableInfo,
+    p: &pigeonhole_engine::TableInfo,
+) {
+    let db = Engine::open(Path::new(DB), common::options(Arc::clone(vfs), 2, BUDGET)).unwrap();
+    for i in 0..n {
+        let row = i.to_be_bytes();
+        for t in [c, p] {
+            let got = db
+                .get_latest(t.id, t.families[0].id, &row, b"q")
+                .unwrap()
+                .map(|v| common::value_bytes(v.value()));
+            assert_eq!(got.as_deref(), Some(&row[..]), "row {i} of {}", t.name);
+        }
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn a_large_report_is_counted_a_slice_per_turn() {
+    // One flush of shard 1 reports 100K shares to shard 0 in one message (#716's ~100K per
+    // flush): the coordinator counts them at most `SLICE` a turn, not in one 50 ms turn.
+    const N: u32 = 100_000;
+    let vfs = SimVfs::new(2541);
+    let (db, mut shards, ..) = two_shard_commits(&vfs, N);
+    let flush = db.submit_flush().unwrap();
+    drive(&mut shards, flush).unwrap();
+    settle(&mut shards);
+    let (msgs, seqnos) = db.share_reports(0);
+    assert_eq!(seqnos, u64::from(N), "shard 0 counted every report");
+    assert!(msgs <= 2, "{msgs} SharesFlushed messages for one flush");
+    assert_eq!(
+        db.report_slice_max(0),
+        SLICE,
+        "the most reports shard 0 counted in one turn"
+    );
+    let logged: Vec<_> = (0..2).map(|s| db.logged_records(s)).collect();
+    assert_eq!(
+        logged,
+        vec![0; 2],
+        "records the checkpoints have not passed"
+    );
+}
+
+/// Two shards with `PARTIAL` commits, flushed: shard 1's report reaches shard 0, which
+/// has counted only some of it when this returns.
+fn partly_counted(
+    vfs: &Arc<SimVfs>,
+) -> (
+    Arc<Engine>,
+    Vec<EngineShard>,
+    Arc<TableInfo>,
+    Arc<TableInfo>,
+) {
+    let (db, mut shards, c, p) = two_shard_commits(vfs, PARTIAL);
+    let _flush = db.submit_flush().unwrap();
+    // Both shards run (shard 1's freeze waits for shard 0's visibility), a turn each,
+    // until shard 0 has the report and has counted some of it.
+    for _ in 0..100_000 {
+        shards[1].run_once(u64::MAX);
+        shards[0].run_once(u64::MAX);
+        if db.share_reports(0).1 > 0 {
+            break;
+        }
+    }
+    let (msgs, counted) = db.share_reports(0);
+    assert_eq!(msgs, 1, "shard 1's one report");
+    assert!(
+        counted > 0 && counted < u64::from(PARTIAL),
+        "shard 0 counted {counted} of {PARTIAL} reports"
+    );
+    assert_eq!(
+        db.logged_records(1),
+        u64::from(PARTIAL),
+        "shard 1's PREPAREs wait"
+    );
+    (db, shards, c, p)
+}
+
+/// Eight slices: more than one turn counts.
+const PARTIAL: u32 = 8 * 4096;
+
+#[test]
+fn a_close_with_reports_still_queued_counts_them_and_is_clean() {
+    let vfs = SimVfs::new(2542);
+    let (db, mut shards, c, p) = partly_counted(&vfs);
+    db.close().unwrap();
+    let mut finished = false;
+    for _ in 0..100_000 {
+        let mut more = false;
+        for s in shards.iter_mut() {
+            more |= s.run_once(u64::MAX);
+        }
+        if !more && db.close_finished() {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "the close never finished (a hang)");
+    assert!(
+        matches!(shards[0].closed(), Some(Ok(()))),
+        "the close was not clean: {:?}",
+        shards[0].closed()
+    );
+    assert_eq!(
+        db.share_reports(0).1,
+        u64::from(PARTIAL),
+        "every report counted"
+    );
+    let logged: Vec<_> = (0..2).map(|s| db.logged_records(s)).collect();
+    assert_eq!(
+        logged,
+        vec![0; 2],
+        "records the checkpoints have not passed"
+    );
+    drop(shards);
+    drop(db);
+    check_rows(&vfs, PARTIAL, &c, &p);
+}
+
+#[test]
+fn a_crash_with_reports_still_queued_replays_every_commit() {
+    let vfs = SimVfs::new(2543);
+    let (db, shards, c, p) = partly_counted(&vfs);
+    vfs.crash(CrashKind::Power);
+    drop(shards);
+    drop(db);
+    // Replay re-reports the flushed shares at start: the queue lost in the crash is not
+    // needed. Then a clean close passes every record.
+    check_rows(&vfs, PARTIAL, &c, &p);
+    check_rows(&vfs, PARTIAL, &c, &p);
 }
