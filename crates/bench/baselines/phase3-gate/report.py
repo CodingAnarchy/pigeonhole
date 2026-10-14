@@ -578,10 +578,14 @@ for level, label in CONTENDED_LEVELS:
     rounds = (f"; {st.get('xshard_rounds', 0)} two-phase rounds, {st.get('xshard_refused_rounds', 0)} refused"
               if "xshard_rounds" in st else "")
     settled = "" if d.get("warmup_settled", True) else ", not settled"
+    stalls = (f"; {d.get('busy_retries', 0)} commits retried after Busy, "
+              f"{st.get('write_stalls', 0)} write stalls ({st.get('write_stall_nanos', 0) / 1e6:.0f} ms)")
+    if d.get("busy_retries", 0):
+        flag += "; **commits stalled past the write-stall timeout: file an issue**"
     rows.append((f"Application-owned mode on the defaults, {label} (reported, not judged; D247)",
                  f"{rate(ar['throughput'])} commits/s, p50 {us(ar['p50_ns']):.0f} µs, p99 {us(ar['p99_ns']):.0f} µs; "
                  f"tablets on {spread} of {len(d.get('shards', []))} shards after a {d.get('warmup_secs', 0):.0f} s "
-                 f"warmup{settled}{rounds}{vs}{flag}", "-", name))
+                 f"warmup{settled}{rounds}{stalls}{vs}{flag}", "-", name))
 
 # ycsb-a's riders (D247, reported): readers under snapshots, a durable backup and a compaction
 # beside the measured phase; the foreground's p99 is held against the judged ycsb-a run's.
