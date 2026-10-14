@@ -36,7 +36,11 @@ fn bucket(ns: u64) -> usize {
         return 0;
     }
     let l = 63 - ns.leading_zeros() as usize;
-    let frac = if l >= 2 { ((ns >> (l - 2)) & 3) as usize } else { 0 };
+    let frac = if l >= 2 {
+        ((ns >> (l - 2)) & 3) as usize
+    } else {
+        0
+    };
     (1 + l * 4 + frac).min(B - 1)
 }
 

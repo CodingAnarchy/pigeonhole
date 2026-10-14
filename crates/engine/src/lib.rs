@@ -40,9 +40,9 @@ mod options;
 mod purge_guard;
 mod read;
 mod row_cache;
-mod shard;
 #[doc(hidden)]
 pub mod scratch_phases;
+mod shard;
 mod snapshot;
 mod source;
 mod timer_state;

@@ -268,7 +268,13 @@ impl Scheduler {
             return;
         };
         e.waker.cell.woken.store(false, Ordering::Relaxed);
-        match e.task.run(deadline, &e.waker) {
+        let t0 = std::time::Instant::now();
+        let poll = e.task.run(deadline, &e.waker);
+        crate::scratch_iter::add(
+            crate::scratch_iter::take_task_kind(),
+            t0.elapsed().as_nanos() as u64,
+        );
+        match poll {
             TaskPoll::Pending => self.runnable.push_back(i),
             TaskPoll::Blocked => {
                 // A wake that raced with the slice keeps the task runnable.

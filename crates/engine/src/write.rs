@@ -536,7 +536,11 @@ fn wait_body(
     spins: bool,
 ) -> crate::Result<CommitInfo> {
     let window = if spins { shared.commit_spin_nanos } else { 0 };
-    let k = if crate::scratch_phases::is_cross() { 2 } else { 0 };
+    let k = if crate::scratch_phases::is_cross() {
+        2
+    } else {
+        0
+    };
     let t0 = std::time::Instant::now();
     if window == 0 {
         // No spin: exactly the parking wait.

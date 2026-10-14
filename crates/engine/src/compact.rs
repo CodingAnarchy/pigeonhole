@@ -902,6 +902,7 @@ fn written_extents(out: &CompactionOutput) -> Vec<ExtentRef> {
 
 impl Task for CompactionWork {
     fn run(&mut self, deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        pigeonhole_runtime::scratch_iter::set_task_kind(28);
         loop {
             match &mut self.stage {
                 Stage::Run => {

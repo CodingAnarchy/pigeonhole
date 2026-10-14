@@ -694,6 +694,7 @@ impl FlushTask {
 
 impl Task for FlushTask {
     fn run(&mut self, deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        pigeonhole_runtime::scratch_iter::set_task_kind(27);
         crate::shard::trace!(
             "flush task shard {}: run in stage {}",
             self.shard.0,

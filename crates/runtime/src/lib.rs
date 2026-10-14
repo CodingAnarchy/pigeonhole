@@ -56,6 +56,7 @@
 
 mod completion;
 mod sched;
+pub mod scratch_iter;
 mod signal;
 mod submit_gate;
 
@@ -614,7 +615,9 @@ impl<H: ShardHandler> ShardCore<H> {
                 }
                 self.attach();
             }
+            let t0 = std::time::Instant::now();
             pigeonhole_io::reap_own_io(None);
+            scratch_iter::add_reap(t0.elapsed().as_nanos() as u64);
         } else if self.attached == 0 {
             self.attach();
         }
@@ -753,8 +756,9 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
         let deadline = start.saturating_add(core.time_slice);
         let more = core.run_once(deadline);
         // The turn's time, for the balancer's view of how busy this shard is (D217).
-        core.signal()
-            .add_busy(core.vfs.monotonic_nanos().saturating_sub(start));
+        let turn = core.vfs.monotonic_nanos().saturating_sub(start);
+        scratch_iter::end_turn(turn);
+        core.signal().add_busy(turn);
         if core.inbox().is_closed() {
             core.finish();
             return core.handler;

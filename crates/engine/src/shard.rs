@@ -1685,6 +1685,7 @@ struct SpareTask {
 
 impl Task for SpareTask {
     fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        pigeonhole_runtime::scratch_iter::set_task_kind(29);
         match self.waker.poll(waker, &mut self.prep) {
             // A failed sync poisons the stream, and its next append or sync fails; a failed
             // allocation or write leaves the slots blank for a later attempt.
@@ -1749,6 +1750,7 @@ impl ClockTimer {
 
 impl Task for ClockTimer {
     fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        pigeonhole_runtime::scratch_iter::set_task_kind(31);
         if self.state.cancelled() {
             return TaskPoll::Done;
         }
@@ -4556,6 +4558,7 @@ impl ShardState {
             self.pending.len(),
             self.stall.score
         );
+        scratch_lap_start();
         // The group commit's WAL calls never block on a sync (#19, D200); debug builds check.
         let _strict = pigeonhole_wal::StrictForeground::enter();
         if self.wal_held_back(ctx) || self.stalled(ctx) {
@@ -4802,6 +4805,7 @@ impl ShardState {
             self.note_group_stamps(&admitted);
         }
 
+        scratch_lap(17);
         // The log: append every record, one write, one submitted sync.
         let mut group = Group {
             id: self.next_group,
@@ -4982,6 +4986,7 @@ impl ShardState {
             }
         }
 
+        scratch_lap(18);
         // Apply. Every member is logged (or failed): a mid-batch failure here is a bug or an
         // arena miscount; the shard poisons itself so nothing half-applied is extended.
         for m in &mut group.members {
@@ -5052,6 +5057,7 @@ impl ShardState {
                 }
             }
         }
+        scratch_lap(19);
         if self.view_dirty
             && let Err(e) = self.publish_memtables()
         {
@@ -5062,12 +5068,16 @@ impl ShardState {
                 }
             }
         }
+        scratch_lap(20);
         self.limit_wal_pin(ctx);
         self.maybe_index(ctx);
+        scratch_lap(21);
         if self.freeze(false).is_err() {
             self.poison(crate::health::FailureCause::Internal);
         }
+        scratch_lap(22);
         self.spawn_flush(ctx);
+        scratch_lap(23);
 
         // Resolution: now, when its sync completes, or (batched) when the next one does.
         match last_sync {
@@ -5092,6 +5102,7 @@ impl ShardState {
         }
         self.reclaim_retired();
         self.maybe_prepare_spares(ctx);
+        scratch_lap(24);
     }
 
     /// Appends a logged record of `len` payload bytes to `log`.
@@ -8243,11 +8254,70 @@ impl ShardHandler for ShardState {
     type Msg = ShardMsg;
 
     fn handle(&mut self, ctx: &mut ShardContext<'_, Self::Msg>, msg: Self::Msg) {
+        let kind = match &msg {
+            ShardMsg::Commit(_) => 0,
+            ShardMsg::Coordinate(_) => 1,
+            ShardMsg::Prepare(_) => 2,
+            ShardMsg::Prepared { .. } => 3,
+            ShardMsg::Decide { .. } => 4,
+            ShardMsg::Applied { .. } => 5,
+            ShardMsg::SyncDone { .. } => 6,
+            ShardMsg::Flushed { .. } => 7,
+            ShardMsg::CompactionDone { .. } => 8,
+            ShardMsg::Maintain => 9,
+            ShardMsg::Wake { .. } | ShardMsg::Released { .. } => 10,
+            ShardMsg::Unpin { .. } => 11,
+            ShardMsg::ShareFlushed { .. } | ShardMsg::CommitSettled { .. } | ShardMsg::Created => {
+                12
+            }
+            ShardMsg::Checkpointed { .. } => 13,
+            ShardMsg::Kick | ShardMsg::PinSlice => 14,
+            _ => 15,
+        };
+        let t0 = std::time::Instant::now();
         self.handle_msg(msg, ctx);
+        pigeonhole_runtime::scratch_iter::add(kind, t0.elapsed().as_nanos() as u64);
     }
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
+        let t0 = std::time::Instant::now();
+        self.end_batch_inner(ctx);
+        let t1 = std::time::Instant::now();
+        let group = SCRATCH_GROUP_NS.with(|c| c.replace(0));
+        let laps = SCRATCH_LAPS_NS.with(|c| c.replace(0));
+        let all = (t1 - t0).as_nanos() as u64;
+        pigeonhole_runtime::scratch_iter::add_info(16, group);
+        pigeonhole_runtime::scratch_iter::add(25, group.saturating_sub(laps));
+        pigeonhole_runtime::scratch_iter::add(26, all.saturating_sub(group));
+    }
+}
+
+thread_local! {
+    static SCRATCH_GROUP_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SCRATCH_LAPS_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SCRATCH_LAP: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// SCRATCH: starts `run_group`'s lap timer.
+fn scratch_lap_start() {
+    SCRATCH_LAP.with(|c| c.set(Some(std::time::Instant::now())));
+}
+
+/// SCRATCH: records the time since the last lap under `kind`.
+fn scratch_lap(kind: usize) {
+    let now = std::time::Instant::now();
+    if let Some(t) = SCRATCH_LAP.with(|c| c.replace(Some(now))) {
+        let ns = (now - t).as_nanos() as u64;
+        SCRATCH_LAPS_NS.with(|c| c.set(c.get() + ns));
+        pigeonhole_runtime::scratch_iter::add(kind, ns);
+    }
+}
+
+impl ShardState {
+    fn end_batch_inner(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let g0 = std::time::Instant::now();
         self.run_group(ctx);
+        SCRATCH_GROUP_NS.with(|c| c.set(g0.elapsed().as_nanos() as u64));
         // Coordinators refused for room hear once the room wait has ended, or once no single
         // waits, no flush is in flight and more room is free than at the refusal: their
         // retry may fit then. Never while nothing has freed room, so never a loop (D245).

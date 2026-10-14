@@ -75,8 +75,15 @@ fn main() {
                     let mut wb = WriteBatch::new();
                     for k in 0..parts {
                         let t = &tables[((first + k) % n) as usize];
-                        wb.put(t.id, t.families[0].id, &rng(1 << 20).to_be_bytes(), b"q", None, ValueRef::Bytes(&v))
-                            .unwrap();
+                        wb.put(
+                            t.id,
+                            t.families[0].id,
+                            &rng(1 << 20).to_be_bytes(),
+                            b"q",
+                            None,
+                            ValueRef::Bytes(&v),
+                        )
+                        .unwrap();
                     }
                     pigeonhole_engine::scratch_phases::set_cross(cross);
                     let t0 = Instant::now();
@@ -93,6 +100,7 @@ fn main() {
     std::thread::sleep(Duration::from_secs(1));
     let m0 = db.metrics();
     let _ = pigeonhole_engine::scratch_phases::take();
+    let _ = pigeonhole_runtime::scratch_iter::take();
     measuring.store(true, Ordering::Relaxed);
     let t0 = Instant::now();
     std::thread::sleep(Duration::from_secs(secs));
@@ -100,6 +108,7 @@ fn main() {
     let el = t0.elapsed().as_secs_f64();
     let m1 = db.metrics();
     let phases = pigeonhole_engine::scratch_phases::take();
+    let iters = pigeonhole_runtime::scratch_iter::take();
     stop.store(true, Ordering::Relaxed);
     let (mut ls, mut lc) = (Vec::new(), Vec::new());
     for h in hs {
@@ -112,8 +121,12 @@ fn main() {
     println!(
         "shards={shards} clients={clients} single%={single_pct} cspin={commit_spin_us}us sspin={shard_spin_us}us | ops/s {:.0} | single p50/p99/p999 {}/{}/{} us | cross {}/{}/{} us | per op: commit_parks {:.2} shard_parks {:.2} shard_wakes {:.2} vis_waits {:.2} vis_contended {:.2} vis_wake_passes {:.2} xrounds {:.2} | busy {:.2} shards",
         ops / el,
-        pct(&mut ls, 0.5), pct(&mut ls, 0.99), pct(&mut ls, 0.999),
-        pct(&mut lc, 0.5), pct(&mut lc, 0.99), pct(&mut lc, 0.999),
+        pct(&mut ls, 0.5),
+        pct(&mut ls, 0.99),
+        pct(&mut ls, 0.999),
+        pct(&mut lc, 0.5),
+        pct(&mut lc, 0.99),
+        pct(&mut lc, 0.999),
         per(m1.commit_parks - m0.commit_parks),
         per(m1.shard_idle.0 - m0.shard_idle.0),
         per(m1.shard_idle.1 - m0.shard_idle.1),
@@ -153,6 +166,75 @@ fn main() {
             q(0.999) as f64 / 1e3,
             mean / 1e3,
             nonzero * 100.0
+        );
+    }
+    use pigeonhole_runtime::scratch_iter::{LONG_NS, upper};
+    let q = |h: &[u64], p: f64| {
+        let total: u64 = h.iter().sum();
+        let want = ((total as f64 * p).ceil() as u64).max(1);
+        let mut acc = 0;
+        for (b, n) in h.iter().enumerate() {
+            acc += n;
+            if acc >= want {
+                return upper(b) as f64 / 1e3;
+            }
+        }
+        0.0
+    };
+    let maxb = |h: &[u64]| {
+        h.iter()
+            .rposition(|n| *n > 0)
+            .map_or(0.0, |b| upper(b) as f64 / 1e3)
+    };
+    let turns: u64 = iters.turns.iter().sum();
+    let at_least = |ns: u64| -> u64 {
+        iters
+            .turns
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| upper(*b) > ns)
+            .map(|(_, n)| n)
+            .sum()
+    };
+    println!(
+        "  shard turns n={turns} ({:.0}/s) p50 {:.1} p99 {:.1} p999 {:.1} p9999 {:.1} max {:.0} us | >=100us {} >=200us {} >=400us {} (/s: {:.0} {:.0} {:.0})",
+        turns as f64 / el,
+        q(&iters.turns, 0.5),
+        q(&iters.turns, 0.99),
+        q(&iters.turns, 0.999),
+        q(&iters.turns, 0.9999),
+        maxb(&iters.turns),
+        at_least(100_000),
+        at_least(200_000),
+        at_least(400_000),
+        at_least(100_000) as f64 / el,
+        at_least(200_000) as f64 / el,
+        at_least(400_000) as f64 / el,
+    );
+    for (k, (name, h, total_ns)) in iters.pieces.iter().enumerate() {
+        let n: u64 = h.iter().sum();
+        if n == 0 {
+            continue;
+        }
+        let long: Vec<String> = (0..LONG_NS.len())
+            .map(|t| {
+                let c = iters.long[t][k];
+                let avg = if c > 0 {
+                    iters.long_share[t][k] as f64 / c as f64 / 1e3
+                } else {
+                    0.0
+                };
+                format!(">={}us {} (avg {:.0}us)", LONG_NS[t] / 1000, c, avg)
+            })
+            .collect();
+        println!(
+            "  piece {name:<22} n={n:>10} time {:>6.1}% p50 {:>7.1} p99 {:>7.1} p999 {:>8.1} max {:>8.0} us | dominant in long turns: {}",
+            *total_ns as f64 / 1e9 / el / shards as f64 * 100.0,
+            q(h, 0.5),
+            q(h, 0.99),
+            q(h, 0.999),
+            maxb(h),
+            long.join(", ")
         );
     }
     db.close().unwrap();

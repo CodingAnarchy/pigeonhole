@@ -1306,6 +1306,7 @@ impl Drop for ManifestPump {
 
 impl Task for ManifestPump {
     fn run(&mut self, _deadline_nanos: u64, waker: &TaskWaker) -> TaskPoll {
+        pigeonhole_runtime::scratch_iter::set_task_kind(30);
         loop {
             if let Some(generation) = self.inflight {
                 #[cfg(feature = "test-hooks")]
