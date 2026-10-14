@@ -114,6 +114,16 @@ const PACK_GROW_PASSES: u64 = 10;
 /// (5 s): packing is slow, so a pause between bursts does not reshuffle.
 const PACK_SHRINK_PASSES: u64 = 50;
 
+/// Packing (D251): an active shard whose thread is busier than this (turn busy, without
+/// D248's sync term) also calls for more active shards, whatever the average (`PACK_SPREAD`
+/// looks only at `B / k`, which a saturated shard beside an idle one never passes), and while
+/// one is, the active shards never shrink.
+const PACK_HOT: f64 = 0.9;
+
+/// How much a hot shard's turn busy fraction must fall (millionths) after a hot-triggered
+/// growth before another one (D251): shedding helped.
+const PACK_HOT_COOLED: u64 = 20_000;
+
 /// Slots reserved on shards receiving tablets (`LoadSlot::reserved`).
 type Reserved = Vec<(ShardId, usize)>;
 
@@ -1578,6 +1588,8 @@ impl ShardState {
         self.note_arrivals(now);
         let (_, mem_per) = self.mem_bytes();
         self.measure_busy(now);
+        self.shared.loads[usize::from(self.id.0)]
+            .set_turn_busy((self.turn_ewma * 1e6).round() as u64);
         self.shared.loads[usize::from(self.id.0)].publish(
             self.load_ewma.round() as u64,
             self.load_slow.round() as u64,
@@ -1780,6 +1792,9 @@ impl ShardState {
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
         }
+        if let Some(t) = turns {
+            self.turn_ewma = LOAD_ALPHA * t.min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
+        }
         self.busy_mark = Some((busy, sync, now));
     }
 
@@ -1809,13 +1824,15 @@ impl ShardState {
     }
 
     /// Updates how many shards stay active (D217): shard 0 decides `k` for every shard and
-    /// publishes it (`Shared::pack_k`), from the published busy fractions, `ceil(B / PACK_TARGET)`. It grows (at least by one) after
-    /// `PACK_GROW_PASSES` passes with the active shards above `PACK_SPREAD` busy on average,
-    /// and shrinks after `PACK_SHRINK_PASSES` passes with one fewer shard enough to stay
-    /// under `PACK_TARGET`. Never fewer than the shards the tablets' memtable slots need
-    /// (`max_slots` each), and at once up to that. Only while the store writes (`balance_min_writes` over all
-    /// shards) and some shard reports busy time: an idle store, or a clock that does not
-    /// move while shards work (the simulated VFS), keeps its placement.
+    /// publishes it (`Shared::pack_k`), from the published busy fractions,
+    /// `ceil(B / PACK_TARGET)`. It grows (at least by one) after `PACK_GROW_PASSES` passes
+    /// with the active shards above `PACK_SPREAD` busy on average, or with one of them above
+    /// `PACK_HOT` (D251), and shrinks after `PACK_SHRINK_PASSES` passes with one fewer shard
+    /// enough to stay under `PACK_TARGET` and none above `PACK_HOT`. Never fewer than the
+    /// shards the tablets' memtable slots need (`max_slots` each), and at once up to that.
+    /// Only while the store writes (`balance_min_writes` over all shards) and some shard
+    /// reports busy time: an idle store, or a clock that does not move while shards work (the
+    /// simulated VFS), keeps its placement.
     fn decide_pack(&mut self, now: u64) -> bool {
         let n = self.shared.shards;
         if !self.shared.balance.pack || n < 2 {
@@ -1867,18 +1884,42 @@ impl ShardState {
             self.pack_down = 0;
             return true;
         }
-        if k < n && busy / k as f64 > PACK_SPREAD {
+        // D251: an active shard whose thread is saturated (turn busy, not D248's sync term:
+        // a shard whose syncs run back to back may not cool however many shards share the
+        // load) grows `k` too, and holds off a shrink. A hot-triggered growth repeats only
+        // once the hot shard has cooled since the last one (what it shed helped), or another
+        // shard is hot: a hot spot more shards cannot cool (one unsplittable tablet) grows
+        // `k` once.
+        let hottest = self.shared.loads[..k.min(n)]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.read_turn_busy_fresh(now, stale).unwrap_or(0), i))
+            .max()
+            .filter(|(b, _)| *b as f64 / 1e6 > PACK_HOT);
+        let hot = hottest.is_some();
+        let hot_grows = hottest.is_some_and(|(b, h)| {
+            self.hot_grew
+                .is_none_or(|(shard, was)| shard != h || b + PACK_HOT_COOLED < was)
+        });
+        if !hot {
+            self.hot_grew = None;
+        }
+        if k < n && (busy / k as f64 > PACK_SPREAD || hot_grows) {
             self.pack_up += 1;
         } else {
             self.pack_up = 0;
         }
-        if k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
+        if !hot && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
             self.pack_down += 1;
         } else {
             self.pack_down = 0;
         }
         if self.pack_up >= PACK_GROW_PASSES {
             self.pack_k = want.max(k + 1).min(n);
+            // Whatever called for it, a growth with a hot shard counts as its growth.
+            if let Some((b, h)) = hottest {
+                self.hot_grew = Some((h, b));
+            }
         } else if self.pack_down >= PACK_SHRINK_PASSES {
             self.pack_k = want.min(k - 1);
         } else {
@@ -2422,6 +2463,14 @@ impl ShardState {
             .iter()
             .filter(|(id, w)| *w < gap && *w >= gap / 8 && fits(*id))
             .min_by_key(|(id, w)| ((gap / 2).abs_diff(*w), *id))
+        {
+            return Some(TabletOpKind::Move { tablet: *t, to });
+        }
+        // No tablet carries an eighth of the gap, and none dominates (the hottest is below the
+        // gap): many small tablets, as a full shard of equal ones (D251). Splitting one would
+        // not help, and needs a slot this shard may not have: the largest that fits moves.
+        if tablets.first().is_some_and(|(_, w)| *w < gap)
+            && let Some((t, _)) = tablets.iter().find(|(id, w)| *w < gap && fits(*id))
         {
             return Some(TabletOpKind::Move { tablet: *t, to });
         }

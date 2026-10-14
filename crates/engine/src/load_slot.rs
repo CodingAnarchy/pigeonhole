@@ -31,6 +31,9 @@ pub(crate) struct LoadSlot {
     writes: AtomicU64,
     /// Moving average of the fraction of the time the shard was busy, in millionths (D217).
     busy: AtomicU64,
+    /// The same for the thread's work turns alone, without D248's group-sync utilization
+    /// (D251's hot test: a saturated thread, not a shard whose syncs run back to back).
+    turn_busy: AtomicU64,
     /// Slow moving average of the rows written per interval (D224).
     writes_slow: AtomicU64,
     /// `(tablet, family)` slots promised to changes in flight that will hand this shard
@@ -57,6 +60,19 @@ impl LoadSlot {
         self.busy.store(busy, Ordering::Relaxed);
         self.passes.store(passes, Ordering::Relaxed);
         self.at.store(now, Ordering::Release);
+    }
+
+    /// The owning shard's turn busy fraction (millionths, D251), published with the next
+    /// [`LoadSlot::publish`] (stored before its `Release`).
+    pub(crate) fn set_turn_busy(&self, turn_busy: u64) {
+        self.turn_busy.store(turn_busy, Ordering::Relaxed);
+    }
+
+    /// The published turn busy fraction (millionths, D251) if it was published within
+    /// `stale` of `now`: like [`LoadSlot::read_fresh`], that publication's or a later one.
+    pub(crate) fn read_turn_busy_fresh(&self, now: u64, stale: u64) -> Option<u64> {
+        let at = self.at.load(Ordering::Acquire);
+        (at != 0 && now.saturating_sub(at) <= stale).then(|| self.turn_busy.load(Ordering::Relaxed))
     }
 
     /// The published rate if it was published within `stale` of `now`.

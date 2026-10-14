@@ -988,6 +988,267 @@ fn an_application_owned_durable_load_is_not_packed() {
     }
 }
 
+/// As `tablets_on`, for a table whose tablets several shards' slots must share: it splits from
+/// the top and moves each new tablet to its owner at once, so no shard ever holds more
+/// tablets than its memtable slots serve.
+fn tablets_on_wide(db: &mut Db, n: usize, owner: impl Fn(usize) -> u16) {
+    let id = db.table.id;
+    let owner_of = |db: &Db, row: &[u8]| {
+        db.ranges()
+            .into_iter()
+            .find(|(_, _, start, end)| {
+                row >= start.as_slice() && end.as_deref().is_none_or(|e| row < e)
+            })
+            .unwrap()
+            .1
+    };
+    for t in (1..n).rev() {
+        let m = db
+            .engine
+            .split_tablet_pending(id, format!("t{t:02}").as_bytes())
+            .unwrap();
+        db.drive(m).unwrap();
+        let row = tablet_row(t, 0);
+        if owner_of(db, &row) != owner(t) {
+            let m = db.engine.move_tablet_pending(id, &row, owner(t)).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    if owner_of(db, b"") != owner(0) {
+        let m = db.engine.move_tablet_pending(id, b"", owner(0)).unwrap();
+        db.drive(m).unwrap();
+    }
+    assert_eq!(db.ranges().len(), n);
+}
+
+/// D251 (amends D214): a shard full of equally written small tablets (16 of a 4-family table
+/// fill its 64 slots) beside a lightly written one. No tablet carries the eighth of the gap a
+/// move used to need, and no split fits the full shard, so it never shed (the pre-release
+/// gate's cross-shard-contention, 2026-10-14). The largest that fits moves now, one per dwell.
+#[test]
+fn a_full_shard_of_equal_small_tablets_sheds_them() {
+    let mut db = open_wide(&SimVfs::new(7), 2, 4, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+        o.balance_pack = false;
+    });
+    tablets_on_wide(&mut db, 17, |t| if t < 16 { 0 } else { 1 });
+    assert_eq!(tablets_per_shard(&db, 2), vec![16, 1]);
+    let before = tablet_changes(&db.engine);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 2)[0] > 11 && passes < 300 {
+        write_and_balance(&mut db, 17, |t| if t < 16 { 20 } else { 50 }, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    let per_shard = tablets_per_shard(&db, 2);
+    assert!(
+        per_shard[0] <= 11,
+        "the full shard shed {} tablets in {passes} passes: {per_shard:?}",
+        16 - per_shard[0].min(16)
+    );
+    assert!(
+        after.2 > before.2,
+        "no tablet moved: {before:?} -> {after:?}"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// D251 (amends D217): packed onto two shards by the slot floor (20 tablets of a 4-family
+/// table need 80 slots), then shard 0 saturates (0.98 busy) beside shard 1 at 0.31. `B / k`
+/// is 0.645, inside D217's band (grow above 0.75, shrink below 0.5), so `k` stayed 2 for good.
+/// A shard above `PACK_HOT` grows `k` now; and while it stays hot, `k` never shrinks back,
+/// although one fewer shard would hold `B` under the target (no shrink-grow oscillation).
+/// Once the load drops, `k` shrinks back to the floor as before.
+#[test]
+fn a_saturated_shard_grows_the_active_shards_holds_them_while_hot_and_lets_go_after() {
+    let shards = 4;
+    let mut db = open_wide(&SimVfs::new(7), shards, 4, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+        o.balance_pack = true;
+    });
+    let n = 20;
+    tablets_on_wide(&mut db, n, |t| (t % shards) as u16);
+    for s in 0..shards {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    let mut written = 0;
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] != Some(2) && passes < 300 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(db.engine.pack_ks()[0], Some(2), "light writes did not pack");
+    for (s, busy) in [0.98, 0.31, 0.0, 0.0].into_iter().enumerate() {
+        db.engine.set_shard_busy(s, Some(busy));
+    }
+    let mut grew = None;
+    for pass in 0..60 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+        if db.engine.pack_ks()[0].is_some_and(|k| k > 2) {
+            grew = Some(pass);
+            break;
+        }
+    }
+    assert!(grew.is_some(), "k stayed 2 beside a saturated shard");
+    let mut k_max = 0;
+    for pass in 0..300 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0].expect("decided");
+        assert!(
+            k >= k_max,
+            "k shrank from {k_max} to {k} at pass {pass} while shard 0 was hot"
+        );
+        k_max = k_max.max(k);
+    }
+    // Once the load drops, `k` shrinks back to the slot floor as before D251.
+    for s in 0..shards {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] != Some(2) && passes < 600 {
+        write_and_balance(&mut db, n, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(2),
+        "k did not shrink back after the load dropped"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// D251's flap guard (perf287's review): one hot tablet written on a single row, which a split
+/// cannot divide and a move would only carry elsewhere, keeps its shard saturated. A hot
+/// shard grows `k` once; with nothing shed since, it never grows again, and while it stays
+/// hot `k` never shrinks: over 300 passes `k` changes at most once.
+#[test]
+fn an_unsplittable_hot_tablet_grows_k_at_most_once_and_does_not_flap() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+        o.balance_pack = true;
+    });
+    tablets_on(&mut db, shards, |t| t as u16);
+    for s in 0..shards {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    let mut written = 0;
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] != Some(1) && passes < 300 {
+        write_and_balance(&mut db, shards, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(db.engine.pack_ks()[0], Some(1), "light writes did not pack");
+    // Shard 0's thread saturates on one row of tablet 0; nothing else is written.
+    db.engine.set_shard_busy(0, Some(0.95));
+    let row = tablet_row(0, 0);
+    let mut ks = vec![db.engine.pack_ks()[0].expect("decided")];
+    for _ in 0..300 {
+        for _ in 0..20 {
+            db.put(&row, b"v");
+        }
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+        let k = db.engine.pack_ks()[0].expect("decided");
+        if *ks.last().unwrap() != k {
+            ks.push(k);
+        }
+    }
+    assert!(ks.len() <= 2, "k changed more than once: {ks:?}");
+    assert!(ks.windows(2).all(|w| w[1] > w[0]), "k shrank back: {ks:?}");
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// D251's shrink guard: spread over four shards, shard 0's thread saturates (0.95) on one
+/// row and the others idle. B is about 0.95, so D217 alone would shrink `k` (B / (k - 1) is
+/// 0.32), and the hot shard would then grow it back: shrink, grow, shrink. While a shard is
+/// hot, `k` never shrinks.
+#[test]
+fn a_hot_shard_holds_off_the_shrink() {
+    let mut db = spread_and_busy(0.0, true);
+    db.engine.set_shard_busy(0, Some(0.95));
+    let row = tablet_row(0, 0);
+    let mut ks = vec![];
+    for _ in 0..300 {
+        for _ in 0..20 {
+            db.put(&row, b"v");
+        }
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+        let k = db.engine.pack_ks()[0].expect("decided");
+        if ks.last() != Some(&k) {
+            ks.push(k);
+        }
+    }
+    assert_eq!(ks, vec![4], "k changed while shard 0 was hot");
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// D251 and D248 together (perf287's review): a single durable writer whose group syncs stay
+/// in flight all the time reads busy (D248's sync term) though its thread is nearly idle.
+/// That is not D251's hot shard (turn busy only): it neither grows `k` past D217's rule nor
+/// holds off its shrink, and the store settles at `k` <= 2 without flapping.
+#[test]
+fn a_sync_saturated_single_writer_settles_at_two_shards_or_fewer() {
+    // Turn busy 0.05 on the writer's shard, none elsewhere; its syncs in flight 95% of the
+    // time: B is about 0.95, D217 wants 2, and the sync term alone is above `PACK_HOT`. Write
+    // skew is off (D214 would split the writer's tablet over the shards): packing alone.
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+        o.balance_pack = true;
+        o.balance_skew = 1e9;
+    });
+    tablets_on(&mut db, shards, |t| t as u16);
+    for s in 0..shards {
+        db.engine
+            .set_shard_busy(s, Some(if s == 0 { 0.05 } else { 0.0 }));
+    }
+    db.vfs.set_deferred_io(true);
+    let mut written = 0;
+    let mut ks = vec![];
+    for _ in 0..300 {
+        sync_pass(
+            &mut db,
+            1,
+            Durability::GroupSync,
+            950_000,
+            50_000,
+            &mut written,
+        );
+        let k = db.engine.pack_ks()[0].expect("decided");
+        if ks.last() != Some(&k) {
+            ks.push(k);
+        }
+    }
+    assert!(*ks.last().unwrap() <= 2, "settled at k {ks:?}");
+    assert!(ks.windows(2).all(|w| w[1] < w[0]), "k grew back: {ks:?}");
+    db.vfs.set_deferred_io(false);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// Packing never strands tablets (D217): six tablets of a 20-family table need 120 memtable
 /// slots, and a shard serves 64 (three tablets). Light writes (B = 0.3, one shard's worth)
 /// pack them onto two shards, not three onto one shard and the rest left where they were.
