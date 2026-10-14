@@ -320,8 +320,9 @@ fn pipeline(
     shard: &mut Shard,
     mut hist: Option<&mut Histogram>,
     crew: &Crew,
-    batches: Option<(&Pigeonhole, &[Write])>,
+    extras: PipelineExtras<'_>,
 ) -> Result<u64, String> {
+    let PipelineExtras { batches, deadline } = extras;
     // A commit can resolve on another shard's thread: its wake must end this thread's wait.
     let waker = shard.waker();
     let mut cx = Context::from_waker(&waker);
@@ -335,7 +336,9 @@ fn pipeline(
     let mut next = writes.iter().enumerate();
     let mut busy = 0u64;
     loop {
-        while flight.len() < in_flight {
+        // Past the deadline (D247) no commit starts; those in flight finish.
+        let open = deadline.is_none_or(|d| Instant::now() < d);
+        while open && flight.len() < in_flight {
             match next.next() {
                 Some((j, w)) => flight.push_back((Instant::now(), j, w, 0, submit_one(j, w))),
                 None => break,
@@ -385,6 +388,21 @@ fn pipeline(
     }
 }
 
+/// What a phase's threads do beyond pipelining their writes: D247's cross-shard batches (the
+/// database to batch with) and the time bound past which no commit starts.
+#[derive(Clone, Copy)]
+struct PhaseExtras<'a> {
+    batches: Option<&'a Pigeonhole>,
+    deadline: Option<Instant>,
+}
+
+/// [`PhaseExtras`] for one thread's pipeline, the batches with the whole stream to pick from.
+#[derive(Clone, Copy)]
+struct PipelineExtras<'a> {
+    batches: Option<(&'a Pigeonhole, &'a [Write])>,
+    deadline: Option<Instant>,
+}
+
 /// How many times the inline driver resubmits a commit refused with `Busy` before the run
 /// fails (as the client runners' `retry_busy`).
 const BUSY_RETRIES: u32 = 20;
@@ -430,8 +448,9 @@ fn phase(
     in_flight: usize,
     record: bool,
     pins: Option<&PinPlan>,
-    batches: Option<&Pigeonhole>,
+    extras: PhaseExtras<'_>,
 ) -> Result<(Vec<Shard>, Duration, Histogram, u64), String> {
+    let PhaseExtras { batches, deadline } = extras;
     let (results, start) = run_crew(shards, |mut shard, crew| {
         // D235: each shard's thread on a CPU of its own, the same one every phase. A pin the
         // OS refuses leaves the thread unpinned (the plan was checked when it was made).
@@ -466,7 +485,10 @@ fn phase(
             &mut shard,
             record.then_some(&mut hist),
             crew,
-            batches.map(|db| (db, writes)),
+            PipelineExtras {
+                batches: batches.map(|db| (db, writes)),
+                deadline,
+            },
         );
         crew.finish();
         // Other threads' commits may still need this shard: serve them, waiting between
@@ -600,7 +622,18 @@ impl PigeonholeRunner {
         let mut shards = shards;
         loop {
             let before = db.shard_stats();
-            let warmed = phase(&t, shards, warm, in_flight, false, pins.as_ref(), batches)?;
+            let warmed = phase(
+                &t,
+                shards,
+                warm,
+                in_flight,
+                false,
+                pins.as_ref(),
+                PhaseExtras {
+                    batches,
+                    deadline: Some(started + cap),
+                },
+            )?;
             shards = warmed.0;
             busy_retries += warmed.3;
             let after = db.shard_stats();
@@ -635,6 +668,9 @@ impl PigeonholeRunner {
         // fixed count measures a faster store for less time, too short for its flushes and
         // compactions to show.
         let (mut shards, mut elapsed, mut hist) = (shards, Duration::ZERO, Histogram::new());
+        // D247: past `max_measured` no commit starts; the record says the phase was capped.
+        let deadline = options_.max_measured.map(|m| Instant::now() + m);
+        let mut capped = false;
         loop {
             let (s, e, h, b) = phase(
                 &t,
@@ -643,12 +679,16 @@ impl PigeonholeRunner {
                 in_flight,
                 true,
                 pins.as_ref(),
-                batches,
+                PhaseExtras { batches, deadline },
             )?;
             shards = s;
             busy_retries += b;
             elapsed += e;
             hist.merge(&h);
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                capped = true;
+                break;
+            }
             if elapsed >= options_.min_measured || measured.is_empty() {
                 break;
             }
@@ -709,6 +749,7 @@ impl PigeonholeRunner {
                 warmup_secs: Some(warmup_secs),
                 warmup_settled: Some(warmup_settled),
                 busy_retries,
+                capped: options_.max_measured.map(|_| capped),
                 ..RunDetail::default()
             },
         })

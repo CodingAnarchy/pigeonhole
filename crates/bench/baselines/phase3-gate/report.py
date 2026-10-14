@@ -640,6 +640,18 @@ for label, w, ph, vs, flag in reported:
                  f"{rate(ph['throughput'])} ops/s, p99 {us(ph['p99_ns']):.0f} µs{per}; {ratios}"
                  + (f"; {flag}" if flag else ""), "-", f"contended-*-{w}.json"))
 
+# D247: every contended run is time-bounded (3x its minimum); a run that hit its bound reports
+# what it measured, and is listed here so its row is read with that in mind.
+capped_runs = []
+for f in sorted(os.listdir(R)) if os.path.isdir(R) else []:
+    if f.startswith("contended-") and f.endswith(".json"):
+        for r in (load(f) or {}).get("results", []):
+            if (r.get("detail") or {}).get("capped"):
+                capped_runs.append(f"{f[len('contended-'):-5]} ({r['store']}, {r['run_secs']:.0f} s)")
+if capped_runs:
+    rows.append(("Contended runs stopped at their time bound (reported; D247)",
+                 "; ".join(capped_runs), "-", "contended-*.json"))
+
 rep = status("all-uring-compare.status")
 # D243: runs shorter than 10 s are reported, not judged; D233: pairs whose measured phases did
 # different background work are noted.

@@ -431,6 +431,11 @@ pub struct RunDetail {
     /// (`--riders`, Pigeonhole); `None` elsewhere.
     #[serde(default)]
     pub riders: Option<Riders>,
+    /// Whether the measured phase stopped at its bound (`RunOptions::max_measured`, D247)
+    /// before its operations were done; `None` for runs without a bound and in results
+    /// written before it.
+    #[serde(default)]
+    pub capped: Option<bool>,
     /// Milliseconds the store took to close after the measured phase (D247: the flush and
     /// drain of a store that was just under load); `None` in results written before it.
     #[serde(default)]
