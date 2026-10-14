@@ -165,7 +165,13 @@ impl RuntimeConfig {
             shards: pigeonhole_io::sys::default_shards(),
             pin_threads: true,
             compaction_threads: 0,
-            time_slice: Duration::from_micros(500),
+            // SCRATCH (perf2): the slice can be overridden for a measurement run.
+            time_slice: Duration::from_micros(
+                std::env::var("PIGEONHOLE_SCRATCH_SLICE_US")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(500),
+            ),
             idle_spin: Duration::ZERO,
             vfs,
         }

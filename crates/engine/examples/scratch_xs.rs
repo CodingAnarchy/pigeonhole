@@ -2,7 +2,8 @@
 //! tablet changes off, one table per shard; each client loops single-shard puts (with
 //! probability `single_pct`) and cross-shard commits over 2-4 shards.
 //!
-//! `scratch_xs DIR shards clients secs single_pct commit_spin_us shard_spin_us`
+//! `scratch_xs DIR shards clients secs single_pct commit_spin_us shard_spin_us [compaction_threads]`
+//! (`PIGEONHOLE_SCRATCH_SLICE_US` overrides the runtime's 500 µs background slice)
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,7 @@ fn main() {
     let single_pct: u64 = arg(&a, 5, 50);
     let commit_spin_us: u64 = arg(&a, 6, 15);
     let shard_spin_us: u64 = arg(&a, 7, 50);
+    let compaction_threads: usize = arg(&a, 8, 0);
     std::fs::create_dir_all(&dir).unwrap();
     let vfs: VfsRef = PreadVfs::new(4);
     let mut o = EngineOptions::new(vfs);
@@ -41,6 +43,7 @@ fn main() {
     o.tablet_changes = false;
     o.commit_spin_nanos = commit_spin_us * 1_000;
     o.shard_spin_nanos = shard_spin_us * 1_000;
+    o.compaction_threads = compaction_threads;
     let db = Engine::open(&dir.join("d.phdb"), o).unwrap();
     let tables = Arc::new(
         (0..shards)
@@ -119,7 +122,8 @@ fn main() {
     let ops = (ls.len() + lc.len()) as f64;
     let per = |x: u64| x as f64 / ops;
     println!(
-        "shards={shards} clients={clients} single%={single_pct} cspin={commit_spin_us}us sspin={shard_spin_us}us | ops/s {:.0} | single p50/p99/p999 {}/{}/{} us | cross {}/{}/{} us | per op: commit_parks {:.2} shard_parks {:.2} shard_wakes {:.2} vis_waits {:.2} vis_contended {:.2} vis_wake_passes {:.2} xrounds {:.2} | busy {:.2} shards",
+        "shards={shards} clients={clients} single%={single_pct} cspin={commit_spin_us}us sspin={shard_spin_us}us cthreads={compaction_threads} slice={}us | ops/s {:.0} | single p50/p99/p999 {}/{}/{} us | cross {}/{}/{} us | per op: commit_parks {:.2} shard_parks {:.2} shard_wakes {:.2} vis_waits {:.2} vis_contended {:.2} vis_wake_passes {:.2} xrounds {:.2} | busy {:.2} shards",
+        std::env::var("PIGEONHOLE_SCRATCH_SLICE_US").unwrap_or_else(|_| "500".into()),
         ops / el,
         pct(&mut ls, 0.5),
         pct(&mut ls, 0.99),
