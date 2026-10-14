@@ -672,17 +672,24 @@ mod tests {
 
     #[test]
     fn placement_smoke_reports_the_check() {
-        // D231: the open-loop placement check runs end to end and reports its record.
+        // D231: the open-loop placement check runs end to end and reports its record, with
+        // writes measured in its window. The window is 3 s: on a slow Windows CI runner a debug
+        // build's commits once stalled through a whole 1 s window and it measured none.
         let dir = std::env::temp_dir().join(format!("phdb-bench-placement-{}", std::process::id()));
         let a = args(&format!(
-            "placement --scale smoke --shards 2 --offered-rate 40000 --min-secs 1 --dir {}",
+            "placement --scale smoke --shards 2 --offered-rate 40000 --min-secs 3 --dir {}",
             dir.display()
         ));
         let suite = bench(&a).unwrap();
         let p = suite.placement.clone().expect("a placement record");
         assert_eq!(p.shards, 2);
         assert_eq!(p.shares.len(), 2);
-        assert!(p.achieved_rate > 0.0);
+        assert!(p.window_secs >= 3.0, "{}", p.window_secs);
+        assert!(
+            p.achieved_rate > 0.0,
+            "no writes measured in {} s",
+            p.window_secs
+        );
         assert!(suite.to_markdown().contains("Balancer placement (D231)"));
         let _ = std::fs::remove_dir_all(&dir);
     }
