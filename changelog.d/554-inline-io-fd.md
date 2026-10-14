@@ -1,2 +1,0 @@
-### Fixed
-- `phdb-bench`'s inline driver (the D213 group commit and the `scaling` gate) waits on each shard's completion fd (`Shard::io_fd`) and a wake eventfd on io_uring instead of spinning while commits are in flight. With the old driver, io_uring results at 32 shards came from 32 spinning threads: p99 1.3–3.5 ms, against 0.29–0.36 ms with the new wait. Results from before this aren't comparable.

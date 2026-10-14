@@ -1,18 +1,18 @@
 # Getting started
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.2.2, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
+> **Status:** this guide describes `main`; the current release on crates.io is 0.3.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
 Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-pigeonhole = "0.2"
+pigeonhole = "0.3"
 ```
 
-This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). Upgrading from 0.1.0: the [changelog](../../CHANGELOG.md) lists every difference and how to migrate (counter families, the version 2 file format, the FUSE opt-in). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
+This is an experimental 0.x release: the on-disk format and the API may change before 1.0 (see [the maturity note](README.md)). Upgrading from 0.2.x: the changelog's [Upgrading from 0.2.x](../../CHANGELOG.md#upgrading-from-02x) lists the behaviour changes you will notice (pinned threads, apply-time visibility, `OutcomeUnknown`, `Busy`, application-owned loops). From 0.1.0, [Migrating from 0.1.0](../../CHANGELOG.md#migrating-from-010) comes first (counter families, the version 2 file format, the FUSE opt-in). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
 
-Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature is on by default on `main` (off in 0.2.2) and adds an async form of every data operation (see [Async](async.md)); `default-features = false` drops it.
+Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature is on by default (since 0.3.0; off in 0.2.x) and adds an async form of every data operation (see [Async](async.md)); `default-features = false` drops it.
 
 ## Open a database
 ```rust

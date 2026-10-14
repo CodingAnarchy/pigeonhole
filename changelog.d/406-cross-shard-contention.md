@@ -1,2 +1,0 @@
-### Added
-- `phdb-bench cross-shard-contention`: 32 clients over 16 partitions, half the commits across 2–4 of them in one commit (`BenchOp::Commit`), against RocksDB's multi-key `WriteBatch`; part of `all`, where Pigeonhole also runs with tablet changes off. Run records carry the sequence numbers used while measuring, and the report gives wasted two-phase rounds per cross-shard commit. The Phase 3 gate judges it (D246).

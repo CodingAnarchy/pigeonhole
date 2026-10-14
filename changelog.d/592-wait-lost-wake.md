@@ -1,2 +1,0 @@
-### Fixed
-- `ShardDriver::wait` (`Shard::wait` in `pigeonhole`) no longer sleeps through a `waker()` wake that arrived while the thread was running the shard's turn (#592). The application wake shared a flag with background-task wakes, which the turn clears as it collects them. So a commit future resolved by the driver's own shard during `run_once` left the next `wait` asleep until an I/O completion or its timeout. On the reference machine's 16-shard durable group commit, that held the bench p99 about 40–90 µs higher.

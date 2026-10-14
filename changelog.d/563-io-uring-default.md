@@ -1,2 +1,0 @@
-### Changed
-- The default I/O backend is `IoBackend::Auto` (D218): io_uring where the kernel offers it, the `pread` thread pool elsewhere; the open never fails over it. `IoBackend::Pread` keeps the old behavior. In application-owned mode on Linux the engine now starts no I/O threads by default, so wait on `Shard::io_fd` in your event loop (D202); a loop that never takes it keeps polling while I/O is in flight.
