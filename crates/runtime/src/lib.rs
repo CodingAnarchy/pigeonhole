@@ -858,7 +858,8 @@ pub struct Pinning {
     pub threads: usize,
     /// Threads pinned to a CPU of their own.
     pub pinned: usize,
-    /// Why the runtime pinned no thread, when pinning was asked for but planned none.
+    /// Why threads the runtime asked to pin were planned no CPU: it pinned none, or, with
+    /// too few free CPUs for every thread, only the shards (D252).
     pub unpinned: Option<pigeonhole_io::sys::Unpinned>,
     /// Threads the OS refused to pin; they run unpinned.
     pub failed: usize,
@@ -913,7 +914,9 @@ impl<H: ShardHandler> Runtime<H> {
     /// siblings (D220, D235), skipping CPUs other runtimes in this process hold
     /// ([`pigeonhole_io::sys::pin_plan`]). Where that plan refuses (no hard affinity on the
     /// platform, a CPU quota narrower than the affinity set, too few free CPUs) or the OS
-    /// refuses a pin, threads run unpinned: pinning never fails the start.
+    /// refuses a pin, threads run unpinned: pinning never fails the start. With too few free
+    /// CPUs for the compaction threads but enough for the shards, only the compaction
+    /// threads run unpinned (D252).
     /// [`pinning`](Runtime::pinning) says what happened.
     ///
     /// # Panics
@@ -935,6 +938,13 @@ impl<H: ShardHandler> Runtime<H> {
         let (plan, unpinned) = if config.pin_threads {
             match pigeonhole_io::sys::pin_plan(threads) {
                 Ok(plan) => (Some(plan), None),
+                // Too few CPUs for the compaction threads too: pin the shards, which carry
+                // the commits, and leave the compaction threads unpinned (D252).
+                Err(why @ pigeonhole_io::sys::Unpinned::TooFewCpus)
+                    if config.compaction_threads > 0 =>
+                {
+                    (pigeonhole_io::sys::pin_plan(config.shards).ok(), Some(why))
+                }
                 Err(why) => (None, Some(why)),
             }
         } else {

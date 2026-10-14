@@ -1358,6 +1358,32 @@ fn the_default_shard_count_is_one_per_physical_core() {
 }
 
 #[test]
+fn engine_owned_mode_defaults_to_compaction_threads() {
+    // D252: one compaction thread per four shards, at least one and at most four; an
+    // explicit 0 keeps flush and compaction on the shards.
+    for (shards, cores, started) in [
+        (2, None, 3),
+        (8, None, 10),
+        (20, None, 24),
+        (2, Some(0), 2),
+        (2, Some(3), 5),
+    ] {
+        let vfs = SimVfs::new(5);
+        let mut o = sim_options(&vfs).shards(shards).pin_threads(false);
+        if let Some(k) = cores {
+            o = o.compaction_cores(k);
+        }
+        let db = Pigeonhole::open("/db/x.phdb", o).unwrap();
+        assert_eq!(
+            db.engine_metrics().threads_started,
+            started,
+            "{shards} shards, compaction_cores {cores:?}"
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
 fn application_owned_mode() {
     let vfs = SimVfs::new(5);
     let err =
@@ -1365,6 +1391,7 @@ fn application_owned_mode() {
             .unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidArgument);
 
+    // The default starts compaction threads only in engine-owned mode (D252): here it is 0.
     let (db, mut shards) =
         Pigeonhole::open_application_owned("/db/app.phdb", sim_options(&vfs)).unwrap();
     assert_eq!(shards.len(), 2);

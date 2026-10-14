@@ -1169,6 +1169,7 @@ Each record carries `detail.settle` (milliseconds, settled, the work done while 
   - the platform has no hard affinity: macOS's affinity tags are hints, so they aren't set;
   - a CPU quota (a cgroup `cpu.max`, seen by `available_parallelism`) is narrower than the affinity set: D158's quota-limited containers, which would all pin to the host's first CPUs;
   - fewer free CPUs than threads: D158's opener pinned to a few CPUs.
+    - [D252](#d252): when the shards fit but the compaction threads don't, the shards are pinned and only the compaction threads run unpinned.
 - **Several databases in one process:** a process-wide registry of claimed CPUs makes each plan skip CPUs another live runtime holds, so the second database pins elsewhere or runs unpinned (D158's first case). Claims are released when the runtime's threads are joined.
 - **Never fails an open.** A pin the OS refuses leaves that thread unpinned. `Runtime::start` returned `Spawn` on a pin error before.
   - `Runtime::pinning` and `Metrics::{pinned_threads, unpinned}` report threads, pinned, and why not.
@@ -1656,6 +1657,70 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
 - A single sync-saturated durable writer (D248 term about 0.95, turn busy 0.05) settles at `k` ≤ 2 (fails if the hot test counts the sync term).
 
 **Acceptance (AX102, after the gate):** no stuck placement, and a buffered packing check (ycsb-a, time-series-ttl, ycsb-f) unchanged against main. Both held in the 2026-10-14 A/B: a 90 s run settled at `k` = 4 with every shard at 0.80–0.89 busy, with no flapping, and the packing check was within run-to-run noise. Cross-shard-contention with tablet changes on reached 0.48–0.52× off (201K against 384–400K), short of D246's 0.8×; hence item 3.
+
+<a id="d252"></a>
+## D252 — Engine-owned mode runs flush and compaction on dedicated threads by default, `clamp(shards / 4, 1, 4)` of them; when they don't fit the CPU set, the shards stay pinned (owner decision, 2026-10-14; pigeonhole, runtime, engine, #406, #721; amends the spec's "Background work", D235)
+
+**Decided:**
+1. **The default count.** `Options::compaction_cores` left unset resolves at open, per mode:
+   - **Engine-owned:** one thread per four shards, at least one and at most four, from the resolved shard count (16 shards: 4; 8: 2; up to 7: 1).
+   - **Application-owned:** 0. That mode starts no threads, and an explicit `k > 0` is still refused (D40, unchanged).
+
+   An explicit value is used as given; `compaction_cores(0)` keeps flush and compaction on the shards in time slices, as before.
+2. **`EngineOptions::new` keeps `compaction_threads = 0`.** The engine's deterministic seed-replay harnesses and tests depend on flush running on the shard thread (a thread completing background work breaks seed replay). The default is the public crate's, the documented user surface. The public `model` test runs at the new default.
+3. **Pinning fallback (amends D235).** When `pin_plan(shards + k)` finds too few free CPUs, `Runtime::start` plans the shards alone: the shards are pinned, the compaction threads run unpinned, and `Pinning::unpinned` reports `TooFewCpus`. Before, nothing was pinned. With the new default, that would have dropped shard pinning on every machine without SMT (shards = cores). The other refusals (no hard affinity, a CPU quota) still pin nothing. Compaction threads take the CPUs after the shards', so on SMT machines they are the first shards' siblings.
+
+**Why.** The cross-shard p99 investigation (perf2, AX102, 2026-10-14) timed the shard threads' turns. With `compaction_threads` 0, ~81% of turns ≥ 400 µs were flush (33%) or compaction (48%) slices, at the runtime's 500 µs `time_slice`. Each one holds up every commit queued on that shard and, through 2PC, the global visibility wait behind it. A 100 µs slice helped about half as much and worsened the 8-client p99.
+
+The A/B below was run on main 175c0ffc on the AX102 (16 shards). It uses the gate's contended (D247) command lines: 16 threads, `--scale full`, 60–180 s, ct0 and ct4 alternated ×2. Each cell is run 1 / run 2; p99 in µs.
+
+| Buffered | ct0 ops/s | ct4 ops/s | ct0 p99 | ct4 p99 | RocksDB (gate) |
+|---|---|---|---|---|---|
+| cross-shard, tablets on | 222K / 229K | 230K / 241K | 553 / 533 | 127 / 121 | 640K, 36 |
+| cross-shard, tablets off | 304K / 298K | 400K / 406K | 827 / 889 | 94 / 93 | |
+| ycsb-a | 807K / 823K | 1,076K / 966K | 391 / 344 | 40 / 46 | 695K, 67 |
+| ycsb-f | 466K / 468K | 533K / 503K | 118 / 127 (rmw 469 / 498) | 103 / 106 (rmw 118 / 121) | 625K, 74 |
+| ycsb-e | 33.2K / 33.5K | 37.5K / 35.8K | 1,540 / 1,524 | 1,352 / 1,458 | 133K, 270 |
+| counters | 160K / 161K | 155K / 167K | 2,753 / 2,523 | 2,818 / 2,802 | 543K, 387 |
+
+| GroupSync | ct0 ops/s | ct4 ops/s | ct0 p99 | ct4 p99 | RocksDB (gate) |
+|---|---|---|---|---|---|
+| cross-shard, tablets on | 85.1K / 81.2K | 86.4K / 89.2K | 297 / 309 | 281 / 274 | 108K, 211 |
+| cross-shard, tablets off | 94.6K / 96.4K | 93.3K / 99.8K | 514 / 348 | 268 / 248 | |
+| ycsb-a | 408K / 397K | 397K / 425K | 110 / 121 | 132 / 110 | 191K, 212 |
+| ycsb-f | 271K / 281K | 308K / 295K | 191 / 184 | 158 / 166 | 170K, 241 |
+| ycsb-e | 33.1K / 34.6K | 35.5K / 32.5K | 1,548 / 1,483 | 1,417 / 1,614 | 111K, 354 |
+| counters | 91.9K / 95.7K | 88.9K / 93.2K | 3,719 / 3,441 | 3,785 / 3,228 | 106K, 537 |
+
+No row regresses beyond run-to-run noise, and p99.9 falls almost everywhere (GroupSync ycsb-a and ycsb-f: ~1 ms → ~0.2 ms). The tails of ycsb-e (scans) and counters (counter reads) are not shard-slice stalls, and this does not touch them.
+
+The remaining long shard turns are the flush install and its `ShareFlushed` messages: about 100K messages per flush, one per share (#716).
+
+**The count** (AX102, Buffered, one run each). The D252 build's default is also checked here on a no-SMT 4-core set.
+- **16 shards (16 clients):**
+  - *cross-shard, tablets on:* p99 is 124–127 µs at ct1, 2, 4 and 8 alike (553 at ct0).
+  - *ycsb-a:* throughput goes 805K → 975K → 966–1,076K → 1,072K at ct1, 2, 4, 8. ct1 removes the p99 (45 µs), but its put p99 (94) and p99.9 (1.6 ms) show a single thread falling behind.
+  - *ycsb-f:* 502–536K at every count.
+
+  The first thread removes the shard-slice stall; more threads add flush and compaction bandwidth for write-heavy loads, flattening by 4. The D252 build's default (4) ran ycsb-a at 1,058K, p99 45 µs.
+- **4 cores with SMT siblings** (`taskset -c 0-3,16-19`, 4 shards, 8 clients):
+  - *cross-shard, tablets on:* 168K / 181K / 188K at ct0, 1, 2; p99.9 1.1 ms → 183 µs at ct1.
+  - *ycsb-a:* 489K / 531K / 551K; put p99 489 → 81 µs.
+
+  One thread gets most of it, so the default's 1 at up to 7 shards keeps small machines lean.
+- **4 cores, no SMT** (`taskset -c 0-3`, the D252 build: explicit 0 against the default 1, whose thread then runs unpinned beside 4 pinned shards):
+  - *cross-shard, tablets on:* 134K → 177K, p99 159 → 118 µs, p99.9 1.13 ms → 471 µs.
+  - *cross-shard, tablets off:* 142K both; p99 148 → 133 µs, but p99.9 1.11 → 3.05 ms in that single run.
+  - *ycsb-a:* 353K → 447K, p99 135 → 79 µs, p99.9 537 → 146 µs.
+
+  The fallback works, with one p99.9 outlier where the unpinned thread shares the shards' CPUs.
+
+**Trade-off:** extra threads, and 1–4 CPUs' worth of background work off the shards. On SMT machines that work runs on the shards' siblings. On small or shared hosts `compaction_cores(0)` gives the threads back, at the cost of the write tail.
+
+**Tests:**
+- The public crate's `engine_owned_mode_defaults_to_compaction_threads` checks the threads started at 2, 8 and 20 shards, with an explicit 0 and an explicit 3.
+- `application_owned_mode` opens with the default (0).
+- The runtime's pinning test starts shards on every CPU plus two compaction threads, and finds the shards pinned and `TooFewCpus` reported (Linux).
 
 <a id="d253"></a>
 ## D253 — A commit's client waits 50 µs before parking, not 15 µs (owner decision, 2026-10-14; engine, pigeonhole, #406; amends D198)

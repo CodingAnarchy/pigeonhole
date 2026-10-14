@@ -40,7 +40,9 @@ pub struct EngineOptions {
     /// about each other and would pin to the same CPUs: give each process its own CPUs (an
     /// affinity mask, a cpuset) or turn this off.
     pub pin_threads: bool,
-    /// Extra threads dedicated to flush and compaction; 0 runs them on the shards.
+    /// Extra threads dedicated to flush and compaction; 0 (the default here) runs them on the
+    /// shards. `pigeonhole::Options` defaults engine-owned opens to one per four shards, 1 to
+    /// 4 (D252); this crate keeps 0 so its deterministic tests run flush on the shard.
     /// Engine-owned mode only: [`Engine::open_application_owned`](crate::Engine::open_application_owned)
     /// refuses a nonzero value with `InvalidArgument` (decision D40).
     pub compaction_threads: usize,

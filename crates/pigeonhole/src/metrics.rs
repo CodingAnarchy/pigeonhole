@@ -107,10 +107,11 @@ pub struct EngineMetrics {
     pub threads_started: u64,
     /// Gauge: of those, threads pinned to a CPU of their own (`Options::pin_threads`).
     pub threads_pinned: u64,
-    /// Gauge: why no thread is pinned although `pin_threads` asked for it, for people to
+    /// Gauge: why threads are unpinned although `pin_threads` asked for them, for people to
     /// read (the wording may change): the platform has no hard thread affinity (macOS), a
-    /// CPU quota is narrower than the affinity set, too few free CPUs, or the OS refused.
-    /// `None` when every thread is pinned or pinning is off.
+    /// CPU quota is narrower than the affinity set, too few free CPUs (with room for the
+    /// shards only, just the compaction threads are unpinned), or the OS refused. `None`
+    /// when every thread is pinned or pinning is off.
     pub unpinned_reason: Option<&'static str>,
     /// Async commits that found their commit not yet visible and waited for it.
     pub visibility_waits: u64,
