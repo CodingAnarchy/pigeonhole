@@ -138,6 +138,8 @@ RocksDB writes on the caller's thread (a write-group leader), which is the main 
    - This holds provided the idle-CPU test still passes: an idle database never keeps spinning.
    - Both windows are documented options that can be set to 0, for battery-powered or CPU-constrained users.
 
+*History: Amended by D253 (the client's window is 50 µs).*
+
 <a id="d199"></a>
 ## D199 — The stale-tail index is on by default; its write cost is accepted for its read gains (owner decision, 2026-10-09; memtable, engine, bench, #387; amends D194)
 D194 built the index off by default. It was to be enabled only if no shape, the write shapes included, regressed beyond noise, and only if a gate run moved the wide-row p99. Measured on Linux callgrind, same binary, index off against on (run 38008347250, on main with the insert fix that reuses the level-0 successor):
@@ -1655,3 +1657,22 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
 
 **Acceptance (AX102, after the gate):** no stuck placement, and a buffered packing check (ycsb-a, time-series-ttl, ycsb-f) unchanged against main. Both held in the 2026-10-14 A/B: a 90 s run settled at `k` = 4 with every shard at 0.80–0.89 busy, with no flapping, and the packing check was within run-to-run noise. Cross-shard-contention with tablet changes on reached 0.48–0.52× off (201K against 384–400K), short of D246's 0.8×; hence item 3.
 
+<a id="d253"></a>
+## D253 — A commit's client waits 50 µs before parking, not 15 µs (owner decision, 2026-10-14; engine, pigeonhole, #406; amends D198)
+**Decision:** `EngineOptions::commit_spin_nanos` and `Options::commit_spin` default to 50 µs instead of D198's 15 µs. The shard's window stays 50 µs. Both can still be set to 0, and an idle database still never spins.
+
+**Why.** perf2 measured the gate's cross-shard mix on the AX102 (16 shards, 32 clients, Buffered, tablet changes off, 20 s runs):
+
+| commit spin | ops/s | single-shard p50 / p99 | cross-shard p50 / p99 | client parks per op |
+|---|--:|--:|--:|--:|
+| 15 µs (D198) | 400K | 47 / 565–660 µs | 50–51 / 602–906 µs | 0.98 |
+| **50 µs** | **466K** | **34** / 574 µs | **38** / 671 µs | **0.08** |
+| 100 µs | 463K | 35 / 597 µs | 38 / 833 µs | 0.03 |
+
+- A cross-shard commit takes two rounds (PREPARE, then decide and apply): about 41 µs to the reply at p50. A 15 µs window expires before almost every one, so nearly every client parks and pays a wake.
+- 50 µs covers those rounds: throughput +16% (0.82× RocksDB's row), p50 −27%. A longer window gains nothing more.
+- The p99 is unchanged: it is the global visibility wait behind held 2PC seqnos, not parking.
+
+**Consequences:**
+- A thread waiting for a `Buffered` or `None` commit may poll for up to 50 µs before it sleeps. Durable commits still park at once.
+- The bench's measured instruction-count shapes set `commit_spin(ZERO)` (ICR 0016), so their counts don't change.

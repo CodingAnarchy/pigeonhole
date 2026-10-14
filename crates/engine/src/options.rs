@@ -173,7 +173,7 @@ pub struct EngineOptions {
     /// unpin): nanoseconds, default 1 ms, doubling up to 100 times this. Mostly for tests.
     pub room_recheck_nanos: u64,
     /// How long a thread waiting for its buffered (or non-durable) commit polls for the
-    /// result before it parks: nanoseconds, default 15 µs (D198). A durable commit waits for
+    /// result before it parks: nanoseconds, default 50 µs (D198, D253). A durable commit waits for
     /// a sync and parks at once. Zero always parks (battery-powered or CPU-constrained
     /// hosts). A poll that finds nothing backs off on that thread.
     pub commit_spin_nanos: u64,
@@ -232,7 +232,7 @@ impl EngineOptions {
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,
-            commit_spin_nanos: 15_000,
+            commit_spin_nanos: 50_000,
             shard_spin_nanos: 50_000,
             memtable_tail_index: std::env::var_os("PIGEONHOLE_TAIL_INDEX").is_none_or(|v| v != "0"),
             async_commit_bound: 0,
