@@ -14,13 +14,14 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pigeonhole::nonblocking::CommitFuture;
-use pigeonhole::{Pigeonhole, Shard, Table};
+use pigeonhole::{ErrorCode, Pigeonhole, Shard, Table};
 use pigeonhole_io::sys::PinPlan;
 
 use super::pigeonhole::{create_table, err, options};
 use crate::{
     BenchOp, EngineCommit, Histogram, PigeonholeRunner, RunDetail, RunOptions, RunRecord, Runner,
-    ShardShare, Stalls, WARMUP_CAP, WARMUP_SETTLED, Workload, WorkloadConfig,
+    ShardShare, Stalls, WARMUP_CAP, WARMUP_CAP_AFTER_SWITCH, WARMUP_SETTLED,
+    WARMUP_SETTLED_AFTER_SWITCH, Workload, WorkloadConfig,
 };
 
 /// Commits each shard thread keeps in flight (D204).
@@ -169,6 +170,38 @@ fn submit(t: &Table, w: &Write) -> CommitFuture {
     m.commit_async()
 }
 
+/// Every this-many commits of a thread with cross-shard batches (D247's app-owned row), one is
+/// a batch: about 20% of the commits.
+const CROSS_BATCH_EVERY: usize = 5;
+
+/// The rows a batch at commit `j` adds to its own write: 1-3, picked across the stream.
+fn batch_extras(j: usize, all: &[Write]) -> impl Iterator<Item = &Write> {
+    let extra = 1 + (j / CROSS_BATCH_EVERY) % 3;
+    (1..=extra).map(move |m| &all[(j.wrapping_mul(7919) + m.wrapping_mul(104_729)) % all.len()])
+}
+
+/// D247's app-owned row: commit `j` of a thread's share is a batch of `w` and 1-3 rows picked
+/// across the whole stream (`all`), most of them owned by other shards; other commits are `w`
+/// alone.
+fn submit_with_batches(
+    db: &Pigeonhole,
+    t: &Table,
+    w: &Write,
+    j: usize,
+    all: &[Write],
+) -> CommitFuture {
+    if !j.is_multiple_of(CROSS_BATCH_EVERY) || all.len() < 2 {
+        return submit(t, w);
+    }
+    let mut batch = db.write_batch();
+    for x in std::iter::once(w).chain(batch_extras(j, all)) {
+        for (q, v) in &x.cells {
+            batch.put(t, &x.row, x.family, q, v);
+        }
+    }
+    batch.commit_async()
+}
+
 /// The threads of one phase (#578): they start together, and if one of them panics the
 /// others stop at once instead of waiting for it (its shard is gone, so commits routed to it
 /// never resolve).
@@ -287,25 +320,34 @@ fn pipeline(
     shard: &mut Shard,
     mut hist: Option<&mut Histogram>,
     crew: &Crew,
-) -> Result<(), String> {
+    batches: Option<(&Pigeonhole, &[Write])>,
+) -> Result<u64, String> {
     // A commit can resolve on another shard's thread: its wake must end this thread's wait.
     let waker = shard.waker();
     let mut cx = Context::from_waker(&waker);
-    let mut flight: VecDeque<(Instant, CommitFuture)> = VecDeque::with_capacity(in_flight);
-    let mut next = writes.iter();
+    let submit_one = |j: usize, w: &Write| match batches {
+        Some((db, all)) => submit_with_batches(db, t, w, j, all),
+        None => submit(t, w),
+    };
+    // (first submission, commit index, write, retries after `Busy`, future)
+    let mut flight: VecDeque<(Instant, usize, &Write, u32, CommitFuture)> =
+        VecDeque::with_capacity(in_flight);
+    let mut next = writes.iter().enumerate();
+    let mut busy = 0u64;
     loop {
         while flight.len() < in_flight {
             match next.next() {
-                Some(w) => flight.push_back((Instant::now(), submit(t, w))),
+                Some((j, w)) => flight.push_back((Instant::now(), j, w, 0, submit_one(j, w))),
                 None => break,
             }
         }
         if flight.is_empty() {
-            return Ok(());
+            return Ok(busy);
         }
         let mut progressed = false;
         let mut failed = None;
-        flight.retain_mut(|(at, f)| match Pin::new(f).poll(&mut cx) {
+        let mut retry = Vec::new();
+        flight.retain_mut(|(at, j, w, tries, f)| match Pin::new(f).poll(&mut cx) {
             Poll::Ready(r) => {
                 progressed = true;
                 match r {
@@ -314,12 +356,21 @@ fn pipeline(
                             h.record(at.elapsed());
                         }
                     }
+                    // A stall past the engine's timeout: retried and counted, as the client
+                    // runners do (D247's app-owned row reports it instead of stopping).
+                    Err(e) if e.code() == ErrorCode::Busy && *tries < BUSY_RETRIES => {
+                        retry.push((*at, *j, *w, *tries + 1));
+                    }
                     Err(e) => failed = Some(err(e)),
                 }
                 false
             }
             Poll::Pending => true,
         });
+        for (at, j, w, tries) in retry {
+            busy += 1;
+            flight.push_back((at, j, w, tries, submit_one(j, w)));
+        }
         if let Some(e) = failed {
             return Err(e);
         }
@@ -333,6 +384,10 @@ fn pipeline(
         }
     }
 }
+
+/// How many times the inline driver resubmits a commit refused with `Busy` before the run
+/// fails (as the client runners' `retry_busy`).
+const BUSY_RETRIES: u32 = 20;
 
 /// Drives every shard on a helper thread while `f` runs (setup and teardown, which use the
 /// blocking API), then gives the shards back.
@@ -375,7 +430,8 @@ fn phase(
     in_flight: usize,
     record: bool,
     pins: Option<&PinPlan>,
-) -> Result<(Vec<Shard>, Duration, Histogram), String> {
+    batches: Option<&Pigeonhole>,
+) -> Result<(Vec<Shard>, Duration, Histogram, u64), String> {
     let (results, start) = run_crew(shards, |mut shard, crew| {
         // D235: each shard's thread on a CPU of its own, the same one every phase. A pin the
         // OS refuses leaves the thread unpinned (the plan was checked when it was made).
@@ -410,6 +466,7 @@ fn phase(
             &mut shard,
             record.then_some(&mut hist),
             crew,
+            batches.map(|db| (db, writes)),
         );
         crew.finish();
         // Other threads' commits may still need this shard: serve them, waiting between
@@ -424,17 +481,19 @@ fn phase(
         }
         // The next phase drives it on another thread (#492).
         shard.release();
-        r.map(|()| (shard, hist))
+        r.map(|busy| (shard, hist, busy))
     })?;
     let elapsed = start.elapsed();
     let mut shards = Vec::with_capacity(results.len());
     let mut hist = Histogram::new();
+    let mut busy = 0;
     for r in results {
-        let (shard, h) = r?;
+        let (shard, h, b) = r?;
         shards.push(shard);
         hist.merge(&h);
+        busy += b;
     }
-    Ok((shards, elapsed, hist))
+    Ok((shards, elapsed, hist, busy))
 }
 
 impl PigeonholeRunner {
@@ -480,6 +539,7 @@ impl PigeonholeRunner {
         let load_start = Instant::now();
         let presplit = self.settings.presplit;
         let by_writes = self.settings.presplit_writes;
+        let load_buffered = self.settings.load_buffered;
         let (shards, setup) = with_drivers(shards, || -> Result<Table, String> {
             let t = create_table(&db)?;
             let keys = if presplit && n > 1 && by_writes {
@@ -504,6 +564,10 @@ impl PigeonholeRunner {
             }
             for w in &load_ops {
                 let mut m = t.mutate(&w.row);
+                // D247: a durable run loads at buffered durability, as the client runs do.
+                if load_buffered {
+                    m = m.durability(pigeonhole::Durability::Buffered);
+                }
                 for (q, v) in &w.cells {
                     m = m.put(w.family, q, v);
                 }
@@ -513,19 +577,32 @@ impl PigeonholeRunner {
         });
         let t = setup?;
         let load = load_start.elapsed();
+        // D247's app-owned row: about 20% of the commits are batches across shards.
+        let batches = self.settings.cross_batches.then_some(&db);
         let (warm, measured) = run.split_at((warmup as usize).min(run.len()));
         // Warm up until the balancer has spread the table and settled: every shard owns a
         // tablet and nothing split, merged or moved for `WARMUP_SETTLED` (a fixed warmup can end
         // before the first split, and the measured phase would then be one tablet on one
         // shard). Passes repeat the warmup writes; the cap bounds a table that never settles,
         // reported as a warning.
+        // D242, D247: after a buffered load the run commits at its durable level, and packing
+        // re-places the tablets for it over tens of seconds; the warmup waits longer then.
+        let (quiet, cap) = if load_buffered {
+            (WARMUP_SETTLED_AFTER_SWITCH, WARMUP_CAP_AFTER_SWITCH)
+        } else {
+            (WARMUP_SETTLED, WARMUP_CAP)
+        };
         let started = Instant::now();
         let mut last_change = started;
         let mut warmup_settled = true;
+        // Commits retried after `Busy`, warmup and measured phase.
+        let mut busy_retries = 0;
         let mut shards = shards;
         loop {
             let before = db.shard_stats();
-            shards = phase(&t, shards, warm, in_flight, false, pins.as_ref())?.0;
+            let warmed = phase(&t, shards, warm, in_flight, false, pins.as_ref(), batches)?;
+            shards = warmed.0;
+            busy_retries += warmed.3;
             let after = db.shard_stats();
             let changed = before
                 .iter()
@@ -536,12 +613,12 @@ impl PigeonholeRunner {
             }
             let spread = after.iter().all(|s| s.tablets > 0);
             // Pre-split, the balancer never runs (D213): one warmup pass is enough.
-            if presplit || (spread && last_change.elapsed() >= WARMUP_SETTLED) || warm.is_empty() {
+            if presplit || (spread && last_change.elapsed() >= quiet) || warm.is_empty() {
                 break;
             }
-            if started.elapsed() > WARMUP_CAP {
+            if started.elapsed() > cap {
                 eprintln!(
-                    "warning: the table did not spread over {n} shards within {WARMUP_CAP:?}; \
+                    "warning: the table did not spread over {n} shards within {cap:?}; \
                      the measured phase may use fewer"
                 );
                 warmup_settled = false;
@@ -559,8 +636,17 @@ impl PigeonholeRunner {
         // compactions to show.
         let (mut shards, mut elapsed, mut hist) = (shards, Duration::ZERO, Histogram::new());
         loop {
-            let (s, e, h) = phase(&t, shards, measured, in_flight, true, pins.as_ref())?;
+            let (s, e, h, b) = phase(
+                &t,
+                shards,
+                measured,
+                in_flight,
+                true,
+                pins.as_ref(),
+                batches,
+            )?;
             shards = s;
+            busy_retries += b;
             elapsed += e;
             hist.merge(&h);
             if elapsed >= options_.min_measured || measured.is_empty() {
@@ -593,8 +679,13 @@ impl PigeonholeRunner {
         Ok(RunRecord {
             store: self.name().to_owned(),
             store_config: format!(
-                "{} inline in-flight={in_flight} {placement}",
-                self.describe()
+                "{} inline in-flight={in_flight} {placement}{}",
+                self.describe(),
+                if self.settings.cross_batches {
+                    " cross-batches=20%"
+                } else {
+                    ""
+                }
             ),
             workload: config.kind.name().to_owned(),
             seed: config.seed,
@@ -617,6 +708,7 @@ impl PigeonholeRunner {
                 engine_commit,
                 warmup_secs: Some(warmup_secs),
                 warmup_settled: Some(warmup_settled),
+                busy_retries,
                 ..RunDetail::default()
             },
         })
@@ -625,7 +717,32 @@ impl PigeonholeRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::{ANOTHER_FAILED, Write, run_crew, split_keys_by_writes};
+    use super::{
+        ANOTHER_FAILED, CROSS_BATCH_EVERY, Write, batch_extras, run_crew, split_keys_by_writes,
+    };
+
+    #[test]
+    fn every_fifth_commit_batches_one_to_three_rows_from_across_the_stream() {
+        // D247's app-owned row: about 20% of the commits are batches, of 2-4 rows.
+        let all = writes_of(
+            &(0..1000)
+                .map(|i| (format!("r{i:04}"), 1))
+                .collect::<Vec<_>>(),
+        );
+        let sizes: Vec<usize> = (0..300)
+            .filter(|j| j % CROSS_BATCH_EVERY == 0)
+            .map(|j| batch_extras(j, &all).count())
+            .collect();
+        assert_eq!(sizes.len(), 60);
+        assert!(sizes.iter().all(|n| (1..=3).contains(n)));
+        assert!((1..=3).all(|n| sizes.contains(&n)), "{sizes:?}");
+        // The extra rows spread over the stream rather than repeating one row.
+        let rows: std::collections::BTreeSet<&[u8]> = (0..300)
+            .step_by(CROSS_BATCH_EVERY)
+            .flat_map(|j| batch_extras(j, &all).map(|w| w.row.as_slice()))
+            .collect();
+        assert!(rows.len() > 100, "{}", rows.len());
+    }
 
     fn writes_of(rows: &[(String, u64)]) -> Vec<Write> {
         rows.iter()

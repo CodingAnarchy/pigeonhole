@@ -49,6 +49,9 @@ pub(crate) struct Settings {
     /// Client threads keep this many operations in flight through the async API (D247's
     /// async rows); 0 runs one at a time.
     pub(crate) async_in_flight: usize,
+    /// The inline driver makes about a fifth of its commits batches across shards (D247's
+    /// app-owned row).
+    pub(crate) cross_batches: bool,
     /// The pre-split cuts at the measured writes' quantiles rather than the loaded rows', so
     /// each piece takes about the same share of the writes (D231's engine scaling).
     pub(crate) presplit_writes: bool,
@@ -198,6 +201,14 @@ impl PigeonholeRunner {
     /// ```
     pub fn async_in_flight(mut self, n: usize) -> Self {
         self.settings.async_in_flight = n;
+        self
+    }
+
+    /// `true`: [`run_inline`](Self::run_inline) makes every fifth commit of each shard thread a
+    /// `WriteBatch` of its write and 1-3 rows picked across the whole stream, most owned by
+    /// other shards: about 20% cross-shard batches (D247, perf287's L).
+    pub fn cross_batches(mut self, yes: bool) -> Self {
+        self.settings.cross_batches = yes;
         self
     }
 
