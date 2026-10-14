@@ -327,6 +327,31 @@ impl Handle {
                 ts,
                 cells,
             } => self.put(row, family, *ts, cells)?,
+            BenchOp::DeleteColumn {
+                row,
+                family,
+                qualifier,
+            } => {
+                let key = keys::cell(row, family_id(family)?, qualifier);
+                match self.cf(family)? {
+                    Some(cf) => self.db.delete_cf_opt(cf, key, &self.write),
+                    None => self.db.delete_opt(key, &self.write),
+                }
+                .map_err(e)?;
+            }
+            BenchOp::DeleteRow { row } => {
+                // Every family: a range over the row's keys in each column family that holds any.
+                let from = keys::row_prefix(row);
+                let mut to = from.clone();
+                *to.last_mut().expect("the row terminator") += 1;
+                let mut batch = WriteBatch::default();
+                batch.delete_range(&from, &to);
+                if self.metric_written.load(Ordering::Relaxed) {
+                    let cf = self.cf(METRIC_FAMILY)?.expect("the metric family");
+                    batch.delete_range_cf(cf, &from, &to);
+                }
+                self.db.write_opt(batch, &self.write).map_err(e)?;
+            }
             BenchOp::Transfer { from, to, amount } => {
                 // Both rows locked from the reads to the batch (D247).
                 let f = family_id(YCSB_FAMILY)?;
