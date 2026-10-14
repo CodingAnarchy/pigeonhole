@@ -403,7 +403,8 @@ def xshard(run, level="buffered"):
     counted = st["xshard_refused_rounds"] / n if n and "xshard_refused_rounds" in st else None
     wasted = counted if counted is not None else inferred
     reasons = (f"below floor {st.get('xshard_refused_below_floor', 0)}, move raise {st.get('xshard_refused_move_raise', 0)}, "
-               f"moved {st.get('xshard_refused_moved', 0)}, room {st.get('xshard_refused_room', 0)}"
+               f"moved {st.get('xshard_refused_moved', 0)}, room {st.get('xshard_refused_room', 0)}, "
+               f"pending overlap {st.get('xshard_refused_pending_overlap', 0)} (D249)"
                if counted is not None else "")
     check = f"{inferred:.3f}" if inferred is not None else "-"
     how = (f"refused rounds, ICR 0043; refusals: {reasons}; seqno inference {check}"
@@ -629,6 +630,11 @@ for label, w, ph, vs, flag in reported:
     conflicts = d.get("txn_conflicts")
     per = (f"; {conflicts / max(ph['operations'], 1):.3f} conflicts per {w}"
            if conflicts is not None and w == "transfer" else "")
+    # D249: overlaps with another commit's undecided share are retried inside the engine, so the
+    # conflicts above are real ones; how many overlaps it absorbed is shown beside them.
+    po = (d.get("stalls") or {}).get("xshard_refused_pending_overlap")
+    if w == "transfer" and po is not None:
+        per += f", {po / max(ph['operations'], 1):.3f} pending-share overlaps retried in the engine (D249)"
     ratios = ", ".join(f"{s.split('-')[0]} {t:.2f}× throughput, p99 {l:.2f}×" for s, (t, l) in vs.items())
     rows.append((f"Contended {w}, 16 threads on the default options, {label} (reported, not judged; D247)",
                  f"{rate(ph['throughput'])} ops/s, p99 {us(ph['p99_ns']):.0f} µs{per}; {ratios}"
