@@ -1297,6 +1297,8 @@ struct Group {
 /// A cross-shard commit this shard coordinates.
 #[derive(Debug)]
 struct Coord {
+    /// SCRATCH phase stamps (ns): coordinate, all prepared, decide sent.
+    scr: (u64, u64, u64),
     participants: usize,
     durability: Durability,
     reply: Option<Notifier<Result<Settled>>>,
@@ -6038,6 +6040,11 @@ impl ShardState {
                     (Err(_), false) => true,
                 };
                 if let Some(c) = self.coord.get_mut(&m.seqno) {
+                    if commit && c.scr.1 != 0 {
+                        let now = ctx.now_nanos();
+                        crate::scratch_phases::record(6, now.saturating_sub(c.scr.1));
+                        c.scr.2 = now;
+                    }
                     c.committing = commit;
                     if let Err(e) = result {
                         c.failed = Some(e);
@@ -6076,6 +6083,7 @@ impl ShardState {
     // ---- two-phase commit ----
 
     fn start_coordination(&mut self, req: CoordinateReq, ctx: &mut ShardContext<'_, ShardMsg>) {
+        crate::scratch_phases::record(4, ctx.now_nanos().saturating_sub(req.submitted_at));
         if self.closing || self.poisoned {
             req.reply.notify(Err(if self.closing {
                 Error::Closed
@@ -6150,6 +6158,7 @@ impl ShardState {
         self.coord.insert(
             seqno,
             Coord {
+                scr: (ctx.now_nanos(), 0, 0),
                 participants: req.parts.len(),
                 durability: req.durability,
                 reply: Some(req.reply),
@@ -6341,6 +6350,9 @@ impl ShardState {
             return;
         }
         c.committing = true;
+        let now = ctx.now_nanos();
+        crate::scratch_phases::record(5, now.saturating_sub(c.scr.0));
+        c.scr.1 = now;
         let streams: Vec<StreamId> = c.shards.iter().map(|s| StreamId(u32::from(s.0))).collect();
         let (durability, shards) = (c.durability, c.shards.clone());
         let mut encoded = Vec::new();
@@ -6555,6 +6567,9 @@ impl ShardState {
             return;
         }
         let mut c = self.coord.remove(&seqno).expect("present");
+        if c.scr.2 != 0 {
+            crate::scratch_phases::record(7, ctx.now_nanos().saturating_sub(c.scr.2));
+        }
         if !self.overlap_released.is_empty() && !(c.moved && c.failed.is_none() && !c.gives_up) {
             // It runs no further attempt: an early overlap wake for it is stale (D249).
             self.overlap_released.retain(|(_, p)| *p != c.priority);

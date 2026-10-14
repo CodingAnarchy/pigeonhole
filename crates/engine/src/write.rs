@@ -536,17 +536,25 @@ fn wait_body(
     spins: bool,
 ) -> crate::Result<CommitInfo> {
     let window = if spins { shared.commit_spin_nanos } else { 0 };
+    let k = if crate::scratch_phases::is_cross() { 2 } else { 0 };
+    let t0 = std::time::Instant::now();
     if window == 0 {
         // No spin: exactly the parking wait.
         let Settled { info, batch } = wait_reply(shared, waiter)?;
+        let t1 = std::time::Instant::now();
         recycle(batch);
         wait_visible(shared, info.seqno)?;
+        crate::scratch_phases::record(k, (t1 - t0).as_nanos() as u64);
+        crate::scratch_phases::record(k + 1, t1.elapsed().as_nanos() as u64);
         return Ok(info);
     }
     let mut spin = SpinWait::new(window);
     let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
+    let t1 = std::time::Instant::now();
     recycle(batch);
     wait_visible_spinning(shared, info.seqno, &mut spin)?;
+    crate::scratch_phases::record(k, (t1 - t0).as_nanos() as u64);
+    crate::scratch_phases::record(k + 1, t1.elapsed().as_nanos() as u64);
     Ok(info)
 }
 
