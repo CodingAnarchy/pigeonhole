@@ -1639,6 +1639,8 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
 
 **Guards** (perf287's pre-review): no flapping when more shards can't help (the once-per-hot-spot rule, turn busy only), the shrink as before once the load drops, and a single sync-saturated writer settling at `k` ≤ 2.
 
+**Trade-off** (perf287's review): a hot spot more shards can't cool (one unsplittable tablet, a single hot row) still grows `k` once, and while it stays hot `k` never shrinks. The extra active shards stay until the hot spot ends, and then D217's shrink applies as before. That costs some of packing's wakeup savings for as long as the hot spot lasts, rather than risking a shrink back onto the saturated shard and a grow-shrink cycle.
+
 **Tests** (simulated, busy hooks; each fails with its rule removed):
 - A full shard of 16 equal small tablets beside a lightly written one sheds them (fails without the small-tablet move).
 - Packed to `k` = 2, a shard at 0.98 beside one at 0.31 grows `k`, keeps it while hot, and lets it shrink back once the load drops (fails without hot growth).
