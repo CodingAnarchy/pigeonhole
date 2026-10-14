@@ -136,7 +136,7 @@ impl Runner for SqliteRunner {
         }
     }
 
-    fn measured_durability(&mut self) -> Result<(), String> {
+    fn measured_durability(&mut self) -> Result<bool, String> {
         match &self.conn {
             Some(Conn(c)) if self.load_buffered => c
                 .pragma_update(
@@ -144,8 +144,9 @@ impl Runner for SqliteRunner {
                     "synchronous",
                     if self.sync { "FULL" } else { "NORMAL" },
                 )
+                .map(|()| self.sync)
                 .map_err(|e| e.to_string()),
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 

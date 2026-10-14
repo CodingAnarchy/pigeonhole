@@ -158,9 +158,10 @@ impl Runner for RocksDbRunner {
         Ok(())
     }
 
-    fn measured_durability(&mut self) -> Result<(), String> {
+    fn measured_durability(&mut self) -> Result<bool, String> {
+        let switched = self.loading && self.sync;
         self.loading = false;
-        Ok(())
+        Ok(switched)
     }
 
     fn execute(&mut self, op: &BenchOp) -> Result<(), String> {
