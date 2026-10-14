@@ -170,6 +170,11 @@ pub(crate) struct ShardCounters {
     /// PREPAREs the shard refuses below its floor before routing them as usual
     /// (`Engine::refuse_prepares`).
     pub refuse_prepares: AtomicU64,
+    /// `SharesFlushed` and `CommitsSettled` messages the shard handled
+    /// (`Engine::share_reports`, D254).
+    pub report_msgs: AtomicU64,
+    /// The seqnos those messages carried (`Engine::share_reports`, D254).
+    pub report_seqnos: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -855,6 +860,18 @@ impl Engine {
             .hooks
             .purge_voids
             .load(Ordering::Relaxed)
+    }
+
+    /// Shard `shard`'s handled `SharesFlushed` and `CommitsSettled` messages, and the
+    /// seqnos they carried: one message carries every report a shard has for that peer at
+    /// once, not one per commit (D254).
+    #[doc(hidden)]
+    pub fn share_reports(&self, shard: usize) -> (u64, u64) {
+        let h = &self.inner.shared.metrics[shard].hooks;
+        (
+            h.report_msgs.load(Ordering::Relaxed),
+            h.report_seqnos.load(Ordering::Relaxed),
+        )
     }
 
     /// Shard `shard`'s arena after its last batch: free bytes, the usable bytes of its

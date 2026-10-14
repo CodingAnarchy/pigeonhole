@@ -445,7 +445,7 @@ impl Shared {
     }
 
     /// Marks the close unclean. The first time, every shard is kicked: one waiting at close
-    /// for its peers' reports (`ShareFlushed`, `CommitSettled`) stops waiting, since a
+    /// for its peers' reports (`SharesFlushed`, `CommitsSettled`) stops waiting, since a
     /// shard that gave up will never send them (5-6 5.1).
     pub(crate) fn fail_close(&self) {
         if self.close.fail() {
@@ -1084,14 +1084,16 @@ pub(crate) enum ShardMsg {
     SyncBarrier {
         reply: Notifier<Result<()>>,
     },
-    /// A participant's share of cross-shard commit `seqno` is in SSTs.
-    ShareFlushed {
-        seqno: Seqno,
+    /// A participant's shares of these cross-shard commits are in SSTs: one message per
+    /// coordinator per report, not one per share (D254).
+    SharesFlushed {
+        seqnos: Vec<Seqno>,
     },
-    /// Every share of cross-shard commit `seqno` is in SSTs (the coordinator counted every
-    /// `ShareFlushed`): the participant's PREPARE is no longer needed (#585).
-    CommitSettled {
-        seqno: Seqno,
+    /// Every share of each of these cross-shard commits is in SSTs (the coordinator counted
+    /// every participant's report): the participant's PREPAREs are no longer needed (#585).
+    /// One message per participant per handler that settles them, not one per commit (D254).
+    CommitsSettled {
+        seqnos: Vec<Seqno>,
     },
     /// This shard's WAL stream's creation settled (D211): a checkpoint held back for it may
     /// be submitted.
@@ -2324,6 +2326,9 @@ pub(crate) struct ShardState {
     share_reports: HashMap<Seqno, (usize, usize)>,
     /// Coordinator: the participants to tell once each logged commit is settled.
     settle_to: HashMap<Seqno, Vec<ShardId>>,
+    /// Coordinator: settled commits not yet sent to each participant, sent together as one
+    /// `CommitsSettled` by `send_settled` (D254), in shard order.
+    settle_out: BTreeMap<ShardId, Vec<Seqno>>,
     /// Participant: applied shares whose flush has not been reported to the coordinator.
     unreported: Vec<UnreportedShare>,
 
@@ -2574,6 +2579,7 @@ impl ShardState {
             commit_ckpt: HashSet::new(),
             share_reports: HashMap::new(),
             settle_to: HashMap::new(),
+            settle_out: BTreeMap::new(),
             unreported: Vec::new(),
             leveled,
             tiered,
@@ -5054,11 +5060,12 @@ impl ShardState {
                         self.log_record(t.end, m.seqno, 0, kind);
                         self.log_cross_record(m.seqno);
                         // Every share may have reported before the record was logged.
-                        self.settle_if_done(m.seqno, ctx);
+                        self.settle_if_done(m.seqno);
                     }
                 }
             }
         }
+        self.send_settled(ctx);
         if self.view_dirty
             && let Err(e) = self.publish_memtables()
         {
@@ -6478,7 +6485,13 @@ impl ShardState {
                         }
                         if slots.is_empty() {
                             // An empty share (validation only): nothing to flush.
-                            self.send(coordinator, ShardMsg::ShareFlushed { seqno }, ctx);
+                            self.send(
+                                coordinator,
+                                ShardMsg::SharesFlushed {
+                                    seqnos: vec![seqno],
+                                },
+                                ctx,
+                            );
                         } else {
                             self.unreported.push(UnreportedShare {
                                 seqno,
@@ -6750,7 +6763,7 @@ impl ShardState {
     /// COMMIT, and neither checkpoint could pass. A replay that finds a participant's
     /// PREPARE gone treats the commit as incomplete and applies none of it, which is right
     /// once every share is in SSTs.
-    fn settle_if_done(&mut self, seqno: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
+    fn settle_if_done(&mut self, seqno: Seqno) {
         let done = self
             .share_reports
             .get(&seqno)
@@ -6761,13 +6774,36 @@ impl ShardState {
         if let Some(participants) = self.settle_to.remove(&seqno) {
             for p in participants {
                 if p != self.id {
-                    self.send(p, ShardMsg::CommitSettled { seqno }, ctx);
+                    self.settle_out.entry(p).or_default().push(seqno);
                 }
             }
         }
     }
 
-    /// Tells coordinators about applied shares whose slots are all in SSTs now.
+    /// Counts a handled `SharesFlushed` or `CommitsSettled` and its seqnos (test hook).
+    #[cfg(feature = "test-hooks")]
+    fn count_reports(&self, seqnos: usize) {
+        let h = &self.shared.metrics[usize::from(self.id.0)].hooks;
+        h.report_msgs.fetch_add(1, Ordering::Relaxed);
+        h.report_seqnos.fetch_add(seqnos as u64, Ordering::Relaxed);
+    }
+
+    /// Coordinator: sends each participant the commits `settle_if_done` found settled, as
+    /// one `CommitsSettled` (D254). Every caller of `settle_if_done` calls this once its loop
+    /// is done.
+    fn send_settled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.settle_out.is_empty() {
+            return;
+        }
+        for (p, seqnos) in std::mem::take(&mut self.settle_out) {
+            self.send(p, ShardMsg::CommitsSettled { seqnos }, ctx);
+        }
+    }
+
+    /// Tells coordinators about applied shares whose slots are all in SSTs now: one
+    /// `SharesFlushed` per coordinator (D254). A flush install can find 100K shares
+    /// flushed, and a message per share cost the install about 20 ms and its coordinators
+    /// as many handler runs (#716).
     fn report_shares_flushed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         let Ok(view) = self.checkpoint_view() else {
             return;
@@ -6777,6 +6813,8 @@ impl ShardState {
             "shard {} report shares: flushed={:?} unreported={:?}",
             self.id.0, self.flushed, self.unreported
         );
+        // Ordered, so the sends keep a seed replay's message order.
+        let mut out: BTreeMap<ShardId, Vec<Seqno>> = BTreeMap::new();
         let mut i = 0;
         while i < self.unreported.len() {
             let u = &self.unreported[i];
@@ -6797,18 +6835,18 @@ impl ShardState {
                         .entry(u.seqno)
                         .or_insert((0, usize::MAX))
                         .0 += 1;
-                    self.settle_if_done(u.seqno, ctx);
+                    self.settle_if_done(u.seqno);
                 } else {
-                    self.send(
-                        u.coordinator,
-                        ShardMsg::ShareFlushed { seqno: u.seqno },
-                        ctx,
-                    );
+                    out.entry(u.coordinator).or_default().push(u.seqno);
                 }
             } else {
                 i += 1;
             }
         }
+        for (coordinator, seqnos) in out {
+            self.send(coordinator, ShardMsg::SharesFlushed { seqnos }, ctx);
+        }
+        self.send_settled(ctx);
     }
 
     /// Pops every unneeded record from the front of the log and, if the checkpoint moved,
@@ -7781,8 +7819,8 @@ impl ShardState {
                 return;
             }
             if (!self.log.is_empty() || self.checkpoint_dirty) && !self.shared.close.failed() {
-                // Waiting for the other shards' flushes and checkpoints (ShareFlushed and
-                // CommitSettled arrive as messages). Once the close is unclean, a shard
+                // Waiting for the other shards' flushes and checkpoints (SharesFlushed and
+                // CommitsSettled arrive as messages). Once the close is unclean, a shard
                 // that gave up flushing never sends its reports: stop waiting (the WAL keeps
                 // whatever the checkpoint did not pass, and the next open replays it).
                 return;
@@ -8036,11 +8074,16 @@ impl ShardState {
                 nanos,
             } => self.on_flushed(items, result, nanos, ctx),
             ShardMsg::SyncBarrier { reply } => self.on_sync_barrier(reply, ctx),
-            ShardMsg::ShareFlushed { seqno } => {
+            ShardMsg::SharesFlushed { seqnos } => {
+                #[cfg(feature = "test-hooks")]
+                self.count_reports(seqnos.len());
                 // The COMMIT record may not be logged yet (a participant flushed before the
                 // coordinator's group ran): the count waits for it.
-                self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
-                self.settle_if_done(seqno, ctx);
+                for seqno in seqnos {
+                    self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
+                    self.settle_if_done(seqno);
+                }
+                self.send_settled(ctx);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
@@ -8049,8 +8092,10 @@ impl ShardState {
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
-            ShardMsg::CommitSettled { seqno } => {
-                self.commit_ckpt.insert(seqno);
+            ShardMsg::CommitsSettled { seqnos } => {
+                #[cfg(feature = "test-hooks")]
+                self.count_reports(seqnos.len());
+                self.commit_ckpt.extend(seqnos);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
