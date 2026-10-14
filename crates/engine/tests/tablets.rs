@@ -4325,3 +4325,67 @@ fn a_younger_commit_refused_behind_an_older_one_waits_for_the_older_ones_next_at
         b_info.seqno
     );
 }
+
+/// Seconds a cross-shard commit takes whose first `aborts` rounds the participant refuses
+/// below its floor (`refuse_prepares`), on a two-shard store whose refusing shard first logs
+/// `backlog` single-shard commits that its checkpoint cannot pass (nothing flushes).
+fn refused_rounds_secs(backlog: usize, aborts: usize) -> f64 {
+    let mut db = open(2, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.memtable_budget = 256 << 20;
+        o.memtable_freeze_bytes = 128 << 20;
+        o.wal_pin_bytes = u64::MAX;
+    });
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    for i in 0..backlog {
+        db.put(format!("z{i:08}").as_bytes(), b"v");
+    }
+    // One cross-shard commit coordinated by `high` (`x` first), which refuses its own first
+    // `aborts` PREPAREs: each round aborts with no record of it in `high`'s log, the case
+    // the scan read to its end, and the coordinator retries at once.
+    db.engine.refuse_prepares(usize::from(high), aborts as u64);
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"x", b"q", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    let start = std::time::Instant::now();
+    db.commit(wb);
+    let secs = start.elapsed().as_secs_f64();
+    let refused = db.engine.metrics().cross_shard.refused_below_floor;
+    assert!(
+        refused >= aborts as u64,
+        "only {refused} of {aborts} rounds were refused"
+    );
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+    secs
+}
+
+#[test]
+fn an_aborted_round_costs_the_same_whatever_the_log_holds() {
+    // A refused round aborts, and each shard records the abort only if the commit's record is
+    // in its log (`mark_aborted`). That check used to scan the log, which holds every
+    // single-shard record since the checkpoint: a storm of refused rounds (application-owned
+    // cross-shard batches, 2026-10-13) scanned it whole once per abort and saturated the
+    // shards. It is a lookup now: the same refused rounds take about as long behind 100K
+    // logged records as behind none.
+    let aborts = 2_000;
+    let small = refused_rounds_secs(0, aborts);
+    let big = refused_rounds_secs(100_000, aborts);
+    assert!(
+        big < small * 3.0 + 0.05,
+        "{aborts} refused rounds took {big:.3} s behind 100K logged records, {small:.3} s behind none"
+    );
+}

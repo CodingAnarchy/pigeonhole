@@ -167,6 +167,9 @@ pub(crate) struct ShardCounters {
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
+    /// PREPAREs the shard refuses below its floor before routing them as usual
+    /// (`Engine::refuse_prepares`).
+    pub refuse_prepares: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -532,6 +535,17 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Makes shard `shard` refuse the next `n` PREPAREs below its floor, whatever their
+    /// timestamps, as a stamp race would (test hook: the cost of refused rounds). Each refused
+    /// round aborts, and its coordinator retries at once.
+    #[doc(hidden)]
+    pub fn refuse_prepares(&self, shard: usize, n: u64) {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .refuse_prepares
+            .store(n, Ordering::Release);
     }
 
     /// Makes shard `shard`'s balancer measure itself `busy` (a fraction of the time, 0 to 1)

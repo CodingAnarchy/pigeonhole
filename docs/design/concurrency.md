@@ -31,15 +31,15 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 
 ## Counts
 
-**138 production primitives and 38 test hooks** (176 in all), counted distinct: a primitive with handles in several structs counts once. Before #134 step 2 (#518, at #306's head) the count was 131 production (75 + 8 + 34 + 16, less the two test statics then among the 75) and 26 test hooks, 159 rows, counted with some handles twice (purge guards, the live-snapshot count). Step 2 removed 8 coordinating primitives (the close gate replaced 6; the watermark registry merged 2 lists). Later features added 19, each justified where it is listed: the registry's `listed` mask (#564), `Signal::app_woken` (#592) and `Signal::turn_woken` (D237), async admission's 4 (D210, D236; previously uninventoried), `LoadSlot::{busy (D217), writes_slow, passes, claimed (D224)}`, `Shared::pack_k` (#641), `Shared::failure` (ICR 0040) and its wake's `Mutex` and `Condvar` (#646, which replaced a poll), the three `CrossShardCounters` fields (ICR 0043), `ShardMetrics::sync_busy_nanos` (D248), `Shared::ts_coord_raises` (D245); test hooks `Hooks::refused` (D244) and `Hooks::refusals` (D245). D221 and D222 removed two statics (`PIGEONHOLE_GROUP_SYNC_DEPTH`, `PIGEONHOLE_READAHEAD`). The table below is a recount of the appendix rows and is the authority.
+**138 production primitives and 39 test hooks** (177 in all), counted distinct: a primitive with handles in several structs counts once. Before #134 step 2 (#518, at #306's head) the count was 131 production (75 + 8 + 34 + 16, less the two test statics then among the 75) and 26 test hooks, 159 rows, counted with some handles twice (purge guards, the live-snapshot count). Step 2 removed 8 coordinating primitives (the close gate replaced 6; the watermark registry merged 2 lists). Later features added 19, each justified where it is listed: the registry's `listed` mask (#564), `Signal::app_woken` (#592) and `Signal::turn_woken` (D237), async admission's 4 (D210, D236; previously uninventoried), `LoadSlot::{busy (D217), writes_slow, passes, claimed (D224)}`, `Shared::pack_k` (#641), `Shared::failure` (ICR 0040) and its wake's `Mutex` and `Condvar` (#646, which replaced a poll), the three `CrossShardCounters` fields (ICR 0043), `ShardMetrics::sync_busy_nanos` (D248), `Shared::ts_coord_raises` (D245); test hooks `Hooks::refused` (D244) and `Hooks::refusals` (D245). D221 and D222 removed two statics (`PIGEONHOLE_GROUP_SYNC_DEPTH`, `PIGEONHOLE_READAHEAD`). The table below is a recount of the appendix rows and is the authority.
 
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
 | `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared` and the helper files appendix A covers) | 79 | 3 | Static test hooks: `READS_STEP`, `TAIL_SKIPS`, `SST_SKIPS` |
-| `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 32 | `Hooks` 24, `ShardCounters` 6, `ReaderHooks` 2 |
+| `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 33 | `Hooks` 24, `ShardCounters` 7, `ReaderHooks` 2 |
 | other `engine/src` files | 31 | 3 | Distinct: 37 rows minus 3 test-only rows minus 3 handles counted elsewhere (`LiveSnapshot::count`, `FlushItem::guard`, `CompactionWork::guard`). 10 thread-locals (one test-only) |
 | `runtime/src` | 19 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
-| **Total** | **138** | **38** | |
+| **Total** | **138** | **39** | |
 
 A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityCounts::{waits, scanned, passes, woken}` and `WatermarkWaiters::contended`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
 
@@ -359,6 +359,7 @@ Other structs in `engine.rs` with no primitive fields: `Engine` (Arc<Inner>), `C
 | `ShardCounters::purge_voids` (hooks.rs:151) | `AtomicU64` | Compactions whose purge a write voided before install. | Owning shard `fetch_add(1, Relaxed)` (shard.rs:6880-6883). | `Engine::compaction_purge_voids` `load(Relaxed)` (hooks.rs:822-826). | Relaxed. | #316 (dc1c601, PR #328). |
 | `ShardCounters::busy_override` (hooks.rs:160) | `AtomicU64` | The busy fraction the shard's balancer measures, in millionths plus one (0 = the thread's real busy time). | `Engine::set_shard_busy` `store(Relaxed)` (hooks.rs:527-533), test thread. | Owning shard: tablets.rs `measure_busy` `load(Relaxed)` (1294). | Relaxed. | D217. |
 | `ShardCounters::pack_k` (hooks.rs:163) | `AtomicU64` | The active shard count (`k`) the shard's balancer used at its last pass, plus one (0 before its first). | Owning shard: tablets.rs `maybe_balance` `store(active_shards() + 1, Relaxed)` (1129-1133). | `Engine::pack_ks` `load(Relaxed)` (hooks.rs:543). | Relaxed. | D217; #641. |
+| `ShardCounters::refuse_prepares` (hooks.rs:172) | `AtomicU64` | PREPAREs the shard refuses below its floor before routing them (a test forces refused rounds). | `Engine::refuse_prepares` `store(Release)`; the owning shard `fetch_sub(1, AcqRel)` in tablets.rs `route_prepare` | The owning shard: `load(Acquire)` in `route_prepare` | Acquire/Release; one decrementer (the owning shard) | The `mark_aborted` lookup's scaling test |
 
 #### `ReaderHooks` (hooks.rs:156, lives at `ReaderState::hooks`, engine.rs:195)
 
