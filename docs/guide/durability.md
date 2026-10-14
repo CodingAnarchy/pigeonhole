@@ -131,6 +131,8 @@ A participant can refuse a round: its rows' tablet is being split, merged or mov
 
 Throughput note: `GroupSync` costs about one fsync per group, not per commit. Many concurrent committers, or one large `WriteBatch`, amortize it. A shard keeps only a bounded number of group syncs in flight per WAL stream; durable commits that arrive while those run batch behind them and share the next sync, so under many concurrent committers each fsync covers more commits (D207). The bound is 2 on Linux and 1 on macOS (D221): on the reference machine, 2 came within about 1.5% of no bound, while 1 lost 6% at 16 concurrent committers.
 
+macOS note: a plain `fsync` on macOS does not survive power loss, so `GroupSync` and `Sync` use `F_FULLFSYNC`, which flushes the whole drive's write cache and takes milliseconds. Those flushes are device-wide, so every shard's syncs queue behind one another on the drive: total durable throughput stays roughly flat as you add shards (on the order of hundreds of syncs per second for the whole store, each carrying its group of commits). If that matters for your workload on a Mac, put more writes in each commit (`WriteBatch`), run more concurrent committers so each sync carries more of them, or use `Buffered` where losing the last commits on a power loss is acceptable. Linux syncs each WAL file separately and is not limited this way. Sharing one flush across shards is tracked in [#685](https://github.com/CodingAnarchy/pigeonhole/issues/685).
+
 Right after a clean reopen, the first `GroupSync` or `Sync` commit also waits for the new WAL files' and their directory's syncs, which the open no longer waits for itself (D203).
 
 ## WAL size
