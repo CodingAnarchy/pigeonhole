@@ -2427,6 +2427,13 @@ pub(crate) struct ShardState {
     /// decision) and the consecutive passes calling for more or fewer of them.
     busy_mark: Option<(u64, u64, u64)>,
     busy_ewma: f64,
+    /// The moving average of the thread's turn busy fraction alone (D251).
+    turn_ewma: f64,
+    /// A hot-triggered growth of the active shards (D251): the hot shard and its turn busy
+    /// fraction then (millionths). Another one needs that shard to have cooled since (what
+    /// it shed helped), or another shard to be hot, so a hot spot more shards cannot cool
+    /// grows `k` only once.
+    hot_grew: Option<(usize, u64)>,
     pack_k: usize,
     pack_up: u64,
     pack_down: u64,
@@ -2613,6 +2620,8 @@ impl ShardState {
             chose_slow: std::cell::Cell::new(false),
             busy_mark: None,
             busy_ewma: 0.0,
+            turn_ewma: 0.0,
+            hot_grew: None,
             pack_k: 0,
             pack_up: 0,
             pack_down: 0,

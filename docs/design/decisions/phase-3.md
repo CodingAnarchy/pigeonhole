@@ -572,6 +572,8 @@ The window's setup step (`machine.py`) also times the data drive's raw fdatasync
 <a id="d214"></a>
 ## D214 — The balancer acts on write skew only once it persists, and keeps acting until the shard is balanced (owner direction, 2026-10-11; tablets, #547; amends D134 and D146)
 
+*Amended by [D251](#d251): when no tablet carries an eighth of the gap and none dominates, the largest tablet that fits moves (a full shard of equal small tablets used to shed nothing).*
+
 **Decided:** write skew (D134 item 2, D146) moves or splits a tablet only when it is sustained:
 - **Persistence.** A shard starts acting on write skew after its load has been above `balance_skew` (1.25) times the mean, and at least `balance_min_writes`, on **10 consecutive balancer passes** (1 s at the default interval). Any pass below resets the count. The count runs on every pass, dwell or not.
 - **Slower average.** The moving averages of write load (a shard's, published for the others, and each tablet's) weigh the newest interval **0.2**, not 0.5.
@@ -703,6 +705,8 @@ With the slot floor (931c578, the same setup, two runs each, ranges):
 - **skewed-multi-shard settled on 2 shards** in both runs, against 3 in the first. `B / k` of 0.62–0.64 sits inside the hysteresis band (grow above 0.75, shrink below 0.5), so `k` stays where the load phase left it. With 3 active shards, the first run reached 464K.
 
 *Amended by [D248](#d248): the busy fraction is the larger of the thread's busy time and its group syncs' utilization, so a load bound by its fsyncs is not packed below the shards it needs.*
+
+*Amended by [D251](#d251): an active shard whose thread is above 0.9 busy also grows `k`, and holds off a shrink while it stays there.*
 
 *History: shard 0's balancer decides `k` and publishes it, and every shard uses that value. Each shard used to run its own hysteresis over loads it read at different passes, so the shards disagreed: in one run, one kept 16 while others used 1 to 3. This is an implementation fix to match the rule above ("every shard computes the same `k`"), from the skewed-multi-shard placement analysis (F3).*
 
@@ -1491,6 +1495,8 @@ Each part disabled fails its test.
 
 **Why:** the gate had no multi-row or cross-shard commit under contention (perf287's #406 audit, finding 1), so a 36× slowdown in the default config got through: on the AX102 (perf2, main a9ecfc77), 16 shards and 32 clients at 50% cross-shard commits ran 401K ops/s with tablet changes off and 11K with them on. Locally (M5, `--scale small`, busy laptop) the new workload shows the same: 3.0K and 5.9K ops/s with tablet changes on against 219K and 204K off and 192K for RocksDB, with about 5 wasted rounds per cross-shard commit on and none off.
 
+*Amended by [D251](#d251): the tablets on ≥ 0.8× off check is judged with packing off (`Options::tablet_packing(false)`, tablet changes on); the default config's on/off ratio, packing's gap, is reported beside it (#707).*
+
 <a id="d247"></a>
 ## D247 — The gate's `contended` step measures every public operation under contention on the default options, judged at two durabilities (owner decision, 2026-10-13; bench, #406)
 
@@ -1618,3 +1624,32 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
 - The Rust crate's public API is the contract every binding follows.
 - The C ABI no longer has to precede the Python, Ruby or mobile libraries; only the Go and C users need it.
 - AGENTS.md's rule to keep Rust-only types out of what becomes the C ABI boundary still applies to `pigeonhole-capi`.
+
+<a id="d251"></a>
+## D251 — Packing grows the active shards when one of them is saturated, and write skew moves small tablets when none dominates (owner decision, 2026-10-14; engine, tablets, #406; amends D214, D217 and D246)
+
+**Decided:**
+1. **Hot-shard growth (amends D217).** An active shard whose **turn busy** (its thread's work time, without D248's sync term) is above `PACK_HOT` = 0.9 grows `k`, with D217's persistence (`PACK_GROW_PASSES`, 1 s), whatever `B / k` says. While any active shard is that hot, `k` never shrinks.
+   - **Turn busy, not D248's combined busy.** A shard whose group syncs run back to back may not cool however many shards share the load, so its sync term neither grows `k` nor blocks a shrink here; D248's average rule still applies to it. Each shard now also publishes its turn busy (`LoadSlot::turn_busy`).
+   - **Once per hot spot.** A hot-triggered growth repeats only after the hot shard's turn busy has fallen by at least 0.02 since the last one (what it shed helped), or when another shard is the hot one. A hot spot that more shards can't cool (one unsplittable tablet) grows `k` once.
+2. **Small tablets move (amends D214).** When no tablet carries the eighth of the gap a move needs, and none dominates (the hottest is below the gap), the largest tablet that fits the coldest shard moves. The dominant-tablet case keeps D214's split.
+3. **D246's tablets check is judged with packing off (amends D246; owner, 2026-10-14).** `cross-shard-contention`'s tablets on ≥ 0.8× off compares tablet changes on with `tablet_packing(false)` against them off. The default config's ratio (packing on) is reported beside it as packing's gap. Packing targets about 0.5 busy per active shard, which caps a closed-loop, mostly cross-shard load at about half of spreading over every shard (0.48–0.63× in the 2026-10-14 A/B on the AX102, #707). Packing less when commits are mostly cross-shard is a Phase 4 design (#707).
+
+**Why** (the pre-release gate, 175c0ffc, AX102, 2026-10-14): `cross-shard-contention` with tablet changes on ran at 184K ops/s, against 384K off.
+- The load had packed the table onto `k` = 2 (the slot floor: 22 tablets × 4 families). In the measured phase, shard 0 held 16 tablets at 0.98 busy and shard 1 held 6 at 0.31.
+- **D217:** B = 1.29, B / k = 0.645 sits between the shrink (0.5) and grow (0.75) thresholds, so `k` stayed 2 for good. The average hides a saturated shard.
+- **D214:** shard 0 was at 1.75× the mean, but each of its 16 tablets carried about 1/16 of its load, under the eighth of the gap (≈ 0.107) a move needed. The split fallback needed a slot, and 16 × 4 families fill a shard's 64. Nothing moved.
+
+**Guards** (perf287's pre-review): no flapping when more shards can't help (the once-per-hot-spot rule, turn busy only), the shrink as before once the load drops, and a single sync-saturated writer settling at `k` ≤ 2.
+
+**Trade-off** (perf287's review): a hot spot more shards can't cool (one unsplittable tablet, a single hot row) still grows `k` once, and while it stays hot `k` never shrinks. The extra active shards stay until the hot spot ends, and then D217's shrink applies as before. That costs some of packing's wakeup savings for as long as the hot spot lasts, rather than risking a shrink back onto the saturated shard and a grow-shrink cycle.
+
+**Tests** (simulated, busy hooks; each fails with its rule removed):
+- A full shard of 16 equal small tablets beside a lightly written one sheds them (fails without the small-tablet move).
+- Packed to `k` = 2, a shard at 0.98 beside one at 0.31 grows `k`, keeps it while hot, and lets it shrink back once the load drops (fails without hot growth).
+- A hot shard holds off D217's shrink (fails without the shrink guard).
+- One unsplittable hot tablet grows `k` at most once (fails without the once-per-hot-spot rule).
+- A single sync-saturated durable writer (D248 term about 0.95, turn busy 0.05) settles at `k` ≤ 2 (fails if the hot test counts the sync term).
+
+**Acceptance (AX102, after the gate):** no stuck placement, and a buffered packing check (ycsb-a, time-series-ttl, ycsb-f) unchanged against main. Both held in the 2026-10-14 A/B: a 90 s run settled at `k` = 4 with every shard at 0.80–0.89 busy, with no flapping, and the packing check was within run-to-run noise. Cross-shard-contention with tablet changes on reached 0.48–0.52× off (201K against 384–400K), short of D246's 0.8×; hence item 3.
+
