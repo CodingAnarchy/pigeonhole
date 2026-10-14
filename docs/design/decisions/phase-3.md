@@ -940,6 +940,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - Telling participants before the shares are settled fails that case with `LostAckedCommit`. A tablet change that commits before the moving tablet's frozen memtables are flushed (the `frozen.is_empty()` wait in `progress_op` dropped) fails its tablet loop.
 - `engine/tests/close_crossed.rs` closes after concurrent cross-shard commits on real files, under a watchdog.
 
+*Amended by [D254](#d254): the reports and settlements go as `SharesFlushed { seqnos }` and `CommitsSettled { seqnos }`, one message per peer per pass, with the same rules.*
 
 <a id="d226"></a>
 ## D226 — The durable group-commit p99 is judged under full load: 16 shards, 16 commits in flight, the D223 driver; 4 and 8 in flight are reported beside it (owner decision, 2026-10-12; bench, engine, #406; amends D213)
@@ -1741,3 +1742,43 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 **Consequences:**
 - A thread waiting for a `Buffered` or `None` commit may poll for up to 50 µs before it sleeps. Durable commits still park at once.
 - The bench's measured instruction-count shapes set `commit_spin(ZERO)` (ICR 0016), so their counts don't change.
+
+<a id="d254"></a>
+## D254 — Share reports and settlements go one message per peer per pass, not one per share (owner decision, 2026-10-14; engine, #716; amends D225's messages)
+
+**Decided:**
+- **`SharesFlushed { seqnos }` replaces `ShareFlushed { seqno }`.** A participant's report pass (`report_shares_flushed`: the flush install, `Maintain` with tablet changes on, `Start`, the close) gathers the seqnos of every share it finds in SSTs by coordinator and sends each coordinator one message. A coordinator's own shares are still counted without a message (D225).
+- **`CommitsSettled { seqnos }` replaces `CommitSettled { seqno }`.** A coordinator collects the commits it finds settled per participant and sends each one message (`send_settled`). That happens once per handler that can settle: the report pass, the `SharesFlushed` handler, and `run_group`'s logging of COMMIT records.
+- **Each handler advances the checkpoint and checks the close once per message**, not once per seqno.
+- **The semantics are unchanged.** The reports are commutative: a count per seqno on the coordinator and a set insert on the participant. So batching them changes no decision, only how many messages carry them, and when a handler's batch is sent within its turn. A commit is still settled exactly when its COMMIT is logged and every share has been reported (D24, D225), and a PREPARE or COMMIT is checkpointed under the same rules as before (`needed`).
+- **A backstop (perf287's review).** `end_batch` debug-asserts that no settled commit is left unsent, and sends any that are. A loop that settled without `send_settled` would otherwise hold its participants' PREPAREs, and so their WAL, until some later settle.
+- **Deterministic order.** The per-peer buffers are ordered maps, so the sends keep a seed replay's message order.
+- **An empty share** (validation only) still reports at once, as a one-seqno message.
+
+**Why** (perf2's shard-turn timer on the AX102, scratch_xs 16 shards, 32 clients, 50% cross-shard, Buffered; `.coord/perf2-xshard-p99-20261014/ct-ab/`):
+- Installing a flush (`on_flushed`) took 21 ms at p50 and up to 59 ms on the shard thread, and `report_shares_flushed` was nearly all of it. It sent one message per share, about 100K per flush and 15.5–18.9M in 20 s.
+- The coordinators then ran about 1 ms turns of 1024 `ShareFlushed`/`CommitSettled` messages, each advancing the checkpoint: 2,921 turns of 400 µs or more with `compaction_threads` = 0, and 7,798 with 4.
+- With compaction off the shard threads (D252), these turns and the install were the remaining long-turn sources.
+
+**Tests:**
+- `share_reports.rs`: 600 cross-shard commits from two coordinators to one participant.
+  - One flush reports in at most 6 messages carrying exactly 1,200 seqnos. With one message per share or commit it was 1,200 messages, and the test fails against that.
+  - Every checkpoint then passes all its records, including the participant's 600 PREPAREs. The test fails if `CommitsSettled` is not sent, and the backstop's assertion fails if one settling loop skips `send_settled`.
+  - After a power loss every write survives.
+- The crash and model sweeps (`model_check` with and without deferred I/O, `model`, `tablets`) check the checkpoints and replay.
+- New test hooks: `ShardCounters::{report_msgs, report_seqnos}` (`Engine::share_reports`) and `ShardCounters::logged` (`Engine::logged_records`).
+
+**Acceptance (AX102, 2026-10-14):** perf2's timer build of `scratch_xs` (16 shards, 32 clients, 50% cross-shard, 20 s), on main c2d29b3d (A) and on this change (B). The runs alternated A/B, 2 each at `compaction_threads` 0 and 4. Data: `.coord/ctr274-d254-ab/`.
+
+| | ct0 A | ct0 B | ct4 A | ct4 B |
+|---|---|---|---|---|
+| ops/s | 375K, 365K | 380K, 381K | 457K, 457K | 471K, 467K |
+| shard turns ≥ 400 µs | 18,341, 18,143 | 16,115, 16,568 | 11,504, 12,652 | **1,051, 1,179** |
+| `on_flushed` p50 / max | 21.0 / 34–42 ms | 14.7 / 21 ms | 25.2 / 42–67 ms | 21.0 / 29 ms |
+| report messages handled | 15.5M | 1,679–1,695 | 18.9M | 1,837–1,877 |
+| their turn p50 / p99 / max | 0.1 µs / 1.5 µs / 29 ms | 0.5 ms / 25–29 ms / 34 ms | 0.2 µs / 2–2.6 µs / 42 ms | 0.66 ms / 42 ms / 50 ms |
+| long turns (≥ 400 µs) they dominate | 2,187–2,431, avg 1.6–1.8 ms | 686–688, avg 6.5 ms | 7,876–8,060, avg 1.0 ms | 530–622, avg 11–13 ms |
+
+- **Long turns:** about 10× fewer at ct4 (the D252 default), and about 11% fewer at ct0. Throughput is up 2–4%.
+- **The install:** `on_flushed` is down about 30% at ct0 and 17% at ct4. The rest of it is `report_shares_flushed`'s per-share scan (each share's slots checked against the catalog), not the messages.
+- **The coordinators' longest turn (perf287's review) did not improve.** One `SharesFlushed` carries a flush's ~100K seqnos, and its handler counts each one and then advances the checkpoint past the records they free. That is the same work as before (about 7 s of long turns at ct4, against about 8 s), in fewer, longer turns: 25–42 ms p99, up to 50 ms, against a 29–42 ms max on main. Bounding it is a follow-up: handle a message in slices across turns, and make the report and its receipt cheaper per share.
