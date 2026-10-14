@@ -1124,11 +1124,12 @@ fn an_aborted_prepare_does_not_keep_refusing_later_commits() {
     // `Txn::commit` blocks: it runs on another thread while this one steps the shards.
     let outcome = std::thread::scope(|s| {
         let t = s.spawn(move || txn.commit(Some(Durability::Buffered)));
-        for _ in 0..10_000 {
-            if t.is_finished() {
-                break;
-            }
+        // Wall time, not a step count: the thread may not have submitted yet when the steps
+        // begin, on a slow runner.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !t.is_finished() && std::time::Instant::now() < deadline {
             db.step();
+            std::thread::yield_now();
         }
         assert!(t.is_finished(), "the transaction never resolved");
         t.join().unwrap()
