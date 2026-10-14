@@ -1371,6 +1371,61 @@ The AX102 confirms at 64 GiB.
 
 At those lengths, one flush or compaction more or less, or a placement change, moves a run by more than the tolerance. That's timing luck, not the engine. In the full-scale `all`, 18 of the 28 runs measured under 10 s, both engines included.
 
+<a id="d244"></a>
+## D244 — A participant keeps a cross-shard commit's timestamp in seqno order with the writes it already stamped, with tablet changes on or off (owner decision, 2026-10-13; engine, tablets, #653; amends D142 and D192's note)
+
+**Decided:**
+- **(i) Within a group:** every admitted PREPARE raises the shard's timestamp floor to its commit timestamp before the group's singles are stamped. The singles get later seqnos than the PREPARE, whose seqno its coordinator reserved earlier, so none of them lands below its timestamp.
+  - A PREPARE that waits for arena room isn't admitted yet and raises nothing.
+- **(ii) Across groups:** a participant refuses a PREPARE `(S, T)` with `BelowFloor` (retried at once, until D241's write-stall timeout) in either case:
+  - it has already stamped a seqno above `S` with a timestamp below `T`;
+  - it has already routed a PREPARE at a seqno below `S` with a timestamp above `T`.
+  - Ties are allowed, as in D142. D142's check (`T` below the floor or a received tablet's raise) is unchanged.
+- **A refusal raises the participant's floor to the refused `T`** before it is republished (perf287's review). The participant's later singles then stamp above `T`, so the retry's fresh timestamp clears what refused this attempt.
+- **A refused or aborted PREPARE's own entry is dropped** (perf287's review). It never lands. Kept, it would refuse PREPAREs out of order with it until the watermark passed it, and their retries could not clear it: no published floor included its timestamp.
+- **The history** is `ShardState::stamps`, per shard, kept only with more than one shard:
+  - one `(seqno, timestamp)` per group of singles: its first, which is the group's lowest of both;
+  - one per PREPARE routed to the shard.
+  - Entries at or below the visible watermark are dropped once it holds 32. A PREPARE's seqno stays held by its coordinator until it is applied everywhere, so it is above the watermark, and a dropped entry is always below it.
+  - It is shard-local; no shared state changes.
+- **With tablet changes off too** (owner decision, 2026-10-13):
+  - the coordinator reads every participant's floor, as with tablet changes on;
+  - participants run D142's check and (ii), and keep a commit's parts for its retry.
+  - So D11 holds for every cross-shard commit. This amends D192's note that a share's timestamp could be below its participant's floor with tablet changes off.
+
+**Why:** issue #653.
+- The coordinator reserves `S`, then picks `T` above the floors it reads. A single queued on a participant ahead of the PREPARE got a later seqno but a lower default timestamp, since the participant raised its floor to `T` only after stamping it.
+- D142's check (`T` below the floor) cannot see that: the floor was still below `T`.
+- A later seqno then sat below an earlier one's timestamp on one tablet, against D11. A latest read of a cell both wrote returned the earlier commit's value.
+- Found on `main` and on v0.2.2. The same happens across groups, when the single is stamped before the PREPARE arrives. It also happens between two PREPAREs routed in one group, found by this decision's sweep.
+- With tablet changes off, nothing ordered a share against its participant at all: a sim probe over 3 shards, one tablet each, found about 50 inversions per 400-operation run.
+
+**Cost:** more `BelowFloor` refusals, which are retried.
+- With tablet changes on, (ii) refuses what D142 used to let through inverted.
+- With tablet changes off, D142's own check now applies too, with #637's race. That is the coordinator's timestamp falling behind a busy participant's floor, refused even when seqno order holds.
+- On the sim's frozen clock:
+  - with tablet changes on, D244 leaves as many commits stuck as `main` (±1 of 22–89 per seed, 12 seeds);
+  - with tablet changes off, 73–98 per seed against none, from #637's retry livelock.
+- On a moving clock the write-stall timeout ends every such wait with `Busy`. #637's option 4 (D142's check made exact by seqno) would remove most of these refusals.
+
+**Tests** (`crates/engine/tests/tablets.rs`):
+- `a_participant_never_stamps_a_later_seqno_below_a_prepared_commit_timestamp`: (i), the #653 interleaving.
+- `a_participant_refuses_a_prepare_above_a_later_seqno_it_stamped_in_an_earlier_group`, and its moving-clock twin `a_cross_shard_commit_refused_below_a_later_stamp_commits_on_retry_with_a_moving_clock`: (ii), then the retry commits (in 3 and 4 attempts; the later refusals are D142's check while the participant's queued singles drain).
+- `an_aborted_prepare_does_not_keep_refusing_later_commits`: a transaction that fails validation leaves no entry behind. Without the drop, a later commit took 50 attempts; with it, 1.
+- `default_timestamps_keep_seqno_order_on_every_shard_under_cross_shard_commits` and `…_with_tablet_changes_off`:
+  - a seeded sweep over 3 shards (6 tablets with moves, or 3 tables with tablet changes off), with bursts that run one shard's floor ahead;
+  - it checks that every shard's committed WAL records keep their timestamps in seqno order;
+  - it runs on a moving clock with a 200 µs write-stall timeout, accepting `Busy`.
+- Each part disabled fails its test:
+  - the tablet-changes-on sweep fails at seed 1 without D244, and at seeds 1 and 3 without (i) or (ii) alone;
+  - the tablet-changes-off sweep fails at seed 1 without D244's tablets-off part.
+- 300 seeds of each pass.
+- **The model checker's harness:**
+  - it excuses a PREPARE-only attempt as refused and retried only when the engine reports that seqno as refused (`Engine::take_refused_attempts`, a test hook), since tablet changes off now retries too;
+  - with more than one shard it reads a retried commit's timestamp from its entries and moves the clock past the floors, as it did with tablet changes on;
+  - the shard-count comparison no longer compares seqnos, since a retry's seqno depends on the shard count.
+- **`purge_race`'s lagging-share case** (D192's note) can no longer arise: the share is refused below its participant's floor. The test now checks that the retry leaves the purge alone.
+
 <a id="d246"></a>
 ## D246 — Contended cross-shard commits are a judged gate workload (owner decision, 2026-10-13; bench, #406; part of D247)
 

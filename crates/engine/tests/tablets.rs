@@ -1486,6 +1486,502 @@ fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
 }
 
 #[test]
+fn a_participant_never_stamps_a_later_seqno_below_a_prepared_commit_timestamp() {
+    // D142's order, the other way round from the test above. `high` coordinates a
+    // cross-shard commit B: it reserves B's seqno, then picks B's timestamp above every
+    // floor, its own here, which ran ahead of `low`'s on the frozen clock. A single A,
+    // queued on the participant `low` ahead of B's PREPARE, is admitted in the same group,
+    // so it gets a later seqno; it must not get a lower default timestamp than B's (D11: a
+    // tablet's default timestamps never go backwards in seqno order).
+    let mut db = open(2, |_| {});
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    // The frozen clock: each default timestamp is the shard's floor plus one, so `high`'s
+    // floor climbs ten above `low`'s.
+    for i in 0..10u8 {
+        db.put(b"z", &[i]);
+    }
+    // A, a single on `low`, then B, coordinated by `high` (its first row is there); neither
+    // has run yet.
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"a", b"s", None, ValueRef::Bytes(b"single"))
+        .unwrap();
+    let mut a = db
+        .engine
+        .submit(wb, Some(Durability::Buffered))
+        .expect("submit");
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"both"))
+        .unwrap();
+    wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"both"))
+        .unwrap();
+    let mut b = db
+        .engine
+        .submit(wb, Some(Durability::Buffered))
+        .expect("submit");
+    // `high` reserves B's seqno, picks its timestamp and sends `low` the PREPARE, which
+    // queues behind A; then `low` admits both in one group.
+    let now = db.clock.monotonic_nanos();
+    db.shards[usize::from(high)].run_once(now + 1_000);
+    db.shards[usize::from(low)].run_once(now + 1_000);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut seqno = |pc: &mut pigeonhole_engine::PendingCommit, db: &mut Db| {
+        for _ in 0..100_000 {
+            if let Poll::Ready(r) = Pin::new(&mut *pc).poll(&mut cx) {
+                return r.expect("commit").seqno;
+            }
+            db.step();
+        }
+        panic!("a commit never resolved");
+    };
+    let seqno_a = seqno(&mut a, &mut db);
+    let seqno_b = seqno(&mut b, &mut db);
+    let ts_a = db
+        .engine
+        .get_latest(id, f, b"a", b"s")
+        .unwrap()
+        .expect("A")
+        .timestamp();
+    let (ts_b, _) = db.get(b"z").unwrap();
+    assert_eq!(db.get(b"a").unwrap().0, ts_b);
+    eprintln!("A: seqno {seqno_a} ts {ts_a}; B: seqno {seqno_b} ts {ts_b}");
+    let (first, second) = if seqno_a < seqno_b {
+        ((seqno_a, ts_a), (seqno_b, ts_b))
+    } else {
+        ((seqno_b, ts_b), (seqno_a, ts_a))
+    };
+    assert!(
+        second.1 >= first.1,
+        "seqno {} has timestamp {} below seqno {}'s {} on one tablet (D11, D142)",
+        second.0,
+        second.1,
+        first.0,
+        first.1
+    );
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_participant_refuses_a_prepare_above_a_later_seqno_it_stamped_in_an_earlier_group() {
+    // D244 (ii), issue #653: as above, but A is stamped in an earlier group than the one
+    // that admits B's PREPARE, which is refused; its retries commit.
+    // Further refusals are D142's own check while `low`'s queued singles drain (#637).
+    let attempts = refused_in_an_earlier_group(false);
+    assert!(attempts <= 3, "B committed at attempt {attempts}");
+}
+
+#[test]
+fn a_cross_shard_commit_refused_below_a_later_stamp_commits_on_retry_with_a_moving_clock() {
+    // D244 on a clock that moves (each read a nanosecond): the refusal is retried and the
+    // retry commits, with no `Busy`.
+    let attempts = refused_in_an_earlier_group(true);
+    assert!(attempts <= 4, "B committed at attempt {attempts}");
+}
+
+/// `low`'s queue holds A and 1,023 more singles ahead of cross-shard commit B's PREPARE, so
+/// its first turn (up to 1,024 messages) stamps them, at later seqnos than B's and below B's
+/// timestamp, before the PREPARE is read. Its floor is still below B's timestamp then, so
+/// only the later-seqno check (D244 (ii)) can refuse it. Returns the coordination attempts B
+/// took (its coordinator logs a PREPARE of its own for each).
+fn refused_in_an_earlier_group(moving_clock: bool) -> usize {
+    let mut db = open(2, |o| {
+        o.memtable_budget = 64 << 20;
+        if moving_clock {
+            o.write_stall_timeout_nanos = 50_000_000;
+            ticking(o);
+        }
+    });
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    // `high`'s floor climbs 3,000 above `low`'s (the clock moves a microsecond per
+    // thousand reads at most).
+    for i in 0..3_000u32 {
+        db.put(b"z", &i.to_le_bytes());
+    }
+    let single = |db: &mut Db, row: &[u8]| {
+        let mut wb = WriteBatch::new();
+        wb.put(id, f, row, b"s", None, ValueRef::Bytes(b"single"))
+            .unwrap();
+        db.engine
+            .submit(wb, Some(Durability::Buffered))
+            .expect("submit")
+    };
+    let mut a = single(&mut db, b"a");
+    let mut rest: Vec<_> = (0..1_023u32)
+        .map(|i| single(&mut db, format!("b{i:04}").as_bytes()))
+        .collect();
+    db.engine.take_appended();
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"both"))
+        .unwrap();
+    wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"both"))
+        .unwrap();
+    let mut b = db
+        .engine
+        .submit(wb, Some(Durability::Buffered))
+        .expect("submit");
+    // `high` reserves B's seqno, picks its timestamp and queues the PREPARE behind the
+    // 1,024 singles; `low`'s first turn stamps only those.
+    let now = db.clock.monotonic_nanos();
+    db.shards[usize::from(high)].run_once(now + 1_000);
+    db.shards[usize::from(low)].run_once(now + 1_000);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut seqno = |pc: &mut pigeonhole_engine::PendingCommit, db: &mut Db| {
+        for _ in 0..100_000 {
+            if let Poll::Ready(r) = Pin::new(&mut *pc).poll(&mut cx) {
+                return r.expect("commit").seqno;
+            }
+            db.step();
+        }
+        panic!("a commit never resolved");
+    };
+    let seqno_a = seqno(&mut a, &mut db);
+    for pc in &mut rest {
+        seqno(pc, &mut db);
+    }
+    let seqno_b = seqno(&mut b, &mut db);
+    let ts_a = db
+        .engine
+        .get_latest(id, f, b"a", b"s")
+        .unwrap()
+        .expect("A")
+        .timestamp();
+    let (ts_b, _) = db.get(b"z").unwrap();
+    assert_eq!(db.get(b"a").unwrap().0, ts_b);
+    eprintln!("A: seqno {seqno_a} ts {ts_a}; B: seqno {seqno_b} ts {ts_b}");
+    assert!(
+        (seqno_a < seqno_b) == (ts_a <= ts_b),
+        "A (seqno {seqno_a}, ts {ts_a}) and B (seqno {seqno_b}, ts {ts_b}) are in opposite \
+         orders on one tablet (D11, D142)"
+    );
+    assert!(seqno_b > seqno_a, "B was never refused");
+    let attempts = db
+        .engine
+        .take_appended()
+        .iter()
+        .filter(|r| r.stream == high && r.kind == pigeonhole_engine::AppendedKind::Prepare)
+        .count();
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+    attempts
+}
+
+#[test]
+fn an_aborted_prepare_does_not_keep_refusing_later_commits() {
+    // D244, perf287's review: a PREPARE is kept from its routing on. One whose transaction
+    // then fails validation on the participant `p` is aborted, and its entry, at a timestamp
+    // above `p`'s floor, must go with it. Otherwise a later commit over shards with lower
+    // floors, at a later seqno and a lower timestamp, is refused by it on every retry (its
+    // fresh timestamp never clears a floor nobody published), on a frozen clock for ever.
+    let mut db = open(3, |o| o.memtable_budget = 64 << 20);
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    for k in [b"h", b"p"] {
+        let m = db.engine.split_tablet_pending(id, k).unwrap();
+        db.drive(m).unwrap();
+    }
+    // Tablets "a".., "h".., "p".. on shards 0, 1 and 2.
+    for (row, to) in [(b"a", 0u16), (b"h", 1), (b"p", 2)] {
+        let owner = db
+            .ranges()
+            .iter()
+            .rfind(|r| r.2.as_slice() <= &row[..])
+            .map(|r| r.1)
+            .unwrap();
+        if owner != to {
+            let m = db.engine.move_tablet_pending(id, row, to).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    // Shard 0's floor runs 50 ahead.
+    for i in 0..50u8 {
+        db.put(b"a", &[i]);
+    }
+    // A transaction reads "p" (on shard 2), then "p" changes: its commit over shards 0 and
+    // 2 (coordinated by 0, at a timestamp above shard 2's floor) fails validation on 2.
+    let mut txn = db.engine.begin().unwrap();
+    txn.get(id, f, b"p", b"q").unwrap();
+    db.put(b"p", b"changed");
+    txn.batch()
+        .put(id, f, b"a", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    txn.batch()
+        .put(id, f, b"p", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let mut t = txn.submit(Some(Durability::Buffered)).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut outcome = None;
+    for _ in 0..10_000 {
+        if let Poll::Ready(r) = Pin::new(&mut t).poll(&mut cx) {
+            outcome = Some(r);
+            break;
+        }
+        db.step();
+    }
+    assert!(
+        matches!(outcome, Some(Err(pigeonhole_engine::Error::Conflict))),
+        "{outcome:?}"
+    );
+    db.settle();
+    // A commit over shards 1 and 2 (coordinated by 1): a later seqno, and a timestamp
+    // below the aborted one's, since neither floor includes it.
+    db.engine.take_appended();
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"h", b"q", None, ValueRef::Bytes(b"c"))
+        .unwrap();
+    wb.put(id, f, b"p", b"q", None, ValueRef::Bytes(b"c"))
+        .unwrap();
+    let mut c = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    let mut done = false;
+    for _ in 0..10_000 {
+        if let Poll::Ready(r) = Pin::new(&mut c).poll(&mut cx) {
+            r.expect("commit");
+            done = true;
+            break;
+        }
+        db.step();
+    }
+    assert!(done, "the commit never resolved");
+    let attempts = db
+        .engine
+        .take_appended()
+        .iter()
+        .filter(|r| r.stream == 1 && r.kind == pigeonhole_engine::AppendedKind::Prepare)
+        .count();
+    assert_eq!(attempts, 1, "the commit took {attempts} attempts");
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// D244's sweep (issue #653): seeded interleavings of single and cross-shard commits over
+/// tablets spread on three shards, with bursts that run one shard's floor ahead and moves
+/// mid-run. Each shard's WAL records of committed writes must have default timestamps that
+/// never go backwards in seqno order (D11, D142): every tablet a shard owns is covered.
+#[test]
+fn default_timestamps_keep_seqno_order_on_every_shard_under_cross_shard_commits() {
+    for seed in seeds() {
+        d142_sweep(seed, true);
+    }
+}
+
+/// The same with tablet changes off (D244): three tables, one per shard (placement is
+/// round-robin), and no moves.
+#[test]
+fn default_timestamps_keep_seqno_order_with_tablet_changes_off() {
+    for seed in seeds() {
+        d142_sweep(seed, false);
+    }
+}
+
+fn d142_sweep(seed: u64, tablet_changes: bool) {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut rng = move |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    // A clock that moves (each read is a nanosecond) and a short write-stall timeout: on a
+    // frozen one, two shards both retrying `BelowFloor` commits can refuse each other for
+    // ever (#637); here they give up with `Busy` as D241 has it, and what landed is checked.
+    let mut db = open(3, |o| {
+        o.memtable_budget = 64 << 20;
+        o.write_stall_timeout_nanos = 200_000;
+        ticking(o);
+        o.tablet_changes = tablet_changes;
+    });
+    let starts = *b"acegik";
+    // Six targets, `(table, first row byte)`: with tablet changes on, six tablets of one
+    // table ("a".., "c".., …), placed at random; off, three tables, one per shard.
+    let mut tables = vec![Arc::clone(&db.table)];
+    if tablet_changes {
+        let id = db.table.id;
+        for k in [b"c", b"e", b"g", b"i", b"k"] {
+            let m = db.engine.split_tablet_pending(id, k).unwrap();
+            db.drive(m).unwrap();
+        }
+        for s in starts {
+            let to = rng(3) as u16;
+            if let Ok(m) = db.engine.move_tablet_pending(id, &[s], to) {
+                let _ = db.drive(m);
+            }
+        }
+    } else {
+        for i in 0..2 {
+            let fam = [("f".into(), FamilyOptions::default())];
+            tables.push(db.engine.create_table(&format!("t{i}"), &fam).unwrap());
+        }
+    }
+    let target = |i: u64| -> (pigeonhole_format::TableId, pigeonhole_format::FamilyId, u8) {
+        let t = &tables[if tablet_changes { 0 } else { i as usize % 3 }];
+        (t.id, t.families[0].id, starts[i as usize])
+    };
+    let row = |rng: &mut dyn FnMut(u64) -> u64| {
+        let (t, f, s) = target(rng(6));
+        (t, f, vec![s, b'0' + rng(10) as u8])
+    };
+    let mut pending: Vec<pigeonhole_engine::PendingCommit> = Vec::new();
+    let mut busy = 0;
+    let mut moves: Vec<PendingMaintenance> = Vec::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    db.engine.take_appended();
+    for _ in 0..400 {
+        match rng(10) {
+            0..=3 => {
+                let (id, f, r) = row(&mut rng);
+                let mut wb = WriteBatch::new();
+                wb.put(id, f, &r, b"q", None, ValueRef::Bytes(b"s"))
+                    .unwrap();
+                pending.push(db.engine.submit(wb, Some(Durability::Buffered)).unwrap());
+            }
+            4..=6 => {
+                let mut wb = WriteBatch::new();
+                for _ in 0..2 + rng(2) {
+                    let (id, f, r) = row(&mut rng);
+                    wb.put(id, f, &r, b"q", None, ValueRef::Bytes(b"x"))
+                        .unwrap();
+                }
+                pending.push(db.engine.submit(wb, Some(Durability::Buffered)).unwrap());
+            }
+            7 => {
+                // A burst on one tablet's rows: its shard's floor runs ahead of the others'.
+                let (id, f, s) = target(rng(6));
+                for i in 0..20 + rng(40) {
+                    let mut wb = WriteBatch::new();
+                    wb.put(
+                        id,
+                        f,
+                        &[s, b'b', i as u8],
+                        b"q",
+                        None,
+                        ValueRef::Bytes(b"b"),
+                    )
+                    .unwrap();
+                    pending.push(db.engine.submit(wb, Some(Durability::Buffered)).unwrap());
+                }
+            }
+            8 if tablet_changes && rng(8) == 0 && moves.is_empty() => {
+                let (id, _, s) = target(rng(6));
+                if let Ok(m) = db.engine.move_tablet_pending(id, &[s], rng(3) as u16) {
+                    moves.push(m);
+                }
+            }
+            _ => {
+                // Some shards run, in a random order; the rest keep their queues.
+                let now = db.clock.monotonic_nanos();
+                for _ in 0..1 + rng(3) {
+                    db.shards[rng(3) as usize].run_once(now + 1_000);
+                }
+            }
+        }
+        pending.retain_mut(|pc| match Pin::new(&mut *pc).poll(&mut cx) {
+            Poll::Ready(r) => {
+                match r {
+                    Ok(_) => {}
+                    Err(pigeonhole_engine::Error::Busy) => busy += 1,
+                    Err(e) => panic!("seed {seed}: commit failed: {e}"),
+                }
+                false
+            }
+            Poll::Pending => true,
+        });
+        moves.retain_mut(|m| Pin::new(&mut *m).poll(&mut cx).is_pending());
+    }
+    for _ in 0..100_000 {
+        if pending.is_empty() && moves.is_empty() {
+            break;
+        }
+        db.step();
+        pending.retain_mut(|pc| match Pin::new(&mut *pc).poll(&mut cx) {
+            Poll::Ready(r) => {
+                match r {
+                    Ok(_) => {}
+                    Err(pigeonhole_engine::Error::Busy) => busy += 1,
+                    Err(e) => panic!("seed {seed}: commit failed: {e}"),
+                }
+                false
+            }
+            Poll::Pending => true,
+        });
+        moves.retain_mut(|m| Pin::new(&mut *m).poll(&mut cx).is_pending());
+    }
+    assert!(
+        pending.is_empty(),
+        "seed {seed}: {} commits never resolved ({} moves pending)",
+        pending.len(),
+        moves.len()
+    );
+    db.settle();
+    // The writes that landed: singles, and the shares of committed cross-shard commits.
+    let records = db.engine.take_appended();
+    let committed: std::collections::HashSet<u64> = records
+        .iter()
+        .filter(|r| r.kind == pigeonhole_engine::AppendedKind::Commit)
+        .map(|r| r.seqno)
+        .collect();
+    let mut shares = 0;
+    for stream in 0..3u16 {
+        let mut writes: Vec<(u64, u64)> = records
+            .iter()
+            .filter(|r| r.stream == stream)
+            .filter(|r| match r.kind {
+                pigeonhole_engine::AppendedKind::Batch => true,
+                pigeonhole_engine::AppendedKind::Prepare => committed.contains(&r.seqno),
+                pigeonhole_engine::AppendedKind::Commit => false,
+            })
+            .map(|r| (r.seqno, r.commit_ts))
+            .collect();
+        shares += records
+            .iter()
+            .filter(|r| r.stream == stream && r.kind == pigeonhole_engine::AppendedKind::Prepare)
+            .count();
+        writes.sort_unstable();
+        for w in writes.windows(2) {
+            assert!(
+                w[1].1 >= w[0].1,
+                "seed {seed}: shard {stream}: seqno {} at ts {} after seqno {} at ts {} (D11, D142)",
+                w[1].0,
+                w[1].1,
+                w[0].0,
+                w[0].1
+            );
+        }
+    }
+    assert!(shares > 0, "seed {seed}: no cross-shard commit");
+    eprintln!(
+        "seed {seed}: {} records, {shares} shares, {busy} busy",
+        records.len()
+    );
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
 fn a_cross_shard_commit_no_participant_refuses_counts_one_round() {
     // ICR 0043: `Metrics::cross_shard` counts the coordinator's decided rounds, and only
     // refused ones as refused.

@@ -1298,6 +1298,9 @@ struct World {
     /// Per stream, the records appended to it in order, as observed in the WAL (plus
     /// `None` commits, placed when they resolve: their records wait in the buffer).
     stream_records: BTreeMap<u32, Vec<(Seqno, RecKind)>>,
+    /// Seqnos of cross-shard attempts a participant refused (`Engine::take_refused_attempts`):
+    /// their commit ran again under a new seqno, or gave up.
+    refused_seqnos: HashSet<Seqno>,
     /// Per stream, parallel to `stream_records`: how many crashes had happened when each
     /// record was appended (a seqno may be reused only across a crash).
     stream_epochs: BTreeMap<u32, Vec<usize>>,
@@ -1362,6 +1365,7 @@ impl World {
             workload,
             queued: std::collections::VecDeque::new(),
             stream_records: BTreeMap::new(),
+            refused_seqnos: HashSet::new(),
             stream_epochs: BTreeMap::new(),
             appended_ts: HashMap::new(),
             blob_files_seen: HashSet::new(),
@@ -1461,6 +1465,8 @@ impl World {
         let Some(store) = self.store.as_ref() else {
             return;
         };
+        self.refused_seqnos
+            .extend(store.engine.take_refused_attempts());
         for r in store.engine.take_appended() {
             let kind = match r.kind {
                 AppendedKind::Batch => RecKind::Batch,
@@ -2153,9 +2159,10 @@ impl World {
             }
             // PREPAREs of a cross-shard attempt whose coordinator never appended a COMMIT
             // record to any stream (it aborted: a participant refused, or it never got that
-            // far) can never be recovered (D83). A commit refused by a shard moving a tablet
+            // far) can never be recovered (D83). A commit refused by a shard moving a tablet,
+            // or below a participant's timestamp floor (D244, with tablet changes on or off),
             // is retried under a new seqno, so such an attempt must not be taken for an
-            // unacknowledged commit's seqno. Only tablet changes refuse and retry this way.
+            // unacknowledged commit's seqno.
             let prepares_only = wal
                 .streams
                 .values()
@@ -2166,7 +2173,10 @@ impl World {
                 .values()
                 .flatten()
                 .any(|(s, kind)| *s == *seqno && *kind == RecKind::Commit);
-            if self.cfg.tablet_changes && prepares_only && !committed_anywhere {
+            if (self.cfg.tablet_changes || self.refused_seqnos.contains(seqno))
+                && prepares_only
+                && !committed_anywhere
+            {
                 self.settled_seqnos.insert(*seqno);
                 self.stats.refused_attempts += 1;
                 self.trace
@@ -3000,12 +3010,19 @@ impl World {
         )
     }
 
+    /// Whether a cross-shard commit can be refused and retried under a new seqno and
+    /// timestamp: by a shard moving a tablet, or below a participant's floor (D244, with
+    /// tablet changes on or off).
+    fn retries(&self) -> bool {
+        self.cfg.tablet_changes || self.cfg.shards > 1
+    }
+
     /// Moves the clock past every shard's default-timestamp floor.
     fn clock_past_floors(&mut self) {
         let Some(store) = &self.store else {
             return;
         };
-        if !self.cfg.tablet_changes {
+        if !self.retries() {
             return;
         }
         let floor = store.engine.max_ts_floor();
@@ -3121,7 +3138,9 @@ impl World {
             let ts = if c.durability == Durability::None {
                 // Never logged: it ran alone with the clock past every timestamp floor.
                 let now = c.commit_ts.expect("alone commits know their timestamp");
-                if self.cfg.tablet_changes {
+                // With tablet changes off only a cross-shard commit is refused and retried
+                // (D244): a single-shard one still runs exactly at its clock.
+                if self.cfg.tablet_changes || self.shards_of(&c.ops).len() > 1 {
                     // A commit a moving tablet refused (`Moved`) or parked runs again later,
                     // above every floor its participants reached meanwhile (a retry keeps
                     // its first timestamp only when strictly above them): read it from the
@@ -5018,17 +5037,10 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
             vfs.crash(CrashKind::Process);
             drop(store);
             store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("reopen");
-            // With tablet changes, seqnos are not compared: a commit refused by a shard
-            // moving a tablet is retried under a new seqno, so numbering depends on the
-            // shard count.
-            if cfg.tablet_changes {
-                results.push(format!("reopen at {i}"));
-            } else {
-                results.push(format!(
-                    "reopen at {i}: seqno {}",
-                    store.engine.snapshot().unwrap().seqno()
-                ));
-            }
+            // Seqnos are not compared: a cross-shard commit refused by a shard moving a
+            // tablet, or below a participant's floor (D244), is retried under a new seqno, so
+            // numbering depends on the shard count.
+            results.push(format!("reopen at {i}"));
         }
         if let Some(every) = cfg.tablet_every
             && i > 0
@@ -5074,17 +5086,16 @@ pub fn final_dump(seed: u64, cfg: &Config) -> Rows {
                     .engine
                     .submit(batch, Some(durability))
                     .expect("submit");
-                let info = loop {
+                loop {
                     match poll_commit(&mut pc) {
-                        Poll::Ready(r) => break r.expect("commit"),
+                        Poll::Ready(r) => {
+                            r.expect("commit");
+                            break;
+                        }
                         Poll::Pending => store.step_shards(vfs.monotonic_nanos()),
                     }
-                };
-                if cfg.tablet_changes {
-                    results.push(format!("commit {i}"));
-                } else {
-                    results.push(format!("commit {}", info.seqno));
                 }
+                results.push(format!("commit {i}"));
             }
             Op::Get {
                 row,

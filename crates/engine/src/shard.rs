@@ -2148,6 +2148,13 @@ pub(crate) struct ShardState {
     /// Slots flushed because their records pinned the checkpoint, whatever their size,
     /// until their active memtable freezes.
     unpin: BTreeSet<(TabletId, FamilyId)>,
+    /// With more than one shard, the first default timestamp of each recent group of singles
+    /// and each routed PREPARE's, by seqno, above the visible watermark (D244): a PREPARE out
+    /// of seqno order with one of them is refused.
+    stamps: Vec<(Seqno, Timestamp)>,
+    /// More than one shard: cross-shard commits can run, and their timestamps are kept in
+    /// seqno order with each participant's writes (D244).
+    cross: bool,
     /// Slots a wait for arena room picked to freeze, whatever their size, until their active
     /// memtable freezes: the largest ones, holding about half the arena (D124).
     room_freezes: BTreeSet<(TabletId, FamilyId)>,
@@ -2318,7 +2325,9 @@ impl ShardState {
         let leveled = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
         let tiered = CompactionPicker::new(CompactionStyle::Tiered, shared.picker.clone());
         let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
+        let cross = shared.ts_floors.len() > 1;
         let shard = Self {
+            cross,
             id,
             shared,
             wal: None,
@@ -2394,6 +2403,7 @@ impl ShardState {
             cross_seqnos: BTreeSet::new(),
             unpin: BTreeSet::new(),
             room_freezes: BTreeSet::new(),
+            stamps: Vec::new(),
             unpin_upto: 0,
             unpin_at: 0,
             asked: HashMap::new(),
@@ -2515,8 +2525,9 @@ impl ShardState {
         trace!("shard {} raise floor {} -> {ts}", self.id.0, self.ts_floor);
         if ts > self.ts_floor {
             self.ts_floor = ts;
-            // Coordinators read it to keep a moved tablet's timestamps above its old floor.
-            if self.tablets_on()
+            // Coordinators read it to keep a moved tablet's timestamps above its old floor,
+            // and a share's above its participant's (D244).
+            if (self.cross || self.tablets_on())
                 && let Some(f) = self.shared.ts_floors.get(usize::from(self.id.0))
             {
                 f.0.store(ts, Ordering::Release);
@@ -4545,13 +4556,17 @@ impl ShardState {
                 }
             }
             self.touch_rows(&m);
-            if let MemberKind::Prepare { .. } = m.kind
-                && let Some(share) = self.prepared.get_mut(&m.seqno)
-                && !share.tracked
-            {
-                share.tracked = true;
-                let bytes = Arc::clone(&share.bytes);
-                self.track_share_rows(bytes.batch().as_bytes(), true);
+            if let MemberKind::Prepare { .. } = m.kind {
+                // Admitted: its timestamp raises the floor before this group's singles are
+                // stamped, below (D244).
+                self.raise_for_prepare(&m);
+                if let Some(share) = self.prepared.get_mut(&m.seqno)
+                    && !share.tracked
+                {
+                    share.tracked = true;
+                    let bytes = Arc::clone(&share.bytes);
+                    self.track_share_rows(bytes.batch().as_bytes(), true);
+                }
             }
             admitted.push(m);
         }
@@ -4596,6 +4611,10 @@ impl ShardState {
                     self.raise_ts_floor(m.commit_ts);
                 }
             }
+        }
+        // One shard has no cross-shard commits: one test of a field on its commit path.
+        if self.cross && first.is_some() {
+            self.note_group_stamps(&admitted);
         }
 
         // The log: append every record, one write, one submitted sync.
@@ -5891,9 +5910,11 @@ impl ShardState {
         // first timestamp only when it is above every participant's floor, or equal to the
         // floor of a shard that reached it through this very commit (`Preset::own`): any
         // other tie would be a write that participant already made at that timestamp.
+        // With tablet changes off too (D244): a share must not land below its participant's
+        // floor either way.
         let mut floor = 0;
         let mut fits = req.commit_ts.is_some();
-        if self.tablets_on() {
+        {
             for s in &shards {
                 let i = usize::from(s.0);
                 let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
@@ -5935,17 +5956,10 @@ impl ShardState {
                 committing: false,
                 not_applied: false,
                 shards: shards.clone(),
-                // Kept for a retry only when a participant may refuse with `Moved`.
-                parts: if self.tablets_on() {
-                    req.parts.clone()
-                } else {
-                    Vec::new()
-                },
-                validate: if self.tablets_on() {
-                    req.validate.clone()
-                } else {
-                    None
-                },
+                // Kept for a retry: a participant may refuse with `Moved` (tablet changes
+                // on) or `BelowFloor` (either way, D244).
+                parts: req.parts.clone(),
+                validate: req.validate.clone(),
                 map_version: req.map_version,
                 moved: false,
                 below_floor: false,
@@ -6137,6 +6151,10 @@ impl ShardState {
         // Every decision is answered, even for a share this shard never held or already
         // dropped (a refused or failed PREPARE): the coordinator waits for every participant.
         let mut error = None;
+        if !commit {
+            // An aborted share never lands: its timestamp orders nothing (D244).
+            self.drop_stamp(seqno);
+        }
         if self.close_gave_up() {
             // The close reported, or gave up flushing (a shard died): apply nothing more.
             // The share's PREPARE stays in the WAL, and the next open decides it by its
@@ -6301,6 +6319,15 @@ impl ShardState {
             // aborted everywhere and runs again once the tablet map has changed. One that
             // refused the timestamp as below its floor runs again at once, with a fresh one.
             // Either gives up once it has waited the write-stall timeout (D241).
+            #[cfg(feature = "test-hooks")]
+            if self.recording() {
+                self.shared
+                    .hooks
+                    .refused
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(seqno);
+            }
             let waited = ctx.now_nanos().saturating_sub(c.submitted_at);
             if moved_gives_up(waited, self.shared.write_stall_timeout_nanos) {
                 trace!("shard {} gives up on {seqno} after {waited} ns", self.id.0);

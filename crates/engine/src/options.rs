@@ -141,8 +141,9 @@ pub struct EngineOptions {
     /// (nanoseconds). A full arena stalls writers rather than refusing them: each waiting
     /// call is refused once it has itself waited this long (D240), and the shard's wait is
     /// counted in `Metrics::stalls`. A commit that waits on a tablet change, or a cross-shard
-    /// commit retried after a participant refused it for one, is refused this long after it
-    /// was submitted (D241). The L0 stall paces commits and never refuses them.
+    /// commit retried after a participant refused it for one, or below its timestamp floor
+    /// (D244, with tablet changes on or off), is refused this long after it was submitted
+    /// (D241). The L0 stall paces commits and never refuses them.
     pub write_stall_timeout_nanos: u64,
     /// Overrides the memtable arena's chunk size (bytes; a multiple of 64, at least 1 KiB),
     /// which is otherwise sized for the slots a shard holds (#283). For tests that need a
