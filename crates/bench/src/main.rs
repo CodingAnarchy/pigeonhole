@@ -100,6 +100,9 @@ OPTIONS:
                            split, merge and move between shards by default)
     --no-packing           Pigeonhole: spread tablets over every shard even under light
                            writes (D217's packing is on by default)
+    --async N              Pigeonhole: each client thread keeps N operations in flight
+                           through the async API (commit_async, read_async, get_async;
+                           D247) [default: 0, one at a time]
     --riders               Pigeonhole: snapshot and durable-snapshot readers, then a
                            durable backup and a compaction, beside the measured
                            phase (D247, reported in the record's riders)
@@ -148,6 +151,7 @@ struct Args {
     no_tablet_changes: bool,
     no_packing: bool,
     riders: bool,
+    async_in_flight: Option<usize>,
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
     dir: Option<PathBuf>,
@@ -211,6 +215,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--no-tablet-changes" => a.no_tablet_changes = true,
             "--no-packing" => a.no_packing = true,
             "--riders" => a.riders = true,
+            "--async" => a.async_in_flight = Some(parse(&arg, it.next())?),
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
@@ -277,6 +282,7 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
         .default_durability(a.durability == Some(Durability::Default))
         .load_buffered(a.durability.is_some())
         .riders(a.riders)
+        .async_in_flight(a.async_in_flight.unwrap_or(0))
         .memory(memory(a))
         .tablet_changes(!a.no_tablet_changes)
         .packing(!a.no_packing);

@@ -550,6 +550,14 @@ impl Workload {
 pub trait Client: Send {
     /// Executes one operation.
     fn execute(&mut self, op: &BenchOp) -> Result<(), String>;
+
+    /// Executes `ops` with several in flight at once (D247's async rows), returning each
+    /// operation's latency from submission to resolution, in `ops`' order; `None` (the
+    /// default) when the client runs one operation at a time.
+    fn pipelined(&mut self, ops: &[&BenchOp]) -> Option<Result<Vec<Duration>, String>> {
+        let _ = ops;
+        None
+    }
 }
 
 /// A store under test.
@@ -1269,7 +1277,21 @@ fn pass(
                 let barrier = Arc::clone(&barrier);
                 scope.spawn(move || {
                     barrier.wait();
-                    run(&mut |op| client.execute(op), share)
+                    let ops: Vec<&BenchOp> = share.iter().map(|(op, _)| op).collect();
+                    match client.pipelined(&ops) {
+                        Some(latencies) => {
+                            let latencies = latencies?;
+                            let (mut hist, mut split) = (Histogram::new(), Split::default());
+                            if record {
+                                for ((op, class), latency) in share.iter().zip(latencies) {
+                                    hist.record(latency);
+                                    split.record(op, *class, latency);
+                                }
+                            }
+                            Ok((hist, split))
+                        }
+                        None => run(&mut |op| client.execute(op), share),
+                    }
                 })
             })
             .collect();

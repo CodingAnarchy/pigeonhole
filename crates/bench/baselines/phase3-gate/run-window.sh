@@ -49,7 +49,8 @@
 #                  every store loads buffered): ycsb-a/b/c/e/f, sparse-wide,
 #                  time-series-ttl, cross-shard-contention (D246, also with tablet
 #                  changes off), counters; transfer, sparse-wide with deletes,
-#                  filtered scans, ycsb-a's riders and 16 KiB values reported        145
+#                  filtered scans, the async API, ycsb-a's riders and 16 KiB values
+#                  reported                                                           150
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   wal-pin        wal_pin_bytes 2x vs 4x the budget: write path, open after a crash
 #                  (#527; phase3-io/wal-pin.sh)                                        10
@@ -58,7 +59,7 @@
 #   scan-cache     ordered scan from cache, GB/s decoded per core (#29)               10
 #   report         summary.md (every #406 target: value, pass/fail, source file),
 #                  and RESULTS_DIR.tar.gz to copy back                                1
-# Total: about 12.5 hours unattended at full scale (the sum of the estimates above; the
+# Total: about 12.6 hours unattended at full scale (the sum of the estimates above; the
 # 2026-10-13b window's steps took 109 minutes before `contended` was added).
 #
 # The results leave the machine as a tarball (no GitHub credentials on a rented box): copy
@@ -99,7 +100,7 @@ results="$(cd "$results" && pwd)"
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     row-cache scaling placement contended open-latency wal-pin cold-get cold-scan scan-cache report)
 declare -A minutes=([setup]=1 [build]=10 [memtable-lookup]=5 [phase2-gate]=40 [phase2-gate-2]=40 [all-uring-1]=90 [all-uring-2]=90
-    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [contended]=145 [open-latency]=5 [wal-pin]=10 [cold-get]=45
+    [all-pread]=90 [latency]=47 [ycsb-a-shards]=15 [row-cache]=30 [scaling]=45 [placement]=8 [contended]=150 [open-latency]=5 [wal-pin]=10 [cold-get]=45
     [cold-scan]=15 [scan-cache]=10 [report]=1)
 
 # The checkout's commit ("-dirty" with local changes), recorded with each finished step.
@@ -441,6 +442,15 @@ step_contended() {
             --dir "$data/bench" --json "$results/contended-$level-ycsb-a-16k.json" \
             --markdown "$results/contended-$level-ycsb-a-16k.md"
         rm -r "$data/bench"
+        # Reported: the async API (Pigeonhole only; perf287's E/E′), ycsb-a and ycsb-c with 16
+        # operations in flight per client thread.
+        for w in ycsb-a ycsb-c; do
+            "$bench" "$w" --engine pigeonhole --scale "$scale" --threads 16 --async 16 \
+                --durability "$level" --ops "$contended_ops" --min-secs "$contended_report_secs" \
+                --dir "$data/bench" --json "$results/contended-$level-$w-async.json" \
+                --markdown "$results/contended-$level-$w-async.md"
+            rm -r "$data/bench"
+        done
         # Reported riders on ycsb-a (Pigeonhole only): snapshot and durable-snapshot readers,
         # a durable backup and a compaction beside the measured phase.
         "$bench" ycsb-a --engine pigeonhole --scale "$scale" --threads 16 --riders \
