@@ -1410,14 +1410,28 @@ fn stall_pass_with(
     let mut cx = Context::from_waker(Waker::noop());
     let mut measured = None;
     let m = if measure_open {
-        // The pass measures while the wait is still open: nothing has completed.
-        let m = db.engine.balance_pending().unwrap();
-        for _ in 0..5 {
-            db.vfs.advance(2_000_000);
-            db.step();
+        // The wait stays open through 26 balancer passes before the reading: nothing has
+        // completed, and the event that began the wait is well outside the stall window,
+        // so only the open span can keep the shard reading stalled.
+        let mut open = None;
+        for _ in 0..26 {
+            let mut m = db.engine.balance_pending().unwrap();
+            let mut done = false;
+            for _ in 0..50 {
+                db.vfs.advance(2_000_000);
+                db.step();
+                if let Poll::Ready(r) = Pin::new(&mut m).poll(&mut cx) {
+                    r.unwrap();
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                open = Some(m);
+            }
         }
         measured = db.engine.shard_stall_busy(0);
-        Some(m)
+        open
     } else {
         None
     };
@@ -1614,7 +1628,7 @@ fn a_stall_still_open_at_the_balancer_pass_counts() {
     assert_eq!(db.engine.shard_stall_busy(0), Some(0.0));
     let measured = stall_pass_with(&mut db, |_| 20, 64, 1_000_000_000, true, &mut written);
     assert!(
-        measured.is_some_and(|f| f > 0.1),
+        measured.is_some_and(|f| f > 0.5),
         "the open wait was not counted: {measured:?}"
     );
     db.vfs.complete_all_io();
@@ -1645,13 +1659,13 @@ fn the_active_shards_a_stall_spread_to_hold_while_the_writes_go_on() {
     }
     let k = db.engine.pack_ks()[0].expect("decided");
     assert!(k >= 2, "after {passes} passes");
-    // The same row rate with 8 KiB rows (160 KiB per tablet per pass: no shard stalls, on
-    // one shard or four), so the floor's write-rate condition holds while nothing is hot;
-    // every thread reads 5% busy.
+    // The same row rate with 1 KiB rows (20 KiB per tablet per pass: no shard waits for
+    // room, on one shard or four), so the floor's write-rate condition holds while nothing
+    // is hot; every thread reads 5% busy.
     let stalls = db.engine.metrics().stalls.0;
     let mut ks = Vec::new();
     for _ in 0..120 {
-        stall_pass_with(&mut db, |_| 20, 8, 1_000_000_000, false, &mut written);
+        stall_pass_with(&mut db, |_| 20, 1, 1_000_000_000, false, &mut written);
         ks.push(db.engine.pack_ks()[0].expect("decided"));
     }
     assert!(
@@ -1817,13 +1831,36 @@ fn packed_with_shard_0_stalled() -> (Db, u64) {
     (db, written)
 }
 
+/// As [`packed_with_shard_0_stalled`], with 650 light passes between the packing and the
+/// stall, past the window in which a stall undoes the shrink: the growth from there is the
+/// rules' own, one shard at a time.
+fn packed_long_ago_with_shard_0_stalled() -> (Db, u64) {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    for _ in 0..650 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    assert_eq!(db.engine.pack_ks()[0], Some(1));
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    db.engine.set_shard_stalled(0, Some(1.0));
+    (db, written)
+}
+
 /// A stall-driven hot shard grows the active shards again while it still has tablets to
 /// shed (D255): its stall fraction stays at 1 however much it sheds, so D251's cooled check
 /// alone would hold it to one growth, at two shards (the busy sum over two is 0.5, under
 /// the spread threshold).
 #[test]
 fn a_stall_driven_growth_repeats_while_the_shard_has_tablets_to_shed() {
-    let (mut db, mut written) = packed_with_shard_0_stalled();
+    let (mut db, mut written) = packed_long_ago_with_shard_0_stalled();
     let mut passes = 0;
     while !db.engine.pack_ks()[0].is_some_and(|k| k >= 3) && passes < 120 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2001,6 +2038,148 @@ fn the_floor_backoff_resets_after_a_quiet_episode() {
     assert!(
         second < 600,
         "the second episode's window doubled although the first expired {first} passes in and 400 quiet passes passed since: {second} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Short stalls a few times a second read as a stalled shard (D255): a packed shard whose
+/// writers wait for room on every fifth pass and not between reads hot through the window
+/// and grows the active shards; pass by pass, the moving average of such stalls peaks near
+/// 0.56 and never reaches the hot test, nor the spread threshold on one shard.
+#[test]
+fn stalls_every_few_passes_read_as_a_stalled_shard() {
+    let (mut db, mut written) = packed_without_compaction();
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    db.vfs.set_deferred_io(true);
+    let mut passes = 0u64;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 150 {
+        if passes.is_multiple_of(5) {
+            stall_pass(&mut db, 4, 1_000_000_000, &mut written);
+        } else {
+            stall_pass_with(&mut db, |_| 1, 8, 1_000_000_000, false, &mut written);
+        }
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k >= 2),
+        "after {passes} passes the active shards are {:?}: stalls every fifth pass did not read hot",
+        db.engine.pack_ks()[0]
+    );
+    db.vfs.complete_all_io();
+    db.vfs.set_deferred_io(false);
+    db.settle();
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Four shards spread with a settled steady load: 300 passes at 60% busy (no shrink count
+/// runs: the busy sum over three is 0.8), long enough for the slow write average to meet
+/// the fast one, so the passes that follow do not read as ramping; then every thread at
+/// `busy`.
+fn spread_and_settled(busy: f64) -> (Db, u64) {
+    let mut db = spread_and_busy(0.6, true);
+    let mut written = 0;
+    for _ in 0..300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(busy));
+    }
+    (db, written)
+}
+
+/// A busy pass resets the shrink count ramping or not (D255, ctr274's review of build 4):
+/// four shards settled at 30% busy have 40 light passes counted, then three passes that are both busy
+/// (every shard at 60%, past the shrink target over three shards) and ramping (a burst of
+/// rows); the count must start over, so 40 more light passes leave the active shards at
+/// four. Pausing the reset too would carry the 40 across and shrink about 13 passes in.
+#[test]
+fn a_busy_pass_during_a_ramp_still_resets_the_shrink_count() {
+    let (mut db, mut written) = spread_and_settled(0.3);
+    for _ in 0..40 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.6));
+    }
+    for _ in 0..3 {
+        write_and_balance(&mut db, 4, |_| 400, &mut written);
+    }
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.3));
+    }
+    for pass in 0..40 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} {pass} passes after the busy burst"
+        );
+    }
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A pass on which an active shard's writers stall resets the shrink count (D255): four
+/// shards settled at 30% busy have 40 light passes counted, then one pass on which shard 0
+/// reads stalling but not hot; 40 more light passes leave the active shards at four. Counting the stalled
+/// pass as light would carry the 40 across and shrink after 10 (a write lull whose writers
+/// waited on room shrank a 16 GiB load from 16 shards to 2 on the AX102).
+#[test]
+fn a_stalled_pass_resets_the_shrink_count() {
+    let (mut db, mut written) = spread_and_settled(0.3);
+    for _ in 0..40 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
+    // Stalling (a published term past 0.1 after the pass), not hot.
+    db.engine.set_shard_stalled(0, Some(0.6));
+    write_and_balance(&mut db, 4, |_| 20, &mut written);
+    db.engine.set_shard_stalled(0, Some(0.0));
+    for pass in 0..40 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} {pass} passes after the stalled pass"
+        );
+    }
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A shrink that stalls writers soon after was wrong, and the first stall-driven growth
+/// undoes it in one step (D255): packed from four shards onto one, a shard reading fully
+/// stalled takes the active shards straight back to four, not to two.
+#[test]
+fn a_stall_soon_after_a_shrink_undoes_it_in_one_step() {
+    let (mut db, mut written) = packed_with_shard_0_stalled();
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] == Some(1) && passes < 60 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(4),
+        "the first growth after {passes} passes did not undo the shrink"
     );
     assert_eq!(db.scan_rows().len() as u64, written);
     db.engine.close().unwrap();

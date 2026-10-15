@@ -135,6 +135,26 @@ const PACK_RAMP: f64 = 1.25;
 /// interval): a load that only ever grows still packs.
 const PACK_RAMP_MAX: u64 = 600;
 
+/// A published stall fraction at or above which an active shard counts as stalling for the
+/// shrink count (D255): a pass on which any active shard's writers stall is no light pass,
+/// whatever the busy sum reads. On the AX102 a write lull in the middle of a 16 GiB load
+/// (the loader's writers waiting on room: writes 2,479 against 10–48K around it, busy
+/// 0.27) completed the count the ramp had let accrue, and D217 shrank 16 → 2 mid-load.
+const PACK_STALLING: u64 = 100_000;
+
+/// Balancer passes after a shrink within which a stall-driven growth undoes it (60 s at
+/// the base interval, D255): the growth goes straight back to the count before the shrink.
+/// Regrowing one shard per ten passes took most of a 16 GiB load on the AX102 after one
+/// mistaken shrink from 16 to 2.
+const PACK_SHRINK_UNDO: u64 = 600;
+
+/// Balancer passes after a stall during which the shard still reads stalled (1 s at the
+/// base interval, D255). A buffered load's stalls are short and a few per second per
+/// shard: a pass-by-pass reading smoothed by the moving average read them at about half,
+/// and never hot (the buffered riders row on the AX102: thousands of write stalls, and the
+/// top shards' stall terms at 0).
+const PACK_STALL_WINDOW: u64 = 10;
+
 /// Balancer passes with no active shard stalling after which a stall-driven floor expires
 /// (30 s at the base interval), and the cap of its doubling after each expiry (D255).
 const PACK_FLOOR_QUIET: u64 = 300;
@@ -1806,19 +1826,24 @@ impl ShardState {
             0 => (turns, counted),
             v => (Some((v - 1) as f64 / 1e6), true),
         };
-        // Stalls that began since the last pass (D255): a pass in which the writers stalled
-        // at all reads as fully stalled. A stall's length is the writers' latency, not the
-        // shard's load: a load that stalls every interval is at the shard's write capacity
-        // however short each stall (the buffered riders row stalled 7,000 times for 11% of
-        // the top shard's time and spread to five shards on the fraction alone).
+        // Stalls that began since the last pass (D255): a shard whose writers stalled at all
+        // within the last `PACK_STALL_WINDOW` passes reads as fully stalled. A stall's
+        // length is the writers' latency, not the shard's load: a load that stalls every
+        // second is at the shard's write capacity however short each stall (the buffered
+        // riders row stalled 7,000 times for 11% of the top shard's time and spread to five
+        // shards on the fraction alone, and read about half on a pass-by-pass reading).
         let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
+        if events > self.stall_events_mark || self.stall_open_since != 0 {
+            self.last_stall_pass = self.balance_pass.max(1);
+        }
+        let recent = self.last_stall_pass != 0
+            && self.balance_pass.saturating_sub(self.last_stall_pass) < PACK_STALL_WINDOW;
         let (syncs, stalls) = match (self.busy_mark, elapsed) {
             (Some((_, sync_was, stall_was, _)), Some(e)) if counted => {
                 let fraction = (stall.saturating_sub(stall_was) as f64 / e).min(1.0);
-                let stalled = events > self.stall_events_mark || self.stall_open_since != 0;
                 (
                     sync.saturating_sub(sync_was) as f64 / e,
-                    if stalled { 1.0 } else { fraction },
+                    if recent { 1.0 } else { fraction },
                 )
             }
             _ => (0.0, 0.0),
@@ -1993,9 +2018,13 @@ impl ShardState {
         // the stalls would come back, and `k` would swing between the two. The floor also
         // expires after a quiet window with no active shard stalling (the cause went away
         // with the load unchanged), each expiry doubling the next window.
-        let any_stalled = self.shared.loads[..k.min(n)]
-            .iter()
-            .any(|l| l.read_stall_busy_fresh(now, stale).unwrap_or(0) > 0);
+        let stall_terms = || {
+            self.shared.loads[..k.min(n)]
+                .iter()
+                .map(|l| l.read_stall_busy_fresh(now, stale).unwrap_or(0))
+        };
+        let any_stalled = stall_terms().any(|s| s > 0);
+        let stalling = stall_terms().any(|s| s >= PACK_STALLING);
         if any_stalled {
             self.floor_quiet = 0;
         } else {
@@ -2035,7 +2064,7 @@ impl ShardState {
         };
         let ramping = ramping && self.ramp_passes <= PACK_RAMP_MAX;
         trace!(
-            "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} (slow {writes_slow}, ramping {ramping}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
+            "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} (slow {writes_slow}, ramping {ramping}, stalling {stalling}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
             self.id.0,
             self.floor_quiet,
             self.floor_quiet_needed.max(PACK_FLOOR_QUIET),
@@ -2048,10 +2077,15 @@ impl ShardState {
         } else {
             self.pack_up = 0;
         }
-        if ramping {
-            // A ramping pass pauses the shrink count; it neither advances nor resets.
-        } else if !hot && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
-            self.pack_down += 1;
+        if !hot && !stalling && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
+            // A ramping pass pauses the shrink count: a light pass advances it only while
+            // the load is not ramping, and a hot, busy or stalling pass resets it ramping
+            // or not (ctr274's review: a count carried across a bursty heavy load's bursts
+            // would shrink and grow in a slow cycle; a lull whose writers wait on room is
+            // no light pass).
+            if !ramping {
+                self.pack_down += 1;
+            }
         } else {
             self.pack_down = 0;
         }
@@ -2065,6 +2099,13 @@ impl ShardState {
                 Some((b, stalled, h)) => {
                     self.hot_grew = Some((h, b));
                     if stalled {
+                        // A shrink that stalls writers within a minute was wrong: back to
+                        // the count before it in one step (D255).
+                        if let Some((from, at)) = self.shrunk_from.take()
+                            && self.balance_pass.saturating_sub(at) <= PACK_SHRINK_UNDO
+                        {
+                            self.pack_k = self.pack_k.max(from.min(n));
+                        }
                         if self.stall_floor.is_none() {
                             // A floor set within one quiet window of the last expiry is
                             // the same cause coming back: the window doubles, up to the
@@ -2090,6 +2131,7 @@ impl ShardState {
             }
         } else if self.pack_down >= PACK_SHRINK_PASSES {
             self.pack_k = want.min(k - 1).max(floor.max(1));
+            self.shrunk_from = Some((k, self.balance_pass));
             "a busy sum low enough for one fewer (D217)"
         } else {
             return true;

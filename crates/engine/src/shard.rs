@@ -2449,8 +2449,11 @@ pub(crate) struct ShardState {
     hot_grew: Option<(usize, u64)>,
     /// The moving average of the writers' stall fraction alone (D255).
     stall_ewma: f64,
-    /// The shard's stall count (`ShardMetrics::stalls`) at the last balancer pass (D255).
+    /// The shard's stall count (`ShardMetrics::stalls`) at the last balancer pass, and the
+    /// pass at which its writers last stalled (a stall began, or a span was open; 0: never):
+    /// a shard whose writers stalled within `PACK_STALL_WINDOW` passes reads stalled (D255).
     stall_events_mark: u64,
+    last_stall_pass: u64,
     /// A stall-driven growth's active shard count and the store's write rate then (D255):
     /// no shrink below that count while the store still writes at least half that rate,
     /// since the shards it spread to read idle once their writers stop stalling, and the
@@ -2469,6 +2472,10 @@ pub(crate) struct ShardState {
     /// Consecutive balancer passes the load has read as ramping: past `PACK_RAMP_MAX` the
     /// shrink counter runs again, so a load that only ever grows still packs.
     ramp_passes: u64,
+    /// The active shard count before the last shrink, and the pass of that shrink (D255): a
+    /// stall-driven growth within `PACK_SHRINK_UNDO` passes of it says the shrink was wrong,
+    /// and goes straight back to that count rather than one shard per ten passes.
+    shrunk_from: Option<(usize, u64)>,
     pack_k: usize,
     pack_up: u64,
     pack_down: u64,
@@ -2662,11 +2669,13 @@ impl ShardState {
             hot_grew: None,
             stall_ewma: 0.0,
             stall_events_mark: 0,
+            last_stall_pass: 0,
             stall_floor: None,
             floor_quiet: 0,
             floor_quiet_needed: 0,
             floor_expired_pass: 0,
             ramp_passes: 0,
+            shrunk_from: None,
             pack_k: 0,
             pack_up: 0,
             pack_down: 0,
