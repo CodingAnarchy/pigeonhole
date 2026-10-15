@@ -400,6 +400,7 @@ pub(crate) fn pool_main(
                 })
                 .min(RING_IDLE_WAIT);
             pigeonhole_io::reap_own_io(Some(until));
+            shared.signal.awake();
             continue;
         }
         match sched.next_deadline() {

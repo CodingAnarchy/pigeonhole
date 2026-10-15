@@ -7,7 +7,8 @@
 //! cover the backend cannot pass without it.
 #![cfg(all(target_os = "linux", not(miri)))]
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use pigeonhole_io::uring::UringVfs;
@@ -100,10 +101,39 @@ impl Task for WriteThenRead {
     }
 }
 
-#[test]
-fn a_pool_thread_completes_its_own_io_on_its_own_ring() {
+/// Stays runnable (one `Pending` slice after another) until told to stop: a compaction
+/// that keeps the pool thread busy, so the thread never reaches its idle wait.
+struct Busy {
+    stop: Arc<AtomicBool>,
+    slices: Arc<AtomicU64>,
+}
+
+impl Task for Busy {
+    fn run(&mut self, _deadline: u64, _waker: &TaskWaker) -> TaskPoll {
+        self.slices.fetch_add(1, Ordering::Relaxed);
+        if self.stop.load(Ordering::Acquire) {
+            TaskPoll::Done
+        } else {
+            TaskPoll::Pending
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "busy"
+    }
+}
+
+struct Started {
+    rt: Runtime<Spawner>,
+    reports: mpsc::Receiver<Report>,
+    dir: std::path::PathBuf,
+}
+
+/// A runtime with one shard and one pool thread, with `WriteThenRead` spawned to the pool
+/// (after `before`, if any).
+fn start(tag: &str, before: Option<Box<dyn Task>>) -> Started {
     let dir = std::env::temp_dir().join(format!(
-        "pigeonhole-runtime-pool-ring-{}",
+        "pigeonhole-runtime-pool-ring-{tag}-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -117,6 +147,9 @@ fn a_pool_thread_completes_its_own_io_on_its_own_ring() {
     c.pin_threads = false;
     let rt = Runtime::start(c, vec![Spawner]).unwrap();
     let (report, reports) = mpsc::channel();
+    if let Some(task) = before {
+        rt.submitter(ShardId(0)).submit(Msg::Spawn(task)).unwrap();
+    }
     rt.submitter(ShardId(0))
         .submit(Msg::Spawn(Box::new(WriteThenRead {
             file,
@@ -124,36 +157,72 @@ fn a_pool_thread_completes_its_own_io_on_its_own_ring() {
             report,
         })))
         .unwrap();
+    Started { rt, reports, dir }
+}
+
+/// Reads the task's two reports and checks the I/O shape they describe.
+fn check_reports(reports: &mpsc::Receiver<Report>, what: &str) {
     let wait = Duration::from_secs(10);
     match reports
         .recv_timeout(wait)
-        .expect("the task ran on the pool")
+        .unwrap_or_else(|e| panic!("{what}: the task did not run on the pool: {e}"))
     {
         Report::Submitted { own, thread } => {
             assert!(
                 thread.starts_with("pigeonhole-compaction-"),
-                "the task ran on {thread}, not a pool thread"
+                "{what}: the task ran on {thread}, not a pool thread"
             );
             assert!(
                 own,
-                "the pool thread's write went to the shared ring, not a ring of its own"
+                "{what}: the pool thread's write went to the shared ring, not a ring of its own"
             );
         }
-        Report::Done { .. } => panic!("the task finished before it reported its submit"),
+        Report::Done { .. } => panic!("{what}: the task finished before it reported its submit"),
     }
     match reports
         .recv_timeout(wait)
-        .expect("the write's completion woke the task while the pool thread idled")
+        .unwrap_or_else(|e| panic!("{what}: the write's completion did not wake the task: {e}"))
     {
         Report::Done {
             thread,
             resolved_on,
         } => assert_eq!(
             resolved_on, thread,
-            "the pool thread's blocking read resolved on another thread"
+            "{what}: the pool thread's blocking read resolved on another thread"
         ),
-        Report::Submitted { .. } => panic!("reported twice"),
+        Report::Submitted { .. } => panic!("{what}: reported twice"),
     }
-    rt.shutdown().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pool_thread_completes_its_own_io_on_its_own_ring() {
+    let s = start("idle", None);
+    check_reports(&s.reports, "idle pool thread");
+    s.rt.shutdown().unwrap();
+    let _ = std::fs::remove_dir_all(&s.dir);
+}
+
+/// The busy path: another task keeps the pool thread running slices, so it never reaches
+/// its idle wait. The write's completion must still reach the blocked task, through the
+/// reap at the top of every pass (a ring that completes only when its owner enters it
+/// posts nothing while the thread stays in user space).
+#[test]
+fn a_busy_pool_thread_still_completes_its_own_io_between_slices() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let slices = Arc::new(AtomicU64::new(0));
+    let s = start(
+        "busy",
+        Some(Box::new(Busy {
+            stop: Arc::clone(&stop),
+            slices: Arc::clone(&slices),
+        })),
+    );
+    check_reports(&s.reports, "busy pool thread");
+    stop.store(true, Ordering::Release);
+    assert!(
+        slices.load(Ordering::Relaxed) > 1,
+        "the busy task did not keep the pool thread running"
+    );
+    s.rt.shutdown().unwrap();
+    let _ = std::fs::remove_dir_all(&s.dir);
 }
