@@ -2426,13 +2426,15 @@ pub(crate) struct ShardState {
     slow_run: u64,
     slow_pass: Option<u64>,
     chose_slow: std::cell::Cell<bool>,
-    /// Packing (D217): this shard's busy time and clock at its last pass, the moving average
-    /// of how busy it was, and, on shard 0 only (which decides for every shard and publishes
-    /// it as `Shared::pack_k`), how many shards stay active (`0..pack_k`; 0 before the first
-    /// decision) and the consecutive passes calling for more or fewer of them.
-    busy_mark: Option<(u64, u64, u64)>,
+    /// Packing (D217): this shard's turn busy, sync busy and stall time (D248, D255) and
+    /// clock at its last pass, the moving average of how busy it was, and, on shard 0 only
+    /// (which decides for every shard and publishes it as `Shared::pack_k`), how many shards
+    /// stay active (`0..pack_k`; 0 before the first decision) and the consecutive passes
+    /// calling for more or fewer of them.
+    busy_mark: Option<(u64, u64, u64, u64)>,
     busy_ewma: f64,
-    /// The moving average of the thread's turn busy fraction alone (D251).
+    /// The moving average of the larger of the thread's turn busy fraction and its writers'
+    /// stall fraction, without the sync term (D251's hot test, D255).
     turn_ewma: f64,
     /// A hot-triggered growth of the active shards (D251): the hot shard and its turn busy
     /// fraction then (millionths). Another one needs that shard to have cooled since (what

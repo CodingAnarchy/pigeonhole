@@ -725,11 +725,17 @@ fn a_short_burst_of_skew_changes_no_tablet() {
 /// Four shards, one written tablet each, every shard measuring itself `busy` (the test hook
 /// stands in for the threads' busy time, which application-owned shards do not count).
 fn spread_and_busy(busy: f64, pack: bool) -> Db {
+    spread_and_busy_with(busy, pack, |_| {})
+}
+
+/// [`spread_and_busy`] with more options.
+fn spread_and_busy_with(busy: f64, pack: bool, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
     let shards = 4;
     let mut db = open(shards, |o| {
         o.balance_interval_nanos = u64::MAX;
         o.balance_min_writes = 10;
         o.balance_pack = pack;
+        tweak(o);
     });
     tablets_on(&mut db, shards, |t| t as u16);
     for s in 0..shards {
@@ -1341,6 +1347,135 @@ fn packed_tablets_spread_again_when_the_shard_turns_busy() {
         "after {passes} passes, changes {:?}",
         (after.0 - packed.0, after.1 - packed.1, after.2 - packed.2)
     );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// One pass of a write load that overflows shard 0's arena (D255's test): a batch per
+/// tablet, each past a quarter of the 4 MiB arena, submitted together with the simulator's
+/// I/O deferred, so the first flush stays in flight and the later batches wait for room;
+/// the clock then advances `stalled` while they wait, the I/O completes, every commit
+/// finishes, and the balancer runs a pass. Every tablet gets the same writes, so only the
+/// placement decides which shard stalls.
+fn stall_pass(db: &mut Db, n: usize, stalled: u64, written: &mut u64) {
+    let f = db.table.families[0].id;
+    let value = vec![7u8; 64 << 10];
+    let mut pending: Vec<_> = (0..n)
+        .map(|t| {
+            let mut wb = WriteBatch::new();
+            for _ in 0..20 {
+                wb.put(
+                    db.table.id,
+                    f,
+                    &tablet_row(t, *written),
+                    b"q",
+                    None,
+                    ValueRef::Bytes(&value),
+                )
+                .unwrap();
+                *written += 1;
+            }
+            db.engine
+                .submit(wb, Some(Durability::Buffered))
+                .expect("submit")
+        })
+        .collect();
+    // The shard admits what fits, freezes and starts a flush (its I/O stays in flight), and
+    // the rest wait for room.
+    for _ in 0..20 {
+        db.vfs.advance(2_000_000);
+        db.step();
+    }
+    db.vfs.advance(stalled);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..10_000 {
+        // The clock keeps moving while the flushes complete, as a real one would, past the
+        // room wait's re-check interval each step: a wait for room on a stopped clock with
+        // nothing in flight is refused (issue #70).
+        db.vfs.advance(2_000_000);
+        db.vfs.complete_all_io();
+        db.step();
+        pending.retain_mut(|pc| match Pin::new(pc).poll(&mut cx) {
+            Poll::Ready(r) => {
+                r.expect("commit");
+                false
+            }
+            Poll::Pending => true,
+        });
+        if pending.is_empty() {
+            break;
+        }
+    }
+    assert!(pending.is_empty(), "commits did not finish");
+    let mut m = db.engine.balance_pending().unwrap();
+    for _ in 0..100_000 {
+        if let Poll::Ready(r) = Pin::new(&mut m).poll(&mut cx) {
+            return r.unwrap();
+        }
+        db.vfs.advance(2_000_000);
+        db.vfs.complete_all_io();
+        db.step();
+    }
+    panic!("the balancer pass did not finish")
+}
+
+/// Once packed, a shard whose thread reads idle but whose writers wait for arena room
+/// reads hot all the same (D255: the stall time counts as busy, beside the turn and sync
+/// terms), so a second shard comes back and the tablets spread over the two. With flush and
+/// compaction on dedicated threads (D252) a loaded shard's turns are cheap: counting only
+/// them kept whole tables on one shard, whose arena then forced tiny flushes (45x write
+/// amplification on a bulk load).
+#[test]
+fn packed_tablets_spread_again_when_the_shard_stalls_for_room() {
+    // No compaction: a job keeps the view it started with, whose readers pin the chunks of
+    // every memtable flushed meanwhile, and on the simulator's stopped clock a wait for
+    // room with nothing but that in flight is refused (issue #70).
+    let mut db = spread_and_busy_with(0.1, true, |o| o.compaction.l0_trigger = 1 << 20);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    // Every thread idle: only the stall can make a shard hot.
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    db.vfs.set_deferred_io(true);
+    let packed = tablet_changes(&db.engine);
+    let stalls_before = db.engine.metrics().stalls.0;
+    passes = 0;
+    let spread = |db: &Db| {
+        let per = tablets_per_shard(db, 4);
+        per[0] < 4 && per.iter().filter(|&&n| n > 0).count() >= 2
+    };
+    while !spread(&db) && passes < 300 {
+        stall_pass(&mut db, 4, 1_000_000_000, &mut written);
+        passes += 1;
+    }
+    let after = tablet_changes(&db.engine);
+    assert!(
+        spread(&db),
+        "after {passes} passes shard 0 still holds every tablet: {:?}, changes {:?}",
+        tablets_per_shard(&db, 4),
+        (after.0 - packed.0, after.1 - packed.1, after.2 - packed.2)
+    );
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k >= 2),
+        "the active shards stayed at {:?}",
+        db.engine.pack_ks()[0]
+    );
+    assert!(
+        db.engine.metrics().stalls.0 > stalls_before,
+        "the load never waited for room"
+    );
+    db.vfs.complete_all_io();
+    db.vfs.set_deferred_io(false);
+    db.settle();
     assert_eq!(db.scan_rows().len() as u64, written);
     db.engine.close().unwrap();
     for _ in 0..8 {

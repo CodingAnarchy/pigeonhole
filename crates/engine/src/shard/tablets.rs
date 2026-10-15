@@ -1745,14 +1745,19 @@ impl ShardState {
     }
 
     /// Updates this shard's moving average of how busy it was since the last pass (D217,
-    /// D248): the larger of its thread's busy time and its group syncs' utilization, each
-    /// over the time that passed. Utilization is the syncs' in-flight time (summed over the
-    /// syncs in flight) over that time, capped at 1, so a shard whose durable commits keep a
-    /// sync in flight reads busy although its thread mostly waits. Not divided by
-    /// `group_sync_depth`: a shard's concurrent syncs fold into one journal commit (D221), so
-    /// they are one server, not two (D248's A/B). `max`, since a turn often runs
-    /// while a sync is in flight. Syncs count only while the runtime counts turn time
-    /// (engine-owned shards): an application-owned store stays unpacked, as before.
+    /// D248, D255): the largest of its thread's busy time, its group syncs' utilization and
+    /// the time its writers stalled, each over the time that passed. Utilization is the
+    /// syncs' in-flight time (summed over the syncs in flight) over that time, capped at 1,
+    /// so a shard whose durable commits keep a sync in flight reads busy although its thread
+    /// mostly waits. Not divided by `group_sync_depth`: a shard's concurrent syncs fold into
+    /// one journal commit (D221), so they are one server, not two (D248's A/B). The stall
+    /// time is what commits spent waiting for arena room or paced on L0 depth (D255): with
+    /// flush and compaction on dedicated threads (D252) a shard carrying a full write load
+    /// runs cheap turns and reads idle, so packing kept whole tables on one shard; a shard
+    /// whose writers wait is hot in the sense that counts, more shards would take the load.
+    /// `max`, since a turn often runs while a sync is in flight or writers wait. Syncs and
+    /// stalls count only while the runtime counts turn time (engine-owned shards): an
+    /// application-owned store stays unpacked, as before.
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
         let busy = self
@@ -1762,13 +1767,14 @@ impl ShardState {
             .and_then(|s| s.get(me))
             .map_or(0, |s| s.busy_nanos());
         let sync = self.sync_busy_nanos(now);
+        let stall = self.stall_busy_nanos(now);
         let elapsed = match self.busy_mark {
-            Some((_, _, at)) if now > at => Some((now - at) as f64),
+            Some((_, _, _, at)) if now > at => Some((now - at) as f64),
             _ => None,
         };
         // The thread's busy time (none counted for an application-owned shard).
         let turns = match (self.busy_mark, elapsed) {
-            (Some((was, _, _)), Some(e)) => Some(busy.saturating_sub(was) as f64 / e),
+            (Some((was, _, _, _)), Some(e)) => Some(busy.saturating_sub(was) as f64 / e),
             _ => None,
         };
         let counted = busy > 0;
@@ -1782,20 +1788,46 @@ impl ShardState {
             0 => (turns, counted),
             v => (Some((v - 1) as f64 / 1e6), true),
         };
-        let syncs = match (self.busy_mark, elapsed) {
-            (Some((_, sync_was, _)), Some(e)) if counted => {
-                sync.saturating_sub(sync_was) as f64 / e
-            }
-            _ => 0.0,
+        let (syncs, stalls) = match (self.busy_mark, elapsed) {
+            (Some((_, sync_was, stall_was, _)), Some(e)) if counted => (
+                sync.saturating_sub(sync_was) as f64 / e,
+                stall.saturating_sub(stall_was) as f64 / e,
+            ),
+            _ => (0.0, 0.0),
         };
-        let measured = turns.map(|t| t.max(syncs).min(1.0));
+        let measured = turns.map(|t| t.max(syncs).max(stalls).min(1.0));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
         }
+        // The hot test (D251) leaves the sync term out, and takes the stall term in (D255):
+        // a shard's syncs may run back to back however many shards share the load, while
+        // its writers' waits for room and L0 depth do ease once it sheds tablets.
         if let Some(t) = turns {
-            self.turn_ewma = LOAD_ALPHA * t.min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
+            self.turn_ewma =
+                LOAD_ALPHA * t.max(stalls).min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
         }
-        self.busy_mark = Some((busy, sync, now));
+        self.busy_mark = Some((busy, sync, stall, now));
+    }
+
+    /// The time this shard's commits have spent stalled up to `now` (D255): waiting for arena
+    /// room (`wait_for_room`) or paced on L0 depth (`stalled`), the per-shard `stall_nanos`
+    /// the engine reports plus whatever wait is still open. That metric grows by a wait's
+    /// whole span when the wait ends, so with the open span added the total only ever moves
+    /// forward, and a pass's share is the difference of two readings.
+    fn stall_busy_nanos(&self, now: u64) -> u64 {
+        let ended = self.shared.metrics[usize::from(self.id.0)]
+            .stall_nanos
+            .load(Ordering::Relaxed);
+        let room = self
+            .room_wait
+            .as_ref()
+            .map_or(0, |w| now.saturating_sub(w.since));
+        let paced = if self.stall.since == 0 {
+            0
+        } else {
+            now.saturating_sub(self.stall.since)
+        };
+        ended.saturating_add(room).saturating_add(paced)
     }
 
     /// The shards that stay active under packing (D217): `0..k`. Every shard, without

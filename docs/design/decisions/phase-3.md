@@ -1566,6 +1566,8 @@ Each part disabled fails its test.
 - ycsb-a `--durability buffered`, main against D248: unchanged within noise, and packing still packs.
 - `k` settles with no oscillation over the 60 s.
 
+*History: amended by [D255](#d255), 2026-10-15: the busy measure gains a third term, the shard's write-stall time, with the same `max`.*
+
 <a id="d249"></a>
 ## D249 — A cross-shard PREPARE that overlaps only an undecided share is refused and retried, not a `Conflict`; crossing pairs resolve older-first (owner decision, 2026-10-13; engine, #406, ICR 0045; amends D145's refusals, builds on D241 and D245)
 
@@ -1660,6 +1662,8 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
 - A single sync-saturated durable writer (D248 term about 0.95, turn busy 0.05) settles at `k` ≤ 2 (fails if the hot test counts the sync term).
 
 **Acceptance (AX102, after the gate):** no stuck placement, and a buffered packing check (ycsb-a, time-series-ttl, ycsb-f) unchanged against main. Both held in the 2026-10-14 A/B: a 90 s run settled at `k` = 4 with every shard at 0.80–0.89 busy, with no flapping, and the packing check was within run-to-run noise. Cross-shard-contention with tablet changes on reached 0.48–0.52× off (201K against 384–400K), short of D246's 0.8×; hence item 3.
+
+*History: amended by [D255](#d255), 2026-10-15: the hot test takes the larger of the turn busy and the write-stall fraction (still without the sync term).*
 
 <a id="d252"></a>
 ## D252 — Engine-owned mode runs flush and compaction on dedicated threads by default, `clamp(shards / 4, 1, 4)` of them; when they don't fit the CPU set, the shards stay pinned (owner decision, 2026-10-14; pigeonhole, runtime, engine, #406, #721; amends the spec's "Background work", D235)
@@ -1787,3 +1791,25 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 - **Long turns:** about 10× fewer at ct4 (the D252 default), and about 11% fewer at ct0. Throughput is up 2–4%.
 - **The install:** `on_flushed` is down about 30% at ct0 and 17% at ct4. The rest of it is `report_shares_flushed`'s per-share scan (each share's slots checked against the catalog), not the messages.
 - **The coordinators' longest turn (perf287's review) did not improve.** One `SharesFlushed` carries a flush's ~100K seqnos, and its handler counts each one and then advances the checkpoint past the records they free. That is the same work as before (about 7 s of long turns at ct4, against about 8 s), in fewer, longer turns: 25–42 ms p99, up to 50 ms, against a 29–42 ms max on main. Bounding it is a follow-up: handle a message in slices across turns, and make the report and its receipt cheaper per share.
+
+<a id="d255"></a>
+## D255 — Packing counts a shard's write-stall time as busy, beside its turn and sync busy (owner decision, 2026-10-15; engine, #406; amends D248, D251)
+
+**Decided:**
+- **A third term in the busy measure.** A shard's balancer measures its busy fraction as the largest of its thread's turn busy time (D217), its group syncs' utilization (D248) and, now, the time its commits spent stalled, each over the time since its last pass: the per-shard `stall_nanos` the engine already reports (waits for arena room in `wait_for_room`, pacing on L0 depth in `stalled`), with the span of a wait still open added, so the total only moves forward and a pass's share is the difference of two readings.
+- **The hot test counts it too.** D251's hot test (`PACK_HOT`, turn busy only) takes the larger of the turn busy and the stall fraction. It still leaves the sync term out: a shard's syncs may run back to back however many shards share the load, while its writers' waits for room and L0 depth do ease once it sheds tablets.
+- **Nothing else moves.** Flush and compaction stay on the dedicated threads (D252); the pacer, the room wait and the pickers are unchanged. Application-owned shards count no turn time, so they count no stall time either and stay unpacked, as before.
+
+**Why** (the 0.3.0 gate's cold-get step and perf2's box traces, `.coord/perf2-d252-uring/fable/`, 2026-10-15):
+- With flush and compaction on the pool (D252), a 16 GiB random load wrote 44–51× its data and took 745–845 s at 4, 8 and 16 compaction threads, against 8× and 120 s with them on the shards. The count did not matter, and the io_uring stall (#729) was already fixed in that build.
+- The traces showed why: packing kept the table on one or two shards. At ct 4 shard 0 owned 86 of 117 tablets and ran 241 of 334 compaction jobs (perf2's metrics run: 70 and 63 tablets on two shards, 18,283 forced room freezes against 45 size freezes on shard 0, 3,444 write stalls for 62 s); at ct 0 the tablets spread 10–15 per shard. Packing grows the active shards when a shard reads hot by turn busy and sync utilization, and D252 took flush and compaction, the bulk of a loaded shard's CPU, off its thread: a shard carrying the whole load runs cheap turns and reads idle.
+- One arena (64 MiB) shared by 86 memtable slots never lets a memtable reach its freeze size; every commit waits for room, and with the last flush long done D124's room freeze forces the largest open memtables, dozens of sub-megabyte ones, into L0 (the ~150 KB L0 files, 55,600 of them against 893). One compaction at a time per shard across 86 always-due L0s then starves L1→L2 (2 jobs against 41), L1 grows, and every L0→L1 rewrites it.
+- A shard whose writers wait is hot in the only sense packing needs: more shards would take the load. Counting the stall time restores the spread D252 removed without putting any work back on the shard thread, so D252's tail gains stay.
+
+**Tests:**
+- `tablets.rs` `packed_tablets_spread_again_when_the_shard_stalls_for_room`: packed onto shard 0 with every thread reading idle (the busy hook at 0), a load whose batches overflow shard 0's 4 MiB arena with the simulator's I/O deferred makes its commits wait for room while the clock advances; within 300 passes shard 0 stops holding every tablet and the active count passes one. Without the stall term it holds all four after 300 passes with no change.
+- The existing packing tests (light writes pack, a busy shard spreads, the slot floor, D248's sync utilization) are unchanged and still pass: a load that never stalls measures as before.
+
+**Acceptance (pending, AX102):** coldget 8 GiB at the default count, expected near ct 0's 7× and ~90 s; the contended ycsb-a riders row at default and buffered with stalls back near bcea95e2's level and p99 kept (no riders ~41 µs).
+
+**Follow-ups (not in this change):** a compaction job keeps the view it started with, whose readers pin the chunks of every memtable flushed meanwhile, so room returns late under back-to-back compactions; D124's room freeze takes half the arena across however many small slots (a floor per slot would keep L0 files larger); L1→L2 can starve behind always-due L0s on a shard with many slots.
