@@ -114,6 +114,15 @@ const PACK_GROW_PASSES: u64 = 10;
 /// (5 s): packing is slow, so a pause between bursts does not reshuffle.
 const PACK_SHRINK_PASSES: u64 = 50;
 
+/// Balancer passes on which the store must have written before its first shrink from the
+/// unpacked start (30 s at the base interval, a slow-average window, D255, #734): a load's
+/// phases (a load, a settle, a warm-up) dip between them for a few seconds, and a pack on
+/// a dip moves every tablet twice, the second time while the load is measured. On the
+/// AX102 the dip packed 16 shards to 2 at about 21 s and D251's regrowth then moved
+/// tablets back out until about 90 s, a put p99.9 of 290-362 µs against 73 with the moves
+/// out of the measured phase. A light store still packs, 30 s in.
+const PACK_FIRST_SHRINK_PASSES: u64 = 300;
+
 /// Packing (D251): an active shard whose thread is busier than this (turn busy, without
 /// D248's sync term) also calls for more active shards, whatever the average (`PACK_SPREAD`
 /// looks only at `B / k`, which a saturated shard beside an idle one never passes), and while
@@ -1941,6 +1950,9 @@ impl ShardState {
             .iter()
             .map(|l| l.read_slow_fresh(now, stale).unwrap_or(0))
             .sum();
+        if writes >= self.shared.balance.min_writes.max(1) {
+            self.writing_passes = self.writing_passes.saturating_add(1);
+        }
         if busy <= 0.0 || writes < self.shared.balance.min_writes.max(1) {
             self.pack_up = 0;
             self.pack_down = 0;
@@ -2129,7 +2141,9 @@ impl ShardState {
                     "the busy sum over the active shards (D217)"
                 }
             }
-        } else if self.pack_down >= PACK_SHRINK_PASSES {
+        } else if self.pack_down >= PACK_SHRINK_PASSES
+            && (k < n || self.writing_passes >= PACK_FIRST_SHRINK_PASSES)
+        {
             self.pack_k = want.min(k - 1).max(floor.max(1));
             self.shrunk_from = Some((k, self.balance_pass, writes));
             "a busy sum low enough for one fewer (D217)"

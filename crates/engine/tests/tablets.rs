@@ -753,7 +753,7 @@ fn light_writes_pack_tablets_onto_fewer_shards() {
     let setup = tablet_changes(&db.engine);
     let mut written = 0;
     let mut passes = 0;
-    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         passes += 1;
     }
@@ -802,7 +802,7 @@ fn every_shard_uses_the_same_active_shard_count_from_light_to_heavy_writes() {
         ks[0].expect("a balancer pass ran")
     };
     let mut passes = 0;
-    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         agree(&db, &format!("light, pass {passes}"));
         passes += 1;
@@ -945,7 +945,7 @@ fn buffered_and_trickling_durable_loads_still_pack() {
         db.vfs.set_deferred_io(true);
         let mut written = 0;
         let mut passes = 0;
-        while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
             sync_pass(&mut db, 4, durability, 1_000_000, idle, &mut written);
             passes += 1;
         }
@@ -1043,7 +1043,7 @@ fn a_full_shard_of_equal_small_tablets_sheds_them() {
     let before = tablet_changes(&db.engine);
     let mut written = 0;
     let mut passes = 0;
-    while tablets_per_shard(&db, 2)[0] > 11 && passes < 300 {
+    while tablets_per_shard(&db, 2)[0] > 11 && passes < 600 {
         write_and_balance(&mut db, 17, |t| if t < 16 { 20 } else { 50 }, &mut written);
         passes += 1;
     }
@@ -1086,7 +1086,7 @@ fn a_saturated_shard_grows_the_active_shards_holds_them_while_hot_and_lets_go_af
     }
     let mut written = 0;
     let mut passes = 0;
-    while db.engine.pack_ks()[0] != Some(2) && passes < 300 {
+    while db.engine.pack_ks()[0] != Some(2) && passes < 600 {
         write_and_balance(&mut db, n, |_| 20, &mut written);
         passes += 1;
     }
@@ -1152,7 +1152,7 @@ fn an_unsplittable_hot_tablet_grows_k_at_most_once_and_does_not_flap() {
     }
     let mut written = 0;
     let mut passes = 0;
-    while db.engine.pack_ks()[0] != Some(1) && passes < 300 {
+    while db.engine.pack_ks()[0] != Some(1) && passes < 600 {
         write_and_balance(&mut db, shards, |_| 20, &mut written);
         passes += 1;
     }
@@ -1232,7 +1232,7 @@ fn a_sync_saturated_single_writer_settles_at_two_shards_or_fewer() {
     db.vfs.set_deferred_io(true);
     let mut written = 0;
     let mut ks = vec![];
-    for _ in 0..300 {
+    for _ in 0..600 {
         sync_pass(
             &mut db,
             1,
@@ -1302,7 +1302,7 @@ fn packing_keeps_as_many_shards_as_the_tablets_slots_need() {
     let mut written = 0;
     let mut passes = 0;
     let packed = |db: &Db| tablets_per_shard(db, shards)[2..].iter().all(|&n| n == 0);
-    while !packed(&db) && passes < 400 {
+    while !packed(&db) && passes < 600 {
         write_and_balance(&mut db, shards, |_| 20, &mut written);
         passes += 1;
     }
@@ -1325,7 +1325,7 @@ fn packed_tablets_spread_again_when_the_shard_turns_busy() {
     let mut db = spread_and_busy(0.1, true);
     let mut written = 0;
     let mut passes = 0;
-    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         passes += 1;
     }
@@ -1493,7 +1493,7 @@ fn packed_tablets_spread_again_when_the_shard_stalls_for_room() {
     let mut db = spread_and_busy_with(0.1, true, |o| o.compaction.l0_trigger = 1 << 20);
     let mut written = 0;
     let mut passes = 0;
-    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         passes += 1;
     }
@@ -1546,7 +1546,7 @@ fn packed_without_compaction() -> (Db, u64) {
     let mut db = spread_and_busy_with(0.1, true, |o| o.compaction.l0_trigger = 1 << 20);
     let mut written = 0;
     let mut passes = 0;
-    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         passes += 1;
     }
@@ -1781,14 +1781,14 @@ fn pacing_ends_when_a_tablet_change_takes_its_commits() {
     }
 }
 
-/// No shrink while the load is still ramping (D255, #734): four shards 30% busy would pack
-/// onto three after 50 passes, but with the rows per pass rising the fast write average
-/// stays above the slow one and the active shards hold; once the rows hold steady long
-/// enough for the slow average to catch up, the shrink comes.
+/// No shrink while the load is still ramping (D255, #734): four shards settled at 30% busy
+/// (past the first-shrink window) would pack onto three after 50 passes, but with the rows
+/// per pass rising the fast write average stays above the slow one and the active shards
+/// hold; once the rows hold steady long enough for the slow average to catch up, the shrink
+/// comes.
 #[test]
 fn no_shrink_while_the_load_is_ramping() {
-    let mut db = spread_and_busy(0.3, true);
-    let mut written = 0;
+    let (mut db, mut written) = spread_and_settled(0.3);
     for pass in 0..80u64 {
         write_and_balance(&mut db, 4, |_| 20 + 4 * pass, &mut written);
         let k = db.engine.pack_ks()[0];
@@ -1819,7 +1819,7 @@ fn packed_with_shard_0_stalled() -> (Db, u64) {
     let mut db = spread_and_busy(0.1, true);
     let mut written = 0;
     let mut passes = 0;
-    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         passes += 1;
     }
@@ -1838,7 +1838,7 @@ fn packed_long_ago_with_shard_0_stalled() -> (Db, u64) {
     let mut db = spread_and_busy(0.1, true);
     let mut written = 0;
     let mut passes = 0;
-    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         passes += 1;
     }
@@ -2291,6 +2291,66 @@ fn a_load_that_only_ramps_still_packs_after_the_cap() {
     assert!(
         db.engine.pack_ks()[0].is_some_and(|k| k < 4),
         "the active shards never shrank under a ramp past the cap ({pass} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// The first shrink from the unpacked start needs a slow-average window of the light
+/// condition (D255, #734): four shards 60% busy for 100 passes, 10% for 100 (a dip between
+/// a load's phases, twice the usual 50-pass persistence), 60% again: the active shards stay
+/// at four throughout. With the usual persistence the dip packed the store, and the load's
+/// return then moved every tablet back out while it was measured.
+#[test]
+fn a_dip_between_phases_does_not_pack_an_unpacked_store() {
+    let mut db = spread_and_busy(0.6, true);
+    let mut written = 0;
+    let phases: [(f64, usize); 3] = [(0.6, 100), (0.1, 100), (0.6, 100)];
+    for (phase, &(busy, passes)) in phases.iter().enumerate() {
+        for s in 0..4 {
+            db.engine.set_shard_busy(s, Some(busy));
+        }
+        for pass in 0..passes {
+            write_and_balance(&mut db, 4, |_| 20, &mut written);
+            let k = db.engine.pack_ks()[0];
+            assert!(
+                k.is_none_or(|k| k == 4),
+                "the active shards shrank to {k:?} at pass {pass} of phase {phase}"
+            );
+        }
+    }
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A light store still packs, after the window (D255, #734): four shards 10% busy hold at
+/// four for 250 passes and have packed by 400; the shrinks after the first keep D217's 50.
+#[test]
+fn a_light_store_packs_after_the_first_window() {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    for pass in 0..250 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass}, before the window"
+        );
+    }
+    let mut passes = 250;
+    while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 400 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k < 4),
+        "a light store never packed ({passes} passes)"
     );
     assert_eq!(db.scan_rows().len() as u64, written);
     db.engine.close().unwrap();

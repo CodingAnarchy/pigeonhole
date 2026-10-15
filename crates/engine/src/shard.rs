@@ -2467,6 +2467,11 @@ pub(crate) struct ShardState {
     /// Consecutive balancer passes the load has read as ramping: past `PACK_RAMP_MAX` the
     /// shrink counter runs again, so a load that only ever grows still packs.
     ramp_passes: u64,
+    /// Balancer passes on which the store wrote (D255): the first shrink from the unpacked
+    /// start waits for `PACK_FIRST_SHRINK_PASSES` of them, a slow-average window, since a
+    /// load's phases dip between them for a few seconds and a pack on a dip moves every
+    /// tablet twice (#734).
+    writing_passes: u64,
     /// The active shard count before the last shrink, the pass of that shrink and the
     /// store's write rate then (D255): a stall-driven growth within `PACK_SHRINK_UNDO` passes
     /// of it, with the store writing at least twice that rate, says the shrink was wrong,
@@ -2669,6 +2674,7 @@ impl ShardState {
             floor_quiet_needed: 0,
             floor_expired_pass: 0,
             ramp_passes: 0,
+            writing_passes: 0,
             shrunk_from: None,
             pack_k: 0,
             pack_up: 0,
