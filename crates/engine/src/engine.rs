@@ -174,7 +174,7 @@ pub struct Metrics {
     /// (D198), summed over shards (D256); not in `shard_busy_nanos`. Its rise over an
     /// interval, divided by the interval, is how many threads' worth of polling the store
     /// did: awake time its clients caused without work behind it.
-    pub shard_spin_nanos: u64,
+    pub shard_spin_time_nanos: u64,
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
@@ -268,11 +268,11 @@ pub struct ShardStats {
     /// the pool term packing adds to the shard's turn busy.
     pub pool_busy_nanos: u64,
     /// Nanoseconds the shard's engine-owned thread spent in its spin before parking (D198:
-    /// polling for the next message after handling one), not in `busy_nanos` (D256). Its
+    /// polling for the next message after handling one), not in `busy_nanos` (D256; the spin window is `EngineOptions::shard_spin_nanos`). Its
     /// rise over an interval, divided by the interval, is the spin term packing adds to the
     /// shard's turn busy: a shard its clients keep awake. Zero for an application-owned
     /// shard.
-    pub spin_nanos: u64,
+    pub spin_time_nanos: u64,
 }
 
 /// The lock-page byte range of the superblock-less file check (decision D59).
@@ -2070,14 +2070,14 @@ impl Engine {
                 busy_nanos: 0,
                 sync_busy_nanos: m.sync_busy_nanos.load(Ordering::Relaxed),
                 pool_busy_nanos: 0,
-                spin_nanos: 0,
+                spin_time_nanos: 0,
             })
             .collect();
         if let Some(subs) = shared.submitters.get() {
             for (s, sub) in out.iter_mut().zip(subs.iter()) {
                 s.busy_nanos = sub.busy_nanos();
                 s.pool_busy_nanos = sub.pool_busy_nanos();
-                s.spin_nanos = sub.spin_nanos();
+                s.spin_time_nanos = sub.spin_nanos();
             }
         }
         for t in shared.view.load().tablets().iter() {
@@ -2183,7 +2183,7 @@ impl Engine {
                 m.shard_idle.1 += wakes;
                 m.shard_busy_nanos += sub.busy_nanos();
                 m.shard_pool_busy_nanos += sub.pool_busy_nanos();
-                m.shard_spin_nanos += sub.spin_nanos();
+                m.shard_spin_time_nanos += sub.spin_nanos();
             }
         }
         let w = &shared.visibility;

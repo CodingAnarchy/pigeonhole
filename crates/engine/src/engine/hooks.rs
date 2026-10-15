@@ -623,6 +623,18 @@ impl Engine {
             .map(|v| v as f64 / 1e6)
     }
 
+    /// The busy fraction and the turn-busy fraction shard `shard`'s balancer published at
+    /// its last pass (D217's moving average of the largest of turn + spin + pool, sync and
+    /// stall, D256; and D251's turn-and-stall average), `None` before its first pass. Test
+    /// hook: with the spin or the pool term above zero the first exceeds the second.
+    #[doc(hidden)]
+    pub fn shard_busy_terms(&self, shard: usize) -> Option<(f64, f64)> {
+        let slot = &self.inner.shared.loads[shard];
+        let busy = slot.read_busy_fresh(u64::MAX, u64::MAX)?;
+        let turn = slot.read_turn_busy_fresh(u64::MAX, u64::MAX)?;
+        Some((busy as f64 / 1e6, turn as f64 / 1e6))
+    }
+
     /// The active shard count (`k`, D217's packing) each shard's balancer used at its last
     /// pass, by shard (`None` before its first pass). Test hook: every shard must use the same.
     #[doc(hidden)]

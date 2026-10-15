@@ -1460,6 +1460,54 @@ fn real_files_reopen_and_lock() {
     copy.close().unwrap();
 }
 
+/// The balancer's spin and pool terms come from real counters (D256, ctr274's review of
+/// #737: the engine tests drive them through the overrides): on real files with one
+/// compaction thread, a flush runs on the pool and shows as the shard's pool busy time, and
+/// the shard thread's spin after a handled commit shows as its spin time, both beside
+/// `busy_nanos`, which keeps counting only the turns.
+#[test]
+fn spin_and_pool_time_are_counted_on_an_engine_owned_store() {
+    let dir = TempDir::new("spin-pool");
+    let db = Pigeonhole::open(
+        dir.0.join("db.phdb"),
+        Options::default()
+            .shards(1)
+            .compaction_cores(1)
+            .memtable_budget(4 << 20)
+            .pin_threads(false),
+    )
+    .unwrap();
+    let t = table(&db);
+    for i in 0..64u32 {
+        t.mutate(format!("r{i:03}").as_bytes())
+            .put("a", b"q", &[0x5A; 512])
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let settled = loop {
+        let m = db.engine_metrics();
+        if m.shard_pool_busy_nanos > 0 && m.shard_spin_time_nanos > 0 {
+            break m;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pool {} spin {} after 10 s",
+            m.shard_pool_busy_nanos,
+            m.shard_spin_time_nanos
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(settled.shard_busy_nanos > 0);
+    let stats = db.shard_stats();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].pool_busy_nanos, settled.shard_pool_busy_nanos);
+    assert!(stats[0].spin_time_nanos >= settled.shard_spin_time_nanos);
+    drop(t);
+    db.close().unwrap();
+}
+
 #[test]
 fn io_rings_report_the_backend() {
     let dir = TempDir::new("io-rings");

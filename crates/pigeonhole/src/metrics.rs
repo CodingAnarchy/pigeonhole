@@ -108,7 +108,7 @@ pub struct EngineMetrics {
     /// (the spin after a handled message), summed over shards; not in `shard_busy_nanos`.
     /// Its rise over an interval, divided by the interval, is how many threads' worth of
     /// awake-but-idle time the database's clients caused.
-    pub shard_spin_nanos: u64,
+    pub shard_spin_time_nanos: u64,
     /// Blocking commit waits (`commit()`) that parked their thread after the short spin.
     /// Async commits never park.
     pub commit_parks: u64,
@@ -228,7 +228,7 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             shard_wakes: m.shard_idle.1,
             shard_busy_nanos: m.shard_busy_nanos,
             shard_pool_busy_nanos: m.shard_pool_busy_nanos,
-            shard_spin_nanos: m.shard_spin_nanos,
+            shard_spin_time_nanos: m.shard_spin_time_nanos,
             commit_parks: m.commit_parks,
             // The engine fills `pinned_threads` as (pinned, started).
             threads_started: m.pinned_threads.1,
