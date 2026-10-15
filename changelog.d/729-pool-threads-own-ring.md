@@ -1,0 +1,2 @@
+### Fixed
+- With io_uring, the flush and compaction threads D252 added now complete their own I/O on rings of their own, as shard threads do, instead of through the backend's shared ring and its single reaper thread. On a 32-CPU machine the shared path serialized every compaction read behind the reaper's block decoding: contended write loads fell to a few thousand ops/s with flushes stalled, `Busy` after the write-stall timeout, and large loads rewrote their data many times over.
