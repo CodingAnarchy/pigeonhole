@@ -148,12 +148,16 @@ const PACK_STALLING: u64 = 100_000;
 /// mistaken shrink from 16 to 2.
 const PACK_SHRINK_UNDO: u64 = 600;
 
-/// Balancer passes after a stall during which the shard still reads stalled (1 s at the
-/// base interval, D255). A buffered load's stalls are short and a few per second per
-/// shard: a pass-by-pass reading smoothed by the moving average read them at about half,
-/// and never hot (the buffered riders row on the AX102: thousands of write stalls, and the
-/// top shards' stall terms at 0).
-const PACK_STALL_WINDOW: u64 = 10;
+/// A shard reads stalled when its writers stalled on at least `PACK_STALL_PASSES` of the
+/// last `PACK_STALL_WINDOW` balancer passes (3 of 10: about 3 stalls a second at the base
+/// interval, or one wait spanning 0.3 s, D255). A buffered load's stalls are short and a few
+/// per second per shard: a pass-by-pass reading smoothed by the moving average read them at
+/// about half and never hot (the buffered riders row on the AX102: thousands of write stalls,
+/// the top shards' stall terms at 0), while any single stall must not count as capacity (a
+/// light store with one burst would spread). The term is 0 or 1 and the hot test reads it
+/// as published, so the decision is this count, not a moving average's tail.
+const PACK_STALL_WINDOW: u32 = 10;
+const PACK_STALL_PASSES: u32 = 3;
 
 /// Balancer passes with no active shard stalling after which a stall-driven floor expires
 /// (30 s at the base interval), and the cap of its doubling after each expiry (D255).
@@ -1627,7 +1631,7 @@ impl ShardState {
         self.shared.loads[usize::from(self.id.0)]
             .set_turn_busy((self.turn_ewma * 1e6).round() as u64);
         self.shared.loads[usize::from(self.id.0)]
-            .set_stall_busy((self.stall_ewma * 1e6).round() as u64);
+            .set_stall_busy((self.stall_term * 1e6).round() as u64);
         self.shared.loads[usize::from(self.id.0)].publish(
             self.load_ewma.round() as u64,
             self.load_slow.round() as u64,
@@ -1784,18 +1788,19 @@ impl ShardState {
 
     /// Updates this shard's moving average of how busy it was since the last pass (D217,
     /// D248, D255): the largest of its thread's busy time, its group syncs' utilization and
-    /// the time its writers stalled, each over the time that passed. Utilization is the
+    /// whether its writers are stalling, each over the time that passed. Utilization is the
     /// syncs' in-flight time (summed over the syncs in flight) over that time, capped at 1,
     /// so a shard whose durable commits keep a sync in flight reads busy although its thread
     /// mostly waits. Not divided by `group_sync_depth`: a shard's concurrent syncs fold into
     /// one journal commit (D221), so they are one server, not two (D248's A/B). The stall
-    /// time is the union of what commits spent waiting for arena room and paced on L0 depth
-    /// (`stall_busy_nanos`, D255): with flush and compaction on dedicated threads (D252) a
-    /// shard carrying a full write load runs cheap turns and reads idle, so packing kept
-    /// whole tables on one shard; a shard whose writers wait is hot in the sense that counts,
-    /// more shards would take the load. `max`, since a turn often runs while a sync is in
-    /// flight or writers wait. Syncs and stalls count only while the runtime counts turn
-    /// time (engine-owned shards): an application-owned store stays unpacked, as before.
+    /// term is 1 when the writers stalled (a wait for room or L0 pacing began or was open) on
+    /// at least `PACK_STALL_PASSES` of the last `PACK_STALL_WINDOW` passes, else 0 (D255):
+    /// with flush and compaction on dedicated threads (D252) a shard carrying a full write
+    /// load runs cheap turns and reads idle, so packing kept whole tables on one shard; a
+    /// shard whose writers wait is hot in the sense that counts, more shards would take the
+    /// load. `max`, since a turn often runs while a sync is in flight or writers wait. Syncs
+    /// and stalls count only while the runtime counts turn time (engine-owned shards): an
+    /// application-owned store stays unpacked, as before.
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
         let busy = self
@@ -1805,14 +1810,13 @@ impl ShardState {
             .and_then(|s| s.get(me))
             .map_or(0, |s| s.busy_nanos());
         let sync = self.sync_busy_nanos(now);
-        let stall = self.stall_busy_nanos(now);
         let elapsed = match self.busy_mark {
-            Some((_, _, _, at)) if now > at => Some((now - at) as f64),
+            Some((_, _, at)) if now > at => Some((now - at) as f64),
             _ => None,
         };
         // The thread's busy time (none counted for an application-owned shard).
         let turns = match (self.busy_mark, elapsed) {
-            (Some((was, _, _, _)), Some(e)) => Some(busy.saturating_sub(was) as f64 / e),
+            (Some((was, _, _)), Some(e)) => Some(busy.saturating_sub(was) as f64 / e),
             _ => None,
         };
         let counted = busy > 0;
@@ -1826,30 +1830,24 @@ impl ShardState {
             0 => (turns, counted),
             v => (Some((v - 1) as f64 / 1e6), true),
         };
-        // Stalls that began since the last pass (D255): a shard whose writers stalled at all
-        // within the last `PACK_STALL_WINDOW` passes reads as fully stalled. A stall's
-        // length is the writers' latency, not the shard's load: a load that stalls every
-        // second is at the shard's write capacity however short each stall (the buffered
-        // riders row stalled 7,000 times for 11% of the top shard's time and spread to five
-        // shards on the fraction alone, and read about half on a pass-by-pass reading).
-        let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
-        if events > self.stall_events_mark || self.stall_open_since != 0 {
-            self.last_stall_pass = self.balance_pass.max(1);
-        }
-        let recent = self.last_stall_pass != 0
-            && self.balance_pass.saturating_sub(self.last_stall_pass) < PACK_STALL_WINDOW;
-        let (syncs, stalls) = match (self.busy_mark, elapsed) {
-            (Some((_, sync_was, stall_was, _)), Some(e)) if counted => {
-                let fraction = (stall.saturating_sub(stall_was) as f64 / e).min(1.0);
-                (
-                    sync.saturating_sub(sync_was) as f64 / e,
-                    if recent { 1.0 } else { fraction },
-                )
+        let syncs = match (self.busy_mark, elapsed) {
+            (Some((_, sync_was, _)), Some(e)) if counted => {
+                sync.saturating_sub(sync_was) as f64 / e
             }
-            _ => (0.0, 0.0),
+            _ => 0.0,
         };
+        // This pass's stall bit, then the count over the window.
+        let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
+        let stalled_now = events > self.stall_events_mark || self.stall_open();
         self.stall_events_mark = events;
-        // A chosen stall fraction (D255's packing tests).
+        self.stall_history = (self.stall_history << 1) | u32::from(stalled_now);
+        let window = self.stall_history & ((1u32 << PACK_STALL_WINDOW) - 1);
+        let stalls = if counted && window.count_ones() >= PACK_STALL_PASSES {
+            1.0
+        } else {
+            0.0
+        };
+        // A chosen stall term (D255's packing tests).
         #[cfg(feature = "test-hooks")]
         let stalls = match self.shared.metrics[me]
             .hooks
@@ -1865,19 +1863,19 @@ impl ShardState {
         }
         if let Some(t) = turns {
             self.turn_ewma = LOAD_ALPHA * t.min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
-            self.stall_ewma = LOAD_ALPHA * stalls + (1.0 - LOAD_ALPHA) * self.stall_ewma;
         }
-        self.busy_mark = Some((busy, sync, stall, now));
+        self.stall_term = stalls;
+        self.busy_mark = Some((busy, sync, now));
         trace!(
-            "shard {} balancer: busy turn {:.2} sync {:.2} stall {:.2} (events {}) -> ewma {:.2}, turn {:.2}, stall {:.2}",
+            "shard {} balancer: busy turn {:.2} sync {:.2} stall {:.2} (events {}, window {:010b}) -> ewma {:.2}, turn {:.2}",
             self.id.0,
             turns.unwrap_or(0.0),
             syncs,
             stalls,
             events,
+            window,
             self.busy_ewma,
-            self.turn_ewma,
-            self.stall_ewma
+            self.turn_ewma
         );
     }
 
@@ -2099,10 +2097,12 @@ impl ShardState {
                 Some((b, stalled, h)) => {
                     self.hot_grew = Some((h, b));
                     if stalled {
-                        // A shrink that stalls writers within a minute was wrong: back to
-                        // the count before it in one step (D255).
-                        if let Some((from, at)) = self.shrunk_from.take()
+                        // A shrink that stalls writers within a minute, with the store
+                        // writing twice what it did then, was wrong (the load came back):
+                        // back to the count before it in one step (D255).
+                        if let Some((from, at, writes_then)) = self.shrunk_from.take()
                             && self.balance_pass.saturating_sub(at) <= PACK_SHRINK_UNDO
+                            && writes >= writes_then.saturating_mul(2)
                         {
                             self.pack_k = self.pack_k.max(from.min(n));
                         }
@@ -2131,7 +2131,7 @@ impl ShardState {
             }
         } else if self.pack_down >= PACK_SHRINK_PASSES {
             self.pack_k = want.min(k - 1).max(floor.max(1));
-            self.shrunk_from = Some((k, self.balance_pass));
+            self.shrunk_from = Some((k, self.balance_pass, writes));
             "a busy sum low enough for one fewer (D217)"
         } else {
             return true;
