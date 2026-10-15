@@ -53,6 +53,14 @@ pub(crate) struct Signal {
     wakes: AtomicU64,
     /// Nanoseconds the consumer's engine-owned thread spent in work turns (D217).
     busy: AtomicU64,
+    /// Nanoseconds the pool's threads spent in slices of tasks this consumer (a shard)
+    /// spawned onto the pool (D256): flush and compaction time counted back to the shard
+    /// whose tablets they serve, as it was inside its turns before D252.
+    pool_busy: AtomicU64,
+    /// Nanoseconds the consumer's engine-owned thread spent in its spin before parking
+    /// (D198, D256): awake and polling for the next message, counted as busy by the
+    /// balancer, since a shard its clients keep awake has no idle time to give packing.
+    spin: AtomicU64,
 }
 
 impl fmt::Debug for Signal {
@@ -75,6 +83,8 @@ impl Signal {
             parks: AtomicU64::new(0),
             wakes: AtomicU64::new(0),
             busy: AtomicU64::new(0),
+            pool_busy: AtomicU64::new(0),
+            spin: AtomicU64::new(0),
         }
     }
 
@@ -178,6 +188,28 @@ impl Signal {
     /// Nanoseconds counted by [`Signal::add_busy`].
     pub(crate) fn busy_nanos(&self) -> u64 {
         self.busy.load(Ordering::Relaxed)
+    }
+
+    /// A pool thread adds a slice's nanoseconds for a task this consumer spawned onto the
+    /// pool (D256; several pool threads may write, each after its own slice).
+    pub(crate) fn add_pool_busy(&self, nanos: u64) {
+        self.pool_busy.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Nanoseconds counted by [`Signal::add_pool_busy`].
+    pub(crate) fn pool_busy_nanos(&self) -> u64 {
+        self.pool_busy.load(Ordering::Relaxed)
+    }
+
+    /// Consumer side: adds a spin's nanoseconds (engine-owned threads only; the one writer
+    /// is the shard's thread, D256).
+    pub(crate) fn add_spin(&self, nanos: u64) {
+        self.spin.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Nanoseconds counted by [`Signal::add_spin`].
+    pub(crate) fn spin_nanos(&self) -> u64 {
+        self.spin.load(Ordering::Relaxed)
     }
 
     /// Whether some task was woken since the last call (clears the flag).

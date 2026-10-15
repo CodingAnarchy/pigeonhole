@@ -137,6 +137,9 @@ struct Entry {
     task: Box<dyn Task>,
     waker: TaskWaker,
     state: State,
+    /// The shard that spawned this task onto the pool (a pool scheduler's entries only):
+    /// its slices' time is counted back to that shard (D256).
+    origin: Option<Arc<Signal>>,
 }
 
 /// Round-robin scheduler over one thread's background tasks. Deterministic: tasks run in
@@ -174,6 +177,17 @@ impl Scheduler {
     }
 
     pub(crate) fn spawn(&mut self, task: Box<dyn Task>) {
+        self.spawn_from(task, None);
+    }
+
+    /// The signal of the thread this scheduler runs on (a shard's, or a pool thread's).
+    pub(crate) fn signal(&self) -> &Arc<Signal> {
+        &self.signal
+    }
+
+    /// Spawns `task`, counting its slices' time to `origin` (the shard that handed it to
+    /// the pool, D256) when given.
+    pub(crate) fn spawn_from(&mut self, task: Box<dyn Task>, origin: Option<Arc<Signal>>) {
         let waker = TaskWaker {
             cell: Arc::new(TaskCell {
                 woken: WokenFlag::new(false),
@@ -184,6 +198,7 @@ impl Scheduler {
             task,
             waker,
             state: State::Runnable,
+            origin,
         };
         let idx = match self.free.pop() {
             Some(i) => {
@@ -259,14 +274,13 @@ impl Scheduler {
         }
     }
 
-    /// Runs the next runnable task for one slice ending at `deadline`.
-    pub(crate) fn run_one(&mut self, deadline: u64) {
-        let Some(i) = self.runnable.pop_front() else {
-            return;
-        };
-        let Some(e) = self.slots[i].as_mut() else {
-            return;
-        };
+    /// Runs the next runnable task for one slice ending at `deadline`. Returns the shard
+    /// the task was spawned from when it came through the pool (D256: the caller counts
+    /// the slice's time to it), else `None`.
+    pub(crate) fn run_one(&mut self, deadline: u64) -> Option<Arc<Signal>> {
+        let i = self.runnable.pop_front()?;
+        let e = self.slots[i].as_mut()?;
+        let origin = e.origin.clone();
         e.waker.cell.woken.store(false, Ordering::Relaxed);
         match e.task.run(deadline, &e.waker) {
             TaskPoll::Pending => self.runnable.push_back(i),
@@ -292,19 +306,26 @@ impl Scheduler {
                 self.free.push(i);
             }
         }
+        origin
     }
+}
+
+/// A task handed to the pool with the shard that spawned it (D256).
+pub(crate) struct PoolTask {
+    task: Box<dyn Task>,
+    origin: Arc<Signal>,
 }
 
 /// One dedicated compaction thread's inbox.
 #[derive(Debug)]
 pub(crate) struct PoolShared {
-    tx: Sender<Box<dyn Task>>,
+    tx: Sender<PoolTask>,
     closed: AtomicBool,
     signal: Arc<Signal>,
 }
 
 impl PoolShared {
-    pub(crate) fn new() -> (Arc<Self>, Receiver<Box<dyn Task>>) {
+    pub(crate) fn new() -> (Arc<Self>, Receiver<PoolTask>) {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Self {
             tx,
@@ -314,10 +335,12 @@ impl PoolShared {
         (shared, rx)
     }
 
-    pub(crate) fn submit(&self, task: Box<dyn Task>) {
+    /// Hands `task` to this thread, from the shard whose signal is `origin` (its slices'
+    /// time is counted to that shard, D256).
+    pub(crate) fn submit(&self, task: Box<dyn Task>, origin: Arc<Signal>) {
         // After shutdown the receiver is gone and the task is dropped, like any unfinished
         // background task.
-        if self.tx.send(task).is_ok() {
+        if self.tx.send(PoolTask { task, origin }).is_ok() {
             self.signal.notify();
         }
     }
@@ -331,7 +354,7 @@ impl PoolShared {
 /// Body of a dedicated compaction thread: back-to-back slices, no foreground queue.
 pub(crate) fn pool_main(
     shared: Arc<PoolShared>,
-    rx: Receiver<Box<dyn Task>>,
+    rx: Receiver<PoolTask>,
     vfs: VfsRef,
     time_slice: u64,
 ) {
@@ -356,8 +379,8 @@ pub(crate) fn pool_main(
         if shared.closed.load(Ordering::SeqCst) {
             return;
         }
-        while let Ok(task) = rx.try_recv() {
-            sched.spawn(task);
+        while let Ok(t) = rx.try_recv() {
+            sched.spawn_from(t.task, Some(t.origin));
         }
         // What completed on this thread's ring resolves now, before the wakes it causes
         // are collected, so the tasks it unblocks run this pass.
@@ -373,13 +396,17 @@ pub(crate) fn pool_main(
         }
         sched.wake_due(now);
         if sched.has_runnable() {
-            sched.run_one(now.saturating_add(time_slice));
+            // The slice's time counts to the shard that spawned the task (D256): the
+            // balancer reads it as that shard's pool busy, beside its turn busy.
+            if let Some(origin) = sched.run_one(now.saturating_add(time_slice)) {
+                origin.add_pool_busy(vfs.monotonic_nanos().saturating_sub(now));
+            }
             continue;
         }
         shared.signal.prepare_sleep();
-        if let Ok(task) = rx.try_recv() {
+        if let Ok(t) = rx.try_recv() {
             shared.signal.awake();
-            sched.spawn(task);
+            sched.spawn_from(t.task, Some(t.origin));
             continue;
         }
         if shared.signal.task_woken() {
@@ -464,7 +491,7 @@ impl Spawner {
         } else {
             let p = &self.pool[self.next % self.pool.len()];
             self.next = self.next.wrapping_add(1);
-            p.submit(task);
+            p.submit(task, Arc::clone(self.local.signal()));
         }
     }
 }
