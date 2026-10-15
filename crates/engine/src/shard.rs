@@ -2456,6 +2456,12 @@ pub(crate) struct ShardState {
     /// since the shards it spread to read idle once their writers stop stalling, and the
     /// stalls would return with the shrink.
     stall_floor: Option<(usize, u64)>,
+    /// Consecutive balancer passes with no active shard stalling, and how many release the
+    /// floor (D255): the stall's cause may go away with the load unchanged (a snapshot
+    /// released, the pool caught up), and then the floor expires. Each release doubles the
+    /// next window, up to `PACK_FLOOR_QUIET_MAX`.
+    floor_quiet: u64,
+    floor_quiet_needed: u64,
     pack_k: usize,
     pack_up: u64,
     pack_down: u64,
@@ -2650,6 +2656,8 @@ impl ShardState {
             stall_ewma: 0.0,
             stall_events_mark: 0,
             stall_floor: None,
+            floor_quiet: 0,
+            floor_quiet_needed: 0,
             pack_k: 0,
             pack_up: 0,
             pack_down: 0,

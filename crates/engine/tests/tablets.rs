@@ -1767,6 +1767,163 @@ fn pacing_ends_when_a_tablet_change_takes_its_commits() {
     }
 }
 
+/// No shrink while the load is still ramping (D255, #734): four shards 30% busy would pack
+/// onto three after 50 passes, but with the rows per pass rising the fast write average
+/// stays above the slow one and the active shards hold; once the rows hold steady long
+/// enough for the slow average to catch up, the shrink comes.
+#[test]
+fn no_shrink_while_the_load_is_ramping() {
+    let mut db = spread_and_busy(0.3, true);
+    let mut written = 0;
+    for pass in 0..80u64 {
+        write_and_balance(&mut db, 4, |_| 20 + 4 * pass, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass} of the ramp"
+        );
+    }
+    let mut passes = 0;
+    while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 600 {
+        write_and_balance(&mut db, 4, |_| 340, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k < 4),
+        "the active shards never shrank once the load held steady ({passes} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Packs four tablets onto shard 0 (threads 10% busy) and then makes shard 0 read fully
+/// stalled through the test hook, every thread idle.
+fn packed_with_shard_0_stalled() -> (Db, u64) {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    db.engine.set_shard_stalled(0, Some(1.0));
+    (db, written)
+}
+
+/// A stall-driven hot shard grows the active shards again while it still has tablets to
+/// shed (D255): its stall fraction stays at 1 however much it sheds, so D251's cooled check
+/// alone would hold it to one growth, at two shards (the busy sum over two is 0.5, under
+/// the spread threshold).
+#[test]
+fn a_stall_driven_growth_repeats_while_the_shard_has_tablets_to_shed() {
+    let (mut db, mut written) = packed_with_shard_0_stalled();
+    let mut passes = 0;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 3) && passes < 120 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k >= 3),
+        "after {passes} passes the active shards are {:?}, tablets {:?}",
+        db.engine.pack_ks()[0],
+        tablets_per_shard(&db, 4)
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// The floor a stall-driven growth set holds under the same write rate once the stall is
+/// gone and every thread reads 5% busy (ctr274's review of #730), and releases when the
+/// rate drops below half of what it was: the shards then pack again.
+#[test]
+fn the_stall_floor_holds_under_the_same_rate_and_releases_when_it_drops() {
+    let (mut db, mut written) = packed_with_shard_0_stalled();
+    let mut passes = 0;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 3) && passes < 120 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    let k = db.engine.pack_ks()[0].expect("decided");
+    assert!(k >= 3, "after {passes} passes");
+    db.engine.set_shard_stalled(0, Some(0.0));
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    for pass in 0..100 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let now = db.engine.pack_ks()[0].expect("decided");
+        assert!(now >= k, "the floor gave way at pass {pass}: {now} < {k}");
+    }
+    // The rate drops to a quarter: the floor releases and the shrink follows (the stalled
+    // phase split tablets, and the moves back take a dwell each, so the count is the check).
+    passes = 0;
+    while db.engine.pack_ks()[0] != Some(1) && passes < 400 {
+        write_and_balance(&mut db, 4, |_| 5, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(1),
+        "after {passes} passes at a quarter of the rate, tablets {:?}",
+        tablets_per_shard(&db, 4)
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// The floor also expires after a quiet window with no active shard stalling (D255,
+/// ctr274's follow-up): the stall's cause gone with the rate unchanged, the shards pack
+/// again after 300 quiet passes, not never.
+#[test]
+fn the_stall_floor_expires_after_a_quiet_window() {
+    let (mut db, mut written) = packed_with_shard_0_stalled();
+    let mut passes = 0;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 3) && passes < 120 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    let k = db.engine.pack_ks()[0].expect("decided");
+    assert!(k >= 3, "after {passes} passes");
+    db.engine.set_shard_stalled(0, Some(0.0));
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    for pass in 0..250 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let now = db.engine.pack_ks()[0].expect("decided");
+        assert!(now >= k, "the floor gave way at pass {pass}: {now} < {k}");
+    }
+    passes = 0;
+    while db.engine.pack_ks()[0] != Some(1) && passes < 400 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(1),
+        "after 250 + {passes} quiet passes, tablets {:?}",
+        tablets_per_shard(&db, 4)
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// With packing off (`balance_pack = false`), or an idle store (writes below
 /// `balance_min_writes`), the same light load changes no tablet.
 #[test]

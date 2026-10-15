@@ -124,6 +124,16 @@ const PACK_HOT: f64 = 0.9;
 /// growth before another one (D251): shedding helped.
 const PACK_HOT_COOLED: u64 = 20_000;
 
+/// The fast write average over the slow one above which the load is still ramping (D255):
+/// no shrink then. The first pass of a load read its ramp as a light store and cut the
+/// active shards from 16 to 2 or 3 on the AX102, and the full load then sat there (#734).
+const PACK_RAMP: f64 = 1.25;
+
+/// Balancer passes with no active shard stalling after which a stall-driven floor expires
+/// (30 s at the base interval), and the cap of its doubling after each expiry (D255).
+const PACK_FLOOR_QUIET: u64 = 300;
+const PACK_FLOOR_QUIET_MAX: u64 = 300 * 16;
+
 /// Slots reserved on shards receiving tablets (`LoadSlot::reserved`).
 type Reserved = Vec<(ShardId, usize)>;
 
@@ -1808,6 +1818,16 @@ impl ShardState {
             _ => (0.0, 0.0),
         };
         self.stall_events_mark = events;
+        // A chosen stall fraction (D255's packing tests).
+        #[cfg(feature = "test-hooks")]
+        let stalls = match self.shared.metrics[me]
+            .hooks
+            .stall_override
+            .load(Ordering::Relaxed)
+        {
+            0 => stalls,
+            v => (v - 1) as f64 / 1e6,
+        };
         let measured = turns.map(|t| t.max(syncs).max(stalls).min(1.0));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
@@ -1886,6 +1906,12 @@ impl ShardState {
             .iter()
             .map(|l| l.read_fresh(now, stale).unwrap_or(0))
             .sum();
+        let writes_slow: u64 = self
+            .shared
+            .loads
+            .iter()
+            .map(|l| l.read_slow_fresh(now, stale).unwrap_or(0))
+            .sum();
         if busy <= 0.0 || writes < self.shared.balance.min_writes.max(1) {
             self.pack_up = 0;
             self.pack_down = 0;
@@ -1934,9 +1960,23 @@ impl ShardState {
             .max()
             .filter(|(b, _, _)| *b as f64 / 1e6 > PACK_HOT);
         let hot = hottest.is_some();
-        let hot_grows = hottest.is_some_and(|(b, _, h)| {
-            self.hot_grew
-                .is_none_or(|(shard, was)| shard != h || b + PACK_HOT_COOLED < was)
+        // A stall-driven hot shard grows `k` again while it still has tablets to shed
+        // (D255): its stall fraction stays at 1 however much it sheds, so D251's cooled
+        // check would hold it to one growth, and on the AX102 a load cut to 3 shards regrew
+        // one shard per 20 s. The cooled check keeps holding thread-saturated hot spots.
+        let view = self.shared.view.load();
+        let hot_grows = hottest.is_some_and(|(b, stalled, h)| {
+            let sheds = stalled
+                && view
+                    .tablets
+                    .iter()
+                    .filter(|t| usize::from(t.shard.0) == h)
+                    .count()
+                    > 1;
+            sheds
+                || self
+                    .hot_grew
+                    .is_none_or(|(shard, was)| shard != h || b + PACK_HOT_COOLED < was)
         });
         if !hot {
             self.hot_grew = None;
@@ -1944,26 +1984,54 @@ impl ShardState {
         // D255: the active shards a stall-driven growth reached stay active while the store
         // writes at least half of what it did then. The shards it spread to run cheap turns
         // once their writers stop stalling, so the busy sum alone would call for a shrink,
-        // the stalls would come back, and `k` would swing between the two.
+        // the stalls would come back, and `k` would swing between the two. The floor also
+        // expires after a quiet window with no active shard stalling (the cause went away
+        // with the load unchanged), each expiry doubling the next window.
+        let any_stalled = self.shared.loads[..k.min(n)]
+            .iter()
+            .any(|l| l.read_stall_busy_fresh(now, stale).unwrap_or(0) > 0);
+        if any_stalled {
+            self.floor_quiet = 0;
+        } else {
+            self.floor_quiet = self.floor_quiet.saturating_add(1);
+        }
         let stall_floor = match self.stall_floor {
-            Some((floor_k, writes_then)) if writes.saturating_mul(2) >= writes_then => floor_k,
-            _ => {
+            Some((floor_k, writes_then))
+                if writes.saturating_mul(2) >= writes_then
+                    && self.floor_quiet < self.floor_quiet_needed.max(PACK_FLOOR_QUIET) =>
+            {
+                floor_k
+            }
+            Some(_) => {
                 self.stall_floor = None;
+                if self.floor_quiet >= self.floor_quiet_needed.max(PACK_FLOOR_QUIET) {
+                    self.floor_quiet_needed = (self.floor_quiet_needed.max(PACK_FLOOR_QUIET) * 2)
+                        .min(PACK_FLOOR_QUIET_MAX);
+                }
                 0
             }
+            None => 0,
         };
         let floor = floor.max(stall_floor.min(n));
         let spread = busy / k as f64 > PACK_SPREAD;
+        // No shrink while the load is still ramping (D255, #734): the fast write average
+        // above the slow one. The first pass of a load read its ramp as a light store.
+        let ramping = writes_slow > 0 && writes as f64 > PACK_RAMP * writes_slow as f64;
         trace!(
-            "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} floor {floor} hottest {:?} up {} down {}",
-            self.id.0, hottest, self.pack_up, self.pack_down
+            "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} (slow {writes_slow}, ramping {ramping}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
+            self.id.0,
+            self.floor_quiet,
+            self.floor_quiet_needed.max(PACK_FLOOR_QUIET),
+            hottest,
+            self.pack_up,
+            self.pack_down
         );
         if k < n && (spread || hot_grows) {
             self.pack_up += 1;
         } else {
             self.pack_up = 0;
         }
-        if !hot && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
+        if !hot && !ramping && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
             self.pack_down += 1;
         } else {
             self.pack_down = 0;
