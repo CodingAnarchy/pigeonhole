@@ -460,6 +460,13 @@ mod riders {
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
 pub(crate) fn options(s: &Settings) -> Options {
     let mut options = Options::default();
+    // SCRATCH (perf2; never merge): compaction cores for an A/B of that default.
+    if let Some(k) = std::env::var("PIGEONHOLE_SCRATCH_COMPACTION_CORES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        options = options.compaction_cores(k);
+    }
     if !s.default_durability {
         options = options.durability(if s.group_sync {
             Durability::GroupSync

@@ -81,7 +81,14 @@ impl Rng {
 }
 
 fn open(dir: &Path, cache: usize) -> Pigeonhole {
-    Pigeonhole::open(dir.join("cold.phdb"), Options::default().block_cache(cache)).unwrap()
+    {
+        // SCRATCH (perf2; never merge): compaction cores for an amplification A/B.
+        let mut o = Options::default().block_cache(cache);
+        if let Some(k) = std::env::var("PIGEONHOLE_SCRATCH_COMPACTION_CORES").ok().and_then(|v| v.parse().ok()) {
+            o = o.compaction_cores(k);
+        }
+        Pigeonhole::open(dir.join("cold.phdb"), o).unwrap()
+    }
 }
 
 fn rows_file(dir: &Path) -> std::path::PathBuf {
