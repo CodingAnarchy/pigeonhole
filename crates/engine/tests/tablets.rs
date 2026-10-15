@@ -1820,6 +1820,114 @@ fn no_shrink_while_the_load_is_ramping() {
     }
 }
 
+/// Packs four tablets onto shard 0 (threads 10% busy): the start of the D256 tests.
+fn packed_onto_shard_0() -> (Db, u64) {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    (db, written)
+}
+
+/// The pool's work for a shard counts toward the busy sum (D256): packed onto shard 0 with
+/// every thread 10% busy, a pool term of 1.5 on shard 0 (a flush and a compaction for it
+/// on two pool threads at once) sizes the active shards to three or more within 100
+/// passes; without it the sum reads 0.1 and the store stays packed.
+#[test]
+fn pool_work_counts_toward_the_busy_sum() {
+    let (mut db, mut written) = packed_onto_shard_0();
+    db.engine.set_shard_pool_busy(0, Some(1.5));
+    let mut passes = 0;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 3) && passes < 100 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k >= 3),
+        "the pool term did not grow the active shards in {passes} passes: {:?}",
+        db.engine.pack_ks()[0]
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// A shard its clients keep awake counts as busy (D256): four shards settled at 60% busy,
+/// then each thread 5% in turns and 90% in its spin before parking, hold at four through
+/// 150 passes (the sum reads 3.8); with the spin gone the same turns pack them. Without
+/// the spin term the sum reads 0.2 and they pack after 50.
+#[test]
+fn a_shard_kept_awake_by_its_clients_counts_as_busy() {
+    let (mut db, mut written) = spread_and_settled(0.05);
+    for s in 0..4 {
+        db.engine.set_shard_spin_busy(s, Some(0.9));
+    }
+    for pass in 0..150 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass} with every thread spinning"
+        );
+    }
+    for s in 0..4 {
+        db.engine.set_shard_spin_busy(s, Some(0.0));
+    }
+    let mut passes = 0;
+    while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k < 4),
+        "the store never packed once the spin stopped ({passes} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// The count a thread-saturated growth (D251) reached is a floor while the store keeps
+/// writing at least half its rate then (D256, as D255's stall floor): packed onto shard 0,
+/// its thread saturated grows the active shards; with every thread 5% busy after that they
+/// hold for 100 passes, and at a quarter of the rate they pack again. Without the floor
+/// the busy sum packs them after 50.
+#[test]
+fn a_saturated_growth_holds_while_the_writes_go_on() {
+    let (mut db, mut written) = packed_onto_shard_0();
+    db.engine.set_shard_busy(0, Some(1.0));
+    let mut passes = 0;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 120 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    let k = db.engine.pack_ks()[0].expect("decided");
+    assert!(k >= 2, "after {passes} passes");
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    for pass in 0..100 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let now = db.engine.pack_ks()[0].expect("decided");
+        assert!(now >= k, "the floor gave way at pass {pass}: {now} < {k}");
+    }
+    passes = 0;
+    while db.engine.pack_ks()[0] != Some(1) && passes < 400 {
+        write_and_balance(&mut db, 4, |_| 5, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(1),
+        "after {passes} passes at a quarter of the rate, tablets {:?}",
+        tablets_per_shard(&db, 4)
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
 /// Packs four tablets onto shard 0 (threads 10% busy) and then makes shard 0 read fully
 /// stalled through the test hook, every thread idle.
 fn packed_with_shard_0_stalled() -> (Db, u64) {

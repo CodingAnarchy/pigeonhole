@@ -167,6 +167,12 @@ pub(crate) struct ShardCounters {
     /// The stall fraction the shard's balancer measures (millionths plus one; 0 measures the
     /// real one), `Engine::set_shard_stalled` (D255's packing tests).
     pub stall_override: AtomicU64,
+    /// The pool busy fraction the shard's balancer measures (millionths plus one; 0 measures
+    /// the real one), `Engine::set_shard_pool_busy` (D256's packing tests).
+    pub pool_override: AtomicU64,
+    /// The spin fraction the shard's balancer measures (millionths plus one; 0 measures the
+    /// real one), `Engine::set_shard_spin_busy` (D256's packing tests).
+    pub spin_override: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -583,6 +589,30 @@ impl Engine {
             .store(v, Ordering::Relaxed);
     }
 
+    /// Makes shard `shard`'s balancer measure the pool's work for it as `busy` (a fraction
+    /// of the time; it may exceed 1 when several pool threads serve the shard at once) from
+    /// now on, or the real pool slice time with `None` (test hook: D256's packing tests).
+    #[doc(hidden)]
+    pub fn set_shard_pool_busy(&self, shard: usize, busy: Option<f64>) {
+        let v = busy.map_or(0, |b| (b.clamp(0.0, 16.0) * 1e6).round() as u64 + 1);
+        self.inner.shared.metrics[shard]
+            .hooks
+            .pool_override
+            .store(v, Ordering::Relaxed);
+    }
+
+    /// Makes shard `shard`'s balancer measure its thread's spin before parking (D198) as
+    /// `busy` (a fraction of the time, 0 to 1) from now on, or the real spin time with
+    /// `None` (test hook: D256's packing tests).
+    #[doc(hidden)]
+    pub fn set_shard_spin_busy(&self, shard: usize, busy: Option<f64>) {
+        let v = busy.map_or(0, |b| (b.clamp(0.0, 1.0) * 1e6).round() as u64 + 1);
+        self.inner.shared.metrics[shard]
+            .hooks
+            .spin_override
+            .store(v, Ordering::Relaxed);
+    }
+
     /// The stall fraction shard `shard`'s balancer published at its last pass (D255: the
     /// moving average of the time its commits waited for arena room or were paced on L0
     /// depth, 0 to 1), `None` before its first pass. Test hook.
@@ -591,6 +621,18 @@ impl Engine {
         self.inner.shared.loads[shard]
             .read_stall_busy_fresh(u64::MAX, u64::MAX)
             .map(|v| v as f64 / 1e6)
+    }
+
+    /// The busy fraction and the turn-busy fraction shard `shard`'s balancer published at
+    /// its last pass (D217's moving average of the largest of turn + spin + pool, sync and
+    /// stall, D256; and D251's turn-and-stall average), `None` before its first pass. Test
+    /// hook: with the spin or the pool term above zero the first exceeds the second.
+    #[doc(hidden)]
+    pub fn shard_busy_terms(&self, shard: usize) -> Option<(f64, f64)> {
+        let slot = &self.inner.shared.loads[shard];
+        let busy = slot.read_busy_fresh(u64::MAX, u64::MAX)?;
+        let turn = slot.read_turn_busy_fresh(u64::MAX, u64::MAX)?;
+        Some((busy as f64 / 1e6, turn as f64 / 1e6))
     }
 
     /// The active shard count (`k`, D217's packing) each shard's balancer used at its last

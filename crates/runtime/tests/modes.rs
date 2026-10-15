@@ -769,6 +769,85 @@ fn compaction_threads_run_spawned_tasks() {
     rt.shutdown().unwrap();
 }
 
+/// Advances the simulated clock by `unit` on each of `left` slices (a pool task whose time
+/// shows on the clock), then reports.
+struct SimSlices {
+    sim: Arc<SimVfs>,
+    unit: u64,
+    left: u32,
+    done: Option<Notifier<()>>,
+}
+
+impl Task for SimSlices {
+    fn run(&mut self, _deadline: u64, _waker: &TaskWaker) -> TaskPoll {
+        self.sim.advance(self.unit);
+        self.left -= 1;
+        if self.left > 0 {
+            return TaskPoll::Pending;
+        }
+        self.done.take().unwrap().notify(());
+        TaskPoll::Done
+    }
+    fn name(&self) -> &'static str {
+        "sim-slices"
+    }
+}
+
+/// A pool thread counts each slice's time to the shard that spawned the task (D256): three
+/// 1 ms slices spawned from shard 0 show as at least 3 ms of shard 0's pool busy time, and
+/// none of shard 1's; the shard's own turn time is not what grew.
+#[test]
+fn pool_slices_count_to_the_spawning_shard() {
+    let (mut cfg, sim) = sim_config(2);
+    cfg.compaction_threads = 1;
+    let rt = Runtime::start(cfg, handlers(2)).unwrap();
+    let turns_before = rt.submitter(ShardId(0)).busy_nanos();
+    let (n, w) = completion();
+    let task = SimSlices {
+        sim: sim.clone(),
+        unit: 1_000_000,
+        left: 3,
+        done: Some(n),
+    };
+    rt.submitter(ShardId(0))
+        .submit(Msg::Spawn(Box::new(task)))
+        .unwrap();
+    w.wait().unwrap();
+    // The last slice's time is added after the task's notify: wait for it to land.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rt.submitter(ShardId(0)).pool_busy_nanos() < 3_000_000 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(
+        rt.submitter(ShardId(0)).pool_busy_nanos() >= 3_000_000,
+        "{}",
+        rt.submitter(ShardId(0)).pool_busy_nanos()
+    );
+    assert_eq!(rt.submitter(ShardId(1)).pool_busy_nanos(), 0);
+    // The shard's own turn that handled the spawn did not advance the clock.
+    assert_eq!(rt.submitter(ShardId(0)).busy_nanos(), turns_before);
+    rt.shutdown().unwrap();
+}
+
+/// A shard thread counts its spin before parking (D198) beside its turns (D256): after a
+/// handled message the thread polls for the spin window on the real clock, and that time
+/// shows in `spin_nanos`, not in `busy_nanos`.
+#[test]
+fn a_shard_counts_its_spin_before_parking() {
+    let cfg = config(1, PreadVfs::new(1));
+    let rt = Runtime::start(cfg, handlers(1)).unwrap();
+    let (n, w) = completion();
+    rt.submitter(ShardId(0)).submit(Msg::Echo(7, n)).unwrap();
+    assert_eq!(w.wait().unwrap(), 7);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rt.submitter(ShardId(0)).spin_nanos() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let spun = rt.submitter(ShardId(0)).spin_nanos();
+    assert!(spun > 0, "no spin counted after a handled message");
+    rt.shutdown().unwrap();
+}
+
 #[test]
 fn shard_threads_are_named_and_handlers_return_in_order() {
     let (cfg, _) = sim_config(3);

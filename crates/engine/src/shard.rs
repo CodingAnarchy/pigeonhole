@@ -2091,6 +2091,22 @@ enum CloseStage {
 // The shard
 // ---------------------------------------------------------------------------------------
 
+/// The counters packing's busy measure differences between two balancer passes
+/// (D217, D248, D256), and the clock at the pass they were read.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BusyMark {
+    /// `Submitter::busy_nanos`: the thread's turns.
+    turns: u64,
+    /// `Submitter::spin_nanos`: the thread's spin before parking (D198).
+    spin: u64,
+    /// `Submitter::pool_busy_nanos`: the pool's slices for this shard's tasks.
+    pool: u64,
+    /// `sync_busy_nanos`: the group syncs' in-flight time (D248).
+    sync: u64,
+    /// The clock at the pass.
+    at: u64,
+}
+
 /// Everything one shard owns.
 pub(crate) struct ShardState {
     pub(crate) id: ShardId,
@@ -2426,12 +2442,12 @@ pub(crate) struct ShardState {
     slow_run: u64,
     slow_pass: Option<u64>,
     chose_slow: std::cell::Cell<bool>,
-    /// Packing (D217): this shard's turn busy and sync busy (D248) and clock at its last
-    /// pass, the moving average of how busy it was, and, on shard 0 only
+    /// Packing (D217): this shard's counters and clock at its last pass
+    /// ([`BusyMark`]), the moving average of how busy it was, and, on shard 0 only
     /// (which decides for every shard and publishes it as `Shared::pack_k`), how many shards
     /// stay active (`0..pack_k`; 0 before the first decision) and the consecutive passes
     /// calling for more or fewer of them.
-    busy_mark: Option<(u64, u64, u64)>,
+    busy_mark: Option<BusyMark>,
     busy_ewma: f64,
     /// The moving average of the larger of the thread's turn busy fraction and its writers'
     /// stall fraction, without the sync term (D251's hot test, D255).

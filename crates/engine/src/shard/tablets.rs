@@ -1807,27 +1807,31 @@ impl ShardState {
     /// with flush and compaction on dedicated threads (D252) a shard carrying a full write
     /// load runs cheap turns and reads idle, so packing kept whole tables on one shard; a
     /// shard whose writers wait is hot in the sense that counts, more shards would take the
-    /// load. `max`, since a turn often runs while a sync is in flight or writers wait. Syncs
-    /// and stalls count only while the runtime counts turn time (engine-owned shards): an
-    /// application-owned store stays unpacked, as before.
+    /// load. Two terms add to the turn term (D256): the thread's spin before parking (D198:
+    /// a shard whose next message arrives within the spin window never parks, so its
+    /// clients keep it awake and it has no idle time packing could give another shard; at
+    /// 1.1M ops/s over 16 shards a message every 14 µs read as 5% busy while the threads
+    /// burned 4.7 cores) and the pool's slices for this shard's flushes and compactions
+    /// (before D252 they ran inside the turns and counted there). The sum may pass 1 (two
+    /// pool threads serving one shard). `max` over that sum, the syncs and the stalls, since
+    /// a turn often runs while a sync is in flight or writers wait. All of them count only
+    /// while the runtime counts turn time (engine-owned shards): an application-owned
+    /// store stays unpacked, as before.
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
-        let busy = self
+        let (busy, spin, pool) = self
             .shared
             .submitters
             .get()
             .and_then(|s| s.get(me))
-            .map_or(0, |s| s.busy_nanos());
+            .map_or((0, 0, 0), |s| {
+                (s.busy_nanos(), s.spin_nanos(), s.pool_busy_nanos())
+            });
         let sync = self.sync_busy_nanos(now);
-        let elapsed = match self.busy_mark {
-            Some((_, _, at)) if now > at => Some((now - at) as f64),
-            _ => None,
-        };
+        let mark = self.busy_mark.filter(|m| now > m.at);
+        let elapsed = mark.map(|m| (now - m.at) as f64);
         // The thread's busy time (none counted for an application-owned shard).
-        let turns = match (self.busy_mark, elapsed) {
-            (Some((was, _, _)), Some(e)) => Some(busy.saturating_sub(was) as f64 / e),
-            _ => None,
-        };
+        let turns = mark.map(|m| busy.saturating_sub(m.turns) as f64 / elapsed.unwrap_or(1.0));
         let counted = busy > 0;
         // A chosen turn busy, as an engine-owned shard measures it.
         #[cfg(feature = "test-hooks")]
@@ -1839,11 +1843,36 @@ impl ShardState {
             0 => (turns, counted),
             v => (Some((v - 1) as f64 / 1e6), true),
         };
-        let syncs = match (self.busy_mark, elapsed) {
-            (Some((_, sync_was, _)), Some(e)) if counted => {
-                sync.saturating_sub(sync_was) as f64 / e
-            }
+        // A counted term over the interval, from its counter's rise (0 for an
+        // application-owned shard, which counts no turns).
+        let term = |now_v: u64, was: fn(&BusyMark) -> u64| match (mark, elapsed) {
+            (Some(m), Some(e)) if counted => now_v.saturating_sub(was(&m)) as f64 / e,
             _ => 0.0,
+        };
+        let syncs = term(sync, |m| m.sync);
+        // The thread's spin before parking (D198) over the interval (D256).
+        let spins = term(spin, |m| m.spin);
+        // A chosen spin term (D256's packing tests).
+        #[cfg(feature = "test-hooks")]
+        let spins = match self.shared.metrics[me]
+            .hooks
+            .spin_override
+            .load(Ordering::Relaxed)
+        {
+            0 => spins,
+            v => (v - 1) as f64 / 1e6,
+        };
+        // The pool's slices for this shard over the interval (D256).
+        let pools = term(pool, |m| m.pool);
+        // A chosen pool term (D256's packing tests).
+        #[cfg(feature = "test-hooks")]
+        let pools = match self.shared.metrics[me]
+            .hooks
+            .pool_override
+            .load(Ordering::Relaxed)
+        {
+            0 => pools,
+            v => (v - 1) as f64 / 1e6,
         };
         // This pass's stall bit, then the count over the window.
         let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
@@ -1866,7 +1895,7 @@ impl ShardState {
             0 => stalls,
             v => (v - 1) as f64 / 1e6,
         };
-        let measured = turns.map(|t| t.max(syncs).max(stalls).min(1.0));
+        let measured = turns.map(|t| (t + spins + pools).max(syncs.min(1.0)).max(stalls));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
         }
@@ -1874,11 +1903,19 @@ impl ShardState {
             self.turn_ewma = LOAD_ALPHA * t.min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
         }
         self.stall_term = stalls;
-        self.busy_mark = Some((busy, sync, now));
+        self.busy_mark = Some(BusyMark {
+            turns: busy,
+            spin,
+            pool,
+            sync,
+            at: now,
+        });
         trace!(
-            "shard {} balancer: busy turn {:.2} sync {:.2} stall {:.2} (events {}, window {:010b}) -> ewma {:.2}, turn {:.2}",
+            "shard {} balancer: busy turn {:.2} spin {:.2} pool {:.2} sync {:.2} stall {:.2} (events {}, window {:010b}) -> ewma {:.2}, turn {:.2}",
             self.id.0,
             turns.unwrap_or(0.0),
+            spins,
+            pools,
             syncs,
             stalls,
             events,
@@ -2035,7 +2072,9 @@ impl ShardState {
         };
         let any_stalled = stall_terms().any(|s| s > 0);
         let stalling = stall_terms().any(|s| s >= PACK_STALLING);
-        if any_stalled {
+        // A pass with a stalling or a saturated shard is not quiet (D255, D256): the floor
+        // expires only once neither cause has shown for a window.
+        if any_stalled || hot {
             self.floor_quiet = 0;
         } else {
             self.floor_quiet = self.floor_quiet.saturating_add(1);
@@ -2118,19 +2157,26 @@ impl ShardState {
                         {
                             self.pack_k = self.pack_k.max(from.min(n));
                         }
-                        if self.stall_floor.is_none() {
-                            // A floor set within one quiet window of the last expiry is
-                            // the same cause coming back: the window doubles, up to the
-                            // cap. One set later starts from the base again.
-                            let since = self.balance_pass.saturating_sub(self.floor_expired_pass);
-                            self.floor_quiet_needed =
-                                if self.floor_expired_pass != 0 && since <= quiet_needed {
-                                    (quiet_needed * 2).min(PACK_FLOOR_QUIET_MAX)
-                                } else {
-                                    PACK_FLOOR_QUIET
-                                };
-                        }
-                        self.stall_floor = Some((self.pack_k, writes));
+                    }
+                    // The count a hot shard grew the store to is the floor while the
+                    // store keeps writing at least half its rate then (D255 for a
+                    // stalling shard, D256 for a saturated one): the shards it spread to
+                    // run cheap turns, so the busy sum alone would shrink it back and the
+                    // stall or the saturation would return.
+                    if self.stall_floor.is_none() {
+                        // A floor set within one quiet window of the last expiry is the
+                        // same cause coming back: the window doubles, up to the cap. One
+                        // set later starts from the base again.
+                        let since = self.balance_pass.saturating_sub(self.floor_expired_pass);
+                        self.floor_quiet_needed =
+                            if self.floor_expired_pass != 0 && since <= quiet_needed {
+                                (quiet_needed * 2).min(PACK_FLOOR_QUIET_MAX)
+                            } else {
+                                PACK_FLOOR_QUIET
+                            };
+                    }
+                    self.stall_floor = Some((self.pack_k, writes));
+                    if stalled {
                         "a shard whose writers stall (D255)"
                     } else {
                         "a shard whose thread is saturated (D251)"
