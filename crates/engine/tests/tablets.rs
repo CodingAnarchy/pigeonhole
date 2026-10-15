@@ -224,7 +224,12 @@ struct Db {
 }
 
 fn open(shards: usize, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
-    let vfs = SimVfs::new(7);
+    open_on(&SimVfs::new(7), shards, tweak)
+}
+
+/// [`open`] on a given simulated disk (a reopen finds the table there).
+fn open_on(vfs: &Arc<SimVfs>, shards: usize, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
+    let vfs = Arc::clone(vfs);
     let mut o = EngineOptions::new(vfs.clone());
     o.create_if_missing = true;
     o.shards = shards;
@@ -238,9 +243,11 @@ fn open(shards: usize, tweak: impl FnOnce(&mut EngineOptions)) -> Db {
     let (engine, shards) =
         Engine::open_application_owned(Path::new("/db/data.phdb"), o).expect("open");
     engine.record_history(true);
-    let table = engine
-        .create_table("t", &[("f".into(), FamilyOptions::default())])
-        .expect("table");
+    let table = engine.table("t").unwrap_or_else(|| {
+        engine
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .expect("table")
+    });
     Db {
         vfs,
         clock,
@@ -2357,6 +2364,107 @@ fn a_light_store_packs_after_the_first_window() {
     for _ in 0..8 {
         db.step();
     }
+}
+
+/// The first-shrink window restarts on a reopen (D255, #734, ctr274's review): a light store
+/// packed onto one shard, closed and reopened on the same four shards comes back unpacked
+/// (owners are not persisted, D130) and holds at four through 250 writing passes, then packs
+/// by 400. Persisting the active count or the counter across a reopen would pack it after
+/// 50.
+#[test]
+fn the_first_shrink_window_restarts_on_a_reopen() {
+    let vfs = SimVfs::new(7);
+    let options = |o: &mut EngineOptions| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+        o.balance_pack = true;
+    };
+    let mut db = open_on(&vfs, 4, options);
+    tablets_on(&mut db, 4, |t| t as u16);
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.1));
+    }
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    db.close();
+
+    let mut db = open_on(&vfs, 4, options);
+    assert_eq!(db.scan_rows().len() as u64, written);
+    let placed = tablets_per_shard(&db, 4);
+    assert!(
+        placed.iter().filter(|n| **n > 0).count() > 1,
+        "placed unpacked at open: {placed:?}"
+    );
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.1));
+    }
+    for pass in 0..250 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass} after the reopen"
+        );
+    }
+    let mut passes = 250;
+    while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 400 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k < 4),
+        "the reopened store never packed ({passes} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// An idle store never packs and its passes do not count toward the first-shrink window
+/// (D255, #734, ctr274's review): four shards 10% busy with writes under
+/// `balance_min_writes` (a row a tablet a pass) for 1,000 passes keep every tablet where it
+/// is and the active shards at four; the writes then hold them at four for 250 passes and
+/// pack by 400, as from open. Counting every pass would pack it within 50 of the first
+/// write. (A tablet written on no pass at all goes cold after 100 and D224's consolidation
+/// moves it, its own rule with its own tests; the active count stays at four there too.)
+#[test]
+fn an_idle_store_stays_unpacked_and_does_not_count_toward_the_window() {
+    let mut db = spread_and_busy(0.1, true);
+    let before = tablet_changes(&db.engine);
+    let mut written = 0;
+    for pass in 0..1_000 {
+        write_and_balance(&mut db, 4, |_| 1, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at idle pass {pass}"
+        );
+    }
+    assert_eq!(tablet_changes(&db.engine), before);
+    assert_eq!(tablets_per_shard(&db, 4), vec![1, 1, 1, 1]);
+    for pass in 0..250 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at writing pass {pass}"
+        );
+    }
+    let mut passes = 250;
+    while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 400 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k < 4),
+        "the store never packed once written ({passes} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
 }
 
 /// With packing off (`balance_pack = false`), or an idle store (writes below
