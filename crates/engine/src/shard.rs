@@ -2426,19 +2426,57 @@ pub(crate) struct ShardState {
     slow_run: u64,
     slow_pass: Option<u64>,
     chose_slow: std::cell::Cell<bool>,
-    /// Packing (D217): this shard's busy time and clock at its last pass, the moving average
-    /// of how busy it was, and, on shard 0 only (which decides for every shard and publishes
-    /// it as `Shared::pack_k`), how many shards stay active (`0..pack_k`; 0 before the first
-    /// decision) and the consecutive passes calling for more or fewer of them.
+    /// Packing (D217): this shard's turn busy and sync busy (D248) and clock at its last
+    /// pass, the moving average of how busy it was, and, on shard 0 only
+    /// (which decides for every shard and publishes it as `Shared::pack_k`), how many shards
+    /// stay active (`0..pack_k`; 0 before the first decision) and the consecutive passes
+    /// calling for more or fewer of them.
     busy_mark: Option<(u64, u64, u64)>,
     busy_ewma: f64,
-    /// The moving average of the thread's turn busy fraction alone (D251).
+    /// The moving average of the larger of the thread's turn busy fraction and its writers'
+    /// stall fraction, without the sync term (D251's hot test, D255).
     turn_ewma: f64,
     /// A hot-triggered growth of the active shards (D251): the hot shard and its turn busy
     /// fraction then (millionths). Another one needs that shard to have cooled since (what
     /// it shed helped), or another shard to be hot, so a hot spot more shards cannot cool
     /// grows `k` only once.
     hot_grew: Option<(usize, u64)>,
+    /// The writers' stall term at the last pass, 0 or 1 (D255).
+    stall_term: f64,
+    /// The shard's stall count (`ShardMetrics::stalls`) at the last balancer pass, and which
+    /// of the last 32 passes its writers stalled on (a stall began, or a wait was open; bit 0
+    /// the last pass): the shard reads stalled on at least `PACK_STALL_PASSES` of the last
+    /// `PACK_STALL_WINDOW` (D255).
+    stall_events_mark: u64,
+    stall_history: u32,
+    /// A stall-driven growth's active shard count and the store's write rate then (D255):
+    /// no shrink below that count while the store still writes at least half that rate,
+    /// since the shards it spread to read idle once their writers stop stalling, and the
+    /// stalls would return with the shrink.
+    stall_floor: Option<(usize, u64)>,
+    /// Consecutive balancer passes with no active shard stalling, and how many release the
+    /// floor (D255): the stall's cause may go away with the load unchanged (a snapshot
+    /// released, the pool caught up), and then the floor expires. Each release doubles the
+    /// next window, up to `PACK_FLOOR_QUIET_MAX`.
+    floor_quiet: u64,
+    floor_quiet_needed: u64,
+    /// The balancer pass at which the floor last expired on a quiet window (0: none since
+    /// a release by a write drop): a stall-driven floor set within one window of it is the
+    /// same cause coming back, and doubles the window; one set later starts from the base.
+    floor_expired_pass: u64,
+    /// Consecutive balancer passes the load has read as ramping: past `PACK_RAMP_MAX` the
+    /// shrink counter runs again, so a load that only ever grows still packs.
+    ramp_passes: u64,
+    /// Balancer passes on which the store wrote (D255): the first shrink from the unpacked
+    /// start waits for `PACK_FIRST_SHRINK_PASSES` of them, a slow-average window, since a
+    /// load's phases dip between them for a few seconds and a pack on a dip moves every
+    /// tablet twice (#734).
+    writing_passes: u64,
+    /// The active shard count before the last shrink, the pass of that shrink and the
+    /// store's write rate then (D255): a stall-driven growth within `PACK_SHRINK_UNDO` passes
+    /// of it, with the store writing at least twice that rate, says the shrink was wrong,
+    /// and goes straight back to that count rather than one shard per ten passes.
+    shrunk_from: Option<(usize, u64, u64)>,
     pack_k: usize,
     pack_up: u64,
     pack_down: u64,
@@ -2628,6 +2666,16 @@ impl ShardState {
             busy_ewma: 0.0,
             turn_ewma: 0.0,
             hot_grew: None,
+            stall_term: 0.0,
+            stall_events_mark: 0,
+            stall_history: 0,
+            stall_floor: None,
+            floor_quiet: 0,
+            floor_quiet_needed: 0,
+            floor_expired_pass: 0,
+            ramp_passes: 0,
+            writing_passes: 0,
+            shrunk_from: None,
             pack_k: 0,
             pack_up: 0,
             pack_down: 0,
@@ -3137,6 +3185,28 @@ impl ShardState {
         }
         self.reserved += needed;
         Ok(needed)
+    }
+
+    /// Whether the shard's writers are stalled now: a wait for room or L0 pacing is open
+    /// (D255's stall term).
+    pub(super) fn stall_open(&self) -> bool {
+        self.room_wait.is_some() || self.stall.since != 0
+    }
+
+    /// L0 pacing is over with no writer left to pace (the waiting commits were parked or
+    /// forwarded by a tablet change): closes its span and its timer, as `stalled` would for
+    /// an admitted group. Left open, the shard would read stalled, and so hot, with no
+    /// writers at all (ctr274's review of #730).
+    fn end_pacing(&mut self, now: u64) {
+        if self.stall.since == 0 {
+            return;
+        }
+        trace!("shard {} pacing ends with no writer left", self.id.0);
+        self.stall.cancel_timer();
+        self.shared.metrics[usize::from(self.id.0)]
+            .stall_nanos
+            .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
+        self.stall.since = 0;
     }
 
     /// The wait for arena room is over: account the stall and cancel its timer.
@@ -4557,10 +4627,14 @@ impl ShardState {
     fn run_group(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.pending.is_empty() {
             // Nothing waits for room any more (the waiting commits were parked or
-            // forwarded by a tablet change): the stall is over and its timer goes.
+            // forwarded by a tablet change): the stall is over and its timer goes, and so
+            // does L0 pacing's (D255 counts both as busy; left open they read as a stall
+            // with no writer).
+            let now = ctx.now_nanos();
             if self.tablets_on() && self.room_wait.is_some() && !self.wait_room {
-                self.end_room_wait(ctx.now_nanos());
+                self.end_room_wait(now);
             }
+            self.end_pacing(now);
             return;
         }
         trace!(

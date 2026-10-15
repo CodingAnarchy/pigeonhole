@@ -114,6 +114,15 @@ const PACK_GROW_PASSES: u64 = 10;
 /// (5 s): packing is slow, so a pause between bursts does not reshuffle.
 const PACK_SHRINK_PASSES: u64 = 50;
 
+/// Balancer passes on which the store must have written before its first shrink from the
+/// unpacked start (30 s at the base interval, a slow-average window, D255, #734): a load's
+/// phases (a load, a settle, a warm-up) dip between them for a few seconds, and a pack on
+/// a dip moves every tablet twice, the second time while the load is measured. On the
+/// AX102 the dip packed 16 shards to 2 at about 21 s and D251's regrowth then moved
+/// tablets back out until about 90 s, a put p99.9 of 290-362 µs against 73 with the moves
+/// out of the measured phase. A light store still packs, 30 s in.
+const PACK_FIRST_SHRINK_PASSES: u64 = 300;
+
 /// Packing (D251): an active shard whose thread is busier than this (turn busy, without
 /// D248's sync term) also calls for more active shards, whatever the average (`PACK_SPREAD`
 /// looks only at `B / k`, which a saturated shard beside an idle one never passes), and while
@@ -123,6 +132,46 @@ const PACK_HOT: f64 = 0.9;
 /// How much a hot shard's turn busy fraction must fall (millionths) after a hot-triggered
 /// growth before another one (D251): shedding helped.
 const PACK_HOT_COOLED: u64 = 20_000;
+
+/// The fast write average over the slow one above which the load is still ramping (D255):
+/// the shrink counter pauses then (it does not reset: a periodic batch writer reads as
+/// ramping after every batch, and a reset would never let it pack). The first pass of a
+/// load read its ramp as a light store and cut the active shards from 16 to 2 or 3 on the
+/// AX102, and the full load then sat there (#734).
+const PACK_RAMP: f64 = 1.25;
+
+/// Consecutive ramping passes after which the shrink counter runs anyway (60 s at the base
+/// interval): a load that only ever grows still packs.
+const PACK_RAMP_MAX: u64 = 600;
+
+/// A published stall fraction at or above which an active shard counts as stalling for the
+/// shrink count (D255): a pass on which any active shard's writers stall is no light pass,
+/// whatever the busy sum reads. On the AX102 a write lull in the middle of a 16 GiB load
+/// (the loader's writers waiting on room: writes 2,479 against 10–48K around it, busy
+/// 0.27) completed the count the ramp had let accrue, and D217 shrank 16 → 2 mid-load.
+const PACK_STALLING: u64 = 100_000;
+
+/// Balancer passes after a shrink within which a stall-driven growth undoes it (60 s at
+/// the base interval, D255): the growth goes straight back to the count before the shrink.
+/// Regrowing one shard per ten passes took most of a 16 GiB load on the AX102 after one
+/// mistaken shrink from 16 to 2.
+const PACK_SHRINK_UNDO: u64 = 600;
+
+/// A shard reads stalled when its writers stalled on at least `PACK_STALL_PASSES` of the
+/// last `PACK_STALL_WINDOW` balancer passes (3 of 10: about 3 stalls a second at the base
+/// interval, or one wait spanning 0.3 s, D255). A buffered load's stalls are short and a few
+/// per second per shard: a pass-by-pass reading smoothed by the moving average read them at
+/// about half and never hot (the buffered riders row on the AX102: thousands of write stalls,
+/// the top shards' stall terms at 0), while any single stall must not count as capacity (a
+/// light store with one burst would spread). The term is 0 or 1 and the hot test reads it
+/// as published, so the decision is this count, not a moving average's tail.
+const PACK_STALL_WINDOW: u32 = 10;
+const PACK_STALL_PASSES: u32 = 3;
+
+/// Balancer passes with no active shard stalling after which a stall-driven floor expires
+/// (30 s at the base interval), and the cap of its doubling after each expiry (D255).
+const PACK_FLOOR_QUIET: u64 = 300;
+const PACK_FLOOR_QUIET_MAX: u64 = 300 * 16;
 
 /// Slots reserved on shards receiving tablets (`LoadSlot::reserved`).
 type Reserved = Vec<(ShardId, usize)>;
@@ -1590,6 +1639,8 @@ impl ShardState {
         self.measure_busy(now);
         self.shared.loads[usize::from(self.id.0)]
             .set_turn_busy((self.turn_ewma * 1e6).round() as u64);
+        self.shared.loads[usize::from(self.id.0)]
+            .set_stall_busy((self.stall_term * 1e6).round() as u64);
         self.shared.loads[usize::from(self.id.0)].publish(
             self.load_ewma.round() as u64,
             self.load_slow.round() as u64,
@@ -1745,14 +1796,20 @@ impl ShardState {
     }
 
     /// Updates this shard's moving average of how busy it was since the last pass (D217,
-    /// D248): the larger of its thread's busy time and its group syncs' utilization, each
-    /// over the time that passed. Utilization is the syncs' in-flight time (summed over the
-    /// syncs in flight) over that time, capped at 1, so a shard whose durable commits keep a
-    /// sync in flight reads busy although its thread mostly waits. Not divided by
-    /// `group_sync_depth`: a shard's concurrent syncs fold into one journal commit (D221), so
-    /// they are one server, not two (D248's A/B). `max`, since a turn often runs
-    /// while a sync is in flight. Syncs count only while the runtime counts turn time
-    /// (engine-owned shards): an application-owned store stays unpacked, as before.
+    /// D248, D255): the largest of its thread's busy time, its group syncs' utilization and
+    /// whether its writers are stalling, each over the time that passed. Utilization is the
+    /// syncs' in-flight time (summed over the syncs in flight) over that time, capped at 1,
+    /// so a shard whose durable commits keep a sync in flight reads busy although its thread
+    /// mostly waits. Not divided by `group_sync_depth`: a shard's concurrent syncs fold into
+    /// one journal commit (D221), so they are one server, not two (D248's A/B). The stall
+    /// term is 1 when the writers stalled (a wait for room or L0 pacing began or was open) on
+    /// at least `PACK_STALL_PASSES` of the last `PACK_STALL_WINDOW` passes, else 0 (D255):
+    /// with flush and compaction on dedicated threads (D252) a shard carrying a full write
+    /// load runs cheap turns and reads idle, so packing kept whole tables on one shard; a
+    /// shard whose writers wait is hot in the sense that counts, more shards would take the
+    /// load. `max`, since a turn often runs while a sync is in flight or writers wait. Syncs
+    /// and stalls count only while the runtime counts turn time (engine-owned shards): an
+    /// application-owned store stays unpacked, as before.
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
         let busy = self
@@ -1788,14 +1845,47 @@ impl ShardState {
             }
             _ => 0.0,
         };
-        let measured = turns.map(|t| t.max(syncs).min(1.0));
+        // This pass's stall bit, then the count over the window.
+        let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
+        let stalled_now = events > self.stall_events_mark || self.stall_open();
+        self.stall_events_mark = events;
+        self.stall_history = (self.stall_history << 1) | u32::from(stalled_now);
+        let window = self.stall_history & ((1u32 << PACK_STALL_WINDOW) - 1);
+        let stalls = if counted && window.count_ones() >= PACK_STALL_PASSES {
+            1.0
+        } else {
+            0.0
+        };
+        // A chosen stall term (D255's packing tests).
+        #[cfg(feature = "test-hooks")]
+        let stalls = match self.shared.metrics[me]
+            .hooks
+            .stall_override
+            .load(Ordering::Relaxed)
+        {
+            0 => stalls,
+            v => (v - 1) as f64 / 1e6,
+        };
+        let measured = turns.map(|t| t.max(syncs).max(stalls).min(1.0));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
         }
         if let Some(t) = turns {
             self.turn_ewma = LOAD_ALPHA * t.min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
         }
+        self.stall_term = stalls;
         self.busy_mark = Some((busy, sync, now));
+        trace!(
+            "shard {} balancer: busy turn {:.2} sync {:.2} stall {:.2} (events {}, window {:010b}) -> ewma {:.2}, turn {:.2}",
+            self.id.0,
+            turns.unwrap_or(0.0),
+            syncs,
+            stalls,
+            events,
+            window,
+            self.busy_ewma,
+            self.turn_ewma
+        );
     }
 
     /// The shards that stay active under packing (D217): `0..k`. Every shard, without
@@ -1854,6 +1944,15 @@ impl ShardState {
             .iter()
             .map(|l| l.read_fresh(now, stale).unwrap_or(0))
             .sum();
+        let writes_slow: u64 = self
+            .shared
+            .loads
+            .iter()
+            .map(|l| l.read_slow_fresh(now, stale).unwrap_or(0))
+            .sum();
+        if writes >= self.shared.balance.min_writes.max(1) {
+            self.writing_passes = self.writing_passes.saturating_add(1);
+        }
         if busy <= 0.0 || writes < self.shared.balance.min_writes.max(1) {
             self.pack_up = 0;
             self.pack_down = 0;
@@ -1886,47 +1985,173 @@ impl ShardState {
         }
         // D251: an active shard whose thread is saturated (turn busy, not D248's sync term:
         // a shard whose syncs run back to back may not cool however many shards share the
-        // load) grows `k` too, and holds off a shrink. A hot-triggered growth repeats only
-        // once the hot shard has cooled since the last one (what it shed helped), or another
-        // shard is hot: a hot spot more shards cannot cool (one unsplittable tablet) grows
-        // `k` once.
+        // load) grows `k` too, and holds off a shrink; so does one whose writers stall
+        // (D255: their waits for room and L0 depth do ease once it sheds tablets). A
+        // hot-triggered growth repeats only once the hot shard has cooled since the last
+        // one (what it shed helped), or another shard is hot: a hot spot more shards cannot
+        // cool (one unsplittable tablet) grows `k` once.
         let hottest = self.shared.loads[..k.min(n)]
             .iter()
             .enumerate()
-            .map(|(i, l)| (l.read_turn_busy_fresh(now, stale).unwrap_or(0), i))
+            .map(|(i, l)| {
+                let turn = l.read_turn_busy_fresh(now, stale).unwrap_or(0);
+                let stall = l.read_stall_busy_fresh(now, stale).unwrap_or(0);
+                (turn.max(stall), stall > turn, i)
+            })
             .max()
-            .filter(|(b, _)| *b as f64 / 1e6 > PACK_HOT);
+            .filter(|(b, _, _)| *b as f64 / 1e6 > PACK_HOT);
         let hot = hottest.is_some();
-        let hot_grows = hottest.is_some_and(|(b, h)| {
-            self.hot_grew
-                .is_none_or(|(shard, was)| shard != h || b + PACK_HOT_COOLED < was)
+        // A stall-driven hot shard grows `k` again while it still has tablets to shed
+        // (D255): its stall fraction stays at 1 however much it sheds, so D251's cooled
+        // check would hold it to one growth, and on the AX102 a load cut to 3 shards regrew
+        // one shard per 20 s. The cooled check keeps holding thread-saturated hot spots.
+        let view = self.shared.view.load();
+        let hot_grows = hottest.is_some_and(|(b, stalled, h)| {
+            let sheds = stalled
+                && view
+                    .tablets
+                    .iter()
+                    .filter(|t| usize::from(t.shard.0) == h)
+                    .count()
+                    > 1;
+            sheds
+                || self
+                    .hot_grew
+                    .is_none_or(|(shard, was)| shard != h || b + PACK_HOT_COOLED < was)
         });
         if !hot {
             self.hot_grew = None;
         }
-        if k < n && (busy / k as f64 > PACK_SPREAD || hot_grows) {
+        // D255: the active shards a stall-driven growth reached stay active while the store
+        // writes at least half of what it did then. The shards it spread to run cheap turns
+        // once their writers stop stalling, so the busy sum alone would call for a shrink,
+        // the stalls would come back, and `k` would swing between the two. The floor also
+        // expires after a quiet window with no active shard stalling (the cause went away
+        // with the load unchanged), each expiry doubling the next window.
+        let stall_terms = || {
+            self.shared.loads[..k.min(n)]
+                .iter()
+                .map(|l| l.read_stall_busy_fresh(now, stale).unwrap_or(0))
+        };
+        let any_stalled = stall_terms().any(|s| s > 0);
+        let stalling = stall_terms().any(|s| s >= PACK_STALLING);
+        if any_stalled {
+            self.floor_quiet = 0;
+        } else {
+            self.floor_quiet = self.floor_quiet.saturating_add(1);
+        }
+        let quiet_needed = self.floor_quiet_needed.max(PACK_FLOOR_QUIET);
+        let stall_floor = match self.stall_floor {
+            Some((floor_k, writes_then))
+                if writes.saturating_mul(2) >= writes_then && self.floor_quiet < quiet_needed =>
+            {
+                floor_k
+            }
+            Some(_) => {
+                self.stall_floor = None;
+                if self.floor_quiet >= quiet_needed {
+                    // Expired on a quiet window: a floor set again within one window is
+                    // the same cause coming back and doubles the next window (below).
+                    self.floor_expired_pass = self.balance_pass.max(1);
+                } else {
+                    // Released by a write drop: the next floor starts from the base window.
+                    self.floor_expired_pass = 0;
+                    self.floor_quiet_needed = PACK_FLOOR_QUIET;
+                }
+                0
+            }
+            None => 0,
+        };
+        let floor = floor.max(stall_floor.min(n));
+        let spread = busy / k as f64 > PACK_SPREAD;
+        // No shrink while the load is still ramping (D255, #734): the fast write average
+        // above the slow one. The first pass of a load read its ramp as a light store.
+        let ramping = writes_slow > 0 && writes as f64 > PACK_RAMP * writes_slow as f64;
+        self.ramp_passes = if ramping {
+            self.ramp_passes.saturating_add(1)
+        } else {
+            0
+        };
+        let ramping = ramping && self.ramp_passes <= PACK_RAMP_MAX;
+        trace!(
+            "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} (slow {writes_slow}, ramping {ramping}, stalling {stalling}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
+            self.id.0,
+            self.floor_quiet,
+            self.floor_quiet_needed.max(PACK_FLOOR_QUIET),
+            hottest,
+            self.pack_up,
+            self.pack_down
+        );
+        if k < n && (spread || hot_grows) {
             self.pack_up += 1;
         } else {
             self.pack_up = 0;
         }
-        if !hot && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
-            self.pack_down += 1;
+        if !hot && !stalling && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
+            // A ramping pass pauses the shrink count: a light pass advances it only while
+            // the load is not ramping, and a hot, busy or stalling pass resets it ramping
+            // or not (ctr274's review: a count carried across a bursty heavy load's bursts
+            // would shrink and grow in a slow cycle; a lull whose writers wait on room is
+            // no light pass).
+            if !ramping {
+                self.pack_down += 1;
+            }
         } else {
             self.pack_down = 0;
         }
-        if self.pack_up >= PACK_GROW_PASSES {
+        let why = if k < floor {
+            self.pack_k = want.max(floor).min(n);
+            "the stall floor"
+        } else if self.pack_up >= PACK_GROW_PASSES {
             self.pack_k = want.max(k + 1).min(n);
             // Whatever called for it, a growth with a hot shard counts as its growth.
-            if let Some((b, h)) = hottest {
-                self.hot_grew = Some((h, b));
+            match hottest {
+                Some((b, stalled, h)) => {
+                    self.hot_grew = Some((h, b));
+                    if stalled {
+                        // A shrink that stalls writers within a minute, with the store
+                        // writing twice what it did then, was wrong (the load came back):
+                        // back to the count before it in one step (D255).
+                        if let Some((from, at, writes_then)) = self.shrunk_from.take()
+                            && self.balance_pass.saturating_sub(at) <= PACK_SHRINK_UNDO
+                            && writes >= writes_then.saturating_mul(2)
+                        {
+                            self.pack_k = self.pack_k.max(from.min(n));
+                        }
+                        if self.stall_floor.is_none() {
+                            // A floor set within one quiet window of the last expiry is
+                            // the same cause coming back: the window doubles, up to the
+                            // cap. One set later starts from the base again.
+                            let since = self.balance_pass.saturating_sub(self.floor_expired_pass);
+                            self.floor_quiet_needed =
+                                if self.floor_expired_pass != 0 && since <= quiet_needed {
+                                    (quiet_needed * 2).min(PACK_FLOOR_QUIET_MAX)
+                                } else {
+                                    PACK_FLOOR_QUIET
+                                };
+                        }
+                        self.stall_floor = Some((self.pack_k, writes));
+                        "a shard whose writers stall (D255)"
+                    } else {
+                        "a shard whose thread is saturated (D251)"
+                    }
+                }
+                None => {
+                    debug_assert!(spread);
+                    "the busy sum over the active shards (D217)"
+                }
             }
-        } else if self.pack_down >= PACK_SHRINK_PASSES {
-            self.pack_k = want.min(k - 1);
+        } else if self.pack_down >= PACK_SHRINK_PASSES
+            && (k < n || self.writing_passes >= PACK_FIRST_SHRINK_PASSES)
+        {
+            self.pack_k = want.min(k - 1).max(floor.max(1));
+            self.shrunk_from = Some((k, self.balance_pass, writes));
+            "a busy sum low enough for one fewer (D217)"
         } else {
             return true;
-        }
+        };
         trace!(
-            "shard {} balancer: active shards {k} -> {} (busy {busy:.2})",
+            "shard {} balancer: active shards {k} -> {} (busy {busy:.2}, floor {floor}, writes {writes}): {why}",
             self.id.0, self.pack_k
         );
         self.pack_up = 0;

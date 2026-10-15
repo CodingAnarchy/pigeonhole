@@ -164,6 +164,9 @@ pub(crate) struct ShardCounters {
     /// The busy fraction the shard's balancer measures (millionths plus one; 0 measures the
     /// thread's real busy time), `Engine::set_shard_busy` (D217's packing tests).
     pub busy_override: AtomicU64,
+    /// The stall fraction the shard's balancer measures (millionths plus one; 0 measures the
+    /// real one), `Engine::set_shard_stalled` (D255's packing tests).
+    pub stall_override: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -566,6 +569,28 @@ impl Engine {
             .hooks
             .busy_override
             .store(v, Ordering::Relaxed);
+    }
+
+    /// Makes shard `shard`'s balancer measure its writers `stalled` (a fraction of the time,
+    /// 0 to 1) from now on, or the real stall time with `None` (test hook: D255's packing
+    /// tests, decided on chosen stalls under any clock).
+    #[doc(hidden)]
+    pub fn set_shard_stalled(&self, shard: usize, stalled: Option<f64>) {
+        let v = stalled.map_or(0, |b| (b.clamp(0.0, 1.0) * 1e6).round() as u64 + 1);
+        self.inner.shared.metrics[shard]
+            .hooks
+            .stall_override
+            .store(v, Ordering::Relaxed);
+    }
+
+    /// The stall fraction shard `shard`'s balancer published at its last pass (D255: the
+    /// moving average of the time its commits waited for arena room or were paced on L0
+    /// depth, 0 to 1), `None` before its first pass. Test hook.
+    #[doc(hidden)]
+    pub fn shard_stall_busy(&self, shard: usize) -> Option<f64> {
+        self.inner.shared.loads[shard]
+            .read_stall_busy_fresh(u64::MAX, u64::MAX)
+            .map(|v| v as f64 / 1e6)
     }
 
     /// The active shard count (`k`, D217's packing) each shard's balancer used at its last
