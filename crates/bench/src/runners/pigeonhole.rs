@@ -460,6 +460,13 @@ mod riders {
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
 pub(crate) fn options(s: &Settings) -> Options {
     let mut options = Options::default();
+    // SCRATCH (perf2; never merge): compaction cores for an A/B of that default.
+    if let Some(k) = std::env::var("PIGEONHOLE_SCRATCH_COMPACTION_CORES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        options = options.compaction_cores(k);
+    }
     if !s.default_durability {
         options = options.durability(if s.group_sync {
             Durability::GroupSync
@@ -646,6 +653,21 @@ impl Runner for PigeonholeRunner {
     }
 
     fn start_riders(&mut self) -> Result<(), String> {
+        // SCRATCH (perf2; never merge): the shards' busy, pool and spin time at the measured
+        // phase's start and end.
+        if let Some(o) = self.open.as_ref() {
+            let m = o.target.db.engine_metrics();
+            eprintln!(
+                "SPIN start {:?} busy {} pool {} spin {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+                m.shard_busy_nanos,
+                m.shard_pool_busy_nanos,
+                m.shard_spin_nanos
+            );
+        }
         if !self.settings.riders {
             return Ok(());
         }
@@ -659,6 +681,19 @@ impl Runner for PigeonholeRunner {
     }
 
     fn stop_riders(&mut self) -> Result<Option<crate::Riders>, String> {
+        if let Some(o) = self.open.as_ref() {
+            let m = o.target.db.engine_metrics();
+            eprintln!(
+                "SPIN end {:?} busy {} pool {} spin {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+                m.shard_busy_nanos,
+                m.shard_pool_busy_nanos,
+                m.shard_spin_nanos
+            );
+        }
         match self.open.as_mut().and_then(|o| o.riders.take()) {
             Some(r) => r.stop().map(Some),
             None => Ok(None),

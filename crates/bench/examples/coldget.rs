@@ -81,7 +81,17 @@ impl Rng {
 }
 
 fn open(dir: &Path, cache: usize) -> Pigeonhole {
-    Pigeonhole::open(dir.join("cold.phdb"), Options::default().block_cache(cache)).unwrap()
+    {
+        // SCRATCH (perf2; never merge): compaction cores for an amplification A/B.
+        let mut o = Options::default().block_cache(cache);
+        if let Some(k) = std::env::var("PIGEONHOLE_SCRATCH_COMPACTION_CORES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            o = o.compaction_cores(k);
+        }
+        Pigeonhole::open(dir.join("cold.phdb"), o).unwrap()
+    }
 }
 
 fn rows_file(dir: &Path) -> std::path::PathBuf {
@@ -141,6 +151,8 @@ fn load(dir: &Path, mib: u64) {
         }
     });
     drop(t);
+    // SCRATCH (perf2; never merge): the load's engine counters, before the final flush.
+    eprintln!("METRICS after load: {:?}", db.engine_metrics());
     db.flush().unwrap();
     // Let background compaction finish what the load started, so `get` measures a quiet tree:
     // done once `COLDGET_QUIET_SECS` (default 60) pass with no compaction finishing.
@@ -154,6 +166,7 @@ fn load(dir: &Path, mib: u64) {
         }
         done = now;
     }
+    eprintln!("METRICS when quiet: {:?}", db.engine_metrics());
     db.close().unwrap();
     std::fs::write(rows_file(dir), rows.to_string()).unwrap();
     eprintln!(
