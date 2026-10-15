@@ -165,6 +165,16 @@ pub struct Metrics {
     /// Its rise over an interval, divided by the interval, is how many shards' worth of
     /// work the store did. Application-owned shards count nothing.
     pub shard_busy_nanos: u64,
+    /// Nanoseconds the compaction pool's threads spent in slices of the shards' flushes and
+    /// compactions, summed over shards (D256). Its rise over an interval, divided by the
+    /// interval, is how many threads' worth of pool work the store did; zero with the pool
+    /// off (that work is inside `shard_busy_nanos` then).
+    pub shard_pool_busy_nanos: u64,
+    /// Nanoseconds the shards' engine-owned threads spent in their spin before parking
+    /// (D198), summed over shards (D256); not in `shard_busy_nanos`. Its rise over an
+    /// interval, divided by the interval, is how many threads' worth of polling the store
+    /// did: awake time its clients caused without work behind it.
+    pub shard_spin_nanos: u64,
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
@@ -252,6 +262,17 @@ pub struct ShardStats {
     /// interval, divided by the interval (capped at 1), is the sync utilization packing
     /// counts as busy. Zero for `Buffered` and `None` commits.
     pub sync_busy_nanos: u64,
+    /// Nanoseconds the compaction pool's threads spent in slices of this shard's flushes
+    /// and compactions (D256); zero with the pool off (they run inside the shard's turns
+    /// and count in `busy_nanos`). Its rise over an interval, divided by the interval, is
+    /// the pool term packing adds to the shard's turn busy.
+    pub pool_busy_nanos: u64,
+    /// Nanoseconds the shard's engine-owned thread spent in its spin before parking (D198:
+    /// polling for the next message after handling one), not in `busy_nanos` (D256). Its
+    /// rise over an interval, divided by the interval, is the spin term packing adds to the
+    /// shard's turn busy: a shard its clients keep awake. Zero for an application-owned
+    /// shard.
+    pub spin_nanos: u64,
 }
 
 /// The lock-page byte range of the superblock-less file check (decision D59).
@@ -2048,11 +2069,15 @@ impl Engine {
                 moves: m.moves.load(Ordering::Relaxed),
                 busy_nanos: 0,
                 sync_busy_nanos: m.sync_busy_nanos.load(Ordering::Relaxed),
+                pool_busy_nanos: 0,
+                spin_nanos: 0,
             })
             .collect();
         if let Some(subs) = shared.submitters.get() {
             for (s, sub) in out.iter_mut().zip(subs.iter()) {
                 s.busy_nanos = sub.busy_nanos();
+                s.pool_busy_nanos = sub.pool_busy_nanos();
+                s.spin_nanos = sub.spin_nanos();
             }
         }
         for t in shared.view.load().tablets().iter() {
@@ -2157,6 +2182,8 @@ impl Engine {
                 m.shard_idle.0 += parks;
                 m.shard_idle.1 += wakes;
                 m.shard_busy_nanos += sub.busy_nanos();
+                m.shard_pool_busy_nanos += sub.pool_busy_nanos();
+                m.shard_spin_nanos += sub.spin_nanos();
             }
         }
         let w = &shared.visibility;

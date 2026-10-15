@@ -99,6 +99,16 @@ pub struct EngineMetrics {
     /// interval, divided by the interval, is how many shards' worth of work the database
     /// did. Application-owned shards count nothing.
     pub shard_busy_nanos: u64,
+    /// Nanoseconds the compaction pool's threads spent on the shards' flushes and
+    /// compactions, summed over shards; zero with the pool off (that work is inside
+    /// `shard_busy_nanos` then). Its rise over an interval, divided by the interval, is how
+    /// many threads' worth of background work the database did.
+    pub shard_pool_busy_nanos: u64,
+    /// Nanoseconds the shard threads spent polling for their next message before parking
+    /// (the spin after a handled message), summed over shards; not in `shard_busy_nanos`.
+    /// Its rise over an interval, divided by the interval, is how many threads' worth of
+    /// awake-but-idle time the database's clients caused.
+    pub shard_spin_nanos: u64,
     /// Blocking commit waits (`commit()`) that parked their thread after the short spin.
     /// Async commits never park.
     pub commit_parks: u64,
@@ -217,6 +227,8 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             shard_parks: m.shard_idle.0,
             shard_wakes: m.shard_idle.1,
             shard_busy_nanos: m.shard_busy_nanos,
+            shard_pool_busy_nanos: m.shard_pool_busy_nanos,
+            shard_spin_nanos: m.shard_spin_nanos,
             commit_parks: m.commit_parks,
             // The engine fills `pinned_threads` as (pinned, started).
             threads_started: m.pinned_threads.1,
