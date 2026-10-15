@@ -125,9 +125,15 @@ const PACK_HOT: f64 = 0.9;
 const PACK_HOT_COOLED: u64 = 20_000;
 
 /// The fast write average over the slow one above which the load is still ramping (D255):
-/// no shrink then. The first pass of a load read its ramp as a light store and cut the
-/// active shards from 16 to 2 or 3 on the AX102, and the full load then sat there (#734).
+/// the shrink counter pauses then (it does not reset: a periodic batch writer reads as
+/// ramping after every batch, and a reset would never let it pack). The first pass of a
+/// load read its ramp as a light store and cut the active shards from 16 to 2 or 3 on the
+/// AX102, and the full load then sat there (#734).
 const PACK_RAMP: f64 = 1.25;
+
+/// Consecutive ramping passes after which the shrink counter runs anyway (60 s at the base
+/// interval): a load that only ever grows still packs.
+const PACK_RAMP_MAX: u64 = 600;
 
 /// Balancer passes with no active shard stalling after which a stall-driven floor expires
 /// (30 s at the base interval), and the cap of its doubling after each expiry (D255).
@@ -1995,18 +2001,23 @@ impl ShardState {
         } else {
             self.floor_quiet = self.floor_quiet.saturating_add(1);
         }
+        let quiet_needed = self.floor_quiet_needed.max(PACK_FLOOR_QUIET);
         let stall_floor = match self.stall_floor {
             Some((floor_k, writes_then))
-                if writes.saturating_mul(2) >= writes_then
-                    && self.floor_quiet < self.floor_quiet_needed.max(PACK_FLOOR_QUIET) =>
+                if writes.saturating_mul(2) >= writes_then && self.floor_quiet < quiet_needed =>
             {
                 floor_k
             }
             Some(_) => {
                 self.stall_floor = None;
-                if self.floor_quiet >= self.floor_quiet_needed.max(PACK_FLOOR_QUIET) {
-                    self.floor_quiet_needed = (self.floor_quiet_needed.max(PACK_FLOOR_QUIET) * 2)
-                        .min(PACK_FLOOR_QUIET_MAX);
+                if self.floor_quiet >= quiet_needed {
+                    // Expired on a quiet window: a floor set again within one window is
+                    // the same cause coming back and doubles the next window (below).
+                    self.floor_expired_pass = self.balance_pass.max(1);
+                } else {
+                    // Released by a write drop: the next floor starts from the base window.
+                    self.floor_expired_pass = 0;
+                    self.floor_quiet_needed = PACK_FLOOR_QUIET;
                 }
                 0
             }
@@ -2017,6 +2028,12 @@ impl ShardState {
         // No shrink while the load is still ramping (D255, #734): the fast write average
         // above the slow one. The first pass of a load read its ramp as a light store.
         let ramping = writes_slow > 0 && writes as f64 > PACK_RAMP * writes_slow as f64;
+        self.ramp_passes = if ramping {
+            self.ramp_passes.saturating_add(1)
+        } else {
+            0
+        };
+        let ramping = ramping && self.ramp_passes <= PACK_RAMP_MAX;
         trace!(
             "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} (slow {writes_slow}, ramping {ramping}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
             self.id.0,
@@ -2031,7 +2048,9 @@ impl ShardState {
         } else {
             self.pack_up = 0;
         }
-        if !hot && !ramping && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
+        if ramping {
+            // A ramping pass pauses the shrink count; it neither advances nor resets.
+        } else if !hot && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
             self.pack_down += 1;
         } else {
             self.pack_down = 0;
@@ -2046,6 +2065,18 @@ impl ShardState {
                 Some((b, stalled, h)) => {
                     self.hot_grew = Some((h, b));
                     if stalled {
+                        if self.stall_floor.is_none() {
+                            // A floor set within one quiet window of the last expiry is
+                            // the same cause coming back: the window doubles, up to the
+                            // cap. One set later starts from the base again.
+                            let since = self.balance_pass.saturating_sub(self.floor_expired_pass);
+                            self.floor_quiet_needed =
+                                if self.floor_expired_pass != 0 && since <= quiet_needed {
+                                    (quiet_needed * 2).min(PACK_FLOOR_QUIET_MAX)
+                                } else {
+                                    PACK_FLOOR_QUIET
+                                };
+                        }
                         self.stall_floor = Some((self.pack_k, writes));
                         "a shard whose writers stall (D255)"
                     } else {

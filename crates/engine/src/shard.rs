@@ -2462,6 +2462,13 @@ pub(crate) struct ShardState {
     /// next window, up to `PACK_FLOOR_QUIET_MAX`.
     floor_quiet: u64,
     floor_quiet_needed: u64,
+    /// The balancer pass at which the floor last expired on a quiet window (0: none since
+    /// a release by a write drop): a stall-driven floor set within one window of it is the
+    /// same cause coming back, and doubles the window; one set later starts from the base.
+    floor_expired_pass: u64,
+    /// Consecutive balancer passes the load has read as ramping: past `PACK_RAMP_MAX` the
+    /// shrink counter runs again, so a load that only ever grows still packs.
+    ramp_passes: u64,
     pack_k: usize,
     pack_up: u64,
     pack_down: u64,
@@ -2658,6 +2665,8 @@ impl ShardState {
             stall_floor: None,
             floor_quiet: 0,
             floor_quiet_needed: 0,
+            floor_expired_pass: 0,
+            ramp_passes: 0,
             pack_k: 0,
             pack_up: 0,
             pack_down: 0,

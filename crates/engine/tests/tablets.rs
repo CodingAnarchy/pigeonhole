@@ -1924,6 +1924,91 @@ fn the_stall_floor_expires_after_a_quiet_window() {
     }
 }
 
+/// A periodic batch writer packs (D255, ctr274's review of #730): four shards 10% busy, a
+/// batch every fifth pass and nothing between. Right after each batch the fast write
+/// average is far above the slow one, so the pass reads as ramping; a shrink count that
+/// reset on every such pass never reached 50 and `k` stayed at four for good. A ramping
+/// pass only pauses the count, so the batches' quiet passes carry it.
+#[test]
+fn periodic_batch_writers_still_pack() {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    let mut passes = 0u64;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
+        let batch = passes.is_multiple_of(5);
+        write_and_balance(&mut db, 4, |_| if batch { 100 } else { 0 }, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        tablets_per_shard(&db, 4),
+        vec![4, 0, 0, 0],
+        "not packed after {passes} passes, k {:?}",
+        db.engine.pack_ks()[0]
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// The floor's quiet window doubles only when a stall comes back within one window of the
+/// last expiry (D255, ctr274's review): a second episode well after the first releases
+/// after the base window again, not the doubled one, so a store's ordinary episodes never
+/// pin a later transient stall for minutes.
+#[test]
+fn the_floor_backoff_resets_after_a_quiet_episode() {
+    let (mut db, mut written) = packed_with_shard_0_stalled();
+    // Episode 1: the stall-driven growth, then the stall gone; the floor expires after the
+    // base window.
+    let episode = |db: &mut Db, written: &mut u64| -> usize {
+        db.engine.set_shard_stalled(0, Some(1.0));
+        let mut passes = 0;
+        while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 120 {
+            write_and_balance(db, 4, |_| 20, written);
+            passes += 1;
+        }
+        assert!(
+            db.engine.pack_ks()[0].is_some_and(|k| k >= 2),
+            "no stall-driven growth after {passes} passes"
+        );
+        db.engine.set_shard_stalled(0, Some(0.0));
+        for s in 0..4 {
+            db.engine.set_shard_busy(s, Some(0.05));
+        }
+        passes = 0;
+        while db.engine.pack_ks()[0] != Some(1) && passes < 1000 {
+            write_and_balance(db, 4, |_| 20, written);
+            passes += 1;
+        }
+        assert_eq!(
+            db.engine.pack_ks()[0],
+            Some(1),
+            "no release after {passes} passes"
+        );
+        passes
+    };
+    let first = episode(&mut db, &mut written);
+    assert!(
+        first < 600,
+        "the first episode's window was not the base one: {first} passes"
+    );
+    // More than a window later, with the stall gone throughout.
+    for _ in 0..400 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    let second = episode(&mut db, &mut written);
+    assert!(
+        second < 600,
+        "the second episode's window doubled although the first expired {first} passes in and 400 quiet passes passed since: {second} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// With packing off (`balance_pack = false`), or an idle store (writes below
 /// `balance_min_writes`), the same light load changes no tablet.
 #[test]
