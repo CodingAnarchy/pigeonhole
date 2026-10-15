@@ -819,7 +819,8 @@ pub enum IoBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub struct IoRings {
-    /// Rings: the shared one, plus one per shard thread that got its own.
+    /// Rings: the shared one, plus one per shard thread and compaction thread that got its
+    /// own.
     pub rings: usize,
     /// Rings with a registered buffer pool; the rest use plain buffers.
     pub pooled: usize,

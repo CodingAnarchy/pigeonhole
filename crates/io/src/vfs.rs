@@ -101,14 +101,15 @@ pub trait Vfs: Send + Sync + Debug {
     /// Gives the calling thread an I/O queue of its own, if this backend has them (an
     /// io_uring ring per shard thread, #402): operations it submits from then on go there,
     /// and it completes them by reaping ([`reap_own_io`](crate::reap_own_io)), in its turns
-    /// and in its waits. Called by threads that drive shards; calling it again does nothing.
+    /// and in its waits. Called by threads that drive shards and by the runtime's compaction
+    /// pool threads; calling it again does nothing.
     /// The default, for backends whose completions arrive on threads of their own, does
     /// nothing.
     fn attach_thread(&self) {}
 
     /// For a backend with io_uring rings (#402): how many rings it has now and how many got
-    /// a registered buffer pool (a ring registers one on the first read that can use it). Rings past the locked-memory budget, and shard threads whose
-    /// ring could not be created (they use the shared one), run with plain buffers; this
+    /// a registered buffer pool (a ring registers one on the first read that can use it). Rings past the locked-memory budget, and shard or compaction threads
+    /// whose ring could not be created (they use the shared one), run with plain buffers; this
     /// shows when that happens. `None` for other backends (the default).
     fn ring_stats(&self) -> Option<RingStats> {
         None

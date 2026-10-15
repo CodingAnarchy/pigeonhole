@@ -335,9 +335,19 @@ pub(crate) fn pool_main(
     vfs: VfsRef,
     time_slice: u64,
 ) {
+    // A ring of this thread's own where the backend has them (io_uring, #402), as a shard
+    // thread has: what its tasks submit (a compaction's block reads, a flush's SST writes,
+    // the manifest pump's root commit) completes here, on the thread that waits for it,
+    // not on the backend's shared ring and its one reaper thread, which every other
+    // thread's reads already queue on (D252's stall under io_uring).
+    vfs.attach_thread();
+    let own_ring = pigeonhole_io::own_io_waker().is_some();
     shared
         .signal
-        .set_target(WakeTarget::Thread(thread::current()));
+        .set_target(match pigeonhole_io::own_io_waker() {
+            Some(w) => WakeTarget::ThreadRing(thread::current(), w),
+            None => WakeTarget::Thread(thread::current()),
+        });
     let mut sched = Scheduler::new(Arc::clone(&shared.signal));
     // The clock when this thread last went idle with sleeping tasks.
     let mut idle_at = None;
@@ -348,6 +358,11 @@ pub(crate) fn pool_main(
         }
         while let Ok(task) = rx.try_recv() {
             sched.spawn(task);
+        }
+        // What completed on this thread's ring resolves now, before the wakes it causes
+        // are collected, so the tasks it unblocks run this pass.
+        if own_ring {
+            pigeonhole_io::reap_own_io(None);
         }
         sched.collect_woken();
         let now = vfs.monotonic_nanos();
@@ -371,17 +386,36 @@ pub(crate) fn pool_main(
             shared.signal.awake();
             continue;
         }
-        if !shared.closed.load(Ordering::SeqCst) {
-            match sched.next_deadline() {
-                None => thread::park(),
-                Some(deadline) => {
-                    idle_at = Some(now);
-                    idle_park.park(&*vfs, deadline);
-                }
+        if shared.closed.load(Ordering::SeqCst) {
+            continue;
+        }
+        if own_ring && pigeonhole_io::own_io_in_flight() {
+            // I/O only this thread completes (its ring): wait on it rather than park, until
+            // a completion, a wake (the ring's eventfd) or the next sleeper's deadline. A
+            // blocked task's completion posts only when this thread enters its ring.
+            let until = sched
+                .next_deadline()
+                .map_or(RING_IDLE_WAIT, |d| {
+                    Duration::from_nanos(d.saturating_sub(now))
+                })
+                .min(RING_IDLE_WAIT);
+            pigeonhole_io::reap_own_io(Some(until));
+            shared.signal.awake();
+            continue;
+        }
+        match sched.next_deadline() {
+            None => thread::park(),
+            Some(deadline) => {
+                idle_at = Some(now);
+                idle_park.park(&*vfs, deadline);
             }
         }
     }
 }
+
+/// Longest an idle pool thread waits on its own I/O ring before it looks again (a wake or a
+/// completion ends the wait sooner).
+const RING_IDLE_WAIT: Duration = Duration::from_millis(100);
 
 /// Parks an idle thread whose earliest sleeping task is due at a VFS-clock deadline.
 #[derive(Debug, Default)]
