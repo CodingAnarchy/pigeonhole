@@ -1360,13 +1360,30 @@ fn packed_tablets_spread_again_when_the_shard_turns_busy() {
 /// the clock then advances `stalled` while they wait, the I/O completes, every commit
 /// finishes, and the balancer runs a pass. Every tablet gets the same writes, so only the
 /// placement decides which shard stalls.
-fn stall_pass(db: &mut Db, n: usize, stalled: u64, written: &mut u64) {
+fn stall_pass(db: &mut Db, _n: usize, stalled: u64, written: &mut u64) {
+    stall_pass_with(db, |_| 20, 64, stalled, false, written);
+}
+
+/// [`stall_pass`] with `rows(t)` rows of `value_kib` KiB per tablet `t` (0: none). With
+/// `measure_open` the balancer pass runs while the commits still wait for room (the I/O
+/// completes only after it), and the shard's published stall fraction after that pass is
+/// returned.
+fn stall_pass_with(
+    db: &mut Db,
+    rows: impl Fn(usize) -> usize,
+    value_kib: usize,
+    stalled: u64,
+    measure_open: bool,
+    written: &mut u64,
+) -> Option<f64> {
+    let n = 4;
     let f = db.table.families[0].id;
-    let value = vec![7u8; 64 << 10];
+    let value = vec![7u8; value_kib << 10];
     let mut pending: Vec<_> = (0..n)
+        .filter(|&t| rows(t) > 0)
         .map(|t| {
             let mut wb = WriteBatch::new();
-            for _ in 0..20 {
+            for _ in 0..rows(t) {
                 wb.put(
                     db.table.id,
                     f,
@@ -1391,6 +1408,19 @@ fn stall_pass(db: &mut Db, n: usize, stalled: u64, written: &mut u64) {
     }
     db.vfs.advance(stalled);
     let mut cx = Context::from_waker(Waker::noop());
+    let mut measured = None;
+    let m = if measure_open {
+        // The pass measures while the wait is still open: nothing has completed.
+        let m = db.engine.balance_pending().unwrap();
+        for _ in 0..5 {
+            db.vfs.advance(2_000_000);
+            db.step();
+        }
+        measured = db.engine.shard_stall_busy(0);
+        Some(m)
+    } else {
+        None
+    };
     for _ in 0..10_000 {
         // The clock keeps moving while the flushes complete, as a real one would, past the
         // room wait's re-check interval each step: a wait for room on a stopped clock with
@@ -1410,16 +1440,29 @@ fn stall_pass(db: &mut Db, n: usize, stalled: u64, written: &mut u64) {
         }
     }
     assert!(pending.is_empty(), "commits did not finish");
-    let mut m = db.engine.balance_pending().unwrap();
+    let mut m = m.unwrap_or_else(|| db.engine.balance_pending().unwrap());
     for _ in 0..100_000 {
         if let Poll::Ready(r) = Pin::new(&mut m).poll(&mut cx) {
-            return r.unwrap();
+            r.unwrap();
+            return measured;
         }
         db.vfs.advance(2_000_000);
         db.vfs.complete_all_io();
         db.step();
     }
     panic!("the balancer pass did not finish")
+}
+
+/// The shard owning tablet `t`.
+fn owner_of(db: &Db, t: usize) -> u16 {
+    let row = tablet_row(t, 0);
+    db.ranges()
+        .into_iter()
+        .find(|(_, _, start, end)| {
+            row.as_slice() >= start.as_slice() && end.as_deref().is_none_or(|e| row.as_slice() < e)
+        })
+        .expect("a tablet holds the row")
+        .1
 }
 
 /// Once packed, a shard whose thread reads idle but whose writers wait for arena room
@@ -1477,6 +1520,247 @@ fn packed_tablets_spread_again_when_the_shard_stalls_for_room() {
     db.vfs.set_deferred_io(false);
     db.settle();
     assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Packs four tablets onto shard 0 (threads 10% busy), with compaction off: a job keeps the
+/// view it started with, whose readers pin the chunks of every memtable flushed meanwhile.
+fn packed_without_compaction() -> (Db, u64) {
+    let mut db = spread_and_busy_with(0.1, true, |o| o.compaction.l0_trigger = 1 << 20);
+    let mut written = 0;
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
+    (db, written)
+}
+
+/// The hot test alone (D251's rule with D255's term): two active shards whose busy sum is
+/// below the spread threshold, one of them with idle turns but stalling writers, grow the
+/// active shards by one. Shard 0 gets to 80% busy, which grows the active shards to two by
+/// the busy sum (not hot: under 90%) and spreads the tablets; then its thread reads idle and
+/// shard 1 30% busy, so the sum over the two is 0.65, under the 0.75 spread threshold, and
+/// only shard 0's writers stalling (its tablets get the heavy writes) can grow `k` further.
+#[test]
+fn a_stalling_shard_is_hot_even_when_the_busy_sum_is_low() {
+    let (mut db, mut written) = packed_without_compaction();
+    db.engine.set_shard_busy(0, Some(0.8));
+    for s in 1..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    let mut passes = 0;
+    while tablets_per_shard(&db, 4) != vec![2, 2, 0, 0] && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        tablets_per_shard(&db, 4),
+        vec![2, 2, 0, 0],
+        "after {passes} passes"
+    );
+    assert_eq!(db.engine.pack_ks()[0], Some(2));
+    db.engine.set_shard_busy(0, Some(0.0));
+    db.engine.set_shard_busy(1, Some(0.3));
+    db.vfs.set_deferred_io(true);
+    passes = 0;
+    while db.engine.pack_ks()[0] == Some(2) && passes < 100 {
+        // The heavy writes follow shard 0's tablets, whichever the balancer leaves it: only
+        // shard 0 ever stalls.
+        let heavy: Vec<usize> = (0..4).filter(|&t| owner_of(&db, t) == 0).collect();
+        assert!(
+            !heavy.is_empty(),
+            "shard 0 holds no tablet after {passes} passes"
+        );
+        stall_pass_with(
+            &mut db,
+            |t| if heavy.contains(&t) { 40 } else { 1 },
+            64,
+            1_000_000_000,
+            false,
+            &mut written,
+        );
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k >= 3),
+        "after {passes} passes the active shards are {:?}: the stalling shard did not read hot",
+        db.engine.pack_ks()[0]
+    );
+    db.vfs.complete_all_io();
+    db.vfs.set_deferred_io(false);
+    db.settle();
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A wait for room still open when the balancer measures counts (D255): the pass taken
+/// while the commits wait reads a stall fraction above zero. Crediting the wait only once it
+/// ends would read zero here, a pass late.
+#[test]
+fn a_stall_still_open_at_the_balancer_pass_counts() {
+    let (mut db, mut written) = packed_without_compaction();
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.0));
+    }
+    db.vfs.set_deferred_io(true);
+    assert_eq!(db.engine.shard_stall_busy(0), Some(0.0));
+    let measured = stall_pass_with(&mut db, |_| 20, 64, 1_000_000_000, true, &mut written);
+    assert!(
+        measured.is_some_and(|f| f > 0.1),
+        "the open wait was not counted: {measured:?}"
+    );
+    db.vfs.complete_all_io();
+    db.vfs.set_deferred_io(false);
+    db.settle();
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// Once a stall-driven growth has spread the tablets and the stalls stop, the active shards
+/// hold while the store keeps writing (D255's floor): the shards it spread to run cheap
+/// turns, so by the busy sum alone they would shrink after 50 passes, the stalls would
+/// return, and `k` would swing between the two.
+#[test]
+fn the_active_shards_a_stall_spread_to_hold_while_the_writes_go_on() {
+    let (mut db, mut written) = packed_without_compaction();
+    for s in 0..4 {
+        db.engine.set_shard_busy(s, Some(0.05));
+    }
+    db.vfs.set_deferred_io(true);
+    let mut passes = 0;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 300 {
+        stall_pass(&mut db, 4, 1_000_000_000, &mut written);
+        passes += 1;
+    }
+    let k = db.engine.pack_ks()[0].expect("decided");
+    assert!(k >= 2, "after {passes} passes");
+    // The same row rate with 8 KiB rows (160 KiB per tablet per pass: no shard stalls, on
+    // one shard or four), so the floor's write-rate condition holds while nothing is hot;
+    // every thread reads 5% busy.
+    let stalls = db.engine.metrics().stalls.0;
+    let mut ks = Vec::new();
+    for _ in 0..120 {
+        stall_pass_with(&mut db, |_| 20, 8, 1_000_000_000, false, &mut written);
+        ks.push(db.engine.pack_ks()[0].expect("decided"));
+    }
+    assert!(
+        ks.iter().all(|&now| now >= 2),
+        "the active shards shrank back: {ks:?} (stalls {} -> {})",
+        stalls,
+        db.engine.metrics().stalls.0
+    );
+    db.vfs.complete_all_io();
+    db.vfs.set_deferred_io(false);
+    db.settle();
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// L0 pacing with its paced commits taken away by a tablet change ends its stall span
+/// (D255, ctr274's review of #730): with the span left open the shard would read stalled,
+/// and so hot, with no writer at all. Two tablets on one shard: a held compaction keeps
+/// tablet 0's L0 at the pacing depth (2 × the trigger of 2), which paces every commit of the
+/// shard; the ninth commit to tablet 1 (the bucket holds 8 tokens) is paced; a move of
+/// tablet 1 parks its commits off this shard's queue while tablet 0 keeps the pacing score.
+#[test]
+fn pacing_ends_when_a_tablet_change_takes_its_commits() {
+    let mut db = open(2, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.compaction.l0_trigger = 2;
+        o.memtable_freeze_bytes = 32 << 10;
+        o.tablet_split_bytes = u64::MAX;
+    });
+    let from = 0u16;
+    let to = 1u16;
+    tablets_on(&mut db, 2, |_| from);
+    db.engine.hold_compactions(true);
+    let value = vec![0x5A; 200];
+    let mut i = 0u64;
+    // Four L0 files on tablet 0 (one memtable each: 40 rows of 200 bytes, about 20 KiB with
+    // their keys, stay under the 32 KiB freeze size): the pacing depth, with the compaction
+    // held. From here every commit on the shard is paced, and a blocking put on a stopped
+    // clock would never get its token, so the rest is submitted and stepped by hand.
+    for _ in 0..4 {
+        for _ in 0..40 {
+            db.put(&tablet_row(0, i), &value);
+            i += 1;
+        }
+        let m = db.engine.flush_pending().unwrap();
+        db.drive(m).unwrap();
+    }
+    assert!(db.engine.compaction_held(), "no compaction started");
+    // Paced commits to tablet 1: after the bucket's eight tokens a commit stays pending on
+    // a clock that does not move.
+    let f = db.table.families[0].id;
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut pending = Vec::new();
+    for _ in 0..12 {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            db.table.id,
+            f,
+            &tablet_row(1, i),
+            b"q",
+            None,
+            ValueRef::Bytes(&value),
+        )
+        .unwrap();
+        i += 1;
+        pending.push(db.engine.submit(wb, Some(Durability::Buffered)).unwrap());
+        for _ in 0..3 {
+            db.step();
+        }
+    }
+    pending.retain_mut(|pc| Pin::new(pc).poll(&mut cx).is_pending());
+    assert!(!pending.is_empty(), "no commit was paced");
+    assert!(db.engine.metrics().stalls.0 > 0, "no stall was counted");
+    // Tablet 1 moves to the other shard: its paced commits leave this shard's queue while
+    // tablet 0's held compaction keeps the pacing score at 1.
+    let m = db
+        .engine
+        .move_tablet_pending(db.table.id, &tablet_row(1, 0), to)
+        .unwrap();
+    db.drive(m).unwrap();
+    for pc in &mut pending {
+        for _ in 0..100_000 {
+            if let Poll::Ready(r) = Pin::new(&mut *pc).poll(&mut cx) {
+                r.expect("commit");
+                break;
+            }
+            db.vfs.advance(2_000_000);
+            db.step();
+        }
+    }
+    assert_eq!(tablets_per_shard(&db, 2), vec![1, 1]);
+    db.engine.hold_compactions(false);
+    db.settle();
+    // Ten balancer passes a second apart with no writer on this shard: its stall fraction
+    // must fall to nothing. Left open, the pacing span would read as a full stall.
+    for _ in 0..10 {
+        db.vfs.advance(1_000_000_000);
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+    }
+    let frac = db.engine.shard_stall_busy(usize::from(from));
+    assert!(
+        frac.is_some_and(|f| f < 0.1),
+        "shard {from} still reads stalled after its commits moved away: {frac:?}"
+    );
+    assert_eq!(db.scan_rows().len() as u64, i);
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();

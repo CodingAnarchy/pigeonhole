@@ -568,6 +568,16 @@ impl Engine {
             .store(v, Ordering::Relaxed);
     }
 
+    /// The stall fraction shard `shard`'s balancer published at its last pass (D255: the
+    /// moving average of the time its commits waited for arena room or were paced on L0
+    /// depth, 0 to 1), `None` before its first pass. Test hook.
+    #[doc(hidden)]
+    pub fn shard_stall_busy(&self, shard: usize) -> Option<f64> {
+        self.inner.shared.loads[shard]
+            .read_stall_busy_fresh(u64::MAX, u64::MAX)
+            .map(|v| v as f64 / 1e6)
+    }
+
     /// The active shard count (`k`, D217's packing) each shard's balancer used at its last
     /// pass, by shard (`None` before its first pass). Test hook: every shard must use the same.
     #[doc(hidden)]

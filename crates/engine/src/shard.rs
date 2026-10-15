@@ -2203,6 +2203,12 @@ pub(crate) struct ShardState {
     wait_room: bool,
     /// The wait for arena room in progress: when it began and its timeout timer.
     room_wait: Option<RoomWait>,
+    /// When the shard's commits began to stall (a wait for room or L0 pacing open, whichever
+    /// came first; 0 = neither), and the time stalled before that (the union of both kinds
+    /// of wait): packing's stall term (D255), kept apart from the `stall_nanos` metric, which
+    /// counts each kind' whole span and so overlapping ones twice.
+    stall_open_since: u64,
+    stall_union_nanos: u64,
     /// A freeze waits for the watermark to pass the memtable (registered in `Shared`).
     freeze_deferred: bool,
     /// A freeze of every memtable (`flush`, `compact`, close) is still owed: some memtable
@@ -2441,6 +2447,15 @@ pub(crate) struct ShardState {
     /// it shed helped), or another shard to be hot, so a hot spot more shards cannot cool
     /// grows `k` only once.
     hot_grew: Option<(usize, u64)>,
+    /// The moving average of the writers' stall fraction alone (D255).
+    stall_ewma: f64,
+    /// The shard's stall count (`ShardMetrics::stalls`) at the last balancer pass (D255).
+    stall_events_mark: u64,
+    /// A stall-driven growth's active shard count and the store's write rate then (D255):
+    /// no shrink below that count while the store still writes at least half that rate,
+    /// since the shards it spread to read idle once their writers stop stalling, and the
+    /// stalls would return with the shrink.
+    stall_floor: Option<(usize, u64)>,
     pack_k: usize,
     pack_up: u64,
     pack_down: u64,
@@ -2536,6 +2551,8 @@ impl ShardState {
             flush_waiters: Vec::new(),
             wait_room: false,
             room_wait: None,
+            stall_open_since: 0,
+            stall_union_nanos: 0,
             freeze_deferred: false,
             freeze_all_pending: false,
             starved_all: false,
@@ -2630,6 +2647,9 @@ impl ShardState {
             busy_ewma: 0.0,
             turn_ewma: 0.0,
             hot_grew: None,
+            stall_ewma: 0.0,
+            stall_events_mark: 0,
+            stall_floor: None,
             pack_k: 0,
             pack_up: 0,
             pack_down: 0,
@@ -3141,6 +3161,50 @@ impl ShardState {
         Ok(needed)
     }
 
+    /// Keeps the union of the shard's stall spans (D255): called whenever a wait for room or
+    /// L0 pacing opens or closes. The first of the two to open starts the span, the last to
+    /// close ends it and adds it to `stall_union_nanos`.
+    fn note_stall_edge(&mut self, now: u64) {
+        let open = self.room_wait.is_some() || self.stall.since != 0;
+        if open && self.stall_open_since == 0 {
+            self.stall_open_since = now;
+        } else if !open && self.stall_open_since != 0 {
+            self.stall_union_nanos = self
+                .stall_union_nanos
+                .saturating_add(now.saturating_sub(self.stall_open_since));
+            self.stall_open_since = 0;
+        }
+    }
+
+    /// The time the shard's commits have spent stalled up to `now` (D255): the union of its
+    /// waits for room and its L0 pacing, with the span still open added, so the total only
+    /// moves forward and a balancer pass's share is the difference of two readings.
+    pub(super) fn stall_busy_nanos(&self, now: u64) -> u64 {
+        let open = if self.stall_open_since == 0 {
+            0
+        } else {
+            now.saturating_sub(self.stall_open_since)
+        };
+        self.stall_union_nanos.saturating_add(open)
+    }
+
+    /// L0 pacing is over with no writer left to pace (the waiting commits were parked or
+    /// forwarded by a tablet change): closes its span and its timer, as `stalled` would for
+    /// an admitted group. Left open, the shard would read stalled, and so hot, with no
+    /// writers at all (ctr274's review of #730).
+    fn end_pacing(&mut self, now: u64) {
+        if self.stall.since == 0 {
+            return;
+        }
+        trace!("shard {} pacing ends with no writer left", self.id.0);
+        self.stall.cancel_timer();
+        self.shared.metrics[usize::from(self.id.0)]
+            .stall_nanos
+            .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
+        self.stall.since = 0;
+        self.note_stall_edge(now);
+    }
+
     /// The wait for arena room is over: account the stall and cancel its timer.
     fn end_room_wait(&mut self, now: u64) {
         if let Some(w) = self.room_wait.take() {
@@ -3153,6 +3217,7 @@ impl ShardState {
             for m in &mut self.pending {
                 m.room_since = 0;
             }
+            self.note_stall_edge(now);
         }
     }
 
@@ -4298,6 +4363,7 @@ impl ShardState {
                     .stall_nanos
                     .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
                 self.stall.since = 0;
+                self.note_stall_edge(now);
             }
             return false;
         }
@@ -4309,6 +4375,7 @@ impl ShardState {
                     .stall_nanos
                     .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
                 self.stall.since = 0;
+                self.note_stall_edge(now);
             }
             return false;
         }
@@ -4317,6 +4384,7 @@ impl ShardState {
             self.shared.metrics[usize::from(self.id.0)]
                 .stalls
                 .fetch_add(1, Ordering::Relaxed);
+            self.note_stall_edge(now);
         }
         // A timer that gave up on a clock that has not moved since is not armed again: the
         // running compaction's completion kicks the shard.
@@ -4411,6 +4479,7 @@ impl ShardState {
                     ShardMsg::Kick,
                 )));
                 self.room_wait = Some(RoomWait::new(now, state));
+                self.note_stall_edge(now);
             }
             Some(w) if frozen && w.failed_flushes >= ROOM_FLUSH_ATTEMPTS => {
                 // On a frozen clock, which never reaches the timeout, the flushes keep
@@ -4559,10 +4628,14 @@ impl ShardState {
     fn run_group(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.pending.is_empty() {
             // Nothing waits for room any more (the waiting commits were parked or
-            // forwarded by a tablet change): the stall is over and its timer goes.
+            // forwarded by a tablet change): the stall is over and its timer goes, and so
+            // does L0 pacing's (D255 counts both as busy; left open they read as a stall
+            // with no writer).
+            let now = ctx.now_nanos();
             if self.tablets_on() && self.room_wait.is_some() && !self.wait_room {
-                self.end_room_wait(ctx.now_nanos());
+                self.end_room_wait(now);
             }
+            self.end_pacing(now);
             return;
         }
         trace!(

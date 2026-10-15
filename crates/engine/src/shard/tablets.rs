@@ -1590,6 +1590,8 @@ impl ShardState {
         self.measure_busy(now);
         self.shared.loads[usize::from(self.id.0)]
             .set_turn_busy((self.turn_ewma * 1e6).round() as u64);
+        self.shared.loads[usize::from(self.id.0)]
+            .set_stall_busy((self.stall_ewma * 1e6).round() as u64);
         self.shared.loads[usize::from(self.id.0)].publish(
             self.load_ewma.round() as u64,
             self.load_slow.round() as u64,
@@ -1751,13 +1753,13 @@ impl ShardState {
     /// so a shard whose durable commits keep a sync in flight reads busy although its thread
     /// mostly waits. Not divided by `group_sync_depth`: a shard's concurrent syncs fold into
     /// one journal commit (D221), so they are one server, not two (D248's A/B). The stall
-    /// time is what commits spent waiting for arena room or paced on L0 depth (D255): with
-    /// flush and compaction on dedicated threads (D252) a shard carrying a full write load
-    /// runs cheap turns and reads idle, so packing kept whole tables on one shard; a shard
-    /// whose writers wait is hot in the sense that counts, more shards would take the load.
-    /// `max`, since a turn often runs while a sync is in flight or writers wait. Syncs and
-    /// stalls count only while the runtime counts turn time (engine-owned shards): an
-    /// application-owned store stays unpacked, as before.
+    /// time is the union of what commits spent waiting for arena room and paced on L0 depth
+    /// (`stall_busy_nanos`, D255): with flush and compaction on dedicated threads (D252) a
+    /// shard carrying a full write load runs cheap turns and reads idle, so packing kept
+    /// whole tables on one shard; a shard whose writers wait is hot in the sense that counts,
+    /// more shards would take the load. `max`, since a turn often runs while a sync is in
+    /// flight or writers wait. Syncs and stalls count only while the runtime counts turn
+    /// time (engine-owned shards): an application-owned store stays unpacked, as before.
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
         let busy = self
@@ -1788,46 +1790,44 @@ impl ShardState {
             0 => (turns, counted),
             v => (Some((v - 1) as f64 / 1e6), true),
         };
+        // Stalls that began since the last pass (D255): a pass in which the writers stalled
+        // at all reads as fully stalled. A stall's length is the writers' latency, not the
+        // shard's load: a load that stalls every interval is at the shard's write capacity
+        // however short each stall (the buffered riders row stalled 7,000 times for 11% of
+        // the top shard's time and spread to five shards on the fraction alone).
+        let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
         let (syncs, stalls) = match (self.busy_mark, elapsed) {
-            (Some((_, sync_was, stall_was, _)), Some(e)) if counted => (
-                sync.saturating_sub(sync_was) as f64 / e,
-                stall.saturating_sub(stall_was) as f64 / e,
-            ),
+            (Some((_, sync_was, stall_was, _)), Some(e)) if counted => {
+                let fraction = (stall.saturating_sub(stall_was) as f64 / e).min(1.0);
+                let stalled = events > self.stall_events_mark || self.stall_open_since != 0;
+                (
+                    sync.saturating_sub(sync_was) as f64 / e,
+                    if stalled { 1.0 } else { fraction },
+                )
+            }
             _ => (0.0, 0.0),
         };
+        self.stall_events_mark = events;
         let measured = turns.map(|t| t.max(syncs).max(stalls).min(1.0));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
         }
-        // The hot test (D251) leaves the sync term out, and takes the stall term in (D255):
-        // a shard's syncs may run back to back however many shards share the load, while
-        // its writers' waits for room and L0 depth do ease once it sheds tablets.
         if let Some(t) = turns {
-            self.turn_ewma =
-                LOAD_ALPHA * t.max(stalls).min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
+            self.turn_ewma = LOAD_ALPHA * t.min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
+            self.stall_ewma = LOAD_ALPHA * stalls + (1.0 - LOAD_ALPHA) * self.stall_ewma;
         }
         self.busy_mark = Some((busy, sync, stall, now));
-    }
-
-    /// The time this shard's commits have spent stalled up to `now` (D255): waiting for arena
-    /// room (`wait_for_room`) or paced on L0 depth (`stalled`), the per-shard `stall_nanos`
-    /// the engine reports plus whatever wait is still open. That metric grows by a wait's
-    /// whole span when the wait ends, so with the open span added the total only ever moves
-    /// forward, and a pass's share is the difference of two readings.
-    fn stall_busy_nanos(&self, now: u64) -> u64 {
-        let ended = self.shared.metrics[usize::from(self.id.0)]
-            .stall_nanos
-            .load(Ordering::Relaxed);
-        let room = self
-            .room_wait
-            .as_ref()
-            .map_or(0, |w| now.saturating_sub(w.since));
-        let paced = if self.stall.since == 0 {
-            0
-        } else {
-            now.saturating_sub(self.stall.since)
-        };
-        ended.saturating_add(room).saturating_add(paced)
+        trace!(
+            "shard {} balancer: busy turn {:.2} sync {:.2} stall {:.2} (events {}) -> ewma {:.2}, turn {:.2}, stall {:.2}",
+            self.id.0,
+            turns.unwrap_or(0.0),
+            syncs,
+            stalls,
+            events,
+            self.busy_ewma,
+            self.turn_ewma,
+            self.stall_ewma
+        );
     }
 
     /// The shards that stay active under packing (D217): `0..k`. Every shard, without
@@ -1918,25 +1918,47 @@ impl ShardState {
         }
         // D251: an active shard whose thread is saturated (turn busy, not D248's sync term:
         // a shard whose syncs run back to back may not cool however many shards share the
-        // load) grows `k` too, and holds off a shrink. A hot-triggered growth repeats only
-        // once the hot shard has cooled since the last one (what it shed helped), or another
-        // shard is hot: a hot spot more shards cannot cool (one unsplittable tablet) grows
-        // `k` once.
+        // load) grows `k` too, and holds off a shrink; so does one whose writers stall
+        // (D255: their waits for room and L0 depth do ease once it sheds tablets). A
+        // hot-triggered growth repeats only once the hot shard has cooled since the last
+        // one (what it shed helped), or another shard is hot: a hot spot more shards cannot
+        // cool (one unsplittable tablet) grows `k` once.
         let hottest = self.shared.loads[..k.min(n)]
             .iter()
             .enumerate()
-            .map(|(i, l)| (l.read_turn_busy_fresh(now, stale).unwrap_or(0), i))
+            .map(|(i, l)| {
+                let turn = l.read_turn_busy_fresh(now, stale).unwrap_or(0);
+                let stall = l.read_stall_busy_fresh(now, stale).unwrap_or(0);
+                (turn.max(stall), stall > turn, i)
+            })
             .max()
-            .filter(|(b, _)| *b as f64 / 1e6 > PACK_HOT);
+            .filter(|(b, _, _)| *b as f64 / 1e6 > PACK_HOT);
         let hot = hottest.is_some();
-        let hot_grows = hottest.is_some_and(|(b, h)| {
+        let hot_grows = hottest.is_some_and(|(b, _, h)| {
             self.hot_grew
                 .is_none_or(|(shard, was)| shard != h || b + PACK_HOT_COOLED < was)
         });
         if !hot {
             self.hot_grew = None;
         }
-        if k < n && (busy / k as f64 > PACK_SPREAD || hot_grows) {
+        // D255: the active shards a stall-driven growth reached stay active while the store
+        // writes at least half of what it did then. The shards it spread to run cheap turns
+        // once their writers stop stalling, so the busy sum alone would call for a shrink,
+        // the stalls would come back, and `k` would swing between the two.
+        let stall_floor = match self.stall_floor {
+            Some((floor_k, writes_then)) if writes.saturating_mul(2) >= writes_then => floor_k,
+            _ => {
+                self.stall_floor = None;
+                0
+            }
+        };
+        let floor = floor.max(stall_floor.min(n));
+        let spread = busy / k as f64 > PACK_SPREAD;
+        trace!(
+            "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} floor {floor} hottest {:?} up {} down {}",
+            self.id.0, hottest, self.pack_up, self.pack_down
+        );
+        if k < n && (spread || hot_grows) {
             self.pack_up += 1;
         } else {
             self.pack_up = 0;
@@ -1946,19 +1968,35 @@ impl ShardState {
         } else {
             self.pack_down = 0;
         }
-        if self.pack_up >= PACK_GROW_PASSES {
+        let why = if k < floor {
+            self.pack_k = want.max(floor).min(n);
+            "the stall floor"
+        } else if self.pack_up >= PACK_GROW_PASSES {
             self.pack_k = want.max(k + 1).min(n);
             // Whatever called for it, a growth with a hot shard counts as its growth.
-            if let Some((b, h)) = hottest {
-                self.hot_grew = Some((h, b));
+            match hottest {
+                Some((b, stalled, h)) => {
+                    self.hot_grew = Some((h, b));
+                    if stalled {
+                        self.stall_floor = Some((self.pack_k, writes));
+                        "a shard whose writers stall (D255)"
+                    } else {
+                        "a shard whose thread is saturated (D251)"
+                    }
+                }
+                None => {
+                    debug_assert!(spread);
+                    "the busy sum over the active shards (D217)"
+                }
             }
         } else if self.pack_down >= PACK_SHRINK_PASSES {
-            self.pack_k = want.min(k - 1);
+            self.pack_k = want.min(k - 1).max(floor.max(1));
+            "a busy sum low enough for one fewer (D217)"
         } else {
             return true;
-        }
+        };
         trace!(
-            "shard {} balancer: active shards {k} -> {} (busy {busy:.2})",
+            "shard {} balancer: active shards {k} -> {} (busy {busy:.2}, floor {floor}, writes {writes}): {why}",
             self.id.0, self.pack_k
         );
         self.pack_up = 0;
