@@ -1,0 +1,2 @@
+### Fixed
+- Tablet packing now counts the time a shard's commits spend waiting for memtable room or paced on L0 depth as busy, beside the shard thread's work time and its fsync utilization (D255). With flush and compaction on their own threads (D252) a shard under a full write load read idle, so packing kept whole tables on one shard: on a 16 GiB random load one shard held 86 tablets on one arena, flushed sub-megabyte memtables by the thousand, and the load wrote 45× its data and took 6× longer than with flush and compaction on the shards.
