@@ -326,6 +326,22 @@ impl<M: Send + 'static> Submitter<M> {
         self.inbox.signal.busy_nanos()
     }
 
+    /// Nanoseconds the compaction pool's threads have spent in slices of the tasks the
+    /// target shard spawned onto the pool (its flushes and compactions, D256), since the
+    /// runtime started. With `compaction_threads = 0` the shard runs those slices inside
+    /// its own turns and nothing is counted here. Relaxed, as [`Submitter::busy_nanos`].
+    pub fn pool_busy_nanos(&self) -> u64 {
+        self.inbox.signal.pool_busy_nanos()
+    }
+
+    /// Nanoseconds the target shard's engine-owned thread has spent in its spin before
+    /// parking (D198: polling for the next message after handling one), since the runtime
+    /// started (D256). Not part of [`Submitter::busy_nanos`]; the balancer adds the two.
+    /// Relaxed, as that one.
+    pub fn spin_nanos(&self) -> u64 {
+        self.inbox.signal.spin_nanos()
+    }
+
     /// Enqueues `msg`. Fails only after shutdown.
     pub fn submit(&self, msg: M) -> Result<()> {
         let inbox = &*self.inbox;
@@ -760,9 +776,17 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
             return core.handler;
         }
         // No spin while I/O only this thread reaps is in flight: it waits on that below.
-        if !more && !(core.own_ring && pigeonhole_io::own_io_in_flight()) && core.spin_before_park()
-        {
-            continue;
+        if !more && !(core.own_ring && pigeonhole_io::own_io_in_flight()) {
+            // The spin's time counts as busy too (D256): the thread is awake and polling,
+            // kept so by its clients. On the VFS clock, as the turns are (a simulated clock
+            // does not move while polling, and counts nothing).
+            let spun_from = core.vfs.monotonic_nanos();
+            let hit = core.spin_before_park();
+            core.signal()
+                .add_spin(core.vfs.monotonic_nanos().saturating_sub(spun_from));
+            if hit {
+                continue;
+            }
         }
         if !more {
             if core.own_ring && pigeonhole_io::own_io_in_flight() {
