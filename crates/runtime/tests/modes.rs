@@ -829,23 +829,36 @@ fn pool_slices_count_to_the_spawning_shard() {
     rt.shutdown().unwrap();
 }
 
-/// A shard thread counts its spin before parking (D198) beside its turns (D256): after a
-/// handled message the thread polls for the spin window on the real clock, and that time
-/// shows in `spin_nanos`, not in `busy_nanos`.
+/// A shard thread counts its spin before parking (D198) beside its turns (D256): with the
+/// engine's 50 µs window, after a handled message the thread polls on the real clock, and
+/// that time shows in `spin_nanos`, not in `busy_nanos`. With the runtime's default window
+/// of zero no poll runs and nothing is counted: a skipped poll adds nothing (on Windows
+/// two consecutive clock reads can be equal, so timing the skip read zero there and a few
+/// nanoseconds elsewhere).
 #[test]
 fn a_shard_counts_its_spin_before_parking() {
-    let cfg = config(1, PreadVfs::new(1));
-    let rt = Runtime::start(cfg, handlers(1)).unwrap();
-    let (n, w) = completion();
-    rt.submitter(ShardId(0)).submit(Msg::Echo(7, n)).unwrap();
-    assert_eq!(w.wait().unwrap(), 7);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while rt.submitter(ShardId(0)).spin_nanos() == 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(1));
+    for (window, spins) in [(Duration::ZERO, false), (Duration::from_micros(50), true)] {
+        let mut cfg = config(1, PreadVfs::new(1));
+        cfg.idle_spin = window;
+        let rt = Runtime::start(cfg, handlers(1)).unwrap();
+        for i in 0..8 {
+            let (n, w) = completion();
+            rt.submitter(ShardId(0)).submit(Msg::Echo(i, n)).unwrap();
+            assert_eq!(w.wait().unwrap(), i);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while spins && rt.submitter(ShardId(0)).spin_nanos() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let spun = rt.submitter(ShardId(0)).spin_nanos();
+        assert_eq!(
+            spun > 0,
+            spins,
+            "window {window:?}: spin counted {spun} ns after eight handled messages"
+        );
+        rt.shutdown().unwrap();
     }
-    let spun = rt.submitter(ShardId(0)).spin_nanos();
-    assert!(spun > 0, "no spin counted after a handled message");
-    rt.shutdown().unwrap();
 }
 
 #[test]

@@ -544,6 +544,22 @@ impl<H: ShardHandler> ShardCore<H> {
         if !self.spin.due() {
             return false;
         }
+        // A poll that runs counts as busy (D256): the thread is awake and polling, kept so
+        // by its clients. On the VFS clock, as the turns are (a simulated clock does not
+        // move while polling, and counts nothing). A skipped poll (the window is zero, no
+        // message since the last park, or the backoff) adds nothing: timing the skip
+        // counted two clock reads' worth on Linux and macOS and nothing on Windows, where
+        // consecutive reads of the clock can be equal.
+        let spun_from = self.vfs.monotonic_nanos();
+        let hit = self.spin_poll();
+        self.signal()
+            .add_spin(self.vfs.monotonic_nanos().saturating_sub(spun_from));
+        hit
+    }
+
+    /// The poll itself: the queue for up to the spin window, then the sleep handshake on a
+    /// miss. Returns whether work arrived.
+    fn spin_poll(&mut self) -> bool {
         // Awake while polling, so a producer does not wake the thread (on a ring backend
         // that is a syscall); sleep is announced again, and checked once more, on a miss.
         self.signal().awake();
@@ -776,17 +792,9 @@ fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
             return core.handler;
         }
         // No spin while I/O only this thread reaps is in flight: it waits on that below.
-        if !more && !(core.own_ring && pigeonhole_io::own_io_in_flight()) {
-            // The spin's time counts as busy too (D256): the thread is awake and polling,
-            // kept so by its clients. On the VFS clock, as the turns are (a simulated clock
-            // does not move while polling, and counts nothing).
-            let spun_from = core.vfs.monotonic_nanos();
-            let hit = core.spin_before_park();
-            core.signal()
-                .add_spin(core.vfs.monotonic_nanos().saturating_sub(spun_from));
-            if hit {
-                continue;
-            }
+        if !more && !(core.own_ring && pigeonhole_io::own_io_in_flight()) && core.spin_before_park()
+        {
+            continue;
         }
         if !more {
             if core.own_ring && pigeonhole_io::own_io_in_flight() {
