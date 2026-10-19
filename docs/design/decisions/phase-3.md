@@ -1535,6 +1535,8 @@ Each part disabled fails its test.
 
 **Why:** the gate measured almost nothing contended, nothing at the shipped durability, and no cross-shard commit (perf287's audit, findings 1–3), which let #637's 36× slowdown through. Judging both levels keeps the long-standing like-for-like comparison (D108) and adds the one users get by default.
 
+*History: amended by [D261](#d261), 2026-10-19: each operation type's p99 against the same type in each store is reported beside the judged mixed p99, not judged; contended default ycsb-f's mixed p99 (2.13× SQLite) is accepted for Phase 4 (#755).*
+
 <a id="d248"></a>
 ## D248 — Packing's busy fraction counts group-sync utilization: a shard's busy is the larger of its thread's busy time and the time its group syncs are in flight (owner decision, 2026-10-13; engine, tablets, #406; amends D217)
 
@@ -2006,3 +2008,18 @@ Main fails the first and last; dropping the family-delete clause fails the third
 - **Why so little on the box:** one run of main with the scratch counters measured 1.0% of conditional commits cut and 0.2% held behind a cut (the VM's 6.4% does not carry over), at commit p50 95 µs and p99 260 µs against 60 and 165 for the rest, 6% of the commits above p99. Nearly every commit was its own group (12.8M groups for about 14M commits): the RMW tail is each commit's own GroupSync, about 150K syncs a second over 16 WAL files.
 - **`--shards 12`** reads the same as 16 (RMW p99 180): the active shard count is not it either.
 
+<a id="d261"></a>
+## D261 — The contended step keeps judging the mixed p99 and reports each operation type's p99 beside it (owner decision, 2026-10-19; bench, #406; amends D247)
+
+**Decided:**
+- **The judged figure is unchanged.** Each judged `contended` row (D247) is judged on throughput and on the p99 over every operation (the mixed p99), within 1.5× of RocksDB and of SQLite at both levels, as before. There is no p99.9 target.
+- **Each operation type's p99 is reported, not judged.** `summary.md` adds a table under the side-by-side one, by workload, level and operation type. It shows Pigeonhole's p99 and its ratio to the same type in each store: read-modify-write against read-modify-write, row read against row read, and so on, with ratios past 1.5× in bold. The types come from each run's `detail.by_type`, which every store's runner already records.
+- **Accepted for Phase 4:** contended ycsb-f at the default durability. Its mixed p99 is 2.13× SQLite's on gate 2026-10-19, tracked with #755.
+
+**Why:** a mixed p99 measures the operation mix as much as the store. Default ycsb-f's 2.13× against SQLite comes from two different types: its RMW is 1.06× SQLite's (191.5 against 180.2 µs) and its row read 2.31× (41.5 against 17.9 µs). The per-type table says which operation is slow.
+
+The owner first asked for per-type verdicts. On gate 2026-10-19's results these made the gate stricter, not looser. ycsb-a, ycsb-f, sparse-wide and buffered time-series-ttl would have failed on one type each, and no failing row would have passed. So the owner kept the mixed p99 as the verdict and the per-type numbers as data. The slow types go to Phase 4 issues:
+- row reads and scans under concurrent writes, at about 1.7–2.3× SQLite's p99;
+- sparse-wide's buffered put p99, at 10× RocksDB's.
+
+**Considered and not taken:** judging each operation type (stricter on every row it changes, above); judging only each workload's defining type (it leaves the other types unjudged).

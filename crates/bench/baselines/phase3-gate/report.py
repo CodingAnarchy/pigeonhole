@@ -456,6 +456,9 @@ else:
 # WAL unsynced, SQLite NORMAL), and `default` (Pigeonhole's GroupSync, the others fsyncing
 # every write). Every workload below is judged within 1.5x of each store, throughput and
 # p99, at both levels; cross-shard-contention is judged as D246 judges it in `all`, at both.
+# The judged p99 is the mixed one over every operation (D261); each operation type's p99
+# against the same type in each store (read-modify-write against read-modify-write, read
+# against read, and so on) is reported beside it, not judged.
 CONTENDED_LEVELS = [("buffered", "D108 parity, buffered"), ("default", "default durability, GroupSync")]
 # ycsb-f's read-modify-write is atomic in every runner (Pigeonhole: commit_if, retried on a
 # lost race; RocksDB and fjall: a row lock; SQLite: an immediate transaction).
@@ -480,7 +483,27 @@ def contended(level, w):
     return ph, vs
 
 
-cont = {}  # (level, workload) -> (pigeonhole run, {store: (tput, p99)}, ok)
+def op_p99s(r):
+    """{operation type: p99 ns} from a run's per-operation stats (empty when it has none)."""
+    return {t["op"]: t["stats"]["p99_ns"] for t in r.get("detail", {}).get("by_type") or []}
+
+
+def contended_ops(level, w, ph):
+    """D261 (reported): {store: {operation type: Pigeonhole/other p99}} over the types both
+    runs measured; a store whose runs share no per-operation stats is absent."""
+    mine = op_p99s(ph)
+    out = {}
+    for store in CONTENDED_AGAINST:
+        o = next(iter(results(f"contended-{level}-{w}.json", store, w)), None)
+        theirs = op_p99s(o) if o else {}
+        common = {k: mine[k] / max(theirs[k], 1) for k in mine if k in theirs}
+        if common:
+            out[store] = common
+    return out
+
+
+cont = {}  # (level, workload) -> (pigeonhole run, {store: (tput, mixed p99)}, ok)
+cont_ops = {}  # (level, workload) -> {store: {operation type: p99 ratio}} (D261, reported)
 for level, _ in CONTENDED_LEVELS:
     for w in CONTENDED_JUDGED:
         c = contended(level, w)
@@ -488,6 +511,7 @@ for level, _ in CONTENDED_LEVELS:
             ph, vs = c
             ok = len(vs) == len(CONTENDED_AGAINST) and all(t <= 1.5 and l <= 1.5 for t, l in vs.values())
             cont[(level, w)] = (ph, vs, ok)
+            cont_ops[(level, w)] = contended_ops(level, w, ph)
 for level, label in CONTENDED_LEVELS:
     target = f"Contended, 16 threads on the default options, {label} (D247): within 1.5× of RocksDB and SQLite"
     got = [(w, cont[(level, w)]) for w in CONTENDED_JUDGED if (level, w) in cont]
@@ -766,6 +790,19 @@ if cont:
             pair = lambda s: f"{vs[s][0]:.2f}, {vs[s][1]:.2f}" if s in vs else "-"
             cells += [f"{ph['throughput']:.0f}", pair("rocksdb"), pair("sqlite-eav"), "yes" if ok else "**no**"]
         print(f"| {w} | " + " | ".join(cells) + " |")
+    print("\nThe judged p99 above is over every operation. Each operation type's p99 against the same type in each "
+          "store (reported, not judged; D261; > 1.5× in bold):\n")
+    print("| Workload | Level | Operation | Pigeonhole p99 µs | vs RocksDB p99 | vs SQLite p99 |")
+    print("|---|---|---|--:|--:|--:|")
+    for w in CONTENDED_JUDGED:
+        for level, _ in CONTENDED_LEVELS:
+            c, ops = cont.get((level, w)), cont_ops.get((level, w), {})
+            if not c:
+                continue
+            for name, p99 in op_p99s(c[0]).items():
+                cell = lambda s: (f"**{ops[s][name]:.2f}**" if ops[s][name] > 1.5 else f"{ops[s][name]:.2f}") \
+                    if name in ops.get(s, {}) else "-"
+                print(f"| {w} | {level} | {name} | {us(p99):.1f} | {cell('rocksdb')} | {cell('sqlite-eav')} |")
 
 print("\n## Decisions this window settles\n")
 # The row cache (D216: on by default, amending D201): off (row-cache step) against the
