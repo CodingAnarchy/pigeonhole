@@ -2508,6 +2508,15 @@ pub(crate) struct ShardState {
     /// load's phases dip between them for a few seconds and a pack on a dip moves every
     /// tablet twice (#734).
     writing_passes: u64,
+    /// Shard 0's slow moving average (`SLOW_ALPHA`) of the store's commits in flight
+    /// (D257): a first shrink from the unpacked start skips the window above when the slow
+    /// and the fast concurrency call for the same active shards, since a concurrency that
+    /// has held for the slow window is no dip between phases.
+    inflight_slow: f64,
+    /// Consecutive passes on which the slow and the fast concurrency called for the same
+    /// active shards (D257): the window is skipped once they have agreed for a shrink
+    /// count, not at the instant the fast average crosses the slow one after a dip.
+    settled_passes: u64,
     /// The active shard count before the last shrink, the pass of that shrink and the
     /// store's write rate then (D255): a stall-driven growth within `PACK_SHRINK_UNDO` passes
     /// of it, with the store writing at least twice that rate, says the shrink was wrong,
@@ -2712,6 +2721,8 @@ impl ShardState {
             floor_expired_pass: 0,
             ramp_passes: 0,
             writing_passes: 0,
+            inflight_slow: 0.0,
+            settled_passes: 0,
             shrunk_from: None,
             pack_k: 0,
             pack_up: 0,

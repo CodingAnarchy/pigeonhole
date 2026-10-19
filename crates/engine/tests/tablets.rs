@@ -1938,6 +1938,78 @@ fn concurrent_commits_grow_a_packed_store() {
     db.close();
 }
 
+/// A concurrency-driven first shrink does not wait for D255's window, its 50 passes or the
+/// write ramp (D257): four shards spread at 10% busy with one client's worth of commits in
+/// flight (0.25 each) pack within 80 passes (50 of agreement and the 10-pass count), where the
+/// busy sum alone holds them to 300
+/// (`a_light_store_packs_after_the_first_window`) and the harness's write ramp (the slow
+/// average from 0) reads as ramping for about 160: once the fast and the slow concurrency
+/// have agreed on one shard for 50 passes, the growth count decides. One client's gate row
+/// measures ten seconds after its load and a 2 s warm-up; each of the three put the pack
+/// inside the measured phase.
+#[test]
+fn a_concurrency_driven_first_shrink_does_not_wait_for_the_window() {
+    let mut db = spread_and_busy(0.1, true);
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.25));
+    }
+    let mut written = 0;
+    let mut passes = 0;
+    while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 80 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k < 4),
+        "one client's commits in flight waited for the window ({passes} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// A concurrency dip after a heavy phase still waits for the window (D257 keeps D255's
+/// guard): four shards spread at 10% busy with three commits in flight (0.75 each) for 200
+/// passes, then 0.4 in all for 50 passes, hold at four: the slow concurrency still reads
+/// the heavy phase (about 2 after 50 passes), so the fast one's call for one shard is a
+/// dip, not a settled load. With the dip test on the fast concurrency alone they pack
+/// after 50.
+#[test]
+fn a_concurrency_dip_after_a_heavy_phase_does_not_pack_an_unpacked_store() {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.75));
+    }
+    for _ in 0..200 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.1));
+    }
+    for pass in 0..50 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass} of the dip"
+        );
+    }
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.75));
+    }
+    for pass in 0..50 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass} after the dip"
+        );
+    }
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
 /// A stall-driven growth is the capacity side and is not held to the concurrency (D257
 /// with D255): packed onto shard 0, one writer's worth of commits in flight (0.9, which
 /// calls for one shard) whose writers stall grows the active shards past one all the same:

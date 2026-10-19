@@ -1994,8 +1994,13 @@ impl ShardState {
     /// average, or fewer than the concurrency calls for, or with one of them above
     /// `PACK_HOT` (D251), and shrinks after `PACK_SHRINK_PASSES` passes with one fewer shard
     /// enough to stay under `PACK_TARGET`, more than the concurrency calls for, and none
-    /// above `PACK_HOT`. Never fewer than the shards the tablets' memtable slots need
-    /// (`max_slots` each), and at once up to that.
+    /// above `PACK_HOT`. The first shrink from the unpacked start waits for
+    /// `PACK_FIRST_SHRINK_PASSES` of writing (D255) unless the slow concurrency has agreed
+    /// with the fast one for a shrink count (D257): that first pack then decides on
+    /// `PACK_GROW_PASSES` and counts through a write ramp, since one client's gate row
+    /// measures ten seconds after a load and a few seconds of warm-up, inside which the
+    /// 30 s wait, the 50 passes and the ramp guard each put the pack. Never fewer than the
+    /// shards the tablets' memtable slots need (`max_slots` each), and at once up to that.
     /// Only while the store writes (`balance_min_writes` over all shards) and some shard
     /// reports busy time: an idle store, or a clock that does not move while shards work (the
     /// simulated VFS), keeps its placement.
@@ -2037,6 +2042,22 @@ impl ShardState {
             .map(|l| l.read_inflight_fresh(now, stale).unwrap_or(0) as f64 / 1e6)
             .sum();
         let k_c = ((inflight / PACK_CONCURRENCY).round() as usize).clamp(1, n);
+        // The slow concurrency (D257): when it calls for the same active shards as the
+        // fast one, the concurrency has held for the slow window and the first shrink from
+        // the unpacked start need not wait for `PACK_FIRST_SHRINK_PASSES`. A dip after a
+        // heavy phase still waits: the slow average remembers the phase for about the
+        // window. A concurrency that reads 0 (the simulated clock, an application-owned
+        // store) settles nothing, so the window applies as before.
+        self.inflight_slow = SLOW_ALPHA * inflight + (1.0 - SLOW_ALPHA) * self.inflight_slow;
+        let k_c_slow = ((self.inflight_slow / PACK_CONCURRENCY).round() as usize).clamp(1, n);
+        // Agreement must hold for a shrink count: the fast average crosses the slow one on
+        // its way back up after a dip, and a count the dip accrued must not fire then.
+        self.settled_passes = if inflight > 0.0 && k_c_slow == k_c {
+            self.settled_passes.saturating_add(1)
+        } else {
+            0
+        };
+        let settled = self.settled_passes >= PACK_SHRINK_PASSES;
         if writes >= self.shared.balance.min_writes.max(1) {
             self.writing_passes = self.writing_passes.saturating_add(1);
         }
@@ -2167,8 +2188,11 @@ impl ShardState {
         };
         let ramping = ramping && self.ramp_passes <= PACK_RAMP_MAX;
         trace!(
-            "shard {} balancer pass: k {k} busy {busy:.2} in flight {inflight:.2} (k_c {k_c}) writes {writes} (slow {writes_slow}, ramping {ramping}, stalling {stalling}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
+            "shard {} balancer pass: k {k} busy {busy:.2} in flight {inflight:.2} (k_c {k_c}, slow {:.2} k_c {k_c_slow}, settled {} of {}) writes {writes} (slow {writes_slow}, ramping {ramping}, stalling {stalling}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
             self.id.0,
+            self.inflight_slow,
+            self.settled_passes,
+            PACK_SHRINK_PASSES,
             self.floor_quiet,
             self.floor_quiet_needed.max(PACK_FLOOR_QUIET),
             hottest,
@@ -2187,12 +2211,26 @@ impl ShardState {
             // or not (ctr274's review: a count carried across a bursty heavy load's bursts
             // would shrink and grow in a slow cycle; a lull whose writers wait on room is
             // no light pass).
-            if !ramping {
+            // A settled concurrency counts through a write ramp (D257): a ramp fools the
+            // busy sum, which reads a load's start as light, not the commits in flight,
+            // which read one client as one client at any rate; and a cold start's slow
+            // write average reads every steady load as ramping for its first 16 s.
+            if !ramping || settled {
                 self.pack_down += 1;
             }
         } else {
             self.pack_down = 0;
         }
+        // The first pack from the unpacked start on a settled concurrency decides on the
+        // growth count, not the shrink count (D257): the concurrency agreed for a shrink
+        // count already, and a client's placement must settle inside the few seconds a
+        // warm-up gives it before its measured phase (D242's 2 s quiet). Later shrinks
+        // keep D217's 50 passes, so a short dip in a running load does not flap.
+        let shrink_passes = if settled && k == n {
+            PACK_GROW_PASSES
+        } else {
+            PACK_SHRINK_PASSES
+        };
         let why = if k < floor {
             self.pack_k = want.max(floor).min(n);
             "the stall floor"
@@ -2243,8 +2281,8 @@ impl ShardState {
                     "the commits in flight (D257)"
                 }
             }
-        } else if self.pack_down >= PACK_SHRINK_PASSES
-            && (k < n || self.writing_passes >= PACK_FIRST_SHRINK_PASSES)
+        } else if self.pack_down >= shrink_passes
+            && (k < n || settled || self.writing_passes >= PACK_FIRST_SHRINK_PASSES)
         {
             self.pack_k = want.min(k - 1).max(floor.max(1));
             self.shrunk_from = Some((k, self.balance_pass, writes));
