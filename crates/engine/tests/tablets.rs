@@ -1855,26 +1855,27 @@ fn pool_work_counts_toward_the_busy_sum() {
     db.close();
 }
 
-/// A shard its clients keep awake counts as busy (D256): four shards settled at 60% busy,
-/// then each thread 5% in turns and 90% in its spin before parking, hold at four through
-/// 150 passes (the sum reads 3.8); with the spin gone the same turns pack them. Without
-/// the spin term the sum reads 0.2 and they pack after 50.
+/// Concurrent commits hold the active shards (D257): four shards settled at 60% busy, then
+/// each thread 5% in turns with three commits in flight over the store (0.75 at each
+/// shard: `round(3 / 0.75)` = 4), hold at four through 150 passes; with the commits in
+/// flight gone the same turns pack them. Without the concurrency term the busy sum reads
+/// 0.2 and they pack after 50 passes.
 #[test]
-fn a_shard_kept_awake_by_its_clients_counts_as_busy() {
+fn concurrent_commits_hold_the_active_shards() {
     let (mut db, mut written) = spread_and_settled(0.05);
     for s in 0..4 {
-        db.engine.set_shard_spin_busy(s, Some(0.9));
+        db.engine.set_shard_inflight(s, Some(0.75));
     }
     for pass in 0..150 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         let k = db.engine.pack_ks()[0];
         assert!(
             k.is_none_or(|k| k == 4),
-            "the active shards shrank to {k:?} at pass {pass} with every thread spinning"
+            "the active shards shrank to {k:?} at pass {pass} with three commits in flight"
         );
     }
     for s in 0..4 {
-        db.engine.set_shard_spin_busy(s, Some(0.0));
+        db.engine.set_shard_inflight(s, Some(0.0));
     }
     let mut passes = 0;
     while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 300 {
@@ -1883,7 +1884,149 @@ fn a_shard_kept_awake_by_its_clients_counts_as_busy() {
     }
     assert!(
         db.engine.pack_ks()[0].is_some_and(|k| k < 4),
-        "the store never packed once the spin stopped ({passes} passes)"
+        "the store never packed once the commits in flight stopped ({passes} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// One client's worth of commits in flight packs to one shard however the threads spin
+/// (D257, the reverse of D256's kept-awake rule): four shards settled, each thread 5% in
+/// turns with a lone writer's commits in flight spread over them (0.25 each, 1.0 in all:
+/// `round(1 / 0.75)` = 1, where a ceiling would keep two), pack onto one shard. The spin
+/// the writer causes on each shard is not measured by the override: on the AX102 it read
+/// 0.5 per shard at one client over 13 shards, which D256 counted as 6.5 shards' worth.
+#[test]
+fn a_lone_writers_commits_in_flight_pack_to_one_shard() {
+    let (mut db, mut written) = spread_and_settled(0.05);
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.25));
+    }
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] != Some(1) && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(1),
+        "one writer's commits in flight kept more than one shard active after {passes} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// Commits in flight grow a packed store (D257): packed onto shard 0 with every thread 10%
+/// busy, three commits in flight at shard 0 (three clients' worth; the busy sum alone
+/// reads 0.1 and wants one shard) take the active shards to `round(3 / 0.75)` = 4 within
+/// 100 passes. Without the `k < k_c` growth the store stays packed.
+#[test]
+fn concurrent_commits_grow_a_packed_store() {
+    let (mut db, mut written) = packed_onto_shard_0();
+    db.engine.set_shard_inflight(0, Some(3.0));
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] != Some(4) && passes < 100 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(4),
+        "three commits in flight did not spread the store in {passes} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// A concurrency-driven first shrink does not wait for D255's window, its 50 passes or the
+/// write ramp (D257): four shards spread at 10% busy with one client's worth of commits in
+/// flight (0.25 each) pack within 80 passes (50 of agreement and the 10-pass count), where the
+/// busy sum alone holds them to 300
+/// (`a_light_store_packs_after_the_first_window`) and the harness's write ramp (the slow
+/// average from 0) reads as ramping for about 160: once the fast and the slow concurrency
+/// have agreed on one shard for 50 passes, the growth count decides. One client's gate row
+/// measures ten seconds after its load and a 2 s warm-up; each of the three put the pack
+/// inside the measured phase.
+#[test]
+fn a_concurrency_driven_first_shrink_does_not_wait_for_the_window() {
+    let mut db = spread_and_busy(0.1, true);
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.25));
+    }
+    let mut written = 0;
+    let mut passes = 0;
+    while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 80 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k < 4),
+        "one client's commits in flight waited for the window ({passes} passes)"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// A concurrency dip after a heavy phase still waits for the window (D257 keeps D255's
+/// guard): four shards spread at 10% busy with three commits in flight (0.75 each) for 200
+/// passes, then 0.4 in all for 50 passes, hold at four: the slow concurrency still reads
+/// the heavy phase (about 2 after 50 passes), so the fast one's call for one shard is a
+/// dip, not a settled load. With the dip test on the fast concurrency alone they pack
+/// after 50.
+#[test]
+fn a_concurrency_dip_after_a_heavy_phase_does_not_pack_an_unpacked_store() {
+    let mut db = spread_and_busy(0.1, true);
+    let mut written = 0;
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.75));
+    }
+    for _ in 0..200 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+    }
+    assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.1));
+    }
+    for pass in 0..50 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass} of the dip"
+        );
+    }
+    for s in 0..4 {
+        db.engine.set_shard_inflight(s, Some(0.75));
+    }
+    for pass in 0..50 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        let k = db.engine.pack_ks()[0];
+        assert!(
+            k.is_none_or(|k| k == 4),
+            "the active shards shrank to {k:?} at pass {pass} after the dip"
+        );
+    }
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
+/// A stall-driven growth is the capacity side and is not held to the concurrency (D257
+/// with D255): packed onto shard 0, one writer's worth of commits in flight (0.9, which
+/// calls for one shard) whose writers stall grows the active shards past one all the same:
+/// a single-threaded loader waiting for arena room still gets more arenas.
+#[test]
+fn a_stall_driven_growth_is_not_held_to_the_commits_in_flight() {
+    let (mut db, mut written) = packed_with_shard_0_stalled();
+    db.engine.set_shard_inflight(0, Some(0.9));
+    let mut passes = 0;
+    while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 120 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert!(
+        db.engine.pack_ks()[0].is_some_and(|k| k >= 2),
+        "a stalling shard with one writer's commits in flight did not grow the active shards in {passes} passes: {:?}",
+        db.engine.pack_ks()[0]
     );
     assert_eq!(db.scan_rows().len() as u64, written);
     db.close();

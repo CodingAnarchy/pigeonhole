@@ -1,0 +1,5 @@
+### Changed
+- Packing sizes the active shards by the commits in flight (D257): the mean number of client commits outstanding over the store (`round(C / 0.75)` shards at least) grows the active shards and gates a shrink, so one client's load packs onto a few shards (ycsb-a at one client 14 → 3–4 on the reference machine, +25%; time-series-ttl 16 → 2, +31%; within seconds of a steady load, not after D255's 30 s window) while concurrent clients keep what they can use (sixteen durable riders keep sixteen; sixteen buffered clients settle at nine, +9% with the write p99.9 105 → 43 µs). The spin term D256 added to the busy measure is dropped (the spin counters and metrics stay). The stall and saturation growths and floors are unchanged.
+
+### Added
+- `Metrics::shard_commit_inflight_nanos`, `ShardStats::commit_inflight_nanos` and the bench's per-shard `commit_inflight_nanos`: the commits' time in flight from submit to reply; its rise over an interval, divided by the interval, is the mean number of commits in flight.

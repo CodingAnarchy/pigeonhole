@@ -106,6 +106,19 @@ const PACK_TARGET: f64 = 0.5;
 /// Packing grows the active shards once `B / k` stays above this for `PACK_GROW_PASSES`.
 const PACK_SPREAD: f64 = 0.75;
 
+/// Packing (D257): the commits in flight each active shard is sized for. With `C` the mean
+/// number of client commits in flight over the store (every shard's rise of
+/// `commit_inflight_nanos` over the interval, Little's law), `round(C / PACK_CONCURRENCY)`
+/// shards stay active, at least one: one writer with one commit in flight gains nothing
+/// from a second shard and pays a wake per write on a thin one (ycsb-a at one client fell
+/// 180K → 130K ops/s spread over 13 shards on the AX102, #734's follow-up), while sixteen
+/// clients with about twelve commits in flight (a get is a quarter of their loop) keep
+/// sixteen. Rounded, so a lone pure writer (`C` → 1) stays on one shard where a ceiling
+/// would give it two. The concurrency is the demand side: it grows `k` and gates a
+/// shrink; the stall and saturation floors (D255, D256) are the capacity side and grow
+/// `k` past it.
+const PACK_CONCURRENCY: f64 = 0.75;
+
 /// Consecutive passes over `PACK_SPREAD` before more shards become active (1 s): a burst
 /// spreads quickly.
 const PACK_GROW_PASSES: u64 = 10;
@@ -1641,6 +1654,8 @@ impl ShardState {
             .set_turn_busy((self.turn_ewma * 1e6).round() as u64);
         self.shared.loads[usize::from(self.id.0)]
             .set_stall_busy((self.stall_term * 1e6).round() as u64);
+        self.shared.loads[usize::from(self.id.0)]
+            .set_inflight((self.inflight_ewma * 1e6).round() as u64);
         self.shared.loads[usize::from(self.id.0)].publish(
             self.load_ewma.round() as u64,
             self.load_slow.round() as u64,
@@ -1807,16 +1822,19 @@ impl ShardState {
     /// with flush and compaction on dedicated threads (D252) a shard carrying a full write
     /// load runs cheap turns and reads idle, so packing kept whole tables on one shard; a
     /// shard whose writers wait is hot in the sense that counts, more shards would take the
-    /// load. Two terms add to the turn term (D256): the thread's spin before parking (D198:
-    /// a shard whose next message arrives within the spin window never parks, so its
-    /// clients keep it awake and it has no idle time packing could give another shard; at
-    /// 1.1M ops/s over 16 shards a message every 14 µs read as 5% busy while the threads
-    /// burned 4.7 cores) and the pool's slices for this shard's flushes and compactions
-    /// (before D252 they ran inside the turns and counted there). The sum may pass 1 (two
-    /// pool threads serving one shard). `max` over that sum, the syncs and the stalls, since
-    /// a turn often runs while a sync is in flight or writers wait. All of them count only
-    /// while the runtime counts turn time (engine-owned shards): an application-owned
-    /// store stays unpacked, as before.
+    /// load. The pool's slices for this shard's flushes and compactions add to the turn
+    /// term (D256; before D252 they ran inside the turns and counted there), and the sum
+    /// may pass 1 (two pool threads serving one shard). `max` over that sum, the syncs and
+    /// the stalls, since a turn often runs while a sync is in flight or writers wait. All
+    /// of them count only while the runtime counts turn time (engine-owned shards): an
+    /// application-owned store stays unpacked, as before. The thread's spin before parking
+    /// (D198) is measured and traced but is no term since D257: a thin shard spins after
+    /// every message, so the term grew with the spread it justified (one client over 13
+    /// shards read 6.5 shards' worth). Its replacement is measured here too, apart from the
+    /// busy fraction: the mean number of client commits in flight at this shard, the rise
+    /// of `commit_inflight_nanos` over the interval (Little's law; a closed-loop client's
+    /// worth is at most 1 whatever the shard count), which shard 0 sums over the shards
+    /// into the store's concurrency (D257, `decide_pack`).
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
         let (busy, spin, pool) = self
@@ -1828,6 +1846,9 @@ impl ShardState {
                 (s.busy_nanos(), s.spin_nanos(), s.pool_busy_nanos())
             });
         let sync = self.sync_busy_nanos(now);
+        let inflight = self.shared.metrics[me]
+            .commit_inflight_nanos
+            .load(Ordering::Relaxed);
         let mark = self.busy_mark.filter(|m| now > m.at);
         let elapsed = mark.map(|m| (now - m.at) as f64);
         // The thread's busy time (none counted for an application-owned shard).
@@ -1850,17 +1871,26 @@ impl ShardState {
             _ => 0.0,
         };
         let syncs = term(sync, |m| m.sync);
-        // The thread's spin before parking (D198) over the interval (D256).
+        // The thread's spin before parking (D198) over the interval: traced, no term (D257).
         let spins = term(spin, |m| m.spin);
-        // A chosen spin term (D256's packing tests).
+        // The client commits in flight at this shard over the interval (D257). Counted on
+        // the shard's own clock reads, so it needs no engine-owned thread: it is the
+        // concurrency of the writers, which any clock that moves between a submit and its
+        // reply measures.
+        let inflights = match (mark, elapsed) {
+            (Some(m), Some(e)) => Some(inflight.saturating_sub(m.inflight) as f64 / e),
+            _ => None,
+        };
+        // A chosen concurrency (D257's packing tests), measured whether or not the clock
+        // moved, as the chosen busy fraction is.
         #[cfg(feature = "test-hooks")]
-        let spins = match self.shared.metrics[me]
+        let inflights = match self.shared.metrics[me]
             .hooks
-            .spin_override
+            .inflight_override
             .load(Ordering::Relaxed)
         {
-            0 => spins,
-            v => (v - 1) as f64 / 1e6,
+            0 => inflights,
+            v => Some((v - 1) as f64 / 1e6),
         };
         // The pool's slices for this shard over the interval (D256).
         let pools = term(pool, |m| m.pool);
@@ -1895,9 +1925,12 @@ impl ShardState {
             0 => stalls,
             v => (v - 1) as f64 / 1e6,
         };
-        let measured = turns.map(|t| (t + spins + pools).max(syncs.min(1.0)).max(stalls));
+        let measured = turns.map(|t| (t + pools).max(syncs.min(1.0)).max(stalls));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
+        }
+        if let Some(c) = inflights {
+            self.inflight_ewma = LOAD_ALPHA * c + (1.0 - LOAD_ALPHA) * self.inflight_ewma;
         }
         if let Some(t) = turns {
             self.turn_ewma = LOAD_ALPHA * t.min(1.0) + (1.0 - LOAD_ALPHA) * self.turn_ewma;
@@ -1908,20 +1941,23 @@ impl ShardState {
             spin,
             pool,
             sync,
+            inflight,
             at: now,
         });
         trace!(
-            "shard {} balancer: busy turn {:.2} spin {:.2} pool {:.2} sync {:.2} stall {:.2} (events {}, window {:010b}) -> ewma {:.2}, turn {:.2}",
+            "shard {} balancer: busy turn {:.2} pool {:.2} sync {:.2} stall {:.2} (events {}, window {:010b}) spin {:.2} in flight {:.2} -> ewma {:.2}, turn {:.2}, in flight {:.2}",
             self.id.0,
             turns.unwrap_or(0.0),
-            spins,
             pools,
             syncs,
             stalls,
             events,
             window,
+            spins,
+            inflights.unwrap_or(0.0),
             self.busy_ewma,
-            self.turn_ewma
+            self.turn_ewma,
+            self.inflight_ewma
         );
     }
 
@@ -1952,10 +1988,18 @@ impl ShardState {
 
     /// Updates how many shards stay active (D217): shard 0 decides `k` for every shard and
     /// publishes it (`Shared::pack_k`), from the published busy fractions,
-    /// `ceil(B / PACK_TARGET)`. It grows (at least by one) after `PACK_GROW_PASSES` passes
-    /// with the active shards above `PACK_SPREAD` busy on average, or with one of them above
+    /// `ceil(B / PACK_TARGET)`, or the published commits in flight,
+    /// `round(C / PACK_CONCURRENCY)` (D257), whichever is more. It grows (at least by one)
+    /// after `PACK_GROW_PASSES` passes with the active shards above `PACK_SPREAD` busy on
+    /// average, or fewer than the concurrency calls for, or with one of them above
     /// `PACK_HOT` (D251), and shrinks after `PACK_SHRINK_PASSES` passes with one fewer shard
-    /// enough to stay under `PACK_TARGET` and none above `PACK_HOT`. Never fewer than the
+    /// enough to stay under `PACK_TARGET`, more than the concurrency calls for, and none
+    /// above `PACK_HOT`. The first shrink from the unpacked start waits for
+    /// `PACK_FIRST_SHRINK_PASSES` of writing (D255) unless the slow concurrency has agreed
+    /// with the fast one for a shrink count (D257): that first pack then decides on
+    /// `PACK_GROW_PASSES` and counts through a write ramp, since one client's gate row
+    /// measures ten seconds after a load and a few seconds of warm-up, inside which the
+    /// 30 s wait, the 50 passes and the ramp guard each put the pack. Never fewer than the
     /// shards the tablets' memtable slots need (`max_slots` each), and at once up to that.
     /// Only while the store writes (`balance_min_writes` over all shards) and some shard
     /// reports busy time: an idle store, or a clock that does not move while shards work (the
@@ -1987,6 +2031,33 @@ impl ShardState {
             .iter()
             .map(|l| l.read_slow_fresh(now, stale).unwrap_or(0))
             .sum();
+        // D257: the store's concurrency, the mean client commits in flight over every shard,
+        // and the active shards it calls for. For `t` closed-loop clients it is at most `t`
+        // whatever `k` is, so unlike the spin term it replaced it never justifies the spread
+        // it caused.
+        let inflight: f64 = self
+            .shared
+            .loads
+            .iter()
+            .map(|l| l.read_inflight_fresh(now, stale).unwrap_or(0) as f64 / 1e6)
+            .sum();
+        let k_c = ((inflight / PACK_CONCURRENCY).round() as usize).clamp(1, n);
+        // The slow concurrency (D257): when it calls for the same active shards as the
+        // fast one, the concurrency has held for the slow window and the first shrink from
+        // the unpacked start need not wait for `PACK_FIRST_SHRINK_PASSES`. A dip after a
+        // heavy phase still waits: the slow average remembers the phase for about the
+        // window. A concurrency that reads 0 (the simulated clock, an application-owned
+        // store) settles nothing, so the window applies as before.
+        self.inflight_slow = SLOW_ALPHA * inflight + (1.0 - SLOW_ALPHA) * self.inflight_slow;
+        let k_c_slow = ((self.inflight_slow / PACK_CONCURRENCY).round() as usize).clamp(1, n);
+        // Agreement must hold for a shrink count: the fast average crosses the slow one on
+        // its way back up after a dip, and a count the dip accrued must not fire then.
+        self.settled_passes = if inflight > 0.0 && k_c_slow == k_c {
+            self.settled_passes.saturating_add(1)
+        } else {
+            0
+        };
+        let settled = self.settled_passes >= PACK_SHRINK_PASSES;
         if writes >= self.shared.balance.min_writes.max(1) {
             self.writing_passes = self.writing_passes.saturating_add(1);
         }
@@ -2008,6 +2079,7 @@ impl ShardState {
         };
         let k = self.pack_k;
         let want = ((busy / PACK_TARGET).ceil() as usize)
+            .max(k_c)
             .max(floor)
             .clamp(1, n);
         if k < floor {
@@ -2103,6 +2175,9 @@ impl ShardState {
         };
         let floor = floor.max(stall_floor.min(n));
         let spread = busy / k as f64 > PACK_SPREAD;
+        // D257: fewer active shards than the commits in flight call for grow them; more
+        // than they call for is one of the conditions of a shrink.
+        let concurrent = k < k_c;
         // No shrink while the load is still ramping (D255, #734): the fast write average
         // above the slow one. The first pass of a load read its ramp as a light store.
         let ramping = writes_slow > 0 && writes as f64 > PACK_RAMP * writes_slow as f64;
@@ -2113,31 +2188,49 @@ impl ShardState {
         };
         let ramping = ramping && self.ramp_passes <= PACK_RAMP_MAX;
         trace!(
-            "shard {} balancer pass: k {k} busy {busy:.2} writes {writes} (slow {writes_slow}, ramping {ramping}, stalling {stalling}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
+            "shard {} balancer pass: k {k} busy {busy:.2} in flight {inflight:.2} (k_c {k_c}, slow {:.2} k_c {k_c_slow}, settled {} of {}) writes {writes} (slow {writes_slow}, ramping {ramping}, stalling {stalling}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
             self.id.0,
+            self.inflight_slow,
+            self.settled_passes,
+            PACK_SHRINK_PASSES,
             self.floor_quiet,
             self.floor_quiet_needed.max(PACK_FLOOR_QUIET),
             hottest,
             self.pack_up,
             self.pack_down
         );
-        if k < n && (spread || hot_grows) {
+        if k < n && (spread || concurrent || hot_grows) {
             self.pack_up += 1;
         } else {
             self.pack_up = 0;
         }
-        if !hot && !stalling && k > floor.max(1) && busy / ((k - 1) as f64) < PACK_TARGET {
+        if !hot && !stalling && k > floor.max(1) && k > k_c && busy / ((k - 1) as f64) < PACK_TARGET
+        {
             // A ramping pass pauses the shrink count: a light pass advances it only while
             // the load is not ramping, and a hot, busy or stalling pass resets it ramping
             // or not (ctr274's review: a count carried across a bursty heavy load's bursts
             // would shrink and grow in a slow cycle; a lull whose writers wait on room is
             // no light pass).
-            if !ramping {
+            // A settled concurrency counts through a write ramp (D257): a ramp fools the
+            // busy sum, which reads a load's start as light, not the commits in flight,
+            // which read one client as one client at any rate; and a cold start's slow
+            // write average reads every steady load as ramping for its first 16 s.
+            if !ramping || settled {
                 self.pack_down += 1;
             }
         } else {
             self.pack_down = 0;
         }
+        // The first pack from the unpacked start on a settled concurrency decides on the
+        // growth count, not the shrink count (D257): the concurrency agreed for a shrink
+        // count already, and a client's placement must settle inside the few seconds a
+        // warm-up gives it before its measured phase (D242's 2 s quiet). Later shrinks
+        // keep D217's 50 passes, so a short dip in a running load does not flap.
+        let shrink_passes = if settled && k == n {
+            PACK_GROW_PASSES
+        } else {
+            PACK_SHRINK_PASSES
+        };
         let why = if k < floor {
             self.pack_k = want.max(floor).min(n);
             "the stall floor"
@@ -2182,22 +2275,23 @@ impl ShardState {
                         "a shard whose thread is saturated (D251)"
                     }
                 }
+                None if spread => "the busy sum over the active shards (D217)",
                 None => {
-                    debug_assert!(spread);
-                    "the busy sum over the active shards (D217)"
+                    debug_assert!(concurrent);
+                    "the commits in flight (D257)"
                 }
             }
-        } else if self.pack_down >= PACK_SHRINK_PASSES
-            && (k < n || self.writing_passes >= PACK_FIRST_SHRINK_PASSES)
+        } else if self.pack_down >= shrink_passes
+            && (k < n || settled || self.writing_passes >= PACK_FIRST_SHRINK_PASSES)
         {
             self.pack_k = want.min(k - 1).max(floor.max(1));
             self.shrunk_from = Some((k, self.balance_pass, writes));
-            "a busy sum low enough for one fewer (D217)"
+            "a busy sum and commits in flight low enough for one fewer (D217, D257)"
         } else {
             return true;
         };
         trace!(
-            "shard {} balancer: active shards {k} -> {} (busy {busy:.2}, floor {floor}, writes {writes}): {why}",
+            "shard {} balancer: active shards {k} -> {} (busy {busy:.2}, in flight {inflight:.2}, floor {floor}, writes {writes}): {why}",
             self.id.0, self.pack_k
         );
         self.pack_up = 0;

@@ -610,6 +610,7 @@ impl Runner for PigeonholeRunner {
                     merges: s.merges,
                     moves: s.moves,
                     busy_nanos: s.busy_nanos,
+                    commit_inflight_nanos: s.commit_inflight_nanos,
                 })
                 .collect()
         })

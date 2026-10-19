@@ -175,6 +175,11 @@ pub struct Metrics {
     /// interval, divided by the interval, is how many threads' worth of polling the store
     /// did: awake time its clients caused without work behind it.
     pub shard_spin_time_nanos: u64,
+    /// Nanoseconds client commits spent in flight, from submit to reply, summed over the
+    /// commits every shard completed (D257). Its rise over an interval, divided by the
+    /// interval, is the mean number of commits in flight (Little's law): the concurrency
+    /// packing sizes the active shards by, at most the clients with a commit outstanding.
+    pub shard_commit_inflight_nanos: u64,
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
@@ -268,11 +273,16 @@ pub struct ShardStats {
     /// the pool term packing adds to the shard's turn busy.
     pub pool_busy_nanos: u64,
     /// Nanoseconds the shard's engine-owned thread spent in its spin before parking (D198:
-    /// polling for the next message after handling one), not in `busy_nanos` (D256; the spin window is `EngineOptions::shard_spin_nanos`). Its
-    /// rise over an interval, divided by the interval, is the spin term packing adds to the
-    /// shard's turn busy: a shard its clients keep awake. Zero for an application-owned
-    /// shard.
+    /// polling for the next message after handling one), not in `busy_nanos` (D256; the
+    /// spin window is `EngineOptions::shard_spin_nanos`). Its rise over an interval, divided
+    /// by the interval, is how much of the time the shard was awake without work: since
+    /// D257 reported, not a packing term. Zero for an application-owned shard.
     pub spin_time_nanos: u64,
+    /// Nanoseconds the client commits this shard completed spent in flight, from submit to
+    /// reply (D257). Its rise over an interval, divided by the interval, is the mean number
+    /// of commits in flight at the shard: summed over shards, the concurrency packing sizes
+    /// the active shards by.
+    pub commit_inflight_nanos: u64,
 }
 
 /// The lock-page byte range of the superblock-less file check (decision D59).
@@ -2071,6 +2081,7 @@ impl Engine {
                 sync_busy_nanos: m.sync_busy_nanos.load(Ordering::Relaxed),
                 pool_busy_nanos: 0,
                 spin_time_nanos: 0,
+                commit_inflight_nanos: m.commit_inflight_nanos.load(Ordering::Relaxed),
             })
             .collect();
         if let Some(subs) = shared.submitters.get() {
@@ -2176,6 +2187,11 @@ impl Engine {
         m.block_cache_capacity = shared.cache.capacity() as u64;
         m.block_cache_pinned_warnings = shared.cache.pinned_warnings();
         m.commit_parks = shared.commit_parks.load(Ordering::Relaxed);
+        m.shard_commit_inflight_nanos = shared
+            .metrics
+            .iter()
+            .map(|m| m.commit_inflight_nanos.load(Ordering::Relaxed))
+            .sum();
         if let Some(subs) = shared.submitters.get() {
             for sub in subs.iter() {
                 let (parks, wakes) = sub.idle_counts();
