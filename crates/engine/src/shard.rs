@@ -1301,6 +1301,30 @@ impl Member {
     }
 }
 
+/// Whether a member of `members` writes the cell `predicate` reads on `row`: any mutation of
+/// its column, or a delete of its family (a row delete is one per family, D10).
+fn writes_cell(members: &[Member], table: TableId, row: &[u8], predicate: &Predicate) -> bool {
+    let (family, qualifier) = match predicate {
+        Predicate::Exists { family, qualifier }
+        | Predicate::Absent { family, qualifier }
+        | Predicate::Value {
+            family, qualifier, ..
+        } => (*family, qualifier.as_slice()),
+    };
+    members
+        .iter()
+        .filter(|m| !matches!(m.kind, MemberKind::CommitRecord { .. }))
+        .filter_map(|m| BatchRef::new(m.bytes.as_slice()).ok())
+        .any(|batch| {
+            batch.iter().flatten().any(|mu| {
+                mu.table == table
+                    && mu.family == family
+                    && mu.row == row
+                    && (mu.kind == Kind::FamilyDelete || mu.qualifier == qualifier)
+            })
+        })
+}
+
 /// A group whose WAL sync is in flight.
 #[derive(Debug)]
 struct Group {
@@ -2212,6 +2236,8 @@ pub(crate) struct ShardState {
     /// The row hashes of the member `reserve_room` sized last, for `touch_rows`.
     admit_rows: Vec<u64>,
     touched: FastSet<u64>,
+    /// Rows of members this group held back for the next one (`run_group`).
+    held_rows: FastSet<u64>,
     /// Slots the last `apply` wrote (deduplicated).
     touched_slots: Vec<(TabletId, FamilyId)>,
     closing: bool,
@@ -2610,6 +2636,7 @@ impl ShardState {
             dedup: Dedup::default(),
             admit_rows: Vec::new(),
             touched: FastSet::default(),
+            held_rows: FastSet::default(),
             touched_slots: Vec::new(),
             closing: false,
             close_stage: CloseStage::Open,
@@ -4710,21 +4737,33 @@ impl ShardState {
         let spare = self.member_buf();
         let mut members = std::mem::replace(&mut self.pending, spare);
 
-        // Admission, in order. A conditional member whose row an earlier member of this
-        // group already touched runs in the next group instead, with everything after it,
-        // so conditions see the applied state and submission order holds per row.
+        // Admission, in order. A conditional member whose predicate cell or read rows an
+        // earlier member of this group already wrote runs in the next group instead, so
+        // conditions see the applied state; later singles on its rows wait with it, so
+        // submission order holds per row. Singles on other rows go on: commits in flight
+        // together have no order (D143).
         let mut admitted = self.member_buf();
         admitted.reserve(members.len());
         self.touched.clear();
-        // Once a conditional member is held back, every later plain commit waits with it
-        // (per-row submission order); two-phase-commit records never wait, since the share
-        // the member waits for may need them to be decided.
+        self.held_rows.clear();
+        // Once a member waits for room or a guarded flush's install, every later single
+        // waits with it (the room wait's queue keeps submission order); two-phase-commit
+        // records never wait, since the share the member waits for may need them to be
+        // decided.
         let mut cut = false;
         let mut need_room = false;
         // A member waits for a guarded flush's install: the shard wakes on its outcome.
         let mut guard_wait = false;
         for mut m in members.drain(..) {
             if cut && matches!(m.kind, MemberKind::Single) {
+                self.pending.push(m);
+                continue;
+            }
+            // A single on a row a held-back member writes or reads waits with it.
+            if !self.held_rows.is_empty()
+                && matches!(m.kind, MemberKind::Single)
+                && self.hold_if_overlapping(&m)
+            {
                 self.pending.push(m);
                 continue;
             }
@@ -4743,19 +4782,20 @@ impl ShardState {
             let Some(mut m) = self.route_member(m, ctx) else {
                 continue;
             };
-            // A conditional member reads the applied state: its written rows, its read
-            // keys and its predicate row must not be touched by an earlier member of this
-            // group (it then waits for the next group, with everything after it, so per-row
-            // submission order holds) nor by a prepared, undecided share (a single member
-            // waits for the decision; a PREPARE aborts instead, since waiting on another
-            // commit's decision could deadlock two coordinators).
+            // A conditional member reads the applied state: its predicate cell and its read
+            // rows must not be written by an earlier member of this group (it then waits
+            // for the next group, with the later singles on its rows, so per-row submission
+            // order holds), and none of its rows by a prepared, undecided share (a single
+            // member waits for the decision; a PREPARE aborts instead, since waiting on
+            // another commit's decision could deadlock two coordinators). An earlier write
+            // to another cell of its predicate row cannot change the predicate.
             if m.conditional() {
-                let (same_group, pending_share) = self.conflicts_with_group(&m);
+                let (same_group, pending_share) = self.conflicts_with_group(&m, &admitted);
                 // Overlapping an earlier member of this group, any conditional member waits
                 // for the next group: that is this shard's own write, waiting on no other
                 // coordinator (D249). A single also waits for an undecided share's decision.
                 if same_group || (pending_share && matches!(m.kind, MemberKind::Single)) {
-                    cut = true;
+                    self.hold_rows(&m);
                     self.pending.push(m);
                     continue;
                 }
@@ -6008,29 +6048,76 @@ impl ShardState {
         }
     }
 
-    /// Whether `m`'s rows (written, read, or its predicate row) overlap rows touched by an
-    /// earlier member of this group, and rows of prepared undecided shares.
-    fn conflicts_with_group(&self, m: &Member) -> (bool, bool) {
+    /// Whether conditional `m` reads what an earlier member of this group (`admitted`)
+    /// wrote: its predicate cell (a write to that column, or a delete of its family or
+    /// row) or any of its read rows; and whether any of its rows (written, read, or its
+    /// predicate row) is a prepared, undecided share's.
+    fn conflicts_with_group(&self, m: &Member, admitted: &[Member]) -> (bool, bool) {
         let mut same = false;
         let mut pending = false;
-        let mut check = |h: u64| {
-            same |= self.touched.contains(&h);
-            pending |= self.pending_rows.contains_key(&h);
-        };
         if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
             for mu in batch.iter().flatten() {
-                check(hash_row(mu.table, mu.row));
+                pending |= self.pending_rows.contains_key(&hash_row(mu.table, mu.row));
             }
         }
         if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
-                check(hash_row(r.table, &r.row));
+                let h = hash_row(r.table, &r.row);
+                same |= self.touched.contains(&h);
+                pending |= self.pending_rows.contains_key(&h);
+            }
+        }
+        if let Some((table, row, predicate)) = m.predicate.as_deref() {
+            let h = hash_row(*table, row);
+            pending |= self.pending_rows.contains_key(&h);
+            // The row hash first: only a row an earlier member touched is looked at cell
+            // by cell.
+            if !same && self.touched.contains(&h) {
+                same = writes_cell(admitted, *table, row, predicate);
+            }
+        }
+        (same, pending)
+    }
+
+    /// Holds `m`'s rows (written, read, and its predicate row) back for the next group:
+    /// later singles on them wait too (`hold_if_overlapping`).
+    fn hold_rows(&mut self, m: &Member) {
+        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+            for mu in batch.iter().flatten() {
+                self.held_rows.insert(hash_row(mu.table, mu.row));
+            }
+        }
+        if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
+            for r in reads {
+                self.held_rows.insert(hash_row(r.table, &r.row));
             }
         }
         if let Some((table, row, _)) = m.predicate.as_deref() {
-            check(hash_row(*table, row));
+            self.held_rows.insert(hash_row(*table, row));
         }
-        (same, pending)
+    }
+
+    /// Whether `m` touches a row held back for the next group; if so, its own rows are
+    /// held too, so a still later single on one of them waits behind it.
+    fn hold_if_overlapping(&mut self, m: &Member) -> bool {
+        let mut overlaps = false;
+        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+            for mu in batch.iter().flatten() {
+                overlaps |= self.held_rows.contains(&hash_row(mu.table, mu.row));
+            }
+        }
+        if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
+            for r in reads {
+                overlaps |= self.held_rows.contains(&hash_row(r.table, &r.row));
+            }
+        }
+        if let Some((table, row, _)) = m.predicate.as_deref() {
+            overlaps |= self.held_rows.contains(&hash_row(*table, row));
+        }
+        if overlaps {
+            self.hold_rows(m);
+        }
+        overlaps
     }
 
     /// Records `m`'s written rows as touched by this group.
