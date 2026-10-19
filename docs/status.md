@@ -60,7 +60,7 @@ Measured on the AX102 in the 2026-10-12 window at `a8b167e` ([results](../crates
 - **Placement and threads:**
   - one shard per physical core by default ([D220](design/decisions/phase-3.md#d220));
   - engine-owned shard threads pinned by default ([D235](design/decisions/phase-3.md#d235));
-  - balancer packing, damping and closed-loop rules ([D214](design/decisions/phase-3.md#d214), [D217](design/decisions/phase-3.md#d217), [D224](design/decisions/phase-3.md#d224)).
+  - balancer packing, damping and closed-loop rules ([D214](design/decisions/phase-3.md#d214), [D217](design/decisions/phase-3.md#d217), [D224](design/decisions/phase-3.md#d224)); packing sized by the commits in flight ([D257](design/decisions/phase-3.md#d257), A/B on the reference machine pending).
 - **Write path:**
   - the L0 write stall starts at 2× `l0_trigger` ([D234](design/decisions/phase-3.md#d234));
   - group syncs shared by concurrent durable commits ([D207](design/decisions/phase-3.md#d207), [D221](design/decisions/phase-3.md#d221));

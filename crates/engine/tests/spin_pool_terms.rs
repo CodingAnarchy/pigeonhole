@@ -1,8 +1,10 @@
-//! D256: the balancer's spin and pool terms come from the runtime's real counters, not
-//! only from the test overrides (ctr274's review of #737): on an engine-owned store with
-//! one compaction thread, a flush runs on the pool and a handled commit leaves the shard
-//! thread spinning, and the busy fraction the balancer publishes exceeds its turn-only
-//! fraction. With either counter read as zero the two would be equal.
+//! D256 and D257: the balancer's pool term and its commits in flight come from the real
+//! counters, not only from the test overrides (ctr274's review of #737): on an engine-owned
+//! store with one compaction thread, a flush runs on the pool and the busy fraction the
+//! balancer publishes exceeds its turn-only fraction (with the pool counter read as zero
+//! the two would be equal), the handled commits leave the shard thread spinning (counted
+//! and reported, no term since D257), and one blocking client's commits read at most about
+//! one commit in flight.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
@@ -65,6 +67,17 @@ fn the_spin_and_pool_terms_lift_the_published_busy_above_the_turns() {
         );
     };
     assert!(busy > turn, "busy {busy} turn {turn}");
+    // D257: one blocking client is at most one commit in flight, and the counter moved.
+    let stats = &db.shard_stats()[0];
+    assert!(
+        stats.commit_inflight_nanos > 0,
+        "no commit in-flight time counted"
+    );
+    let inflight = db.shard_inflight(0).expect("published");
+    assert!(
+        inflight > 0.0 && inflight <= 1.05,
+        "one blocking client read {inflight} commits in flight"
+    );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1500,10 +1500,16 @@ fn spin_and_pool_time_are_counted_on_an_engine_owned_store() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
     assert!(settled.shard_busy_nanos > 0);
+    // D257: the 64 blocking commits' time in flight is counted, and summed per shard.
+    assert!(settled.shard_commit_inflight_nanos > 0);
     let stats = db.shard_stats();
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].pool_busy_nanos, settled.shard_pool_busy_nanos);
     assert!(stats[0].spin_time_nanos >= settled.shard_spin_time_nanos);
+    assert_eq!(
+        stats[0].commit_inflight_nanos,
+        settled.shard_commit_inflight_nanos
+    );
     drop(t);
     db.close().unwrap();
 }

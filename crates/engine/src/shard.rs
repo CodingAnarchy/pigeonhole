@@ -143,6 +143,12 @@ pub(crate) struct ShardMetrics {
     /// Group syncs' in-flight time (D248): the integral of the group syncs in flight over
     /// time, in nanoseconds, as of the last change in their number.
     pub sync_busy_nanos: AtomicU64,
+    /// Client commits' in-flight time (D257): the sum over the commits this shard completed
+    /// (singles and the cross-shard commits it coordinated, committed or failed) of the
+    /// nanoseconds from the client's submit to the reply. Its rise over an interval, divided
+    /// by the interval, is the mean number of commits in flight at this shard (Little's
+    /// law), the concurrency packing sizes the active shards by.
+    pub commit_inflight_nanos: AtomicU64,
     /// The shard's WAL stream stall counters (ICR 0015), once the stream is open.
     pub wal: std::sync::OnceLock<Arc<pigeonhole_wal::WalCounters>>,
     /// Cross-shard two-phase commit counters (ICR 0043).
@@ -173,6 +179,7 @@ impl Default for ShardMetrics {
             refused_slots: AtomicU64::new(0),
             refused_view: AtomicU64::new(0),
             sync_busy_nanos: AtomicU64::new(0),
+            commit_inflight_nanos: AtomicU64::new(0),
             wal: std::sync::OnceLock::new(),
             cross: CrossShardCounters::default(),
             #[cfg(feature = "test-hooks")]
@@ -226,6 +233,13 @@ impl ShardMetrics {
         let d = durability as usize;
         self.commits[d].fetch_add(1, Ordering::Relaxed);
         self.latency[d][bucket(nanos)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a client commit's time in flight, from its submit to its reply, committed or
+    /// failed (D257's concurrency measure).
+    fn count_inflight(&self, nanos: u64) {
+        self.commit_inflight_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
     }
 }
 
@@ -2091,18 +2105,21 @@ enum CloseStage {
 // The shard
 // ---------------------------------------------------------------------------------------
 
-/// The counters packing's busy measure differences between two balancer passes
-/// (D217, D248, D256), and the clock at the pass they were read.
+/// The counters packing's measures difference between two balancer passes
+/// (D217, D248, D256, D257), and the clock at the pass they were read.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BusyMark {
     /// `Submitter::busy_nanos`: the thread's turns.
     turns: u64,
-    /// `Submitter::spin_nanos`: the thread's spin before parking (D198).
+    /// `Submitter::spin_nanos`: the thread's spin before parking (D198; traced, not a term
+    /// since D257).
     spin: u64,
     /// `Submitter::pool_busy_nanos`: the pool's slices for this shard's tasks.
     pool: u64,
     /// `sync_busy_nanos`: the group syncs' in-flight time (D248).
     sync: u64,
+    /// `commit_inflight_nanos`: the client commits' in-flight time (D257).
+    inflight: u64,
     /// The clock at the pass.
     at: u64,
 }
@@ -2449,6 +2466,9 @@ pub(crate) struct ShardState {
     /// calling for more or fewer of them.
     busy_mark: Option<BusyMark>,
     busy_ewma: f64,
+    /// The moving average of the mean number of client commits in flight at this shard
+    /// (D257): the rise of `commit_inflight_nanos` over the interval, by Little's law.
+    inflight_ewma: f64,
     /// The moving average of the larger of the thread's turn busy fraction and its writers'
     /// stall fraction, without the sync term (D251's hot test, D255).
     turn_ewma: f64,
@@ -2680,6 +2700,7 @@ impl ShardState {
             chose_slow: std::cell::Cell::new(false),
             busy_mark: None,
             busy_ewma: 0.0,
+            inflight_ewma: 0.0,
             turn_ewma: 0.0,
             hot_grew: None,
             stall_term: 0.0,
@@ -6098,10 +6119,11 @@ impl ShardState {
         };
         match m.kind {
             MemberKind::Single => {
+                let in_flight = ctx.now_nanos().saturating_sub(m.submitted_at);
+                let metrics = &self.shared.metrics[usize::from(self.id.0)];
+                metrics.count_inflight(in_flight);
                 if result.is_ok() {
-                    let now = ctx.now_nanos();
-                    self.shared.metrics[usize::from(self.id.0)]
-                        .record(m.durability, now.saturating_sub(m.submitted_at));
+                    metrics.record(m.durability, in_flight);
                 }
                 let batch = match std::mem::replace(&mut m.bytes, Bytes::Streams(Vec::new())) {
                     Bytes::Own(b) => Some(b),
@@ -6763,12 +6785,13 @@ impl ShardState {
             self.try_finish_close(ctx);
             return;
         }
+        let in_flight = ctx.now_nanos().saturating_sub(c.submitted_at);
+        let metrics = &self.shared.metrics[usize::from(self.id.0)];
+        metrics.count_inflight(in_flight);
         let outcome = match c.failed.take() {
             Some(e) => Err(e),
             None => {
-                let now = ctx.now_nanos();
-                self.shared.metrics[usize::from(self.id.0)]
-                    .record(c.durability, now.saturating_sub(c.submitted_at));
+                metrics.record(c.durability, in_flight);
                 Ok(CommitInfo {
                     seqno,
                     durability: c.durability,

@@ -109,6 +109,11 @@ pub struct EngineMetrics {
     /// Its rise over an interval, divided by the interval, is how many threads' worth of
     /// awake-but-idle time the database's clients caused.
     pub shard_spin_time_nanos: u64,
+    /// Nanoseconds commits spent in flight, from `commit()` to its reply, summed over every
+    /// commit completed. Its rise over an interval, divided by the interval, is the mean
+    /// number of commits in flight: how many clients had a write outstanding at once, which
+    /// is what decides how many shards the database keeps active for them.
+    pub shard_commit_inflight_nanos: u64,
     /// Blocking commit waits (`commit()`) that parked their thread after the short spin.
     /// Async commits never park.
     pub commit_parks: u64,
@@ -229,6 +234,7 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             shard_busy_nanos: m.shard_busy_nanos,
             shard_pool_busy_nanos: m.shard_pool_busy_nanos,
             shard_spin_time_nanos: m.shard_spin_time_nanos,
+            shard_commit_inflight_nanos: m.shard_commit_inflight_nanos,
             commit_parks: m.commit_parks,
             // The engine fills `pinned_threads` as (pinned, started).
             threads_started: m.pinned_threads.1,

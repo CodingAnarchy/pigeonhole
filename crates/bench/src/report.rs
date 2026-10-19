@@ -744,6 +744,12 @@ pub struct ShardShare {
     /// shards.
     #[serde(default)]
     pub busy_nanos: u64,
+    /// Nanoseconds the commits this shard completed spent in flight, from submit to reply
+    /// (D257); divided by the phase's length, the mean number of commits in flight at the
+    /// shard, and summed over shards the store's concurrency, which sizes the active
+    /// shards. Absent from results written before it.
+    #[serde(default)]
+    pub commit_inflight_nanos: u64,
 }
 
 impl ShardShare {
@@ -758,6 +764,9 @@ impl ShardShare {
             merges: after.merges.saturating_sub(before.merges),
             moves: after.moves.saturating_sub(before.moves),
             busy_nanos: after.busy_nanos.saturating_sub(before.busy_nanos),
+            commit_inflight_nanos: after
+                .commit_inflight_nanos
+                .saturating_sub(before.commit_inflight_nanos),
         }
     }
 }

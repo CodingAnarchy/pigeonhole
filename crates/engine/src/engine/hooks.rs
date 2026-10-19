@@ -170,9 +170,9 @@ pub(crate) struct ShardCounters {
     /// The pool busy fraction the shard's balancer measures (millionths plus one; 0 measures
     /// the real one), `Engine::set_shard_pool_busy` (D256's packing tests).
     pub pool_override: AtomicU64,
-    /// The spin fraction the shard's balancer measures (millionths plus one; 0 measures the
-    /// real one), `Engine::set_shard_spin_busy` (D256's packing tests).
-    pub spin_override: AtomicU64,
+    /// The mean commits in flight the shard's balancer measures (millionths plus one; 0
+    /// measures the real one), `Engine::set_shard_inflight` (D257's packing tests).
+    pub inflight_override: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -601,16 +601,27 @@ impl Engine {
             .store(v, Ordering::Relaxed);
     }
 
-    /// Makes shard `shard`'s balancer measure its thread's spin before parking (D198) as
-    /// `busy` (a fraction of the time, 0 to 1) from now on, or the real spin time with
-    /// `None` (test hook: D256's packing tests).
+    /// Makes shard `shard`'s balancer measure `inflight` client commits in flight at it on
+    /// average (0 up; a closed-loop client's worth is at most 1) from now on, or the real
+    /// in-flight time with `None` (test hook: D257's packing tests, decided on chosen
+    /// concurrency under any clock).
     #[doc(hidden)]
-    pub fn set_shard_spin_busy(&self, shard: usize, busy: Option<f64>) {
-        let v = busy.map_or(0, |b| (b.clamp(0.0, 1.0) * 1e6).round() as u64 + 1);
+    pub fn set_shard_inflight(&self, shard: usize, inflight: Option<f64>) {
+        let v = inflight.map_or(0, |b| (b.clamp(0.0, 1e6) * 1e6).round() as u64 + 1);
         self.inner.shared.metrics[shard]
             .hooks
-            .spin_override
+            .inflight_override
             .store(v, Ordering::Relaxed);
+    }
+
+    /// The mean commits in flight shard `shard`'s balancer published at its last pass
+    /// (D257's moving average of the rise of `commit_inflight_nanos` over each interval),
+    /// `None` before its first pass. Test hook: one blocking client reads at most about 1.
+    #[doc(hidden)]
+    pub fn shard_inflight(&self, shard: usize) -> Option<f64> {
+        self.inner.shared.loads[shard]
+            .read_inflight_fresh(u64::MAX, u64::MAX)
+            .map(|v| v as f64 / 1e6)
     }
 
     /// The stall fraction shard `shard`'s balancer published at its last pass (D255: the
@@ -624,9 +635,9 @@ impl Engine {
     }
 
     /// The busy fraction and the turn-busy fraction shard `shard`'s balancer published at
-    /// its last pass (D217's moving average of the largest of turn + spin + pool, sync and
-    /// stall, D256; and D251's turn-and-stall average), `None` before its first pass. Test
-    /// hook: with the spin or the pool term above zero the first exceeds the second.
+    /// its last pass (D217's moving average of the largest of turn + pool, sync and stall,
+    /// D256, D257; and D251's turn-and-stall average), `None` before its first pass. Test
+    /// hook: with the pool term above zero the first exceeds the second.
     #[doc(hidden)]
     pub fn shard_busy_terms(&self, shard: usize) -> Option<(f64, f64)> {
         let slot = &self.inner.shared.loads[shard];

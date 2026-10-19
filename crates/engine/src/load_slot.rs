@@ -37,6 +37,9 @@ pub(crate) struct LoadSlot {
     /// The same for the writers' stall fraction alone: the time the shard's commits waited
     /// for arena room or were paced on L0 depth (D255's term of the hot test).
     stall_busy: AtomicU64,
+    /// Moving average of the mean number of client commits in flight at the shard, in
+    /// millionths (D257): shard 0 sums every shard's into the store's concurrency.
+    inflight: AtomicU64,
     /// Slow moving average of the rows written per interval (D224).
     writes_slow: AtomicU64,
     /// `(tablet, family)` slots promised to changes in flight that will hand this shard
@@ -90,6 +93,19 @@ impl LoadSlot {
         let at = self.at.load(Ordering::Acquire);
         (at != 0 && now.saturating_sub(at) <= stale)
             .then(|| self.stall_busy.load(Ordering::Relaxed))
+    }
+
+    /// The owning shard's mean commits in flight (millionths, D257), published with the next
+    /// [`LoadSlot::publish`] (stored before its `Release`).
+    pub(crate) fn set_inflight(&self, inflight: u64) {
+        self.inflight.store(inflight, Ordering::Relaxed);
+    }
+
+    /// The published mean commits in flight (millionths, D257) if it was published within
+    /// `stale` of `now`: like [`LoadSlot::read_fresh`], that publication's or a later one.
+    pub(crate) fn read_inflight_fresh(&self, now: u64, stale: u64) -> Option<u64> {
+        let at = self.at.load(Ordering::Acquire);
+        (at != 0 && now.saturating_sub(at) <= stale).then(|| self.inflight.load(Ordering::Relaxed))
     }
 
     /// The published rate if it was published within `stale` of `now`.

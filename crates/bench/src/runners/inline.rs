@@ -710,6 +710,7 @@ impl PigeonholeRunner {
                 merges: a.merges - b.merges,
                 moves: a.moves - b.moves,
                 busy_nanos: a.busy_nanos - b.busy_nanos,
+                commit_inflight_nanos: a.commit_inflight_nanos - b.commit_inflight_nanos,
             })
             .collect();
         drop(t);
