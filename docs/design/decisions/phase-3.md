@@ -1378,7 +1378,7 @@ The AX102 confirms at 64 GiB.
   - D233's background-work note still applies to every pair, judged or not.
 - **The short runs are lengthened.** `--min-secs S` now applies to client runs as well as inline ones. A client run whose configured operations measure under S seconds continues with the workload stream's next operations, in passes sized from the rate so far, until S seconds are measured. Each pass's operations are generated before its clock starts.
 - **In the gate.** `run-window.sh` runs every `all` (both io_uring runs and pread) with `--min-secs 10`, and the D213 group-commit run inside it with the judged run's 2M commits (`--inline-ops`). The dry run (`--scale small`) uses 1 s.
-- The tolerance itself (±20% throughput and p50, ±40% p99) is unchanged.
+- The tolerance itself (±20% throughput and p50, ±40% p99) is unchanged. (D259 later added absolute floors for the latencies.)
 
 **Why:** the 2026-10-13 gate's second pair failed only on short runs:
 - the D213 shape inside `all` measured 0.16 s (+53% throughput, −41% p50);
@@ -1388,6 +1388,8 @@ The AX102 confirms at 64 GiB.
 At those lengths, one flush or compaction more or less, or a placement change, moves a run by more than the tolerance. That's timing luck, not the engine. In the full-scale `all`, 18 of the 28 runs measured under 10 s, both engines included.
 
 *History: amended by [D258](#d258), 2026-10-19: the gate window trims the data file system before every step, so the reproducibility pair doesn't also differ in how much of the NVMe the drive maps.*
+
+*History: amended by [D259](#d259), 2026-10-19: a judged latency fails only past both its relative tolerance and an absolute floor (p50 3 µs, p99 6 µs at the default tolerance).*
 
 <a id="d244"></a>
 ## D244 — A participant keeps a cross-shard commit's timestamp in seqno order with the writes it already stamped, with tablet changes on or off (owner decision, 2026-10-13; engine, tablets, #653; amends D142 and D192's note)
@@ -1955,6 +1957,23 @@ Shard parks fell 650K → 98K at one client and 9.08M → 2.12M on no riders. co
 - That's one reproduction, so it suggests the drive's mapping state rather than proving it. The trim removes the variable from the gate either way: every window, and every step in it, starts from the same drive state, whatever the earlier steps or other users of the box deleted. The single-file 4 KiB fdatasync probe didn't move during any of this (59–63 µs, the slow row included), so it can't stand in for the trim or detect the state.
 
 **Considered and not taken:** mounting with `discard` (a discard on every delete, inside the measured phases of the steps that delete stores); one trim at setup only (the window's own steps delete terabytes, and the slow rows came about an hour in); a probe that predicts the slow state (none found: the flush probe never moved).
+
+<a id="d259"></a>
+## D259 — The reproducibility check gives each latency an absolute floor: it fails only past both its relative tolerance and the floor (owner decision, 2026-10-19; bench, #406, #747; amends D243)
+
+**Decided:**
+- **A latency fails only past both.** `phdb-bench compare` fails a judged p50 only when it moved by more than ±20% *and* by more than 3 µs. It fails a judged p99 only when it moved by more than ±40% *and* by more than 6 µs. A move within either one passes.
+- **The floors scale with `--tolerance T`** the way the p99's relative tolerance does: `T × 15 µs` at p50 and `T × 30 µs` at p99 (3 and 6 µs at the default 0.20). `Tolerance` carries them as `p50_floor_ns` and `p99_floor_ns`.
+- **Unchanged:**
+  - throughput has no floor and stays at ±20%;
+  - p99.9 and max are reported, not judged;
+  - D243's 10 s rule still decides which pairs are judged at all; a pair too short to judge gets neither tolerance nor floor.
+- **In the report:** the Allowed column reads `±20% or ±3 µs` for a judged latency.
+
+**Why:** gate 2026-10-19's reproducibility pair failed on one metric only: ycsb-f's Pigeonhole p50 at one thread, 10.2 against 12.7 µs. That is +25.2% against ±20%, but only 2.5 µs. The same row's p99 moved +9.2% and p99.9 +6.3%, and RocksDB's ycsb-f p50 moved −1.8%. At latencies of a few microseconds, a relative tolerance alone judges drifts too small to mean a different store. D243 made the judged runs long enough. D259 makes the judged move large enough.
+- Re-checked with the floor, gate 19's `all-uring-1` against `all-uring-2` passes. Gate 2026-10-18's pair still fails on the same 9 metrics. Those moves were tens of percent at several µs, or throughput, so the floor doesn't hide real drift.
+
+**Considered and not taken:** loosening the relative p50 tolerance (it would also loosen the long-latency rows, where ±20% is already µs-scale); a separate `--floor-us` flag (the floor scaling with `--tolerance` keeps one knob, as the p99's 2T does).
 
 <a id="d260"></a>
 ## D260 — A conditional commit waits for the next group only when its group wrote its predicate cell, and only the commits on its rows wait with it (coordinator decision, 2026-10-19; engine, #406; amends D91)

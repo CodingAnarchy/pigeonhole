@@ -43,7 +43,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--no-tablet-changes` | Pigeonhole: keep each table one tablet on one shard (`Options::tablet_changes(false)`; by default tablets split, merge and move between shards, so one table's writes spread over every shard) |
 | `--row-cache B` | Pigeonhole: a row cache of B bytes (`Options::row_cache`, D201); 0 turns it off. Without it the library default applies (on, D216) and the run's description names no row cache, so results stay comparable with earlier ones. The gate window (#405) runs `ycsb-c` and `ycsb-a` with it off beside the default |
 | `--json PATH`, `--markdown PATH` | Write results |
-| `--tolerance T` | `compare`: ±T on throughput and p50, ±2T on p99 (default 0.20) |
+| `--tolerance T` | `compare`: ±T on throughput and p50, ±2T on p99 (default 0.20); a latency also passes within `T × 15 µs` at p50 and `T × 30 µs` at p99 (D259) |
 
 Always use `--release`: a debug build prints a warning and its numbers mean nothing.
 
@@ -209,9 +209,11 @@ Two runs of the same suite on the same machine agree when, for every result:
 | Metric | Tolerance |
 |---|---|
 | Throughput | ±20% |
-| p50 | ±20% |
-| p99 | ±40% |
+| p50 | ±20% or ±3 µs |
+| p99 | ±40% or ±6 µs |
 | p99.9, max | reported, not checked |
+
+A latency fails only when it is past both its relative tolerance and its absolute floor (D259): at a few microseconds a ±20% move can be under 3 µs, which doesn't mean a different store. The floors scale with `--tolerance` (3 and 6 µs at 0.20).
 
 Only results that measured at least 10 s in both runs are judged, or at least 2M commits for group commit (D243). Shorter ones are listed with no tolerance and named under "Not judged (D243)": at a few seconds, one flush or compaction more or less moves a run past the tolerance. The 2026-10-13 gate's second pair failed only on such runs (the 0.16 s D213 shape, a 5.3 s ycsb-a). The gate window runs `all` with `--min-secs 10` so every result is judged.
 

@@ -121,7 +121,8 @@ OPTIONS:
     --json PATH            write results as JSON
     --markdown PATH        write the markdown summary
     --tolerance T          compare: relative tolerance for throughput and p50; p99
-                           gets 2T [default: 0.20]
+                           gets 2T. A latency also passes within T × 15 µs at p50
+                           and T × 30 µs at p99 (D259) [default: 0.20]
 ";
 
 /// A `--durability` beyond buffered and sync.
