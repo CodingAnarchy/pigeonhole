@@ -146,8 +146,9 @@ pub(crate) struct ShardMetrics {
     /// Client commits' in-flight time (D257, D262): the sum over the commits this shard
     /// completed (singles and the cross-shard commits it coordinated, committed or failed)
     /// of the nanoseconds from the client's submit to the reply, plus, over the cross-shard
-    /// shares it prepared and decided (committed or aborted), the nanoseconds from the
-    /// client's submit to the decision's application here. Its rise over an interval,
+    /// shares it prepared and decided for another shard's coordination (committed or
+    /// aborted; its own share is inside its reply span), the nanoseconds from the client's
+    /// submit to the decision's application here. Its rise over an interval,
     /// divided by the interval, is the mean number of commit rounds in flight at this shard
     /// (Little's law), the concurrency packing sizes the active shards by.
     pub commit_inflight_nanos: AtomicU64,
@@ -6690,8 +6691,12 @@ impl ShardState {
             self.release_room(share.reserved);
             // The round occupied this shard from the client's submit to here (D262): count
             // it as the coordinator counts its own span at the reply, decided either way.
-            self.shared.metrics[usize::from(self.id.0)]
-                .count_inflight(ctx.now_nanos().saturating_sub(share.submitted_at));
+            // The coordinator prepares its own share the same way, and its reply span
+            // already covers that: it counts nothing here.
+            if coordinator != self.id {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .count_inflight(ctx.now_nanos().saturating_sub(share.submitted_at));
+            }
             if commit {
                 self.refresh_tablets();
                 #[cfg(feature = "test-hooks")]

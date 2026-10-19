@@ -195,6 +195,14 @@ fn one_clients_cross_shard_commits_count_at_the_coordinator_and_the_participant(
         counted[1] < counted[0],
         "the participant's rounds end at the decision, before the coordinator's reply: {counted:?}"
     );
+    // The coordinator prepares its own share too and must not count it at the decision on
+    // top of its reply: the reply follows the decision by one hop and the settle (the reply
+    // spans read about 1.1× the decision spans), while a coordinator counting both reads
+    // about 2×.
+    assert!(
+        counted[0] * 2 < counted[1] * 3,
+        "the coordinator counted its own share at the decision on top of its reply: {counted:?}"
+    );
     assert!(
         store_inflight <= 2.1,
         "one blocking client read {store_inflight} commit rounds in flight over two shards"
