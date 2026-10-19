@@ -53,8 +53,9 @@ fn spinning_stops_when_the_database_goes_idle() {
     o.create_if_missing = true;
     o.shards = 2;
     o.durability = Durability::Buffered;
-    // D198's windows are the defaults (the commit window from D253).
-    assert_eq!((o.commit_spin_nanos, o.shard_spin_nanos), (50_000, 50_000));
+    // D198's windows are the defaults (the commit window from D253, the shard window from
+    // D198's 2026-10-19 amendment).
+    assert_eq!((o.commit_spin_nanos, o.shard_spin_nanos), (50_000, 200_000));
     let db = Engine::open(&dir.join("idle.phdb"), o).unwrap();
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])

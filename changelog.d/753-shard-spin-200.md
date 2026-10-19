@@ -1,0 +1,3 @@
+### Changed
+- `Options::shard_spin` and `EngineOptions::shard_spin_nanos` default to 200 µs instead of 50 µs (D198, amended 2026-10-19): a shard that handled a message polls up to 200 µs for the next one, so a store whose clients keep its shards busy wakes them less (shard parks on D257's shapes 0.02–0.42 → at most 0.075 per op, riders default's write p99.9 424 → 289 µs, the gate's one-client ycsb-a spin rows +10–13%). An idle store still never polls; `Duration::ZERO` still turns the window off. It is not the fix for the 0.3.0 gate's cross-shard row (that is the share-report rescan, #761).
+- The Phase 3 gate window's `ycsb-a-shards` step runs the shard spin at 0, 100 and 500 µs beside the default (200), instead of 100, 200 and 500.

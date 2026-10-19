@@ -180,7 +180,8 @@ pub struct EngineOptions {
     /// hosts). A poll that finds nothing backs off on that thread.
     pub commit_spin_nanos: u64,
     /// How long an engine-owned shard thread that just handled a message keeps polling its
-    /// queue before it parks: nanoseconds, default 50 µs (D198). An idle shard never polls.
+    /// queue before it parks: nanoseconds, default 200 µs (D198, amended 2026-10-19 from
+    /// 50 µs). An idle shard never polls.
     /// Zero always parks. Application-owned shards are driven by the application and ignore
     /// it.
     pub shard_spin_nanos: u64,
@@ -235,7 +236,7 @@ impl EngineOptions {
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,
             commit_spin_nanos: 50_000,
-            shard_spin_nanos: 50_000,
+            shard_spin_nanos: 200_000,
             memtable_tail_index: std::env::var_os("PIGEONHOLE_TAIL_INDEX").is_none_or(|v| v != "0"),
             async_commit_bound: 0,
         }
