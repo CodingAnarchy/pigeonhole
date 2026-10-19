@@ -1504,7 +1504,10 @@ fn spin_and_pool_time_are_counted_on_an_engine_owned_store() {
     assert!(settled.shard_commit_inflight_nanos > 0);
     let stats = db.shard_stats();
     assert_eq!(stats.len(), 1);
-    assert_eq!(stats[0].pool_busy_nanos, settled.shard_pool_busy_nanos);
+    // Two live reads: the pool (the flush's compaction) and the spinning shard thread may
+    // add time between them, so the per-shard stat is at least the summed metric. Nothing
+    // commits between the reads, so the time in flight is equal.
+    assert!(stats[0].pool_busy_nanos >= settled.shard_pool_busy_nanos);
     assert!(stats[0].spin_time_nanos >= settled.shard_spin_time_nanos);
     assert_eq!(
         stats[0].commit_inflight_nanos,
