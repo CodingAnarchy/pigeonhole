@@ -1456,7 +1456,8 @@ impl Suite {
 }
 
 /// How far a candidate run may drift from a baseline and still count as the same
-/// result. Relative: 0.20 allows ±20%.
+/// result. Relative: 0.20 allows ±20%. A latency also passes within its absolute floor
+/// (D259): it fails only past both.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tolerance {
     /// Throughput.
@@ -1465,23 +1466,35 @@ pub struct Tolerance {
     pub p50: f64,
     /// 99th percentile. Tails are noisier, so this is looser.
     pub p99: f64,
+    /// The p50's absolute floor, in nanoseconds (D259).
+    pub p50_floor_ns: f64,
+    /// The p99's absolute floor, in nanoseconds (D259).
+    pub p99_floor_ns: f64,
 }
 
 impl Default for Tolerance {
-    /// The documented reproducibility tolerance (docs/bench.md): ±20% throughput and
-    /// p50, ±40% p99. p99.9 and max are reported but not checked.
+    /// The documented reproducibility tolerance (docs/bench.md): ±20% throughput,
+    /// p50 within ±20% or ±3 µs, p99 within ±40% or ±6 µs (D259). p99.9 and max are
+    /// reported but not checked.
     fn default() -> Self {
         Self::uniform(0.20)
     }
 }
 
+/// The p50's absolute floor per unit of relative tolerance (D259): 3 µs at the default
+/// 0.20. The p99's is twice this, as its relative tolerance is.
+const P50_FLOOR_NS_PER_T: f64 = 15_000.0;
+
 impl Tolerance {
-    /// `t` for throughput and p50, `2t` for p99.
+    /// `t` for throughput and p50, `2t` for p99; floors of `t × 15 µs` for p50 and
+    /// `t × 30 µs` for p99 (D259: 3 and 6 µs at 0.20).
     pub fn uniform(t: f64) -> Self {
         Self {
             throughput: t,
             p50: t,
             p99: 2.0 * t,
+            p50_floor_ns: t * P50_FLOOR_NS_PER_T,
+            p99_floor_ns: 2.0 * t * P50_FLOOR_NS_PER_T,
         }
     }
 }
@@ -1501,12 +1514,39 @@ pub struct Delta {
     pub change: f64,
     /// Allowed `|change|`; `None` for informational metrics.
     pub allowed: Option<f64>,
+    /// Allowed `|candidate - baseline|` in nanoseconds, for a judged latency (D259):
+    /// within either this or `allowed` passes.
+    pub floor_ns: Option<f64>,
 }
 
 impl Delta {
-    /// Whether this metric is within tolerance (informational metrics always are).
+    /// Whether this metric is within tolerance (informational metrics always are): within
+    /// its relative tolerance or, for a latency, its absolute floor (D259).
     pub fn ok(&self) -> bool {
-        self.allowed.is_none_or(|a| self.change.abs() <= a)
+        self.allowed.is_none_or(|a| {
+            self.change.abs() <= a
+                || self
+                    .floor_ns
+                    .is_some_and(|f| (self.candidate - self.baseline).abs() <= f)
+        })
+    }
+
+    /// The Allowed column: `±20%`, or `±20% or ±3 µs` for a judged latency.
+    fn allowed_text(&self) -> String {
+        let Some(a) = self.allowed else {
+            return "—".into();
+        };
+        match self.floor_ns {
+            Some(f) => {
+                let us = f / 1000.0;
+                if us.fract() == 0.0 {
+                    format!("±{:.0}% or ±{us:.0} µs", a * 100.0)
+                } else {
+                    format!("±{:.0}% or ±{us:.2} µs", a * 100.0)
+                }
+            }
+            None => format!("±{:.0}%", a * 100.0),
+        }
     }
 }
 
@@ -1575,9 +1615,7 @@ impl Comparison {
                 fmt(d.baseline),
                 fmt(d.candidate),
                 d.change * 100.0,
-                d.allowed
-                    .map(|a| format!("±{:.0}%", a * 100.0))
-                    .unwrap_or_else(|| "—".into()),
+                d.allowed_text(),
                 if d.ok() { "ok" } else { "**FAIL**" }
             );
         }
@@ -1657,28 +1695,32 @@ pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Com
             ));
         }
         let allow = |t: f64| judge.then_some(t);
-        let metrics: [(&'static str, f64, f64, Option<f64>); 4] = [
+        type Metric = (&'static str, f64, f64, Option<f64>, Option<f64>);
+        let metrics: [Metric; 4] = [
             (
                 "throughput",
                 b.throughput,
                 c.throughput,
                 allow(tolerance.throughput),
+                None,
             ),
             (
                 "p50",
                 b.p50_ns as f64,
                 c.p50_ns as f64,
                 allow(tolerance.p50),
+                allow(tolerance.p50_floor_ns),
             ),
             (
                 "p99",
                 b.p99_ns as f64,
                 c.p99_ns as f64,
                 allow(tolerance.p99),
+                allow(tolerance.p99_floor_ns),
             ),
-            ("p99.9", b.p999_ns as f64, c.p999_ns as f64, None),
+            ("p99.9", b.p999_ns as f64, c.p999_ns as f64, None, None),
         ];
-        for (metric, bv, cv, allowed) in metrics {
+        for (metric, bv, cv, allowed, floor_ns) in metrics {
             let change = if bv > 0.0 { cv / bv - 1.0 } else { 0.0 };
             deltas.push(Delta {
                 key: b.key(),
@@ -1687,6 +1729,7 @@ pub fn compare(baseline: &Suite, candidate: &Suite, tolerance: Tolerance) -> Com
                 candidate: cv,
                 change,
                 allowed,
+                floor_ns,
             });
         }
     }
@@ -1856,20 +1899,69 @@ mod tests {
 
     #[test]
     fn each_checked_metric_can_fail() {
-        let a = suite(vec![rec("ycsb-a", 1e5, 1000, 5000)]);
+        let a = suite(vec![rec("ycsb-a", 1e5, 20_000, 50_000)]);
         for b in [
-            rec("ycsb-a", 0.75e5, 1000, 5000),
-            rec("ycsb-a", 1e5, 1250, 5000),
-            rec("ycsb-a", 1e5, 1000, 7500),
+            rec("ycsb-a", 0.75e5, 20_000, 50_000),
+            rec("ycsb-a", 1e5, 25_000, 50_000),
+            rec("ycsb-a", 1e5, 20_000, 75_000),
         ] {
             let cmp = compare(&a, &suite(vec![b]), Tolerance::default());
             assert!(!cmp.passes());
             assert!(cmp.to_markdown().contains("FAIL"));
         }
         // p99.9 is informational only.
-        let mut b = rec("ycsb-a", 1e5, 1000, 5000);
+        let mut b = rec("ycsb-a", 1e5, 20_000, 50_000);
         b.p999_ns *= 10;
         assert!(compare(&a, &suite(vec![b]), Tolerance::default()).passes());
+    }
+
+    #[test]
+    fn latency_fails_only_past_both_its_tolerance_and_its_floor() {
+        // D259: the 2026-10-19 gate's ycsb-f p50 at one thread, 10.2 -> 12.7 µs (+25%,
+        // 2.5 µs), is within the 3 µs floor.
+        let pass = |base: (u64, u64), cand: (u64, u64), t: Tolerance| {
+            compare(
+                &suite(vec![rec("ycsb-f", 1e5, base.0, base.1)]),
+                &suite(vec![rec("ycsb-f", 1e5, cand.0, cand.1)]),
+                t,
+            )
+            .passes()
+        };
+        let t = Tolerance::default();
+        assert!(pass((10_200, 26_400), (12_700, 28_800), t));
+        assert!(pass((1000, 5000), (1250, 7500), t), "sub-µs drift");
+        // Past both: +35% and 3.5 µs at p50, +65% and 6.5 µs at p99.
+        assert!(!pass((10_000, 30_000), (13_500, 30_000), t));
+        assert!(!pass((10_000, 10_000), (10_000, 16_500), t));
+        // Within the relative tolerance however many µs.
+        assert!(pass((100_000, 300_000), (115_000, 400_000), t));
+        // The floors scale with --tolerance as the p99 tolerance does: 6 and 12 µs at 0.40.
+        let wide = Tolerance::uniform(0.40);
+        assert!((wide.p50_floor_ns - 6000.0).abs() < 1e-6);
+        assert!((wide.p99_floor_ns - 12_000.0).abs() < 1e-6);
+        assert!(pass((10_000, 10_000), (15_500, 21_500), wide));
+        assert!(!pass((10_000, 10_000), (16_500, 10_000), wide));
+        // Throughput has no floor.
+        assert!(
+            !compare(
+                &suite(vec![rec("ycsb-f", 1e5, 1000, 5000)]),
+                &suite(vec![rec("ycsb-f", 0.75e5, 1000, 5000)]),
+                t,
+            )
+            .passes()
+        );
+        let md = compare(
+            &suite(vec![rec("ycsb-f", 1e5, 10_200, 26_400)]),
+            &suite(vec![rec("ycsb-f", 1e5, 12_700, 28_800)]),
+            t,
+        )
+        .to_markdown();
+        assert!(md.contains("| ±20% or ±3 µs | ok |"), "{md}");
+        assert!(md.contains("| ±40% or ±6 µs | ok |"), "{md}");
+        assert!(
+            md.contains("| throughput |") && md.contains("| ±20% | ok |"),
+            "{md}"
+        );
     }
 
     #[test]
