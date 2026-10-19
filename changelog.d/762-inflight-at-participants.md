@@ -1,0 +1,2 @@
+### Changed
+- A cross-shard commit's time in flight now counts at every shard its round occupies (each participant adds it when it applies the decision), so the concurrency that sizes the active shards (D257, amended by D262) reads a client with a two-shard commit outstanding as two shards' worth: sixteen clients committing across shards keep sixteen shards instead of shrinking to 13–15 under the load and moving tablets inside the measurement. `shard_commit_inflight_nanos` and the per-shard stat rise accordingly.

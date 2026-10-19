@@ -176,9 +176,11 @@ pub struct Metrics {
     /// did: awake time its clients caused without work behind it.
     pub shard_spin_time_nanos: u64,
     /// Nanoseconds client commits spent in flight, from submit to reply, summed over the
-    /// commits every shard completed (D257). Its rise over an interval, divided by the
-    /// interval, is the mean number of commits in flight (Little's law): the concurrency
-    /// packing sizes the active shards by, at most the clients with a commit outstanding.
+    /// commits every shard completed (D257), plus each cross-shard commit's time from
+    /// submit to the decision at every participant (D262). Its rise over an interval,
+    /// divided by the interval, is the mean number of commit rounds in flight (Little's
+    /// law): the concurrency packing sizes the active shards by, at most the clients with
+    /// a commit outstanding times the shards a commit occupies.
     pub shard_commit_inflight_nanos: u64,
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
@@ -279,9 +281,10 @@ pub struct ShardStats {
     /// D257 reported, not a packing term. Zero for an application-owned shard.
     pub spin_time_nanos: u64,
     /// Nanoseconds the client commits this shard completed spent in flight, from submit to
-    /// reply (D257). Its rise over an interval, divided by the interval, is the mean number
-    /// of commits in flight at the shard: summed over shards, the concurrency packing sizes
-    /// the active shards by.
+    /// reply (D257), plus the cross-shard shares it decided, from submit to the decision
+    /// (D262). Its rise over an interval, divided by the interval, is the mean number of
+    /// commit rounds in flight at the shard: summed over shards, the concurrency packing
+    /// sizes the active shards by.
     pub commit_inflight_nanos: u64,
 }
 

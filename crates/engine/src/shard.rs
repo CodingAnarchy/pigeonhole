@@ -143,11 +143,13 @@ pub(crate) struct ShardMetrics {
     /// Group syncs' in-flight time (D248): the integral of the group syncs in flight over
     /// time, in nanoseconds, as of the last change in their number.
     pub sync_busy_nanos: AtomicU64,
-    /// Client commits' in-flight time (D257): the sum over the commits this shard completed
-    /// (singles and the cross-shard commits it coordinated, committed or failed) of the
-    /// nanoseconds from the client's submit to the reply. Its rise over an interval, divided
-    /// by the interval, is the mean number of commits in flight at this shard (Little's
-    /// law), the concurrency packing sizes the active shards by.
+    /// Client commits' in-flight time (D257, D262): the sum over the commits this shard
+    /// completed (singles and the cross-shard commits it coordinated, committed or failed)
+    /// of the nanoseconds from the client's submit to the reply, plus, over the cross-shard
+    /// shares it prepared and decided (committed or aborted), the nanoseconds from the
+    /// client's submit to the decision's application here. Its rise over an interval,
+    /// divided by the interval, is the mean number of commit rounds in flight at this shard
+    /// (Little's law), the concurrency packing sizes the active shards by.
     pub commit_inflight_nanos: AtomicU64,
     /// The shard's WAL stream stall counters (ICR 0015), once the stream is open.
     pub wal: std::sync::OnceLock<Arc<pigeonhole_wal::WalCounters>>,
@@ -967,6 +969,9 @@ pub(crate) struct PrepareReq {
     pub participants: Vec<ShardId>,
     /// The commit's priority (D249).
     pub priority: CommitPriority,
+    /// The client's submit time, as the coordinator keeps it across retries: the participant
+    /// counts the round's time in flight from it at the decision (D262).
+    pub submitted_at: u64,
 }
 
 /// Why a participant could not prepare.
@@ -1410,6 +1415,8 @@ struct PreparedShare {
     participants: Vec<ShardId>,
     /// `PrepareReq::priority` (D249).
     priority: CommitPriority,
+    /// `PrepareReq::submitted_at` (D262).
+    submitted_at: u64,
 }
 
 /// A memtable with what flush and compaction need to know about it: the smallest user
@@ -6430,6 +6437,7 @@ impl ShardState {
                 validate: req.validate.clone(),
                 participants: shards.clone(),
                 priority,
+                submitted_at: req.submitted_at,
             });
             if shard == self.id {
                 self.handle_msg(msg, ctx);
@@ -6466,6 +6474,7 @@ impl ShardState {
                 tracked: false,
                 participants: req.participants,
                 priority: req.priority,
+                submitted_at: req.submitted_at,
             },
         );
         self.pending.push(Member {
@@ -6679,6 +6688,10 @@ impl ShardState {
                 self.track_share_rows(share.bytes.batch().as_bytes(), false);
             }
             self.release_room(share.reserved);
+            // The round occupied this shard from the client's submit to here (D262): count
+            // it as the coordinator counts its own span at the reply, decided either way.
+            self.shared.metrics[usize::from(self.id.0)]
+                .count_inflight(ctx.now_nanos().saturating_sub(share.submitted_at));
             if commit {
                 self.refresh_tablets();
                 #[cfg(feature = "test-hooks")]

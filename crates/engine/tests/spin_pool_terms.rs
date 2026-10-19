@@ -3,10 +3,11 @@
 //! store with one compaction thread, a flush runs on the pool and the busy fraction the
 //! balancer publishes exceeds its turn-only fraction (with the pool counter read as zero
 //! the two would be equal), the handled commits leave the shard thread spinning (counted
-//! and reported, no term since D257), and one blocking client's commits read at most about
-//! one commit in flight, whether single-shard or cross-shard (the coordinator counts a
-//! cross-shard commit once), and a commit that fails at its shard counts too (ctr274's
-//! review of #741: the two counting sites each have a test that fails without them).
+//! and reported, no term since D257), one blocking client's single-shard commits read at
+//! most about one commit in flight, its cross-shard commits count at the coordinator and at
+//! the participant (D262: at most about two over the store, the participant's share below
+//! the coordinator's), and a commit that fails at its shard counts too (ctr274's review of
+//! #741: the counting sites each have a test that fails without them).
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
@@ -122,7 +123,7 @@ fn put(t: &TableInfo, row: &[u8]) -> WriteBatch {
 /// store, and more than none (without the coordinator's count it would read none: the
 /// participants' PREPAREs and COMMIT records count nothing).
 #[test]
-fn one_clients_cross_shard_commits_read_as_one_commit_in_flight() {
+fn one_clients_cross_shard_commits_count_at_the_coordinator_and_the_participant() {
     let (dir, db) = open("inflight-cross", 2);
     let tables: Vec<std::sync::Arc<TableInfo>> = (0..8)
         .map(|i| {
@@ -173,18 +174,30 @@ fn one_clients_cross_shard_commits_read_as_one_commit_in_flight() {
                 .collect::<Vec<_>>()
         );
     };
-    let counted: u64 = db
+    // Shard 0 owns each pair's first row, so it coordinates every commit and shard 1
+    // prepares every share (D262): the participant counts the round from the client's
+    // submit to the decision, which the coordinator's reply follows, so its count is above
+    // zero and below the coordinator's.
+    let counted: Vec<u64> = db
         .shard_stats()
         .iter()
         .map(|s| s.commit_inflight_nanos)
-        .sum();
+        .collect();
     assert!(
-        counted > 0,
-        "no cross-shard commit's in-flight time counted"
+        counted[0] > 0,
+        "the coordinator counted no cross-shard commit's in-flight time: {counted:?}"
     );
     assert!(
-        store_inflight <= 1.05,
-        "one blocking client read {store_inflight} commits in flight over the store"
+        counted[1] > 0,
+        "the participant counted no cross-shard round's in-flight time: {counted:?}"
+    );
+    assert!(
+        counted[1] < counted[0],
+        "the participant's rounds end at the decision, before the coordinator's reply: {counted:?}"
+    );
+    assert!(
+        store_inflight <= 2.1,
+        "one blocking client read {store_inflight} commit rounds in flight over two shards"
     );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

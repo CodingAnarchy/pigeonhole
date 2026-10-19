@@ -1943,6 +1943,8 @@ Shard parks fell 650K → 98K at one client and 9.08M → 2.12M on no riders. co
 
 **Follow-up (the regrow):** the gate would hit fix r3's pattern at random, and a real application whose load jumps from a single loader to many clients regrows the same way. The plan is in the coordinator's inbox (fable252, 2026-10-19); the smallest change that removes the randomness from the gate and helps that application is preferred over a cap on how far a load packs.
 
+*History: amended by [D262](#d262), 2026-10-19: a cross-shard commit counts its time in flight at every shard its round occupies (each participant adds the span from the client's submit to the decision it applies), so `C` is the mean number of commit rounds in flight; the gate's contended 16-client cross-shard row read `C` 8 at `k` = 16 and shrank to 13–15 inside the measured phase.*
+
 <a id="d258"></a>
 ## D258 — The gate window trims the data file system before every step (coordinator decision, 2026-10-19; bench, #406; amends the Phase 3 gate procedure, D242, D243)
 
@@ -2023,3 +2025,17 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - sparse-wide's buffered put p99, at 10× RocksDB's.
 
 **Considered and not taken:** judging each operation type (stricter on every row it changes, above); judging only each workload's defining type (it leaves the other types unjudged).
+
+<a id="d262"></a>
+## D262 — A cross-shard commit's time in flight counts at every shard its round occupies: each participant adds its span at the decision, so sixteen clients committing across shards keep sixteen shards (coordinator decision, 2026-10-19; engine, #406; amends D257)
+
+**Decided:**
+- **A participant counts the round too.** The PREPARE carries the client's `submitted_at` (the coordinator's `Coord::submitted_at`, kept across retries), the participant keeps it with the prepared share, and when it applies the decision, commit or abort, it adds `now − submitted_at` to its `commit_inflight_nanos`, as the coordinator adds its own span at the reply. A PREPARE the participant refused or failed, or dropped because its close gave up, counts nothing, as before; the coordinator's count is unchanged; nothing on the client's path.
+- **What `C` means now:** the mean number of commit rounds in flight, each client commit counted once per shard it occupies. A client with a two-shard commit outstanding reads as 2 while its rows live on two shards and as 1 once packing puts them on one. The bound is the clients times the shards a commit spans, independent of `k` beyond that: a packed store reads lower, which grows it back out, and the growth stops at the spread the commits' rows have (the spin term D257 removed grew with `k` without bound). The error is toward more shards during a tablet change: a share decided abort because a peer refused (`Moved`, `BelowFloor`) counts its attempt, and the retry counts again from the client's submit.
+- **Exposed:** the same counters and metrics as D257 (`ShardStats::commit_inflight_nanos`, `EngineMetrics::shard_commit_inflight_nanos`, `Metrics::shard_commit_inflight_nanos`, the bench's `ShardShare::commit_inflight_nanos`), now rising at the participants too; their docs say so. No new shared state: the inventory row's text in `concurrency.md` names the second writer site.
+
+**Why** (perf2's xs16 slot, AX102, 0bcf0b4b, 2026-10-19, `.coord/inbox/archive/20261019-215213-perf2.md`): the gate's contended 16-client cross-shard row read `C` 7.9–8.1 at `k` = 16 (a client's commit holds it for about half its loop; its gets are the rest), so `k_c` = round(8 / 0.75) = 11, the busy sum called for about 14, and every run shrank 16 → 13–15 inside the measured phase (22–74 s in), moving 19–32 tablets under load against 2 on gate 19's row; the reps that stayed longer at 16 ran faster (328–350K ops/s). The row's larger loss is the share-report rescan (#761); the shrink is the rest, and it stays after that fix. Half the row's operations are two-shard commits, so each participant's count adds about half the coordinator's: `C` ≈ 12, `k_c` 16, the level ycsb-a reads at sixteen clients, and the store no longer shrinks under the load it is sized for. Counting at the participant fixes the measure rather than adding hysteresis (the alternative was a shrink needing `k_c ≤ k − 2`): a round that holds two shards' seqnos and watermarks does occupy two shards, and D217's busy sum already counts both shards' work for it.
+
+**Expected (perf2's A/B on the box, `C` and `k` printed per rep on both sides):** the contended cross-shard row at sixteen clients: `C` 8 → about 12, `k` 16 through the measured phase, no mid-measure moves; ycsb-a at one and sixteen clients and time-series-ttl: unchanged (single-shard commits count nothing new); the riders rows: unchanged (`k` = 16 already at `C` 11–12). Acceptance: <PERF2 A/B>.
+
+**Tests:** `spin_pool_terms.rs`'s `one_clients_cross_shard_commits_count_at_the_coordinator_and_the_participant` (one blocking client's two-shard commits on two shards that never pack: the participant's counter is above zero and below the coordinator's, the store reads at most about 2; without the participant's count the second assertion fails). D257's simulated tests use the override and pass unchanged.
