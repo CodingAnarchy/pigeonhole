@@ -1480,24 +1480,27 @@ mod tests {
     fn a_quiet_window_longer_than_the_move_cadence_outlasts_a_slow_spread() {
         // D242/D247: a store whose placement moves once every 300 ms for 1.5 s, as packing
         // re-places tablets one per dwell after a durability switch. A 200 ms window ends
-        // between two moves; a 500 ms one outlasts the spread.
+        // between two moves, with moves still to come; a 500 ms one outlasts the spread.
+        // The early end is judged by the fake's own move count, not by wall seconds: on a
+        // loaded macOS runner the 5 ms op sleeps stretched until the window fell between
+        // the third and fourth moves (1.15 s), which is still mid-spread (#741's CI).
+        const MOVES: u64 = 5;
         let spreading = || {
             let mut r = fake(0);
             r.op_time = Duration::from_millis(5);
-            r.spread = Some((Instant::now(), Duration::from_millis(300), 5));
+            r.spread = Some((Instant::now(), Duration::from_millis(300), MOVES));
             r
         };
         let warm = warm_ops(4);
         let cap = Duration::from_secs(10);
-        let (early, settled) = warm_up(
-            &mut spreading(),
-            &mut [],
-            &warm,
-            Duration::from_millis(200),
-            cap,
-        )
-        .unwrap();
-        assert!(settled && early < 1.0, "ended mid-spread: {early}");
+        let mut early = spreading();
+        let (secs, settled) =
+            warm_up(&mut early, &mut [], &warm, Duration::from_millis(200), cap).unwrap();
+        let moved = early.shard_shares()[0].moves;
+        assert!(
+            settled && moved < MOVES,
+            "ended mid-spread: after move {moved} of {MOVES}, {secs} s"
+        );
         let (secs, settled) = warm_up(
             &mut spreading(),
             &mut [],
