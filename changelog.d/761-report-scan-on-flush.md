@@ -1,0 +1,2 @@
+### Fixed
+- A shard rescanned every applied-but-unflushed cross-shard share on every manifest commit anywhere in the store (an SST, a WAL checkpoint, a flushed seqno, a tablet change), 1–3 ms inside a turn each, which held the visible watermark for every client; on the 0.3.0 gate's cross-shard row after a packed load regrew that was 20–60 scans a second per shard and 398K against 590K ops/s with packing off. The scan now runs only when one of the listed slots' flushed-through seqno moved.
