@@ -1954,3 +1954,25 @@ Shard parks fell 650K → 98K at one client and 9.08M → 2.12M on no riders. co
 - That's one reproduction, so it suggests the drive's mapping state rather than proving it. The trim removes the variable from the gate either way: every window, and every step in it, starts from the same drive state, whatever the earlier steps or other users of the box deleted. The single-file 4 KiB fdatasync probe didn't move during any of this (59–63 µs, the slow row included), so it can't stand in for the trim or detect the state.
 
 **Considered and not taken:** mounting with `discard` (a discard on every delete, inside the measured phases of the steps that delete stores); one trim at setup only (the window's own steps delete terabytes, and the slow rows came about an hour in); a probe that predicts the slow state (none found: the flush probe never moved).
+
+<a id="d260"></a>
+## D260 — A conditional commit waits for the next group only when its group wrote its predicate cell, and only the commits on its rows wait with it (coordinator decision, 2026-10-19; engine, #406; amends D91)
+
+**Decided:**
+- **The predicate's cell, not its row.** `run_group` holds a conditional member (`check_and_mutate`) back for the next group only when an earlier member of its group writes the cell its predicate reads: any mutation of that column, or a delete of its family (a row delete is one family marker per family, D10). Another cell of the same row cannot change the predicate's answer. The row hash (`touched`) is looked at first, so the members' batches are scanned only for a row the group already wrote.
+- **Read rows stay row level.** A transaction's read rows (`validate.reads`) are still checked by row against the group, and every row of a conditional member (written, read, predicate) against prepared, undecided shares, as D91 and D249 decided.
+- **Its written rows are no longer checked against the group.** A write needs no applied state: plain commits and plain PREPAREs already share a group with earlier writes to their rows, in seqno order.
+- **Only the commits on a held-back row wait with it.** A held-back member's rows (written, read, predicate) are held for the rest of the group, and a later single touching one waits too, its own rows then held as well, so per-row submission order holds. A single on other rows is admitted: commits in flight together have no order (D143, `Engine::submit`). A member that waits for arena room or a guarded flush's install still holds back every later single (the room wait's queue keeps submission order, D240). PREPAREs and COMMIT records never wait behind either, as before.
+
+**Why:** gate 19 (5933e23e, `.coord/bench/results-20261019/`) measured contended ycsb-f at default durability (GroupSync) with Pigeonhole's p99 at 2.13× SQLite's (gate 18: 1.92×). The read side is a plain row read (p50 14.7 µs, p99 41 µs), and the run had no stalls, `Busy` retries or conflicts. The tail is the commit wait: read-modify-write minus its read was about 75 µs mean against a ycsb-a put's 59, and its p99 191 µs against 118. Under D91's row-level check, two read-modify-writes on one hot Zipfian row in one group put the second in the next group, behind the first group's sync, with every later single of the group, about one extra sync each. A local Linux repro (16 clients, scratch counters) deferred 6.4% of conditional commits at 16 shards and 11% at 4, where they were about 30% of the commits above p99. ycsb-f picks one of 10 fields, so about 90% of those overlaps were on another cell.
+
+**Tests:** `crates/engine/tests/conditional_groups.rs`, application-owned on one shard, one WAL sync per group:
+- a predicate on another cell of a row the group wrote joins the group (one sync);
+- a predicate on the cell the group wrote waits, and `Exists` then holds (two syncs);
+- the same after a family delete and a row delete;
+- behind a held-back member, a commit on its row waits (seqno after it) and one on another row is admitted (seqno before it).
+
+Main fails the first and last; dropping the family-delete clause fails the third, and dropping the held-row check fails the last.
+
+**Acceptance (pending):** an AX102 A/B of contended ycsb-f at default durability, 16 clients, 3 runs each, against main, with a `--shards 12` run beside it (reported only).
+

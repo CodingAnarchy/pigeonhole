@@ -438,8 +438,8 @@ Waiting on a thread that drives a shard can deadlock, because visibility is the 
 The hook is not public API: it compiles only with the non-default `test-hooks` cargo feature, which only the engine's own tests enable.
 
 <a id="d91"></a>
-## D91 — conditional writes, OCC and prepared shares (approved; changed in review)
-A conditional member's written rows, read keys and predicate row are checked against earlier writers in its group (it then runs in the next group) and against prepared, undecided shares (a single member waits for the decision; a PREPARE aborts with `Conflict` rather than wait on another commit's decision). Every shard owning a row a transaction read is a two-phase-commit participant with an empty PREPARE that validates it, so there is no cross-shard write skew. Arena room is reserved per group and per prepared share, and a participant's apply error reaches the coordinator, so a half-applied commit is never acknowledged. Every decide is answered, so an aborted commit never blocks the watermark.
+## D91 — conditional writes, OCC and prepared shares (approved; changed in review; amended by D260)
+A conditional member's written rows, read keys and predicate row are checked against earlier writers in its group (it then runs in the next group; since D260 its predicate cell and read rows only, and only later commits on its rows wait with it) and against prepared, undecided shares (a single member waits for the decision; a PREPARE aborts with `Conflict` rather than wait on another commit's decision). Every shard owning a row a transaction read is a two-phase-commit participant with an empty PREPARE that validates it, so there is no cross-shard write skew. Arena room is reserved per group and per prepared share, and a participant's apply error reaches the coordinator, so a half-applied commit is never acknowledged. Every decide is answered, so an aborted commit never blocks the watermark.
 
 <a id="d92"></a>
 ## D92 — one resolver for reads and compaction (approved; coordinator)
