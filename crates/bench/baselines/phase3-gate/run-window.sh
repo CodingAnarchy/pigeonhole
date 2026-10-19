@@ -16,6 +16,13 @@
 # taken for a hang: every thread's stack goes to logs/STEP.stacks (gdb), it is killed and
 # listed in timedout.txt, and the window moves on.
 #
+# At full scale every step starts on a trimmed drive (D258): `fstrim -v` on DATA_DIR's file
+# system before it, logged in the window's output and in RESULTS_DIR/fstrim.tsv (step, time,
+# bytes trimmed, seconds). The data file system is mounted without `discard`, so the stores
+# each step deletes stay mapped on the NVMe until a trim; gate 2026-10-18's slow D213
+# group-commit row came back once only after the namespace was re-mapped. A missing or
+# failing fstrim is logged, not fatal. `--scale small` doesn't trim.
+#
 # Steps (estimated minutes at full scale, from laptop runs scaled; the log records the real
 # ones in RESULTS_DIR/durations.tsv):
 #   setup          machine, kernel, drive and file-system checks; machine.json        1
@@ -97,6 +104,8 @@ command -v cargo >/dev/null || {
 mkdir -p "$data" "$results/logs"
 data="$(cd "$data" && pwd)"
 results="$(cd "$results" && pwd)"
+# D258: the mount point fstrim trims (DATA_DIR's file system).
+data_mount="$(findmnt -no TARGET -T "$data" 2> /dev/null || true)"
 
 steps=(setup build memtable-lookup phase2-gate phase2-gate-2 all-uring-1 all-uring-2 all-pread latency ycsb-a-shards
     row-cache scaling placement contended open-latency wal-pin cold-get cold-scan scan-cache report)
@@ -158,6 +167,44 @@ stacks() {
     done
 }
 
+# D258: trims DATA_DIR's file system before step $1 (full scale only), so no step runs on a
+# drive still mapping the stores earlier steps deleted. Sets `trimmed` to the bytes fstrim
+# reported (empty when it didn't run), which the setup step records in machine.json. Never
+# fails the window.
+trimmed=""
+trim_data() {
+    local name="$1" out t0 secs
+    trimmed=""
+    [[ "$scale" == full ]] || return 0
+    if ! command -v fstrim > /dev/null; then
+        echo "-- trim before $name: fstrim not found, not trimmed (D258)"
+        return 0
+    fi
+    if [[ -z "$data_mount" ]]; then
+        echo "-- trim before $name: no mount point found for $data, not trimmed (D258)"
+        return 0
+    fi
+    t0=$(date +%s)
+    if out="$(fstrim -v "$data_mount" 2>&1)"; then
+        secs=$(($(date +%s) - t0))
+        # "/data: 1.5 TiB (1630803361792 bytes) trimmed"
+        trimmed="$(sed -n 's/.*(\([0-9]*\) bytes) trimmed.*/\1/p' <<< "$out")"
+        echo "-- trim before $name: $out (${secs} s)"
+        printf '%s\t%s\t%s\t%d\n' "$name" "$(date -u +%H:%M:%SZ)" "${trimmed:-?}" "$secs" >> "$results/fstrim.tsv"
+        # fstrim waits in D state, which counts in the load average, and setup refuses a
+        # 1-minute load above 1.0: give the average up to 3 minutes to fall back first.
+        if [[ "$name" == setup ]]; then
+            local i
+            for ((i = 0; i < 36; i++)); do
+                awk '{ exit !($1 > 1.0) }' /proc/loadavg || break
+                sleep 5
+            done
+        fi
+    else
+        echo "-- trim before $name: fstrim $data_mount did not succeed, not fatal (D258): $out"
+    fi
+}
+
 # Runs step NAME (the function step_NAME) unless it is done, logging its output and time. A
 # step that outlives its limit (3x its estimate at full scale) is a hang: its stacks are
 # taken, it is killed, recorded in timedout.txt and the window moves on, so one hang cannot
@@ -173,6 +220,7 @@ run() {
     if [[ "$scale" == small ]]; then
         limit=$((minutes[$name] > 20 ? minutes[$name] : 20))
     fi
+    trim_data "$name"
     echo "== $name ($(date -u +%H:%MZ); about ${minutes[$name]} min, limit $limit; then about $(remaining "$name") min left)"
     start=$(date +%s)
     local status=0 pid
@@ -218,7 +266,8 @@ run() {
 SKIP=75
 
 step_setup() {
-    python3 "$here/machine.py" "$data" "$results/machine.json" "$scale"
+    # The trim just before this step, recorded with the machine (D258).
+    GATE_TRIMMED_BYTES="$trimmed" python3 "$here/machine.py" "$data" "$results/machine.json" "$scale"
 }
 
 step_build() {
