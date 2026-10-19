@@ -17,7 +17,11 @@ commit p99 target (D213).
 
 It records the CPU's chiplet (CCD) size, the physical cores that share one L3 cache, from
 /sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list: the scaling gate judges N up to
-it and reports the rest (D238)."""
+it and reports the rest (D238).
+
+It records the trim run-window.sh ran just before this step (D258: the bytes `fstrim -v`
+reported, from GATE_TRIMMED_BYTES; null when none ran) and the NVMe namespace's utilization
+(`nvme id-ns`: the blocks the drive still maps, against the namespace's size)."""
 import json, os, platform, shutil, subprocess, sys, time
 
 data, out, scale = sys.argv[1:4]
@@ -125,6 +129,24 @@ def fdatasync_us(directory, n=2000):
     return {"p50": round(t[n // 2], 1), "p99": round(t[n * 99 // 100], 1), "max": round(t[-1], 1)}
 
 
+def namespace_use(dev):
+    """The NVMe namespace's size and the part of it the drive maps (`nuse`), in GB, from
+    `nvme id-ns`; None without nvme-cli or an NVMe namespace (D258)."""
+    if not dev:
+        return None
+    try:
+        ns = json.loads(subprocess.run(["nvme", "id-ns", f"/dev/{dev}", "-o", "json"],
+                                       capture_output=True, text=True, timeout=10).stdout)
+        block = 1 << ns["lbafs"][ns["flbas"] & 0xF]["ds"]
+        return {"size_gb": round(ns["nsze"] * block / 1e9, 1),
+                "used_gb": round(ns["nuse"] * block / 1e9, 1),
+                "used_pct": round(100 * ns["nuse"] / ns["nsze"], 1)}
+    except (OSError, ValueError, KeyError, IndexError, ZeroDivisionError, subprocess.SubprocessError):
+        return None
+
+
+trimmed = os.environ.get("GATE_TRIMMED_BYTES", "")
+
 try:
     fdatasync = fdatasync_us(data)
 except OSError as e:
@@ -152,6 +174,9 @@ machine = {
     "nvme_list": sh("nvme list 2>/dev/null"),
     "mount": sh(f"findmnt -no FSTYPE,OPTIONS -T {data}"),
     "free_gb": round(free_gb),
+    # D258: the trim just before setup, and how much of the namespace the drive maps after it.
+    "trimmed_bytes": int(trimmed) if trimmed.isdigit() else None,
+    "nvme_namespace": namespace_use(nvme),
     "fdatasync_4k_us": fdatasync,
     "io_uring_disabled": uring,
     "memlock": sh("ulimit -l"),
@@ -165,6 +190,7 @@ machine = {
 with open(out, "w") as f:
     json.dump(machine, f, indent=1)
 print(f"fdatasync 4 KiB on {data}: {fdatasync}")
+print(f"trimmed before setup: {machine['trimmed_bytes']} bytes; NVMe namespace: {machine['nvme_namespace']}")
 for w in warnings:
     print(f"warning: {w}")
 for e in failures:

@@ -1366,6 +1366,8 @@ The AX102 confirms at 64 GiB.
 - So the phase measured placement converging after the switch from 1 client to 4, not the steady state. On the 2026-10-13 gate, Pigeonhole's skewed-multi-shard fell from 362K/368K to 285K/325K ops/s between the two pairs, with its background work doubled.
 - This is a bench change, not an engine one: users' placement is unchanged. Faster unpacking (E-F3b) and making the shards agree on `k` (E-F3c) are separate engine questions.
 
+*History: amended by [D258](#d258), 2026-10-19: the gate window also trims the data file system before every step, so each warm-up and measured phase starts on a drive with no stale mappings.*
+
 <a id="d243"></a>
 ## D243 — The reproducibility check judges only runs of about 10 s or more; the short runs are lengthened, not dropped (owner decision, 2026-10-13; bench, #406 reproducibility)
 
@@ -1383,6 +1385,8 @@ The AX102 confirms at 64 GiB.
 - the 16-client group commit measured 1.7 s.
 
 At those lengths, one flush or compaction more or less, or a placement change, moves a run by more than the tolerance. That's timing luck, not the engine. In the full-scale `all`, 18 of the 28 runs measured under 10 s, both engines included.
+
+*History: amended by [D258](#d258), 2026-10-19: the gate window trims the data file system before every step, so the reproducibility pair doesn't also differ in how much of the NVMe the drive maps.*
 
 <a id="d244"></a>
 ## D244 — A participant keeps a cross-shard commit's timestamp in seqno order with the writes it already stamped, with tablet changes on or off (owner decision, 2026-10-13; engine, tablets, #653; amends D142 and D192's note)
@@ -1934,3 +1938,19 @@ Shard parks fell 650K → 98K at one client and 9.08M → 2.12M on no riders. co
 
 **Follow-up (the regrow):** the gate would hit fix r3's pattern at random, and a real application whose load jumps from a single loader to many clients regrows the same way. The plan is in the coordinator's inbox (fable252, 2026-10-19); the smallest change that removes the randomness from the gate and helps that application is preferred over a cap on how far a load packs.
 
+<a id="d258"></a>
+## D258 — The gate window trims the data file system before every step (coordinator decision, 2026-10-19; bench, #406; amends the Phase 3 gate procedure, D242, D243)
+
+**Decided:**
+- **Every step starts on a trimmed drive.** At full scale `run-window.sh` runs `fstrim -v` on DATA_DIR's file system (its mount point, from `findmnt -T`) before each step it runs; steps already done are skipped untrimmed. The trim is outside the step's time and its hang limit.
+- **Logged, never fatal.** Each trim's output and duration go to the window's log (`-- trim before STEP: …`), and a line per step to `RESULTS_DIR/fstrim.tsv` (step, UTC time, bytes trimmed, seconds). A missing `fstrim`, a mount point not found, or an fstrim that fails is logged and the window goes on. The dry run (`--scale small`) doesn't trim.
+- **Recorded with the machine.** `setup` writes the bytes the trim before it reported (`trimmed_bytes`) and the NVMe namespace's size and mapped part (`nvme_namespace`: `size_gb`, `used_gb`, `used_pct`, from `nvme id-ns`'s `nsze` and `nuse`) into `machine.json`. The drive may report `nuse` lazily: on the AX102, `nvme list` still showed 1.81 TB mapped right after a 1.5 TiB trim.
+- **The quiet-machine check still holds.** fstrim waits in D state, which counts in the load average, so after the trim before `setup` the window waits up to 3 minutes for the 1-minute load to fall back under 1.0 before setup judges it.
+
+**Why:** the data file system is mounted without `discard`. The gate's steps write and delete terabytes (2026-10-14c's cold-get alone wrote 2.9 TB), and an XFS delete without `discard` leaves those blocks mapped on the NVMe until something trims them. Before D258 nothing in the window did.
+- **Gate 2026-10-18 (f61510dd):** the D213 group-commit row failed its p99 (222 µs, 5.69M cells/s, the engine's commit p50 in the 131 µs histogram bucket), and `all`'s inline group-commit rows were slow too (1.34–1.40M, p99 222–256 µs). 2026-10-13 through 2026-10-14c had measured 9.5–9.75M with the engine's p50 at 66 µs. The window started after about 40 minutes of other full-scale runs and their deletes.
+- **perf2's bisect (2026-10-19)** found no slow commit: 0 slow rows in 96 over 175c0ffc..f61510dd, and about 140 inline rows that day on a trimmed drive were all fast, f61510dd's included.
+- **perf2's arm T (2026-10-19, f61510dd)** re-mapped the namespace: 1335 GiB of incompressible data written with `oflag=direct` and deleted took it from 716.5 GB to 1.81 TB mapped. The fresh-process rows right after stayed fast (2.38–2.40M, engine p50 66 µs). `all-uring-1` then put its pinned inline row in gate 18's band: 1.44M, engine p50 131 µs, p99 219 µs, the day's only slow row. RocksDB was within ±2% on every workload, so the drive wasn't slower in general. `fstrim -v /data` then trimmed 1.5 TiB.
+- That's one reproduction, so it suggests the drive's mapping state rather than proving it. The trim removes the variable from the gate either way: every window, and every step in it, starts from the same drive state, whatever the earlier steps or other users of the box deleted. The single-file 4 KiB fdatasync probe didn't move during any of this (59–63 µs, the slow row included), so it can't stand in for the trim or detect the state.
+
+**Considered and not taken:** mounting with `discard` (a discard on every delete, inside the measured phases of the steps that delete stores); one trim at setup only (the window's own steps delete terabytes, and the slow rows came about an hour in); a probe that predicts the slow state (none found: the flush probe never moved).
