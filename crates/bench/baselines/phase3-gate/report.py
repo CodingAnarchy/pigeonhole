@@ -788,7 +788,7 @@ if rc_rows:
         print(f"| {w} | {a['throughput']:.0f} → {b['throughput']:.0f} | {us(a['p50_ns']):.2f} → {us(b['p50_ns']):.2f} µs | {us(a['p99_ns']):.1f} → {us(b['p99_ns']):.1f} µs | {hit_rate(b)} |")
 # ycsb-a, one client, shard count and shard spin (D198 item 2, #478; ICR 0027's counters).
 ya = [(n, results(f"ycsb-a-{n}.json", "pigeonhole")) for n in
-      ("default", "shards1", "shards4", "spin100", "spin200", "spin500")]
+      ("default", "shards1", "shards4", "spin0", "spin100", "spin200", "spin500")]
 if any(r for _, r in ya):
     rk = results("ycsb-a-default.json", "rocksdb")
     print("\n**ycsb-a, one client (D198 item 2, #478):** Pigeonhole by shard count and shard spin, RocksDB alongside.\n")

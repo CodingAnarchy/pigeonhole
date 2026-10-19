@@ -42,7 +42,7 @@
 #                  all, commits in flight inline) on 2M commits (D219), then 1/4/16
 #                  client threads vs RocksDB; the short 200K run, the same on
 #                  pread, and 4 and 8 commits in flight (D226), reported              57
-#   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins (D198)  15
+#   ycsb-a-shards  ycsb-a, one client: default shards vs 1 and 4, and shard spins 0/100/500 µs (D198)  15
 #   row-cache      ycsb-c and ycsb-a with the row cache off (D216: on by default)      30
 #   scaling        engine scaling (D204, D231: pre-split, balancer off) at 1, 4, 8, 16
 #                  shards, 8 s or more each (D219)                                    45
@@ -398,7 +398,8 @@ step_latency() {
 }
 
 # ycsb-a's write gap (perf287; ICR 0027; D198 item 2, #478): one client at the default shard
-# count, at 1 and 4 shards, and at the default with longer shard spins, beside RocksDB. The
+# count, at 1 and 4 shards, and at the default with the shard spin off, shorter and longer
+# (0, 100 and 500 µs; the default is 200 µs since D198's 2026-10-19 amendment), beside RocksDB. The
 # stall table and JSON carry shard parks, wakes and commit parks per operation.
 step_ycsb-a-shards() {
     if ! "$bench" --help | grep -q -- --shard-spin; then
@@ -416,7 +417,7 @@ step_ycsb-a-shards() {
     run_one shards1 --engine pigeonhole --shards 1
     run_one shards4 --engine pigeonhole --shards 4
     local us
-    for us in 100 200 500; do
+    for us in 0 100 500; do
         run_one "spin$us" --engine pigeonhole --shard-spin "$us"
     done
 }
