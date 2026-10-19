@@ -607,7 +607,9 @@ pub trait Runner {
     /// The store's active shard count and the count its balancer is heading for, `None`
     /// (the default) for stores without one. The warm-up does not end while the second
     /// exceeds the first (D242's amendment): a growth whose passes are still accruing has
-    /// not moved a tablet yet, so the placement reads quiet right before it changes.
+    /// not moved a tablet yet, so the placement reads quiet right before it changes. Nor
+    /// while fewer shards hold a tablet than the first (D242's second amendment): the
+    /// growth's moves come one per dwell and can leave a quiet window between them.
     fn pack_target(&self) -> Option<(usize, usize)> {
         None
     }
@@ -1234,9 +1236,12 @@ fn warm_up(
         let before = runner.shard_shares();
         pass(runner, clients, warm, false, Some(started + cap))
             .map_err(|e| format!("warmup: {e}"))?;
-        // A pending growth counts as a change: its moves have not started yet.
-        let growing = runner.pack_target().is_some_and(|(k, target)| target > k);
-        if growing || placement_changed(&before, &runner.shard_shares()) {
+        let after = runner.shard_shares();
+        // A pending growth counts as a change: its moves have not started yet. So does a
+        // growth whose moves have not spread the tablets yet: fewer shards hold one than
+        // the active count calls for (as many as there are tablets at most), and the next
+        // move may be more than a quiet window away (one per dwell, behind a compaction).
+        if unwinding(runner.pack_target(), &after) || placement_changed(&before, &after) {
             last_change = Instant::now();
         }
         if last_change.elapsed() >= quiet {
@@ -1252,6 +1257,18 @@ fn warm_up(
         }
     };
     Ok((started.elapsed().as_secs_f64(), settled))
+}
+
+/// Whether the balancer is still heading somewhere (D242's amendments): a growth is
+/// pending (`target > k`), or fewer shards hold a tablet than the active count `k`, bounded
+/// by the tablets there are. A shrink is not waited for: its last steps are slow and the
+/// quiet rule covers their moves.
+fn unwinding(target: Option<(usize, usize)>, shares: &[ShardShare]) -> bool {
+    target.is_some_and(|(k, target)| {
+        let holders = shares.iter().filter(|s| s.tablets_end > 0).count() as u64;
+        let tablets: u64 = shares.iter().map(|s| s.tablets_end).sum();
+        target > k || holders < (k as u64).min(tablets)
+    })
 }
 
 /// Whether any shard split, merged or moved a tablet between two [`Runner::shard_shares`]
@@ -1390,6 +1407,9 @@ mod tests {
         /// none.
         targets: std::cell::Cell<u64>,
         growing: u64,
+        /// Readings of the shares that report the tablets still on one of 4 active shards
+        /// (3 there, 1 arriving on the next), then one per shard.
+        unwinding: u64,
     }
 
     impl Runner for Fake {
@@ -1426,6 +1446,17 @@ mod tests {
             }
             let n = self.readings.get();
             self.readings.set(n + 1);
+            if self.unwinding > 0 {
+                let spread = n >= self.unwinding;
+                let tablets = |i: u64| if spread { 1 } else { [3, 1, 0, 0][i as usize] };
+                return (0..4)
+                    .map(|i| ShardShare {
+                        tablets_end: tablets(i),
+                        moves: u64::from(spread),
+                        ..ShardShare::default()
+                    })
+                    .collect();
+            }
             vec![ShardShare {
                 moves: n.min(self.moving),
                 ..ShardShare::default()
@@ -1456,6 +1487,7 @@ mod tests {
             op_time: Duration::ZERO,
             targets: std::cell::Cell::new(0),
             growing: 0,
+            unwinding: 0,
         }
     }
 
@@ -1496,6 +1528,54 @@ mod tests {
         let (secs, settled) = warm_up(&mut r, &mut [], &warm, quiet, cap).unwrap();
         assert!(!settled);
         assert!(secs >= cap.as_secs_f64());
+    }
+
+    #[test]
+    fn the_warmup_waits_while_fewer_shards_hold_tablets_than_the_active_count() {
+        // D242's second amendment: the balancer reports 4 active shards reached (no growth
+        // pending), but for the first 6 readings only 2 of them hold tablets and no move
+        // lands within a quiet window. The warm-up waits until every active shard holds
+        // one; before, two quiet readings ended it inside the unwind (the gate's
+        // cross-shard row at 228–236K, 2 of 6 reps).
+        const UNWINDING: u64 = 6;
+        let mut r = fake(0);
+        r.growing = 0; // the target reads (16, 16): no growth pending
+        r.unwinding = UNWINDING;
+        r.op_time = Duration::from_millis(5);
+        let warm = warm_ops(4);
+        let quiet = Duration::from_millis(100);
+        let (secs, settled) =
+            warm_up(&mut r, &mut [], &warm, quiet, Duration::from_secs(10)).unwrap();
+        assert!(settled);
+        let readings = r.readings.get();
+        assert!(
+            readings > UNWINDING,
+            "ended with 2 of 4 active shards holding tablets: {readings} readings, {secs} s"
+        );
+        // Fewer tablets than active shards is not an unwind: one tablet on one of four
+        // shards is as spread as it gets.
+        let one = [ShardShare {
+            tablets_end: 1,
+            ..ShardShare::default()
+        }];
+        assert!(!unwinding(Some((4, 4)), &one));
+        assert!(!unwinding(
+            Some((4, 4)),
+            &[one[0], one[0], ShardShare::default()]
+        ));
+        let three = ShardShare {
+            tablets_end: 3,
+            ..ShardShare::default()
+        };
+        assert!(unwinding(
+            Some((4, 4)),
+            &[three, one[0], ShardShare::default()]
+        ));
+        assert!(!unwinding(
+            Some((2, 2)),
+            &[three, one[0], ShardShare::default()]
+        ));
+        assert!(!unwinding(None, &[ShardShare::default()]));
     }
 
     #[test]
