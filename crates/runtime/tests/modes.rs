@@ -770,16 +770,25 @@ fn compaction_threads_run_spawned_tasks() {
 }
 
 /// Advances the simulated clock by `unit` on each of `left` slices (a pool task whose time
-/// shows on the clock), then reports.
+/// shows on the clock), then reports. Until `go` is set it blocks, leaving its waker in
+/// `waker` for the test to release it: the clock is shared, so a slice that ran while the
+/// spawning shard's turn was still open would show in that turn's time too (the Windows
+/// runner's 3 ms, #742).
 struct SimSlices {
     sim: Arc<SimVfs>,
     unit: u64,
     left: u32,
     done: Option<Notifier<()>>,
+    go: Arc<AtomicBool>,
+    waker: Arc<Mutex<Option<TaskWaker>>>,
 }
 
 impl Task for SimSlices {
-    fn run(&mut self, _deadline: u64, _waker: &TaskWaker) -> TaskPoll {
+    fn run(&mut self, _deadline: u64, waker: &TaskWaker) -> TaskPoll {
+        if !self.go.load(Ordering::Acquire) {
+            *self.waker.lock().unwrap() = Some(waker.clone());
+            return TaskPoll::Blocked;
+        }
         self.sim.advance(self.unit);
         self.left -= 1;
         if self.left > 0 {
@@ -795,23 +804,52 @@ impl Task for SimSlices {
 
 /// A pool thread counts each slice's time to the shard that spawned the task (D256): three
 /// 1 ms slices spawned from shard 0 show as at least 3 ms of shard 0's pool busy time, and
-/// none of shard 1's; the shard's own turn time is not what grew.
+/// none of shard 1's; the shard's own turn time is not what grew. The slices run only once
+/// shard 0 has parked after the turn that spawned them: a turn is the clock's rise across
+/// it, and on the shared simulated clock a slice advancing it inside an open turn would
+/// count there as well (on a real clock a turn is the thread's own wall time, which the
+/// pool's concurrent work does not lengthen).
 #[test]
 fn pool_slices_count_to_the_spawning_shard() {
     let (mut cfg, sim) = sim_config(2);
     cfg.compaction_threads = 1;
     let rt = Runtime::start(cfg, handlers(2)).unwrap();
     let turns_before = rt.submitter(ShardId(0)).busy_nanos();
+    let parks_before = rt.submitter(ShardId(0)).idle_counts().0;
+    let go = Arc::new(AtomicBool::new(false));
+    let waker = Arc::new(Mutex::new(None));
     let (n, w) = completion();
     let task = SimSlices {
         sim: sim.clone(),
         unit: 1_000_000,
         left: 3,
         done: Some(n),
+        go: go.clone(),
+        waker: waker.clone(),
     };
     rt.submitter(ShardId(0))
         .submit(Msg::Spawn(Box::new(task)))
         .unwrap();
+    // The spawning turn has closed (its time counted) once shard 0 parks again, and the
+    // task has blocked once its waker is in place: then let the slices advance the clock.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (rt.submitter(ShardId(0)).idle_counts().0 == parks_before
+        || waker.lock().unwrap().is_none())
+        && Instant::now() < deadline
+    {
+        thread::yield_now();
+    }
+    assert!(
+        rt.submitter(ShardId(0)).idle_counts().0 > parks_before,
+        "shard 0 did not park after the spawn"
+    );
+    go.store(true, Ordering::Release);
+    waker
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the task blocked")
+        .wake();
     w.wait().unwrap();
     // The last slice's time is added after the task's notify: wait for it to land.
     let deadline = Instant::now() + Duration::from_secs(5);
