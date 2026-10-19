@@ -336,6 +336,14 @@ impl Pigeonhole {
         self.db.engine.shard_stats()
     }
 
+    /// The active shard count the balancer published and the count it is heading for (the
+    /// same unless a growth is pending), `None` before its first decision: a bench hook
+    /// (D242's amendment) so a warm-up does not end inside a regrow.
+    #[doc(hidden)]
+    pub fn pack_target(&self) -> Option<(usize, usize)> {
+        self.db.engine.pack_target()
+    }
+
     /// What the row cache did since open: hits, misses and fills (D201). All zero when
     /// [`Options::row_cache`](crate::Options::row_cache) is 0.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {

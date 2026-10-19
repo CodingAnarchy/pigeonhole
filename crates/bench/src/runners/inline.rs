@@ -641,7 +641,10 @@ impl PigeonholeRunner {
                 .iter()
                 .zip(&after)
                 .any(|(b, a)| (a.splits, a.merges, a.moves) != (b.splits, b.merges, b.moves));
-            if changed {
+            // A pending growth counts as a change too (D242's amendment): its moves have
+            // not started yet.
+            let growing = db.pack_target().is_some_and(|(k, target)| target > k);
+            if changed || growing {
                 last_change = Instant::now();
             }
             let spread = after.iter().all(|s| s.tablets > 0);

@@ -808,6 +808,7 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             pack_k: AtomicUsize::new(0),
+            pack_target: AtomicUsize::new(0),
             waiters: WatermarkWaiters::new(shards),
             durable_waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
@@ -1315,6 +1316,7 @@ impl Engine {
             tablet_epoch: AtomicU64::new(0),
             full_compactions: AtomicUsize::new(0),
             pack_k: AtomicUsize::new(0),
+            pack_target: AtomicUsize::new(0),
             waiters: WatermarkWaiters::new(shards),
             durable_waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
@@ -2061,6 +2063,18 @@ impl Engine {
                 v + m.refused_view.load(Ordering::Relaxed),
             )
         })
+    }
+
+    /// The active shard count shard 0's balancer published at its last pass and the count it
+    /// is heading for: the same unless a growth is accruing its passes, then the count that
+    /// growth reaches (D217's `k`, D242's amendment of 2026-10-19). `None` before its first
+    /// decision (packing off, one shard, or no pass yet). A bench hook: the warm-up does not
+    /// end while the second exceeds the first, so a measured phase never starts inside a
+    /// regrow after a packed load.
+    #[doc(hidden)]
+    pub fn pack_target(&self) -> Option<(usize, usize)> {
+        let target = self.inner.shared.pack_target.load(Ordering::Acquire);
+        (target > 0).then(|| (self.inner.shared.pack_k.load(Ordering::Acquire), target))
     }
 
     /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,

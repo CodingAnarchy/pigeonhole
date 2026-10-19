@@ -1938,6 +1938,43 @@ fn concurrent_commits_grow_a_packed_store() {
     db.close();
 }
 
+/// A growth publishes where it is heading while its passes accrue (D242's amendment, the
+/// bench's warm-up): packed onto one shard, three commits in flight call for four, and
+/// `pack_target` reads a target above 1 on the passes before the growth decides (rising
+/// with the concurrency's moving average), then (4, 4).
+#[test]
+fn a_pending_growth_publishes_the_count_it_is_heading_for() {
+    let (mut db, mut written) = packed_onto_shard_0();
+    assert_eq!(db.engine.pack_target(), Some((1, 1)));
+    db.engine.set_shard_inflight(0, Some(3.0));
+    let mut pending = 0;
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] != Some(4) && passes < 100 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+        // The target rises with the concurrency's moving average: 2, 3, then 4.
+        if db
+            .engine
+            .pack_target()
+            .is_some_and(|(k, target)| k == 1 && target > 1)
+        {
+            pending += 1;
+        }
+    }
+    assert_eq!(
+        db.engine.pack_ks()[0],
+        Some(4),
+        "no growth in {passes} passes"
+    );
+    assert!(
+        pending >= 5,
+        "the pending growth published its target on {pending} of {passes} passes"
+    );
+    assert_eq!(db.engine.pack_target(), Some((4, 4)));
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}
+
 /// A concurrency-driven first shrink does not wait for D255's window, its 50 passes or the
 /// write ramp (D257): four shards spread at 10% busy with one client's worth of commits in
 /// flight (0.25 each) pack within 80 passes (50 of agreement and the 10-pass count), where the
