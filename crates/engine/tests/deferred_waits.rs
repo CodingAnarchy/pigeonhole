@@ -1011,14 +1011,20 @@ fn a_visibility_wait_ends_with_outcome_unknown_when_the_shard_holding_it_dies_mi
             "seed {seed}: visible past shard 1's group"
         );
 
-        // Shard 1 dies with its group's sync in flight: another thread drops it, and its
-        // final sync waits for the group's (#179) until this thread completes it.
+        // Shard 1 dies with its group's sync in flight. This thread drops it: its final sync
+        // waits for the group's (#179), running the device's deferred I/O meanwhile, one
+        // operation at a time in the seed's order, as the harness's own waits do (ICR 0028).
+        // Dropped on another thread while this one completed the I/O, the drop's blocking
+        // sync and this thread's completions reached the trace in the scheduler's order, and
+        // a seed did not replay (#754).
         let b = rig.shards.pop().unwrap();
-        let before = rig.dev.blocking_syncs(&wal(1));
-        let dropper = thread::spawn(move || drop(b));
-        rig.dev.await_blocking_sync(&wal(1), before);
+        drop(b);
+        assert_eq!(
+            rig.dev.in_flight(&wal(1)),
+            0,
+            "seed {seed}: the drop returned with shard 1's sync in flight"
+        );
         rig.sim.complete_all_io();
-        dropper.join().unwrap();
         let ended = waiter.join().unwrap();
         assert!(
             matches!(ended, Err(Error::OutcomeUnknown)),
