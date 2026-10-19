@@ -163,8 +163,23 @@ The Phase 3 gate ([D197](docs/design/decisions/phase-3.md#d197), [#406](https://
 
 ### Known issues
 The owner released 0.3.0 with these gaps against the Phase 3 gate; each is a Phase 4 issue under [#695](https://github.com/CodingAnarchy/pigeonhole/issues/695).
-- <GATE:each judged row outside 1.5×, with its numbers and issue>
-- <GATE:reported rows flagged for an issue (> 3× worse, under a third), with their issues>
+
+Under contention (16 client threads on the default options):
+
+- **Short scans** (ycsb-e: scans of 1–100 rows) trail RocksDB by <GATE:ycsb-e ratio, both durabilities>. At one client they are within 1.5×, so the gap opens with concurrency ([#712](https://github.com/CodingAnarchy/pigeonhole/issues/712)).
+- **Counters:** counter reads have a p99 of <GATE:counters read p99> at 16 clients (SQLite's upsert: <GATE:counters vs SQLite p99>) ([#713](https://github.com/CodingAnarchy/pigeonhole/issues/713)).
+- **Transactions on hot rows:** `transfer` (optimistic transactions moving units between Zipfian accounts) runs <GATE:transfer vs RocksDB> behind RocksDB, with <GATE:conflicts per transfer> conflicts per transfer ([#708](https://github.com/CodingAnarchy/pigeonhole/issues/708)).
+- **Cross-shard commits:** their p99 trails SQLite's single-writer transactions by <GATE:xshard vs SQLite p99> at the default durability, and packing gathers mostly cross-shard loads onto fewer shards than they need ([#707](https://github.com/CodingAnarchy/pigeonhole/issues/707)).
+- <GATE:any other judged row outside 1.5× or reported row flagged for an issue, with its issue>
+
+Placement and tails:
+
+- The write-skew mover can stop with tablets still to move: a hot shard keeps most of the tablets while active shards sit empty, until the load changes ([#735](https://github.com/CodingAnarchy/pigeonhole/issues/735)).
+- With the store spread over every shard, a commit that lands on a shard that has just parked pays its wakeup: the put p99.9 is about 110 µs at 16 clients, against about 85 µs when the same load is packed onto fewer shards ([#738](https://github.com/CodingAnarchy/pigeonhole/issues/738)).
+- A store packed by a light load (one loader) regrows one tablet move per dwell when many clients arrive: the regrow takes several seconds, and writes during it see a p99.9 of about 420 µs against about 110 µs on a spread store ([#744](https://github.com/CodingAnarchy/pigeonhole/issues/744)).
+
+Also:
+
 - ycsb-f at one client missed D243's run-to-run tolerance on its p50 (10.2 µs and 12.7 µs, +25% against ±20%); every other judged row was within it ([#747](https://github.com/CodingAnarchy/pigeonhole/issues/747)).
 - Under heavy cross-shard load, a shard can still spend tens of milliseconds in one turn (34–42 ms at most on the reference machine) when the oldest cross-shard commit settles and its WAL checkpoint passes everything queued behind it in one step. Commits queued on that shard wait for that turn. D254 removed the per-commit messages, but not this step ([#727](https://github.com/CodingAnarchy/pigeonhole/issues/727)).
 

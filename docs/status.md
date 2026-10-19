@@ -50,7 +50,7 @@ Measured on the AX102 in the <GATE:window date> window at `<GATE:commit>` ([resu
 | D193 instruction ceilings; #387 | **ceilings hold** (CI). #387: <GATE:row read and scan ratios to SQLite EAV> |
 | Run-to-run reproducibility (runs of 10 s or more, [D243](design/decisions/phase-3.md#d243)) | <GATE:pass/fail> |
 
-**Carried to Phase 4** (owner, 2026-10-14; triaged under [#695](https://github.com/CodingAnarchy/pigeonhole/issues/695)): <GATE:the rows outside, each with its issue>.
+**Carried to Phase 4** (owner, 2026-10-14; triaged under [#695](https://github.com/CodingAnarchy/pigeonhole/issues/695)): <GATE:the rows outside, each with its issue>. Accepted for Phase 4: contended short scans (#712), counters (#713), transfer (#708), cross-shard tails and packing (#707), the mover stopping early (#735), the put tail on thinly loaded shards (#738), the regrow after a packed load (#744), the checkpoint's long turn (#727), and ycsb-f's one-client p50 against D243 (#747).
 
 ## What's in 0.3.0
 The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2026-10-13).
