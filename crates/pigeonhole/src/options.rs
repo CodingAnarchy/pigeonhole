@@ -239,8 +239,9 @@ impl Options {
     }
 
     /// How long a shard thread that just handled a commit keeps polling for the next one
-    /// before it sleeps (default 50 µs, D198), so a steady stream of commits is taken
-    /// without waking the thread each time. An idle database never polls, and polls that
+    /// before it sleeps (default 200 µs, D198 as amended on 2026-10-19), so a steady stream
+    /// of commits is taken without waking the thread each time, and a store whose clients
+    /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
     /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
     /// by application-owned shards, whose loop the application runs.
     pub fn shard_spin(mut self, window: Duration) -> Self {
