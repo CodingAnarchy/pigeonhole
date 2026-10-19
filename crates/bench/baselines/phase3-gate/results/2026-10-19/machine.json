@@ -1,0 +1,47 @@
+{
+ "machine": true,
+ "scale": "full",
+ "kernel": "6.8.0-139-generic",
+ "os": "\"Ubuntu 24.04.5 LTS\"",
+ "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor",
+ "cpus": 32,
+ "smt": "on",
+ "l3_cores": [
+  8,
+  8
+ ],
+ "ccd_cores": 8,
+ "governors": [
+  "performance"
+ ],
+ "memory": "MemTotal:       131361660 kB",
+ "thp": "always [madvise] never",
+ "data_dir": "/data/scratch/blob33/gate",
+ "device": "/dev/nvme0n1",
+ "blockdev": "nvme0n1",
+ "drive": "mn        : SAMSUNG MZQL21T9HCJR-00A07              \nfr        : GDC5A02Q\nvwc       : 0x6",
+ "nvme_list": "Node                  Generic               SN                   Model                                    Namespace  Usage                      Format           FW Rev  \n--------------------- --------------------- -------------------- ---------------------------------------- ---------- -------------------------- ---------------- --------\n/dev/nvme0n1          /dev/ng0n1            S64GNG0W407418       SAMSUNG MZQL21T9HCJR-00A07               0x1        289.71  GB /   1.92  TB    512   B +  0 B   GDC5A02Q\n/dev/nvme1n1          /dev/ng1n1            S64GNE0R806290       SAMSUNG MZQL21T9HCJR-00A07               0x1        111.58  GB /   1.92  TB    512   B +  0 B   GDC5A02Q",
+ "mount": "xfs    rw,noatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota",
+ "free_gb": 1594,
+ "trimmed_bytes": 1630803460096,
+ "nvme_namespace": {
+  "size_gb": 1920.4,
+  "used_gb": 289.7,
+  "used_pct": 15.1
+ },
+ "fdatasync_4k_us": {
+  "p50": 24.6,
+  "p99": 80.1,
+  "max": 148.5
+ },
+ "io_uring_disabled": "0",
+ "memlock": "unlimited",
+ "load": "0.08 0.02 0.08 1/416 1214556",
+ "commit": "5933e23e6f4fa0ce70bfa9e4ccd34a6879b517dc",
+ "dirty": "",
+ "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+ "warnings": [
+  "nvme0n1 reports a volatile write cache (vwci      : 0\nvwc       : 0x6): check it has power-loss protection"
+ ],
+ "failures": []
+}
