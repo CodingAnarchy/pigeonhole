@@ -1974,5 +1974,15 @@ Shard parks fell 650K → 98K at one client and 9.08M → 2.12M on no riders. co
 
 Main fails the first and last; dropping the family-delete clause fails the third, and dropping the held-row check fails the last.
 
-**Acceptance (pending):** an AX102 A/B of contended ycsb-f at default durability, 16 clients, 3 runs each, against main, with a `--shards 12` run beside it (reported only).
+**Acceptance (AX102, 2026-10-19, ctr274):** contended ycsb-f at default durability, the gate's shape (full scale, 16 clients, `--ops 100000 --min-secs 60`), main 5933e23e against the fix (code identical to this PR's), 3 runs each, sides alternated; `--shards 12` on main reported beside it. Raw: `/root/scratch/ctr274/out-ycsbf` on the box.
+
+| run | ops/s | all p99 µs | RMW p50 µs | RMW p99 µs | RMW p99.9 µs | read p99 µs | `C` | shards with commits |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| main r1 / r2 / r3 | 303K / 311K / 310K | 167 / 163 / 168 | 81.9 / 78.8 / 78.8 | 184 / 183 / 187 | 274 / 279 / 283 | 40.4 / 42.0 / 41.7 | 11.3 | 13–16 |
+| D260 r1 / r2 / r3 | 307K / 313K / 305K | 164 / 155 / 164 | 79.9 / 79.4 / 80.4 | 182 / 172 / 183 | 272 / 257 / 272 | 42.5 / 43.0 / 45.1 | 11.2 | 15–16 |
+| main, `--shards 12` | 308K | 162 | 81.4 | 180 | 281 | 39.7 | 11.4 | 12 |
+
+- **Medians:** RMW p99 184 → 182 µs, p99.9 279 → 272, all-operation p99 167 → 164. Within run-to-run spread: **not the ycsb-f fix the gate asked for.** The change stands as a correctness-neutral narrowing.
+- **Why so little on the box:** one run of main with the scratch counters measured 1.0% of conditional commits cut and 0.2% held behind a cut (the VM's 6.4% does not carry over), at commit p50 95 µs and p99 260 µs against 60 and 165 for the rest, 6% of the commits above p99. Nearly every commit was its own group (12.8M groups for about 14M commits): the RMW tail is each commit's own GroupSync, about 150K syncs a second over 16 WAL files.
+- **`--shards 12`** reads the same as 16 (RMW p99 180): the active shard count is not it either.
 
