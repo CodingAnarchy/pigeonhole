@@ -604,6 +604,14 @@ pub trait Runner {
         Vec::new()
     }
 
+    /// The store's active shard count and the count its balancer is heading for, `None`
+    /// (the default) for stores without one. The warm-up does not end while the second
+    /// exceeds the first (D242's amendment): a growth whose passes are still accruing has
+    /// not moved a tablet yet, so the placement reads quiet right before it changes.
+    fn pack_target(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Cumulative stall counters since open ([`Stalls`]); `None` (the default) for stores
     /// that do not report them. [`run_detailed`] reads it around the measured phase.
     fn stalls(&self) -> Option<Stalls> {
@@ -1226,7 +1234,9 @@ fn warm_up(
         let before = runner.shard_shares();
         pass(runner, clients, warm, false, Some(started + cap))
             .map_err(|e| format!("warmup: {e}"))?;
-        if placement_changed(&before, &runner.shard_shares()) {
+        // A pending growth counts as a change: its moves have not started yet.
+        let growing = runner.pack_target().is_some_and(|(k, target)| target > k);
+        if growing || placement_changed(&before, &runner.shard_shares()) {
             last_change = Instant::now();
         }
         if last_change.elapsed() >= quiet {
@@ -1376,6 +1386,10 @@ mod tests {
         /// Operations executed, and how long each takes.
         executed: u64,
         op_time: Duration,
+        /// Readings of the pack target that report a growth pending (4 of 16 shards), then
+        /// none.
+        targets: std::cell::Cell<u64>,
+        growing: u64,
     }
 
     impl Runner for Fake {
@@ -1396,6 +1410,11 @@ mod tests {
         fn flush(&mut self) -> Result<(), String> {
             self.flushed = true;
             Ok(())
+        }
+        fn pack_target(&self) -> Option<(usize, usize)> {
+            let n = self.targets.get();
+            self.targets.set(n + 1);
+            Some(if n < self.growing { (4, 16) } else { (16, 16) })
         }
         fn shard_shares(&self) -> Vec<ShardShare> {
             if let Some((from, every, moves)) = self.spread {
@@ -1435,6 +1454,8 @@ mod tests {
             spread: None,
             executed: 0,
             op_time: Duration::ZERO,
+            targets: std::cell::Cell::new(0),
+            growing: 0,
         }
     }
 
@@ -1445,6 +1466,36 @@ mod tests {
             .map(|op| (op, Class::Other))
             .collect::<Vec<_>>();
         deal(ops.into_iter(), 1)
+    }
+
+    #[test]
+    fn the_warmup_waits_for_a_pending_growth_before_its_quiet_window() {
+        // D242's amendment: a store whose balancer reports a growth pending (4 of 16 shards)
+        // for its first 6 readings, with no tablet change yet. The quiet window starts only
+        // once the target is reached, so the warm-up runs the 6 passes and then the window;
+        // on the placement alone it would have ended after the window.
+        const GROWING: u64 = 6;
+        let mut r = fake(0);
+        r.growing = GROWING;
+        r.op_time = Duration::from_millis(5);
+        let warm = warm_ops(4);
+        let quiet = Duration::from_millis(100);
+        let (secs, settled) =
+            warm_up(&mut r, &mut [], &warm, quiet, Duration::from_secs(10)).unwrap();
+        assert!(settled);
+        let passes = r.executed / 4;
+        assert!(
+            passes > GROWING,
+            "ended with the growth pending: {passes} passes, {secs} s"
+        );
+        assert!(secs >= quiet.as_secs_f64());
+        // A growth that never completes ends at the cap, unsettled.
+        let mut r = fake(0);
+        r.growing = u64::MAX;
+        let cap = Duration::from_millis(200);
+        let (secs, settled) = warm_up(&mut r, &mut [], &warm, quiet, cap).unwrap();
+        assert!(!settled);
+        assert!(secs >= cap.as_secs_f64());
     }
 
     #[test]

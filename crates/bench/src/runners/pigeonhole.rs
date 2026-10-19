@@ -596,6 +596,10 @@ impl Runner for PigeonholeRunner {
             .map_or(0, |o| o.busy.load(Ordering::Relaxed))
     }
 
+    fn pack_target(&self) -> Option<(usize, usize)> {
+        self.open.as_ref().and_then(|o| o.target.db.pack_target())
+    }
+
     fn shard_shares(&self) -> Vec<ShardShare> {
         self.open.as_ref().map_or_else(Vec::new, |o| {
             o.target

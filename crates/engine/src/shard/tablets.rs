@@ -1983,6 +1983,9 @@ impl ShardState {
         }
         let writing = self.decide_pack(now);
         self.shared.pack_k.store(self.pack_k, Ordering::Release);
+        self.shared
+            .pack_target
+            .store(self.pack_target, Ordering::Release);
         writing
     }
 
@@ -2012,6 +2015,7 @@ impl ShardState {
         if self.pack_k == 0 {
             self.pack_k = n;
         }
+        self.pack_target = self.pack_k;
         let stale = self.shared.balance.interval_nanos.saturating_mul(3).max(1);
         let busy: f64 = self
             .shared
@@ -2084,6 +2088,7 @@ impl ShardState {
             .clamp(1, n);
         if k < floor {
             self.pack_k = want;
+            self.pack_target = want;
             trace!(
                 "shard {} balancer: active shards {k} -> {want} (slots need {floor})",
                 self.id.0
@@ -2201,6 +2206,9 @@ impl ShardState {
         );
         if k < n && (spread || concurrent || hot_grows) {
             self.pack_up += 1;
+            // Where the growth is heading, for the bench's warm-up (D242's amendment): it
+            // does not measure across a growth whose passes are still accruing.
+            self.pack_target = want.max(k + 1).min(n);
         } else {
             self.pack_up = 0;
         }
@@ -2289,6 +2297,12 @@ impl ShardState {
             "a busy sum and commits in flight low enough for one fewer (D217, D257)"
         } else {
             return true;
+        };
+        // A shrink lands where it decided; a growth's undo may land above its target.
+        self.pack_target = if self.pack_k < k {
+            self.pack_k
+        } else {
+            self.pack_target.max(self.pack_k)
         };
         trace!(
             "shard {} balancer: active shards {k} -> {} (busy {busy:.2}, in flight {inflight:.2}, floor {floor}, writes {writes}): {why}",

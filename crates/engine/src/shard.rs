@@ -419,6 +419,11 @@ pub(crate) struct Shared {
     /// How many shards stay active under packing (`0..pack_k`, D217; 0 before shard 0's
     /// first decision): shard 0's balancer decides it for every shard.
     pub pack_k: AtomicUsize,
+    /// The active count shard 0's balancer is heading for (D242's amendment, 2026-10-19):
+    /// `pack_k` unless a growth is accruing its passes, then the count that growth reaches.
+    /// 0 before the first decision. Read by `Engine::pack_target` only (a bench hook: the
+    /// warm-up does not end while a growth is pending).
+    pub pack_target: AtomicUsize,
     /// Async commits and deferred freezes waiting for the watermark.
     pub waiters: WatermarkWaiters,
     /// Shards whose deferred freeze waits for the durable seqno (D227, ICR 0037): a frozen
@@ -2523,6 +2528,9 @@ pub(crate) struct ShardState {
     /// and goes straight back to that count rather than one shard per ten passes.
     shrunk_from: Option<(usize, u64, u64)>,
     pack_k: usize,
+    /// Shard 0 only: `pack_k`, or the count a growth whose passes are accruing would reach
+    /// (published as `Shared::pack_target`).
+    pack_target: usize,
     pack_up: u64,
     pack_down: u64,
     /// Wakes the shard for its next balancer pass (#103).
@@ -2725,6 +2733,7 @@ impl ShardState {
             settled_passes: 0,
             shrunk_from: None,
             pack_k: 0,
+            pack_target: 0,
             pack_up: 0,
             pack_down: 0,
             balance_timer: None,
