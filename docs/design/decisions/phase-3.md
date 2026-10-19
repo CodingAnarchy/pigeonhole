@@ -1911,5 +1911,25 @@ A durable single writer: sync 1.0 → busy `want` 2, `k_c` 1 → 2 (D251's guard
 - Real counters (`spin_pool_terms.rs`): one blocking client reads at 0 < `C` ≤ 1.05 and the counter above zero; the same client's cross-shard commits over two shards read 0 < `C` ≤ 1.05 over the store with the counters above zero (`one_clients_cross_shard_commits_read_as_one_commit_in_flight`, which fails without the coordinator's count: the participants count nothing); a hundred transactions that fail validation (`Conflict`) raise the counter (`failed_commits_count_their_time_in_flight`, which fails when only committed singles count). The public `api.rs` metrics test checks `shard_commit_inflight_nanos` and the per-shard stat agree.
 - D217's, D248's, D251's, D255's and D256's pool and floor tests pass unchanged (`C` = 0 on the simulated clock: `k_c` = 1).
 
-**Acceptance (AX102, perf2's A/B against main after the gate; to be filled in):** ycsb-a buffered at 1, 2, 4 and 16 clients with `k` and the measured `C` per row; time-series-ttl and ycsb-f at one client back to 234c5c2f's throughput and shard count; no riders at 16 clients within noise of 1.1M on 16 shards; coldget's write amplification within noise of D255's; the riders rows level. The `k`-per-row and the `C` column come from the per-shard `commit_inflight_nanos` in the results JSON.
+**Acceptance (AX102, perf2's A/B of ed5ee0ba against main 305e594c, 2026-10-19, `.coord/inbox/done/20261019-050430-perf2.md`; 3 runs each, sides alternated, medians; `k` = shards with any commit / with ≥ 1% of the commits in the measured phase; `C` from the per-shard `commit_inflight_nanos`):**
+
+| row | main ops/s | D257 ops/s | Δ | main `k` | D257 `k` | `C` | write p50 µs | write p99.9 µs |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| ycsb-a t=1 | 132K | 165K | +25% | 14 | 4/3 | 0.36 | 9.41 → 4.67 | 19.2 → 14.9 |
+| ycsb-a t=1, 60 s | 134K | 158K | +18% | 11/9 | 4/3 | 0.33 | 8.13 → 4.70 | 16.9 → 14.1 |
+| ycsb-a t=2 | 243K | 293K | +21% | 16 | 3 | 0.65 | 9.02 → 4.89 | 20.6 → 15.6 |
+| ycsb-a t=4 | 456K | 485K | +6% | 16 | 5 | 1.15 | 8.51 → 5.09 | 27.4 → 16.4 |
+| ycsb-a t=16 | 1166K | 1275K | +9% | 16 | 9 | 4.82 | 8.00 → 7.20 | 105 → 43 |
+| time-series-ttl t=1 | 170K | 223K | +31% | 16 | 2 | 0.37 | 8.96 → 4.61 | 17.7 → 13.6 |
+| ycsb-f t=1 | 70K | 75K | +7% | 11/10 | 4 | 0.38 | 21.1 → 19.5 | 48 → 40 |
+| no riders t=16 | 1098K | 1122K | +2% | 16 | 16/13 | 4.57 | 8.45 → 7.55 | 112 → 62.5 |
+| riders buffered | 770K | 884K | +15% | 16 | 10/9 | 3.54 | 11.58 → 7.84 | 436 → 80 |
+| riders default | 389K | 386K | −1% | 16/14 | 16 | 11.56 | 57.85 → 57.85 | 397 → 436 |
+
+Shard parks fell 650K → 98K at one client and 9.08M → 2.12M on no riders. coldget's 8 GiB load: 93 s at write amplification 7.09 against 92 s at 6.85 (one run each; not a signal). **Accepted** (the owner, 2026-10-19: merge on this A/B), with three readings recorded:
+- **`C` reads about 0.35 per ycsb-a client, not the 0.5–0.7 estimated above** (a buffered put's span from submit to reply is about a third of a client's loop), so `k_c` is 1 up to two clients, 2 at four and 6 at sixteen, and binds only on riders default (`C` 11.6 → 16). Above `k_c` the busy sum sizes `k`: one ycsb-a client settles at 3–4 shards (the pool term and the thin shards' turn time, as the Mac pre-check's 2-not-1), two at 3, sixteen at 9, time-series-ttl at 2. The owner's one-client point (`k` = 1) is not met on ycsb-a, and costs nothing visible: put p50 is 234c5c2f's 4.6–4.7 µs and the row beats main by 25%; 8–9 moves still land in its measured phase (the shrink's last steps and D214's skew moves among 3–4 shards). `PACK_CONCURRENCY` stays 0.75: lowering it to make `k_c` ≈ `t` would force 16 shards at sixteen clients, where 9 measured faster with a 2.4× lower write tail.
+- **The regrow after a packed load is real, once in three no-riders runs** (fix r3): the single-threaded load left the store on 4 shards, D242's warm-up ended at its 2.0 s minimum before the sixteen clients' growth had moved a tablet, and the 4 → 16 regrow ran inside the measured phase: 70 moves, 13 splits, write p99.9 424 µs against main's 112, row p99.9 142 against 101, throughput held at 1100K. The other two runs started on 8 and 12 shards with 6 and 41 moves and beat main. riders buffered r1 shows the same pattern smaller (60 moves, write p99.9 444, main's 426–455). The follow-up is below.
+- **riders default's row p99.9 is +8%** (256–261 µs against 231–242) at identical p50 and `k` = 16; the only regression on the fix side, and within the shape's run-to-run range on main (its measured-phase moves were 8–10 against the fix's 1–2).
+
+**Follow-up (the regrow):** the gate would hit fix r3's pattern at random, and a real application whose load jumps from a single loader to many clients regrows the same way. The plan is in the coordinator's inbox (fable252, 2026-10-19); the smallest change that removes the randomness from the gate and helps that application is preferred over a cap on how far a load packs.
 
