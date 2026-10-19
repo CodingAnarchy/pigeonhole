@@ -1,0 +1,12 @@
+seek/262k entries/hit (get)
+                        time:   [336.50 ns 336.58 ns 336.66 ns]
+seek/262k entries/miss (lower bound)
+                        time:   [260.86 ns 260.89 ns 260.93 ns]
+seek/1M entries/hit (get)
+                        time:   [481.03 ns 481.13 ns 481.22 ns]
+seek/1M entries/miss (lower bound)
+                        time:   [398.64 ns 398.66 ns 398.68 ns]
+seek/10k entries/hit (get)
+                        time:   [128.12 ns 128.15 ns 128.18 ns]
+seek/10k entries/miss (lower bound)
+                        time:   [105.32 ns 105.35 ns 105.38 ns]
