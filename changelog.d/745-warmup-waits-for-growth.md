@@ -1,2 +1,0 @@
-### Changed
-- The bench's warm-up (D242) does not end while the store's balancer has a growth pending: a measured phase no longer starts inside a regrow after a packed load (D257's acceptance saw a 4 → 16 regrow under a measurement, with the write p99.9 at 424 µs against 112). The hooks `Engine::pack_target()` and `Pigeonhole::pack_target()` return the active shard count and the count the balancer is heading for; engine behaviour is unchanged.
