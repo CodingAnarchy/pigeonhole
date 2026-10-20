@@ -114,6 +114,13 @@ fn moved_gives_up(waited: u64, timeout: u64) -> bool {
 // Engine-wide state shared with the shards
 // ---------------------------------------------------------------------------------------
 
+/// How many unneeded records `advance_checkpoint` pops from the log's front in one call while
+/// the shard is open (#763). A `CommitsSettled`, a flush report or a flush install can free
+/// thousands at once; at about a microsecond each (the catalog and index lookups per record),
+/// popping them all held a turn, and the shard's pending watermark, for 3-5 ms. The rest
+/// follows on the next turns, one budget each; a closing shard pops everything.
+const CHECKPOINT_POP_BUDGET: usize = 256;
+
 /// Counters and a log-scale latency histogram for one shard, updated only by that shard.
 #[derive(Debug)]
 pub(crate) struct ShardMetrics {
@@ -2420,6 +2427,12 @@ pub(crate) struct ShardState {
     checkpoint_candidate: Lsn,
     checkpoint_inflight: bool,
     checkpoint_dirty: bool,
+    /// `advance_checkpoint` stopped at its pop budget with more unneeded records at the
+    /// front: `end_batch` kicks the shard, and the kick's turn continues (#763).
+    checkpoint_more: bool,
+    /// A kick for that continuation is in the queue (the kick's handler then advances the
+    /// checkpoint; other kicks leave it alone).
+    checkpoint_kicked: bool,
     /// A wake is armed for the stream's creation to settle (D211, `advance_checkpoint`).
     creation_wake: bool,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
@@ -2738,6 +2751,8 @@ impl ShardState {
             checkpoint_candidate: Lsn::default(),
             checkpoint_inflight: false,
             checkpoint_dirty: false,
+            checkpoint_more: false,
+            checkpoint_kicked: false,
             creation_wake: false,
             aborted: HashSet::new(),
             commit_ckpt: HashSet::new(),
@@ -7183,17 +7198,28 @@ impl ShardState {
         self.send_settled(ctx);
     }
 
-    /// Pops every unneeded record from the front of the log and, if the checkpoint moved,
-    /// submits a `WalCheckpoint` edit (one in flight at a time).
+    /// Pops the unneeded records from the front of the log, at most
+    /// [`CHECKPOINT_POP_BUDGET`] per call while the shard is open (the rest on the following
+    /// turns, #763), and, if the checkpoint moved, submits a `WalCheckpoint` edit (one in
+    /// flight at a time).
     fn advance_checkpoint(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         let Ok(view) = self.checkpoint_view() else {
             return;
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
+        let mut popped = 0;
         while let Some(front) = self.log.front() {
             if self.needed(catalog, front) {
                 break;
             }
+            if popped == CHECKPOINT_POP_BUDGET && !self.closing {
+                // A settle or a flush can free thousands of records at once; popping them
+                // all held the turn for milliseconds (#763: 3-5 ms, and the shard's pending
+                // watermark with it). The next turn continues from here.
+                self.checkpoint_more = true;
+                break;
+            }
+            popped += 1;
             let l = self.log.pop_front().expect("checked");
             self.unindex_front(&l);
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
@@ -8490,7 +8516,13 @@ impl ShardState {
                 self.spawn_flush(ctx);
                 self.maintain(ctx);
             }
-            ShardMsg::Kick => {}
+            ShardMsg::Kick => {
+                if self.checkpoint_kicked {
+                    self.checkpoint_kicked = false;
+                    self.checkpoint_more = false;
+                    self.advance_checkpoint(ctx);
+                }
+            }
             ShardMsg::PinSlice => {
                 self.pin_slice_queued = false;
                 self.pin_slice(ctx);
@@ -8631,6 +8663,11 @@ impl ShardHandler for ShardState {
             self.progress_op(ctx);
         }
         self.run_retries(ctx);
+        if self.checkpoint_more && !self.checkpoint_kicked {
+            // Continue on the next turn, not this one: the budget bounds a turn's pops.
+            self.checkpoint_kicked = true;
+            let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+        }
         self.expire_tablet_waits(ctx);
         self.maybe_balance(false, None, ctx);
         // Every loop that settles commits sends them before its handler returns

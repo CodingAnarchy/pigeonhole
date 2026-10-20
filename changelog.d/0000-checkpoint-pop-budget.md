@@ -1,0 +1,2 @@
+### Fixed
+- A shard popped every record its WAL checkpoint could pass in one handler run: after a flush report, a settle or a flush install that freed thousands of records, that held a turn, and the shard's pending watermark with it, for 3–5 ms (on the AX102's cross-shard row about five such turns per shard per second; the 0.4–0.5 ms p99.9 of its packing-off row). A call now pops at most 256 records and the rest follow on the next turns, one budget each; a closing shard still drains its log in one go (#763).
