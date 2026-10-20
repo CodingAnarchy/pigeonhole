@@ -1,6 +1,6 @@
 //! #763: the flush-time bookkeeping is budgeted per batch. A coordinator counts and settles
-//! at most `SETTLE_BUDGET` (64) seqnos of its received `SharesFlushed` reports per batch, and
-//! a participant's report scan examines at most `REPORT_SCAN_BUDGET` (1024) unreported shares
+//! at most `SETTLE_BUDGET` (16) seqnos of its received `SharesFlushed` reports per batch, and
+//! a participant's report scan examines at most `REPORT_SCAN_BUDGET` (256) unreported shares
 //! per batch; the rest follow on the batches a kick brings. After a pack → regrow the shards
 //! flush out of phase, and these turns, 3-5 ms each, then hit one shard after another all
 //! cycle long; bounded, a staggered flush schedule costs what a clustered one does.
@@ -22,8 +22,8 @@ use pigeonhole_io::sim::SimVfs;
 const DB: &str = "/db/data.phdb";
 /// Large enough that nothing flushes until the test asks.
 const BUDGET: u64 = 64 << 20;
-const SETTLE_BUDGET: u64 = 64;
-const REPORT_SCAN_BUDGET: u64 = 1024;
+const SETTLE_BUDGET: u64 = 16;
+const REPORT_SCAN_BUDGET: u64 = 256;
 
 /// Runs every shard until `pending` resolves.
 fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Output {
@@ -128,8 +128,8 @@ fn a_report_of_a_thousand_shares_settles_over_several_batches() {
     commit_cross(&db, &mut shards, &c0, &p, COMMITS);
     assert_eq!(db.logged_records(2), u64::from(COMMITS));
 
-    // Shard 2's flush reports its shares to shard 0, which settles them 64 per batch and tells
-    // shard 2 once the run ends.
+    // Shard 2's flush reports its shares to shard 0, which settles them 16 per batch and tells
+    // shard 2 once the run ends (1000 settles are under one `SETTLE_SEND_EVERY`).
     let flush = db.submit_flush().unwrap();
     drive(&mut shards, flush).unwrap();
     settle(&mut shards);
@@ -153,7 +153,7 @@ fn a_report_of_a_thousand_shares_settles_over_several_batches() {
         "{msgs} messages carried {seqnos} seqnos"
     );
     // The sliced run told shard 2 once (D254's one message per run), not once per batch,
-    // which would be 1000 / 64 = 16.
+    // which would be 1000 / 16 = 63.
     assert!(
         msgs <= 2,
         "{msgs} CommitsSettled messages for one report run of {seqnos} seqnos"
@@ -167,7 +167,7 @@ fn a_flush_of_thousands_of_shares_reports_them_in_chunks() {
     let (_vfs, db, mut shards, c0, p) = open(7632);
     commit_cross(&db, &mut shards, &c0, &p, COMMITS);
 
-    // Shard 2's scan examines 1024 shares per batch, three chunks, and reports to shard 0 once
+    // Shard 2's scan examines 256 shares per batch, ten chunks, and reports to shard 0 once
     // the pass ends: one message per coordinator per pass (D254), not one per chunk.
     let flush = db.submit_flush().unwrap();
     drive(&mut shards, flush).unwrap();
@@ -190,7 +190,7 @@ fn a_flush_of_thousands_of_shares_reports_them_in_chunks() {
         u64::from(COMMITS),
         "{msgs} messages carried {seqnos} seqnos"
     );
-    // One message per coordinator per pass (D254), not one per chunk, which would be 3.
+    // One message per coordinator per pass (D254), not one per chunk, which would be 10.
     assert!(
         msgs <= 2,
         "{msgs} report messages for {seqnos} shares scanned in chunks of {REPORT_SCAN_BUDGET}: one per pass"
@@ -201,7 +201,7 @@ fn a_flush_of_thousands_of_shares_reports_them_in_chunks() {
 /// #763's review: a flush that lands while a pass is in progress makes shares *before* the
 /// cursor reportable (the pass's swap-removes brought them forward, and they were not in SSTs
 /// when the pass examined them). On a store that then goes quiet, nothing else looks at them,
-/// so the pass must restart when a slot moved mid-pass. Here the first flush's pass runs 20
+/// so the pass must restart when a slot moved mid-pass. Here the first flush's pass runs 235
 /// chunks; more commits land during it, a second flush covers them, and the store goes quiet.
 #[test]
 fn a_flush_landing_mid_pass_reports_the_shares_before_the_cursor() {
@@ -229,7 +229,7 @@ fn a_flush_landing_mid_pass_reports_the_shares_before_the_cursor() {
     }
     assert!(chunked, "the pass never ran a chunk");
 
-    // Late commits, driven to completion while the pass continues (60 chunks against the
+    // Late commits, driven to completion while the pass continues (235 chunks against the
     // few batches these take): their shares append, and the pass's swap-removes bring them
     // before the cursor, not in SSTs yet. Flush B then puts them in SSTs, still mid-pass.
     commit_cross_from(&db, &mut shards, &c0, &p, COMMITS, LATE);

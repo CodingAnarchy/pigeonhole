@@ -126,24 +126,26 @@ const CHECKPOINT_POP_BUDGET: usize = 64;
 
 /// How many seqnos a coordinator counts and settles from its received `SharesFlushed`
 /// reports in one batch while open (#763): each is a map update and a settle check, about
-/// 1.5 µs, and a flush's report of thousands held the coordinator's turn 4-5 ms. 64 is about
-/// 100 µs of work, under the cross-shard rows' p99 (a 256 batch, ~0.4 ms, sat above it, as
-/// ctr274's sweep found for the checkpoint pops). The rest wait in `reports_pending` for the
-/// kicked batches; the settles go out once the run ends, one `CommitsSettled` per participant
-/// per report run (D254), not one per batch.
-const SETTLE_BUDGET: usize = 64;
+/// 1.5 µs, and a flush's report of thousands held the coordinator's turn 4-5 ms. A slice
+/// must be short against an operation's latency (p50 about 45 µs on the AX102's cross-shard
+/// rows), since every message arriving during a sliced run waits for the current slice: at
+/// 64 (~100 µs) the regrown row's p99 read 463 µs against 175 and the packing-off row's 170
+/// against 136; 16 is ~25 µs. The rest wait in `reports_pending` for the kicked batches; the
+/// settles go out once the run ends or every `SETTLE_SEND_EVERY` settles, one `CommitsSettled`
+/// per participant (D254), not one per batch.
+const SETTLE_BUDGET: usize = 16;
 
 /// A settle run that reports keep extending (a flush on every shard reports to this
-/// coordinator while it works through the last report) still sends every this many budgets:
-/// about 1024 settles per message, as a report pass's chunk, so a run cannot hold its
-/// participants' settles indefinitely (#765's review).
-const SETTLE_SEND_EVERY: u32 = 16;
+/// coordinator while it works through the last report) still sends every this many settles,
+/// so a run cannot hold its participants' settles indefinitely (#765's review).
+const SETTLE_SEND_EVERY: usize = 1024;
 
 /// How many unreported shares a report scan (`report_shares_flushed`) examines in one batch
 /// while open (#763): the scan after a flush covers every share applied since the last one,
-/// 30-50K on the AX102's cross-shard row, 1-3 ms inside the flushing shard's turn. The rest
+/// 30-50K on the AX102's cross-shard row, 1-3 ms inside the flushing shard's turn; a share is
+/// about 50 ns, so 256 is ~13 µs, short against an operation (see `SETTLE_BUDGET`). The rest
 /// follows on the kicked batches from `report_cursor`; a closing shard scans everything.
-const REPORT_SCAN_BUDGET: usize = 1024;
+const REPORT_SCAN_BUDGET: usize = 256;
 
 /// Handler work left for the next batch (#763): a handler that stops at its budget sets its
 /// bit, `end_batch` sends one `Kick` for all of them, and the kick's batch runs each set bit's
@@ -2507,8 +2509,8 @@ pub(crate) struct ShardState {
     reports_pending: VecDeque<Seqno>,
     /// Seqnos `settle_reports` settled in this batch (`end_batch` resets it).
     settled_in_batch: usize,
-    /// Budgets the current settle run has used since it last sent (`SETTLE_SEND_EVERY`).
-    settle_slices: u32,
+    /// Settles the current run has made since it last sent (`SETTLE_SEND_EVERY`).
+    settle_slices: usize,
     /// A report scan in progress: the next `unreported` index to examine; `None` when no
     /// scan is under way (#763).
     report_cursor: Option<usize>,
@@ -7193,7 +7195,7 @@ impl ShardState {
             self.settle_if_done(seqno);
         }
         if cut_short {
-            self.settle_slices += 1;
+            self.settle_slices += self.settled_in_batch;
             if self.settle_slices >= SETTLE_SEND_EVERY {
                 // A run that reports keep extending still sends (#765's review).
                 self.settle_slices = 0;

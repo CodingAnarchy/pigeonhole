@@ -41,14 +41,18 @@ fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Ou
     panic!("never resolved");
 }
 
-/// Runs every shard until all of them go idle.
+/// Runs every shard until all of them stay idle: a shard's batch can kick itself or send a
+/// peer polled earlier in the same round a message (#763's sliced report passes and settle
+/// runs), so one quiet round is not enough; three in a row are.
 fn settle(shards: &mut [EngineShard]) {
+    let mut quiet = 0;
     for _ in 0..100_000 {
         let mut more = false;
         for s in shards.iter_mut() {
             more |= s.run_once(u64::MAX);
         }
-        if !more {
+        quiet = if more { 0 } else { quiet + 1 };
+        if quiet == 3 {
             return;
         }
     }
