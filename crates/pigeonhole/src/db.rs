@@ -717,9 +717,24 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The snapshot's sequence number.
+    /// The snapshot's floor: every commit at or below this sequence number is in the
+    /// snapshot, and commits above it may be too (a snapshot is a per-shard cut; see
+    /// [`floor`](Self::floor), which this is the old name of).
+    #[deprecated(
+        note = "a snapshot is a per-shard cut; use `floor()`, the same value under its meaning"
+    )]
     pub fn seqno(&self) -> u64 {
-        self.inner.seqno()
+        self.inner.floor()
+    }
+
+    /// The highest sequence number at or below which every commit is in the snapshot. It
+    /// never decreases from one snapshot to the next, and a consumer that persists it as a
+    /// cursor re-reads commits above it next time rather than missing any. Not every commit
+    /// the snapshot contains is at or below it: a cross-shard commit can enter a later
+    /// snapshot below sequence numbers this one already shows (durable snapshots are
+    /// exact prefixes).
+    pub fn floor(&self) -> u64 {
+        self.inner.floor()
     }
 }
 

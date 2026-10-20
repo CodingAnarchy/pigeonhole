@@ -5488,7 +5488,7 @@ fn async_txn_after_a_purged_delete(
 
     // T is submitted (its snapshot handle goes with `t` unless `held` keeps it) and waits on
     // X's share in `low`'s pending queue.
-    let t_seqno = t.snapshot().seqno();
+    let t_seqno = t.snapshot().floor();
     let mut pt = t.submit(Some(Durability::Buffered)).unwrap();
     // The waiting commit holds T's snapshot (#672).
     assert!(db.engine.live_snapshot_seqnos().contains(&t_seqno));
@@ -5628,7 +5628,7 @@ fn a_transactions_commit_releases_its_snapshot_on_every_outcome() {
     let mut t = db.engine.begin().unwrap();
     t.get(id, f, b"a", b"q").unwrap();
     put(&mut t, b"a");
-    let seqno = t.snapshot().seqno();
+    let seqno = t.snapshot().floor();
     let pc = t.submit(Some(Durability::Buffered)).unwrap();
     assert_eq!(
         db.engine.live_snapshot_seqnos(),

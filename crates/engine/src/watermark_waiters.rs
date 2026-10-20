@@ -170,7 +170,12 @@ impl<W> WatermarkWaiters<W> {
     /// entries listed in the key's part before it. The caller then re-reads the watermark: a
     /// publish that missed this registration is seen there.
     pub(crate) fn register(&self, key: u64, seqno: Seqno, wake: W) -> usize {
-        let i = self.part_index(key);
+        self.register_in(self.part_index(key), key, seqno, wake)
+    }
+
+    /// [`register`](Self::register) in part `i` (chosen by the caller: a shard's part for a
+    /// commit waiting on that shard's component, #717 (b2)).
+    pub(crate) fn register_in(&self, i: usize, key: u64, seqno: Seqno, wake: W) -> usize {
         let part = &self.parts[i];
         let mut list = part.lock();
         let listed = list.keys.len();
@@ -228,6 +233,28 @@ impl<W> WatermarkWaiters<W> {
             return false;
         }
         self.wake_listed(first, &visible, &mut wake)
+    }
+
+    /// [`wake_ready_fenced`](Self::wake_ready_fenced) for one part, against `visible`:
+    /// the publisher of one shard's component wakes only that shard's part.
+    #[inline]
+    pub(crate) fn wake_part_fenced(
+        &self,
+        i: usize,
+        visible: Seqno,
+        mut wake: impl FnMut(W),
+    ) -> bool {
+        let (word, bit) = (i / 64, i % 64);
+        let listed = if word == 0 {
+            self.listed.0.load(Ordering::SeqCst)
+        } else {
+            self.more[word - 1].0.load(Ordering::SeqCst)
+        };
+        if listed & (1u64 << bit) == 0 {
+            return false;
+        }
+        let mut now = Some(visible);
+        self.wake_part(i, &mut now, &|| visible, &mut wake)
     }
 
     /// `wake_ready` past its check: visits every part the `listed` bits mark, starting

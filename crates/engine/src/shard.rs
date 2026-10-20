@@ -476,6 +476,8 @@ pub(crate) struct Shared {
     pub pack_target: AtomicUsize,
     /// Async commits and deferred freezes waiting for the watermark.
     pub waiters: WatermarkWaiters,
+    /// Per-shard visibility lines and the cut over them (#717 (b2), `cut.rs`).
+    pub vis: crate::cut::Visibility,
     /// Shards whose deferred freeze waits for the durable seqno (D227, ICR 0037): a frozen
     /// memtable holds only durable entries, so flush and compaction GC never collapse a
     /// version a durable snapshot may still read. Woken from `publish_watermark` beside
@@ -534,12 +536,21 @@ impl Shared {
     /// Registers an async waiter for `seqno` to become visible; returns true if it already is
     /// (the caller then proceeds without waiting). `seqno` is a commit's, which has one
     /// waiter: registering again (a spurious wake, a new waker) replaces its wake in place.
-    pub(crate) fn wait_visible(&self, seqno: Seqno, waker: &Waker) -> bool {
-        if self.shm.visible_seqno() >= seqno {
+    pub(crate) fn wait_visible(&self, shard: u16, seqno: Seqno, waker: &Waker) -> bool {
+        if self.vis.visible_now(shard, seqno) {
             return true;
         }
         self.visibility.waits.fetch_add(1, Ordering::Relaxed);
-        let scanned = self.waiters.register(
+        // A single waits in its shard's part until the shard's `own` passes it, then (rarely)
+        // in the mark part until no cross-shard reservation below it is in progress; a
+        // cross-shard commit only in the mark part.
+        let part = if shard != crate::cut::NO_SHARD && self.vis.own(shard) <= seqno {
+            usize::from(shard)
+        } else {
+            self.mark_part()
+        };
+        let scanned = self.waiters.register_in(
+            part,
             crate::watermark_waiters::commit_key(seqno),
             seqno,
             Wake::Task(waker.clone()),
@@ -548,7 +559,13 @@ impl Shared {
             .scanned
             .fetch_add(scanned as u64, Ordering::Relaxed);
         // A publish that missed the registration is seen here (`watermark_waiters`).
-        self.shm.visible_seqno() >= seqno
+        self.vis.visible_now(shard, seqno)
+    }
+
+    /// The waiter part for commits blocked on a cross-shard reservation mark.
+    #[inline]
+    pub(crate) fn mark_part(&self) -> usize {
+        self.vis.shards()
     }
 
     /// Whether visibility can no longer advance: the close finished, or a shard died (its
@@ -602,24 +619,38 @@ impl Shared {
 
     /// Wakes, outside the lock, every watermark waiter whose seqno is visible now. Called by
     /// shards after a watermark publish (one fence and one load when nobody waits).
-    pub(crate) fn wake_visible(&self) {
+    pub(crate) fn wake_visible(&self, shard: u16) {
         // One fence for both registries: it pairs with the fence in each one's `register`.
         std::sync::atomic::fence(Ordering::SeqCst);
-        let passed = self.waiters.wake_ready_fenced(
-            || self.shm.visible_seqno(),
-            |w| {
-                if matches!(w, Wake::Task(_)) {
-                    self.visibility.woken.fetch_add(1, Ordering::Relaxed);
-                }
-                self.wake(w);
-            },
-        );
+        let own = self.vis.own(shard).saturating_sub(1);
+        let passed = self.waiters.wake_part_fenced(usize::from(shard), own, |w| {
+            if matches!(w, Wake::Task(_)) {
+                self.visibility.woken.fetch_add(1, Ordering::Relaxed);
+            }
+            self.wake(w);
+        });
         if passed {
             self.visibility.passes.fetch_add(1, Ordering::Relaxed);
         }
         // Deferred freezes wait for the durable seqno (D227).
         self.durable_waiters
             .wake_ready_fenced(|| self.shm.durable_seqno(), |w| self.wake(w));
+    }
+
+    /// After a mark changed (a cross-shard reservation ended, or overflow moved): wakes the
+    /// commits waiting on the marks.
+    pub(crate) fn wake_marks(&self) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let below = self.vis.mark_min().saturating_sub(1);
+        let passed = self.waiters.wake_part_fenced(self.mark_part(), below, |w| {
+            if matches!(w, Wake::Task(_)) {
+                self.visibility.woken.fetch_add(1, Ordering::Relaxed);
+            }
+            self.wake(w);
+        });
+        if passed {
+            self.visibility.passes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Publishes a new view built by `f` from the current one, in shared memory too. The
@@ -2288,6 +2319,11 @@ pub(crate) struct ShardState {
     next_group: u64,
     /// Cross-shard seqnos this shard coordinates, not yet applied everywhere.
     held: BTreeSet<Seqno>,
+    /// Which of `held` sits in which published slot (`VisLine::held`); 0 = free.
+    vis_slots: [Seqno; crate::cut::HELD_SLOTS],
+    /// Commit decisions whose share waits for this shard's `own` watermark to pass their
+    /// seqno (a group under a held segment header, D200), as `(seqno, coordinator)`.
+    deferred_decides: Vec<(Seqno, ShardId)>,
     /// The lowest seqno of a group whose WAL sync failed (D85): never durable, so the
     /// durable watermark stays below it for good (D227, ICR 0037).
     sync_failed_floor: Seqno,
@@ -2718,6 +2754,8 @@ impl ShardState {
             sync_since: 0,
             next_group: 1,
             held: BTreeSet::new(),
+            vis_slots: [0; crate::cut::HELD_SLOTS],
+            deferred_decides: Vec::new(),
             sync_failed_floor: u64::MAX,
             published_durable: std::cell::Cell::new(u64::MAX),
             coord: HashMap::new(),
@@ -4132,10 +4170,24 @@ impl ShardState {
         (pending, durable)
     }
 
+    /// The lowest seqno this shard's own groups hold back: a group not yet where a crash
+    /// recovers it (D200). `watermark()` without `held` (#717 (b2)).
+    fn own_watermark(&self) -> Seqno {
+        self.unresolved
+            .iter()
+            .filter(|g| g.unwritten)
+            .filter_map(|g| g.first)
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     fn publish_watermark(&self) {
         let shard = u32::from(self.id.0);
         let (pending, durable) = self.watermarks();
         debug_assert_eq!(pending, self.watermark());
+        // The visibility line first, then the shared-memory line: a cut taken after a floor
+        // read from shared memory then sees an `own` at least as new (`Inner::latest_view`).
+        self.shared.vis.publish_own(self.id.0, self.own_watermark());
         // Durable first: a reader that sees the raised pending watermark (Acquire) then sees
         // the durable one covering what is applied but not yet synced. An unchanged value is
         // already published.
@@ -4144,7 +4196,7 @@ impl ShardState {
             self.published_durable.set(durable);
         }
         self.shared.shm.publish_pending(shard, pending);
-        self.shared.wake_visible();
+        self.shared.wake_visible(self.id.0);
     }
 
     /// Reserves `n` seqnos per FORMAT §11.3: publish the lower bound, reserve, publish the
@@ -4152,10 +4204,59 @@ impl ShardState {
     fn reserve(&mut self, n: u64) -> Seqno {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
+        let own = self.own_watermark();
+        self.shared
+            .vis
+            .publish_own(self.id.0, own.min(shm.next_seqno()));
         shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
         let first = shm.reserve_seqnos(n);
+        self.shared.vis.publish_own(self.id.0, own.min(first));
         shm.publish_pending(shard, self.watermark().min(first));
         first
+    }
+
+    /// Publishes `seqno` as held (a cross-shard commit this shard coordinates, just
+    /// reserved under a mark): a free slot, or the mark stays below it (overflow).
+    fn vis_held_insert(&mut self, seqno: Seqno) {
+        let free = self.vis_slots.iter().position(|s| *s == 0);
+        if let Some(i) = free {
+            self.vis_slots[i] = seqno;
+        }
+        self.shared.vis.held_insert(self.id.0, seqno, free);
+        self.vis_set_mark();
+    }
+
+    /// Clears `seqno`'s slot after its release, moves a slotless held seqno into it, and
+    /// sets the mark.
+    fn vis_held_remove(&mut self, seqno: Seqno) {
+        if let Some(i) = self.vis_slots.iter().position(|s| *s == seqno) {
+            self.vis_slots[i] = 0;
+            self.shared.vis.held_clear(self.id.0, i);
+            // Slots before the mark: the mark only drops once every held seqno has one.
+            if let Some(orphan) = self
+                .held
+                .iter()
+                .copied()
+                .find(|h| !self.vis_slots.contains(h))
+            {
+                self.vis_slots[i] = orphan;
+                self.shared.vis.held_insert(self.id.0, orphan, Some(i));
+            }
+        }
+        self.vis_set_mark();
+    }
+
+    /// The mark after the slots are up to date: the oldest held seqno without a slot
+    /// (overflow), else `MAX` (no reservation is in progress outside `reserve_cross`).
+    fn vis_set_mark(&self) {
+        let mark = self
+            .held
+            .iter()
+            .copied()
+            .find(|h| !self.vis_slots.contains(h))
+            .unwrap_or(u64::MAX);
+        self.shared.vis.set_mark(self.id.0, mark);
+        self.shared.wake_marks();
     }
 
     /// `preset` (a retried commit's first timestamp) when it still fits this shard's floor
@@ -4290,13 +4391,19 @@ impl ShardState {
 
     /// Whether any entry of `(table, row, family)` on this shard has a seqno above
     /// `snapshot` (optimistic validation). Reads of rows other shards own are theirs to check.
-    fn conflicts(&mut self, snapshot: Seqno, read: &ReadKey) -> Result<bool> {
-        let Some((tablet, shard)) = self.tablets.route(read.table, &read.row) else {
+    fn conflicts(&mut self, cut: &crate::cut::Cut, read: &ReadKey) -> Result<bool> {
+        let Some(entry) = self.tablets.route_entry(read.table, &read.row) else {
             return Ok(false);
         };
+        let (tablet, shard) = (entry.id, entry.shard);
         if shard != self.id {
             return Ok(false);
         }
+        // Above the transaction's component for this shard, or applied but excluded by its
+        // cut (a cross-shard share in flight when it read): not seen, so a conflict.
+        let at = cut.read_point(shard.0, entry.visible_floor);
+        let snapshot = at.seqno;
+        let unseen = |seqno: Seqno| !at.visible(seqno);
         self.key_buf.clear();
         encode_row_prefix(&mut self.key_buf, &read.row)?;
         let prefix = std::mem::take(&mut self.key_buf);
@@ -4308,7 +4415,7 @@ impl ShardState {
                     it.seek(&prefix)?;
                     while it.valid() && it.key().starts_with(&prefix) {
                         let (_, _, seqno, _) = split_suffix(it.key())?;
-                        if seqno > snapshot {
+                        if unseen(seqno) {
                             return Ok(true);
                         }
                         it.next()?;
@@ -4336,7 +4443,7 @@ impl ShardState {
                     it.seek(&prefix)?;
                     while it.valid() && it.key().starts_with(&prefix) {
                         let (_, _, seqno, _) = split_suffix(it.key())?;
-                        if seqno > snapshot {
+                        if unseen(seqno) {
                             found = true;
                             break 'ssts;
                         }
@@ -4929,10 +5036,11 @@ impl ShardState {
                     }
                 }
             }
-            if let Some((snapshot, reads)) = m.validate.as_ref().map(|v| (&v.seqno, &v.reads)) {
+            if let Some((cut, reads)) = m.validate.as_ref().map(|v| (Arc::clone(&v.cut), &v.reads))
+            {
                 let mut conflict = false;
                 for r in reads {
-                    match self.conflicts(*snapshot, r) {
+                    match self.conflicts(&cut, r) {
                         Ok(true) => {
                             conflict = true;
                             break;
@@ -6108,6 +6216,7 @@ impl ShardState {
             };
             self.resolve_group(group, outcome, ctx);
         }
+        self.run_deferred_decides(ctx);
         if failed {
             // The durable watermark stays below the failed group for good, so every shard's
             // freezes (which wait for the durable seqno) would stall behind it: treat the
@@ -6327,6 +6436,7 @@ impl ShardState {
             (None, Ok(())) => Ok(CommitInfo {
                 seqno: m.seqno,
                 durability: m.durability,
+                shard: self.id.0,
             }),
         };
         match m.kind {
@@ -6472,8 +6582,14 @@ impl ShardState {
                     .fetch_max(commit_ts, Ordering::Release);
             }
         }
+        // The mark before the reservation: a cut taken meanwhile stays below the seqno
+        // until the slot publishes it (`cut.rs`).
+        self.shared
+            .vis
+            .reserve_mark(self.id.0, self.shared.shm.next_seqno());
         let seqno = self.reserve(1);
         self.held.insert(seqno);
+        self.vis_held_insert(seqno);
         self.publish_watermark();
         let priority = (
             req.submitted_at,
@@ -6781,6 +6897,14 @@ impl ShardState {
             );
             return;
         }
+        if commit && self.prepared.contains_key(&seqno) && self.own_watermark() <= seqno {
+            // A share is applied only once this shard's `own` watermark is past its seqno:
+            // then every component a cut gives this shard is at or above the seqno from here
+            // on, and the commit's release can never show it on one participant and not
+            // another (#717 (b2), `cut.rs`). The group holding `own` resolves on its sync.
+            self.deferred_decides.push((seqno, coordinator));
+            return;
+        }
         if let Some(share) = self.prepared.remove(&seqno) {
             if share.tracked {
                 self.track_share_rows(share.bytes.batch().as_bytes(), false);
@@ -6938,6 +7062,7 @@ impl ShardState {
             return;
         }
         self.held.remove(&seqno);
+        self.vis_held_remove(seqno);
         self.publish_watermark();
         if c.moved
             && c.failed.is_none()
@@ -7024,6 +7149,7 @@ impl ShardState {
                 Ok(CommitInfo {
                     seqno,
                     durability: c.durability,
+                    shard: crate::cut::NO_SHARD,
                 })
             }
         };
@@ -7860,6 +7986,7 @@ impl ShardState {
         let now = self.shared.vfs.now_micros();
         let mut gc = compact::gc_policy(
             &self.shared,
+            key.0,
             fam,
             &task,
             (
@@ -8079,10 +8206,27 @@ impl ShardState {
         self.shared.failure.record(u32::from(self.id.0), cause);
     }
 
+    /// Decides the shares deferred behind this shard's `own` watermark (`decide_share`) once
+    /// it moved, or once the close gave up (they are then answered as not applied).
+    fn run_deferred_decides(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.deferred_decides.is_empty() {
+            return;
+        }
+        let own = self.own_watermark();
+        if !self.close_gave_up() && self.deferred_decides.iter().all(|(s, _)| *s >= own) {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.deferred_decides);
+        for (seqno, coordinator) in deferred {
+            self.decide_share(seqno, true, coordinator, ctx);
+        }
+    }
+
     fn try_finish_close(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         if !self.closing || self.close_stage == CloseStage::Reported {
             return;
         }
+        self.run_deferred_decides(ctx);
         trace!(
             "shard {} close: stage {:?} unresolved={} coord={} prepared={} pending={} flush_idle={} \
              flush_running={} queue={} frozen={} to_freeze={:?} deferred={} log={} ckpt_inflight={} \

@@ -125,9 +125,20 @@ impl RowCaches {
     /// when a write to the row is applied but not visible at `seqno` (no lookup can hit, and
     /// no fill may store).
     #[inline]
-    pub fn epoch(&self, table: TableId, row: &[u8], seqno: Seqno) -> Option<RowKey> {
+    pub fn epoch(
+        &self,
+        table: TableId,
+        row: &[u8],
+        at: crate::cut::ReadPoint<'_>,
+    ) -> Option<RowKey> {
         let hash = self.hash(table, row);
-        let epoch = self.lw.epoch(hash, seqno)?;
+        let epoch = self.lw.epoch(hash, at.seqno)?;
+        // A write applied to the row above the floor may be an excluded cross-shard share
+        // (#717 (b2)): the cache would serve or store it as visible. Rows written only at or
+        // below the floor are unaffected.
+        if !at.excluded.is_empty() && epoch > at.floor {
+            return None;
+        }
         Some(RowKey { hash, epoch })
     }
 
@@ -342,7 +353,7 @@ fn unprojected(spec: &ReadSpec) -> bool {
 pub(crate) fn read_row_cached(
     rc: &RowCaches,
     view: &Arc<View>,
-    seqno: Seqno,
+    cut: &crate::cut::Cut,
     table: TableId,
     row: &[u8],
     families: &[FamilyId],
@@ -352,12 +363,14 @@ pub(crate) fn read_row_cached(
     sink: &mut impl RowSink,
 ) -> Result<bool> {
     let uncached = |families: &[FamilyId], sink: &mut _| {
-        read_row_into(
-            view, seqno, table, row, families, spec, now, cache_only, sink,
-        )
+        read_row_into(view, cut, table, row, families, spec, now, cache_only, sink)
     };
-    // A write to the row applied but not yet visible at `seqno`: neither hit nor fill.
-    let Some(key) = rc.epoch(table, row, seqno) else {
+    let Some(entry) = view.tablets().route_entry(table, row) else {
+        return uncached(families, sink);
+    };
+    let at = cut.read_point(entry.shard.0, entry.visible_floor);
+    // A write to the row applied but not yet visible at the read point: neither hit nor fill.
+    let Some(key) = rc.epoch(table, row, at) else {
         return uncached(families, sink);
     };
     let info = if rc.families.is_empty() {
@@ -416,14 +429,19 @@ pub(crate) fn read_row_cached(
 pub(crate) fn get_cached(
     rc: &RowCaches,
     view: &View,
-    seqno: Seqno,
+    cut: &crate::cut::Cut,
     now: Timestamp,
     table: TableId,
     family: FamilyId,
     row: &[u8],
     qualifier: &[u8],
 ) -> Option<Option<CellData>> {
-    let key = rc.epoch(table, row, seqno)?;
+    let entry = view.tablets().route_entry(table, row)?;
+    let key = rc.epoch(
+        table,
+        row,
+        cut.read_point(entry.shard.0, entry.visible_floor),
+    )?;
     if !rc.families.is_empty() {
         let info = view.catalog.table(table)?;
         let f = info.families.iter().find(|f| f.id == family)?;
@@ -547,19 +565,27 @@ mod tests {
         let (t, f) = (TableId(1), FamilyId(2));
         rc.note_write(t, b"r", 5);
         // A read at 10 sees the write at 5 and fills under epoch 5.
-        let k = rc.epoch(t, b"r", 10).unwrap();
+        let k = rc.epoch(t, b"r", crate::cut::ReadPoint::plain(10)).unwrap();
         assert_eq!(k.epoch, 5);
         let mut buf = Vec::new();
         Encoded::start(&mut buf);
         rc.insert(f, b"r", k, buf);
         assert!(matches!(
-            rc.get(f, b"r", rc.epoch(t, b"r", 10).unwrap(), 0),
+            rc.get(
+                f,
+                b"r",
+                rc.epoch(t, b"r", crate::cut::ReadPoint::plain(10)).unwrap(),
+                0
+            ),
             Lookup::Hit(_)
         ));
         // A write at 11, applied: a read at 10 may neither hit nor fill; a read at 11 misses.
         rc.note_write(t, b"r", 11);
-        assert!(rc.epoch(t, b"r", 10).is_none());
-        let k = rc.epoch(t, b"r", 11).unwrap();
+        assert!(
+            rc.epoch(t, b"r", crate::cut::ReadPoint::plain(10))
+                .is_none()
+        );
+        let k = rc.epoch(t, b"r", crate::cut::ReadPoint::plain(11)).unwrap();
         assert!(matches!(rc.get(f, b"r", k, 0), Lookup::Miss));
     }
 
@@ -567,12 +593,12 @@ mod tests {
     fn a_row_is_admitted_on_its_second_miss() {
         let rc = RowCaches::new(1 << 20, 4096, Vec::new()).unwrap();
         let (t, f) = (TableId(1), FamilyId(2));
-        let k = rc.epoch(t, b"r", 1).unwrap();
+        let k = rc.epoch(t, b"r", crate::cut::ReadPoint::plain(1)).unwrap();
         assert!(!rc.admit(f, k));
         assert!(rc.admit(f, k));
         // After a write, the row has been seen: its next miss fills.
         rc.note_write(t, b"r", 2);
-        let k = rc.epoch(t, b"r", 2).unwrap();
+        let k = rc.epoch(t, b"r", crate::cut::ReadPoint::plain(2)).unwrap();
         assert!(rc.admit(f, k));
         // Another family of the row has not.
         assert!(!rc.admit(FamilyId(3), k));
@@ -582,7 +608,7 @@ mod tests {
     fn an_entry_misses_once_a_cell_expires() {
         let rc = RowCaches::new(1 << 20, 4096, Vec::new()).unwrap();
         let (t, f) = (TableId(1), FamilyId(1));
-        let k = rc.epoch(t, b"r", 0).unwrap();
+        let k = rc.epoch(t, b"r", crate::cut::ReadPoint::plain(0)).unwrap();
         let mut buf = Vec::new();
         Encoded::start(&mut buf);
         Encoded::push(&mut buf, b"q", 1, b"v", 100);

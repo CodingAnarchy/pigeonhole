@@ -130,8 +130,8 @@ fn snapshots_across_a_flush(mutation: FlushGcMutation) -> (Vec<Option<Vec<u8>>>,
     assert_eq!(rig.get(&s1), Some(b"v1".to_vec()));
     assert_eq!(rig.get(&s2), Some(b"v2".to_vec()));
     let reads = vec![
-        rig.get(&latest.at_seqno(s1.seqno())),
-        rig.get(&latest.at_seqno(s2.seqno())),
+        rig.get(&latest.at_seqno(s1.floor())),
+        rig.get(&latest.at_seqno(s2.floor())),
         rig.get(&latest),
     ];
     let stored = rig.stored();
@@ -218,7 +218,7 @@ fn delete_during_flush(mutation: FlushGcMutation) -> (Option<Vec<u8>>, Option<Ve
     rig.wait(flush).unwrap();
     while rig.shard.run_once(u64::MAX) {}
     let latest = rig.db.snapshot().unwrap();
-    let reads = (rig.get(&latest.at_seqno(s.seqno())), rig.get(&latest));
+    let reads = (rig.get(&latest.at_seqno(s.floor())), rig.get(&latest));
     drop((s, latest));
     rig.close();
     reads

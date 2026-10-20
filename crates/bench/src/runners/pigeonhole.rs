@@ -681,7 +681,7 @@ impl Runner for PigeonholeRunner {
             .db
             .snapshot()
             .ok()
-            .map(|s| s.seqno())
+            .map(|s| s.floor())
     }
 
     fn client(&self) -> Option<Box<dyn Client>> {

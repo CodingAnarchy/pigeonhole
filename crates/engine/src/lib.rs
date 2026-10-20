@@ -25,6 +25,7 @@ mod admission;
 mod catalog;
 mod close_gate;
 mod compact;
+mod cut;
 mod engine;
 mod error;
 mod flush;
@@ -51,6 +52,7 @@ mod watermark_waiters;
 mod write;
 
 pub use admission::Admit;
+pub use cut::Cut;
 pub use engine::PendingMaintenance;
 pub use engine::{
     CommitInfo, CrossShardMetrics, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats,

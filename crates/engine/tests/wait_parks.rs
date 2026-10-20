@@ -103,18 +103,32 @@ fn a_commit_wait_held_by_another_shards_group_parks() {
     .unwrap();
     let held = db.submit(both, Some(Durability::Sync)).unwrap();
     gate.wait_held(&wal(sb));
-    // A `None` commit on shard A resolves at once, then waits for visibility.
+    // Per-shard visibility (#717 (b2)): a `None` commit on shard A no longer waits for the
+    // held seqno; it returns at once. The waiter that parks is the held commit's own.
     let (db2, a2) = (Arc::clone(&db), Arc::clone(&a));
+    let single = std::thread::spawn(move || db2.commit(put(&a2, "single"), Some(Durability::None)));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        single.is_finished(),
+        "a single waited behind shard B's held seqno"
+    );
+    single.join().unwrap().unwrap();
     let waiter = std::thread::spawn(move || {
-        let r = db2.commit(put(&a2, "waits"), Some(Durability::None));
+        let r = held.wait();
         (r, Instant::now())
     });
     std::thread::sleep(Duration::from_millis(200));
-    assert!(!waiter.is_finished(), "visible before shard B published");
+    assert!(
+        !waiter.is_finished(),
+        "the held commit returned before shard B's sync"
+    );
     let (cpu0, wall0) = (process_cpu(), Instant::now());
     std::thread::sleep(Duration::from_millis(1_500));
     let (cpu, wall) = (process_cpu() - cpu0, wall0.elapsed());
-    assert!(!waiter.is_finished(), "visible before shard B published");
+    assert!(
+        !waiter.is_finished(),
+        "the held commit returned before shard B's sync"
+    );
     assert!(
         cpu.as_secs_f64() < wall.as_secs_f64() * 0.1,
         "{cpu:?} of CPU in {wall:?} of waiting for visibility (issue #135)"
@@ -129,6 +143,5 @@ fn a_commit_wait_held_by_another_shards_group_parks() {
         "woke {:?} after the publish",
         woke.duration_since(released)
     );
-    held.wait().unwrap();
     db.close().unwrap();
 }

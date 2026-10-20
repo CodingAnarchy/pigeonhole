@@ -951,7 +951,7 @@ pub(crate) fn end(
     // their extents retire below.
     let removed = catalog.removed_since(&old);
     let published = shared.publish_view(&flushed_roots, |cur, view_version| {
-        let mems = cur
+        let mems: Vec<Arc<ShardMems>> = cur
             .mems
             .iter()
             .enumerate()
@@ -984,13 +984,26 @@ pub(crate) fn end(
             shared.pager.data_file().clone(),
             Arc::clone(&shared.cache),
         ));
+        let tablets = match &tablets {
+            Some(tablets) => {
+                // A tablet that changed shards reads at or above everything applied to it on
+                // the old shard (`TabletEntry::visible_floor`, #717 (b2)); the rest keep
+                // their floors.
+                let mut entries = tablets.clone();
+                for t in &mut entries {
+                    t.visible_floor = match cur.tablets.entry(t.id) {
+                        Some(prev) if prev.shard == t.shard => prev.visible_floor,
+                        _ => moved_floor(&catalog, &mems, &ssts, t),
+                    };
+                }
+                Arc::new(TabletMap::build(cur.tablets.version() + 1, &entries))
+            }
+            None => Arc::clone(&cur.tablets),
+        };
         View {
             version: view_version,
             manifest_version: version,
-            tablets: match &tablets {
-                Some(tablets) => Arc::new(TabletMap::build(cur.tablets.version() + 1, tablets)),
-                None => Arc::clone(&cur.tablets),
-            },
+            tablets,
             catalog: Arc::clone(&catalog),
             mems,
             ssts,
@@ -1356,4 +1369,34 @@ pub(crate) fn notify(
     tx: Notifier<Result<ManifestVersion>>,
 ) -> impl FnOnce(Result<ManifestVersion>) {
     move |r| tx.notify(r)
+}
+
+/// The highest seqno applied to tablet `t` in `mems` and `ssts`: everything at or below it
+/// was applied before the tablet moved (its memtables are frozen first), so a read of the
+/// tablet on its new shard is at least at it (`TabletEntry::visible_floor`).
+fn moved_floor(
+    catalog: &Catalog,
+    mems: &[Arc<ShardMems>],
+    ssts: &SstSet,
+    t: &crate::snapshot::TabletEntry,
+) -> pigeonhole_format::Seqno {
+    let mut floor = 0;
+    let Some(info) = catalog.table(t.table) else {
+        return 0;
+    };
+    for f in &info.families {
+        for piece in mems {
+            if let Some(set) = piece.map.get(&(t.id, f.id)) {
+                for r in &set.readers {
+                    floor = floor.max(r.max_seqno());
+                }
+            }
+        }
+        if let Some(fam) = ssts.family(t.id, f.id) {
+            for s in fam.iter() {
+                floor = floor.max(s.meta.seqno_range.1);
+            }
+        }
+    }
+    floor
 }

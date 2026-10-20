@@ -76,7 +76,7 @@ fn a_durable_snapshot_sees_a_commit_only_once_its_sync_returned() {
     assert_eq!(read(&db, &visible, &b, b"x").as_deref(), Some(&b"1"[..]));
     assert_eq!(read(&db, &visible, &a, b"y").as_deref(), Some(&b"2"[..]));
     let durable = db.durable_snapshot().unwrap();
-    assert!(durable.seqno() < visible.seqno());
+    assert!(durable.floor() < visible.floor());
     assert_eq!(read(&db, &durable, &b, b"x"), None, "unsynced commit seen");
     // A later commit above the unsynced one is not in the durable view either: it holds
     // every seqno at or below it.

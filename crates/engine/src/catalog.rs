@@ -208,6 +208,7 @@ impl Catalog {
                         start: start.clone(),
                         end: end.clone(),
                         shard: shard_for(*tablet, shards),
+                        visible_floor: 0,
                     },
                 );
             }

@@ -143,7 +143,6 @@ mod imp {
             self.atomic_u32(off).store(v, ord);
         }
 
-        #[cfg(test)]
         pub(crate) fn load_u64(&self, off: usize, ord: Ordering) -> u64 {
             self.atomic_u64(off).load(ord)
         }
@@ -266,6 +265,12 @@ mod imp {
         pub(crate) fn store_u64(&self, off: usize, v: u64, ord: Ordering) {
             self.word(off).store(v as u32, ord);
             self.word(off + 4).store((v >> 32) as u32, ord);
+        }
+
+        pub(crate) fn load_u64(&self, off: usize, ord: Ordering) -> u64 {
+            let lo = u64::from(self.word(off).load(ord));
+            let hi = u64::from(self.word(off + 4).load(ord));
+            lo | (hi << 32)
         }
 
         pub(crate) fn load_u8(&self, off: usize, ord: Ordering) -> u8 {

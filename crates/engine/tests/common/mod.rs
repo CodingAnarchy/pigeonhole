@@ -1867,7 +1867,7 @@ impl World {
         };
         let rebuilt = self.model_at(snap);
         let model = rebuilt.as_ref().unwrap_or(&self.model);
-        let model = match model_dump(model, self.model_seqno(snap.seqno()), now) {
+        let model = match model_dump(model, self.model_seqno(snap.floor()), now) {
             Ok(d) => d,
             Err(e) => return fail(FailureClass::Protocol, format!("model dump failed: {e}")),
         };
@@ -1876,8 +1876,8 @@ impl World {
                 class,
                 format!(
                     "state at engine seqno {} (model {}) differs: {d}",
-                    snap.seqno(),
-                    self.model_seqno(snap.seqno())
+                    snap.floor(),
+                    self.model_seqno(snap.floor())
                 ),
             );
         }
@@ -2653,7 +2653,7 @@ impl World {
                 );
             }
         };
-        let recovered_seqno = snap.seqno();
+        let recovered_seqno = snap.floor();
         let last_kept = self.engine_seqnos.last().copied().unwrap_or(0);
         self.trace.push(format!(
             "RECOVERED with {shards} shards: engine seqno {recovered_seqno}, {} commits kept (last {last_kept}), manifest {} ({} from SSTs only)",
@@ -3345,7 +3345,7 @@ impl World {
             Err(_) if !self.alive() => return Ok(()),
             Err(e) => return fail(FailureClass::Protocol, format!("snapshot: {e}")),
         };
-        let ms = self.model_seqno(snap.seqno());
+        let ms = self.model_seqno(snap.floor());
         let now = self.now();
         // Per cell: Some(true) shows the commit, Some(false) the model, None either (equal).
         let mut seen: Vec<Option<bool>> = Vec::new();
@@ -3374,7 +3374,7 @@ impl World {
                              shows neither the commit's value nor the model's: {got:?}",
                             text(row),
                             text(qualifier),
-                            snap.seqno()
+                            snap.floor()
                         ),
                     );
                 }
@@ -3387,7 +3387,7 @@ impl World {
                 format!(
                     "in-flight commit {:?} is partly visible at engine seqno {}: {seen:?}",
                     self.in_flight[pick].commit.ops,
-                    snap.seqno()
+                    snap.floor()
                 ),
             );
         }
@@ -3397,7 +3397,7 @@ impl World {
             self.trace.push(format!(
                 "observed in-flight commit {:?} at engine seqno {}",
                 self.in_flight[pick].commit.ops.len(),
-                snap.seqno()
+                snap.floor()
             ));
             drop(snap);
             if self.cfg.observed_crash_ppm > 0 && rng.chance(self.cfg.observed_crash_ppm) {
@@ -3450,14 +3450,14 @@ impl World {
             Err(_) if !self.alive() => return Ok(()),
             Err(e) => return fail(FailureClass::Protocol, format!("snapshot: {e}")),
         };
-        let ms = self.model_seqno(snap.seqno());
+        let ms = self.model_seqno(snap.floor());
         let now = self.now();
         self.stats.flight_reads += 1;
         self.trace.push(format!(
             "flight read {}/{family}:{} @engine {} (model {ms}, {} in flight)",
             text(&row),
             text(&qualifier),
-            snap.seqno(),
+            snap.floor(),
             self.in_flight.len()
         ));
         let got = self.store().get(&snap, &row, &family, &qualifier);
@@ -3481,7 +3481,7 @@ impl World {
                     self.in_flight.len(),
                     text(&row),
                     text(&qualifier),
-                    snap.seqno(),
+                    snap.floor(),
                     g.map(|c| c.as_ref().map(show_cell)),
                     w.map(|c| c.as_ref().map(show_cell))
                 ),
@@ -3671,11 +3671,11 @@ impl World {
             Err(e) => return fail(FailureClass::Protocol, e.to_string()),
         };
         if let Some(last) = self.engine_seqnos.last()
-            && snap.seqno() < *last
+            && snap.floor() < *last
         {
             return fail(
                 FailureClass::Protocol,
-                format!("snapshot {} after commit {last}", snap.seqno()),
+                format!("snapshot {} after commit {last}", snap.floor()),
             );
         }
         if self.in_flight.is_empty() {
@@ -3924,7 +3924,7 @@ impl World {
             Ok(t) => t,
             Err(e) => return fail(FailureClass::Protocol, format!("begin: {e}")),
         };
-        let snapshot = txn.snapshot().seqno();
+        let snapshot = txn.snapshot().floor();
         let fams = families();
         let mut reads = Vec::new();
         for i in 0..1 + rng.below(2) {
@@ -4299,12 +4299,12 @@ impl World {
                     Err(f) if !self.alive() => return self.background_crash(f.message, rng),
                     Err(f) => return Err(f),
                 };
-                let ms = self.model_seqno(snap.seqno());
+                let ms = self.model_seqno(snap.floor());
                 self.trace.push(format!(
                     "get {}/{family}:{} @engine {} (model {ms})",
                     text(&row),
                     text(&qualifier),
-                    snap.seqno()
+                    snap.floor()
                 ));
                 let got = self.store().get(&snap, &row, &family, &qualifier);
                 let rebuilt = self.model_at(&snap);
@@ -4332,7 +4332,7 @@ impl World {
                                 "get {}/{family}:{} at engine seqno {}: engine {:?} vs model {:?}",
                                 text(&row),
                                 text(&qualifier),
-                                snap.seqno(),
+                                snap.floor(),
                                 g.map(|c| c.as_ref().map(show_cell)),
                                 w.map(|c| c.as_ref().map(show_cell))
                             ),
@@ -4346,12 +4346,12 @@ impl World {
                     Err(f) if !self.alive() => return self.background_crash(f.message, rng),
                     Err(f) => return Err(f),
                 };
-                let ms = self.model_seqno(snap.seqno());
+                let ms = self.model_seqno(snap.floor());
                 self.trace.push(format!(
                     "scan [{}, {}) @engine {} (model {ms})",
                     text(&start),
                     text(&end),
-                    snap.seqno()
+                    snap.floor()
                 ));
                 let rebuilt = self.model_at(&snap);
                 let model = rebuilt.as_ref().unwrap_or(&self.model);
@@ -4376,7 +4376,7 @@ impl World {
                             if let Some(d) = first_diff(&g, &w) {
                                 return fail(
                                     FailureClass::LiveReadMismatch,
-                                    format!("scan of {t} at engine seqno {}: {d}", snap.seqno()),
+                                    format!("scan of {t} at engine seqno {}: {d}", snap.floor()),
                                 );
                             }
                         }
@@ -4401,7 +4401,7 @@ impl World {
                 }
                 if rng.chance(self.cfg.dump_ppm) {
                     self.trace
-                        .push(format!("full dump @engine {}", snap.seqno()));
+                        .push(format!("full dump @engine {}", snap.floor()));
                     let dumped = self.compare_dump(&snap, FailureClass::LiveReadMismatch);
                     if self.recover_if_fired(dumped, rng)? {
                         return Ok(());
@@ -4414,7 +4414,7 @@ impl World {
                     Err(e) if !self.alive() => return self.background_crash(e, rng),
                     Err(e) => return fail(FailureClass::Protocol, format!("snapshot: {e}")),
                 };
-                self.trace.push(format!("snapshot engine {}", snap.seqno()));
+                self.trace.push(format!("snapshot engine {}", snap.floor()));
                 self.snaps.push(snap);
                 if self.snaps.len() > 8 {
                     self.snaps.remove(0);

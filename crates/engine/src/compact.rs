@@ -339,8 +339,9 @@ impl BlobGc {
 /// The read points GC must preserve (decision D70): every live snapshot of this process plus
 /// the oldest reader pin's seqno (a reader's snapshots pin its own view, so the oldest pin
 /// bounds everything a reader can still read), ascending.
-pub(crate) fn gc_snapshots(shared: &Shared) -> Vec<Seqno> {
-    let mut snapshots = shared.live_seqnos.list();
+pub(crate) fn gc_snapshots(shared: &Shared, tablet: TabletId) -> Vec<Seqno> {
+    let mut snapshots = Vec::new();
+    shared.live_seqnos.read_points(tablet, &mut snapshots);
     if let Some((seqno, _)) = shared.shm.oldest_reader_pin()
         && seqno != 0
     {
@@ -360,6 +361,7 @@ pub(crate) fn gc_snapshots(shared: &Shared) -> Vec<Seqno> {
 /// `mem_min_seqno`) and the prepared shares (`prepared_seqnos`).
 pub(crate) fn gc_policy(
     shared: &Shared,
+    tablet: TabletId,
     fam: &FamilySsts,
     task: &CompactionTask,
     (mem_min_ts, mem_min_seqno): (Timestamp, Option<Seqno>),
@@ -367,7 +369,7 @@ pub(crate) fn gc_policy(
     counter: bool,
     now: Timestamp,
 ) -> GcPolicy {
-    let snapshots = gc_snapshots(shared);
+    let snapshots = gc_snapshots(shared, tablet);
     let input_ids: Vec<SstId> = task
         .inputs
         .iter()

@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use pigeonhole_cache::BlockHandle;
-use pigeonhole_format::{FamilyId, Seqno, TableId, Timestamp};
+use pigeonhole_format::{FamilyId, TableId, Timestamp};
 use pigeonhole_io::Completion;
 use pigeonhole_sst::Fetch;
 
@@ -42,7 +42,10 @@ const READER_EXPIRED_RETRIES: u32 = 8;
 /// Where a read reads: the latest view through an unpinned seqno (writer process, as
 /// `get_latest`), or a snapshot.
 enum At {
-    Latest { view: Arc<View>, seqno: Seqno },
+    Latest {
+        view: Arc<View>,
+        cut: Arc<crate::cut::Cut>,
+    },
     Snapshot(Snapshot),
 }
 
@@ -54,10 +57,10 @@ impl At {
         }
     }
 
-    fn seqno(&self) -> Seqno {
+    fn cut(&self) -> &crate::cut::Cut {
         match self {
-            At::Latest { seqno, .. } => *seqno,
-            At::Snapshot(s) => s.seqno,
+            At::Latest { cut, .. } => cut,
+            At::Snapshot(s) => &s.cut,
         }
     }
 
@@ -107,11 +110,11 @@ impl Reading {
     /// a pinned snapshot in a reader process or under a steady stream of commits.
     fn take_point(&self) -> Result<At> {
         if !self.inner.is_reader()
-            && let Some((view, seqno)) = self.inner.latest_view()
+            && let Some((view, cut)) = self.inner.latest_view()
         {
             return Ok(At::Latest {
                 view: arc_swap::Guard::into_inner(view),
-                seqno,
+                cut,
             });
         }
         self.inner.snapshot().map(At::Snapshot)
@@ -121,7 +124,7 @@ impl Reading {
     fn poll_read<T>(
         &mut self,
         cx: &mut Context<'_>,
-        mut attempt: impl FnMut(&Arc<View>, Seqno, Timestamp, bool) -> Result<T>,
+        mut attempt: impl FnMut(&Arc<View>, &crate::cut::Cut, Timestamp, bool) -> Result<T>,
     ) -> Poll<Result<T>> {
         loop {
             if let Some((completion, fetch)) = &mut self.fetch {
@@ -157,7 +160,7 @@ impl Reading {
             };
             let cache_only = !self.sync;
             let (r, sync_reads) = as_async_read(cache_only, || {
-                attempt(at.view(), at.seqno(), self.now, cache_only)
+                attempt(at.view(), at.cut(), self.now, cache_only)
             });
             if sync_reads > 0 {
                 self.inner
@@ -250,19 +253,18 @@ impl Future for GetFuture {
         // A latest get consults the row cache, as the sync one does (D201).
         let row_cache = (!this.reading.given && this.reading.inner.shared.row_cache.is_some())
             .then(|| Arc::clone(&this.reading.inner));
-        this.reading.poll_read(cx, |view, seqno, now, cache_only| {
+        this.reading.poll_read(cx, |view, cut, now, cache_only| {
             if let Some(inner) = &row_cache
                 && let Some(rc) = &inner.shared.row_cache
-                && let Some(hit) = crate::row_cache::get_cached(
-                    rc, view, seqno, now, table, family, row, qualifier,
-                )
+                && let Some(hit) =
+                    crate::row_cache::get_cached(rc, view, cut, now, table, family, row, qualifier)
             {
                 return Ok(hit);
             }
             if cache_only {
                 get_in::<true>(
                     view,
-                    seqno,
+                    cut,
                     || now,
                     table,
                     family,
@@ -273,7 +275,7 @@ impl Future for GetFuture {
             } else {
                 get_in::<false>(
                     view,
-                    seqno,
+                    cut,
                     || now,
                     table,
                     family,
@@ -357,18 +359,18 @@ impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
             }
             _ => None,
         };
-        let r = this.reading.poll_read(cx, |view, seqno, now, cache_only| {
+        let r = this.reading.poll_read(cx, |view, cut, now, cache_only| {
             sink.clone_from(empty);
             let families = crate::engine::families_in_order(view, table, families)?;
             if let Some(inner) = &row_cache
                 && let Some(rc) = &inner.shared.row_cache
             {
                 return crate::row_cache::read_row_cached(
-                    rc, view, seqno, table, row, &families, spec, now, cache_only, sink,
+                    rc, view, cut, table, row, &families, spec, now, cache_only, sink,
                 );
             }
             read::read_row_into(
-                view, seqno, table, row, &families, spec, now, cache_only, sink,
+                view, cut, table, row, &families, spec, now, cache_only, sink,
             )
         });
         match r {

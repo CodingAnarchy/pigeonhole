@@ -295,8 +295,11 @@ fn flush_gc(
 ) {
     let view = shared.view.load();
     let now = shared.vfs.now_micros();
-    let mut policy =
-        pigeonhole_compaction::GcPolicy::new(crate::compact::gc_snapshots(shared), now, false);
+    let mut policy = pigeonhole_compaction::GcPolicy::new(
+        crate::compact::gc_snapshots(shared, item.tablet),
+        now,
+        false,
+    );
     policy.no_outside_deletes = item.guard.is_some();
     // The record (test hook) describes the real GC, so a deliberate fault below shows up.
     let real = policy.clone();

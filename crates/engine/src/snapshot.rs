@@ -34,6 +34,11 @@ pub(crate) struct TabletEntry {
     /// Exclusive end row; `None` means unbounded.
     pub end: Option<Vec<u8>>,
     pub shard: ShardId,
+    /// Everything at or below this seqno was applied to the tablet before it last moved to
+    /// `shard`: a cut reads the tablet at `max(component(shard), visible_floor)`, so a
+    /// commit acknowledged on the old shard stays visible once the destination's own
+    /// groups, reserved earlier, still hold its component below it (#717 (b2)).
+    pub visible_floor: Seqno,
 }
 
 /// An immutable routing table: for each table, its tablets' row ranges and owning shards.
@@ -95,6 +100,17 @@ impl TabletMap {
         match &t.end {
             Some(end) if compare(row, end).is_ge() => None,
             _ => Some((t.id, t.shard)),
+        }
+    }
+
+    /// [`route`](Self::route), returning the entry.
+    pub(crate) fn route_entry(&self, table: TableId, row: &[u8]) -> Option<&TabletEntry> {
+        let list = self.tables.get(&table)?;
+        let idx = list.partition_point(|t| compare(&t.start, row).is_le());
+        let t = list.get(idx.checked_sub(1)?)?;
+        match &t.end {
+            Some(end) if compare(row, end).is_ge() => None,
+            _ => Some(t),
         }
     }
 
@@ -809,70 +825,124 @@ impl Drop for ViewPin {
     }
 }
 
-/// Every live in-process snapshot seqno, for compaction's `GcPolicy::snapshots`.
+/// One live snapshot's cut and view, for GC's read points.
+#[derive(Debug)]
+struct LiveCut {
+    cut: Arc<crate::cut::Cut>,
+    /// Set once the snapshot loaded its view; until then GC takes every component.
+    view: Option<Arc<View>>,
+}
+
+/// Every live in-process snapshot (its cut and view), for compaction's and flush's GC read
+/// points (`compact::gc_snapshots`).
 #[derive(Debug, Default)]
 pub(crate) struct LiveSeqnos {
-    seqnos: Mutex<BTreeMap<Seqno, u32>>,
+    live: Mutex<(u64, BTreeMap<u64, LiveCut>)>,
 }
 
 impl LiveSeqnos {
-    /// The live seqnos, ascending.
+    /// The live snapshots' floors, ascending (a test hook).
     pub(crate) fn list(&self) -> Vec<Seqno> {
-        self.seqnos
+        let mut v: Vec<Seqno> = self
+            .live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .copied()
-            .collect()
+            .1
+            .values()
+            .map(|l| l.cut.floor)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The read points GC must keep for tablet `tablet` (#717 (b2), proto-717b.md §2.4): per
+    /// live snapshot its component for the tablet's shard in the snapshot's own view (every
+    /// component while the view is not loaded yet), raised to the tablet's floor there; plus
+    /// `e - 1` and `e` for every excluded seqno `e`, so an excluded entry sits alone in its
+    /// stripe and the newest entry below it is kept too.
+    pub(crate) fn read_points(&self, tablet: TabletId, out: &mut Vec<Seqno>) {
+        let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        for l in live.1.values() {
+            match l.view.as_ref().and_then(|v| v.tablets.entry(tablet)) {
+                Some(t) => out.push(l.cut.read_point(t.shard.0, t.visible_floor).seqno),
+                None => out.extend(l.cut.v.iter().copied()),
+            }
+            for e in l.cut.e.iter() {
+                out.push(e.saturating_sub(1));
+                out.push(*e);
+            }
+        }
     }
 }
 
-/// Keeps a snapshot's seqno registered while any clone of the snapshot lives.
+/// Keeps a snapshot's cut registered while any clone of the snapshot lives.
 #[derive(Debug)]
 pub(crate) struct SeqnoPin {
     registry: Arc<LiveSeqnos>,
-    seqno: Seqno,
+    id: u64,
+    cut: Arc<crate::cut::Cut>,
 }
 
 impl SeqnoPin {
-    /// Reads the visible seqno with `visible` and registers it, in one critical section with
-    /// the GC's reading of the list (`compact::gc_snapshots`): a flush or compaction that read
-    /// the list before saw only inputs at or below this seqno (reads at it equal latest for
+    /// Takes the cut with `cut` and registers it, in one critical section with the GC's
+    /// reading of the list (`compact::gc_snapshots`): a flush or compaction that read the
+    /// list before saw only inputs at or below the cut's floor (reads at it equal latest for
     /// them), and one that reads it after keeps its versions (#315 review). The caller loads
-    /// the view afterwards.
-    pub(crate) fn pin_visible(registry: &Arc<LiveSeqnos>, visible: impl FnOnce() -> Seqno) -> Self {
-        let mut seqnos = registry
-            .seqnos
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let seqno = visible();
-        *seqnos.entry(seqno).or_insert(0) += 1;
-        drop(seqnos);
+    /// the view afterwards and hands it to [`set_view`](Self::set_view).
+    pub(crate) fn pin_visible(
+        registry: &Arc<LiveSeqnos>,
+        cut: impl FnOnce() -> crate::cut::Cut,
+    ) -> Self {
+        let mut live = registry.live.lock().unwrap_or_else(PoisonError::into_inner);
+        let cut = Arc::new(cut());
+        let id = live.0;
+        live.0 += 1;
+        live.1.insert(
+            id,
+            LiveCut {
+                cut: Arc::clone(&cut),
+                view: None,
+            },
+        );
+        drop(live);
         Self {
             registry: Arc::clone(registry),
-            seqno,
+            id,
+            cut,
         }
     }
 
-    /// The pinned seqno.
+    /// The view the snapshot reads through, for GC's per-tablet read points.
+    pub(crate) fn set_view(&self, view: &Arc<View>) {
+        let mut live = self
+            .registry
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(l) = live.1.get_mut(&self.id) {
+            l.view = Some(Arc::clone(view));
+        }
+    }
+
+    /// The pinned floor.
     pub(crate) fn seqno(&self) -> Seqno {
-        self.seqno
+        self.cut.floor
+    }
+
+    pub(crate) fn cut(&self) -> &Arc<crate::cut::Cut> {
+        &self.cut
     }
 }
 
 impl Drop for SeqnoPin {
     fn drop(&mut self) {
-        let mut m = self
-            .registry
-            .seqnos
+        self.registry
+            .live
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(n) = m.get_mut(&self.seqno) {
-            *n -= 1;
-            if *n == 0 {
-                m.remove(&self.seqno);
-            }
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .1
+            .remove(&self.id);
     }
 }
 
@@ -1020,7 +1090,10 @@ impl Drop for LiveSnapshot {
 /// Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// The cut's floor (`Cut::floor`).
     pub(crate) seqno: Seqno,
+    /// The cut: a component per shard and the excluded seqnos (#717 (b2)).
+    pub(crate) cut: Arc<crate::cut::Cut>,
     pub(crate) view: Arc<View>,
     /// Reader processes only: counted while any clone of this snapshot lives (a drop guard).
     pub(crate) _live: Option<Arc<LiveSnapshot>>,
@@ -1029,9 +1102,25 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The snapshot seqno.
+    /// The snapshot's floor: every commit at or below it is in the snapshot. Commits above
+    /// it may be too (the snapshot is a per-shard cut, #717 (b2)); use
+    /// [`floor`](Self::floor), of which this is the old name.
+    #[deprecated(
+        note = "a snapshot is a per-shard cut; `floor()` is the same value under its meaning"
+    )]
     pub fn seqno(&self) -> Seqno {
         self.seqno
+    }
+
+    /// The highest seqno at or below which every commit is in the snapshot. Monotone across
+    /// snapshots; a safe at-least-once cursor.
+    pub fn floor(&self) -> Seqno {
+        self.seqno
+    }
+
+    /// The cut.
+    pub fn cut(&self) -> &crate::cut::Cut {
+        &self.cut
     }
 
     /// The pinned view.
@@ -1061,6 +1150,7 @@ impl Snapshot {
     pub fn at_seqno(&self, seqno: Seqno) -> Snapshot {
         Snapshot {
             seqno: seqno.min(self.seqno),
+            cut: Arc::new(self.cut.at_most(seqno)),
             view: Arc::clone(&self.view),
             _live: self._live.clone(),
             _pin: self._pin.clone(),

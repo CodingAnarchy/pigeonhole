@@ -91,6 +91,11 @@ pub(crate) struct Hooks {
     /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
     /// (`Engine::before_snapshot_view_load`, #315 review).
     pub before_snapshot_view_load: Once,
+    /// Runs in the next cut (`Inner::cut`) after its first pass (marks and held slots) and
+    /// before its second (the shards' `own` watermarks), and after the second pass's first
+    /// shard (`Engine::after_snapshot_marks`, `Engine::mid_snapshot_own`; #717 (b2)).
+    pub after_snapshot_marks: Once,
+    pub mid_snapshot_own: Once,
     /// Runs in the next unpinned read as of now (`get_latest`, `read_row_latest_into`),
     /// between its first visible-seqno read and its view load
     /// (`Engine::before_latest_view_load`).
@@ -701,6 +706,30 @@ impl Engine {
     #[doc(hidden)]
     pub fn before_snapshot_view_load(&self, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.before_snapshot_view_load.set(f);
+    }
+
+    /// Runs `f` once in the next cut, between its pass over the marks and held slots and its
+    /// pass over the shards' components (#717 (b2); test hook).
+    #[doc(hidden)]
+    pub fn after_snapshot_marks(&self, f: Box<dyn FnOnce() + Send>) {
+        self.inner.shared.hooks.after_snapshot_marks.set(f);
+    }
+
+    /// Runs `f` once in the next cut, after shard 0's component is loaded and before shard
+    /// 1's (#717 (b2); test hook).
+    #[doc(hidden)]
+    pub fn mid_snapshot_own(&self, f: Box<dyn FnOnce() + Send>) {
+        self.inner.shared.hooks.mid_snapshot_own.set(f);
+    }
+
+    /// Cuts taken while a shard held more cross-shard commits than its slots (#717 (b2)).
+    #[doc(hidden)]
+    pub fn overflow_cuts(&self) -> u64 {
+        self.inner
+            .shared
+            .vis
+            .overflow_cuts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Runs `f` once, on the calling thread of the next unpinned read as of now

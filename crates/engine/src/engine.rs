@@ -98,6 +98,10 @@ pub struct CommitInfo {
     pub seqno: Seqno,
     /// The durability level actually applied.
     pub durability: Durability,
+    /// The shard whose component makes the commit visible, or `u16::MAX` for a cross-shard
+    /// commit (#717 (b2) prototype).
+    #[doc(hidden)]
+    pub shard: u16,
 }
 
 /// Counters and latencies.
@@ -372,7 +376,9 @@ const GET_LATEST_TRIES: u32 = 4;
 /// let info = db.commit(wb, None)?;
 ///
 /// let snap = db.snapshot()?;
-/// assert!(snap.seqno() >= info.seqno);
+/// // Read-your-writes: the commit returned, so the snapshot holds it (its floor need not
+/// // reach `info.seqno` while a cross-shard commit is in flight: a snapshot is a cut).
+/// let _ = info;
 /// let cell = db.get(&snap, pages.id, meta, b"com.example/a", b"status")?.unwrap();
 /// assert_eq!(cell.value(), ValueRef::Bytes(b"200"));
 /// let row = db.read_row(&snap, pages.id, b"com.example/a", &ReadSpec::default())?.unwrap();
@@ -812,7 +818,8 @@ impl Engine {
             full_compactions: AtomicUsize::new(0),
             pack_k: AtomicUsize::new(0),
             pack_target: AtomicUsize::new(0),
-            waiters: WatermarkWaiters::new(shards),
+            waiters: WatermarkWaiters::new(shards + 1),
+            vis: crate::cut::Visibility::new(shards),
             durable_waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
@@ -1320,7 +1327,8 @@ impl Engine {
             full_compactions: AtomicUsize::new(0),
             pack_k: AtomicUsize::new(0),
             pack_target: AtomicUsize::new(0),
-            waiters: WatermarkWaiters::new(shards),
+            waiters: WatermarkWaiters::new(shards + 1),
+            vis: crate::cut::Visibility::new(shards),
             durable_waiters: WatermarkWaiters::new(shards),
             visibility: VisibilityCounts::default(),
             shard_died: AtomicBool::new(false),
@@ -1680,12 +1688,19 @@ impl Engine {
         // it sees (#315 review). Otherwise read again; under a steady stream of commits, fall
         // back to a pinned snapshot. (The loop of `Inner::latest_view`, written out: through
         // the helper, a point get measured a few instructions more, #287.)
+        // The cut after a floor read from shared memory, then the view, then the floor
+        // again: unchanged, no flush that published in between had inputs above the floor
+        // (its inputs are at or below the durable watermark at its freeze, at or below the
+        // floor), and the cut's components are at or above the floor, so the flush's GC
+        // kept what a read at the cut sees (#315 review, restated for a cut in
+        // proto-717b.md).
         for _ in 0..GET_LATEST_TRIES {
-            let seqno = inner.shared.shm.visible_seqno();
+            let floor = inner.shared.shm.visible_seqno();
+            let cut = inner.cut();
             #[cfg(feature = "test-hooks")]
             inner.shared.hooks.before_latest_view_load.run();
             let view = inner.shared.view.load();
-            if inner.shared.shm.visible_seqno() != seqno {
+            if inner.shared.shm.visible_seqno() != floor {
                 continue;
             }
             let clock = || inner.shared.vfs.now_micros();
@@ -1693,7 +1708,7 @@ impl Engine {
                 && let Some(hit) = crate::row_cache::get_cached(
                     rc,
                     &view,
-                    seqno,
+                    &cut,
                     clock(),
                     table,
                     family,
@@ -1703,7 +1718,7 @@ impl Engine {
             {
                 return Ok(hit);
             }
-            return get_in::<false>(&view, seqno, clock, table, family, row, qualifier, || {
+            return get_in::<false>(&view, &cut, clock, table, family, row, qualifier, || {
                 Arc::clone(&view)
             });
         }
@@ -1754,7 +1769,7 @@ impl Engine {
         let now = self.inner.shared.vfs.now_micros();
         snapshot.checked(read::read_row_into(
             &snapshot.view,
-            snapshot.seqno,
+            &snapshot.cut,
             table,
             row,
             &families,
@@ -1864,19 +1879,17 @@ impl Engine {
                 }
             }
         }
-        if let Some((view, seqno)) = inner.latest_view() {
+        if let Some((view, cut)) = inner.latest_view() {
             let families = families_in_order(&view, table, families)?;
             let now = inner.shared.vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
                 && crate::row_cache::serves_spec(spec)
             {
                 return crate::row_cache::read_row_cached(
-                    rc, &view, seqno, table, row, &families, spec, now, false, sink,
+                    rc, &view, &cut, table, row, &families, spec, now, false, sink,
                 );
             }
-            return read::read_row_into(
-                &view, seqno, table, row, &families, spec, now, false, sink,
-            );
+            return read::read_row_into(&view, &cut, table, row, &families, spec, now, false, sink);
         }
         let snapshot = inner.snapshot()?;
         self.read_row_into_families(&snapshot, table, row, families, spec, sink)
@@ -1961,7 +1974,13 @@ impl Engine {
             return Err(Error::ReadOnly);
         }
         let _guard = inner.enter_maintenance()?;
-        let snapshot = inner.snapshot_of(durable)?;
+        // A backup copies memtables as they are: at the floor, a global prefix, so no
+        // excluded share is copied (proto-717b.md §2.6; `backup_durable` likewise).
+        let snapshot = inner.snapshot_kind(if durable {
+            SnapshotKind::Durable
+        } else {
+            SnapshotKind::Floor
+        })?;
         crate::maintenance::backup(&inner.shared, snapshot, dest)
     }
 
@@ -3267,44 +3286,70 @@ impl Inner {
         self.role == Role::Reader
     }
 
-    pub(crate) fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, Seqno)> {
+    pub(crate) fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, Arc<crate::cut::Cut>)> {
         for _ in 0..GET_LATEST_TRIES {
-            let seqno = self.shared.shm.visible_seqno();
+            let floor = self.shared.shm.visible_seqno();
+            let cut = self.cut();
             #[cfg(feature = "test-hooks")]
             self.shared.hooks.before_latest_view_load.run();
             let view = self.shared.view.load();
-            if self.shared.shm.visible_seqno() == seqno {
-                return Some((view, seqno));
+            if self.shared.shm.visible_seqno() == floor {
+                return Some((view, Arc::new(cut)));
             }
         }
         None
+    }
+
+    /// A cut as of now (writer process; `cut.rs`), with the test hooks' pauses.
+    pub(crate) fn cut(&self) -> crate::cut::Cut {
+        #[cfg(feature = "test-hooks")]
+        {
+            let hooks = &self.shared.hooks;
+            self.shared.vis.cut(&self.shared.shm, |at| match at {
+                0 => hooks.after_snapshot_marks.run(),
+                _ => hooks.mid_snapshot_own.run(),
+            })
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        self.shared.vis.cut(&self.shared.shm, |_| {})
     }
 
     pub(crate) fn snapshot(&self) -> Result<Snapshot> {
         self.snapshot_of(false)
     }
 
-    /// A snapshot at the visible seqno, or (`durable`) at the durable one (D227, ICR 0037).
+    /// A snapshot at the visible cut, or (`durable`) at the durable seqno (D227, ICR 0037).
     pub(crate) fn snapshot_of(&self, durable: bool) -> Result<Snapshot> {
+        self.snapshot_kind(if durable {
+            SnapshotKind::Durable
+        } else {
+            SnapshotKind::Visible
+        })
+    }
+
+    pub(crate) fn snapshot_kind(&self, kind: SnapshotKind) -> Result<Snapshot> {
         if self.reader.is_some() {
-            return self.reader_snapshot(durable);
+            return self.reader_snapshot(kind == SnapshotKind::Durable);
         }
-        // The seqno is pinned before the view loads (and read under the pin's lock), so a
-        // flush GC that publishes in between keeps what it reads; still seqno before view: a
+        // The cut is pinned before the view loads (and taken under the pin's lock), so a
+        // flush GC that publishes in between keeps what it reads; still cut before view: a
         // seqno is only visible once the view holding its memtables is published.
-        let pin = SeqnoPin::pin_visible(&self.shared.live_seqnos, || {
-            if durable {
-                self.shared.shm.durable_seqno()
-            } else {
-                self.shared.shm.visible_seqno()
+        let shards = self.shared.vis.shards();
+        let pin = SeqnoPin::pin_visible(&self.shared.live_seqnos, || match kind {
+            SnapshotKind::Durable => {
+                crate::cut::Cut::global(self.shared.shm.durable_seqno(), shards)
             }
+            SnapshotKind::Floor => crate::cut::Cut::global(self.shared.shm.visible_seqno(), shards),
+            SnapshotKind::Visible => self.cut(),
         });
         let seqno = pin.seqno();
         #[cfg(feature = "test-hooks")]
         self.shared.hooks.before_snapshot_view_load.run();
         let view = self.shared.view.load_full();
+        pin.set_view(&view);
         Ok(Snapshot {
             seqno,
+            cut: Arc::clone(pin.cut()),
             view,
             _live: None,
             _pin: Some(Arc::new(pin)),
@@ -3321,7 +3366,7 @@ impl Inner {
     ) -> Result<Option<CellData>> {
         snapshot.checked(get_in::<false>(
             &snapshot.view,
-            snapshot.seqno,
+            &snapshot.cut,
             || self.shared.vfs.now_micros(),
             table,
             family,
@@ -3584,6 +3629,7 @@ impl Inner {
                 Ok(Some(view)) => {
                     return Ok(Snapshot {
                         seqno,
+                        cut: Arc::new(crate::cut::Cut::global(seqno, self.shared.vis.shards())),
                         view,
                         _live: Some(live),
                         _pin: None,
@@ -3624,6 +3670,17 @@ const READER_EXPIRED_RETRIES: u32 = 8;
 /// Names no manifest version: a reader's catalog cache after a re-attach.
 const NO_MANIFEST_VERSION: ManifestVersion = ManifestVersion::MAX;
 
+/// Which cut a snapshot takes (`Inner::snapshot_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotKind {
+    /// The per-shard cut (#717 (b2)).
+    Visible,
+    /// The global cut at the floor (a backup).
+    Floor,
+    /// The global cut at the durable seqno (D227, ICR 0037).
+    Durable,
+}
+
 /// Builds a reader's view from the record published in shared memory.
 fn view_from_record(
     shm: &ShmRegion,
@@ -3642,6 +3699,7 @@ fn view_from_record(
             start: t.start.clone(),
             end: t.end.clone(),
             shard: ShardId(t.shard),
+            visible_floor: 0,
         })
         .collect();
     let mut arenas: HashMap<u16, ArenaRegion> = HashMap::new();

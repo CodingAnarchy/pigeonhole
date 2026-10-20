@@ -50,7 +50,7 @@ fn single_shard_commit_and_read() {
     );
     assert_eq!(info.seqno, 1);
     let snap = store.engine.snapshot().unwrap();
-    assert_eq!(snap.seqno(), 1);
+    assert_eq!(snap.floor(), 1);
     let cell = store.get(&snap, b"r", "f", b"q").unwrap().unwrap();
     assert_eq!(cell.value, b"v");
     let info = commit(&mut store, &vfs, &[put("r", "q", b"w")], Durability::None);

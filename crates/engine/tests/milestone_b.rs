@@ -343,7 +343,7 @@ fn close_with_flushes_in_flight_loses_nothing_and_needs_no_replay() {
     assert!(info.clean);
     let store = Store::open_cfg(&vfs, 2, &cfg).unwrap();
     let snap = store.engine.snapshot().unwrap();
-    assert!(snap.seqno() >= last);
+    assert!(snap.floor() >= last);
     let mut rows = 0;
     for t in common::TABLES {
         rows += store

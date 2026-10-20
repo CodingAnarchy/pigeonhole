@@ -319,22 +319,31 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     }
     let (on_a, on_b) = tables.join().unwrap();
     gate.hold(&wal(1));
-    drop(
-        db.submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
-            .unwrap(),
-    );
+    let held = db
+        .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
+        .unwrap();
     while gate.held().is_empty() {
         idle(&mut b);
         thread::park_timeout(Duration::from_millis(1));
     }
+    // Per-shard visibility (#717 (b2)): the single on shard 0 no longer waits behind shard
+    // 1's held cross-shard seqno; it returns at once. The wait that ends with the shard's
+    // death is the cross-shard commit's own.
     let (tx, rx) = mpsc::channel();
     let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
     thread::spawn(move || {
         let _ = tx.send(db2.commit(put(&on_a2, "waits"), Some(Durability::None)));
     });
+    rx.recv_timeout(Duration::from_millis(2000))
+        .expect("the single waited behind another shard's held seqno")
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(held.wait());
+    });
     assert!(
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
-        "visible while shard 1 held the watermark"
+        "the cross-shard commit returned while its sync was held"
     );
     // Dropping the shard syncs its stream, and that sync waits for every older sync of the
     // stream to finish (#179), the held sync included: release it from another thread once
@@ -351,9 +360,13 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
     releaser.join().unwrap();
     let ended = rx
         .recv_timeout(Duration::from_secs(10))
-        .expect("the visibility wait outlived the shard holding it");
-    // Acknowledged by its shard but never visible here: the next open decides (ICR 0038).
-    assert!(matches!(ended, Err(Error::OutcomeUnknown)), "{ended:?}");
+        .expect("the cross-shard commit's wait outlived its coordinator");
+    // Its coordinator died with the commit undecided: aborted, `Closed` (D227); decided but
+    // never visible here, `OutcomeUnknown` (ICR 0038).
+    assert!(
+        matches!(ended, Err(Error::OutcomeUnknown | Error::Closed)),
+        "{ended:?}"
+    );
     // A new commit, even on the live shard, is refused before anything is written.
     let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
     let refused = gate::within(10, move || {

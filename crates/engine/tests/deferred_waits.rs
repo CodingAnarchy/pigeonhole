@@ -560,9 +560,11 @@ fn commit_waits_park_until_their_sync_completes_and_the_driver_is_refused() {
             matches!(waited, Err(Error::WouldDeadlock)),
             "seed {seed}: {waited:?}"
         );
+        // Per-shard visibility (#717 (b2)): shard 0's single is visible once shard 0 applied
+        // it, whatever shard 1 holds; it no longer waits behind the cross-shard seqno.
         assert!(
-            poll(&mut later).is_pending(),
-            "seed {seed}: visible past shard 1's unresolved group"
+            matches!(poll(&mut later), Poll::Ready(Ok(_))),
+            "seed {seed}: a single waited behind shard 1's held seqno"
         );
         assert_eq!(
             rig.sim.io_in_flight(),
@@ -991,24 +993,39 @@ fn a_visibility_wait_ends_with_outcome_unknown_when_the_shard_holding_it_dies_mi
     each_seed(|seed| {
         let mut rig = Rig::open(seed, 2);
         let (on_a, on_b) = rig.tables_on_0_and_1();
-        drop(
-            rig.db
-                .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
-                .unwrap(),
-        );
+        let mut held = rig
+            .db
+            .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
+            .unwrap();
         rig.run();
         assert!(
             rig.dev.in_flight(&wal(1)) > 0,
             "seed {seed}: no sync in flight"
         );
 
+        // Per-shard visibility (#717 (b2)): the single on shard 0 returns once shard 0
+        // applied it; the wait that shard 1's death ends is the cross-shard commit's own.
         let (db, t) = (Arc::clone(&rig.db), Arc::clone(&on_a));
         let waiter =
             rig.spawn_submitter(move || db.commit(put(&t, "waits"), Some(Durability::None)));
-        rig.run();
+        // Running the shards only (no I/O completes: shard 1's sync stays in flight).
+        let mut returned = false;
+        for _ in 0..10_000 {
+            rig.run();
+            if waiter.is_finished() {
+                returned = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
         assert!(
-            !waiter.is_finished(),
-            "seed {seed}: visible past shard 1's group"
+            returned,
+            "seed {seed}: the single waited behind shard 1's held seqno"
+        );
+        waiter.join().unwrap().unwrap();
+        assert!(
+            poll(&mut held).is_pending(),
+            "seed {seed}: the cross-shard commit returned with its sync in flight"
         );
 
         // Shard 1 dies with its group's sync in flight. This thread drops it: its final sync
@@ -1025,9 +1042,12 @@ fn a_visibility_wait_ends_with_outcome_unknown_when_the_shard_holding_it_dies_mi
             "seed {seed}: the drop returned with shard 1's sync in flight"
         );
         rig.sim.complete_all_io();
-        let ended = waiter.join().unwrap();
+        let ended = poll(&mut held);
         assert!(
-            matches!(ended, Err(Error::OutcomeUnknown)),
+            matches!(
+                ended,
+                Poll::Ready(Err(Error::OutcomeUnknown | Error::Closed))
+            ),
             "seed {seed}: {ended:?}"
         );
         // This thread still drives shard 0: `close` cannot wait here.
@@ -1054,14 +1074,13 @@ fn a_visibility_wait_ends_when_the_database_closes_mid_io() {
                 .unwrap(),
         );
         rig.run();
+        // Per-shard visibility (#717 (b2)): the single on shard 0 may already have returned
+        // (it does not wait for shard 1's held seqno); whether it did or the close ends its
+        // wait, it ends with its commit visible or `Closed`, and the close is clean.
         let (db, t) = (Arc::clone(&rig.db), Arc::clone(&on_a));
         let waiter =
             rig.spawn_submitter(move || db.commit(put(&t, "waits"), Some(Durability::None)));
         rig.run();
-        assert!(
-            !waiter.is_finished(),
-            "seed {seed}: visible past shard 1's group"
-        );
         rig.db.close().unwrap();
         rig.close_loop()
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));

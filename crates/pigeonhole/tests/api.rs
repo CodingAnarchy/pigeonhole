@@ -614,7 +614,7 @@ fn snapshots_isolate_reads() {
     let snap = db.snapshot().unwrap();
     t.mutate(b"r").put("a", b"q", b"2").commit().unwrap();
     t.mutate(b"s").put("a", b"q", b"3").commit().unwrap();
-    assert!(db.snapshot().unwrap().seqno() > snap.seqno());
+    assert!(db.snapshot().unwrap().floor() > snap.floor());
     assert_eq!(
         t.get_at(&snap, b"r", "a", b"q").unwrap().unwrap().value(),
         b"1"

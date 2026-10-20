@@ -78,6 +78,12 @@ impl ValuePredicate {
 pub struct ResolveOptions {
     /// Ignore entries with a newer seqno.
     pub snapshot: Seqno,
+    /// Every entry at or below this seqno is visible: `excluded` is tested only above it.
+    /// Defaults to `snapshot`.
+    pub floor: Seqno,
+    /// Seqnos between `floor` and `snapshot` that are not visible (a per-shard cut's
+    /// cross-shard commits in flight, #717 (b2)), sorted.
+    pub excluded: Vec<Seqno>,
     /// Current time in microseconds, for TTL.
     pub now: Timestamp,
     /// Family TTL in microseconds (0 = none).
@@ -121,6 +127,8 @@ impl ResolveOptions {
     pub fn new(snapshot: Seqno, now: Timestamp) -> Self {
         Self {
             snapshot,
+            floor: snapshot,
+            excluded: Vec::new(),
             now,
             ttl_micros: 0,
             versions: 1,
@@ -132,6 +140,13 @@ impl ResolveOptions {
             counter: false,
             skip_columns: false,
         }
+    }
+
+    /// Whether an entry at `seqno` is visible at this read point.
+    #[inline]
+    pub fn visible(&self, seqno: Seqno) -> bool {
+        seqno <= self.snapshot
+            && (seqno <= self.floor || self.excluded.binary_search(&seqno).is_err())
     }
 
     /// Puts a scan's time range where it belongs: pushed down into `filter` for a family
@@ -549,7 +564,7 @@ where
         self.cursor.seek(&self.col)?;
         while self.cursor.valid() && self.cursor.key().starts_with(&self.col) {
             if let Ok((_, ts, seqno, Kind::FamilyDelete)) = split_suffix(self.cursor.key())
-                && seqno <= self.opts.snapshot
+                && self.opts.visible(seqno)
             {
                 raise(&mut self.family_cover, ts);
                 if self.opts.counter {
@@ -876,7 +891,7 @@ where
                     self.note_row_bound();
                 }
                 if kind == Kind::FamilyDelete {
-                    if seqno <= self.opts.snapshot {
+                    if self.opts.visible(seqno) {
                         raise(&mut self.family_cover, ts);
                         if self.opts.counter {
                             self.markers.push((ts, seqno));
@@ -980,7 +995,7 @@ where
                     (seqno, kind)
                 }
             };
-            if seqno <= snapshot && seqno >= floor {
+            if seqno <= snapshot && seqno >= floor && self.opts.visible(seqno) {
                 match kind {
                     Kind::ColumnDelete => {
                         raise(&mut self.col_cover, ts);

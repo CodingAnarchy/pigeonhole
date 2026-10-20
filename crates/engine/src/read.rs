@@ -15,7 +15,7 @@ use pigeonhole_format::key::{
 use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
-use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, Timestamp};
+use pigeonhole_format::{Cursor, FamilyId, TableId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
@@ -249,10 +249,12 @@ impl ReadSpec {
     pub(crate) fn resolve_opts(
         &self,
         meta: &FamilyMeta,
-        snapshot: Seqno,
+        at: crate::cut::ReadPoint<'_>,
         now: Timestamp,
     ) -> (ResolveOptions, ScanFilter) {
-        let mut opts = ResolveOptions::new(snapshot, now);
+        let mut opts = ResolveOptions::new(at.seqno, now);
+        opts.floor = at.floor;
+        opts.excluded = at.excluded.to_vec();
         opts.ttl_micros = meta.options.ttl_micros;
         // Decision D76: the caller folds the family's max_versions in (0 = unlimited).
         opts.versions = match (meta.options.max_versions, self.versions) {
@@ -956,10 +958,13 @@ impl ScanCursor {
             let Some(meta) = view.catalog.family(family) else {
                 continue;
             };
-            let (mut opts, filter) =
-                self.spec
-                    .read
-                    .resolve_opts(meta, self.snapshot.seqno, self.now);
+            let (mut opts, filter) = self.spec.read.resolve_opts(
+                meta,
+                self.snapshot
+                    .cut
+                    .read_point(tablet.shard.0, tablet.visible_floor),
+                self.now,
+            );
             let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
             let mut resolver = take_scan_resolver();
             let filled = view.scan_sources_located::<CACHE_ONLY>(
@@ -1427,7 +1432,7 @@ pub(crate) fn read_row(
     };
     let any = read_row_into(
         &snapshot.view,
-        snapshot.seqno,
+        &snapshot.cut,
         table,
         row,
         families,
@@ -1458,7 +1463,7 @@ thread_local! {
 /// instructions per row).
 pub(crate) fn read_row_into(
     view: &Arc<View>,
-    seqno: Seqno,
+    cut: &crate::cut::Cut,
     table: TableId,
     row: &[u8],
     families: &[FamilyId],
@@ -1476,7 +1481,7 @@ pub(crate) fn read_row_into(
     let read = read_row_with(
         &mut resolver,
         view,
-        seqno,
+        cut,
         table,
         row,
         families,
@@ -1508,7 +1513,7 @@ pub(crate) fn read_row_into(
 fn read_row_with(
     resolver: &mut Resolver,
     view: &Arc<View>,
-    seqno: Seqno,
+    cut: &crate::cut::Cut,
     table: TableId,
     row: &[u8],
     families: &[FamilyId],
@@ -1518,9 +1523,11 @@ fn read_row_with(
     sink: &mut impl RowSink,
     large: &mut bool,
 ) -> Result<bool> {
-    let Some((tablet, shard)) = view.tablets().route(table, row) else {
+    let Some(entry) = view.tablets().route_entry(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
     };
+    let (tablet, shard) = (entry.id, entry.shard);
+    let at = cut.read_point(shard.0, entry.visible_floor);
     // Inline for rows of usual length: the setup allocates nothing per read.
     let prefix = row_prefix(row)?;
     let mut past = prefix.clone();
@@ -1541,7 +1548,7 @@ fn read_row_with(
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
-        let (mut opts, filter) = spec.resolve_opts(meta, seqno, now);
+        let (mut opts, filter) = spec.resolve_opts(meta, at, now);
         let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let cursor = resolver.cursor_mut();
         cursor.sources_mut().clear();
@@ -1681,7 +1688,7 @@ fn point_resolver() -> Resolver {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_in<const CACHE_ONLY: bool>(
     view: &View,
-    seqno: Seqno,
+    cut: &crate::cut::Cut,
     now: impl FnOnce() -> Timestamp,
     table: TableId,
     family: FamilyId,
@@ -1690,9 +1697,8 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
     pin: impl FnOnce() -> Arc<View>,
 ) -> Result<Option<CellData>> {
     let mut run = Some(|resolver: &mut Resolver| {
-        let got = get_with::<CACHE_ONLY>(
-            resolver, view, seqno, now, table, family, row, qualifier, pin,
-        );
+        let got =
+            get_with::<CACHE_ONLY>(resolver, view, cut, now, table, family, row, qualifier, pin);
         // Whatever happened, the sources (each pins its memtable or SST) and the options
         // (merge operator, blob reader) go now; only the allocations stay.
         let cursor = resolver.cursor_mut();
@@ -1741,8 +1747,12 @@ fn skips_columns(sources: &[Source]) -> bool {
 
 /// A point get's resolver options: as `ReadSpec { versions: 1, .. }.resolve_opts`, built
 /// directly (no spec, filter or time range to make and drop on every get).
-fn point_opts(meta: &FamilyMeta, seqno: Seqno, now: Timestamp) -> ResolveOptions {
-    let mut opts = ResolveOptions::new(seqno, now);
+fn point_opts(meta: &FamilyMeta, at: crate::cut::ReadPoint<'_>, now: Timestamp) -> ResolveOptions {
+    let mut opts = ResolveOptions::new(at.seqno, now);
+    opts.floor = at.floor;
+    if !at.excluded.is_empty() {
+        opts.excluded = at.excluded.to_vec();
+    }
     opts.ttl_micros = meta.options.ttl_micros;
     // `versions: 1` folded with the family's `max_versions` (0 = unlimited): always 1.
     opts.versions = 1;
@@ -1763,7 +1773,7 @@ enum Resolved {
 fn get_with<const CACHE_ONLY: bool>(
     resolver: &mut Resolver,
     view: &View,
-    seqno: Seqno,
+    cut: &crate::cut::Cut,
     now: impl FnOnce() -> Timestamp,
     table: TableId,
     family: FamilyId,
@@ -1771,9 +1781,11 @@ fn get_with<const CACHE_ONLY: bool>(
     qualifier: &[u8],
     pin: impl FnOnce() -> Arc<View>,
 ) -> Result<Option<CellData>> {
-    let Some((tablet, shard)) = view.tablets().route(table, row) else {
+    let Some(entry) = view.tablets().route_entry(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
     };
+    let (tablet, shard) = (entry.id, entry.shard);
+    let at = cut.read_point(shard.0, entry.visible_floor);
     let Some(meta) = view.catalog.family(family) else {
         return Err(Error::FamilyNotFound(format!("family {}", family.0)));
     };
@@ -1795,7 +1807,7 @@ fn get_with<const CACHE_ONLY: bool>(
     } else {
         now()
     };
-    let mut opts = point_opts(meta, seqno, now);
+    let mut opts = point_opts(meta, at, now);
     let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
     resolver.cursor_mut().reset();
     resolver.reset(opts);

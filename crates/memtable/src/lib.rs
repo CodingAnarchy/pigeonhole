@@ -1095,6 +1095,13 @@ impl MemtableReader {
         self.len() == 0
     }
 
+    /// The largest seqno inserted so far (0 when empty).
+    pub fn max_seqno(&self) -> Seqno {
+        self.region
+            .mem
+            .load_u64(self.root as usize + layout::H_MAX_SEQNO, Ordering::Acquire)
+    }
+
     /// A cursor, initially unpositioned. Holds its own clone of the reader, so it can be
     /// stored beside the view that keeps the arena memory alive.
     pub fn iter(&self) -> MemIter {

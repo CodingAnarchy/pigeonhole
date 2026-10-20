@@ -540,13 +540,13 @@ fn wait_body(
         // No spin: exactly the parking wait.
         let Settled { info, batch } = wait_reply(shared, waiter)?;
         recycle(batch);
-        wait_visible(shared, info.seqno)?;
+        wait_visible(shared, info.shard, info.seqno)?;
         return Ok(info);
     }
     let mut spin = SpinWait::new(window);
     let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
     recycle(batch);
-    wait_visible_spinning(shared, info.seqno, &mut spin)?;
+    wait_visible_spinning(shared, info.shard, info.seqno, &mut spin)?;
     Ok(info)
 }
 
@@ -747,16 +747,17 @@ fn wait_reply_spinning<T: Send>(
 /// shard died): the commit was acknowledged by its shard, but never became visible here.
 pub(crate) fn wait_visible(
     shared: &crate::shard::Shared,
+    shard: u16,
     seqno: pigeonhole_format::Seqno,
 ) -> crate::Result<()> {
-    if shared.shm.visible_seqno() >= seqno {
+    if shared.vis.visible_now(shard, seqno) {
         return Ok(());
     }
     if shared.drivers.current_drives() {
         return Err(Error::WouldDeadlock);
     }
     let waker = crate::waker::thread_waker();
-    while !shared.wait_visible(seqno, &waker) {
+    while !shared.wait_visible(shard, seqno, &waker) {
         if shared.visibility_ended() {
             return Err(Error::OutcomeUnknown);
         }
@@ -768,20 +769,21 @@ pub(crate) fn wait_visible(
 /// [`wait_visible`], polling first for what is left of `spin`'s window.
 fn wait_visible_spinning(
     shared: &crate::shard::Shared,
+    shard: u16,
     seqno: pigeonhole_format::Seqno,
     spin: &mut SpinWait,
 ) -> crate::Result<()> {
-    if shared.shm.visible_seqno() >= seqno {
+    if shared.vis.visible_now(shard, seqno) {
         return Ok(());
     }
     if shared.drivers.current_drives() {
         return Err(Error::WouldDeadlock);
     }
-    if spin.poll(|| shared.shm.visible_seqno() >= seqno) {
+    if spin.poll(|| shared.vis.visible_now(shard, seqno)) {
         return Ok(());
     }
     let waker = crate::waker::thread_waker();
-    while !shared.wait_visible(seqno, &waker) {
+    while !shared.wait_visible(shard, seqno, &waker) {
         if shared.visibility_ended() {
             return Err(Error::OutcomeUnknown);
         }
@@ -853,7 +855,11 @@ impl Future for PendingCommit {
         // Durable and applied on its shard; another shard's in-flight group may still hold
         // the global watermark below it (D19). The shards wake registered waiters when they
         // publish a watermark, so this never spins.
-        if this.sub.shared.wait_visible(info.seqno, cx.waker()) {
+        if this
+            .sub
+            .shared
+            .wait_visible(info.shard, info.seqno, cx.waker())
+        {
             Poll::Ready(Ok(info))
         } else if this.sub.shared.visibility_ended() {
             Poll::Ready(Err(Error::OutcomeUnknown))
@@ -889,7 +895,7 @@ impl PendingCheck {
         }
         let (applied, info) = wait_reply(&self.shared, &mut self.waiter)?;
         if let Some(info) = info {
-            wait_visible(&self.shared, info.seqno)?;
+            wait_visible(&self.shared, info.shard, info.seqno)?;
         }
         Ok((applied, info))
     }
@@ -956,7 +962,7 @@ impl Future for PendingCheck {
         let Some(info) = outcome.1 else {
             return Poll::Ready(Ok(outcome));
         };
-        if this.shared.wait_visible(info.seqno, cx.waker()) {
+        if this.shared.wait_visible(info.shard, info.seqno, cx.waker()) {
             Poll::Ready(Ok(outcome))
         } else if this.shared.visibility_ended() {
             Poll::Ready(Err(Error::OutcomeUnknown))
@@ -984,7 +990,9 @@ pub(crate) struct ReadKey {
 /// pointer-sized `None`.
 #[derive(Debug, Clone)]
 pub(crate) struct Validate {
-    pub seqno: pigeonhole_format::Seqno,
+    /// The snapshot's cut: a participant validates its reads against its own component and
+    /// the excluded seqnos (#717 (b2)).
+    pub cut: Arc<crate::cut::Cut>,
     pub reads: Vec<ReadKey>,
     /// Never read: held so the seqno stays in `LiveSeqnos`. `None` only for a snapshot that
     /// pins no seqno (a reader process's, which has no transactions).
@@ -995,7 +1003,7 @@ impl Validate {
     /// Takes the snapshot's seqno pin and drops the rest of it (its view).
     pub(crate) fn boxed(snapshot: Snapshot, reads: Vec<ReadKey>) -> Box<Self> {
         Box::new(Self {
-            seqno: snapshot.seqno,
+            cut: Arc::clone(&snapshot.cut),
             reads,
             _pin: snapshot._pin.clone(),
         })
