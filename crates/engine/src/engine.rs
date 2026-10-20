@@ -228,12 +228,14 @@ pub struct CrossShardMetrics {
     pub rounds: u64,
     /// Rounds that a participant refused.
     pub refused_rounds: u64,
-    /// PREPAREs refused because the commit timestamp was out of seqno order with a write
-    /// the participant had already made: above one at a later seqno, or below one at an
-    /// earlier seqno (D11, D244, D245). With tablet changes on or off.
+    /// Always 0 since D263: a PREPARE carries no timestamp, so none is refused for its
+    /// order with the participant's writes (D11, D244, D245 before it). Removed at the 1.0
+    /// API freeze.
+    #[deprecated(note = "always 0 since D263; removed at the 1.0 API freeze")]
     pub refused_below_floor: u64,
-    /// PREPAREs refused because the commit timestamp was below the floor a tablet move
-    /// raised the participant to (D11), though not below the participant's own.
+    /// Always 0 since D263: a PREPARE carries no timestamp, so none is refused below a
+    /// tablet move's raise (D11 before it). Removed at the 1.0 API freeze.
+    #[deprecated(note = "always 0 since D263; removed at the 1.0 API freeze")]
     pub refused_move_raise: u64,
     /// PREPAREs refused because a row's tablet was being split, merged or moved, or had
     /// moved to another shard (D145).
@@ -2223,8 +2225,6 @@ impl Engine {
             x.rounds += s.cross.rounds.load(Ordering::Relaxed);
             x.refused_rounds += s.cross.refused_rounds.load(Ordering::Relaxed);
             let refused = |r: CrossRefusal| s.cross.refused[r as usize].load(Ordering::Relaxed);
-            x.refused_below_floor += refused(CrossRefusal::BelowFloor);
-            x.refused_move_raise += refused(CrossRefusal::MoveRaise);
             x.refused_moved += refused(CrossRefusal::Moved);
             x.refused_room += refused(CrossRefusal::Room);
             x.refused_pending_overlap += refused(CrossRefusal::PendingOverlap);

@@ -3101,6 +3101,7 @@ fn a_bottommost_compaction_counts_a_prepared_share_above_its_inputs() {
 }
 
 #[test]
+#[allow(deprecated)] // the D263-deprecated refusal counters stay 0
 fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
     // Issue #105: a coordinator picks a cross-shard commit's timestamp above the floors it
     // reads, but a participant may assign higher default timestamps before the PREPARE
@@ -3982,6 +3983,7 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
 }
 
 #[test]
+#[allow(deprecated)] // the D263-deprecated refusal counters stay 0
 fn a_cross_shard_commit_no_participant_refuses_counts_one_round() {
     // ICR 0043: `Metrics::cross_shard` counts the coordinator's decided rounds, and only
     // refused ones as refused.
@@ -4933,6 +4935,7 @@ fn a_prepare_routed_with_an_older_map_runs_when_none_of_its_rows_moved() {
 }
 
 #[test]
+#[allow(deprecated)] // the D263-deprecated refusal counters stay 0
 fn a_commit_refused_many_times_before_the_timeout_still_commits() {
     // As below, but other tablet changes complete many times while the split waits: each
     // one retries the commit, and shard 0 refuses it again. It used to
@@ -5990,7 +5993,7 @@ fn a_younger_commit_refused_behind_an_older_one_waits_for_the_older_ones_next_at
 }
 
 /// Seconds a cross-shard commit takes whose first `aborts` rounds the participant refuses
-/// below its floor (`refuse_prepares`), on a two-shard store whose refusing shard first logs
+/// (`refuse_prepares`, as overlapping an undecided share), on a two-shard store whose refusing shard first logs
 /// `backlog` single-shard commits that its checkpoint cannot pass (nothing flushes).
 fn refused_rounds_secs(backlog: usize, aborts: usize) -> f64 {
     let mut db = open(2, |o| {
@@ -6014,7 +6017,7 @@ fn refused_rounds_secs(backlog: usize, aborts: usize) -> f64 {
     }
     // One cross-shard commit coordinated by `high` (`x` first), which refuses its own first
     // `aborts` PREPAREs: each round aborts with no record of it in `high`'s log, the case
-    // the scan read to its end, and the coordinator retries at once.
+    // the scan read to its end, and the coordinator retries on the abort's wake.
     db.engine.refuse_prepares(usize::from(high), aborts as u64);
     let mut wb = WriteBatch::new();
     wb.put(id, f, b"x", b"q", None, ValueRef::Bytes(b"v"))
@@ -6024,7 +6027,7 @@ fn refused_rounds_secs(backlog: usize, aborts: usize) -> f64 {
     let start = std::time::Instant::now();
     db.commit(wb);
     let secs = start.elapsed().as_secs_f64();
-    let refused = db.engine.metrics().cross_shard.refused_below_floor;
+    let refused = db.engine.metrics().cross_shard.refused_pending_overlap;
     assert!(
         refused >= aborts as u64,
         "only {refused} of {aborts} rounds were refused"

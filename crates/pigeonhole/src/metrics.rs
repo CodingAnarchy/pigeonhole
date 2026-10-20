@@ -184,12 +184,13 @@ pub struct CrossShardMetrics {
     /// Of those, rounds a participant refused. `rounds - refused_rounds` counts the rounds
     /// that committed, or failed for another reason (a conflict, an I/O error).
     pub refused_rounds: u64,
-    /// PREPAREs refused because the commit timestamp was out of order with a write the
-    /// participant had already made (a later write at a lower timestamp, or an earlier one at
-    /// a higher timestamp). The commit is retried with a fresh timestamp.
+    /// Always 0 since 0.4.0: a cross-shard PREPARE carries no timestamp, so none is refused
+    /// for being out of order with the participant's writes. Removed at 1.0.
+    #[deprecated(note = "always 0 since 0.4.0; removed at 1.0")]
     pub refused_below_floor: u64,
-    /// PREPAREs refused because the commit timestamp was below the floor a tablet move
-    /// raised the participant to.
+    /// Always 0 since 0.4.0: a cross-shard PREPARE carries no timestamp, so none is refused
+    /// below a tablet move's raise. Removed at 1.0.
+    #[deprecated(note = "always 0 since 0.4.0; removed at 1.0")]
     pub refused_move_raise: u64,
     /// PREPAREs refused because a row's tablet was being split, merged or moved.
     pub refused_moved: u64,
@@ -207,6 +208,8 @@ pub struct CrossShardMetrics {
     pub share_wait_nanos: u64,
 }
 
+// The deprecated cross-shard refusal counters are always 0 (D263).
+#[allow(deprecated)]
 impl From<pigeonhole_engine::Metrics> for EngineMetrics {
     fn from(m: pigeonhole_engine::Metrics) -> Self {
         let x = m.cross_shard;
@@ -256,8 +259,8 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             cross_shard: CrossShardMetrics {
                 rounds: x.rounds,
                 refused_rounds: x.refused_rounds,
-                refused_below_floor: x.refused_below_floor,
-                refused_move_raise: x.refused_move_raise,
+                refused_below_floor: 0,
+                refused_move_raise: 0,
                 refused_moved: x.refused_moved,
                 refused_room: x.refused_room,
                 refused_pending_overlap: x.refused_pending_overlap,
