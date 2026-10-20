@@ -3135,6 +3135,7 @@ impl ShardState {
         self.cross_seqnos.clear();
         self.asked.clear();
         self.unreported.clear();
+        self.report_cursor = None;
         self.unreported_slots.clear();
         self.unreported_unslotted = 0;
         self.share_reports.clear();
@@ -7236,32 +7237,34 @@ impl ShardState {
             "shard {}: unreported slot counts drifted",
             self.id.0
         );
-        let mut i = match self.report_cursor {
-            // A scan in progress continues from its cursor (#763).
-            Some(i) => i,
-            None => {
-                let moved = unreported_slots_moved(&mut self.unreported_slots, |s| match catalog {
-                    Some(c) => c.flushed_through(s.0, s.1),
-                    None if self.dropped.contains(&s.0) => None,
-                    None => Some(self.flushed.get(s).copied().unwrap_or(0)),
-                });
-                if !moved && self.unreported_unslotted == 0 {
-                    trace!(
-                        "shard {} report skipped: slots {:?} unreported {}",
-                        self.id.0,
-                        self.unreported_slots,
-                        self.unreported.len()
-                    );
-                    self.send_settled(ctx);
-                    return;
-                }
+        // Checked on every call, a pass in progress included: a flush landing mid-pass makes
+        // shares before the cursor reportable, and nothing else would look at them again on
+        // a store that then goes quiet (#763's review), so a moved slot restarts the pass.
+        let moved = unreported_slots_moved(&mut self.unreported_slots, |s| match catalog {
+            Some(c) => c.flushed_through(s.0, s.1),
+            None if self.dropped.contains(&s.0) => None,
+            None => Some(self.flushed.get(s).copied().unwrap_or(0)),
+        });
+        let mut i = match (moved, self.report_cursor) {
+            (true, _) => 0,
+            // A pass in progress continues from its cursor (#763).
+            (false, Some(i)) => i,
+            (false, None) if self.unreported_unslotted > 0 => 0,
+            (false, None) => {
                 trace!(
-                    "shard {} report shares: flushed={:?} unreported={:?}",
-                    self.id.0, self.flushed, self.unreported
+                    "shard {} report skipped: slots {:?} unreported {}",
+                    self.id.0,
+                    self.unreported_slots,
+                    self.unreported.len()
                 );
-                0
+                self.send_settled(ctx);
+                return;
             }
         };
+        trace!(
+            "shard {} report shares from {i}: flushed={:?} unreported={:?}",
+            self.id.0, self.flushed, self.unreported
+        );
         // Ordered, so the sends keep a seed replay's message order.
         let mut out: BTreeMap<ShardId, Vec<Seqno>> = BTreeMap::new();
         while i < self.unreported.len() {

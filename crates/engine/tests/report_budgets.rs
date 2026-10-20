@@ -84,7 +84,19 @@ fn open(seed: u64) -> Opened {
 }
 
 fn commit_cross(db: &Engine, shards: &mut [EngineShard], c0: &TableInfo, p: &TableInfo, n: u32) {
-    for i in 0..n {
+    commit_cross_from(db, shards, c0, p, 0, n);
+}
+
+/// `n` cross-shard commits on rows `from..from + n`.
+fn commit_cross_from(
+    db: &Engine,
+    shards: &mut [EngineShard],
+    c0: &TableInfo,
+    p: &TableInfo,
+    from: u32,
+    n: u32,
+) {
+    for i in from..from + n {
         let row = i.to_be_bytes();
         let mut wb = WriteBatch::new();
         wb.put(
@@ -175,5 +187,59 @@ fn a_flush_of_thousands_of_shares_reports_them_in_chunks() {
         (3..=6).contains(&msgs),
         "{msgs} report messages for {seqnos} shares scanned in chunks of {REPORT_SCAN_BUDGET}"
     );
+    db.close().unwrap();
+}
+
+/// #763's review: a flush that lands while a pass is in progress makes shares *before* the
+/// cursor reportable (the pass's swap-removes brought them forward, and they were not in SSTs
+/// when the pass examined them). On a store that then goes quiet, nothing else looks at them,
+/// so the pass must restart when a slot moved mid-pass. Here the first flush's pass runs 20
+/// chunks; more commits land during it, a second flush covers them, and the store goes quiet.
+#[test]
+fn a_flush_landing_mid_pass_reports_the_shares_before_the_cursor() {
+    const COMMITS: u32 = 60_000;
+    const LATE: u32 = 4;
+    let (_vfs, db, mut shards, c0, p) = open(7633);
+    commit_cross(&db, &mut shards, &c0, &p, COMMITS);
+
+    // Flush A: drive it only until shard 2's pass has run its first chunk.
+    let mut flush_a = db.submit_flush().unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut chunked = false;
+    for _ in 0..1_000_000 {
+        for s in shards.iter_mut() {
+            s.run_once(u64::MAX);
+        }
+        if db.max_report_scan_per_batch(2) >= REPORT_SCAN_BUDGET {
+            chunked = true;
+            break;
+        }
+        assert!(
+            Pin::new(&mut flush_a).poll(&mut cx).is_pending(),
+            "the flush resolved before the pass ran a chunk"
+        );
+    }
+    assert!(chunked, "the pass never ran a chunk");
+
+    // Late commits, driven to completion while the pass continues (60 chunks against the
+    // few batches these take): their shares append, and the pass's swap-removes bring them
+    // before the cursor, not in SSTs yet. Flush B then puts them in SSTs, still mid-pass.
+    commit_cross_from(&db, &mut shards, &c0, &p, COMMITS, LATE);
+    let (_, reported) = db.share_reports(0);
+    assert!(
+        reported < u64::from(COMMITS),
+        "the first pass had reported everything ({reported}) before the second flush: the test's timing premise failed"
+    );
+    let flush_b = db.submit_flush().unwrap();
+    drive(&mut shards, flush_b).unwrap();
+    drive(&mut shards, flush_a).unwrap();
+    settle(&mut shards);
+
+    // Every share reported and every PREPARE and COMMIT checkpointed, with no further
+    // manifest commit to prompt another pass.
+    let logged: Vec<_> = (0..3).map(|s| db.logged_records(s)).collect();
+    assert_eq!(logged, vec![0; 3], "records the checkpoints never passed");
+    let (_, seqnos) = db.share_reports(0);
+    assert_eq!(seqnos, u64::from(COMMITS + LATE));
     db.close().unwrap();
 }
