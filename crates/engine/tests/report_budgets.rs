@@ -247,7 +247,13 @@ fn a_flush_landing_mid_pass_reports_the_shares_before_the_cursor() {
     // manifest commit to prompt another pass.
     let logged: Vec<_> = (0..3).map(|s| db.logged_records(s)).collect();
     assert_eq!(logged, vec![0; 3], "records the checkpoints never passed");
-    let (_, seqnos) = db.share_reports(0);
+    // The restart sent what the first pass had found before flush B landed (the chunks before
+    // the restart), then the new pass sent the rest: two messages, not one held to the end.
+    let (msgs, seqnos) = db.share_reports(0);
     assert_eq!(seqnos, u64::from(COMMITS + LATE));
+    assert!(
+        msgs >= 2,
+        "{msgs} report messages: the restart did not send the reports the pass held"
+    );
     db.close().unwrap();
 }

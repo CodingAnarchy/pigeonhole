@@ -133,6 +133,12 @@ const CHECKPOINT_POP_BUDGET: usize = 64;
 /// per report run (D254), not one per batch.
 const SETTLE_BUDGET: usize = 64;
 
+/// A settle run that reports keep extending (a flush on every shard reports to this
+/// coordinator while it works through the last report) still sends every this many budgets:
+/// about 1024 settles per message, as a report pass's chunk, so a run cannot hold its
+/// participants' settles indefinitely (#765's review).
+const SETTLE_SEND_EVERY: u32 = 16;
+
 /// How many unreported shares a report scan (`report_shares_flushed`) examines in one batch
 /// while open (#763): the scan after a flush covers every share applied since the last one,
 /// 30-50K on the AX102's cross-shard row, 1-3 ms inside the flushing shard's turn. The rest
@@ -2501,6 +2507,8 @@ pub(crate) struct ShardState {
     reports_pending: VecDeque<Seqno>,
     /// Seqnos `settle_reports` settled in this batch (`end_batch` resets it).
     settled_in_batch: usize,
+    /// Budgets the current settle run has used since it last sent (`SETTLE_SEND_EVERY`).
+    settle_slices: u32,
     /// A report scan in progress: the next `unreported` index to examine; `None` when no
     /// scan is under way (#763).
     report_cursor: Option<usize>,
@@ -2831,6 +2839,7 @@ impl ShardState {
             continuations: Continuations::default(),
             reports_pending: VecDeque::new(),
             settled_in_batch: 0,
+            settle_slices: 0,
             report_cursor: None,
             scanned_in_batch: 0,
             report_out: BTreeMap::new(),
@@ -7169,9 +7178,11 @@ impl ShardState {
     /// `SETTLE_BUDGET` seqnos per batch while the shard is open; the rest wait for the
     /// kicked batches (#763). A closing shard settles them all.
     fn settle_reports(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let mut cut_short = false;
         while let Some(&seqno) = self.reports_pending.front() {
             if self.settled_in_batch >= SETTLE_BUDGET && !self.closing {
                 self.continuations.set(Continuations::SETTLE);
+                cut_short = true;
                 break;
             }
             self.reports_pending.pop_front();
@@ -7181,7 +7192,17 @@ impl ShardState {
             self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
             self.settle_if_done(seqno);
         }
-        self.send_settled(ctx);
+        if cut_short {
+            self.settle_slices += 1;
+            if self.settle_slices >= SETTLE_SEND_EVERY {
+                // A run that reports keep extending still sends (#765's review).
+                self.settle_slices = 0;
+                self.send_settled_now(ctx);
+            }
+        } else {
+            self.settle_slices = 0;
+            self.send_settled(ctx);
+        }
     }
 
     /// Counts a handled `SharesFlushed` or `CommitsSettled` and its seqnos (test hook).
@@ -7196,9 +7217,18 @@ impl ShardState {
     /// one `CommitsSettled` (D254). Every caller of `settle_if_done` calls this once its loop
     /// is done; `end_batch` checks that (debug) and sends anything left.
     fn send_settled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
-        // A settle run cut short by its budget sends once it ends: a message per batch was
-        // one `CommitsSettled` per participant per 64 seqnos (#763), where D254 has one per run.
-        if self.settle_out.is_empty() || self.continuations.due(Continuations::SETTLE) {
+        // A settle run cut short by its budget sends once it ends (or every
+        // `SETTLE_SEND_EVERY` budgets): a message per batch was one `CommitsSettled` per
+        // participant per 64 seqnos (#763), where D254 has one per run.
+        if self.continuations.due(Continuations::SETTLE) {
+            return;
+        }
+        self.send_settled_now(ctx);
+    }
+
+    /// `send_settled` whatever the settle run's state.
+    fn send_settled_now(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.settle_out.is_empty() {
             return;
         }
         for (p, seqnos) in std::mem::take(&mut self.settle_out) {
@@ -7260,7 +7290,13 @@ impl ShardState {
             None => Some(self.flushed.get(s).copied().unwrap_or(0)),
         });
         let mut i = match (moved, self.report_cursor) {
-            (true, _) => 0,
+            (true, Some(_)) => {
+                // A restart mid-pass sends what the pass found so far: restarts that keep
+                // coming (a flush per batch) would otherwise hold the reports (#765's review).
+                self.send_report_out(ctx);
+                0
+            }
+            (true, None) => 0,
             // A pass in progress continues from its cursor (#763).
             (false, Some(i)) => i,
             (false, None) if self.unreported_unslotted > 0 => 0,
@@ -7321,11 +7357,16 @@ impl ShardState {
         self.report_cursor = (i < self.unreported.len()).then_some(i);
         if self.report_cursor.is_none() {
             // The pass is done: one message per coordinator for everything it found (D254).
-            for (coordinator, seqnos) in std::mem::take(&mut self.report_out) {
-                self.send(coordinator, ShardMsg::SharesFlushed { seqnos }, ctx);
-            }
+            self.send_report_out(ctx);
         }
         self.send_settled(ctx);
+    }
+
+    /// Sends the shares the report pass found so far, one `SharesFlushed` per coordinator.
+    fn send_report_out(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        for (coordinator, seqnos) in std::mem::take(&mut self.report_out) {
+            self.send(coordinator, ShardMsg::SharesFlushed { seqnos }, ctx);
+        }
     }
 
     /// Pops the unneeded records from the front of the log, at most
