@@ -187,6 +187,10 @@ pub(crate) struct ShardCounters {
     /// Records in the shard's log (those its checkpoint has not passed) after its last
     /// batch (`Engine::logged_records`, D254).
     pub logged: AtomicU64,
+    /// Spans the shard added to `commit_inflight_nanos` (`ShardMetrics::count_inflight`):
+    /// one per commit it replied to and one per share it decided for another coordinator
+    /// (D257, D262), `Engine::inflight_counts`.
+    pub inflight_counts: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -953,6 +957,17 @@ impl Engine {
             h.report_msgs.load(Ordering::Relaxed),
             h.report_seqnos.load(Ordering::Relaxed),
         )
+    }
+
+    /// How many spans shard `shard` added to its commits' in-flight time: one per commit it
+    /// replied to (D257) and one per share it decided for another shard's coordination
+    /// (D262); its own share counts nothing at the decision. Test hook.
+    #[doc(hidden)]
+    pub fn inflight_counts(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .inflight_counts
+            .load(Ordering::Relaxed)
     }
 
     /// The records shard `shard`'s checkpoint has not passed yet, as of its last batch: a

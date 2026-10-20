@@ -243,6 +243,8 @@ impl ShardMetrics {
     fn count_inflight(&self, nanos: u64) {
         self.commit_inflight_nanos
             .fetch_add(nanos, Ordering::Relaxed);
+        #[cfg(feature = "test-hooks")]
+        self.hooks.inflight_counts.fetch_add(1, Ordering::Relaxed);
     }
 }
 

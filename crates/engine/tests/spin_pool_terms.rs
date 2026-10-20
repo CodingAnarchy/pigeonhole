@@ -196,12 +196,16 @@ fn one_clients_cross_shard_commits_count_at_the_coordinator_and_the_participant(
         "the participant's rounds end at the decision, before the coordinator's reply: {counted:?}"
     );
     // The coordinator prepares its own share too and must not count it at the decision on
-    // top of its reply: the reply follows the decision by one hop and the settle (the reply
-    // spans read about 1.1× the decision spans), while a coordinator counting both reads
-    // about 2×.
-    assert!(
-        counted[0] * 2 < counted[1] * 3,
-        "the coordinator counted its own share at the decision on top of its reply: {counted:?}"
+    // top of its reply: it adds one span per round (its reply), as the participant does (its
+    // decision); counting its own share too would double its spans. Counts, not a ratio of
+    // the nanos: the reply hop's share of a round varies by platform (1.1× the decision span
+    // on the Linux runners, 1.7× on the macOS one).
+    let counts: Vec<u64> = (0..2).map(|s| db.inflight_counts(s)).collect();
+    assert_eq!(
+        counts[0], counts[1],
+        "the coordinator added {} spans and the participant {}: one per round each, or the \
+         coordinator counted its own share at the decision on top of its reply",
+        counts[0], counts[1]
     );
     assert!(
         store_inflight <= 2.1,
