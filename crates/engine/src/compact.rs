@@ -479,7 +479,7 @@ pub(crate) struct CompactionWork {
     pub guard: Option<Arc<crate::purge_guard::PurgeGuard>>,
     /// Test hook (`Engine::hold_compactions`): held before the first slice, then released.
     #[cfg(feature = "test-hooks")]
-    hold: (bool, bool),
+    hold: (Option<u64>, bool),
     stage: Stage,
     waker: StdWaker,
     started: u64,
@@ -547,7 +547,7 @@ impl CompactionWork {
             record,
             guard: None,
             #[cfg(feature = "test-hooks")]
-            hold: (false, false),
+            hold: (None, false),
             stage: Stage::Run,
             waker: StdWaker::default(),
             started,
@@ -919,13 +919,27 @@ impl Task for CompactionWork {
                             .compaction_held
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if self.hold.0 && held.is_none() {
-                            // Released.
-                            self.hold.1 = true;
-                        } else {
-                            *held = Some(waker.clone());
-                            self.hold.0 = true;
-                            return TaskPoll::Blocked;
+                        match self.hold.0 {
+                            // Released: its waker was taken.
+                            Some(id) if !held.iter().any(|(h, _)| *h == id) => {
+                                self.hold.1 = true;
+                            }
+                            Some(id) => {
+                                if let Some(e) = held.iter_mut().find(|(h, _)| *h == id) {
+                                    e.1 = waker.clone();
+                                }
+                                return TaskPoll::Blocked;
+                            }
+                            None => {
+                                let id = self
+                                    .shared
+                                    .hooks
+                                    .compaction_hold_ids
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                held.push((id, waker.clone()));
+                                self.hold.0 = Some(id);
+                                return TaskPoll::Blocked;
+                            }
                         }
                     }
                     // A write voided the purge (#316): the commit would be refused, so stop

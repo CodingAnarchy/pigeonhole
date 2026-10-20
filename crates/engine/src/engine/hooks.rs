@@ -109,9 +109,11 @@ pub(crate) struct Hooks {
     pub manifest_park: AtomicBool,
     pub manifest_parked: Mutex<Option<TaskWaker>>,
     /// Holds each compaction job before its first slice (`Engine::hold_compactions`), and
-    /// the held job's waker (`Engine::release_held_compaction` takes it to let it run).
+    /// the held jobs' ids and wakers, oldest first (`Engine::release_held_compaction` takes
+    /// one to let it run; clearing the hold takes them all).
     pub compaction_hold: AtomicBool,
-    pub compaction_held: Mutex<Option<TaskWaker>>,
+    pub compaction_held: Mutex<Vec<(u64, TaskWaker)>>,
+    pub compaction_hold_ids: AtomicU64,
     /// Refuses batches of only `WalCheckpoint` edits as `NoSpace`, as a snapshot rewrite
     /// that finds no space does (`Engine::refuse_checkpoints`).
     pub refuse_checkpoints: AtomicBool,
@@ -1193,22 +1195,31 @@ impl Engine {
         let hooks = &self.inner.shared.hooks;
         hooks.compaction_hold.store(hold, Ordering::Release);
         if !hold {
-            self.release_held_compaction();
+            let held = std::mem::take(
+                &mut *hooks
+                    .compaction_held
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            for (_, w) in held {
+                w.wake();
+            }
         }
     }
 
-    /// Lets the held compaction job run (test hook).
+    /// Lets the oldest held compaction job run (test hook).
     #[doc(hidden)]
     pub fn release_held_compaction(&self) {
-        let held = self
+        let mut held = self
             .inner
             .shared
             .hooks
             .compaction_held
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(w) = held {
+            .unwrap_or_else(PoisonError::into_inner);
+        let first = (!held.is_empty()).then(|| held.remove(0));
+        drop(held);
+        if let Some((_, w)) = first {
             w.wake();
         }
     }
@@ -1216,13 +1227,14 @@ impl Engine {
     /// Whether a compaction job is held before its first slice (test hook).
     #[doc(hidden)]
     pub fn compaction_held(&self) -> bool {
-        self.inner
+        !self
+            .inner
             .shared
             .hooks
             .compaction_held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
+            .is_empty()
     }
 
     /// Threads that parked waiting for the manifest writer (`commit_req_from_thread`):
