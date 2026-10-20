@@ -4400,8 +4400,12 @@ impl ShardState {
             return Ok(false);
         }
         // Above the transaction's component for this shard, or applied but excluded by its
-        // cut (a cross-shard share in flight when it read): not seen, so a conflict.
-        let at = cut.read_point(shard.0, entry.visible_floor);
+        // cut (a cross-shard share in flight when it read): not seen, so a conflict. The
+        // tablet's move floor is left out: it is sound only for a snapshot taken after the
+        // move published, which the cut alone does not say, and leaving it out can only add
+        // a conflict (the 50-seed tablets model check caught a transaction validated at a
+        // floor above its own snapshot).
+        let at = cut.read_point(shard.0, 0);
         let snapshot = at.seqno;
         let unseen = |seqno: Seqno| !at.visible(seqno);
         self.key_buf.clear();

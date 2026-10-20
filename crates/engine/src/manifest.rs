@@ -993,7 +993,12 @@ pub(crate) fn end(
                 for t in &mut entries {
                     t.visible_floor = match cur.tablets.entry(t.id) {
                         Some(prev) if prev.shard == t.shard => prev.visible_floor,
-                        _ => moved_floor(&catalog, &mems, &ssts, t),
+                        Some(_) => moved_floor(&catalog, &mems, &ssts, t),
+                        // A split's or merge's child on its parent's shard: no floor. One
+                        // computed from its data would raise a snapshot's read point above
+                        // its own cut (a commit applied before the split but after the
+                        // snapshot was taken), which a transaction's validation then missed.
+                        None => 0,
                     };
                 }
                 Arc::new(TabletMap::build(cur.tablets.version() + 1, &entries))

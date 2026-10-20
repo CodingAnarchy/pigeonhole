@@ -1110,6 +1110,9 @@ enum Kind {
     /// A transaction: reads at the engine snapshot, then the batch.
     Txn {
         snapshot: Seqno,
+        /// The snapshot's cut (#717 (b2)): what the transaction could see is decided per
+        /// shard, not by `snapshot` (the floor).
+        cut: pigeonhole_engine::Cut,
         reads: Vec<(String, Vec<u8>, String)>,
     },
 }
@@ -3222,10 +3225,19 @@ impl World {
                 format!("durability {:?} != {:?}", info.durability, c.durability),
             );
         }
-        if let Kind::Txn { snapshot, reads } = &c.kind {
-            // Validation must have seen every commit between the snapshot and this one.
+        if let Kind::Txn {
+            snapshot,
+            cut,
+            reads,
+        } = &c.kind
+        {
+            // Validation must have seen every commit the snapshot's cut does not include
+            // (per-shard visibility, #717 (b2): a commit above the floor may still be in
+            // the cut) that touched a read key.
+            let _ = snapshot;
             if let Some(bad) = self.history.values().find(|h| {
-                h.seqno.is_some_and(|s| s > *snapshot && s < seqno)
+                h.seqno
+                    .is_some_and(|s| s < seqno && !h.shards.iter().all(|sh| cut.includes(*sh, s)))
                     && reads.iter().any(|(t, r, f)| h.touches(t, r, f))
             }) {
                 return fail(
@@ -3566,12 +3578,19 @@ impl World {
                     self.aborted.push(inf.commit);
                 }
                 Outcome::Commit(Err(Error::Conflict)) => {
-                    let Kind::Txn { snapshot, reads } = &inf.commit.kind else {
+                    let Kind::Txn {
+                        snapshot,
+                        cut,
+                        reads,
+                    } = &inf.commit.kind
+                    else {
                         return fail(FailureClass::Protocol, "conflict on a plain commit".into());
                     };
-                    // A real conflict: some commit above the snapshot touched a read key.
+                    // A real conflict: some commit the snapshot's cut does not include
+                    // touched a read key (#717 (b2)).
                     let real = self.history.values().any(|c| {
-                        c.seqno.is_some_and(|s| s > *snapshot)
+                        c.seqno
+                            .is_some_and(|s| !c.shards.iter().all(|sh| cut.includes(*sh, s)))
                             && reads.iter().any(|(t, r, f)| c.touches(t, r, f))
                     });
                     if !real {
@@ -3925,6 +3944,7 @@ impl World {
             Err(e) => return fail(FailureClass::Protocol, format!("begin: {e}")),
         };
         let snapshot = txn.snapshot().floor();
+        let cut = txn.snapshot().cut().clone();
         let fams = families();
         let mut reads = Vec::new();
         for i in 0..1 + rng.below(2) {
@@ -4052,7 +4072,11 @@ impl World {
                 shards,
                 acked: false,
                 observed: false,
-                kind: Kind::Txn { snapshot, reads },
+                kind: Kind::Txn {
+                    snapshot,
+                    cut,
+                    reads,
+                },
             },
             armed,
             alone: true,
