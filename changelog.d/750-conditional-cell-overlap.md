@@ -1,2 +1,0 @@
-### Fixed
-- A conditional commit (`commit_if`, `check_and_mutate`) no longer waits for the next group commit, and an extra sync at `GroupSync`, because an earlier commit in its group wrote another cell of its row. It now waits only when that commit wrote the cell its condition reads (or deleted its family or row), and only later commits on its rows wait with it. Contended read-modify-write workloads paid an extra sync on a few percent of commits (D260).
