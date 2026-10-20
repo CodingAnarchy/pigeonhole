@@ -318,7 +318,9 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
         thread::park_timeout(Duration::from_millis(1));
     }
     let (on_a, on_b) = tables.join().unwrap();
-    gate.hold(&wal(1));
+    // D263: the seqno is held from the decision, so shard 1's DECISION sync
+    // (its second; its own PREPARE's is the first) is the one held.
+    gate.hold_after(&wal(1), 1);
     drop(
         db.submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
             .unwrap(),
@@ -916,4 +918,65 @@ fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     let db2 = Arc::clone(&db);
     let closed = gate::within(10, move || db2.close()).expect("close hung");
     assert!(closed.is_err(), "a close with a poisoned shard reported Ok");
+}
+
+/// D263 (perf287's review): a single on an undecided share's row waits for its decision,
+/// with no timeout of its own. Shard 1 coordinates a cross-shard commit X, and shard 0
+/// admits X's share on row `x` while both PREPARE syncs are held. A blind single and a
+/// conditional one on `x` then wait on shard 0. Shard 1 panics on its next sync (its
+/// DECISION's), before deciding: X's decision never comes. Both singles end with `Closed`
+/// (never written, so not committed) once the death is known, instead of waiting until
+/// the application closes the database.
+#[test]
+fn singles_held_behind_a_share_end_closed_when_its_coordinator_panics() {
+    let (vfs, gate) = gate::vfs(1774);
+    let db = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
+    let (on_a, on_b) = tables_on_0_and_1(&db);
+    gate.hold(&wal(1));
+    gate.hold(&wal(0));
+    let x = db
+        .submit(cross(&on_b, &on_a, "x"), Some(Durability::Sync))
+        .unwrap();
+    // Shard 0 logged X's share: it was admitted, undecided.
+    gate.wait_held(&wal(0));
+    let waits = |db: &Engine| db.metrics().cross_shard.share_waits;
+    let before = waits(&db);
+    let blind = db.submit(put(&on_a, "x"), Some(Durability::None)).unwrap();
+    let (db2, on_a2) = (Arc::clone(&db), Arc::clone(&on_a));
+    let conditional = thread::spawn(move || {
+        db2.check_and_mutate(
+            on_a2.id,
+            b"x",
+            &Predicate::Absent {
+                family: on_a2.families[0].id,
+                qualifier: b"q".to_vec(),
+            },
+            put(&on_a2, "x"),
+            Some(Durability::None),
+        )
+    });
+    for _ in 0..1_000 {
+        if waits(&db) > before {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        waits(&db) > before,
+        "the singles did not wait for X's share"
+    );
+    gate.panic(&wal(1));
+    gate.release();
+    let blind = gate::within(10, move || blind.wait()).expect("the blind single hung");
+    assert!(matches!(blind, Err(Error::Closed)), "{blind:?}");
+    let conditional =
+        gate::within(10, move || conditional.join().unwrap()).expect("the conditional single hung");
+    assert!(matches!(conditional, Err(Error::Closed)), "{conditional:?}");
+    // X itself: its coordinator died before deciding (or while its DECISION was in flight).
+    let x = gate::within(10, move || x.wait()).expect("X hung");
+    assert!(
+        matches!(x, Err(Error::Closed | Error::OutcomeUnknown)),
+        "{x:?}"
+    );
+    let _ = gate::within(10, move || db.close()).expect("close hung after a shard panic");
 }

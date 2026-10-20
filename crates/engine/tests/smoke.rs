@@ -89,7 +89,9 @@ fn cross_shard_commit_is_atomic() {
         &[put(a, "q", b"1"), put(&b, "q", b"2")],
         Durability::GroupSync,
     );
-    assert_eq!(info.seqno, 1);
+    // D263: seqno 1 is the commit's id; it applies at the next, reserved at its
+    // decision.
+    assert_eq!(info.seqno, 2);
     let snap = store.engine.snapshot().unwrap();
     assert_eq!(
         store
@@ -113,5 +115,6 @@ fn cross_shard_commit_is_atomic() {
         &[put(a, "q", b"3"), put(&b, "q", b"4")],
         Durability::Buffered,
     );
-    assert_eq!(info.seqno, 2);
+    // D263: two seqnos per cross-shard commit (its id, then its decision's).
+    assert_eq!(info.seqno, 4);
 }

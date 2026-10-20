@@ -664,6 +664,13 @@ pub struct Stalls {
     /// inside the engine, not returned as a `Conflict` (D249, ICR 0045).
     #[serde(default)]
     pub xshard_refused_pending_overlap: u64,
+    /// D263: singles held back behind an undecided cross-shard share (once
+    /// per group that held them), and the time shards had one held, summed over shards.
+    #[serde(default)]
+    pub xshard_share_waits: u64,
+    /// See [`Stalls::xshard_share_waits`].
+    #[serde(default)]
+    pub xshard_share_wait_nanos: u64,
 }
 
 impl Stalls {
@@ -709,6 +716,11 @@ impl Stalls {
             xshard_refused_pending_overlap: d(
                 before.xshard_refused_pending_overlap,
                 after.xshard_refused_pending_overlap,
+            ),
+            xshard_share_waits: d(before.xshard_share_waits, after.xshard_share_waits),
+            xshard_share_wait_nanos: d(
+                before.xshard_share_wait_nanos,
+                after.xshard_share_wait_nanos,
             ),
         }
     }
@@ -1241,8 +1253,8 @@ impl Suite {
             .filter_map(|r| r.rounds().map(|x| (r, x)))
             .collect();
         if !rounds.is_empty() {
-            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: below floor, move raise, moved, room, pending overlap | Seqnos used | Inferred wasted rounds |\n");
-            s.push_str("|---|---|---|--:|--:|--:|--:|---|--:|--:|\n");
+            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: below floor, move raise, moved, room, pending overlap | Seqnos used | Inferred wasted rounds | Share waits, ms held |\n");
+            s.push_str("|---|---|---|--:|--:|--:|--:|---|--:|--:|---|\n");
             let opt = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
             for (r, x) in rounds {
                 let reasons = r.detail.stalls.as_ref().map_or_else(
@@ -1258,9 +1270,19 @@ impl Suite {
                         )
                     },
                 );
+                let share_waits = r.detail.stalls.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    |st| {
+                        format!(
+                            "{}, {:.1}",
+                            st.xshard_share_waits,
+                            st.xshard_share_wait_nanos as f64 / 1e6
+                        )
+                    },
+                );
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {} | {} | {} | {:.3} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {:.3} | {} | {} | {} | {} |",
                     r.workload,
                     r.store,
                     r.store_config,
@@ -1271,6 +1293,7 @@ impl Suite {
                     reasons,
                     opt(x.seqnos),
                     opt(x.inferred()),
+                    share_waits,
                 );
             }
         }

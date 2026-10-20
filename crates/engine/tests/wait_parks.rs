@@ -90,7 +90,9 @@ fn a_commit_wait_held_by_another_shards_group_parks() {
     // A cross-shard commit shard B coordinates stays in flight: its seqno is held until
     // every participant applied, so the global watermark stays below it (D227: a
     // single-shard group no longer holds visibility while its sync runs).
-    gate.hold(&wal(sb));
+    // D263: the seqno is held from the decision, so shard B's DECISION sync
+    // (its second; its own PREPARE's is the first) is the one held.
+    gate.hold_after(&wal(sb), 1);
     let mut both = put(&b, "held");
     both.put(
         a.id,

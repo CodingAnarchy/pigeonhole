@@ -388,6 +388,27 @@ impl Rig {
     }
 
     /// Runs every shard until none has work and none was woken, completing no I/O.
+    /// D263: a cross-shard commit's seqno is held only from its decision, so
+    /// a test pinning visibility on its sync completes the PREPAREs' syncs until the
+    /// coordinator has logged its DECISION, whose sync then holds the seqno. Needs
+    /// `record_history(true)` before the commit.
+    fn run_to_decision(&mut self, seed: u64) {
+        self.run();
+        for _ in 0..64 {
+            if self
+                .db
+                .take_appended()
+                .iter()
+                .any(|r| r.kind == pigeonhole_engine::AppendedKind::Commit)
+            {
+                return;
+            }
+            self.sim.complete_io();
+            self.run();
+        }
+        panic!("seed {seed}: never decided");
+    }
+
     fn run(&mut self) {
         loop {
             self.woke.store(false, Ordering::Release);
@@ -524,11 +545,13 @@ fn commit_waits_park_until_their_sync_completes_and_the_driver_is_refused() {
 
         // Shard 1 coordinates a cross-shard commit whose sync is in flight: it holds the
         // global watermark (D227: a single-shard group would not).
+        rig.db.record_history(true);
+        rig.db.take_appended();
         let held = rig
             .db
             .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
             .unwrap();
-        rig.run();
+        rig.run_to_decision(seed);
         assert!(
             rig.dev.in_flight(&wal(1)) > 0,
             "seed {seed}: no sync in flight"
@@ -991,12 +1014,14 @@ fn a_visibility_wait_ends_with_outcome_unknown_when_the_shard_holding_it_dies_mi
     each_seed(|seed| {
         let mut rig = Rig::open(seed, 2);
         let (on_a, on_b) = rig.tables_on_0_and_1();
+        rig.db.record_history(true);
+        rig.db.take_appended();
         drop(
             rig.db
                 .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
                 .unwrap(),
         );
-        rig.run();
+        rig.run_to_decision(seed);
         assert!(
             rig.dev.in_flight(&wal(1)) > 0,
             "seed {seed}: no sync in flight"
@@ -1048,12 +1073,14 @@ fn a_visibility_wait_ends_when_the_database_closes_mid_io() {
     each_seed(|seed| {
         let mut rig = Rig::open(seed, 2);
         let (on_a, on_b) = rig.tables_on_0_and_1();
+        rig.db.record_history(true);
+        rig.db.take_appended();
         drop(
             rig.db
                 .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
                 .unwrap(),
         );
-        rig.run();
+        rig.run_to_decision(seed);
         let (db, t) = (Arc::clone(&rig.db), Arc::clone(&on_a));
         let waiter =
             rig.spawn_submitter(move || db.commit(put(&t, "waits"), Some(Durability::None)));

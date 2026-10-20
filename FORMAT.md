@@ -348,6 +348,7 @@ The payload of a reassembled record:
 | Batch | `1` | `seqno` u64, `commit_ts` u64, batch |
 | Prepare | `2` | `seqno` u64, `commit_ts` u64, `coordinator_stream` u32, batch |
 | Commit | `3` | `seqno` u64, `count` u16, `count` x `participant_stream` u32 |
+| Decision | `4` | `seqno` u64, `apply_seqno` u64, `commit_ts` u64, `count` u16, `count` x `participant_stream` u32 |
 
 **Batch** encoding (shared with the engine's `WriteBatch`, so commit never re-encodes): `count` u32, then `count` mutations:
 
@@ -361,7 +362,9 @@ The payload of a reassembled record:
 | `qualifier` | bytes (unescaped; empty for FamilyDelete) |
 | `value` | bytes: a stored value (§3); empty for deletes |
 
-**Cross-shard commits.** The commit's id is its seqno, reserved once by the coordinator, so it is unique for the life of the database (decision D26). Each participant writes a Prepare with its share of the mutations. The coordinator writes a Commit to its own stream once every Prepare meets the requested durability. At recovery, a Prepare is applied if and only if its coordinator's stream holds a Commit with the same seqno. Recovery sets `next_seqno` above every seqno in every replayed record, **including discarded Prepares**, so no seqno is ever reused. A stream's checkpoint never advances past a Commit record while any of its participants' Prepares may still need replay (decision D24).
+**Cross-shard commits** (decision D263, ICR 0046). A commit's **id** is a seqno its coordinator reserves once, at the start (`NEXT_SEQNO`, §11.3), and never applies: nothing is ever written at it, so it is never held, and it is unique for the life of the database (D26). Each participant writes a Prepare carrying the id in `seqno` and its share of the mutations; the Prepare's `commit_ts` is 0, since the timestamp is not picked yet, and every mutation without an explicit timestamp takes the Decision's. Once every Prepare meets the requested durability, the coordinator picks the commit timestamp above every participant's floor, reserves the seqno the commit **applies at** (held from then until every participant applied, §11.3), and writes a Decision to its own stream: the id in `seqno`, then `apply_seqno` and `commit_ts`. At recovery, a Prepare is applied if and only if its coordinator's stream holds a Decision (or a Commit, below) with the same id, and it is applied at the Decision's `apply_seqno` and `commit_ts`. Recovery sets `next_seqno` above every seqno in every replayed record, **including discarded Prepares and every Decision's `apply_seqno`**, so no seqno is ever reused. A stream's checkpoint never advances past a Decision or Commit record while any of its participants' Prepares may still need replay (decision D24).
+
+A **Commit** (type 3) is the decision as format version 2 (0.2.x, 0.3.x) wrote it: its Prepares carry the commit's own seqno and timestamp, and are applied at those. This build replays it; it writes only Decisions.
 
 A `Durability::None` commit's record is appended to the shard's in-memory stream buffer with no I/O of its own; the next `write()` or fsync, triggered by a stronger commit on the same stream, carries it to the file. So a stronger commit also makes every earlier `None` commit of its stream durable (the mixed-levels rule), and a `None` commit that no stronger commit follows survives nothing past the last flush.
 
@@ -417,10 +420,10 @@ One 64-byte line per shard at `watermarks_off + 64 x shard`. The rest of the lin
 
 ### 11.3 Seqno reservation and snapshot protocol
 
-Each shard tracks `held`: the seqnos of cross-shard commits it coordinates that are not yet applied everywhere. Every store to `pending` publishes `min(held, x)`:
+Each shard tracks `held`: the seqnos of cross-shard commits it coordinates that are decided and not yet applied everywhere (the seqno a Decision applies at, §10.3; a commit's id is reserved with a bare `fetch_add`, never held, since nothing is written at it). Every store to `pending` publishes `min(held, x)`:
 
 1. `pending[shard].store(min(held, next_seqno.load()))` (Release): a lower bound, published before reserving.
-2. `first = next_seqno.fetch_add(n)` (AcqRel). A cross-shard commit reserves `n = 1` and adds its seqno to `held`.
+2. `first = next_seqno.fetch_add(n)` (AcqRel). A cross-shard commit's decision reserves `n = 1` and adds its seqno to `held`.
 3. `pending[shard].store(min(held, first))`; apply the group; then store `min(held, next unapplied seqno)`, which is `u64::MAX` when nothing is held or pending.
 4. When every participant has applied a cross-shard commit, remove it from `held` and store `pending` again.
 
@@ -503,6 +506,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 
 - A reader rejects a `FormatVersion` above what it supports and refuses a `ShmLayoutVersion` that differs at all.
 - **Shared-memory layout version 2** adds each shard's `durable` watermark (§11.2, D227). A version 1 process cannot attach to a version 2 region, nor the reverse, so writer and reader processes must run builds with the same layout.
+- **Version 3** adds the WAL's Decision record (§10.3, D263, ICR 0046). A version 2 build (0.2.x, 0.3.x) would fail on it as corruption, and would skip a version 3 segment header as torn, dropping every record from there on. So a writable open of an older file first commits its current root twice (`OpenedPager::finish`), and both superblock pages carry version 3 before this build writes any WAL record; a version 2 build then refuses the file (`UnsupportedFormat(3)`) instead of falling back to the page it can still decode. A crash between the two commits leaves one older page naming the same root, and the next writable open finishes the upgrade. This build still reads version 1 and 2 files and replays their Commit records.
 - **Version 2** adds blob files (§7): separated values, `PutBlobFile`/`DropBlobFile` edits in use, and the `Blob` value tag in SSTs. A version 1 build (0.1.0) would read a blob pointer as an empty value, so every structure is now written with version 2 and a version 1 build refuses the file (version 2 also covers zstd blocks, codec 2 in §4.1, which a version 1 build cannot decode). This build still reads version 1 files; a file it writes to (any commit rewrites the superblock) is version 2 from then on.
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.

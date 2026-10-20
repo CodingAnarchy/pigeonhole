@@ -8,6 +8,7 @@
 ///
 /// assert!(FormatVersion::CURRENT.is_readable());
 /// assert!(FormatVersion(1).is_readable()); // 0.1.0 files
+/// assert!(FormatVersion(2).is_readable()); // 0.2.x and 0.3.x files
 /// assert!(!FormatVersion(99).is_readable());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,8 +18,10 @@ pub struct FormatVersion(pub u32);
 impl FormatVersion {
     /// The format this build writes. Version 2 adds blob files (FORMAT §7): a version 1
     /// build (0.1.0) would read a blob pointer as an empty value, so it must refuse a file
-    /// this build has written.
-    pub const CURRENT: Self = Self(2);
+    /// this build has written. Version 3 adds the WAL's DECISION record (FORMAT §10.3, D263,
+    /// ICR 0046): a version 2 build (0.2.x, 0.3.x) would fail on it as corruption, or skip a
+    /// version 3 segment as a torn header, so it must refuse the file by its version.
+    pub const CURRENT: Self = Self(3);
     /// The oldest format this build reads.
     pub const MIN_READABLE: Self = Self(1);
 

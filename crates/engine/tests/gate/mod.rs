@@ -20,6 +20,8 @@ use pigeonhole_io::{Completion, FileRef, Resolver, Vfs, VfsRef};
 #[derive(Debug, Default)]
 struct Rules {
     hold: HashSet<PathBuf>,
+    /// Asynchronous syncs of a held path let through before the hold starts.
+    skip: std::collections::HashMap<PathBuf, usize>,
     fail: HashSet<PathBuf>,
     panic: HashSet<PathBuf>,
 }
@@ -47,6 +49,15 @@ impl Gate {
     /// Holds every later asynchronous sync of `path` until [`Gate::release`].
     pub fn hold(&self, path: &Path) {
         self.rules.lock().unwrap().hold.insert(path.to_path_buf());
+    }
+
+    /// Holds every asynchronous sync of `path` after the next `skip`, which complete as
+    /// usual (D263: a cross-shard commit's seqno is held only from its
+    /// decision, so a test pinning visibility holds the DECISION's sync, not the PREPARE's).
+    pub fn hold_after(&self, path: &Path, skip: usize) {
+        let mut rules = self.rules.lock().unwrap();
+        rules.hold.insert(path.to_path_buf());
+        rules.skip.insert(path.to_path_buf(), skip);
     }
 
     /// Fails every later sync (blocking or not) of `path`.
@@ -101,7 +112,10 @@ impl Gate {
     /// Stops holding and completes every held sync (on this thread), including syncs the
     /// completions submit in turn.
     pub fn release(&self) {
-        self.rules.lock().unwrap().hold.clear();
+        let mut rules = self.rules.lock().unwrap();
+        rules.hold.clear();
+        rules.skip.clear();
+        drop(rules);
         loop {
             let held = std::mem::take(&mut *self.held.lock().unwrap());
             if held.is_empty() {
@@ -274,10 +288,15 @@ impl pigeonhole_io::File for GateFile {
     fn submit_sync_data(&self) -> Completion<()> {
         let (hold, panic) = {
             let mut rules = self.gate.rules.lock().unwrap();
-            (
-                rules.hold.contains(&self.path),
-                rules.panic.remove(&self.path),
-            )
+            let mut hold = rules.hold.contains(&self.path);
+            if hold
+                && let Some(n) = rules.skip.get_mut(&self.path)
+                && *n > 0
+            {
+                *n -= 1;
+                hold = false;
+            }
+            (hold, rules.panic.remove(&self.path))
         };
         assert!(!panic, "injected panic in a sync of {:?}", self.path);
         let result = if self.failing() {

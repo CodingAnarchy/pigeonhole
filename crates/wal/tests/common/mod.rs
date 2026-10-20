@@ -147,7 +147,9 @@ impl Replayed {
             .map(|(_, b)| match WalRecord::decode(b).unwrap() {
                 WalRecord::Batch { seqno, .. }
                 | WalRecord::Prepare { seqno, .. }
-                | WalRecord::Commit { seqno, .. } => seqno,
+                | WalRecord::Commit { seqno, .. }
+                | WalRecord::Decision { seqno, .. } => seqno,
+                other => panic!("unexpected record {other:?}"),
             })
             .collect()
     }

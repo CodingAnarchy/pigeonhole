@@ -320,22 +320,24 @@ fn versions_are_checked() {
         column_filter: BlockAddr::default(),
         properties: BlockAddr::default(),
         compression_dict: BlockAddr::default(),
-        version: FormatVersion(3),
+        version: FormatVersion(4),
         flags: 0,
     };
     assert_eq!(
         Footer::decode(&f.encode()),
         Err(pigeonhole_format::Error::UnsupportedVersion {
             what: "sst footer",
-            found: 3
+            found: 4
         })
     );
-    // Files written by 0.1.0 (version 1) stay readable.
-    let old = Footer {
-        version: FormatVersion(1),
-        ..f
-    };
-    assert_eq!(Footer::decode(&old.encode()), Ok(old));
+    // Files written by 0.1.0 (version 1) and 0.2.x/0.3.x (version 2) stay readable.
+    for v in [1, 2] {
+        let old = Footer {
+            version: FormatVersion(v),
+            ..f
+        };
+        assert_eq!(Footer::decode(&old.encode()), Ok(old));
+    }
     let mut page = [0u8; 4096];
     let h = ShmHeader {
         layout_version: pigeonhole_format::ShmLayoutVersion(3),
