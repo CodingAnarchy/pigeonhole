@@ -119,7 +119,10 @@ fn moved_gives_up(waited: u64, timeout: u64) -> bool {
 /// free thousands at once; at about a microsecond each (the catalog and index lookups per
 /// record), popping them all held a turn, and the shard's pending watermark, for 3-5 ms. The
 /// rest follows on the next batches, one budget each; a closing shard pops everything.
-const CHECKPOINT_POP_BUDGET: usize = 256;
+/// Every batch that pops a budget delays the commits behind it by that long: on the AX102's
+/// regrown cross-shard row 256 cut the p99.9 from 2.0-2.5 ms to about 1 ms and raised the
+/// p99 by 40%, and 64 cut it to 0.65-0.8 ms for 5% (2026-10-20, #764).
+const CHECKPOINT_POP_BUDGET: usize = 64;
 
 /// Handler work left for the next batch (#763): a handler that stops at its budget sets its
 /// bit, `end_batch` sends one `Kick` for all of them, and the kick's batch runs each set bit's

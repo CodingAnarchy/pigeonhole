@@ -1,4 +1,4 @@
-//! #763: a shard pops at most `CHECKPOINT_POP_BUDGET` (256) unneeded records from its log per
+//! #763: a shard pops at most `CHECKPOINT_POP_BUDGET` (64) unneeded records from its log per
 //! batch, the rest on the batches a kick brings, so a flush or a settle that frees thousands
 //! of records no longer holds a turn (and the shard's pending watermark) for milliseconds.
 //!
@@ -20,7 +20,7 @@ const DB: &str = "/db/data.phdb";
 /// Large enough that nothing flushes until the test asks.
 const BUDGET: u64 = 64 << 20;
 const COMMITS: u64 = 1000;
-const POP_BUDGET: u64 = 256;
+const POP_BUDGET: u64 = 64;
 
 /// Runs the shard until `pending` resolves.
 fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Output {
