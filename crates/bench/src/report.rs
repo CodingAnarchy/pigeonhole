@@ -745,7 +745,8 @@ pub struct ShardShare {
     #[serde(default)]
     pub busy_nanos: u64,
     /// Nanoseconds the commits this shard completed spent in flight, from submit to reply
-    /// (D257); divided by the phase's length, the mean number of commits in flight at the
+    /// (D257), plus the cross-shard shares it decided, from submit to the decision (D262);
+    /// divided by the phase's length, the mean number of commit rounds in flight at the
     /// shard, and summed over shards the store's concurrency, which sizes the active
     /// shards. Absent from results written before it.
     #[serde(default)]

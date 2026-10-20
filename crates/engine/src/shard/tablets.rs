@@ -107,9 +107,10 @@ const PACK_TARGET: f64 = 0.5;
 const PACK_SPREAD: f64 = 0.75;
 
 /// Packing (D257): the commits in flight each active shard is sized for. With `C` the mean
-/// number of client commits in flight over the store (every shard's rise of
-/// `commit_inflight_nanos` over the interval, Little's law), `round(C / PACK_CONCURRENCY)`
-/// shards stay active, at least one: one writer with one commit in flight gains nothing
+/// number of client commit rounds in flight over the store (every shard's rise of
+/// `commit_inflight_nanos` over the interval, Little's law; a cross-shard commit counts at
+/// its coordinator and at each participant, D262), `round(C / PACK_CONCURRENCY)` shards
+/// stay active, at least one: one writer with one commit in flight gains nothing
 /// from a second shard and pays a wake per write on a thin one (ycsb-a at one client fell
 /// 180K → 130K ops/s spread over 13 shards on the AX102, #734's follow-up), while sixteen
 /// clients with about twelve commits in flight (a get is a quarter of their loop) keep
@@ -1831,10 +1832,11 @@ impl ShardState {
     /// (D198) is measured and traced but is no term since D257: a thin shard spins after
     /// every message, so the term grew with the spread it justified (one client over 13
     /// shards read 6.5 shards' worth). Its replacement is measured here too, apart from the
-    /// busy fraction: the mean number of client commits in flight at this shard, the rise
-    /// of `commit_inflight_nanos` over the interval (Little's law; a closed-loop client's
-    /// worth is at most 1 whatever the shard count), which shard 0 sums over the shards
-    /// into the store's concurrency (D257, `decide_pack`).
+    /// busy fraction: the mean number of client commit rounds in flight at this shard, the
+    /// rise of `commit_inflight_nanos` over the interval (Little's law; a closed-loop
+    /// client's worth is at most 1 per shard its commit occupies, whatever the shard
+    /// count), which shard 0 sums over the shards into the store's concurrency (D257,
+    /// D262, `decide_pack`).
     fn measure_busy(&mut self, now: u64) {
         let me = usize::from(self.id.0);
         let (busy, spin, pool) = self

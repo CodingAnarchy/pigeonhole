@@ -110,9 +110,11 @@ pub struct EngineMetrics {
     /// awake-but-idle time the database's clients caused.
     pub shard_spin_time_nanos: u64,
     /// Nanoseconds commits spent in flight, from `commit()` to its reply, summed over every
-    /// commit completed. Its rise over an interval, divided by the interval, is the mean
-    /// number of commits in flight: how many clients had a write outstanding at once, which
-    /// is what decides how many shards the database keeps active for them.
+    /// commit completed, and over each further shard a commit occupied (its rows on more
+    /// than one shard), from `commit()` to that shard's part of the decision. Its rise over
+    /// an interval, divided by the interval, is the mean number of commit rounds in flight:
+    /// how many clients had a write outstanding at once, each counted per shard its write
+    /// occupied, which is what decides how many shards the database keeps active for them.
     pub shard_commit_inflight_nanos: u64,
     /// Blocking commit waits (`commit()`) that parked their thread after the short spin.
     /// Async commits never park.
