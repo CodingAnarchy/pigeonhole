@@ -6057,3 +6057,105 @@ fn an_aborted_round_costs_the_same_whatever_the_log_holds() {
         "{aborts} refused rounds took {big:.3} s behind 100K logged records, {small:.3} s behind none"
     );
 }
+
+/// #772: D249's older-first rule leaves a younger commit refused behind an older one waiting
+/// at that participant for the older one's next attempt there, its last, or `Released`. The
+/// older commit A is refused with `Moved` (a move of its row `a` is held mid-flight by a held
+/// compaction) while the younger transaction B is refused at shard 2 behind A's undecided
+/// share. The move then lands `a` on shard 2, so A's retry is a single-shard commit there: no
+/// further two-phase attempt reaches shard 2. It must still release B there, or B waits
+/// until the write-stall timeout's `Busy`, which this test's clock never reaches.
+#[test]
+fn a_retry_that_lands_on_one_shard_releases_commits_waiting_behind_it() {
+    // A clock that moves a nanosecond per read: the held compaction's retry timer needs it,
+    // and the write-stall timeout (30 s) is never reached.
+    let mut db = open(3, ticking);
+    let id = db.table.id;
+    for key in [b"h".as_slice(), b"p".as_slice()] {
+        let m = db.engine.split_tablet_pending(id, key).unwrap();
+        db.drive(m).unwrap();
+    }
+    for (row, shard) in [
+        (b"a".as_slice(), 0u16),
+        (b"k".as_slice(), 1),
+        (b"z".as_slice(), 2),
+    ] {
+        let owner = db
+            .ranges()
+            .into_iter()
+            .find(|r| r.2.as_slice() <= row && r.3.as_deref().is_none_or(|e| row < e))
+            .map(|r| r.1)
+            .unwrap();
+        if owner != shard {
+            let m = db.engine.move_tablet_pending(id, row, shard).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    for row in [b"a".as_slice(), b"j", b"k", b"z"] {
+        db.put(row, b"0");
+    }
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    // The move of `a`'s tablet to shard 2 waits behind a held compaction: shard 0 refuses
+    // PREPAREs touching `a` with `Moved` meanwhile.
+    db.engine.hold_compactions(true);
+    let compact = db.engine.compact_pending(Some(id)).unwrap();
+    for _ in 0..1_000 {
+        if db.engine.compaction_held() {
+            break;
+        }
+        db.step();
+    }
+    assert!(db.engine.compaction_held());
+    let mv = db.engine.move_tablet_pending(id, b"a", 2).unwrap();
+    for _ in 0..50 {
+        db.step();
+    }
+    let before = db.engine.metrics().cross_shard;
+    // A (older): coordinated by shard 0 (`a` first), writes `z` on shard 2. B (younger):
+    // coordinated by shard 1 (`k` first), reads `j` there, writes `z`.
+    let a = overlap_txn(&db, &[], &[b"a", b"z"]);
+    let b = overlap_txn(&db, &[b"j"], &[b"k", b"z"]);
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    // Shard 0 refuses A's own share (`Moved`) and sends A's PREPARE to shard 2; shard 1
+    // sends B's; shard 2 admits A's share, then refuses B behind it.
+    turn(&mut db, 0);
+    turn(&mut db, 1);
+    turn(&mut db, 2);
+    let mid = db.engine.metrics().cross_shard;
+    assert!(
+        mid.refused_moved > before.refused_moved,
+        "A was not refused"
+    );
+    assert!(
+        mid.refused_pending_overlap > before.refused_pending_overlap,
+        "B was not refused behind A"
+    );
+    for _ in 0..200 {
+        db.step();
+    }
+    assert!(poll_commit(&mut pa).is_none() && poll_commit(&mut pb).is_none());
+    // The move lands: A's retry runs on shard 2 alone.
+    db.engine.hold_compactions(false);
+    db.drive(compact).unwrap();
+    db.drive(mv).unwrap();
+    assert_eq!(
+        db.ranges()
+            .into_iter()
+            .find(|r| r.2.is_empty())
+            .map(|r| r.1),
+        Some(2),
+        "`a` did not move to shard 2"
+    );
+    let (ra, rb) = resolve_both(&mut db, &mut pa, &mut pb);
+    let (a_info, b_info) = (ra.expect("A commits"), rb.expect("B commits"));
+    assert!(
+        a_info.seqno < b_info.seqno,
+        "B went ahead of the older A: A {} B {}",
+        a_info.seqno,
+        b_info.seqno
+    );
+    assert_eq!(db.get(b"z").map(|(_, v)| v), Some(b"t".to_vec()));
+    close(db);
+}

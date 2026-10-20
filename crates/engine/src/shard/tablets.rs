@@ -870,10 +870,18 @@ impl ShardState {
         let shards = match shards {
             Ok(s) => s,
             Err(e) => {
+                self.release_prev_shards(&m, ctx);
                 m.reply.resolve(Err(e));
                 return None;
             }
         };
+        if shards.len() <= 1 {
+            // A retried cross-shard commit now on one shard runs no further two-phase attempt
+            // at its earlier participants: commits refused there behind it (D249's
+            // older-first) are released now, or they would wait for the write-stall timeout
+            // (#772).
+            self.release_prev_shards(&m, ctx);
+        }
         match shards.as_slice() {
             [] => Some(m),
             [s] if *s == self.id => {
@@ -931,6 +939,28 @@ impl ShardState {
                 }
                 None
             }
+        }
+    }
+
+    /// Sends `Released` to the earlier participants of a retried cross-shard commit that runs
+    /// no further two-phase attempt (D249, #772).
+    fn release_prev_shards(&mut self, m: &Member, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if let Some(r) = m.retry.as_deref() {
+            self.release_shards(m.submitted_at, r.first_seqno, &r.prev_shards.clone(), ctx);
+        }
+    }
+
+    /// `Released` for the commit of priority `(submitted_at, first_seqno)` to `shards`.
+    fn release_shards(
+        &mut self,
+        submitted_at: u64,
+        first_seqno: Seqno,
+        shards: &[ShardId],
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let priority = (submitted_at, first_seqno);
+        for p in shards {
+            self.send(*p, ShardMsg::Released { priority }, ctx);
         }
     }
 
@@ -1011,6 +1041,7 @@ impl ShardState {
             }
         }
         if let Some(e) = failed {
+            self.release_shards(r.submitted_at, r.first_seqno, &r.prev_shards, ctx);
             r.reply.notify(Err(e));
             return;
         }
@@ -1066,6 +1097,8 @@ impl ShardState {
             self.retries = kept;
             for r in expired {
                 trace!("shard {} retried commit times out", self.id.0);
+                // It runs no further attempt: commits waiting behind it go (#772).
+                self.release_shards(r.submitted_at, r.first_seqno, &r.prev_shards, ctx);
                 r.reply.notify(Err(Error::Busy));
             }
         }
