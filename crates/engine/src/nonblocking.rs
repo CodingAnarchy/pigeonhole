@@ -44,7 +44,7 @@ const READER_EXPIRED_RETRIES: u32 = 8;
 enum At {
     Latest {
         view: Arc<View>,
-        cut: Arc<crate::cut::Cut>,
+        cut: crate::cut::Cut,
     },
     Snapshot(Snapshot),
 }

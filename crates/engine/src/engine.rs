@@ -3286,7 +3286,7 @@ impl Inner {
         self.role == Role::Reader
     }
 
-    pub(crate) fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, Arc<crate::cut::Cut>)> {
+    pub(crate) fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, crate::cut::Cut)> {
         for _ in 0..GET_LATEST_TRIES {
             let floor = self.shared.shm.visible_seqno();
             let cut = self.cut();
@@ -3294,7 +3294,7 @@ impl Inner {
             self.shared.hooks.before_latest_view_load.run();
             let view = self.shared.view.load();
             if self.shared.shm.visible_seqno() == floor {
-                return Some((view, Arc::new(cut)));
+                return Some((view, cut));
             }
         }
         None

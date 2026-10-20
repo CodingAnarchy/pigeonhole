@@ -33,6 +33,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pigeonhole_format::Seqno;
 use pigeonhole_shm::ShmRegion;
+use smallvec::SmallVec;
+
+/// Components inline up to this many shards (no allocation on the latest-read path).
+const INLINE_SHARDS: usize = 16;
+/// Excluded seqnos inline up to this many.
+const INLINE_EXCLUDED: usize = 4;
 
 /// Held slots per shard. Beyond them, the shard's oldest held seqno becomes a global floor
 /// (`mark`) until the count drops.
@@ -139,7 +145,7 @@ impl Visibility {
     pub(crate) fn cut(&self, shm: &ShmRegion, mut pause: impl FnMut(u8)) -> Cut {
         let n = shm.next_seqno();
         let mut r = u64::MAX;
-        let mut e: Vec<Seqno> = Vec::new();
+        let mut e: SmallVec<[Seqno; INLINE_EXCLUDED]> = SmallVec::new();
         let mut overflow = false;
         for l in &self.lines {
             let m = l.mark.load(Ordering::Acquire);
@@ -157,7 +163,7 @@ impl Visibility {
             }
         }
         pause(0);
-        let mut v = Vec::with_capacity(self.lines.len());
+        let mut v: SmallVec<[Seqno; INLINE_SHARDS]> = SmallVec::with_capacity(self.lines.len());
         for (i, l) in self.lines.iter().enumerate() {
             let own = l.own.load(Ordering::Acquire);
             v.push(n.min(r).min(own).saturating_sub(1));
@@ -176,11 +182,7 @@ impl Visibility {
             .min()
             .unwrap_or(0)
             .min(e.first().map_or(u64::MAX, |f| f.saturating_sub(1)));
-        Cut {
-            floor,
-            v: v.into_boxed_slice(),
-            e: e.into_boxed_slice(),
-        }
+        Cut { floor, v, e }
     }
 
     // ---- the coordinating shard's side (one thread per shard) ----
@@ -223,8 +225,8 @@ impl Visibility {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cut {
     pub(crate) floor: Seqno,
-    pub(crate) v: Box<[Seqno]>,
-    pub(crate) e: Box<[Seqno]>,
+    pub(crate) v: SmallVec<[Seqno; INLINE_SHARDS]>,
+    pub(crate) e: SmallVec<[Seqno; INLINE_EXCLUDED]>,
 }
 
 impl Cut {
@@ -233,8 +235,8 @@ impl Cut {
     pub(crate) fn global(seqno: Seqno, shards: usize) -> Self {
         Self {
             floor: seqno,
-            v: vec![seqno; shards.max(1)].into_boxed_slice(),
-            e: Box::default(),
+            v: std::iter::repeat_n(seqno, shards.max(1)).collect(),
+            e: SmallVec::new(),
         }
     }
 
