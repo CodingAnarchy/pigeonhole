@@ -1,12 +1,16 @@
-//! Loom model of the timestamp order between a cross-shard commit's coordinator and a
-//! participant's own stamping (D245, D263; `RUSTFLAGS="--cfg engine_loom" cargo test
-//! --release -p pigeonhole-engine --lib loom`).
+//! Loom model of the timestamp order between a cross-shard commit's coordinator, a shard
+//! handing over a tablet, and a participant's own stamping (D11, D245, D263, D264;
+//! `RUSTFLAGS="--cfg engine_loom" cargo test --release -p pigeonhole-engine --lib loom`).
 //!
 //! The protocol's shared state, with the orderings the engine uses:
 //! - `NEXT_SEQNO` (`shm::Region::reserve_seqnos`): one `fetch_add(AcqRel)` per reservation.
-//! - `ts_coord_raises[p]` (`Shared`): the coordinator's `fetch_max(T, Release)` at the
-//!   decision, before it reserves the commit's seqno `S`; the participant's `load(Acquire)`
-//!   when it stamps (`fold_coord_raise`).
+//! - `ts_raises[p]` (`Shared`, D264): the coordinator's `fetch_max(T, Release)` at the
+//!   decision, before it reserves the commit's seqno `S`, and a tablet's old owner's
+//!   `fetch_max(floor, AcqRel)` before the move is published; the participant's
+//!   `load(Acquire)` once per group after its reservation (`fold_raises`).
+//! - the view (`Shared::view`, an `ArcSwap`): published (Release) after the move's raise,
+//!   loaded (Acquire) by the client that routes a write on the moved tablet to the new
+//!   owner, before it submits the write through the new owner's queue.
 //! - `ts_floors[p]`: the participant's published floor (`store(Release)` after stamping),
 //!   which a coordinator reads (`Acquire`) to pick `T`.
 //!
@@ -102,5 +106,56 @@ fn loom_crossing_decisions_are_reachable() {
     assert!(
         CROSSED.load(std::sync::atomic::Ordering::Relaxed),
         "the model never crossed"
+    );
+}
+
+#[test]
+fn loom_a_moved_tablets_floor_and_a_decision_share_one_raise() {
+    // D264: one raise per shard carries both a tablet move's floor and a coordinator's
+    // timestamp. The old owner raises, then publishes the move. A client routes a write on
+    // the moved tablet to the new owner only once it sees the published view; the write
+    // reaches the new owner through its queue, which admits it, reserves, then folds.
+    // Whatever the interleaving with a concurrent decision, such a single stamps above the
+    // moved floor, and above the decision's timestamp when its seqno is later.
+    use std::sync::atomic::AtomicBool as StdBool;
+    const MOVED_FLOOR: u64 = 20;
+    static ROUTED: StdBool = StdBool::new(false);
+    loom::model(|| {
+        let next = Arc::new(AtomicU64::new(1));
+        let floor = Arc::new(AtomicU64::new(0));
+        let raise = Arc::new(AtomicU64::new(0));
+        let view = Arc::new(AtomicU64::new(0));
+        let mover = {
+            let (raise, view) = (Arc::clone(&raise), Arc::clone(&view));
+            thread::spawn(move || {
+                raise.fetch_max(MOVED_FLOOR, Ordering::AcqRel);
+                view.store(1, Ordering::Release);
+            })
+        };
+        let coordinator = {
+            let (next, floor, raise) = (Arc::clone(&next), Arc::clone(&floor), Arc::clone(&raise));
+            thread::spawn(move || coordinate(&next, &floor, &raise, COORD_FLOOR))
+        };
+        // The client and the new owner, as one thread (the shard queue between them is a
+        // release/acquire handoff): a single on the moved tablet is routed here only under
+        // the new view.
+        let routed = view.load(Ordering::Acquire) == 1;
+        let stamped = routed.then(|| stamp_single(&next, &floor, &raise, 0));
+        mover.join().unwrap();
+        let (s, t) = coordinator.join().unwrap();
+        if let Some((ps, pts)) = stamped {
+            ROUTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                pts > MOVED_FLOOR,
+                "stamped {pts} at or below the moved floor"
+            );
+            if ps > s {
+                assert!(pts > t, "seqno {ps} > {s} stamped at {pts} <= {t}");
+            }
+        }
+    });
+    assert!(
+        ROUTED.load(std::sync::atomic::Ordering::Relaxed),
+        "the model never routed the single to the new owner"
     );
 }

@@ -1503,6 +1503,8 @@ Each part disabled fails its test.
 
 *Amended by D263 (#717): raise-then-reserve happens at the decision, for the seqno the commit applies at; the exact check by seqno goes with D244's history. The room refusal stays.*
 
+*Amended by D264 (#724): the coordinators' raises and the move raise are one atomic, `ts_raises`, folded once per group after the reservation (`ts_coord_raises` goes).*
+
 <a id="d246"></a>
 ## D246 — Contended cross-shard commits are a judged gate workload (owner decision, 2026-10-13; bench, #406; part of D247)
 
@@ -2099,3 +2101,18 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - the D142 sweeps, `cross_shard_commits_converge_on_a_frozen_clock`, `purge_race.rs` unmodified, and `model_check.rs` with a harness that pairs a PREPARE with its DECISION by id (`tests/common/mod.rs`: a decided commit's PREPAREs are rekeyed from id to `S` within the run that appended them, and an alias whose `S` a crash lost is reverted to the id, history included);
 - `crates/pager/tests/format_upgrade.rs`, `crates/engine/tests/format_upgrade.rs`: ICR 0046's upgrade;
 - loom (`src/ts_order_loom.rs`): raise→reserve at the decision keeps every later-seqno single above `T`; the straddle and crossing decisions are reachable.
+
+<a id="d264"></a>
+## D264 — One timestamp raise per shard: a tablet move's floor and a cross-shard decision's timestamp share `ts_raises`, folded once per group after the reservation (owner decision, 2026-10-20; engine, #724; amends D245)
+
+**Decided:**
+- **One atomic.** `Shared::ts_coord_raises` goes; a coordinator `fetch_max`es its decision's timestamp into each participant's `ts_raises` (Release, before it reserves the seqno the commit applies at), where a tablet's old owner already raises the new owner to its floor (`commit_op`, AcqRel, before the move is published).
+- **One fold.** A shard folds `ts_raises` into its floor once per group, after the group's reservation and before it stamps (`fold_raises`), as it folded the coordinators' raises. `default_ts` no longer loads `ts_raises` for every single it stamps.
+- **Why it still orders both:**
+  - a coordinator's raise: unchanged from D245 (the participant's reservation is a read-modify-write on `NEXT_SEQNO` after the coordinator's, so the fold reads from its release sequence);
+  - a move's raise, through the commit's routing: the old owner raises, then the move is published in the view (Release). A client routes a write on the moved tablet to the new owner only after loading that view (Acquire), and submits it through the new owner's queue; the new owner then admits it, reserves, and folds. A write the old owner forwards was forwarded after its raise, on the same thread. Either way the raise happens before the fold.
+- `decide_commit` reads each participant's published floor and its one raise.
+
+**Why:** D245 kept the coordinators' raises apart from the move raise only because D142's seqno-blind check compared a PREPARE's timestamp with `ts_raises`: coordinator raises for later seqnos there would have refused earlier ones again. D263 removed that check (a PREPARE carries no timestamp). One fewer shared primitive (#724), and one fewer atomic load per stamped single on the single-shard commit path.
+
+**Tests:** the D142 sweeps and `cross_shard_commits_converge_on_a_frozen_clock` (tablet moves among cross-shard commits, every shard's timestamps in seqno order), `purge_race.rs`, `model_check.rs`, unmodified; loom: `loom_a_moved_tablets_floor_and_a_decision_share_one_raise` (the old owner raises then publishes the view, a coordinator decides concurrently, and a client that loads the published view routes a single to the new owner, which stamps it above the moved floor and above a decision at a lower seqno; it fails with the view published Relaxed), beside D245's two models on the same atomic.
