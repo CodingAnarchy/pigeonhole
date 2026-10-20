@@ -3094,10 +3094,129 @@ fn a_single_reserved_after_a_decision_stamps_above_it_before_the_share_is_applie
         stamped.seqno,
         stamped.commit_ts
     );
+    assert_eq!(db.get(b"b"), Some((stamped.commit_ts, b"Y".to_vec())));
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn a_round_refused_for_an_overlap_and_for_room_retries_on_the_overlap_wake_only() {
+    // #724 PR 4 (perf287): a round refused for an overlap at P and for room at Q waits for
+    // P's overlap wake only (`RetryWait`'s precedence), even when Q's room wake comes first.
+    // Three shards: Q (shard 0, the manifest pump's) with a full arena, P, and R. Z, older,
+    // has an undecided share on P's row `n` while R, its other participant, is held back. X
+    // (Q coordinates) is refused for room at Q and behind Z at P, which acknowledges X's
+    // abort without waking it. Q alone then frees room and wakes itself: no retry runs. Once
+    // R runs, Z commits, P wakes X, and X commits.
+    let mut db = open(3, |o| {
+        o.memtable_budget = 4 << 20;
+        // No memtable freezes by size: only the wait for room frees the arena.
+        o.memtable_freeze_bytes = 64 << 20;
+        o.balance_interval_nanos = u64::MAX;
+    });
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    for key in [b"m", b"t"] {
+        let m = db.engine.split_tablet_pending(id, key).unwrap();
+        db.drive(m).unwrap();
+    }
+    let (q, p, r) = (0u16, 1u16, 2u16);
+    for (i, key, to) in [(0, &b"a"[..], q), (1, &b"n"[..], p), (2, &b"u"[..], r)] {
+        if db.ranges()[i].1 != to {
+            let m = db.engine.move_tablet_pending(id, key, to).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
     assert_eq!(
-        db.get(b"b").map(|(ts, v)| (ts, v)),
-        Some((stamped.commit_ts, b"Y".to_vec()))
+        db.ranges().iter().map(|t| t.1).collect::<Vec<_>>(),
+        [q, p, r]
     );
+    let value = vec![7u8; 64 << 10];
+    for i in 0..1_000u32 {
+        let (free, largest, _) = db.engine.arena_free(usize::from(q));
+        if free < 4 * value.len() as u64 || largest < 4 * value.len() as u64 {
+            break;
+        }
+        let mut wb = WriteBatch::new();
+        wb.put(
+            id,
+            f,
+            format!("a{i:04}").as_bytes(),
+            b"q",
+            None,
+            ValueRef::Bytes(&value),
+        )
+        .unwrap();
+        db.commit(wb);
+    }
+    let put = |rows: &[(&[u8], &[u8])]| {
+        let mut wb = WriteBatch::new();
+        for (row, v) in rows {
+            wb.put(id, f, row, b"q", None, ValueRef::Bytes(v)).unwrap();
+        }
+        wb
+    };
+    let run = |db: &mut Db, shard: u16| {
+        let now = db.clock.monotonic_nanos();
+        db.shards[usize::from(shard)].run_once(now + 1_000);
+    };
+    db.engine.record_history(true);
+    db.engine.take_appended();
+    // Z: P coordinates (`n` first); its share on P is admitted, R never answers yet.
+    let mut z = db
+        .engine
+        .submit(
+            put(&[(b"n", b"Z"), (b"u", b"Z")]),
+            Some(Durability::Buffered),
+        )
+        .unwrap();
+    for _ in 0..4 {
+        run(&mut db, p);
+    }
+    // X: Q coordinates (`b` first, a 1 MiB share that does not fit there) and writes `n`.
+    let big = vec![9u8; 1 << 20];
+    let before = db.engine.room_refusals();
+    let refused_before = db.engine.metrics().cross_shard.refused_rounds;
+    let mut x = db
+        .engine
+        .submit(
+            put(&[(b"b", &big), (b"n", b"X")]),
+            Some(Durability::Buffered),
+        )
+        .unwrap();
+    // Q and P only: Q refuses its own share for room, P refuses X behind Z, Q decides the
+    // abort, P acknowledges it (no wake: Z has not moved), and Q queues the retry.
+    for _ in 0..6 {
+        run(&mut db, q);
+        run(&mut db, p);
+    }
+    assert!(
+        db.engine.room_refusals() > before,
+        "Q never refused for room"
+    );
+    // Q alone: whatever room its wait has not freed yet frees, and its room wake reaches
+    // the coordinator (Q itself), here or already during the abort round. The retry still
+    // waits for P's overlap wake.
+    for _ in 0..5_000 {
+        run(&mut db, q);
+    }
+    let (free, _, _) = db.engine.arena_free(usize::from(q));
+    assert!(free >= big.len() as u64, "Q never freed room: {free} free");
+    assert!(
+        poll_commit(&mut x).is_none(),
+        "X resolved before P's overlap wake"
+    );
+    // R answers: Z commits, P wakes X, and X's retry commits.
+    let rz = poll_until(&mut db, &mut z, 100_000).expect("Z resolved");
+    rz.expect("Z commits");
+    let rx = poll_until(&mut db, &mut x, 100_000).expect("X resolved");
+    rx.expect("X commits");
+    assert_eq!(db.get(b"n").map(|(_, v)| v), Some(b"X".to_vec()));
+    // One refused round: a retry run on Q's room wake would have met Z's share at P again.
+    let refused = db.engine.metrics().cross_shard.refused_rounds - refused_before;
+    assert_eq!(refused, 1, "X's retry ran before P's overlap wake");
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
