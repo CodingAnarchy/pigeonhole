@@ -7252,11 +7252,13 @@ impl ShardState {
             return;
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
+        let mut more = false;
         while let Some(front) = self.log.front() {
             if self.needed(catalog, front) {
                 break;
             }
             if self.checkpoint_pops >= CHECKPOINT_POP_BUDGET && !self.closing {
+                more = true;
                 // A settle or a flush can free thousands of records at once; popping them
                 // all held the turn for milliseconds (#763: 3-5 ms, and the shard's pending
                 // watermark with it). The next turn continues from here.
@@ -7306,7 +7308,9 @@ impl ShardState {
                 .min(wal.written())
                 .max(self.checkpoint);
         }
-        if self.checkpoint_candidate <= self.checkpoint {
+        // A run cut short by the budget submits its edit once it ends: an edit per budget
+        // was a manifest commit per 64 records (a flush of 4,000 made about 60, #763).
+        if more || self.checkpoint_candidate <= self.checkpoint {
             return;
         }
         // D211: no checkpoint may name a stream whose file creation is not durable. A new
