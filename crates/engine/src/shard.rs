@@ -40,9 +40,11 @@ use pigeonhole_shm::{Presence, ShmRegion, WriterLock};
 use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
 mod tablets;
+mod unreported;
 
 use tablets::{ActiveOp, TabletLoad};
 pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
+use unreported::Unreported;
 
 use crate::catalog::{Catalog, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
@@ -124,6 +126,13 @@ fn moved_gives_up(waited: u64, timeout: u64) -> bool {
 /// p99 by 40%, and 64 cut it to 0.65-0.8 ms for 5% (2026-10-20, #764).
 const CHECKPOINT_POP_BUDGET: usize = 64;
 
+/// Shares `report_shares_flushed` reports per batch while the shard is open (#777). A flush
+/// install can find ~60K shares flushed at once; reporting them all in one turn held it for
+/// 17-21 ms on the AX102's 16-shard cross-shard rows, and every PREPARE and commit queued
+/// behind it. The rest follows on the next batches, one budget each; a closing shard
+/// reports everything.
+const SHARE_REPORT_BUDGET: usize = 1024;
+
 /// Handler work left for the next batch (#763): a handler that stops at its budget sets its
 /// bit, `end_batch` sends one `Kick` for all of them, and the kick's batch runs each set bit's
 /// work after the batches in between ran their groups. One kick in the queue at a time.
@@ -138,6 +147,8 @@ struct Continuations {
 impl Continuations {
     /// `advance_checkpoint` stopped at `CHECKPOINT_POP_BUDGET` with more to pop.
     const CHECKPOINT: u8 = 1;
+    /// `report_shares_flushed` stopped at `SHARE_REPORT_BUDGET` with more to report.
+    const REPORT: u8 = 2;
 
     fn set(&mut self, bit: u8) {
         self.due |= bit;
@@ -2122,50 +2133,6 @@ impl Pinning {
     }
 }
 
-/// A share this shard applied whose coordinator has not yet been told it is in SSTs.
-#[derive(Debug)]
-struct UnreportedShare {
-    seqno: Seqno,
-    /// The seqno the share applied at, which its slots must be flushed through (D263:
-    /// above the id `seqno`).
-    flush_seqno: Seqno,
-    coordinator: ShardId,
-    slots: Vec<(TabletId, FamilyId)>,
-}
-
-/// A slot some unreported share writes: how many, and the flushed-through seqno the last
-/// report scan saw for it (`None` until a scan ran with the slot listed). A share resolves
-/// only when a slot's flushed-through seqno moves (or its tablet goes), so a report call
-/// that finds every listed slot where the last scan left it has nothing to report and
-/// skips the scan: every manifest commit anywhere (an SST, a checkpoint, a flushed seqno,
-/// a tablet change) tells every shard to report, and on a 16-shard store running
-/// cross-shard commits that was 20–60 scans a second per shard over 30–40K shares, 1–3 ms
-/// inside a turn each, with the visible watermark held for every client meanwhile (the
-/// 0.3.0 gate's cross-shard row after a packed load regrew: 398K against 590K ops/s).
-#[derive(Debug, Default)]
-struct UnreportedSlot {
-    shares: usize,
-    seen: Option<Option<Seqno>>,
-}
-
-/// Whether any slot's flushed-through seqno (`current`, `None` when its tablet is gone)
-/// differs from what the last report scan saw; records what it sees. True for a slot no
-/// scan has seen yet.
-fn unreported_slots_moved<K: std::hash::Hash + Eq>(
-    slots: &mut HashMap<K, UnreportedSlot>,
-    current: impl Fn(&K) -> Option<Seqno>,
-) -> bool {
-    let mut moved = false;
-    for (key, slot) in slots.iter_mut() {
-        let now = Some(current(key));
-        if slot.seen != now {
-            slot.seen = now;
-            moved = true;
-        }
-    }
-    moved
-}
-
 /// The per-shard token bucket on L0 depth (spec: Write path).
 #[derive(Debug)]
 struct Stall {
@@ -2519,13 +2486,9 @@ pub(crate) struct ShardState {
     /// Coordinator: settled commits not yet sent to each participant, sent together as one
     /// `CommitsSettled` by `send_settled` (D254), in shard order.
     settle_out: BTreeMap<ShardId, Vec<Seqno>>,
-    /// Participant: applied shares whose flush has not been reported to the coordinator.
-    unreported: Vec<UnreportedShare>,
-    /// The slots the shares in `unreported` write, with what the last report scan saw.
-    unreported_slots: HashMap<(TabletId, FamilyId), UnreportedSlot>,
-    /// Shares in `unreported` that write no slot (replayed validation-only shares): due
-    /// at the next report call, whatever the slots did.
-    unreported_unslotted: usize,
+    /// Participant: applied shares whose flush has not been reported to the coordinator
+    /// (#777: indexed by slots and flush seqno).
+    unreported: Unreported,
 
     // ---- compaction and stalls ----
     /// Pickers by `CompactionStyle`: each family compacts by its own style.
@@ -2831,9 +2794,7 @@ impl ShardState {
             share_reports: HashMap::new(),
             settle_to: HashMap::new(),
             settle_out: BTreeMap::new(),
-            unreported: Vec::new(),
-            unreported_slots: HashMap::new(),
-            unreported_unslotted: 0,
+            unreported: Unreported::default(),
             leveled,
             tiered,
             fifo,
@@ -3056,13 +3017,8 @@ impl ShardState {
             } => {
                 if let Some(apply_seqno) = applied {
                     self.share_seqnos.insert(seqno, apply_seqno);
-                    self.unreported_slots_add(&slots);
-                    self.unreported.push(UnreportedShare {
-                        seqno,
-                        flush_seqno: apply_seqno,
-                        coordinator,
-                        slots: slots.clone(),
-                    });
+                    self.unreported
+                        .push(seqno, apply_seqno, coordinator, &slots);
                 } else {
                     self.aborted.insert(seqno);
                 }
@@ -3138,8 +3094,6 @@ impl ShardState {
         self.cross_seqnos.clear();
         self.asked.clear();
         self.unreported.clear();
-        self.unreported_slots.clear();
-        self.unreported_unslotted = 0;
         self.share_reports.clear();
         self.aborted.clear();
         out
@@ -6033,12 +5987,7 @@ impl ShardState {
             .unpin_passes
             .fetch_add(1, Ordering::Relaxed);
         self.start_pin_pass(Pinning::Through(through), false, ctx);
-        let shares: Vec<(TabletId, FamilyId)> = self
-            .unreported
-            .iter()
-            .filter(|u| u.seqno <= through)
-            .flat_map(|u| u.slots.iter().copied())
-            .collect();
+        let shares: Vec<(TabletId, FamilyId)> = self.unreported.slots_through(through).collect();
         self.unpin.extend(shares);
         if self.freeze(false).is_err() {
             self.poison(crate::health::FailureCause::Internal);
@@ -6981,13 +6930,8 @@ impl ShardState {
                                 ctx,
                             );
                         } else {
-                            self.unreported_slots_add(&slots);
-                            self.unreported.push(UnreportedShare {
-                                seqno,
-                                flush_seqno: apply_seqno,
-                                coordinator,
-                                slots,
-                            });
+                            self.unreported
+                                .push(seqno, apply_seqno, coordinator, &slots);
                         }
                     }
                     Err(e) => {
@@ -7295,61 +7239,29 @@ impl ShardState {
         }
     }
 
-    /// Counts a share's slots into `unreported_slots` (see `UnreportedSlot`).
-    fn unreported_slots_add(&mut self, slots: &[(TabletId, FamilyId)]) {
-        if slots.is_empty() {
-            self.unreported_unslotted += 1;
-        }
-        for s in slots {
-            self.unreported_slots.entry(*s).or_default().shares += 1;
-        }
-    }
-
-    /// Takes a reported share's slots out of `unreported_slots`.
-    fn unreported_slots_remove(&mut self, slots: &[(TabletId, FamilyId)]) {
-        if slots.is_empty() {
-            self.unreported_unslotted -= 1;
-        }
-        for s in slots {
-            if let Some(slot) = self.unreported_slots.get_mut(s) {
-                slot.shares -= 1;
-                if slot.shares == 0 {
-                    self.unreported_slots.remove(s);
-                }
-            }
-        }
-    }
-
     /// Tells coordinators about applied shares whose slots are all in SSTs now: one
-    /// `SharesFlushed` per coordinator (D254). A flush install can find 100K shares
-    /// flushed, and a message per share cost the install about 20 ms and its coordinators
-    /// as many handler runs (#716).
+    /// `SharesFlushed` per coordinator (D254), at most [`SHARE_REPORT_BUDGET`] shares per
+    /// batch while the shard is open (the rest on the following batches, #777). A flush
+    /// install can find 100K shares flushed, and a message per share cost the install about
+    /// 20 ms and its coordinators as many handler runs (#716).
     fn report_shares_flushed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         let Ok(view) = self.checkpoint_view() else {
             return;
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
-        // Nothing to report unless a listed slot's flushed-through seqno moved since the
-        // last scan (`UnreportedSlot`); the settles found by other callers still go out.
-        debug_assert_eq!(
-            self.unreported_slots
-                .values()
-                .map(|s| s.shares)
-                .sum::<usize>(),
-            self.unreported.iter().map(|u| u.slots.len()).sum::<usize>(),
-            "shard {}: unreported slot counts drifted",
-            self.id.0
-        );
-        let moved = unreported_slots_moved(&mut self.unreported_slots, |s| match catalog {
+        self.unreported.debug_check();
+        let current = |s: &(TabletId, FamilyId)| match catalog {
             Some(c) => c.flushed_through(s.0, s.1),
             None if self.dropped.contains(&s.0) => None,
             None => Some(self.flushed.get(s).copied().unwrap_or(0)),
-        });
-        if !moved && self.unreported_unslotted == 0 {
+        };
+        // Nothing to report unless a listed slot's flushed-through seqno moved since the
+        // last report (`UnreportedSlot`), or the last one stopped at its budget; the settles
+        // found by other callers still go out.
+        if !self.unreported.due(current) {
             trace!(
-                "shard {} report skipped: slots {:?} unreported {}",
+                "shard {} report skipped: unreported {}",
                 self.id.0,
-                self.unreported_slots,
                 self.unreported.len()
             );
             self.send_settled(ctx);
@@ -7359,35 +7271,36 @@ impl ShardState {
             "shard {} report shares: flushed={:?} unreported={:?}",
             self.id.0, self.flushed, self.unreported
         );
+        let budget = if self.closing {
+            usize::MAX
+        } else {
+            SHARE_REPORT_BUDGET
+        };
+        let mut done: Vec<(Seqno, ShardId)> = Vec::new();
+        if self
+            .unreported
+            .take_flushed(budget, current, |seqno, coordinator| {
+                done.push((seqno, coordinator))
+            })
+        {
+            // A flush can find ~60K shares flushed; reporting them all held its turn for
+            // ~20 ms on the AX102's cross-shard rows (#777). The next batches continue.
+            self.continuations.set(Continuations::REPORT);
+        }
         // Ordered, so the sends keep a seed replay's message order.
         let mut out: BTreeMap<ShardId, Vec<Seqno>> = BTreeMap::new();
-        let mut i = 0;
-        while i < self.unreported.len() {
-            let u = &self.unreported[i];
-            let done = u
-                .slots
-                .iter()
-                .all(|s| self.slot_flushed(catalog, s, u.flush_seqno));
-            if done {
-                let u = self.unreported.swap_remove(i);
-                self.unreported_slots_remove(&u.slots);
-                if u.coordinator == self.id {
-                    // Our own share of a commit we coordinate: counted here, not handled as
-                    // a message sent to ourselves. That handler would advance the checkpoint
-                    // and re-enter the close (which calls this), one stack frame per share:
-                    // a close with thousands of them overflowed the shard's stack (#585).
-                    // Every caller advances the checkpoint next, and the batch's `end_batch`
-                    // re-checks the close.
-                    self.share_reports
-                        .entry(u.seqno)
-                        .or_insert((0, usize::MAX))
-                        .0 += 1;
-                    self.settle_if_done(u.seqno);
-                } else {
-                    out.entry(u.coordinator).or_default().push(u.seqno);
-                }
+        for (seqno, coordinator) in done {
+            if coordinator == self.id {
+                // Our own share of a commit we coordinate: counted here, not handled as a
+                // message sent to ourselves. That handler would advance the checkpoint and
+                // re-enter the close (which calls this), one stack frame per share: a close
+                // with thousands of them overflowed the shard's stack (#585). Every caller
+                // advances the checkpoint next, and the batch's `end_batch` re-checks the
+                // close.
+                self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
+                self.settle_if_done(seqno);
             } else {
-                i += 1;
+                out.entry(coordinator).or_default().push(seqno);
             }
         }
         for (coordinator, seqnos) in out {
@@ -8731,7 +8644,11 @@ impl ShardState {
             }
             ShardMsg::Kick => {
                 let due = self.continuations.take_on_kick();
-                if due & Continuations::CHECKPOINT != 0 {
+                if due & Continuations::REPORT != 0 {
+                    self.report_shares_flushed(ctx);
+                }
+                if due != 0 {
+                    // A report can settle our own shares: the checkpoint may move too.
                     self.advance_checkpoint(ctx);
                 }
             }
@@ -8917,56 +8834,6 @@ impl ShardHandler for ShardState {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_report_scan_runs_only_when_a_listed_slot_flushed_further() {
-        use super::{UnreportedSlot, unreported_slots_moved};
-        let mut slots: std::collections::HashMap<u8, UnreportedSlot> = Default::default();
-        slots.insert(
-            1,
-            UnreportedSlot {
-                shares: 3,
-                seen: None,
-            },
-        );
-        slots.insert(
-            2,
-            UnreportedSlot {
-                shares: 1,
-                seen: None,
-            },
-        );
-        let flushed = std::cell::Cell::new((10u64, 20u64));
-        let current = |k: &u8| {
-            Some(if *k == 1 {
-                flushed.get().0
-            } else {
-                flushed.get().1
-            })
-        };
-        // Unseen slots: the first call scans.
-        assert!(unreported_slots_moved(&mut slots, current));
-        // Nothing moved: every later call skips, however many manifest commits arrive.
-        for _ in 0..5 {
-            assert!(!unreported_slots_moved(&mut slots, current));
-        }
-        // One slot flushed further: scan once, then skip again.
-        flushed.set((11, 20));
-        assert!(unreported_slots_moved(&mut slots, current));
-        assert!(!unreported_slots_moved(&mut slots, current));
-        // A tablet that went (its flushed-through reads `None`) counts as a move too.
-        assert!(unreported_slots_moved(&mut slots, |_| None));
-        assert!(!unreported_slots_moved(&mut slots, |_| None));
-        // A slot a new share lists starts unseen and forces the next scan.
-        slots.insert(
-            3,
-            UnreportedSlot {
-                shares: 1,
-                seen: None,
-            },
-        );
-        assert!(unreported_slots_moved(&mut slots, |_| None));
-    }
-
     use super::*;
 
     /// One committer against a stalled shard for two simulated seconds: it commits while
