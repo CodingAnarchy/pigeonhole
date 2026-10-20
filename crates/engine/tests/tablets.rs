@@ -3004,6 +3004,107 @@ fn the_default_timestamp_floor_travels_with_a_tablet() {
 }
 
 #[test]
+fn a_single_reserved_after_a_decision_stamps_above_it_before_the_share_is_applied() {
+    // D245, D264 (perf287): on a frozen clock every default timestamp comes from a floor.
+    // The coordinator's floor runs well above the participant's; it decides a cross-shard
+    // commit X at (S, T) and raises the participant to T. While the DECISION's sync is in
+    // flight the participant has no `Decide` yet (it raises its own floor to T only when it
+    // applies the share), so a single it reserves after S stamps above T only through the
+    // folded raise. Without the fold it would stamp at its own floor, below T, at a later
+    // seqno.
+    let mut db = open(2, |o| o.balance_interval_nanos = u64::MAX);
+    let id = db.table.id;
+    let f = db.table.families[0].id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = db.ranges()[0].1;
+    let high = 1 - low;
+    if db.ranges()[1].1 != high {
+        let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
+        db.drive(m).unwrap();
+    }
+    for i in 0..20u8 {
+        db.put(&[b'x', i], b"v");
+    }
+    db.engine.record_history(true);
+    db.engine.take_appended();
+    db.vfs.set_deferred_io(true);
+    // X: `x` first, so `high` coordinates; its share on `low` writes `a`.
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"x", b"q", None, ValueRef::Bytes(b"X"))
+        .unwrap();
+    wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"X"))
+        .unwrap();
+    let mut x = db.engine.submit(wb, Some(Durability::Sync)).unwrap();
+    let mut decision = None;
+    for _ in 0..1_000 {
+        db.step();
+        decision = db
+            .engine
+            .take_appended()
+            .into_iter()
+            .find(|r| r.kind == pigeonhole_engine::AppendedKind::Commit);
+        if decision.is_some() {
+            break;
+        }
+        db.vfs.complete_all_io();
+    }
+    let decision = decision.expect("X was never decided");
+    let s = decision.apply_seqno;
+    // The DECISION's sync is still in flight: `low` reserves and stamps a single on another
+    // row before it hears X's decision.
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"b", b"q", None, ValueRef::Bytes(b"Y"))
+        .unwrap();
+    let mut y = db.engine.submit(wb, Some(Durability::None)).unwrap();
+    let mut stamped = None;
+    for _ in 0..100 {
+        let now = db.clock.monotonic_nanos();
+        db.shards[usize::from(low)].run_once(now + 1_000);
+        stamped = db
+            .engine
+            .take_appended()
+            .into_iter()
+            .find(|r| r.kind == pigeonhole_engine::AppendedKind::Batch);
+        if stamped.is_some() {
+            break;
+        }
+    }
+    let stamped = stamped.expect("the single was never stamped");
+    assert!(
+        stamped.seqno > s,
+        "single at {} not after S {s}",
+        stamped.seqno
+    );
+    db.vfs.set_deferred_io(false);
+    db.vfs.complete_all_io();
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..10_000 {
+        let done_x = matches!(Pin::new(&mut x).poll(&mut cx), Poll::Ready(_));
+        let done_y = matches!(Pin::new(&mut y).poll(&mut cx), Poll::Ready(_));
+        if done_x && done_y {
+            break;
+        }
+        db.step();
+    }
+    let (t, _) = db.get(b"a").expect("X committed");
+    assert!(
+        stamped.commit_ts > t,
+        "the single at seqno {} (after S {s}) stamped {} at or below X's timestamp {t}",
+        stamped.seqno,
+        stamped.commit_ts
+    );
+    assert_eq!(
+        db.get(b"b").map(|(ts, v)| (ts, v)),
+        Some((stamped.commit_ts, b"Y".to_vec()))
+    );
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
 fn a_full_compaction_rewrites_a_lone_sst() {
     // Issue #94: with tablet changes on, how many SSTs a slot holds depends on when splits
     // and moves flushed it, so a full compaction rewrites a lone L0 SST rather than moving

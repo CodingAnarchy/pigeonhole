@@ -221,8 +221,8 @@ pub struct AppendedRecord {
     /// timestamp here when its record was checkpointed and compaction dropped every entry
     /// it wrote.
     pub commit_ts: Timestamp,
-    /// A COMMIT's (DECISION's) applied seqno, the commit's `seqno` being its id (D263)
-    ///; 0 for other records.
+    /// A COMMIT's (DECISION's) applied seqno, the commit's `seqno` being its id (D263); 0
+    /// for other records.
     pub apply_seqno: Seqno,
 }
 
