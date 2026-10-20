@@ -799,7 +799,6 @@ impl Engine {
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
             ts_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
-            ts_raisers: (0..shards).map(|_| Mutex::new((0, 0))).collect(),
             ts_coord_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
             balance: BalanceConfig {
@@ -1347,7 +1346,6 @@ impl Engine {
             metrics: Vec::new(),
             ts_floors: Vec::new(),
             ts_raises: Vec::new(),
-            ts_raisers: Vec::new(),
             ts_coord_raises: Vec::new(),
             loads: Vec::new(),
             balance: BalanceConfig::default(),
@@ -3151,7 +3149,6 @@ impl Inner {
             submitted_at,
             validate,
             map_version: view.tablets.version(),
-            commit_ts: None,
             epoch: 0,
             room_wait: None,
             first_seqno: 0,

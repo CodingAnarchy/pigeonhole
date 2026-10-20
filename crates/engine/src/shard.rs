@@ -454,9 +454,6 @@ pub(crate) struct Shared {
     /// Per-shard floor raises from shards handing it tablets (D11: the floor travels with
     /// the tablet); the shard's next default timestamp is above it.
     pub ts_raises: Vec<Padded>,
-    /// Per shard, the shards whose floor set its current raise (a bit per shard below 64),
-    /// with that raise: a retried commit may tie a raise only its own shards made.
-    pub ts_raisers: Vec<Mutex<(Timestamp, u64)>>,
     /// Per shard, the largest timestamp a coordinator of a cross-shard commit it takes part
     /// in picked, raised (`fetch_max`, Release) before that coordinator reserved the
     /// commit's seqno (D245). The shard's stamping folds it in (Acquire), so its singles at
@@ -937,43 +934,12 @@ pub(crate) type CommitPriority = (u64, Seqno);
 /// What a retried cross-shard commit carries into its next attempt.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Retried {
-    /// Its first timestamp, when the retry keeps it.
-    pub preset: Option<Preset>,
     /// The seqno its first attempt reserved: with `submitted_at`, its `CommitPriority`
     /// (D249).
     pub first_seqno: Seqno,
     /// The participants of the attempt it retries: those the next route leaves out hear
     /// `ShardMsg::Released`, so a commit waiting behind it there stops waiting (D249).
     pub prev_shards: Vec<ShardId>,
-}
-
-/// A refused commit's first timestamp, carried into its retry.
-#[derive(Debug, Clone)]
-pub(crate) struct Preset {
-    pub ts: Timestamp,
-    /// Shards whose floor may equal `ts` because of this commit itself (the coordinator that
-    /// assigned it and the participants that prepared it). Any other shard at `ts` made a
-    /// write of its own there, and the retry takes a new timestamp rather than tie with it.
-    pub own: Vec<ShardId>,
-}
-
-/// Whether a retried commit may keep timestamp `ts` on `shard`, whose floor is `floor` and
-/// whose raise is `raise`, set by the shards in the bit mask `raisers`: above both, or equal
-/// only where the shards that reached `ts` are the commit's own (`Preset::own`).
-fn preset_fits(
-    ts: Timestamp,
-    own: &[ShardId],
-    shard: ShardId,
-    floor: Timestamp,
-    (raise, raisers): (Timestamp, u64),
-) -> bool {
-    let own_mask = own
-        .iter()
-        .filter(|s| s.0 < 64)
-        .fold(0u64, |m, s| m | (1 << s.0));
-    let floor_ok = ts > floor || (ts == floor && own.contains(&shard));
-    let raise_ok = ts > raise || (ts == raise && raisers & !own_mask == 0);
-    floor_ok && raise_ok
 }
 
 /// A cross-shard commit request, sent to the coordinator (the shard owning the first row).
@@ -987,9 +953,6 @@ pub(crate) struct CoordinateReq {
     /// Version of the tablet map the parts were routed with: a commit a participant refused
     /// because it is moving a tablet is retried once the map is newer.
     pub map_version: u64,
-    /// A retry's first commit timestamp, kept when it is still above every participant's
-    /// floor (the refused attempt then leaves no trace).
-    pub commit_ts: Option<Preset>,
     /// `Shared::tablet_epoch` when the commit was coordinated: a refused commit is also
     /// retried once a tablet change has finished since (it may have failed, leaving the map
     /// as it was).
@@ -1332,11 +1295,7 @@ impl Member {
             kind: MemberKind::Single,
             durability: req.durability,
             seqno: 0,
-            commit_ts: req
-                .retry
-                .as_ref()
-                .and_then(|r| r.preset.as_ref())
-                .map_or(0, |p| p.ts),
+            commit_ts: 0,
             retry: req.retry,
             bytes: Bytes::Own(req.bytes),
             reply: req.reply,
@@ -1448,8 +1407,6 @@ struct Coord {
     commit_ts: Timestamp,
     /// The seqno reserved and held at the decision (D263), 0 before.
     apply_seqno: Seqno,
-    /// Shards that may hold `commit_ts` because of this commit (see `Preset::own`).
-    own: Vec<ShardId>,
     epoch: u64,
     /// The commit's priority, the same across its retries (D249).
     priority: CommitPriority,
@@ -4192,22 +4149,6 @@ impl ShardState {
         first
     }
 
-    /// `preset` (a retried commit's first timestamp) when it still fits this shard's floor
-    /// (`preset_fits`), else a fresh default timestamp.
-    fn default_ts_or(&mut self, preset: Timestamp, own: &[ShardId]) -> Timestamp {
-        if preset == 0 {
-            return self.default_ts();
-        }
-        let raise = *self.shared.ts_raisers[usize::from(self.id.0)]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if preset_fits(preset, own, self.id, self.ts_floor, raise) {
-            self.raise_ts_floor(preset);
-            return preset;
-        }
-        self.default_ts()
-    }
-
     fn default_ts(&mut self) -> Timestamp {
         let now = self.shared.vfs.now_micros();
         // A shard that handed us a tablet raised our floor to its own (D11). Coordinators'
@@ -5145,7 +5086,7 @@ impl ShardState {
         let first = (singles > 0).then(|| self.reserve(singles));
         // One shard has no cross-shard commits: one test of a field on its commit path. With
         // more, the coordinators' raises are folded in after this group's reservation, so
-        // every single it stamps, presets included, lands above any cross-shard commit
+        // every single it stamps lands above any cross-shard commit
         // reserved before it (D245).
         let cross = self.cross && first.is_some();
         if cross {
@@ -5157,12 +5098,7 @@ impl ShardState {
                 MemberKind::Single => {
                     m.seqno = next;
                     next += 1;
-                    let own = m
-                        .retry
-                        .as_ref()
-                        .and_then(|r| r.preset.as_ref())
-                        .map_or(&[][..], |p| p.own.as_slice());
-                    m.commit_ts = self.default_ts_or(m.commit_ts, own);
+                    m.commit_ts = self.default_ts();
                 }
                 MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
                     self.raise_ts_floor(m.commit_ts);
@@ -6337,10 +6273,8 @@ impl ShardState {
             // An undecodable batch fails its apply; it writes nothing.
             return true;
         };
-        // The least timestamp a mutation without one gets: for a single commit its preset if
-        // that still fits the floor, else a fresh default above the floor (`default_ts_or`);
-        // a share's commit timestamp, which may be below this shard's floor (D11 refuses
-        // that only with tablet changes on).
+        // The least timestamp a mutation without one gets: for a single commit its default
+        // timestamp, above the floor; a share's, above this floor too (below).
         let default_ts = match m.kind {
             MemberKind::Single if m.commit_ts == 0 => self.ts_floor + 1,
             MemberKind::Single => m.commit_ts.min(self.ts_floor + 1),
@@ -6619,7 +6553,6 @@ impl ShardState {
         // its timestamp, are picked at the decision (`decide_commit`).
         let seqno = self.shared.shm.reserve_seqnos(1);
         let commit_ts: Timestamp = 0;
-        let own = vec![self.id];
         let priority = (
             req.submitted_at,
             if req.first_seqno == 0 {
@@ -6656,7 +6589,6 @@ impl ShardState {
                 room: None,
                 commit_ts,
                 apply_seqno: 0,
-                own,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
                 priority,
                 overlap: None,
@@ -6761,11 +6693,8 @@ impl ShardState {
             let i = usize::from(s.0);
             let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
             let coord = self.shared.ts_coord_raises[i].0.load(Ordering::Acquire);
-            let raise = *self.shared.ts_raisers[i]
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
             let moved = self.shared.ts_raises[i].0.load(Ordering::Acquire);
-            floor = floor.max(own_floor).max(coord).max(raise.0).max(moved);
+            floor = floor.max(own_floor).max(coord).max(moved);
         }
         self.ts_floor = self.ts_floor.max(floor);
         let commit_ts = self.default_ts();
@@ -6822,12 +6751,7 @@ impl ShardState {
             }
             Some(e) if c.failed.is_none() => c.failed = Some(e.into()),
             Some(_) => {}
-            // It raised its floor to the commit timestamp.
-            None => {
-                if !c.own.contains(&from) {
-                    c.own.push(from);
-                }
-            }
+            None => {}
         }
         c.prepared += 1;
         if c.prepared < c.participants || c.decided {
@@ -7178,9 +7102,6 @@ impl ShardState {
                 submitted_at: c.submitted_at,
                 validate: c.validate.take(),
                 map_version: c.map_version,
-                // D263: an aborted attempt never picked a timestamp (its
-                // `commit_ts` only gathered floors): the retry takes a fresh one.
-                commit_ts: None,
                 epoch: c.epoch,
                 room_wait: c.room,
                 first_seqno: c.priority.1,
@@ -9161,23 +9082,6 @@ mod tests {
         let wait = RoomWait::new(10, TimerState::new());
         wait.timer.give_up(60);
         assert!(wait.stopped(60));
-    }
-
-    #[test]
-    fn a_retry_keeps_its_timestamp_only_where_no_other_write_reached_it() {
-        let (a, b, c) = (ShardId(0), ShardId(1), ShardId(2));
-        let own = [a, b];
-        // Strictly above the floor and the raise: kept anywhere.
-        assert!(preset_fits(10, &own, c, 9, (9, 0b100)));
-        // Below either: never.
-        assert!(!preset_fits(10, &own, a, 11, (0, 0)));
-        assert!(!preset_fits(10, &own, a, 9, (11, 0b1)));
-        // A tie with the floor only on a shard that reached it through this commit.
-        assert!(preset_fits(10, &own, b, 10, (0, 0)));
-        assert!(!preset_fits(10, &own, c, 10, (0, 0)));
-        // A tie with a raise only when every shard that raised it is the commit's own.
-        assert!(preset_fits(10, &own, c, 9, (10, 0b011)));
-        assert!(!preset_fits(10, &own, c, 9, (10, 0b101)));
     }
 
     #[test]
