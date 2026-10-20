@@ -1,5 +1,5 @@
 //! #763: the flush-time bookkeeping is budgeted per batch. A coordinator counts and settles
-//! at most `SETTLE_BUDGET` (256) seqnos of its received `SharesFlushed` reports per batch, and
+//! at most `SETTLE_BUDGET` (64) seqnos of its received `SharesFlushed` reports per batch, and
 //! a participant's report scan examines at most `REPORT_SCAN_BUDGET` (1024) unreported shares
 //! per batch; the rest follow on the batches a kick brings. After a pack → regrow the shards
 //! flush out of phase, and these turns, 3-5 ms each, then hit one shard after another all
@@ -22,7 +22,7 @@ use pigeonhole_io::sim::SimVfs;
 const DB: &str = "/db/data.phdb";
 /// Large enough that nothing flushes until the test asks.
 const BUDGET: u64 = 64 << 20;
-const SETTLE_BUDGET: u64 = 256;
+const SETTLE_BUDGET: u64 = 64;
 const REPORT_SCAN_BUDGET: u64 = 1024;
 
 /// Runs every shard until `pending` resolves.
@@ -128,7 +128,8 @@ fn a_report_of_a_thousand_shares_settles_over_several_batches() {
     commit_cross(&db, &mut shards, &c0, &p, COMMITS);
     assert_eq!(db.logged_records(2), u64::from(COMMITS));
 
-    // Shard 2's flush reports its shares to shard 0, which settles them 256 per batch.
+    // Shard 2's flush reports its shares to shard 0, which settles them 64 per batch and tells
+    // shard 2 once the run ends.
     let flush = db.submit_flush().unwrap();
     drive(&mut shards, flush).unwrap();
     settle(&mut shards);
@@ -151,6 +152,12 @@ fn a_report_of_a_thousand_shares_settles_over_several_batches() {
         u64::from(COMMITS),
         "{msgs} messages carried {seqnos} seqnos"
     );
+    // The sliced run told shard 2 once (D254's one message per run), not once per batch,
+    // which would be 1000 / 64 = 16.
+    assert!(
+        msgs <= 2,
+        "{msgs} CommitsSettled messages for one report run of {seqnos} seqnos"
+    );
     db.close().unwrap();
 }
 
@@ -160,8 +167,8 @@ fn a_flush_of_thousands_of_shares_reports_them_in_chunks() {
     let (_vfs, db, mut shards, c0, p) = open(7632);
     commit_cross(&db, &mut shards, &c0, &p, COMMITS);
 
-    // Shard 2's scan examines 1024 shares per batch: three chunks, each reported to shard 0
-    // as one message (D254's one message per coordinator per pass).
+    // Shard 2's scan examines 1024 shares per batch, three chunks, and reports to shard 0 once
+    // the pass ends: one message per coordinator per pass (D254), not one per chunk.
     let flush = db.submit_flush().unwrap();
     drive(&mut shards, flush).unwrap();
     settle(&mut shards);
@@ -183,9 +190,10 @@ fn a_flush_of_thousands_of_shares_reports_them_in_chunks() {
         u64::from(COMMITS),
         "{msgs} messages carried {seqnos} seqnos"
     );
+    // One message per coordinator per pass (D254), not one per chunk, which would be 3.
     assert!(
-        (3..=6).contains(&msgs),
-        "{msgs} report messages for {seqnos} shares scanned in chunks of {REPORT_SCAN_BUDGET}"
+        msgs <= 2,
+        "{msgs} report messages for {seqnos} shares scanned in chunks of {REPORT_SCAN_BUDGET}: one per pass"
     );
     db.close().unwrap();
 }

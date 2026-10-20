@@ -125,10 +125,13 @@ fn moved_gives_up(waited: u64, timeout: u64) -> bool {
 const CHECKPOINT_POP_BUDGET: usize = 64;
 
 /// How many seqnos a coordinator counts and settles from its received `SharesFlushed`
-/// reports in one batch while open (#763): each is a map update and a settle check, and a
-/// flush's report of thousands held the coordinator's turn 4-5 ms. The rest wait in
-/// `reports_pending` for the kicked batches.
-const SETTLE_BUDGET: usize = 256;
+/// reports in one batch while open (#763): each is a map update and a settle check, about
+/// 1.5 µs, and a flush's report of thousands held the coordinator's turn 4-5 ms. 64 is about
+/// 100 µs of work, under the cross-shard rows' p99 (a 256 batch, ~0.4 ms, sat above it, as
+/// ctr274's sweep found for the checkpoint pops). The rest wait in `reports_pending` for the
+/// kicked batches; the settles go out once the run ends, one `CommitsSettled` per participant
+/// per report run (D254), not one per batch.
+const SETTLE_BUDGET: usize = 64;
 
 /// How many unreported shares a report scan (`report_shares_flushed`) examines in one batch
 /// while open (#763): the scan after a flush covers every share applied since the last one,
@@ -157,6 +160,11 @@ impl Continuations {
 
     fn set(&mut self, bit: u8) {
         self.due |= bit;
+    }
+
+    /// Whether `bit`'s work is left for the next batch.
+    fn due(&self, bit: u8) -> bool {
+        self.due & bit != 0
     }
 
     /// At `end_batch`: whether to send the kick (work is due and no kick is queued).
@@ -2498,6 +2506,9 @@ pub(crate) struct ShardState {
     report_cursor: Option<usize>,
     /// Shares the report scan examined in this batch (`end_batch` resets it).
     scanned_in_batch: usize,
+    /// The shares a pass found in SSTs so far, by coordinator: sent when the pass ends, one
+    /// `SharesFlushed` per coordinator per pass (D254), not one per batch (#763).
+    report_out: BTreeMap<ShardId, Vec<Seqno>>,
     /// A wake is armed for the stream's creation to settle (D211, `advance_checkpoint`).
     creation_wake: bool,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
@@ -2822,6 +2833,7 @@ impl ShardState {
             settled_in_batch: 0,
             report_cursor: None,
             scanned_in_batch: 0,
+            report_out: BTreeMap::new(),
             creation_wake: false,
             aborted: HashSet::new(),
             commit_ckpt: HashSet::new(),
@@ -7184,7 +7196,9 @@ impl ShardState {
     /// one `CommitsSettled` (D254). Every caller of `settle_if_done` calls this once its loop
     /// is done; `end_batch` checks that (debug) and sends anything left.
     fn send_settled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
-        if self.settle_out.is_empty() {
+        // A settle run cut short by its budget sends once it ends: a message per batch was
+        // one `CommitsSettled` per participant per 64 seqnos (#763), where D254 has one per run.
+        if self.settle_out.is_empty() || self.continuations.due(Continuations::SETTLE) {
             return;
         }
         for (p, seqnos) in std::mem::take(&mut self.settle_out) {
@@ -7265,8 +7279,6 @@ impl ShardState {
             "shard {} report shares from {i}: flushed={:?} unreported={:?}",
             self.id.0, self.flushed, self.unreported
         );
-        // Ordered, so the sends keep a seed replay's message order.
-        let mut out: BTreeMap<ShardId, Vec<Seqno>> = BTreeMap::new();
         while i < self.unreported.len() {
             if self.scanned_in_batch >= REPORT_SCAN_BUDGET && !self.closing {
                 // The rest of the scan follows on a kicked batch (#763); a share this
@@ -7296,15 +7308,22 @@ impl ShardState {
                         .0 += 1;
                     self.settle_if_done(u.seqno);
                 } else {
-                    out.entry(u.coordinator).or_default().push(u.seqno);
+                    // Ordered, so the sends keep a seed replay's message order.
+                    self.report_out
+                        .entry(u.coordinator)
+                        .or_default()
+                        .push(u.seqno);
                 }
             } else {
                 i += 1;
             }
         }
         self.report_cursor = (i < self.unreported.len()).then_some(i);
-        for (coordinator, seqnos) in out {
-            self.send(coordinator, ShardMsg::SharesFlushed { seqnos }, ctx);
+        if self.report_cursor.is_none() {
+            // The pass is done: one message per coordinator for everything it found (D254).
+            for (coordinator, seqnos) in std::mem::take(&mut self.report_out) {
+                self.send(coordinator, ShardMsg::SharesFlushed { seqnos }, ctx);
+            }
         }
         self.send_settled(ctx);
     }
@@ -8795,7 +8814,7 @@ impl ShardHandler for ShardState {
         // (`send_settled`). One that forgot would hold the participants' PREPAREs, and so
         // their WAL, until some later settle: caught in tests, and sent here regardless.
         debug_assert!(
-            self.settle_out.is_empty(),
+            self.settle_out.is_empty() || self.continuations.due(Continuations::SETTLE),
             "settled commits left unsent to {} participants",
             self.settle_out.len()
         );
